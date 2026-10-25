@@ -35,6 +35,7 @@ pub enum Ev {
         is_error: bool,
         text: String,
         cost: f64,
+        secs: u64,
     },
     Exited(String),
 }
@@ -207,6 +208,7 @@ pub fn parse(line: &str) -> Vec<Ev> {
                 text_of(&v["errors"])
             },
             cost: v["total_cost_usd"].as_f64().unwrap_or(0.0),
+            secs: v["duration_ms"].as_u64().unwrap_or(0) / 1000,
         }],
         _ => vec![],
     }
@@ -230,7 +232,7 @@ mod tests {
 {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "h"}}, "parent_tool_use_id": null}
 {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{"}}, "parent_tool_use_id": null}
 {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "x"}, {"type": "text", "text": "hello"}]}, "parent_tool_use_id": null}
-{"type":"result","subtype":"success","is_error":false,"result":"hello","total_cost_usd":0.5,"session_id":"s1"}
+{"type":"result","subtype":"success","is_error":false,"result":"hello","total_cost_usd":0.5,"duration_ms":48210,"session_id":"s1"}
 {"type":"result","subtype":"error_during_execution","is_error":true,"errors":["Invalid API key"],"total_cost_usd":0}
 not json"#;
 
@@ -257,12 +259,14 @@ not json"#;
                 Ev::Result {
                     is_error: false,
                     text: "hello".into(),
-                    cost: 0.5
+                    cost: 0.5,
+                    secs: 48
                 },
                 Ev::Result {
                     is_error: true,
                     text: "Invalid API key".into(),
-                    cost: 0.0
+                    cost: 0.0,
+                    secs: 0
                 },
             ]
         );
