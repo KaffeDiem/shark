@@ -70,7 +70,13 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
   - A view of the open workspace becomes a header tab (add a `Tab` variant).
   - A view not tied to one workspace (settings, repo list) opens with `window.open_dialog`, `w(px(640.))`, like the palette.
   - Don't add a second sidebar or panes outside the island.
-- **Sidebar row:** 28px tall, `mx_2 px_2 gap_2`, `rounded(theme.radius)`, `text_sm`. Order: status icon (14px), name (`flex_1`, truncated), optional badge, metadata (`text_xs`, `muted_foreground`). Sidebar width 244px.
+- **Sidebar row:** 28px tall, `mx_2 mb_1 px_2 gap_2` (the 4px gap keeps hover and selection backgrounds apart), `rounded(theme.radius)`, `text_sm`. Order: status icon (14px), name (`flex_1`, truncated), optional badge, metadata (`text_xs`, `muted_foreground`). Sidebar width 244px.
+  - Workspace rows are 44px with two lines: the name, then its repos (`text_xs`, `muted_foreground`, `api · web`), so you can see where an agent works without opening it.
+- **Context menus:** right-click on sidebar rows (`.context_menu(..)`, gpui-kit `PopupMenu`). Follow the Apple HIG:
+  - A disabled label first that says what the menu acts on (branch, or repo + path).
+  - At most three groups: open/reveal (`Reveal in Finder`, `Open in Terminal`, `Copy Path`, one submenu each with "Workspace folder" plus one row per repo, every row showing its `~/…` path), then git (`Open Pull Requests`, hidden when there are none), then destructive (`Archive`, `Force Archive…`) last.
+  - Hide items that don't apply instead of disabling them. No shortcuts in the menu; every item also exists in the palette.
+  - Title Case labels; an ellipsis only when the item asks for confirmation.
 - **Header:** 44px, `px_3`, `border_b_1` in `border`. Tabs on the left; on the right: branch (12px `GitBranch` + `text_xs`), the git button (`src/sync/`), optional badges, then status (6px `rounded_full` dot + "Running"/"Idle").
 - **Git button:** a `small` button plus a `ghost` `xsmall` chevron for the git menu. It is the header's one primary button: `primary` for a step to run, `outline` with a `warning_foreground` icon when something needs the agent or a human, `ghost` for a wait. Disabled while the agent runs if the step writes.
 - **Tabs:** 26px pills (`rounded_full`, `px_2p5`, 14px icon + `text_sm` label). Active: `secondary` + `foreground`. Inactive: `muted_foreground`, hover → `foreground`.
@@ -131,6 +137,8 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 | Keyboard hint | `Kbd::new(Keystroke::parse("cmd-k").unwrap())`, one chip per key of a chord |
 | Command palette entry | A row in `COMMANDS` in `src/app.rs`: label, `IconName`, handler |
 | Dialog with a form | `window.open_dialog` with a small `Render` entity (see `NewWorkspaceForm`) |
+| Right-click menu | `.context_menu(..)` with `PopupMenuItem::new(..).on_click(..)`; see `ws_menu` |
+| Multi-select from a list | `Command` embedded in the form, items `.checked(..)`, `on_confirm` toggles (see `NewWorkspaceForm`) |
 | Destructive confirm | `window.open_alert_dialog`, `ButtonVariant::Danger` |
 | Feedback | `window.push_notification(Notification::success/error(..))`. No custom toasts |
 | Text input | `Input` / `Textarea`; inside a card use `.appearance(false)` and let the card draw the border |
