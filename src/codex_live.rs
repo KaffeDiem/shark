@@ -593,6 +593,17 @@ fn codex_live_sub_agent() {
         r.text().contains("FINISHED"),
         "Result came before the main turn's reply"
     );
+    // Its row: started, and ended before the main turn did.
+    let Some(Ev::ToolUse { id, .. }) =
+        (r.evs.iter()).find(|e| matches!(e, Ev::ToolUse { name, .. } if name == "Agent"))
+    else {
+        panic!("no Agent row")
+    };
+    let end = (r.evs.iter()).position(|e| matches!(e, Ev::ToolResult { id: i, .. } if i == id));
+    assert!(
+        end.is_some_and(|e| e < r.evs.len() - 1),
+        "Agent row never ended"
+    );
     r.close();
     check_replay(&env, &r.evs);
 }
