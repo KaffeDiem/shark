@@ -1,5 +1,6 @@
 //! Pure git/GitHub state per repo and the step it calls for. No gpui here, so it is unit tested.
 use crate::git::{cmd_bounded, git, run};
+use crate::prompts;
 use serde_json::Value;
 use std::path::Path;
 
@@ -427,12 +428,7 @@ pub fn next_action(repos: &[Repo], branch: &str) -> Action {
     }
     let conflicted = names(&|_, l| l.conflicts > 0);
     if !conflicted.is_empty() {
-        let prompt = format!(
-            "These repos have unresolved conflicts: {}. In each, inspect `git status`, resolve every conflict \
-             keeping the intent of both sides, then finish the merge or rebase in progress \
-             (`git rebase --continue` or `git commit`). Abort only if resolving is impossible, and explain why.",
-            conflicted.join(", ")
-        );
+        let prompt = prompts::render("conflicts", &conflicted.join(", "), branch);
         return act(
             label("Resolve conflicts", &conflicted),
             Kind::Agent(prompt),
@@ -442,11 +438,7 @@ pub fn next_action(repos: &[Repo], branch: &str) -> Action {
     }
     let midway = names(&|_, l| l.op.is_some());
     if !midway.is_empty() {
-        let prompt = format!(
-            "A merge, rebase, cherry-pick or revert was left unfinished in: {}. Check `git status` in each and \
-             finish it (`git rebase --continue`, `git commit`, …), then report what you did.",
-            midway.join(", ")
-        );
+        let prompt = prompts::render("finish", &midway.join(", "), branch);
         return act(
             label("Finish operation", &midway),
             Kind::Agent(prompt),
@@ -456,11 +448,7 @@ pub fn next_action(repos: &[Repo], branch: &str) -> Action {
     }
     let detached = names(&|_, l| l.branch.is_none());
     if !detached.is_empty() {
-        let prompt = format!(
-            "HEAD is detached in: {}. Get back onto branch `{branch}` without losing commits \
-             (if HEAD has commits that aren't on `{branch}`, bring them over), then report what you did.",
-            detached.join(", ")
-        );
+        let prompt = prompts::render("detached", &detached.join(", "), branch);
         return act(
             label("Fix detached HEAD", &detached),
             Kind::Agent(prompt),
@@ -470,11 +458,7 @@ pub fn next_action(repos: &[Repo], branch: &str) -> Action {
     }
     let wrong = names(&|_, l| l.branch.as_deref() != Some(branch));
     if !wrong.is_empty() {
-        let prompt = format!(
-            "These repos are on a different branch than the workspace branch `{branch}`: {}. Switch them back to \
-             `{branch}` (bring over any commits made on the other branch), then report what you did.",
-            wrong.join(", ")
-        );
+        let prompt = prompts::render("wrong_branch", &wrong.join(", "), branch);
         return act(
             label("Switch to branch", &wrong),
             Kind::Agent(prompt),
@@ -484,14 +468,7 @@ pub fn next_action(repos: &[Repo], branch: &str) -> Action {
     }
     let dirty = names(&|_, l| l.changed > 0);
     if !dirty.is_empty() {
-        let prompt = format!(
-            "Commit and push the uncommitted changes in: {}. In each repo review the diff and stage the files that \
-             belong to this change. Never commit secrets or build output; if such files show up, add them to \
-             .gitignore instead. Write a concise commit message in the repo's style, commit, then \
-             `git push -u origin {branch}`. If the push is rejected because the remote moved, \
-             `git pull --rebase origin {branch}` and push again.",
-            dirty.join(", ")
-        );
+        let prompt = prompts::render("commit", &dirty.join(", "), branch);
         return act(
             label("Commit and push", &dirty),
             Kind::Agent(prompt),
@@ -519,12 +496,7 @@ pub fn next_action(repos: &[Repo], branch: &str) -> Action {
     }
     let diverged = names(&|_, l| l.remote.is_some_and(|(a, b)| a > 0 && b > 0));
     if !diverged.is_empty() {
-        let prompt = format!(
-            "Branch `{branch}` has diverged from `origin/{branch}` in: {}. Rebase the local commits onto \
-             `origin/{branch}` (`git pull --rebase origin {branch}`), resolve any conflicts, run a quick sanity \
-             check, and push.",
-            diverged.join(", ")
-        );
+        let prompt = prompts::render("diverged", &diverged.join(", "), branch);
         return act(
             label("Sync with remote", &diverged),
             Kind::Agent(prompt),
@@ -573,11 +545,7 @@ pub fn next_action(repos: &[Repo], branch: &str) -> Action {
     let prs = |f: &dyn Fn(&Pr, &Local) -> bool| names(&|r, l| r.open_pr().is_some_and(|p| f(p, l)));
     let conflicting = prs(&|p, _| p.merge_state == "DIRTY");
     if !conflicting.is_empty() {
-        let prompt = format!(
-            "These PRs conflict with their base: {}. In each repo `git fetch origin`, merge the base into \
-             `{branch}`, resolve the conflicts, run a quick sanity check, commit and push.",
-            with_base(&conflicting)
-        );
+        let prompt = prompts::render("pr_conflicts", &with_base(&conflicting), branch);
         return act(
             label("Resolve PR conflicts", &conflicting),
             Kind::Agent(prompt),
@@ -593,23 +561,13 @@ pub fn next_action(repos: &[Repo], branch: &str) -> Action {
         })
         .collect();
     if !failing.is_empty() {
-        let prompt = format!(
-            "CI checks fail on the PRs ({}). For each, read the failure (`gh pr checks`, then \
-             `gh run view <run-id> --log-failed` in that repo), fix the cause, commit and push. \
-             Don't disable or skip checks.",
-            failing.join("; ")
-        );
+        let prompt = prompts::render("checks", &failing.join("; "), branch);
         let rs = prs(&|p, _| matches!(p.checks, Checks::Failing(_)));
         return act(label("Fix checks", &rs), Kind::Agent(prompt), rs, true);
     }
     let changes = prs(&|p, _| p.review == "CHANGES_REQUESTED");
     if !changes.is_empty() {
-        let prompt = format!(
-            "Reviewers requested changes on the PRs in: {}. Read the review comments \
-             (`gh pr view --comments` and `gh api repos/{{owner}}/{{repo}}/pulls/<n>/comments`), address each one, \
-             commit and push, then summarize what you changed per comment.",
-            changes.join(", ")
-        );
+        let prompt = prompts::render("review", &changes.join(", "), branch);
         return act(
             label("Address review", &changes),
             Kind::Agent(prompt),

@@ -512,17 +512,14 @@ impl GitSync {
                 Row::Run(Kind::CreatePr),
             ),
         ]);
-        let base_prompt = format!(
-            "Bring the latest base branch into `{}` in every repo that is behind it: `git fetch origin`, \
-             merge the base ({}), resolve conflicts, run a quick sanity check, commit and push.",
-            self.ws.branch,
-            self.ws
-                .repos
-                .iter()
-                .map(|r| format!("{}: `{}`", r.name, r.base))
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
+        let bases = self
+            .ws
+            .repos
+            .iter()
+            .map(|r| format!("{}: `{}`", r.name, r.base))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let base_prompt = crate::prompts::render("update_base", &bases, &self.ws.branch);
         rows.push((
             "Update from base (agent)".into(),
             IconName::GitMerge,

@@ -40,11 +40,9 @@ pub(crate) fn inter_features() -> FontFeatures {
 }
 
 /// Hint text below the muted level; gpui-kit has no token for it. Never use it for content.
+/// `docs/themes.py` checks the same blend against the contrast floor.
 pub(crate) fn faint(theme: &Theme) -> Hsla {
-    match theme.is_dark() {
-        true => rgb(0x808083).into(),
-        false => rgb(0x9c9d9f).into(),
-    }
+    theme.muted_foreground.blend(theme.background.opacity(0.4))
 }
 
 /// `/Users/me/x` → `~/x`: paths in menus are read, so keep them short.
@@ -418,13 +416,23 @@ const COMMANDS: &[(&str, IconName, Cmd)] = &[
     ("Change model…", IconName::Sparkles, |s, w, cx| {
         s.pick_model(w, cx)
     }),
+    ("Settings…", IconName::Settings, |s, w, cx| {
+        crate::settings::open(&s.state, w, cx)
+    }),
 ];
 
 impl Shark {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let state = State::load();
+        crate::prompts::set_overrides(&state.prompts);
+        crate::settings::apply(&state.appearance, cx);
         let sidebar_focus = cx.focus_handle();
         sidebar_focus.focus(window, cx);
+        let _subs = vec![cx.observe_window_appearance(window, |s, _, cx| {
+            if s.state.appearance.mode == crate::state::Mode::System {
+                crate::settings::apply(&s.state.appearance, cx)
+            }
+        })];
         Shark {
             state,
             sel: 0,
@@ -451,7 +459,7 @@ impl Shark {
             _editor_subs: vec![],
             syncs: HashMap::new(),
             sidebar_focus,
-            _subs: vec![],
+            _subs,
         }
     }
 
@@ -2201,6 +2209,9 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &ToggleFileTree, w, cx| this.toggle_tree(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleVim, w, cx| this.toggle_vim(w, cx)))
             .on_action(cx.listener(|this, _: &CloseFile, w, cx| this.close_file(w, cx)))
+            .on_action(cx.listener(|this, _: &OpenSettings, w, cx| {
+                crate::settings::open(&this.state, w, cx)
+            }))
             .child(self.render_sidebar(window, cx))
             .child(
                 // Linear's "island": content floats on the sidebar color, inset and rounded.
@@ -2430,6 +2441,59 @@ mod ui_tests {
         .unwrap();
     }
 
+    /// Settings apply and persist at once; an edited prompt reaches the git button, reset drops it.
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn settings_apply_and_save(cx: &mut TestAppContext) {
+        use crate::settings::Settings;
+        use crate::state::Mode;
+        let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        test_home();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::bind_keys(cx);
+        });
+        let (window, shark) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| Shark::new(w, cx))
+                })
+            })
+            .unwrap();
+        cx.update_window(window, |_, w, cx| {
+            let state = shark.read(cx).state.clone();
+            let weak = shark.downgrade();
+            let view = cx.new(|cx| Settings::new(weak, &state, w, cx));
+            view.update(cx, |v, cx| {
+                v.appearance(cx, |a| {
+                    a.mode = Mode::Dark;
+                    a.dark = "Sequoia".into();
+                    a.mono_font = Some("Menlo".into());
+                });
+                v.set_prompt(0, Some("ship {repos}".into()), cx);
+            });
+            assert_eq!(cx.theme().theme_name().as_ref(), "Sequoia Dark");
+            // Headless tests have no system fonts, so check the config, not the resolved family.
+            let mono = |t: &gpui_kit::component::ThemeConfig| t.mono_font_family.clone();
+            assert_eq!(mono(&cx.theme().dark_theme).as_deref(), Some("Menlo"));
+            let saved = State::load();
+            assert_eq!(saved.appearance.dark, "Sequoia");
+            assert_eq!(saved.prompts["commit"], "ship {repos}");
+            assert_eq!(crate::prompts::render("commit", "api", "b"), "ship api");
+
+            view.update(cx, |v, cx| {
+                v.appearance(cx, |a| a.mode = Mode::Light);
+                v.reset_prompt(0, w, cx);
+            });
+            assert_eq!(cx.theme().theme_name().as_ref(), "Linear Light");
+            // The font override survives the mode switch.
+            assert_eq!(mono(&cx.theme().light_theme).as_deref(), Some("Menlo"));
+            assert!(State::load().prompts.is_empty());
+            assert!(crate::prompts::render("commit", "api", "b").starts_with("Commit and push"));
+        })
+        .unwrap();
+    }
+
     /// Drives the real keymap headlessly: create a workspace, vim focus moves, tabs, archive.
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)] // each test owns its thread; the lock only orders them
@@ -2451,6 +2515,7 @@ mod ui_tests {
             workspaces: vec![],
             vim: false,
             last_repos: vec!["api".into()],
+            ..Default::default()
         }
         .save();
 
