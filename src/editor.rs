@@ -311,9 +311,7 @@ impl FileEditor {
                 (None, None) => {}
             }
         });
-        if edited && !self.dirty {
-            self.dirty = true;
-        }
+        self.dirty |= edited;
         if let Some(y) = out.yank {
             cx.write_to_clipboard(ClipboardItem::new_string(y));
         }

@@ -6383,7 +6383,6 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
- "smol",
 ]
 
 [[package]]

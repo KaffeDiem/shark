@@ -1,16 +1,16 @@
 //! The header's git button: keeps every repo of the open workspace in sync with git and GitHub,
 //! and runs the next step toward a merged PR. `status` decides what that step is; this file
 //! polls, renders and executes. The app only embeds the entity and forwards three actions.
-pub mod background;
 mod status;
 pub use status::Kind;
 
-use crate::app::{inter_features, open_menu};
+use crate::app::{inter_features, notify_err, open_menu};
 use crate::chat::Chat;
-use crate::git::cmd_bounded;
+use crate::git::{cmd_bounded, par_map};
 use crate::pr;
 use crate::state::Workspace;
 use gpui_kit::assets::IconName;
+use gpui_kit::base::async_util::{Receiver, Sender, unbounded};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::command::CommandItem;
 use gpui_kit::component::notification::Notification;
@@ -19,8 +19,8 @@ use gpui_kit::component::{ActiveTheme, Disableable as _, Icon, Sizable as _, Win
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use status::{
-    Action, Local, Pr, Repo, ago, diverged, fetch_pr, next_action, pr_head_moved, pr_settling,
-    probe,
+    Action, Local, Pr, Repo, ago, among, diverged, fetch_pr, next_action, pr_head_moved,
+    pr_settling, probe,
 };
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -69,8 +69,8 @@ pub struct GitSync {
     settling_since: Option<Instant>,
     want_fetch: bool,
     want_pr: bool,
-    kick: smol::channel::Sender<()>,
-    kicked: smol::channel::Receiver<()>,
+    kick: Sender<()>,
+    kicked: Receiver<()>,
     /// Polling runs only while the workspace is shown; dropping the task stops it.
     poll: Option<Task<()>>,
     _subs: Vec<Subscription>,
@@ -89,6 +89,19 @@ struct Job {
     prev: Vec<Local>,
 }
 
+impl Job {
+    /// Every repo of `ws`, asking GitHub, not fetching.
+    fn prs(ws: &Workspace) -> Job {
+        Job {
+            branch: ws.branch.clone(),
+            repos: worktrees(ws),
+            fetch: false,
+            pr: true,
+            prev: vec![],
+        }
+    }
+}
+
 struct Probed {
     locals: Vec<Result<Local, String>>,
     prs: Option<Vec<Result<Option<Pr>, String>>>,
@@ -98,29 +111,16 @@ struct Probed {
 
 /// Repos run in parallel, so one hung remote costs one timeout, not one per repo.
 fn run_job(job: &Job) -> Probed {
-    let results: Vec<_> = std::thread::scope(|s| {
-        let handles: Vec<_> = job
-            .repos
-            .iter()
-            .enumerate()
-            .map(|(i, (wt, base))| {
-                s.spawn(move || {
-                    // Errors (offline, no origin) show in the tooltip and menu, not a toast every 3 min.
-                    let fetch_err = job
-                        .fetch
-                        .then(|| {
-                            cmd_bounded(wt, "git", &["fetch", "--prune", "--quiet", "origin"], 60)
-                                .err()
-                        })
-                        .flatten();
-                    let local = probe(wt, &job.branch, base, job.prev.get(i));
-                    let head = local.as_ref().map(|l| l.head.as_str()).unwrap_or_default();
-                    let pr = job.pr.then(|| fetch_pr(wt, &job.branch, head));
-                    (local, pr, fetch_err)
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    let results = par_map(job.repos.iter().enumerate(), |(i, (wt, base))| {
+        // Errors (offline, no origin) show in the tooltip and menu, not a toast every 3 min.
+        let fetch_err = job
+            .fetch
+            .then(|| cmd_bounded(wt, "git", &["fetch", "--prune", "--quiet", "origin"], 60).err())
+            .flatten();
+        let local = probe(wt, &job.branch, base, job.prev.get(i));
+        let head = local.as_ref().map(|l| l.head.as_str()).unwrap_or_default();
+        let pr = job.pr.then(|| fetch_pr(wt, &job.branch, head));
+        (local, pr, fetch_err)
     });
     let mut locals = vec![];
     let mut prs = vec![];
@@ -141,17 +141,40 @@ fn run_job(job: &Job) -> Probed {
     }
 }
 
+/// A slow check of a workspace that isn't on screen, so its sidebar row can say "needs you"
+/// (red CI, a review, conflicts) without opening it. It never fetches: that would fight the
+/// agent for refs, and what changes while nobody looks is GitHub's answer.
+///
+/// Blocking: one `git status` and one `gh pr list` per repo, in parallel, each with its timeout.
+/// `Ok(label)` names the step when it is the user's to take; `Err` when gh failed for any repo
+/// (offline, logged out, rate limited), so the caller keeps the last answer and may back off.
+pub fn check_in_background(ws: &Workspace) -> Result<Option<String>, String> {
+    let p = run_job(&Job::prs(ws));
+    let prs = p.prs.unwrap_or_default();
+    if let Some(Err(e)) = prs.iter().find(|p| p.is_err()) {
+        return Err(e.clone());
+    }
+    let repos = repos_from(ws, p.locals, prs.into_iter().map(Some));
+    let a = next_action(&repos, &ws.branch, &crate::state::reviewed(&ws.name));
+    Ok(needs_you(&a).then_some(a.label))
+}
+
+/// Something is wrong (conflicts, failing checks, a git error), a review waits, or it can merge.
+fn needs_you(a: &Action) -> bool {
+    a.attention || !a.reviews.is_empty() || a.kind == Kind::Merge
+}
+
 fn due(at: Option<Instant>, every: Duration) -> bool {
     at.is_none_or(|t| t.elapsed() >= every)
 }
 
 impl GitSync {
     pub fn new(ws: Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (kick, kicked) = smol::channel::unbounded();
+        let (kick, kicked) = unbounded();
         let repos = ws.repos.iter().map(Repo::fresh).collect();
-        let _subs = vec![cx.observe_window_activation(window, |s, window, cx| {
+        let _subs = vec![cx.observe_window_activation(window, |s, window, _| {
             if window.is_window_active() {
-                s.kick(due(s.fetched, FETCH_ON_FOCUS), true, cx);
+                s.kick(due(s.fetched, FETCH_ON_FOCUS), true);
             }
         })];
         GitSync {
@@ -204,7 +227,7 @@ impl GitSync {
             .collect();
         self.merge_order = pr::merge_order(&ws, &self.merge_order);
         self.ws = ws;
-        self.kick(true, true, cx);
+        self.kick(true, true);
         cx.notify();
     }
 
@@ -238,17 +261,15 @@ impl GitSync {
                 if this.update(cx, |s, cx| s.apply(probed, cx)).is_err() {
                     break;
                 }
-                let tick = cx.background_executor().timer(LOCAL_EVERY);
-                smol::future::or(tick, async {
-                    let _ = kicked.recv().await;
-                })
-                .await;
+                let _ = (kicked.recv())
+                    .with_timeout(LOCAL_EVERY, cx.background_executor())
+                    .await;
                 while kicked.try_recv().is_ok() {}
             }
         }));
     }
 
-    fn kick(&mut self, fetch: bool, pr: bool, _: &mut Context<Self>) {
+    fn kick(&mut self, fetch: bool, pr: bool) {
         self.want_fetch |= fetch;
         self.want_pr |= pr;
         let _ = self.kick.try_send(());
@@ -297,15 +318,10 @@ impl GitSync {
             self.gh_error = None;
             self.gh_down = !prs.is_empty() && prs.iter().all(|p| p.is_err());
             for (r, pr) in self.repos.iter_mut().zip(prs) {
-                match pr {
-                    // Keep the last good answer through a blip instead of flickering to "unknown".
-                    Err(e) if matches!(r.pr, Some(Ok(_))) => self.gh_error = Some(e),
-                    Err(e) => {
-                        self.gh_error = Some(e.clone());
-                        r.pr = Some(Err(e));
-                    }
-                    ok => r.pr = Some(ok),
+                if let Err(e) = &pr {
+                    self.gh_error = Some(e.clone());
                 }
+                r.pr = fresh_or_last(Some(&pr), &r.pr);
             }
             self.pr_checked = Some(Instant::now());
         }
@@ -330,9 +346,9 @@ impl GitSync {
         chat.update(cx, |c, _| c.hold = hold);
         self._subs.extend([
             cx.observe(&chat, |_, _, cx| cx.notify()), // working toggles enable/disable the button
-            cx.subscribe(&chat, |s, _, ev, cx| {
+            cx.subscribe(&chat, |s, _, ev, _| {
                 if let crate::chat::ChatEvent::TurnDone = ev {
-                    s.kick(false, true, cx); // the agent may have committed, pushed or opened a PR
+                    s.kick(false, true); // the agent may have committed, pushed or opened a PR
                 }
             }),
         ]);
@@ -415,7 +431,7 @@ impl GitSync {
     }
 
     pub fn fetch_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.kick(true, true, cx);
+        self.kick(true, true);
         window.push_notification("Fetching…", cx);
     }
 
@@ -434,12 +450,7 @@ impl GitSync {
         }
         match &a.kind {
             Kind::None if a.attention => {
-                let detail: Vec<String> = self
-                    .repos
-                    .iter()
-                    .filter(|r| a.repos.contains(&r.name))
-                    .map(Repo::summary)
-                    .collect();
+                let detail: Vec<String> = among(&self.repos, &a.repos).map(Repo::summary).collect();
                 notify_err(window, cx, detail.join("\n"))
             }
             Kind::None => {}
@@ -531,13 +542,7 @@ impl GitSync {
         let ws = self.ws.clone();
         let snapshot: Vec<_> = self.repos.iter().map(|r| r.pr.clone()).collect();
         let handled = self.reviewed.clone();
-        let all = Job {
-            branch: ws.branch.clone(),
-            repos: worktrees(&self.ws),
-            fetch: false,
-            pr: true,
-            prev: vec![],
-        };
+        let all = Job::prs(&ws);
         // Only steps that act on GitHub ask it again; the rest re-check git and decide with the
         // PR state already shown, so an agent prompt doesn't wait on a slow gh.
         let pr_kinds = !matches!(
@@ -629,7 +634,7 @@ impl GitSync {
                 for c in s.chats.clone() {
                     c.update(cx, |c, cx| c.drain(cx));
                 }
-                s.kick(true, true, cx); // the step may have moved the branch on GitHub
+                s.kick(true, true); // the step may have moved the branch on GitHub
                 cx.notify();
             })
             .ok();
@@ -679,7 +684,7 @@ impl GitSync {
             sel,
             move |s, row, window, cx| {
                 let name = s.merge_order[row].clone();
-                s.merge_order = pr::move_in_order(s.merge_order.clone(), &name, earlier);
+                pr::move_in_order(&mut s.merge_order, &name, earlier);
                 crate::state::set_merge_order(&s.ws.name, &s.merge_order);
                 let at = s.merge_order.iter().position(|n| *n == name).unwrap_or(0);
                 s.order_menu(earlier, at, window, cx);
@@ -700,6 +705,14 @@ impl GitSync {
                     .then(|| (r.name.clone(), l.head.clone()))
             })
             .collect()
+    }
+
+    /// The shown workspace's own answer to `check_in_background`, from its faster polling.
+    pub fn needs_you(&self) -> Option<String> {
+        self.action
+            .as_ref()
+            .filter(|a| needs_you(a))
+            .map(|a| a.label.clone())
     }
 
     /// The button's tooltip: the step, each repo's state, how fresh it is, and what failed.
@@ -911,30 +924,22 @@ fn execute(
     let planned = |r: &Repo| status::step_args(&a.kind, b, r);
     match &a.kind {
         Kind::Agent(p) => Ok(Outcome::Ask(p.clone())),
-        Kind::Pull => each(&|wt, r| {
+        Kind::Pull | Kind::Push | Kind::ForcePush => each(&|wt, r| {
             let Some(args) = planned(r)? else {
                 return Ok(None);
             };
-            cmd_bounded(wt, "git", &argv(&args), 120).map_err(|e| match diverged(&e) {
-                true => format!("{e}\nThe branches diverged; use “Sync with remote”."),
-                false => e,
+            cmd_bounded(wt, "git", &argv(&args), 120).map_err(|e| match a.kind {
+                Kind::Pull if diverged(&e) => {
+                    format!("{e}\nThe branches diverged; use “Sync with remote”.")
+                }
+                Kind::Push => format!("{e}\nIf the remote moved, pull first."),
+                _ => e,
             })?;
-            Ok(Some("pulled".into()))
-        }),
-        Kind::Push => each(&|wt, r| {
-            let Some(args) = planned(r)? else {
-                return Ok(None);
-            };
-            cmd_bounded(wt, "git", &argv(&args), 120)
-                .map_err(|e| format!("{e}\nIf the remote moved, pull first."))?;
-            Ok(Some("pushed".into()))
-        }),
-        Kind::ForcePush => each(&|wt, r| {
-            let Some(args) = planned(r)? else {
-                return Ok(None);
-            };
-            cmd_bounded(wt, "git", &argv(&args), 120)?;
-            Ok(Some("force-pushed".into()))
+            Ok(Some(match a.kind {
+                Kind::Pull => "pulled".into(),
+                Kind::Push => "pushed".into(),
+                _ => "force-pushed".into(),
+            }))
         }),
         Kind::CreatePr | Kind::CreateDraftPr => {
             let landed: Vec<String> = repos
@@ -1004,11 +1009,11 @@ fn execute(
                 r.open_pr().map_or(0, |p| p.number)
             )))
         }),
-        Kind::Archive | Kind::OpenPr | Kind::None => Ok(Outcome::Done(String::new())),
+        // `run` handles these without a step.
+        Kind::Archive | Kind::OpenPr | Kind::None => unreachable!(),
     }
 }
 
-/// This repo's PR as just asked, or the last answer when gh wasn't asked or failed (a blip).
 /// `(worktree, base)` per repo of `ws`.
 fn worktrees(ws: &Workspace) -> Vec<(PathBuf, String)> {
     let dir = ws.dir();
@@ -1036,6 +1041,7 @@ fn repos_from(
         .collect()
 }
 
+/// This repo's PR as just asked, or the last answer when gh wasn't asked or failed (a blip).
 fn fresh_or_last(
     fresh: Option<&Result<Option<Pr>, String>>,
     last: &Option<Result<Option<Pr>, String>>,
@@ -1098,10 +1104,6 @@ fn merge_method(wt: &std::path::Path) -> Result<&'static str, String> {
     .find(|(k, _)| v[k] == true)
     .map(|(_, f)| f)
     .ok_or_else(|| "the repo allows no merge method".into())
-}
-
-fn notify_err(window: &mut Window, cx: &mut App, e: impl Into<SharedString>) {
-    window.push_notification(Notification::error(e), cx);
 }
 
 fn icon(a: &Action) -> IconName {
@@ -1181,7 +1183,23 @@ impl Render for GitSync {
 
 #[cfg(test)]
 mod tests {
-    use super::{Pr, fresh_or_last};
+    use super::{Action, Kind, Pr, fresh_or_last, needs_you};
+
+    #[test]
+    fn what_needs_you() {
+        let a = |kind, attention, reviews: &[&str]| Action {
+            label: String::new(),
+            kind,
+            repos: vec![],
+            attention,
+            reviews: reviews.iter().map(|s| s.to_string()).collect(),
+        };
+        assert!(needs_you(&a(Kind::Merge, false, &[])));
+        assert!(needs_you(&a(Kind::Agent("fix".into()), true, &[])));
+        assert!(needs_you(&a(Kind::Agent("review".into()), false, &["r1"])));
+        assert!(!needs_you(&a(Kind::Agent("commit".into()), false, &[])));
+        assert!(!needs_you(&a(Kind::OpenPr, false, &[])), "a wait");
+    }
 
     #[test]
     fn unasked_or_failed_gh_keeps_the_last_pr() {
