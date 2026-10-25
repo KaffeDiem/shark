@@ -59,6 +59,11 @@ pub enum Ev {
         tool_use_id: String,
         input: Value,
     },
+    /// A plan codex's plan mode proposed. claude's come as an ExitPlanMode `Permission`.
+    Plan {
+        id: String,
+        text: String,
+    },
     Exited(String),
 }
 
@@ -335,13 +340,23 @@ impl Agent {
         self.write(&json!({"type": "control_request", "request_id": "interrupt", "request": {"subtype": "interrupt"}}))
     }
 
-    /// `plan`, or back to the mode the process started in. claude switches at once, mid-turn too.
+    /// `plan`, or back to the mode the process started in. claude switches at once, mid-turn
+    /// too; codex from the next message.
     pub fn set_plan_mode(&mut self, on: bool) -> std::io::Result<()> {
-        if self.codex.is_some() {
-            return Err(std::io::Error::other("plan mode needs a Claude model"));
+        if let Some(st) = &self.codex {
+            st.lock().unwrap().plan = on;
+            return Ok(());
         }
         let mode = if on { "plan" } else { PERMISSION_MODE };
         self.write(&json!({"type": "control_request", "request_id": format!("mode-{mode}"), "request": {"subtype": "set_permission_mode", "mode": mode}}))
+    }
+
+    /// codex's Fast service tier, from the next message. claude has none: a chat switched to
+    /// codex takes it from its meta when it respawns.
+    pub fn set_fast(&mut self, on: bool) {
+        if let Some(st) = &self.codex {
+            st.lock().unwrap().fast = Some(on);
+        }
     }
 
     /// Answers an `Ev::Permission`: the tool doesn't run, and claude reads `message` as the

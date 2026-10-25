@@ -106,6 +106,8 @@ pub fn menus() -> Vec<Menu> {
                 sep(),
                 MenuItem::action("Toggle Vim Mode", ToggleVim),
                 MenuItem::action("Change Model…", PickModel),
+                MenuItem::action("Toggle Plan Mode", TogglePlanMode),
+                MenuItem::action("Toggle Fast Mode", ToggleFastMode),
             ],
         ),
         menu(

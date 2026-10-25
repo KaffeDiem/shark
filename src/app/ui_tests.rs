@@ -428,6 +428,28 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     assert_eq!(model(cx).as_deref(), Some("sonnet"));
     cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
 
+    // Fast mode is codex's: cmd-shift-f toggles it there and is saved with the chat; plan
+    // mode's shift-tab works on codex too. Both keep the draft.
+    let saved = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let m = &shark.read(cx).state.workspaces[0].chats[0];
+            (m.fast, m.plan)
+        })
+    };
+    press(cx, &["cmd-shift-f"]);
+    assert_eq!(saved(cx), (None, false), "not on a claude model");
+    press(cx, &["ctrl-cmd-7"]);
+    assert_eq!(model(cx).as_deref(), Some("codex:gpt-6.1-sol"));
+    let by_config = cx.update(|cx| chat.read(cx).fast()); // this machine's codex config
+    press(cx, &["cmd-shift-f"]);
+    assert_eq!(saved(cx), (Some(!by_config), false));
+    press(cx, &["cmd-shift-f", "shift-tab"]);
+    assert_eq!(saved(cx), (Some(by_config), true));
+    press(cx, &["shift-tab", "ctrl-cmd-4"]);
+    assert_eq!(saved(cx), (Some(by_config), false));
+    assert_eq!(model(cx).as_deref(), Some("sonnet"));
+    cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
+
     press(cx, &["escape"]);
     cx.update_window(window, |_, w, cx| {
         assert!(chat.read(cx).focus.is_focused(w), "escape -> transcript")

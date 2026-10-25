@@ -529,3 +529,37 @@ fn codex_live_steer_at_end() {
     assert!(r.text().contains("TWO"), "second message lost");
     assert_eq!(users, 2);
 }
+
+/// Plan mode: a plan turn proposes a plan and edits nothing (read-only sandbox); with plan
+/// mode off, the next message builds it. Fast off rides along. Then the transcript's replay.
+#[test]
+#[ignore]
+fn codex_live_plan() {
+    let mut env = Env::new("plan", MODEL);
+    env.ws.chats[0].plan = true;
+    env.ws.chats[0].fast = Some(false);
+    let mut r = env.spawn(None);
+    r.agent
+        .send("Plan adding api/hello.txt containing the single line hi. Two steps at most; don't ask me anything.")
+        .unwrap();
+    assert!(r.until(TURN, |e| is_result(e) || is_exit(e)), "no Result");
+    let plan = r.evs.iter().find_map(|e| match e {
+        Ev::Plan { text, .. } => Some(text.clone()),
+        _ => None,
+    });
+    eprintln!("plan: {plan:?}");
+    assert!(plan.is_some_and(|p| p.contains("hello")), "no plan");
+    assert!(
+        !env.repo("api").join("hello.txt").exists(),
+        "plan mode edited"
+    );
+    r.agent.set_plan_mode(false).unwrap();
+    r.agent
+        .send("I approve the plan. Implement it now.")
+        .unwrap();
+    let at = r.results();
+    assert!(r.until(TURN, |e| is_result(e) || is_exit(e)) && r.results() > at);
+    assert!(env.repo("api").join("hello.txt").exists(), "not built");
+    r.close();
+    check_replay(&env, &r.evs);
+}
