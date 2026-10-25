@@ -62,13 +62,13 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 | `text_base()` | 15px | Empty-state and dialog titles |
 
 - **Weights:** 400 for text; `FontWeight::MEDIUM` for emphasis (active sidebar item, tool names, section headers); `SEMIBOLD` for markdown headings only.
-- Sentence case for labels and headers ("Workspaces", not "WORKSPACES").
+- Sentence case for labels, headers and menu items ("Workspaces", not "WORKSPACES"; "Copy branch name", not "Copy Branch Name"). Proper nouns keep their capitals ("Reveal in Finder"). The macOS menu bar is the one exception: it uses Title Case, as every Mac app does.
 - **Line length:** prose sits in a centered `max_w(px(680.))` column (~70 characters). The composer card is `max_w(px(712.))`.
 
 ## Layout
 - **Inverted L:** the sidebar and the window's top edge share `sidebar`. Content sits in one island: inset 8px top, right and bottom, `rounded(theme.radius_lg)`, 1px `border`, `bg(background)`, `overflow_hidden()`.
 - **Titlebar:** transparent. The sidebar starts with a 36px drag area for the traffic lights; put no controls there.
-- **Settings dialog:** pill tabs (Appearance, Prompts) styled like header tabs but active on `accent`, so they show on cards too. Settings are rows inside a `secondary` card: label `text_sm` plus a `text_xs` `muted_foreground` description on the left, a 240px control on the right, 1px `border` between rows. Changes apply immediately; there is no Save button.
+- **Settings dialog:** 800px, a 168px left nav of `ghost` `small` buttons (General, Appearance, Prompts; `ctrl-tab` cycles them), the selected one `selected`. A page is `section()` headers over `card()`s. Settings are rows inside a `secondary` card: label `text_sm` plus a `text_xs` `muted_foreground` description on the left, a 240px control on the right, 1px `border` between rows. Changes apply immediately; there is no Save button.
 - **Where a new view goes:**
   - A view of the open workspace becomes a header tab (add a `Tab` variant).
   - A view not tied to one workspace (settings, repo list) opens with `window.open_dialog`, `w(px(640.))`, like the palette.
@@ -78,14 +78,17 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 - **Sections:** groups inside the Workspaces list, above the ungrouped workspaces. A header is a 28px row: section icon (14px, picked from `SECTION_ICONS`, default `Folder`), name in `MEDIUM`, the count (`text_xs`) only while folded, then `ChevronDown`/`ChevronRight` (12px); all `muted_foreground`. Its workspaces indent 16px. New and renamed sections are named in place: the row turns into an `Input` with the focus ring, `enter` saves, `esc` cancels, clicking away saves. Drag a workspace onto a header to move it in, or onto a workspace to take its slot (in that workspace's section); drag a header onto another to reorder sections. A drop target shows the `primary` border. Deleting a section doesn't confirm (nothing is lost); in the rail a header is just its icon.
 - **Sidebar rail:** `cmd-b` shrinks the sidebar to 48px icons with tooltips; opening a file does it automatically and closing the file undoes it unless the user toggled it. The header then pads left to clear the traffic lights.
 - **File tree:** 260px column on the right of the Diff and file views, `Files` header with "n/m viewed", 28px rows indented 12px per level, then the `v` checkbox (a folder's box is ticked when all its files are viewed and toggles them all). Folders first; single-child folders are joined.
-- **Context menus** (right-click, not the menu bar): right-click on sidebar rows opens `src/menu.rs`, drawn after Linear's menus (gpui-kit's `PopupMenu` hard-codes 26px rows, 2px separators and full-colour icons):
-  - `popover` surface, `radius` 8px, `p(4px)`, 200–340px wide, a 10% `foreground` ring plus a soft shadow instead of a border. 13px text.
+- **Menus** (right-click menus and dropdowns, not the menu bar): `src/menu.rs`, drawn after Linear's menus (gpui-kit's `PopupMenu` hard-codes 26px rows, 2px separators and full-colour icons). Right-click on sidebar rows opens one at the mouse. A dropdown hangs from the button that opens it (`menu::open_at` with the anchor corner): the git menu under its chevron, the model menu above the composer's model button (also cmd-/; Claude's models, a separator, then Codex's, with a hint naming the backend where the label doesn't), each starting on the current choice. Typing letters jumps to the row that starts with them, as in a Mac menu. The composer's completions use the same `menu::chrome` and `menu::highlight`.
+  - `popover` surface, `theme.radius`, `p(4px)`, 200–340px wide, a 10% `foreground` ring plus a soft shadow instead of a border (the one place a shadow is used). `text_sm`.
   - 28px rows, `px(8px) gap(8px)`, highlight an inset 4px-radius pill in 7% `foreground`; the text color doesn't change. Mouse and arrow keys share one highlight.
   - 14px icons in `muted_foreground`; separators are 1px, full width, 4px space above and below.
   - No header row: say what an item acts on with a right-aligned muted hint instead (the branch on `Copy Branch Name`, the `~/…` path on each path row).
-  - At most three groups: open/reveal (`Reveal in Finder`, `Open in Terminal`, `Copy Path`, one submenu each with "Workspace folder" plus one row per repo), then git (`Open Pull Requests`, hidden when there are none), then destructive (`Archive`, `Force Archive…`) last, in normal text like Linear's Delete.
-  - Hide items that don't apply instead of disabling them. No shortcuts in these menus; every item also exists in the palette.
-  - Title Case labels; an ellipsis only when the item asks for confirmation.
+  - At most three groups: open/reveal (`Reveal in Finder`, `Open in Terminal`, `Copy path`, one submenu each with "Workspace folder" plus one row per repo; a repo row's menu has the same items flat, each with the path hint), then git (`Open pull requests`, hidden when there are none), then destructive (`Archive`, `Force archive…`) last, in normal text like Linear's Delete.
+  - The current choice or a setting that's on gets `.checked(true)`: a 14px `Check` at the right end (never a `✓` hint).
+  - Hide items that don't apply instead of disabling them. No shortcuts in these menus; every item also exists in the palette, which shows them.
+  - Sentence case labels; an ellipsis only when the item opens a picker or asks for confirmation.
+- **Git menu:** the chevron next to the git button. Groups: the next step (hint "Next"), then sync (Fetch now, Pull, Push, Update from base), then PRs (Create or update, Create draft, Merge PRs… and Open PRs in browser while a PR is open, and with more than one repo a Merge order submenu, the order as its hint, holding each repo's possible moves (Merge web earlier, Merge api later)), then the "Delete remote branches after merge" setting, checked while on. Repo states and errors stay in the git button's tooltip, not as rows that do nothing.
+- **Command palette** (`cmd-k`, `src/app/palette.rs`): gpui-kit's `Command` in `menu_dialog`. Each `COMMANDS` row is a `Row(label, icon, action, keywords, handler)`: the handler runs it; the action is only read for its shortcut, shown right-aligned in `muted_foreground` (the newest one-key binding valid where the palette was opened, never a Vim-only key). Keywords are extra words the filter matches. Rows are grouped under headings (`GROUPS` names each group by its first row): Workspace, Chat, Plan, Files and diff, Git, Sections, View, Shark, then Open workspace with one row per workspace, in sidebar order. Rows only a Claude chat can do (`CLAUDE_ONLY`: plan mode, side question) are left out while the shown chat runs Codex. Pickers that aren't tied to a button (section, icon, merge order from cmd-k, reopen chat, add repo) go through `open_menu`, with a placeholder that says what they pick, and look the same.
 - **Menu bar** (`src/menubar.rs`): items dispatch existing actions, so their shortcuts come from the keymap. Every Shark command in it also exists in the palette; the macOS standard items (Hide, Quit, Minimize, Zoom, Services, Edit) don't need to. Edit uses gpui-kit's input actions with an `os_action`, so it works in any text field.
 - **Header:** 44px, `px_3`, `border_b_1` in `border`. Tabs on the left; on the right: branch (12px `GitBranch` + `text_xs`), the git button (`src/sync/`), optional badges, then status (6px `rounded_full` dot + "Running"/"Idle").
 - **Git button:** a `small` button plus a `ghost` `xsmall` chevron for the git menu. It is the header's one primary button: `primary` for a step to run, `outline` with a `warning_foreground` icon when something needs the agent or a human, `ghost` for a wait. Disabled while the agent runs if the step writes.
@@ -109,9 +112,9 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
   - Tool paths are shown relative to the workspace (`api/src/a.rs`).
   - A turn ends with an info line: "done · 48s · $0.12", or "interrupted · 12s · $0.03" after `ctrl-c`. A turn cut off by quitting gets "interrupted" on replay.
 - **Composer completions** (`@` files, `/` skills; `src/complete.rs`):
-  - The menu opens upward from the composer, at its width, over the transcript: `secondary` card, 1px `border`, `radius_lg`, `p_1`. It shows 8 rows of 28px and scrolls to more, with a `faint` key-hint footer.
+  - The menu opens upward from the composer, at its width, over the transcript, on the menu surface (`menu::chrome`). It shows 8 rows of 28px and scrolls to more, with a `faint` key-hint footer.
   - Each row has a 14px `File` / `Folder` / `SquareSlash` icon, the name in `foreground`, the folder or description in `text_xs` `muted_foreground` (truncated), and on the right the repo (`FolderGit2` + name) when the workspace has more than one repo, or a command's argument hint in `faint`.
-  - The selected row is `list_active`, others hover `list_hover`. The first row starts selected. ↑/↓ move, Enter/Tab add, Esc closes and stays in the composer. With no match, Enter sends.
+  - The selected and hovered rows get the menu highlight (`menu::highlight`, a 4px-radius pill). The first row starts selected. ↑/↓ move, Enter/Tab add, Esc closes and stays in the composer. With no match, Enter sends.
   - A pick becomes an inline chip, an atomic `InlineToken` whose text is `@repo/path` and whose label is `name · repo`. Paths are workspace-relative, so the repo is part of what gets sent. Typing `repo/` scopes the search to one repo.
   - Sources never block typing. Files come from `git ls-files` per repo and skills from claude's `initialize` control request. Both load when the chat opens and refresh in the background each time the menu opens; until a refresh lands, the old list (for skills, the on-disk cache) is used.
 - **Message queue** (`render_queue` in `src/chat.rs`): messages sent while the agent runs sit inside the composer card, above the input, separated by a 1px `border`. The panel only renders while something is queued.
@@ -147,7 +150,7 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 | Diff loading / git failed / no changes | Empty state with a `faint` 32px `Spinner` / `TriangleAlert` in `warning_foreground` and git's error / `FileDiff` in `faint`; the tab reads `Diff` / `Diff · error` / `Diff · 0` |
 | Unsaved edits / changed on disk | 6px `foreground` dot after the file name / `TriangleAlert` in `warning_foreground` with Reload and Keep mine |
 | Pending diff comment | Annotation under its line: 14px `MessageSquare` in `muted_foreground`, the text in `foreground`; the diff cursor is the selected line |
-| Vim mode | Mono `text_xs` pill on `secondary`: `NORMAL`, `INSERT`, `VISUAL`, `V-LINE` plus pending keys; `VIM OFF` without the fill |
+| Vim mode | Mono `text_xs` pill: `NORMAL`, `INSERT`, `VISUAL`, `V-LINE` plus pending keys, on `secondary` in the editor header and on `muted` in the composer footer (the card is `secondary`). Hidden while Vim mode is off |
 | Git step to run | Its own icon (`GitCommitHorizontal`, `ArrowUp`/`ArrowDown`, `GitPullRequestCreate`, `GitMerge`, …) in a `primary` button |
 | Git needs attention (conflicts, failing checks, detached HEAD, git error) | `TriangleAlert` in `warning_foreground`, `outline` button |
 | Git waiting (GitHub catching up, checks running, review) / reading / step running | `GitPullRequest` / static `RefreshCw`, `ghost` button |
@@ -168,10 +171,10 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 | Need | Use |
 |---|---|
 | Keyboard hint | `Kbd::new(Keystroke::parse("cmd-k").unwrap())`, one chip per key of a chord |
-| Command palette entry | A row in `COMMANDS` in `src/app.rs`: label, `IconName`, handler |
+| Command palette entry | A `Row` in `COMMANDS` in `src/app/palette.rs`: label, `IconName`, the action (for its shortcut), keywords, handler |
 | Dialog with a form | `window.open_dialog` with a small `Render` entity (see `NewWorkspaceForm`) |
-| Right-click menu | `Shark::show_menu` with `menu::item(..)`, `menu::sub(..)`, `Entry::Sep`; see `ws_menu` |
-| Multi-select from a list | `Command` embedded in the form, items `.checked(..)`, `on_confirm` toggles (see `NewWorkspaceForm`) |
+| Right-click menu or dropdown | `Shark::show_menu` with `menu::item(..)`, `menu::sub(..)`, `Entry::Sep`, `.hint(..)`, `.checked(..)`; see `ws_menu`. A view that isn't Shark keeps its own `menu::open` + `menu::layer` (see the git menu in `src/sync/mod.rs`) |
+| Multi-select from a list | `Command` embedded in the form, each item a `.child(..)` with a small `Checkbox` before the label so it reads as multi-select, `on_confirm` toggles (see `NewWorkspaceForm`) |
 | Destructive confirm | `window.open_alert_dialog`, `ButtonVariant::Danger` |
 | Feedback | `window.push_notification(Notification::success/error(..))`. No custom toasts |
 | Text input | `Input` / `Textarea`; inside a card use `.appearance(false)` and let the card draw the border |
@@ -192,19 +195,19 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
   - Title `Verb {name}?`.
   - The description states the consequence.
   - `ok_text` is the verb; use `show_cancel(true)`.
-- **Errors name the fix**, including the key when there is one: "Add a repo first (space r a)".
+- **Errors name the fix**, including the key or the palette command: "Add a repo first (Add repo in cmd-k)".
 - **Progress notifications** end with an ellipsis: "Creating PRs…".
 
 ## Keyboard and focus
 - **Focus handling:** every view that handles keys gets a `key_context(..)` and a `FocusHandle`.
-- **Bindings** go in `bind_keys` in `src/main.rs`:
-  - Add the new context to `NAV` so leader keys work in it.
-  - For lists, also add it to `LIST` and handle `SelectNext/Prev/First/Last/Confirm`, plus `PageDown/PageUp` where the list scrolls. The sidebar currently doesn't handle `PageDown/PageUp`.
+- **Bindings** go in `bind_keys` in `src/main.rs`. There are no `space` leader chords: a command without a key is found in `cmd-k`.
+  - **Vim mode** (Settings › General, `ctrl-cmd-v`, `State::vim`) is one switch for the editor, the composer and the lists. While it's on the root view carries the `Vim` key context; Vim-style keys (`j/k`, `gg`, `G`, `ctrl-d/u`, `h/l`, `g t`, `]c`/`[c`, the queue's `shift-j/k`) are bound with the `vim(..)` helper under `Vim > (…)`, and `ctrl-w h/l` under `Vim`. Each has a non-Vim key that always works: the arrows, `home`/`end` and `pageup`/`pagedown` in lists (`ARROWS`), `←/→` to fold and switch plan versions, `alt-↑/↓` for changes and queue order, `cmd-alt-←/→` for panes. `Shark::set_vim` applies a change everywhere at once.
+  - For lists, add the context to `LIST`, `MOVE` and `ARROWS`, and handle `SelectNext/Prev/First/Last/Confirm`, plus `PageDown/PageUp` where the list scrolls. The sidebar currently doesn't handle `PageDown/PageUp`.
 - **New global commands** need:
   - an `actions!` entry;
-  - a leader binding `space <group> <key>` in `NAV`;
-  - a `COMMANDS` row;
+  - a `COMMANDS` row with its action and keywords;
   - a menu-bar item where it fits;
+  - a direct shortcut only when it's used often; otherwise the palette is the way in;
   - a line in the README keys table.
 - **Row actions** act on the cursor row of the focused list, otherwise on the open item (see `archive`). They get a single-key binding in the list's context plus a palette row.
 

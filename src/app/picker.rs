@@ -95,7 +95,7 @@ impl Render for FilePicker {
 }
 
 impl Shark {
-    /// `space f f`: the picker over every tracked and untracked file of the open workspace.
+    /// cmd-p: the picker over every tracked and untracked file of the open workspace.
     pub(super) fn open_any_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ws) = self.active_ws() else {
             return notify_err(window, cx, "Open a workspace first");
@@ -106,7 +106,7 @@ impl Shark {
         let shark = cx.entity().downgrade();
         let picker = cx.new(|cx| FilePicker::new(repos, shark, window, cx));
         let state = picker.read(cx).state.clone();
-        window.open_dialog(cx, move |d, _, _| menu_dialog(d).child(picker.clone()));
+        window.open_dialog(cx, move |d, _, cx| menu_dialog(d, cx).child(picker.clone()));
         state.update(cx, |p, cx| p.focus(window, cx));
     }
 
@@ -120,7 +120,7 @@ impl Shark {
             return notify_err(
                 window,
                 cx,
-                format!("{path} is binary, too large or unreadable; open it in Finder (space o f)"),
+                format!("{path} is binary, too large or unreadable; open it in Finder (Reveal in Finder in cmd-k)"),
             );
         }
         self.open_path(path, window, cx);

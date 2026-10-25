@@ -136,13 +136,21 @@ impl Shark {
     }
 
     pub(super) fn toggle_vim(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.state.vim = !self.state.vim;
-        self.state.save();
+        self.set_vim(!self.state.vim, cx);
         let on = self.state.vim;
+        window.push_notification(format!("Vim mode {}", if on { "on" } else { "off" }), cx);
+    }
+
+    /// Vim mode everywhere: the editor, the composer and the list keys (the root's `Vim`).
+    pub(crate) fn set_vim(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.state.vim = on;
+        self.state.save();
         if let Some(e) = &self.editor {
             e.update(cx, |e, cx| e.set_vim(on, cx));
         }
-        window.push_notification(format!("Vim keys {}", if on { "on" } else { "off" }), cx);
+        for c in self.chats.values() {
+            c.update(cx, |c, cx| c.set_vim(on, cx));
+        }
         cx.notify();
     }
 
@@ -167,7 +175,7 @@ impl Shark {
             }
         });
         let (dirty, conflict) = (e.dirty, e.conflict);
-        // Leader keys (`space …`) work in Vim's Normal mode, where space types nothing.
+        // `g t` works in Vim's Normal mode, where it types nothing.
         let normal =
             e.vim_on && e.vim.mode == crate::vim::Mode::Normal && e.vim.pending().is_empty();
         v_flex()
@@ -220,7 +228,8 @@ impl Shark {
                                 )
                             }),
                     )
-                    .child(
+                    .when_some(vim, |d, vim| {
+                        d.child(
                         div()
                             .id("vim-pill")
                             .px_2()
@@ -231,14 +240,15 @@ impl Shark {
                             .text_xs()
                             .font_family(theme.mono_font_family.clone())
                             .text_color(theme.muted_foreground)
-                            .when(vim.is_some(), |d| d.bg(theme.secondary))
+                            .bg(theme.secondary)
                             .hover(|d| d.text_color(theme.foreground))
-                            .child(vim.unwrap_or_else(|| "VIM OFF".into()))
+                            .child(vim)
                             .tooltip(|w, cx| {
-                                Tooltip::new("Toggle Vim keys (ctrl-cmd-v)").build(w, cx)
+                                Tooltip::new("Turn off Vim mode (ctrl-cmd-v)").build(w, cx)
                             })
                             .on_click(cx.listener(|this, _, w, cx| this.toggle_vim(w, cx))),
-                    )
+                        )
+                    })
                     .when_some(viewed, |d, v| {
                         let ix = ix.unwrap_or_default();
                         d.child(

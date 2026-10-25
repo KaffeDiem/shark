@@ -15,11 +15,14 @@ pub(crate) enum Entry {
         label: SharedString,
         /// Right-aligned and muted: the branch a copy will copy, the path an open will open.
         hint: Option<SharedString>,
+        /// A setting that's on, or the current choice: a check at the right end.
+        checked: bool,
         on_click: OnClick,
     },
     Sub {
         icon: IconName,
         label: SharedString,
+        hint: Option<SharedString>,
         entries: Vec<Entry>,
     },
     Sep,
@@ -34,6 +37,7 @@ pub(crate) fn item(
         icon: icon.into(),
         label: label.into(),
         hint: None,
+        checked: false,
         on_click: Rc::new(on_click),
     }
 }
@@ -42,14 +46,24 @@ pub(crate) fn sub(icon: IconName, label: impl Into<SharedString>, entries: Vec<E
     Entry::Sub {
         icon,
         label: label.into(),
+        hint: None,
         entries,
     }
 }
 
 impl Entry {
+    /// An empty `text` shows no hint.
     pub(crate) fn hint(mut self, text: impl Into<SharedString>) -> Self {
-        if let Entry::Item { hint, .. } = &mut self {
-            *hint = Some(text.into());
+        let text = text.into();
+        if let Entry::Item { hint, .. } | Entry::Sub { hint, .. } = &mut self {
+            *hint = (!text.is_empty()).then_some(text);
+        }
+        self
+    }
+
+    pub(crate) fn checked(mut self, on: bool) -> Self {
+        if let Entry::Item { checked, .. } = &mut self {
+            *checked = on;
         }
         self
     }
@@ -64,6 +78,18 @@ pub(crate) fn open(
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<Menu> {
+    open_at(entries, pos, Anchor::TopLeft, window, cx)
+}
+
+/// [`open`] with the menu's `corner` at `pos`: a dropdown at the window's right edge hangs
+/// from its button's right end (`Anchor::TopRight`).
+pub(crate) fn open_at(
+    entries: Vec<Entry>,
+    pos: Point<Pixels>,
+    corner: Anchor,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<Menu> {
     let prev = window.focused(cx);
     let focus = cx.focus_handle();
     // Deferred: the right-click is still bubbling, and the sidebar's `track_focus`
@@ -75,17 +101,20 @@ pub(crate) fn open(
     cx.new(|_| Menu {
         entries,
         pos,
+        corner,
         focus,
         prev,
         sel: None,
+        typed: String::new(),
         sub: None,
         sub_sel: None,
         last_x: px(0.),
     })
 }
 
+/// Pinned to the window's corner, so the click catcher covers the window wherever it's drawn.
 pub(crate) fn layer(menu: Entity<Menu>) -> impl IntoElement {
-    deferred(anchored().child(menu)).with_priority(POPUP_PRIORITY)
+    deferred(anchored().position(point(px(0.), px(0.))).child(menu)).with_priority(POPUP_PRIORITY)
 }
 
 const POPUP_PRIORITY: usize = 100;
@@ -93,10 +122,13 @@ const POPUP_PRIORITY: usize = 100;
 pub(crate) struct Menu {
     entries: Vec<Entry>,
     pos: Point<Pixels>,
+    corner: Anchor,
     focus: FocusHandle,
     prev: Option<FocusHandle>,
     /// Highlighted row; the mouse and the arrow keys share it, as in Linear.
     sel: Option<usize>,
+    /// Letters typed so far: like a Mac menu, typing jumps to the row that starts with them.
+    typed: String,
     /// Open submenu, and its highlighted row once the keyboard has moved into it.
     sub: Option<usize>,
     sub_sel: Option<usize>,
@@ -119,6 +151,34 @@ fn step(entries: &[Entry], from: Option<usize>, down: bool) -> Option<usize> {
 }
 
 impl Menu {
+    /// Starts the highlight on `ix`, e.g. the current choice of a picker.
+    pub(crate) fn select(&mut self, ix: usize) {
+        self.sel = Some(ix);
+    }
+
+    /// The first row whose label starts with what was typed, ignoring case.
+    fn jump(&mut self, ch: &str) -> bool {
+        self.typed.push_str(&ch.to_lowercase());
+        let find = |typed: &str| {
+            self.entries.iter().position(|e| match e {
+                Entry::Item { label, .. } | Entry::Sub { label, .. } => {
+                    label.to_lowercase().starts_with(typed)
+                }
+                Entry::Sep => false,
+            })
+        };
+        let hit = find(&self.typed).or_else(|| {
+            self.typed = ch.to_lowercase();
+            find(&self.typed)
+        });
+        if let Some(ix) = hit {
+            self.sel = Some(ix);
+            self.sub = None;
+            self.sub_sel = None;
+        }
+        hit.is_some()
+    }
+
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(f) = self.prev.take() {
             f.focus(window, cx);
@@ -198,6 +258,10 @@ impl Menu {
                 (true, Some(ix), _) | (false, _, Some(ix)) => self.activate(ix, in_sub, window, cx),
                 _ => return,
             },
+            k if !in_sub
+                && k.chars().count() == 1
+                && !e.keystroke.modifiers.modified()
+                && self.jump(k) => {}
             _ => return,
         }
         cx.stop_propagation();
@@ -226,26 +290,45 @@ impl Menu {
                         .into_any_element();
                 }
                 Entry::Item {
-                    icon, label, hint, ..
+                    icon,
+                    label,
+                    hint,
+                    checked,
+                    ..
                 } => (
                     *icon,
                     label,
-                    hint.as_ref().map(|h| {
-                        div()
-                            .max_w(px(180.))
-                            .truncate()
-                            .text_color(theme.muted_foreground)
-                            .child(h.clone())
-                            .into_any_element()
-                    }),
+                    Some(
+                        h_flex()
+                            .gap(px(8.))
+                            .children(hint.as_ref().map(|h| {
+                                div()
+                                    .max_w(px(180.))
+                                    .truncate()
+                                    .text_color(theme.muted_foreground)
+                                    .child(h.clone())
+                            }))
+                            .when(*checked, |d| {
+                                d.child(
+                                    Icon::new(IconName::Check)
+                                        .with_size(px(14.))
+                                        .text_color(theme.muted_foreground),
+                                )
+                            })
+                            .into_any_element(),
+                    ),
                 ),
-                Entry::Sub { icon, label, .. } => (
+                Entry::Sub {
+                    icon, label, hint, ..
+                } => (
                     Some(*icon),
                     label,
                     Some(
-                        Icon::new(IconName::ChevronRight)
-                            .with_size(px(12.))
+                        h_flex()
+                            .gap(px(8.))
                             .text_color(theme.muted_foreground)
+                            .children(hint.as_ref().map(|h| div().max_w(px(180.)).truncate().child(h.clone())))
+                            .child(Icon::new(IconName::ChevronRight).with_size(px(12.)))
                             .into_any_element(),
                     ),
                 ),
@@ -258,9 +341,7 @@ impl Menu {
                 .px(px(8.))
                 .gap(px(8.))
                 .rounded(px(4.))
-                .when(sel == Some(ix) || open, |d| {
-                    d.bg(theme.foreground.alpha(0.07))
-                })
+                .when(sel == Some(ix) || open, |d| d.bg(highlight(theme)))
                 .when(icons, |d| {
                     d.child(match icon {
                         Some(i) => Icon::new(i)
@@ -285,16 +366,23 @@ impl Menu {
                 .on_click(cx.listener(move |this, _, w, cx| this.activate(ix, in_sub, w, cx)))
                 .when(open, |d| {
                     let sub = self.panel(self.sub_entries(), self.sub_sel, true, cx);
+                    // A menu hanging from the window's right side opens its submenus leftward.
+                    let leftward = matches!(self.corner, Anchor::TopRight | Anchor::BottomRight);
                     d.child(
                         div()
                             .absolute()
                             .top(px(-4.))
-                            .left_full()
-                            .pl(px(4.))
+                            .when(!leftward, |d| d.left_full().pl(px(4.)))
+                            .when(leftward, |d| d.right_full().pr(px(4.)))
                             // Deferred above the main panel, so a submenu the window
                             // edge pushes back over it still gets the mouse.
                             .child(
-                                deferred(anchored().snap_to_window_with_margin(px(8.)).child(sub))
+                                deferred(
+                                    anchored()
+                                        .anchor(if leftward { Anchor::TopRight } else { Anchor::TopLeft })
+                                        .snap_to_window_with_margin(px(8.))
+                                        .child(sub),
+                                )
                                     .with_priority(POPUP_PRIORITY + 1),
                             ),
                     )
@@ -306,22 +394,30 @@ impl Menu {
 }
 
 fn surface(theme: &Theme) -> Div {
+    chrome(theme).occlude().min_w(px(200.)).max_w(px(340.))
+}
+
+/// The look every floating menu shares (this one and the composer's completions): `popover`,
+/// 4px inset, 8px corners, and a translucent ring instead of a border, so the shadow shows
+/// through the edge.
+pub(crate) fn chrome(theme: &Theme) -> Div {
     let ink = hsla(0., 0., 0., if theme.is_dark() { 0.5 } else { 0.12 });
     v_flex()
-        .occlude()
         .p(px(4.))
-        .min_w(px(200.))
-        .max_w(px(340.))
         .bg(theme.popover)
         .text_color(theme.popover_foreground)
-        .text_size(px(13.))
-        .rounded(px(8.))
-        // A translucent ring instead of a border, so the shadow shows through the edge.
+        .text_sm()
+        .rounded(theme.radius)
         .shadow(vec![
             BoxShadow::new(px(0.), px(0.), theme.foreground.alpha(0.1)).spread_radius(px(1.)),
             BoxShadow::new(px(0.), px(4.), ink).blur_radius(px(8.)),
             BoxShadow::new(px(0.), px(1.), ink.alpha(ink.a / 2.)).blur_radius(px(1.)),
         ])
+}
+
+/// The highlighted row: an inset 4px pill, the text colour unchanged.
+pub(crate) fn highlight(theme: &Theme) -> Hsla {
+    theme.foreground.alpha(0.07)
 }
 
 impl Render for Menu {
@@ -336,6 +432,7 @@ impl Render for Menu {
             .child(
                 anchored()
                     .position(self.pos)
+                    .anchor(self.corner)
                     .snap_to_window_with_margin(px(8.))
                     .child(
                         self.panel(&self.entries, self.sel, false, cx)

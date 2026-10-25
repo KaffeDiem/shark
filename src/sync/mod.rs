@@ -5,6 +5,7 @@ mod status;
 pub use status::Kind;
 
 use crate::app::{inter_features, notify_err, open_menu};
+use crate::menu::{self, Entry};
 use crate::chat::Chat;
 use crate::git::{cmd_bounded, par_map};
 use crate::pr;
@@ -22,7 +23,9 @@ use status::{
     Action, Local, Pr, Repo, ago, among, diverged, fetch_pr, next_action, pr_head_moved,
     pr_settling, probe,
 };
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 /// `git status` per repo. ponytail: polling, not FSEvents; watch .git if huge repos make this slow.
@@ -73,6 +76,9 @@ pub struct GitSync {
     kicked: Receiver<()>,
     /// Polling runs only while the workspace is shown; dropping the task stops it.
     poll: Option<Task<()>>,
+    /// The git menu, open under the chevron, whose bounds the last paint recorded.
+    menu: Option<(Entity<menu::Menu>, Subscription)>,
+    chevron: Rc<Cell<Bounds<Pixels>>>,
     _subs: Vec<Subscription>,
 }
 
@@ -197,6 +203,8 @@ impl GitSync {
             kick,
             kicked,
             poll: None,
+            menu: None,
+            chevron: Default::default(),
             _subs,
         }
     }
@@ -399,7 +407,7 @@ impl GitSync {
     pub fn open_prs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let urls = self.pr_urls();
         if urls.is_empty() {
-            return notify_err(window, cx, "No PRs yet: create them with space p r");
+            return notify_err(window, cx, "No PRs yet: create them from the git menu");
         }
         urls.iter().for_each(|u| cx.open_url(u));
     }
@@ -642,6 +650,13 @@ impl GitSync {
         .detach();
     }
 
+    /// Moves `name` one place earlier or later in the merge order, and saves it.
+    fn move_repo(&mut self, name: &str, earlier: bool, cx: &mut Context<Self>) {
+        pr::move_in_order(&mut self.merge_order, name, earlier);
+        crate::state::set_merge_order(&self.ws.name, &self.merge_order);
+        cx.notify();
+    }
+
     /// Picks a repo and moves it one place earlier (or later) in the merge order. The menu
     /// reopens on the moved repo, so `enter` again keeps moving it; `esc` is done.
     pub fn move_in_merge_order(
@@ -680,12 +695,12 @@ impl GitSync {
             .collect();
         open_menu(
             cx.entity().downgrade(),
+            "Pick a repo to move…",
             items,
             sel,
             move |s, row, window, cx| {
                 let name = s.merge_order[row].clone();
-                pr::move_in_order(&mut s.merge_order, &name, earlier);
-                crate::state::set_merge_order(&s.ws.name, &s.merge_order);
+                s.move_repo(&name, earlier, cx);
                 let at = s.merge_order.iter().position(|n| *n == name).unwrap_or(0);
                 s.order_menu(earlier, at, window, cx);
             },
@@ -717,7 +732,7 @@ impl GitSync {
 
     /// The button's tooltip: the step, each repo's state, how fresh it is, and what failed.
     fn tooltip(&self, cx: &App) -> String {
-        let mut lines = vec!["Next git step (space g g)".to_string()];
+        let mut lines = vec!["Next git step".to_string()];
         match (&self.running, &self.action) {
             (Some(r), _) => lines.push(format!("Running: {r}")),
             (None, Some(a)) => {
@@ -748,127 +763,115 @@ impl GitSync {
         lines.join("\n")
     }
 
-    pub fn open_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let mut rows: Vec<(String, IconName, Row)> = vec![];
-        if let Some(a) = self.action.clone().filter(|a| a.kind != Kind::None) {
-            rows.push((format!("Next: {}", a.label), icon(&a), Row::Next));
-        }
-        let has_pr = self.repos.iter().any(|r| r.open_pr().is_some());
-        rows.extend([
-            ("Fetch now".into(), IconName::RefreshCw, Row::Fetch),
-            (
-                "Pull (fast-forward)".into(),
-                IconName::ArrowDown,
-                Row::Run(Kind::Pull),
-            ),
-            ("Push".into(), IconName::ArrowUp, Row::Run(Kind::Push)),
-            (
-                "Create / update linked PRs".into(),
-                IconName::GitPullRequestCreate,
-                Row::Run(Kind::CreatePr),
-            ),
-            (
-                "Create draft PRs".into(),
-                IconName::GitPullRequestDraft,
-                Row::Run(Kind::CreateDraftPr),
-            ),
-        ]);
-        let bases = self
-            .ws
-            .repos
-            .iter()
+    /// Asks the agent to bring every repo up to date with its base.
+    pub fn update_from_base(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let bases = (self.ws.repos.iter())
             .map(|r| format!("{}: `{}`", r.name, r.base))
             .collect::<Vec<_>>()
             .join(", ");
-        let base_prompt = crate::prompts::render("update_base", &bases, &self.ws.branch);
-        rows.push((
-            "Update from base (agent)".into(),
-            IconName::GitMerge,
-            Row::Run(Kind::Agent(base_prompt)),
-        ));
-        if has_pr {
-            rows.push((
-                "Merge PRs…".into(),
+        let prompt = crate::prompts::render("update_base", &bases, &self.ws.branch);
+        self.run_kind(Kind::Agent(prompt), "Update from base", window, cx)
+    }
+
+    /// The git menu, anchored under the chevron: the next step, syncing, PRs, then the one
+    /// setting. Repo states and errors stay in the button's tooltip.
+    pub fn open_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let this = cx.entity().downgrade();
+        let run = |f: fn(&mut Self, &mut Window, &mut Context<Self>)| {
+            let this = this.clone();
+            move |w: &mut Window, cx: &mut App| {
+                this.update(cx, |s, cx| f(s, w, cx)).ok();
+            }
+        };
+        let kind = |k: Kind, label: &'static str| {
+            let this = this.clone();
+            move |w: &mut Window, cx: &mut App| {
+                this.update(cx, |s, cx| s.run_kind(k.clone(), label, w, cx)).ok();
+            }
+        };
+        let mut entries = vec![];
+        if let Some(a) = self.action.clone().filter(|a| a.kind != Kind::None) {
+            entries.push(menu::item(icon(&a), a.label.clone(), run(Self::primary)).hint("Next"));
+            entries.push(Entry::Sep);
+        }
+        entries.extend([
+            menu::item(IconName::RefreshCw, "Fetch now", run(Self::fetch_now)),
+            menu::item(IconName::ArrowDown, "Pull", kind(Kind::Pull, "Pull")).hint("Fast-forward"),
+            menu::item(IconName::ArrowUp, "Push", kind(Kind::Push, "Push")),
+            menu::item(
+                IconName::GitCompareArrows,
+                "Update from base",
+                run(Self::update_from_base),
+            )
+            .hint("Agent"),
+            Entry::Sep,
+            menu::item(
+                IconName::GitPullRequestCreate,
+                "Create or update PRs",
+                kind(Kind::CreatePr, "Create or update PRs"),
+            ),
+            menu::item(
+                IconName::GitPullRequestDraft,
+                "Create draft PRs",
+                kind(Kind::CreateDraftPr, "Create draft PRs"),
+            ),
+        ]);
+        if self.repos.iter().any(|r| r.open_pr().is_some()) {
+            entries.push(menu::item(
                 IconName::GitMerge,
-                Row::Run(Kind::Merge),
+                "Merge PRs…",
+                kind(Kind::Merge, "Merge PRs"),
             ));
-            rows.push((
-                "Open PRs in browser".into(),
+            entries.push(menu::item(
                 IconName::ExternalLink,
-                Row::Run(Kind::OpenPr),
+                "Open PRs in browser",
+                kind(Kind::OpenPr, "Open PRs in browser"),
             ));
         }
         if self.repos.len() > 1 {
-            rows.push((
-                format!("Merge order: {}…", self.merge_order.join(", ")),
-                IconName::ListOrdered,
-                Row::Order,
-            ));
-        }
-        rows.push((
-            format!(
-                "Delete remote branches after merge: {}",
-                if crate::state::delete_remote_branches() {
-                    "on"
-                } else {
-                    "off"
+            // Each repo's possible moves, in merge order: the first can't go earlier.
+            let n = self.merge_order.len();
+            let mut moves = vec![];
+            for (i, name) in self.merge_order.iter().enumerate() {
+                if i > 0 {
+                    moves.push(Entry::Sep);
                 }
-            ),
+                for (earlier, ok, icon, verb) in [
+                    (true, i > 0, IconName::ArrowUp, "earlier"),
+                    (false, i + 1 < n, IconName::ArrowDown, "later"),
+                ] {
+                    let (this, name) = (this.clone(), name.clone());
+                    moves.extend(ok.then(|| {
+                        menu::item(icon, format!("Merge {name} {verb}"), move |_, cx| {
+                            this.update(cx, |s, cx| s.move_repo(&name, earlier, cx)).ok();
+                        })
+                    }));
+                }
+            }
+            entries.push(
+                menu::sub(IconName::ListOrdered, "Merge order", moves)
+                    .hint(self.merge_order.join(" → ")),
+            );
+        }
+        entries.push(Entry::Sep);
+        // A setting: the check when it's on, "Off" when not, so it never reads as "delete now".
+        let on = crate::state::delete_remote_branches();
+        let delete = menu::item(
             IconName::GitBranch,
-            Row::DeleteRemote,
-        ));
-        // Per-repo status lines; picking one opens its PR.
-        for r in &self.repos {
-            rows.push((
-                r.summary(),
-                IconName::FolderGit2,
-                Row::Open(r.pr().map(|p| p.url.clone())),
-            ));
-        }
-        if let Some(e) = &self.fetch_error {
-            rows.push((
-                format!("Fetch failed: {}", e.replace('\n', "; ")),
-                IconName::TriangleAlert,
-                Row::Open(None),
-            ));
-        }
-        if let Some(e) = &self.gh_error {
-            rows.push((
-                format!("GitHub: {e}"),
-                IconName::TriangleAlert,
-                Row::Open(None),
-            ));
-        }
-        let items = rows
-            .iter()
-            .map(|(l, i, _)| CommandItem::new().label(l.clone()).icon(*i))
-            .collect();
-        open_menu(
-            cx.entity().downgrade(),
-            items,
-            0,
-            move |s, row, window, cx| match &rows[row] {
-                (_, _, Row::Next) => s.primary(window, cx),
-                (_, _, Row::Fetch) => s.fetch_now(window, cx),
-                (_, _, Row::Order) => s.move_in_merge_order(true, window, cx),
-                (_, _, Row::DeleteRemote) => toggle_delete_remote(window, cx),
-                (l, _, Row::Run(k)) => s.run_kind(k.clone(), l.trim_end_matches('…'), window, cx),
-                (_, _, Row::Open(Some(url))) => cx.open_url(url),
-                (_, _, Row::Open(None)) => {}
-            },
-            window,
-            cx,
+            "Delete remote branches after merge",
+            toggle_delete_remote,
         );
+        entries.push(if on { delete.checked(true) } else { delete.hint("Off") });
+        let b = self.chevron.get();
+        let at = point(b.right(), b.bottom() + px(4.));
+        let m = menu::open_at(entries, at, Anchor::TopRight, window, cx);
+        let sub = cx.subscribe(&m, |s, _, _: &DismissEvent, cx| {
+            s.menu = None;
+            cx.notify();
+        });
+        self.menu = Some((m, sub));
+        cx.notify();
     }
-}
-
-enum Row {
-    Next,
-    Fetch,
-    Order,
-    DeleteRemote,
-    Run(Kind),
-    Open(Option<String>),
 }
 
 enum Outcome {
@@ -1171,13 +1174,26 @@ impl Render for GitSync {
                     ),
             )
             .child(
-                Button::new("git-menu")
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::ChevronDown)
-                    .tooltip("Git menu (space g m)")
-                    .on_click(cx.listener(|s, _, window, cx| s.open_menu(window, cx))),
+                div()
+                    .relative()
+                    .child(
+                        Button::new("git-menu")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::ChevronDown)
+                            .tooltip("Git menu")
+                            .on_click(cx.listener(|s, _, window, cx| s.open_menu(window, cx))),
+                    )
+                    .child({
+                        let at = self.chevron.clone();
+                        canvas(move |b, _, _| at.set(b), |_, _, _, _| {})
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                    }),
             )
+            .children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))
     }
 }
 

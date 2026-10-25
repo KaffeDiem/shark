@@ -1,4 +1,4 @@
-//! Settings dialog (cmd-,): general (stay awake), appearance (mode, light and dark theme, fonts)
+//! Settings dialog (cmd-,): general (stay awake, Vim mode), appearance (mode, light and dark theme, fonts)
 //! and the git button's agent prompts. Every change applies and saves at once; there is no Save
 //! button.
 use crate::SwitchField;
@@ -90,8 +90,8 @@ pub fn open(state: &State, window: &mut Window, cx: &mut Context<Shark>) {
     let view = cx.new(|cx| Settings::new(shark, state, window, cx));
     let focus = view.read(cx).focus.clone();
     window.open_dialog(cx, move |d, _, _| {
+        // No dialog title: the page list and the page title say where you are.
         d.font_features(inter_features())
-            .title("Settings")
             .w(px(800.))
             .child(view.clone())
     });
@@ -223,8 +223,9 @@ impl Settings {
             .enumerate()
             .map(|(i, p)| {
                 let text = prompts::get(p.id);
-                // ponytail: auto_grow counts newlines, not wrapped lines; ~70 mono chars fit a row.
-                let rows = (text.len() / 70 + 1).clamp(3, 10);
+                // ponytail: auto_grow counts newlines, not wrapped lines; ~60 mono chars fit a row,
+                // plus one spare so the last line is never cut.
+                let rows = (text.len() / 60 + 2).clamp(3, 12);
                 let ta = cx.new(|cx| {
                     TextareaState::new(window, cx)
                         .auto_grow(rows, 14)
@@ -284,6 +285,11 @@ impl Settings {
         cx.notify();
     }
 
+    pub(crate) fn set_vim(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.shark.update(cx, |s, cx| s.set_vim(on, cx)).ok();
+        cx.notify();
+    }
+
     /// `None` or the default text drops the override.
     pub(crate) fn set_prompt(&mut self, i: usize, text: Option<String>, cx: &mut Context<Self>) {
         let p = &PROMPTS[i];
@@ -311,22 +317,33 @@ impl Settings {
     }
 
     fn render_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let on = (self.shark.upgrade()).is_some_and(|s| s.read(cx).state.stay_awake);
+        let (awake, vim) = (self.shark.upgrade())
+            .map(|s| (s.read(cx).state.stay_awake, s.read(cx).state.vim))
+            .unwrap_or_default();
         let this = cx.entity().downgrade();
         let theme = cx.theme();
-        v_flex().gap_3().child(section(theme, "Power")).child(
-            card(theme).child(row(
+        card(theme)
+            .child(row(
                 theme,
                 false,
                 "Stay awake while agents run",
                 "The Mac doesn't idle-sleep mid-turn; the display may still turn off",
-                Switch::new("stay-awake")
-                    .checked(on)
-                    .on_click(move |&v, _, cx| {
+                Switch::new("stay-awake").checked(awake).on_click({
+                    let this = this.clone();
+                    move |&v, _, cx| {
                         this.update(cx, |s, cx| s.set_stay_awake(v, cx)).ok();
-                    }),
-            )),
-        )
+                    }
+                }),
+            ))
+            .child(row(
+                theme,
+                true,
+                "Vim mode",
+                "Vim keys in the file editor, the composer and lists (ctrl-cmd-v)",
+                Switch::new("vim").checked(vim).on_click(move |&v, _, cx| {
+                    this.update(cx, |s, cx| s.set_vim(v, cx)).ok();
+                }),
+            ))
     }
 
     fn render_appearance(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -427,12 +444,6 @@ impl Settings {
             .collect();
         v_flex()
             .gap_4()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(muted_fg)
-                    .child("Sent to the agent by the git button. {repos} and {branch} are filled in when the step runs."),
-            )
             .children(PROMPTS.iter().enumerate().map(|(i, p)| {
                 v_flex()
                     .gap_1p5()
@@ -495,7 +506,10 @@ const PAGES: &[(IconName, (&str, &str))] = &[
     ),
     (
         IconName::MessageSquareText,
-        ("Prompts", "What the git button asks the agent to do"),
+        (
+            "Prompts",
+            "Sent to the agent by the git button; {repos} and {branch} are filled in when the step runs",
+        ),
     ),
 ];
 
@@ -570,9 +584,20 @@ impl Render for Settings {
             }))
             .child(v_flex().w(px(168.)).flex_none().gap_0p5().children(
                 PAGES.iter().enumerate().map(|(i, (icon, (label, _)))| {
-                    pill(label, Some(icon.clone()), i == self.tab)
-                        .w_full()
-                        .justify_start()
+                    let on = i == self.tab;
+                    // Rows, not buttons: a Button centres its content, so the icons wouldn't line up.
+                    h_flex()
+                        .id(*label)
+                        .h(px(28.))
+                        .px_2()
+                        .gap_2()
+                        .rounded(theme.radius)
+                        .text_sm()
+                        .text_color(if on { theme.foreground } else { theme.muted_foreground })
+                        .when(on, |d| d.bg(theme.accent))
+                        .when(!on, |d| d.hover(|d| d.bg(theme.secondary_hover)))
+                        .child(gpui_kit::component::Icon::new(icon.clone()).with_size(px(14.)))
+                        .child(*label)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.tab = i;
                             cx.notify();
@@ -580,9 +605,13 @@ impl Render for Settings {
                 }),
             ))
             .child(
+                // A fixed height, so switching pages doesn't move the dialog; long pages scroll.
                 v_flex()
+                    .id("settings-page")
                     .flex_1()
                     .min_w_0()
+                    .h(px(520.))
+                    .overflow_y_scroll()
                     .gap_4()
                     .child(
                         v_flex()

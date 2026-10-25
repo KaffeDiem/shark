@@ -27,6 +27,10 @@ impl Chat {
 
     /// Opens, filters or closes the menu from the text before the cursor.
     pub(super) fn update_menu(&mut self, cx: &mut Context<Self>) {
+        // Normal-mode edits change the text too, but only Insert completes.
+        if self.vim_on && self.vim.mode != crate::vim::Mode::Insert {
+            return self.close_menu(cx);
+        }
         let c = self.composer.read(cx);
         let (text, cursor) = (c.value(), c.cursor());
         let found = complete::trigger(&text, cursor).filter(|(r, _)| {
@@ -138,13 +142,20 @@ impl Chat {
                 let icon = match it.kind {
                     Kind::File => IconName::File,
                     Kind::Dir => IconName::Folder,
-                    Kind::Command => IconName::SquareSlash,
+                    Kind::Command => IconName::Slash,
                 };
                 let badge = match it.kind {
-                    Kind::Command => (!it.badge.is_empty())
-                        .then(|| div().flex_none().text_color(faint).child(it.badge.clone())),
-                    // The repo, so two README.md rows are told apart at a glance.
-                    _ => multi.then(|| {
+                    Kind::Command => (!it.badge.is_empty()).then(|| {
+                        div()
+                            .flex_none()
+                            .max_w(px(200.))
+                            .truncate()
+                            .text_color(faint)
+                            .child(it.badge.clone())
+                    }),
+                    // The repo, so two README.md rows are told apart at a glance; a repo's own
+                    // row (`api/`) already names it.
+                    _ => (multi && !it.detail.is_empty()).then(|| {
                         h_flex()
                             .flex_none()
                             .gap_1()
@@ -153,16 +164,29 @@ impl Chat {
                             .child(it.badge.clone())
                     }),
                 };
+                // The badge names the repo, so the folder starts inside it.
+                let detail = match it.kind {
+                    Kind::File | Kind::Dir if multi => {
+                        let d = it.detail.strip_prefix(it.badge.as_str()).unwrap_or(&it.detail);
+                        d.trim_start_matches('/').to_string()
+                    }
+                    _ => it.detail.clone(),
+                };
                 Some(
                     h_flex()
                         .id(ix)
                         .h(px(28.))
                         .px_2()
                         .gap_2()
-                        .rounded(theme.radius)
-                        .text_sm()
-                        .when(ix == m.sel, |d| d.bg(theme.list_active))
-                        .when(ix != m.sel, |d| d.hover(|d| d.bg(theme.list_hover)))
+                        .rounded(px(4.))
+                        .when(ix == m.sel, |d| d.bg(crate::menu::highlight(theme)))
+                        // The mouse moves the one highlight, as in the other menus.
+                        .on_mouse_move(cx.listener(move |this, _, _, cx| {
+                            if let Some(m) = this.menu.as_mut().filter(|m| m.sel != ix) {
+                                m.sel = ix;
+                                cx.notify();
+                            }
+                        }))
                         .on_mouse_down(
                             MouseButton::Left,
                             cx.listener(move |this, _, window, cx| {
@@ -188,7 +212,7 @@ impl Chat {
                                 .truncate()
                                 .text_xs()
                                 .text_color(theme.muted_foreground)
-                                .child(it.detail.clone()),
+                                .child(detail),
                         )
                         .children(badge.map(|b| b.text_xs()))
                         .into_any_element(),
@@ -207,18 +231,13 @@ impl Chat {
             (false, _) => Some("No matching files"),
         };
         Some(
-            v_flex()
+            crate::menu::chrome(theme)
                 .id("completions")
                 .absolute()
                 .left_0()
                 .right_0()
                 .bottom_full()
                 .mb_1()
-                .p_1()
-                .rounded(theme.radius_lg)
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.secondary)
                 .occlude()
                 .child(
                     div()

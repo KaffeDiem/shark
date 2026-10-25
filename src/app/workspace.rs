@@ -101,12 +101,20 @@ impl Render for NewWorkspaceForm {
         let (muted, faint) = (theme.muted_foreground, faint(theme));
         let in_branch = self.branch.read(cx).focus_handle(cx).is_focused(window)
             || self.prompt.read(cx).focus_handle(cx).is_focused(window);
-        let items = self.repos.iter().zip(&self.picked).map(|(r, p)| {
+        // A checkbox on every row, so it reads as multi-select before anything is ticked.
+        let items = self.repos.iter().zip(&self.picked).enumerate().map(|(i, (r, &p))| {
+            let name = r.name.clone();
             CommandItem::new()
                 .label(r.name.clone())
-                .icon(IconName::FolderGit2)
                 .keywords([r.path.to_string_lossy().to_string()])
-                .checked(*p)
+                .child(move |_, _| {
+                    h_flex()
+                        .flex_1()
+                        .gap_2()
+                        .items_center()
+                        .child(Checkbox::new(("repo-pick", i)).small().checked(p))
+                        .child(name.clone())
+                })
         });
         let entity = cx.entity().downgrade();
         let picker = self.picker.clone();
@@ -302,7 +310,7 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         if self.state.repos.is_empty() {
-            return notify_err(window, cx, "Add a repo first (space r a)");
+            return notify_err(window, cx, "Add a repo first (Add repo in cmd-k)");
         }
         let shark = cx.entity().downgrade();
         let repos = self.state.repos.clone();
@@ -403,7 +411,7 @@ impl Shark {
             return notify_err(
                 window,
                 cx,
-                format!("{} has every repo; add another first (space r a)", ws.name),
+                format!("{} has every repo; add another first (Add repo in cmd-k)", ws.name),
             );
         }
         let items = missing
@@ -418,6 +426,7 @@ impl Shark {
         let name = ws.name.clone();
         open_menu(
             cx.entity().downgrade(),
+            "Add a repo to this workspace…",
             items,
             0,
             move |s, row, window, cx| {
@@ -677,7 +686,7 @@ impl Shark {
                 for chat in self.started_chats(name) {
                     chat.update(cx, |c, _| c.archiving = false);
                 }
-                notify_err(window, cx, format!("{e}\nUse space w D to force."))
+                notify_err(window, cx, format!("{e}\nUse Force archive workspace in cmd-k to discard them."))
             }
         }
         cx.notify();

@@ -88,7 +88,7 @@ def build(name, mode, pal):
         "ring": pr,
         "caret": fg,
         "selection.background": a(pr, "55" if dark else "40"),
-        "overlay": "#00000066" if dark else "#00000040",
+        "overlay": "#00000066" if dark else "#0000001a",
         "window.border": p["border"],
         "muted.background": p["muted"],
         "muted.foreground": mfg,
