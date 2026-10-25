@@ -341,7 +341,7 @@ impl Chat {
                 let status = match (result, is_error) {
                     (None, _) => Spinner::new().with_size(px(14.)).into_any_element(),
                     (Some(_), true) => icon(IconName::X)
-                        .text_color(theme.danger)
+                        .text_color(theme.danger_foreground)
                         .into_any_element(),
                     _ => icon(IconName::Check).into_any_element(),
                 };
@@ -386,7 +386,7 @@ impl Chat {
                                 .text_size(theme.mono_font_size)
                                 .line_height(relative(1.45))
                                 .text_color(if *is_error {
-                                    theme.danger
+                                    theme.danger_foreground
                                 } else {
                                     theme.foreground
                                 })

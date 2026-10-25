@@ -37,4 +37,4 @@ Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH.
   - Each PR body then gets a "Related PRs" section, which is idempotent on re-runs.
   - Refuses to run while any repo has uncommitted changes.
 
-Background and prior art: [docs/research.md](docs/research.md).
+Background and prior art: [docs/research.md](docs/research.md). UI theme, design rules and checklist: [docs/design.md](docs/design.md).

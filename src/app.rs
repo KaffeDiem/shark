@@ -18,10 +18,20 @@ use gpui_kit::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Inter disambiguation (ss02 + cv05/cv08/zero): serifed I, tailed l, slashed 0 for paths and hashes.
+/// Dialogs render outside this view's tree, so they apply it again.
+pub(crate) fn inter_features() -> FontFeatures {
+    FontFeatures(Arc::new(
+        ["ss02", "cv05", "cv08", "zero"]
+            .map(|f| (f.to_string(), 1))
+            .to_vec(),
+    ))
+}
+
 /// Hint text below the muted level; gpui-kit has no token for it. Never use it for content.
 pub(crate) fn faint(theme: &Theme) -> Hsla {
     match theme.is_dark() {
-        true => rgb(0x6e6e71).into(),
+        true => rgb(0x808083).into(),
         false => rgb(0x9c9d9f).into(),
     }
 }
@@ -231,7 +241,8 @@ impl Shark {
         window.open_dialog(cx, move |d, _, _| {
             let f = form.clone();
             // Dialog binds enter to Confirm, which runs on_ok and closes when it returns true.
-            d.title("New workspace")
+            d.font_features(inter_features())
+                .title("New workspace")
                 .w(px(480.))
                 .child(form.clone())
                 .on_ok(move |_, window, cx| f.update(cx, |f, cx| f.submit(window, cx)))
@@ -287,7 +298,8 @@ impl Shark {
         let shark = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |d, _, _| {
             let (shark, name) = (shark.clone(), name.clone());
-            d.title(format!("Force-archive {name}?"))
+            d.font_features(inter_features())
+                .title(format!("Force-archive {name}?"))
                 .description(
                     "Removes its worktrees including uncommitted changes. Branches are kept.",
                 )
@@ -421,6 +433,7 @@ impl Shark {
         window.open_dialog(cx, move |d, _, _| {
             let shark = shark.clone();
             d.w(px(640.))
+                .font_features(inter_features())
                 .margin_top(px(96.))
                 .entrance(DialogEntrance::None)
                 .child(Command::new(&state).items(items.clone()).on_confirm(
@@ -475,7 +488,12 @@ impl Shark {
             let active = self.active.as_ref() == Some(&w.name);
             row()
                 .id(ix)
-                .when(selected && focused, |d| d.bg(theme.list_active))
+                .border_1()
+                .border_color(theme.transparent)
+                // The tint alone is too subtle to find the cursor; the accent ring makes it visible.
+                .when(selected && focused, |d| {
+                    d.bg(theme.list_active).border_color(theme.primary)
+                })
                 .when(selected && !focused, |d| d.bg(theme.sidebar_accent))
                 .hover(|d| d.bg(theme.sidebar_accent))
                 .on_click(
@@ -500,7 +518,7 @@ impl Shark {
                         .child(w.name.clone()),
                 )
                 .child(
-                    div().text_xs().text_color(faint(theme)).child(
+                    div().text_xs().text_color(theme.muted_foreground).child(
                         w.repos
                             .iter()
                             .map(|r| r.name.as_str())
@@ -710,12 +728,7 @@ impl Render for Shark {
             .size_full()
             .bg(theme.sidebar)
             .text_color(theme.foreground)
-            // Inter disambiguation (ss02 + cv05/cv08/zero): serifed I, tailed l, slashed 0 for paths and hashes.
-            .font_features(FontFeatures(Arc::new(
-                ["ss02", "cv05", "cv08", "zero"]
-                    .map(|f| (f.to_string(), 1))
-                    .to_vec(),
-            )))
+            .font_features(inter_features())
             .on_action(cx.listener(|this, _: &TogglePalette, w, cx| this.toggle_palette(w, cx)))
             .on_action(cx.listener(|this, _: &NewWorkspace, w, cx| this.new_workspace(w, cx)))
             .on_action(cx.listener(|this, _: &ArchiveWorkspace, w, cx| this.archive(false, w, cx)))
