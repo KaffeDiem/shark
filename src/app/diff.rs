@@ -83,7 +83,7 @@ impl Shark {
         .detach();
     }
 
-    pub(super) fn apply_diff(&mut self, data: DiffData, cx: &mut Context<Self>) {
+    pub(super) fn apply_diff(&mut self, mut data: DiffData, cx: &mut Context<Self>) {
         let status_changed = !self.diff_loaded || data.error != self.diff_error;
         self.diff_loaded = true;
         self.diff_error = data.error;
@@ -94,6 +94,18 @@ impl Shark {
             }
             return;
         }
+        // The file edited in place shows its buffer, saved or not.
+        if let Some(e) = &self.editing
+            && let Some(f) = data.files.iter_mut().find(|f| *f.path() == e.path)
+        {
+            *f = e.file.clone();
+            data.hunks
+                .insert(e.path.clone(), review::parse_hunks(&e.patch));
+        }
+        // While editing, the same files are replaced one by one so the view stays put.
+        let in_place = self.editing.is_some()
+            && (self.diff_files.iter().map(|f| f.path())).eq(data.files.iter().map(|f| f.path()));
+        let old_fps = std::mem::take(&mut self.diff_fps);
         self.review.hunks = data.hunks;
         self.set_media(data.media, cx);
         if let Some(ws) = self.active.clone() {
@@ -122,8 +134,14 @@ impl Shark {
         let files = self.diff_files.clone();
         let viewed = self.viewed_now.clone();
         let at = self.diff_file;
+        let fps = self.diff_fps.clone();
         self.diff.update(cx, |d, cx| {
-            d.set_files(files.iter().cloned(), cx);
+            match in_place {
+                true => (files.iter().zip(fps.iter().zip(&old_fps)))
+                    .filter(|(_, (new, old))| new != old)
+                    .for_each(|(f, _)| d.replace_file(f.clone(), cx)),
+                false => d.set_files(files.iter().cloned(), cx),
+            }
             for f in &files {
                 let path = f.path();
                 if viewed.contains(path) {
@@ -137,7 +155,8 @@ impl Shark {
             self.review.at_file(f.path());
         }
         // The keyboard view comes back to its line; otherwise the file last moved to.
-        if !self.restore_view(cx)
+        if !in_place
+            && !self.restore_view(cx)
             && let Some(f) = files.get(at)
         {
             self.diff.update(cx, |d, cx| d.scroll_to_file(f.path(), cx));
@@ -318,8 +337,9 @@ impl Shark {
 
     /// Trailing controls of a file card's header, after its "+a −d": the edit and comment
     /// buttons go here.
-    fn card_header_suffix(&self, _path: &SharedString, _cx: &App) -> Vec<AnyElement> {
-        vec![]
+    fn card_header_suffix(&self, file: &DiffFile, shark: WeakEntity<Self>) -> Vec<AnyElement> {
+        let editing = self.editing.as_ref().map(|e| (e.path.clone(), e.dirty));
+        vec![inline_edit::edit_buttons(file, editing.as_ref(), shark)]
     }
 
     /// Files shows beside Changes and the file view, not the chat.
@@ -475,16 +495,33 @@ impl Shark {
         )
     }
 
-    pub(super) fn render_diff(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_diff(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let viewed = self.viewed_now.clone();
         let shark = cx.entity().downgrade();
         let placeholder = self.diff_placeholder(cx);
         let empty = placeholder.is_some();
-        let diff_with_annotations = self
-            .with_comments(Diff::new(&self.diff), cx)
-            .hunk_separator(DiffHunkSeparator::LineInfo);
-        let pane = div()
-            .key_context("DiffPane")
+        let diff_with_annotations = self.with_comments(Diff::new(&self.diff), cx);
+        let diff_with_annotations = (self.with_edit_parts(diff_with_annotations, cx))
+            .hunk_separator(DiffHunkSeparator::LineInfo)
+            .flex_1()
+            .min_h_0();
+        // Typing in the line input must not reach the pane's letter keys.
+        let typing = (self.editing.as_ref()).is_some_and(|e| e.focused(window, cx));
+        let status = self.edit_status();
+        let theme = cx.theme();
+        let footer = status.map(|status| {
+            div()
+                .flex_none()
+                .px_3()
+                .py_1p5()
+                .border_t_1()
+                .border_color(theme.border)
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(status)
+        });
+        let pane = v_flex()
+            .key_context(if typing { "DiffEdit" } else { "DiffPane" })
             .relative()
             .flex_1()
             .min_w_0()
@@ -492,9 +529,10 @@ impl Shark {
             .child(self.viewport_probe())
             .on_scroll_wheel(cx.listener(|this, _, _, _| this.lose_view()))
             // The diff's own scrolling keys move it without the line cursor.
-            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _, _| {
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
                 let k = ev.keystroke.key.as_str();
-                if matches!(k, "up" | "down" | "pageup" | "pagedown" | "home" | "end") {
+                let typing = (this.editing.as_ref()).is_some_and(|e| e.focused(w, cx));
+                if !typing && matches!(k, "up" | "down" | "pageup" | "pagedown" | "home" | "end") {
                     this.lose_view();
                 }
             }))
@@ -535,7 +573,7 @@ impl Shark {
                             move |file, _, cx| {
                                 h_flex().gap_1().children(
                                     (shark.upgrade())
-                                        .map(|s| s.read(cx).card_header_suffix(file.path(), cx))
+                                        .map(|s| s.read(cx).card_header_suffix(file, shark.clone()))
                                         .unwrap_or_default(),
                                 )
                             }
@@ -556,7 +594,8 @@ impl Shark {
                                 })
                         }),
                 )
-            });
+            })
+            .children(footer);
         v_flex()
             .flex_1()
             .min_w_0()
@@ -638,6 +677,36 @@ impl Shark {
                     .tooltip("Workspace tools")
                     .on_click(cx.listener(|this, _, w, cx| this.toggle_tree(w, cx))),
             )
+    }
+
+    /// Side headings and the line input of the file edited in place; its header buttons come
+    /// through `card_header_suffix`.
+    fn with_edit_parts(&self, diff: Diff, cx: &mut Context<Self>) -> Diff {
+        let bases: HashMap<String, String> = (self.active_ws().into_iter())
+            .flat_map(|ws| ws.repos.iter().map(|r| (r.name.clone(), r.base.clone())))
+            .collect();
+        let clicks = cx.entity().downgrade();
+        let edited =
+            (self.editing.as_ref()).map(|e| (e.path.clone(), self.working_heading(&e.path)));
+        self.with_inline_edit(diff, cx)
+            .side_headings(move |file, _, _| {
+                let repo = file.path().split('/').next().unwrap_or_default();
+                let base = bases.get(repo).map_or("base", |b| b.as_str());
+                let working = match &edited {
+                    Some((path, heading)) if path == file.path() => heading,
+                    _ => "Working copy · saved",
+                };
+                (
+                    format!("Original · {base} · read only").into(),
+                    working.into(),
+                )
+            })
+            // A click on a working line of the edited file moves the caret there.
+            .on_line_click(move |pos, _, window, cx| {
+                clicks
+                    .update(cx, |s, cx| s.edit_click(pos, window, cx))
+                    .ok();
+            })
     }
 
     pub(super) fn render_tree(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {

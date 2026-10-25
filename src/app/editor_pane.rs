@@ -100,7 +100,19 @@ impl Shark {
     /// Runs `then` now, or after the user agrees to drop unsaved edits in the open file.
     /// Quit, asking first if the open file has unsaved edits.
     pub fn quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.confirm_discard(window, cx, |_, _, cx| cx.quit())
+        self.confirm_discard_all(window, cx, |_, _, cx| cx.quit())
+    }
+
+    /// `confirm_discard` for the editor, then for the file edited in the diff.
+    pub(super) fn confirm_discard_all(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Shark, &mut Window, &mut Context<Shark>) + 'static,
+    ) {
+        self.confirm_discard(window, cx, move |s, window, cx| {
+            s.confirm_discard_edit(window, cx, then)
+        })
     }
 
     pub(super) fn confirm_discard(

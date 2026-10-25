@@ -210,10 +210,11 @@ impl Shark {
         let Some(name) = self.state.workspaces.get(ix).map(|w| w.name.clone()) else {
             return;
         };
-        if self.active.as_ref() == Some(&name) || self.editor.is_none() {
+        if self.active.as_ref() == Some(&name) || (self.editor.is_none() && self.editing.is_none())
+        {
             return self.open_workspace_now(ix, window, cx);
         }
-        self.confirm_discard(window, cx, move |s, window, cx| {
+        self.confirm_discard_all(window, cx, move |s, window, cx| {
             s.drop_editor();
             s.open_workspace_now(ix, window, cx)
         });
@@ -230,6 +231,7 @@ impl Shark {
         };
         if self.active.as_ref() != Some(&ws.name) {
             // A fresh tree and diff for another workspace.
+            self.editing = None;
             self.diff_fp = 0;
             self.diff_files.clear();
             self.diff_fps.clear();
@@ -613,10 +615,11 @@ impl Shark {
     ) {
         // Git only sees the disk; unsaved editor edits would vanish with the worktree.
         if self.active.as_deref() == Some(name)
-            && self.editor.as_ref().is_some_and(|e| e.read(cx).dirty)
+            && (self.editor.as_ref().is_some_and(|e| e.read(cx).dirty)
+                || self.editing.as_ref().is_some_and(|e| e.dirty))
         {
             let name = name.to_string();
-            return self.confirm_discard(window, cx, move |s, window, cx| {
+            return self.confirm_discard_all(window, cx, move |s, window, cx| {
                 s.remove_workspace(&name, force, window, cx)
             });
         }
@@ -688,6 +691,7 @@ impl Shark {
                 if self.active.as_deref() == Some(name) {
                     self.active = None;
                     self.drop_editor();
+                    self.editing = None;
                     self.tab = Tab::Chat;
                     self.sidebar_focus.focus(window, cx);
                 }

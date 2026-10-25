@@ -126,7 +126,16 @@ actions!(
 );
 
 // Editor and diff review: cmd-p, and `c` / `shift-c` in the diff.
-actions!(shark, [OpenAnyFile, AddComment, SendComments, PlayMedia]);
+actions!(
+    shark,
+    [
+        OpenAnyFile,
+        AddComment,
+        SendComments,
+        PlayMedia,
+        EditWorkingCopy
+    ]
+);
 
 /// Switch the open workspace to `chat::MODELS[n]` without opening the menu.
 #[derive(Clone, PartialEq, Debug, serde::Deserialize, Action)]
@@ -254,6 +263,9 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("r", RefreshDiff, Some("DiffPane")),
         KeyBinding::new("p", PlayMedia, Some("DiffPane")),
         KeyBinding::new("cmd-p", OpenAnyFile, None),
+        // Edit the cursor file's working copy in the diff; cmd-s saves it there.
+        KeyBinding::new("i", EditWorkingCopy, Some("DiffPane")),
+        KeyBinding::new("cmd-s", SaveFile, Some("InlineEdit")),
         KeyBinding::new("c", AddComment, Some("DiffPane")),
         // Plan mode; in the composer shift-tab is caught before the input outdents.
         KeyBinding::new(
