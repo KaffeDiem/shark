@@ -8,6 +8,7 @@
 # Changes shows "origin/master → working tree" with the three files.
 set -eu
 root=${1:-$(mktemp -d -t shark-demo)}
+if [ -e "$root/shark" ]; then echo "$root/shark already exists" >&2; exit 1; fi
 mkdir -p "$root/shark/src/app"
 root=$(cd "$root" && pwd)
 repo=$root/shark
