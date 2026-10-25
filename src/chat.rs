@@ -1,0 +1,458 @@
+//! One agent conversation per workspace: transcript blocks, composer, and the claude process.
+use crate::agent::{self, Agent, Ev};
+use crate::state::Workspace;
+use crate::*;
+use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+use gpui_kit::component::text::{TextView, TextViewState};
+use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
+use gpui_kit::component::{IndexPath, Sizable as _};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use serde_json::Value;
+
+enum Block {
+    User(String),
+    Text {
+        md: Entity<TextViewState>,
+        done: bool,
+    },
+    Tool {
+        id: String,
+        name: String,
+        summary: String,
+        result: Option<String>,
+        is_error: bool,
+        open: bool,
+    },
+    Info(String),
+}
+
+pub enum ChatEvent {
+    SessionId(String),
+    Model(Option<String>),
+    TurnDone,
+}
+
+pub struct Chat {
+    pub ws: Workspace,
+    blocks: Vec<Block>,
+    sel: usize,
+    pub busy: bool,
+    agent: Option<Agent>,
+    pub(crate) composer: Entity<TextareaState>,
+    model_select: Entity<SelectState<Vec<&'static str>>>,
+    /// Model the running process was started with; a mismatch respawns it on the next send.
+    agent_model: Option<String>,
+    scroll: ScrollHandle,
+    pub focus: FocusHandle,
+    reader: Option<Task<()>>,
+    _subs: Vec<Subscription>,
+}
+
+/// `default` means "no --model flag".
+const MODELS: &[&str] = &["default", "fable", "opus", "sonnet", "haiku"];
+
+impl EventEmitter<ChatEvent> for Chat {}
+
+fn summarize(input: &Value) -> String {
+    let field = [
+        "command",
+        "file_path",
+        "pattern",
+        "path",
+        "url",
+        "description",
+        "prompt",
+    ]
+    .iter()
+    .find_map(|k| input[k].as_str());
+    let s = field
+        .map(str::to_string)
+        .unwrap_or_else(|| input.to_string());
+    let s = s.lines().next().unwrap_or_default();
+    s.chars().take(120).collect()
+}
+
+impl Chat {
+    pub fn new(ws: Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let composer = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(1, 10)
+                .placeholder("Message the agent (Enter to send, Shift-Enter for newline, Esc for normal mode)")
+                .submit_on_enter(true)
+        });
+        let current = ws.model.as_deref().unwrap_or("default");
+        let ix = MODELS.iter().position(|m| *m == current).unwrap_or(0);
+        let model_select =
+            cx.new(|cx| SelectState::new(MODELS.to_vec(), Some(IndexPath::new(ix)), window, cx));
+        let model_sub = cx.subscribe(
+            &model_select,
+            |this, _, ev: &SelectEvent<Vec<&'static str>>, cx| {
+                let SelectEvent::Confirm(Some(m)) = ev else {
+                    return;
+                };
+                let model = (*m != "default").then(|| m.to_string());
+                if this.ws.model != model {
+                    this.ws.model = model.clone();
+                    cx.emit(ChatEvent::Model(model));
+                    cx.notify();
+                }
+            },
+        );
+        let _sub = cx.subscribe_in(&composer, window, |this, _, ev: &InputEvent, window, cx| {
+            if let InputEvent::PressEnter { shift: false, .. } = ev {
+                this.send(window, cx);
+            }
+        });
+        let mut chat = Chat {
+            ws,
+            blocks: vec![],
+            sel: 0,
+            busy: false,
+            agent: None,
+            composer,
+            model_select,
+            agent_model: None,
+            scroll: ScrollHandle::new(),
+            focus: cx.focus_handle(),
+            reader: None,
+            _subs: vec![_sub, model_sub],
+        };
+        // Replay history through the same path as live events.
+        let history =
+            std::fs::read_to_string(agent::transcript_path(&chat.ws.name)).unwrap_or_default();
+        for ev in history.lines().flat_map(agent::parse) {
+            chat.apply(ev, cx);
+        }
+        chat.busy = false;
+        chat.sel = chat.blocks.len().saturating_sub(1);
+        chat.scroll.scroll_to_bottom();
+        chat
+    }
+
+    pub fn focus_composer(&self, window: &mut Window, cx: &mut Context<Self>) {
+        self.composer.update(cx, |c, cx| c.focus(window, cx));
+    }
+
+    fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.composer.read(cx).value().trim().to_string();
+        if text.is_empty() || self.busy {
+            return;
+        }
+        if self.agent.is_some() && self.agent_model != self.ws.model {
+            self.agent = None; // drop stops it; the respawn resumes the same session on the new model
+        }
+        if self.agent.is_none() {
+            match agent::spawn(&self.ws) {
+                Ok((a, rx)) => {
+                    self.agent = Some(a);
+                    self.agent_model = self.ws.model.clone();
+                    self.reader = Some(cx.spawn(async move |this, cx| {
+                        while let Ok(ev) = rx.recv().await {
+                            if this.update(cx, |c, cx| c.apply(ev, cx)).is_err() {
+                                break;
+                            }
+                        }
+                    }));
+                }
+                Err(e) => {
+                    self.push(Block::Info(format!("failed to start claude: {e}")), cx);
+                    return;
+                }
+            }
+        }
+        if let Err(e) = self.agent.as_mut().unwrap().send(&text) {
+            self.push(Block::Info(format!("send failed: {e}")), cx);
+            return;
+        }
+        self.composer
+            .update(cx, |c, cx| c.set_value("", window, cx));
+        self.busy = true;
+        self.push(Block::User(text), cx);
+    }
+
+    pub fn stop(&mut self, cx: &mut Context<Self>) {
+        if let Some(a) = &self.agent {
+            a.stop();
+            self.push(Block::Info("stopping…".into()), cx);
+        }
+    }
+
+    fn push(&mut self, b: Block, cx: &mut Context<Self>) {
+        let follow = self.sel + 1 >= self.blocks.len();
+        self.blocks.push(b);
+        if follow {
+            self.sel = self.blocks.len() - 1;
+            self.scroll.scroll_to_bottom();
+        }
+        cx.notify();
+    }
+
+    fn apply(&mut self, ev: Ev, cx: &mut Context<Self>) {
+        match ev {
+            Ev::Init(id) => {
+                if self.ws.session_id.as_ref() != Some(&id) {
+                    self.ws.session_id = Some(id.clone());
+                    cx.emit(ChatEvent::SessionId(id));
+                }
+            }
+            Ev::User(text) => self.push(Block::User(text), cx),
+            Ev::TextDelta(s) => match self.blocks.last_mut() {
+                Some(Block::Text { md, done: false }) => {
+                    md.update(cx, |m, cx| m.push_str(&s, cx));
+                    self.scroll.scroll_to_bottom();
+                }
+                _ => {
+                    let md = cx.new(|cx| TextViewState::markdown(&s, cx));
+                    self.push(Block::Text { md, done: false }, cx);
+                }
+            },
+            Ev::Text(full) => match self.blocks.last_mut() {
+                Some(Block::Text { md, done }) if !*done => {
+                    md.update(cx, |m, cx| m.set_text(&full, cx));
+                    *done = true;
+                }
+                _ => {
+                    let md = cx.new(|cx| TextViewState::markdown(&full, cx));
+                    self.push(Block::Text { md, done: true }, cx);
+                }
+            },
+            Ev::ToolUse { id, name, input } => {
+                let summary = summarize(&input);
+                self.push(
+                    Block::Tool {
+                        id,
+                        name,
+                        summary,
+                        result: None,
+                        is_error: false,
+                        open: false,
+                    },
+                    cx,
+                )
+            }
+            Ev::ToolResult {
+                id,
+                text,
+                is_error: err,
+            } => {
+                for b in self.blocks.iter_mut().rev() {
+                    if let Block::Tool {
+                        id: tid,
+                        result,
+                        is_error,
+                        ..
+                    } = b
+                        && *tid == id
+                    {
+                        *result = Some(text);
+                        *is_error = err;
+                        break;
+                    }
+                }
+                cx.notify();
+            }
+            Ev::Result {
+                is_error,
+                text,
+                cost,
+            } => {
+                self.busy = false;
+                if is_error {
+                    self.push(Block::Info(format!("error: {text}")), cx);
+                } else {
+                    self.push(Block::Info(format!("done · ${cost:.2}")), cx);
+                }
+                cx.emit(ChatEvent::TurnDone);
+            }
+            Ev::Exited(msg) => {
+                self.agent = None;
+                if self.busy {
+                    self.busy = false;
+                    self.push(Block::Info(msg), cx);
+                    cx.emit(ChatEvent::TurnDone);
+                }
+                cx.notify();
+            }
+        }
+    }
+
+    fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.sel = ix.min(self.blocks.len().saturating_sub(1));
+        self.scroll.scroll_to_item(self.sel);
+        cx.notify();
+    }
+
+    fn render_block(
+        &self,
+        ix: usize,
+        b: &Block,
+        focused: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let row = div()
+            .id(ix)
+            .w_full()
+            .px_4()
+            .py_1p5()
+            .border_l_2()
+            .border_color(if focused && ix == self.sel {
+                theme.accent
+            } else {
+                theme.transparent
+            })
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.sel = ix;
+                this.toggle(cx);
+            }));
+        match b {
+            Block::User(t) => row
+                .child(
+                    div()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .bg(theme.secondary)
+                        .text_color(theme.secondary_foreground)
+                        .child(t.clone()),
+                )
+                .into_any_element(),
+            Block::Text { md, .. } => row
+                .child(TextView::new(md).selectable(true))
+                .into_any_element(),
+            Block::Tool {
+                name,
+                summary,
+                result,
+                is_error,
+                open,
+                ..
+            } => {
+                let status = match (result, is_error) {
+                    (None, _) => "…",
+                    (Some(_), true) => "✗",
+                    _ => "✓",
+                };
+                row.text_sm()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .text_color(theme.muted_foreground)
+                            .child(if *open { "▾" } else { "▸" })
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme.foreground)
+                                    .child(name.clone()),
+                            )
+                            .child(div().flex_1().truncate().child(summary.clone()))
+                            .child(status),
+                    )
+                    .when(*open, |d| {
+                        let text: String = result
+                            .as_deref()
+                            .unwrap_or("(running)")
+                            .chars()
+                            .take(20_000)
+                            .collect();
+                        d.child(
+                            div()
+                                .mt_1()
+                                .p_2()
+                                .rounded_md()
+                                .bg(theme.muted)
+                                .font_family("Menlo")
+                                .text_xs()
+                                .text_color(if *is_error {
+                                    theme.danger
+                                } else {
+                                    theme.foreground
+                                })
+                                .child(text),
+                        )
+                    })
+                    .into_any_element()
+            }
+            Block::Info(t) => row
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(t.clone())
+                .into_any_element(),
+        }
+    }
+
+    fn toggle(&mut self, cx: &mut Context<Self>) {
+        if let Some(Block::Tool { open, .. }) = self.blocks.get_mut(self.sel) {
+            *open = !*open;
+            cx.notify();
+        }
+    }
+}
+
+impl Render for Chat {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let focused = self.focus.is_focused(window);
+        let blocks: Vec<AnyElement> = (0..self.blocks.len())
+            .map(|ix| self.render_block(ix, &self.blocks[ix], focused, cx))
+            .collect();
+        v_flex()
+            .size_full()
+            .child(
+                div()
+                    .id("transcript")
+                    .key_context("Transcript")
+                    .track_focus(&self.focus)
+                    .flex_1()
+                    .min_h_0()
+                    .py_2()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.scroll)
+                    .vertical_scrollbar(&self.scroll)
+                    .on_action(
+                        cx.listener(|this, _: &SelectNext, _, cx| this.select(this.sel + 1, cx)),
+                    )
+                    .on_action(cx.listener(|this, _: &SelectPrev, _, cx| {
+                        this.select(this.sel.saturating_sub(1), cx)
+                    }))
+                    .on_action(cx.listener(|this, _: &SelectFirst, _, cx| this.select(0, cx)))
+                    .on_action(
+                        cx.listener(|this, _: &SelectLast, _, cx| this.select(usize::MAX, cx)),
+                    )
+                    .on_action(
+                        cx.listener(|this, _: &PageDown, _, cx| this.select(this.sel + 5, cx)),
+                    )
+                    .on_action(cx.listener(|this, _: &PageUp, _, cx| {
+                        this.select(this.sel.saturating_sub(5), cx)
+                    }))
+                    .on_action(cx.listener(|this, _: &Confirm, _, cx| this.toggle(cx)))
+                    .on_action(cx.listener(|this, _: &FocusComposer, window, cx| {
+                        this.focus_composer(window, cx)
+                    }))
+                    .children(blocks),
+            )
+            .child(
+                div()
+                    .key_context("Composer")
+                    .p_2()
+                    .border_t_1()
+                    .border_color(cx.theme().border)
+                    .on_action(cx.listener(|this, _: &FocusTranscript, window, cx| {
+                        this.focus.focus(window, cx);
+                        cx.notify();
+                    }))
+                    .child(Textarea::new(&self.composer))
+                    .child(
+                        h_flex()
+                            .pt_1()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Claude Code")
+                            .child(Select::new(&self.model_select).xsmall().w(px(120.))),
+                    ),
+            )
+    }
+}

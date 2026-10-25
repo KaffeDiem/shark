@@ -1,0 +1,852 @@
+//! Root view: sidebar of repos and workspaces, Chat/Diff tabs, palette and dialogs.
+use crate::chat::{Chat, ChatEvent};
+use crate::state::{Repo, State, workspaces_dir};
+use crate::*;
+use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
+use gpui_kit::component::command::{Command, CommandItem, CommandState};
+use gpui_kit::component::dialog::DialogEntrance;
+use gpui_kit::component::diff::{Diff, DiffFile, DiffMode, DiffState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::{ActiveTheme, WindowExt, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use std::collections::HashMap;
+
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum Tab {
+    Chat,
+    Diff,
+}
+
+pub struct Shark {
+    pub(crate) state: State,
+    sel: usize,
+    pub(crate) active: Option<String>,
+    pub(crate) chats: HashMap<String, Entity<Chat>>,
+    tab: Tab,
+    diff: Entity<DiffState>,
+    diff_files: Vec<String>,
+    diff_file: usize,
+    prs: HashMap<String, Vec<String>>,
+    pub(crate) sidebar_focus: FocusHandle,
+    _subs: Vec<Subscription>,
+}
+
+type Cmd = fn(&mut Shark, &mut Window, &mut Context<Shark>);
+
+const COMMANDS: &[(&str, Cmd)] = &[
+    ("New workspace", |s, w, cx| s.new_workspace(w, cx)),
+    ("Add repo", |s, w, cx| s.add_repo(w, cx)),
+    ("Archive workspace", |s, w, cx| s.archive(false, w, cx)),
+    ("Archive workspace (force, discards changes)", |s, w, cx| {
+        s.archive(true, w, cx)
+    }),
+    ("Show chat", |s, w, cx| s.show(Tab::Chat, w, cx)),
+    ("Show diff", |s, w, cx| s.show(Tab::Diff, w, cx)),
+    ("Create / update linked PRs", |s, w, cx| s.create_prs(w, cx)),
+    ("Open PRs in browser", |s, w, cx| s.open_prs(w, cx)),
+    ("Stop agent", |s, _, cx| s.stop(cx)),
+];
+
+impl Shark {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let state = State::load();
+        let sidebar_focus = cx.focus_handle();
+        sidebar_focus.focus(window, cx);
+        Shark {
+            state,
+            sel: 0,
+            active: None,
+            chats: HashMap::new(),
+            tab: Tab::Chat,
+            diff: cx.new(|cx| DiffState::new(vec![], cx)),
+            diff_files: vec![],
+            diff_file: 0,
+            prs: HashMap::new(),
+            sidebar_focus,
+            _subs: vec![],
+        }
+    }
+
+    fn notify_err(window: &mut Window, cx: &mut App, e: impl Into<SharedString>) {
+        window.push_notification(Notification::error(e), cx);
+    }
+
+    fn active_chat(&self) -> Option<&Entity<Chat>> {
+        self.chats.get(self.active.as_ref()?)
+    }
+
+    fn open_workspace(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.state.workspaces.get(ix).cloned() else {
+            return;
+        };
+        self.sel = ix;
+        if !self.chats.contains_key(&ws.name) {
+            let chat = cx.new(|cx| Chat::new(ws.clone(), window, cx));
+            let name = ws.name.clone();
+            self._subs.push(
+                cx.subscribe(&chat, move |this, _, ev: &ChatEvent, cx| match ev {
+                    ChatEvent::SessionId(id) => {
+                        if let Some(w) = this.state.workspaces.iter_mut().find(|w| w.name == name) {
+                            w.session_id = Some(id.clone());
+                            this.state.save();
+                        }
+                    }
+                    ChatEvent::Model(model) => {
+                        if let Some(w) = this.state.workspaces.iter_mut().find(|w| w.name == name) {
+                            w.model = model.clone();
+                            this.state.save();
+                        }
+                    }
+                    ChatEvent::TurnDone => {
+                        if this.active.as_ref() == Some(&name) {
+                            this.refresh_diff(cx);
+                        }
+                        cx.notify();
+                    }
+                }),
+            );
+            self.chats.insert(ws.name.clone(), chat);
+        }
+        self.active = Some(ws.name);
+        self.refresh_diff(cx);
+        self.show(Tab::Chat, window, cx);
+        if let Some(chat) = self.active_chat().cloned() {
+            chat.update(cx, |c, cx| c.focus_composer(window, cx));
+        }
+    }
+
+    fn show(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        self.tab = tab;
+        match tab {
+            Tab::Chat => {
+                if let Some(chat) = self.active_chat() {
+                    let focus = chat.read(cx).focus.clone();
+                    focus.focus(window, cx);
+                }
+            }
+            Tab::Diff => {
+                self.refresh_diff(cx);
+                self.diff.read(cx).focus_handle(cx).focus(window, cx);
+            }
+        }
+        cx.notify();
+    }
+
+    fn refresh_diff(&mut self, cx: &mut Context<Self>) {
+        let Some(ws) = self
+            .active
+            .as_ref()
+            .and_then(|n| self.state.workspaces.iter().find(|w| &w.name == n))
+            .cloned()
+        else {
+            return;
+        };
+        cx.spawn(async move |this, cx| {
+            let name = ws.name.clone();
+            let patch = cx
+                .background_executor()
+                .spawn(async move { git::combined_diff(&ws, &ws.dir()) })
+                .await;
+            let files = DiffFile::parse(&patch).unwrap_or_default();
+            this.update(cx, |s, cx| {
+                if s.active.as_ref() != Some(&name) {
+                    return; // a slower refresh for a workspace that is no longer shown
+                }
+                s.diff_files = files.iter().map(|f| f.path().to_string()).collect();
+                s.diff_file = 0;
+                s.diff.update(cx, |d, cx| d.set_files(files, cx));
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn add_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: true,
+            prompt: Some("Add repo".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            this.update_in(cx, |s, window, cx| {
+                for p in paths {
+                    match git::add_repo(&p, &s.state.repos) {
+                        Ok(r) => s.state.repos.push(r),
+                        Err(e) => Self::notify_err(window, cx, e),
+                    }
+                }
+                s.state.save();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn new_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.state.repos.is_empty() {
+            return Self::notify_err(window, cx, "Add a repo first (space r a)");
+        }
+        let shark = cx.entity().downgrade();
+        let form = cx.new(|cx| NewWorkspaceForm::new(self.state.repos.clone(), shark, window, cx));
+        let input = form.read(cx).branch.clone();
+        window.open_dialog(cx, move |d, _, _| {
+            let f = form.clone();
+            // Dialog binds enter to Confirm, which runs on_ok and closes when it returns true.
+            d.title("New workspace")
+                .w(px(480.))
+                .child(form.clone())
+                .on_ok(move |_, window, cx| f.update(cx, |f, cx| f.submit(window, cx)))
+        });
+        input.update(cx, |i, cx| i.focus(window, cx));
+    }
+
+    fn create_workspace(
+        &mut self,
+        branch: String,
+        repos: Vec<Repo>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let name = branch.replace('/', "-");
+        if self.state.workspaces.iter().any(|w| w.name == name) {
+            return Self::notify_err(window, cx, format!("workspace `{name}` already exists"));
+        }
+        window.push_notification(format!("Creating {name}…"), cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let dir = workspaces_dir().join(&name);
+            let result = cx
+                .background_executor()
+                .spawn(async move { git::create_workspace(&dir, &name, &branch, &repos) })
+                .await;
+            this.update_in(cx, |s, window, cx| match result {
+                Ok(ws) => {
+                    s.state.workspaces.push(ws);
+                    s.state.save();
+                    s.open_workspace(s.state.workspaces.len() - 1, window, cx);
+                }
+                Err(e) => Self::notify_err(window, cx, e),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Archives the workspace under the sidebar cursor when the sidebar is focused, else the open one.
+    fn archive(&mut self, force: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let target = if self.sidebar_focus.is_focused(window) {
+            self.state.workspaces.get(self.sel).map(|w| w.name.clone())
+        } else {
+            self.active.clone()
+        };
+        let Some(name) = target else { return };
+        if self.chats.get(&name).is_some_and(|c| c.read(cx).busy) {
+            return Self::notify_err(window, cx, "Agent is running; stop it first (ctrl-c)");
+        }
+        if !force {
+            return self.remove_workspace(&name, false, window, cx);
+        }
+        let shark = cx.entity().downgrade();
+        window.open_alert_dialog(cx, move |d, _, _| {
+            let (shark, name) = (shark.clone(), name.clone());
+            d.title(format!("Force-archive {name}?"))
+                .description(
+                    "Removes its worktrees including uncommitted changes. Branches are kept.",
+                )
+                .ok_text("Archive")
+                .ok_variant(ButtonVariant::Danger)
+                .show_cancel(true)
+                .on_ok(move |_, window, cx| {
+                    shark
+                        .update(cx, |s, cx| s.remove_workspace(&name, true, window, cx))
+                        .ok();
+                    true
+                })
+        });
+    }
+
+    fn remove_workspace(
+        &mut self,
+        name: &str,
+        force: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ws) = self
+            .state
+            .workspaces
+            .iter()
+            .find(|w| w.name == name)
+            .cloned()
+        else {
+            return;
+        };
+        match git::remove_workspace(&ws, &ws.dir(), force) {
+            Ok(()) => {
+                self.chats.remove(name);
+                self.state.workspaces.retain(|w| w.name != name);
+                self.state.save();
+                // A later workspace with the same name must not replay or resume this conversation.
+                let _ = std::fs::remove_file(crate::agent::transcript_path(name));
+                if self.active.as_deref() == Some(name) {
+                    self.active = None;
+                }
+                self.sel = self.sel.min(self.state.workspaces.len().saturating_sub(1));
+                window.push_notification(
+                    Notification::success(format!("Archived {name} (branch kept)")),
+                    cx,
+                );
+                self.sidebar_focus.focus(window, cx);
+            }
+            Err(e) => Self::notify_err(window, cx, format!("{e}\nUse space w D to force.")),
+        }
+        cx.notify();
+    }
+
+    fn create_prs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self
+            .active
+            .as_ref()
+            .and_then(|n| self.state.workspaces.iter().find(|w| &w.name == n))
+            .cloned()
+        else {
+            return Self::notify_err(window, cx, "Open a workspace first");
+        };
+        window.push_notification("Creating PRs…", cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let name = ws.name.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move { pr::create_linked_prs(&ws, &ws.dir()) })
+                .await;
+            this.update_in(cx, |s, window, cx| match result {
+                Ok(prs) => {
+                    let list = prs
+                        .iter()
+                        .map(|(r, u)| format!("{r}: {u}"))
+                        .collect::<Vec<_>>()
+                        .join("\n");
+                    s.prs
+                        .insert(name, prs.into_iter().map(|(_, u)| u).collect());
+                    window.push_notification(
+                        Notification::success(list).title("Linked PRs ready (space p o)"),
+                        cx,
+                    );
+                }
+                Err(e) => Self::notify_err(window, cx, e),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn open_prs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let urls = self.active.as_ref().and_then(|n| self.prs.get(n));
+        // ponytail: PR URLs live in memory; space p r re-finds existing PRs after a restart
+        let Some(urls) = urls else {
+            return Self::notify_err(
+                window,
+                cx,
+                "No PRs known yet: run space p r (finds existing PRs too)",
+            );
+        };
+        for url in urls {
+            cx.open_url(url);
+        }
+    }
+
+    fn stop(&mut self, cx: &mut Context<Self>) {
+        if let Some(chat) = self.active_chat() {
+            chat.update(cx, |c, cx| c.stop(cx));
+        }
+    }
+
+    fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let palette = cx.new(|cx| CommandState::new(window, cx));
+        let shark = cx.entity().downgrade();
+        let workspaces: Vec<String> = self
+            .state
+            .workspaces
+            .iter()
+            .map(|w| w.name.clone())
+            .collect();
+        let items: Vec<CommandItem> = COMMANDS
+            .iter()
+            .map(|(label, _)| CommandItem::new().label(*label))
+            .chain(
+                workspaces
+                    .iter()
+                    .map(|w| CommandItem::new().label(format!("Open workspace: {w}"))),
+            )
+            .collect();
+        let state = palette.clone();
+        window.open_dialog(cx, move |d, _, _| {
+            let shark = shark.clone();
+            d.w(px(560.)).entrance(DialogEntrance::None).child(
+                Command::new(&state)
+                    .items(items.clone())
+                    .on_confirm(move |ix, window, cx| {
+                        window.close_dialog(cx);
+                        let row = ix.row;
+                        shark
+                            .update(cx, |s, cx| match COMMANDS.get(row) {
+                                Some((_, f)) => f(s, window, cx),
+                                None => s.open_workspace(row - COMMANDS.len(), window, cx),
+                            })
+                            .ok();
+                    }),
+            )
+        });
+        palette.update(cx, |p, cx| p.focus(window, cx));
+    }
+
+    fn render_sidebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let focused = self.sidebar_focus.is_focused(window);
+        let header = |t: &'static str| {
+            div()
+                .px_3()
+                .pt_3()
+                .pb_1()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .child(t)
+        };
+        let repos = self
+            .state
+            .repos
+            .iter()
+            .map(|r| div().px_3().py_0p5().text_sm().child(r.name.clone()));
+        let workspaces = self.state.workspaces.iter().enumerate().map(|(ix, w)| {
+            let busy = self.chats.get(&w.name).is_some_and(|c| c.read(cx).busy);
+            let selected = ix == self.sel;
+            let active = self.active.as_ref() == Some(&w.name);
+            h_flex()
+                .id(ix)
+                .px_3()
+                .py_1()
+                .gap_2()
+                .text_sm()
+                .when(selected && focused, |d| d.bg(theme.list_active))
+                .when(selected && !focused, |d| d.bg(theme.list_hover))
+                .on_click(
+                    cx.listener(move |this, _, window, cx| this.open_workspace(ix, window, cx)),
+                )
+                .child(
+                    div()
+                        .text_color(if busy {
+                            theme.success
+                        } else {
+                            theme.muted_foreground
+                        })
+                        .child(if busy { "●" } else { "○" }),
+                )
+                .child(
+                    v_flex()
+                        .child(
+                            div()
+                                .when(active, |d| d.font_weight(FontWeight::SEMIBOLD))
+                                .child(w.name.clone()),
+                        )
+                        .child(
+                            div().text_xs().text_color(theme.muted_foreground).child(
+                                w.repos
+                                    .iter()
+                                    .map(|r| r.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join(" · "),
+                            ),
+                        ),
+                )
+        });
+        v_flex()
+            .id("sidebar")
+            .key_context("Sidebar")
+            .track_focus(&self.sidebar_focus)
+            .w(px(240.))
+            .h_full()
+            .flex_none()
+            .bg(theme.sidebar)
+            .border_r_1()
+            .border_color(theme.sidebar_border)
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| {
+                this.sel = (this.sel + 1).min(this.state.workspaces.len().saturating_sub(1));
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SelectPrev, _, cx| {
+                this.sel = this.sel.saturating_sub(1);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SelectFirst, _, cx| {
+                this.sel = 0;
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &SelectLast, _, cx| {
+                this.sel = this.state.workspaces.len().saturating_sub(1);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &Confirm, window, cx| {
+                this.open_workspace(this.sel, window, cx)
+            }))
+            .child(header("REPOS"))
+            .children(repos)
+            .when(self.state.repos.is_empty(), |d| {
+                d.child(
+                    div()
+                        .px_3()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("space r a to add"),
+                )
+            })
+            .child(header("WORKSPACES"))
+            .children(workspaces)
+            .when(self.state.workspaces.is_empty(), |d| {
+                d.child(
+                    div()
+                        .px_3()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("space w n to create"),
+                )
+            })
+    }
+
+    fn render_main(&self, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let Some(chat) = self.active_chat().cloned() else {
+            return v_flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .gap_2()
+                .text_color(theme.muted_foreground)
+                .child("No workspace open")
+                .child(div().text_sm().child(
+                    "j/k + enter to open · space w n new · space r a add repo · cmd-k commands",
+                ))
+                .into_any_element();
+        };
+        let busy = chat.read(cx).busy;
+        let tab = |label: String, t: Tab| {
+            div()
+                .id(label.clone())
+                .px_3()
+                .py_1()
+                .rounded_md()
+                .text_sm()
+                .when(self.tab == t, |d| d.bg(theme.tab_active))
+                .on_click(cx.listener(move |this, _, window, cx| this.show(t, window, cx)))
+                .child(label)
+        };
+        let ws_name = self.active.clone().unwrap_or_default();
+        v_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(
+                h_flex()
+                    .px_2()
+                    .py_1()
+                    .gap_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .bg(theme.tab_bar)
+                    .child(tab("Chat".into(), Tab::Chat))
+                    .child(tab(
+                        format!("Diff · {} files", self.diff_files.len()),
+                        Tab::Diff,
+                    ))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(ws_name),
+                    )
+                    .child(
+                        div()
+                            .px_2()
+                            .text_xs()
+                            .text_color(if busy {
+                                theme.success
+                            } else {
+                                theme.muted_foreground
+                            })
+                            .child(if busy { "● running" } else { "idle" }),
+                    ),
+            )
+            .child(match self.tab {
+                Tab::Chat => div().flex_1().min_h_0().child(chat).into_any_element(),
+                Tab::Diff => div()
+                    .key_context("DiffPane")
+                    .flex_1()
+                    .min_h_0()
+                    .on_action(cx.listener(|this, _: &NextHunk, _, cx| {
+                        this.diff.update(cx, |d, cx| d.next_change(cx))
+                    }))
+                    .on_action(cx.listener(|this, _: &PrevHunk, _, cx| {
+                        this.diff.update(cx, |d, cx| d.previous_change(cx))
+                    }))
+                    .on_action(cx.listener(|this, _: &NextFile, _, cx| this.step_file(1, cx)))
+                    .on_action(cx.listener(|this, _: &PrevFile, _, cx| this.step_file(-1, cx)))
+                    .on_action(cx.listener(|this, _: &RefreshDiff, _, cx| this.refresh_diff(cx)))
+                    .on_action(cx.listener(|this, _: &ToggleDiffMode, _, cx| {
+                        this.diff.update(cx, |d, cx| {
+                            let mode = if d.mode() == DiffMode::Split {
+                                DiffMode::Unified
+                            } else {
+                                DiffMode::Split
+                            };
+                            d.set_mode(mode, cx)
+                        })
+                    }))
+                    .child(Diff::new(&self.diff))
+                    .into_any_element(),
+            })
+            .into_any_element()
+    }
+
+    fn step_file(&mut self, delta: isize, cx: &mut Context<Self>) {
+        if self.diff_files.is_empty() {
+            return;
+        }
+        let n = self.diff_files.len() as isize;
+        self.diff_file = (self.diff_file as isize + delta).rem_euclid(n) as usize;
+        let path = self.diff_files[self.diff_file].clone();
+        self.diff.update(cx, |d, cx| d.scroll_to_file(&path, cx));
+    }
+}
+
+impl Render for Shark {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        h_flex()
+            .key_context("Shark")
+            .size_full()
+            .bg(cx.theme().background)
+            .text_color(cx.theme().foreground)
+            .on_action(cx.listener(|this, _: &TogglePalette, w, cx| this.toggle_palette(w, cx)))
+            .on_action(cx.listener(|this, _: &NewWorkspace, w, cx| this.new_workspace(w, cx)))
+            .on_action(cx.listener(|this, _: &ArchiveWorkspace, w, cx| this.archive(false, w, cx)))
+            .on_action(
+                cx.listener(|this, _: &ForceArchiveWorkspace, w, cx| this.archive(true, w, cx)),
+            )
+            .on_action(cx.listener(|this, _: &AddRepo, w, cx| this.add_repo(w, cx)))
+            .on_action(cx.listener(|this, _: &StopAgent, _, cx| this.stop(cx)))
+            .on_action(cx.listener(|this, _: &ShowChat, w, cx| this.show(Tab::Chat, w, cx)))
+            .on_action(cx.listener(|this, _: &ShowDiff, w, cx| this.show(Tab::Diff, w, cx)))
+            .on_action(cx.listener(|this, _: &CreatePrs, w, cx| this.create_prs(w, cx)))
+            .on_action(cx.listener(|this, _: &OpenPrs, w, cx| this.open_prs(w, cx)))
+            .on_action(cx.listener(|this, _: &FocusSidebar, w, cx| {
+                this.sidebar_focus.focus(w, cx);
+                cx.notify();
+            }))
+            .on_action(cx.listener(|this, _: &FocusMain, w, cx| {
+                let tab = this.tab;
+                this.show(tab, w, cx)
+            }))
+            .child(self.render_sidebar(window, cx))
+            .child(self.render_main(cx))
+    }
+}
+
+/// Contents of the New workspace dialog: a branch name and the repos to include.
+struct NewWorkspaceForm {
+    branch: Entity<InputState>,
+    repos: Vec<Repo>,
+    picked: Vec<bool>,
+    shark: WeakEntity<Shark>,
+    _sub: Subscription,
+}
+
+impl NewWorkspaceForm {
+    fn new(
+        repos: Vec<Repo>,
+        shark: WeakEntity<Shark>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let branch = cx
+            .new(|cx| InputState::new(window, cx).placeholder("branch, e.g. kasper/eng-123-login"));
+        // Branch names can't contain spaces; turn them into dashes as you type.
+        let _sub = cx.subscribe_in(&branch, window, |_, input, ev: &InputEvent, window, cx| {
+            if let InputEvent::Change = ev {
+                let value = input.read(cx).value();
+                if value.contains(' ') {
+                    let fixed = value.replace(' ', "-");
+                    input.update(cx, |i, cx| i.set_value(fixed, window, cx));
+                }
+            }
+        });
+        let picked = vec![true; repos.len()];
+        NewWorkspaceForm {
+            branch,
+            repos,
+            picked,
+            shark,
+            _sub,
+        }
+    }
+
+    /// Returns whether the form was valid (and the dialog may close).
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let branch = self.branch.read(cx).value().trim().to_string();
+        let repos: Vec<Repo> = self
+            .repos
+            .iter()
+            .zip(&self.picked)
+            .filter(|(_, p)| **p)
+            .map(|(r, _)| r.clone())
+            .collect();
+        if branch.is_empty() || repos.is_empty() {
+            return false;
+        }
+        self.shark
+            .update(cx, |s, cx| s.create_workspace(branch, repos, window, cx))
+            .ok();
+        true
+    }
+}
+
+impl Render for NewWorkspaceForm {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex()
+            .gap_3()
+            .child(Input::new(&self.branch))
+            .children(self.repos.iter().enumerate().map(|(i, r)| {
+                Checkbox::new(("repo", i))
+                    .label(r.name.clone())
+                    .checked(self.picked[i])
+                    .on_click(cx.listener(move |this, v: &bool, _, cx| {
+                        this.picked[i] = *v;
+                        cx.notify();
+                    }))
+            }))
+            .child(
+                h_flex().justify_end().child(
+                    Button::new("create")
+                        .primary()
+                        .label("Create")
+                        .on_click(cx.listener(|this, _, window, cx| {
+                            if this.submit(window, cx) {
+                                window.close_dialog(cx);
+                            }
+                        })),
+                ),
+            )
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod ui_tests {
+    use super::*;
+    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+    use std::{fs, time::Duration};
+
+    /// Drives the real keymap headlessly: create a workspace, vim focus moves, tabs, archive.
+    #[gpui_kit::test]
+    async fn keyboard_flow(cx: &mut TestAppContext) {
+        let home = std::env::temp_dir().join(format!("shark-ui-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&home);
+        let repo = home.join("src/api");
+        fs::create_dir_all(&repo).unwrap();
+        git::git(&repo, &["init", "-q", "-b", "main"]).unwrap();
+        git::git(
+            &repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "i",
+            ],
+        )
+        .unwrap();
+        crate::state::TEST_HOME.set(home.clone()).unwrap();
+        State {
+            repos: vec![Repo {
+                name: "api".into(),
+                path: repo,
+            }],
+            workspaces: vec![],
+        }
+        .save();
+
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::bind_keys(cx);
+        });
+        let (window, shark) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| Shark::new(w, cx))
+                })
+            })
+            .unwrap();
+        let press = |cx: &mut TestAppContext, keys: &[&str]| {
+            cx.update_window(window, |_, w, cx| keys.iter().for_each(|k| w.press(k, cx)))
+                .unwrap()
+        };
+
+        press(cx, &["space", "w", "n"]);
+        cx.update_window(window, |_, w, cx| w.input("ui x", cx))
+            .unwrap();
+        press(cx, &["enter"]);
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).active.is_some()
+        })
+        .await;
+        let ws_dir = home.join("shark/workspaces/ui-x");
+        assert!(ws_dir.join("api").exists() && ws_dir.join("CLAUDE.md").exists());
+
+        // Opening a workspace focuses the composer: vim keys must type, not navigate.
+        cx.update_window(window, |_, w, cx| w.input("jk g", cx))
+            .unwrap();
+        let chat = cx.update(|cx| shark.read(cx).chats["ui-x"].clone());
+        cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
+
+        press(cx, &["escape"]);
+        cx.update_window(window, |_, w, cx| {
+            assert!(chat.read(cx).focus.is_focused(w), "escape -> transcript")
+        })
+        .unwrap();
+        press(cx, &["ctrl-w", "h"]);
+        cx.update_window(window, |_, w, cx| {
+            assert!(
+                shark.read(cx).sidebar_focus.is_focused(w),
+                "ctrl-w h -> sidebar"
+            )
+        })
+        .unwrap();
+        press(cx, &["space", "d"]);
+        cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Diff));
+        press(cx, &["space", "c"]);
+        cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Chat));
+
+        press(cx, &["ctrl-w", "h", "space", "w", "shift-d"]);
+        cx.update(|cx| {
+            assert_eq!(
+                shark.read(cx).state.workspaces.len(),
+                1,
+                "force archive waits for confirm"
+            )
+        });
+        press(cx, &["enter"]);
+        cx.update(|cx| assert!(shark.read(cx).state.workspaces.is_empty()));
+        assert!(!ws_dir.exists());
+        fs::remove_dir_all(&home).unwrap();
+    }
+}
