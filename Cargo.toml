@@ -27,3 +27,7 @@ opt-level = 3
 [features]
 # Headless UI tests: cargo test --features test-support
 test-support = ["gpui-kit/test-support"]
+
+# Vendored with a small split-diff patch; see vendor/gpui-component/PROVENANCE.md.
+[patch.crates-io]
+gpui-component = { path = "vendor/gpui-component" }
