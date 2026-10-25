@@ -711,6 +711,9 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &ApprovePlan, w, cx| {
                 this.with_plan(w, cx, |c, w, cx| c.approve_plan(w, cx))
             }))
+            .on_action(cx.listener(|this, _: &BuildPlanInNewChat, w, cx| {
+                this.build_plan_in_new_chat(w, cx)
+            }))
             .on_action(cx.listener(|this, _: &RevealInFinder, w, cx| {
                 this.with_target(w, cx, |ws, _, cx| cx.reveal_path(&ws.dir()))
             }))

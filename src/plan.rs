@@ -767,6 +767,17 @@ impl Render for PlanPane {
             })
             .when(n > 0 && latest && self.approved != Some(self.shown), |d| {
                 d.child(
+                    Button::new("plan-new-chat")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Plus)
+                        .label("Build in new chat")
+                        .tooltip("Implement this plan in a new chat that gets only the plan (n)")
+                        .on_click(|_, window, cx| {
+                            window.dispatch_action(BuildPlanInNewChat.boxed_clone(), cx)
+                        }),
+                )
+                .child(
                     Button::new("plan-approve")
                         .primary()
                         .small()
