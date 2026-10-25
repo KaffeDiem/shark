@@ -167,6 +167,8 @@ impl Chat {
         self.composer
             .update(cx, |c, cx| c.set_value("", window, cx));
         self.busy = true;
+        // Jump to the end so push follows the new message and the reply.
+        self.sel = self.blocks.len().saturating_sub(1);
         self.push(Block::User(text), cx);
     }
 
