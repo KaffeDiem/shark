@@ -1,5 +1,9 @@
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, fs, path::PathBuf};
+use std::{
+    collections::{BTreeMap, HashMap},
+    fs,
+    path::PathBuf,
+};
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct State {
@@ -11,6 +15,43 @@ pub struct State {
     /// Repo names picked for the last new workspace; the next dialog starts with them.
     #[serde(default)]
     pub last_repos: Vec<String>,
+    #[serde(default)]
+    pub appearance: Appearance,
+    /// Edited git-button prompts by id (`prompts::PROMPTS`); missing ids use the default.
+    #[serde(default)]
+    pub prompts: BTreeMap<String, String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Default, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+/// Theme families by name (`main::THEMES`); fonts `None` use the theme's.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct Appearance {
+    pub mode: Mode,
+    pub light: String,
+    pub dark: String,
+    pub ui_font: Option<String>,
+    pub mono_font: Option<String>,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Appearance {
+            mode: Mode::System,
+            light: "Linear".into(),
+            dark: "Linear".into(),
+            ui_font: None,
+            mono_font: None,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
