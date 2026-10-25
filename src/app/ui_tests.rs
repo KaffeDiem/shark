@@ -773,6 +773,49 @@ async fn add_repo_and_restore(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
+/// Tabs that outgrow the header scroll; a new or selected tab is scrolled into view.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn many_tabs_scroll(cx: &mut TestAppContext) {
+    use std::cmp::Ordering;
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(1000.), px(700.)),
+            ))),
+            ..Default::default()
+        },
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace("tabs".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    for _ in 0..20 {
+        on(cx, &|s, w, cx| s.new_chat(w, cx));
+    }
+    let hidden = |cx: &mut TestAppContext, ix: usize| cx.update(|cx| shark.read(cx).tab_hidden(ix));
+    cx.update(|cx| assert_eq!(shark.read(cx).active_ws().unwrap().active_chat, 20));
+    assert_eq!(hidden(cx, 20), Ordering::Equal, "the new tab is in view");
+    assert_eq!(hidden(cx, 0), Ordering::Less, "the first scrolled off");
+    on(cx, &|s, w, cx| s.select_chat(0, w, cx));
+    assert_eq!(hidden(cx, 0), Ordering::Equal);
+    assert_eq!(hidden(cx, 20), Ordering::Greater);
+    fs::remove_dir_all(&home).ok();
+}
+
 /// Times the hot paths on a big change: 2000 changed files and a 50K-line file.
 /// Run in release for real numbers: `cargo test --release --features test-support perf_ -- --nocapture`.
 #[gpui_kit::test]

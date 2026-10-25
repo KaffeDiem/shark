@@ -187,6 +187,8 @@ pub struct Shark {
     tree_focus: FocusHandle,
     tree_scroll: UniformListScrollHandle,
     sidebar_scroll: ScrollHandle,
+    /// The chat tab strip, which scrolls sideways once the tabs outgrow the header.
+    tab_scroll: ScrollHandle,
     /// Workspaces whose worktrees are being removed in the background.
     pub(crate) archiving: HashSet<String>,
     show_tree: bool,
@@ -248,6 +250,7 @@ impl Shark {
             tree_focus: cx.focus_handle(),
             tree_scroll: UniformListScrollHandle::new(),
             sidebar_scroll: ScrollHandle::new(),
+            tab_scroll: ScrollHandle::new(),
             archiving: HashSet::new(),
             show_tree: true,
             rail: false,
