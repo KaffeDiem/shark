@@ -3454,10 +3454,6 @@ exec cat >/dev/null
             branch: "b".into(),
             ..Default::default()
         };
-        // test_home wipes workspace dirs: hold the lock it runs under.
-        let _turn = crate::app::ui_tests::UI_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         let (dir, src) = (
             ws.dir(),
             std::env::temp_dir().join(format!("shark-drop-{}", std::process::id())),
