@@ -1,13 +1,17 @@
 //! One agent conversation (a chat tab): transcript blocks, composer, and the claude process.
+mod completion;
+mod side;
+
 use crate::agent::{self, Agent, Ev};
-use crate::complete::{self, Item, Kind};
+use crate::complete::{self, Item};
 use crate::state::{ChatMeta, Workspace};
 use crate::*;
+use completion::Menu;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
-    Enter, Escape, IndentInline, InlineToken, InputContent, InputEvent, MoveDown, MoveUp, Textarea,
+    Enter, Escape, IndentInline, InputContent, InputEvent, MoveDown, MoveUp, Textarea,
     TextareaState,
 };
 use gpui_kit::component::kbd::Kbd;
@@ -19,6 +23,7 @@ use gpui_kit::component::{ActiveTheme, Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
+use side::Side;
 use std::collections::VecDeque;
 use std::time::Instant;
 
@@ -89,17 +94,6 @@ fn group_summary(calls: &[Call]) -> String {
         .unwrap_or_default()
 }
 
-/// The open `@`/`/` completion menu.
-struct Menu {
-    /// Bytes of the `@query` in the composer that a pick replaces.
-    range: std::ops::Range<usize>,
-    command: bool,
-    matches: Vec<usize>,
-    sel: usize,
-}
-
-const MENU_ROWS: usize = 50;
-
 /// A message typed while the agent runs. The top one goes out when a turn ends well; any can
 /// go out now to steer the running turn.
 struct Queued {
@@ -131,25 +125,6 @@ pub enum ChatEvent {
     /// `meta` changed (session, model or title); the app saves it.
     Meta,
     TurnDone,
-}
-
-/// A side question and its answer, in a card above the composer. A forked, tool-less claude
-/// answers it; neither the question nor the answer reaches the chat or its transcript.
-struct Side {
-    /// The card's own question field when opened empty; `None` once asked.
-    input: Option<Entity<TextareaState>>,
-    question: String,
-    answer: Entity<TextViewState>,
-    /// The answer as markdown, for copy and insert.
-    text: String,
-    done: bool,
-    error: Option<String>,
-    focus: FocusHandle,
-    scroll: ScrollHandle,
-    /// Dropping the card stops the process and its reader.
-    agent: Option<Agent>,
-    _reader: Option<Task<()>>,
-    _sub: Option<Subscription>,
 }
 
 pub struct Chat {
@@ -274,6 +249,17 @@ fn full_input(input: &Value) -> String {
         None => serde_json::to_string_pretty(input).unwrap_or_default(),
     };
     cap(&s, 2000)
+}
+
+/// Keys (space-separated) and what they do, for a hint row.
+fn hint(keys: &str, label: &'static str) -> Div {
+    h_flex()
+        .gap_1()
+        .children(
+            keys.split(' ')
+                .map(|k| Kbd::new(Keystroke::parse(k).unwrap())),
+        )
+        .child(label)
 }
 
 /// "48s", "2m 5s".
@@ -507,94 +493,6 @@ impl Chat {
         }));
     }
 
-    fn close_menu(&mut self, cx: &mut Context<Self>) {
-        if self.menu.take().is_some() {
-            cx.notify();
-        }
-    }
-
-    /// Opens, filters or closes the menu from the text before the cursor.
-    fn update_menu(&mut self, cx: &mut Context<Self>) {
-        let c = self.composer.read(cx);
-        let (text, cursor) = (c.value(), c.cursor());
-        let found = complete::trigger(&text, cursor).filter(|(r, _)| {
-            // Text right after a chip belongs to the chip, not to a new query.
-            !c.tokens()
-                .iter()
-                .any(|t| t.range().start < r.end && r.start < t.range().end)
-        });
-        let Some((range, command)) = found else {
-            return self.close_menu(cx);
-        };
-        let opening = self.menu.as_ref().is_none_or(|m| m.command != command);
-        if opening {
-            // Sources may have changed since the last menu; refresh behind the cached list.
-            match command {
-                true => self.reprobe(cx),
-                false => self.reindex(cx),
-            }
-        }
-        let items = if command { &self.commands } else { &self.files };
-        let matches = complete::rank(items, &text[range.start + 1..range.end], MENU_ROWS);
-        let sel = match &self.menu {
-            Some(m) if !opening && m.matches == matches => m.sel,
-            _ => 0,
-        };
-        self.menu = Some(Menu {
-            range,
-            command,
-            matches,
-            sel,
-        });
-        self.menu_scroll.scroll_to_item(sel);
-        cx.notify();
-    }
-
-    fn menu_item(&self, ix: usize) -> Option<&Item> {
-        let m = self.menu.as_ref()?;
-        let items = if m.command {
-            &self.commands
-        } else {
-            &self.files
-        };
-        items.get(*m.matches.get(ix)?)
-    }
-
-    fn move_menu(&mut self, d: isize, cx: &mut Context<Self>) {
-        if let Some(m) = &mut self.menu
-            && !m.matches.is_empty()
-        {
-            m.sel = (m.sel as isize + d).rem_euclid(m.matches.len() as isize) as usize;
-            self.menu_scroll.scroll_to_item(m.sel);
-            cx.notify();
-        }
-    }
-
-    /// Replaces the query with the picked item as a chip, plus a space to keep typing.
-    fn pick(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(item) = self.menu_item(ix).cloned() else {
-            return self.close_menu(cx);
-        };
-        let range = self.menu.take().unwrap().range;
-        // Two repos can both have README.md; the chip names the repo too.
-        let label = match item.kind {
-            Kind::File | Kind::Dir if self.ws.repos.len() > 1 && !item.detail.is_empty() => {
-                format!("{} · {}", item.label, item.badge)
-            }
-            _ => item.label.clone(),
-        };
-        let token = InlineToken::new(item.insert.clone(), item.insert.clone()).with_label(label);
-        self.composer.update(cx, |c, cx| {
-            c.set_selected_range(range, cx);
-            if c.replace_with_token(token, window, cx).is_err() {
-                // ponytail: tokens reject control characters; such a path goes in as plain text
-                c.replace(item.insert.clone(), window, cx);
-            }
-            c.insert(" ", window, cx);
-        });
-        cx.notify();
-    }
-
     /// Enter: sends, or queues while a turn or git step runs. `now` (cmd-enter) steers the
     /// running turn instead; claude reads it at its next tool call.
     fn send(&mut self, now: bool, window: &mut Window, cx: &mut Context<Self>) {
@@ -612,10 +510,7 @@ impl Chat {
         let sent = !self.hold && (!busy || now) && self.send_text(text, now, cx);
         self.steered |= sent && busy;
         if !sent && (self.busy || self.hold) {
-            let at = self
-                .editing
-                .unwrap_or(self.queue.len())
-                .min(self.queue.len());
+            let at = self.queue_slot();
             self.queue.insert(at, Queued::new(content));
             self.qsel = at;
         } else if !sent {
@@ -641,6 +536,13 @@ impl Chat {
             false => self.queue.insert(0, q),
         }
         self.after_queue_change(cx);
+    }
+
+    /// Where a message goes back into the queue: the slot of the one being edited, else last.
+    fn queue_slot(&self) -> usize {
+        self.editing
+            .unwrap_or(self.queue.len())
+            .min(self.queue.len())
     }
 
     /// Removes a queued message, keeping the slot of the one being edited in place.
@@ -735,10 +637,7 @@ impl Chat {
         let item = self.take_queued(ix);
         let draft = self.composer.read(cx).content();
         if !draft.text().trim().is_empty() {
-            let at = self
-                .editing
-                .unwrap_or(self.queue.len())
-                .min(self.queue.len());
+            let at = self.queue_slot();
             self.queue.insert(at, Queued::new(draft));
             if at <= ix {
                 ix += 1;
@@ -805,13 +704,7 @@ impl Chat {
                 Ok((a, rx)) => {
                     self.agent = Some(a);
                     self.agent_model = self.meta.model.clone();
-                    self.reader = Some(cx.spawn(async move |this, cx| {
-                        while let Ok(ev) = rx.recv().await {
-                            if this.update(cx, |c, cx| c.apply(ev, cx)).is_err() {
-                                break;
-                            }
-                        }
-                    }));
+                    self.reader = Some(Self::read_events(rx, Self::apply, cx));
                 }
                 Err(e) => {
                     self.push(Block::Info(format!("failed to start claude: {e}")), cx);
@@ -830,6 +723,21 @@ impl Chat {
         self.note = None;
         self.sent(text, cx);
         true
+    }
+
+    /// Feeds a process's events to `apply` until it ends or the chat is gone.
+    fn read_events(
+        rx: gpui_kit::base::async_util::Receiver<Ev>,
+        apply: fn(&mut Self, Ev, &mut Context<Self>),
+        cx: &mut Context<Self>,
+    ) -> Task<()> {
+        cx.spawn(async move |this, cx| {
+            while let Ok(ev) = rx.recv().await {
+                if this.update(cx, |c, cx| apply(c, ev, cx)).is_err() {
+                    break;
+                }
+            }
+        })
     }
 
     /// A repo joined the workspace: refresh `@` files, show it, and tell the agent next turn
@@ -859,150 +767,6 @@ impl Chat {
         self.list.set_follow_mode(FollowMode::Tail);
         self.unread.push_back(self.blocks.len());
         self.push(Block::User(text, queued), cx);
-    }
-
-    /// cmd-shift-enter: asks the draft as a side question, or opens the card's own field when
-    /// the composer is empty.
-    fn ask_draft_aside(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.composer.read(cx).value().trim().to_string();
-        if text.is_empty() {
-            return self.open_side(window, cx);
-        }
-        self.composer
-            .update(cx, |c, cx| c.set_value("", window, cx));
-        self.ask_side(text, window, cx);
-    }
-
-    /// Opens the side-question card with an empty field, keeping any draft in the composer.
-    pub fn open_side(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let input = cx.new(|cx| {
-            TextareaState::new(window, cx)
-                .auto_grow(1, 4)
-                .placeholder("Ask a side question (the chat won't see it)")
-                .submit_on_enter(true)
-        });
-        let sub = cx.subscribe_in(
-            &input,
-            window,
-            |this, input, ev: &InputEvent, window, cx| {
-                if let InputEvent::PressEnter { shift: false, .. } = ev {
-                    let q = input.read(cx).value().trim().to_string();
-                    if !q.is_empty() {
-                        this.ask_side(q, window, cx);
-                    }
-                }
-            },
-        );
-        input.update(cx, |i, cx| i.focus(window, cx));
-        self.side = Some(Side {
-            input: Some(input),
-            question: String::new(),
-            answer: cx.new(|cx| TextViewState::markdown("", cx)),
-            text: String::new(),
-            done: false,
-            error: None,
-            focus: cx.focus_handle(),
-            scroll: ScrollHandle::new(),
-            agent: None,
-            _reader: None,
-            _sub: Some(sub),
-        });
-        cx.notify();
-    }
-
-    /// Replaces any earlier side question; only the latest is kept.
-    fn ask_side(&mut self, question: String, window: &mut Window, cx: &mut Context<Self>) {
-        let mut side = Side {
-            input: None,
-            question: question.clone(),
-            answer: cx.new(|cx| TextViewState::markdown("", cx)),
-            text: String::new(),
-            done: false,
-            error: None,
-            focus: cx.focus_handle(),
-            scroll: ScrollHandle::new(),
-            agent: None,
-            _reader: None,
-            _sub: None,
-        };
-        match agent::spawn_side(&self.ws, &self.meta) {
-            Ok((mut a, rx)) => match a.send(&question) {
-                Ok(()) => {
-                    side.agent = Some(a);
-                    side._reader = Some(cx.spawn(async move |this, cx| {
-                        while let Ok(ev) = rx.recv().await {
-                            if this.update(cx, |c, cx| c.apply_side(ev, cx)).is_err() {
-                                break;
-                            }
-                        }
-                    }));
-                }
-                Err(e) => (side.done, side.error) = (true, Some(format!("send failed: {e}"))),
-            },
-            Err(e) => {
-                (side.done, side.error) = (true, Some(format!("failed to start claude: {e}")))
-            }
-        }
-        side.focus.focus(window, cx);
-        self.side = Some(side);
-        cx.notify();
-    }
-
-    fn apply_side(&mut self, ev: Ev, cx: &mut Context<Self>) {
-        let Some(side) = &mut self.side else { return };
-        match ev {
-            Ev::TextDelta(d) => {
-                side.text.push_str(&d);
-                side.answer.update(cx, |m, cx| m.push_str(&d, cx));
-            }
-            Ev::Text(full) => {
-                side.text = full;
-                let t = side.text.clone();
-                side.answer.update(cx, |m, cx| m.set_text(&t, cx));
-            }
-            Ev::Result { is_error, text, .. } => {
-                side.done = true;
-                side.agent = None; // stays alive on stdin otherwise
-                if is_error {
-                    side.error = Some(text);
-                }
-            }
-            Ev::Exited(msg) if !side.done => (side.done, side.error) = (true, Some(msg)),
-            _ => return,
-        }
-        side.scroll.scroll_to_bottom();
-        cx.notify();
-    }
-
-    fn close_side(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.side.take().is_some() {
-            self.focus_composer(window, cx);
-            cx.notify();
-        }
-    }
-
-    fn copy_side(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(side) = &self.side
-            && !side.text.is_empty()
-        {
-            cx.write_to_clipboard(ClipboardItem::new_string(side.text.clone()));
-            window.push_notification("Copied the answer", cx);
-        }
-    }
-
-    /// Puts the answer into the composer after any draft, to send or edit.
-    fn insert_side(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(side) = self.side.take() else { return };
-        if !side.text.is_empty() {
-            self.composer.update(cx, |c, cx| {
-                let (draft, end) = (c.value().trim_end().len(), c.value().len());
-                let sep = if draft == 0 { "" } else { "\n\n" };
-                c.set_selected_range(draft..end, cx);
-                c.replace(format!("{sep}{}", side.text), window, cx);
-            });
-        }
-        self.focus_composer(window, cx);
-        cx.notify();
     }
 
     /// Interrupts a running turn and keeps the process warm; SIGTERM if claude doesn't stop
@@ -1061,21 +825,26 @@ impl Chat {
         }
     }
 
+    /// The process is gone (or going): forget its state, end its calls, flag what it never read.
+    fn drop_process(&mut self) {
+        self.agent = None; // drop stops it
+        self.background.clear();
+        self.stopping = None;
+        self.cut = false;
+        self.steered = false;
+        self.interrupt();
+        self.drop_unread();
+    }
+
     /// Forgets the claude session and stops the agent; the next send starts a new conversation.
     pub fn new_conversation(&mut self, cx: &mut Context<Self>) {
         let was_working = self.working();
         self.meta.session_id = None;
         cx.emit(ChatEvent::Meta);
         self.reader = None; // its Exited would be about the old process
-        self.agent = None; // drop stops it
         self.busy = false;
-        self.background.clear();
-        self.stopping = None;
-        self.cut = false;
-        self.steered = false;
         self.follow(cx, |this, _| {
-            this.interrupt();
-            this.drop_unread();
+            this.drop_process();
             this.blocks.push(Block::Info("new conversation".into()));
         });
         if was_working {
@@ -1310,13 +1079,7 @@ impl Chat {
                 }
             }
             Ev::Exited(msg) => {
-                self.agent = None;
-                self.background.clear();
-                self.stopping = None;
-                self.cut = false;
-                self.steered = false;
-                self.interrupt();
-                self.drop_unread();
+                self.drop_process();
                 if self.busy {
                     self.busy = false;
                     self.blocks.push(Block::Info(msg));
@@ -1508,245 +1271,6 @@ impl Chat {
         row.child(inner).into_any_element()
     }
 
-    /// The side-question card, just above the composer so the transcript stays in view.
-    fn render_side(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let side = self.side.as_ref()?;
-        let theme = cx.theme();
-        let muted = theme.muted_foreground;
-        let hint = |k: &str, label: &'static str| {
-            h_flex()
-                .gap_1()
-                .child(Kbd::new(Keystroke::parse(k).unwrap()))
-                .child(label)
-        };
-        let focused = side.focus.is_focused(window)
-            || (side.input.as_ref()).is_some_and(|i| i.focus_handle(cx).is_focused(window));
-        let header = h_flex()
-            .gap_2()
-            .text_xs()
-            .text_color(muted)
-            .child(Icon::new(IconName::MessageCircleQuestionMark).with_size(px(14.)))
-            .child("Side question · not added to chat")
-            .child(div().flex_1())
-            .when(!side.done && side.input.is_none(), |d| {
-                d.child(Spinner::new().with_size(px(12.)))
-            })
-            .child(
-                Button::new("close-side")
-                    .ghost()
-                    .xsmall()
-                    .icon(IconName::X)
-                    .tooltip("Dismiss (esc)")
-                    .on_click(cx.listener(|this, _, window, cx| this.close_side(window, cx))),
-            );
-        let body = match &side.input {
-            Some(input) => div()
-                .capture_action(cx.listener(|this, _: &Escape, window, cx| {
-                    this.close_side(window, cx);
-                    cx.stop_propagation();
-                }))
-                .child(Textarea::new(input).appearance(false).text_size(px(14.)))
-                .into_any_element(),
-            None => v_flex()
-                .gap_2()
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme.foreground)
-                        .child(side.question.clone()),
-                )
-                .child(
-                    div()
-                        .id("side-answer")
-                        .key_context("SideAnswer")
-                        .track_focus(&side.focus)
-                        .max_h(px(280.))
-                        .overflow_y_scroll()
-                        .track_scroll(&side.scroll)
-                        .text_size(px(14.))
-                        .line_height(relative(1.5))
-                        .on_action(cx.listener(|this, _: &CloseSide, window, cx| {
-                            this.close_side(window, cx)
-                        }))
-                        .on_action(
-                            cx.listener(|this, _: &CopySide, window, cx| {
-                                this.copy_side(window, cx)
-                            }),
-                        )
-                        .on_action(cx.listener(|this, _: &InsertSide, window, cx| {
-                            this.insert_side(window, cx)
-                        }))
-                        .child(TextView::new(&side.answer).selectable(true))
-                        .when_some(side.error.clone(), |d, e| {
-                            d.child(div().text_xs().text_color(theme.danger_foreground).child(e))
-                        }),
-                )
-                .child(
-                    h_flex()
-                        .gap_3()
-                        .text_xs()
-                        .text_color(muted)
-                        .child(hint("escape", "dismiss"))
-                        .child(hint("c", "copy"))
-                        .child(hint("enter", "insert into message")),
-                )
-                .into_any_element(),
-        };
-        Some(
-            v_flex()
-                .w_full()
-                .max_w(px(712.))
-                .mx_auto()
-                .mb_2()
-                .p_3()
-                .gap_2()
-                .rounded(theme.radius_lg)
-                .border_1()
-                .border_color(if focused { theme.primary } else { theme.border })
-                .bg(theme.muted)
-                .child(header)
-                .child(body)
-                .into_any_element(),
-        )
-    }
-
-    /// Opens upward over the transcript, like Slack's: the composer sits at the bottom.
-    fn render_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let m = self.menu.as_ref()?;
-        let theme = cx.theme();
-        let faint = crate::app::faint(theme);
-        let (fg, muted, active, hover) = (
-            theme.foreground,
-            theme.muted_foreground,
-            theme.list_active,
-            theme.list_hover,
-        );
-        let multi = self.ws.repos.len() > 1;
-        let rows: Vec<AnyElement> = (0..m.matches.len())
-            .filter_map(|ix| {
-                let it = self.menu_item(ix)?;
-                let icon = match it.kind {
-                    Kind::File => IconName::File,
-                    Kind::Dir => IconName::Folder,
-                    Kind::Command => IconName::SquareSlash,
-                };
-                let badge = match it.kind {
-                    Kind::Command => (!it.badge.is_empty())
-                        .then(|| div().flex_none().text_color(faint).child(it.badge.clone())),
-                    // The repo, so two README.md rows are told apart at a glance.
-                    _ => multi.then(|| {
-                        h_flex()
-                            .flex_none()
-                            .gap_1()
-                            .text_color(muted)
-                            .child(Icon::new(IconName::FolderGit2).with_size(px(12.)))
-                            .child(it.badge.clone())
-                    }),
-                };
-                Some(
-                    h_flex()
-                        .id(ix)
-                        .h(px(28.))
-                        .px_2()
-                        .gap_2()
-                        .rounded(theme.radius)
-                        .text_sm()
-                        .when(ix == m.sel, |d| d.bg(active))
-                        .when(ix != m.sel, |d| d.hover(|d| d.bg(hover)))
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |this, _, window, cx| {
-                                this.pick(ix, window, cx);
-                                window.prevent_default(); // keep focus in the composer
-                            }),
-                        )
-                        .child(Icon::new(icon).with_size(px(14.)).text_color(muted))
-                        .child(div().flex_none().text_color(fg).child(it.label.clone()))
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(it.detail.clone()),
-                        )
-                        .children(badge.map(|b| b.text_xs()))
-                        .into_any_element(),
-                )
-            })
-            .collect();
-        let empty = match (m.command, rows.is_empty()) {
-            (_, false) => None,
-            (true, _) if self.probing.is_some() && self.commands.is_empty() => {
-                Some("Loading skills…")
-            }
-            (false, _) if self.indexing.is_some() && self.files.is_empty() => {
-                Some("Indexing files…")
-            }
-            (true, _) => Some("No matching skills or commands"),
-            (false, _) => Some("No matching files"),
-        };
-        let hint = |k: &str, label: &'static str| {
-            h_flex()
-                .gap_1()
-                .children(k.split(' ').map(|k| Kbd::new(Keystroke::parse(k).unwrap())))
-                .child(label)
-        };
-        Some(
-            v_flex()
-                .id("completions")
-                .absolute()
-                .left_0()
-                .right_0()
-                .bottom_full()
-                .mb_1()
-                .p_1()
-                .rounded(theme.radius_lg)
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.secondary)
-                .occlude()
-                .child(
-                    div()
-                        .id("completion-rows")
-                        .max_h(px(8. * 28.))
-                        .overflow_y_scroll()
-                        .track_scroll(&self.menu_scroll)
-                        .children(rows)
-                        .when_some(empty, |d, e| {
-                            d.child(
-                                div()
-                                    .h(px(28.))
-                                    .px_2()
-                                    .flex()
-                                    .items_center()
-                                    .text_sm()
-                                    .text_color(muted)
-                                    .child(e),
-                            )
-                        }),
-                )
-                .child(
-                    h_flex()
-                        .px_2()
-                        .pt_1()
-                        .gap_3()
-                        .text_xs()
-                        .text_color(faint)
-                        .child(hint("up down", "navigate"))
-                        .child(hint("enter", "add"))
-                        .child(hint("escape", "close"))
-                        .when(!m.command && multi, |d| {
-                            d.child(div().flex_1())
-                                .child("Type repo/ to search one repo")
-                        }),
-                )
-                .into_any_element(),
-        )
-    }
-
     /// Queued messages above the input, in send order: the top row goes next.
     fn render_queue(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.queue.is_empty() {
@@ -1755,18 +1279,21 @@ impl Chat {
         let focused = self.qfocus.is_focused(window);
         let theme = cx.theme();
         let faint = crate::app::faint(theme);
-        let (fg, muted, active, hover, primary, transparent, radius, border) = (
-            theme.foreground,
-            theme.muted_foreground,
-            theme.list_active,
-            theme.list_hover,
-            theme.primary,
-            theme.transparent,
-            theme.radius,
-            theme.border,
-        );
-        let action = |id: (&'static str, usize), icon: IconName, tip: &'static str| {
-            Button::new(id).ghost().xsmall().icon(icon).tooltip(tip)
+        let action = |id: (&'static str, usize),
+                      icon: IconName,
+                      tip: &'static str,
+                      f: fn(&mut Self, &mut Window, &mut Context<Self>)| {
+            let ix = id.1;
+            Button::new(id)
+                .ghost()
+                .xsmall()
+                .icon(icon)
+                .tooltip(tip)
+                .on_click(cx.listener(move |this, _, window, cx| {
+                    this.qsel = ix;
+                    f(this, window, cx);
+                    cx.stop_propagation(); // the row's own click would refocus the queue
+                }))
         };
         let rows: Vec<AnyElement> = (self.queue.iter().enumerate())
             .map(|(ix, q)| {
@@ -1776,11 +1303,15 @@ impl Chat {
                     .h(px(28.))
                     .pl_2()
                     .gap_2()
-                    .rounded(radius)
+                    .rounded(theme.radius)
                     .border_l_2()
-                    .border_color(if sel { primary } else { transparent })
-                    .when(sel, |d| d.bg(active))
-                    .when(!sel, |d| d.hover(|d| d.bg(hover)))
+                    .border_color(if sel {
+                        theme.primary
+                    } else {
+                        theme.transparent
+                    })
+                    .when(sel, |d| d.bg(theme.list_active))
+                    .when(!sel, |d| d.hover(|d| d.bg(theme.list_hover)))
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.qsel = ix;
                         this.focus_queue(window, cx);
@@ -1788,52 +1319,37 @@ impl Chat {
                     .child(
                         Icon::new(IconName::CornerDownRight)
                             .with_size(px(14.))
-                            .text_color(muted),
+                            .text_color(theme.muted_foreground),
                     )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .truncate()
-                            .text_color(fg)
+                            .text_color(theme.foreground)
                             .child(q.preview.clone()),
                     )
-                    .child(
-                        action(("q-send", ix), IconName::ArrowUp, "Send now (enter)").on_click(
-                            cx.listener(move |this, _, window, cx| {
-                                this.qsel = ix;
-                                this.steer(window, cx);
-                                cx.stop_propagation(); // the row's own click would refocus the queue
-                            }),
-                        ),
-                    )
-                    .child(
-                        action(("q-edit", ix), IconName::Pencil, "Edit (e)").on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.qsel = ix;
-                                this.edit_queued(window, cx);
-                                cx.stop_propagation(); // the row's own click would refocus the queue
-                            },
-                        )),
-                    )
-                    .child(
-                        action(("q-del", ix), IconName::Trash, "Delete (d)").on_click(cx.listener(
-                            move |this, _, window, cx| {
-                                this.qsel = ix;
-                                this.delete_queued(window, cx);
-                                cx.stop_propagation(); // the row's own click would refocus the queue
-                            },
-                        )),
-                    )
+                    .child(action(
+                        ("q-send", ix),
+                        IconName::ArrowUp,
+                        "Send now (enter)",
+                        Self::steer,
+                    ))
+                    .child(action(
+                        ("q-edit", ix),
+                        IconName::Pencil,
+                        "Edit (e)",
+                        Self::edit_queued,
+                    ))
+                    .child(action(
+                        ("q-del", ix),
+                        IconName::Trash,
+                        "Delete (d)",
+                        Self::delete_queued,
+                    ))
                     .into_any_element()
             })
             .collect();
-        let hint = |k: &str, label: &'static str| {
-            h_flex()
-                .gap_1()
-                .children(k.split(' ').map(|k| Kbd::new(Keystroke::parse(k).unwrap())))
-                .child(label)
-        };
         let n = self.queue.len();
         Some(
             v_flex()
@@ -1843,7 +1359,7 @@ impl Chat {
                 .pb_1()
                 .mb_1()
                 .border_b_1()
-                .border_color(border)
+                .border_color(theme.border)
                 .text_sm()
                 .on_action(cx.listener(|this, _: &SelectNext, w, cx| {
                     this.queue_select(this.qsel + 1, w, cx)
@@ -1867,7 +1383,7 @@ impl Chat {
                         .px_2()
                         .gap_3()
                         .text_xs()
-                        .text_color(muted)
+                        .text_color(theme.muted_foreground)
                         .child(match self.editing.is_some() {
                             true => format!("{n} queued · paused while you edit"),
                             false => format!("{n} queued · sends when the turn ends"),
@@ -2016,19 +1532,12 @@ impl Render for Chat {
                             }))
                             .capture_action(cx.listener(|this, a: &Enter, window, cx| {
                                 // With no match, Enter sends what was typed.
-                                if let Some(m) = &this.menu
-                                    && !a.shift
-                                    && !m.matches.is_empty()
-                                {
-                                    this.pick(m.sel, window, cx);
+                                if !a.shift && this.pick_selected(window, cx) {
                                     cx.stop_propagation();
                                 }
                             }))
                             .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
-                                if let Some(m) = &this.menu
-                                    && !m.matches.is_empty()
-                                {
-                                    this.pick(m.sel, window, cx);
+                                if this.pick_selected(window, cx) {
                                     cx.stop_propagation();
                                 }
                             }))
@@ -2255,19 +1764,23 @@ exec cat >/dev/null
         });
         act(cx, &|w, cx| w.input("what is x?", cx));
         act(cx, &|w, cx| w.press("cmd-shift-enter", cx));
+        let result = || Ev::Result {
+            is_error: false,
+            text: String::new(),
+            cost: 0.,
+            secs: 0,
+        };
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
+                // The fork first finishes a turn for a task notification left in the session.
+                c.apply_side(Ev::Text("notification noise".into()), cx);
+                c.apply_side(result(), cx);
+                let side = c.side.as_ref().unwrap();
+                assert!(!side.done && side.text.is_empty(), "not the answer yet");
+                c.apply_side(Ev::User("what is x?".into()), cx);
                 c.apply_side(Ev::TextDelta("Forty".into()), cx);
                 c.apply_side(Ev::Text("Forty-two".into()), cx);
-                c.apply_side(
-                    Ev::Result {
-                        is_error: false,
-                        text: String::new(),
-                        cost: 0.,
-                        secs: 0,
-                    },
-                    cx,
-                );
+                c.apply_side(result(), cx);
             })
         });
         act(cx, &|_, _| {});
@@ -2297,6 +1810,24 @@ exec cat >/dev/null
             let c = chat.read(cx);
             assert!(c.side.is_none());
             assert_eq!(c.composer.read(cx).value().as_ref(), "Forty-two");
+        });
+
+        // An error before the echo (the fork's session is gone) still ends the card with it.
+        act(cx, &|w, cx| w.press("cmd-shift-enter", cx));
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.apply_side(
+                    Ev::Result {
+                        is_error: true,
+                        text: "No conversation found".into(),
+                        cost: 0.,
+                        secs: 0,
+                    },
+                    cx,
+                );
+                let side = c.side.as_ref().unwrap();
+                assert!(side.done && side.error.as_deref() == Some("No conversation found"));
+            })
         });
         let _ = std::fs::remove_file(ws.dir());
     }

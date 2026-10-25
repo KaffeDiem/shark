@@ -44,6 +44,22 @@ pub struct Out {
     pub cmd: Option<Cmd>,
 }
 
+impl Out {
+    fn at(c: usize) -> Self {
+        Out {
+            cursor: Some(c),
+            ..Out::default()
+        }
+    }
+
+    fn cmd(c: Cmd) -> Self {
+        Out {
+            cmd: Some(c),
+            ..Out::default()
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct Vim {
     pub mode: Mode,
@@ -113,9 +129,6 @@ impl Vim {
     }
 
     pub fn key(&mut self, key: &str, text: &Rope, cursor: usize, clipboard: Option<&str>) -> Out {
-        if key.starts_with("cmd-") {
-            return Out::default();
-        }
         let t = text;
         let cur = t.floor_char_boundary(cursor.min(t.len()));
         let esc = key == "escape" || key == "ctrl-[";
@@ -136,8 +149,7 @@ impl Vim {
             let c = if cur > s { prev(t, cur) } else { cur };
             return Out {
                 handled: true,
-                cursor: Some(clamp(t, c)),
-                ..Out::default()
+                ..Out::at(clamp(t, c))
             };
         }
         let mut out = if self.cmdline {
@@ -200,15 +212,11 @@ impl Vim {
     }
 
     fn normal(&mut self, key: &str, esc: bool, t: &Rope, cur: usize, clip: Option<&str>) -> Out {
-        let cursor = |c: usize| Out {
-            cursor: Some(c),
-            ..Out::default()
-        };
         if esc {
             self.reset();
             if self.visual() {
                 self.mode = Mode::Normal;
-                return cursor(clamp(t, cur));
+                return Out::at(clamp(t, cur));
             }
             return Out::default();
         }
@@ -292,15 +300,14 @@ impl Vim {
             match ch {
                 'd' | 'x' | 'y' | 'c' | '>' | '<' => {
                     self.reset();
-                    let line = self.mode == Mode::VisualLine;
+                    let kind = match self.mode {
+                        Mode::VisualLine => Kind::Linewise,
+                        _ => Kind::Inclusive,
+                    };
                     self.mode = Mode::Normal;
                     let (a, b) = (self.anchor.min(cur), self.anchor.max(cur));
                     let op = if ch == 'x' { 'd' } else { ch };
-                    let mut out = if line {
-                        self.apply(op, t, a, b, Kind::Linewise)
-                    } else {
-                        self.apply(op, t, a, b, Kind::Inclusive)
-                    };
+                    let mut out = self.apply(op, t, a, b, kind);
                     if op == 'y' {
                         out.cursor = Some(clamp(t, a));
                     }
@@ -310,17 +317,7 @@ impl Vim {
                     self.reset();
                     let c = self.anchor;
                     self.anchor = cur;
-                    return cursor(c);
-                }
-                'v' | 'V' => {
-                    self.reset();
-                    let m = if ch == 'v' {
-                        Mode::Visual
-                    } else {
-                        Mode::VisualLine
-                    };
-                    self.mode = if self.mode == m { Mode::Normal } else { m };
-                    return cursor(cur);
+                    return Out::at(c);
                 }
                 _ => {}
             }
@@ -328,17 +325,14 @@ impl Vim {
 
         if let Some((p, _)) = self.motion(t, cur, ch, n, has_count, gg, false) {
             self.reset();
-            return cursor(clamp(t, p));
+            return Out::at(clamp(t, p));
         }
 
         let r = row(t, cur);
         let (s, e) = (lstart(t, r), lend(t, r));
         let insert = |v: &mut Vim, c: usize| {
             v.mode = Mode::Insert;
-            Out {
-                cursor: Some(c),
-                ..Out::default()
-            }
+            Out::at(c)
         };
         let simple = !self.visual();
         let pend = |v: &mut Vim, op: char| {
@@ -377,15 +371,13 @@ impl Vim {
                     let c = e + nl.len() + ind.len();
                     Out {
                         edit: Some((e..e, format!("{nl}{ind}"))),
-                        cursor: Some(c),
-                        ..Out::default()
+                        ..Out::at(c)
                     }
                 } else {
                     let c = s + ind.len();
                     Out {
                         edit: Some((s..s, format!("{ind}{nl}"))),
-                        cursor: Some(c),
-                        ..Out::default()
+                        ..Out::at(c)
                     }
                 }
             }
@@ -419,13 +411,7 @@ impl Vim {
             'p' | 'P' if simple => paste(t, cur, n, ch == 'p', clip),
             'J' if simple => join(t, r, n.max(2)),
             '~' if simple => {
-                let mut end = cur;
-                for _ in 0..n {
-                    if end >= e {
-                        break;
-                    }
-                    end = next(t, end);
-                }
+                let end = right_n(t, cur, n);
                 let s: String = t
                     .slice(cur..end)
                     .chars()
@@ -447,36 +433,27 @@ impl Vim {
                         cur + s.len()
                     };
                     Out {
-                        cursor: Some(c),
                         edit: Some((cur..end, s)),
-                        ..Out::default()
+                        ..Out::at(c)
                     }
                 }
             }
-            'u' if simple => Out {
-                cmd: Some(Cmd::Undo),
-                ..Out::default()
-            },
-            '/' => Out {
-                cmd: Some(Cmd::Search),
-                ..Out::default()
-            },
-            'n' => Out {
-                cmd: Some(Cmd::SearchNext),
-                ..Out::default()
-            },
-            'N' => Out {
-                cmd: Some(Cmd::SearchPrev),
-                ..Out::default()
-            },
+            'u' if simple => Out::cmd(Cmd::Undo),
+            '/' => Out::cmd(Cmd::Search),
+            'n' => Out::cmd(Cmd::SearchNext),
+            'N' => Out::cmd(Cmd::SearchPrev),
+            // In Visual mode the same key leaves it and the other switches kind.
             'v' | 'V' => {
-                self.mode = if ch == 'v' {
+                let m = if ch == 'v' {
                     Mode::Visual
                 } else {
                     Mode::VisualLine
                 };
-                self.anchor = cur;
-                cursor(cur)
+                if simple {
+                    self.anchor = cur;
+                }
+                self.mode = if self.mode == m { Mode::Normal } else { m };
+                Out::at(cur)
             }
             _ => Out::default(),
         };
@@ -520,17 +497,7 @@ impl Vim {
                 }
                 (p, Exclusive)
             }
-            'l' => {
-                let e = lend(t, r);
-                let mut p = cur;
-                for _ in 0..n {
-                    if p >= e {
-                        break;
-                    }
-                    p = next(t, p);
-                }
-                (p, Exclusive)
-            }
+            'l' => (right_n(t, cur, n), Exclusive),
             'j' | 'k' => {
                 let rr = if ch == 'j' {
                     (r + n).min(last)
@@ -560,20 +527,14 @@ impl Vim {
                 }
                 (p, Exclusive)
             }
-            'b' | 'B' => {
-                let mut p = cur;
-                for _ in 0..n {
-                    p = word_back(t, p, ch == 'B');
-                }
-                (p, Exclusive)
-            }
-            'e' | 'E' => {
-                let mut p = cur;
-                for _ in 0..n {
-                    p = word_end(t, p, ch == 'E');
-                }
-                (p, Inclusive)
-            }
+            'b' | 'B' => (
+                (0..n).fold(cur, |p, _| word_back(t, p, ch == 'B')),
+                Exclusive,
+            ),
+            'e' | 'E' => (
+                (0..n).fold(cur, |p, _| word_end(t, p, ch == 'E')),
+                Inclusive,
+            ),
             '0' => (lstart(t, r), Exclusive),
             '^' => (first_nonblank(t, r), Exclusive),
             '$' => {
@@ -629,8 +590,7 @@ impl Vim {
                     Out {
                         yank: Some(lines()),
                         edit: Some((range, String::new())),
-                        cursor: Some(c),
-                        ..Out::default()
+                        ..Out::at(c)
                     }
                 }
                 'c' => {
@@ -652,14 +612,12 @@ impl Vim {
                     };
                     Out {
                         yank: Some(lines()),
-                        cursor: Some(clamp(t, c)),
-                        ..Out::default()
+                        ..Out::at(clamp(t, c))
                     }
                 }
                 _ => Out {
                     select: Some(lstart(t, r0)..lend(t, r1)),
-                    cmd: Some(if op == '>' { Cmd::Indent } else { Cmd::Outdent }),
-                    ..Out::default()
+                    ..Out::cmd(if op == '>' { Cmd::Indent } else { Cmd::Outdent })
                 },
             };
         }
@@ -672,10 +630,7 @@ impl Vim {
         match op {
             'd' => {
                 if a == b {
-                    return Out {
-                        cursor: Some(clamp(t, a)),
-                        ..Out::default()
-                    };
+                    return Out::at(clamp(t, a));
                 }
                 // Clamp in post-edit text: if the deletion reaches end of line, step left.
                 let eol = b >= lend(t, row(t, b));
@@ -687,8 +642,7 @@ impl Vim {
                 Out {
                     yank,
                     edit: Some((a..b, String::new())),
-                    cursor: Some(c),
-                    ..Out::default()
+                    ..Out::at(c)
                 }
             }
             'c' => {
@@ -697,34 +651,40 @@ impl Vim {
                 Out {
                     yank,
                     edit,
-                    cursor: Some(a),
-                    ..Out::default()
+                    ..Out::at(a)
                 }
             }
             _ => Out {
                 yank,
-                cursor: Some(clamp(t, a)),
-                ..Out::default()
+                ..Out::at(clamp(t, a))
             },
         }
     }
 }
 
-fn replace_chars(t: &Rope, cur: usize, n: usize, ch: char) -> Out {
-    let e = lend(t, row(t, cur));
-    let mut end = cur;
+/// `n` chars right of `p`, stopping at the end of its line.
+fn right_n(t: &Rope, mut p: usize, n: usize) -> usize {
+    let e = lend(t, row(t, p));
     for _ in 0..n {
-        if end >= e {
-            return Out::default();
+        if p >= e {
+            break;
         }
-        end = next(t, end);
+        p = next(t, p);
+    }
+    p
+}
+
+fn replace_chars(t: &Rope, cur: usize, n: usize, ch: char) -> Out {
+    // Fewer than `n` chars left on the line: nothing is replaced.
+    let last = right_n(t, cur, n - 1);
+    if last >= lend(t, row(t, cur)) {
+        return Out::default();
     }
     let s: String = std::iter::repeat_n(ch, n).collect();
     let c = cur + s.len() - ch.len_utf8();
     Out {
-        edit: Some((cur..end, s)),
-        cursor: Some(c),
-        ..Out::default()
+        edit: Some((cur..next(t, last), s)),
+        ..Out::at(c)
     }
 }
 
@@ -743,17 +703,13 @@ fn paste(t: &Rope, cur: usize, n: usize, after: bool, clip: Option<&str>) -> Out
             (s, body, s)
         } else {
             let e = t.len();
-            let mut text = String::with_capacity(body.len());
-            text.push('\n');
-            text.push_str(&body[..body.len() - 1]);
-            (e, text, e + 1)
+            (e, format!("\n{}", &body[..body.len() - 1]), e + 1)
         };
         let ind = clip.len() - clip.trim_start_matches([' ', '\t']).len();
         let ind = if clip[..ind].contains('\n') { 0 } else { ind };
         return Out {
             edit: Some((at..at, text)),
-            cursor: Some(c + ind),
-            ..Out::default()
+            ..Out::at(c + ind)
         };
     }
     let at = if after && lend(t, r) > lstart(t, r) {
@@ -766,8 +722,7 @@ fn paste(t: &Rope, cur: usize, n: usize, after: bool, clip: Option<&str>) -> Out
     let c = at + text.len() - last;
     Out {
         edit: Some((at..at, text)),
-        cursor: Some(c),
-        ..Out::default()
+        ..Out::at(c)
     }
 }
 
@@ -804,8 +759,7 @@ fn join(t: &Rope, r: usize, n: usize) -> Out {
     }
     Out {
         edit: Some((start..end, text)),
-        cursor: Some(c),
-        ..Out::default()
+        ..Out::at(c)
     }
 }
 
@@ -1045,7 +999,6 @@ mod tests {
                     "cr" => "enter".into(),
                     "bs" => "backspace".into(),
                     n if n.starts_with("C-") => format!("ctrl-{}", &n[2..]),
-                    n if n.starts_with("D-") => format!("cmd-{}", &n[2..]),
                     n => panic!("unknown key <{n}>"),
                 });
             } else {
@@ -1200,9 +1153,10 @@ mod tests {
         let r = run("|a", "i");
         assert_eq!(r.vim.status(), "INSERT");
         assert!(!run("|a", "ix").last.handled);
-        let mut v = Vim::default();
-        assert!(!v.key("cmd-s", &Rope::from("a"), 0, None).handled);
-        v.mode = Mode::Insert;
+        let mut v = Vim {
+            mode: Mode::Insert,
+            ..Vim::default()
+        };
         assert!(!v.key("x", &Rope::from("a"), 0, None).handled);
         assert!(!v.key("enter", &Rope::from("a"), 0, None).handled);
         assert!(v.key("ctrl-[", &Rope::from("a"), 0, None).handled);
