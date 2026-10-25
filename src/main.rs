@@ -68,6 +68,11 @@ actions!(
         SwitchField,
         SubmitForm,
         OpenSettings,
+        EditQueued,
+        DeleteQueued,
+        MoveQueuedUp,
+        MoveQueuedDown,
+        FocusQueue,
     ]
 );
 
@@ -95,8 +100,8 @@ fn fix_path() {
 }
 
 fn bind_keys(cx: &mut App) {
-    const NAV: &str = "Sidebar || Transcript || DiffPane || FileTree";
-    const LIST: &str = "Sidebar || Transcript || FileTree";
+    const NAV: &str = "Sidebar || Transcript || DiffPane || FileTree || Queue";
+    const LIST: &str = "Sidebar || Transcript || FileTree || Queue";
     cx.bind_keys([
         KeyBinding::new("cmd-k", TogglePalette, None),
         KeyBinding::new("cmd-shift-p", TogglePalette, None),
@@ -126,6 +131,19 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("i", FocusComposer, Some("Transcript")),
         KeyBinding::new("a", FocusComposer, Some("Transcript")),
         KeyBinding::new("escape", FocusTranscript, Some("Composer")),
+        KeyBinding::new("space q", FocusQueue, Some(NAV)),
+        KeyBinding::new("up", SelectPrev, Some("Queue")),
+        KeyBinding::new("down", SelectNext, Some("Queue")),
+        KeyBinding::new("e", EditQueued, Some("Queue")),
+        KeyBinding::new("d", DeleteQueued, Some("Queue")),
+        KeyBinding::new("backspace", DeleteQueued, Some("Queue")),
+        KeyBinding::new("shift-k", MoveQueuedUp, Some("Queue")),
+        KeyBinding::new("shift-j", MoveQueuedDown, Some("Queue")),
+        KeyBinding::new("alt-up", MoveQueuedUp, Some("Queue")),
+        KeyBinding::new("alt-down", MoveQueuedDown, Some("Queue")),
+        KeyBinding::new("escape", FocusComposer, Some("Queue")),
+        KeyBinding::new("i", FocusComposer, Some("Queue")),
+        KeyBinding::new("a", FocusComposer, Some("Queue")),
         KeyBinding::new("space space", TogglePalette, Some(NAV)),
         KeyBinding::new("space w n", NewWorkspace, Some(NAV)),
         KeyBinding::new("space w d", ArchiveWorkspace, Some(NAV)),

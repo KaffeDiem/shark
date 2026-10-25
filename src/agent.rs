@@ -67,7 +67,8 @@ pub fn spawn(ws: &Workspace) -> std::io::Result<(Agent, smol::channel::Receiver<
     fs::create_dir_all(&logs)?;
     fs::create_dir_all(support_dir().join("transcripts"))?;
     let log = logs.join(format!("{}.stderr.log", ws.name));
-    let mut cmd = Command::new("claude");
+    // SHARK_CLAUDE swaps in another binary; the UI tests use a fake that swallows stdin.
+    let mut cmd = Command::new(std::env::var("SHARK_CLAUDE").unwrap_or("claude".into()));
     cmd.args([
         "-p",
         "--input-format",

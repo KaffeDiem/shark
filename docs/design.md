@@ -100,6 +100,11 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
   - The selected row is `list_active`, others hover `list_hover`. The first row starts selected. ↑/↓ move, Enter/Tab add, Esc closes and stays in the composer. With no match, Enter sends.
   - A pick becomes an inline chip, an atomic `InlineToken` whose text is `@repo/path` and whose label is `name · repo`. Paths are workspace-relative, so the repo is part of what gets sent. Typing `repo/` scopes the search to one repo.
   - Sources never block typing. Files come from `git ls-files` per repo and skills from claude's `initialize` control request. Both load when the chat opens and refresh in the background each time the menu opens; until a refresh lands, the old list (for skills, the on-disk cache) is used.
+- **Message queue** (`render_queue` in `src/chat.rs`): messages sent while the agent runs sit inside the composer card, above the input, separated by a 1px `border`. The panel only renders while something is queued.
+  - A 24px `text_xs` `muted_foreground` header: "2 queued · sends when the turn ends" (or "· paused while you edit"), with `faint` key hints on the right: `↑ manage` while the composer has focus, and the queue keys while the queue has focus.
+  - 28px rows in send order, top row first: a `CornerDownRight` icon, the message's first line (`foreground`, truncated), then row actions `ArrowUp` send now, `Pencil` edit, `Trash` delete (`ghost` `xsmall`). The focused row is `list_active` plus a 2px `primary` left bar. 5 rows show, then it scrolls.
+  - The preview is cut once when the message is queued (first line, 200 characters), so a long paste isn't shaped on every frame.
+  - The composer footer names what Enter does: "send", "queue" while the agent runs (plus `cmd-enter` "send now"), "save" while editing a queued message.
 - **Radii:** `theme.radius` (8px) for rows, inputs and code blocks; `theme.radius_lg` (12px) for the island, cards and dialogs; `rounded_full()` for pills and dots.
 - **Borders, not shadows:** `shadow` is off. Separate with a 1px `border` or a surface change. Prefer fewer separators.
 - **Spacing:** the gpui scale only (`gap_1`=4px, `gap_1p5`=6px, `gap_2`=8px, `px_3`=12px, `px_4`=16px), plus the fixed sizes above.
