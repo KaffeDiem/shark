@@ -1,5 +1,7 @@
 //! The cmd-k palette and the cmd-k style menus built on it.
+use super::menus::app_icon;
 use super::*;
+use crate::apps::{self, Kind, OpenApp};
 
 /// The cmd-k bar look: a bare 640px dialog near the top, on the menus' `popover` surface with
 /// their 4px inset, holding a borderless `Command`.
@@ -140,13 +142,6 @@ pub(super) const COMMANDS: &[Row] = &[
         Some(&RevealInFinder),
         "workspace folder",
         |s, w, cx| s.with_target(w, cx, |ws, _, cx| cx.reveal_path(&ws.dir())),
-    ),
-    Row(
-        "Open in Terminal",
-        IconName::SquareTerminal,
-        Some(&OpenInTerminal),
-        "workspace shell",
-        |s, w, cx| s.with_target(w, cx, |ws, _, _| open_terminal(&ws.dir())),
     ),
     Row(
         "Copy workspace path",
@@ -581,7 +576,71 @@ fn row_item(label: impl Into<SharedString>, icon: IconName, key: Option<Keystrok
     }
 }
 
+/// A palette row: a command, or opening the workspace in an app.
+enum Pick {
+    Cmd(usize),
+    App(&'static OpenApp),
+}
+
+/// "Open in <app>" with the app's own icon.
+fn app_item(app: &'static OpenApp) -> CommandItem {
+    let label: SharedString = format!("Open in {}", app.name).into();
+    match app.icon.clone() {
+        None => row_item(label, app_icon(app), None),
+        Some(icon) => CommandItem::new().label(label.clone()).child(move |_, _| {
+            h_flex()
+                .flex_1()
+                .gap_2()
+                .items_center()
+                .child(img(icon.clone()).size_4().flex_none())
+                .child(div().flex_1().min_w_0().truncate().child(label.clone()))
+        }),
+    }
+}
+
+/// A workspace's repos as (name, path).
+pub(super) fn repo_paths(ws: &Workspace) -> Vec<(String, PathBuf)> {
+    (ws.repos.iter())
+        .map(|r| (r.name.clone(), ws.dir().join(&r.name)))
+        .collect()
+}
+
 impl Shark {
+    /// Terminals and editors open the target workspace's folder; git clients a repo and
+    /// Xcode a project, asking which when there are several.
+    pub(super) fn open_in(
+        &mut self,
+        app: &'static OpenApp,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ws) = self.target(window) else {
+            return notify_err(window, cx, "Open a workspace first");
+        };
+        let targets = match app.kind {
+            Kind::Terminal | Kind::Folder => vec![(String::new(), ws.dir())],
+            Kind::Git | Kind::Xcode => app.targets(None, &repo_paths(&ws)),
+        };
+        let (icon, ask, none) = match app.kind {
+            Kind::Xcode => (IconName::FileCode, "Open which project?", "No Xcode project"),
+            _ => (IconName::FolderGit2, "Open which repo?", "No repo"),
+        };
+        match &targets[..] {
+            [] => notify_err(window, cx, format!("{none} in {}", ws.name)),
+            [(_, path)] => app.open(path),
+            _ => {
+                let items = (targets.iter())
+                    .map(|(name, _)| CommandItem::new().label(name.clone()).icon(icon))
+                    .collect();
+                let pick =
+                    move |_: &mut Shark, row: usize, _: &mut Window, _: &mut Context<Shark>| {
+                        app.open(&targets[row].1)
+                    };
+                open_menu(cx.entity().downgrade(), ask, items, 0, pick, window, cx)
+            }
+        }
+    }
+
     pub(super) fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // Sidebar order with folded sections opened; cmd-n counts the shown rows only.
         let order = self.ws_order(true);
@@ -589,6 +648,15 @@ impl Shark {
         let codex = self.active_chat().is_some_and(|c| c.read(cx).codex());
         let mut groups: Vec<(Option<&'static str>, Vec<CommandItem>)> = vec![];
         let mut rows = vec![];
+        // Xcode only where there's a project; the rest open the folder or ask which repo.
+        let target = self.target(window);
+        let mut apps: Vec<_> = (apps::installed().iter())
+            .filter(|a| {
+                a.kind != Kind::Xcode
+                    || (target.as_ref())
+                        .is_some_and(|ws| !a.targets(None, &repo_paths(ws)).is_empty())
+            })
+            .collect();
         for (ix, Row(label, icon, action, words, _)) in COMMANDS.iter().enumerate() {
             if let Some((heading, _)) = GROUPS.iter().find(|(_, first)| first == label) {
                 groups.push((Some(heading), vec![]));
@@ -596,10 +664,17 @@ impl Shark {
             if codex && CLAUDE_ONLY.contains(label) {
                 continue;
             }
-            rows.push(ix);
+            rows.push(Pick::Cmd(ix));
             let key = action.and_then(|a| shortcut(a, window));
             let item = row_item(*label, *icon, key).keywords(words.split_whitespace());
-            groups.last_mut().expect("COMMANDS starts a group").1.push(item);
+            let group = &mut groups.last_mut().expect("COMMANDS starts a group").1;
+            group.push(item);
+            if *label == "Reveal in Finder" {
+                for app in apps.drain(..) {
+                    rows.push(Pick::App(app));
+                    group.push(app_item(app).keywords(["app", "open", "workspace"]));
+                }
+            }
         }
         let workspaces = order.iter().map(|&ix| {
             let key = (shown.iter().position(|&s| s == ix))
@@ -617,7 +692,8 @@ impl Shark {
             0,
             // Rows count the shown commands, then the workspaces.
             move |s, row, window, cx| match rows.get(row) {
-                Some(&ix) => (COMMANDS[ix].4)(s, window, cx),
+                Some(&Pick::Cmd(ix)) => (COMMANDS[ix].4)(s, window, cx),
+                Some(&Pick::App(app)) => s.open_in(app, window, cx),
                 None => s.open_workspace(order[row - rows.len()], window, cx),
             },
             window,

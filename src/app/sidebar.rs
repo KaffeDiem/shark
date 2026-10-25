@@ -594,9 +594,9 @@ impl Shark {
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, e: &MouseDownEvent, w, cx| {
-                        let (p1, p2, p3) = (path.clone(), path.clone(), path.clone());
+                        let (p1, p3) = (path.clone(), path.clone());
                         let picked = vec![name.clone()];
-                        let entries = vec![
+                        let mut entries = vec![
                             menu::item(
                                 IconName::Plus,
                                 "New workspace…",
@@ -608,16 +608,14 @@ impl Shark {
                             menu::item(IconName::FolderOpen, "Reveal in Finder", move |_, cx| {
                                 cx.reveal_path(&p1)
                             }),
-                            menu::item(
-                                IconName::SquareTerminal,
-                                "Open in Terminal",
-                                move |_, _| open_terminal(&p2),
-                            ),
+                        ];
+                        entries.extend(open_in_entries(None, &[(name.clone(), path.clone())]));
+                        entries.push(
                             menu::item(IconName::Copy, "Copy path", move |w, cx| {
                                 copy(p3.display().to_string(), w, cx)
                             })
                             .hint(tilde(&path)),
-                        ];
+                        );
                         this.show_menu(e.position, entries, w, cx);
                     }),
                 )

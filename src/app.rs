@@ -46,7 +46,7 @@ pub(crate) mod ui_tests;
 mod workspace;
 
 use diff::Viewed;
-use menus::{copy, on_shark, open_terminal, tilde, ws_menu};
+use menus::{copy, on_shark, open_in_entries, tilde, ws_menu};
 use palette::menu_dialog;
 pub(crate) use palette::open_menu;
 use sidebar::{Naming, SideRow, move_submenu};
@@ -730,9 +730,6 @@ impl Render for Shark {
             }))
             .on_action(cx.listener(|this, _: &RevealInFinder, w, cx| {
                 this.with_target(w, cx, |ws, _, cx| cx.reveal_path(&ws.dir()))
-            }))
-            .on_action(cx.listener(|this, _: &OpenInTerminal, w, cx| {
-                this.with_target(w, cx, |ws, _, _| open_terminal(&ws.dir()))
             }))
             .on_action(cx.listener(|this, _: &CopyPath, w, cx| {
                 this.with_target(w, cx, |ws, w, cx| {

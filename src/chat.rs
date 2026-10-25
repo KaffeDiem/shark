@@ -3260,6 +3260,10 @@ exec cat >/dev/null
     /// `@` opens the file menu; keys drive it and a pick leaves a repo-qualified chip.
     #[gpui_kit::test]
     fn dropping_a_file_attaches_it(cx: &mut TestAppContext) {
+        // Its workspace dir is under the UI tests' home, which they wipe.
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         cx.update(|cx| {
             gpui_kit::init(cx);
             crate::bind_keys(cx);
