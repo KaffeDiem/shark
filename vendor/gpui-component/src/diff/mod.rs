@@ -519,15 +519,11 @@ fn render_diff(
         state.set_content_width(width);
     }
     state.sync_annotations(&props.annotations.items);
-    let ratio = state.split_ratio();
-    let content_width = if mode == DiffMode::Split {
-        // Measured for two equal columns; widen so the narrower one still fits.
-        state.content_width() / 2. / ratio.min(1. - ratio)
-    } else {
-        state.content_width()
-    }
-    .max(state.viewport().width);
-    let left_width = content_width * ratio;
+    let (content_width, left_width) = split_widths(
+        state.content_width(),
+        state.viewport().width,
+        state.split_ratio(),
+    );
     let code = Rc::new(CodePresentation {
         files: state.files().to_vec(),
         presentations: state.presentations().to_vec(),
@@ -829,6 +825,14 @@ impl CodePresentation {
             .as_ref()
             .is_some_and(|selected| selected.contains(&self.files, file, side, ix))
     }
+}
+
+/// The row width and, in Split mode, the original column's share of it. The
+/// width doesn't depend on the ratio, so the divider follows the pointer; a
+/// column narrower than its longest line clips it.
+fn split_widths(measured: Pixels, viewport: Pixels, ratio: f32) -> (Pixels, Pixels) {
+    let width = measured.max(viewport);
+    (width, width * ratio)
 }
 
 /// Total row width for code of `width` in the current mode.
@@ -1459,6 +1463,7 @@ fn render_cell(
     cx: &mut App,
 ) -> AnyElement {
     let cell = v_flex()
+        .overflow_x_hidden()
         .w(if side == DiffSide::Original {
             code.left_width
         } else {

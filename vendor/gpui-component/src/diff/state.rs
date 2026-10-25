@@ -602,26 +602,32 @@ impl DiffState {
     }
 
     /// Replaces the file with the same [`DiffFile::path`] in place, keeping
-    /// scrolling, collapse and the other files' state, so an owner can show
-    /// live edits. That file's disclosures, resolutions and selection reset.
+    /// scrolling, collapse, disclosures and selection, so an owner can show
+    /// live edits. Disclosures and selection are clipped to the new file;
+    /// conflict resolutions past its conflicts are dropped.
     pub fn replace_file(&mut self, file: DiffFile, cx: &mut Context<Self>) {
         let Some(ix) = self.file_ix(file.path()) else {
             return;
         };
         let path = file.path().clone();
+        let (pairs, conflicts) = (file.pairs().len(), file.conflicts().len());
         self.files[ix] = file;
-        self.expanded[ix].clear();
+        for range in &mut self.expanded[ix] {
+            *range = range.start.min(pairs)..range.end.min(pairs);
+        }
+        self.expanded[ix].retain(|range| !range.is_empty());
         self.resolutions
-            .retain(|(resolved, _), _| *resolved != path);
-        if self
-            .selected_lines
-            .as_ref()
-            .is_some_and(|range| *range.path() == path)
+            .retain(|(resolved, conflict), _| *resolved != path || *conflict < conflicts);
+        if let Some(range) = self.selected_lines.clone()
+            && *range.path() == path
         {
-            self.selected_lines = None;
-            self.selection_anchor = None;
-            self.selection_cursor = None;
-            self.selection.set_local_selection(false, cx);
+            let clipped = self.clip_range(&range);
+            if clipped.is_none() {
+                self.selection_anchor = None;
+                self.selection_cursor = None;
+                self.selection.set_local_selection(false, cx);
+            }
+            self.selected_lines = clipped;
         }
         self.geometry.borrow_mut().clear();
         // Cancel a preparation of the old file; the others prepare again if pending.
@@ -635,6 +641,11 @@ impl DiffState {
         self.rebuild(false);
         self.ensure_presentation(cx);
         cx.notify();
+    }
+
+    /// The first visible row and how far it is scrolled.
+    pub fn scroll_top(&self) -> ListOffset {
+        self.list.logical_scroll_top()
     }
 
     /// Reveals a source line, expanding its file or the fold hiding it, and

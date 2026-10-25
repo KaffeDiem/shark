@@ -28,7 +28,8 @@ All in `src/diff/`, tested in `src/diff/split_tests.rs` (new):
 5. **In-place file replacement** (`state.rs`): `DiffState::replace_file` swaps
    one file by path and splices the rows, keeping scrolling, collapse and the
    other files' state (`set_files` resets them); `DiffState::show_line` expands
-   the fold hiding a line and scrolls only as far as needed.
+   the fold hiding a line and scrolls only as far as needed; `DiffState::scroll_top`
+   reads the scroll position.
 
 The crate's own tests include files from the upstream monorepo
 (`../../assets`, `../../../base`, `../../../../themes`, …) that the package

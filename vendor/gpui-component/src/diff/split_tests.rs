@@ -54,8 +54,22 @@ fn replace_file_keeps_scroll_and_shows_new_lines(cx: &mut TestAppContext) {
         DiffState::new([two_hunks(), fixture::modified("b.txt", "b\n", "B\n")], cx)
             .with_mode(DiffMode::Split)
     });
+    // Line 30 sits in the fold between the hunks until it is shown.
+    let shown = |state: &DiffState, line: usize| {
+        let line = DiffLinePosition::new("split.txt", DiffSide::Modified, line);
+        state
+            .source_row(&line)
+            .is_some_and(|row| matches!(state.rows()[row], DisplayRow::Code { .. }))
+    };
     state.update(cx, |state, cx| {
         state.set_file_collapsed("b.txt", true, cx);
+        assert!(!shown(state, 30));
+        state.show_line(DiffLinePosition::new("split.txt", DiffSide::Modified, 30), cx);
+        assert!(shown(state, 30));
+        state.set_selected_lines(
+            Some(super::DiffLineRange::new("split.txt", DiffSide::Modified, 5, 6)),
+            cx,
+        );
         state.list().scroll_to(ListOffset {
             item_ix: 3,
             offset_in_item: px(5.),
@@ -69,21 +83,28 @@ fn replace_file_keeps_scroll_and_shows_new_lines(cx: &mut TestAppContext) {
         assert_eq!((top.item_ix, top.offset_in_item), (3, px(5.)));
         assert!(state.is_file_collapsed("b.txt"));
         assert_eq!(state.files()[0].additions(), 3);
+        // The edited file keeps its open fold (now one line lower) and its selection.
+        assert!(shown(state, 31));
+        assert_eq!(
+            state.selected_lines(),
+            Some(super::DiffLineRange::new("split.txt", DiffSide::Modified, 5, 6))
+        );
         // Unknown paths are ignored.
         state.replace_file(fixture::modified("missing.txt", "a\n", "b\n"), cx);
         assert_eq!(state.files().len(), 2);
-
-        // Line 30 sits in the fold between the hunks until it is shown.
-        let line_30 = DiffLinePosition::new("split.txt", DiffSide::Modified, 31);
-        let shown = |state: &DiffState| {
-            state
-                .source_row(&line_30)
-                .is_some_and(|row| matches!(state.rows()[row], DisplayRow::Code { .. }))
-        };
-        assert!(!shown(state));
-        state.show_line(line_30.clone(), cx);
-        assert!(shown(state));
     });
+}
+
+#[test]
+fn split_widths_follow_the_ratio_at_any_content_width() {
+    for (measured, viewport) in [(px(400.), px(800.)), (px(1600.), px(800.))] {
+        let width = measured.max(viewport);
+        for ratio in [0.3, 0.5, 0.7] {
+            let (content, left) = super::split_widths(measured, viewport, ratio);
+            assert_eq!(content, width);
+            assert_eq!(left, width * ratio);
+        }
+    }
 }
 
 struct Host {
