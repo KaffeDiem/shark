@@ -290,26 +290,7 @@ impl Shark {
         let Some(chat) = self.active_chat().cloned() else {
             return notify_err(window, cx, "Open a workspace first");
         };
-        let current = chat.read(cx).model().to_string();
-        let items = MODELS
-            .iter()
-            .map(|m| {
-                CommandItem::new()
-                    .label(crate::chat::model_label(m))
-                    .icon(IconName::Sparkles)
-                    .checked(*m == current)
-            })
-            .collect();
-        let selected = MODELS.iter().position(|m| *m == current).unwrap_or(0);
-        open_menu(
-            cx.entity().downgrade(),
-            "Switch model…",
-            items,
-            selected,
-            move |_, row, _, cx| chat.update(cx, |c, cx| c.set_model(MODELS[row], cx)),
-            window,
-            cx,
-        );
+        chat.update(cx, |c, cx| c.open_model_menu(window, cx));
     }
 
     /// Plan commands act on the shown chat, and bring its tab up.

@@ -650,6 +650,13 @@ impl GitSync {
         .detach();
     }
 
+    /// Moves `name` one place earlier or later in the merge order, and saves it.
+    fn move_repo(&mut self, name: &str, earlier: bool, cx: &mut Context<Self>) {
+        pr::move_in_order(&mut self.merge_order, name, earlier);
+        crate::state::set_merge_order(&self.ws.name, &self.merge_order);
+        cx.notify();
+    }
+
     /// Picks a repo and moves it one place earlier (or later) in the merge order. The menu
     /// reopens on the moved repo, so `enter` again keeps moving it; `esc` is done.
     pub fn move_in_merge_order(
@@ -693,8 +700,7 @@ impl GitSync {
             sel,
             move |s, row, window, cx| {
                 let name = s.merge_order[row].clone();
-                pr::move_in_order(&mut s.merge_order, &name, earlier);
-                crate::state::set_merge_order(&s.ws.name, &s.merge_order);
+                s.move_repo(&name, earlier, cx);
                 let at = s.merge_order.iter().position(|n| *n == name).unwrap_or(0);
                 s.order_menu(earlier, at, window, cx);
             },
@@ -823,12 +829,28 @@ impl GitSync {
             ));
         }
         if self.repos.len() > 1 {
-            let this = this.clone();
+            // Each repo's possible moves, in merge order: the first can't go earlier.
+            let n = self.merge_order.len();
+            let mut moves = vec![];
+            for (i, name) in self.merge_order.iter().enumerate() {
+                if i > 0 {
+                    moves.push(Entry::Sep);
+                }
+                for (earlier, ok, icon, verb) in [
+                    (true, i > 0, IconName::ArrowUp, "earlier"),
+                    (false, i + 1 < n, IconName::ArrowDown, "later"),
+                ] {
+                    let (this, name) = (this.clone(), name.clone());
+                    moves.extend(ok.then(|| {
+                        menu::item(icon, format!("Merge {name} {verb}"), move |_, cx| {
+                            this.update(cx, |s, cx| s.move_repo(&name, earlier, cx)).ok();
+                        })
+                    }));
+                }
+            }
             entries.push(
-                menu::item(IconName::ListOrdered, "Merge order…", move |w, cx| {
-                    this.update(cx, |s, cx| s.move_in_merge_order(true, w, cx)).ok();
-                })
-                .hint(self.merge_order.join(" → ")),
+                menu::sub(IconName::ListOrdered, "Merge order", moves)
+                    .hint(self.merge_order.join(" → ")),
             );
         }
         entries.push(Entry::Sep);

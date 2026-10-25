@@ -401,10 +401,10 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         Some("opus"),
         "menu opens on the current model"
     );
+    // The menu jumps to the row that starts with what's typed.
     press(cx, &["cmd-/"]);
-    cx.update_window(window, |_, w, cx| w.input("son", cx))
-        .unwrap();
-    press(cx, &["enter"]);
+    cx.run_until_parked();
+    press(cx, &["s", "enter"]);
     assert_eq!(model(cx).as_deref(), Some("sonnet"));
     cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
 

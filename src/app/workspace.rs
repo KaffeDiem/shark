@@ -101,12 +101,20 @@ impl Render for NewWorkspaceForm {
         let (muted, faint) = (theme.muted_foreground, faint(theme));
         let in_branch = self.branch.read(cx).focus_handle(cx).is_focused(window)
             || self.prompt.read(cx).focus_handle(cx).is_focused(window);
-        let items = self.repos.iter().zip(&self.picked).map(|(r, p)| {
+        // A checkbox on every row, so it reads as multi-select before anything is ticked.
+        let items = self.repos.iter().zip(&self.picked).enumerate().map(|(i, (r, &p))| {
+            let name = r.name.clone();
             CommandItem::new()
                 .label(r.name.clone())
-                .icon(IconName::FolderGit2)
                 .keywords([r.path.to_string_lossy().to_string()])
-                .checked(*p)
+                .child(move |_, _| {
+                    h_flex()
+                        .flex_1()
+                        .gap_2()
+                        .items_center()
+                        .child(Checkbox::new(("repo-pick", i)).small().checked(p))
+                        .child(name.clone())
+                })
         });
         let entity = cx.entity().downgrade();
         let picker = self.picker.clone();

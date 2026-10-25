@@ -170,7 +170,7 @@ impl Shark {
     }
 
     /// `p`: play or pause the video of the file last moved to.
-    fn play_media(&mut self, window: &Window, cx: &mut Context<Self>) {
+    pub(super) fn play_media(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(path) =
             (self.cursor_file(window, cx)).map(|ix| self.diff_files[ix].path().clone())
         else {

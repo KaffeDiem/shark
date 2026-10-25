@@ -10,7 +10,7 @@ use crate::*;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
-use gpui_kit::component::command::{Command, CommandItem, CommandState};
+use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::dialog::{Dialog, DialogEntrance};
 use gpui_kit::component::diff::{Diff, DiffFile, DiffFileStatus, DiffMode, DiffState};
 use gpui_kit::component::hover_card::HoverCard;

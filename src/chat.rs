@@ -159,6 +159,9 @@ pub struct Chat {
     pub vim_on: bool,
     /// The key the interceptor just handled; its key-down still arrives and must not run twice.
     vim_took: Option<Keystroke>,
+    /// The model menu, opening upward from the model button, whose bounds the last paint kept.
+    model_menu: Option<(Entity<crate::menu::Menu>, Subscription)>,
+    model_at: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
     /// Model the running process was started with; a mismatch respawns it on the next send.
     agent_model: Option<String>,
     /// Virtualized: only visible rows render, which matters while a spinner redraws every frame.
@@ -394,6 +397,8 @@ impl Chat {
             vim: insert_mode(),
             vim_on,
             vim_took: None,
+            model_menu: None,
+            model_at: Default::default(),
             agent_model: None,
             list: ListState::new(0, ListAlignment::Top, px(400.)),
             focus: cx.focus_handle(),
@@ -529,6 +534,33 @@ impl Chat {
     }
 
     /// Takes effect on the next send, which restarts the process on the new model.
+    /// cmd-/ or the model button: the models, the current one checked; type a letter to jump.
+    pub fn open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let current = self.model().to_string();
+        let this = cx.entity().downgrade();
+        let entries = (MODELS.iter())
+            .map(|&m| {
+                let this = this.clone();
+                crate::menu::item(None, model_label(m), move |_, cx| {
+                    this.update(cx, |c, cx| c.set_model(m, cx)).ok();
+                })
+                .checked(m == current)
+            })
+            .collect();
+        let b = self.model_at.get();
+        let at = point(b.left(), b.top() - px(4.));
+        let m = crate::menu::open_at(entries, at, Anchor::BottomLeft, window, cx);
+        if let Some(ix) = MODELS.iter().position(|m| *m == current) {
+            m.update(cx, |m, _| m.select(ix));
+        }
+        let sub = cx.subscribe(&m, |c, _, _: &DismissEvent, cx| {
+            c.model_menu = None;
+            cx.notify();
+        });
+        self.model_menu = Some((m, sub));
+        cx.notify();
+    }
+
     pub fn set_model(&mut self, m: &str, cx: &mut Context<Self>) {
         let model = (m != MODELS[0]).then(|| m.to_string());
         if self.meta.model != model {
@@ -2050,6 +2082,7 @@ impl Render for Chat {
                                             })),
                                     ))
                                     .child(
+                                        div().relative().child(
                                         Button::new("model")
                                             .ghost()
                                             .xsmall()
@@ -2067,6 +2100,17 @@ impl Render for Chat {
                                             .on_click(|_, window, cx| {
                                                 window.dispatch_action(PickModel.boxed_clone(), cx)
                                             }),
+                                        )
+                                        .child({
+                                            let at = self.model_at.clone();
+                                            canvas(move |b, _, _| at.set(b), |_, _, _, _| {})
+                                                .absolute()
+                                                .size_full()
+                                        }),
+                                    )
+                                    .children(
+                                        (self.model_menu.as_ref())
+                                            .map(|(m, _)| crate::menu::layer(m.clone())),
                                     )
                                     .when_some(vim_pill, |d, p| d.child(p))
                                     .child(div().flex_1())

@@ -23,36 +23,57 @@ pub(crate) fn open_menu<T: 'static>(
     window: &mut Window,
     cx: &mut App,
 ) {
+    let groups = vec![(None, items)];
+    open_grouped(target, placeholder, groups, selected, on_pick, window, cx)
+}
+
+/// [`open_menu`] with headed groups; `selected` and the picked row count down through all
+/// the groups, as if they were one list.
+pub(crate) fn open_grouped<T: 'static>(
+    target: WeakEntity<T>,
+    placeholder: &'static str,
+    groups: Vec<(Option<&'static str>, Vec<CommandItem>)>,
+    selected: usize,
+    on_pick: impl Fn(&mut T, usize, &mut Window, &mut Context<T>) + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let starts: Rc<Vec<usize>> = Rc::new(
+        (groups.iter())
+            .scan(0, |n, (_, items)| {
+                *n += items.len();
+                Some(*n - items.len())
+            })
+            .collect(),
+    );
+    let command = move |state: &Entity<CommandState>| {
+        groups.iter().fold(
+            Command::new(state).bordered(false).placeholder(placeholder),
+            |c, (heading, items)| {
+                let g = CommandGroup::new().items(items.clone());
+                c.group(match heading {
+                    Some(h) => g.label(*h),
+                    None => g,
+                })
+            },
+        )
+    };
     let palette = cx.new(|cx| CommandState::new(window, cx));
     // The menu only learns its items when it renders; install them now so the
     // highlight can start on `selected`. The dialog's renders keep it.
-    RenderOnce::render(
-        Command::new(&palette)
-            .placeholder(placeholder)
-            .items(items.clone()),
-        window,
-        cx,
-    );
-    palette.update(cx, |p, cx| {
-        p.set_selected_index(Some(IndexPath::new(selected)), window, cx)
-    });
+    RenderOnce::render(command(&palette), window, cx);
+    let section = starts.iter().rposition(|&s| s <= selected).unwrap_or(0);
+    let at = IndexPath::new(selected - starts[section]).section(section);
+    palette.update(cx, |p, cx| p.set_selected_index(Some(at), window, cx));
     let on_pick = Rc::new(on_pick);
     let state = palette.clone();
     window.open_dialog(cx, move |d, _, cx| {
-        let (target, on_pick) = (target.clone(), on_pick.clone());
-        menu_dialog(d, cx).child(
-            Command::new(&state)
-                .bordered(false)
-                .placeholder(placeholder)
-                .items(items.clone())
-                .on_confirm(
-            move |ix, window, cx| {
-                window.close_dialog(cx);
-                target
-                    .update(cx, |s, cx| on_pick(s, ix.row, window, cx))
-                    .ok();
-            },
-        ))
+        let (target, on_pick, starts) = (target.clone(), on_pick.clone(), starts.clone());
+        menu_dialog(d, cx).child(command(&state).on_confirm(move |ix, window, cx| {
+            window.close_dialog(cx);
+            let row = starts[ix.section] + ix.row;
+            target.update(cx, |s, cx| on_pick(s, row, window, cx)).ok();
+        }))
     });
     palette.update(cx, |p, cx| p.focus(window, cx));
 }
@@ -69,8 +90,7 @@ pub(super) struct Row(
     pub Cmd,
 );
 
-/// Grouped the way people reach for them: workspace, chat, plan, files and diff, git, sections,
-/// view, app.
+/// Grouped the way people reach for them; `GROUPS` names each group by its first row.
 pub(super) const COMMANDS: &[Row] = &[
     Row(
         "New workspace…",
@@ -322,6 +342,9 @@ pub(super) const COMMANDS: &[Row] = &[
         "editor",
         |s, w, cx| s.close_file(w, cx),
     ),
+    Row("Play or pause video", IconName::Play, Some(&PlayMedia), "media movie diff", |s, w, cx| {
+        s.play_media(w, cx)
+    }),
     Row(
         "Run next git step",
         IconName::GitPullRequestArrow,
@@ -488,6 +511,18 @@ pub(super) const COMMANDS: &[Row] = &[
     ),
 ];
 
+/// The palette's headings, each with the label of the row it starts at.
+const GROUPS: &[(&str, &str)] = &[
+    ("Workspace", "New workspace…"),
+    ("Chat", "Show chat"),
+    ("Plan", "Toggle plan mode"),
+    ("Files and diff", "Open file…"),
+    ("Git", "Run next git step"),
+    ("Sections", "New section"),
+    ("View", "Toggle sidebar"),
+    ("Shark", "Settings"),
+];
+
 /// The shortcut to show for `action` from where the palette was opened: the newest one-key
 /// binding (palette rows can't show chords), skipping the Vim-only keys.
 fn shortcut(action: &dyn Action, window: &Window) -> Option<Keystroke> {
@@ -534,25 +569,28 @@ impl Shark {
         // Sidebar order with folded sections opened; cmd-n counts the shown rows only.
         let order = self.ws_order(true);
         let shown = self.ws_order(false);
-        let items: Vec<CommandItem> = COMMANDS
-            .iter()
-            .map(|Row(label, icon, action, words, _)| {
-                let key = action.and_then(|a| shortcut(a, window));
-                row_item(*label, *icon, key).keywords(words.split_whitespace())
-            })
-            .chain(order.iter().map(|&ix| {
-                let key = (shown.iter().position(|&s| s == ix))
-                    .filter(|&n| n < 9)
-                    .and_then(|n| shortcut(&OpenWorkspace(n), window));
-                let name = &self.state.workspaces[ix].name;
-                row_item(format!("Open workspace {name}"), IconName::GitBranch, key)
-                    .keywords(["go", "switch"])
-            }))
-            .collect();
-        open_menu(
+        let mut groups: Vec<(Option<&'static str>, Vec<CommandItem>)> = vec![];
+        for Row(label, icon, action, words, _) in COMMANDS {
+            if let Some((heading, _)) = GROUPS.iter().find(|(_, first)| first == label) {
+                groups.push((Some(heading), vec![]));
+            }
+            let key = action.and_then(|a| shortcut(a, window));
+            let item = row_item(*label, *icon, key).keywords(words.split_whitespace());
+            groups.last_mut().expect("COMMANDS starts a group").1.push(item);
+        }
+        let workspaces = order.iter().map(|&ix| {
+            let key = (shown.iter().position(|&s| s == ix))
+                .filter(|&n| n < 9)
+                .and_then(|n| shortcut(&OpenWorkspace(n), window));
+            let name = &self.state.workspaces[ix].name;
+            row_item(format!("Open {name}"), IconName::GitBranch, key)
+                .keywords(["go", "switch", "workspace"])
+        });
+        groups.push((Some("Open workspace"), workspaces.collect()));
+        open_grouped(
             cx.entity().downgrade(),
             "Type a command or search…",
-            items,
+            groups,
             0,
             move |s, row, window, cx| match COMMANDS.get(row) {
                 Some(Row(.., f)) => f(s, window, cx),
@@ -561,5 +599,19 @@ impl Shark {
             window,
             cx,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+
+    #[test]
+    fn every_group_starts_at_a_row() {
+        assert_eq!(COMMANDS[0].0, GROUPS[0].1, "the first row starts a group");
+        for (heading, first) in GROUPS {
+            assert!(COMMANDS.iter().any(|r| r.0 == *first), "{heading}: no row {first}");
+        }
     }
 }

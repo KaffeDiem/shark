@@ -22,6 +22,7 @@ pub(crate) enum Entry {
     Sub {
         icon: IconName,
         label: SharedString,
+        hint: Option<SharedString>,
         entries: Vec<Entry>,
     },
     Sep,
@@ -45,6 +46,7 @@ pub(crate) fn sub(icon: IconName, label: impl Into<SharedString>, entries: Vec<E
     Entry::Sub {
         icon,
         label: label.into(),
+        hint: None,
         entries,
     }
 }
@@ -53,7 +55,7 @@ impl Entry {
     /// An empty `text` shows no hint.
     pub(crate) fn hint(mut self, text: impl Into<SharedString>) -> Self {
         let text = text.into();
-        if let Entry::Item { hint, .. } = &mut self {
+        if let Entry::Item { hint, .. } | Entry::Sub { hint, .. } = &mut self {
             *hint = (!text.is_empty()).then_some(text);
         }
         self
@@ -103,6 +105,7 @@ pub(crate) fn open_at(
         focus,
         prev,
         sel: None,
+        typed: String::new(),
         sub: None,
         sub_sel: None,
         last_x: px(0.),
@@ -124,6 +127,8 @@ pub(crate) struct Menu {
     prev: Option<FocusHandle>,
     /// Highlighted row; the mouse and the arrow keys share it, as in Linear.
     sel: Option<usize>,
+    /// Letters typed so far: like a Mac menu, typing jumps to the row that starts with them.
+    typed: String,
     /// Open submenu, and its highlighted row once the keyboard has moved into it.
     sub: Option<usize>,
     sub_sel: Option<usize>,
@@ -146,6 +151,34 @@ fn step(entries: &[Entry], from: Option<usize>, down: bool) -> Option<usize> {
 }
 
 impl Menu {
+    /// Starts the highlight on `ix`, e.g. the current choice of a picker.
+    pub(crate) fn select(&mut self, ix: usize) {
+        self.sel = Some(ix);
+    }
+
+    /// The first row whose label starts with what was typed, ignoring case.
+    fn jump(&mut self, ch: &str) -> bool {
+        self.typed.push_str(&ch.to_lowercase());
+        let find = |typed: &str| {
+            self.entries.iter().position(|e| match e {
+                Entry::Item { label, .. } | Entry::Sub { label, .. } => {
+                    label.to_lowercase().starts_with(typed)
+                }
+                Entry::Sep => false,
+            })
+        };
+        let hit = find(&self.typed).or_else(|| {
+            self.typed = ch.to_lowercase();
+            find(&self.typed)
+        });
+        if let Some(ix) = hit {
+            self.sel = Some(ix);
+            self.sub = None;
+            self.sub_sel = None;
+        }
+        hit.is_some()
+    }
+
     fn close(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(f) = self.prev.take() {
             f.focus(window, cx);
@@ -225,6 +258,10 @@ impl Menu {
                 (true, Some(ix), _) | (false, _, Some(ix)) => self.activate(ix, in_sub, window, cx),
                 _ => return,
             },
+            k if !in_sub
+                && k.chars().count() == 1
+                && !e.keystroke.modifiers.modified()
+                && self.jump(k) => {}
             _ => return,
         }
         cx.stop_propagation();
@@ -281,13 +318,17 @@ impl Menu {
                             .into_any_element(),
                     ),
                 ),
-                Entry::Sub { icon, label, .. } => (
+                Entry::Sub {
+                    icon, label, hint, ..
+                } => (
                     Some(*icon),
                     label,
                     Some(
-                        Icon::new(IconName::ChevronRight)
-                            .with_size(px(12.))
+                        h_flex()
+                            .gap(px(8.))
                             .text_color(theme.muted_foreground)
+                            .children(hint.as_ref().map(|h| div().max_w(px(180.)).truncate().child(h.clone())))
+                            .child(Icon::new(IconName::ChevronRight).with_size(px(12.)))
                             .into_any_element(),
                     ),
                 ),
