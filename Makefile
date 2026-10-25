@@ -36,6 +36,8 @@ release:
 	plutil -insert LSMinimumSystemVersion -string 11.0 $(APP)/Contents/Info.plist
 	plutil -insert NSHighResolutionCapable -bool YES $(APP)/Contents/Info.plist
 	plutil -insert NSHumanReadableCopyright -string "© Kasper Munch Jensen. GPL-3.0." $(APP)/Contents/Info.plist
+	cp LICENSE $(APP)/Contents/Resources/LICENSE
+	cp assets/fonts/*-LICENSE.txt $(APP)/Contents/Resources/
 	codesign --force --options runtime $(TIMESTAMP) --sign "$(SIGN)" $(APP)
 	cp -R $(APP) target/release/dmg/
 	ln -s /Applications target/release/dmg/Applications

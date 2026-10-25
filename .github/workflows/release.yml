@@ -26,8 +26,9 @@ jobs:
       - name: Pick version
         run: |
           v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
-          # Already released: bump the patch number.
+          # Already released: bump the patch number. A re-run must not publish a second release.
           if git rev-parse -q --verify "refs/tags/v$v" >/dev/null; then
+            if [ "$GITHUB_RUN_ATTEMPT" != 1 ]; then echo "v$v exists; re-runs don't release again"; exit 1; fi
             v=$(echo "$v" | awk -F. '{print $1"."$2"."$3+1}')
             sed -i '' "1,/^version = /s/^version = .*/version = \"$v\"/" Cargo.toml
           fi
@@ -44,7 +45,7 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -am "Release $VERSION"
-          git pull --rebase
+          # No rebase: the tag must point at the code that was built. If master moved, re-run the job.
           git push
 
       - name: Publish release
