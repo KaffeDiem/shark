@@ -2,6 +2,9 @@ mod agent;
 mod app;
 mod attention;
 mod chat;
+mod codex;
+#[cfg(test)]
+mod codex_live;
 mod complete;
 mod editor;
 mod files;

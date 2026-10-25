@@ -93,9 +93,7 @@ impl Chat {
                 }
                 Err(e) => (side.done, side.error) = (true, Some(format!("send failed: {e}"))),
             },
-            Err(e) => {
-                (side.done, side.error) = (true, Some(format!("failed to start claude: {e}")))
-            }
+            Err(e) => (side.done, side.error) = (true, Some(format!("no side question: {e}"))),
         }
         side.focus.focus(window, cx);
         self.side = Some(side);
