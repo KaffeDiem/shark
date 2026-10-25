@@ -261,6 +261,20 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| s.with_plan(w, cx, |c, w, cx| c.toggle_plan(w, cx)),
     ),
     Row(
+        "Copy plan",
+        IconName::Copy,
+        Some(&CopySelected),
+        "clipboard",
+        |s, w, cx| s.with_plan(w, cx, |c, w, cx| c.plan.update(cx, |p, cx| p.copy(w, cx))),
+    ),
+    Row(
+        "Copy selected message",
+        IconName::Copy,
+        Some(&CopySelected),
+        "clipboard reply tool output",
+        |s, w, cx| s.with_plan(w, cx, |c, w, cx| c.copy_selected(w, cx)),
+    ),
+    Row(
         "Approve plan and build",
         IconName::Hammer,
         Some(&ApprovePlan),

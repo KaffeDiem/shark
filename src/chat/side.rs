@@ -186,6 +186,16 @@ impl Chat {
             .when(!side.done && side.input.is_none(), |d| {
                 d.child(Spinner::new().with_size(px(12.)))
             })
+            // Laid out from the start so the spinner doesn't move when the answer lands.
+            .when(side.input.is_none(), |d| {
+                d.child(
+                    div().when(side.text.is_empty(), |d| d.invisible()).child(
+                        Clipboard::new("copy-side")
+                            .value(side.text.clone())
+                            .tooltip("Copy answer (c)"),
+                    ),
+                )
+            })
             .child(
                 Button::new("close-side")
                     .ghost()
@@ -214,6 +224,7 @@ impl Chat {
                 .child(
                     div()
                         .id("side-answer")
+                        .group("side-answer")
                         .key_context("SideAnswer")
                         .track_focus(&side.focus)
                         .max_h(px(280.))
@@ -232,7 +243,7 @@ impl Chat {
                         .on_action(cx.listener(|this, _: &InsertSide, window, cx| {
                             this.insert_side(window, cx)
                         }))
-                        .child(TextView::new(&side.answer).selectable(true))
+                        .child(markdown(&side.answer, "side-answer"))
                         .when_some(side.error.clone(), |d, e| {
                             d.child(div().text_xs().text_color(theme.danger_foreground).child(e))
                         }),
