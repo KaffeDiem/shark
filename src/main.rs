@@ -4,6 +4,7 @@ mod chat;
 mod git;
 mod pr;
 mod state;
+mod sync;
 
 use gpui_kit::component::{Theme, ThemeConfig, ThemeRegistry, ThemeSet, TitleBar};
 use gpui_kit::*;
@@ -25,6 +26,9 @@ actions!(
         ShowDiff,
         CreatePrs,
         OpenPrs,
+        GitNext,
+        GitMenu,
+        GitFetch,
         SelectNext,
         SelectPrev,
         SelectFirst,
@@ -92,6 +96,9 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("space d", ShowDiff, Some(NAV)),
         KeyBinding::new("space p r", CreatePrs, Some(NAV)),
         KeyBinding::new("space p o", OpenPrs, Some(NAV)),
+        KeyBinding::new("space g g", GitNext, Some(NAV)),
+        KeyBinding::new("space g m", GitMenu, Some(NAV)),
+        KeyBinding::new("space g f", GitFetch, Some(NAV)),
         KeyBinding::new("cmd-/", PickModel, None),
         KeyBinding::new("space m m", PickModel, Some(NAV)),
         KeyBinding::new("] c", NextHunk, Some("DiffPane")),

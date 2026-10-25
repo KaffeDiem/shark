@@ -2,7 +2,8 @@ use crate::state::{Repo, Workspace, WsRepo};
 use std::{
     fs,
     path::{Path, PathBuf},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
+    time::Duration,
 };
 
 pub fn run(dir: &Path, prog: &str, args: &[&str]) -> Result<Output, String> {
@@ -15,7 +16,10 @@ pub fn run(dir: &Path, prog: &str, args: &[&str]) -> Result<Output, String> {
 
 /// Run a command, returning trimmed stdout, or stderr as the error on non-zero exit.
 pub fn cmd(dir: &Path, prog: &str, args: &[&str]) -> Result<String, String> {
-    let out = run(dir, prog, args)?;
+    finish(prog, args, run(dir, prog, args)?)
+}
+
+fn finish(prog: &str, args: &[&str], out: Output) -> Result<String, String> {
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
     } else {
@@ -24,6 +28,35 @@ pub fn cmd(dir: &Path, prog: &str, args: &[&str]) -> Result<String, String> {
             args.join(" "),
             String::from_utf8_lossy(&out.stderr).trim()
         ))
+    }
+}
+
+/// `cmd` for network calls: never prompts for credentials, and is killed after `secs`
+/// so a hung fetch or gh can't stall whoever waits on it.
+pub fn cmd_bounded(dir: &Path, prog: &str, args: &[&str], secs: u64) -> Result<String, String> {
+    let child = Command::new(prog)
+        .current_dir(dir)
+        .args(args)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GH_PROMPT_DISABLED", "1")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("{prog}: {e}"))?;
+    let pid = child.id().to_string();
+    let (tx, rx) = std::sync::mpsc::channel();
+    // wait_with_output drains both pipes, so a big gh response can't fill one and deadlock.
+    std::thread::spawn(move || tx.send(child.wait_with_output()));
+    match rx.recv_timeout(Duration::from_secs(secs)) {
+        Ok(out) => finish(prog, args, out.map_err(|e| format!("{prog}: {e}"))?),
+        Err(_) => {
+            let _ = Command::new("kill").args(["-TERM", &pid]).status(); // the waiting thread reaps it
+            Err(format!(
+                "{prog} {}: timed out after {secs}s",
+                args.join(" ")
+            ))
+        }
     }
 }
 
@@ -137,7 +170,11 @@ fn add_worktree(dir: &Path, branch: &str, r: &Repo) -> Result<WsRepo, String> {
     {
         git(&r.path, &["worktree", "add", &wt_s, branch])?;
     } else {
-        git(&r.path, &["worktree", "add", "-b", branch, &wt_s, &base])?;
+        // --no-track: otherwise the branch tracks its base, and `git pull` would merge main.
+        git(
+            &r.path,
+            &["worktree", "add", "--no-track", "-b", branch, &wt_s, &base],
+        )?;
     }
     copy_included(&r.path, &wt)?;
     Ok(WsRepo {

@@ -1,6 +1,7 @@
 //! Root view: sidebar of repos and workspaces, Chat/Diff tabs, palette and dialogs.
 use crate::chat::{Chat, ChatEvent, MODELS};
 use crate::state::{Repo, State, workspaces_dir};
+use crate::sync::{GitSync, SyncEvent};
 use crate::*;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
@@ -39,6 +40,45 @@ pub(crate) fn faint(theme: &Theme) -> Hsla {
     }
 }
 
+/// Opens a cmd-k style menu over `target`; `on_pick` gets the confirmed row.
+pub(crate) fn open_menu<T: 'static>(
+    target: WeakEntity<T>,
+    items: Vec<CommandItem>,
+    selected: usize,
+    on_pick: impl Fn(&mut T, usize, &mut Window, &mut Context<T>) + 'static,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let palette = cx.new(|cx| CommandState::new(window, cx));
+    // The menu only learns its items when it renders; install them now so the
+    // highlight can start on `selected`. The dialog's renders keep it.
+    RenderOnce::render(Command::new(&palette).items(items.clone()), window, cx);
+    palette.update(cx, |p, cx| {
+        p.set_selected_index(Some(IndexPath::new(selected)), window, cx)
+    });
+    let on_pick = Rc::new(on_pick);
+    let state = palette.clone();
+    window.open_dialog(cx, move |d, _, _| {
+        let (target, on_pick) = (target.clone(), on_pick.clone());
+        d.w(px(640.))
+            .font_features(inter_features())
+            .margin_top(px(96.))
+            .entrance(DialogEntrance::None)
+            .close_button(false)
+            .child(
+                Command::new(&state)
+                    .items(items.clone())
+                    .on_confirm(move |ix, window, cx| {
+                        window.close_dialog(cx);
+                        target
+                            .update(cx, |s, cx| on_pick(s, ix.row, window, cx))
+                            .ok();
+                    }),
+            )
+    });
+    palette.update(cx, |p, cx| p.focus(window, cx));
+}
+
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum Tab {
     Chat,
@@ -54,7 +94,7 @@ pub struct Shark {
     diff: Entity<DiffState>,
     diff_files: Vec<String>,
     diff_file: usize,
-    prs: HashMap<String, Vec<String>>,
+    pub(crate) syncs: HashMap<String, Entity<GitSync>>,
     pub(crate) sidebar_focus: FocusHandle,
     _subs: Vec<Subscription>,
 }
@@ -90,6 +130,17 @@ const COMMANDS: &[(&str, IconName, Cmd)] = &[
     ("Open PRs in browser", IconName::ExternalLink, |s, w, cx| {
         s.open_prs(w, cx)
     }),
+    (
+        "Git: next step",
+        IconName::GitPullRequestArrow,
+        |s, w, cx| s.with_sync(w, cx, GitSync::primary),
+    ),
+    ("Git menu…", IconName::GitBranch, |s, w, cx| {
+        s.with_sync(w, cx, GitSync::open_menu)
+    }),
+    ("Git: fetch now", IconName::RefreshCw, |s, w, cx| {
+        s.with_sync(w, cx, GitSync::fetch_now)
+    }),
     ("Stop agent", IconName::Square, |s, _, cx| s.stop(cx)),
     ("Change model…", IconName::Sparkles, |s, w, cx| {
         s.pick_model(w, cx)
@@ -110,7 +161,7 @@ impl Shark {
             diff: cx.new(|cx| DiffState::new(vec![], cx)),
             diff_files: vec![],
             diff_file: 0,
-            prs: HashMap::new(),
+            syncs: HashMap::new(),
             sidebar_focus,
             _subs: vec![],
         }
@@ -122,6 +173,22 @@ impl Shark {
 
     fn active_chat(&self) -> Option<&Entity<Chat>> {
         self.chats.get(self.active.as_ref()?)
+    }
+
+    fn active_sync(&self) -> Option<&Entity<GitSync>> {
+        self.syncs.get(self.active.as_ref()?)
+    }
+
+    fn with_sync(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut GitSync, &mut Window, &mut Context<GitSync>),
+    ) {
+        match self.active_sync().cloned() {
+            Some(sync) => sync.update(cx, |g, cx| f(g, window, cx)),
+            None => Self::notify_err(window, cx, "Open a workspace first"),
+        }
     }
 
     fn open_workspace(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -154,7 +221,21 @@ impl Shark {
                     }
                 }),
             );
+            let sync = cx.new(|cx| GitSync::new(ws.clone(), chat.clone(), window, cx));
+            let name = ws.name.clone();
+            self._subs.push(cx.subscribe_in(
+                &sync,
+                window,
+                move |this, _, ev: &SyncEvent, window, cx| match ev {
+                    SyncEvent::Archive => this.remove_workspace(&name, false, window, cx),
+                },
+            ));
             self.chats.insert(ws.name.clone(), chat);
+            self.syncs.insert(ws.name.clone(), sync);
+        }
+        for (name, sync) in &self.syncs {
+            let on = *name == ws.name;
+            sync.update(cx, |g, cx| g.set_active(on, cx));
         }
         self.active = Some(ws.name);
         self.refresh_diff(cx);
@@ -340,6 +421,7 @@ impl Shark {
         match git::remove_workspace(&ws, &ws.dir(), force) {
             Ok(()) => {
                 self.chats.remove(name);
+                self.syncs.remove(name);
                 self.state.workspaces.retain(|w| w.name != name);
                 self.state.save();
                 // A later workspace with the same name must not replay or resume this conversation.
@@ -360,55 +442,18 @@ impl Shark {
     }
 
     fn create_prs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self
-            .active
-            .as_ref()
-            .and_then(|n| self.state.workspaces.iter().find(|w| &w.name == n))
-            .cloned()
-        else {
-            return Self::notify_err(window, cx, "Open a workspace first");
-        };
-        window.push_notification("Creating PRs…", cx);
-        cx.spawn_in(window, async move |this, cx| {
-            let name = ws.name.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move { pr::create_linked_prs(&ws, &ws.dir()) })
-                .await;
-            this.update_in(cx, |s, window, cx| match result {
-                Ok(prs) => {
-                    let list = prs
-                        .iter()
-                        .map(|(r, u)| format!("{r}: {u}"))
-                        .collect::<Vec<_>>()
-                        .join("\n");
-                    s.prs
-                        .insert(name, prs.into_iter().map(|(_, u)| u).collect());
-                    window.push_notification(
-                        Notification::success(list).title("Linked PRs ready (space p o)"),
-                        cx,
-                    );
-                }
-                Err(e) => Self::notify_err(window, cx, e),
-            })
-            .ok();
+        self.with_sync(window, cx, |g, window, cx| {
+            g.run_kind(
+                sync::Kind::CreatePr,
+                "Create / update linked PRs",
+                window,
+                cx,
+            )
         })
-        .detach();
     }
 
     fn open_prs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let urls = self.active.as_ref().and_then(|n| self.prs.get(n));
-        // ponytail: PR URLs live in memory; space p r re-finds existing PRs after a restart
-        let Some(urls) = urls else {
-            return Self::notify_err(
-                window,
-                cx,
-                "No PRs known yet: run space p r (finds existing PRs too)",
-            );
-        };
-        for url in urls {
-            cx.open_url(url);
-        }
+        self.with_sync(window, cx, GitSync::open_prs)
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
@@ -417,7 +462,6 @@ impl Shark {
         }
     }
 
-    /// Opens a cmd-k style menu; `on_pick` gets the confirmed row.
     fn open_menu(
         &self,
         items: Vec<CommandItem>,
@@ -426,32 +470,14 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let palette = cx.new(|cx| CommandState::new(window, cx));
-        // The menu only learns its items when it renders; install them now so the
-        // highlight can start on `selected`. The dialog's renders keep it.
-        RenderOnce::render(Command::new(&palette).items(items.clone()), window, cx);
-        palette.update(cx, |p, cx| {
-            p.set_selected_index(Some(IndexPath::new(selected)), window, cx)
-        });
-        let shark = cx.entity().downgrade();
-        let on_pick = Rc::new(on_pick);
-        let state = palette.clone();
-        window.open_dialog(cx, move |d, _, _| {
-            let (shark, on_pick) = (shark.clone(), on_pick.clone());
-            d.w(px(640.))
-                .font_features(inter_features())
-                .margin_top(px(96.))
-                .entrance(DialogEntrance::None)
-                .child(Command::new(&state).items(items.clone()).on_confirm(
-                    move |ix, window, cx| {
-                        window.close_dialog(cx);
-                        shark
-                            .update(cx, |s, cx| on_pick(s, ix.row, window, cx))
-                            .ok();
-                    },
-                ))
-        });
-        palette.update(cx, |p, cx| p.focus(window, cx));
+        open_menu(
+            cx.entity().downgrade(),
+            items,
+            selected,
+            on_pick,
+            window,
+            cx,
+        )
     }
 
     fn pick_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -727,6 +753,9 @@ impl Shark {
                             .child(Icon::new(IconName::GitBranch).with_size(px(12.)))
                             .child(ws_name),
                     )
+                    .when_some(self.active_sync().cloned(), |d, sync| {
+                        d.child(div().pl_3().child(sync))
+                    })
                     .child(
                         h_flex()
                             .pl_3()
@@ -804,6 +833,15 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &ShowDiff, w, cx| this.show(Tab::Diff, w, cx)))
             .on_action(cx.listener(|this, _: &CreatePrs, w, cx| this.create_prs(w, cx)))
             .on_action(cx.listener(|this, _: &OpenPrs, w, cx| this.open_prs(w, cx)))
+            .on_action(
+                cx.listener(|this, _: &GitNext, w, cx| this.with_sync(w, cx, GitSync::primary)),
+            )
+            .on_action(
+                cx.listener(|this, _: &GitMenu, w, cx| this.with_sync(w, cx, GitSync::open_menu)),
+            )
+            .on_action(
+                cx.listener(|this, _: &GitFetch, w, cx| this.with_sync(w, cx, GitSync::fetch_now)),
+            )
             .on_action(cx.listener(|this, _: &PickModel, w, cx| this.pick_model(w, cx)))
             .on_action(cx.listener(|this, a: &SetModel, w, cx| this.set_model(a.0, w, cx)))
             .on_action(cx.listener(|this, _: &FocusSidebar, w, cx| {
@@ -1033,6 +1071,20 @@ mod ui_tests {
         press(cx, &["space", "c"]);
         cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Chat));
 
+        // The git button follows the worktree: clean, then dirty within a poll tick.
+        let sync = cx.update(|cx| shark.read(cx).syncs["ui-x"].clone());
+        let label = |cx: &App| sync.read(cx).action.as_ref().map(|a| a.label.clone());
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            label(cx).as_deref() == Some("No changes")
+        })
+        .await;
+        fs::write(ws_dir.join("api/new.txt"), "x\n").unwrap();
+        cx.executor().advance_clock(Duration::from_secs(4));
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            label(cx).as_deref() == Some("Commit and push")
+        })
+        .await;
+
         press(cx, &["ctrl-w", "h", "space", "w", "shift-d"]);
         cx.update(|cx| {
             assert_eq!(
@@ -1044,6 +1096,18 @@ mod ui_tests {
         press(cx, &["enter"]);
         cx.update(|cx| assert!(shark.read(cx).state.workspaces.is_empty()));
         assert!(!ws_dir.exists());
+
+        // Quick bars are bare menus: no dialog close X.
+        press(cx, &["cmd-k"]);
+        cx.run_until_parked();
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            assert!(
+                w.within("dialog").try_find("close").is_none(),
+                "palette shows a close X"
+            );
+        })
+        .unwrap();
         fs::remove_dir_all(&home).unwrap();
     }
 }

@@ -71,7 +71,8 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
   - A view not tied to one workspace (settings, repo list) opens with `window.open_dialog`, `w(px(640.))`, like the palette.
   - Don't add a second sidebar or panes outside the island.
 - **Sidebar row:** 28px tall, `mx_2 px_2 gap_2`, `rounded(theme.radius)`, `text_sm`. Order: status icon (14px), name (`flex_1`, truncated), optional badge, metadata (`text_xs`, `muted_foreground`). Sidebar width 244px.
-- **Header:** 44px, `px_3`, `border_b_1` in `border`. Tabs on the left; on the right: branch (12px `GitBranch` + `text_xs`), optional badges, then status (6px `rounded_full` dot + "Running"/"Idle").
+- **Header:** 44px, `px_3`, `border_b_1` in `border`. Tabs on the left; on the right: branch (12px `GitBranch` + `text_xs`), the git button (`src/sync/`), optional badges, then status (6px `rounded_full` dot + "Running"/"Idle").
+- **Git button:** a `small` button plus a `ghost` `xsmall` chevron for the git menu. It is the header's one primary button: `primary` for a step to run, `outline` with a `warning_foreground` icon when something needs the agent or a human, `ghost` for a wait. Disabled while the agent runs if the step writes.
 - **Tabs:** 26px pills (`rounded_full`, `px_2p5`, 14px icon + `text_sm` label). Active: `secondary` + `foreground`. Inactive: `muted_foreground`, hover → `foreground`.
 - **Rows inside the island:** 28px for compact rows (tool calls, lists in dialogs). Transcript blocks are `px_4 py_1p5`.
 - **Agent activity in the transcript:** prose is what people read; tool calls are evidence.
@@ -102,6 +103,9 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 | Tool group with failures | `X` + "N failed" in `danger_foreground`, on the collapsed row |
 | Skill / subagent row | `BookOpen` / `Bot`, `muted_foreground`, before the tool name |
 | Collapsed / expanded | `ChevronRight` / `ChevronDown` |
+| Git step to run | Its own icon (`GitCommitHorizontal`, `ArrowUp`/`ArrowDown`, `GitPullRequestCreate`, `GitMerge`, …) in a `primary` button |
+| Git needs attention (conflicts, failing checks, detached HEAD, git error) | `TriangleAlert` in `warning_foreground`, `outline` button |
+| Git waiting (GitHub catching up, checks running, review) / reading / step running | `GitPullRequest` / static `RefreshCw`, `ghost` button |
 
   Only the agent-running state uses a spinner or `primary`. Other pending states (checks running, syncing) use a static icon.
 - **Badges** are a status icon (14px in rows, 12px in the header), optionally followed by a `text_xs` label. Don't use `Tag` or `Badge` fills in chrome.
