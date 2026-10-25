@@ -95,20 +95,18 @@ pub fn mention(path: &str) -> String {
 /// diffs, and archive removes them with the workspace.
 pub const ATTACHMENTS: &str = ".context/attachments";
 
-/// The `@` mention for a dropped or pasted path. A file inside the workspace is referenced where
-/// it is; one outside is copied into [`ATTACHMENTS`] (a folder is referenced by absolute path).
+/// The path to mention for a dropped or pasted path. A file inside the workspace is referenced
+/// where it is; one outside is copied into [`ATTACHMENTS`] (a folder is referenced by absolute path).
 pub fn attach(ws: &Path, src: &Path) -> Result<String, String> {
     let err = |e: std::io::Error| format!("{}: {e}", src.display());
     // Resolves symlinks too, so the copy holds the target's bytes.
     let src = src.canonicalize().map_err(err)?;
     let root = ws.canonicalize().map_err(err)?;
-    if let Ok(rel) = src.strip_prefix(&root) {
-        let dir = if src.is_dir() { "/" } else { "" };
-        return Ok(mention(&format!("{}{dir}", rel.to_string_lossy())));
-    }
-    if src.is_dir() {
-        // ponytail: folders aren't copied (size, nested .git); the agent can read them in place
-        return Ok(mention(&format!("{}/", src.to_string_lossy())));
+    // ponytail: outside folders aren't copied (size, nested .git); the agent can read them in place
+    if src.is_dir() || src.starts_with(&root) {
+        let shown = src.strip_prefix(&root).unwrap_or(&src);
+        let slash = if src.is_dir() { "/" } else { "" };
+        return Ok(format!("{}{slash}", shown.display()));
     }
     let name = src.file_name().unwrap_or_default().to_string_lossy();
     let ext = src.extension().unwrap_or_default().to_string_lossy();
@@ -121,42 +119,33 @@ pub fn attach(ws: &Path, src: &Path) -> Result<String, String> {
             .arg(&src)
             .arg("--out")
             .arg(&dest)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success());
+            .output()
+            .is_ok_and(|o| o.status.success());
         if !ok {
             return Err(format!("{}: couldn't convert to JPEG", src.display()));
         }
-        return Ok(rel_mention(&dest));
+        return Ok(rel(&dest));
     }
-    let len = src.metadata().map_err(err)?.len();
-    let same = |p: &Path| {
-        p.metadata().is_ok_and(|m| m.len() == len)
-            && std::fs::read(p).ok() == std::fs::read(&src).ok()
-    };
-    let (dest, found) = slot(ws, &name, same).map_err(err)?;
-    if !found {
-        // Right away: screenshots dragged from the floating thumbnail are deleted within seconds.
-        std::fs::copy(&src, &dest).map_err(err)?;
-    }
-    Ok(rel_mention(&dest))
+    // Right away: screenshots dragged from the floating thumbnail are deleted within seconds.
+    std::fs::read(&src)
+        .map_err(err)
+        .and_then(|b| attach_bytes(ws, &name, &b))
 }
 
-/// Saves pasted image bytes as `Pasted image.<ext>` and returns its mention.
-pub fn attach_bytes(ws: &Path, bytes: &[u8], ext: &str) -> Result<String, String> {
-    let err = |e: std::io::Error| format!("pasted image: {e}");
+/// Saves `bytes` as attachment `name`, reusing an identical one, and returns its path.
+pub fn attach_bytes(ws: &Path, name: &str, bytes: &[u8]) -> Result<String, String> {
+    let err = |e: std::io::Error| format!("{name}: {e}");
     let same = |p: &Path| std::fs::read(p).is_ok_and(|b| b == bytes);
-    let (dest, found) = slot(ws, &format!("Pasted image.{ext}"), same).map_err(err)?;
+    let (dest, found) = slot(ws, name, same).map_err(err)?;
     if !found {
         std::fs::write(&dest, bytes).map_err(err)?;
     }
-    Ok(rel_mention(&dest))
+    Ok(rel(&dest))
 }
 
-fn rel_mention(dest: &Path) -> String {
+fn rel(dest: &Path) -> String {
     let name = dest.file_name().unwrap_or_default().to_string_lossy();
-    mention(&format!("{ATTACHMENTS}/{name}"))
+    format!("{ATTACHMENTS}/{name}")
 }
 
 /// The attachment path for `name`: an existing file `same` accepts, else the first free one of
@@ -362,7 +351,7 @@ mod tests {
         fs::write(ws.join("web/src/a.rs"), "x").unwrap();
         let shot = out.join("Screenshot 2026-10-25 at 10.22.33\u{202F}AM.png");
         fs::write(&shot, "png").unwrap();
-        let want = "@\".context/attachments/Screenshot 2026-10-25 at 10.22.33 AM.png\"";
+        let want = ".context/attachments/Screenshot 2026-10-25 at 10.22.33 AM.png";
         assert_eq!(attach(&ws, &shot).unwrap(), want);
         // Same bytes again: the copy is reused.
         assert_eq!(attach(&ws, &shot).unwrap(), want);
@@ -372,22 +361,22 @@ mod tests {
         let got = attach(&ws, &other).unwrap();
         assert_eq!(
             got,
-            "@\".context/attachments/Screenshot 2026-10-25 at 10.22.33 AM (1).png\""
+            ".context/attachments/Screenshot 2026-10-25 at 10.22.33 AM (1).png"
         );
         assert_eq!(fs::read_dir(ws.join(ATTACHMENTS)).unwrap().count(), 2);
         // Inside the workspace: referenced, not copied.
         assert_eq!(
             attach(&ws, &ws.join("web/src/a.rs")).unwrap(),
-            "@web/src/a.rs"
+            "web/src/a.rs"
         );
-        assert_eq!(attach(&ws, &ws.join("web")).unwrap(), "@web/");
+        assert_eq!(attach(&ws, &ws.join("web")).unwrap(), "web/");
         assert_eq!(
-            attach_bytes(&ws, b"img", "png").unwrap(),
-            "@\".context/attachments/Pasted image.png\""
+            attach_bytes(&ws, "Pasted image.png", b"img").unwrap(),
+            ".context/attachments/Pasted image.png"
         );
         assert_eq!(
-            attach_bytes(&ws, b"img", "png").unwrap(),
-            "@\".context/attachments/Pasted image.png\""
+            attach_bytes(&ws, "Pasted image.png", b"img").unwrap(),
+            ".context/attachments/Pasted image.png"
         );
         fs::remove_dir_all(&root).ok();
     }

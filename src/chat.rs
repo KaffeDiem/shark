@@ -21,7 +21,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
 use std::collections::VecDeque;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 struct Call {
@@ -624,20 +624,19 @@ impl Chat {
                 .background_executor()
                 .spawn(async move {
                     let mut out: Vec<_> = paths.iter().map(|p| complete::attach(&dir, p)).collect();
-                    out.extend(image.map(|(b, ext)| complete::attach_bytes(&dir, &b, ext)));
+                    out.extend(image.map(|(b, ext)| {
+                        complete::attach_bytes(&dir, &format!("Pasted image.{ext}"), &b)
+                    }));
                     out
                 })
                 .await;
             this.update_in(cx, |c, window, cx| {
                 for r in done {
                     match r {
-                        Ok(m) => {
-                            let path = m
-                                .trim_start_matches('@')
-                                .trim_matches('"')
-                                .trim_end_matches('/');
-                            let label = path.rsplit('/').next().unwrap_or(path).to_string();
-                            c.insert_mention(m, label, window, cx);
+                        Ok(p) => {
+                            let label = Path::new(&p).file_name().unwrap_or_default();
+                            let label = label.to_string_lossy().into_owned();
+                            c.insert_mention(complete::mention(&p), label, window, cx);
                         }
                         Err(e) => window.push_notification(Notification::error(e), cx),
                     }
@@ -672,18 +671,12 @@ impl Chat {
         }) else {
             return false;
         };
-        let ext = match img.format {
-            ImageFormat::Png => "png",
-            ImageFormat::Jpeg => "jpg",
-            ImageFormat::Webp => "webp",
-            ImageFormat::Gif => "gif",
-            ImageFormat::Svg => "svg",
-            ImageFormat::Bmp => "bmp",
-            ImageFormat::Tiff => "tiff",
-            ImageFormat::Ico => "ico",
-            ImageFormat::Pnm => "pnm",
-        };
-        self.attach(vec![], Some((img.bytes.clone(), ext)), window, cx);
+        self.attach(
+            vec![],
+            Some((img.bytes.clone(), img.format.extension())),
+            window,
+            cx,
+        );
         true
     }
 

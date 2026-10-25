@@ -445,8 +445,7 @@ pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), S
         // Only our generated file may remain; anything else the user must force away.
         let _ = fs::remove_file(dir.join("CLAUDE.md"));
         // Dropped and pasted files; sent messages may still refer to them until now.
-        let _ = fs::remove_dir_all(dir.join(crate::complete::ATTACHMENTS));
-        let _ = fs::remove_dir(dir.join(".context"));
+        let _ = fs::remove_dir_all(dir.join(".context"));
         fs::remove_dir(dir)
             .map_err(|e| format!("{}: {e} (unexpected files left)", dir.display()))?;
     }
