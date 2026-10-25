@@ -160,6 +160,7 @@ impl Shark {
         self.state.save();
         for m in evicted.iter().chain(untouched.then_some(&meta)) {
             let _ = std::fs::remove_file(crate::agent::transcript_path(&m.id));
+            crate::plan::delete(&m.id);
         }
         self.unread.remove(&meta.id);
         if let Some(chat) = self.chats.remove(&meta.id)
@@ -291,6 +292,22 @@ impl Shark {
             window,
             cx,
         );
+    }
+
+    /// Plan commands act on the shown chat, and bring its tab up.
+    pub(super) fn with_plan(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Chat, &mut Window, &mut Context<Chat>),
+    ) {
+        let Some(chat) = self.active_chat().cloned() else {
+            return notify_err(window, cx, "Open a workspace first");
+        };
+        if self.tab != Tab::Chat {
+            self.show(Tab::Chat, window, cx);
+        }
+        chat.update(cx, |c, cx| f(c, window, cx));
     }
 
     /// The no-menu fast path, so confirm the switch in a toast.

@@ -148,6 +148,8 @@ enum Tab {
 enum Pane {
     Sidebar,
     Chat,
+    /// The chat's plan pane, right of its transcript.
+    Plan,
     Diff,
     Editor,
     Tree,
@@ -353,10 +355,15 @@ impl Shark {
         cx.notify();
     }
 
-    fn panes(&self) -> Vec<Pane> {
+    fn panes(&self, cx: &App) -> Vec<Pane> {
         let mut v = vec![Pane::Sidebar];
         match self.tab {
-            Tab::Chat => v.push(Pane::Chat),
+            Tab::Chat => {
+                v.push(Pane::Chat);
+                if self.active_chat().is_some_and(|c| c.read(cx).plan_open) {
+                    v.push(Pane::Plan);
+                }
+            }
             Tab::Diff => v.push(Pane::Diff),
             Tab::File => v.extend([Pane::Chat, Pane::Editor]),
         }
@@ -382,6 +389,9 @@ impl Shark {
         }
         if let Some(chat) = self.active_chat() {
             let c = chat.read(cx);
+            if c.plan_focused(window, cx) {
+                return Some(Pane::Plan);
+            }
             if c.focus.is_focused(window) || c.composer.read(cx).focus_handle(cx).is_focused(window)
             {
                 return Some(Pane::Chat);
@@ -404,6 +414,11 @@ impl Shark {
                     chat.read(cx).focus.clone().focus(window, cx);
                 }
             }
+            Pane::Plan => {
+                if let Some(chat) = self.active_chat() {
+                    chat.read(cx).plan.read(cx).focus.clone().focus(window, cx);
+                }
+            }
             Pane::Editor => {
                 if let Some(e) = &self.editor {
                     crate::editor::focus(e, window, cx);
@@ -415,7 +430,7 @@ impl Shark {
 
     /// `ctrl-w h` / `ctrl-w l`.
     fn move_focus(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
-        let panes = self.panes();
+        let panes = self.panes(cx);
         let at = self
             .focused_pane(window, cx)
             .and_then(|p| panes.iter().position(|q| *q == p));
@@ -687,6 +702,15 @@ impl Render for Shark {
                 cx.listener(|this, _: &GitFetch, w, cx| this.with_sync(w, cx, GitSync::fetch_now)),
             )
             .on_action(cx.listener(|this, _: &PickModel, w, cx| this.pick_model(w, cx)))
+            .on_action(cx.listener(|this, _: &TogglePlanMode, w, cx| {
+                this.with_plan(w, cx, |c, _, cx| c.set_plan_mode(!c.meta.plan, cx))
+            }))
+            .on_action(cx.listener(|this, _: &TogglePlan, w, cx| {
+                this.with_plan(w, cx, |c, w, cx| c.toggle_plan(w, cx))
+            }))
+            .on_action(cx.listener(|this, _: &ApprovePlan, w, cx| {
+                this.with_plan(w, cx, |c, w, cx| c.approve_plan(w, cx))
+            }))
             .on_action(cx.listener(|this, _: &RevealInFinder, w, cx| {
                 this.with_target(w, cx, |ws, _, cx| cx.reveal_path(&ws.dir()))
             }))

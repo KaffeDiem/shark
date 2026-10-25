@@ -4,6 +4,7 @@ mod side;
 
 use crate::agent::{self, Agent, Ev};
 use crate::complete::{self, Item};
+use crate::plan::{self, PlanPane};
 use crate::state::{ChatMeta, Workspace};
 use crate::*;
 use completion::Menu;
@@ -11,15 +12,15 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
-    Enter, Escape, IndentInline, InputContent, InputEvent, MoveDown, MoveUp, Textarea,
-    TextareaState,
+    Enter, Escape, IndentInline, InputContent, InputEvent, MoveDown, MoveUp, OutdentInline,
+    Textarea, TextareaState,
 };
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, Icon, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Icon, Selectable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
@@ -62,6 +63,8 @@ fn standalone(name: &str) -> Option<IconName> {
     match name {
         "Skill" => Some(IconName::BookOpen),
         "Agent" | "Task" => Some(IconName::Bot),
+        // A submitted plan: its row opens the version in the plan pane.
+        "ExitPlanMode" => Some(IconName::ClipboardList),
         _ => None,
     }
 }
@@ -180,8 +183,23 @@ pub struct Chat {
     /// What the CLI reported at init: its model, permission mode and MCP servers.
     reported: Option<String>,
     side: Option<Side>,
+    /// Plan versions and the pane that shows them, next to the transcript while `plan_open`.
+    pub plan: Entity<PlanPane>,
+    pub plan_open: bool,
     _subs: Vec<Subscription>,
 }
+
+/// Replies to tools that need a person, which claude asks us about (`Ev::Permission`).
+const PLAN_SHOWN: &str = "The user now sees this plan in the app's plan panel, where they \
+    approve it or reply with changes. End your turn with one short sentence, without repeating \
+    the plan. If they ask for changes, update the plan file and call ExitPlanMode again.";
+const ASK_IN_TEXT: &str = "This app can't show AskUserQuestion. Ask in plain text in your reply \
+    and end your turn.";
+const ENTER_PLAN: &str = "Only the user turns plan mode on in this app (shift-tab). Carry on, or \
+    suggest it in your reply.";
+const NEEDS_APPROVAL: &str = "This needs the user's approval, which this app can't ask for. Do \
+    without it, or tell the user what to run.";
+const APPROVED: &str = "I approve the plan. Plan mode is off: implement it now.";
 
 /// How long an interrupt may take before the process is stopped instead.
 const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -293,6 +311,8 @@ impl Chat {
                 },
             );
         let ws_name = ws.name.clone();
+        let plan = cx.new(|cx| PlanPane::new(&meta.id, cx));
+        let plan_open = meta.plan;
         let mut chat = Chat {
             ws,
             meta,
@@ -329,6 +349,8 @@ impl Chat {
             steered: false,
             side: None,
             reported: None,
+            plan_open,
+            plan,
             _subs: vec![_sub],
         };
         // Warm both sources now so the first `@` or `/` doesn't wait.
@@ -442,6 +464,59 @@ impl Chat {
             cx.emit(ChatEvent::Meta);
             cx.notify();
         }
+    }
+
+    /// Plan mode on or off. A running process switches at once, mid-turn too; a new one
+    /// switches as it starts.
+    pub fn set_plan_mode(&mut self, on: bool, cx: &mut Context<Self>) {
+        if self.meta.plan == on {
+            return;
+        }
+        self.meta.plan = on;
+        if let Some(a) = &mut self.agent
+            && let Err(e) = a.set_plan_mode(on)
+        {
+            self.push(Block::Info(format!("switching plan mode failed: {e}")), cx);
+        }
+        // The pane says what will appear there; with nothing in it, it goes with the mode.
+        if on || self.plan.read(cx).versions.is_empty() {
+            self.plan_open = on;
+        }
+        cx.emit(ChatEvent::Meta);
+        cx.notify();
+    }
+
+    /// Ends plan mode and tells the agent to build the latest plan. A draft rides along.
+    pub fn approve_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let why = if self.plan.read(cx).latest().is_none() {
+            "no plan to approve yet; the agent submits one in plan mode (shift-tab)"
+        } else if self.busy {
+            "the agent is still working; approve when the turn ends (ctrl-c stops it)"
+        } else {
+            let was = self.meta.plan;
+            self.set_plan_mode(false, cx);
+            if self.ask(APPROVED, window, cx) {
+                self.plan.update(cx, |p, cx| p.approve(cx));
+            } else {
+                self.set_plan_mode(was, cx);
+            }
+            return;
+        };
+        self.push(Block::Info(why.into()), cx);
+    }
+
+    /// `space l v`: shows the plan pane and focuses it, or hides it.
+    pub fn toggle_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.plan_open = !self.plan_open;
+        match self.plan_open {
+            true => self.plan.read(cx).focus.clone().focus(window, cx),
+            false => self.focus_composer(window, cx),
+        }
+        cx.notify();
+    }
+
+    pub fn plan_focused(&self, window: &Window, cx: &App) -> bool {
+        self.plan_open && self.plan.read(cx).focus.is_focused(window)
     }
 
     pub fn focus_composer(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -701,7 +776,13 @@ impl Chat {
         }
         if self.agent.is_none() {
             match agent::spawn(&self.ws, &self.meta) {
-                Ok((a, rx)) => {
+                Ok((mut a, rx)) => {
+                    if self.meta.plan
+                        && let Err(e) = a.set_plan_mode(true)
+                    {
+                        self.push(Block::Info(format!("plan mode failed: {e}")), cx);
+                        return false;
+                    }
                     self.agent = Some(a);
                     self.agent_model = self.meta.model.clone();
                     self.reader = Some(Self::read_events(rx, Self::apply, cx));
@@ -1012,7 +1093,10 @@ impl Chat {
             },
             Ev::ToolUse { id, name, input } => {
                 let call = Call {
-                    summary: summarize(&input, &self.ws.dir().to_string_lossy()),
+                    summary: match name.as_str() {
+                        "ExitPlanMode" => plan::title(input["plan"].as_str().unwrap_or_default()),
+                        _ => summarize(&input, &self.ws.dir().to_string_lossy()),
+                    },
                     input: full_input(&input),
                     id,
                     name,
@@ -1041,6 +1125,34 @@ impl Chat {
                     c.result = Some(text.into());
                     c.is_error = is_error;
                     self.remeasure(bi); // an open call shows its output
+                }
+            }
+            Ev::Permission {
+                request_id,
+                tool,
+                tool_use_id,
+                input,
+            } => {
+                // Plan mode's approval happens in the plan pane, after the turn: the agent is
+                // told the plan was shown, and the turn ends instead of waiting on a person.
+                let reason = match tool.as_str() {
+                    "ExitPlanMode" => {
+                        let text = input["plan"].as_str().unwrap_or_default().to_string();
+                        if !text.trim().is_empty() {
+                            self.plan.update(cx, |p, cx| p.add(tool_use_id, text, cx));
+                            self.plan_open = true;
+                        }
+                        PLAN_SHOWN
+                    }
+                    "AskUserQuestion" => ASK_IN_TEXT,
+                    "EnterPlanMode" => ENTER_PLAN,
+                    _ => NEEDS_APPROVAL,
+                };
+                if let Some(a) = &mut self.agent
+                    && let Err(e) = a.deny(&request_id, reason)
+                {
+                    self.blocks
+                        .push(Block::Info(format!("answering claude failed: {e}")));
                 }
             }
             Ev::Result {
@@ -1137,9 +1249,11 @@ impl Chat {
                 IconName::ChevronRight
             })
         };
+        let plan = self.plan.read(cx);
         let status = |c: &Call| match (&c.result, c.is_error) {
             (None, _) => Spinner::new().with_size(px(14.)).into_any_element(),
-            (Some(_), true) => icon(IconName::X)
+            // Denied on purpose: approval happens in the plan pane.
+            (Some(_), true) if c.name != "ExitPlanMode" => icon(IconName::X)
                 .text_color(theme.danger_foreground)
                 .into_any_element(),
             _ => icon(IconName::Check).into_any_element(),
@@ -1161,9 +1275,21 @@ impl Chat {
                             div()
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.foreground)
-                                .child(c.name.clone()),
+                                .child(match c.name.as_str() {
+                                    "ExitPlanMode" => "Plan".to_string(),
+                                    _ => c.name.clone(),
+                                }),
                         )
-                        .child(div().flex_1().truncate().child(c.summary.clone()))
+                        .child(div().flex_1().truncate().child(
+                            match (c.name.as_str(), plan.number_of(&c.id)) {
+                                // The call's own input can be stale: claude fills
+                                // in the plan file when it asks, not when it calls.
+                                ("ExitPlanMode", Some(n)) => {
+                                    format!("v{n} · {}", plan::title(&plan.versions[n - 1].text))
+                                }
+                                _ => c.summary.clone(),
+                            },
+                        ))
                         .child(status(c))
                         .tooltip(move |w, cx| {
                             let (input, mono) = (input.clone(), mono.clone());
@@ -1416,6 +1542,18 @@ impl Chat {
         let Some(&(bi, call)) = self.rows.get(self.sel) else {
             return;
         };
+        // A submitted plan opens in the plan pane rather than showing the tool's reply.
+        if let Block::Tool(c) = &self.blocks[bi]
+            && c.name == "ExitPlanMode"
+        {
+            let n = self.plan.read(cx).number_of(&c.id);
+            if let Some(n) = n {
+                self.plan.update(cx, |p, cx| p.show(n - 1, cx));
+            }
+            self.plan_open = true;
+            cx.notify();
+            return;
+        }
         match (&mut self.blocks[bi], call) {
             (Block::Tool(c), _) => c.open = !c.open,
             (Block::Tools { calls, .. }, Some(j)) => calls[j].open = !calls[j].open,
@@ -1446,8 +1584,11 @@ impl Render for Chat {
         )
         .size_full()
         .py_2();
-        v_flex()
+        let main = v_flex()
             .size_full()
+            .on_action(cx.listener(|this, _: &FocusComposer, window, cx| {
+                this.focus_composer(window, cx)
+            }))
             .child(
                 div()
                     .id("transcript")
@@ -1541,6 +1682,11 @@ impl Render for Chat {
                                     cx.stop_propagation();
                                 }
                             }))
+                            // shift-tab: plan mode, as in Claude Code, instead of outdenting.
+                            .capture_action(cx.listener(|this, _: &OutdentInline, _, cx| {
+                                this.set_plan_mode(!this.meta.plan, cx);
+                                cx.stop_propagation();
+                            }))
                             .capture_action(cx.listener(|this, _: &Escape, _, cx| {
                                 if this.menu.is_some() {
                                     this.close_menu(cx);
@@ -1559,6 +1705,22 @@ impl Render for Chat {
                                     .gap_2()
                                     .text_xs()
                                     .text_color(muted)
+                                    .child(
+                                        Button::new("plan-mode")
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(IconName::ClipboardList)
+                                            .label("Plan")
+                                            .selected(self.meta.plan)
+                                            .tooltip(if self.meta.plan {
+                                                "Plan mode on: the agent plans and edits nothing (shift-tab)"
+                                            } else {
+                                                "Plan mode: plan first, build after you approve (shift-tab)"
+                                            })
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.set_plan_mode(!this.meta.plan, cx)
+                                            })),
+                                    )
                                     .child(
                                         Button::new("model")
                                             .ghost()
@@ -1597,7 +1759,27 @@ impl Render for Chat {
                                     .child("side question"),
                             ),
                     ),
+            );
+        if !self.plan_open {
+            return main.into_any_element();
+        }
+        h_flex()
+            .size_full()
+            // `i` in the plan pane: the pane is beside `main`, not inside it.
+            .on_action(
+                cx.listener(|this, _: &FocusComposer, window, cx| this.focus_composer(window, cx)),
             )
+            .child(div().flex_1().min_w_0().h_full().child(main))
+            .child(
+                div()
+                    .w(relative(0.48))
+                    .min_w(px(340.))
+                    .h_full()
+                    .border_l_1()
+                    .border_color(border)
+                    .child(self.plan.clone()),
+            )
+            .into_any_element()
     }
 }
 
@@ -1829,6 +2011,110 @@ exec cat >/dev/null
                 assert!(side.done && side.error.as_deref() == Some("No conversation found"));
             })
         });
+        let _ = std::fs::remove_file(ws.dir());
+    }
+
+    /// shift-tab turns plan mode on; each ExitPlanMode is a version with its changes marked;
+    /// approving ends plan mode and tells the agent to build.
+    #[gpui_kit::test]
+    fn plan_mode(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::bind_keys(cx);
+        });
+        let root = std::env::temp_dir().join(format!("shark-plan-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        fake_claude();
+        let ws = Workspace {
+            name: format!("plan-test-{}", std::process::id()),
+            ..Default::default()
+        };
+        let meta = ChatMeta {
+            id: ws.name.clone(),
+            ..Default::default()
+        };
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
+        let _ = std::fs::remove_file(ws.dir());
+        std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
+        let (window, chat) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| Chat::new(ws.clone(), meta, w, cx))
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let act = |cx: &mut TestAppContext, f: &dyn Fn(&mut Window, &mut App)| {
+            cx.update_window(window, |_, w, cx| {
+                f(w, cx);
+                w.render_frame(cx);
+            })
+            .unwrap()
+        };
+        act(cx, &|w, cx| {
+            chat.update(cx, |c, cx| c.focus_composer(w, cx))
+        });
+        act(cx, &|w, cx| w.press("shift-tab", cx));
+        cx.update(|cx| {
+            let c = chat.read(cx);
+            assert!(c.meta.plan && c.plan_open, "shift-tab turns plan mode on");
+        });
+        act(cx, &|w, cx| w.input("plan a cache", cx));
+        act(cx, &|w, cx| w.press("enter", cx));
+        let submit = |cx: &mut TestAppContext, id: &str, plan: &str| {
+            cx.update(|cx| {
+                chat.update(cx, |c, cx| {
+                    let input = serde_json::json!({"plan": plan});
+                    c.apply(
+                        Ev::ToolUse {
+                            id: id.into(),
+                            name: "ExitPlanMode".into(),
+                            input: input.clone(),
+                        },
+                        cx,
+                    );
+                    c.apply(
+                        Ev::Permission {
+                            request_id: "r".into(),
+                            tool: "ExitPlanMode".into(),
+                            tool_use_id: id.into(),
+                            input,
+                        },
+                        cx,
+                    );
+                    c.apply(
+                        Ev::Result {
+                            is_error: false,
+                            text: String::new(),
+                            cost: 0.,
+                            secs: 0,
+                        },
+                        cx,
+                    );
+                })
+            })
+        };
+        submit(cx, "t1", "# Cache\n\nUse a map.\n");
+        submit(cx, "t2", "# Cache\n\nUse an LRU map.\n");
+        act(cx, &|_, _| {});
+        cx.update(|cx| {
+            let p = chat.read(cx).plan.read(cx);
+            assert_eq!(p.versions.len(), 2);
+            assert_eq!((p.shown, p.changes), (1, true), "the new version, redlined");
+            assert_eq!(p.number_of("t1"), Some(1));
+        });
+        act(cx, &|w, cx| chat.update(cx, |c, cx| c.approve_plan(w, cx)));
+        cx.update(|cx| {
+            let c = chat.read(cx);
+            assert!(!c.meta.plan, "approving ends plan mode");
+            assert_eq!(c.plan.read(cx).approved, Some(1));
+            assert!(matches!(c.blocks.last(), Some(Block::User(t, _)) if t == APPROVED));
+        });
+        cx.update(|cx| chat.update(cx, |c, _| c.agent = None));
+        let _ = std::fs::remove_file(super::plan::tests_store_path(&ws.name));
         let _ = std::fs::remove_file(ws.dir());
     }
 

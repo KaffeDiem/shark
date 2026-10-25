@@ -224,6 +224,15 @@ pub(super) const COMMANDS: &[(&str, IconName, Cmd)] = &[
     ("Change model…", IconName::Sparkles, |s, w, cx| {
         s.pick_model(w, cx)
     }),
+    ("Toggle plan mode", IconName::ClipboardList, |s, w, cx| {
+        s.with_plan(w, cx, |c, _, cx| c.set_plan_mode(!c.meta.plan, cx))
+    }),
+    ("Show or hide plan", IconName::ClipboardList, |s, w, cx| {
+        s.with_plan(w, cx, |c, w, cx| c.toggle_plan(w, cx))
+    }),
+    ("Approve plan and build", IconName::Hammer, |s, w, cx| {
+        s.with_plan(w, cx, |c, w, cx| c.approve_plan(w, cx))
+    }),
     (
         "Next workspace needing attention",
         IconName::CircleAlert,
