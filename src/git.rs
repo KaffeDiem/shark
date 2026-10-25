@@ -408,6 +408,15 @@ pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), S
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| n != "CLAUDE.md" && !ws.repos.iter().any(|r| &r.name == n))
+            // Ours too: `.context` holding only the dropped and pasted files.
+            .filter(|n| {
+                n != ".context"
+                    || fs::read_dir(dir.join(n))
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                        .any(|e| e.file_name() != "attachments")
+            })
             .collect();
         if !extra.is_empty() {
             return Err(format!(
@@ -435,6 +444,9 @@ pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), S
     } else {
         // Only our generated file may remain; anything else the user must force away.
         let _ = fs::remove_file(dir.join("CLAUDE.md"));
+        // Dropped and pasted files; sent messages may still refer to them until now.
+        let _ = fs::remove_dir_all(dir.join(crate::complete::ATTACHMENTS));
+        let _ = fs::remove_dir(dir.join(".context"));
         fs::remove_dir(dir)
             .map_err(|e| format!("{}: {e} (unexpected files left)", dir.display()))?;
     }

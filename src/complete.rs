@@ -77,10 +77,122 @@ fn item(kind: Kind, repo: &str, path: &str) -> Item {
         label: full[at..].to_string(),
         detail: full[..at].trim_end_matches('/').to_string(),
         badge: repo.to_string(),
-        insert: format!("@{full}"),
+        insert: mention(&full),
         name_at: name_at(&key),
         key,
     }
+}
+
+/// `@path`, quoted when it has whitespace: Claude Code silently drops an unquoted `@a b.png`.
+pub fn mention(path: &str) -> String {
+    match path.contains(char::is_whitespace) {
+        true => format!("@\"{path}\""),
+        false => format!("@{path}"),
+    }
+}
+
+/// Where dropped and pasted files land. The workspace root isn't a repo, so they stay out of
+/// diffs, and archive removes them with the workspace.
+pub const ATTACHMENTS: &str = ".context/attachments";
+
+/// The `@` mention for a dropped or pasted path. A file inside the workspace is referenced where
+/// it is; one outside is copied into [`ATTACHMENTS`] (a folder is referenced by absolute path).
+pub fn attach(ws: &Path, src: &Path) -> Result<String, String> {
+    let err = |e: std::io::Error| format!("{}: {e}", src.display());
+    // Resolves symlinks too, so the copy holds the target's bytes.
+    let src = src.canonicalize().map_err(err)?;
+    let root = ws.canonicalize().map_err(err)?;
+    if let Ok(rel) = src.strip_prefix(&root) {
+        let dir = if src.is_dir() { "/" } else { "" };
+        return Ok(mention(&format!("{}{dir}", rel.to_string_lossy())));
+    }
+    if src.is_dir() {
+        // ponytail: folders aren't copied (size, nested .git); the agent can read them in place
+        return Ok(mention(&format!("{}/", src.to_string_lossy())));
+    }
+    let name = src.file_name().unwrap_or_default().to_string_lossy();
+    let ext = src.extension().unwrap_or_default().to_string_lossy();
+    // Claude can't read HEIC, and a bad image block can break the session; sips ships with macOS.
+    if ext.eq_ignore_ascii_case("heic") || ext.eq_ignore_ascii_case("heif") {
+        let stem = src.file_stem().unwrap_or_default().to_string_lossy();
+        let (dest, _) = slot(ws, &format!("{stem}.jpg"), |_| false).map_err(err)?;
+        let ok = Command::new("sips")
+            .args(["-s", "format", "jpeg"])
+            .arg(&src)
+            .arg("--out")
+            .arg(&dest)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+        if !ok {
+            return Err(format!("{}: couldn't convert to JPEG", src.display()));
+        }
+        return Ok(rel_mention(&dest));
+    }
+    let len = src.metadata().map_err(err)?.len();
+    let same = |p: &Path| {
+        p.metadata().is_ok_and(|m| m.len() == len)
+            && std::fs::read(p).ok() == std::fs::read(&src).ok()
+    };
+    let (dest, found) = slot(ws, &name, same).map_err(err)?;
+    if !found {
+        // Right away: screenshots dragged from the floating thumbnail are deleted within seconds.
+        std::fs::copy(&src, &dest).map_err(err)?;
+    }
+    Ok(rel_mention(&dest))
+}
+
+/// Saves pasted image bytes as `Pasted image.<ext>` and returns its mention.
+pub fn attach_bytes(ws: &Path, bytes: &[u8], ext: &str) -> Result<String, String> {
+    let err = |e: std::io::Error| format!("pasted image: {e}");
+    let same = |p: &Path| std::fs::read(p).is_ok_and(|b| b == bytes);
+    let (dest, found) = slot(ws, &format!("Pasted image.{ext}"), same).map_err(err)?;
+    if !found {
+        std::fs::write(&dest, bytes).map_err(err)?;
+    }
+    Ok(rel_mention(&dest))
+}
+
+fn rel_mention(dest: &Path) -> String {
+    let name = dest.file_name().unwrap_or_default().to_string_lossy();
+    mention(&format!("{ATTACHMENTS}/{name}"))
+}
+
+/// The attachment path for `name`: an existing file `same` accepts, else the first free one of
+/// `name`, `name (1)`, … like Finder. `true` when it already exists.
+fn slot(ws: &Path, name: &str, same: impl Fn(&Path) -> bool) -> std::io::Result<(PathBuf, bool)> {
+    let dir = ws.join(ATTACHMENTS);
+    std::fs::create_dir_all(&dir)?;
+    // macOS screenshot names have U+202F before AM/PM, which tools often turn into a space and
+    // then can't find the file; a `"` would end the quoted mention.
+    let name: String = name
+        .chars()
+        .map(|c| match c {
+            '\u{202F}' | '\u{00A0}' => ' ',
+            '"' => '\'',
+            c => c,
+        })
+        .collect();
+    let p = Path::new(&name);
+    let stem = p.file_stem().unwrap_or_default().to_string_lossy();
+    let ext = p
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    for n in 0.. {
+        let cand = match n {
+            0 => dir.join(&name),
+            _ => dir.join(format!("{stem} ({n}){ext}")),
+        };
+        if !cand.exists() {
+            return Ok((cand, false));
+        }
+        if same(&cand) {
+            return Ok((cand, true));
+        }
+    }
+    unreachable!()
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -239,6 +351,45 @@ mod tests {
             .into_iter()
             .map(|i| items[i].insert.clone())
             .collect()
+    }
+
+    #[test]
+    fn attach_copies_dedupes_and_references_in_place() {
+        let root = std::env::temp_dir().join(format!("shark-attach-{}", std::process::id()));
+        let (ws, out) = (root.join("ws"), root.join("out"));
+        fs::create_dir_all(ws.join("web/src")).unwrap();
+        fs::create_dir_all(&out).unwrap();
+        fs::write(ws.join("web/src/a.rs"), "x").unwrap();
+        let shot = out.join("Screenshot 2026-10-25 at 10.22.33\u{202F}AM.png");
+        fs::write(&shot, "png").unwrap();
+        let want = "@\".context/attachments/Screenshot 2026-10-25 at 10.22.33 AM.png\"";
+        assert_eq!(attach(&ws, &shot).unwrap(), want);
+        // Same bytes again: the copy is reused.
+        assert_eq!(attach(&ws, &shot).unwrap(), want);
+        // Same name, other bytes: Finder-style suffix.
+        let other = root.join("Screenshot 2026-10-25 at 10.22.33\u{202F}AM.png");
+        fs::write(&other, "other").unwrap();
+        let got = attach(&ws, &other).unwrap();
+        assert_eq!(
+            got,
+            "@\".context/attachments/Screenshot 2026-10-25 at 10.22.33 AM (1).png\""
+        );
+        assert_eq!(fs::read_dir(ws.join(ATTACHMENTS)).unwrap().count(), 2);
+        // Inside the workspace: referenced, not copied.
+        assert_eq!(
+            attach(&ws, &ws.join("web/src/a.rs")).unwrap(),
+            "@web/src/a.rs"
+        );
+        assert_eq!(attach(&ws, &ws.join("web")).unwrap(), "@web/");
+        assert_eq!(
+            attach_bytes(&ws, b"img", "png").unwrap(),
+            "@\".context/attachments/Pasted image.png\""
+        );
+        assert_eq!(
+            attach_bytes(&ws, b"img", "png").unwrap(),
+            "@\".context/attachments/Pasted image.png\""
+        );
+        fs::remove_dir_all(&root).ok();
     }
 
     #[test]
