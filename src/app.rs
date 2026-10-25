@@ -1045,6 +1045,18 @@ mod ui_tests {
         press(cx, &["enter"]);
         cx.update(|cx| assert!(shark.read(cx).state.workspaces.is_empty()));
         assert!(!ws_dir.exists());
+
+        // Quick bars are bare menus: no dialog close X.
+        press(cx, &["cmd-k"]);
+        cx.run_until_parked();
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            assert!(
+                w.within("dialog").try_find("close").is_none(),
+                "palette shows a close X"
+            );
+        })
+        .unwrap();
         fs::remove_dir_all(&home).unwrap();
     }
 }
