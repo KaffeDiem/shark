@@ -4,9 +4,12 @@ use crate::state::support_dir;
 use crate::*;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::clipboard::Clipboard;
 use gpui_kit::component::kbd::Kbd;
-use gpui_kit::component::text::{TextView, TextViewState};
-use gpui_kit::component::{ActiveTheme, Icon, Selectable as _, Sizable as _, h_flex, v_flex};
+use gpui_kit::component::text::TextViewState;
+use gpui_kit::component::{
+    ActiveTheme, Icon, Selectable as _, Sizable as _, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde::{Deserialize, Serialize};
@@ -525,6 +528,14 @@ impl PlanPane {
         cx.notify();
     }
 
+    /// `y`: the shown version's markdown, without the change marks.
+    pub fn copy(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(v) = self.versions.get(self.shown) {
+            cx.write_to_clipboard(ClipboardItem::new_string(v.text.clone()));
+            window.push_notification("Copied the plan", cx);
+        }
+    }
+
     pub fn show(&mut self, ix: usize, cx: &mut Context<Self>) {
         if ix < self.versions.len() && ix != self.shown {
             self.shown = ix;
@@ -686,6 +697,13 @@ impl Render for PlanPane {
                         .on_click(cx.listener(|this, _, _, cx| this.toggle_changes(cx))),
                 )
             })
+            .when(n > 0, |d| {
+                d.child(
+                    Clipboard::new("plan-copy")
+                        .value(self.versions[self.shown].text.clone())
+                        .tooltip("Copy plan (y)"),
+                )
+            })
             .child(
                 Button::new("plan-close")
                     .ghost()
@@ -721,13 +739,14 @@ impl Render for PlanPane {
                 )
                 .into_any_element(),
             _ => div()
+                .group("plan-body")
                 .flex_1()
                 .min_h_0()
                 .px_4()
                 .pt_2()
                 .text_size(px(14.))
                 .line_height(relative(1.5))
-                .child(TextView::new(&self.md).selectable(true).scrollable(true))
+                .child(crate::chat::markdown(&self.md, "plan-body").scrollable(true))
                 .into_any_element(),
         };
         let hint = |keys: &[&str], label: &'static str| {
@@ -818,6 +837,7 @@ impl Render for PlanPane {
             )
             .on_action(cx.listener(|this, _: &PlanNewer, _, cx| this.show(this.shown + 1, cx)))
             .on_action(cx.listener(|this, _: &TogglePlanChanges, _, cx| this.toggle_changes(cx)))
+            .on_action(cx.listener(|this, _: &CopySelected, w, cx| this.copy(w, cx)))
             .on_click(cx.listener(|this, _, window, cx| this.focus.focus(window, cx)))
             .child(header)
             .child(body)

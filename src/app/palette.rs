@@ -230,12 +230,20 @@ pub(super) const COMMANDS: &[(&str, IconName, Cmd)] = &[
     ("Show or hide plan", IconName::ClipboardList, |s, w, cx| {
         s.with_plan(w, cx, |c, w, cx| c.toggle_plan(w, cx))
     }),
+    ("Copy plan", IconName::Copy, |s, w, cx| {
+        s.with_plan(w, cx, |c, w, cx| c.plan.update(cx, |p, cx| p.copy(w, cx)))
+    }),
+    ("Copy selected message", IconName::Copy, |s, w, cx| {
+        s.with_plan(w, cx, |c, w, cx| c.copy_selected(w, cx))
+    }),
     ("Approve plan and build", IconName::Hammer, |s, w, cx| {
         s.with_plan(w, cx, |c, w, cx| c.approve_plan(w, cx))
     }),
-    ("Approve plan and build in a new chat", IconName::Hammer, |s, w, cx| {
-        s.build_plan_in_new_chat(w, cx)
-    }),
+    (
+        "Approve plan and build in a new chat",
+        IconName::Hammer,
+        |s, w, cx| s.build_plan_in_new_chat(w, cx),
+    ),
     (
         "Next workspace needing attention",
         IconName::CircleAlert,

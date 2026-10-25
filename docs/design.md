@@ -178,6 +178,13 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 | Markdown | `TextView` + `TextViewState::markdown` |
 | Primary action | `Button::new(..).primary()`, at most one per view |
 | Row action button | `Button::new(..).ghost().xsmall()` with an icon only, shown on the row |
+| Copy button | `chat::copy_button` (gpui-kit `Clipboard`: `Copy` turns into `Check` for 2s) in content, `Clipboard` itself in a header. Rendered markdown goes through `chat::markdown` for code-block copy |
+
+## Copy buttons
+- **Never move anything.** A hover-revealed button is `invisible()` until its group is hovered, so its slot is always laid out. Showing it, and the check after a copy, changes no size.
+- **Never cover text.** Content reserves the corner the button sits in: the user card's text column stops before it, tool output has `pr_8`, code blocks keep the 28px top padding the language label had.
+- **Where:** user messages top-right of the card; a reply on its closing line ("done · 48s", always shown on the latest reply); code blocks and tool output in their top-right corner; the plan pane and side-question card in the header before ×, always shown.
+- Hover is never the only way: `y` copies the selected transcript row or the shown plan, `c` the side answer, and the palette has "Copy selected message" and "Copy plan".
 
 ## Copy and destructive actions
 - **Confirm only when data is lost.** Archive doesn't confirm; force-archive does.
