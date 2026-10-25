@@ -21,7 +21,7 @@ use std::{collections::HashMap, rc::Rc, sync::Arc};
 use gpui::{
     AnyElement, App, Axis, ClickEvent, ClipboardItem, Context, ElementId, Entity, Focusable as _,
     HighlightStyle, Hsla, InteractiveElement as _, IntoElement, KeyBinding, ListOffset,
-    MouseButton, ParentElement as _, Pixels, RenderOnce, SharedString,
+    MouseButton, MouseMoveEvent, ParentElement as _, Pixels, RenderOnce, SharedString,
     StatefulInteractiveElement as _, StyleRefinement, Styled, TextRun, Window, div, list, point,
     prelude::FluentBuilder as _, px,
 };
@@ -176,6 +176,8 @@ type AnnotationRenderer = Rc<dyn Fn(&DiffAnnotation, &mut Window, &mut App) -> A
 type RangeHandler = Rc<dyn Fn(&DiffLineRange, &mut Window, &mut App)>;
 type ClickHandler = Rc<dyn Fn(&DiffLinePosition, &ClickEvent, &mut Window, &mut App)>;
 type HoverHandler = Rc<dyn Fn(Option<&DiffLinePosition>, &mut Window, &mut App)>;
+type SideHeadings = Rc<dyn Fn(&DiffFile, &mut Window, &mut App) -> (SharedString, SharedString)>;
+type WorkingCell = Rc<dyn Fn(&SharedString, usize, &mut Window, &mut App) -> Option<AnyElement>>;
 
 #[derive(Default)]
 struct HeaderSlots {
@@ -217,6 +219,8 @@ pub struct Diff {
     on_add_annotation: Option<RangeHandler>,
     on_line_click: Option<ClickHandler>,
     on_line_hover: Option<HoverHandler>,
+    side_headings: Option<SideHeadings>,
+    working_cell: Option<WorkingCell>,
 }
 
 fn file_renderer<F, E>(render: F) -> FileRenderer
@@ -246,6 +250,8 @@ impl Diff {
             on_add_annotation: None,
             on_line_click: None,
             on_line_hover: None,
+            side_headings: None,
+            working_cell: None,
         }
     }
     /// Shows the original and modified line-number lanes. Default is true.
@@ -430,6 +436,24 @@ impl Diff {
         self.on_line_hover = Some(Rc::new(handler));
         self
     }
+    /// Titles the original and modified columns below each file header in Split mode.
+    pub fn side_headings<F>(mut self, headings: F) -> Self
+    where
+        F: Fn(&DiffFile, &mut Window, &mut App) -> (SharedString, SharedString) + 'static,
+    {
+        self.side_headings = Some(Rc::new(headings));
+        self
+    }
+    /// Replaces the code of a modified-side line, given the file path and the
+    /// one-based line number, keeping its gutter, marker and background.
+    /// Return `None` to show the line as usual.
+    pub fn render_working_cell<F>(mut self, render: F) -> Self
+    where
+        F: Fn(&SharedString, usize, &mut Window, &mut App) -> Option<AnyElement> + 'static,
+    {
+        self.working_cell = Some(Rc::new(render));
+        self
+    }
 }
 impl Styled for Diff {
     fn style(&mut self) -> &mut StyleRefinement {
@@ -495,18 +519,21 @@ fn render_diff(
         state.set_content_width(width);
     }
     state.sync_annotations(&props.annotations.items);
-    let content_width = state.content_width().max(state.viewport().width);
-    let column_width = if mode == DiffMode::Split {
-        content_width / 2.
+    let ratio = state.split_ratio();
+    let content_width = if mode == DiffMode::Split {
+        // Measured for two equal columns; widen so the narrower one still fits.
+        state.content_width() / 2. / ratio.min(1. - ratio)
     } else {
-        content_width
-    };
+        state.content_width()
+    }
+    .max(state.viewport().width);
+    let left_width = content_width * ratio;
     let code = Rc::new(CodePresentation {
         files: state.files().to_vec(),
         presentations: state.presentations().to_vec(),
         mode,
         content_width,
-        column_width,
+        left_width,
         font_size,
         row_height,
         gutter_width,
@@ -526,6 +553,8 @@ fn render_diff(
         on_add_annotation: props.on_add_annotation,
         on_line_click: props.on_line_click,
         on_line_hover: props.on_line_hover,
+        side_headings: props.side_headings,
+        working_cell: props.working_cell,
         selection: state.selection().clone(),
         selected_lines: state.selected_lines(),
         selected: state.selected_span(),
@@ -588,12 +617,23 @@ fn render_diff(
         // A line-number drag may finish anywhere, including outside the body.
         .on_mouse_up(
             MouseButton::Left,
-            cx.listener(|this, _, _, cx| this.end_line_selection(cx)),
+            cx.listener(|this, _, _, cx| {
+                this.end_line_selection(cx);
+                this.end_divider_drag(cx);
+            }),
         )
         .on_mouse_up_out(
             MouseButton::Left,
-            cx.listener(|this, _, _, cx| this.end_line_selection(cx)),
+            cx.listener(|this, _, _, cx| {
+                this.end_line_selection(cx);
+                this.end_divider_drag(cx);
+            }),
         )
+        .on_mouse_move(cx.listener(move |this, event: &MouseMoveEvent, _, cx| {
+            if event.pressed_button == Some(MouseButton::Left) {
+                this.drag_divider(event.position.x, content_width, cx)
+            }
+        }))
         .on_action(cx.listener(|this, _: &ScrollUp, window, cx| {
             if !body_focused(this, window, cx) {
                 return;
@@ -744,7 +784,8 @@ struct CodePresentation {
     presentations: Vec<Option<Arc<FilePresentation>>>,
     mode: DiffMode,
     content_width: Pixels,
-    column_width: Pixels,
+    /// The original column's width in Split mode; the modified one takes the rest.
+    left_width: Pixels,
     font_size: Pixels,
     row_height: Pixels,
     gutter_width: Pixels,
@@ -764,6 +805,8 @@ struct CodePresentation {
     on_add_annotation: Option<RangeHandler>,
     on_line_click: Option<ClickHandler>,
     on_line_hover: Option<HoverHandler>,
+    side_headings: Option<SideHeadings>,
+    working_cell: Option<WorkingCell>,
     selection: gpui_base::TextSelectionHandle,
     selected_lines: Option<DiffLineRange>,
     selected: Option<SelectedLines>,
@@ -880,7 +923,9 @@ fn render_row(
             changed,
         } => {
             if code.mode == DiffMode::Split && !code.files[*file].is_single_column() {
+                let divider = render_divider(&code, cx);
                 h_flex()
+                    .relative()
                     .items_stretch()
                     .w_full()
                     .child(render_cell(
@@ -903,6 +948,7 @@ fn render_row(
                         window,
                         cx,
                     ))
+                    .child(divider)
                     .into_any_element()
             } else {
                 let (side, ix) = match (original, modified) {
@@ -923,6 +969,27 @@ fn render_row(
             }
         }
     }
+}
+
+/// The column boundary of a Split row; dragging it resizes every file's columns.
+fn render_divider(code: &CodePresentation, cx: &App) -> AnyElement {
+    let state = code.state.clone();
+    div()
+        .id("split-divider")
+        .test_support()
+        .absolute()
+        .top_0()
+        .bottom_0()
+        .left(code.left_width - px(3.))
+        .w(px(6.))
+        .cursor_col_resize()
+        .hover(|this| this.bg(cx.theme().border))
+        .on_mouse_down(MouseButton::Left, move |event, _, cx| {
+            // A drag on the divider is not a text selection.
+            cx.stop_propagation();
+            state.update(cx, |state, _| state.begin_divider_drag(event.position.x));
+        })
+        .into_any_element()
 }
 
 fn render_hunk_separator(
@@ -1176,6 +1243,11 @@ fn render_file_header(
             .children(suffix)
             .into_any_element()
     };
+    let headings = code
+        .side_headings
+        .as_ref()
+        .filter(|_| code.mode == DiffMode::Split && !collapsed && !document.is_single_column())
+        .map(|headings| headings(document, window, cx));
     let state = code.state.clone();
     let name = document.path().clone();
     v_flex()
@@ -1215,6 +1287,36 @@ fn render_file_header(
                 )
                 .child(div().flex_1().min_w_0().child(content)),
         )
+        .when_some(headings, |this, (original, modified)| {
+            this.child(
+                h_flex()
+                    .w_full()
+                    .border_t_1()
+                    .border_color(border)
+                    .text_xs()
+                    .text_color(foreground)
+                    .child(
+                        div()
+                            .w(code.left_width)
+                            .flex_shrink_0()
+                            .px_3()
+                            .py_1()
+                            .border_r_1()
+                            .border_color(border)
+                            .truncate()
+                            .child(original),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .px_3()
+                            .py_1()
+                            .truncate()
+                            .child(modified),
+                    ),
+            )
+        })
         .children(file_annotations(file, code, window, cx))
         .into_any_element()
 }
@@ -1357,7 +1459,11 @@ fn render_cell(
     cx: &mut App,
 ) -> AnyElement {
     let cell = v_flex()
-        .w(code.column_width)
+        .w(if side == DiffSide::Original {
+            code.left_width
+        } else {
+            code.content_width - code.left_width
+        })
         .min_w_0()
         .flex_shrink_0()
         .when(side == DiffSide::Original, |this| {
@@ -1385,6 +1491,7 @@ fn render_cell(
         changed,
         code.clone(),
         [Some((side, Some(ix))), None],
+        window,
         cx,
     ))
     .children(line_extras(
@@ -1432,11 +1539,7 @@ fn render_unified_cell(
         ]
     };
     v_flex()
-        .w(if single_column {
-            code.content_width
-        } else {
-            code.column_width
-        })
+        .w(code.content_width)
         .id((
             if side == DiffSide::Original {
                 "old"
@@ -1452,6 +1555,7 @@ fn render_unified_cell(
             changed,
             code.clone(),
             gutters,
+            window,
             cx,
         ))
         .children(extras)
@@ -1555,6 +1659,7 @@ fn add_annotation_button(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn code_line(
     file: usize,
     side: DiffSide,
@@ -1562,6 +1667,7 @@ fn code_line(
     changed: bool,
     code: Rc<CodePresentation>,
     gutters: [Option<(DiffSide, Option<usize>)>; 2],
+    window: &mut Window,
     cx: &mut App,
 ) -> AnyElement {
     let document = &code.files[file];
@@ -1635,6 +1741,12 @@ fn code_line(
                 code.geometry.clone(),
             )
         }));
+    let working = (text_side == DiffSide::Modified)
+        .then(|| {
+            let render = code.working_cell.as_ref()?;
+            render(document.path(), position.line(), window, cx)
+        })
+        .flatten();
     let gutters_width = if code.line_number {
         code.gutter_width * gutters.iter().flatten().count() as f32
     } else {
@@ -1710,7 +1822,7 @@ fn code_line(
                 .id("source")
                 .test_support()
                 .map(|this| {
-                    if code.soft_wrap {
+                    if code.soft_wrap || working.is_some() {
                         this.flex_1().min_w_0()
                     } else {
                         this.flex_shrink_0()
@@ -1747,7 +1859,10 @@ fn code_line(
                         handler(&position, event, window, cx)
                     })
                 })
-                .child(text),
+                .map(|this| match working {
+                    Some(working) => this.child(working),
+                    None => this.child(text),
+                }),
         )
         .children(add_button)
         .into_any_element()
@@ -1862,5 +1977,7 @@ mod review_tests;
 mod scroll_tests;
 #[cfg(test)]
 mod selection_tests;
+#[cfg(test)]
+mod split_tests;
 #[cfg(test)]
 mod tests;

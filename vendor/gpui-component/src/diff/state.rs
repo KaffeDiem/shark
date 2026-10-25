@@ -90,6 +90,9 @@ pub enum DiffEvent {
     /// The user resolved a merge conflict, or undid its resolution; read it
     /// with [`DiffState::conflict_resolution`].
     ConflictResolved(SharedString, usize),
+    /// The user finished dragging the Split divider; read the ratio with
+    /// [`DiffState::split_ratio`].
+    SplitRatioChanged(f32),
 }
 
 /// Inputs that determine row heights and content width.
@@ -232,6 +235,9 @@ pub struct DiffState {
     row_height: Option<Pixels>,
     /// The list width the row-height hint was last applied at.
     hinted_width: Option<Pixels>,
+    split_ratio: f32,
+    /// The pointer x and ratio where a divider drag started.
+    divider_drag: Option<(Pixels, f32)>,
     annotations: HashSet<(Option<DiffLinePosition>, SharedString, ElementId)>,
     window: Option<WindowId>,
     /// Bumped when files or presentation options change, so a preparation
@@ -364,6 +370,8 @@ impl DiffState {
             content_width: px(0.),
             row_height: None,
             hinted_width: None,
+            split_ratio: 0.5,
+            divider_drag: None,
             annotations: HashSet::new(),
             window: None,
             presentation_generation: 0,
@@ -552,6 +560,93 @@ impl DiffState {
         let resized = self.viewport != viewport;
         self.viewport = viewport;
         wider || resized
+    }
+
+    /// The share of the width the original column takes in Split mode. Default is 0.5.
+    pub fn split_ratio(&self) -> f32 {
+        self.split_ratio
+    }
+
+    /// Sets the Split column ratio, clamped to 0.2–0.8, without emitting an event.
+    pub fn set_split_ratio(&mut self, ratio: f32, cx: &mut Context<Self>) {
+        let ratio = ratio.clamp(0.2, 0.8);
+        if self.split_ratio == ratio {
+            return;
+        }
+        self.split_ratio = ratio;
+        // Wrapped rows change height with their column width.
+        if self.layout.as_ref().is_some_and(|layout| layout.soft_wrap) {
+            self.list.remeasure();
+            self.apply_row_height_hint();
+        }
+        cx.notify();
+    }
+
+    pub(crate) fn begin_divider_drag(&mut self, x: Pixels) {
+        self.divider_drag = Some((x, self.split_ratio));
+    }
+
+    /// Moves the divider to pointer `x` while a drag is active, over rows `width` wide.
+    pub(crate) fn drag_divider(&mut self, x: Pixels, width: Pixels, cx: &mut Context<Self>) {
+        if let Some((start, ratio)) = self.divider_drag
+            && width > px(0.)
+        {
+            self.set_split_ratio(ratio + (x - start) / width, cx);
+        }
+    }
+
+    pub(crate) fn end_divider_drag(&mut self, cx: &mut Context<Self>) {
+        if self.divider_drag.take().is_some() {
+            cx.emit(DiffEvent::SplitRatioChanged(self.split_ratio));
+        }
+    }
+
+    /// Replaces the file with the same [`DiffFile::path`] in place, keeping
+    /// scrolling, collapse and the other files' state, so an owner can show
+    /// live edits. That file's disclosures, resolutions and selection reset.
+    pub fn replace_file(&mut self, file: DiffFile, cx: &mut Context<Self>) {
+        let Some(ix) = self.file_ix(file.path()) else {
+            return;
+        };
+        let path = file.path().clone();
+        self.files[ix] = file;
+        self.expanded[ix].clear();
+        self.resolutions
+            .retain(|(resolved, _), _| *resolved != path);
+        if self
+            .selected_lines
+            .as_ref()
+            .is_some_and(|range| *range.path() == path)
+        {
+            self.selected_lines = None;
+            self.selection_anchor = None;
+            self.selection_cursor = None;
+            self.selection.set_local_selection(false, cx);
+        }
+        self.geometry.borrow_mut().clear();
+        // Cancel a preparation of the old file; the others prepare again if pending.
+        self.presentation_generation += 1;
+        self.preparing = None;
+        self._presentation = Task::ready(());
+        self.presentations[ix] = None;
+        // Measure the width again: an edit may lengthen the widest line.
+        self.layout = None;
+        // Spliced, so the list keeps its scroll offset and unchanged rows their heights.
+        self.rebuild(false);
+        self.ensure_presentation(cx);
+        cx.notify();
+    }
+
+    /// Reveals a source line, expanding its file or the fold hiding it, and
+    /// scrolls only as far as needed to show it.
+    pub fn show_line(&mut self, position: DiffLinePosition, cx: &mut Context<Self>) {
+        if self.collapsed.remove(position.path().as_str()) {
+            self.rebuild_at_anchor();
+        }
+        if let Some(row) = self.expand_line(&position) {
+            self.list.scroll_to_reveal_item(row);
+            cx.notify();
+        }
     }
 
     /// Replaces the files and resets expansion, selection and viewport.
