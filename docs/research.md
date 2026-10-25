@@ -38,8 +38,20 @@ Open-source GPUI apps in the same space, worth reading: **Arbor** (worktrees, te
 - Event types: `system/init` (carries `session_id`), `stream_event` (text deltas), `assistant` (full content blocks), `user` (tool_result), `result`. Use `--resume <id>` to continue a session. SIGTERM, then resume, is safe.
 - Headless `-p` denies tools that need approval, so the agent needs `bypassPermissions` (or a host permission prompt).
 - **Multi-repo caveat:** with cwd = the workspace root, a repo's `CLAUDE.md` loads only after the agent touches that subdirectory, and its `.claude/settings.json`, hooks and `.mcp.json` are ignored. `--add-dir` grants file access but doesn't load CLAUDE.md unless `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` is set. Shark writes a root `CLAUDE.md` that `@`-imports each repo's file. https://code.claude.com/docs/en/memory
-- Codex (later): `codex app-server` speaks typed JSON-RPC over stdio (`generate-json-schema`). `sandboxPolicy.writableRoots` accepts several directories.
 - Licensing: building on a user's claude.ai subscription needs Anthropic's approval for third-party products.
+
+## Driving Codex (codex-cli 0.164.0, checked Oct 2026)
+- `codex app-server`: JSON-RPC over stdio, with no `jsonrpc` field. The protocol schema comes from `codex app-server generate-json-schema --out <dir>`. Auth is whatever `codex login` set up: a ChatGPT subscription or an API key. Shark never handles tokens.
+- Requests can be pipelined: `initialize`, then `initialized`, then `thread/start` or `thread/resume {threadId}`, written without waiting. `thread/start` takes `cwd`, `model`, `approvalPolicy` (`never`) and `sandbox` (`danger-full-access` / `workspace-write` / `read-only`).
+- `turn/start {threadId, input:[{type:"text",text}]}`. `turn/steer {expectedTurnId, …}` adds input to a running turn. `turn/interrupt {threadId, turnId}` ends with `turn/completed` status `interrupted`.
+- Notifications:
+  - `turn/started`, `turn/completed` (`status`, `error.message`, `durationMs`; also repeats the turn's items).
+  - `item/started` / `item/completed` with item types `userMessage`, `agentMessage`, `commandExecution` (`command`, `aggregatedOutput`, `exitCode`), `fileChange` (`changes[].path`, `.diff`), `mcpToolCall`, `webSearch` and `reasoning`.
+  - `item/agentMessage/delta`, and many `hook/*` lines that Shark ignores.
+- A missing thread on resume: error `no rollout found for thread id …`.
+- `model/list` on a Pro plan: `gpt-6.1-sol` (default), `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`.
+- A non-git workspace root is fine. `instructionSources` lists `~/.codex/AGENTS.md` and the root `AGENTS.md`. Codex has no `@` imports, so the root file points at each repo's file.
+- Licensing: Shark only launches the user's own `codex` CLI with its own login, the same arrangement as with `claude`.
 
 ## Git worktree pitfalls
 - A branch can't be checked out in two worktrees. Detect this and fail early.

@@ -161,7 +161,10 @@ impl Shark {
         }
         ws.active_chat = ix.min(ws.chats.len() - 1);
         let next = ws.active_chat;
-        let (name, untouched) = (ws.name.clone(), meta.session_id.is_none());
+        // No session can also mean one just dropped (a backend switch): the transcript tells.
+        let untouched =
+            meta.session_id.is_none() && !crate::agent::transcript_path(&meta.id).exists();
+        let name = ws.name.clone();
         // An empty chat isn't worth reopening.
         if !untouched {
             ws.closed.push(meta.clone());

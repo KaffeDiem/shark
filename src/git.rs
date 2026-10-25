@@ -155,7 +155,7 @@ pub fn create_workspace(
             ..Default::default()
         };
         ws.migrate();
-        fs::write(dir.join("CLAUDE.md"), claude_md(&ws, dir)).map_err(|e| e.to_string())?;
+        write_root_docs(&ws, dir)?;
         Ok(ws)
     })();
     if result.is_err() {
@@ -180,7 +180,7 @@ pub fn add_to_workspace(ws: &Workspace, dir: &Path, r: &Repo) -> Result<Workspac
     let mut ws = ws.clone();
     let added = add_worktree(dir, &ws.branch, r, &plan).and_then(|wr| {
         ws.repos.push(wr);
-        fs::write(dir.join("CLAUDE.md"), claude_md(&ws, dir)).map_err(|e| e.to_string())
+        write_root_docs(&ws, dir)
     });
     if let Err(e) = added {
         undo_worktree(dir, &ws.branch, r, &plan);
@@ -336,13 +336,49 @@ fn copy_included(src: &Path, wt: &Path) -> Result<(), String> {
     Ok(())
 }
 
-/// Rewrites the root CLAUDE.md from the workspace's repo list; a failure only leaves it stale.
+/// Rewrites the root CLAUDE.md and AGENTS.md from the workspace's repo list; a failure only
+/// leaves them stale.
 pub fn write_claude_md(ws: &Workspace) {
-    let dir = ws.dir();
-    let _ = fs::write(dir.join("CLAUDE.md"), claude_md(ws, &dir));
+    let _ = write_root_docs(ws, &ws.dir());
+}
+
+/// The files the agent reads at the workspace root: CLAUDE.md for claude, AGENTS.md for codex.
+const ROOT_DOCS: [&str; 2] = ["CLAUDE.md", "AGENTS.md"];
+
+fn write_root_docs(ws: &Workspace, dir: &Path) -> Result<(), String> {
+    fs::write(dir.join("CLAUDE.md"), claude_md(ws, dir))
+        .and_then(|()| fs::write(dir.join("AGENTS.md"), agents_md(ws, dir)))
+        .map_err(|e| e.to_string())
 }
 
 fn claude_md(ws: &Workspace, dir: &Path) -> String {
+    let mut s = header(ws);
+    for r in &ws.repos {
+        if dir.join(&r.name).join("CLAUDE.md").exists() {
+            s += &format!("@{}/CLAUDE.md\n", r.name);
+        }
+    }
+    s
+}
+
+/// Codex has no `@` imports and reads AGENTS.md only from here, so it is pointed at each repo's.
+fn agents_md(ws: &Workspace, dir: &Path) -> String {
+    let mut s = header(ws);
+    for r in &ws.repos {
+        if let Some(f) = ["AGENTS.md", "CLAUDE.md"]
+            .into_iter()
+            .find(|f| dir.join(&r.name).join(f).exists())
+        {
+            s += &format!(
+                "- Before working in `{0}/`, read `{0}/{f}`: its instructions apply there.\n",
+                r.name
+            );
+        }
+    }
+    s
+}
+
+fn header(ws: &Workspace) -> String {
     let mut s = format!(
         "# Workspace `{}`\n\nThis directory is NOT a git repo. Each subdirectory is a git worktree on branch `{}`:\n",
         ws.name, ws.branch
@@ -356,11 +392,6 @@ fn claude_md(ws: &Workspace, dir: &Path) -> String {
         );
     }
     s += "\nRun git per repo (e.g. `git -C <repo> status`) and commit in each repo separately. Never run git in this root directory.\n\n";
-    for r in &ws.repos {
-        if dir.join(&r.name).join("CLAUDE.md").exists() {
-            s += &format!("@{}/CLAUDE.md\n", r.name);
-        }
-    }
     s
 }
 
@@ -423,7 +454,7 @@ pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), S
             .flatten()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n != "CLAUDE.md" && !ws.repos.iter().any(|r| &r.name == n))
+            .filter(|n| !ROOT_DOCS.contains(&n.as_str()) && !ws.repos.iter().any(|r| &r.name == n))
             // Ours too: `.context` holding only the dropped and pasted files.
             .filter(|n| {
                 // Unreadable, or a file, counts as unexpected: refuse before removing anything.
@@ -458,7 +489,9 @@ pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), S
         let _ = fs::remove_dir_all(dir);
     } else {
         // Only our generated file may remain; anything else the user must force away.
-        let _ = fs::remove_file(dir.join("CLAUDE.md"));
+        for f in ROOT_DOCS {
+            let _ = fs::remove_file(dir.join(f));
+        }
         // Dropped and pasted files; sent messages may still refer to them until now.
         let _ = fs::remove_dir_all(dir.join(".context"));
         fs::remove_dir(dir)
@@ -589,6 +622,11 @@ mod tests {
         assert!(
             md.contains("@api/CLAUDE.md") && md.contains("@web/CLAUDE.md"),
             "{md}"
+        );
+        let agents = fs::read_to_string(dir.join("AGENTS.md")).unwrap();
+        assert!(
+            agents.contains("read `api/CLAUDE.md`") && agents.contains("branch `feat-x`"),
+            "{agents}"
         );
         assert!(
             create_workspace(&root.join("ws/other"), "other", "feat-x", &repos).is_err(),

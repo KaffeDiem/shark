@@ -116,7 +116,8 @@ pub struct ChatMeta {
     pub title: String,
     #[serde(default)]
     pub session_id: Option<String>,
-    /// Claude model alias (`opus`, `fable`, …); `None` uses the CLI default.
+    /// Claude model alias (`opus`, `fable`, …) or `codex[:<model id>]`; `None` uses the claude
+    /// CLI default.
     #[serde(default)]
     pub model: Option<String>,
     /// Plan mode: the agent plans and edits nothing until the plan is approved.
