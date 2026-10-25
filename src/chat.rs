@@ -43,6 +43,8 @@ pub struct Chat {
     blocks: Vec<Block>,
     sel: usize,
     pub busy: bool,
+    /// Set while a git step runs in these worktrees; sends wait for it.
+    pub hold: bool,
     agent: Option<Agent>,
     pub(crate) composer: Entity<TextareaState>,
     /// Model the running process was started with; a mismatch respawns it on the next send.
@@ -95,6 +97,7 @@ impl Chat {
             blocks: vec![],
             sel: 0,
             busy: false,
+            hold: false,
             agent: None,
             composer,
             agent_model: None,
@@ -135,8 +138,39 @@ impl Chat {
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let text = self.composer.read(cx).value().trim().to_string();
+        if self.send_text(text, cx) {
+            self.composer
+                .update(cx, |c, cx| c.set_value("", window, cx));
+        }
+    }
+
+    /// Sends a host-written prompt (git steps). A draft in the composer rides along as extra
+    /// instructions, so "Commit and push" can carry "…and mention the ticket".
+    pub fn ask(&mut self, prompt: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let draft = self.composer.read(cx).value().trim().to_string();
+        let text = match draft.is_empty() {
+            true => prompt.to_string(),
+            false => format!("{prompt}\n\nAlso: {draft}"),
+        };
+        let sent = self.send_text(text, cx);
+        if sent && !draft.is_empty() {
+            self.composer
+                .update(cx, |c, cx| c.set_value("", window, cx));
+        }
+        sent
+    }
+
+    /// Returns whether the text went out; not while a turn is running.
+    fn send_text(&mut self, text: String, cx: &mut Context<Self>) -> bool {
         if text.is_empty() || self.busy {
-            return;
+            return false;
+        }
+        if self.hold {
+            self.push(
+                Block::Info("a git step is running; send again when it finishes".into()),
+                cx,
+            );
+            return false;
         }
         if self.agent.is_some() && self.agent_model != self.ws.model {
             self.agent = None; // drop stops it; the respawn resumes the same session on the new model
@@ -156,17 +190,16 @@ impl Chat {
                 }
                 Err(e) => {
                     self.push(Block::Info(format!("failed to start claude: {e}")), cx);
-                    return;
+                    return false;
                 }
             }
         }
         if let Err(e) = self.agent.as_mut().unwrap().send(&text) {
             self.push(Block::Info(format!("send failed: {e}")), cx);
-            return;
+            return false;
         }
-        self.composer
-            .update(cx, |c, cx| c.set_value("", window, cx));
         self.sent(text, cx);
+        true
     }
 
     fn sent(&mut self, text: String, cx: &mut Context<Self>) {
