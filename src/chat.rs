@@ -32,6 +32,7 @@ use serde_json::Value;
 use side::Side;
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Instant;
 
 struct Call {
@@ -62,6 +63,24 @@ enum Block {
     /// Skills and subagents stay visible on their own row: they say what the agent is doing.
     Tool(Call),
     Info(String),
+    /// A diff review (`send_review`); `true` while claude hasn't read it, like `User`.
+    Review(Rc<ReviewCard>, bool),
+}
+
+/// Diff comments sent as one message (src/app/review.rs), shown as a card instead of the
+/// prompt text.
+pub struct ReviewCard {
+    pub prompt: String,
+    pub items: Vec<ReviewItem>,
+    /// The diff when it was sent, e.g. "3 files · +5 −3".
+    pub changes: String,
+}
+
+/// One comment of a review card: its id, "app.rs · Working copy · lines 631–632", its text.
+pub struct ReviewItem {
+    pub id: u64,
+    pub place: String,
+    pub text: String,
 }
 
 /// A transcript row: a block, or one call inside an expanded tool group.
@@ -144,6 +163,8 @@ struct Queued {
     content: InputContent,
     /// First line, capped, so a long paste isn't shaped on every frame.
     preview: SharedString,
+    /// A review waiting for the turn to end; it goes out as its card.
+    review: Option<Rc<ReviewCard>>,
 }
 
 impl Queued {
@@ -156,6 +177,7 @@ impl Queued {
         Queued {
             content,
             preview: preview.into(),
+            review: None,
         }
     }
 
@@ -170,6 +192,17 @@ pub enum ChatEvent {
     /// The user picked the model or thinking level (after `Meta`); new chats start on it.
     Picked,
     TurnDone,
+    /// A review card's "Review changes" row: show the diff.
+    ShowChanges,
+    /// A review card's comment link: show that comment in the diff.
+    ShowComment(u64),
+    /// Remove on a queued review card: those comments never went out.
+    ReviewRemoved(Vec<u64>),
+    /// A review went out (now, or from the queue): its comments are read in `turn`.
+    ReviewSent {
+        ids: Vec<u64>,
+        turn: usize,
+    },
 }
 
 pub struct Chat {
@@ -193,6 +226,9 @@ pub struct Chat {
     note: Option<String>,
     agent: Option<Agent>,
     pub(crate) composer: Entity<TextareaState>,
+    /// The reply of the turn that ended last, and that turn's number (see `turns`).
+    pub last_reply: String,
+    pub last_turn: usize,
     /// Vim keys in the composer (`State::vim`); it starts each message in Insert mode.
     pub vim: Vim,
     pub vim_on: bool,
@@ -482,6 +518,8 @@ impl Chat {
             note: None,
             agent: None,
             composer,
+            last_reply: String::new(),
+            last_turn: 0,
             vim: insert_mode(),
             vim_on,
             vim_took: None,
@@ -1090,7 +1128,7 @@ impl Chat {
             return;
         }
         let q = self.queue.remove(0); // editing is None here
-        match self.send_text(q.text(), false, cx) {
+        match self.send_block(q.text(), false, q.review.clone(), cx) {
             true => self.qsel = self.qsel.saturating_sub(1),
             false => self.queue.insert(0, q),
         }
@@ -1152,7 +1190,7 @@ impl Chat {
         let editing = self.editing;
         let q = self.take_queued(self.qsel);
         let busy = self.busy;
-        if self.send_text(q.text(), true, cx) {
+        if self.send_block(q.text(), true, q.review.clone(), cx) {
             // Claude may hold it unread until this turn ends; don't restart the process under it.
             self.steered |= busy;
         } else {
@@ -1165,11 +1203,33 @@ impl Chat {
         }
     }
 
+    /// Remove on a queued review card.
+    pub(crate) fn remove_queued(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.qsel = ix;
+        self.delete_queued(window, cx);
+    }
+
+    /// What went out, oldest first: messages, and reviews as their prompt.
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn sent_texts(&self) -> Vec<String> {
+        (self.blocks.iter())
+            .filter_map(|b| match b {
+                Block::User(t, _) => Some(t.clone()),
+                Block::Review(r, _) => Some(r.prompt.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
     fn delete_queued(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.qsel >= self.queue.len() {
             return;
         }
-        self.take_queued(self.qsel);
+        if let Some(r) = self.take_queued(self.qsel).review {
+            cx.emit(ChatEvent::ReviewRemoved(
+                r.items.iter().map(|i| i.id).collect(),
+            ));
+        }
         self.after_queue_change(cx);
         if self.queue.is_empty() {
             self.focus_composer(window, cx);
@@ -1189,7 +1249,7 @@ impl Chat {
     /// Loads the selected message into the composer; Enter puts it back in the same slot.
     /// A draft already there is queued first, so nothing typed is lost.
     fn edit_queued(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.qsel >= self.queue.len() {
+        if self.queue.get(self.qsel).is_none_or(|q| q.review.is_some()) {
             return;
         }
         let mut ix = self.qsel;
@@ -1243,6 +1303,17 @@ impl Chat {
     /// Returns whether the text went out; while a turn runs only if `steer`. Mid-turn, claude
     /// holds it and reads it at its next step.
     fn send_text(&mut self, text: String, steer: bool, cx: &mut Context<Self>) -> bool {
+        self.send_block(text, steer, None, cx)
+    }
+
+    /// `send_text`, shown as `review`'s card when there is one.
+    fn send_block(
+        &mut self,
+        text: String,
+        steer: bool,
+        review: Option<Rc<ReviewCard>>,
+        cx: &mut Context<Self>,
+    ) -> bool {
         if text.is_empty() || (self.busy && !steer) {
             return false;
         }
@@ -1304,8 +1375,67 @@ impl Chat {
             return false;
         }
         self.note = None;
-        self.sent(text, cx);
+        let ids = (review.as_ref()).map(|r| r.items.iter().map(|i| i.id).collect());
+        self.sent(text, review, cx);
+        if let Some(ids) = ids {
+            let turn = self.turns();
+            cx.emit(ChatEvent::ReviewSent { ids, turn });
+        }
         true
+    }
+
+    /// Sends exactly a review's prompt, leaving the composer's draft alone. While a turn or
+    /// git step runs it waits at the top of the queue. `ReviewSent` says when it goes out;
+    /// false when it was refused (the transcript says why).
+    pub fn send_review(&mut self, mut card: ReviewCard, cx: &mut Context<Self>) -> bool {
+        // As the queue sends it, so claude's echo matches the card.
+        card.prompt = card.prompt.trim().to_string();
+        let card = Rc::new(card);
+        if self.busy || self.hold {
+            let q = Queued {
+                review: Some(card.clone()),
+                ..Queued::new(card.prompt.clone().into())
+            };
+            self.queue.insert(0, q);
+            self.after_queue_change(cx);
+            return true;
+        }
+        self.send_block(card.prompt.clone(), false, Some(card), cx)
+    }
+
+    /// The ended turn's reply and number, for review reports: the text after the last message
+    /// claude read (ones queued mid-turn and still unread don't start it).
+    fn keep_reply(&mut self) {
+        let start = (self.blocks.iter())
+            .rposition(|b| matches!(b, Block::User(_, false) | Block::Review(_, false)));
+        let after = start.map_or(0, |i| i + 1);
+        self.last_reply = (self.blocks[after..].iter())
+            .filter_map(|b| match b {
+                Block::Text { src, .. } => Some(src.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        self.last_turn = (self.blocks[..after].iter())
+            .filter(|b| matches!(b, Block::User(..) | Block::Review(..)))
+            .count();
+    }
+
+    /// Messages in the transcript; the nth one starts turn n.
+    pub fn turns(&self) -> usize {
+        (self.blocks.iter())
+            .filter(|b| matches!(b, Block::User(..) | Block::Review(..)))
+            .count()
+    }
+
+    /// Comments of reviews still waiting to be read: the tab shows "Chat · N".
+    pub fn review_count(&self) -> usize {
+        let queued = self.queue.iter().filter_map(|q| q.review.as_ref());
+        let unread = (self.unread.iter()).filter_map(|&bi| match self.blocks.get(bi) {
+            Some(Block::Review(r, _)) => Some(r),
+            _ => None,
+        });
+        queued.chain(unread).map(|r| r.items.len()).sum()
     }
 
     /// Feeds a process's events to `apply` until it ends or the chat is gone.
@@ -1336,7 +1466,7 @@ impl Chat {
         self.prs_at = None; // the next `#` lists the new repo's PRs
     }
 
-    fn sent(&mut self, text: String, cx: &mut Context<Self>) {
+    fn sent(&mut self, text: String, review: Option<Rc<ReviewCard>>, cx: &mut Context<Self>) {
         let queued = self.busy;
         if !queued {
             self.started = Some(Instant::now());
@@ -1350,7 +1480,13 @@ impl Chat {
         self.sel = self.rows.len().saturating_sub(1);
         self.list.set_follow_mode(FollowMode::Tail);
         self.unread.push_back(self.blocks.len());
-        self.push(Block::User(text, queued), cx);
+        self.push(
+            match review {
+                Some(r) => Block::Review(r, queued),
+                None => Block::User(text, queued),
+            },
+            cx,
+        );
     }
 
     /// Interrupts a running turn and keeps the process warm; SIGTERM if claude doesn't stop
@@ -1397,7 +1533,8 @@ impl Chat {
     fn drop_unread(&mut self) {
         let n = self.unread.len();
         for bi in std::mem::take(&mut self.unread) {
-            if let Some(Block::User(_, queued)) = self.blocks.get_mut(bi) {
+            if let Some(Block::User(_, queued) | Block::Review(_, queued)) = self.blocks.get_mut(bi)
+            {
                 *queued = false;
             }
         }
@@ -1534,7 +1671,8 @@ impl Chat {
     /// The streaming text block a reply continues: the last block, looking past messages
     /// queued while it streams (they'd otherwise split the reply in two).
     fn live_text(&self) -> Option<usize> {
-        let bi = (self.blocks.iter()).rposition(|b| !matches!(b, Block::User(_, true)))?;
+        let bi = (self.blocks.iter())
+            .rposition(|b| !matches!(b, Block::User(_, true) | Block::Review(_, true)))?;
         matches!(self.blocks[bi], Block::Text { done: false, .. }).then_some(bi)
     }
 
@@ -1576,13 +1714,17 @@ impl Chat {
             // `ends_with`: a workspace `note` may have been put before the text on the wire.
             // Not just the oldest: one the CLI refused (a failed codex turn/start) is never echoed.
             Ev::User(text) => {
-                let read = (self.unread.iter()).position(
-                    |&bi| matches!(&self.blocks[bi], Block::User(t, _) if text.ends_with(t.as_str())),
-                );
+                let read = (self.unread.iter()).position(|&bi| match &self.blocks[bi] {
+                    Block::User(t, _) => text.ends_with(t.as_str()),
+                    Block::Review(r, _) => text.ends_with(r.prompt.as_str()),
+                    _ => false,
+                });
                 match read {
                     Some(k) => {
                         let bi = self.unread.remove(k).unwrap();
-                        if let Block::User(_, queued) = &mut self.blocks[bi] {
+                        if let Block::User(_, queued) | Block::Review(_, queued) =
+                            &mut self.blocks[bi]
+                        {
                             *queued = false;
                         }
                         self.remeasure(bi);
@@ -1736,6 +1878,7 @@ impl Chat {
                     if gone {
                         cx.emit(ChatEvent::Meta);
                     }
+                    self.keep_reply();
                     cx.emit(ChatEvent::TurnDone);
                 }
             }
@@ -1985,6 +2128,12 @@ impl Chat {
                             .child("Queued · the agent reads it at its next step"),
                     )
                 }),
+            (Block::Review(r, queued), _) => column().child(self.review_card(
+                r,
+                ix,
+                queued.then(|| "Queued · the agent reads it at its next step".into_any_element()),
+                cx,
+            )),
             (Block::Text { md, .. }, _) => column()
                 .text_size(px(14.))
                 .line_height(relative(1.5))
@@ -2044,6 +2193,83 @@ impl Chat {
         row.child(inner).into_any_element()
     }
 
+    /// A review as sent (screen 06): its comments, each linking to the diff, then a row that
+    /// opens the diff. `footer` says where it stands.
+    fn review_card(
+        &self,
+        r: &ReviewCard,
+        key: usize,
+        footer: Option<AnyElement>,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let n = r.items.len();
+        v_flex()
+            .gap_2()
+            .text_sm()
+            .child(
+                v_flex()
+                    .gap_2()
+                    .pl_3()
+                    .py_2()
+                    .border_l_2()
+                    .border_color(theme.primary)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.success_foreground)
+                            .child(match n {
+                                1 => "Diff comment added to context".to_string(),
+                                n => format!("{n} diff comments added to context"),
+                            }),
+                    )
+                    .children(r.items.iter().map(|it| {
+                        let id = it.id;
+                        v_flex()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .id(("review-link", (key << 16) + id as usize))
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .cursor_pointer()
+                                    .hover(|d| d.text_color(theme.foreground))
+                                    .child(format!("{} ↗", it.place))
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.stop_propagation();
+                                        cx.emit(ChatEvent::ShowComment(id))
+                                    })),
+                            )
+                            .child(div().text_color(theme.foreground).child(it.text.clone()))
+                    }))
+                    .when_some(footer, |d, f| {
+                        d.child(div().text_xs().text_color(theme.muted_foreground).child(f))
+                    }),
+            )
+            .child(
+                h_flex()
+                    .id(("review-changes", key))
+                    .h(px(32.))
+                    .px_3()
+                    .rounded(theme.radius)
+                    .border_1()
+                    .border_color(theme.border)
+                    .cursor_pointer()
+                    .hover(|d| d.bg(theme.list_hover))
+                    .on_click(cx.listener(|_, _, _, cx| {
+                        cx.stop_propagation();
+                        cx.emit(ChatEvent::ShowChanges)
+                    }))
+                    .child(div().flex_1().child("Review changes"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(r.changes.clone()),
+                    ),
+            )
+    }
+
     /// Queued messages above the input, in send order: the top row goes next.
     fn render_queue(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         if self.queue.is_empty() {
@@ -2071,6 +2297,30 @@ impl Chat {
         let rows: Vec<AnyElement> = (self.queue.iter().enumerate())
             .map(|(ix, q)| {
                 let sel = focused && ix == self.qsel;
+                if let Some(r) = &q.review {
+                    let footer = h_flex()
+                        .gap_1()
+                        .child("Included with your next message ·")
+                        .child(
+                            div()
+                                .id(("q-remove", ix))
+                                .cursor_pointer()
+                                .text_color(theme.foreground)
+                                .hover(|d| d.underline())
+                                .child("Remove")
+                                .on_click(cx.listener(move |this, _, window, cx| {
+                                    this.remove_queued(ix, window, cx);
+                                    cx.stop_propagation();
+                                })),
+                        );
+                    return div()
+                        .px_2()
+                        .py_1()
+                        .rounded(theme.radius)
+                        .when(sel, |d| d.bg(theme.list_active))
+                        .child(self.review_card(r, ix, Some(footer.into_any_element()), cx))
+                        .into_any_element();
+                }
                 h_flex()
                     .id(("queued", ix))
                     .h(px(28.))
@@ -2202,6 +2452,7 @@ impl Chat {
         let text = match (&self.blocks[bi], call) {
             (Block::Info(t), _) => Some(self.reply_above(bi).unwrap_or(t).clone()),
             (Block::User(t, _), _) => Some(t.clone()),
+            (Block::Review(r, _), _) => Some(r.prompt.clone()),
             (Block::Text { src, .. }, _) => Some(src.clone()),
             (Block::Tool(c), _) if c.name == "ExitPlanMode" => {
                 let plan = self.plan.read(cx);
@@ -2686,7 +2937,7 @@ pub(crate) mod ui_tests {
     use super::*;
 
     /// Feeds recorded protocol lines to the chat as its process would.
-    fn play(c: &mut Chat, lines: &[&str], cx: &mut Context<Chat>) {
+    pub(crate) fn play(c: &mut Chat, lines: &[&str], cx: &mut Context<Chat>) {
         for l in lines {
             for ev in agent::parse(l) {
                 c.apply(ev, cx);
@@ -3153,7 +3404,7 @@ exec cat >/dev/null
         frame(cx);
         assert_eq!(top(), 0, "still at the top");
 
-        cx.update(|cx| chat.update(cx, |c, cx| c.sent("new".into(), cx)));
+        cx.update(|cx| chat.update(cx, |c, cx| c.sent("new".into(), None, cx)));
         frame(cx);
         assert!(list.is_following_tail() && top() > 0, "at the bottom");
 
@@ -3322,7 +3573,7 @@ exec cat >/dev/null
                 assert!(!c.fast() && c.meta.fast == Some(false));
                 c.set_plan_mode(true, cx);
                 assert!(c.meta.plan && c.plan_open);
-                c.sent("plan a cache".into(), cx);
+                c.sent("plan a cache".into(), None, cx);
                 // In codex's order: the reply after the plan streams before the plan completes.
                 play(c, &[
                     r#"{"method":"turn/started","params":{"threadId":"th1","turn":{"id":"t1"}}}"#,
@@ -3373,9 +3624,9 @@ exec cat >/dev/null
             chat.update(cx, |c, cx| {
                 c.meta.model = Some("codex:gpt-6-astra".into());
                 c.agent_model = c.meta.model.clone();
-                c.sent("first".into(), cx);
+                c.sent("first".into(), None, cx);
                 c.steered = true; // what a cmd-enter send does mid-turn
-                c.sent("second".into(), cx);
+                c.sent("second".into(), None, cx);
                 play(c, &[
                     r#"{"method":"turn/started","params":{"threadId":"th9","turn":{"id":"t1"}}}"#,
                     &echo("first"),
@@ -3385,9 +3636,9 @@ exec cat >/dev/null
                 ], cx);
                 assert_eq!(c.meta.session_id.as_deref(), Some("th9"));
                 assert!(!c.busy && c.unread.is_empty() && !c.steered);
-                c.sent("refused".into(), cx);
+                c.sent("refused".into(), None, cx);
                 play(c, &[r#"{"id":3,"error":{"code":-32600,"message":"bad input"}}"#], cx);
-                c.sent("next".into(), cx);
+                c.sent("next".into(), None, cx);
                 play(c, &[&echo("next")], cx);
                 let users: Vec<(&str, bool)> = (c.blocks.iter())
                     .filter_map(|b| match b {
@@ -3466,8 +3717,8 @@ exec cat >/dev/null
         });
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
-                c.sent("first".into(), cx);
-                c.sent("steer".into(), cx);
+                c.sent("first".into(), None, cx);
+                c.sent("steer".into(), None, cx);
                 let queued = |c: &Chat| {
                     (c.blocks.iter())
                         .map(|b| matches!(b, Block::User(_, true)))
@@ -3478,7 +3729,7 @@ exec cat >/dev/null
                 c.blocks.remove(1);
                 c.unread.pop_back();
                 c.apply(Ev::TextDelta("Hel".into()), cx);
-                c.sent("steer".into(), cx);
+                c.sent("steer".into(), None, cx);
                 c.apply(Ev::TextDelta("lo".into()), cx);
                 c.apply(Ev::Text("Hello".into()), cx);
                 assert!(

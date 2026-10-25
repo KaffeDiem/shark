@@ -335,11 +335,14 @@ impl Shark {
         cx.notify();
     }
 
-    /// Trailing controls of a file card's header, after its "+a −d": the edit and comment
-    /// buttons go here.
-    fn card_header_suffix(&self, file: &DiffFile, shark: WeakEntity<Self>) -> Vec<AnyElement> {
+    /// Trailing controls of a file card's header, after its "+a −d": the review chip and
+    /// Comment button, then the edit buttons.
+    fn card_header_suffix(&self, file: &DiffFile, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let editing = self.editing.as_ref().map(|e| (e.path.clone(), e.dirty));
-        vec![inline_edit::edit_buttons(file, editing.as_ref(), shark)]
+        vec![
+            self.review_chips(file.path(), cx),
+            inline_edit::edit_buttons(file, editing.as_ref(), cx.entity().downgrade()),
+        ]
     }
 
     /// Files shows beside Changes and the file view, not the chat.
@@ -508,18 +511,6 @@ impl Shark {
         // Typing in the line input must not reach the pane's letter keys.
         let typing = (self.editing.as_ref()).is_some_and(|e| e.focused(window, cx));
         let status = self.edit_status();
-        let theme = cx.theme();
-        let footer = status.map(|status| {
-            div()
-                .flex_none()
-                .px_3()
-                .py_1p5()
-                .border_t_1()
-                .border_color(theme.border)
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(status)
-        });
         let pane = v_flex()
             .key_context(if typing { "DiffEdit" } else { "DiffPane" })
             .relative()
@@ -547,7 +538,16 @@ impl Shark {
                 cx.listener(|this, _: &SelectLast, w, cx| this.diff_move(0, Some(false), w, cx)),
             )
             .on_action(cx.listener(|this, _: &AddComment, w, cx| this.comment_dialog(w, cx)))
-            .on_action(cx.listener(|this, _: &SendComments, w, cx| this.send_comments(w, cx)))
+            .on_action(cx.listener(|this, _: &SendComments, w, cx| this.open_sheet(w, cx)))
+            .on_action(cx.listener(|this, _: &EditThread, w, cx| this.edit_thread(w, cx)))
+            .on_action(cx.listener(|this, _: &DeleteThread, _, cx| this.delete_thread(cx)))
+            .on_action(cx.listener(|this, _: &ViewChange, w, cx| this.view_change(w, cx)))
+            .on_action(cx.listener(|this, _: &ResolveThread, _, cx| this.resolve_thread(cx)))
+            .on_action(cx.listener(|this, _: &ReopenThread, _, cx| this.reopen_thread(cx)))
+            .on_action(cx.listener(|this, _: &NextThread, w, cx| this.thread_jump(true, w, cx)))
+            .on_action(cx.listener(|this, _: &PrevThread, w, cx| this.thread_jump(false, w, cx)))
+            .on_action(cx.listener(|this, _: &ResolveAddressed, _, cx| this.resolve_addressed(cx)))
+            .on_action(cx.listener(|this, _: &RequeueOutdated, _, cx| this.requeue_outdated(cx)))
             .on_action(cx.listener(|this, _: &NextHunk, w, cx| this.diff_change(true, w, cx)))
             .on_action(cx.listener(|this, _: &PrevHunk, w, cx| this.diff_change(false, w, cx)))
             .on_action(cx.listener(|this, _: &NextFile, _, cx| this.step_file(1, cx)))
@@ -572,8 +572,7 @@ impl Shark {
                             let shark = shark.clone();
                             move |file, _, cx| {
                                 h_flex().gap_1().children(
-                                    (shark.upgrade())
-                                        .map(|s| s.read(cx).card_header_suffix(file, shark.clone()))
+                                    (shark.update(cx, |s, cx| s.card_header_suffix(file, cx)))
                                         .unwrap_or_default(),
                                 )
                             }
@@ -594,14 +593,21 @@ impl Shark {
                                 })
                         }),
                 )
-            })
-            .children(footer);
+            });
         v_flex()
+            .relative()
             .flex_1()
             .min_w_0()
             .h_full()
             .when(!empty, |d| d.child(self.render_changes_bar(cx)))
             .child(pane)
+            .children(self.render_orphans(cx))
+            // One bottom bar: in edit mode it says what editing is doing.
+            .when(!empty, |d| {
+                d.child(self.render_review_bar(status.map(Into::into), cx))
+            })
+            .children(self.render_sheet(window, cx))
+            .children(self.render_share(cx))
             .into_any_element()
     }
 

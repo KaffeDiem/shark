@@ -390,11 +390,28 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| s.comment_dialog(w, cx),
     ),
     Row(
-        "Send diff comments to agent",
+        "Send review…",
         IconName::Send,
         Some(&SendComments),
-        "review",
-        |s, w, cx| s.send_comments(w, cx),
+        "review diff comments agent",
+        |s, w, cx| {
+            s.show(Tab::Diff, w, cx);
+            s.open_sheet(w, cx)
+        },
+    ),
+    Row(
+        "Resolve addressed",
+        IconName::Check,
+        Some(&ResolveAddressed),
+        "review comments threads",
+        |s, _, cx| s.resolve_addressed(cx),
+    ),
+    Row(
+        "Re-queue outdated",
+        IconName::RotateCcw,
+        Some(&RequeueOutdated),
+        "review comments threads pending",
+        |s, _, cx| s.requeue_outdated(cx),
     ),
     Row(
         "Save file",

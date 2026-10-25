@@ -44,6 +44,8 @@ mod menus;
 mod palette;
 mod picker;
 mod review;
+mod review_send;
+mod review_share;
 mod sidebar;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod ui_tests;

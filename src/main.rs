@@ -137,6 +137,24 @@ actions!(
     ]
 );
 
+// The review queue (src/app/review.rs): threads at the diff cursor, the composer, the sheet.
+actions!(
+    shark,
+    [
+        EditThread,
+        DeleteThread,
+        ViewChange,
+        ResolveThread,
+        ReopenThread,
+        NextThread,
+        PrevThread,
+        SuggestChange,
+        ToggleRow,
+        ResolveAddressed,
+        RequeueOutdated
+    ]
+);
+
 /// Switch the open workspace to `chat::MODELS[n]` without opening the menu.
 #[derive(Clone, PartialEq, Debug, serde::Deserialize, Action)]
 #[action(namespace = shark, no_json)]
@@ -151,13 +169,17 @@ fn bind_keys(cx: &mut App) {
     // Vim-style keys sit under `Vim`, which the root view carries while Vim mode is on
     // (Settings › General). The arrows, letters that name an action and cmd shortcuts work
     // either way. VimNormal: the editor in Vim's Normal mode.
-    const NAV: &str =
-        "Sidebar || Home || Transcript || DiffPane || FileTree || Queue || PlanPane || VimNormal";
+    const NAV: &str = concat!(
+        "Sidebar || Home || Transcript || (DiffPane && !Input) || FileTree || Queue || PlanPane",
+        " || VimNormal"
+    );
     const LIST: &str = "Sidebar || Home || Transcript || FileTree || Queue";
+    // The diff's letter keys; not while typing in the review composer, which sits in the diff.
+    const DIFF: &str = "DiffPane && !Input";
     // The diff's line cursor (src/app/review.rs) moves like a list. With Vim its arrows
     // scroll natively and j/k move the cursor; without, the arrows move it.
     const MOVE: &str =
-        "Sidebar || Home || Transcript || FileTree || Queue || DiffPane || PlanPane";
+        "Sidebar || Home || Transcript || FileTree || Queue || (DiffPane && !Input) || PlanPane";
     const ARROWS: &str =
         "Sidebar || Home || Transcript || FileTree || Queue || PlanPane || (Diff && !Vim)";
     let vim = |keys: &str, action: Box<dyn Action>, context: &str| {
@@ -197,8 +219,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-b", ToggleSidebar, None),
         KeyBinding::new("ctrl-cmd-v", ToggleVim, None),
         // In the diff: the file last moved to with `}`/`{` or the tree.
-        KeyBinding::new("v", ToggleViewed, Some("FileTree || DiffPane")),
-        KeyBinding::new("o", OpenFile, Some("FileTree || DiffPane")),
+        KeyBinding::new("v", ToggleViewed, Some("FileTree || (DiffPane && !Input)")),
+        KeyBinding::new("o", OpenFile, Some("FileTree || (DiffPane && !Input)")),
         KeyBinding::new("left", CollapseDir, Some("FileTree || Sidebar")),
         KeyBinding::new("right", ExpandDir, Some("FileTree || Sidebar")),
         KeyBinding::new("cmd-s", SaveFile, Some("FileEditor")),
@@ -255,18 +277,22 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-,", LowerEffort, None),
         KeyBinding::new("cmd->", RaiseEffort, None),
         KeyBinding::new("cmd-<", LowerEffort, None),
-        KeyBinding::new("alt-down", NextHunk, Some("DiffPane || PlanPane")),
-        KeyBinding::new("alt-up", PrevHunk, Some("DiffPane || PlanPane")),
-        KeyBinding::new("}", NextFile, Some("DiffPane")),
-        KeyBinding::new("{", PrevFile, Some("DiffPane")),
-        KeyBinding::new("s", ToggleDiffMode, Some("DiffPane")),
-        KeyBinding::new("r", RefreshDiff, Some("DiffPane")),
-        KeyBinding::new("p", PlayMedia, Some("DiffPane")),
+        KeyBinding::new(
+            "alt-down",
+            NextHunk,
+            Some("(DiffPane && !Input) || PlanPane"),
+        ),
+        KeyBinding::new("alt-up", PrevHunk, Some("(DiffPane && !Input) || PlanPane")),
+        KeyBinding::new("}", NextFile, Some(DIFF)),
+        KeyBinding::new("{", PrevFile, Some(DIFF)),
+        KeyBinding::new("s", ToggleDiffMode, Some(DIFF)),
+        KeyBinding::new("r", RefreshDiff, Some(DIFF)),
+        KeyBinding::new("p", PlayMedia, Some(DIFF)),
         KeyBinding::new("cmd-p", OpenAnyFile, None),
         // Edit the cursor file's working copy in the diff; cmd-s saves it there.
-        KeyBinding::new("i", EditWorkingCopy, Some("DiffPane")),
+        KeyBinding::new("i", EditWorkingCopy, Some(DIFF)),
         KeyBinding::new("cmd-s", SaveFile, Some("InlineEdit")),
-        KeyBinding::new("c", AddComment, Some("DiffPane")),
+        KeyBinding::new("c", AddComment, Some(DIFF)),
         // Plan mode; in the composer shift-tab is caught before the input outdents.
         KeyBinding::new(
             "shift-tab",
@@ -279,11 +305,41 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("a", ApprovePlan, Some("PlanPane")),
         KeyBinding::new("n", BuildPlanInNewChat, Some("PlanPane")),
         KeyBinding::new("i", FocusComposer, Some("PlanPane")),
-        KeyBinding::new("shift-c", SendComments, Some("DiffPane")),
+        KeyBinding::new("shift-c", SendComments, Some(DIFF)),
+        // Threads at the diff cursor. `r` resolves one, else falls through to RefreshDiff.
+        KeyBinding::new("e", EditThread, Some(DIFF)),
+        KeyBinding::new("x", DeleteThread, Some(DIFF)),
+        KeyBinding::new("d", ViewChange, Some(DIFF)),
+        KeyBinding::new("r", ResolveThread, Some(DIFF)),
+        KeyBinding::new("shift-r", ReopenThread, Some(DIFF)),
+        KeyBinding::new("] c", NextThread, Some(DIFF)),
+        KeyBinding::new("[ c", PrevThread, Some(DIFF)),
+        // The composer takes cmd-enter and escape from its textarea itself.
+        KeyBinding::new("cmd-shift-s", SuggestChange, Some("ReviewComposer")),
+        KeyBinding::new("space", ToggleRow, Some("ReviewSheet")),
+        KeyBinding::new("enter", Confirm, Some("ReviewSheet")),
+        KeyBinding::new("escape", CancelEdit, Some("ReviewSheet || ShareDialog")),
+        KeyBinding::new("cmd-enter", SubmitForm, Some("ReviewSheet || ShareDialog")),
+        KeyBinding::new("down", SelectNext, Some("ReviewSheet")),
+        KeyBinding::new("up", SelectPrev, Some("ReviewSheet")),
+        KeyBinding::new("j", SelectNext, Some("ReviewSheet")),
+        KeyBinding::new("k", SelectPrev, Some("ReviewSheet")),
     ]);
     cx.bind_keys([
-        vim("] c", Box::new(NextHunk), "DiffPane || PlanPane"),
-        vim("[ c", Box::new(PrevHunk), "DiffPane || PlanPane"),
+        vim(
+            "] c",
+            Box::new(NextHunk),
+            "(DiffPane && !Input) || PlanPane",
+        ),
+        vim(
+            "[ c",
+            Box::new(PrevHunk),
+            "(DiffPane && !Input) || PlanPane",
+        ),
+        // With threads in the diff, ]c / [c jump between them (the design's keys); without,
+        // they still go to the next change. alt-down / alt-up always do.
+        vim("] c", Box::new(NextThread), DIFF),
+        vim("[ c", Box::new(PrevThread), DIFF),
         vim("shift-k", Box::new(MoveQueuedUp), "Queue"),
         vim("shift-j", Box::new(MoveQueuedDown), "Queue"),
         vim("g t", Box::new(NextChat), NAV),
@@ -308,7 +364,7 @@ fn bind_keys(cx: &mut App) {
         (0..9).map(|i| KeyBinding::new(&format!("cmd-{}", i + 1), OpenWorkspace(i), None)),
     );
     // The Diff component's scroll actions are private; bind vim keys to them by name.
-    let diff = Rc::new(KeyBindingContextPredicate::parse("Vim > Diff").unwrap());
+    let diff = Rc::new(KeyBindingContextPredicate::parse("Vim > (Diff && !Input)").unwrap());
     let scroll = [("h", "diff::ScrollLeft"), ("l", "diff::ScrollRight")];
     let bindings: Vec<KeyBinding> = scroll
         .iter()
