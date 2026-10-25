@@ -78,9 +78,12 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 - **Sections:** groups inside the Workspaces list, above the ungrouped workspaces. A header is a 28px row: section icon (14px, picked from `SECTION_ICONS`, default `Folder`), name in `MEDIUM`, the count (`text_xs`) only while folded, then `ChevronDown`/`ChevronRight` (12px); all `muted_foreground`. Its workspaces indent 16px. New and renamed sections are named in place: the row turns into an `Input` with the focus ring, `enter` saves, `esc` cancels, clicking away saves. Drag a workspace onto a header to move it in, or onto a workspace to take its slot (in that workspace's section); drag a header onto another to reorder sections. A drop target shows the `primary` border. Deleting a section doesn't confirm (nothing is lost); in the rail a header is just its icon.
 - **Sidebar rail:** `cmd-b` shrinks the sidebar to 48px icons with tooltips; opening a file does it automatically and closing the file undoes it unless the user toggled it. The header then pads left to clear the traffic lights.
 - **File tree:** 260px column on the right of the Diff and file views, `Files` header with "n/m viewed", 28px rows indented 12px per level, then the `v` checkbox (a folder's box is ticked when all its files are viewed and toggles them all). Folders first; single-child folders are joined.
-- **Context menus:** right-click on sidebar rows (`.context_menu(..)`, gpui-kit `PopupMenu`). Follow the Apple HIG:
-  - A disabled label first that says what the menu acts on (branch, or repo + path).
-  - At most three groups: open/reveal (`Reveal in Finder`, `Open in Terminal`, `Copy Path`, one submenu each with "Workspace folder" plus one row per repo, every row showing its `~/…` path), then git (`Open Pull Requests`, hidden when there are none), then destructive (`Archive`, `Force Archive…`) last.
+- **Context menus:** right-click on sidebar rows opens `src/menu.rs`, drawn after Linear's menus (gpui-kit's `PopupMenu` hard-codes 26px rows, 2px separators and full-colour icons):
+  - `popover` surface, `radius` 8px, `p(4px)`, 200–340px wide, a 10% `foreground` ring plus a soft shadow instead of a border. 13px text.
+  - 28px rows, `px(8px) gap(8px)`, highlight an inset 4px-radius pill in 7% `foreground`; the text color doesn't change. Mouse and arrow keys share one highlight.
+  - 14px icons in `muted_foreground`; separators are 1px, full width, 4px space above and below.
+  - No header row: say what an item acts on with a right-aligned muted hint instead (the branch on `Copy Branch Name`, the `~/…` path on each path row).
+  - At most three groups: open/reveal (`Reveal in Finder`, `Open in Terminal`, `Copy Path`, one submenu each with "Workspace folder" plus one row per repo), then git (`Open Pull Requests`, hidden when there are none), then destructive (`Archive`, `Force Archive…`) last, in normal text like Linear's Delete.
   - Hide items that don't apply instead of disabling them. No shortcuts in the menu; every item also exists in the palette.
   - Title Case labels; an ellipsis only when the item asks for confirmation.
 - **Header:** 44px, `px_3`, `border_b_1` in `border`. Tabs on the left; on the right: branch (12px `GitBranch` + `text_xs`), the git button (`src/sync/`), optional badges, then status (6px `rounded_full` dot + "Running"/"Idle").
@@ -154,7 +157,7 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 | Keyboard hint | `Kbd::new(Keystroke::parse("cmd-k").unwrap())`, one chip per key of a chord |
 | Command palette entry | A row in `COMMANDS` in `src/app.rs`: label, `IconName`, handler |
 | Dialog with a form | `window.open_dialog` with a small `Render` entity (see `NewWorkspaceForm`) |
-| Right-click menu | `.context_menu(..)` with `PopupMenuItem::new(..).on_click(..)`; see `ws_menu` |
+| Right-click menu | `Shark::show_menu` with `menu::item(..)`, `menu::sub(..)`, `Entry::Sep`; see `ws_menu` |
 | Multi-select from a list | `Command` embedded in the form, items `.checked(..)`, `on_confirm` toggles (see `NewWorkspaceForm`) |
 | Destructive confirm | `window.open_alert_dialog`, `ButtonVariant::Danger` |
 | Feedback | `window.push_notification(Notification::success/error(..))`. No custom toasts |

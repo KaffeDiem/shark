@@ -5,6 +5,7 @@ mod complete;
 mod editor;
 mod files;
 mod git;
+mod menu;
 mod pr;
 mod prompts;
 mod settings;
