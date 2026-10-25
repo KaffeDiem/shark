@@ -123,6 +123,9 @@ pub struct ChatMeta {
     /// Plan mode: the agent plans and edits nothing until the plan is approved.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub plan: bool,
+    /// codex's Fast service tier, once toggled; `None` follows codex's own config.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fast: Option<bool>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -403,6 +406,7 @@ mod tests {
                 session_id: Some("s1".into()),
                 model: Some("opus".into()),
                 plan: false,
+                fast: None,
             }]
         );
         assert_eq!(ws.next_chat_id(), "feat~2");

@@ -108,17 +108,18 @@ impl Shark {
         }
     }
 
-    /// cmd-t: a new tab right of the current one, on the current chat's model.
+    /// cmd-t: a new tab right of the current one, on the current chat's model and speed.
     pub(super) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let model = self
-            .active_chat()
-            .and_then(|c| c.read(cx).meta.model.clone());
+        let (model, fast) = (self.active_chat())
+            .map(|c| (c.read(cx).meta.model.clone(), c.read(cx).meta.fast))
+            .unwrap_or_default();
         let Some(ws) = self.active_ws_mut() else {
             return notify_err(window, cx, "Open a workspace first");
         };
         let meta = ChatMeta {
             id: ws.next_chat_id(),
             model,
+            fast,
             ..Default::default()
         };
         let at = ws.active_chat + 1;
@@ -307,6 +308,19 @@ impl Shark {
             self.show(Tab::Chat, window, cx);
         }
         chat.update(cx, |c, cx| f(c, window, cx));
+    }
+
+    /// Fast on or off in the shown chat, toasting the result: a shortcut has no button in view.
+    pub(super) fn toggle_fast(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self.active_chat().cloned() else {
+            return notify_err(window, cx, "Open a workspace first");
+        };
+        if !chat.read(cx).codex() {
+            return notify_err(window, cx, "Fast mode needs a Codex model");
+        }
+        let on = !chat.read(cx).fast();
+        chat.update(cx, |c, cx| c.set_fast(on, cx));
+        window.push_notification(if on { "Fast mode on" } else { "Fast mode off" }, cx);
     }
 
     /// Approves the shown chat's plan and builds it in a new chat that gets only the plan, so

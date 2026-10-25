@@ -3,6 +3,7 @@
 //! become the same `Ev`s claude's stream-json does; tool items take claude's tool names so the
 //! chat summarizes them the same way.
 use crate::agent::{self, Agent, Ev, MAX_OUTPUT, clip_strings, cut, output, text_of};
+use crate::chat::ASK_IN_TEXT;
 use crate::state::{ChatMeta, Workspace};
 use gpui_kit::base::async_util::Receiver;
 use serde_json::{Value, json};
@@ -20,7 +21,8 @@ pub fn is_codex(model: Option<&str>) -> bool {
     model.is_some_and(|m| m == "codex" || m.starts_with("codex:"))
 }
 
-/// The thread messages go to, and the running turn an interrupt names.
+/// The thread messages go to, the running turn an interrupt names, and the settings each
+/// `turn/start` carries.
 #[derive(Default)]
 pub struct State {
     thread: Option<String>,
@@ -28,13 +30,25 @@ pub struct State {
     /// Messages sent before the thread exists.
     pending: Vec<String>,
     next: u64,
+    /// Plan mode: codex's `plan` collaboration mode, in a read-only sandbox.
+    pub plan: bool,
+    /// The Fast service tier, on or off; `None` leaves the thread on what codex's config says.
+    pub fast: Option<bool>,
+    /// The thread's model and reasoning effort, which a collaboration mode must name: a null
+    /// effort would drop the configured one.
+    model: String,
+    effort: Value,
 }
 
 pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receiver<Ev>)> {
     // SHARK_CODEX swaps in another binary, like SHARK_CLAUDE.
     let mut cmd = Command::new(std::env::var("SHARK_CODEX").unwrap_or("codex".into()));
     cmd.arg("app-server");
-    let st = Arc::new(Mutex::new(State::default()));
+    let st = Arc::new(Mutex::new(State {
+        plan: chat.plan,
+        fast: chat.fast,
+        ..Default::default()
+    }));
     if !ws.dir().join("AGENTS.md").exists() {
         crate::git::write_claude_md(ws); // a workspace from before codex chats
     }
@@ -53,7 +67,7 @@ pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receive
     // the messages once the thread is there.
     let version = env!("CARGO_PKG_VERSION");
     let mut lines = vec![
-        json!({"id": "init", "method": "initialize", "params": {"clientInfo": {"name": "shark", "version": version}}}),
+        json!({"id": "init", "method": "initialize", "params": {"clientInfo": {"name": "shark", "version": version}, "capabilities": {"experimentalApi": true}}}),
         json!({"method": "initialized"}),
     ];
     lines.push(match &chat.session_id {
@@ -78,19 +92,62 @@ fn flush(s: &mut State, stdin: &Mutex<ChildStdin>) -> std::io::Result<()> {
     };
     for text in std::mem::take(&mut s.pending) {
         s.next += 1;
-        let input = json!([{"type": "text", "text": text}]);
         agent::write(
             stdin,
-            &json!({"id": s.next, "method": "turn/start", "params": {"threadId": thread, "input": input}}),
+            &json!({"id": s.next, "method": "turn/start", "params": turn_params(&s, &thread, &text)}),
         )?;
     }
     Ok(())
+}
+
+/// A `turn/start`'s params. Mode, sandbox and tier hold for later turns too; sent with a
+/// message that joins a running turn, they take effect from the next one.
+fn turn_params(s: &State, thread: &str, text: &str) -> Value {
+    let (mode, sandbox) = match s.plan {
+        true => ("plan", json!({"type": "readOnly", "networkAccess": false})),
+        false => ("default", json!({"type": "dangerFullAccess"})),
+    };
+    // A null developer_instructions picks the mode's built-in prompt.
+    let settings =
+        json!({"model": s.model, "reasoning_effort": s.effort, "developer_instructions": null});
+    let mut p = json!({
+        "threadId": thread,
+        "input": [{"type": "text", "text": text}],
+        "collaborationMode": {"mode": mode, "settings": settings},
+        "sandboxPolicy": sandbox,
+    });
+    if let Some(fast) = s.fast {
+        p["serviceTier"] = if fast { "priority" } else { "default" }.into();
+    }
+    p
 }
 
 pub fn send(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, text: &str) -> std::io::Result<()> {
     let mut s = st.lock().unwrap();
     s.pending.push(text.into());
     flush(&mut s, stdin)
+}
+
+/// Whether codex's config puts threads on the Fast tier: what a chat gets until it toggles.
+// ponytail: top-level `service_tier` only; a profile or `-c` override isn't seen
+pub fn fast_by_config() -> bool {
+    let home = std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from);
+    let home =
+        home.or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".codex")));
+    let config = home.and_then(|h| std::fs::read_to_string(h.join("config.toml")).ok());
+    fast_in(&config.unwrap_or_default())
+}
+
+fn fast_in(config: &str) -> bool {
+    (config.lines())
+        .map(str::trim)
+        .take_while(|l| !l.starts_with('['))
+        .filter_map(|l| {
+            l.strip_prefix("service_tier")?
+                .trim_start()
+                .strip_prefix('=')
+        })
+        .any(|v| matches!(v.trim().trim_matches(['"', '\'']), "fast" | "priority"))
 }
 
 /// Errs before `turn/started` (the server refuses it until then), so the caller stops the
@@ -140,6 +197,16 @@ pub fn track(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, pid: u32, line: &str)
             "mcpServer/elicitation/request" => {
                 json!({"id": v["id"], "result": {"action": "decline"}})
             }
+            // Plan mode asks its questions this way; claude's AskUserQuestion gets the same.
+            "item/tool/requestUserInput" => {
+                let answers: serde_json::Map<String, Value> = (v["params"]["questions"].as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|q| q["id"].as_str())
+                    .map(|id| (id.into(), json!({"answers": [ASK_IN_TEXT]})))
+                    .collect();
+                json!({"id": v["id"], "result": {"answers": answers}})
+            }
             _ => {
                 json!({"id": v["id"], "error": {"code": -32601, "message": "not supported by shark"}})
             }
@@ -151,7 +218,10 @@ pub fn track(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, pid: u32, line: &str)
     match (id, method) {
         (Some("start" | "resume"), _) if v["error"].is_object() => crate::git::term(pid),
         (Some("start" | "resume"), _) => {
-            s.thread = v["result"]["thread"]["id"].as_str().map(Into::into);
+            let r = &v["result"];
+            s.thread = r["thread"]["id"].as_str().map(Into::into);
+            s.model = r["model"].as_str().unwrap_or_default().into();
+            s.effort = r["reasoningEffort"].clone();
             let _ = flush(&mut s, stdin);
         }
         (_, Some("turn/started")) => s.turn = v["params"]["turn"]["id"].as_str().map(Into::into),
@@ -174,6 +244,25 @@ pub fn parse(v: &Value) -> Vec<Ev> {
         (Some("item/agentMessage/delta"), _) => vec![Ev::TextDelta(s(&p["delta"]))],
         (Some("item/started"), Some("userMessage")) => vec![Ev::User(text_of(&item["content"]))],
         (Some("item/completed"), Some("agentMessage")) => vec![Ev::Text(s(&item["text"]))],
+        // Plan mode's `<proposed_plan>`, cut out of the reply: a row like claude's
+        // ExitPlanMode, then a version for the plan pane. The row comes first because the
+        // reply after the plan streams before the plan is complete.
+        (Some("item/started"), Some("plan")) => vec![Ev::ToolUse {
+            id: s(&item["id"]),
+            name: "ExitPlanMode".into(),
+            input: json!({"plan": ""}),
+        }],
+        (Some("item/completed"), Some("plan")) => {
+            let (id, text) = (s(&item["id"]), s(&item["text"]));
+            vec![
+                Ev::ToolResult {
+                    id: id.clone(),
+                    text: String::new(),
+                    is_error: false,
+                },
+                Ev::Plan { id, text },
+            ]
+        }
         (Some("item/started"), Some(kind)) => tool_use(kind, item).into_iter().collect(),
         (Some("item/completed"), Some(kind)) if tool_use(kind, item).is_some() => {
             vec![Ev::ToolResult {
@@ -327,9 +416,9 @@ mod tests {
     use std::borrow::Cow;
 
     // Recorded from codex-cli 0.164.0 (`codex app-server`), trimmed.
-    const SESSION: &str = r#"{"id": "init", "result": {"userAgent": "shark/0.164.0", "codexHome": "/Users/u/.codex"}}
+    const SESSION: &str = r##"{"id": "init", "result": {"userAgent": "shark/0.164.0", "codexHome": "/Users/u/.codex"}}
 {"error": {"code": -32600, "message": "no rollout found for thread id 0000"}, "id": "resume"}
-{"id": "start", "result": {"thread": {"id": "th1", "sessionId": "th1"}, "model": "gpt-6.1-sol"}}
+{"id": "start", "result": {"thread": {"id": "th1", "sessionId": "th1"}, "model": "gpt-6.1-sol", "reasoningEffort": "high", "serviceTier": "priority"}}
 {"method": "hook/started", "params": {"threadId": "th1", "turnId": "t1"}}
 {"method": "turn/started", "params": {"threadId": "th1", "turn": {"id": "t1", "items": [], "status": "inProgress"}}}
 {"method": "item/started", "params": {"item": {"type": "userMessage", "id": "u1", "content": [{"type": "text", "text": "run echo hi", "text_elements": []}]}, "threadId": "th1", "turnId": "t1"}}
@@ -351,7 +440,12 @@ mod tests {
 {"id": 8, "method": "mcpServer/elicitation/request", "params": {"threadId": "th1"}}
 {"error": {"code": -32600, "message": "no active turn to interrupt"}, "id": "interrupt"}
 {"error": {"code": -32600, "message": "config error"}, "id": "resume"}
-{"error": {"code": -32600, "message": "bad input"}, "id": 2}"#;
+{"error": {"code": -32600, "message": "bad input"}, "id": 2}
+{"id": "resume", "result": {"thread": {"id": "th1"}, "model": "gpt-6.1-sol", "serviceTier": null}}
+{"method": "item/started", "params": {"item": {"type": "plan", "id": "t6-plan", "text": ""}, "threadId": "th1", "turnId": "t6"}}
+{"method": "item/plan/delta", "params": {"threadId": "th1", "turnId": "t6", "itemId": "t6-plan", "delta": "#"}}
+{"method": "item/tool/requestUserInput", "id": 0, "params": {"threadId": "th1", "turnId": "t6", "itemId": "call_1", "questions": [{"id": "filename", "header": "Filename", "question": "Which file?", "isOther": true, "isSecret": false, "options": [{"label": "hello.txt", "description": ""}]}], "isBlocking": true}}
+{"method": "item/completed", "params": {"item": {"type": "plan", "id": "t6-plan", "text": "# Add hello.txt\n\n1. Create it.\n"}, "threadId": "th1", "turnId": "t6"}}"##;
 
     #[test]
     fn parses_app_server() {
@@ -416,8 +510,58 @@ mod tests {
                 },
                 done(true, "config error", 0), // not gone: the session stays
                 done(true, "bad input", 0),
+                // A plan's row as it starts; its text, in deltas, counts once complete.
+                Ev::ToolUse {
+                    id: "t6-plan".into(),
+                    name: "ExitPlanMode".into(),
+                    input: json!({"plan": ""}),
+                },
+                Ev::ToolResult {
+                    id: "t6-plan".into(),
+                    text: String::new(),
+                    is_error: false,
+                },
+                Ev::Plan {
+                    id: "t6-plan".into(),
+                    text: "# Add hello.txt\n\n1. Create it.\n".into(),
+                },
             ]
         );
+    }
+
+    /// Each `turn/start` names the mode, sandbox and tier, and the thread's model and effort.
+    #[test]
+    fn turns_carry_plan_mode_and_fast() {
+        let mut s = State {
+            model: "gpt-6.1-sol".into(),
+            effort: json!("high"),
+            ..Default::default()
+        };
+        let p = turn_params(&s, "th1", "hi");
+        assert_eq!(p["threadId"], "th1");
+        assert_eq!(p["input"], json!([{"type": "text", "text": "hi"}]));
+        assert_eq!(
+            p["collaborationMode"],
+            json!({"mode": "default", "settings": {"model": "gpt-6.1-sol", "reasoning_effort": "high", "developer_instructions": null}})
+        );
+        assert_eq!(p["sandboxPolicy"], json!({"type": "dangerFullAccess"}));
+        assert!(p.get("serviceTier").is_none(), "codex's config decides");
+        s.plan = true;
+        s.fast = Some(true);
+        let p = turn_params(&s, "th1", "hi");
+        assert_eq!(p["collaborationMode"]["mode"], "plan");
+        assert_eq!(
+            p["collaborationMode"]["settings"]["reasoning_effort"],
+            "high"
+        );
+        assert_eq!(
+            p["sandboxPolicy"],
+            json!({"type": "readOnly", "networkAccess": false}),
+            "plan mode edits nothing"
+        );
+        assert_eq!(p["serviceTier"], "priority");
+        s.fast = Some(false);
+        assert_eq!(turn_params(&s, "th1", "hi")["serviceTier"], "default");
     }
 
     #[test]
@@ -465,11 +609,23 @@ mod tests {
     }
 
     #[cfg(feature = "test-support")] // shares the UI tests' home
-    const FAKE: &str = r#"#!/bin/sh
+    const FAKE: &str = r##"#!/bin/sh
 while read -r l; do
   case "$l" in
+  *'"initialize"'*) case "$l" in *'"experimentalApi":true'*) ;; *) echo "no experimentalApi: $l" >&2; exit 4;; esac;;
   *'"thread/resume"'*) echo '{"id":"resume","error":{"code":-32600,"message":"no rollout found"}}';;
-  *'"thread/start"'*) echo '{"id":"start","result":{"thread":{"id":"th1"}}}';;
+  *'"thread/start"'*) echo '{"id":"start","result":{"thread":{"id":"th1"},"model":"m1","reasoningEffort":"high","serviceTier":"priority"}}';;
+  *'"turn/start"'*'"mode":"plan"'*)
+    for want in '"readOnly"' '"serviceTier":"default"' '"model":"m1"' '"reasoning_effort":"high"'; do
+      case "$l" in *"$want"*) ;; *) echo "plan turn lacks $want: $l" >&2; exit 5;; esac
+    done
+    echo '{"method":"turn/started","params":{"threadId":"th1","turn":{"id":"t2"}}}'
+    echo '{"id":10,"method":"item/tool/requestUserInput","params":{"threadId":"th1","questions":[{"id":"q1","question":"Which?"}]}}'
+    read -r reply
+    case "$reply" in *'"id":10'*'"q1"'*'Ask in plain'*) ;; *) echo "bad answer: $reply" >&2; exit 6;; esac
+    echo '{"method":"item/started","params":{"item":{"type":"plan","id":"t2-plan","text":""}}}'
+    echo '{"method":"item/completed","params":{"item":{"type":"plan","id":"t2-plan","text":"# P"}}}'
+    echo '{"method":"turn/completed","params":{"threadId":"th1","turn":{"id":"t2","status":"completed","durationMs":1000}}}';;
   *'"turn/start"'*)
     echo '{"method":"turn/started","params":{"threadId":"th1","turn":{"id":"t1"}}}'
     echo '{"id":9,"method":"mcpServer/elicitation/request","params":{"threadId":"th1"}}'
@@ -480,11 +636,11 @@ while read -r l; do
     echo '{"method":"turn/completed","params":{"threadId":"th1","turn":{"id":"t1","status":"completed","durationMs":2000}}}';;
   esac
 done
-"#;
+"##;
 
     #[cfg(feature = "test-support")] // shares the UI tests' home
     /// Runs the chat's process against a fake `codex app-server` until it exits or a turn ends.
-    fn run_fake(session_id: Option<&str>, tag: &str) -> Vec<Ev> {
+    fn run_fake(session_id: Option<&str>, tag: &str, plan: bool) -> Vec<Ev> {
         static FAKE_PATH: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         FAKE_PATH.get_or_init(|| {
             let dir = std::env::temp_dir().join(format!("shark-fake-codex-{}", std::process::id()));
@@ -509,6 +665,8 @@ done
             id: ws.name.clone(),
             model: Some("codex:gpt-6-astra".into()),
             session_id: session_id.map(Into::into),
+            plan,
+            fast: plan.then_some(false),
             ..Default::default()
         };
         let _turn = crate::app::ui_tests::UI_LOCK
@@ -543,7 +701,7 @@ done
     #[cfg(feature = "test-support")] // shares the UI tests' home
     #[test]
     fn runs_a_turn() {
-        let evs = run_fake(None, "turn");
+        let evs = run_fake(None, "turn", false);
         assert_eq!(
             evs,
             vec![
@@ -570,11 +728,36 @@ done
     /// message starts a new one.
     #[test]
     fn gone_thread_ends_the_process() {
-        let evs = run_fake(Some("old"), "gone");
+        let evs = run_fake(Some("old"), "gone", false);
         assert!(
             matches!(&evs[..], [Ev::Result { is_error: true, text, .. }, Ev::Exited(_)]
                 if text.starts_with("No conversation found with session ID")),
             "{evs:?}"
+        );
+    }
+
+    #[cfg(feature = "test-support")] // shares the UI tests' home
+    /// A chat in plan mode with Fast off starts its turns that way, and plan mode's question
+    /// is answered so the turn goes on to its plan.
+    #[test]
+    fn plans_a_turn() {
+        let evs = run_fake(None, "plan", true);
+        assert!(
+            matches!(&evs[..], [Ev::Init { .. }, Ev::ToolUse { name, .. }, Ev::ToolResult { .. }, Ev::Plan { id, text }, Ev::Result { is_error: false, .. }]
+                if name == "ExitPlanMode" && id == "t2-plan" && text == "# P"),
+            "{evs:?}"
+        );
+    }
+
+    #[test]
+    fn reads_fast_from_config() {
+        assert!(fast_in("model = \"m\"\nservice_tier = \"fast\"\n"));
+        assert!(fast_in("service_tier='priority'"));
+        assert!(!fast_in("service_tier = \"flex\""));
+        assert!(!fast_in(""));
+        assert!(
+            !fast_in("[profiles.x]\nservice_tier = \"fast\""),
+            "a profile's isn't the default"
         );
     }
 

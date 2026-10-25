@@ -240,6 +240,8 @@ pub struct Chat {
     pub steered: bool,
     /// What the CLI reported at init: its model, permission mode and MCP servers.
     reported: Option<String>,
+    /// codex's config puts threads on the Fast tier; `meta.fast` overrides it.
+    fast_by_config: bool,
     side: Option<Side>,
     /// Plan versions and the pane that shows them, next to the transcript while `plan_open`.
     pub plan: Entity<PlanPane>,
@@ -253,8 +255,8 @@ pub struct Chat {
 const PLAN_SHOWN: &str = "The user now sees this plan in the app's plan panel, where they \
     approve it or reply with changes. End your turn with one short sentence, without repeating \
     the plan. If they ask for changes, update the plan file and call ExitPlanMode again.";
-const ASK_IN_TEXT: &str = "This app can't show AskUserQuestion. Ask in plain text in your reply \
-    and end your turn.";
+pub(crate) const ASK_IN_TEXT: &str = "This app can't show questions like this one. Ask in plain \
+    text in your reply and end your turn.";
 const ENTER_PLAN: &str = "Only the user turns plan mode on in this app (shift-tab). Carry on, or \
     suggest it in your reply.";
 const NEEDS_APPROVAL: &str = "This needs the user's approval, which this app can't ask for. Do \
@@ -475,6 +477,7 @@ impl Chat {
             steered: false,
             side: None,
             reported: None,
+            fast_by_config: codex::fast_by_config(),
             plan_open,
             dropping: None,
             plan,
@@ -628,9 +631,6 @@ impl Chat {
                 self.meta.session_id = None;
                 self.push(Block::Info(format!("{m} starts a new conversation")), cx);
             }
-            if codex {
-                self.set_plan_mode(false, cx);
-            }
             self.meta.model = model;
             cx.emit(ChatEvent::Meta);
             cx.notify();
@@ -643,11 +643,10 @@ impl Chat {
         if self.meta.plan == on {
             return;
         }
-        if on && self.codex() {
-            self.push(Block::Info("plan mode needs a Claude model".into()), cx);
-            return;
-        }
         self.meta.plan = on;
+        if self.busy && self.codex() {
+            self.push(Block::Info("codex switches plan mode from the next message".into()), cx);
+        }
         if let Some(a) = &mut self.agent
             && let Err(e) = a.set_plan_mode(on)
         {
@@ -656,6 +655,22 @@ impl Chat {
         // The pane says what will appear there; with nothing in it, it goes with the mode.
         if on || self.plan.read(cx).versions.is_empty() {
             self.plan_open = on;
+        }
+        cx.emit(ChatEvent::Meta);
+        cx.notify();
+    }
+
+    /// codex's Fast service tier: its own default until toggled here.
+    pub fn fast(&self) -> bool {
+        self.meta.fast.unwrap_or(self.fast_by_config)
+    }
+
+    /// Fast on or off for a codex chat (callers check), from its next message (a running turn
+    /// keeps its tier).
+    pub fn set_fast(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.meta.fast = Some(on);
+        if let Some(a) = &mut self.agent {
+            a.set_fast(on);
         }
         cx.emit(ChatEvent::Meta);
         cx.notify();
@@ -1381,6 +1396,14 @@ impl Chat {
         self.follow(cx, |this, _| this.blocks.push(b));
     }
 
+    /// A submitted plan as the pane's newest version, shown.
+    fn show_plan(&mut self, id: String, text: String, cx: &mut Context<Self>) {
+        if !text.trim().is_empty() {
+            self.plan.update(cx, |p, cx| p.add(id, text, cx));
+            self.plan_open = true;
+        }
+    }
+
     fn apply(&mut self, ev: Ev, cx: &mut Context<Self>) {
         // Only a turn that ended well sends the next message; after a stop or an error the
         // queue waits for the user.
@@ -1542,10 +1565,7 @@ impl Chat {
                 let reason = match tool.as_str() {
                     "ExitPlanMode" => {
                         let text = input["plan"].as_str().unwrap_or_default().to_string();
-                        if !text.trim().is_empty() {
-                            self.plan.update(cx, |p, cx| p.add(tool_use_id, text, cx));
-                            self.plan_open = true;
-                        }
+                        self.show_plan(tool_use_id, text, cx);
                         PLAN_SHOWN
                     }
                     "AskUserQuestion" => ASK_IN_TEXT,
@@ -1557,6 +1577,20 @@ impl Chat {
                 {
                     self.blocks
                         .push(Block::Info(format!("answering the agent failed: {e}")));
+                }
+            }
+            // codex's turn goes on to its end by itself: there is no request to answer. The
+            // pane keeps its versions, so history doesn't add them again.
+            Ev::Plan { id, text } => {
+                let row = (self.blocks.iter()).rposition(|b| matches!(b, Block::Tool(c) if c.id == id));
+                if let Some(bi) = row
+                    && let Block::Tool(c) = &mut self.blocks[bi]
+                {
+                    c.summary = plan::title(&text); // its row started out empty
+                    self.remeasure(bi);
+                }
+                if !self.replaying {
+                    self.show_plan(id, text, cx);
                 }
             }
             Ev::Result {
@@ -2325,7 +2359,7 @@ impl Render for Chat {
                                     .gap_2()
                                     .text_xs()
                                     .text_color(muted)
-                                    .when(!self.codex(), |d| d.child(
+                                    .child(
                                         Button::new("plan-mode")
                                             .ghost()
                                             .xsmall()
@@ -2339,6 +2373,22 @@ impl Render for Chat {
                                             })
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.set_plan_mode(!this.meta.plan, cx)
+                                            })),
+                                    )
+                                    .when(self.codex(), |d| d.child(
+                                        Button::new("fast-mode")
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(IconName::Zap)
+                                            .label("Fast")
+                                            .selected(self.fast())
+                                            .tooltip_with_action(
+                                                "Fast: quicker replies that use more of your plan's usage",
+                                                &ToggleFastMode,
+                                                None,
+                                            )
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.set_fast(!this.fast(), cx)
                                             })),
                                     ))
                                     .child(
@@ -2951,7 +3001,7 @@ exec cat >/dev/null
         assert_eq!(clip(cx).as_deref(), Some("hi"));
     }
 
-    /// A codex model starts a new conversation (claude's session can't carry over) and has no
+    /// A codex model starts a new conversation (claude's session can't carry over) and keeps
     /// plan mode; another codex model keeps the thread.
     #[gpui_kit::test]
     fn codex_models_switch_backend(cx: &mut TestAppContext) {
@@ -2962,9 +3012,7 @@ exec cat >/dev/null
                 c.set_plan_mode(true, cx);
                 c.set_model("codex:gpt-6-astra", cx);
                 assert_eq!(c.meta.session_id, None);
-                assert!(!c.meta.plan, "plan mode ends");
-                c.set_plan_mode(true, cx);
-                assert!(!c.meta.plan, "and can't come back");
+                assert!(c.meta.plan, "plan mode stays");
                 c.meta.session_id = Some("th1".into());
                 c.set_model("codex:gpt-6.1-sol", cx);
                 assert_eq!(c.meta.session_id.as_deref(), Some("th1"));
@@ -2978,6 +3026,67 @@ exec cat >/dev/null
                     c.apply(ev, cx);
                 }
                 assert_eq!(c.meta.session_id, None);
+            })
+        });
+    }
+
+    /// A codex plan: its plan item is a version in the pane, which opens, and its row opens it
+    /// again; history shows the row without adding the version twice. Fast follows codex's config
+    /// until toggled.
+    #[gpui_kit::test]
+    fn codex_plan_mode_and_fast(cx: &mut TestAppContext) {
+        let chat = open_chat("codex-plan", cx);
+        let plan = r##"{"method":"item/completed","params":{"item":{"type":"plan","id":"t1-plan","text":"# Cache\n\nUse a map.\n"}}}"##;
+        let started = r#"{"method":"item/started","params":{"item":{"type":"plan","id":"t1-plan","text":""}}}"#;
+        let play = |c: &mut Chat, lines: &[&str], cx: &mut Context<Chat>| {
+            for l in lines {
+                for ev in agent::parse(l) {
+                    c.apply(ev, cx);
+                }
+            }
+        };
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.set_model("codex:gpt-6.1-sol", cx);
+                c.agent_model = c.meta.model.clone();
+                c.fast_by_config = true;
+                assert!(c.fast() && c.meta.fast.is_none(), "codex's config, untouched");
+                c.set_fast(false, cx);
+                assert!(!c.fast() && c.meta.fast == Some(false));
+                c.set_plan_mode(true, cx);
+                assert!(c.meta.plan && c.plan_open);
+                c.sent("plan a cache".into(), cx);
+                // In codex's order: the reply after the plan streams before the plan completes.
+                play(c, &[
+                    r#"{"method":"turn/started","params":{"threadId":"th1","turn":{"id":"t1"}}}"#,
+                    started,
+                    r#"{"method":"item/agentMessage/delta","params":{"itemId":"m","delta":"Done"}}"#,
+                    plan,
+                    r#"{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"m","text":"Done."}}}"#,
+                    r#"{"method":"turn/completed","params":{"threadId":"th1","turn":{"id":"t1","status":"completed","durationMs":1000}}}"#,
+                ], cx);
+                let texts: Vec<(&str, bool)> = (c.blocks.iter())
+                    .filter_map(|b| match b {
+                        Block::Text { src, done, .. } => Some((src.as_str(), *done)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(texts, [("Done.", true)], "the reply once, finished");
+                let p = c.plan.read(cx);
+                assert_eq!(p.versions.len(), 1);
+                assert_eq!(p.number_of("t1-plan"), Some(1));
+                assert!(c.plan_open && !c.busy);
+                assert!(
+                    c.blocks.iter().any(|b| matches!(b, Block::Tool(t) if t.name == "ExitPlanMode" && t.summary == "Cache")),
+                    "a Plan row"
+                );
+                c.plan_open = false;
+                c.replaying = true;
+                play(c, &[started, plan], cx);
+                c.replaying = false;
+                assert_eq!(c.plan.read(cx).versions.len(), 1, "history adds no version");
+                assert!(!c.plan_open);
+                plan::delete(&c.meta.id);
             })
         });
     }
@@ -3350,6 +3459,10 @@ exec cat >/dev/null
             branch: "b".into(),
             ..Default::default()
         };
+        // test_home wipes workspace dirs: hold the lock it runs under.
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (dir, src) = (
             ws.dir(),
             std::env::temp_dir().join(format!("shark-drop-{}", std::process::id())),

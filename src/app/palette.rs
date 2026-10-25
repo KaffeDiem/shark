@@ -218,6 +218,13 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| s.pick_model(w, cx),
     ),
     Row(
+        "Toggle fast mode",
+        IconName::Zap,
+        Some(&ToggleFastMode),
+        "codex speed priority tier",
+        |s, w, cx| s.toggle_fast(w, cx),
+    ),
+    Row(
         "Interrupt agent",
         IconName::Square,
         Some(&StopAgent),
@@ -521,7 +528,8 @@ pub(super) const COMMANDS: &[Row] = &[
 ];
 
 /// Rows that only a Claude chat can do; a Codex chat's palette leaves them out.
-const CLAUDE_ONLY: &[&str] = &["Ask a side question", "Toggle plan mode"];
+const CLAUDE_ONLY: &[&str] = &["Ask a side question"];
+const CODEX_ONLY: &[&str] = &["Toggle fast mode"];
 
 /// The palette's headings, each with the label of the row it starts at.
 const GROUPS: &[(&str, &str)] = &[
@@ -661,7 +669,7 @@ impl Shark {
             if let Some((heading, _)) = GROUPS.iter().find(|(_, first)| first == label) {
                 groups.push((Some(heading), vec![]));
             }
-            if codex && CLAUDE_ONLY.contains(label) {
+            if (if codex { CLAUDE_ONLY } else { CODEX_ONLY }).contains(label) {
                 continue;
             }
             rows.push(Pick::Cmd(ix));
@@ -713,7 +721,7 @@ mod tests {
         for (heading, first) in GROUPS {
             assert!(COMMANDS.iter().any(|r| r.0 == *first), "{heading}: no row {first}");
         }
-        for label in CLAUDE_ONLY {
+        for label in CLAUDE_ONLY.iter().chain(CODEX_ONLY) {
             assert!(COMMANDS.iter().any(|r| r.0 == *label), "no row {label}");
         }
     }

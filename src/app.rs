@@ -720,6 +720,7 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &TogglePlanMode, w, cx| {
                 this.with_plan(w, cx, |c, _, cx| c.set_plan_mode(!c.meta.plan, cx))
             }))
+            .on_action(cx.listener(|this, _: &ToggleFastMode, w, cx| this.toggle_fast(w, cx)))
             .on_action(cx.listener(|this, _: &TogglePlan, w, cx| {
                 this.with_plan(w, cx, |c, w, cx| c.toggle_plan(w, cx))
             }))
