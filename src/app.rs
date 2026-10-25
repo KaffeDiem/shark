@@ -18,7 +18,9 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::link::Link;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::resizable::{h_resizable, resizable_panel};
+use gpui_kit::component::resizable::{
+    ResizablePanelEvent, ResizableState, h_resizable, resizable_panel,
+};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
@@ -190,6 +192,11 @@ pub struct Shark {
     tree_sel: usize,
     tree_focus: FocusHandle,
     tree_scroll: UniformListScrollHandle,
+    /// The Files panel's "Filter files…" box, and its text the tree filters by.
+    tree_filter: Entity<InputState>,
+    tree_query: String,
+    /// The island | Files split, kept across tabs; its width also persists in `State`.
+    tree_resize: Entity<ResizableState>,
     sidebar_scroll: ScrollHandle,
     /// The chat tab strip, which scrolls sideways once the tabs outgrow the header.
     tab_scroll: ScrollHandle,
@@ -239,6 +246,8 @@ impl Shark {
             state.save();
         }
         let home = home::Home::new(window, cx);
+        let unified = state.unified;
+        let tree_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files…"));
         cx.defer_in(window, move |s, window, cx| {
             s.restore_last_open(window, cx);
             s.check_deps(cx);
@@ -260,7 +269,24 @@ impl Shark {
         cx.background_executor()
             .spawn(async { media::prune_cache() })
             .detach();
+        let tree_resize = cx.new(|_| ResizableState::default());
         let _subs = vec![
+            // A drag of the Files edge: remember the width for the next launch.
+            cx.subscribe(&tree_resize, |s, r, _: &ResizablePanelEvent, cx| {
+                if let Some(w) = r.read(cx).sizes().get(1) {
+                    s.state.tree_width = Some(w.as_f32());
+                    s.state.save();
+                }
+            }),
+            cx.subscribe_in(
+                &tree_filter,
+                window,
+                |s, input, ev: &InputEvent, w, cx| match ev {
+                    InputEvent::Change => s.filter_tree(input.read(cx).value().to_string(), cx),
+                    InputEvent::PressEnter { .. } => s.filter_jump(w, cx),
+                    _ => {}
+                },
+            ),
             // Keys need a rendered target. A closing dialog gives focus back to what had it
             // when it opened, which may be gone by then: a closed select's popover, or Home
             // after what the dialog did (open a workspace) took Home away.
@@ -289,7 +315,12 @@ impl Shark {
             awake: None,
             unread: HashSet::new(),
             tab: Tab::Chat,
-            diff: cx.new(|cx| DiffState::new(vec![], cx)),
+            diff: cx.new(|cx| {
+                DiffState::new(vec![], cx).with_mode(match unified {
+                    true => DiffMode::Unified,
+                    false => DiffMode::Split,
+                })
+            }),
             diff_files: vec![],
             diff_fps: vec![],
             diff_fp: 0,
@@ -303,6 +334,9 @@ impl Shark {
             tree_sel: 0,
             tree_focus: cx.focus_handle(),
             tree_scroll: UniformListScrollHandle::new(),
+            tree_filter,
+            tree_query: String::new(),
+            tree_resize,
             sidebar_scroll: ScrollHandle::new(),
             tab_scroll: ScrollHandle::new(),
             archiving: HashSet::new(),
@@ -455,7 +489,7 @@ impl Shark {
             Tab::Diff => v.push(Pane::Diff),
             Tab::File => v.extend([Pane::Chat, Pane::Editor]),
         }
-        if self.tab != Tab::Chat && self.show_tree && self.active.is_some() {
+        if self.tree_shown() {
             v.push(Pane::Tree);
         }
         v
@@ -636,13 +670,11 @@ impl Shark {
                             )
                             .child(resizable_panel().child(self.render_editor(cx))),
                     )
-                    .when(self.show_tree, |d| d.child(self.render_tree(window, cx)))
                     .into_any_element(),
                 Tab::Diff => h_flex()
                     .flex_1()
                     .min_h_0()
                     .child(self.render_diff(cx))
-                    .when(self.show_tree, |d| d.child(self.render_tree(window, cx)))
                     .into_any_element(),
             })
             .into_any_element()
@@ -834,16 +866,20 @@ impl Render for Shark {
             .child(self.render_sidebar(window, cx))
             .children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))
             .child(
-                // Linear's "island": content floats on the sidebar color, inset and rounded.
-                div().flex_1().min_w_0().h_full().py_2().pr_2().child(
-                    h_flex()
-                        .size_full()
-                        .rounded(cx.theme().radius_lg)
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .bg(cx.theme().background)
-                        .overflow_hidden()
-                        .child(self.render_main(window, cx)),
+                self.with_tree(
+                    // Linear's "island": content floats on the sidebar color, inset and rounded.
+                    div().size_full().py_2().pr_2().child(
+                        h_flex()
+                            .size_full()
+                            .rounded(cx.theme().radius_lg)
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .bg(cx.theme().background)
+                            .overflow_hidden()
+                            .child(self.render_main(window, cx)),
+                    ),
+                    window,
+                    cx,
                 ),
             )
     }

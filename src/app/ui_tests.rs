@@ -2012,3 +2012,116 @@ async fn home_checklist(cx: &mut TestAppContext) {
     assert!(!done(cx).1, "dismissed");
     fs::remove_dir_all(&home).ok();
 }
+
+/// Changes' toolbar and the Files panel: counts, Split / Unified, the filter and its Enter,
+/// viewed boxes, and a Files width that survives Chat ↔ Changes and a restart.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let options = || WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+            point(px(0.), px(0.)),
+            size(px(1440.), px(900.)),
+        ))),
+        ..Default::default()
+    };
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        options(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| {
+        s.create_workspace("tb".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let api = home.join("shark/workspaces/tb/api");
+    fs::create_dir_all(api.join("src")).unwrap();
+    fs::write(api.join("a.md"), "x\n").unwrap();
+    fs::write(api.join("src/b.rs"), "1\n2\n").unwrap();
+    fs::write(api.join("src/chat.rs"), "1\n2\n3\n").unwrap();
+    on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+    let base = cx.update(|cx| shark.read(cx).state.workspaces[0].repos[0].base.clone());
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.changes_stats(), (base.clone(), 6, 0));
+        assert_eq!((s.viewed_now.len(), s.diff_files.len()), (0, 3));
+        assert!(s.tree_shown(), "Files is open beside Changes");
+        assert_eq!(s.diff.read(cx).mode(), DiffMode::Split, "split by default");
+    });
+
+    // `s` flips Split / Unified, and the choice persists.
+    press(cx, &["s"]);
+    cx.update(|cx| assert_eq!(shark.read(cx).diff.read(cx).mode(), DiffMode::Unified));
+    assert!(State::load().unified);
+    press(cx, &["s"]);
+    assert!(!State::load().unified);
+
+    // The filter narrows the tree; its rows keep their file; Enter shows it in the diff.
+    let input = cx.update(|cx| shark.read(cx).tree_filter.read(cx).focus_handle(cx));
+    on(cx, &|_, w, cx| input.focus(w, cx));
+    cx.update_window(window, |_, w, cx| w.input("CHAT", cx))
+        .unwrap();
+    cx.run_until_parked();
+    let chat_ix = cx.update(|cx| {
+        let s = shark.read(cx);
+        let files: Vec<usize> = s.tree_rows.iter().filter_map(|r| r.file).collect();
+        assert_eq!(files.len(), 1, "only chat.rs matches");
+        assert_eq!(s.diff_files[files[0]].path().as_str(), "api/src/chat.rs");
+        files[0]
+    });
+    press(cx, &["enter"]);
+    cx.update_window(window, |_, w, cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.diff_file, chat_ix, "Enter jumps to the match");
+        assert!(s.diff.read(cx).focus_handle(cx).is_focused(w));
+    })
+    .unwrap();
+
+    // A viewed box ticks the file, and the counts follow.
+    on(cx, &|s, _, cx| s.toggle_viewed(chat_ix, cx));
+    cx.update(|cx| assert_eq!(shark.read(cx).viewed_now.len(), 1));
+
+    // The Files edge: a dragged width persists and survives Chat ↔ Changes.
+    let resize = cx.update(|cx| shark.read(cx).tree_resize.clone());
+    on(cx, &|_, w, cx| {
+        resize.update(cx, |r, cx| r.resize_panel(1, px(333.), w, cx))
+    });
+    assert_eq!(State::load().tree_width, Some(333.));
+    on(cx, &|s, w, cx| s.show(Tab::Chat, w, cx));
+    cx.update(|cx| assert!(!shark.read(cx).tree_shown(), "no Files beside the chat"));
+    on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.diff_file, chat_ix, "file selection kept");
+        assert_eq!(s.tree_query, "chat", "filter kept");
+        assert_eq!(s.tree_resize.read(cx).sizes()[1], px(333.));
+    });
+
+    // A restart opens Files at the saved width, in the saved mode.
+    cx.update_window(window, |_, w, _| w.remove_window())
+        .unwrap();
+    let (window2, shark2) = open(cx, options());
+    cx.run_until_parked();
+    cx.update_window(window2, |_, w, cx| w.render_frame(cx))
+        .unwrap();
+    cx.update(|cx| {
+        let s = shark2.read(cx);
+        assert!(s.tree_shown());
+        assert_eq!(s.tree_resize.read(cx).sizes()[1], px(333.));
+        assert_eq!(s.diff.read(cx).mode(), DiffMode::Split);
+    });
+    cx.update_window(window2, |_, w, _| w.remove_window())
+        .unwrap();
+    fs::remove_dir_all(&home).ok();
+}

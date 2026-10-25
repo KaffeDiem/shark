@@ -57,6 +57,12 @@ pub struct State {
     pub last_model: Option<String>,
     #[serde(default)]
     pub last_effort: Option<String>,
+    /// Changes shows one column instead of Original | Working copy (`s`).
+    #[serde(default)]
+    pub unified: bool,
+    /// The Files panel's width, once dragged.
+    #[serde(default)]
+    pub tree_width: Option<f32>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
