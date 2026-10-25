@@ -527,18 +527,31 @@ fn render_diff(
         state.set_content_width(width);
     }
     state.sync_annotations(&props.annotations.items);
-    // Rows fill at least the cards' visible width; the width doesn't depend on the ratio, so
-    // the divider follows the pointer, and a column narrower than its longest line clips it.
-    let content_width = (state.content_width()).max(state.viewport().width - CARD_INSET * 2.);
-    let left_width = content_width * state.split_ratio();
+    // Cards, headers and annotations take the view's width (the longest line's before the first
+    // paint); only code scrolls sideways, as far as the narrower column needs for the widest line.
+    let viewport_width = state.viewport().width;
+    let content_width = match viewport_width > px(0.) {
+        true => viewport_width - CARD_INSET * 2.,
+        false => state.content_width(),
+    }
+    .max(px(0.));
+    let ratio = state.split_ratio();
+    let left_width = content_width * ratio;
+    let (needed, narrow) = match mode {
+        DiffMode::Split => (state.content_width() * 0.5, content_width * ratio.min(1. - ratio)),
+        _ => (state.content_width(), content_width),
+    };
+    let overflow = match soft_wrap {
+        true => px(0.),
+        false => (needed - narrow).max(px(0.)),
+    };
     let code = Rc::new(CodePresentation {
         files: state.files().to_vec(),
         presentations: state.presentations().to_vec(),
         mode,
         content_width,
         left_width,
-        viewport_width: state.viewport().width,
-        scroll_x: -state.horizontal_scroll().offset().x,
+        scroll_x: (-state.horizontal_scroll().offset().x).clamp(px(0.), overflow),
         font_size,
         row_height,
         gutter_width,
@@ -582,14 +595,23 @@ fn render_diff(
         .min_h_0()
         .min_w_0()
         .flex_1()
-        .child(SelectionLayer::new(
+        // The scrollbar gets its own strip under the rows.
+        .when(overflow > px(0.), |this| this.pb(px(16.)))
+        // Only tracks the sideways scroll: the code rows shift their text by it. Without
+        // GPUI's single-axis wheel remapping; the sibling mask owns X input.
+        .child(
             div()
                 .id("diff-horizontal")
-                .size_full()
-                // Preserve offset tracking and clipping without GPUI's
-                // single-axis wheel remapping. The sibling mask owns X input.
-                .when(!soft_wrap, |this| this.overflow_x_hidden())
+                .absolute()
+                .inset_0()
+                .overflow_x_hidden()
                 .track_scroll(&horizontal)
+                .child(div().w(viewport_width + overflow).h(px(1.))),
+        )
+        .child(SelectionLayer::new(
+            div()
+                .size_full()
+                .overflow_x_hidden()
                 .child(gpui_base::ScrollBounce::new(
                     "diff-bounce",
                     &scrollbar,
@@ -616,8 +638,7 @@ fn render_diff(
                             )
                             .into_any_element()
                     })
-                    .w(content_width + CARD_INSET * 2.)
-                    .h_full(),
+                    .size_full(),
                 ))
                 .into_any_element(),
             scrollbar.clone(),
@@ -809,9 +830,7 @@ struct CodePresentation {
     content_width: Pixels,
     /// The original column's width in Split mode; the modified one takes the rest.
     left_width: Pixels,
-    /// The body's painted width (zero before the first paint), and how far it is scrolled
-    /// right: file headers stay within it.
-    viewport_width: Pixels,
+    /// How far the code is scrolled right.
     scroll_x: Pixels,
     font_size: Pixels,
     row_height: Pixels,
@@ -851,29 +870,6 @@ impl CodePresentation {
             side,
             document.line_number(side, ix),
         )
-    }
-
-    /// Where `side`'s column of `file` lies in a row.
-    fn column(&self, file: usize, side: DiffSide) -> (Pixels, Pixels) {
-        let split = self.mode == DiffMode::Split && !self.files[file].is_single_column();
-        match (split, side) {
-            (true, DiffSide::Original) => (px(0.), self.left_width),
-            (true, DiffSide::Modified) => (self.left_width, self.content_width),
-            _ => (px(0.), self.content_width),
-        }
-    }
-
-    /// The part of row span `start..end` in view, as an offset from `start` and a width: rows
-    /// scroll sideways, but headers and annotations stay on what is visible. Never narrower
-    /// than 240 px (or the span), so off-screen ones don't wrap into tall rows.
-    fn pinned(&self, (start, end): (Pixels, Pixels)) -> (Pixels, Pixels) {
-        if self.viewport_width <= px(0.) {
-            return (px(0.), end - start);
-        }
-        let left = (self.scroll_x - CARD_INSET).max(start);
-        let right = (self.scroll_x + self.viewport_width - CARD_INSET).min(end);
-        let width = (right - left).max((end - start).min(px(240.)));
-        (left.min(end - width) - start, width)
     }
 
     fn is_selected(&self, file: usize, side: DiffSide, ix: usize) -> bool {
@@ -1306,9 +1302,6 @@ fn render_file_header(
         .map(|headings| headings(document, window, cx));
     let state = code.state.clone();
     let name = document.path().clone();
-    // Rows are as wide as the longest line and scroll sideways; the header bar stays on the
-    // visible part, so its suffix is at the body's right edge.
-    let (bar_left, bar_width) = code.pinned((px(0.), code.content_width));
     v_flex()
         .id("file-header")
         .w_full()
@@ -1316,9 +1309,7 @@ fn render_file_header(
         .border_color(border)
         .child(
             h_flex()
-                .relative()
-                .left(bar_left)
-                .w(bar_width)
+                .w_full()
                 .min_w_0()
                 .rounded_t(px(7.))
                 .when(collapsed, |this| this.rounded_b(px(7.)))
@@ -1397,7 +1388,7 @@ fn file_annotations(
         .get(path)
         .cloned()
         .unwrap_or_default();
-    annotation_elements(&ixs, (px(0.), code.content_width), code, window, cx)
+    annotation_elements(&ixs, code, window, cx)
 }
 
 /// Summarizes a file without source rows: binary, metadata-only or empty.
@@ -1607,7 +1598,7 @@ fn render_unified_cell(
         ]
     };
     v_flex()
-        .w(code.content_width)
+        .w_full()
         .id((
             if side == DiffSide::Original {
                 "old"
@@ -1791,6 +1782,8 @@ fn code_line(
     };
     // A block container gives wrapped text a definite width to break at.
     let text = div()
+        .relative()
+        .left(-code.scroll_x)
         .map(|this| {
             if code.soft_wrap {
                 this.w_full()
@@ -1899,13 +1892,10 @@ fn code_line(
             div()
                 .id("source")
                 .test_support()
-                .map(|this| {
-                    if code.soft_wrap || working.is_some() {
-                        this.flex_1().min_w_0()
-                    } else {
-                        this.flex_shrink_0()
-                    }
-                })
+                // The code scrolls sideways within its column; the gutter stays.
+                .flex_1()
+                .min_w_0()
+                .overflow_x_hidden()
                 .role(gpui::accesskit::Role::Label)
                 .aria_label(source_line.text().clone())
                 .aria_description(
@@ -1997,13 +1987,12 @@ fn line_annotations(
         .get(&position)
         .cloned()
         .unwrap_or_default();
-    annotation_elements(&ixs, code.column(file, side), code, window, cx)
+    annotation_elements(&ixs, code, window, cx)
 }
 
-/// Annotations under a line or header, kept on the visible part of row span `span`.
+/// Annotations under a line or header.
 fn annotation_elements(
     ixs: &[usize],
-    span: (Pixels, Pixels),
     code: &CodePresentation,
     window: &mut Window,
     cx: &mut App,
@@ -2011,15 +2000,11 @@ fn annotation_elements(
     let Some(render) = &code.annotation_content else {
         return Vec::new();
     };
-    let (left, width) = code.pinned(span);
     ixs.iter()
         .map(|ix| {
             let annotation = &code.annotations.items[*ix];
             div()
                 .id(annotation.id.clone())
-                .relative()
-                .left(left)
-                .w(width)
                 .px_3()
                 .py_3()
                 .border_t_1()

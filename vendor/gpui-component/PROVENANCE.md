@@ -13,8 +13,7 @@ All in `src/diff/` (and `src/checkbox.rs`, one string in `locales/ui.yml`), test
 
 1. **Split ratio** (`state.rs`, `mod.rs`): `DiffState::split_ratio` /
    `set_split_ratio` (clamped 0.2–0.8, default 0.5). The original column is
-   `content_width * ratio` and the modified one the rest; the content width is
-   widened so the narrower column still fits the widest line.
+   `content_width * ratio` of the row and the modified one the rest.
 2. **Draggable divider** (`mod.rs` `render_divider`, `state.rs`
    `begin/drag/end_divider_drag`): a 6 px col-resize strip at the column
    boundary of Split code rows. Dragging sets the ratio; releasing emits the new
@@ -31,15 +30,18 @@ All in `src/diff/` (and `src/checkbox.rs`, one string in `locales/ui.yml`), test
    longer line widens the rows when painted); `DiffState::show_line` expands
    the fold hiding a line and scrolls only as far as needed; `DiffState::scroll_top`
    reads the scroll position.
-6. **Pinned file headers** (`mod.rs` `render_file_header`): rows are as wide as
-   the longest line and scroll sideways, so a header's suffix sat at the far end
-   of the content. The header bar now takes the body's painted width and is
-   offset by the horizontal scroll, keeping prefix, name and suffix in view
-   (`CodePresentation::viewport_width` / `scroll_x`). Tested by Shark's
-   `card_header_pinned` UI test.
-7. **Pinned annotations** (`mod.rs` `CodePresentation::pinned`, `annotation_elements`): line
-   and file annotations (review threads, the composer) likewise keep to the visible part of
-   their column, so only code scrolls sideways.
+6. **Only code scrolls sideways** (`mod.rs` `render_diff`, `code_line`): upstream rows
+   are as wide as the longest line and the whole list scrolls sideways, cards, headers
+   and annotations with it. Rows now take the view's width; each line's code is shifted
+   by the horizontal scroll and clipped to its column (`CodePresentation::scroll_x`),
+   which reaches as far as the narrower column needs for the widest line. The scroll
+   handle is tracked by an empty `diff-horizontal` layer sized to that range, and the
+   horizontal scrollbar gets its own 16 px strip under the rows. Tested (through the
+   test-only `SelectionGeometry::run_bounds` in `selection.rs`) by
+   `only_code_scrolls_sideways_and_the_narrow_column_reaches_its_longest_line` and
+   Shark's `card_header_pinned` UI test.
+7. **Annotations** (`mod.rs` `annotation_elements`): line and file annotations (review
+   threads, the composer) fill their column or row; with 6 they no longer scroll.
 8. **File cards** (`mod.rs` list rows, `render_file_header`): each file's rows form one
    rounded, bordered card, 16 px in from the sides with 12 px between cards
    (`CARD_INSET`, `CARD_GAP`); the header has a tinted bar; the outer border is gone.

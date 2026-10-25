@@ -2831,8 +2831,8 @@ async fn review_queue(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
-/// A file card's header buttons stay at the diff's right edge, though a long line makes the
-/// rows wider than the view and the view scrolls sideways.
+/// A file card's header buttons stay at the diff's right edge, though a long line is wider
+/// than the view and its code scrolls sideways.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn card_header_pinned(cx: &mut TestAppContext) {
@@ -2882,7 +2882,7 @@ async fn card_header_pinned(cx: &mut TestAppContext) {
         .unwrap();
     };
     check(cx);
-    // Scrolled sideways (the line numbers move left): the header stays.
+    // Scrolled sideways: the header stays.
     let plus = |w: &Window| w.find(("line", 0usize)).bounds().left();
     let before = cx
         .update_window(window, |_, w, _| {
@@ -2908,11 +2908,8 @@ async fn card_header_pinned(cx: &mut TestAppContext) {
             (plus(w), w.find("edit-working-copy").bounds())
         })
         .unwrap();
-    assert!(
-        after.0 < before.0,
-        "the rows scrolled: {before:?} → {after:?}"
-    );
-    assert_eq!(after.1, before.1, "the header did not");
+    // Only the code scrolls: line numbers and the header stay.
+    assert_eq!(after, before);
     fs::remove_dir_all(&home).ok();
 }
 
