@@ -1,10 +1,13 @@
 mod agent;
 mod app;
 mod chat;
+mod editor;
+mod files;
 mod git;
 mod pr;
 mod state;
 mod sync;
+mod vim;
 
 use gpui_kit::component::{Theme, ThemeConfig, ThemeRegistry, ThemeSet, TitleBar};
 use gpui_kit::*;
@@ -20,8 +23,8 @@ actions!(
         ForceArchiveWorkspace,
         AddRepo,
         StopAgent,
-        FocusSidebar,
-        FocusMain,
+        FocusLeft,
+        FocusRight,
         ShowChat,
         ShowDiff,
         CreatePrs,
@@ -45,6 +48,15 @@ actions!(
         ToggleDiffMode,
         RefreshDiff,
         PickModel,
+        ToggleSidebar,
+        ToggleFileTree,
+        ToggleViewed,
+        OpenFile,
+        CollapseDir,
+        ExpandDir,
+        SaveFile,
+        CloseFile,
+        ToggleVim,
     ]
 );
 
@@ -67,15 +79,26 @@ fn fix_path() {
 }
 
 fn bind_keys(cx: &mut App) {
-    const NAV: &str = "Sidebar || Transcript || DiffPane";
-    const LIST: &str = "Sidebar || Transcript";
+    const NAV: &str = "Sidebar || Transcript || DiffPane || FileTree";
+    const LIST: &str = "Sidebar || Transcript || FileTree";
     cx.bind_keys([
         KeyBinding::new("cmd-k", TogglePalette, None),
         KeyBinding::new("cmd-shift-p", TogglePalette, None),
         KeyBinding::new("cmd-n", NewWorkspace, None),
         KeyBinding::new("ctrl-c", StopAgent, None),
-        KeyBinding::new("ctrl-w h", FocusSidebar, None),
-        KeyBinding::new("ctrl-w l", FocusMain, None),
+        KeyBinding::new("ctrl-w h", FocusLeft, None),
+        KeyBinding::new("ctrl-w l", FocusRight, None),
+        KeyBinding::new("cmd-b", ToggleSidebar, None),
+        KeyBinding::new("space b", ToggleSidebar, Some(NAV)),
+        KeyBinding::new("space t", ToggleFileTree, Some(NAV)),
+        KeyBinding::new("space x", CloseFile, Some(NAV)),
+        KeyBinding::new("ctrl-cmd-v", ToggleVim, None),
+        KeyBinding::new("v", ToggleViewed, Some("FileTree || DiffPane")),
+        KeyBinding::new("o", OpenFile, Some("FileTree || DiffPane")),
+        KeyBinding::new("h", CollapseDir, Some("FileTree")),
+        KeyBinding::new("l", ExpandDir, Some("FileTree")),
+        KeyBinding::new("cmd-s", SaveFile, Some("FileEditor")),
+        KeyBinding::new("cmd-w", CloseFile, Some("FileEditor")),
         KeyBinding::new("j", SelectNext, Some(LIST)),
         KeyBinding::new("k", SelectPrev, Some(LIST)),
         KeyBinding::new("g g", SelectFirst, Some(LIST)),

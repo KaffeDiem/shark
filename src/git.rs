@@ -108,6 +108,7 @@ pub fn create_workspace(
             repos: done,
             session_id: None,
             model: None,
+            viewed: Default::default(),
         };
         fs::write(dir.join("CLAUDE.md"), claude_md(&ws, dir)).map_err(|e| e.to_string())?;
         Ok(ws)
@@ -255,30 +256,44 @@ pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), S
 
 /// One unified patch for all repos. Every path is prefixed with the repo name.
 pub fn combined_diff(ws: &Workspace, dir: &Path) -> String {
+    static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let mut out = String::new();
     for r in &ws.repos {
         let wt = dir.join(&r.name);
+        // Untracked files join the same `git diff` through a throwaway index where they are
+        // intent-to-add: one process instead of one per file, and the real index (and the
+        // agent's index.lock) is never touched.
+        let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let tmp = std::env::temp_dir().join(format!("shark-{}-{seq}.index", std::process::id()));
+        if let Ok(index) = git(
+            &wt,
+            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        ) {
+            let _ = fs::copy(index, &tmp);
+        }
+        let git_tmp = |args: &[&str]| {
+            Command::new("git")
+                .current_dir(&wt)
+                .env("GIT_INDEX_FILE", &tmp)
+                .args(args)
+                .output()
+        };
+        let _ = git_tmp(&["add", "--intent-to-add", "--ignore-errors", "."]);
         let src = format!("--src-prefix=a/{}/", r.name);
         let dst = format!("--dst-prefix=b/{}/", r.name);
-        let base = ["diff", "--no-color", "--no-ext-diff", &src, &dst];
-        if let Ok(o) = run(
-            &wt,
-            "git",
-            &[&base[..], &["--merge-base", &r.base]].concat(),
-        ) {
+        // ponytail: untracked files are diffed whole, add a size cap when big binaries bite
+        if let Ok(o) = git_tmp(&[
+            "diff",
+            "--no-color",
+            "--no-ext-diff",
+            &src,
+            &dst,
+            "--merge-base",
+            &r.base,
+        ]) {
             out += &String::from_utf8_lossy(&o.stdout);
         }
-        // ponytail: untracked files are diffed whole, add a size cap when big binaries bite
-        for f in ls_files(&wt, &["-o", "--exclude-standard"]) {
-            // exit code 1 means "differs", which is always the case here
-            if let Ok(o) = run(
-                &wt,
-                "git",
-                &[&base[..], &["--no-index", "--", "/dev/null", &f]].concat(),
-            ) {
-                out += &String::from_utf8_lossy(&o.stdout);
-            }
-        }
+        let _ = fs::remove_file(&tmp);
     }
     out
 }

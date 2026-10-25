@@ -690,6 +690,7 @@ mod ui_tests {
             repos: vec![],
             session_id: None,
             model: None,
+            viewed: Default::default(),
         };
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::new(

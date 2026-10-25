@@ -1,10 +1,13 @@
 use serde::{Deserialize, Serialize};
-use std::{fs, path::PathBuf};
+use std::{collections::HashMap, fs, path::PathBuf};
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct State {
     pub repos: Vec<Repo>,
     pub workspaces: Vec<Workspace>,
+    /// Vim keys in the file editor.
+    #[serde(default)]
+    pub vim: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -22,6 +25,9 @@ pub struct Workspace {
     /// Claude model alias (`opus`, `fable`, …); `None` uses the CLI default.
     #[serde(default)]
     pub model: Option<String>,
+    /// Diff path -> fingerprint of its patch when marked viewed; a new patch makes it unviewed.
+    #[serde(default)]
+    pub viewed: HashMap<String, u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

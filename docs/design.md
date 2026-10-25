@@ -69,7 +69,9 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 - **Where a new view goes:**
   - A view of the open workspace becomes a header tab (add a `Tab` variant).
   - A view not tied to one workspace (settings, repo list) opens with `window.open_dialog`, `w(px(640.))`, like the palette.
-  - Don't add a second sidebar or panes outside the island.
+  - Don't add a second sidebar or panes outside the island. Panes inside it (the file tree, the editor next to the chat) are columns separated by a 1px `border`.
+- **Sidebar rail:** `cmd-b` shrinks the sidebar to 48px icons with tooltips; opening a file does it automatically and closing the file undoes it unless the user toggled it. The header then pads left to clear the traffic lights.
+- **File tree:** 260px column on the right of the Diff and file views, `Files` header with "n/m viewed", 28px rows indented 12px per level, then the `v` checkbox. Folders first; single-child folders are joined.
 - **Sidebar row:** 28px tall, `mx_2 px_2 gap_2`, `rounded(theme.radius)`, `text_sm`. Order: status icon (14px), name (`flex_1`, truncated), optional badge, metadata (`text_xs`, `muted_foreground`). Sidebar width 244px.
 - **Header:** 44px, `px_3`, `border_b_1` in `border`. Tabs on the left; on the right: branch (12px `GitBranch` + `text_xs`), the git button (`src/sync/`), optional badges, then status (6px `rounded_full` dot + "Running"/"Idle").
 - **Git button:** a `small` button plus a `ghost` `xsmall` chevron for the git menu. It is the header's one primary button: `primary` for a step to run, `outline` with a `warning_foreground` icon when something needs the agent or a human, `ghost` for a wait. Disabled while the agent runs if the step writes.
@@ -103,6 +105,10 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 | Tool group with failures | `X` + "N failed" in `danger_foreground`, on the collapsed row |
 | Skill / subagent row | `BookOpen` / `Bot`, `muted_foreground`, before the tool name |
 | Collapsed / expanded | `ChevronRight` / `ChevronDown` |
+| Changed file added / deleted / other | `FilePlus` / `FileMinus` / `FileDiff`, `muted_foreground`; `+n` `success_foreground`, `−n` `danger_foreground` |
+| File viewed / changed since viewed | Checked `Checkbox` and the name in `muted_foreground` / 6px `warning_foreground` dot |
+| Unsaved edits / changed on disk | 6px `foreground` dot after the file name / `TriangleAlert` in `warning_foreground` with Reload and Keep mine |
+| Vim mode | Mono `text_xs` pill on `secondary`: `NORMAL`, `INSERT`, `VISUAL`, `V-LINE` plus pending keys; `VIM OFF` without the fill |
 | Git step to run | Its own icon (`GitCommitHorizontal`, `ArrowUp`/`ArrowDown`, `GitPullRequestCreate`, `GitMerge`, …) in a `primary` button |
 | Git needs attention (conflicts, failing checks, detached HEAD, git error) | `TriangleAlert` in `warning_foreground`, `outline` button |
 | Git waiting (GitHub catching up, checks running, review) / reading / step running | `GitPullRequest` / static `RefreshCw`, `ghost` button |
