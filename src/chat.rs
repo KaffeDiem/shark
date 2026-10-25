@@ -17,9 +17,11 @@ use gpui_kit::component::input::{
     Enter, Escape, IndentInline, InputContent, InputEvent, MoveDown, MoveUp, OutdentInline, Redo,
     Textarea, TextareaState, Undo,
 };
+use gpui_kit::component::hover_card::HoverCard;
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement;
+use gpui_kit::component::shimmer::ShimmerText;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_kit::component::tooltip::Tooltip;
@@ -435,7 +437,7 @@ impl Chat {
             model_menu: None,
             model_at: Default::default(),
             agent_model: None,
-            list: ListState::new(0, ListAlignment::Top, px(400.)),
+            list: ListState::new(1, ListAlignment::Top, px(400.)), // the activity footer
             focus: cx.focus_handle(),
             reader: None,
             commands: complete::cached_commands(&ws_name),
@@ -519,7 +521,7 @@ impl Chat {
         self.blocks.extend(live);
         self.unread = unread.into_iter().map(|i| i + n).collect();
         self.rows = self.build_rows();
-        self.list.reset(self.rows.len());
+        self.list.reset(self.rows.len() + 1); // + the activity footer
         self.list.set_follow_mode(FollowMode::Tail);
         self.sel = self.rows.len().saturating_sub(1);
         if self.meta.title.is_empty()
@@ -535,17 +537,6 @@ impl Chat {
     /// Whether anything is still going on: a turn, or tasks it left running in the background.
     pub fn working(&self) -> bool {
         self.busy || !self.background.is_empty()
-    }
-
-    /// "Read: api/src/a.rs" for the call in flight.
-    pub fn running_tool(&self) -> Option<String> {
-        let calls = self.blocks.iter().rev().flat_map(|b| match b {
-            Block::Tool(c) => std::slice::from_ref(c),
-            Block::Tools { calls, .. } => calls.as_slice(),
-            _ => &[],
-        });
-        let c = calls.rev().find(|c| c.result.is_none())?;
-        Some(format!("{}: {}", c.name, c.summary))
     }
 
     pub fn queued(&self) -> usize {
@@ -1554,9 +1545,77 @@ impl Chat {
         cx.notify();
     }
 
+    /// The list's last item, under the newest message: a quiet line while a turn or background
+    /// tasks run; hovering lists the details. Fixed height, so it comes and goes
+    /// without remeasuring or moving the transcript.
+    fn render_activity(&self, cx: &App) -> impl IntoElement {
+        let theme = cx.theme();
+        let line = div().id("activity").w_full().h(px(24.)).px_4();
+        if !self.working() {
+            return line;
+        }
+        let text = match (self.busy, self.background.len()) {
+            (true, 0) => "Working".into(),
+            (true, n) => format!("Working · {n} in background"),
+            (false, n) => format!("{n} in background"),
+        };
+        let (busy, started, model) = (self.busy, self.started, self.model().to_string());
+        let (queued, steered, tasks) = (self.queued(), self.steered, self.background.clone());
+        line.child(
+            div().w_full().max_w(px(680.)).mx_auto().child(
+                HoverCard::new("activity-card")
+                    .anchor(Anchor::BottomLeft)
+                    .trigger(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            // The shimmer redraws the chat every frame, as a tool's spinner
+                            // does; only during a turn, not for tasks left running after it.
+                            .map(|d| match busy {
+                                true => d.child(ShimmerText::new(text).id("activity-text")),
+                                false => d.child(text),
+                            }),
+                    )
+                    .content(move |_, _, cx| {
+                        let theme = cx.theme();
+                        let line = |t: String| div().child(t);
+                        v_flex()
+                            .gap_1()
+                            .text_xs()
+                            .max_w(px(420.))
+                            .when_some(started.filter(|_| busy), |d, t| {
+                                d.child(line(format!(
+                                    "Turn running for {}",
+                                    duration(t.elapsed().as_secs())
+                                )))
+                            })
+                            .child(line(format!("Model {model}")))
+                            .when(queued > 0, |d| d.child(line(format!("{queued} queued"))))
+                            .when(steered, |d| {
+                                d.child(line("Message sent mid-turn, not read yet".into()))
+                            })
+                            .when(!tasks.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .pt_1()
+                                        .text_color(theme.muted_foreground)
+                                        .child(format!("{} in background", tasks.len())),
+                                )
+                                .children(tasks.iter().map(|t| {
+                                    h_flex()
+                                        .gap_1p5()
+                                        .child(Icon::new(IconName::Bot).with_size(px(12.)))
+                                        .child(t.clone())
+                                }))
+                            })
+                    }),
+            ),
+        )
+    }
+
     fn render_row(&self, ix: usize, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(&(bi, call)) = self.rows.get(ix) else {
-            return div().into_any_element();
+            return self.render_activity(cx).into_any_element();
         };
         let focused = self.focus.is_focused(window);
         let theme = cx.theme();
@@ -2706,6 +2765,10 @@ exec cat >/dev/null
         });
         frame(cx);
         let list = cx.update(|cx| chat.read(cx).list.clone());
+        let footer = |cx: &mut TestAppContext| {
+            assert_eq!(list.item_count(), cx.update(|cx| chat.read(cx).rows.len()) + 1)
+        };
+        footer(cx);
         let top = || list.logical_scroll_top().item_ix;
         assert!(
             list.is_following_tail() && top() > 0,
@@ -2733,6 +2796,7 @@ exec cat >/dev/null
             !list.is_following_tail() && top() == read_at,
             "stays scrolled up"
         );
+        footer(cx);
     }
 
     /// A chat on a fresh workspace resuming session `s1`.
