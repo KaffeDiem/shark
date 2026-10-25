@@ -376,8 +376,10 @@ pub(crate) fn start(
     let (name, pid) = (if codex.is_some() { "codex" } else { "claude" }, child.id());
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Some(st) = &codex {
-                codex::track(st, &stdin, pid, &line);
+            if let Some(st) = &codex
+                && !codex::track(st, &stdin, pid, &line)
+            {
+                continue;
             }
             let evs = parse(&line);
             if (evs.iter()).any(|e| !matches!(e, Ev::TextDelta(_) | Ev::Permission { .. })) {

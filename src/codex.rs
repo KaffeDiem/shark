@@ -176,14 +176,10 @@ pub fn deny(stdin: &Mutex<ChildStdin>, request_id: &str) -> std::io::Result<()> 
 
 /// Keeps `State` current from the server's lines, on the reader thread. A thread that can't
 /// start or resume ends the process, as claude's does: `parse` reports why, and the next
-/// message respawns it.
-pub fn track(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, pid: u32, line: &str) {
-    // Most lines are deltas and hooks: skip them before parsing or locking.
-    if !line.contains("\"id\"") && !line.contains("\"turn/") {
-        return;
-    }
+/// message respawns it. False for a sub-agent's line, which the chat doesn't show or store.
+pub fn track(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, pid: u32, line: &str) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
-        return;
+        return true;
     };
     let (id, method) = (v["id"].as_str(), v["method"].as_str());
     // A request nothing here can answer would hold up its turn: refuse it.
@@ -210,9 +206,19 @@ pub fn track(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, pid: u32, line: &str)
             }
         };
         let _ = agent::write(stdin, &reply);
-        return;
+        return true;
     }
     let mut s = st.lock().unwrap();
+    // Sub-agents run on threads of their own in the same server: their turns starting and
+    // ending aren't the chat's, which goes on until its own thread's turn completes.
+    if let (Some(t), Some(main)) = (v["params"]["threadId"].as_str(), &s.thread)
+        && t != main
+    {
+        if !v["id"].is_null() {
+            let _ = deny(stdin, &v["id"].to_string()); // an approval no one would see
+        }
+        return false;
+    }
     match (id, method) {
         (Some("start" | "resume"), _) if v["error"].is_object() => crate::git::term(pid),
         (Some("start" | "resume"), _) => {
@@ -226,6 +232,7 @@ pub fn track(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, pid: u32, line: &str)
         (_, Some("turn/completed")) => s.turn = None,
         _ => {}
     }
+    true
 }
 
 pub fn parse(v: &Value) -> Vec<Ev> {
@@ -630,6 +637,9 @@ while read -r l; do
     read -r reply
     case "$reply" in *'"id":9'*decline*) ;; *) echo "bad reply: $reply" >&2; exit 3;; esac
     echo '{"method":"item/started","params":{"item":{"type":"userMessage","id":"u","content":[{"type":"text","text":"hi"}]}}}'
+    echo '{"method":"turn/started","params":{"threadId":"sub1","turn":{"id":"s1"}}}'
+    echo '{"method":"item/completed","params":{"threadId":"sub1","item":{"type":"agentMessage","id":"sm","text":"sub done"}}}'
+    echo '{"method":"turn/completed","params":{"threadId":"sub1","turn":{"id":"s1","status":"completed","durationMs":1000}}}'
     echo '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"m","text":"hello"}}}'
     echo '{"method":"turn/completed","params":{"threadId":"th1","turn":{"id":"t1","status":"completed","durationMs":2000}}}';;
   esac
@@ -697,6 +707,7 @@ done
     }
 
     #[cfg(feature = "test-support")] // shares the UI tests' home
+    /// A sub-agent's turn, on its own thread, neither ends the chat's turn nor shows in it.
     #[test]
     fn runs_a_turn() {
         let evs = run_fake(None, "turn", false);
