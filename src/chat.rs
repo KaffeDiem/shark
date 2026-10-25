@@ -11,6 +11,7 @@ use completion::Menu;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::clipboard::Clipboard;
 use gpui_kit::component::input::{
     Enter, Escape, IndentInline, InputContent, InputEvent, MoveDown, MoveUp, OutdentInline,
     Textarea, TextareaState,
@@ -19,7 +20,7 @@ use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::text::{TextView, TextViewState};
+use gpui_kit::component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Icon, Selectable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -46,6 +47,8 @@ enum Block {
     User(String, bool),
     Text {
         md: Entity<TextViewState>,
+        /// The markdown source, for copying: the view doesn't hand it back.
+        src: String,
         done: bool,
     },
     /// Consecutive tool calls between two pieces of prose, shown as one summary row.
@@ -60,6 +63,38 @@ enum Block {
 
 /// A transcript row: a block, or one call inside an expanded tool group.
 type Row = (usize, Option<usize>);
+
+/// A copy button whose icon turns into a check for 2s. Until `group` is hovered it is
+/// invisible but laid out, so showing it never moves anything.
+pub(crate) fn copy_button(
+    id: impl Into<ElementId>,
+    text: impl Into<SharedString>,
+    group: &'static str,
+) -> Div {
+    div()
+        .flex_none()
+        .invisible()
+        .group_hover(group, |s| s.visible())
+        .child(Clipboard::new(id).value(text).tooltip("Copy"))
+}
+
+/// Markdown whose code blocks get the language and a copy button in their top-right corner.
+/// The blocks keep the top padding the language label had, so the corner never covers code.
+pub(crate) fn markdown(md: &Entity<TextViewState>, group: &'static str) -> TextView {
+    TextView::new(md)
+        .selectable(true)
+        .style(TextViewStyle::default().code_block(StyleRefinement::default().pt(px(28.))))
+        .code_block_actions(move |block, _, cx| {
+            h_flex()
+                .h(px(20.))
+                .gap_1()
+                .pl_1()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .when_some(block.lang().filter(|l| !l.is_empty()), |d, l| d.child(l))
+                .child(copy_button("copy", block.code(), group))
+        })
+}
 
 fn standalone(name: &str) -> Option<IconName> {
     match name {
@@ -1166,27 +1201,37 @@ impl Chat {
             },
             Ev::TextDelta(s) => match self.live_text() {
                 Some(bi) => {
-                    if let Block::Text { md, .. } = &self.blocks[bi] {
+                    if let Block::Text { md, src, .. } = &mut self.blocks[bi] {
                         md.update(cx, |m, cx| m.push_str(&s, cx));
+                        src.push_str(&s);
                     }
                     self.remeasure(bi);
                 }
                 None => {
                     let md = cx.new(|cx| TextViewState::markdown(&s, cx));
-                    self.blocks.push(Block::Text { md, done: false });
+                    self.blocks.push(Block::Text {
+                        md,
+                        src: s,
+                        done: false,
+                    });
                 }
             },
             Ev::Text(full) => match self.live_text() {
                 Some(bi) => {
-                    if let Block::Text { md, done } = &mut self.blocks[bi] {
+                    if let Block::Text { md, src, done } = &mut self.blocks[bi] {
                         md.update(cx, |m, cx| m.set_text(&full, cx));
+                        *src = full;
                         *done = true;
                     }
                     self.remeasure(bi);
                 }
                 None => {
                     let md = cx.new(|cx| TextViewState::markdown(&full, cx));
-                    self.blocks.push(Block::Text { md, done: true });
+                    self.blocks.push(Block::Text {
+                        md,
+                        src: full,
+                        done: true,
+                    });
                 }
             },
             Ev::ToolUse { id, name, input } => {
@@ -1324,6 +1369,7 @@ impl Chat {
         let theme = cx.theme();
         let row = div()
             .id(ix)
+            .group("row")
             .w_full()
             .px_4()
             .py_1p5()
@@ -1404,11 +1450,15 @@ impl Chat {
                 )
                 .when(c.open, |d| {
                     // Clipped, with a "truncated" note, when parsed (agent::MAX_OUTPUT).
-                    let text = c.result.clone().unwrap_or("(running)".into());
+                    let result = c.result.clone();
+                    let text = result.clone().unwrap_or("(running)".into());
                     d.child(
                         div()
+                            .relative()
                             .mt_1()
-                            .px_3()
+                            .pl_3()
+                            // The corner stays clear for the copy button.
+                            .pr_8()
                             .py_2()
                             .rounded(theme.radius)
                             .border_1()
@@ -1422,7 +1472,14 @@ impl Chat {
                             } else {
                                 theme.foreground
                             })
-                            .child(text),
+                            .child(text)
+                            .when_some(result, |d, r| {
+                                d.child(div().absolute().top_1().right_1().child(copy_button(
+                                    ("copy-out", ix),
+                                    r,
+                                    "row",
+                                )))
+                            }),
                     )
                 })
         };
@@ -1437,7 +1494,13 @@ impl Chat {
                 .text_color(theme.secondary_foreground)
                 .text_size(px(14.))
                 .line_height(relative(1.5))
-                .child(t.clone())
+                .child(
+                    h_flex()
+                        .items_start()
+                        .gap_2()
+                        .child(div().flex_1().min_w_0().child(t.clone()))
+                        .child(copy_button(("copy", ix), t.clone(), "row").mr_neg_1()),
+                )
                 .when(*queued, |d| {
                     d.child(
                         h_flex()
@@ -1451,7 +1514,7 @@ impl Chat {
             (Block::Text { md, .. }, _) => column()
                 .text_size(px(14.))
                 .line_height(relative(1.5))
-                .child(TextView::new(md).selectable(true)),
+                .child(markdown(md, "row")),
             (Block::Tool(c), _) => column().text_sm().child(tool_row(c)),
             // Calls sit under the group's summary text, past its chevron and gap.
             (Block::Tools { calls, .. }, Some(j)) => {
@@ -1487,10 +1550,22 @@ impl Chat {
                         }),
                 )
             }
-            (Block::Info(t), _) => column()
-                .text_xs()
-                .text_color(theme.muted_foreground)
-                .child(t.clone()),
+            // The line after a reply ("done · 48s") carries its copy button, like the action row
+            // under a ChatGPT answer: always on the latest reply, on hover above it.
+            (Block::Info(t), _) => {
+                let reply = self.reply_above(bi).cloned();
+                let latest = ix + 1 == self.rows.len();
+                column()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(t.clone())
+                    .when_some(reply, |d, r| {
+                        d.child(copy_button(("copy", ix), r, "row").when(latest, |d| d.visible()))
+                    })
+            }
         };
         row.child(inner).into_any_element()
     }
@@ -1636,6 +1711,41 @@ impl Chat {
         )
     }
 
+    /// The reply a turn's closing line ("done · 48s") sits under, if it ended on one.
+    fn reply_above(&self, bi: usize) -> Option<&String> {
+        match self.blocks.get(bi.checked_sub(1)?) {
+            Some(Block::Text { src, .. }) => Some(src),
+            _ => None,
+        }
+    }
+
+    /// `y`: the selected row's text. A message, a reply (also from the line under it), a
+    /// call's output or a submitted plan.
+    pub(crate) fn copy_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(&(bi, call)) = self.rows.get(self.sel) else {
+            return;
+        };
+        let text = match (&self.blocks[bi], call) {
+            (Block::Info(t), _) => Some(self.reply_above(bi).unwrap_or(t).clone()),
+            (Block::User(t, _), _) => Some(t.clone()),
+            (Block::Text { src, .. }, _) => Some(src.clone()),
+            (Block::Tool(c), _) if c.name == "ExitPlanMode" => {
+                let plan = self.plan.read(cx);
+                plan.number_of(&c.id)
+                    .map(|n| plan.versions[n - 1].text.clone())
+            }
+            (Block::Tool(c), _) => c.result.as_ref().map(|r| r.to_string()),
+            (Block::Tools { calls, .. }, Some(j)) => {
+                calls[j].result.as_ref().map(|r| r.to_string())
+            }
+            (Block::Tools { .. }, None) => None,
+        };
+        if let Some(text) = text {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+            window.push_notification("Copied", cx);
+        }
+    }
+
     fn toggle(&mut self, cx: &mut Context<Self>) {
         let Some(&(bi, call)) = self.rows.get(self.sel) else {
             return;
@@ -1753,6 +1863,7 @@ impl Render for Chat {
                         this.select(this.sel.saturating_sub(5), cx)
                     }))
                     .on_action(cx.listener(|this, _: &Confirm, _, cx| this.toggle(cx)))
+                    .on_action(cx.listener(|this, _: &CopySelected, w, cx| this.copy_selected(w, cx)))
                     .on_action(cx.listener(|this, _: &FocusComposer, window, cx| {
                         this.focus_composer(window, cx)
                     }))
@@ -2401,6 +2512,55 @@ exec cat >/dev/null
             })
             .unwrap();
         chat
+    }
+
+    /// Copy buttons: a message's shows on hover without moving, the latest reply's always
+    /// shows and copies its markdown, and `y` copies the selected row.
+    #[gpui_kit::test]
+    fn copy_buttons(cx: &mut TestAppContext) {
+        use gpui_kit::test::TestEventExt as _;
+        let chat = open_chat("copy", cx);
+        let window = cx.windows()[0];
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.apply(Ev::User("hi".into()), cx);
+                c.apply(Ev::Text("**bold** reply".into()), cx);
+                let result = Ev::Result {
+                    is_error: false,
+                    text: String::new(),
+                    cost: 0.,
+                    secs: 1,
+                };
+                c.apply(result, cx);
+            })
+        });
+        let clip = |cx: &mut TestAppContext| cx.update(|cx| cx.read_from_clipboard()?.text());
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            let before = w.find(("copy", 0usize));
+            assert!(!before.visible(), "hidden until hovered");
+            // Over the message, left of the button: the row is what reveals it.
+            let at = before.bounds().center() - point(px(100.), px(0.));
+            w.pointer_move(at, None, cx);
+            let after = w.find(("copy", 0usize));
+            assert!(after.visible());
+            assert_eq!(before.bounds(), after.bounds(), "showing it moves nothing");
+            assert!(
+                w.find(("copy", 2usize)).visible(),
+                "the latest reply's always shows"
+            );
+            w.click(("copy", 2usize), cx);
+        })
+        .unwrap();
+        assert_eq!(clip(cx).as_deref(), Some("**bold** reply"));
+        cx.update_window(window, |_, w, cx| {
+            chat.update(cx, |c, cx| {
+                c.sel = 0;
+                c.copy_selected(w, cx);
+            })
+        })
+        .unwrap();
+        assert_eq!(clip(cx).as_deref(), Some("hi"));
     }
 
     /// Calls cut off by an exit stop spinning; a missing session is dropped, an early exit isn't.
