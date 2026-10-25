@@ -20,6 +20,7 @@ pub(super) struct DiffData {
     /// git failed for some repo; the patch is then empty, which must not read as "no changes".
     error: Option<String>,
     hunks: HashMap<SharedString, Vec<review::Hunk>>,
+    media: Vec<media::MediaFile>,
 }
 
 impl DiffData {
@@ -30,11 +31,14 @@ impl DiffData {
         };
         let fp = files::fingerprint(&patch);
         let mut hunks = HashMap::new();
+        let mut media = vec![];
+        let ws_dir = ws.dir();
         let parsed: Vec<(DiffFile, u64)> = files::split_patch(&patch)
             .into_iter()
             .filter_map(|chunk| {
                 let file = DiffFile::parse(chunk).ok()?.into_iter().next()?;
                 hunks.insert(file.path().clone(), review::parse_hunks(chunk));
+                media.extend(media::MediaFile::parse(file.path(), chunk, &ws_dir));
                 Some((file, files::fingerprint(chunk)))
             })
             .collect();
@@ -48,6 +52,7 @@ impl DiffData {
             fps,
             error,
             hunks,
+            media,
         }
     }
 }
@@ -88,6 +93,7 @@ impl Shark {
             return;
         }
         self.review.hunks = data.hunks;
+        self.set_media(data.media, cx);
         if let Some(ws) = self.active.clone() {
             self.review.load_comments(&ws);
         }
@@ -135,6 +141,48 @@ impl Shark {
             self.diff.update(cx, |d, cx| d.scroll_to_file(f.path(), cx));
         }
         cx.notify();
+    }
+
+    /// Keeps the row (and any playing video) of a media file whose blobs didn't change.
+    fn set_media(&mut self, files: Vec<media::MediaFile>, cx: &mut Context<Self>) {
+        let mut old = std::mem::take(&mut self.media);
+        for file in files {
+            let path = file.path.clone();
+            let view = match old.iter().position(|(_, v)| v.read(cx).file == file) {
+                Some(at) => old.swap_remove(at).1,
+                None => {
+                    let (cache, width) = (self.media_cache.clone(), self.media_width.clone());
+                    let view = cx.new(|_| media::MediaView::new(file, cache, width));
+                    // One video plays at a time.
+                    cx.subscribe(&view, |this, playing, _: &media::Playing, cx| {
+                        for (_, v) in &this.media {
+                            if v != &playing {
+                                v.update(cx, |v, cx| v.stop(cx));
+                            }
+                        }
+                    })
+                    .detach();
+                    view
+                }
+            };
+            self.media.push((path, view));
+        }
+    }
+
+    /// `p`: play or pause the video of the file last moved to.
+    fn play_media(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let Some(path) =
+            (self.cursor_file(window, cx)).map(|ix| self.diff_files[ix].path().clone())
+        else {
+            return;
+        };
+        if let Some((_, v)) = self.media.iter().find(|(p, _)| *p == path) {
+            v.update(cx, |v, cx| {
+                if v.file.kind == media::Kind::Video {
+                    v.toggle_default(cx)
+                }
+            });
+        }
     }
 
     pub(super) fn viewed(&self, ix: usize) -> Viewed {
@@ -385,6 +433,7 @@ impl Shark {
             .on_action(cx.listener(|this, _: &NextFile, _, cx| this.step_file(1, cx)))
             .on_action(cx.listener(|this, _: &PrevFile, _, cx| this.step_file(-1, cx)))
             .on_action(cx.listener(|this, _: &RefreshDiff, _, cx| this.refresh_diff(cx)))
+            .on_action(cx.listener(|this, _: &PlayMedia, w, cx| this.play_media(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleDiffMode, _, cx| {
                 this.diff.update(cx, |d, cx| {
                     let mode = if d.mode() == DiffMode::Split {

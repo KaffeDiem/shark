@@ -142,7 +142,7 @@ pub fn move_item<T>(v: &mut Vec<T>, from: usize, to: usize) {
 #[cfg(test)]
 pub static TEST_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
-fn home() -> PathBuf {
+pub(crate) fn home() -> PathBuf {
     #[cfg(test)]
     if let Some(h) = TEST_HOME.get() {
         return h.clone();

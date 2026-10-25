@@ -434,10 +434,16 @@ impl Shark {
 
     /// Tracks the pane's height for paging; goes in the diff pane.
     pub(super) fn viewport_probe(&self) -> impl IntoElement {
-        let vp = self.review.viewport.clone();
-        canvas(move |b, _, _| vp.set(b.size.height), |_, _, _, _| {})
-            .absolute()
-            .size_full()
+        let (vp, width) = (self.review.viewport.clone(), self.media_width.clone());
+        canvas(
+            move |b, _, _| {
+                vp.set(b.size.height);
+                width.set(b.size.width);
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full()
     }
 
     pub(super) fn ws_comments(&self) -> &[Comment] {
@@ -447,22 +453,39 @@ impl Shark {
             .map_or(&[], |c| &c[..])
     }
 
-    /// The pending comments as diff annotations, under their last line.
+    /// The pending comments as diff annotations, under their last line, and the before/after
+    /// row of each image or video, under its header (not while the file is folded).
     pub(super) fn with_comments(&self, diff: Diff, cx: &App) -> Diff {
         let comments = self.ws_comments();
         let texts: Rc<Vec<String>> = Rc::new(comments.iter().map(|c| c.text.clone()).collect());
+        let state = self.diff.read(cx);
+        let media: Vec<_> = (self.media.iter())
+            .filter(|(path, _)| !state.is_file_collapsed(path))
+            .map(|(path, view)| (path.clone(), view.clone()))
+            .collect();
+        let views: Rc<Vec<AnyView>> =
+            Rc::new(media.iter().map(|(_, v)| v.clone().into()).collect());
         let (muted, fg) = (cx.theme().muted_foreground, cx.theme().foreground);
         diff.annotations(
-            comments
-                .iter()
-                .enumerate()
-                .map(|(i, c)| DiffAnnotation::line(("comment", i), c.anchor())),
+            (comments.iter().enumerate())
+                .map(|(i, c)| DiffAnnotation::line(("comment", i), c.anchor()))
+                .chain(
+                    (media.iter().enumerate())
+                        .map(|(i, (path, _))| DiffAnnotation::file(("media", i), path.clone())),
+                ),
         )
         .render_annotation(move |a, _, _| {
-            let text = match a.id() {
-                ElementId::NamedInteger(_, i) => texts.get(*i as usize).cloned(),
-                _ => None,
+            let (name, i) = match a.id() {
+                ElementId::NamedInteger(name, i) => (name.as_ref(), *i as usize),
+                _ => ("", 0),
             };
+            if name == "media" {
+                return views
+                    .get(i)
+                    .cloned()
+                    .map(|v| v.into_any_element())
+                    .unwrap_or_else(|| div().into_any_element());
+            }
             h_flex()
                 .gap_2()
                 .items_start()
@@ -478,8 +501,9 @@ impl Shark {
                         .flex_1()
                         .text_color(fg)
                         .whitespace_normal()
-                        .child(text.unwrap_or_default()),
+                        .child(texts.get(i).cloned().unwrap_or_default()),
                 )
+                .into_any_element()
         })
     }
 

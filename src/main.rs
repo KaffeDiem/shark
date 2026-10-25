@@ -116,7 +116,7 @@ actions!(
 );
 
 // Editor and diff review: `space f f`, and `c` / `shift-c` in the diff.
-actions!(shark, [OpenAnyFile, AddComment, SendComments]);
+actions!(shark, [OpenAnyFile, AddComment, SendComments, PlayMedia]);
 
 /// Switch the open workspace to `chat::MODELS[n]` without opening the menu.
 #[derive(Clone, PartialEq, Debug, serde::Deserialize, Action)]
@@ -260,6 +260,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("{", PrevFile, Some("DiffPane")),
         KeyBinding::new("s", ToggleDiffMode, Some("DiffPane")),
         KeyBinding::new("r", RefreshDiff, Some("DiffPane")),
+        KeyBinding::new("p", PlayMedia, Some("DiffPane")),
         KeyBinding::new("space f f", OpenAnyFile, Some(NAV)),
         KeyBinding::new("cmd-p", OpenAnyFile, None),
         KeyBinding::new("c", AddComment, Some("DiffPane")),

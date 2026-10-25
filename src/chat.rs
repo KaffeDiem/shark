@@ -188,6 +188,8 @@ pub struct Chat {
     /// Plan versions and the pane that shows them, next to the transcript while `plan_open`.
     pub plan: Entity<PlanPane>,
     pub plan_open: bool,
+    /// Files from Finder being dragged over the pane.
+    dropping: Option<Vec<PathBuf>>,
     _subs: Vec<Subscription>,
 }
 
@@ -354,6 +356,7 @@ impl Chat {
             side: None,
             reported: None,
             plan_open,
+            dropping: None,
             plan,
             _subs: vec![_sub],
         };
@@ -1681,6 +1684,7 @@ impl Render for Chat {
         .py_2();
         let drop_bg = theme.drop_target;
         let accent = theme.drag_border;
+        let (bg, fg) = (theme.background.opacity(0.85), theme.foreground);
         let main = v_flex()
             .id("chat-pane")
             .group("chat-pane")
@@ -1690,9 +1694,40 @@ impl Render for Chat {
                 this.focus_composer(window, cx)
             }))
             // Files from Finder anywhere on the pane are copied in and mentioned in the composer.
-            .on_drop(cx.listener(|this, p: &ExternalPaths, window, cx| {
-                this.attach(p.paths().to_vec(), None, window, cx)
+            // Not `drag_over`/`on_drop`: gpui checks hover for those, and hover is off while the
+            // last input was a key (a file drag doesn't count as the mouse), so a drag right
+            // after typing showed nothing and dropped nothing.
+            .on_drag_move(cx.listener(|this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
+                let over = (e.bounds.contains(&e.event.position)).then(|| e.drag(cx).paths().to_vec());
+                if over.is_some() != this.dropping.is_some() {
+                    cx.notify();
+                }
+                this.dropping = over;
             }))
+            .on_file_drop_exit(cx.listener(|this, _, _, cx| {
+                this.dropping = None;
+                cx.notify();
+            }))
+            .child({
+                let chat = cx.entity().downgrade();
+                canvas(|_, _, _| {}, move |_, _, window, _| {
+                    let chat = chat.clone();
+                    window.on_mouse_event(move |_: &MouseUpEvent, phase, window, cx| {
+                        if phase != DispatchPhase::Bubble {
+                            return;
+                        }
+                        chat.update(cx, |this, cx| {
+                            if let Some(paths) = this.dropping.take() {
+                                this.attach(paths, None, window, cx);
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    });
+                })
+                .absolute()
+                .size_0()
+            })
             .child(
                 div()
                     .id("transcript")
@@ -1871,24 +1906,42 @@ impl Render for Chat {
                             ),
                     ),
             )
-            // No hitbox, so it never takes the drop or the mouse; shown only while files hover.
-            .child(
-                div()
+            // No hitbox, so it never takes the drop or the mouse. A drag that ends elsewhere
+            // leaves no active drag, so a missed exit can't leave it up.
+            .when(self.dropping.is_some() && cx.has_active_drag(), |d| d.child(
+                v_flex()
                     .absolute()
                     .inset_2()
-                    .invisible()
-                    .group_drag_over::<ExternalPaths>("chat-pane", |s| s.visible())
-                    .flex()
                     .items_center()
                     .justify_center()
+                    .gap_1()
                     .rounded(radius)
                     .border_2()
                     .border_dashed()
                     .border_color(accent)
-                    .bg(drop_bg)
-                    .text_color(muted)
-                    .child("Drop to attach"),
-            );
+                    .bg(bg)
+                    // The theme's drop tint over a faded transcript.
+                    .child(div().absolute().inset_0().rounded(radius).bg(drop_bg))
+                    .child(
+                        Icon::new(IconName::Paperclip)
+                            .with_size(px(32.))
+                            .text_color(accent)
+                            .mb_2(),
+                    )
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg)
+                            .child("Drop to attach"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("Files and images are added to your message"),
+                    ),
+            ));
         if !self.plan_open {
             return main.into_any_element();
         }
@@ -2687,13 +2740,27 @@ exec cat >/dev/null
             let size = w.viewport_size();
             let position = point(size.width / 2., size.height / 2.);
             let paths = ExternalPaths(vec![shot.clone()].into());
+            // After a key the drag still shows the overlay: gpui's hover styles wouldn't.
+            w.dispatch_keystroke(Keystroke::parse("a").unwrap(), cx);
             w.dispatch_event(
                 FileDropEvent::Entered { position, paths }.to_platform_input(),
                 cx,
             );
+            w.dispatch_event(FileDropEvent::Pending { position }.to_platform_input(), cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert!(
+                chat.read(cx).dropping.is_some(),
+                "overlay while files hover"
+            )
+        });
+        cx.update_window(window, |_, w, cx| {
+            let position = point(w.viewport_size().width / 2., w.viewport_size().height / 2.);
             w.dispatch_event(FileDropEvent::Submit { position }.to_platform_input(), cx);
         })
         .unwrap();
+        cx.update(|cx| assert!(chat.read(cx).dropping.is_none(), "gone after the drop"));
         cx.run_until_parked();
         cx.update(|cx| {
             let c = chat.read(cx).composer.read(cx);
