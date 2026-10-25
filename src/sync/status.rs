@@ -61,6 +61,20 @@ pub struct Pr {
     pub review: String,
     pub checks: Checks,
     pub head: String,
+    /// IDs of the reviews that requested changes.
+    pub change_requests: Vec<String>,
+    /// IDs of comment-only reviews (inline comments come as one) by anyone but the PR's author.
+    pub comments: Vec<String>,
+    /// Merged PRs only: the local HEAD, when it was found to be an ancestor of `head`. A web
+    /// merge can land a newer head than ours (Update branch, a teammate's push).
+    pub contains_head: String,
+}
+
+impl Pr {
+    /// `head` is the PR's head, or a merged PR contains it.
+    pub fn has(&self, head: &str) -> bool {
+        self.head == head || (!head.is_empty() && self.contains_head == head)
+    }
 }
 
 /// Parses `git status --porcelain=v2 --branch -z`.
@@ -91,8 +105,9 @@ fn counts(s: &str) -> (u32, u32) {
 }
 
 /// Probes one worktree. Read-only: `--no-optional-locks` keeps `git status` from taking
-/// `index.lock`, which would make the agent's own git commands fail.
-pub fn probe(wt: &Path, branch: &str, base: &str) -> Result<Local, String> {
+/// `index.lock`, which would make the agent's own git commands fail. `prev` is the last probe:
+/// while HEAD and `origin/<branch>` haven't moved, its remote counts still hold.
+pub fn probe(wt: &Path, branch: &str, base: &str, prev: Option<&Local>) -> Result<Local, String> {
     if !wt.exists() {
         return Err(format!("{} is missing", wt.display()));
     }
@@ -131,6 +146,12 @@ pub fn probe(wt: &Path, branch: &str, base: &str) -> Result<Local, String> {
     l.origin = git(wt, &["remote", "get-url", "origin"]).is_ok();
     let remote = format!("refs/remotes/origin/{branch}");
     if let Ok(oid) = git(wt, &["rev-parse", "--verify", "--quiet", &remote]) {
+        if let Some(p) =
+            prev.filter(|p| p.remote.is_some() && (&p.head, &p.remote_head) == (&l.head, &oid))
+        {
+            (l.remote, l.rewritten, l.remote_head) = (p.remote, p.rewritten, oid);
+            return base_counts(wt, base, l);
+        }
         l.remote_head = oid;
         let range = format!("HEAD...{remote}");
         let ab = counts(&git(wt, &["rev-list", "--left-right", "--count", &range])?);
@@ -153,6 +174,10 @@ pub fn probe(wt: &Path, branch: &str, base: &str) -> Result<Local, String> {
         }
         l.remote = Some(ab);
     }
+    base_counts(wt, base, l)
+}
+
+fn base_counts(wt: &Path, base: &str, mut l: Local) -> Result<Local, String> {
     // Fails on an unborn branch or a base that no longer resolves; (0, 0) is the honest answer then.
     if let Ok(c) = git(
         wt,
@@ -168,7 +193,7 @@ pub fn probe(wt: &Path, branch: &str, base: &str) -> Result<Local, String> {
     Ok(l)
 }
 
-const PR_FIELDS: &str = "url,number,state,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,updatedAt";
+const PR_FIELDS: &str = "url,number,state,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,updatedAt,reviews,author";
 
 fn checks(rollup: &Value) -> Checks {
     let Some(items) = rollup.as_array().filter(|a| !a.is_empty()) else {
@@ -234,6 +259,15 @@ pub fn parse_prs(json: &str) -> Option<Pr> {
             .max_by_key(|p| p["updatedAt"].as_str().unwrap_or("").to_string())
     })?;
     let s = |k: &str| pick[k].as_str().unwrap_or_default().to_string();
+    let ids = |keep: &dyn Fn(&Value) -> bool| -> Vec<String> {
+        pick["reviews"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|r| keep(r))
+            .filter_map(|r| Some(r["id"].as_str()?.to_string()))
+            .collect()
+    };
     Some(Pr {
         url: s("url"),
         number: pick["number"].as_u64().unwrap_or(0),
@@ -247,12 +281,19 @@ pub fn parse_prs(json: &str) -> Option<Pr> {
         review: s("reviewDecision"),
         checks: checks(&pick["statusCheckRollup"]),
         head: s("headRefOid"),
+        change_requests: ids(&|r| r["state"] == "CHANGES_REQUESTED"),
+        // The author's own replies to threads are COMMENTED reviews too; they ask for nothing.
+        comments: ids(&|r| {
+            r["state"] == "COMMENTED" && r["author"]["login"] != pick["author"]["login"]
+        }),
+        contains_head: String::new(),
     })
 }
 
 /// `Ok(None)` means the branch has no PR. Unlike `gh pr view`, "none" isn't an error exit,
 /// so it can't be confused with being offline or logged out.
-pub fn fetch_pr(wt: &Path, branch: &str) -> Result<Option<Pr>, String> {
+/// `head` is the local HEAD as just probed.
+pub fn fetch_pr(wt: &Path, branch: &str, head: &str) -> Result<Option<Pr>, String> {
     let json = cmd_bounded(
         wt,
         "gh",
@@ -261,7 +302,23 @@ pub fn fetch_pr(wt: &Path, branch: &str) -> Result<Option<Pr>, String> {
         ],
         20,
     )?;
-    Ok(parse_prs(&json))
+    let mut pr = parse_prs(&json);
+    if let Some(p) = pr
+        .as_mut()
+        .filter(|p| p.state == PrState::Merged && !head.is_empty() && p.head != head)
+    {
+        // A head pushed on GitHub (Update branch) and auto-deleted right after the merge
+        // may never have reached a fetch here; the PR ref keeps it.
+        let have = format!("{}^{{commit}}", p.head);
+        if git(wt, &["cat-file", "-e", &have]).is_err() {
+            let pull = format!("refs/pull/{}/head", p.number);
+            let _ = cmd_bounded(wt, "git", &["fetch", "--quiet", "origin", &pull], 20);
+        }
+        if git(wt, &["merge-base", "--is-ancestor", head, &p.head]).is_ok() {
+            p.contains_head = head.to_string();
+        }
+    }
+    Ok(pr)
 }
 
 /// Everything known about one repo of a workspace.
@@ -276,6 +333,16 @@ pub struct Repo {
 }
 
 impl Repo {
+    /// Known by name only: nothing probed yet.
+    pub fn fresh(r: &crate::state::WsRepo) -> Repo {
+        Repo {
+            name: r.name.clone(),
+            base: r.base.clone(),
+            local: Ok(Local::default()),
+            pr: None,
+        }
+    }
+
     pub fn pr(&self) -> Option<&Pr> {
         self.pr.as_ref()?.as_ref().ok()?.as_ref()
     }
@@ -292,7 +359,7 @@ impl Repo {
             .map(|l| l.head.as_str())
             .unwrap_or_default();
         self.pr()
-            .is_some_and(|p| p.state == PrState::Merged && p.head == head)
+            .is_some_and(|p| p.state == PrState::Merged && p.has(head))
     }
 
     /// One line for the menu, e.g. `api: ↑2 · 3 changed · PR #12 checks failing`.
@@ -348,6 +415,8 @@ pub enum Kind {
     Push,
     ForcePush,
     CreatePr,
+    /// `CreatePr` with new PRs opened as drafts; only from the menu or palette.
+    CreateDraftPr,
     Reopen,
     UpdateBranch,
     Ready,
@@ -373,6 +442,8 @@ pub struct Action {
     pub repos: Vec<String>,
     /// Something is wrong and needs the agent or a human.
     pub attention: bool,
+    /// Review IDs this step sends to the agent; remembered so it isn't asked twice.
+    pub reviews: Vec<String>,
 }
 
 fn act(label: impl Into<String>, kind: Kind, repos: Vec<String>, attention: bool) -> Action {
@@ -381,13 +452,15 @@ fn act(label: impl Into<String>, kind: Kind, repos: Vec<String>, attention: bool
         kind,
         repos,
         attention,
+        reviews: vec![],
     }
 }
 
 /// The single most useful next step for the whole workspace. Local problems come before
 /// remote ones, and within the PR phase actionable steps beat passive waits, so a
-/// "checks running" in one repo can't hide a "ready for review" in another.
-pub fn next_action(repos: &[Repo], branch: &str) -> Action {
+/// "checks running" in one repo can't hide a "ready for review" in another. `handled`: review
+/// IDs already sent to the agent.
+pub fn next_action(repos: &[Repo], branch: &str, handled: &[String]) -> Action {
     let names = |f: &dyn Fn(&Repo, &Local) -> bool| -> Vec<String> {
         repos
             .iter()
@@ -536,32 +609,22 @@ pub fn next_action(repos: &[Repo], branch: &str) -> Action {
     if !behind.is_empty() {
         return act(label("Pull", &behind), Kind::Pull, behind, false);
     }
-    // Without a GitHub answer "no PR" is a guess; don't offer to create a duplicate.
+    // Without a GitHub answer "no PR" is a guess; those repos sit out the PR steps, so they
+    // can't get a duplicate PR, nor block the other repos' steps.
     let unknown = names(&|r, l| l.base.0 > 0 && !matches!(r.pr, Some(Ok(_))));
-    if !unknown.is_empty() {
-        let failed = repos
-            .iter()
-            .any(|r| unknown.contains(&r.name) && matches!(r.pr, Some(Err(_))));
-        return match failed {
-            true => act(
-                label("GitHub unavailable", &unknown),
-                Kind::None,
-                unknown,
-                true,
-            ),
-            false => act("Checking PR…", Kind::None, vec![], false),
-        };
-    }
-    // A merged PR at exactly HEAD means "landed"; any newer commit needs a new PR.
+    let known = |r: &Repo| !unknown.contains(&r.name);
+    // A merged PR holding HEAD means "landed"; any newer commit needs a new PR.
     let at_head =
-        |r: &Repo, l: &Local, s: PrState| r.pr().is_some_and(|p| p.state == s && p.head == l.head);
-    let closed =
-        names(&|r, l| l.base.0 > 0 && r.open_pr().is_none() && at_head(r, l, PrState::Closed));
+        |r: &Repo, l: &Local, s: PrState| r.pr().is_some_and(|p| p.state == s && p.has(&l.head));
+    let closed = names(&|r, l| {
+        known(r) && l.base.0 > 0 && r.open_pr().is_none() && at_head(r, l, PrState::Closed)
+    });
     if !closed.is_empty() {
         return act(label("Reopen PR", &closed), Kind::Reopen, closed, false);
     }
-    let unpr =
-        names(&|r, l| l.base.0 > 0 && r.open_pr().is_none() && !at_head(r, l, PrState::Merged));
+    let unpr = names(&|r, l| {
+        known(r) && l.base.0 > 0 && r.open_pr().is_none() && !at_head(r, l, PrState::Merged)
+    });
     if !unpr.is_empty() {
         return act(label("Create PR", &unpr), Kind::CreatePr, unpr, false);
     }
@@ -571,7 +634,10 @@ pub fn next_action(repos: &[Repo], branch: &str) -> Action {
     }
 
     let prs = |f: &dyn Fn(&Pr, &Local) -> bool| names(&|r, l| r.open_pr().is_some_and(|p| f(p, l)));
-    let conflicting = prs(&|p, _| p.merge_state == "DIRTY");
+    // GitHub lags a push by a few seconds; until a PR shows our head, its verdicts are about
+    // the old one. Such a PR waits on its own instead of holding up the others.
+    let current = |f: &dyn Fn(&Pr) -> bool| prs(&|p, l| p.head == l.head && f(p));
+    let conflicting = current(&|p| p.merge_state == "DIRTY");
     if !conflicting.is_empty() {
         let prompt = format!(
             "These PRs conflict with their base: {}. In each repo `git fetch origin`, merge the base into \
@@ -585,24 +651,40 @@ pub fn next_action(repos: &[Repo], branch: &str) -> Action {
             true,
         );
     }
-    let failing: Vec<String> = repos
-        .iter()
-        .filter_map(|r| match &r.open_pr()?.checks {
-            Checks::Failing(n) => Some(format!("{}: {}", r.name, n.join(", "))),
-            _ => None,
-        })
-        .collect();
-    if !failing.is_empty() {
+    let rs = current(&|p| matches!(p.checks, Checks::Failing(_)));
+    if !rs.is_empty() {
+        let failing: Vec<String> = repos
+            .iter()
+            .filter(|r| rs.contains(&r.name))
+            .filter_map(|r| match &r.open_pr()?.checks {
+                Checks::Failing(n) => Some(format!("{}: {}", r.name, n.join(", "))),
+                _ => None,
+            })
+            .collect();
         let prompt = format!(
             "CI checks fail on the PRs ({}). For each, read the failure (`gh pr checks`, then \
              `gh run view <run-id> --log-failed` in that repo), fix the cause, commit and push. \
              Don't disable or skip checks.",
             failing.join("; ")
         );
-        let rs = prs(&|p, _| matches!(p.checks, Checks::Failing(_)));
         return act(label("Fix checks", &rs), Kind::Agent(prompt), rs, true);
     }
-    let changes = prs(&|p, _| p.review == "CHANGES_REQUESTED");
+    let with_reviews =
+        |what: &str, names: Vec<String>, prompt, ids: &dyn Fn(&Pr) -> Vec<String>| Action {
+            reviews: repos
+                .iter()
+                .filter(|r| names.contains(&r.name))
+                .filter_map(|r| r.open_pr())
+                .flat_map(ids)
+                .collect(),
+            ..act(label(what, &names), Kind::Agent(prompt), names, false)
+        };
+    // GitHub keeps CHANGES_REQUESTED until the reviewer looks again, so only reviews the agent
+    // hasn't seen ask for work. Without IDs there's nothing to remember; ask every time.
+    let unhandled = |p: &Pr| {
+        p.change_requests.is_empty() || p.change_requests.iter().any(|id| !handled.contains(id))
+    };
+    let changes = current(&|p| p.review == "CHANGES_REQUESTED" && unhandled(p));
     if !changes.is_empty() {
         let prompt = format!(
             "Reviewers requested changes on the PRs in: {}. Read the review comments \
@@ -610,14 +692,25 @@ pub fn next_action(repos: &[Repo], branch: &str) -> Action {
              commit and push, then summarize what you changed per comment.",
             changes.join(", ")
         );
-        return act(
-            label("Address review", &changes),
-            Kind::Agent(prompt),
-            changes,
-            false,
-        );
+        // Its prompt reads every comment, so the comment-only reviews are handled too.
+        return with_reviews("Address review", changes, prompt, &|p| {
+            [p.change_requests.clone(), p.comments.clone()].concat()
+        });
     }
-    let stale = prs(&|p, _| p.merge_state == "BEHIND");
+    let new_comments = |p: &Pr| p.comments.iter().any(|id| !handled.contains(id));
+    let commented = current(&new_comments);
+    if !commented.is_empty() {
+        let prompt = format!(
+            "Reviewers left comments on the PRs in: {}. Read them (`gh pr view --comments` and \
+             `gh api repos/{{owner}}/{{repo}}/pulls/<n>/comments`). Address the ones that ask for a change, \
+             commit and push, then summarize per comment what you changed or why you left it.",
+            commented.join(", ")
+        );
+        return with_reviews("Address comments", commented, prompt, &|p| {
+            p.comments.clone()
+        });
+    }
+    let stale = current(&|p| p.merge_state == "BEHIND");
     if !stale.is_empty() {
         return act(
             label("Update branch", &stale),
@@ -635,6 +728,20 @@ pub fn next_action(repos: &[Repo], branch: &str) -> Action {
             false,
         );
     }
+    if !unknown.is_empty() {
+        let failed = repos
+            .iter()
+            .any(|r| unknown.contains(&r.name) && matches!(r.pr, Some(Err(_))));
+        return match failed {
+            true => act(
+                label("GitHub unavailable", &unknown),
+                Kind::None,
+                unknown,
+                true,
+            ),
+            false => act("Checking PR…", Kind::None, vec![], false),
+        };
+    }
     let passive = |l: &str| act(l, Kind::OpenPr, vec![], false);
     // GitHub computes mergeability lazily, and lags a push by a few seconds.
     if !prs(&|p, l| p.head != l.head || matches!(p.merge_state.as_str(), "UNKNOWN" | "")).is_empty()
@@ -643,6 +750,9 @@ pub fn next_action(repos: &[Repo], branch: &str) -> Action {
     }
     if !prs(&|p, _| p.checks == Checks::Pending).is_empty() {
         return passive("Checks running");
+    }
+    if !prs(&|p, _| p.review == "CHANGES_REQUESTED").is_empty() {
+        return passive("Awaiting re-review");
     }
     if !prs(&|p, _| p.merge_state == "BLOCKED").is_empty() {
         let review =
@@ -688,6 +798,58 @@ pub fn pr_head_moved(repos: &[Repo]) -> bool {
     repos
         .iter()
         .any(|r| r.open_pr().is_some_and(|p| head_moved(r, p)))
+}
+
+/// The command one repo's part of a mechanical step runs: `git` args for Pull, Push and
+/// ForcePush, `gh` args for Merge (minus the merge method). `Ok(None)` when the repo has nothing
+/// to do. Menu steps skip the next-step check, so these guards are what keeps them from moving
+/// the wrong commit.
+pub fn step_args(kind: &Kind, b: &str, r: &Repo) -> Result<Option<Vec<String>>, String> {
+    let local = || r.local.clone();
+    let on_branch = || {
+        let l = local()?;
+        match l.branch.as_deref() == Some(b) && l.op.is_none() {
+            true => Ok(l),
+            false => Err(format!("not on `{b}`, or a merge or rebase is in progress")),
+        }
+    };
+    let args = |a: &[&str]| Ok(Some(a.iter().map(|s| s.to_string()).collect()));
+    match kind {
+        Kind::Pull => match on_branch()?.remote.is_some_and(|(_, n)| n > 0) {
+            true => args(&["pull", "--ff-only", "--no-rebase", "origin", b]),
+            false => Ok(None),
+        },
+        Kind::Push => {
+            let l = on_branch()?;
+            if l.remote.is_some_and(|(a, _)| a == 0) || (l.remote.is_none() && l.base.0 == 0) {
+                return Ok(None);
+            }
+            args(&["push", "-u", "origin", b])
+        }
+        Kind::ForcePush => {
+            let l = on_branch()?;
+            if !l.rewritten {
+                return Ok(None);
+            }
+            // The commit whose patches were checked, not whatever a later fetch put there.
+            let lease = format!("--force-with-lease={b}:{}", l.remote_head);
+            args(&["push", &lease, "-u", "origin", b])
+        }
+        Kind::Merge => {
+            let Some(p) = r.open_pr() else {
+                return Ok(None);
+            };
+            let l = local()?;
+            // Merge exactly what this workspace has: clean, pushed, and GitHub's head matching.
+            if l.changed > 0 || l.remote != Some((0, 0)) || p.head != l.head {
+                return Err(
+                    "local branch, origin and the PR don't match; push or pull first".into(),
+                );
+            }
+            args(&["pr", "merge", &p.url, "--match-head-commit", &p.head])
+        }
+        _ => Ok(None),
+    }
 }
 
 #[cfg(test)]
@@ -773,11 +935,14 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
             review: String::new(),
             checks,
             head: "h".into(),
+            change_requests: vec![],
+            comments: vec![],
+            contains_head: String::new(),
         }
     }
 
     fn next(repos: &[Repo]) -> Action {
-        next_action(repos, "feat")
+        next_action(repos, "feat", &[])
     }
 
     fn one(l: Local, p: Option<Pr>) -> Action {
@@ -991,6 +1156,174 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         assert_eq!(one(clean(1), Some(closed)).kind, Kind::Reopen);
     }
 
+    #[test]
+    fn merged_at_a_newer_head_landed() {
+        let gone = Local {
+            remote: None, // auto-deleted after the merge
+            ..clean(1)
+        };
+        let merged = Pr {
+            state: PrState::Merged,
+            head: "newer".into(),
+            ..pr("", Checks::None)
+        };
+        assert_eq!(one(gone.clone(), Some(merged.clone())).kind, Kind::CreatePr);
+        let contains = Pr {
+            contains_head: "h".into(),
+            ..merged
+        };
+        assert!(repo("a", gone.clone(), Some(contains.clone())).landed());
+        assert_eq!(one(gone, Some(contains)).kind, Kind::Archive);
+    }
+
+    #[test]
+    fn stale_or_unknown_repos_wait_alone() {
+        let lagging = Pr {
+            head: "old".into(),
+            ..pr("DIRTY", Checks::Failing(vec!["test".into()]))
+        };
+        assert_eq!(one(clean(1), Some(lagging.clone())).label, "Checking PR…");
+        let draft = Pr {
+            draft: true,
+            ..pr("DRAFT", Checks::Passing)
+        };
+        let web = || repo("web", clean(1), Some(draft.clone()));
+        assert_eq!(
+            next(&[repo("api", clean(1), Some(lagging)), web()]).label,
+            "Ready for review · web"
+        );
+        let offline = Repo {
+            pr: Some(Err("not GitHub".into())),
+            ..repo("api", clean(1), None)
+        };
+        assert_eq!(
+            next(&[offline.clone(), web()]).label,
+            "Ready for review · web"
+        );
+        assert_eq!(
+            next(&[offline.clone(), repo("web", clean(1), None)]).label,
+            "Create PR · web"
+        );
+        let a = next(&[
+            offline,
+            repo("web", clean(1), Some(pr("CLEAN", Checks::Passing))),
+        ]);
+        assert_eq!(a.label, "GitHub unavailable · api", "not Merge");
+    }
+
+    #[test]
+    fn a_handled_review_awaits_re_review() {
+        let reviewed = |ids: &[&str]| Pr {
+            review: "CHANGES_REQUESTED".into(),
+            change_requests: ids.iter().map(|s| s.to_string()).collect(),
+            ..pr("BLOCKED", Checks::Passing)
+        };
+        let ask = |p: Pr, handled: &[String]| {
+            next_action(&[repo("a", clean(1), Some(p))], "feat", handled)
+        };
+        let a = ask(reviewed(&["r1"]), &[]);
+        assert_eq!(
+            (a.label.as_str(), a.reviews),
+            ("Address review", vec!["r1".to_string()])
+        );
+        let handled = vec!["r1".to_string()];
+        assert_eq!(ask(reviewed(&["r1"]), &handled).label, "Awaiting re-review");
+        assert_eq!(
+            ask(reviewed(&["r1", "r2"]), &handled).label,
+            "Address review"
+        );
+        let json = r#"[{"state":"OPEN","reviews":[{"id":"r1","state":"CHANGES_REQUESTED"},{"id":"r2","state":"COMMENTED"}]}]"#;
+        assert_eq!(parse_prs(json).unwrap().change_requests, ["r1"]);
+    }
+
+    #[test]
+    fn comment_only_reviews_ask_once() {
+        let json = r#"[{"state":"OPEN","author":{"login":"me"},"reviews":[
+            {"id":"c1","state":"COMMENTED","author":{"login":"rev"}},
+            {"id":"c2","state":"COMMENTED","author":{"login":"me"}}]}]"#;
+        assert_eq!(
+            parse_prs(json).unwrap().comments,
+            ["c1"],
+            "own replies skipped"
+        );
+        let p = Pr {
+            comments: vec!["c1".into()],
+            ..pr("CLEAN", Checks::Passing)
+        };
+        let ask = |h: &[String]| next_action(&[repo("a", clean(1), Some(p.clone()))], "feat", h);
+        let a = ask(&[]);
+        assert_eq!(
+            (a.label.as_str(), a.reviews),
+            ("Address comments", vec!["c1".to_string()])
+        );
+        assert_eq!(ask(&["c1".to_string()]).kind, Kind::Merge);
+    }
+
+    #[test]
+    fn step_guards() {
+        let args = |k: Kind, l: Local, p: Option<Pr>| step_args(&k, "feat", &repo("a", l, p));
+        let behind = Local {
+            remote: Some((0, 2)),
+            ..clean(1)
+        };
+        assert_eq!(
+            args(Kind::Pull, behind.clone(), None).unwrap().unwrap(),
+            ["pull", "--ff-only", "--no-rebase", "origin", "feat"]
+        );
+        assert_eq!(args(Kind::Pull, clean(1), None), Ok(None));
+        let other = Local {
+            branch: Some("main".into()),
+            ..behind
+        };
+        assert!(args(Kind::Pull, other.clone(), None).is_err());
+        assert!(args(Kind::Push, other, None).is_err());
+        let rebasing = Local {
+            op: Some(Op::Rebase),
+            remote: Some((1, 0)),
+            ..clean(1)
+        };
+        assert!(args(Kind::Push, rebasing, None).is_err());
+        assert_eq!(
+            args(Kind::Push, clean(1), None),
+            Ok(None),
+            "nothing to push"
+        );
+        assert_eq!(
+            args(Kind::ForcePush, clean(1), None),
+            Ok(None),
+            "not rewritten"
+        );
+        let rewritten = Local {
+            remote: Some((1, 1)),
+            remote_head: "probed".into(),
+            rewritten: true,
+            ..clean(1)
+        };
+        assert!(
+            args(Kind::ForcePush, rewritten, None).unwrap().unwrap()[1]
+                == "--force-with-lease=feat:probed"
+        );
+        let open = || Some(pr("CLEAN", Checks::Passing));
+        assert_eq!(
+            args(Kind::Merge, clean(1), open()).unwrap().unwrap(),
+            ["pr", "merge", "u", "--match-head-commit", "h"]
+        );
+        let moved = Local {
+            head: "h2".into(),
+            ..clean(1)
+        };
+        assert!(
+            args(Kind::Merge, moved, open()).is_err(),
+            "PR head isn't ours"
+        );
+        let dirty = Local {
+            changed: 1,
+            ..clean(1)
+        };
+        assert!(args(Kind::Merge, dirty, open()).is_err());
+        assert_eq!(args(Kind::Merge, clean(1), None), Ok(None));
+    }
+
     /// The real thing: a linked worktree from `create_workspace` against a bare origin.
     #[test]
     fn probes_a_linked_worktree() {
@@ -1034,7 +1367,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         let ws = create_workspace(&root.join("ws/feat"), "feat", "feat", &[repo]).unwrap();
         let wt = root.join("ws/feat/api");
         let base = ws.repos[0].base.clone();
-        let p = || probe(&wt, "feat", &base).unwrap();
+        let p = || probe(&wt, "feat", &base, None).unwrap();
 
         let l = p();
         assert_eq!(
@@ -1055,7 +1388,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
             local: Ok(l),
             pr: Some(Ok(None)),
         };
-        assert_eq!(next_action(&[r(p())], "feat").kind, Kind::CreatePr);
+        assert_eq!(next_action(&[r(p())], "feat", &[]).kind, Kind::CreatePr);
 
         git(&wt, &["push", "-q", "-u", "origin", "feat"]).unwrap();
         assert_eq!(p().remote, Some((0, 0)));
@@ -1079,7 +1412,24 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         assert!(status.success());
         let l = p();
         assert!(l.remote == Some((1, 1)) && l.rewritten, "{l:?}");
-        assert_eq!(next_action(&[r(l)], "feat").kind, Kind::ForcePush);
+        let fake = Local {
+            remote: Some((7, 7)),
+            ..l.clone()
+        };
+        assert_eq!(
+            probe(&wt, "feat", &base, Some(&fake)).unwrap().remote,
+            Some((7, 7)),
+            "unmoved refs reuse the last counts"
+        );
+        let force = step_args(&Kind::ForcePush, "feat", &r(l.clone()))
+            .unwrap()
+            .unwrap();
+        assert_eq!(next_action(&[r(l)], "feat", &[]).kind, Kind::ForcePush);
+        // Someone pushes after the probe: the lease on the probed commit must refuse.
+        git(&src, &["push", "-qf", "origin", "main:feat"]).unwrap();
+        let force: Vec<&str> = force.iter().map(String::as_str).collect();
+        let e = git(&wt, &force).unwrap_err();
+        assert!(e.contains("stale info"), "{e}");
 
         // A conflicting merge; its MERGE_HEAD lives in .git/worktrees/<name>/, not the worktree.
         c(&src, &["checkout", "-qb", "other"]);
@@ -1101,7 +1451,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         );
         let l = p();
         assert_eq!((l.op, l.conflicts), (Some(Op::Merge), 1));
-        assert_eq!(next_action(&[r(l)], "feat").label, "Resolve conflicts");
+        assert_eq!(next_action(&[r(l)], "feat", &[]).label, "Resolve conflicts");
         fs::remove_dir_all(&root).unwrap();
     }
 }

@@ -23,6 +23,11 @@ pub enum Cmd {
     SearchNext,
     SearchPrev,
     Save,
+    /// `:wq`/`:x`: save, then close once the write lands.
+    SaveQuit,
+    Quit,
+    /// `:q!`: close and drop unsaved edits.
+    ForceQuit,
     PageDown,
     PageUp,
     Indent,
@@ -119,6 +124,8 @@ impl Vim {
             (Mode::Visual | Mode::VisualLine, Some(v)) => clamp(t, v.min(t.len())),
             _ => clamp(t, cur),
         };
+        // A reload can replace the text under a Visual selection.
+        self.anchor = clamp(t, self.anchor);
         if self.mode == Mode::Insert {
             if !esc {
                 return Out::default();
@@ -162,9 +169,13 @@ impl Vim {
                 }
             }
             "enter" => {
-                if matches!(&self.keys[1..], "w" | "w!" | "wq" | "wq!" | "x" | "x!") {
-                    out.cmd = Some(Cmd::Save);
-                }
+                out.cmd = match &self.keys[1..] {
+                    "w" | "w!" => Some(Cmd::Save),
+                    "wq" | "wq!" | "x" | "x!" => Some(Cmd::SaveQuit),
+                    "q" => Some(Cmd::Quit),
+                    "q!" => Some(Cmd::ForceQuit),
+                    _ => None,
+                };
                 self.reset();
             }
             k if k.chars().count() == 1 => self.keys.push_str(k),
@@ -355,18 +366,24 @@ impl Vim {
             'A' if simple => insert(self, e),
             'o' | 'O' if simple => {
                 let ind = indent(t, r);
+                // Keep CRLF files CRLF.
+                let nl = if t.line_end_offset(r) > e {
+                    "\r\n"
+                } else {
+                    "\n"
+                };
                 self.mode = Mode::Insert;
                 if ch == 'o' {
-                    let c = e + 1 + ind.len();
+                    let c = e + nl.len() + ind.len();
                     Out {
-                        edit: Some((e..e, format!("\n{ind}"))),
+                        edit: Some((e..e, format!("{nl}{ind}"))),
                         cursor: Some(c),
                         ..Out::default()
                     }
                 } else {
                     let c = s + ind.len();
                     Out {
-                        edit: Some((s..s, format!("{ind}\n"))),
+                        edit: Some((s..s, format!("{ind}{nl}"))),
                         cursor: Some(c),
                         ..Out::default()
                     }
@@ -661,7 +678,7 @@ impl Vim {
                     };
                 }
                 // Clamp in post-edit text: if the deletion reaches end of line, step left.
-                let eol = b >= t.len() || t.byte(b) == b'\n';
+                let eol = b >= lend(t, row(t, b));
                 let c = if eol && a > lstart(t, row(t, a)) {
                     prev(t, a)
                 } else {
@@ -778,7 +795,7 @@ fn join(t: &Rope, r: usize, n: usize) -> Out {
     let end = first_nonblank(t, last);
     let mut c = start + sep_at;
     // Joined an empty last line: keep the cursor off the '\n'.
-    if c == start + text.len() && (end >= t.len() || t.byte(end) == b'\n') && c > lstart(t, r) {
+    if c == start + text.len() && end == lend(t, last) && c > lstart(t, r) {
         c = if text.is_empty() {
             prev(t, start)
         } else {
@@ -802,9 +819,14 @@ fn lstart(t: &Rope, r: usize) -> usize {
     t.line_start_offset(r)
 }
 
-/// End of line `r`, excluding the '\n'.
+/// End of line `r`, excluding the '\n' and a CRLF's '\r'.
 fn lend(t: &Rope, r: usize) -> usize {
-    t.line_end_offset(r)
+    let e = t.line_end_offset(r);
+    if e > lstart(t, r) && t.byte(e - 1) == b'\r' {
+        e - 1
+    } else {
+        e
+    }
 }
 
 fn char_at(t: &Rope, off: usize) -> Option<char> {
@@ -925,7 +947,8 @@ fn word_end(t: &Rope, p: usize, big: bool) -> usize {
     it.next();
     let mut cur = loop {
         match it.next() {
-            None => return prev(t, t.len()).max(p),
+            // Never the trailing '\n': `de` on the last word would eat it.
+            None => return clamp(t, prev(t, t.len())).max(p),
             Some((_, c)) if c.is_whitespace() => {}
             Some(x) => break x,
         }
@@ -1358,15 +1381,48 @@ mod tests {
         let r = run("|a", ":w");
         assert_eq!(r.vim.pending(), ":w");
         assert_eq!(run("|a", ":w<cr>").last.cmd, Some(Cmd::Save));
-        assert_eq!(run("|a", ":wq<cr>").last.cmd, Some(Cmd::Save));
-        assert_eq!(run("|a", ":x<cr>").last.cmd, Some(Cmd::Save));
-        assert_eq!(run("|a", ":q<cr>").last.cmd, None);
+        assert_eq!(run("|a", ":wq<cr>").last.cmd, Some(Cmd::SaveQuit));
+        assert_eq!(run("|a", ":x<cr>").last.cmd, Some(Cmd::SaveQuit));
+        assert_eq!(run("|a", ":q<cr>").last.cmd, Some(Cmd::Quit));
+        assert_eq!(run("|a", ":q!<cr>").last.cmd, Some(Cmd::ForceQuit));
+        assert_eq!(run("|a", ":qa<cr>").last.cmd, None);
         assert_eq!(run("|a", ":w<esc>").vim.pending(), "");
         assert_eq!(run("|a", ":wx<bs><cr>").last.cmd, Some(Cmd::Save));
         let r = run("|a", ":<bs>");
         assert_eq!(r.vim.pending(), "");
         assert_eq!(k("|a", ":<bs>x"), "|");
         assert_eq!(k("|a", ":x"), "|a");
+    }
+
+    #[test]
+    fn crlf_lines() {
+        assert_eq!(k("a|b\r\nc\r\n", "A!<esc>"), "ab|!\r\nc\r\n");
+        assert_eq!(k("|ab\r\nc\r\n", "$"), "a|b\r\nc\r\n");
+        assert_eq!(k("a|b\r\nc\r\n", "x"), "|a\r\nc\r\n");
+        assert_eq!(k("a|b\r\nc\r\n", "D"), "|a\r\nc\r\n");
+        assert_eq!(k("|ab\r\nc\r\n", "ox<esc>"), "ab\r\n|x\r\nc\r\n");
+        assert_eq!(k("|ab\r\nc\r\n", "Ox<esc>"), "|x\r\nab\r\nc\r\n");
+        assert_eq!(k("|ab\r\nc\r\n", "J"), "ab| c\r\n");
+        assert_eq!(k("ab\r\n|c\r\n", "dd"), "|ab\r\n");
+    }
+
+    #[test]
+    fn de_keeps_final_newline() {
+        assert_eq!(k("fo|o\n", "de"), "f|o\n");
+        assert_eq!(run("a |foo\n", "ye").clip.as_deref(), Some("foo"));
+    }
+
+    #[test]
+    fn visual_anchor_survives_reload() {
+        let mut v = Vim::default();
+        let long = Rope::from("abcdefghij\n");
+        v.key("$", &long, 0, None);
+        v.key("v", &long, 9, None);
+        // The file is replaced with shorter, multi-byte text while the selection is up.
+        let short = Rope::from("ææ\n");
+        let out = v.key("d", &short, 0, None);
+        let (r, _) = out.edit.expect("delete");
+        assert!(r.end <= short.len() && short.is_char_boundary(r.start));
     }
 
     #[test]

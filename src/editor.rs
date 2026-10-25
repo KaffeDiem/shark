@@ -5,8 +5,10 @@ use crate::*;
 use gpui_kit::component::input::{
     Editor, EditorState, Indent, InputEvent, MovePageDown, MovePageUp, Outdent, Redo, Search, Undo,
 };
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::{RopeExt as _, WindowExt as _};
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 /// Bigger files open in the diff only; the editor is built for up to ~50K lines.
 pub const MAX_BYTES: u64 = 4 << 20;
@@ -25,6 +27,8 @@ pub struct FileEditor {
     pub input: Entity<EditorState>,
     /// Fingerprint of the file as last read or written, to notice other writers.
     disk: u64,
+    /// Length and mtime as last read; the poll skips reading while they hold.
+    stat: Option<(u64, SystemTime)>,
     loaded: bool,
     pub dirty: bool,
     /// The file changed on disk while the buffer had unsaved edits.
@@ -34,6 +38,8 @@ pub struct FileEditor {
     /// A write is in flight; reloads started before it finished are stale.
     saving: bool,
     saves: u64,
+    /// `:wq` is waiting for its write to land.
+    close_after_save: bool,
     _subs: Vec<Subscription>,
     _poll: Task<()>,
 }
@@ -62,20 +68,10 @@ impl FileEditor {
         let this = cx.entity().downgrade();
         subs.push(cx.intercept_keystrokes(move |ev, window, cx| {
             let Some(this) = this.upgrade() else { return };
-            let ks = &ev.keystroke;
-            let handled = this.update(cx, |e, cx| {
-                // The second key of an app chord (`ctrl-w h`) belongs to the keymap, not Vim.
-                if !e.is_focused(window, cx) || window.has_pending_keystrokes() {
-                    return false;
-                }
-                let idle =
-                    !e.vim_on || (e.vim.mode == vim::Mode::Normal && e.vim.pending().is_empty());
-                if idle && ks.key == "escape" && ks.modifiers.number_of_modifiers() == 0 {
-                    cx.emit(EditorEvent::Leave);
-                    return true;
-                }
-                e.vim_on && vim_key(ks).is_some_and(|k| e.vim_key(&k, window, cx))
-            });
+            // The second key of an app chord (`ctrl-w h`) belongs to the keymap, not Vim; when
+            // it completes none, the key-down fallback in `render` gets it.
+            let handled = !window.has_pending_keystrokes()
+                && this.update(cx, |e, cx| e.intercept(&ev.keystroke, window, cx));
             if handled {
                 cx.stop_propagation();
             }
@@ -94,6 +90,7 @@ impl FileEditor {
             abs,
             input,
             disk: 0,
+            stat: None,
             loaded: false,
             dirty: false,
             conflict: false,
@@ -101,12 +98,37 @@ impl FileEditor {
             vim_on,
             saving: false,
             saves: 0,
+            close_after_save: false,
             _subs: subs,
             _poll,
         };
         editor.sync_readonly(cx);
         editor.reload(window, cx);
         editor
+    }
+
+    /// Escape out of an idle editor, or a key for Vim; true when handled.
+    fn intercept(&mut self, ks: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.is_focused(window, cx) {
+            return false;
+        }
+        if self.idle() && ks.key == "escape" && ks.modifiers.number_of_modifiers() == 0 {
+            cx.emit(EditorEvent::Leave);
+            return true;
+        }
+        // Space starts a leader sequence (`space x`), bound under the VimNormal context.
+        if self.leader(ks) {
+            return false;
+        }
+        self.vim_on && vim_key(ks).is_some_and(|k| self.vim_key(&k, window, cx))
+    }
+
+    fn idle(&self) -> bool {
+        !self.vim_on || (self.vim.mode == vim::Mode::Normal && self.vim.pending().is_empty())
+    }
+
+    fn leader(&self, ks: &Keystroke) -> bool {
+        self.vim_on && self.idle() && ks.key == "space" && ks.modifiers.number_of_modifiers() == 0
     }
 
     pub fn is_focused(&self, window: &Window, cx: &App) -> bool {
@@ -132,16 +154,27 @@ impl FileEditor {
         if self.saving {
             return;
         }
-        let (abs, saves) = (self.abs.clone(), self.saves);
+        let (abs, saves, seen) = (self.abs.clone(), self.saves, self.stat);
         cx.spawn_in(window, async move |this, cx| {
-            let text = cx
+            let read = cx
                 .background_executor()
-                .spawn(async move { std::fs::read(&abs) })
+                .spawn(async move {
+                    let m = std::fs::metadata(&abs)?;
+                    let stat = (m.len(), m.modified()?);
+                    // Unchanged, or grown past what the editor handles: stop following it.
+                    if Some(stat) == seen || m.len() > MAX_BYTES {
+                        return Ok(None);
+                    }
+                    std::fs::read(&abs).map(|b| Some((stat, b)))
+                })
                 .await;
             this.update_in(cx, |e, window, cx| {
                 if e.saving || e.saves != saves {
                     return; // read before our own write landed
                 }
+                let Some(read) = read.transpose() else { return };
+                e.stat = read.as_ref().ok().map(|(stat, _)| *stat);
+                let text = read.map(|(_, b)| b);
                 let fp = text.as_ref().map(fingerprint).ok();
                 if e.loaded && fp == Some(e.disk) {
                     return;
@@ -158,10 +191,14 @@ impl FileEditor {
                             let pos = i.cursor_position();
                             i.set_value(text, window, cx);
                             if e.loaded {
-                                i.set_cursor_position(pos, window, cx);
+                                // Not set_cursor_position: it focuses, stealing the composer's keys.
+                                let off = i.text().position_to_offset(&pos);
+                                i.set_selected_range(off..off, cx);
                             }
                         });
-                        if !e.loaded {
+                        if e.loaded {
+                            e.clamp_cursor(cx);
+                        } else {
                             e.loaded = true;
                             e.sync_readonly(cx);
                         }
@@ -179,6 +216,7 @@ impl FileEditor {
     pub fn discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.dirty = false;
         self.disk = 0;
+        self.stat = None;
         self.reload(window, cx);
     }
 
@@ -204,9 +242,10 @@ impl FileEditor {
                         .map(|_| Some(fingerprint(text.as_bytes())))
                 })
                 .await;
-            this.update(cx, |e, cx| {
+            this.update_in(cx, |e, window, cx| {
                 e.saving = false;
                 e.saves += 1;
+                let close = std::mem::take(&mut e.close_after_save);
                 match result {
                     Ok(Some(fp)) => {
                         e.disk = fp;
@@ -214,9 +253,15 @@ impl FileEditor {
                         e.dirty = e.input.read(cx).value() != saved;
                         e.conflict = false;
                         cx.emit(EditorEvent::Saved);
+                        if close && !e.dirty {
+                            window.dispatch_action(Box::new(CloseFile), cx);
+                        }
                     }
                     Ok(None) => e.conflict = true,
-                    Err(err) => eprintln!("save {}: {err}", e.path),
+                    Err(err) => window.push_notification(
+                        Notification::error(format!("Could not save {}: {err}", e.path)),
+                        cx,
+                    ),
                 }
                 cx.notify();
             })
@@ -286,6 +331,15 @@ impl FileEditor {
         use vim::Cmd::*;
         let action: Box<dyn Action> = match cmd {
             Save => return self.save(false, window, cx),
+            SaveQuit if self.dirty => {
+                self.close_after_save = true;
+                return self.save(false, window, cx);
+            }
+            SaveQuit | Quit => return window.dispatch_action(Box::new(CloseFile), cx),
+            ForceQuit => {
+                self.dirty = false;
+                return window.dispatch_action(Box::new(CloseFile), cx);
+            }
             SearchNext | SearchPrev => {
                 self.input.update(cx, |i, cx| {
                     let m = match cmd {
@@ -317,9 +371,6 @@ impl FileEditor {
             })
             .ok();
         });
-        if matches!(cmd, Undo | Redo | Indent | Outdent) {
-            self.dirty = true;
-        }
     }
 }
 
@@ -340,10 +391,21 @@ pub fn language(path: &str) -> String {
 /// The Vim name of a keystroke, or `None` when it belongs to the app (cmd-…, ctrl-w, …).
 fn vim_key(ks: &Keystroke) -> Option<String> {
     let m = &ks.modifiers;
+    // Nordic and German layouts need Option for `{ } [ ] | ~ @`.
+    if m.alt && !(m.platform || m.control || m.function) {
+        return ks.key_char.clone().filter(|c| {
+            let mut cs = c.chars();
+            matches!((cs.next(), cs.next()), (Some(ch), None) if ch.is_ascii_punctuation())
+        });
+    }
     if m.platform || m.alt || m.function {
         return None;
     }
     if m.control {
+        // ctrl-c doesn't stop the agent in the editor; leave insert mode with it, as in Vim.
+        if ks.key == "c" {
+            return Some("ctrl-[".into());
+        }
         return matches!(ks.key.as_str(), "d" | "u" | "r" | "[")
             .then(|| format!("ctrl-{}", ks.key));
     }
@@ -360,8 +422,21 @@ fn vim_key(ks: &Keystroke) -> Option<String> {
 }
 
 impl Render for FileEditor {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        Editor::new(&self.input).appearance(false).h_full()
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // A key after a pending prefix that completes no binding (`space j`) skips interceptors;
+        // it arrives here once nothing is pending. Keys the interceptor handled never bubble here,
+        // and the ones it declined decline again. The replayed `space` itself is dropped: the
+        // Editor element resets the state's readonly each render, so it would type.
+        div()
+            .size_full()
+            .on_key_down(cx.listener(|e, ev: &KeyDownEvent, window, cx| {
+                let ks = &ev.keystroke;
+                if !window.has_pending_keystrokes() && (e.leader(ks) || e.intercept(ks, window, cx))
+                {
+                    cx.stop_propagation();
+                }
+            }))
+            .child(Editor::new(&self.input).appearance(false).h_full())
     }
 }
 
@@ -373,5 +448,111 @@ mod tests {
         assert_eq!(super::language("api/Makefile"), "Makefile");
         assert_eq!(super::language("api/.env"), ".env");
         assert_eq!(super::language("web/a.test.ts"), "ts");
+    }
+
+    #[test]
+    fn option_chars_reach_vim() {
+        let ks = |s: &str, c: &str| {
+            let mut k = gpui_kit::Keystroke::parse(s).unwrap();
+            k.key_char = Some(c.into());
+            super::vim_key(&k)
+        };
+        assert_eq!(ks("alt-shift-8", "{").as_deref(), Some("{"));
+        assert_eq!(ks("alt-s", "ß"), None);
+        assert_eq!(ks("alt-cmd-8", "{"), None);
+        let ctrl_c = gpui_kit::Keystroke::parse("ctrl-c").unwrap();
+        assert_eq!(super::vim_key(&ctrl_c).as_deref(), Some("ctrl-["));
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod ui_tests {
+    use super::*;
+    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+    use gpui_kit::test::{TestAppContextExt, TestWindowExt};
+    use std::fs;
+
+    /// A loaded editor on `contents` in a fresh temp dir; returns the dir and the file.
+    async fn open_editor(
+        tag: &str,
+        contents: &str,
+        cx: &mut TestAppContext,
+    ) -> (PathBuf, PathBuf, AnyWindowHandle, Entity<FileEditor>) {
+        let dir = std::env::temp_dir().join(format!("shark-{tag}-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        fs::write(&file, contents).unwrap();
+        cx.update(gpui_kit::init);
+        let abs = file.clone();
+        let (window, editor) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| FileEditor::new("r/a.txt".into(), abs, true, w, cx))
+                })
+            })
+            .unwrap();
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            editor.read(cx).loaded
+        })
+        .await;
+        (dir, file, window, editor)
+    }
+
+    #[gpui_kit::test]
+    async fn reload_keeps_focus_and_undo_stays_clean(cx: &mut TestAppContext) {
+        let (dir, file, window, editor) = open_editor("editor", "one\n", cx).await;
+        let text = |cx: &mut TestAppContext| {
+            cx.update(|cx| editor.read(cx).input.read(cx).value().to_string())
+        };
+
+        // `u` with nothing to undo is not an edit.
+        cx.update_window(window, |_, w, cx| {
+            focus(&editor, w, cx);
+            w.press("u", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert!(!editor.read(cx).dirty));
+
+        // An agent write while the user types elsewhere must not pull focus into the file.
+        let other = cx.update(|cx| cx.focus_handle());
+        cx.update_window(window, |_, w, cx| other.focus(w, cx))
+            .unwrap();
+        fs::write(&file, "two\n").unwrap();
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            editor.read(cx).input.read(cx).value().as_ref() == "two\n"
+        })
+        .await;
+        cx.update_window(window, |_, w, cx| {
+            assert!(!editor.read(cx).is_focused(w, cx))
+        })
+        .unwrap();
+
+        // Past the size cap the buffer stops following the file.
+        fs::write(&file, "x".repeat(MAX_BYTES as usize + 1)).unwrap();
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.run_until_parked();
+        assert_eq!(text(cx), "two\n");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// `space j` completes no leader binding: the `j` still moves Vim's cursor.
+    #[gpui_kit::test]
+    async fn key_after_unbound_leader_reaches_vim(cx: &mut TestAppContext) {
+        let (dir, _, window, editor) = open_editor("leader", "one\ntwo\n", cx).await;
+        cx.update(|cx| cx.bind_keys([KeyBinding::new("space z", crate::OpenAnyFile, None)]));
+        cx.update_window(window, |_, w, cx| {
+            focus(&editor, w, cx);
+            w.press("space", cx);
+            w.press("j", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let i = editor.read(cx).input.read(cx);
+            assert_eq!((i.value().as_ref(), i.cursor()), ("one\ntwo\n", 4));
+        });
+        let _ = fs::remove_dir_all(&dir);
     }
 }

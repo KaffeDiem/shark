@@ -36,32 +36,16 @@ pub struct Item {
 /// Every tracked and untracked-but-not-ignored path in each repo, plus their folders.
 /// Paths are workspace-relative (`api/src/a.rs`), which is how Claude Code resolves `@`.
 pub fn files(repos: &[(String, PathBuf)]) -> Vec<Item> {
-    let lists: Vec<(String, String)> = std::thread::scope(|s| {
-        let jobs: Vec<_> = repos
-            .iter()
-            .map(|(name, dir)| {
-                s.spawn(move || {
-                    let out = crate::git::git(
-                        dir,
-                        &[
-                            "-c",
-                            "core.quotepath=off",
-                            "ls-files",
-                            "-co",
-                            "--exclude-standard",
-                        ],
-                    );
-                    (name.clone(), out.unwrap_or_default())
-                })
-            })
-            .collect();
-        jobs.into_iter().filter_map(|j| j.join().ok()).collect()
+    let lists = crate::git::par_map(repos, |(name, dir)| {
+        // -z: unquoted names; --deduplicate: one line per conflicted file, not per stage.
+        let out = crate::git::ls_files(dir, &["-co", "--exclude-standard", "--deduplicate"]);
+        (name.clone(), out)
     });
     let mut items = vec![];
     for (repo, out) in &lists {
         let mut dirs = BTreeSet::new();
-        for path in out.lines() {
-            let mut p = path;
+        for path in out {
+            let mut p = path.as_str();
             while let Some(i) = p.rfind('/') {
                 p = &p[..i];
                 if !dirs.insert(p) {
@@ -84,16 +68,18 @@ fn item(kind: Kind, repo: &str, path: &str) -> Item {
         (Kind::Dir, _) => format!("{repo}/{path}/"),
         _ => format!("{repo}/{path}"),
     };
-    let trimmed = full.trim_end_matches('/');
-    let name_at = trimmed.rfind('/').map_or(0, |i| i + 1);
+    let name_at = |s: &str| s.trim_end_matches('/').rfind('/').map_or(0, |i| i + 1);
+    let at = name_at(&full);
+    // Lowercasing can change byte lengths (Kelvin sign, `İ`), so the key gets its own offset.
+    let key = full.to_lowercase();
     Item {
         kind,
-        label: full[name_at..].to_string(),
-        detail: full[..name_at].trim_end_matches('/').to_string(),
+        label: full[at..].to_string(),
+        detail: full[..at].trim_end_matches('/').to_string(),
         badge: repo.to_string(),
         insert: format!("@{full}"),
-        key: full.to_lowercase(),
-        name_at,
+        name_at: name_at(&key),
+        key,
     }
 }
 
@@ -165,15 +151,18 @@ pub fn probe_commands(ws: &str, dir: &Path) -> Option<Vec<Item>> {
 
 fn commands(cmds: Vec<Cmd>) -> Vec<Item> {
     cmds.into_iter()
-        .map(|c| Item {
-            kind: Kind::Command,
-            insert: format!("/{}", c.name),
-            label: format!("/{}", c.name),
-            detail: c.description.lines().next().unwrap_or_default().to_string(),
-            badge: c.argument_hint,
-            // `plugin:skill` also matches on `skill`, with the name bonus.
-            name_at: c.name.find(':').map_or(0, |i| i + 1),
-            key: c.name.to_lowercase(),
+        .map(|c| {
+            let key = c.name.to_lowercase();
+            Item {
+                kind: Kind::Command,
+                insert: format!("/{}", c.name),
+                label: format!("/{}", c.name),
+                detail: c.description.lines().next().unwrap_or_default().to_string(),
+                badge: c.argument_hint,
+                // `plugin:skill` also matches on `skill`, with the name bonus.
+                name_at: key.find(':').map_or(0, |i| i + 1),
+                key,
+            }
         })
         .collect()
 }
@@ -259,7 +248,12 @@ mod tests {
         for name in ["api", "web"] {
             let dir = root.join(name);
             fs::create_dir_all(dir.join("docs/deep")).unwrap();
-            for f in ["README.md", "docs/deep/README.md", "src_reader.rs"] {
+            for f in [
+                "README.md",
+                "docs/deep/README.md",
+                "src_reader.rs",
+                "q\"uote.md",
+            ] {
                 fs::write(dir.join(f), "").unwrap();
             }
             fs::write(dir.join(".gitignore"), "target/\n").unwrap();
@@ -278,6 +272,11 @@ mod tests {
             ["@api/README.md", "@web/README.md"]
         );
         assert_eq!(inserts(&items, "web/readme")[0], "@web/README.md");
+        assert_eq!(
+            inserts(&items, "quote")[0],
+            "@api/q\"uote.md",
+            "not C-quoted"
+        );
         assert_eq!(inserts(&items, "api/deep")[0], "@api/docs/deep/");
         let readme = items
             .iter()
@@ -294,6 +293,9 @@ mod tests {
         let t = std::time::Instant::now();
         rank(&many, "f19", 50);
         assert!(t.elapsed() < Duration::from_millis(40), "{:?}", t.elapsed());
+        // The Kelvin sign lowercases to a shorter `k`; slicing the key must not panic.
+        let odd = [item(Kind::File, "r", "\u{212A}\u{212A}\u{212A}/é.rs")];
+        assert_eq!(rank(&odd, "é", 1), [0]);
         fs::remove_dir_all(root).unwrap();
     }
 

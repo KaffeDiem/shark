@@ -1,5 +1,6 @@
 mod agent;
 mod app;
+mod attention;
 mod chat;
 mod complete;
 mod editor;
@@ -23,6 +24,7 @@ actions!(
         ArchiveWorkspace,
         ForceArchiveWorkspace,
         AddRepo,
+        AddRepoToWorkspace,
         StopAgent,
         FocusLeft,
         FocusRight,
@@ -30,6 +32,9 @@ actions!(
         ShowDiff,
         CreatePrs,
         OpenPrs,
+        CreateDraftPrs,
+        MergeEarlier,
+        MergeLater,
         GitNext,
         GitMenu,
         GitFetch,
@@ -65,35 +70,47 @@ actions!(
         ToggleRepo,
         SwitchField,
         SubmitForm,
+        NextAttention,
     ]
 );
+
+// Editor and diff review: `space f f`, and `c` / `shift-c` in the diff.
+actions!(shark, [OpenAnyFile, AddComment, SendComments]);
 
 /// Switch the open workspace to `chat::MODELS[n]` without opening the menu.
 #[derive(Clone, PartialEq, Debug, serde::Deserialize, Action)]
 #[action(namespace = shark, no_json)]
 pub struct SetModel(pub usize);
 
+/// Open the Nth workspace in the sidebar (cmd-1…9).
+#[derive(Clone, PartialEq, Debug, serde::Deserialize, Action)]
+#[action(namespace = shark, no_json)]
+pub struct OpenWorkspaceAt(pub usize);
+
 /// Apps launched from Finder get a minimal PATH; borrow the login shell's so claude/gh/git resolve.
 fn fix_path() {
     let shell = std::env::var("SHELL").unwrap_or("/bin/zsh".into());
-    if let Ok(out) = std::process::Command::new(shell)
-        .args(["-lic", "printf '__P__%s' \"$PATH\""])
-        .output()
-        && let Some(path) = String::from_utf8_lossy(&out.stdout).split("__P__").nth(1)
+    // Bounded: an rc file that blocks (pinentry, a network call) must not hang launch.
+    let probe = ["-lic", "printf '__P__%s' \"$PATH\""];
+    if let Ok(out) = git::cmd_bounded(std::path::Path::new("/"), &shell, &probe, 5)
+        && let Some(path) = out.split("__P__").nth(1)
     {
-        // SAFETY: called first thing in main, before any other threads exist.
+        // SAFETY: called first thing in main; the only other thread is cmd_bounded's waiter,
+        // which has already handed over the output and never reads the environment.
         unsafe { std::env::set_var("PATH", path.trim()) };
     }
 }
 
 fn bind_keys(cx: &mut App) {
-    const NAV: &str = "Sidebar || Transcript || DiffPane || FileTree";
+    // VimNormal: the editor in Vim's Normal mode, where space types nothing.
+    const NAV: &str = "Sidebar || Transcript || DiffPane || FileTree || VimNormal";
     const LIST: &str = "Sidebar || Transcript || FileTree";
     cx.bind_keys([
         KeyBinding::new("cmd-k", TogglePalette, None),
         KeyBinding::new("cmd-shift-p", TogglePalette, None),
         KeyBinding::new("cmd-n", NewWorkspace, None),
-        KeyBinding::new("ctrl-c", StopAgent, None),
+        // Not in the editor: Vim users leave insert mode with ctrl-c.
+        KeyBinding::new("ctrl-c", StopAgent, Some("!FileEditor")),
         KeyBinding::new("ctrl-w h", FocusLeft, None),
         KeyBinding::new("ctrl-w l", FocusRight, None),
         KeyBinding::new("cmd-b", ToggleSidebar, None),
@@ -101,8 +118,9 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("space t", ToggleFileTree, Some(NAV)),
         KeyBinding::new("space x", CloseFile, Some(NAV)),
         KeyBinding::new("ctrl-cmd-v", ToggleVim, None),
-        KeyBinding::new("v", ToggleViewed, Some("FileTree")),
-        KeyBinding::new("o", OpenFile, Some("FileTree")),
+        // In the diff: the file last moved to with `}`/`{` or the tree.
+        KeyBinding::new("v", ToggleViewed, Some("FileTree || DiffPane")),
+        KeyBinding::new("o", OpenFile, Some("FileTree || DiffPane")),
         KeyBinding::new("h", CollapseDir, Some("FileTree")),
         KeyBinding::new("l", ExpandDir, Some("FileTree")),
         KeyBinding::new("cmd-s", SaveFile, Some("FileEditor")),
@@ -123,10 +141,14 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("space w d", ArchiveWorkspace, Some(NAV)),
         KeyBinding::new("space w shift-d", ForceArchiveWorkspace, Some(NAV)),
         KeyBinding::new("space r a", AddRepo, Some(NAV)),
+        KeyBinding::new("space w a", AddRepoToWorkspace, Some(NAV)),
         KeyBinding::new("space c", ShowChat, Some(NAV)),
         KeyBinding::new("space d", ShowDiff, Some(NAV)),
         KeyBinding::new("space p r", CreatePrs, Some(NAV)),
         KeyBinding::new("space p o", OpenPrs, Some(NAV)),
+        KeyBinding::new("space p d", CreateDraftPrs, Some(NAV)),
+        KeyBinding::new("space p k", MergeEarlier, Some(NAV)),
+        KeyBinding::new("space p j", MergeLater, Some(NAV)),
         KeyBinding::new("space g g", GitNext, Some(NAV)),
         KeyBinding::new("space g m", GitMenu, Some(NAV)),
         KeyBinding::new("space g f", GitFetch, Some(NAV)),
@@ -134,6 +156,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("space o t", OpenInTerminal, Some(NAV)),
         KeyBinding::new("space y p", CopyPath, Some(NAV)),
         KeyBinding::new("space y b", CopyBranch, Some(NAV)),
+        KeyBinding::new("cmd-j", NextAttention, None),
+        KeyBinding::new("space w j", NextAttention, Some(NAV)),
         // New workspace dialog: tab hops between branch and repo filter, space ticks the
         // highlighted repo (names have no spaces), cmd-enter creates from either field.
         KeyBinding::new("tab", SwitchField, Some("NewWorkspace")),
@@ -148,6 +172,17 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("{", PrevFile, Some("DiffPane")),
         KeyBinding::new("s", ToggleDiffMode, Some("DiffPane")),
         KeyBinding::new("r", RefreshDiff, Some("DiffPane")),
+        KeyBinding::new("space f f", OpenAnyFile, Some(NAV)),
+        KeyBinding::new("cmd-p", OpenAnyFile, None),
+        // A line cursor that survives refreshes (src/app/review.rs); h/l stay native below.
+        KeyBinding::new("j", SelectNext, Some("DiffPane")),
+        KeyBinding::new("k", SelectPrev, Some("DiffPane")),
+        KeyBinding::new("g g", SelectFirst, Some("DiffPane")),
+        KeyBinding::new("shift-g", SelectLast, Some("DiffPane")),
+        KeyBinding::new("ctrl-d", PageDown, Some("DiffPane")),
+        KeyBinding::new("ctrl-u", PageUp, Some("DiffPane")),
+        KeyBinding::new("c", AddComment, Some("DiffPane")),
+        KeyBinding::new("shift-c", SendComments, Some("DiffPane")),
     ]);
     // Direct picks, numbered like the model menu: ctrl-cmd-1 / space m 1 is the first row.
     cx.bind_keys((0..chat::MODELS.len()).flat_map(|i| {
@@ -156,18 +191,12 @@ fn bind_keys(cx: &mut App) {
             KeyBinding::new(&format!("space m {}", i + 1), SetModel(i), Some(NAV)),
         ]
     }));
+    cx.bind_keys(
+        (1..=9).map(|i| KeyBinding::new(&format!("cmd-{i}"), OpenWorkspaceAt(i - 1), None)),
+    );
     // The Diff component's scroll actions are private; bind vim keys to them by name.
     let diff = Rc::new(KeyBindingContextPredicate::parse("Diff").unwrap());
-    let vim = [
-        ("j", "diff::ScrollDown"),
-        ("k", "diff::ScrollUp"),
-        ("h", "diff::ScrollLeft"),
-        ("l", "diff::ScrollRight"),
-        ("ctrl-d", "diff::PageDown"),
-        ("ctrl-u", "diff::PageUp"),
-        ("g g", "diff::First"),
-        ("shift-g", "diff::Last"),
-    ];
+    let vim = [("h", "diff::ScrollLeft"), ("l", "diff::ScrollRight")];
     let bindings: Vec<KeyBinding> = vim
         .iter()
         .filter_map(|(k, name)| {

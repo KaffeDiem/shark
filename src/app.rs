@@ -1,4 +1,5 @@
 //! Root view: sidebar of repos and workspaces, Chat/Diff tabs, palette and dialogs.
+use crate::attention::Attn;
 use crate::chat::{Chat, ChatEvent, MODELS};
 use crate::editor::{EditorEvent, FileEditor};
 use crate::files::{self, Row};
@@ -9,7 +10,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
-use gpui_kit::component::dialog::DialogEntrance;
+use gpui_kit::component::dialog::{Dialog, DialogEntrance};
 use gpui_kit::component::diff::{Diff, DiffFile, DiffFileStatus, DiffMode, DiffState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
@@ -28,6 +29,9 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
+
+mod picker;
+mod review;
 
 /// Inter disambiguation (ss02 + cv05/cv08/zero): serifed I, tailed l, slashed 0 for paths and hashes.
 /// Dialogs render outside this view's tree, so they apply it again.
@@ -97,6 +101,15 @@ fn path_submenu(
     })
 }
 
+/// The cmd-k bar look: a bare 640px dialog near the top.
+fn menu_dialog(d: Dialog) -> Dialog {
+    d.w(px(640.))
+        .font_features(inter_features())
+        .margin_top(px(96.))
+        .entrance(DialogEntrance::None)
+        .close_button(false)
+}
+
 /// Opens a cmd-k style menu over `target`; `on_pick` gets the confirmed row.
 pub(crate) fn open_menu<T: 'static>(
     target: WeakEntity<T>,
@@ -117,21 +130,14 @@ pub(crate) fn open_menu<T: 'static>(
     let state = palette.clone();
     window.open_dialog(cx, move |d, _, _| {
         let (target, on_pick) = (target.clone(), on_pick.clone());
-        d.w(px(640.))
-            .font_features(inter_features())
-            .margin_top(px(96.))
-            .entrance(DialogEntrance::None)
-            .close_button(false)
-            .child(
-                Command::new(&state)
-                    .items(items.clone())
-                    .on_confirm(move |ix, window, cx| {
-                        window.close_dialog(cx);
-                        target
-                            .update(cx, |s, cx| on_pick(s, ix.row, window, cx))
-                            .ok();
-                    }),
-            )
+        menu_dialog(d).child(Command::new(&state).items(items.clone()).on_confirm(
+            move |ix, window, cx| {
+                window.close_dialog(cx);
+                target
+                    .update(cx, |s, cx| on_pick(s, ix.row, window, cx))
+                    .ok();
+            },
+        ))
     });
     palette.update(cx, |p, cx| p.focus(window, cx));
 }
@@ -269,16 +275,24 @@ struct DiffData {
     /// In tree order.
     files: Vec<DiffFile>,
     fps: Vec<u64>,
+    /// git failed for some repo; the patch is then empty, which must not read as "no changes".
+    error: Option<String>,
+    hunks: HashMap<SharedString, Vec<review::Hunk>>,
 }
 
 impl DiffData {
     fn load(ws: &Workspace) -> DiffData {
-        let patch = git::combined_diff(ws, &ws.dir());
+        let (patch, error) = match git::combined_diff(ws, &ws.dir()) {
+            Ok(p) => (p, None),
+            Err(e) => (String::new(), Some(e)),
+        };
         let fp = files::fingerprint(&patch);
+        let mut hunks = HashMap::new();
         let mut parsed: Vec<(DiffFile, u64)> = files::split_patch(&patch)
             .into_iter()
             .filter_map(|chunk| {
                 let file = DiffFile::parse(chunk).ok()?.into_iter().next()?;
+                hunks.insert(file.path().clone(), review::parse_hunks(chunk));
                 Some((file, files::fingerprint(chunk)))
             })
             .collect();
@@ -286,7 +300,13 @@ impl DiffData {
         let order = files::tree_order(&paths);
         let mut slots: Vec<Option<(DiffFile, u64)>> = parsed.drain(..).map(Some).collect();
         let (files, fps) = order.into_iter().filter_map(|i| slots[i].take()).unzip();
-        DiffData { fp, files, fps }
+        DiffData {
+            fp,
+            files,
+            fps,
+            error,
+            hunks,
+        }
     }
 }
 
@@ -303,7 +323,11 @@ pub struct Shark {
     diff_fp: u64,
     /// Bumped per refresh, so a slow older refresh can't overwrite a newer one.
     diff_gen: u64,
+    /// The file last moved to (`}`/`{`, the tree); the diff can't say which one is on screen.
     diff_file: usize,
+    /// False until the first refresh of the open workspace lands.
+    diff_loaded: bool,
+    diff_error: Option<String>,
     /// Paths currently viewed (fingerprint still matches), for the diff headers.
     viewed_now: Rc<HashSet<SharedString>>,
     tree_rows: Vec<Row>,
@@ -311,6 +335,9 @@ pub struct Shark {
     tree_sel: usize,
     tree_focus: FocusHandle,
     tree_scroll: UniformListScrollHandle,
+    sidebar_scroll: ScrollHandle,
+    /// Workspaces whose worktrees are being removed in the background.
+    pub(crate) archiving: HashSet<String>,
     show_tree: bool,
     /// Sidebar shrunk to icons; `rail_auto` when opening a file did it, so closing undoes it.
     rail: bool,
@@ -319,8 +346,10 @@ pub struct Shark {
     /// What the editor header shows, to redraw only when it changes, not on every key.
     editor_header: (bool, bool, &'static str, String),
     _editor_subs: Vec<Subscription>,
+    review: review::Review,
     pub(crate) syncs: HashMap<String, Entity<GitSync>>,
     pub(crate) sidebar_focus: FocusHandle,
+    pub(crate) attn: crate::attention::Attention,
     _subs: Vec<Subscription>,
 }
 
@@ -333,6 +362,11 @@ const COMMANDS: &[(&str, IconName, Cmd)] = &[
     ("Add repo", IconName::FolderPlus, |s, w, cx| {
         s.add_repo(w, cx)
     }),
+    (
+        "Add repo to workspace…",
+        IconName::FolderPlus,
+        |s, w, cx| s.pick_repo_for_workspace(w, cx),
+    ),
     ("Archive workspace", IconName::Archive, |s, w, cx| {
         s.archive(false, w, cx)
     }),
@@ -374,6 +408,26 @@ const COMMANDS: &[(&str, IconName, Cmd)] = &[
         s.open_prs(w, cx)
     }),
     (
+        "Create draft PRs",
+        IconName::GitPullRequestDraft,
+        |s, w, cx| s.create_draft_prs(w, cx),
+    ),
+    (
+        "Move repo earlier in merge order…",
+        IconName::ArrowUp,
+        |s, w, cx| s.with_sync(w, cx, |g, w, cx| g.move_in_merge_order(true, w, cx)),
+    ),
+    (
+        "Move repo later in merge order…",
+        IconName::ArrowDown,
+        |s, w, cx| s.with_sync(w, cx, |g, w, cx| g.move_in_merge_order(false, w, cx)),
+    ),
+    (
+        "Toggle deleting remote branches after merge",
+        IconName::GitBranch,
+        |_, w, cx| sync::toggle_delete_remote(w, cx),
+    ),
+    (
         "Git: next step",
         IconName::GitPullRequestArrow,
         |s, w, cx| s.with_sync(w, cx, GitSync::primary),
@@ -400,6 +454,19 @@ const COMMANDS: &[(&str, IconName, Cmd)] = &[
             s.open_file(ix, w, cx)
         }
     }),
+    ("Open file…", IconName::FileSearch, |s, w, cx| {
+        s.open_any_file(w, cx)
+    }),
+    (
+        "Comment on the diff line",
+        IconName::MessageSquarePlus,
+        |s, w, cx| s.comment_dialog(w, cx),
+    ),
+    (
+        "Send diff comments to the agent",
+        IconName::Send,
+        |s, w, cx| s.send_comments(w, cx),
+    ),
     ("Save file", IconName::Save, |s, w, cx| {
         if let Some(e) = s.editor.clone() {
             e.update(cx, |e, cx| e.save(false, w, cx))
@@ -409,10 +476,23 @@ const COMMANDS: &[(&str, IconName, Cmd)] = &[
     ("Toggle Vim keys", IconName::Keyboard, |s, w, cx| {
         s.toggle_vim(w, cx)
     }),
-    ("Stop agent", IconName::Square, |s, _, cx| s.stop(cx)),
+    ("Interrupt agent", IconName::Square, |s, _, cx| s.stop(cx)),
+    (
+        "New conversation (forget the claude session)",
+        IconName::MessageSquarePlus,
+        |s, w, cx| match s.active_chat().cloned() {
+            Some(chat) => chat.update(cx, |c, cx| c.new_conversation(cx)),
+            None => Shark::notify_err(w, cx, "Open a workspace first"),
+        },
+    ),
     ("Change model…", IconName::Sparkles, |s, w, cx| {
         s.pick_model(w, cx)
     }),
+    (
+        "Next workspace needing attention",
+        IconName::CircleAlert,
+        |s, w, cx| s.next_attention(w, cx),
+    ),
 ];
 
 impl Shark {
@@ -420,6 +500,7 @@ impl Shark {
         let state = State::load();
         let sidebar_focus = cx.focus_handle();
         sidebar_focus.focus(window, cx);
+        cx.defer_in(window, |s, window, cx| s.restore_last_open(window, cx));
         Shark {
             state,
             sel: 0,
@@ -432,21 +513,29 @@ impl Shark {
             diff_fp: 0,
             diff_gen: 0,
             diff_file: 0,
+            diff_loaded: false,
+            diff_error: None,
             viewed_now: Rc::default(),
             tree_rows: vec![],
             collapsed_dirs: HashSet::new(),
             tree_sel: 0,
             tree_focus: cx.focus_handle(),
             tree_scroll: UniformListScrollHandle::new(),
+            sidebar_scroll: ScrollHandle::new(),
+            archiving: HashSet::new(),
             show_tree: true,
             rail: false,
             rail_auto: false,
             editor: None,
             editor_header: Default::default(),
             _editor_subs: vec![],
+            review: Default::default(),
             syncs: HashMap::new(),
             sidebar_focus,
-            _subs: vec![],
+            attn: crate::attention::Attention::new(cx),
+            _subs: vec![cx.observe_window_activation(window, |s, w, _| {
+                s.attn.window_active = w.is_window_active()
+            })],
         }
     }
 
@@ -474,7 +563,12 @@ impl Shark {
         }
     }
 
-    fn open_workspace(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_workspace(
+        &mut self,
+        ix: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(name) = self.state.workspaces.get(ix).map(|w| w.name.clone()) else {
             return;
         };
@@ -495,13 +589,25 @@ impl Shark {
             // A fresh tree and diff for another workspace.
             self.diff_fp = 0;
             self.diff_files.clear();
+            self.diff_fps.clear();
+            self.viewed_now = Rc::default();
+            self.diff_file = 0;
+            self.diff_loaded = false;
+            self.diff_error = None;
             self.tree_rows.clear();
             self.collapsed_dirs.clear();
             self.tree_sel = 0;
+            self.lose_view();
         }
         self.sel = ix;
         if !self.chats.contains_key(&ws.name) {
-            let chat = cx.new(|cx| Chat::new(ws.clone(), window, cx));
+            // Opened mid-archive (its row is still listed): sends stay refused.
+            let archiving = self.archiving.contains(&ws.name);
+            let chat = cx.new(|cx| {
+                let mut c = Chat::new(ws.clone(), window, cx);
+                c.archiving = archiving;
+                c
+            });
             let name = ws.name.clone();
             // Busy also flips without a ChatEvent (background tasks, turns the CLI starts itself).
             self._subs.push(cx.observe(&chat, |_, _, cx| cx.notify()));
@@ -509,7 +615,7 @@ impl Shark {
                 cx.subscribe(&chat, move |this, _, ev: &ChatEvent, cx| match ev {
                     ChatEvent::SessionId(id) => {
                         if let Some(w) = this.state.workspaces.iter_mut().find(|w| w.name == name) {
-                            w.session_id = Some(id.clone());
+                            w.session_id = id.clone();
                             this.state.save();
                         }
                     }
@@ -523,6 +629,7 @@ impl Shark {
                         if this.active.as_ref() == Some(&name) {
                             this.refresh_diff(cx);
                         }
+                        this.turn_done(&name, cx);
                         cx.notify();
                     }
                 }),
@@ -543,7 +650,9 @@ impl Shark {
             let on = *name == ws.name;
             sync.update(cx, |g, cx| g.set_active(on, cx));
         }
+        self.attn.opened(&ws.name);
         self.active = Some(ws.name);
+        self.refresh_attention(cx);
         self.refresh_diff(cx);
         self.show(Tab::Chat, window, cx);
         if let Some(chat) = self.active_chat().cloned() {
@@ -553,6 +662,7 @@ impl Shark {
 
     fn show(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
         self.tab = tab;
+        self.remember_open();
         match tab {
             Tab::Chat => {
                 if let Some(chat) = self.active_chat() {
@@ -601,19 +711,45 @@ impl Shark {
     }
 
     fn apply_diff(&mut self, data: DiffData, cx: &mut Context<Self>) {
+        let status_changed = !self.diff_loaded || data.error != self.diff_error;
+        self.diff_loaded = true;
+        self.diff_error = data.error;
         // Turn ends and saves refresh often; an unchanged patch keeps scroll and expansion.
         if data.fp == self.diff_fp && !self.diff_files.is_empty() {
+            if status_changed {
+                cx.notify();
+            }
             return;
         }
+        self.review.hunks = data.hunks;
+        if let Some(ws) = self.active.clone() {
+            self.review.load_comments(&ws);
+        }
         let was_viewed = self.viewed_now.clone();
+        // set_files scrolls back to the top; come back to the file the user was on.
+        let kept = self
+            .diff_files
+            .get(self.diff_file)
+            .map(|f| f.path().clone());
+        let tree_on_file = (self.tree_rows.get(self.tree_sel)).is_none_or(|r| r.file.is_some());
+        // First files of this workspace's diff: no mouse scroll yet, so `j` starts a line cursor.
+        let first_load = self.diff_files.is_empty();
         self.diff_fp = data.fp;
         self.diff_fps = data.fps;
-        self.diff_file = 0; // set_files scrolls back to the top
         self.diff_files = data.files;
+        self.diff_file = kept
+            .and_then(|p| self.diff_files.iter().position(|f| *f.path() == p))
+            .unwrap_or(self.diff_file.min(self.diff_files.len().saturating_sub(1)));
         self.rebuild_tree();
+        if tree_on_file
+            && let Some(row) = (self.tree_rows.iter()).position(|r| r.file == Some(self.diff_file))
+        {
+            self.tree_sel = row;
+        }
         self.recompute_viewed();
         let files = self.diff_files.clone();
         let viewed = self.viewed_now.clone();
+        let at = self.diff_file;
         self.diff.update(cx, |d, cx| {
             d.set_files(files.iter().cloned(), cx);
             for f in &files {
@@ -625,6 +761,15 @@ impl Shark {
                 }
             }
         });
+        if first_load && let Some(f) = files.get(at) {
+            self.review.at_file(f.path());
+        }
+        // The keyboard view comes back to its line; otherwise the file last moved to.
+        if !self.restore_view(cx)
+            && let Some(f) = files.get(at)
+        {
+            self.diff.update(cx, |d, cx| d.scroll_to_file(f.path(), cx));
+        }
         cx.notify();
     }
 
@@ -705,6 +850,7 @@ impl Shark {
             self.diff_file = ix;
             if self.tab == Tab::Diff {
                 let path = self.diff_files[ix].path().to_string();
+                self.review.at_file(&path);
                 self.diff.update(cx, |d, cx| d.scroll_to_file(&path, cx));
             }
         }
@@ -750,7 +896,8 @@ impl Shark {
         }
     }
 
-    /// The file a row action applies to: the open file in the file view, else the tree cursor.
+    /// The file a row action applies to: the tree cursor in the tree, the open file in the file
+    /// view, else the file last moved to in the diff.
     fn cursor_file(&self, window: &Window, cx: &App) -> Option<usize> {
         if self.tree_focus.is_focused(window) {
             return self.tree_rows.get(self.tree_sel)?.file;
@@ -761,28 +908,38 @@ impl Shark {
             let path = &e.read(cx).path;
             return self.diff_files.iter().position(|f| f.path() == path);
         }
-        // The diff can't say which file is on screen; the highlighted tree row is what the user sees.
-        self.tree_rows.get(self.tree_sel)?.file
+        // The diff can't say which file is on screen; use the last one moved to, which the
+        // tree cursor follows.
+        (self.diff_file < self.diff_files.len()).then_some(self.diff_file)
     }
 
     fn open_file(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(f), Some(ws)) = (self.diff_files.get(ix), self.active_ws()) else {
+        let Some(f) = self.diff_files.get(ix) else {
             return;
         };
         let path = f.path().to_string();
+        let open = (self.editor.as_ref()).is_some_and(|e| e.read(cx).path == path);
+        if !open && (f.status() == DiffFileStatus::Deleted || f.is_binary()) {
+            return Self::notify_err(
+                window,
+                cx,
+                format!("{path} is deleted or binary; it shows in the diff only"),
+            );
+        }
+        self.open_path(path, window, cx)
+    }
+
+    /// Opens `repo/rel/path` of the open workspace in the editor next to the chat.
+    fn open_path(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.active_ws() else {
+            return;
+        };
         if self
             .editor
             .as_ref()
             .is_some_and(|e| e.read(cx).path == path)
         {
             return self.show(Tab::File, window, cx);
-        }
-        if f.status() == DiffFileStatus::Deleted || f.is_binary() {
-            return Self::notify_err(
-                window,
-                cx,
-                format!("{path} is deleted or binary; it shows in the diff only"),
-            );
         }
         let abs = ws.dir().join(&path);
         if std::fs::metadata(&abs).is_ok_and(|m| m.len() > crate::editor::MAX_BYTES) {
@@ -1041,10 +1198,12 @@ impl Shark {
         input.update(cx, |i, cx| i.focus(window, cx));
     }
 
+    /// `prompt`, when set, is sent to the agent once the workspace is open.
     fn create_workspace(
         &mut self,
         branch: String,
         repos: Vec<Repo>,
+        prompt: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -1063,15 +1222,167 @@ impl Shark {
                 .await;
             this.update_in(cx, |s, window, cx| match result {
                 Ok(ws) => {
+                    let name = ws.name.clone();
                     s.state.workspaces.push(ws);
                     s.state.save();
                     s.open_workspace(s.state.workspaces.len() - 1, window, cx);
+                    if let Some(p) = prompt
+                        && s.active.as_ref() == Some(&name)
+                        && let Some(chat) = s.active_chat().cloned()
+                    {
+                        chat.update(cx, |c, cx| c.ask(&p, window, cx));
+                    }
                 }
                 Err(e) => Self::notify_err(window, cx, e),
             })
             .ok();
         })
         .detach();
+    }
+
+    /// Launch: reopen the workspace and tab that were open at quit.
+    fn restore_last_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some((name, tab)) = self.state.last_open.clone() else {
+            return;
+        };
+        let Some(ix) = self.state.workspaces.iter().position(|w| w.name == name) else {
+            return;
+        };
+        self.open_workspace_now(ix, window, cx);
+        if tab == "diff" {
+            self.show(Tab::Diff, window, cx);
+        }
+    }
+
+    /// Remembers the open workspace and tab in state.json, for the next launch.
+    fn remember_open(&mut self) {
+        let tab = match self.tab {
+            Tab::Diff => "diff",
+            Tab::Chat | Tab::File => "chat",
+        };
+        let open = self.active.clone().map(|n| (n, tab.to_string()));
+        if self.state.last_open != open {
+            self.state.last_open = open;
+            self.state.save();
+        }
+    }
+
+    /// "Add repo to workspace…": a menu of the repos the target workspace doesn't have yet.
+    fn pick_repo_for_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.target(window) else {
+            return Self::notify_err(window, cx, "Open a workspace first");
+        };
+        let missing: Vec<Repo> = (self.state.repos.iter())
+            .filter(|r| !ws.repos.iter().any(|w| w.name == r.name))
+            .cloned()
+            .collect();
+        if missing.is_empty() {
+            return Self::notify_err(
+                window,
+                cx,
+                format!("{} has every repo; add another first (space r a)", ws.name),
+            );
+        }
+        let items = missing
+            .iter()
+            .map(|r| {
+                CommandItem::new()
+                    .label(r.name.clone())
+                    .icon(IconName::FolderGit2)
+                    .keywords([r.path.to_string_lossy().to_string()])
+            })
+            .collect();
+        let name = ws.name.clone();
+        self.open_menu(
+            items,
+            0,
+            move |s, row, window, cx| {
+                s.add_repo_to_workspace(name.clone(), missing[row].clone(), window, cx)
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn add_repo_to_workspace(
+        &mut self,
+        name: String,
+        repo: Repo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.archiving.contains(&name) {
+            return Self::notify_err(window, cx, format!("{name} is being archived"));
+        }
+        let Some(ws) = self
+            .state
+            .workspaces
+            .iter()
+            .find(|w| w.name == name)
+            .cloned()
+        else {
+            return;
+        };
+        window.push_notification(format!("Adding {} to {name}…", repo.name), cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let dir = ws.dir();
+            let result = cx
+                .background_executor()
+                .spawn(async move { git::add_to_workspace(&ws, &dir, &repo) })
+                .await;
+            this.update_in(cx, |s, window, cx| match result {
+                Ok(ws) => s.repo_added(ws, window, cx),
+                Err(e) => Self::notify_err(window, cx, e),
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Saves the new repo list and tells the chat, the git button and the diff.
+    fn repo_added(&mut self, ws: Workspace, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(slot) = self.state.workspaces.iter_mut().find(|w| w.name == ws.name) else {
+            return;
+        };
+        // Only the repos change; session, model and viewed may have moved on meanwhile.
+        // Merge rather than replace: another add may have finished since this one started.
+        let Some(r) = ws.repos.last().cloned() else {
+            return;
+        };
+        let raced = slot.repos.len() + 1 != ws.repos.len();
+        if !slot.repos.iter().any(|w| w.name == r.name) {
+            slot.repos.push(r.clone());
+        }
+        let ws = slot.clone();
+        self.state.save();
+        if raced {
+            git::write_claude_md(&ws);
+        }
+        let rules = match ws.dir().join(&r.name).join("CLAUDE.md").exists() {
+            true => format!(" Read {}/CLAUDE.md for its rules.", r.name),
+            false => String::new(),
+        };
+        let note = format!(
+            "[shark] Repo `{0}` joined this workspace: `{0}/` is a git worktree of {1} on branch `{2}` (base `{3}`), and the root CLAUDE.md now lists it.{rules}",
+            r.name,
+            r.src.display(),
+            ws.branch,
+            r.base
+        );
+        if let Some(chat) = self.chats.get(&ws.name) {
+            chat.update(cx, |c, cx| c.repos_changed(&ws, note, cx));
+        }
+        if let Some(sync) = self.syncs.get(&ws.name) {
+            sync.update(cx, |g, cx| g.set_workspace(ws.clone(), cx));
+        }
+        if self.active.as_ref() == Some(&ws.name) {
+            self.refresh_diff(cx);
+        }
+        window.push_notification(
+            Notification::success(format!("Added {} to {}", r.name, ws.name)),
+            cx,
+        );
+        cx.notify();
     }
 
     /// Row actions hit the workspace under the sidebar cursor when the sidebar is focused, else the open one.
@@ -1113,7 +1424,14 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         if self.chats.get(&name).is_some_and(|c| c.read(cx).working()) {
-            return Self::notify_err(window, cx, "Agent is running; stop it first (ctrl-c)");
+            // ctrl-c stops the open workspace's agent only.
+            let msg = match self.active.as_deref() == Some(name.as_str()) {
+                true => "Agent is running; stop it first (ctrl-c)".into(),
+                false => {
+                    format!("The agent in {name} is running; open it and stop it first (ctrl-c)")
+                }
+            };
+            return Self::notify_err(window, cx, msg);
         }
         if !force {
             return self.remove_workspace(&name, false, window, cx);
@@ -1163,8 +1481,51 @@ impl Shark {
         else {
             return;
         };
-        match git::remove_workspace(&ws, &ws.dir(), force) {
-            Ok(()) => {
+        // The merge step and the menu can both ask while a removal runs.
+        if !self.archiving.insert(ws.name.clone()) {
+            return;
+        }
+        if let Some(chat) = self.chats.get(name) {
+            chat.update(cx, |c, _| c.archiving = true);
+        }
+        // Force-archive keeps every branch, as its dialog says.
+        let merged = match force {
+            true => vec![],
+            false => self
+                .syncs
+                .get(name)
+                .map_or(vec![], |g| g.read(cx).merged_branches()),
+        };
+        // `worktree remove` deletes node_modules, target and the like: seconds, off the UI thread.
+        window.push_notification(format!("Archiving {name}…"), cx);
+        cx.spawn_in(window, async move |this, cx| {
+            let dir = ws.dir();
+            let name = ws.name.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    git::remove_workspace(&ws, &dir, force)
+                        .map(|()| git::delete_merged_branches(&ws, &merged))
+                })
+                .await;
+            this.update_in(cx, |s, window, cx| {
+                s.archiving.remove(&name);
+                s.archived(&name, result, window, cx)
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn archived(
+        &mut self,
+        name: &str,
+        result: Result<Vec<String>, String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(deleted) => {
                 self.chats.remove(name);
                 self.syncs.remove(name);
                 self.state.workspaces.retain(|w| w.name != name);
@@ -1175,15 +1536,24 @@ impl Shark {
                     self.active = None;
                     self.drop_editor();
                     self.tab = Tab::Chat;
+                    self.sidebar_focus.focus(window, cx);
                 }
                 self.sel = self.sel.min(self.state.workspaces.len().saturating_sub(1));
+                let branch = match deleted.is_empty() {
+                    true => "branch kept".to_string(),
+                    false => format!("merged branch deleted in {}", deleted.join(", ")),
+                };
                 window.push_notification(
-                    Notification::success(format!("Archived {name} (branch kept)")),
+                    Notification::success(format!("Archived {name} ({branch})")),
                     cx,
                 );
-                self.sidebar_focus.focus(window, cx);
             }
-            Err(e) => Self::notify_err(window, cx, format!("{e}\nUse space w D to force.")),
+            Err(e) => {
+                if let Some(chat) = self.chats.get(name) {
+                    chat.update(cx, |c, _| c.archiving = false);
+                }
+                Self::notify_err(window, cx, format!("{e}\nUse space w D to force."))
+            }
         }
         cx.notify();
     }
@@ -1196,6 +1566,12 @@ impl Shark {
                 window,
                 cx,
             )
+        })
+    }
+
+    fn create_draft_prs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.with_sync(window, cx, |g, window, cx| {
+            g.run_kind(sync::Kind::CreateDraftPr, "Create draft PRs", window, cx)
         })
     }
 
@@ -1364,6 +1740,7 @@ impl Shark {
                 .is_some_and(|c| c.read(cx).working());
             let selected = ix == self.sel;
             let active = self.active.as_ref() == Some(&w.name);
+            let attn = self.attention_of(&w.name, cx);
             let ws = w.clone();
             let shark = shark.clone();
             row()
@@ -1388,16 +1765,22 @@ impl Shark {
                         cx.notify();
                     }),
                 )
-                .child(match busy {
-                    true => Spinner::new()
+                .child(if busy {
+                    Spinner::new()
                         .icon(IconName::LoaderCircle)
                         .color(theme.primary)
                         .with_size(px(14.))
-                        .into_any_element(),
-                    false => Icon::new(IconName::CircleDashed)
+                        .into_any_element()
+                } else {
+                    let (icon, color) = match &attn {
+                        Attn::Needs(_) => (IconName::CircleAlert, theme.warning_foreground),
+                        Attn::Unread => (IconName::CircleCheck, theme.success_foreground),
+                        Attn::None => (IconName::CircleDashed, theme.muted_foreground),
+                    };
+                    Icon::new(icon)
                         .with_size(px(14.))
-                        .text_color(theme.muted_foreground)
-                        .into_any_element(),
+                        .text_color(color)
+                        .into_any_element()
                 })
                 .when(!rail, |d| {
                     d.child(
@@ -1415,13 +1798,16 @@ impl Shark {
                                     .truncate()
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
-                                    .child(
-                                        w.repos
+                                    .child(match &attn {
+                                        // The step says where, and that it's waiting on you.
+                                        Attn::Needs(step) => step.clone(),
+                                        _ => w
+                                            .repos
                                             .iter()
                                             .map(|r| r.name.as_str())
                                             .collect::<Vec<_>>()
                                             .join(" · "),
-                                    ),
+                                    }),
                             ),
                     )
                 })
@@ -1439,22 +1825,12 @@ impl Shark {
             .h_full()
             .flex_none()
             .text_color(theme.sidebar_foreground)
-            .on_action(cx.listener(|this, _: &SelectNext, _, cx| {
-                this.sel = (this.sel + 1).min(this.state.workspaces.len().saturating_sub(1));
-                cx.notify();
-            }))
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.select_ws(this.sel + 1, cx)))
             .on_action(cx.listener(|this, _: &SelectPrev, _, cx| {
-                this.sel = this.sel.saturating_sub(1);
-                cx.notify();
+                this.select_ws(this.sel.saturating_sub(1), cx)
             }))
-            .on_action(cx.listener(|this, _: &SelectFirst, _, cx| {
-                this.sel = 0;
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &SelectLast, _, cx| {
-                this.sel = this.state.workspaces.len().saturating_sub(1);
-                cx.notify();
-            }))
+            .on_action(cx.listener(|this, _: &SelectFirst, _, cx| this.select_ws(0, cx)))
+            .on_action(cx.listener(|this, _: &SelectLast, _, cx| this.select_ws(usize::MAX, cx)))
             .on_action(cx.listener(|this, _: &Confirm, window, cx| {
                 this.open_workspace(this.sel, window, cx)
             }))
@@ -1465,16 +1841,32 @@ impl Shark {
                     .flex_none()
                     .window_control_area(WindowControlArea::Drag),
             )
-            .child(header("Workspaces"))
-            .children(workspaces)
-            .when(self.state.workspaces.is_empty(), |d| {
-                d.child(hint("space w n to create"))
-            })
-            .child(header("Repos"))
-            .children(repos)
-            .when(self.state.repos.is_empty(), |d| {
-                d.child(hint("space r a to add"))
-            })
+            .child(
+                // Children are indexed by `select_ws`: the header, then one per workspace.
+                v_flex()
+                    .id("sidebar-rows")
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_y_scroll()
+                    .track_scroll(&self.sidebar_scroll)
+                    .child(header("Workspaces"))
+                    .children(workspaces)
+                    .when(self.state.workspaces.is_empty(), |d| {
+                        d.child(hint("space w n to create"))
+                    })
+                    .child(header("Repos"))
+                    .children(repos)
+                    .when(self.state.repos.is_empty(), |d| {
+                        d.child(hint("space r a to add"))
+                    }),
+            )
+    }
+
+    /// Moves the sidebar cursor (clamped) and scrolls it into view.
+    fn select_ws(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.sel = ix.min(self.state.workspaces.len().saturating_sub(1));
+        self.sidebar_scroll.scroll_to_item(self.sel + 1);
+        cx.notify();
     }
 
     fn render_main(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1540,7 +1932,10 @@ impl Shark {
                 .child(Icon::new(icon).with_size(px(14.)))
                 .child(label)
         };
-        let ws_name = self.active.clone().unwrap_or_default();
+        let branch = self
+            .active_ws()
+            .map(|w| w.branch.clone())
+            .unwrap_or_default();
         let viewed = self.viewed_now.len();
         let file_tab = self.editor.as_ref().map(|e| {
             let path = &e.read(cx).path;
@@ -1576,6 +1971,8 @@ impl Shark {
                     .child(tab("Chat".into(), IconName::MessageSquare, Tab::Chat))
                     .child(tab(
                         match viewed {
+                            _ if self.diff_error.is_some() => "Diff · error".into(),
+                            _ if !self.diff_loaded => "Diff".into(),
                             0 => format!("Diff · {}", self.diff_files.len()),
                             v => format!("Diff · {v}/{} viewed", self.diff_files.len()),
                         },
@@ -1588,11 +1985,12 @@ impl Shark {
                     .child(div().flex_1())
                     .child(
                         h_flex()
+                            .min_w_0()
                             .gap_1p5()
                             .text_xs()
                             .text_color(theme.muted_foreground)
                             .child(Icon::new(IconName::GitBranch).with_size(px(12.)))
-                            .child(ws_name),
+                            .child(div().min_w_0().truncate().child(branch)),
                     )
                     .when_some(self.active_sync().cloned(), |d, sync| {
                         d.child(div().pl_3().child(sync))
@@ -1617,7 +2015,12 @@ impl Shark {
                     ),
             )
             .child(match self.tab {
-                Tab::Chat => div().flex_1().min_h_0().child(chat).into_any_element(),
+                // Cached: the sidebar spinner redraws this view every frame, the chat only on change.
+                Tab::Chat => div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(chat.cached(StyleRefinement::default().size_full()))
+                    .into_any_element(),
                 Tab::File => h_flex()
                     .flex_1()
                     .min_h_0()
@@ -1627,7 +2030,7 @@ impl Shark {
                                 resizable_panel()
                                     .size(px(420.))
                                     .size_range(px(320.)..px(900.))
-                                    .child(chat),
+                                    .child(chat.cached(StyleRefinement::default().size_full())),
                             )
                             .child(resizable_panel().child(self.render_editor(cx))),
                     )
@@ -1643,20 +2046,90 @@ impl Shark {
             .into_any_element()
     }
 
+    /// Loading, git failed, or nothing changed; `None` when there is a diff to show.
+    fn diff_placeholder(&self, cx: &App) -> Option<AnyElement> {
+        let theme = cx.theme();
+        let big = |name, color| Icon::new(name).with_size(px(32.)).text_color(color);
+        let (icon, title, detail) = match &self.diff_error {
+            Some(e) => (
+                big(IconName::TriangleAlert, theme.warning_foreground).into_any_element(),
+                "Could not load the diff",
+                Some(e.clone()),
+            ),
+            None if !self.diff_loaded => (
+                Spinner::new()
+                    .with_size(px(32.))
+                    .color(faint(theme))
+                    .into_any_element(),
+                "Loading diff…",
+                None,
+            ),
+            None if self.diff_files.is_empty() => (
+                big(IconName::FileDiff, faint(theme)).into_any_element(),
+                "No changes",
+                None,
+            ),
+            None => return None,
+        };
+        Some(
+            v_flex()
+                .size_full()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .px_4()
+                .text_color(theme.muted_foreground)
+                .child(icon)
+                .child(div().text_base().text_color(theme.foreground).child(title))
+                .when_some(detail, |d, e| {
+                    d.child(div().max_w(px(560.)).text_sm().text_center().child(e))
+                })
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .text_sm()
+                        .child(Kbd::new(Keystroke::parse("r").unwrap()))
+                        .child("refresh"),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn render_diff(&self, cx: &mut Context<Self>) -> AnyElement {
         let viewed = self.viewed_now.clone();
         let shark = cx.entity().downgrade();
+        let placeholder = self.diff_placeholder(cx);
+        let empty = placeholder.is_some();
+        let diff_with_annotations = self.with_comments(Diff::new(&self.diff), cx);
         div()
             .key_context("DiffPane")
+            .relative()
             .flex_1()
             .min_w_0()
             .h_full()
-            .on_action(cx.listener(|this, _: &NextHunk, _, cx| {
-                this.diff.update(cx, |d, cx| d.next_change(cx))
+            .child(self.viewport_probe())
+            .on_scroll_wheel(cx.listener(|this, _, _, _| this.lose_view()))
+            // The diff's own scrolling keys move it without the line cursor.
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, _, _| {
+                let k = ev.keystroke.key.as_str();
+                if matches!(k, "up" | "down" | "pageup" | "pagedown" | "home" | "end") {
+                    this.lose_view();
+                }
             }))
-            .on_action(cx.listener(|this, _: &PrevHunk, _, cx| {
-                this.diff.update(cx, |d, cx| d.previous_change(cx))
-            }))
+            .on_action(cx.listener(|this, _: &SelectNext, w, cx| this.diff_move(1, None, w, cx)))
+            .on_action(cx.listener(|this, _: &SelectPrev, w, cx| this.diff_move(-1, None, w, cx)))
+            .on_action(cx.listener(|this, _: &PageDown, w, cx| this.diff_move(2, None, w, cx)))
+            .on_action(cx.listener(|this, _: &PageUp, w, cx| this.diff_move(-2, None, w, cx)))
+            .on_action(
+                cx.listener(|this, _: &SelectFirst, w, cx| this.diff_move(0, Some(true), w, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &SelectLast, w, cx| this.diff_move(0, Some(false), w, cx)),
+            )
+            .on_action(cx.listener(|this, _: &AddComment, w, cx| this.comment_dialog(w, cx)))
+            .on_action(cx.listener(|this, _: &SendComments, w, cx| this.send_comments(w, cx)))
+            .on_action(cx.listener(|this, _: &NextHunk, w, cx| this.diff_change(true, w, cx)))
+            .on_action(cx.listener(|this, _: &PrevHunk, w, cx| this.diff_change(false, w, cx)))
             .on_action(cx.listener(|this, _: &NextFile, _, cx| this.step_file(1, cx)))
             .on_action(cx.listener(|this, _: &PrevFile, _, cx| this.step_file(-1, cx)))
             .on_action(cx.listener(|this, _: &RefreshDiff, _, cx| this.refresh_diff(cx)))
@@ -1680,23 +2153,30 @@ impl Shark {
                     this.open_file(ix, w, cx)
                 }
             }))
-            .child(
-                Diff::new(&self.diff).render_header_prefix(move |file, _, _| {
-                    // A prefix, not a suffix: the header is as wide as the longest line, so
-                    // a suffix scrolls out of view.
-                    let path = file.path().clone();
-                    let shark = shark.clone();
-                    Checkbox::new(SharedString::from(format!("viewed:{path}")))
-                        .small()
-                        .tooltip("Viewed (v)")
-                        .checked(viewed.contains(&path))
-                        .on_click(move |_, _, cx| {
-                            shark
-                                .update(cx, |s, cx| s.toggle_viewed_path(&path, cx))
-                                .ok();
-                        })
-                }),
-            )
+            // The diff isn't drawn, so its focus handle lands here and the pane's keys still work.
+            .when(empty, |d| {
+                d.track_focus(&self.diff.read(cx).focus_handle(cx))
+            })
+            .children(placeholder)
+            .when(!empty, |d| {
+                d.child(
+                    diff_with_annotations.render_header_prefix(move |file, _, _| {
+                        // A prefix, not a suffix: the header is as wide as the longest line, so
+                        // a suffix scrolls out of view.
+                        let path = file.path().clone();
+                        let shark = shark.clone();
+                        Checkbox::new(SharedString::from(format!("viewed:{path}")))
+                            .small()
+                            .tooltip("Viewed (v)")
+                            .checked(viewed.contains(&path))
+                            .on_click(move |_, _, cx| {
+                                shark
+                                    .update(cx, |s, cx| s.toggle_viewed_path(&path, cx))
+                                    .ok();
+                            })
+                    }),
+                )
+            })
             .into_any_element()
     }
 
@@ -1920,8 +2400,15 @@ impl Shark {
             }
         });
         let (dirty, conflict) = (e.dirty, e.conflict);
+        // Leader keys (`space …`) work in Vim's Normal mode, where space types nothing.
+        let normal =
+            e.vim_on && e.vim.mode == crate::vim::Mode::Normal && e.vim.pending().is_empty();
         v_flex()
-            .key_context("FileEditor")
+            .key_context(if normal {
+                "FileEditor VimNormal"
+            } else {
+                "FileEditor"
+            })
             .size_full()
             .border_l_1()
             .border_color(theme.border)
@@ -2062,6 +2549,7 @@ impl Shark {
         let n = self.diff_files.len() as isize;
         self.diff_file = (self.diff_file as isize + delta).rem_euclid(n) as usize;
         let path = self.diff_files[self.diff_file].path().to_string();
+        self.review.at_file(&path);
         self.diff.update(cx, |d, cx| d.scroll_to_file(&path, cx));
         if let Some(row) = self
             .tree_rows
@@ -2092,11 +2580,21 @@ impl Render for Shark {
                 cx.listener(|this, _: &ForceArchiveWorkspace, w, cx| this.archive(true, w, cx)),
             )
             .on_action(cx.listener(|this, _: &AddRepo, w, cx| this.add_repo(w, cx)))
+            .on_action(cx.listener(|this, _: &AddRepoToWorkspace, w, cx| {
+                this.pick_repo_for_workspace(w, cx)
+            }))
             .on_action(cx.listener(|this, _: &StopAgent, _, cx| this.stop(cx)))
             .on_action(cx.listener(|this, _: &ShowChat, w, cx| this.show(Tab::Chat, w, cx)))
             .on_action(cx.listener(|this, _: &ShowDiff, w, cx| this.show(Tab::Diff, w, cx)))
             .on_action(cx.listener(|this, _: &CreatePrs, w, cx| this.create_prs(w, cx)))
             .on_action(cx.listener(|this, _: &OpenPrs, w, cx| this.open_prs(w, cx)))
+            .on_action(cx.listener(|this, _: &CreateDraftPrs, w, cx| this.create_draft_prs(w, cx)))
+            .on_action(cx.listener(|this, _: &MergeEarlier, w, cx| {
+                this.with_sync(w, cx, |g, w, cx| g.move_in_merge_order(true, w, cx))
+            }))
+            .on_action(cx.listener(|this, _: &MergeLater, w, cx| {
+                this.with_sync(w, cx, |g, w, cx| g.move_in_merge_order(false, w, cx))
+            }))
             .on_action(
                 cx.listener(|this, _: &GitNext, w, cx| this.with_sync(w, cx, GitSync::primary)),
             )
@@ -2122,12 +2620,17 @@ impl Render for Shark {
                 this.with_target(w, cx, |ws, w, cx| copy(ws.branch.clone(), w, cx))
             }))
             .on_action(cx.listener(|this, a: &SetModel, w, cx| this.set_model(a.0, w, cx)))
+            .on_action(
+                cx.listener(|this, a: &OpenWorkspaceAt, w, cx| this.open_workspace(a.0, w, cx)),
+            )
+            .on_action(cx.listener(|this, _: &NextAttention, w, cx| this.next_attention(w, cx)))
             .on_action(cx.listener(|this, _: &FocusLeft, w, cx| this.move_focus(-1, w, cx)))
             .on_action(cx.listener(|this, _: &FocusRight, w, cx| this.move_focus(1, w, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
             .on_action(cx.listener(|this, _: &ToggleFileTree, w, cx| this.toggle_tree(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleVim, w, cx| this.toggle_vim(w, cx)))
             .on_action(cx.listener(|this, _: &CloseFile, w, cx| this.close_file(w, cx)))
+            .on_action(cx.listener(|this, _: &OpenAnyFile, w, cx| this.open_any_file(w, cx)))
             .child(self.render_sidebar(window, cx))
             .child(
                 // Linear's "island": content floats on the sidebar color, inset and rounded.
@@ -2150,6 +2653,8 @@ impl Render for Shark {
 /// is type a branch, enter.
 struct NewWorkspaceForm {
     branch: Entity<InputState>,
+    /// Optional first message, sent once the workspace is created.
+    prompt: Entity<InputState>,
     picker: Entity<CommandState>,
     repos: Vec<Repo>,
     picked: Vec<bool>,
@@ -2183,6 +2688,9 @@ impl NewWorkspaceForm {
         let picked = repos.iter().map(was_picked).collect();
         NewWorkspaceForm {
             branch,
+            prompt: cx.new(|cx| {
+                InputState::new(window, cx).placeholder("First message to the agent (optional)")
+            }),
             picker: cx.new(|cx| CommandState::new(window, cx)),
             repos,
             picked,
@@ -2223,8 +2731,12 @@ impl NewWorkspaceForm {
             }
             return false;
         }
+        let prompt = self.prompt.read(cx).value().trim().to_string();
+        let prompt = (!prompt.is_empty()).then_some(prompt);
         self.shark
-            .update(cx, |s, cx| s.create_workspace(branch, repos, window, cx))
+            .update(cx, |s, cx| {
+                s.create_workspace(branch, repos, prompt, window, cx)
+            })
             .ok();
         true
     }
@@ -2234,7 +2746,8 @@ impl Render for NewWorkspaceForm {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (muted, faint) = (theme.muted_foreground, faint(theme));
-        let in_branch = self.branch.read(cx).focus_handle(cx).is_focused(window);
+        let in_branch = self.branch.read(cx).focus_handle(cx).is_focused(window)
+            || self.prompt.read(cx).focus_handle(cx).is_focused(window);
         let items = self.repos.iter().zip(&self.picked).map(|(r, p)| {
             CommandItem::new()
                 .label(r.name.clone())
@@ -2256,9 +2769,13 @@ impl Render for NewWorkspaceForm {
             .key_context("NewWorkspace")
             .gap_3()
             .on_action(cx.listener(|this, _: &SwitchField, window, cx| {
-                match this.branch.read(cx).focus_handle(cx).is_focused(window) {
-                    true => this.picker.update(cx, |p, cx| p.focus(window, cx)),
-                    false => this.branch.update(cx, |i, cx| i.focus(window, cx)),
+                // branch -> repos -> first message -> branch
+                if this.branch.read(cx).focus_handle(cx).is_focused(window) {
+                    this.picker.update(cx, |p, cx| p.focus(window, cx))
+                } else if this.prompt.read(cx).focus_handle(cx).is_focused(window) {
+                    this.branch.update(cx, |i, cx| i.focus(window, cx))
+                } else {
+                    this.prompt.update(cx, |i, cx| i.focus(window, cx))
                 }
                 cx.notify();
             }))
@@ -2292,6 +2809,7 @@ impl Render for NewWorkspaceForm {
                         picker.update(cx, |p, cx| p.set_query("", window, cx));
                     }),
             )
+            .child(Input::new(&self.prompt))
             .child(
                 h_flex()
                     .gap_3()
@@ -2357,6 +2875,37 @@ mod ui_tests {
         .unwrap();
     }
 
+    /// Saves `state`, then starts the app on the real keymap.
+    fn boot(cx: &mut TestAppContext, state: State) -> (AnyWindowHandle, Entity<Shark>) {
+        state.save();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::bind_keys(cx);
+        });
+        open(cx)
+    }
+
+    fn open(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Shark>) {
+        cx.update(|cx| {
+            gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                cx.new(|cx| Shark::new(w, cx))
+            })
+        })
+        .unwrap()
+    }
+
+    /// `on(cx, f)` runs `f` on the app, then lets it settle.
+    fn on_app(
+        window: AnyWindowHandle,
+        shark: Entity<Shark>,
+    ) -> impl Fn(&mut TestAppContext, &dyn Fn(&mut Shark, &mut Window, &mut Context<Shark>)) {
+        move |cx, f| {
+            cx.update_window(window, |_, w, cx| shark.update(cx, |s, cx| f(s, w, cx)))
+                .unwrap();
+            cx.run_until_parked();
+        }
+    }
+
     /// Drives the real keymap headlessly: create a workspace, vim focus moves, tabs, archive.
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)] // each test owns its thread; the lock only orders them
@@ -2373,25 +2922,16 @@ mod ui_tests {
                 }
             })
             .into();
-        State {
-            repos,
-            workspaces: vec![],
-            vim: false,
-            last_repos: vec!["api".into()],
-        }
-        .save();
-
-        cx.update(|cx| {
-            gpui_kit::init(cx);
-            crate::bind_keys(cx);
-        });
-        let (window, shark) = cx
-            .update(|cx| {
-                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
-                    cx.new(|cx| Shark::new(w, cx))
-                })
-            })
-            .unwrap();
+        let (window, shark) = boot(
+            cx,
+            State {
+                repos,
+                workspaces: vec![],
+                vim: false,
+                last_repos: vec!["api".into()],
+                ..Default::default()
+            },
+        );
         let press = |cx: &mut TestAppContext, keys: &[&str]| {
             cx.update_window(window, |_, w, cx| keys.iter().for_each(|k| w.press(k, cx)))
                 .unwrap()
@@ -2577,6 +3117,11 @@ mod ui_tests {
         })
         .unwrap();
         assert_eq!(text(cx), "zx\ny!\n");
+        // Leader keys work in Normal mode: space t hides and shows the tree, typing nothing.
+        press(cx, &["space", "t"]);
+        cx.update(|cx| assert!(!shark.read(cx).show_tree, "space t in the editor"));
+        press(cx, &["space", "t"]);
+        assert_eq!(text(cx), "zx\ny!\n");
 
         // The agent writes the file while it has unsaved edits: offer reload, don't clobber.
         fs::write(&file, "agent\n").unwrap();
@@ -2617,7 +3162,10 @@ mod ui_tests {
             )
         });
         press(cx, &["enter"]);
-        cx.update(|cx| assert!(shark.read(cx).state.workspaces.is_empty()));
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).state.workspaces.is_empty()
+        })
+        .await;
         assert!(!ws_dir.exists());
 
         // Repo picker: tab to the filter, enter ticks the match, space unticks the
@@ -2647,7 +3195,10 @@ mod ui_tests {
             assert_eq!(s.state.last_repos, ["web"]);
         });
         press(cx, &["ctrl-w", "h", "space", "w", "d"]);
-        cx.update(|cx| assert!(shark.read(cx).state.workspaces.is_empty()));
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).state.workspaces.is_empty()
+        })
+        .await;
 
         // Quick bars are bare menus: no dialog close X.
         press(cx, &["cmd-k"]);
@@ -2661,6 +3212,227 @@ mod ui_tests {
         })
         .unwrap();
         fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// Diff states, `v` in the diff, refreshes that keep the file, New conversation, archive.
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn diff_states_and_archive(cx: &mut TestAppContext) {
+        let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = test_home();
+        let repo = home.join("src/api");
+        init_repo(&repo);
+        let (window, shark) = boot(
+            cx,
+            State {
+                repos: vec![Repo {
+                    name: "api".into(),
+                    path: repo,
+                }],
+                ..Default::default()
+            },
+        );
+        let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
+        let on = on_app(window, shark.clone());
+        on(cx, &|s, w, cx| {
+            s.create_workspace("st".into(), repos.clone(), None, w, cx)
+        });
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).active.is_some()
+        })
+        .await;
+        on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+        cx.update(|cx| {
+            let s = shark.read(cx);
+            assert!(s.diff_loaded && s.diff_error.is_none() && s.diff_files.is_empty());
+            assert!(
+                s.diff_placeholder(cx).is_some(),
+                "no changes shows the empty state"
+            );
+        });
+
+        let api = home.join("shark/workspaces/st/api");
+        for f in ["a", "b", "c"] {
+            fs::write(api.join(f), "x\n").unwrap();
+        }
+        on(cx, &|s, _, cx| s.refresh_diff(cx));
+        cx.update(|cx| assert_eq!(shark.read(cx).diff_files.len(), 3));
+        let press = |cx: &mut TestAppContext, k: &str| {
+            cx.update_window(window, |_, w, cx| w.press(k, cx)).unwrap();
+        };
+        let cursor = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                shark
+                    .read(cx)
+                    .diff
+                    .read(cx)
+                    .selected_lines()
+                    .map(|r| r.path().to_string())
+            })
+        };
+        // A freshly loaded diff has a line cursor from the first `j`.
+        press(cx, "j");
+        assert_eq!(cursor(cx).as_deref(), Some("api/a"));
+        press(cx, "}");
+        press(cx, "v");
+        let at = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let s = shark.read(cx);
+                let row = s.tree_rows[s.tree_sel].file;
+                (
+                    s.diff_files[s.diff_file].path().to_string(),
+                    row == Some(s.diff_file),
+                )
+            })
+        };
+        assert_eq!(at(cx), ("api/b".into(), true));
+        cx.update(|cx| assert_eq!(shark.read(cx).viewed(1), Viewed::Yes, "v in the diff"));
+        // Another file changes: the diff and the tree stay on b.
+        fs::write(api.join("a"), "y\n").unwrap();
+        fs::write(api.join("0"), "new\n").unwrap();
+        on(cx, &|s, _, cx| s.refresh_diff(cx));
+        assert_eq!(at(cx), ("api/b".into(), true));
+        // j walks a line cursor (past the collapsed, viewed b); a refresh keeps it and `c` targets it.
+        press(cx, "j");
+        press(cx, "j");
+        assert_eq!(cursor(cx).as_deref(), Some("api/c"));
+        fs::write(api.join("0"), "newer\n").unwrap();
+        on(cx, &|s, _, cx| s.refresh_diff(cx));
+        assert_eq!(
+            cursor(cx).as_deref(),
+            Some("api/c"),
+            "cursor survives a refresh"
+        );
+        assert_eq!(at(cx).0, "api/c", "v/o follow the cursor");
+        press(cx, "c");
+        cx.update_window(window, |_, w, cx| w.input("rename this", cx))
+            .unwrap();
+        press(cx, "enter");
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let p = review::prompt(shark.read(cx).ws_comments());
+            assert!(p.contains("\napi/c:1\n> rename this\n"), "{p}");
+        });
+
+        // A git failure is not "no changes".
+        on(cx, &|s, _, cx| {
+            s.state.workspaces[0].repos[0].base = "no/such-base".into();
+            s.refresh_diff(cx)
+        });
+        cx.update(|cx| {
+            let s = shark.read(cx);
+            assert!(
+                s.diff_error
+                    .as_deref()
+                    .is_some_and(|e| e.starts_with("api: "))
+            );
+            assert!(s.diff_placeholder(cx).is_some());
+        });
+
+        // New conversation forgets the session in state.json too.
+        let chat = cx.update(|cx| shark.read(cx).chats["st"].clone());
+        on(cx, &|s, _, cx| {
+            s.state.workspaces[0].session_id = Some("old".into());
+            chat.update(cx, |c, _| c.ws.session_id = Some("old".into()));
+        });
+        let row = COMMANDS
+            .iter()
+            .position(|(l, ..)| l.starts_with("New conversation"))
+            .unwrap();
+        on(cx, &|s, w, cx| (COMMANDS[row].2)(s, w, cx));
+        assert_eq!(State::load().workspaces[0].session_id, None);
+
+        // Archive runs in the background, once.
+        on(cx, &|s, w, cx| {
+            s.remove_workspace("st", true, w, cx);
+            assert!(s.archiving.contains("st"));
+            s.remove_workspace("st", true, w, cx);
+        });
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).state.workspaces.is_empty()
+        })
+        .await;
+        cx.update(|cx| assert!(shark.read(cx).archiving.is_empty()));
+        assert!(!api.exists());
+        fs::remove_dir_all(&home).ok();
+    }
+
+    /// A repo joins a running workspace; the open workspace and tab come back after a restart.
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn add_repo_and_restore(cx: &mut TestAppContext) {
+        let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = test_home();
+        let repos: Vec<Repo> = ["api", "web"]
+            .map(|name| {
+                let path = home.join("src").join(name);
+                init_repo(&path);
+                Repo {
+                    name: name.into(),
+                    path,
+                }
+            })
+            .into();
+        let (window, shark) = boot(
+            cx,
+            State {
+                repos: repos.clone(),
+                ..Default::default()
+            },
+        );
+        let on = on_app(window, shark.clone());
+        on(cx, &|s, w, cx| {
+            s.create_workspace("grow".into(), repos[..1].to_vec(), None, w, cx)
+        });
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).active.is_some()
+        })
+        .await;
+        on(cx, &|s, w, cx| {
+            s.add_repo_to_workspace("grow".into(), repos[1].clone(), w, cx)
+        });
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).state.workspaces[0].repos.len() == 2
+        })
+        .await;
+        let ws_dir = home.join("shark/workspaces/grow");
+        assert!(ws_dir.join("web").exists());
+        assert_eq!(State::load().workspaces[0].repos.len(), 2, "saved");
+        let chat = cx.update(|cx| shark.read(cx).chats["grow"].clone());
+        cx.update(|cx| assert_eq!(chat.read(cx).ws.repos.len(), 2, "the chat knows"));
+        on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+        assert_eq!(
+            State::load().last_open,
+            Some(("grow".into(), "diff".into()))
+        );
+
+        // A restart reopens it on the Diff tab.
+        let (window2, shark2) = open(cx);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let s = shark2.read(cx);
+            assert_eq!(s.active.as_deref(), Some("grow"));
+            assert_eq!(s.tab, Tab::Diff);
+        });
+        cx.update_window(window2, |_, w, _| w.remove_window())
+            .unwrap();
+
+        // Sends are refused while the worktrees are being removed.
+        on(cx, &|s, w, cx| {
+            s.remove_workspace("grow", true, w, cx);
+            assert!(chat.read(cx).archiving);
+            // Also when it is first opened during the removal.
+            s.chats.remove("grow");
+            s.syncs.remove("grow");
+            s.open_workspace_now(0, w, cx);
+            assert!(s.chats["grow"].read(cx).archiving);
+        });
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).state.workspaces.is_empty()
+        })
+        .await;
+        assert!(!ws_dir.exists());
+        fs::remove_dir_all(&home).ok();
     }
 
     /// Times the hot paths on a big change: 2000 changed files and a 50K-line file.
@@ -2698,7 +3470,9 @@ mod ui_tests {
             .unwrap();
         let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
         cx.update_window(window, |_, w, cx| {
-            shark.update(cx, |s, cx| s.create_workspace("perf".into(), repos, w, cx))
+            shark.update(cx, |s, cx| {
+                s.create_workspace("perf".into(), repos, None, w, cx)
+            })
         })
         .unwrap();
         cx.wait_for(window, Duration::from_secs(20), |_, cx| {
