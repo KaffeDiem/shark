@@ -2,6 +2,7 @@
 use crate::chat::{Chat, ChatEvent, MODELS};
 use crate::editor::{EditorEvent, FileEditor};
 use crate::files::{self, Row};
+use crate::menu::{self, Entry};
 use crate::state::{Repo, State, Workspace, workspaces_dir};
 use crate::sync::{GitSync, SyncEvent};
 use crate::*;
@@ -15,7 +16,6 @@ use gpui_kit::component::hover_card::HoverCard;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::link::Link;
-use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::spinner::Spinner;
@@ -71,30 +71,27 @@ fn copy(text: String, window: &mut Window, cx: &mut App) {
     cx.write_to_clipboard(ClipboardItem::new_string(text));
 }
 
-/// "Workspace folder" plus one row per repo; `f` gets the picked path.
+/// "Workspace folder" plus one row per repo, each with its path muted on the right.
 fn path_submenu(
-    menu: PopupMenu,
     icon: IconName,
     label: &'static str,
     paths: &[(String, PathBuf)],
     f: fn(&Path, &mut Window, &mut App),
-    window: &mut Window,
-    cx: &mut Context<PopupMenu>,
-) -> PopupMenu {
-    let paths = paths.to_vec();
-    menu.submenu_with_icon(Some(icon.into()), label, window, cx, move |mut m, _, _| {
-        for (ix, (name, path)) in paths.iter().enumerate() {
-            if ix == 1 {
-                m = m.separator();
-            }
-            let path = path.clone();
-            m = m.item(
-                PopupMenuItem::new(format!("{name} — {}", tilde(&path)))
-                    .on_click(move |_, window, cx| f(&path, window, cx)),
-            );
+) -> Entry {
+    let mut entries = vec![];
+    for (ix, (name, path)) in paths.iter().enumerate() {
+        if ix == 1 {
+            entries.push(Entry::Sep);
         }
-        m
-    })
+        let p = path.clone();
+        let icon = if ix == 0 {
+            IconName::Folder
+        } else {
+            IconName::FolderGit2
+        };
+        entries.push(menu::item(icon, name.clone(), move |w, cx| f(&p, w, cx)).hint(tilde(path)));
+    }
+    menu::sub(icon, label, entries)
 }
 
 /// Opens a cmd-k style menu over `target`; `on_pick` gets the confirmed row.
@@ -138,14 +135,7 @@ pub(crate) fn open_menu<T: 'static>(
 
 /// Right-click menu of a sidebar workspace. Shows where everything lives on disk,
 /// and keeps the destructive items last. Shortcuts live in the palette, not here (Apple HIG).
-fn ws_menu(
-    menu: PopupMenu,
-    ws: &Workspace,
-    ix: usize,
-    shark: &WeakEntity<Shark>,
-    window: &mut Window,
-    cx: &mut Context<PopupMenu>,
-) -> PopupMenu {
+fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<Entry> {
     let paths: Vec<(String, PathBuf)> = std::iter::once(("Workspace folder".into(), ws.dir()))
         .chain(
             ws.repos
@@ -153,86 +143,77 @@ fn ws_menu(
                 .map(|r| (r.name.clone(), ws.dir().join(&r.name))),
         )
         .collect();
-    let pr_urls = shark
-        .upgrade()
-        .and_then(|s| Some(s.read(cx).syncs.get(&ws.name)?.read(cx).pr_urls()))
+    let shark = &cx.entity().downgrade();
+    let pr_urls = this
+        .syncs
+        .get(&ws.name)
+        .map(|s| s.read(cx).pr_urls())
         .unwrap_or_default();
     let on = |f: fn(&mut Shark, String, &mut Window, &mut Context<Shark>)| {
         let (shark, name) = (shark.clone(), ws.name.clone());
-        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+        move |window: &mut Window, cx: &mut App| {
             shark
                 .update(cx, |s, cx| f(s, name.clone(), window, cx))
                 .ok();
         }
     };
     let branch = ws.branch.clone();
-    let shark2 = shark.clone();
-    let menu = menu
-        .label(format!("Branch {}", ws.branch))
-        .separator()
-        .item(
-            PopupMenuItem::new("Open Workspace")
-                .icon(IconName::MessageSquare)
-                .on_click(move |_, window, cx| {
-                    shark2
-                        .update(cx, |s, cx| s.open_workspace(ix, window, cx))
-                        .ok();
-                }),
-        )
-        .separator();
-    let menu = path_submenu(
-        menu,
-        IconName::FolderOpen,
-        "Reveal in Finder",
-        &paths,
-        |p, _, cx| cx.reveal_path(p),
-        window,
-        cx,
-    );
-    let menu = path_submenu(
-        menu,
-        IconName::SquareTerminal,
-        "Open in Terminal",
-        &paths,
-        |p, _, _| open_terminal(p),
-        window,
-        cx,
-    );
-    let menu = path_submenu(
-        menu,
-        IconName::Copy,
-        "Copy Path",
-        &paths,
-        |p, w, cx| copy(p.display().to_string(), w, cx),
-        window,
-        cx,
-    )
-    .item(
-        PopupMenuItem::new("Copy Branch Name")
-            .icon(IconName::GitBranch)
-            .on_click(move |_, w, cx| copy(branch.clone(), w, cx)),
-    )
-    .when(!pr_urls.is_empty(), |m| {
-        m.separator().item(
-            PopupMenuItem::new(match pr_urls.len() {
-                1 => "Open Pull Request".to_string(),
-                n => format!("Open {n} Pull Requests"),
-            })
-            .icon(IconName::ExternalLink)
-            .on_click(move |_, _, cx| pr_urls.iter().for_each(|u| cx.open_url(u))),
-        )
-    });
-    menu.separator()
-        .item(
-            PopupMenuItem::new("Archive")
-                .icon(IconName::Archive)
-                .on_click(on(|s, name, w, cx| s.archive_ws(name, false, w, cx))),
-        )
-        .item(
-            PopupMenuItem::new("Force Archive…")
-                .icon(IconName::ArchiveX)
-                .on_click(on(|s, name, w, cx| s.archive_ws(name, true, w, cx))),
-        )
+    let mut entries = vec![
+        // By name: the list can change under an open menu (a background auto-archive).
+        menu::item(
+            IconName::MessageSquare,
+            "Open Workspace",
+            on(|s, name, w, cx| {
+                if let Some(ix) = s.state.workspaces.iter().position(|w| w.name == name) {
+                    s.open_workspace(ix, w, cx)
+                }
+            }),
+        ),
+        Entry::Sep,
+        path_submenu(
+            IconName::FolderOpen,
+            "Reveal in Finder",
+            &paths,
+            |p, _, cx| cx.reveal_path(p),
+        ),
+        path_submenu(
+            IconName::SquareTerminal,
+            "Open in Terminal",
+            &paths,
+            |p, _, _| open_terminal(p),
+        ),
+        path_submenu(IconName::Copy, "Copy Path", &paths, |p, w, cx| {
+            copy(p.display().to_string(), w, cx)
+        }),
+        menu::item(IconName::GitBranch, "Copy Branch Name", move |w, cx| {
+            copy(branch.clone(), w, cx)
+        })
+        .hint(ws.branch.clone()),
+    ];
+    if !pr_urls.is_empty() {
+        let label = match pr_urls.len() {
+            1 => "Open Pull Request".to_string(),
+            n => format!("Open {n} Pull Requests"),
+        };
+        entries.push(Entry::Sep);
+        entries.push(menu::item(IconName::ExternalLink, label, move |_, cx| {
+            pr_urls.iter().for_each(|u| cx.open_url(u))
+        }));
+    }
+    entries.extend([
+        Entry::Sep,
+        menu::item(
+            IconName::Archive,
+            "Archive",
+            on(|s, name, w, cx| s.archive_ws(name, false, w, cx)),
+        ),
+        menu::item(
+            IconName::ArchiveX,
+            "Force Archive…",
+            on(|s, name, w, cx| s.archive_ws(name, true, w, cx)),
+        ),
+    ]);
+    entries
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -321,6 +302,8 @@ pub struct Shark {
     _editor_subs: Vec<Subscription>,
     pub(crate) syncs: HashMap<String, Entity<GitSync>>,
     pub(crate) sidebar_focus: FocusHandle,
+    /// The open right-click menu, dropped when it dismisses.
+    menu: Option<(Entity<menu::Menu>, Subscription)>,
     _subs: Vec<Subscription>,
 }
 
@@ -461,12 +444,29 @@ impl Shark {
             _editor_subs: vec![],
             syncs: HashMap::new(),
             sidebar_focus,
+            menu: None,
             _subs,
         }
     }
 
     fn notify_err(window: &mut Window, cx: &mut App, e: impl Into<SharedString>) {
         window.push_notification(Notification::error(e), cx);
+    }
+
+    fn show_menu(
+        &mut self,
+        pos: Point<Pixels>,
+        entries: Vec<Entry>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let m = menu::open(entries, pos, window, cx);
+        let sub = cx.subscribe(&m, |this, _, _: &DismissEvent, cx| {
+            this.menu = None;
+            cx.notify();
+        });
+        self.menu = Some((m, sub));
+        cx.notify();
     }
 
     fn active_chat(&self) -> Option<&Entity<Chat>> {
@@ -1372,7 +1372,6 @@ impl Shark {
         };
         let m = window.modifiers();
         let cmd_held = m.platform && m.number_of_modifiers() == 1;
-        let shark = cx.entity().downgrade();
         let repos = self.state.repos.iter().enumerate().map(|(ix, r)| {
             let (name, path) = (r.name.clone(), r.path.clone());
             let tip: SharedString = name.clone().into();
@@ -1385,26 +1384,27 @@ impl Shark {
                 .when(rail, |d| {
                     d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
                 })
-                .context_menu(move |menu, _, _| {
-                    let (p1, p2, p3) = (path.clone(), path.clone(), path.clone());
-                    menu.label(format!("{name} — {}", tilde(&path)))
-                        .separator()
-                        .item(
-                            PopupMenuItem::new("Reveal in Finder")
-                                .icon(IconName::FolderOpen)
-                                .on_click(move |_, _, cx| cx.reveal_path(&p1)),
-                        )
-                        .item(
-                            PopupMenuItem::new("Open in Terminal")
-                                .icon(IconName::SquareTerminal)
-                                .on_click(move |_, _, _| open_terminal(&p2)),
-                        )
-                        .item(
-                            PopupMenuItem::new("Copy Path")
-                                .icon(IconName::Copy)
-                                .on_click(move |_, w, cx| copy(p3.display().to_string(), w, cx)),
-                        )
-                })
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, e: &MouseDownEvent, w, cx| {
+                        let (p1, p2, p3) = (path.clone(), path.clone(), path.clone());
+                        let entries = vec![
+                            menu::item(IconName::FolderOpen, "Reveal in Finder", move |_, cx| {
+                                cx.reveal_path(&p1)
+                            }),
+                            menu::item(
+                                IconName::SquareTerminal,
+                                "Open in Terminal",
+                                move |_, _| open_terminal(&p2),
+                            ),
+                            menu::item(IconName::Copy, "Copy Path", move |w, cx| {
+                                copy(p3.display().to_string(), w, cx)
+                            })
+                            .hint(tilde(&path)),
+                        ];
+                        this.show_menu(e.position, entries, w, cx);
+                    }),
+                )
         });
         let workspaces = self.state.workspaces.iter().enumerate().map(|(ix, w)| {
             let busy = self
@@ -1414,7 +1414,6 @@ impl Shark {
             let selected = ix == self.sel;
             let active = self.active.as_ref() == Some(&w.name);
             let ws = w.clone();
-            let shark = shark.clone();
             row()
                 .id(ix)
                 .h(px(44.))
@@ -1432,9 +1431,10 @@ impl Shark {
                 // Right-click moves the cursor too, so it's clear which row the menu is for.
                 .on_mouse_down(
                     MouseButton::Right,
-                    cx.listener(move |this, _, _, cx| {
+                    cx.listener(move |this, e: &MouseDownEvent, w, cx| {
                         this.sel = ix;
-                        cx.notify();
+                        let entries = ws_menu(this, &ws, cx);
+                        this.show_menu(e.position, entries, w, cx);
                     }),
                 )
                 .child(match busy {
@@ -1482,7 +1482,6 @@ impl Shark {
                     let name: SharedString = w.name.clone().into();
                     d.tooltip(move |w, cx| Tooltip::new(name.clone()).build(w, cx))
                 })
-                .context_menu(move |menu, window, cx| ws_menu(menu, &ws, ix, &shark, window, cx))
         });
         v_flex()
             .id("sidebar")
@@ -2313,6 +2312,7 @@ impl Render for Shark {
                 crate::settings::open(&this.state, w, cx)
             }))
             .child(self.render_sidebar(window, cx))
+            .children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))
             .child(
                 // Linear's "island": content floats on the sidebar color, inset and rounded.
                 div().flex_1().min_w_0().h_full().py_2().pr_2().child(
