@@ -1,29 +1,45 @@
-# Merging a PR labelled "release" builds the DMG, publishes a GitHub release,
+# Every push to master builds the app, which keeps the Rust cache warm (caches saved on
+# master are shared; unused caches are evicted after 7 days). If the merged PR has the
+# "release" label, it also tags the built commit, publishes a GitHub release with the DMG,
 # and commits the new version to Cargo.toml, the brew cask and the README.
 name: release
 
 on:
-  pull_request:
-    types: [closed]
-
-permissions:
-  contents: write
-
-concurrency: release
+  push:
+    branches: [master]
 
 jobs:
-  release:
-    if: github.event.pull_request.merged && contains(github.event.pull_request.labels.*.name, 'release')
+  check:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: read
+    outputs:
+      release: ${{ steps.label.outputs.release }}
+    steps:
+      - id: label
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          labels=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '.[].labels[].name')
+          echo "release=$(grep -qx release <<<"$labels" && echo true || echo false)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
     runs-on: macos-latest
+    permissions:
+      contents: write
+    concurrency: ${{ needs.check.outputs.release == 'true' && 'release' || format('build-{0}', github.run_id) }}
     env:
       GH_TOKEN: ${{ github.token }}
+      RELEASE: ${{ needs.check.outputs.release }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.pull_request.base.ref }}
           fetch-depth: 0
 
       - name: Pick version
+        if: env.RELEASE == 'true'
         run: |
           v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
           # Already released: bump the patch number. A re-run must not publish a second release.
@@ -35,9 +51,16 @@ jobs:
           echo "VERSION=$v" >> "$GITHUB_ENV"
 
       - run: rustup toolchain install
-      - run: make release
+      - uses: Swatinem/rust-cache@v2
 
-      - name: Update cask and README
+      - if: env.RELEASE != 'true'
+        run: cargo build --release
+
+      - if: env.RELEASE == 'true'
+        run: make release
+
+      - name: Publish release
+        if: env.RELEASE == 'true'
         run: |
           sha=$(shasum -a 256 "target/release/Shark-$VERSION.dmg" | cut -d' ' -f1)
           sed -i '' -e "s/^  version \".*\"/  version \"$VERSION\"/" -e "s/^  sha256 \".*\"/  sha256 \"$sha\"/" Casks/shark.rb
@@ -45,8 +68,13 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git commit -am "Release $VERSION"
-          # No rebase: the tag must point at the code that was built. If master moved, re-run the job.
-          git push
-
-      - name: Publish release
-        run: gh release create "v$VERSION" "target/release/Shark-$VERSION.dmg" --title "Shark $VERSION" --generate-notes --target "$(git rev-parse HEAD)"
+          # The tag points at exactly the code that was built, however far master has moved.
+          git tag "v$VERSION"
+          git push origin "v$VERSION"
+          gh release create "v$VERSION" "target/release/Shark-$VERSION.dmg" --title "Shark $VERSION" --generate-notes --verify-tag
+          # Then carry the version commit onto master; retry if more merges land meanwhile.
+          for _ in 1 2 3 4 5; do
+            git pull --rebase origin master && git push origin HEAD:master && exit 0
+            sleep 5
+          done
+          exit 1
