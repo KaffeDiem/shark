@@ -4,6 +4,15 @@ A keyboard-first, native (GPUI) app for running Claude Code on features that spa
 
 One workspace = one feature = N git worktrees on a shared branch, e.g. `~/shark/workspaces/eng-123-login/{ios,backend}`. A single agent works across all of them. The diff view is combined, and PRs are cross-linked.
 
+## Install
+```sh
+brew tap KaffeDiem/shark https://github.com/KaffeDiem/shark
+brew install --cask KaffeDiem/shark/shark
+```
+Or [Download Shark 0.0.0](https://github.com/KaffeDiem/shark/releases/download/v0.0.0/Shark-0.0.0.dmg) (Apple Silicon), open it and drag Shark to Applications. The app isn't notarized: on first launch, open it, then allow it in System Settings → Privacy & Security → Open Anyway, or run `xattr -dr com.apple.quarantine /Applications/Shark.app`.
+
+Releases: merge a PR with the `release` label. CI builds the DMG (`make release`), publishes a GitHub release, and commits the new version to `Cargo.toml`, `Casks/shark.rb` and this section. The version is the one in `Cargo.toml`, or its next patch if that is already released.
+
 ## Run
 ```sh
 cargo run                                  # needs Xcode (Metal); Rust is pinned in rust-toolchain.toml
@@ -18,12 +27,13 @@ Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH.
 |---|---|
 | anywhere | `cmd-k` palette · `cmd-,` settings · `cmd-n` new workspace · `cmd-t` new chat · `cmd-w` close chat · `cmd-shift-t` reopen closed chat · `ctrl-tab`/`ctrl-shift-tab` or `cmd-shift-]`/`[` next/previous chat · `cmd-1…9` open the Nth workspace (hold `cmd` to see the numbers) · `ctrl-c` stop agent · `ctrl-w h/l` previous/next pane · `cmd-b` sidebar ↔ icon rail · `ctrl-cmd-v` Vim keys in the editor on/off · `cmd-/` model menu · `ctrl-cmd-1…5` default/fable/opus/sonnet/haiku |
 | sidebar, transcript | `j/k` `gg` `G` `ctrl-d/u` · `enter` open / toggle tool output · `i`/`a` → composer |
+| sidebar sections | `space s n` new section (named in place, `enter` saves, `esc` cancels) · `m` / `space s m` move workspace to a section · `h`/`l` fold/unfold · `enter` on a header toggles it · `space s r` rename · `space s i` icon · `space s d` delete (its workspaces stay) |
 | composer | `enter` send (queues while the agent runs) · `cmd-enter` send now, steering the running turn · `cmd-shift-enter` ask as a side question · `↑` on the first line → queue · `shift-enter` newline · `esc` → normal mode · `@` add a file or folder (`repo/` to pick the repo) · `/` skills and commands at the start · in the menu `↑/↓` `enter`/`tab` `esc` |
 | queue | `j/k` `↑/↓` `gg` `G` · `enter` send now · `e` edit (`enter` puts it back) · `d`/`backspace` delete · `shift-k/j` or `alt-↑/↓` move up/down · `esc`/`i`, or `↓` past the last row → composer |
 | side question | `esc` dismiss · `c` copy the answer · `enter` put the answer into the composer |
 | leader (normal mode) | `space space` palette · `space ?` side question · `g t`/`g T` next/previous chat · `space ,` settings · `space q` queue · `space w n/d/D` new/archive/force-archive · `space r a` add repo · `space c/d` chat/diff · `space p r` create linked PRs · `space p o` open PRs · `space g g` next git step · `space g m` git menu · `space g f` fetch now · `space m m` model menu · `space m 1…5` pick model · `space o f/t` reveal in Finder / open in Terminal · `space y p/b` copy path / branch · `space b` sidebar rail · `space t` file tree · `space x` close file |
 | new workspace | `enter` create (in branch) · `tab` branch ↔ repo filter · type to filter · `enter` tick match · `space` tick/untick highlighted · `cmd-enter` create · last-used repos start ticked |
-| sidebar mouse | right-click a workspace: open, reveal in Finder / Terminal / copy path (per repo), copy branch, open PRs, archive |
+| sidebar mouse | right-click a workspace: open, move to section, reveal in Finder / Terminal / copy path (per repo), copy branch, open PRs, archive · drag a workspace onto a section header to move it in (onto Workspaces to ungroup), or onto another workspace to take its place · drag a section header onto another to reorder sections · hover Workspaces for **+** new section, or right-click it or the empty space below · click a section header to fold it; right-click it to rename, change icon, delete |
 | settings | `ctrl-tab` Appearance ↔ Prompts |
 | diff | `j/k/h/l` `gg` `G` `ctrl-d/u` scroll · `]c`/`[c` hunks · `}`/`{` files · `s` split/unified · `r` refresh · viewed checkbox in each file header |
 | file tree | `j/k` `gg` `G` `ctrl-d/u` · `enter` show file / toggle folder · `h/l` collapse/expand · `v` viewed (on a folder: every file in it) · `o` open in editor |
@@ -61,3 +71,6 @@ Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH.
   - Refuses to run while any repo has uncommitted changes. Only an open PR is reused; after a merge, new commits get a new PR.
 
 Background and prior art: [docs/research.md](docs/research.md). UI theme, design rules and checklist: [docs/design.md](docs/design.md).
+
+## License
+GPL-3.0 with an attribution term: copies and derived works must keep the copyright notice and credit "Shark by Kasper Munch Jensen". See [LICENSE](LICENSE).
