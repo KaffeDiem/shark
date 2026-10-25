@@ -21,7 +21,13 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          labels=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '.[].labels[].name')
+          # GitHub links a merge commit to its PR a few seconds after the push: wait for it.
+          for _ in $(seq 12); do
+            prs=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls")
+            [ "$(jq length <<<"$prs")" != 0 ] && break
+            sleep 5
+          done
+          labels=$(jq -r '.[].labels[].name' <<<"$prs")
           echo "release=$(grep -qx release <<<"$labels" && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
   build:
