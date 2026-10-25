@@ -442,6 +442,7 @@ impl Shark {
                 .font_features(inter_features())
                 .margin_top(px(96.))
                 .entrance(DialogEntrance::None)
+                .close_button(false)
                 .child(Command::new(&state).items(items.clone()).on_confirm(
                     move |ix, window, cx| {
                         window.close_dialog(cx);
