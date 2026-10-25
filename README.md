@@ -16,13 +16,15 @@ Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH.
 ## Keys
 | Where | Keys |
 |---|---|
-| anywhere | `cmd-k` palette · `cmd-n` new workspace · `ctrl-c` stop agent · `ctrl-w h/l` sidebar/main · `cmd-/` model menu · `ctrl-cmd-1…5` default/fable/opus/sonnet/haiku |
+| anywhere | `cmd-k` palette · `cmd-n` new workspace · `ctrl-c` stop agent · `ctrl-w h/l` previous/next pane · `cmd-b` sidebar ↔ icon rail · `ctrl-cmd-v` Vim keys in the editor on/off · `cmd-/` model menu · `ctrl-cmd-1…5` default/fable/opus/sonnet/haiku |
 | sidebar, transcript | `j/k` `gg` `G` `ctrl-d/u` · `enter` open / toggle tool output · `i`/`a` → composer |
 | composer | `enter` send · `shift-enter` newline · `esc` → normal mode · `@` add a file or folder (`repo/` to pick the repo) · `/` skills and commands at the start · in the menu `↑/↓` `enter`/`tab` `esc` |
-| leader (normal mode) | `space space` palette · `space w n/d/D` new/archive/force-archive · `space r a` add repo · `space c/d` chat/diff · `space p r` create linked PRs · `space p o` open PRs · `space g g` next git step · `space g m` git menu · `space g f` fetch now · `space m m` model menu · `space m 1…5` pick model · `space o f/t` reveal in Finder / open in Terminal · `space y p/b` copy path / branch |
+| leader (normal mode) | `space space` palette · `space w n/d/D` new/archive/force-archive · `space r a` add repo · `space c/d` chat/diff · `space p r` create linked PRs · `space p o` open PRs · `space g g` next git step · `space g m` git menu · `space g f` fetch now · `space m m` model menu · `space m 1…5` pick model · `space o f/t` reveal in Finder / open in Terminal · `space y p/b` copy path / branch · `space b` sidebar rail · `space t` file tree · `space x` close file |
 | new workspace | `enter` create (in branch) · `tab` branch ↔ repo filter · type to filter · `enter` tick match · `space` tick/untick highlighted · `cmd-enter` create · last-used repos start ticked |
 | sidebar mouse | right-click a workspace: open, reveal in Finder / Terminal / copy path (per repo), copy branch, open PRs, archive |
-| diff | `j/k/h/l` `gg` `G` `ctrl-d/u` scroll · `]c`/`[c` hunks · `}`/`{` files · `s` split/unified · `r` refresh |
+| diff | `j/k/h/l` `gg` `G` `ctrl-d/u` scroll · `]c`/`[c` hunks · `}`/`{` files · `s` split/unified · `r` refresh · viewed checkbox in each file header |
+| file tree | `j/k` `gg` `G` `ctrl-d/u` · `enter` show file / toggle folder · `h/l` collapse/expand · `v` viewed · `o` open in editor |
+| editor | `cmd-s` save · `cmd-w` close · `esc` back to the tree · with Vim on: motions `hjkl w b e 0 ^ $ gg G { }` with counts, `i a I A o O`, `x dd yy cc D C p P J r ~`, `d/c/y/>/<` + motion, `v`/`V`, `u` / `ctrl-r`, `/ n N`, `:w` |
 
 ## How it works
 - **Workspace creation:**
@@ -33,7 +35,9 @@ Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH.
   - One process per workspace: `claude -p --input-format stream-json --output-format stream-json`, with the workspace root as cwd.
   - Runs with `--permission-mode bypassPermissions`. Worktrees isolate branches, not the filesystem.
   - The transcript is stored in `~/Library/Application Support/shark/transcripts/`, and `--resume` continues the session after a restart.
-- **Diff:** `git diff --merge-base <base>` in each worktree plus untracked files, with paths prefixed by repo name.
+- **Diff:** one `git diff --merge-base <base>` per worktree, with paths prefixed by repo name. Untracked files are included by marking them intent-to-add in a throwaway copy of the index (`GIT_INDEX_FILE`), so the real index and the agent's `index.lock` are never touched.
+- **Files tree and viewed:** the changed files show as a tree to the right of the diff (and of an open file), folders first, single-child folders joined (`src/ui`). Marking a file viewed stores a fingerprint of its patch in `state.json`; when the patch changes the file is unviewed again and gets a dot.
+- **Editor:** `o` opens a changed file next to the chat and shrinks the sidebar to an icon rail. Saves are refused if the file changed on disk since it was read (the agent writes the same worktree); the file is re-read every 2 s and a clean buffer follows the disk. The Vim toggle is saved in `state.json`.
 - **Git button** (header, top right; code in `src/sync/`): shows the next step toward a merged PR for all repos at once, e.g. "Commit and push · api" or "Fix checks · web".
   - Steps that need judgment (commit, resolve conflicts, fix failing checks, address review, sync a diverged branch) are prompts to the agent; text in the composer is added to the prompt. Mechanical ones (pull `--ff-only`, push, force push with lease, create PRs, update branch, ready for review, merge, archive) run directly.
   - Order: git errors → conflicts / unfinished rebase or merge → detached or wrong branch → uncommitted changes → no origin → rewritten or diverged history → behind remote → create or reopen PR → unpushed → PR conflicts → failing checks → changes requested → base moved → draft → waiting (GitHub catching up, checks running, review) → merge → archive. Actionable steps outrank waits across repos.

@@ -161,14 +161,17 @@ impl Chat {
                 .placeholder("Message the agent (@ to add files, / for skills, Enter to send, Esc for normal mode)")
                 .submit_on_enter(true)
         });
-        let _sub = cx.subscribe_in(&composer, window, |this, _, ev: &InputEvent, window, cx| {
-            match ev {
-                InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
-                InputEvent::Change => this.update_menu(cx),
-                InputEvent::Blur => this.close_menu(cx),
-                _ => {}
-            }
-        });
+        let _sub =
+            cx.subscribe_in(
+                &composer,
+                window,
+                |this, _, ev: &InputEvent, window, cx| match ev {
+                    InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
+                    InputEvent::Change => this.update_menu(cx),
+                    InputEvent::Blur => this.close_menu(cx),
+                    _ => {}
+                },
+            );
         let ws_name = ws.name.clone();
         let mut chat = Chat {
             ws,
@@ -287,7 +290,9 @@ impl Chat {
         let (text, cursor) = (c.value(), c.cursor());
         let found = complete::trigger(&text, cursor).filter(|(r, _)| {
             // Text right after a chip belongs to the chip, not to a new query.
-            !c.tokens().iter().any(|t| t.range().start < r.end && r.start < t.range().end)
+            !c.tokens()
+                .iter()
+                .any(|t| t.range().start < r.end && r.start < t.range().end)
         });
         let Some((range, command)) = found else {
             return self.close_menu(cx);
@@ -318,7 +323,11 @@ impl Chat {
 
     fn menu_item(&self, ix: usize) -> Option<&Item> {
         let m = self.menu.as_ref()?;
-        let items = if m.command { &self.commands } else { &self.files };
+        let items = if m.command {
+            &self.commands
+        } else {
+            &self.files
+        };
         items.get(*m.matches.get(ix)?)
     }
 
@@ -731,9 +740,8 @@ impl Chat {
                     Kind::Command => IconName::SquareSlash,
                 };
                 let badge = match it.kind {
-                    Kind::Command => (!it.badge.is_empty()).then(|| {
-                        div().flex_none().text_color(faint).child(it.badge.clone())
-                    }),
+                    Kind::Command => (!it.badge.is_empty())
+                        .then(|| div().flex_none().text_color(faint).child(it.badge.clone())),
                     // The repo, so two README.md rows are told apart at a glance.
                     _ => multi.then(|| {
                         h_flex()
@@ -839,7 +847,8 @@ impl Chat {
                         .child(hint("enter", "add"))
                         .child(hint("escape", "close"))
                         .when(!m.command && multi, |d| {
-                            d.child(div().flex_1()).child("Type repo/ to search one repo")
+                            d.child(div().flex_1())
+                                .child("Type repo/ to search one repo")
                         }),
                 )
                 .into_any_element(),
@@ -1039,6 +1048,7 @@ mod ui_tests {
             repos: vec![],
             session_id: None,
             model: None,
+            viewed: Default::default(),
         };
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::new(
@@ -1100,6 +1110,7 @@ mod ui_tests {
             repos: vec![repo("api"), repo("web")],
             session_id: None,
             model: None,
+            viewed: Default::default(),
         };
         let (window, chat) = cx
             .update(|cx| {
@@ -1118,10 +1129,17 @@ mod ui_tests {
         let act = |cx: &mut TestAppContext, f: &dyn Fn(&mut Window, &mut App)| {
             cx.update_window(window, |_, w, cx| f(w, cx)).unwrap()
         };
-        act(cx, &|w, cx| chat.update(cx, |c, cx| c.focus_composer(w, cx)));
+        act(cx, &|w, cx| {
+            chat.update(cx, |c, cx| c.focus_composer(w, cx))
+        });
         act(cx, &|w, cx| w.input("see @readme", cx));
         let menu = |cx: &mut TestAppContext| {
-            cx.update(|cx| chat.read(cx).menu.as_ref().map(|m| (m.matches.len(), m.sel)))
+            cx.update(|cx| {
+                chat.read(cx)
+                    .menu
+                    .as_ref()
+                    .map(|m| (m.matches.len(), m.sel))
+            })
         };
         assert_eq!(menu(cx), Some((2, 0)), "both READMEs");
         act(cx, &|w, cx| w.press("down", cx));
@@ -1130,7 +1148,11 @@ mod ui_tests {
         let value = |cx: &mut TestAppContext| {
             cx.update(|cx| chat.read(cx).composer.read(cx).value().to_string())
         };
-        assert_eq!(value(cx), "see @web/README.md ", "enter picks, doesn't send");
+        assert_eq!(
+            value(cx),
+            "see @web/README.md ",
+            "enter picks, doesn't send"
+        );
         assert_eq!(menu(cx), None);
         cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).tokens().len(), 1));
 
@@ -1139,7 +1161,10 @@ mod ui_tests {
         act(cx, &|w, cx| w.press("escape", cx));
         assert_eq!(menu(cx), None, "escape closes the menu");
         act(cx, &|w, cx| {
-            assert!(!chat.read(cx).focus.is_focused(w), "and stays in the composer")
+            assert!(
+                !chat.read(cx).focus.is_focused(w),
+                "and stays in the composer"
+            )
         });
         std::fs::remove_dir_all(root).unwrap();
     }

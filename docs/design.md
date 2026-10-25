@@ -69,9 +69,11 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 - **Where a new view goes:**
   - A view of the open workspace becomes a header tab (add a `Tab` variant).
   - A view not tied to one workspace (settings, repo list) opens with `window.open_dialog`, `w(px(640.))`, like the palette.
-  - Don't add a second sidebar or panes outside the island.
+  - Don't add a second sidebar or panes outside the island. Panes inside it (the file tree, the editor next to the chat) are columns separated by a 1px `border`.
 - **Sidebar row:** 28px tall, `mx_2 mb_1 px_2 gap_2` (the 4px gap keeps hover and selection backgrounds apart), `rounded(theme.radius)`, `text_sm`. Order: status icon (14px), name (`flex_1`, truncated), optional badge, metadata (`text_xs`, `muted_foreground`). Sidebar width 244px.
   - Workspace rows are 44px with two lines: the name, then its repos (`text_xs`, `muted_foreground`, `api · web`), so you can see where an agent works without opening it.
+- **Sidebar rail:** `cmd-b` shrinks the sidebar to 48px icons with tooltips; opening a file does it automatically and closing the file undoes it unless the user toggled it. The header then pads left to clear the traffic lights.
+- **File tree:** 260px column on the right of the Diff and file views, `Files` header with "n/m viewed", 28px rows indented 12px per level, then the `v` checkbox. Folders first; single-child folders are joined.
 - **Context menus:** right-click on sidebar rows (`.context_menu(..)`, gpui-kit `PopupMenu`). Follow the Apple HIG:
   - A disabled label first that says what the menu acts on (branch, or repo + path).
   - At most three groups: open/reveal (`Reveal in Finder`, `Open in Terminal`, `Copy Path`, one submenu each with "Workspace folder" plus one row per repo, every row showing its `~/…` path), then git (`Open Pull Requests`, hidden when there are none), then destructive (`Archive`, `Force Archive…`) last.
@@ -115,6 +117,10 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 | Tool group with failures | `X` + "N failed" in `danger_foreground`, on the collapsed row |
 | Skill / subagent row | `BookOpen` / `Bot`, `muted_foreground`, before the tool name |
 | Collapsed / expanded | `ChevronRight` / `ChevronDown` |
+| Changed file added / deleted / other | `FilePlus` / `FileMinus` / `FileDiff`, `muted_foreground`; `+n` `success_foreground`, `−n` `danger_foreground` |
+| File viewed / changed since viewed | Checked `Checkbox` and the name in `muted_foreground` / 6px `warning_foreground` dot |
+| Unsaved edits / changed on disk | 6px `foreground` dot after the file name / `TriangleAlert` in `warning_foreground` with Reload and Keep mine |
+| Vim mode | Mono `text_xs` pill on `secondary`: `NORMAL`, `INSERT`, `VISUAL`, `V-LINE` plus pending keys; `VIM OFF` without the fill |
 | Git step to run | Its own icon (`GitCommitHorizontal`, `ArrowUp`/`ArrowDown`, `GitPullRequestCreate`, `GitMerge`, …) in a `primary` button |
 | Git needs attention (conflicts, failing checks, detached HEAD, git error) | `TriangleAlert` in `warning_foreground`, `outline` button |
 | Git waiting (GitHub catching up, checks running, review) / reading / step running | `GitPullRequest` / static `RefreshCw`, `ghost` button |

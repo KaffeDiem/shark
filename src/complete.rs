@@ -43,7 +43,13 @@ pub fn files(repos: &[(String, PathBuf)]) -> Vec<Item> {
                 s.spawn(move || {
                     let out = crate::git::git(
                         dir,
-                        &["-c", "core.quotepath=off", "ls-files", "-co", "--exclude-standard"],
+                        &[
+                            "-c",
+                            "core.quotepath=off",
+                            "ls-files",
+                            "-co",
+                            "--exclude-standard",
+                        ],
                     );
                     (name.clone(), out.unwrap_or_default())
                 })
@@ -117,14 +123,22 @@ pub fn cached_commands(ws: &str) -> Vec<Item> {
 /// `initialize` control request. Takes about a second, costs no tokens, starts no session.
 pub fn probe_commands(ws: &str, dir: &Path) -> Option<Vec<Item>> {
     let mut child = Command::new("claude")
-        .args(["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"])
+        .args([
+            "-p",
+            "--input-format",
+            "stream-json",
+            "--output-format",
+            "stream-json",
+            "--verbose",
+        ])
         .current_dir(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .ok()?;
-    let req = r#"{"type":"control_request","request_id":"commands","request":{"subtype":"initialize"}}"#;
+    let req =
+        r#"{"type":"control_request","request_id":"commands","request":{"subtype":"initialize"}}"#;
     let mut stdin = child.stdin.take()?;
     let stdout = child.stdout.take()?;
     let (tx, rx) = mpsc::channel();
@@ -141,7 +155,8 @@ pub fn probe_commands(ws: &str, dir: &Path) -> Option<Vec<Item>> {
     let _ = child.kill();
     let _ = child.wait();
     let v: serde_json::Value = serde_json::from_str(&line?).ok()?;
-    let cmds: Vec<Cmd> = serde_json::from_value(v["response"]["response"]["commands"].clone()).ok()?;
+    let cmds: Vec<Cmd> =
+        serde_json::from_value(v["response"]["response"]["commands"].clone()).ok()?;
     let path = cache_path(ws);
     let _ = std::fs::create_dir_all(path.parent()?);
     let _ = std::fs::write(&path, serde_json::to_vec(&cmds).ok()?);
@@ -211,7 +226,11 @@ fn greedy(q: &[char], s: &str) -> Option<i32> {
         if c == q[qi] {
             qi += 1;
             score += 1 + if run { 4 } else { 0 };
-            score += if matches!(prev, '/' | '_' | '-' | '.' | ' ' | ':') { 3 } else { 0 };
+            score += if matches!(prev, '/' | '_' | '-' | '.' | ' ' | ':') {
+                3
+            } else {
+                0
+            };
             run = true;
         } else {
             run = false;
@@ -227,7 +246,10 @@ mod tests {
     use std::fs;
 
     fn inserts(items: &[Item], q: &str) -> Vec<String> {
-        rank(items, q, 3).into_iter().map(|i| items[i].insert.clone()).collect()
+        rank(items, q, 3)
+            .into_iter()
+            .map(|i| items[i].insert.clone())
+            .collect()
     }
 
     #[test]
@@ -247,14 +269,28 @@ mod tests {
             repos.push((name.to_string(), dir));
         }
         let items = files(&repos);
-        assert!(!items.iter().any(|i| i.insert.contains("target")), "gitignored");
-        assert_eq!(inserts(&items, "readme")[..2], ["@api/README.md", "@web/README.md"]);
+        assert!(
+            !items.iter().any(|i| i.insert.contains("target")),
+            "gitignored"
+        );
+        assert_eq!(
+            inserts(&items, "readme")[..2],
+            ["@api/README.md", "@web/README.md"]
+        );
         assert_eq!(inserts(&items, "web/readme")[0], "@web/README.md");
         assert_eq!(inserts(&items, "api/deep")[0], "@api/docs/deep/");
-        let readme = items.iter().find(|i| i.insert == "@web/docs/deep/README.md").unwrap();
-        assert_eq!((readme.label.as_str(), readme.detail.as_str()), ("README.md", "web/docs/deep"));
+        let readme = items
+            .iter()
+            .find(|i| i.insert == "@web/docs/deep/README.md")
+            .unwrap();
+        assert_eq!(
+            (readme.label.as_str(), readme.detail.as_str()),
+            ("README.md", "web/docs/deep")
+        );
         // 20k paths: well under a frame.
-        let many: Vec<Item> = (0..20_000).map(|i| item(Kind::File, "r", &format!("d{i}/f{i}.rs"))).collect();
+        let many: Vec<Item> = (0..20_000)
+            .map(|i| item(Kind::File, "r", &format!("d{i}/f{i}.rs")))
+            .collect();
         let t = std::time::Instant::now();
         rank(&many, "f19", 50);
         assert!(t.elapsed() < Duration::from_millis(40), "{:?}", t.elapsed());
@@ -284,6 +320,10 @@ mod tests {
     fn live_probe() {
         let cmds = probe_commands("live-probe-test", &std::env::temp_dir()).expect("probe");
         let _ = fs::remove_file(cache_path("live-probe-test"));
-        assert!(cmds.iter().any(|c| c.insert == "/compact"), "{} commands", cmds.len());
+        assert!(
+            cmds.iter().any(|c| c.insert == "/compact"),
+            "{} commands",
+            cmds.len()
+        );
     }
 }

@@ -1,24 +1,30 @@
 //! Root view: sidebar of repos and workspaces, Chat/Diff tabs, palette and dialogs.
 use crate::chat::{Chat, ChatEvent, MODELS};
+use crate::editor::{EditorEvent, FileEditor};
+use crate::files::{self, Row};
 use crate::state::{Repo, State, Workspace, workspaces_dir};
 use crate::sync::{GitSync, SyncEvent};
 use crate::*;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
 use gpui_kit::component::dialog::DialogEntrance;
-use gpui_kit::component::diff::{Diff, DiffFile, DiffMode, DiffState};
+use gpui_kit::component::diff::{Diff, DiffFile, DiffFileStatus, DiffMode, DiffState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme, Icon, IndexPath, Sizable as _, Theme, WindowExt, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
@@ -233,6 +239,55 @@ fn ws_menu(
 enum Tab {
     Chat,
     Diff,
+    /// The open file next to the chat; only while `editor` is set.
+    File,
+}
+
+/// Focusable columns, left to right; `ctrl-w h/l` walks them.
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum Pane {
+    Sidebar,
+    Chat,
+    Diff,
+    Editor,
+    Tree,
+}
+
+/// A changed file against the fingerprint stored when it was marked viewed.
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum Viewed {
+    No,
+    Yes,
+    /// Marked viewed, then the agent or the editor changed it.
+    Changed,
+}
+
+/// One parsed diff refresh, built off the main thread.
+struct DiffData {
+    /// Fingerprint of the whole patch; equal means nothing to redo.
+    fp: u64,
+    /// In tree order.
+    files: Vec<DiffFile>,
+    fps: Vec<u64>,
+}
+
+impl DiffData {
+    fn load(ws: &Workspace) -> DiffData {
+        let patch = git::combined_diff(ws, &ws.dir());
+        let fp = files::fingerprint(&patch);
+        let mut parsed: Vec<(DiffFile, u64)> = files::split_patch(&patch)
+            .into_iter()
+            .filter_map(|chunk| {
+                let file = DiffFile::parse(chunk).ok()?.into_iter().next()?;
+                Some((file, files::fingerprint(chunk)))
+            })
+            .collect();
+        let paths: Vec<String> = parsed.iter().map(|(f, _)| f.path().to_string()).collect();
+        let order = files::tree_order(&paths);
+        let mut slots: Vec<Option<(DiffFile, u64)>> = parsed.drain(..).map(Some).collect();
+        let (files, fps) = order.into_iter().filter_map(|i| slots[i].take()).unzip();
+        DiffData { fp, files, fps }
+    }
 }
 
 pub struct Shark {
@@ -242,8 +297,28 @@ pub struct Shark {
     pub(crate) chats: HashMap<String, Entity<Chat>>,
     tab: Tab,
     diff: Entity<DiffState>,
-    diff_files: Vec<String>,
+    /// Changed files in tree order, with each patch's fingerprint.
+    diff_files: Vec<DiffFile>,
+    diff_fps: Vec<u64>,
+    diff_fp: u64,
+    /// Bumped per refresh, so a slow older refresh can't overwrite a newer one.
+    diff_gen: u64,
     diff_file: usize,
+    /// Paths currently viewed (fingerprint still matches), for the diff headers.
+    viewed_now: Rc<HashSet<SharedString>>,
+    tree_rows: Vec<Row>,
+    collapsed_dirs: HashSet<String>,
+    tree_sel: usize,
+    tree_focus: FocusHandle,
+    tree_scroll: UniformListScrollHandle,
+    show_tree: bool,
+    /// Sidebar shrunk to icons; `rail_auto` when opening a file did it, so closing undoes it.
+    rail: bool,
+    rail_auto: bool,
+    editor: Option<Entity<FileEditor>>,
+    /// What the editor header shows, to redraw only when it changes, not on every key.
+    editor_header: (bool, bool, &'static str, String),
+    _editor_subs: Vec<Subscription>,
     pub(crate) syncs: HashMap<String, Entity<GitSync>>,
     pub(crate) sidebar_focus: FocusHandle,
     _subs: Vec<Subscription>,
@@ -309,6 +384,31 @@ const COMMANDS: &[(&str, IconName, Cmd)] = &[
     ("Git: fetch now", IconName::RefreshCw, |s, w, cx| {
         s.with_sync(w, cx, GitSync::fetch_now)
     }),
+    ("Toggle sidebar", IconName::PanelLeft, |s, _, cx| {
+        s.toggle_sidebar(cx)
+    }),
+    ("Toggle file tree", IconName::ListTree, |s, w, cx| {
+        s.toggle_tree(w, cx)
+    }),
+    ("Mark file viewed / unviewed", IconName::Eye, |s, w, cx| {
+        if let Some(ix) = s.cursor_file(w, cx) {
+            s.toggle_viewed(ix, cx)
+        }
+    }),
+    ("Open file in editor", IconName::FilePen, |s, w, cx| {
+        if let Some(ix) = s.cursor_file(w, cx) {
+            s.open_file(ix, w, cx)
+        }
+    }),
+    ("Save file", IconName::Save, |s, w, cx| {
+        if let Some(e) = s.editor.clone() {
+            e.update(cx, |e, cx| e.save(false, w, cx))
+        }
+    }),
+    ("Close file", IconName::X, |s, w, cx| s.close_file(w, cx)),
+    ("Toggle Vim keys", IconName::Keyboard, |s, w, cx| {
+        s.toggle_vim(w, cx)
+    }),
     ("Stop agent", IconName::Square, |s, _, cx| s.stop(cx)),
     ("Change model…", IconName::Sparkles, |s, w, cx| {
         s.pick_model(w, cx)
@@ -328,7 +428,22 @@ impl Shark {
             tab: Tab::Chat,
             diff: cx.new(|cx| DiffState::new(vec![], cx)),
             diff_files: vec![],
+            diff_fps: vec![],
+            diff_fp: 0,
+            diff_gen: 0,
             diff_file: 0,
+            viewed_now: Rc::default(),
+            tree_rows: vec![],
+            collapsed_dirs: HashSet::new(),
+            tree_sel: 0,
+            tree_focus: cx.focus_handle(),
+            tree_scroll: UniformListScrollHandle::new(),
+            show_tree: true,
+            rail: false,
+            rail_auto: false,
+            editor: None,
+            editor_header: Default::default(),
+            _editor_subs: vec![],
             syncs: HashMap::new(),
             sidebar_focus,
             _subs: vec![],
@@ -360,9 +475,30 @@ impl Shark {
     }
 
     fn open_workspace(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.state.workspaces.get(ix).map(|w| w.name.clone()) else {
+            return;
+        };
+        if self.active.as_ref() == Some(&name) || self.editor.is_none() {
+            return self.open_workspace_now(ix, window, cx);
+        }
+        self.confirm_discard(window, cx, move |s, window, cx| {
+            s.drop_editor();
+            s.open_workspace_now(ix, window, cx)
+        });
+    }
+
+    fn open_workspace_now(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ws) = self.state.workspaces.get(ix).cloned() else {
             return;
         };
+        if self.active.as_ref() != Some(&ws.name) {
+            // A fresh tree and diff for another workspace.
+            self.diff_fp = 0;
+            self.diff_files.clear();
+            self.tree_rows.clear();
+            self.collapsed_dirs.clear();
+            self.tree_sel = 0;
+        }
         self.sel = ix;
         if !self.chats.contains_key(&ws.name) {
             let chat = cx.new(|cx| Chat::new(ws.clone(), window, cx));
@@ -428,6 +564,10 @@ impl Shark {
                 self.refresh_diff(cx);
                 self.diff.read(cx).focus_handle(cx).focus(window, cx);
             }
+            Tab::File => match &self.editor {
+                Some(e) => crate::editor::focus(e, window, cx),
+                None => return self.show(Tab::Diff, window, cx),
+            },
         }
         cx.notify();
     }
@@ -441,25 +581,417 @@ impl Shark {
         else {
             return;
         };
+        self.diff_gen += 1;
+        let generation = self.diff_gen;
         cx.spawn(async move |this, cx| {
             let name = ws.name.clone();
-            let patch = cx
+            let data = cx
                 .background_executor()
-                .spawn(async move { git::combined_diff(&ws, &ws.dir()) })
+                .spawn(async move { DiffData::load(&ws) })
                 .await;
-            let files = DiffFile::parse(&patch).unwrap_or_default();
             this.update(cx, |s, cx| {
-                if s.active.as_ref() != Some(&name) {
-                    return; // a slower refresh for a workspace that is no longer shown
+                if s.active.as_ref() != Some(&name) || s.diff_gen != generation {
+                    return; // superseded: another workspace, or a newer refresh
                 }
-                s.diff_files = files.iter().map(|f| f.path().to_string()).collect();
-                s.diff_file = 0;
-                s.diff.update(cx, |d, cx| d.set_files(files, cx));
-                cx.notify();
+                s.apply_diff(data, cx);
             })
             .ok();
         })
         .detach();
+    }
+
+    fn apply_diff(&mut self, data: DiffData, cx: &mut Context<Self>) {
+        // Turn ends and saves refresh often; an unchanged patch keeps scroll and expansion.
+        if data.fp == self.diff_fp && !self.diff_files.is_empty() {
+            return;
+        }
+        let was_viewed = self.viewed_now.clone();
+        self.diff_fp = data.fp;
+        self.diff_fps = data.fps;
+        self.diff_file = 0; // set_files scrolls back to the top
+        self.diff_files = data.files;
+        self.rebuild_tree();
+        self.recompute_viewed();
+        let files = self.diff_files.clone();
+        let viewed = self.viewed_now.clone();
+        self.diff.update(cx, |d, cx| {
+            d.set_files(files.iter().cloned(), cx);
+            for f in &files {
+                let path = f.path();
+                if viewed.contains(path) {
+                    d.set_file_collapsed(path, true, cx);
+                } else if was_viewed.contains(path) {
+                    d.set_file_collapsed(path, false, cx);
+                }
+            }
+        });
+        cx.notify();
+    }
+
+    fn active_ws(&self) -> Option<&Workspace> {
+        let name = self.active.as_ref()?;
+        self.state.workspaces.iter().find(|w| &w.name == name)
+    }
+
+    fn viewed(&self, ix: usize) -> Viewed {
+        let (Some(ws), Some(f)) = (self.active_ws(), self.diff_files.get(ix)) else {
+            return Viewed::No;
+        };
+        match ws.viewed.get(f.path().as_str()) {
+            None => Viewed::No,
+            Some(fp) if *fp == self.diff_fps[ix] => Viewed::Yes,
+            Some(_) => Viewed::Changed,
+        }
+    }
+
+    fn recompute_viewed(&mut self) {
+        let set = (0..self.diff_files.len())
+            .filter(|&ix| self.viewed(ix) == Viewed::Yes)
+            .map(|ix| self.diff_files[ix].path().clone())
+            .collect();
+        self.viewed_now = Rc::new(set);
+    }
+
+    fn toggle_viewed(&mut self, ix: usize, cx: &mut Context<Self>) {
+        let Some(f) = self.diff_files.get(ix) else {
+            return;
+        };
+        let (path, fp) = (f.path().to_string(), self.diff_fps[ix]);
+        let on = self.viewed(ix) != Viewed::Yes;
+        let Some(name) = self.active.clone() else {
+            return;
+        };
+        let Some(ws) = self.state.workspaces.iter_mut().find(|w| w.name == name) else {
+            return;
+        };
+        match on {
+            true => ws.viewed.insert(path.clone(), fp),
+            false => ws.viewed.remove(&path),
+        };
+        // Forget files that left the diff so the map doesn't grow forever.
+        let live: HashSet<&str> = self.diff_files.iter().map(|f| f.path().as_str()).collect();
+        ws.viewed.retain(|p, _| live.contains(p.as_str()));
+        self.state.save();
+        self.recompute_viewed();
+        self.diff
+            .update(cx, |d, cx| d.set_file_collapsed(&path, on, cx));
+        cx.notify();
+    }
+
+    fn toggle_viewed_path(&mut self, path: &str, cx: &mut Context<Self>) {
+        if let Some(ix) = self.diff_files.iter().position(|f| f.path() == path) {
+            self.toggle_viewed(ix, cx);
+        }
+    }
+
+    fn rebuild_tree(&mut self) {
+        let paths: Vec<String> = self
+            .diff_files
+            .iter()
+            .map(|f| f.path().to_string())
+            .collect();
+        self.tree_rows = files::rows(&paths, &self.collapsed_dirs);
+        self.tree_sel = self.tree_sel.min(self.tree_rows.len().saturating_sub(1));
+    }
+
+    fn tree_select(&mut self, row: usize, cx: &mut Context<Self>) {
+        let Some(r) = self.tree_rows.get(row) else {
+            return;
+        };
+        self.tree_sel = row;
+        self.tree_scroll
+            .scroll_to_item(row, ScrollStrategy::Nearest);
+        if let Some(ix) = r.file {
+            self.diff_file = ix;
+            if self.tab == Tab::Diff {
+                let path = self.diff_files[ix].path().to_string();
+                self.diff.update(cx, |d, cx| d.scroll_to_file(&path, cx));
+            }
+        }
+        cx.notify();
+    }
+
+    fn set_dir_open(&mut self, open: Option<bool>, cx: &mut Context<Self>) {
+        let Some(r) = self.tree_rows.get(self.tree_sel) else {
+            return;
+        };
+        if r.file.is_some() {
+            // `h` on a file jumps to its folder, like most tree views.
+            if open == Some(false)
+                && let Some(up) = (0..self.tree_sel)
+                    .rev()
+                    .find(|&i| self.tree_rows[i].depth < r.depth)
+            {
+                self.tree_select(up, cx);
+            }
+            return;
+        }
+        let path = r.path.clone();
+        let is_open = !self.collapsed_dirs.contains(&path);
+        if open.unwrap_or(!is_open) == is_open {
+            return;
+        }
+        match is_open {
+            true => self.collapsed_dirs.insert(path),
+            false => self.collapsed_dirs.remove(&path),
+        };
+        self.rebuild_tree();
+        cx.notify();
+    }
+
+    /// Enter / click on a tree row: toggle a folder, show a file (in the diff, or the editor
+    /// when one is open).
+    fn tree_confirm(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.tree_select(row, cx);
+        match self.tree_rows.get(row).and_then(|r| r.file) {
+            None => self.set_dir_open(None, cx),
+            Some(ix) if self.tab == Tab::File => self.open_file(ix, window, cx),
+            Some(_) => {}
+        }
+    }
+
+    /// The file a row action applies to: the open file in the file view, else the tree cursor.
+    fn cursor_file(&self, window: &Window, cx: &App) -> Option<usize> {
+        if self.tree_focus.is_focused(window) {
+            return self.tree_rows.get(self.tree_sel)?.file;
+        }
+        if self.tab == Tab::File
+            && let Some(e) = &self.editor
+        {
+            let path = &e.read(cx).path;
+            return self.diff_files.iter().position(|f| f.path() == path);
+        }
+        // The diff can't say which file is on screen; the highlighted tree row is what the user sees.
+        self.tree_rows.get(self.tree_sel)?.file
+    }
+
+    fn open_file(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(f), Some(ws)) = (self.diff_files.get(ix), self.active_ws()) else {
+            return;
+        };
+        let path = f.path().to_string();
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|e| e.read(cx).path == path)
+        {
+            return self.show(Tab::File, window, cx);
+        }
+        if f.status() == DiffFileStatus::Deleted || f.is_binary() {
+            return Self::notify_err(
+                window,
+                cx,
+                format!("{path} is deleted or binary; it shows in the diff only"),
+            );
+        }
+        let abs = ws.dir().join(&path);
+        if std::fs::metadata(&abs).is_ok_and(|m| m.len() > crate::editor::MAX_BYTES) {
+            return Self::notify_err(
+                window,
+                cx,
+                format!("{path} is too large to edit; it shows in the diff only"),
+            );
+        }
+        self.confirm_discard(window, cx, move |s, window, cx| {
+            let vim = s.state.vim;
+            let editor = cx.new(|cx| FileEditor::new(path, abs, vim, window, cx));
+            s._editor_subs = vec![
+                cx.subscribe_in(
+                    &editor,
+                    window,
+                    |s, _, ev: &EditorEvent, window, cx| match ev {
+                        EditorEvent::Saved => s.refresh_diff(cx),
+                        EditorEvent::Leave => {
+                            let pane = if s.show_tree { Pane::Tree } else { Pane::Chat };
+                            s.focus_pane(pane, window, cx)
+                        }
+                    },
+                ),
+                cx.observe(&editor, |s, editor, cx| {
+                    let e = editor.read(cx);
+                    let header = (
+                        e.dirty,
+                        e.conflict,
+                        e.vim.status(),
+                        e.vim.pending().to_string(),
+                    );
+                    if header != s.editor_header {
+                        s.editor_header = header;
+                        cx.notify();
+                    }
+                }),
+            ];
+            s.editor = Some(editor);
+            if !s.rail {
+                s.rail = true;
+                s.rail_auto = true;
+            }
+            s.show(Tab::File, window, cx);
+        });
+    }
+
+    fn close_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.editor.is_none() {
+            return;
+        }
+        self.confirm_discard(window, cx, |s, window, cx| {
+            s.drop_editor();
+            if s.tab == Tab::File {
+                s.show(Tab::Diff, window, cx);
+            }
+        });
+    }
+
+    fn drop_editor(&mut self) {
+        self.editor = None;
+        self._editor_subs.clear();
+        if self.rail_auto {
+            self.rail = false;
+            self.rail_auto = false;
+        }
+    }
+
+    /// Runs `then` now, or after the user agrees to drop unsaved edits in the open file.
+    fn confirm_discard(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Shark, &mut Window, &mut Context<Shark>) + 'static,
+    ) {
+        let Some(path) = self
+            .editor
+            .as_ref()
+            .filter(|e| e.read(cx).dirty)
+            .map(|e| e.read(cx).path.clone())
+        else {
+            return then(self, window, cx);
+        };
+        let shark = cx.entity().downgrade();
+        let then = Rc::new(RefCell::new(Some(then)));
+        window.open_alert_dialog(cx, move |d, _, _| {
+            let (shark, then) = (shark.clone(), then.clone());
+            d.font_features(inter_features())
+                .title(format!("Discard changes to {path}?"))
+                .description("Your edits are not saved. Cancel and press cmd-s to keep them.")
+                .ok_text("Discard")
+                .ok_variant(ButtonVariant::Danger)
+                .show_cancel(true)
+                .on_ok(move |_, window, cx| {
+                    if let Some(f) = then.borrow_mut().take() {
+                        shark
+                            .update(cx, |s, cx| {
+                                if let Some(e) = &s.editor {
+                                    e.update(cx, |e, _| e.dirty = false);
+                                }
+                                f(s, window, cx)
+                            })
+                            .ok();
+                    }
+                    true
+                })
+        });
+    }
+
+    fn toggle_vim(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.vim = !self.state.vim;
+        self.state.save();
+        let on = self.state.vim;
+        if let Some(e) = &self.editor {
+            e.update(cx, |e, cx| e.set_vim(on, cx));
+        }
+        window.push_notification(format!("Vim keys {}", if on { "on" } else { "off" }), cx);
+        cx.notify();
+    }
+
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.rail = !self.rail;
+        self.rail_auto = false;
+        cx.notify();
+    }
+
+    fn toggle_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.show_tree = !self.show_tree;
+        if !self.show_tree && self.tree_focus.is_focused(window) {
+            let tab = self.tab;
+            self.show(tab, window, cx);
+        }
+        cx.notify();
+    }
+
+    fn panes(&self) -> Vec<Pane> {
+        let mut v = vec![Pane::Sidebar];
+        match self.tab {
+            Tab::Chat => v.push(Pane::Chat),
+            Tab::Diff => v.push(Pane::Diff),
+            Tab::File => v.extend([Pane::Chat, Pane::Editor]),
+        }
+        if self.tab != Tab::Chat && self.show_tree && self.active.is_some() {
+            v.push(Pane::Tree);
+        }
+        v
+    }
+
+    fn focused_pane(&self, window: &Window, cx: &App) -> Option<Pane> {
+        if self.sidebar_focus.is_focused(window) {
+            return Some(Pane::Sidebar);
+        }
+        if self.tree_focus.is_focused(window) {
+            return Some(Pane::Tree);
+        }
+        if self
+            .editor
+            .as_ref()
+            .is_some_and(|e| e.read(cx).is_focused(window, cx))
+        {
+            return Some(Pane::Editor);
+        }
+        if let Some(chat) = self.active_chat() {
+            let c = chat.read(cx);
+            if c.focus.is_focused(window) || c.composer.read(cx).focus_handle(cx).is_focused(window)
+            {
+                return Some(Pane::Chat);
+            }
+        }
+        self.diff
+            .read(cx)
+            .focus_handle(cx)
+            .is_focused(window)
+            .then_some(Pane::Diff)
+    }
+
+    fn focus_pane(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
+        match pane {
+            Pane::Sidebar => self.sidebar_focus.focus(window, cx),
+            Pane::Tree => self.tree_focus.focus(window, cx),
+            Pane::Diff => self.diff.read(cx).focus_handle(cx).focus(window, cx),
+            Pane::Chat => {
+                if let Some(chat) = self.active_chat() {
+                    chat.read(cx).focus.clone().focus(window, cx);
+                }
+            }
+            Pane::Editor => {
+                if let Some(e) = &self.editor {
+                    crate::editor::focus(e, window, cx);
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    /// `ctrl-w h` / `ctrl-w l`.
+    fn move_focus(&mut self, delta: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let panes = self.panes();
+        let at = self
+            .focused_pane(window, cx)
+            .and_then(|p| panes.iter().position(|q| *q == p));
+        let to = match at {
+            Some(i) => (i as isize + delta).clamp(0, panes.len() as isize - 1) as usize,
+            None if delta < 0 => 0,
+            None => 1.min(panes.len() - 1),
+        };
+        if panes[to] == Pane::Sidebar || self.active.is_some() {
+            self.focus_pane(panes[to], window, cx);
+        }
     }
 
     fn add_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -613,6 +1145,15 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Git only sees the disk; unsaved editor edits would vanish with the worktree.
+        if self.active.as_deref() == Some(name)
+            && self.editor.as_ref().is_some_and(|e| e.read(cx).dirty)
+        {
+            let name = name.to_string();
+            return self.confirm_discard(window, cx, move |s, window, cx| {
+                s.remove_workspace(&name, force, window, cx)
+            });
+        }
         let Some(ws) = self
             .state
             .workspaces
@@ -632,6 +1173,8 @@ impl Shark {
                 let _ = std::fs::remove_file(crate::agent::transcript_path(name));
                 if self.active.as_deref() == Some(name) {
                     self.active = None;
+                    self.drop_editor();
+                    self.tab = Tab::Chat;
                 }
                 self.sel = self.sel.min(self.state.workspaces.len().saturating_sub(1));
                 window.push_notification(
@@ -748,8 +1291,10 @@ impl Shark {
     fn render_sidebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let focused = self.sidebar_focus.is_focused(window);
+        let rail = self.rail;
         let header = |t: &'static str| {
             div()
+                .when(rail, |d| d.invisible())
                 .px_4()
                 .pt_4()
                 .pb_1()
@@ -758,7 +1303,14 @@ impl Shark {
                 .text_color(theme.muted_foreground)
                 .child(t)
         };
-        let hint = |t: &'static str| div().px_4().text_xs().text_color(faint(theme)).child(t);
+        let hint = |t: &'static str| {
+            div()
+                .when(rail, |d| d.hidden())
+                .px_4()
+                .text_xs()
+                .text_color(faint(theme))
+                .child(t)
+        };
         let row = || {
             h_flex()
                 .h(px(28.))
@@ -769,16 +1321,21 @@ impl Shark {
                 .gap_2()
                 .rounded(theme.radius)
                 .text_sm()
+                .when(rail, |d| d.justify_center())
         };
         let shark = cx.entity().downgrade();
         let repos = self.state.repos.iter().enumerate().map(|(ix, r)| {
             let (name, path) = (r.name.clone(), r.path.clone());
+            let tip: SharedString = name.clone().into();
             row()
                 .id(("repo", ix))
                 .text_color(theme.muted_foreground)
                 .hover(|d| d.bg(theme.sidebar_accent))
                 .child(Icon::new(IconName::FolderGit2).with_size(px(14.)))
-                .child(div().truncate().child(r.name.clone()))
+                .when(!rail, |d| d.child(div().truncate().child(r.name.clone())))
+                .when(rail, |d| {
+                    d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+                })
                 .context_menu(move |menu, _, _| {
                     let (p1, p2, p3) = (path.clone(), path.clone(), path.clone());
                     menu.label(format!("{name} — {}", tilde(&path)))
@@ -801,7 +1358,10 @@ impl Shark {
                 })
         });
         let workspaces = self.state.workspaces.iter().enumerate().map(|(ix, w)| {
-            let busy = self.chats.get(&w.name).is_some_and(|c| c.read(cx).working());
+            let busy = self
+                .chats
+                .get(&w.name)
+                .is_some_and(|c| c.read(cx).working());
             let selected = ix == self.sel;
             let active = self.active.as_ref() == Some(&w.name);
             let ws = w.clone();
@@ -839,37 +1399,43 @@ impl Shark {
                         .text_color(theme.muted_foreground)
                         .into_any_element(),
                 })
-                .child(
-                    v_flex()
-                        .flex_1()
-                        .min_w_0()
-                        .child(
-                            div()
-                                .truncate()
-                                .when(active, |d| d.font_weight(FontWeight::MEDIUM))
-                                .child(w.name.clone()),
-                        )
-                        .child(
-                            div()
-                                .truncate()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(
-                                    w.repos
-                                        .iter()
-                                        .map(|r| r.name.as_str())
-                                        .collect::<Vec<_>>()
-                                        .join(" · "),
-                                ),
-                        ),
-                )
+                .when(!rail, |d| {
+                    d.child(
+                        v_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .when(active, |d| d.font_weight(FontWeight::MEDIUM))
+                                    .child(w.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(
+                                        w.repos
+                                            .iter()
+                                            .map(|r| r.name.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(" · "),
+                                    ),
+                            ),
+                    )
+                })
+                .when(rail, |d| {
+                    let name: SharedString = w.name.clone().into();
+                    d.tooltip(move |w, cx| Tooltip::new(name.clone()).build(w, cx))
+                })
                 .context_menu(move |menu, window, cx| ws_menu(menu, &ws, ix, &shark, window, cx))
         });
         v_flex()
             .id("sidebar")
             .key_context("Sidebar")
             .track_focus(&self.sidebar_focus)
-            .w(px(244.))
+            .w(px(if rail { 48. } else { 244. }))
             .h_full()
             .flex_none()
             .text_color(theme.sidebar_foreground)
@@ -911,7 +1477,7 @@ impl Shark {
             })
     }
 
-    fn render_main(&self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_main(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let Some(chat) = self.active_chat().cloned() else {
             let key = |k: &str| Kbd::new(Keystroke::parse(k).unwrap());
@@ -975,6 +1541,11 @@ impl Shark {
                 .child(label)
         };
         let ws_name = self.active.clone().unwrap_or_default();
+        let viewed = self.viewed_now.len();
+        let file_tab = self.editor.as_ref().map(|e| {
+            let path = &e.read(cx).path;
+            path.rsplit('/').next().unwrap_or(path).to_string()
+        });
         v_flex()
             .flex_1()
             .min_w_0()
@@ -984,15 +1555,36 @@ impl Shark {
                     .h(px(44.))
                     .flex_none()
                     .px_3()
+                    // The rail is narrower than the traffic lights; keep the header clear of them.
+                    .when(self.rail, |d| d.pl(px(36.)))
                     .gap_1()
                     .border_b_1()
                     .border_color(theme.border)
+                    .window_control_area(WindowControlArea::Drag)
+                    .child(
+                        Button::new("toggle-sidebar")
+                            .ghost()
+                            .xsmall()
+                            .icon(if self.rail {
+                                IconName::PanelLeftOpen
+                            } else {
+                                IconName::PanelLeftClose
+                            })
+                            .tooltip("Toggle sidebar (cmd-b)")
+                            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                    )
                     .child(tab("Chat".into(), IconName::MessageSquare, Tab::Chat))
                     .child(tab(
-                        format!("Diff · {}", self.diff_files.len()),
+                        match viewed {
+                            0 => format!("Diff · {}", self.diff_files.len()),
+                            v => format!("Diff · {v}/{} viewed", self.diff_files.len()),
+                        },
                         IconName::FileDiff,
                         Tab::Diff,
                     ))
+                    .when_some(file_tab, |d, name| {
+                        d.child(tab(name, IconName::FileCode, Tab::File))
+                    })
                     .child(div().flex_1())
                     .child(
                         h_flex()
@@ -1026,32 +1618,440 @@ impl Shark {
             )
             .child(match self.tab {
                 Tab::Chat => div().flex_1().min_h_0().child(chat).into_any_element(),
-                Tab::Diff => div()
-                    .key_context("DiffPane")
+                Tab::File => h_flex()
                     .flex_1()
                     .min_h_0()
-                    .on_action(cx.listener(|this, _: &NextHunk, _, cx| {
-                        this.diff.update(cx, |d, cx| d.next_change(cx))
-                    }))
-                    .on_action(cx.listener(|this, _: &PrevHunk, _, cx| {
-                        this.diff.update(cx, |d, cx| d.previous_change(cx))
-                    }))
-                    .on_action(cx.listener(|this, _: &NextFile, _, cx| this.step_file(1, cx)))
-                    .on_action(cx.listener(|this, _: &PrevFile, _, cx| this.step_file(-1, cx)))
-                    .on_action(cx.listener(|this, _: &RefreshDiff, _, cx| this.refresh_diff(cx)))
-                    .on_action(cx.listener(|this, _: &ToggleDiffMode, _, cx| {
-                        this.diff.update(cx, |d, cx| {
-                            let mode = if d.mode() == DiffMode::Split {
-                                DiffMode::Unified
-                            } else {
-                                DiffMode::Split
-                            };
-                            d.set_mode(mode, cx)
-                        })
-                    }))
-                    .child(Diff::new(&self.diff))
+                    .child(
+                        h_resizable("chat-editor")
+                            .child(
+                                resizable_panel()
+                                    .size(px(420.))
+                                    .size_range(px(320.)..px(900.))
+                                    .child(chat),
+                            )
+                            .child(resizable_panel().child(self.render_editor(cx))),
+                    )
+                    .when(self.show_tree, |d| d.child(self.render_tree(window, cx)))
+                    .into_any_element(),
+                Tab::Diff => h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.render_diff(cx))
+                    .when(self.show_tree, |d| d.child(self.render_tree(window, cx)))
                     .into_any_element(),
             })
+            .into_any_element()
+    }
+
+    fn render_diff(&self, cx: &mut Context<Self>) -> AnyElement {
+        let viewed = self.viewed_now.clone();
+        let shark = cx.entity().downgrade();
+        div()
+            .key_context("DiffPane")
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .on_action(cx.listener(|this, _: &NextHunk, _, cx| {
+                this.diff.update(cx, |d, cx| d.next_change(cx))
+            }))
+            .on_action(cx.listener(|this, _: &PrevHunk, _, cx| {
+                this.diff.update(cx, |d, cx| d.previous_change(cx))
+            }))
+            .on_action(cx.listener(|this, _: &NextFile, _, cx| this.step_file(1, cx)))
+            .on_action(cx.listener(|this, _: &PrevFile, _, cx| this.step_file(-1, cx)))
+            .on_action(cx.listener(|this, _: &RefreshDiff, _, cx| this.refresh_diff(cx)))
+            .on_action(cx.listener(|this, _: &ToggleDiffMode, _, cx| {
+                this.diff.update(cx, |d, cx| {
+                    let mode = if d.mode() == DiffMode::Split {
+                        DiffMode::Unified
+                    } else {
+                        DiffMode::Split
+                    };
+                    d.set_mode(mode, cx)
+                })
+            }))
+            .on_action(cx.listener(|this, _: &ToggleViewed, w, cx| {
+                if let Some(ix) = this.cursor_file(w, cx) {
+                    this.toggle_viewed(ix, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &OpenFile, w, cx| {
+                if let Some(ix) = this.cursor_file(w, cx) {
+                    this.open_file(ix, w, cx)
+                }
+            }))
+            .child(
+                Diff::new(&self.diff).render_header_prefix(move |file, _, _| {
+                    // A prefix, not a suffix: the header is as wide as the longest line, so
+                    // a suffix scrolls out of view.
+                    let path = file.path().clone();
+                    let shark = shark.clone();
+                    Checkbox::new(SharedString::from(format!("viewed:{path}")))
+                        .small()
+                        .tooltip("Viewed (v)")
+                        .checked(viewed.contains(&path))
+                        .on_click(move |_, _, cx| {
+                            shark
+                                .update(cx, |s, cx| s.toggle_viewed_path(&path, cx))
+                                .ok();
+                        })
+                }),
+            )
+            .into_any_element()
+    }
+
+    fn render_tree(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (border, muted) = (theme.border, theme.muted_foreground);
+        let focused = self.tree_focus.is_focused(window);
+        let n = self.diff_files.len();
+        v_flex()
+            .id("file-tree")
+            .key_context("FileTree")
+            .track_focus(&self.tree_focus)
+            .w(px(260.))
+            .flex_none()
+            .h_full()
+            .border_l_1()
+            .border_color(border)
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| {
+                let to = (this.tree_sel + 1).min(this.tree_rows.len().saturating_sub(1));
+                this.tree_select(to, cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectPrev, _, cx| {
+                this.tree_select(this.tree_sel.saturating_sub(1), cx)
+            }))
+            .on_action(cx.listener(|this, _: &SelectFirst, _, cx| this.tree_select(0, cx)))
+            .on_action(cx.listener(|this, _: &SelectLast, _, cx| {
+                this.tree_select(this.tree_rows.len().saturating_sub(1), cx)
+            }))
+            .on_action(cx.listener(|this, _: &PageDown, _, cx| {
+                let to = (this.tree_sel + 15).min(this.tree_rows.len().saturating_sub(1));
+                this.tree_select(to, cx)
+            }))
+            .on_action(cx.listener(|this, _: &PageUp, _, cx| {
+                this.tree_select(this.tree_sel.saturating_sub(15), cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &Confirm, w, cx| this.tree_confirm(this.tree_sel, w, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &CollapseDir, _, cx| this.set_dir_open(Some(false), cx)),
+            )
+            .on_action(cx.listener(|this, _: &ExpandDir, _, cx| this.set_dir_open(Some(true), cx)))
+            .on_action(cx.listener(|this, _: &ToggleViewed, w, cx| {
+                if let Some(ix) = this.cursor_file(w, cx) {
+                    this.toggle_viewed(ix, cx)
+                }
+            }))
+            .on_action(cx.listener(|this, _: &OpenFile, w, cx| {
+                if let Some(ix) = this.cursor_file(w, cx) {
+                    this.open_file(ix, w, cx)
+                }
+            }))
+            .child(
+                h_flex()
+                    .h(px(36.))
+                    .flex_none()
+                    .px_3()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(
+                        div()
+                            .flex_1()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child("Files"),
+                    )
+                    .child(format!("{}/{n} viewed", self.viewed_now.len())),
+            )
+            .child(
+                uniform_list(
+                    "file-tree-rows",
+                    self.tree_rows.len(),
+                    cx.processor(move |this, range: std::ops::Range<usize>, _, cx| {
+                        range
+                            .map(|ix| this.render_tree_row(ix, focused, cx))
+                            .collect()
+                    }),
+                )
+                .track_scroll(&self.tree_scroll)
+                .flex_1()
+                .pb_2(),
+            )
+    }
+
+    fn render_tree_row(&self, ix: usize, focused: bool, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let r = &self.tree_rows[ix];
+        let selected = ix == self.tree_sel;
+        let open_file = self.editor.as_ref().map(|e| e.read(cx).path.clone());
+        let row = h_flex()
+            .id(("tree-row", ix))
+            .h(px(28.))
+            .w_full()
+            .pr_2()
+            .pl(px(8. + 12. * r.depth as f32))
+            .gap_1p5()
+            .rounded(theme.radius)
+            .border_1()
+            .border_color(theme.transparent)
+            .text_sm()
+            .when(selected && focused, |d| {
+                d.bg(theme.list_active).border_color(theme.primary)
+            })
+            .when(selected && !focused, |d| d.bg(theme.list_hover))
+            .hover(|d| d.bg(theme.list_hover))
+            .on_click(cx.listener(move |this, e: &ClickEvent, w, cx| {
+                this.tree_focus.focus(w, cx);
+                match (e.click_count(), this.tree_rows.get(ix).and_then(|r| r.file)) {
+                    (2, Some(file)) => this.open_file(file, w, cx),
+                    _ => this.tree_confirm(ix, w, cx),
+                }
+            }));
+        let Some(file) = r.file else {
+            let open = !self.collapsed_dirs.contains(&r.path);
+            return div()
+                .px_2()
+                .child(
+                    row.text_color(theme.muted_foreground)
+                        .child(
+                            Icon::new(if open {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            })
+                            .with_size(px(14.)),
+                        )
+                        .child(div().flex_1().truncate().child(r.name.clone())),
+                )
+                .into_any_element();
+        };
+        let f = &self.diff_files[file];
+        let state = self.viewed(file);
+        let icon = match f.status() {
+            DiffFileStatus::Added => IconName::FilePlus,
+            DiffFileStatus::Deleted => IconName::FileMinus,
+            _ => IconName::FileDiff,
+        };
+        let is_open = open_file.as_deref() == Some(f.path().as_str());
+        let row = row
+            .child(
+                Icon::new(icon)
+                    .with_size(px(14.))
+                    .text_color(theme.muted_foreground),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .truncate()
+                    .text_color(match state {
+                        Viewed::Yes => theme.muted_foreground,
+                        _ => theme.foreground,
+                    })
+                    .when(is_open, |d| d.font_weight(FontWeight::MEDIUM))
+                    .child(r.name.clone()),
+            )
+            .when(state == Viewed::Changed, |d| {
+                d.child(
+                    div()
+                        .id(("changed", ix))
+                        .size(px(6.))
+                        .rounded_full()
+                        .bg(theme.warning_foreground)
+                        .tooltip(|w, cx| Tooltip::new("Changed since viewed").build(w, cx)),
+                )
+            })
+            .child(
+                h_flex()
+                    .gap_1()
+                    .text_xs()
+                    .when(f.additions() > 0, |d| {
+                        d.child(
+                            div()
+                                .text_color(theme.success_foreground)
+                                .child(format!("+{}", f.additions())),
+                        )
+                    })
+                    .when(f.deletions() > 0, |d| {
+                        d.child(
+                            div()
+                                .text_color(theme.danger_foreground)
+                                .child(format!("−{}", f.deletions())),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .id(("viewed-box", ix))
+                    // The row's click selects; this one only toggles.
+                    .on_click(|_, _, cx| cx.stop_propagation())
+                    .child(
+                        Checkbox::new(("viewed", ix))
+                            .small()
+                            .checked(state == Viewed::Yes)
+                            .tooltip("Viewed (v)")
+                            .on_click(cx.listener(move |this, _: &bool, _, cx| {
+                                this.toggle_viewed(file, cx)
+                            })),
+                    ),
+            );
+        div().px_2().child(row).into_any_element()
+    }
+
+    fn render_editor(&self, cx: &mut Context<Self>) -> AnyElement {
+        let Some(editor) = self.editor.clone() else {
+            return div().into_any_element();
+        };
+        let theme = cx.theme();
+        let e = editor.read(cx);
+        let path = e.path.clone();
+        let ix = self.diff_files.iter().position(|f| *f.path() == path);
+        let viewed = ix.map(|ix| self.viewed(ix));
+        let (dir, name) = match path.rsplit_once('/') {
+            Some((d, n)) => (format!("{d}/"), n.to_string()),
+            None => (String::new(), path.clone()),
+        };
+        let vim = e.vim_on.then(|| {
+            let p = e.vim.pending();
+            match p.is_empty() {
+                true => e.vim.status().to_string(),
+                false => format!("{} {p}", e.vim.status()),
+            }
+        });
+        let (dirty, conflict) = (e.dirty, e.conflict);
+        v_flex()
+            .key_context("FileEditor")
+            .size_full()
+            .border_l_1()
+            .border_color(theme.border)
+            .on_action(cx.listener(|this, _: &SaveFile, w, cx| {
+                if let Some(e) = this.editor.clone() {
+                    e.update(cx, |e, cx| e.save(false, w, cx))
+                }
+            }))
+            .on_action(cx.listener(|this, _: &CloseFile, w, cx| this.close_file(w, cx)))
+            .child(
+                h_flex()
+                    .h(px(36.))
+                    .flex_none()
+                    .px_3()
+                    .gap_2()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .text_sm()
+                    .child(
+                        Icon::new(IconName::FileCode)
+                            .with_size(px(14.))
+                            .text_color(theme.muted_foreground),
+                    )
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .text_color(theme.muted_foreground)
+                                    .child(dir),
+                            )
+                            .child(div().flex_none().child(name))
+                            .when(dirty, |d| {
+                                d.child(
+                                    div()
+                                        .id("dirty")
+                                        .ml_2()
+                                        .size(px(6.))
+                                        .rounded_full()
+                                        .bg(theme.foreground)
+                                        .tooltip(|w, cx| {
+                                            Tooltip::new("Unsaved (cmd-s)").build(w, cx)
+                                        }),
+                                )
+                            }),
+                    )
+                    .child(
+                        div()
+                            .id("vim-pill")
+                            .px_2()
+                            .h(px(20.))
+                            .flex()
+                            .items_center()
+                            .rounded_full()
+                            .text_xs()
+                            .font_family(theme.mono_font_family.clone())
+                            .text_color(theme.muted_foreground)
+                            .when(vim.is_some(), |d| d.bg(theme.secondary))
+                            .hover(|d| d.text_color(theme.foreground))
+                            .child(vim.unwrap_or_else(|| "VIM OFF".into()))
+                            .tooltip(|w, cx| {
+                                Tooltip::new("Toggle Vim keys (ctrl-cmd-v)").build(w, cx)
+                            })
+                            .on_click(cx.listener(|this, _, w, cx| this.toggle_vim(w, cx))),
+                    )
+                    .when_some(viewed, |d, v| {
+                        let ix = ix.unwrap_or_default();
+                        d.child(
+                            Checkbox::new("editor-viewed")
+                                .label("Viewed")
+                                .small()
+                                .checked(v == Viewed::Yes)
+                                .on_click(cx.listener(move |this, _: &bool, _, cx| {
+                                    this.toggle_viewed(ix, cx)
+                                })),
+                        )
+                    })
+                    .child(
+                        Button::new("close-file")
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::X)
+                            .tooltip("Close file (cmd-w)")
+                            .on_click(cx.listener(|this, _, w, cx| this.close_file(w, cx))),
+                    ),
+            )
+            .when(conflict, |d| {
+                let (e1, e2) = (editor.clone(), editor.clone());
+                d.child(
+                    h_flex()
+                        .h(px(36.))
+                        .flex_none()
+                        .px_3()
+                        .gap_2()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .text_sm()
+                        .child(
+                            Icon::new(IconName::TriangleAlert)
+                                .with_size(px(14.))
+                                .text_color(theme.warning_foreground),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .child("Changed on disk since you started editing"),
+                        )
+                        .child(
+                            Button::new("reload")
+                                .small()
+                                .outline()
+                                .label("Reload")
+                                .on_click(move |_, w, cx| e1.update(cx, |e, cx| e.discard(w, cx))),
+                        )
+                        .child(
+                            Button::new("overwrite")
+                                .small()
+                                .ghost()
+                                .label("Keep mine")
+                                .on_click(move |_, w, cx| {
+                                    e2.update(cx, |e, cx| e.save(true, w, cx))
+                                }),
+                        ),
+                )
+            })
+            .child(div().flex_1().min_h_0().child(editor))
             .into_any_element()
     }
 
@@ -1061,8 +2061,18 @@ impl Shark {
         }
         let n = self.diff_files.len() as isize;
         self.diff_file = (self.diff_file as isize + delta).rem_euclid(n) as usize;
-        let path = self.diff_files[self.diff_file].clone();
+        let path = self.diff_files[self.diff_file].path().to_string();
         self.diff.update(cx, |d, cx| d.scroll_to_file(&path, cx));
+        if let Some(row) = self
+            .tree_rows
+            .iter()
+            .position(|r| r.file == Some(self.diff_file))
+        {
+            self.tree_sel = row;
+            self.tree_scroll
+                .scroll_to_item(row, ScrollStrategy::Nearest);
+        }
+        cx.notify();
     }
 }
 
@@ -1112,14 +2122,12 @@ impl Render for Shark {
                 this.with_target(w, cx, |ws, w, cx| copy(ws.branch.clone(), w, cx))
             }))
             .on_action(cx.listener(|this, a: &SetModel, w, cx| this.set_model(a.0, w, cx)))
-            .on_action(cx.listener(|this, _: &FocusSidebar, w, cx| {
-                this.sidebar_focus.focus(w, cx);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &FocusMain, w, cx| {
-                let tab = this.tab;
-                this.show(tab, w, cx)
-            }))
+            .on_action(cx.listener(|this, _: &FocusLeft, w, cx| this.move_focus(-1, w, cx)))
+            .on_action(cx.listener(|this, _: &FocusRight, w, cx| this.move_focus(1, w, cx)))
+            .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &ToggleFileTree, w, cx| this.toggle_tree(w, cx)))
+            .on_action(cx.listener(|this, _: &ToggleVim, w, cx| this.toggle_vim(w, cx)))
+            .on_action(cx.listener(|this, _: &CloseFile, w, cx| this.close_file(w, cx)))
             .child(self.render_sidebar(window, cx))
             .child(
                 // Linear's "island": content floats on the sidebar color, inset and rounded.
@@ -1131,7 +2139,7 @@ impl Render for Shark {
                         .border_color(cx.theme().border)
                         .bg(cx.theme().background)
                         .overflow_hidden()
-                        .child(self.render_main(cx)),
+                        .child(self.render_main(window, cx)),
                 ),
             )
     }
@@ -1314,43 +2322,61 @@ mod ui_tests {
     use super::*;
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
-    use std::{fs, time::Duration};
+    use std::sync::Mutex;
+    use std::time::Instant;
+    use std::{fs, path::PathBuf, time::Duration};
+
+    /// UI tests share the process-wide `TEST_HOME` and `state.json`, so they take turns.
+    static UI_LOCK: Mutex<()> = Mutex::new(());
+
+    fn test_home() -> PathBuf {
+        let home = crate::state::TEST_HOME
+            .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())))
+            .clone();
+        let _ = fs::remove_dir_all(&home);
+        home
+    }
+
+    fn init_repo(repo: &std::path::Path) {
+        fs::create_dir_all(repo).unwrap();
+        git::git(repo, &["init", "-q", "-b", "main"]).unwrap();
+        git::git(
+            repo,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "i",
+            ],
+        )
+        .unwrap();
+    }
 
     /// Drives the real keymap headlessly: create a workspace, vim focus moves, tabs, archive.
     #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)] // each test owns its thread; the lock only orders them
     async fn keyboard_flow(cx: &mut TestAppContext) {
-        let home = std::env::temp_dir().join(format!("shark-ui-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&home);
+        let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = test_home();
         let repos: Vec<Repo> = ["api", "web"]
             .map(|name| {
                 let path = home.join("src").join(name);
-                fs::create_dir_all(&path).unwrap();
-                git::git(&path, &["init", "-q", "-b", "main"]).unwrap();
-                git::git(
-                    &path,
-                    &[
-                        "-c",
-                        "user.name=t",
-                        "-c",
-                        "user.email=t@t",
-                        "commit",
-                        "-q",
-                        "--allow-empty",
-                        "-m",
-                        "i",
-                    ],
-                )
-                .unwrap();
+                init_repo(&path);
                 Repo {
                     name: name.into(),
                     path,
                 }
             })
             .into();
-        crate::state::TEST_HOME.set(home.clone()).unwrap();
         State {
             repos,
             workspaces: vec![],
+            vim: false,
             last_repos: vec!["api".into()],
         }
         .save();
@@ -1448,7 +2474,141 @@ mod ui_tests {
         })
         .await;
 
-        press(cx, &["ctrl-w", "h", "space", "w", "shift-d"]);
+        // Diff tree: the new file is listed and can be marked viewed from the tree.
+        let refresh = |cx: &mut TestAppContext| {
+            cx.update(|cx| shark.update(cx, |s, cx| s.refresh_diff(cx)));
+            cx.run_until_parked();
+        };
+        press(cx, &["space", "d"]);
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).diff_files.len() == 1
+        })
+        .await;
+        cx.update(|cx| {
+            let names: Vec<String> = shark
+                .read(cx)
+                .tree_rows
+                .iter()
+                .map(|r| r.name.clone())
+                .collect();
+            assert_eq!(names, ["api", "new.txt"]);
+        });
+        press(cx, &["ctrl-w", "l"]);
+        cx.update_window(window, |_, w, cx| {
+            assert!(
+                shark.read(cx).tree_focus.is_focused(w),
+                "ctrl-w l from the diff -> tree"
+            )
+        })
+        .unwrap();
+        press(cx, &["j", "v"]);
+        let viewed = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).viewed(0));
+        assert_eq!(viewed(cx), Viewed::Yes);
+        assert!(
+            State::load().workspaces[0]
+                .viewed
+                .contains_key("api/new.txt"),
+            "viewed is saved"
+        );
+        refresh(cx);
+        assert_eq!(viewed(cx), Viewed::Yes, "an unchanged file stays viewed");
+        let file = ws_dir.join("api/new.txt");
+        fs::write(&file, "x\ny\n").unwrap();
+        refresh(cx);
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).viewed(0) == Viewed::Changed
+        })
+        .await;
+
+        // `o` opens the file next to the chat and shrinks the sidebar to a rail.
+        press(cx, &["o"]);
+        let editor = cx.update(|cx| shark.read(cx).editor.clone().expect("editor opened"));
+        let text = |cx: &mut TestAppContext| {
+            cx.update(|cx| editor.read(cx).input.read(cx).value().to_string())
+        };
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            editor.read(cx).input.read(cx).value().as_ref() == "x\ny\n"
+        })
+        .await;
+        cx.update(|cx| {
+            let s = shark.read(cx);
+            assert!(s.rail && s.tab == Tab::File);
+        });
+
+        // Plain editing and cmd-s.
+        cx.update_window(window, |_, w, cx| w.input("z", cx))
+            .unwrap();
+        assert_eq!(text(cx), "zx\ny\n");
+        cx.update(|cx| assert!(editor.read(cx).dirty));
+        press(cx, &["cmd-s"]);
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            !editor.read(cx).dirty
+        })
+        .await;
+        assert_eq!(fs::read_to_string(&file).unwrap(), "zx\ny\n");
+
+        // Vim keys: normal mode edits, never inserts; the toggle survives a restart.
+        press(cx, &["ctrl-cmd-v"]);
+        assert!(State::load().vim, "vim toggle is saved");
+        press(cx, &["d", "d"]);
+        assert_eq!(text(cx), "y\n");
+        press(cx, &["u"]);
+        cx.run_until_parked();
+        assert_eq!(text(cx), "zx\ny\n");
+        press(cx, &["j", "q"]);
+        assert_eq!(text(cx), "zx\ny\n", "normal mode never types");
+        press(cx, &["shift-a", "!", "escape"]);
+        assert_eq!(text(cx), "zx\ny!\n");
+        // App chords still work in normal mode: `h`/`l` after `ctrl-w` aren't Vim motions.
+        press(cx, &["ctrl-w", "l"]);
+        cx.update_window(window, |_, w, cx| {
+            assert!(
+                shark.read(cx).tree_focus.is_focused(w),
+                "ctrl-w l from the editor"
+            )
+        })
+        .unwrap();
+        press(cx, &["ctrl-w", "h"]);
+        cx.update_window(window, |_, w, cx| {
+            assert!(
+                editor.read(cx).is_focused(w, cx),
+                "ctrl-w h back to the editor"
+            )
+        })
+        .unwrap();
+        assert_eq!(text(cx), "zx\ny!\n");
+
+        // The agent writes the file while it has unsaved edits: offer reload, don't clobber.
+        fs::write(&file, "agent\n").unwrap();
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            editor.read(cx).conflict
+        })
+        .await;
+        press(cx, &[":", "w", "enter"]);
+        cx.executor().advance_clock(Duration::from_millis(100));
+        cx.run_until_parked();
+        assert_eq!(
+            fs::read_to_string(&file).unwrap(),
+            "agent\n",
+            "save refuses to overwrite"
+        );
+
+        // Escape leaves the editor; closing asks before dropping edits.
+        press(cx, &["escape"]);
+        cx.update_window(window, |_, w, cx| {
+            assert!(shark.read(cx).tree_focus.is_focused(w))
+        })
+        .unwrap();
+        press(cx, &["space", "x"]);
+        cx.update(|cx| assert!(shark.read(cx).editor.is_some(), "close waits for confirm"));
+        press(cx, &["enter"]);
+        cx.update(|cx| {
+            let s = shark.read(cx);
+            assert!(s.editor.is_none() && !s.rail && s.tab == Tab::Diff);
+        });
+
+        press(cx, &["ctrl-w", "h", "ctrl-w", "h", "space", "w", "shift-d"]);
         cx.update(|cx| {
             assert_eq!(
                 shark.read(cx).state.workspaces.len(),
@@ -1501,5 +2661,217 @@ mod ui_tests {
         })
         .unwrap();
         fs::remove_dir_all(&home).unwrap();
+    }
+
+    /// Times the hot paths on a big change: 2000 changed files and a 50K-line file.
+    /// Run in release for real numbers: `cargo test --release --features test-support perf_ -- --nocapture`.
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn perf_large_change(cx: &mut TestAppContext) {
+        let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = test_home();
+        let repo = home.join("src/big");
+        init_repo(&repo);
+        State {
+            repos: vec![Repo {
+                name: "big".into(),
+                path: repo.clone(),
+            }],
+            workspaces: vec![],
+            vim: true,
+            ..Default::default()
+        }
+        .save();
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::bind_keys(cx);
+        });
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(1440.), px(900.)),
+            ))),
+            ..Default::default()
+        };
+        let (window, shark) = cx
+            .update(|cx| gpui_kit::open_window(options, cx, |w, cx| cx.new(|cx| Shark::new(w, cx))))
+            .unwrap();
+        let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
+        cx.update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| s.create_workspace("perf".into(), repos, w, cx))
+        })
+        .unwrap();
+        cx.wait_for(window, Duration::from_secs(20), |_, cx| {
+            shark.read(cx).active.is_some()
+        })
+        .await;
+        let ws_dir = home.join("shark/workspaces/perf/big");
+        for i in 0..2000 {
+            let dir = ws_dir.join(format!("src/mod{}/sub{}", i % 40, i % 7));
+            fs::create_dir_all(&dir).unwrap();
+            fs::write(
+                dir.join(format!("f{i}.rs")),
+                format!("fn f{i}() {{}}\n").repeat(20),
+            )
+            .unwrap();
+        }
+        let big: String = (0..50_000usize)
+            .map(|i| {
+                format!(
+                    "    let value_{i} = compute(value_{}, \"line {i}\"); // note\n",
+                    i.saturating_sub(1)
+                )
+            })
+            .collect();
+        fs::write(ws_dir.join("big.rs"), &big).unwrap();
+
+        let ms = |t: Instant| t.elapsed().as_secs_f64() * 1000.;
+        let frame = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, w, cx| w.render_frame(cx))
+                .unwrap()
+        };
+        let press = |cx: &mut TestAppContext, k: &str| {
+            cx.update_window(window, |_, w, cx| w.press(k, cx)).unwrap();
+        };
+        let mut report = vec![];
+
+        let ws = cx.update(|cx| shark.read(cx).active_ws().unwrap().clone());
+        let t = Instant::now();
+        let data = DiffData::load(&ws);
+        report.push(format!(
+            "diff load (git + parse, background): {:.0} ms",
+            ms(t)
+        ));
+        assert_eq!(data.files.len(), 2001);
+        press(cx, "space");
+        press(cx, "d");
+        let t = Instant::now();
+        cx.update(|cx| shark.update(cx, |s, cx| s.apply_diff(data, cx)));
+        frame(cx);
+        report.push(format!("apply diff + first frame: {:.0} ms", ms(t)));
+        let t = Instant::now();
+        let data = DiffData::load(&ws);
+        cx.update(|cx| shark.update(cx, |s, cx| s.apply_diff(data, cx)));
+        frame(cx);
+        report.push(format!("unchanged refresh + frame: {:.0} ms", ms(t)));
+
+        cx.update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| s.focus_pane(Pane::Tree, w, cx))
+        })
+        .unwrap();
+        frame(cx);
+        let n = 200;
+        let t = Instant::now();
+        for _ in 0..n {
+            press(cx, "j");
+            frame(cx);
+        }
+        let tree_key = ms(t) / n as f64;
+        report.push(format!("tree j + frame: {tree_key:.2} ms/key"));
+        let t = Instant::now();
+        for _ in 0..20 {
+            press(cx, "v");
+            frame(cx);
+        }
+        report.push(format!("toggle viewed + frame: {:.2} ms", ms(t) / 20.));
+        let t = Instant::now();
+        press(cx, "shift-g");
+        press(cx, "k");
+        press(cx, "h");
+        frame(cx);
+        press(cx, "l");
+        frame(cx);
+        report.push(format!("collapse + expand folder: {:.1} ms", ms(t)));
+
+        // big.rs sorts after the folders: the last row.
+        let last = cx.update(|cx| shark.read(cx).tree_rows.len() - 1);
+        cx.update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| {
+                s.tree_select(last, cx);
+                s.open_file(s.tree_rows[last].file.unwrap(), w, cx)
+            })
+        })
+        .unwrap();
+        let editor = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
+        // Syntax highlighting of a big file runs on a background thread in the app; the test
+        // executor runs it inline, so time only what the main thread does when a file opens.
+        cx.wait_for(window, Duration::from_secs(60), |_, cx| {
+            editor.read(cx).input.read(cx).text().len() == big.len()
+        })
+        .await;
+        frame(cx);
+        let t = Instant::now();
+        cx.update_window(window, |_, w, cx| {
+            editor.update(cx, |e, cx| {
+                e.input.update(cx, |i, cx| i.set_value(big.clone(), w, cx))
+            })
+        })
+        .unwrap();
+        frame(cx);
+        report.push(format!(
+            "open 50K-line file, main thread (set_value + frame): {:.0} ms",
+            ms(t)
+        ));
+
+        let t = Instant::now();
+        (0..50).for_each(|_| frame(cx));
+        report.push(format!(
+            "editor idle frame (baseline): {:.2} ms",
+            ms(t) / 50.
+        ));
+        let mut keys = |cx: &mut TestAppContext, label: &str, seq: &[&str], rounds: usize| {
+            let t = Instant::now();
+            for _ in 0..rounds {
+                for k in seq {
+                    press(cx, k);
+                    frame(cx);
+                }
+            }
+            let per = ms(t) / (rounds * seq.len()) as f64;
+            report.push(format!("{label}: {per:.2} ms/key"));
+            per
+        };
+        let motion = keys(cx, "vim j/w/e/b + frame", &["j", "w", "e", "b"], 50);
+        keys(cx, "vim ctrl-d / ctrl-u + frame", &["ctrl-d", "ctrl-u"], 20);
+        let edit = keys(cx, "vim dd / u + frame", &["d", "d", "u"], 10);
+        press(cx, "shift-g");
+        frame(cx);
+        keys(cx, "vim G / gg + frame", &["g", "g", "shift-g"], 10);
+        press(cx, "i");
+        let typing = keys(
+            cx,
+            "insert-mode typing + frame",
+            &["a", "b", "c", "space"],
+            25,
+        );
+        press(cx, "escape");
+        cx.update(|cx| assert!(editor.read(cx).dirty));
+        // Baseline: the editor's own arrow key, so Vim's share of the cost is visible.
+        let arrow = keys(
+            cx,
+            "editor's own down key + frame (baseline)",
+            &["down"],
+            100,
+        );
+        println!(
+            "\n--- perf ({} build) ---",
+            if cfg!(debug_assertions) {
+                "debug"
+            } else {
+                "release"
+            }
+        );
+        report.iter().for_each(|l| println!("{l}"));
+        // Budgets hold in debug too; release is several times faster.
+        assert!(tree_key < 50., "tree navigation {tree_key:.1} ms/key");
+        assert!(motion < 50., "vim motion {motion:.1} ms/key");
+        assert!(edit < 80., "vim edit {edit:.1} ms/key");
+        assert!(typing < 50., "typing {typing:.1} ms/key");
+        assert!(
+            motion < arrow * 1.5 + 1.,
+            "vim adds {:.1} ms/key over the editor",
+            motion - arrow
+        );
+        fs::remove_dir_all(&home).ok();
     }
 }
