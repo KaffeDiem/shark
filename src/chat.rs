@@ -14,15 +14,19 @@ use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState};
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Icon, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
+use std::time::Instant;
 
 struct Call {
     id: String,
     name: String,
     summary: String,
+    /// The full input, one `key: value` per line and capped, for the row's tooltip.
+    input: String,
     result: Option<String>,
     is_error: bool,
     open: bool,
@@ -132,8 +136,11 @@ pub struct Chat {
     blocks: Vec<Block>,
     sel: usize,
     pub busy: bool,
-    /// Background tasks (subagents, shells) still running; the turn can end before they do.
-    pub background: usize,
+    /// Background tasks (subagents, shells) still running, by description; the turn can end
+    /// before they do.
+    pub background: Vec<String>,
+    /// When the running turn started.
+    pub started: Option<Instant>,
     /// Set while a git step runs in these worktrees; sends wait for it.
     pub hold: bool,
     agent: Option<Agent>,
@@ -157,7 +164,9 @@ pub struct Chat {
     /// so the message doesn't lose its turn.
     editing: Option<usize>,
     /// A message was sent into a running turn and claude may not have read it yet.
-    steered: bool,
+    pub steered: bool,
+    /// What the CLI reported at init: its model, permission mode and MCP servers.
+    reported: Option<String>,
     _subs: Vec<Subscription>,
 }
 
@@ -190,6 +199,39 @@ fn summarize(input: &Value, root: &str) -> String {
     s.chars().take(120).collect()
 }
 
+/// The first `n` chars, with "…" when cut.
+fn cap(s: &str, n: usize) -> String {
+    let mut c: String = s.chars().take(n).collect();
+    if c.len() < s.len() {
+        c.push('…');
+    }
+    c
+}
+
+fn full_input(input: &Value) -> String {
+    let s = match input.as_object() {
+        Some(o) => (o.iter())
+            .map(|(k, v)| {
+                format!(
+                    "{k}: {}",
+                    v.as_str().map_or_else(|| v.to_string(), Into::into)
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        None => serde_json::to_string_pretty(input).unwrap_or_default(),
+    };
+    cap(&s, 2000)
+}
+
+/// "48s", "2m 5s".
+pub(crate) fn duration(secs: u64) -> String {
+    match secs {
+        0..60 => format!("{secs}s"),
+        _ => format!("{}m {}s", secs / 60, secs % 60),
+    }
+}
+
 impl Chat {
     pub fn new(ws: Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let composer = cx.new(|cx| {
@@ -218,7 +260,8 @@ impl Chat {
             blocks: vec![],
             sel: 0,
             busy: false,
-            background: 0,
+            background: vec![],
+            started: None,
             hold: false,
             agent: None,
             composer,
@@ -238,6 +281,7 @@ impl Chat {
             qscroll: ScrollHandle::new(),
             editing: None,
             steered: false,
+            reported: None,
             _subs: vec![_sub],
         };
         // Warm both sources now so the first `@` or `/` doesn't wait.
@@ -250,7 +294,7 @@ impl Chat {
             chat.apply(ev, cx);
         }
         chat.busy = false;
-        chat.background = 0;
+        chat.background.clear();
         chat.sel = chat.rows().len().saturating_sub(1);
         chat.scroll.scroll_to_bottom();
         chat
@@ -258,7 +302,22 @@ impl Chat {
 
     /// Whether anything is still going on: a turn, or tasks it left running in the background.
     pub fn working(&self) -> bool {
-        self.busy || self.background > 0
+        self.busy || !self.background.is_empty()
+    }
+
+    /// "Read: api/src/a.rs" for the call in flight.
+    pub fn running_tool(&self) -> Option<String> {
+        let calls = self.blocks.iter().rev().flat_map(|b| match b {
+            Block::Tool(c) => std::slice::from_ref(c),
+            Block::Tools { calls, .. } => calls.as_slice(),
+            _ => &[],
+        });
+        let c = calls.rev().find(|c| c.result.is_none())?;
+        Some(format!("{}: {}", c.name, c.summary))
+    }
+
+    pub fn queued(&self) -> usize {
+        self.queue.len()
     }
 
     pub fn model(&self) -> &str {
@@ -633,6 +692,9 @@ impl Chat {
     }
 
     fn sent(&mut self, text: String, cx: &mut Context<Self>) {
+        if !self.busy {
+            self.started = Some(Instant::now());
+        }
         self.busy = true;
         // Jump to the end so push follows the new message and the reply.
         self.sel = self.rows().len().saturating_sub(1);
@@ -690,17 +752,30 @@ impl Chat {
 
     fn apply_inner(&mut self, ev: Ev, cx: &mut Context<Self>) {
         match ev {
-            Ev::Init(id) => {
+            Ev::Init {
+                session_id: id,
+                model,
+                permission_mode,
+                mcp,
+            } => {
                 if self.ws.session_id.as_ref() != Some(&id) {
                     self.ws.session_id = Some(id.clone());
                     cx.emit(ChatEvent::SessionId(id));
                 }
+                let mut r = format!("running {model} · permissions: {permission_mode}");
+                if !mcp.is_empty() {
+                    r += &format!(" · MCP: {}", mcp.join(", "));
+                }
+                self.reported = Some(r);
                 // Each turn starts with init, including ones the CLI starts itself when a
                 // background task finishes.
+                if !self.busy {
+                    self.started = Some(Instant::now());
+                }
                 self.busy = true;
                 self.steered = false;
             }
-            Ev::Background(n) => self.background = n,
+            Ev::Background(tasks) => self.background = tasks,
             Ev::User(text) => self.blocks.push(Block::User(text)),
             Ev::TextDelta(s) => match self.blocks.last_mut() {
                 Some(Block::Text { md, done: false }) => {
@@ -724,6 +799,7 @@ impl Chat {
             Ev::ToolUse { id, name, input } => {
                 let call = Call {
                     summary: summarize(&input, &self.ws.dir().to_string_lossy()),
+                    input: full_input(&input),
                     id,
                     name,
                     result: None,
@@ -757,10 +833,7 @@ impl Chat {
                 secs,
             } => {
                 self.busy = false;
-                let took = match secs {
-                    0..60 => format!("{secs}s"),
-                    _ => format!("{}m {}s", secs / 60, secs % 60),
-                };
+                let took = duration(secs);
                 self.blocks.push(Block::Info(if is_error {
                     format!("error: {text}")
                 } else {
@@ -770,11 +843,16 @@ impl Chat {
             }
             Ev::Exited(msg) => {
                 self.agent = None;
-                self.background = 0;
+                self.background.clear();
                 if self.busy {
                     self.busy = false;
                     self.blocks.push(Block::Info(msg));
                     cx.emit(ChatEvent::TurnDone);
+                } else {
+                    let first = msg.lines().next().unwrap_or_default();
+                    self.blocks.push(Block::Info(format!(
+                        "{first} while idle · the next message restarts it"
+                    )));
                 }
             }
         }
@@ -826,10 +904,14 @@ impl Chat {
                 .into_any_element(),
             _ => icon(IconName::Check).into_any_element(),
         };
+        let (mono, mono_size) = (theme.mono_font_family.clone(), theme.mono_font_size);
         let tool_row = |c: &Call| {
+            let input: SharedString = c.input.clone().into();
+            let (mono, mono_size) = (mono.clone(), mono_size);
             v_flex()
                 .child(
                     h_flex()
+                        .id(SharedString::from(c.id.clone()))
                         .h(px(28.))
                         .gap_2()
                         .text_color(theme.muted_foreground)
@@ -842,16 +924,26 @@ impl Chat {
                                 .child(c.name.clone()),
                         )
                         .child(div().flex_1().truncate().child(c.summary.clone()))
-                        .child(status(c)),
+                        .child(status(c))
+                        .tooltip(move |w, cx| {
+                            let (input, mono) = (input.clone(), mono.clone());
+                            Tooltip::element(move |_, _| {
+                                div()
+                                    .max_w(px(560.))
+                                    .py_1()
+                                    .font_family(mono.clone())
+                                    .text_size(mono_size)
+                                    .child(input.clone())
+                            })
+                            .build(w, cx)
+                        }),
                 )
                 .when(c.open, |d| {
-                    let text: String = c
-                        .result
-                        .as_deref()
-                        .unwrap_or("(running)")
-                        .chars()
-                        .take(20_000)
-                        .collect();
+                    let full = c.result.as_deref().unwrap_or("(running)");
+                    let mut text: String = full.chars().take(20_000).collect();
+                    if text.len() < full.len() {
+                        text += &format!("\n… truncated, {} chars total", full.chars().count());
+                    }
                     d.child(
                         div()
                             .mt_1()
@@ -1369,7 +1461,14 @@ impl Render for Chat {
                                         .icon(IconName::Sparkles)
                                         .label(self.model().to_string())
                                         .dropdown_caret(true)
-                                        .tooltip_with_action("Change model", &PickModel, None)
+                                        .tooltip_with_action(
+                                            match &self.reported {
+                                                Some(r) => format!("Change model · {r}"),
+                                                None => "Change model".into(),
+                                            },
+                                            &PickModel,
+                                            None,
+                                        )
                                         .on_click(|_, window, cx| {
                                             window.dispatch_action(PickModel.boxed_clone(), cx)
                                         }),
@@ -1402,6 +1501,7 @@ mod tests {
             id: String::new(),
             name: name.into(),
             summary: String::new(),
+            input: String::new(),
             result: Some(String::new()),
             is_error: err,
             open: false,
@@ -1416,6 +1516,9 @@ mod tests {
         assert_eq!(summarize(&input, "/ws/feat"), "api/src/a.rs");
         let skill = serde_json::json!({"skill": "pdf", "args": "x"});
         assert_eq!(summarize(&skill, "/ws/feat"), "pdf");
+        let bash = serde_json::json!({"command": "a\nb", "timeout": 5});
+        assert_eq!(full_input(&bash), "command: a\nb\ntimeout: 5");
+        assert_eq!(cap("abcdef", 3), "abc…");
     }
 }
 

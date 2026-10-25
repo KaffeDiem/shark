@@ -13,10 +13,14 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::command::CommandItem;
 use gpui_kit::component::notification::Notification;
+use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Disableable as _, Icon, Sizable as _, WindowExt, h_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use status::{Action, Local, Pr, Repo, fetch_pr, next_action, pr_head_moved, pr_settling, probe};
+use status::{
+    Action, Local, Pr, Repo, ago, diverged, fetch_pr, next_action, pr_head_moved, pr_settling,
+    probe,
+};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
@@ -50,6 +54,8 @@ pub struct GitSync {
     fetched: Option<Instant>,
     pr_checked: Option<Instant>,
     gh_error: Option<String>,
+    /// From the last fetch; cleared when one succeeds everywhere.
+    fetch_error: Option<String>,
     /// gh failed for every repo on the last ask.
     gh_down: bool,
     settling_since: Option<Instant>,
@@ -77,6 +83,7 @@ struct Probed {
     locals: Vec<Result<Local, String>>,
     prs: Option<Vec<Result<Option<Pr>, String>>>,
     fetched: bool,
+    fetch_error: Option<String>,
 }
 
 /// Repos run in parallel, so one hung remote costs one timeout, not one per repo.
@@ -87,23 +94,37 @@ fn run_job(job: &Job) -> Probed {
             .iter()
             .map(|(wt, base)| {
                 s.spawn(move || {
-                    if job.fetch {
-                        // Errors (offline, no origin) show through gh and the menu, not a toast every 3 min.
-                        let _ =
-                            cmd_bounded(wt, "git", &["fetch", "--prune", "--quiet", "origin"], 60);
-                    }
+                    // Errors (offline, no origin) show in the tooltip and menu, not a toast every 3 min.
+                    let fetch_err = job
+                        .fetch
+                        .then(|| {
+                            cmd_bounded(wt, "git", &["fetch", "--prune", "--quiet", "origin"], 60)
+                                .err()
+                        })
+                        .flatten();
                     let local = probe(wt, &job.branch, base);
-                    (local, job.pr.then(|| fetch_pr(wt, &job.branch)))
+                    (local, job.pr.then(|| fetch_pr(wt, &job.branch)), fetch_err)
                 })
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let (locals, prs): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+    let mut locals = vec![];
+    let mut prs = vec![];
+    let mut errs = vec![];
+    for ((local, pr, err), (wt, _)) in results.into_iter().zip(&job.repos) {
+        locals.push(local);
+        prs.extend(pr);
+        if let Some(e) = err {
+            let name = wt.file_name().unwrap_or_default().to_string_lossy();
+            errs.push(format!("{name}: {e}"));
+        }
+    }
     Probed {
         locals,
-        prs: job.pr.then(|| prs.into_iter().flatten().collect()),
+        prs: job.pr.then_some(prs),
         fetched: job.fetch,
+        fetch_error: (!errs.is_empty()).then(|| errs.join("\n")),
     }
 }
 
@@ -151,6 +172,7 @@ impl GitSync {
             fetched: None,
             pr_checked: None,
             gh_error: None,
+            fetch_error: None,
             gh_down: false,
             settling_since: None,
             want_fetch: true,
@@ -283,6 +305,10 @@ impl GitSync {
         }
         if p.fetched {
             self.fetched = Some(Instant::now());
+            if self.fetch_error != p.fetch_error {
+                self.fetch_error = p.fetch_error;
+                cx.notify();
+            }
         }
         let action = next_action(&self.repos, &self.ws.branch);
         if self.action.as_ref() != Some(&action) {
@@ -293,6 +319,14 @@ impl GitSync {
 
     fn busy(&self, cx: &App) -> bool {
         self.chat.read(cx).working()
+    }
+
+    /// `(repo, branch on GitHub)` per repo; the URL is `None` until it is pushed to GitHub.
+    pub fn branch_urls(&self) -> Vec<(String, Option<String>)> {
+        self.repos
+            .iter()
+            .map(|r| (r.name.clone(), r.branch_url(&self.ws.branch)))
+            .collect()
     }
 
     pub fn pr_urls(&self) -> Vec<String> {
@@ -374,7 +408,14 @@ impl GitSync {
     fn confirm(&mut self, a: Action, check: bool, window: &mut Window, cx: &mut Context<Self>) {
         let (title, body, ok) = match a.kind {
             Kind::Merge => (
-                format!("Merge {} PRs?", self.pr_urls().len().max(1)),
+                format!(
+                    "Merge {} PRs?",
+                    self.repos
+                        .iter()
+                        .filter(|r| r.open_pr().is_some())
+                        .count()
+                        .max(1)
+                ),
                 "Merges with each repo's allowed method, in order, and stops at the first failure. \
                  Merging can't be undone from here.",
                 "Merge",
@@ -492,6 +533,39 @@ impl GitSync {
         .detach();
     }
 
+    /// The button's tooltip: the step, each repo's state, how fresh it is, and what failed.
+    fn tooltip(&self, cx: &App) -> String {
+        let mut lines = vec!["Next git step (space g g)".to_string()];
+        match (&self.running, &self.action) {
+            (Some(r), _) => lines.push(format!("Running: {r}")),
+            (None, Some(a)) => {
+                lines.push(a.label.clone());
+                if a.kind.needs_idle() && self.busy(cx) {
+                    lines.push("Waits for the agent to finish".into());
+                }
+            }
+            (None, None) => lines.push("Reading git…".into()),
+        }
+        lines.extend(self.repos.iter().map(Repo::summary));
+        let fresh: Vec<String> = [
+            ("Fetched", self.fetched),
+            ("GitHub checked", self.pr_checked),
+        ]
+        .into_iter()
+        .filter_map(|(what, at)| Some(format!("{what} {}", ago(at?.elapsed()))))
+        .collect();
+        if !fresh.is_empty() {
+            lines.push(fresh.join(" · "));
+        }
+        if let Some(e) = &self.fetch_error {
+            lines.push(format!("Fetch failed: {e}"));
+        }
+        if let Some(e) = &self.gh_error {
+            lines.push(format!("GitHub: {e} (showing last good state)"));
+        }
+        lines.join("\n")
+    }
+
     pub fn open_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let mut rows: Vec<(String, IconName, Row)> = vec![];
         if let Some(a) = self.action.clone().filter(|a| a.kind != Kind::None) {
@@ -543,6 +617,13 @@ impl GitSync {
                 r.summary(),
                 IconName::FolderGit2,
                 Row::Open(r.pr().map(|p| p.url.clone())),
+            ));
+        }
+        if let Some(e) = &self.fetch_error {
+            rows.push((
+                format!("Fetch failed: {}", e.replace('\n', "; ")),
+                IconName::TriangleAlert,
+                Row::Open(None),
             ));
         }
         if let Some(e) = &self.gh_error {
@@ -635,7 +716,10 @@ fn execute(a: &Action, ws: &Workspace, repos: &[Repo]) -> Result<Outcome, String
                 &["pull", "--ff-only", "--no-rebase", "origin", b],
                 120,
             )
-            .map_err(|e| format!("{e}\nIf the branches diverged, use “Sync with remote”."))?;
+            .map_err(|e| match diverged(&e) {
+                true => format!("{e}\nThe branches diverged; use “Sync with remote”."),
+                false => e,
+            })?;
             Ok(Some("pulled".into()))
         }),
         Kind::Push => each(&|wt, r| {
@@ -802,6 +886,7 @@ fn icon(a: &Action) -> IconName {
 impl Render for GitSync {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let busy = self.busy(cx);
+        let this = cx.entity().downgrade();
         let warning = cx.theme().warning_foreground;
         let (label, a) = match (&self.running, &self.action) {
             (Some(r), _) => (format!("{r}…"), None),
@@ -823,21 +908,27 @@ impl Render for GitSync {
         h_flex()
             .gap_1()
             .child(
-                Button::new("git-next")
-                    .small()
-                    .icon(icon)
-                    .label(label)
-                    .map(|b| match (passive, attention) {
-                        (true, _) => b.ghost(),
-                        (false, true) => b.outline(),
-                        (false, false) => b.primary(),
+                // A div, not Button::tooltip: that takes fixed text, and this is built on hover so
+                // the "ago" times are current.
+                div()
+                    .id("git-next-tip")
+                    .tooltip(move |w, cx| {
+                        let text = this.upgrade().map(|s| s.read(cx).tooltip(cx));
+                        Tooltip::new(text.unwrap_or_default()).build(w, cx)
                     })
-                    .disabled(!clickable || blocked)
-                    .tooltip(match blocked {
-                        true => "Waits for the agent to finish",
-                        false => "Next git step (space g g)",
-                    })
-                    .on_click(cx.listener(|s, _, window, cx| s.primary(window, cx))),
+                    .child(
+                        Button::new("git-next")
+                            .small()
+                            .icon(icon)
+                            .label(label)
+                            .map(|b| match (passive, attention) {
+                                (true, _) => b.ghost(),
+                                (false, true) => b.outline(),
+                                (false, false) => b.primary(),
+                            })
+                            .disabled(!clickable || blocked)
+                            .on_click(cx.listener(|s, _, window, cx| s.primary(window, cx))),
+                    ),
             )
             .child(
                 Button::new("git-menu")
