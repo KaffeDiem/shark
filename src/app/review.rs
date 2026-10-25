@@ -888,7 +888,11 @@ impl Shark {
             input,
             suggest,
         });
-        focus.update(cx, |i, cx| i.focus(window, cx));
+        focus.update(cx, |i, cx| {
+            let end = i.value().len();
+            i.set_selected_range(end..end, cx);
+            i.focus(window, cx)
+        });
         cx.notify();
     }
 
@@ -907,7 +911,11 @@ impl Shark {
                         .placeholder("The code you propose")
                         .default_value(text)
                 });
-                s.update(cx, |i, cx| i.focus(window, cx));
+                s.update(cx, |i, cx| {
+                    let end = i.value().len();
+                    i.set_selected_range(end..end, cx);
+                    i.focus(window, cx)
+                });
                 comp.suggest = Some(s);
             }
         }
@@ -1315,7 +1323,8 @@ impl Shark {
             Status::Queued | Status::Sent { .. } | Status::Addressed { .. }
         );
         // Off its line (gone from the diff): the lines as they were, so it still reads.
-        let snapshot = (!self.on_its_line(&c) && !c.snapshot.is_empty()).then(|| c.snapshot.clone());
+        let snapshot =
+            (!self.on_its_line(&c) && !c.snapshot.is_empty()).then(|| c.snapshot.clone());
         let posted = c.github.as_deref().map(posted_as);
         let mono = theme.mono_font_family.clone();
         v_flex()

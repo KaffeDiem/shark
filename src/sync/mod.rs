@@ -437,9 +437,28 @@ impl GitSync {
         Some((pr, pushed))
     }
 
+    /// Gives `repo` open PR `number`, whose head is ours when `pushed`.
     #[cfg(all(test, feature = "test-support"))]
-    pub fn set_repos(&mut self, repos: Vec<Repo>) {
-        self.repos = repos;
+    pub fn set_pr(&mut self, repo: &str, number: u64, pushed: bool) {
+        let r = self.repos.iter_mut().find(|r| r.name == repo).unwrap();
+        r.pr = Some(Ok(Some(Pr {
+            url: format!("https://github.com/o/{repo}/pull/{number}"),
+            number,
+            state: PrState::Open,
+            draft: false,
+            merge_state: "CLEAN".into(),
+            review: String::new(),
+            checks: status::Checks::Passing,
+            head: "h".into(),
+            change_requests: vec![],
+            comments: vec![],
+            contains_head: String::new(),
+        })));
+        let head = if pushed { "h" } else { "local" };
+        r.local = Ok(Local {
+            head: head.into(),
+            ..Default::default()
+        });
     }
 
     pub fn pr_urls(&self) -> Vec<String> {

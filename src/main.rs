@@ -160,8 +160,10 @@ fn bind_keys(cx: &mut App) {
     // Vim-style keys sit under `Vim`, which the root view carries while Vim mode is on
     // (Settings › General). The arrows, letters that name an action and cmd shortcuts work
     // either way. VimNormal: the editor in Vim's Normal mode.
-    const NAV: &str =
-        "Sidebar || Home || Transcript || (DiffPane && !Input) || FileTree || Queue || PlanPane || VimNormal";
+    const NAV: &str = concat!(
+        "Sidebar || Home || Transcript || (DiffPane && !Input) || FileTree || Queue || PlanPane",
+        " || VimNormal"
+    );
     const LIST: &str = "Sidebar || Home || Transcript || FileTree || Queue";
     // The diff's letter keys; not while typing in the review composer, which sits in the diff.
     const DIFF: &str = "DiffPane && !Input";
@@ -266,7 +268,11 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-,", LowerEffort, None),
         KeyBinding::new("cmd->", RaiseEffort, None),
         KeyBinding::new("cmd-<", LowerEffort, None),
-        KeyBinding::new("alt-down", NextHunk, Some("(DiffPane && !Input) || PlanPane")),
+        KeyBinding::new(
+            "alt-down",
+            NextHunk,
+            Some("(DiffPane && !Input) || PlanPane"),
+        ),
         KeyBinding::new("alt-up", PrevHunk, Some("(DiffPane && !Input) || PlanPane")),
         KeyBinding::new("}", NextFile, Some(DIFF)),
         KeyBinding::new("{", PrevFile, Some(DIFF)),
@@ -308,8 +314,16 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("k", SelectPrev, Some("ReviewSheet")),
     ]);
     cx.bind_keys([
-        vim("] c", Box::new(NextHunk), "(DiffPane && !Input) || PlanPane"),
-        vim("[ c", Box::new(PrevHunk), "(DiffPane && !Input) || PlanPane"),
+        vim(
+            "] c",
+            Box::new(NextHunk),
+            "(DiffPane && !Input) || PlanPane",
+        ),
+        vim(
+            "[ c",
+            Box::new(PrevHunk),
+            "(DiffPane && !Input) || PlanPane",
+        ),
         // With threads in the diff, ]c / [c jump between them (the design's keys); without,
         // they still go to the next change. alt-down / alt-up always do.
         vim("] c", Box::new(NextThread), DIFF),

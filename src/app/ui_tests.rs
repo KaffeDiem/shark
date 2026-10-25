@@ -876,7 +876,10 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.update(|cx| {
         let p = review::prompt(shark.read(cx).ws_comments(), "");
-        assert!(p.contains(" api/c:1 · working tree\n```\nx\n```\n> rename this\n"), "{p}");
+        assert!(
+            p.contains(" api/c:1 · working tree\n```\nx\n```\n> rename this\n"),
+            "{p}"
+        );
     });
 
     // A git failure is not "no changes".
@@ -2010,5 +2013,286 @@ async fn home_checklist(cx: &mut TestAppContext) {
     assert!(done(cx).1);
     on(cx, &|s, _, _| s.state.home_checklist_dismissed = true);
     assert!(!done(cx).1, "dismissed");
+    fs::remove_dir_all(&home).ok();
+}
+
+/// The review queue end to end: compose (c), suggest, edit (e) and delete (x) threads, the
+/// send sheet (shift-c) sending only what is ticked, agent reports and changed lines judging
+/// the threads, resolve / reopen / re-queue, a review queued behind a busy turn and removed
+/// from its chat card, orphaned threads, and sharing to GitHub through a fake gh.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn review_queue(cx: &mut TestAppContext) {
+    use review::Status;
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos(&home, &["api"]),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace("rq".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let api = home.join("shark/workspaces/rq/api");
+    fs::write(api.join("f"), "a\nb\nc\n").unwrap();
+    on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+    cx.update(|cx| assert_eq!(shark.read(cx).diff_files.len(), 1));
+    let press = press_in(window);
+    let comments = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            (shark.read(cx).ws_comments().iter())
+                .map(|c| (c.id, c.text.clone(), c.status.clone()))
+                .collect::<Vec<_>>()
+        })
+    };
+    let typing = |cx: &mut TestAppContext, t: &str| {
+        cx.update_window(window, |_, w, cx| w.input(t, cx)).unwrap();
+        cx.run_until_parked();
+    };
+
+    // c on line 1: the composer; its letters don't reach the diff's keys. cmd-shift-s opens
+    // Suggest change on the lines; cmd-enter adds a pending thread with the snapshot.
+    press(cx, &["down", "c"]);
+    cx.update(|cx| assert!(shark.read(cx).review.composer.is_some()));
+    typing(cx, "rename vars");
+    press(cx, &["cmd-shift-s"]);
+    typing(cx, "!");
+    press(cx, &["cmd-enter"]);
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert!(s.review.composer.is_none());
+        let c = &s.ws_comments()[0];
+        assert_eq!((c.id, c.text.as_str()), (1, "rename vars"));
+        assert_eq!(
+            (c.snapshot.as_str(), c.suggestion.as_deref()),
+            ("a", Some("a!"))
+        );
+        assert_eq!(c.status, Status::Pending);
+    });
+    // e edits the thread at the cursor; Esc leaves it as it was.
+    press(cx, &["e"]);
+    cx.update(|cx| {
+        let comp = shark.read(cx).review.composer.as_ref().unwrap();
+        assert_eq!(comp.input.read(cx).value().as_ref(), "rename vars");
+    });
+    press(cx, &["escape"]);
+    assert_eq!(comments(cx)[0].1, "rename vars");
+    // Two more threads, x deletes the one at the cursor (line 2).
+    press(cx, &["down", "down", "c"]);
+    typing(cx, "third line");
+    press(cx, &["cmd-enter", "up", "c"]);
+    typing(cx, "drop me");
+    press(cx, &["cmd-enter"]);
+    assert_eq!(comments(cx).len(), 3);
+    press(cx, &["x"]);
+    let ids: Vec<u64> = comments(cx).iter().map(|c| c.0).collect();
+    assert_eq!(ids, [1, 2], "x deleted the line-2 thread");
+
+    // shift-c: the sheet; space unticks the first row, cmd-enter sends only the second.
+    press(cx, &["shift-c"]);
+    cx.update(|cx| {
+        let s = shark.read(cx).review.sheet.as_ref().unwrap();
+        assert_eq!(s.rows, [(1, true), (2, true)]);
+    });
+    press(cx, &["space", "cmd-enter"]);
+    let chat = cx.update(|cx| shark.read(cx).active_chat().cloned().unwrap());
+    let sent = cx.update(|cx| chat.read(cx).sent_texts());
+    assert_eq!(sent.len(), 1);
+    assert!(
+        sent[0].contains("\n[c2] api/f:3 · working tree\n```\nc\n```\n> third line\n"),
+        "{}",
+        sent[0]
+    );
+    assert!(!sent[0].contains("rename vars"), "unticked stays out");
+    assert_eq!(
+        comments(cx).iter().map(|c| c.2.clone()).collect::<Vec<_>>(),
+        [Status::Pending, Status::Sent { turn: 1 }]
+    );
+    // The agent reports c2 addressed.
+    let said = |t: &str| {
+        [
+            serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}, "parent_tool_use_id": null}).to_string(),
+            serde_json::json!({"type": "result", "is_error": false, "result": t, "total_cost_usd": 0, "duration_ms": 1}).to_string(),
+        ]
+    };
+    let reply = |cx: &mut TestAppContext, t: &str| {
+        let lines = said(t);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                let lines: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+                crate::chat::ui_tests::play(c, &lines, cx)
+            })
+        });
+        cx.run_until_parked();
+    };
+    reply(cx, "Renamed it.\n\n[c2] addressed: Renamed the third line.");
+    assert_eq!(
+        comments(cx)[1].2,
+        Status::Addressed {
+            turn: 1,
+            note: "Renamed the third line.".into()
+        }
+    );
+
+    // c1 goes too; the agent rewrites line 1 without a report: Outdated.
+    press(cx, &["shift-c", "cmd-enter"]);
+    assert_eq!(comments(cx)[0].2, Status::Sent { turn: 2 });
+    fs::write(api.join("f"), "A\nb\nc\n").unwrap();
+    reply(cx, "Done.");
+    assert_eq!(comments(cx)[0].2, Status::Outdated);
+    // Resolve (r) the addressed one; R reopens the outdated one; re-queue does the rest.
+    on(cx, &|s, w, cx| s.jump_to_comment(2, w, cx));
+    press(cx, &["r"]);
+    assert_eq!(comments(cx)[1].2, Status::Resolved);
+    on(cx, &|s, w, cx| s.jump_to_comment(1, w, cx));
+    press(cx, &["shift-r"]);
+    assert_eq!(comments(cx)[0].2, Status::Pending);
+    on(cx, &|s, _, cx| s.set_status(&[1], Status::Outdated, cx));
+    on(cx, &|s, _, cx| s.requeue_outdated(cx));
+    assert_eq!(comments(cx)[0].2, Status::Pending);
+
+    // A busy chat queues the review: the tab counts it, the card's Remove puts it back.
+    // (The fake claude never echoes, so the reviews sent above still count as unread.)
+    let unread = cx.update(|cx| chat.read(cx).review_count());
+    cx.update(|cx| chat.update(cx, |c, _| c.busy = true));
+    on(cx, &|s, w, cx| s.send_review(&[1], "", false, w, cx));
+    assert_eq!(comments(cx)[0].2, Status::Queued);
+    cx.update(|cx| assert_eq!(chat.read(cx).review_count(), unread + 1));
+    cx.update_window(window, |_, w, cx| {
+        chat.update(cx, |c, cx| c.remove_queued(0, w, cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(comments(cx)[0].2, Status::Pending);
+    cx.update(|cx| assert_eq!(chat.read(cx).review_count(), unread));
+    // Queued again, it goes out when the turn ends, read in the next turn; claude's echo
+    // of it (the same text) marks it read.
+    on(cx, &|s, w, cx| s.send_review(&[1], "", false, w, cx));
+    reply(cx, "Busy work done.");
+    assert_eq!(comments(cx)[0].2, Status::Sent { turn: 3 });
+    let echo = cx.update(|cx| chat.read(cx).sent_texts().pop().unwrap());
+    let echo = serde_json::json!({"type": "user", "message": {"role": "user", "content": echo}})
+        .to_string();
+    cx.update(|cx| chat.update(cx, |c, cx| crate::chat::ui_tests::play(c, &[&echo], cx)));
+    cx.update(|cx| assert_eq!(chat.read(cx).review_count(), unread));
+    reply(cx, "[c1] addressed: Renamed.");
+    assert!(matches!(
+        comments(cx)[0].2,
+        Status::Addressed { turn: 3, .. }
+    ));
+    on(cx, &|s, _, cx| s.set_status(&[1], Status::Pending, cx));
+
+    // Share to GitHub through a fake gh: argv logged, URL kept; a failure keeps the comment.
+    let bin = home.join("gh-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let (log, fail) = (bin.join("log"), bin.join("fail"));
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\nprintf '%s|' \"$@\" >> {log}\necho >> {log}\n[ -e {fail} ] && {{ echo 'gh: offline' >&2; exit 1; }}\ncase \"$1\" in api) echo https://github.com/o/api/pull/7#pullrequestreview-5 ;; *) echo https://github.com/o/api/pull/7#issuecomment-9 ;; esac\n",
+            log = log.display(),
+            fail = fail.display()
+        ),
+    )
+    .unwrap();
+    std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(&gh)
+        .status()
+        .unwrap();
+    // SAFETY: tests that read SHARK_GH hold UI_LOCK.
+    unsafe { std::env::set_var("SHARK_GH", &gh) };
+    let github = |cx: &mut TestAppContext, id: u64| {
+        cx.update(|cx| shark.read(cx).comment(id).and_then(|c| c.github.clone()))
+    };
+    on(cx, &|s, w, cx| {
+        s.active_sync()
+            .unwrap()
+            .update(cx, |g, _| g.set_pr("api", 7, false));
+        s.open_share(1, w, cx);
+        s.post_share(w, cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).review.share.is_none()
+    })
+    .await;
+    assert_eq!(
+        github(cx, 1).as_deref(),
+        Some("https://github.com/o/api/pull/7#issuecomment-9")
+    );
+    let argv = fs::read_to_string(&log).unwrap();
+    assert!(
+        argv.starts_with(
+            "pr|comment|7|--body|**api/f** · working copy · 1\n\n```\na\n```\n\nrename vars"
+        ),
+        "{argv}"
+    );
+    // A PR review of pushed lines sits on them: gh api with the line.
+    fs::write(&log, "").unwrap();
+    on(cx, &|s, w, cx| {
+        s.set_status(&[2], Status::Pending, cx);
+        s.active_sync()
+            .unwrap()
+            .update(cx, |g, _| g.set_pr("api", 7, true));
+        s.open_share(2, w, cx);
+        s.review.share.as_mut().unwrap().review = true;
+        s.post_share(w, cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).review.share.is_none()
+    })
+    .await;
+    let argv = fs::read_to_string(&log).unwrap();
+    assert!(
+        argv.starts_with("api|--method|POST|repos/{owner}/{repo}/pulls/7/reviews|-f|event=COMMENT|-f|comments[][path]=f|-F|comments[][line]=3|-f|comments[][side]=RIGHT|-f|comments[][body]=third line|"),
+        "{argv}"
+    );
+    assert!(github(cx, 2).is_some_and(|u| u.ends_with("#pullrequestreview-5")));
+    // gh fails: the dialog stays with the error, the comment unshared.
+    fs::write(&fail, "").unwrap();
+    on(cx, &|s, w, cx| {
+        s.edit_comments(cx, |l| l[0].github = None);
+        s.open_share(1, w, cx);
+        s.post_share(w, cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark
+            .read(cx)
+            .review
+            .share
+            .as_ref()
+            .is_some_and(|s| !s.posting)
+    })
+    .await;
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        let err = s.review.share.as_ref().unwrap().error.clone().unwrap();
+        assert!(err.contains("gh: offline"), "{err}");
+        assert_eq!(s.comment(1).unwrap().github, None);
+    });
+    unsafe { std::env::remove_var("SHARK_GH") };
+    on(cx, &|s, w, cx| s.close_share(w, cx));
+
+    // A thread whose file left the diff still shows, with its snapshot, below it.
+    fs::remove_file(api.join("f")).unwrap();
+    fs::write(api.join("g"), "x\n").unwrap();
+    on(cx, &|s, _, cx| s.refresh_diff(cx));
+    on(cx, &|s, _, cx| {
+        assert_eq!(s.diff_files.len(), 1);
+        assert!(s.render_orphans(cx).is_some());
+    });
     fs::remove_dir_all(&home).ok();
 }

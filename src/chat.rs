@@ -199,7 +199,10 @@ pub enum ChatEvent {
     /// Remove on a queued review card: those comments never went out.
     ReviewRemoved(Vec<u64>),
     /// A review went out (now, or from the queue): its comments are read in `turn`.
-    ReviewSent { ids: Vec<u64>, turn: usize },
+    ReviewSent {
+        ids: Vec<u64>,
+        turn: usize,
+    },
 }
 
 pub struct Chat {
@@ -1198,6 +1201,24 @@ impl Chat {
         if self.queue.is_empty() {
             self.focus_composer(window, cx);
         }
+    }
+
+    /// Remove on a queued review card.
+    pub(crate) fn remove_queued(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.qsel = ix;
+        self.delete_queued(window, cx);
+    }
+
+    /// What went out, oldest first: messages, and reviews as their prompt.
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn sent_texts(&self) -> Vec<String> {
+        (self.blocks.iter())
+            .filter_map(|b| match b {
+                Block::User(t, _) => Some(t.clone()),
+                Block::Review(r, _) => Some(r.prompt.clone()),
+                _ => None,
+            })
+            .collect()
     }
 
     fn delete_queued(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -2288,8 +2309,7 @@ impl Chat {
                                 .hover(|d| d.underline())
                                 .child("Remove")
                                 .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.qsel = ix;
-                                    this.delete_queued(window, cx);
+                                    this.remove_queued(ix, window, cx);
                                     cx.stop_propagation();
                                 })),
                         );
@@ -2917,7 +2937,7 @@ pub(crate) mod ui_tests {
     use super::*;
 
     /// Feeds recorded protocol lines to the chat as its process would.
-    fn play(c: &mut Chat, lines: &[&str], cx: &mut Context<Chat>) {
+    pub(crate) fn play(c: &mut Chat, lines: &[&str], cx: &mut Context<Chat>) {
         for l in lines {
             for ev in agent::parse(l) {
                 c.apply(ev, cx);

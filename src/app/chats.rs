@@ -44,7 +44,7 @@ impl Shark {
             &chat,
             window,
             move |this, chat, ev: &ChatEvent, window, cx| match ev {
-                ChatEvent::Meta => this.save_meta(&chat, cx),
+                ChatEvent::Meta => this.save_meta(chat, cx),
                 ChatEvent::Picked => {
                     // The level the chat runs at, so an old chat with none doesn't clear it.
                     let m = &chat.read(cx).meta;
@@ -59,7 +59,7 @@ impl Shark {
                     if this.active.as_ref() == Some(&name) {
                         this.refresh_diff(cx);
                     }
-                    if this.active_chat() != Some(&chat) {
+                    if this.active_chat() != Some(chat) {
                         this.unread.insert(id.clone());
                     }
                     this.refresh_home(Some(&name), cx);

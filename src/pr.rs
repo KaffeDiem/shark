@@ -238,9 +238,16 @@ mod tests {
              -F comments[][start_line]=631 -f comments[][start_side]=RIGHT \
              -f comments[][body]=Keep it aligned. -q .html_url"
         );
-        let one = Anchor { start: None, left: true, ..a };
+        let one = Anchor {
+            start: None,
+            left: true,
+            ..a
+        };
         let args = review_api_args("7", "note", &one, "x").join(" ");
-        assert!(args.contains("-f body=note") && args.contains("side]=LEFT"), "{args}");
+        assert!(
+            args.contains("-f body=note") && args.contains("side]=LEFT"),
+            "{args}"
+        );
         assert!(!args.contains("start_line"));
     }
 
