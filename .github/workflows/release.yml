@@ -1,0 +1,51 @@
+# Merging a PR labelled "release" builds the DMG, publishes a GitHub release,
+# and commits the new version to Cargo.toml, the brew cask and the README.
+name: release
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+
+concurrency: release
+
+jobs:
+  release:
+    if: github.event.pull_request.merged && contains(github.event.pull_request.labels.*.name, 'release')
+    runs-on: macos-latest
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.ref }}
+          fetch-depth: 0
+
+      - name: Pick version
+        run: |
+          v=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          # Already released: bump the patch number.
+          if git rev-parse -q --verify "refs/tags/v$v" >/dev/null; then
+            v=$(echo "$v" | awk -F. '{print $1"."$2"."$3+1}')
+            sed -i '' "1,/^version = /s/^version = .*/version = \"$v\"/" Cargo.toml
+          fi
+          echo "VERSION=$v" >> "$GITHUB_ENV"
+
+      - run: rustup toolchain install
+      - run: make release
+
+      - name: Update cask and README
+        run: |
+          sha=$(shasum -a 256 "target/release/Shark-$VERSION.dmg" | cut -d' ' -f1)
+          sed -i '' -e "s/^  version \".*\"/  version \"$VERSION\"/" -e "s/^  sha256 \".*\"/  sha256 \"$sha\"/" Casks/shark.rb
+          sed -i '' -E "s#(releases/download/v)[^/]+/Shark-[^)]+\.dmg#\1$VERSION/Shark-$VERSION.dmg#; s/Download Shark [0-9.]+/Download Shark $VERSION/" README.md
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -am "Release $VERSION"
+          git pull --rebase
+          git push
+
+      - name: Publish release
+        run: gh release create "v$VERSION" "target/release/Shark-$VERSION.dmg" --title "Shark $VERSION" --generate-notes --target "$(git rev-parse HEAD)"
