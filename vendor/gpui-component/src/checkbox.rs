@@ -245,7 +245,8 @@ impl RenderOnce for Checkbox {
             .clone();
         let is_focused = focus_handle.is_focused(window);
 
-        let unchecked_border = cx.theme().input;
+        // Shark: the input border nearly vanishes on dark themes; the muted text color shows.
+        let unchecked_border = cx.theme().muted_foreground.opacity(0.7);
         let checked_color = cx.theme().primary;
         let disabled_indicator_color = if checked {
             checked_color.opacity(0.5)

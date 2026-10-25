@@ -76,6 +76,8 @@ impl Spot {
 #[derive(Debug)]
 struct Row {
     spot: Spot,
+    /// The original line also shown on this row: a context line, or a split pair's removal.
+    old: Option<usize>,
     changed: bool,
     /// Height in code rows; headers and hunk separators are taller than a line.
     h: f32,
@@ -90,6 +92,7 @@ fn rows(files: &[(SharedString, &[Hunk], bool)], split: bool) -> Vec<Row> {
     for (path, hunks, collapsed) in files {
         out.push(Row {
             spot: Spot::File(path.clone()),
+            old: None,
             changed: false,
             h: 2.,
         });
@@ -105,6 +108,7 @@ fn rows(files: &[(SharedString, &[Hunk], bool)], split: bool) -> Vec<Row> {
                 if hunk[i].0 == b' ' {
                     out.push(Row {
                         spot: line(false, hunk[i].2),
+                        old: Some(hunk[i].1),
                         changed: false,
                         h: 1.,
                     });
@@ -116,19 +120,23 @@ fn rows(files: &[(SharedString, &[Hunk], bool)], split: bool) -> Vec<Row> {
                     .unwrap_or(hunk.len());
                 let (dels, adds): (Vec<usize>, Vec<usize>) =
                     (i..end).partition(|&j| hunk[j].0 == b'-');
-                let spots: Vec<Spot> = match split {
-                    false => (dels.iter().map(|&j| line(true, hunk[j].1)))
-                        .chain(adds.iter().map(|&j| line(false, hunk[j].2)))
+                let spots: Vec<(Spot, Option<usize>)> = match split {
+                    false => (dels.iter().map(|&j| (line(true, hunk[j].1), None)))
+                        .chain(adds.iter().map(|&j| (line(false, hunk[j].2), None)))
                         .collect(),
                     true => (0..dels.len().max(adds.len()))
-                        .map(|k| match adds.get(k) {
-                            Some(&j) => line(false, hunk[j].2),
-                            None => line(true, hunk[dels[k]].1),
+                        .map(|k| {
+                            let old = dels.get(k).map(|&j| hunk[j].1);
+                            match adds.get(k) {
+                                Some(&j) => (line(false, hunk[j].2), old),
+                                None => (line(true, hunk[dels[k]].1), None),
+                            }
                         })
                         .collect(),
                 };
-                out.extend(spots.into_iter().map(|spot| Row {
+                out.extend(spots.into_iter().map(|(spot, old)| Row {
                     spot,
+                    old,
                     changed: true,
                     h: 1.,
                 }));
@@ -144,7 +152,19 @@ fn rows(files: &[(SharedString, &[Hunk], bool)], split: bool) -> Vec<Row> {
 
 /// The row showing `spot`, or the closest one before it in the same file after a refresh.
 fn find(rows: &[Row], spot: &Spot) -> usize {
-    if let Some(i) = rows.iter().position(|r| r.spot == *spot) {
+    // An original line is on its own row, or beside the working line it pairs with.
+    let before = |r: &Row, want: &DiffLinePosition| match &r.spot {
+        Spot::Line(l) if l.side() == want.side() => l.line() <= want.line(),
+        Spot::Line(_) if want.side() == DiffSide::Original => {
+            r.old.is_some_and(|o| o <= want.line())
+        }
+        _ => false,
+    };
+    if let Some(i) = rows.iter().position(|r| {
+        r.spot == *spot
+            || matches!(spot, Spot::Line(w) if w.side() == DiffSide::Original
+                && r.spot.path() == w.path() && r.old == Some(w.line()))
+    }) {
         return i;
     }
     let Some(head) = rows
@@ -161,9 +181,7 @@ fn find(rows: &[Row], spot: &Spot) -> usize {
         .take_while(|r| matches!(&r.spot, Spot::Line(_)));
     same_file
         .enumerate()
-        .filter(|(_, r)| {
-            matches!(&r.spot, Spot::Line(l) if l.side() == want.side() && l.line() <= want.line())
-        })
+        .filter(|(_, r)| before(r, want))
         .last()
         .map_or(head, |(i, _)| head + 1 + i)
 }
@@ -798,7 +816,7 @@ impl Shark {
             add.update(cx, |s, cx| {
                 s.diff
                     .update(cx, |d, cx| d.set_selected_lines(Some(range.clone()), cx));
-                s.comment_dialog(window, cx)
+                s.comment_at(range.clone(), window, cx)
             })
             .ok();
         })
@@ -905,9 +923,20 @@ impl Shark {
         if self.active.is_none() {
             return notify_err(window, cx, "Open a workspace first");
         }
-        let Some(range) = self.diff.read(cx).selected_lines() else {
-            return notify_err(window, cx, "Move to a line first (j/k), or select lines");
+        // Code selected with the mouse, else the line cursor or selected lines.
+        let d = self.diff.read(cx);
+        let Some(range) = d.text_selection_lines(cx).or_else(|| d.selected_lines()) else {
+            return notify_err(
+                window,
+                cx,
+                "Select code or lines first, or move to a line (j/k)",
+            );
         };
+        self.comment_at(range, window, cx)
+    }
+
+    /// The composer on `range`, whatever is selected (the header's Comment, the diff's +).
+    fn comment_at(&mut self, range: DiffLineRange, window: &mut Window, cx: &mut Context<Self>) {
         let draft = Comment::from_range(&range);
         let same = (self.ws_comments().iter())
             .find(|c| c.status == Status::Pending && c.place() == draft.place())
@@ -1578,7 +1607,7 @@ impl Shark {
             .when(button, |d| {
                 d.child(
                     Button::new(SharedString::from(format!("comment:{path}")))
-                        .ghost()
+                        .outline()
                         .xsmall()
                         .label(label)
                         .on_click(cx.listener(move |this, _, w, cx| this.comment_in(&path, w, cx))),
@@ -1589,20 +1618,27 @@ impl Shark {
 
     /// The header's Comment: the selection when it is in `path`, else its first changed line.
     fn comment_in(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let here = (self.diff.read(cx).selected_lines()).is_some_and(|r| r.path() == path);
-        if !here {
+        let d = self.diff.read(cx);
+        let here = (d.text_selection_lines(cx).or_else(|| d.selected_lines()))
+            .filter(|r| r.path() == path);
+        let range = here.or_else(|| {
             let first = (self.review.hunks.get(path))
                 .and_then(|h| h.iter().flatten().find(|l| l.0 != b' '))
                 .map(|&(k, old, new)| match k {
                     b'-' => (DiffSide::Original, old),
                     _ => (DiffSide::Modified, new),
-                });
-            let Some((side, line)) = first else { return };
-            let sel = DiffLineRange::new(path.to_string(), side, line, line);
-            self.diff
-                .update(cx, |d, cx| d.set_selected_lines(Some(sel), cx));
-        }
-        self.comment_dialog(window, cx);
+                })?;
+            Some(DiffLineRange::new(
+                path.to_string(),
+                first.0,
+                first.1,
+                first.1,
+            ))
+        });
+        let Some(range) = range else { return };
+        self.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(range.clone()), cx));
+        self.comment_at(range, window, cx);
     }
 
     /// The sticky review bar at the bottom of the diff (A·01/02/04). `status`, when set,
@@ -1768,6 +1804,10 @@ mod tests {
         let gone = Spot::Line(DiffLinePosition::new("r/f", DiffSide::Modified, 7));
         assert_eq!(find(&unified, &gone), 5);
         assert_eq!(find(&unified, &Spot::File("r/x".into())), 0);
+        // An original line on a context row, or paired beside a working line in split.
+        let orig = |n| Spot::Line(DiffLinePosition::new("r/f", DiffSide::Original, n));
+        assert_eq!(find(&unified, &orig(10)), 6);
+        assert_eq!(find(&split, &orig(2)), 2);
         assert_eq!(next_change(&unified, 0, true), Some(2));
         assert_eq!(next_change(&unified, 2, true), Some(7));
         assert_eq!(next_change(&unified, 7, true), Some(2), "wraps");

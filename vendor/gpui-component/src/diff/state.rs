@@ -238,6 +238,8 @@ pub struct DiffState {
     split_ratio: f32,
     /// The pointer x and ratio where a divider drag started.
     divider_drag: Option<(Pixels, f32)>,
+    /// The line under the pointer, which shows the add-annotation button.
+    pub(crate) hovered: Option<DiffLinePosition>,
     annotations: HashSet<(Option<DiffLinePosition>, SharedString, ElementId)>,
     window: Option<WindowId>,
     /// Bumped when files or presentation options change, so a preparation
@@ -372,6 +374,7 @@ impl DiffState {
             hinted_width: None,
             split_ratio: 0.5,
             divider_drag: None,
+            hovered: None,
             annotations: HashSet::new(),
             window: None,
             presentation_generation: 0,
@@ -635,8 +638,8 @@ impl DiffState {
         self.preparing = None;
         self._presentation = Task::ready(());
         self.presentations[ix] = None;
-        // Measure the width again: an edit may lengthen the widest line.
-        self.layout = None;
+        // No re-measure of every file (this runs per keystroke while editing): a longer line
+        // widens the rows once it is painted (`record_paint`).
         // Spliced, so the list keeps its scroll offset and unchanged rows their heights.
         self.rebuild(false);
         self.ensure_presentation(cx);
@@ -867,6 +870,12 @@ impl DiffState {
             .and_then(|file| file.source(side).get(range))
             .unwrap_or("")
             .to_owned()
+    }
+
+    /// The lines a text selection made by dragging over code touches, on its one side.
+    pub fn text_selection_lines(&self, cx: &App) -> Option<DiffLineRange> {
+        let (file, side, range) = super::selection::selected_source_range(&self.selection, cx)?;
+        source_lines(self.files.get(file)?, side, range)
     }
 
     /// Reveals and scrolls to a source line, expanding its file and hidden
@@ -1860,4 +1869,23 @@ fn project_conflicts(
             pairs: start..ix,
         });
     }
+}
+
+/// The lines of `side` that source bytes `range` touch.
+pub(crate) fn source_lines(
+    document: &DiffFile,
+    side: DiffSide,
+    range: Range<usize>,
+) -> Option<DiffLineRange> {
+    let lines = document.lines(side);
+    let at = |byte: usize| lines.partition_point(|line| line.source().end <= byte);
+    let (first, last) = (at(range.start), at(range.end.saturating_sub(1).max(range.start)));
+    (last < lines.len()).then(|| {
+        DiffLineRange::new(
+            document.path().clone(),
+            side,
+            lines[first].line_number(),
+            lines[last].line_number(),
+        )
+    })
 }
