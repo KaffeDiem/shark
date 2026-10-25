@@ -41,7 +41,10 @@ pub enum SyncEvent {
 
 pub struct GitSync {
     ws: Workspace,
-    chat: Entity<Chat>,
+    /// Every open chat of the workspace; git writes wait for all of them.
+    chats: Vec<Entity<Chat>>,
+    /// The shown chat; judgment steps prompt it.
+    chat: Option<Entity<Chat>>,
     repos: Vec<Repo>,
     /// `None` until the first probe lands.
     pub(crate) action: Option<Action>,
@@ -112,12 +115,7 @@ fn due(at: Option<Instant>, every: Duration) -> bool {
 }
 
 impl GitSync {
-    pub fn new(
-        ws: Workspace,
-        chat: Entity<Chat>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> Self {
+    pub fn new(ws: Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (kick, kicked) = smol::channel::unbounded();
         let repos = ws
             .repos
@@ -129,22 +127,15 @@ impl GitSync {
                 pr: None,
             })
             .collect();
-        let _subs = vec![
-            cx.observe(&chat, |_, _, cx| cx.notify()), // working toggles enable/disable the button
-            cx.subscribe(&chat, |s, _, ev, cx| {
-                if let crate::chat::ChatEvent::TurnDone = ev {
-                    s.kick(false, true, cx); // the agent may have committed, pushed or opened a PR
-                }
-            }),
-            cx.observe_window_activation(window, |s, window, cx| {
-                if window.is_window_active() {
-                    s.kick(due(s.fetched, FETCH_ON_FOCUS), true, cx);
-                }
-            }),
-        ];
+        let _subs = vec![cx.observe_window_activation(window, |s, window, cx| {
+            if window.is_window_active() {
+                s.kick(due(s.fetched, FETCH_ON_FOCUS), true, cx);
+            }
+        })];
         GitSync {
             ws,
-            chat,
+            chats: vec![],
+            chat: None,
             repos,
             action: None,
             running: None,
@@ -291,8 +282,46 @@ impl GitSync {
         }
     }
 
+    // ponytail: a closed chat's two subscriptions live until the workspace closes; they hold no
+    // strong ref, so this only costs a few bytes per closed tab
+    pub fn add_chat(&mut self, chat: Entity<Chat>, cx: &mut Context<Self>) {
+        let hold = self.running.is_some();
+        chat.update(cx, |c, _| c.hold = hold);
+        self._subs.extend([
+            cx.observe(&chat, |_, _, cx| cx.notify()), // working toggles enable/disable the button
+            cx.subscribe(&chat, |s, _, ev, cx| {
+                if let crate::chat::ChatEvent::TurnDone = ev {
+                    s.kick(false, true, cx); // the agent may have committed, pushed or opened a PR
+                }
+            }),
+        ]);
+        self.chats.push(chat);
+    }
+
+    pub fn remove_chat(&mut self, chat: &Entity<Chat>, cx: &mut Context<Self>) {
+        self.chats.retain(|c| c != chat);
+        if self.chat.as_ref() == Some(chat) {
+            self.chat = None;
+        }
+        cx.notify();
+    }
+
+    pub fn set_chat(&mut self, chat: Entity<Chat>, cx: &mut Context<Self>) {
+        self.chat = Some(chat);
+        cx.notify();
+    }
+
     fn busy(&self, cx: &App) -> bool {
-        self.chat.read(cx).working()
+        self.chats.iter().any(|c| c.read(cx).working())
+    }
+
+    fn set_hold(&self, hold: bool, cx: &mut App) {
+        for c in &self.chats {
+            c.update(cx, |c, cx| {
+                c.hold = hold;
+                cx.notify(); // the composer footer says Enter queues now
+            });
+        }
     }
 
     pub fn pr_urls(&self) -> Vec<String> {
@@ -405,10 +434,7 @@ impl GitSync {
 
     fn exec(&mut self, a: Action, check: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.running = Some(a.label.clone());
-        self.chat.update(cx, |c, cx| {
-            c.hold = true;
-            cx.notify(); // the composer footer says Enter queues now
-        });
+        self.set_hold(true, cx);
         cx.notify();
         let ws = self.ws.clone();
         let snapshot: Vec<_> = self.repos.iter().map(|r| r.pr.clone()).collect();
@@ -462,13 +488,12 @@ impl GitSync {
                 .await;
             this.update_in(cx, |s, window, cx| {
                 s.running = None;
-                s.chat.update(cx, |c, cx| {
-                    c.hold = false;
-                    cx.notify();
-                });
+                s.set_hold(false, cx);
                 match result {
                     Ok((_, Outcome::Ask(prompt))) => {
-                        if !s.chat.update(cx, |c, cx| c.ask(&prompt, window, cx)) {
+                        let asked = (s.chat.clone())
+                            .is_some_and(|c| c.update(cx, |c, cx| c.ask(&prompt, window, cx)));
+                        if !asked {
                             notify_err(
                                 window,
                                 cx,
@@ -483,7 +508,9 @@ impl GitSync {
                     Err(e) => notify_err(window, cx, e),
                 }
                 // Messages queued during the step go now, unless the step's prompt went first.
-                s.chat.update(cx, |c, cx| c.drain(cx));
+                for c in s.chats.clone() {
+                    c.update(cx, |c, cx| c.drain(cx));
+                }
                 s.kick(true, true, cx); // the step may have moved the branch on GitHub
                 cx.notify();
             })

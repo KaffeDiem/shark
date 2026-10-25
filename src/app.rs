@@ -2,7 +2,7 @@
 use crate::chat::{Chat, ChatEvent, MODELS};
 use crate::editor::{EditorEvent, FileEditor};
 use crate::files::{self, Row};
-use crate::state::{Repo, State, Workspace, workspaces_dir};
+use crate::state::{ChatMeta, Repo, State, Workspace, workspaces_dir};
 use crate::sync::{GitSync, SyncEvent};
 use crate::*;
 use gpui_kit::assets::IconName;
@@ -292,7 +292,10 @@ pub struct Shark {
     pub(crate) state: State,
     sel: usize,
     pub(crate) active: Option<String>,
+    /// By chat id; created when a chat is first shown.
     pub(crate) chats: HashMap<String, Entity<Chat>>,
+    /// Chats whose turn ended while another chat was shown.
+    unread: HashSet<String>,
     tab: Tab,
     diff: Entity<DiffState>,
     /// Changed files in tree order, with each patch's fingerprint.
@@ -360,6 +363,24 @@ const COMMANDS: &[(&str, IconName, Cmd)] = &[
     ("Show chat", IconName::MessageSquare, |s, w, cx| {
         s.show(Tab::Chat, w, cx)
     }),
+    ("New chat", IconName::Plus, |s, w, cx| s.new_chat(w, cx)),
+    ("Close chat", IconName::X, |s, w, cx| s.close_chat(w, cx)),
+    (
+        "Reopen closed chat…",
+        IconName::ArchiveRestore,
+        |s, w, cx| s.pick_closed_chat(w, cx),
+    ),
+    ("Next chat", IconName::ChevronRight, |s, w, cx| {
+        s.cycle_chat(1, w, cx)
+    }),
+    ("Previous chat", IconName::ChevronLeft, |s, w, cx| {
+        s.cycle_chat(-1, w, cx)
+    }),
+    (
+        "Ask a side question",
+        IconName::MessageCircleQuestionMark,
+        |s, w, cx| s.open_side(w, cx),
+    ),
     ("Show diff", IconName::FileDiff, |s, w, cx| {
         s.show(Tab::Diff, w, cx)
     }),
@@ -438,6 +459,7 @@ impl Shark {
             sel: 0,
             active: None,
             chats: HashMap::new(),
+            unread: HashSet::new(),
             tab: Tab::Chat,
             diff: cx.new(|cx| DiffState::new(vec![], cx)),
             diff_files: vec![],
@@ -467,8 +489,240 @@ impl Shark {
         window.push_notification(Notification::error(e), cx);
     }
 
+    fn active_ws(&self) -> Option<&Workspace> {
+        let name = self.active.as_ref()?;
+        self.state.workspaces.iter().find(|w| &w.name == name)
+    }
+
+    fn active_ws_mut(&mut self) -> Option<&mut Workspace> {
+        let name = self.active.clone()?;
+        self.state.workspaces.iter_mut().find(|w| w.name == name)
+    }
+
     fn active_chat(&self) -> Option<&Entity<Chat>> {
-        self.chats.get(self.active.as_ref()?)
+        let ws = self.active_ws()?;
+        self.chats.get(&ws.chats.get(ws.active_chat)?.id)
+    }
+
+    /// The chat entity for `meta`, started (transcript replayed) on first use.
+    fn ensure_chat(
+        &mut self,
+        ws: &Workspace,
+        meta: &ChatMeta,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Entity<Chat> {
+        if let Some(chat) = self.chats.get(&meta.id) {
+            return chat.clone();
+        }
+        let chat = cx.new(|cx| Chat::new(ws.clone(), meta.clone(), window, cx));
+        let (id, name) = (meta.id.clone(), ws.name.clone());
+        // Busy also flips without a ChatEvent (background tasks, turns the CLI starts itself).
+        self._subs.push(cx.observe(&chat, |_, _, cx| cx.notify()));
+        self._subs.push(
+            cx.subscribe(&chat, move |this, chat, ev: &ChatEvent, cx| match ev {
+                ChatEvent::Meta => this.save_meta(&chat, cx),
+                ChatEvent::TurnDone => {
+                    if this.active.as_ref() == Some(&name) {
+                        this.refresh_diff(cx);
+                    }
+                    if this.active_chat() != Some(&chat) {
+                        this.unread.insert(id.clone());
+                    }
+                    cx.notify();
+                }
+            }),
+        );
+        if let Some(sync) = self.syncs.get(&ws.name) {
+            sync.update(cx, |g, cx| g.add_chat(chat.clone(), cx));
+        }
+        self.chats.insert(meta.id.clone(), chat.clone());
+        self.save_meta(&chat, cx); // replay may have found a title
+        chat
+    }
+
+    fn save_meta(&mut self, chat: &Entity<Chat>, cx: &mut Context<Self>) {
+        let meta = chat.read(cx).meta.clone();
+        let slot = (self.state.workspaces.iter_mut())
+            .flat_map(|w| w.chats.iter_mut())
+            .find(|c| c.id == meta.id);
+        if let Some(slot) = slot
+            && *slot != meta
+        {
+            *slot = meta;
+            self.state.save();
+        }
+    }
+
+    /// Shows the workspace's `ix`th chat tab.
+    fn select_chat(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.active_ws_mut() else {
+            return;
+        };
+        let Some(meta) = ws.chats.get(ix).cloned() else {
+            return;
+        };
+        if ws.active_chat != ix {
+            ws.active_chat = ix;
+            self.state.save();
+        }
+        let ws = self.active_ws().cloned().unwrap();
+        let chat = self.ensure_chat(&ws, &meta, window, cx);
+        self.unread.remove(&meta.id);
+        if let Some(sync) = self.syncs.get(&ws.name) {
+            sync.update(cx, |g, cx| g.set_chat(chat.clone(), cx));
+        }
+        if self.tab == Tab::Diff {
+            self.tab = Tab::Chat;
+        }
+        chat.update(cx, |c, cx| c.focus_composer(window, cx));
+        cx.notify();
+    }
+
+    fn cycle_chat(&mut self, d: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ws) = self.active_ws() {
+            let n = ws.chats.len() as isize;
+            let ix = (ws.active_chat as isize + d).rem_euclid(n) as usize;
+            self.select_chat(ix, window, cx);
+        }
+    }
+
+    /// cmd-t: a new tab right of the current one, on the current chat's model.
+    fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let model = self
+            .active_chat()
+            .and_then(|c| c.read(cx).meta.model.clone());
+        let Some(ws) = self.active_ws_mut() else {
+            return Self::notify_err(window, cx, "Open a workspace first");
+        };
+        let meta = ChatMeta {
+            id: ws.next_chat_id(),
+            model,
+            ..Default::default()
+        };
+        let at = ws.active_chat + 1;
+        ws.chats.insert(at, meta);
+        self.state.save();
+        self.select_chat(at, window, cx);
+    }
+
+    /// cmd-w: closes the shown chat, asking first if it's running. The last tab gives way to a
+    /// fresh one, so a workspace always has a chat.
+    fn close_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self.active_chat().cloned() else {
+            return;
+        };
+        if !chat.read(cx).working() {
+            return self.close_chat_now(window, cx);
+        }
+        let shark = cx.entity().downgrade();
+        let title = chat.read(cx).title();
+        window.open_alert_dialog(cx, move |d, _, _| {
+            let shark = shark.clone();
+            d.font_features(inter_features())
+                .title(format!("Stop and close “{title}”?"))
+                .description("The agent is still running in this chat. Closing stops it; cmd-shift-t reopens the chat.")
+                .ok_text("Stop and close")
+                .ok_variant(ButtonVariant::Danger)
+                .show_cancel(true)
+                .on_ok(move |_, window, cx| {
+                    shark.update(cx, |s, cx| s.close_chat_now(window, cx)).ok();
+                    true
+                })
+        });
+    }
+
+    fn close_chat_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.active_ws_mut() else {
+            return;
+        };
+        let ix = ws.active_chat;
+        let meta = ws.chats.remove(ix);
+        if ws.chats.is_empty() {
+            let id = ws.next_chat_id();
+            ws.chats.push(ChatMeta {
+                id,
+                model: meta.model.clone(),
+                ..Default::default()
+            });
+        }
+        ws.active_chat = ix.min(ws.chats.len() - 1);
+        let next = ws.active_chat;
+        let (name, untouched) = (ws.name.clone(), meta.session_id.is_none());
+        // An empty chat isn't worth reopening.
+        if !untouched {
+            ws.closed.push(meta.clone());
+        }
+        // ponytail: keeps the 20 newest closed chats; a closed-chats browser can lift this
+        let drop = ws.closed.len().saturating_sub(20);
+        let evicted: Vec<ChatMeta> = ws.closed.drain(..drop).collect();
+        self.state.save();
+        for m in evicted.iter().chain(untouched.then_some(&meta)) {
+            let _ = std::fs::remove_file(crate::agent::transcript_path(&m.id));
+        }
+        self.unread.remove(&meta.id);
+        if let Some(chat) = self.chats.remove(&meta.id)
+            && let Some(sync) = self.syncs.get(&name)
+        {
+            sync.update(cx, |g, cx| g.remove_chat(&chat, cx)); // the last ref; dropping stops claude
+        }
+        self.select_chat(next, window, cx);
+    }
+
+    /// cmd-shift-t: brings back the most recently closed chat, or a picked one.
+    fn reopen_chat(&mut self, pick: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.active_ws_mut() else {
+            return Self::notify_err(window, cx, "Open a workspace first");
+        };
+        let Some(ix) = pick.or(ws.closed.len().checked_sub(1)) else {
+            return Self::notify_err(window, cx, "No closed chats in this workspace");
+        };
+        let meta = ws.closed.remove(ix);
+        let at = ws.active_chat + 1;
+        ws.chats.insert(at, meta);
+        self.state.save();
+        self.select_chat(at, window, cx);
+    }
+
+    fn pick_closed_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.active_ws() else {
+            return Self::notify_err(window, cx, "Open a workspace first");
+        };
+        if ws.closed.is_empty() {
+            return Self::notify_err(window, cx, "No closed chats in this workspace");
+        }
+        // Newest first.
+        let n = ws.closed.len();
+        let items = (ws.closed.iter().rev())
+            .map(|c| {
+                let title = if c.title.is_empty() {
+                    "Untitled chat"
+                } else {
+                    &c.title
+                };
+                CommandItem::new()
+                    .label(title.to_string())
+                    .icon(IconName::MessageSquare)
+            })
+            .collect();
+        self.open_menu(
+            items,
+            0,
+            move |s, row, w, cx| s.reopen_chat(Some(n - 1 - row), w, cx),
+            window,
+            cx,
+        );
+    }
+
+    fn open_side(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self.active_chat().cloned() else {
+            return Self::notify_err(window, cx, "Open a workspace first");
+        };
+        if self.tab == Tab::Diff {
+            self.tab = Tab::Chat;
+        }
+        chat.update(cx, |c, cx| c.open_side(window, cx));
+        cx.notify();
     }
 
     fn active_sync(&self) -> Option<&Entity<GitSync>> {
@@ -513,34 +767,8 @@ impl Shark {
             self.tree_sel = 0;
         }
         self.sel = ix;
-        if !self.chats.contains_key(&ws.name) {
-            let chat = cx.new(|cx| Chat::new(ws.clone(), window, cx));
-            let name = ws.name.clone();
-            // Busy also flips without a ChatEvent (background tasks, turns the CLI starts itself).
-            self._subs.push(cx.observe(&chat, |_, _, cx| cx.notify()));
-            self._subs.push(
-                cx.subscribe(&chat, move |this, _, ev: &ChatEvent, cx| match ev {
-                    ChatEvent::SessionId(id) => {
-                        if let Some(w) = this.state.workspaces.iter_mut().find(|w| w.name == name) {
-                            w.session_id = Some(id.clone());
-                            this.state.save();
-                        }
-                    }
-                    ChatEvent::Model(model) => {
-                        if let Some(w) = this.state.workspaces.iter_mut().find(|w| w.name == name) {
-                            w.model = model.clone();
-                            this.state.save();
-                        }
-                    }
-                    ChatEvent::TurnDone => {
-                        if this.active.as_ref() == Some(&name) {
-                            this.refresh_diff(cx);
-                        }
-                        cx.notify();
-                    }
-                }),
-            );
-            let sync = cx.new(|cx| GitSync::new(ws.clone(), chat.clone(), window, cx));
+        if !self.syncs.contains_key(&ws.name) {
+            let sync = cx.new(|cx| GitSync::new(ws.clone(), window, cx));
             let name = ws.name.clone();
             self._subs.push(cx.subscribe_in(
                 &sync,
@@ -549,7 +777,6 @@ impl Shark {
                     SyncEvent::Archive => this.remove_workspace(&name, false, window, cx),
                 },
             ));
-            self.chats.insert(ws.name.clone(), chat);
             self.syncs.insert(ws.name.clone(), sync);
         }
         for (name, sync) in &self.syncs {
@@ -559,9 +786,7 @@ impl Shark {
         self.active = Some(ws.name);
         self.refresh_diff(cx);
         self.show(Tab::Chat, window, cx);
-        if let Some(chat) = self.active_chat().cloned() {
-            chat.update(cx, |c, cx| c.focus_composer(window, cx));
-        }
+        self.select_chat(ws.active_chat, window, cx);
     }
 
     fn show(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
@@ -639,11 +864,6 @@ impl Shark {
             }
         });
         cx.notify();
-    }
-
-    fn active_ws(&self) -> Option<&Workspace> {
-        let name = self.active.as_ref()?;
-        self.state.workspaces.iter().find(|w| &w.name == name)
     }
 
     fn viewed(&self, ix: usize) -> Viewed {
@@ -1150,8 +1370,8 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.chats.get(&name).is_some_and(|c| c.read(cx).working()) {
-            return Self::notify_err(window, cx, "Agent is running; stop it first (ctrl-c)");
+        if self.running_chats(&name, cx) > 0 {
+            return Self::notify_err(window, cx, "An agent is running; stop it first (ctrl-c)");
         }
         if !force {
             return self.remove_workspace(&name, false, window, cx);
@@ -1203,12 +1423,15 @@ impl Shark {
         };
         match git::remove_workspace(&ws, &ws.dir(), force) {
             Ok(()) => {
-                self.chats.remove(name);
+                // A later workspace with the same name must not replay or resume these chats.
+                for c in ws.chats.iter().chain(&ws.closed) {
+                    self.chats.remove(&c.id);
+                    self.unread.remove(&c.id);
+                    let _ = std::fs::remove_file(crate::agent::transcript_path(&c.id));
+                }
                 self.syncs.remove(name);
                 self.state.workspaces.retain(|w| w.name != name);
                 self.state.save();
-                // A later workspace with the same name must not replay or resume this conversation.
-                let _ = std::fs::remove_file(crate::agent::transcript_path(name));
                 if self.active.as_deref() == Some(name) {
                     self.active = None;
                     self.drop_editor();
@@ -1246,6 +1469,16 @@ impl Shark {
             self.show(Tab::Chat, window, cx);
             chat.update(cx, |c, cx| c.focus_queue(window, cx));
         }
+    }
+
+    /// How many of a workspace's chats have something going on.
+    fn running_chats(&self, ws: &str, cx: &App) -> usize {
+        let Some(ws) = self.state.workspaces.iter().find(|w| w.name == ws) else {
+            return 0;
+        };
+        (ws.chats.iter())
+            .filter(|c| self.chats.get(&c.id).is_some_and(|c| c.read(cx).working()))
+            .count()
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
@@ -1405,10 +1638,8 @@ impl Shark {
                 })
         });
         let workspaces = self.state.workspaces.iter().enumerate().map(|(ix, w)| {
-            let busy = self
-                .chats
-                .get(&w.name)
-                .is_some_and(|c| c.read(cx).working());
+            let running = self.running_chats(&w.name, cx);
+            let busy = running > 0;
             let selected = ix == self.sel;
             let active = self.active.as_ref() == Some(&w.name);
             let ws = w.clone();
@@ -1466,13 +1697,16 @@ impl Shark {
                                     .truncate()
                                     .text_xs()
                                     .text_color(theme.muted_foreground)
-                                    .child(
-                                        w.repos
-                                            .iter()
+                                    .child({
+                                        let repos = (w.repos.iter())
                                             .map(|r| r.name.as_str())
                                             .collect::<Vec<_>>()
-                                            .join(" · "),
-                                    ),
+                                            .join(" · ");
+                                        match running {
+                                            0 | 1 => repos,
+                                            n => format!("{n} chats running · {repos}"),
+                                        }
+                                    }),
                             ),
                     )
                 })
@@ -1529,6 +1763,7 @@ impl Shark {
     }
 
     fn render_main(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let chat_tabs = self.render_chat_tabs(cx);
         let theme = cx.theme();
         let Some(chat) = self.active_chat().cloned() else {
             let key = |k: &str| Kbd::new(Keystroke::parse(k).unwrap());
@@ -1624,7 +1859,7 @@ impl Shark {
                             .tooltip("Toggle sidebar (cmd-b)")
                             .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
                     )
-                    .child(tab("Chat".into(), IconName::MessageSquare, Tab::Chat))
+                    .children(chat_tabs)
                     .child(tab(
                         match viewed {
                             0 => format!("Diff · {}", self.diff_files.len()),
@@ -1692,6 +1927,100 @@ impl Shark {
                     .into_any_element(),
             })
             .into_any_element()
+    }
+
+    /// One pill per chat, like the Diff and file tabs; a single chat reads "Chat" as before.
+    fn render_chat_tabs(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(ws) = self.active_ws() else {
+            return vec![];
+        };
+        let theme = cx.theme();
+        let many = ws.chats.len() > 1;
+        let mut tabs: Vec<AnyElement> = (ws.chats.iter().enumerate())
+            .map(|(ix, meta)| {
+                let chat = self.chats.get(&meta.id).map(|c| c.read(cx));
+                let on = ix == ws.active_chat && self.tab == Tab::Chat;
+                let current = ix == ws.active_chat;
+                let label: SharedString = match (many, chat) {
+                    (false, _) => "Chat".into(),
+                    (true, Some(c)) => c.title(),
+                    (true, None) if meta.title.is_empty() => "New chat".into(),
+                    (true, None) => meta.title.clone().into(),
+                };
+                let icon = match (
+                    chat.is_some_and(|c| c.working()),
+                    self.unread.contains(&meta.id),
+                ) {
+                    (true, _) => Spinner::new()
+                        .icon(IconName::LoaderCircle)
+                        .color(theme.primary)
+                        .with_size(px(14.))
+                        .into_any_element(),
+                    (false, unread) => div()
+                        .relative()
+                        .child(Icon::new(IconName::MessageSquare).with_size(px(14.)))
+                        // A finished turn you haven't looked at yet.
+                        .when(unread, |d| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .top(px(-2.))
+                                    .right(px(-2.))
+                                    .size(px(6.))
+                                    .rounded_full()
+                                    .bg(theme.primary),
+                            )
+                        })
+                        .into_any_element(),
+                };
+                h_flex()
+                    .id(SharedString::from(format!("chat-tab-{}", meta.id)))
+                    .h(px(26.))
+                    .pl_2p5()
+                    .when(!(many && current), |d| d.pr_2p5())
+                    .when(many && current, |d| d.pr_1())
+                    .gap_1p5()
+                    .rounded_full()
+                    .text_sm()
+                    .text_color(if on {
+                        theme.foreground
+                    } else {
+                        theme.muted_foreground
+                    })
+                    .when(on, |d| d.bg(theme.secondary))
+                    .hover(|d| d.text_color(theme.foreground))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.select_chat(ix, window, cx);
+                        this.show(Tab::Chat, window, cx);
+                    }))
+                    .child(icon)
+                    .child(div().max_w(px(180.)).truncate().child(label))
+                    .when(many && current, |d| {
+                        d.child(
+                            Button::new("close-chat")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::X)
+                                .tooltip("Close chat (cmd-w)")
+                                .on_click(cx.listener(|this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.close_chat(window, cx)
+                                })),
+                        )
+                    })
+                    .into_any_element()
+            })
+            .collect();
+        tabs.push(
+            Button::new("new-chat")
+                .ghost()
+                .xsmall()
+                .icon(IconName::Plus)
+                .tooltip("New chat (cmd-t)")
+                .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx)))
+                .into_any_element(),
+        );
+        tabs
     }
 
     fn render_diff(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2170,6 +2499,12 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &StopAgent, _, cx| this.stop(cx)))
             .on_action(cx.listener(|this, _: &FocusQueue, w, cx| this.focus_queue(w, cx)))
             .on_action(cx.listener(|this, _: &ShowChat, w, cx| this.show(Tab::Chat, w, cx)))
+            .on_action(cx.listener(|this, _: &NewChat, w, cx| this.new_chat(w, cx)))
+            .on_action(cx.listener(|this, _: &CloseChat, w, cx| this.close_chat(w, cx)))
+            .on_action(cx.listener(|this, _: &ReopenChat, w, cx| this.reopen_chat(None, w, cx)))
+            .on_action(cx.listener(|this, _: &NextChat, w, cx| this.cycle_chat(1, w, cx)))
+            .on_action(cx.listener(|this, _: &PrevChat, w, cx| this.cycle_chat(-1, w, cx)))
+            .on_action(cx.listener(|this, _: &OpenSide, w, cx| this.open_side(w, cx)))
             .on_action(cx.listener(|this, _: &ShowDiff, w, cx| this.show(Tab::Diff, w, cx)))
             .on_action(cx.listener(|this, _: &CreatePrs, w, cx| this.create_prs(w, cx)))
             .on_action(cx.listener(|this, _: &OpenPrs, w, cx| this.open_prs(w, cx)))
@@ -2560,12 +2895,54 @@ mod ui_tests {
         let chat = cx.update(|cx| shark.read(cx).chats["ui-x"].clone());
         cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
 
+        // Chat tabs: cmd-t opens one next to the current chat, ctrl-tab cycles, cmd-w closes,
+        // cmd-shift-t brings back a closed chat that had a session.
+        let tabs = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let ws = &shark.read(cx).state.workspaces[0];
+                let ids: Vec<String> = ws.chats.iter().map(|c| c.id.clone()).collect();
+                (ids, ws.active_chat, ws.closed.len())
+            })
+        };
+        press(cx, &["cmd-t"]);
+        assert_eq!(tabs(cx), (vec!["ui-x".into(), "ui-x~2".into()], 1, 0));
+        press(cx, &["ctrl-tab"]);
+        assert_eq!(tabs(cx).1, 0);
+        cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
+        press(cx, &["ctrl-tab"]);
+        let second = cx.update(|cx| shark.read(cx).chats["ui-x~2"].clone());
+        cx.update(|cx| {
+            second.update(cx, |c, cx| {
+                c.meta.session_id = Some("s2".into());
+                cx.emit(ChatEvent::Meta);
+            })
+        });
+        press(cx, &["cmd-w"]);
+        assert_eq!(tabs(cx), (vec!["ui-x".into()], 0, 1));
+        cx.update(|cx| assert!(!shark.read(cx).chats.contains_key("ui-x~2")));
+        press(cx, &["cmd-shift-t"]);
+        assert_eq!(tabs(cx), (vec!["ui-x".into(), "ui-x~2".into()], 1, 0));
+        cx.update(|cx| {
+            let ws = &shark.read(cx).state.workspaces[0];
+            assert_eq!(
+                ws.chats[1].session_id.as_deref(),
+                Some("s2"),
+                "reopens the session"
+            );
+        });
+        press(cx, &["cmd-t"]);
+        press(cx, &["cmd-w"]); // an untouched chat isn't kept for reopening
+        assert_eq!(tabs(cx), (vec!["ui-x".into(), "ui-x~2".into()], 1, 0));
+        press(cx, &["cmd-w"]);
+        assert_eq!(tabs(cx), (vec!["ui-x".into()], 0, 1));
+        cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
+
         // Model shortcuts work while typing and keep the draft. Let the New workspace
         // dialog's deferred focus restore run first (it targets the sidebar), then go back.
         cx.executor().advance_clock(Duration::from_secs(1));
         press(cx, &["ctrl-w", "l", "i"]);
         let model = |cx: &mut TestAppContext| {
-            cx.update(|cx| shark.read(cx).state.workspaces[0].model.clone())
+            cx.update(|cx| shark.read(cx).state.workspaces[0].chats[0].model.clone())
         };
         press(cx, &["ctrl-cmd-3"]);
         assert_eq!(model(cx).as_deref(), Some("opus"));
