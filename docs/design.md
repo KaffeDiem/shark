@@ -73,7 +73,7 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 - **Sidebar row:** 28px tall, `mx_2 mb_1 px_2 gap_2` (the 4px gap keeps hover and selection backgrounds apart), `rounded(theme.radius)`, `text_sm`. Order: status icon (14px), name (`flex_1`, truncated), optional badge, metadata (`text_xs`, `muted_foreground`). Sidebar width 244px.
   - Workspace rows are 44px with two lines: the name, then its repos (`text_xs`, `muted_foreground`, `api · web`), so you can see where an agent works without opening it.
 - **Sidebar rail:** `cmd-b` shrinks the sidebar to 48px icons with tooltips; opening a file does it automatically and closing the file undoes it unless the user toggled it. The header then pads left to clear the traffic lights.
-- **File tree:** 260px column on the right of the Diff and file views, `Files` header with "n/m viewed", 28px rows indented 12px per level, then the `v` checkbox. Folders first; single-child folders are joined.
+- **File tree:** 260px column on the right of the Diff and file views, `Files` header with "n/m viewed", 28px rows indented 12px per level, then the `v` checkbox (a folder's box is ticked when all its files are viewed and toggles them all). Folders first; single-child folders are joined.
 - **Context menus:** right-click on sidebar rows (`.context_menu(..)`, gpui-kit `PopupMenu`). Follow the Apple HIG:
   - A disabled label first that says what the menu acts on (branch, or repo + path).
   - At most three groups: open/reveal (`Reveal in Finder`, `Open in Terminal`, `Copy Path`, one submenu each with "Workspace folder" plus one row per repo, every row showing its `~/…` path), then git (`Open Pull Requests`, hidden when there are none), then destructive (`Archive`, `Force Archive…`) last.

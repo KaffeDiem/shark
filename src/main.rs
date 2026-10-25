@@ -73,6 +73,11 @@ actions!(
 #[action(namespace = shark, no_json)]
 pub struct SetModel(pub usize);
 
+/// Open the nth sidebar workspace (cmd-1 is the top one).
+#[derive(Clone, PartialEq, Debug, serde::Deserialize, Action)]
+#[action(namespace = shark, no_json)]
+pub struct OpenWorkspace(pub usize);
+
 /// Apps launched from Finder get a minimal PATH; borrow the login shell's so claude/gh/git resolve.
 fn fix_path() {
     let shell = std::env::var("SHELL").unwrap_or("/bin/zsh".into());
@@ -156,6 +161,9 @@ fn bind_keys(cx: &mut App) {
             KeyBinding::new(&format!("space m {}", i + 1), SetModel(i), Some(NAV)),
         ]
     }));
+    cx.bind_keys(
+        (0..9).map(|i| KeyBinding::new(&format!("cmd-{}", i + 1), OpenWorkspace(i), None)),
+    );
     // The Diff component's scroll actions are private; bind vim keys to them by name.
     let diff = Rc::new(KeyBindingContextPredicate::parse("Diff").unwrap());
     let vim = [
