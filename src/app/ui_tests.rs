@@ -130,6 +130,15 @@ fn open(cx: &mut TestAppContext, options: WindowOptions) -> (AnyWindowHandle, En
 }
 
 /// `on(cx, f)` runs `f` on the app, then lets it settle.
+/// Presses `keys` in `window`, then lets what they started finish.
+fn press_in(window: AnyWindowHandle) -> impl Fn(&mut TestAppContext, &[&str]) {
+    move |cx, keys| {
+        cx.update_window(window, |_, w, cx| keys.iter().for_each(|k| w.press(k, cx)))
+            .unwrap();
+        cx.run_until_parked();
+    }
+}
+
 fn on_app(
     window: AnyWindowHandle,
     shark: Entity<Shark>,
@@ -231,11 +240,7 @@ async fn vim_setting_and_palette_target(cx: &mut TestAppContext) {
         })
         .await;
     }
-    let press = |cx: &mut TestAppContext, keys: &[&str]| {
-        cx.update_window(window, |_, w, cx| keys.iter().for_each(|k| w.press(k, cx)))
-            .unwrap();
-        cx.run_until_parked();
-    };
+    let press = press_in(window);
     let sel = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).sel.clone());
     press(cx, &["escape", "cmd-alt-left"]);
     cx.update_window(window, |_, w, cx| {
@@ -706,7 +711,9 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
 
     // Clicking a repo in the sidebar starts a workspace with only that repo ticked.
     let on = on_app(window, shark.clone());
-    on(cx, &|s, w, cx| s.new_workspace(vec!["web".into()], w, cx));
+    on(cx, &|s, w, cx| {
+        s.new_workspace(vec!["web".into()], None, w, cx)
+    });
     cx.update_window(window, |_, w, cx| w.input("only web", cx))
         .unwrap();
     press(cx, &["enter"]);
@@ -1460,7 +1467,6 @@ async fn perf_large_change(cx: &mut TestAppContext) {
     );
     fs::remove_dir_all(&home).ok();
 }
-
 /// Open in an app: terminals take the workspace folder, Fork asks which repo, Xcode shows
 /// only where a repo has a project and opens it. Through cmd-k and the right-click menu.
 #[gpui_kit::test]
@@ -1494,11 +1500,7 @@ async fn open_in_apps(cx: &mut TestAppContext) {
         .await;
     }
     let ws_dir = home.join("shark/workspaces/both");
-    let press = |cx: &mut TestAppContext, keys: &[&str]| {
-        cx.update_window(window, |_, w, cx| keys.iter().for_each(|k| w.press(k, cx)))
-            .unwrap();
-        cx.run_until_parked();
-    };
+    let press = press_in(window);
     let run = |cx: &mut TestAppContext, query: &str| {
         press(cx, &["cmd-k"]);
         cx.update_window(window, |_, w, cx| w.input(query, cx)).unwrap();
@@ -1573,5 +1575,411 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     press(cx, &["escape"]);
     run(cx, "open in fork");
     assert_eq!(last(), Some(("Fork".into(), home.join("shark/workspaces/web-only/web"))));
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Home shows while nothing is open; cmd-0 toggles it over a workspace, esc and opening a
+/// workspace leave it, the arrows and enter open a row, and a relaunch comes back to it.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn home_navigation(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos(&home, &["api"]),
+            last_repos: vec!["api".into()],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    cx.run_until_parked();
+    let press = press_in(window);
+    let shown = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).home_shown());
+    let active = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).active.clone());
+    assert!(shown(cx), "nothing open: Home");
+    cx.update_window(window, |_, w, cx| {
+        let s = shark.read(cx);
+        assert!(
+            s.home.prompt.read(cx).focus_handle(cx).is_focused(w),
+            "the prompt has focus"
+        );
+    })
+    .unwrap();
+    // tab switches the prompt to Ask Shark and back.
+    press(cx, &["tab"]);
+    cx.update(|cx| assert!(shark.read(cx).home.asking));
+    press(cx, &["tab"]);
+    cx.update(|cx| assert!(!shark.read(cx).home.asking));
+    // enter opens the New workspace dialog with the text as the first message.
+    cx.update_window(window, |_, w, cx| w.input("add a login page", cx))
+        .unwrap();
+    press(cx, &["enter"]);
+    cx.update_window(window, |_, w, cx| {
+        assert!(w.has_active_dialog(cx), "enter opens New workspace");
+        w.close_dialog(cx);
+    })
+    .unwrap();
+
+    let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
+    let on = on_app(window, shark.clone());
+    for name in ["one", "two"] {
+        on(cx, &|s, w, cx| {
+            s.create_workspace(name.into(), repos.clone(), None, w, cx)
+        });
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).active.as_deref() == Some(name)
+        })
+        .await;
+    }
+    assert!(!shown(cx), "opening a workspace leaves Home");
+    press(cx, &["cmd-0"]);
+    assert!(shown(cx));
+    assert_eq!(State::load().last_open, Some(("two".into(), "home".into())));
+    press(cx, &["cmd-0"]);
+    assert!(!shown(cx), "cmd-0 toggles back");
+    assert_eq!(active(cx).as_deref(), Some("two"));
+    press(cx, &["cmd-0"]);
+    press(cx, &["escape"]);
+    assert!(!shown(cx), "esc goes back to the workspace");
+
+    press(cx, &["cmd-0"]);
+    cx.update_window(window, |_, w, cx| {
+        assert!(
+            shark.read(cx).home.focus.is_focused(w),
+            "the list has focus"
+        )
+    })
+    .unwrap();
+    let sel = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).home.sel.clone());
+    assert_eq!(
+        sel(cx).as_deref(),
+        Some("two"),
+        "the cursor starts on the workspace just left"
+    );
+    press(cx, &["up"]);
+    assert_eq!(sel(cx).as_deref(), Some("one"));
+    // The palette gives focus back to what had it when it opened, here a closed select's
+    // popover that is gone by then; keys land on the list instead.
+    let gone = cx.update(|cx| cx.focus_handle());
+    on(cx, &|s, w, cx| {
+        gone.focus(w, cx);
+        s.toggle_palette(w, cx);
+    });
+    cx.update_window(window, |_, w, cx| assert!(w.has_active_dialog(cx)))
+        .unwrap();
+    press(cx, &["escape"]);
+    cx.executor().advance_clock(Duration::from_secs(1)); // the dialog's deferred restore
+    cx.run_until_parked();
+    press(cx, &["down"]);
+    assert_eq!(sel(cx).as_deref(), Some("two"), "the list has the keys");
+    press(cx, &["up"]);
+    press(cx, &["enter"]);
+    assert_eq!(active(cx).as_deref(), Some("one"));
+    assert!(!shown(cx));
+
+    // A relaunch restores Home over the workspace it was shown over.
+    press(cx, &["cmd-0"]);
+    let (window2, shark2) = open(cx, WindowOptions::default());
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let s = shark2.read(cx);
+        assert!(s.home.on && s.active.as_deref() == Some("one"));
+    });
+    cx.update_window(window2, |_, w, _| w.remove_window())
+        .unwrap();
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Points `SHARK_CLAUDE` at another script until dropped, then back. Take it after UI_LOCK,
+/// so it drops (and restores) first.
+struct ClaudeGuard(Option<std::ffi::OsString>);
+
+impl ClaudeGuard {
+    fn set(path: &std::path::Path) -> Self {
+        let old = std::env::var_os("SHARK_CLAUDE");
+        // SAFETY: tests that start claude hold UI_LOCK.
+        unsafe { std::env::set_var("SHARK_CLAUDE", path) };
+        ClaudeGuard(old)
+    }
+}
+
+impl Drop for ClaudeGuard {
+    fn drop(&mut self) {
+        // SAFETY: as in `set`; the lock is still held.
+        unsafe {
+            match &self.0 {
+                Some(v) => std::env::set_var("SHARK_CLAUDE", v),
+                None => std::env::remove_var("SHARK_CLAUDE"),
+            }
+        }
+    }
+}
+
+/// A claude that never answers: a reply from a real thread would trip the deterministic
+/// scheduler. It writes its arguments next to itself.
+fn quiet_claude() -> PathBuf {
+    let quiet = crate::chat::ui_tests::fake_claude().with_file_name("quiet-claude");
+    fs::write(
+        &quiet,
+        "#!/bin/sh\necho \"$*\" > \"$0.args\"\nexec cat >/dev/null\n",
+    )
+    .unwrap();
+    std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(&quiet)
+        .status()
+        .unwrap();
+    quiet
+}
+
+/// Ask Shark: tab, a question, enter; the answer streams in as markdown, and esc stops one
+/// still being written. claude here is a script that never answers: a reply from a real
+/// thread would trip the deterministic scheduler, so the test plays it in (the process round
+/// trip is `chat::ui_tests::ask_process`).
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn home_ask_shark(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    cx.run_until_parked();
+    let press = press_in(window);
+    press(cx, &["tab"]);
+    cx.update_window(window, |_, w, cx| w.input("how do I open PRs?", cx))
+        .unwrap();
+    let _ = fs::remove_file(quiet.with_extension("args"));
+    press(cx, &["enter"]);
+    // The script writes them from its own process: nothing to wait on but the file.
+    let args = (0..100)
+        .find_map(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            fs::read_to_string(quiet.with_extension("args")).ok()
+        })
+        .expect("claude started");
+    assert!(
+        args.contains("--model haiku") && args.contains("# Shortcuts"),
+        "{args}"
+    );
+    assert!(
+        args.contains("cmd-n: New workspace…"),
+        "the live keymap: {args}"
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, _, cx| {
+        let ask = s.home.ask.as_ref().unwrap();
+        assert_eq!(ask.question, "how do I open PRs?");
+        assert!(!ask.done && ask.agent.is_some(), "asking");
+        assert_eq!(
+            s.home.prompt.read(cx).value().as_ref(),
+            "",
+            "the box is cleared"
+        );
+        s.apply_ask(crate::agent::Ev::TextDelta("Forty".into()), cx);
+        s.apply_ask(crate::agent::Ev::Text("Forty-two".into()), cx);
+        s.apply_ask(
+            crate::agent::Ev::Result {
+                is_error: false,
+                text: String::new(),
+                cost: 0.,
+                secs: 0,
+            },
+            cx,
+        );
+        let ask = s.home.ask.as_ref().unwrap();
+        assert_eq!(
+            (ask.text.as_str(), &ask.error, ask.done),
+            ("Forty-two", &None, true)
+        );
+    });
+
+    on(cx, &|s, w, cx| {
+        s.ask("again?".into(), w, cx);
+        assert!(s.home.ask.as_ref().is_some_and(|a| !a.done));
+        s.home_escape(w, cx);
+        let ask = s.home.ask.as_ref().unwrap();
+        assert!(ask.done && ask.agent.is_none(), "esc stops it");
+    });
+    assert!(
+        cx.update(|cx| shark.read(cx).home_shown()),
+        "and stays on Home"
+    );
+
+    // claude's error streams in as the answer too; it shows once, and a login one says how.
+    on(cx, &|s, w, cx| {
+        s.ask("again?".into(), w, cx);
+        let msg = "Invalid API key · Please run /login";
+        s.apply_ask(crate::agent::Ev::Text(msg.into()), cx);
+        s.apply_ask(
+            crate::agent::Ev::Result {
+                is_error: true,
+                text: msg.into(),
+                cost: 0.,
+                secs: 0,
+            },
+            cx,
+        );
+        let ask = s.home.ask.as_ref().unwrap();
+        assert_eq!(ask.text, "", "not also as the answer");
+        assert_eq!(
+            ask.error.as_deref(),
+            Some("claude isn't logged in: run `claude` in a terminal and log in")
+        );
+    });
+}
+
+/// The prompt's text survives a cancelled New workspace dialog and clears once the workspace
+/// is made from it. Chat keys on Home act on the chat and show it (cmd-w, with no chat shown,
+/// does nothing), and a turn's end re-reads what the workspace waits on.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn home_prompt_and_chat_keys(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos(&home, &["api"]),
+            last_repos: vec!["api".into()],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    cx.run_until_parked();
+    let press = press_in(window);
+    let text = |cx: &mut TestAppContext| {
+        cx.update(|cx| shark.read(cx).home.prompt.read(cx).value().to_string())
+    };
+    cx.update_window(window, |_, w, cx| w.input("add a login page", cx))
+        .unwrap();
+    press(cx, &["enter"]);
+    cx.update_window(window, |_, w, cx| w.close_dialog(cx))
+        .unwrap();
+    assert_eq!(text(cx), "add a login page", "cancelled: kept");
+
+    let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace(
+            "one".into(),
+            repos.clone(),
+            Some("add a login page".into()),
+            w,
+            cx,
+        )
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    assert_eq!(text(cx), "", "made from it: cleared");
+
+    let chats = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let s = shark.read(cx);
+            (s.home_shown(), s.active_ws().unwrap().chats.len())
+        })
+    };
+    press(cx, &["cmd-0"]);
+    assert_eq!(chats(cx), (true, 1));
+    press(cx, &["cmd-w"]);
+    assert_eq!(chats(cx), (true, 1), "cmd-w on Home: nothing to close");
+    press(cx, &["cmd-t"]);
+    assert_eq!(chats(cx), (false, 2), "cmd-t shows the new chat");
+
+    let chat = cx.update(|cx| shark.read(cx).active_chat().cloned().unwrap());
+    let id = cx.update(|cx| chat.read(cx).meta.id.clone());
+    let path = crate::agent::transcript_path(&id);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    let said = |t: &str| {
+        format!(
+            "{}\n{}\n",
+            serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}}),
+            serde_json::json!({"type": "result", "is_error": false, "result": t}),
+        )
+    };
+    let waiting = |cx: &mut TestAppContext, said: String| {
+        let mut f = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut f, said.as_bytes()).unwrap();
+        cx.update(|cx| chat.update(cx, |_, cx| cx.emit(crate::chat::ChatEvent::TurnDone)));
+        cx.run_until_parked();
+        cx.update(|cx| shark.read(cx).home.waiting.get("one").copied())
+    };
+    assert_eq!(
+        waiting(cx, said("Shall I push it?")),
+        Some(crate::agent::QUESTION)
+    );
+    assert_eq!(
+        waiting(cx, said("Pushed.")),
+        None,
+        "re-read once it changed"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Get started ticks itself off and hides once all done, or when dismissed.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn home_checklist(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos(&home, &["api"]),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    cx.run_until_parked();
+    let done = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let s = shark.read(cx);
+            let items = s.checklist(cx).map(|(_, d)| d);
+            (items, s.checklist_open(&s.checklist(cx)))
+        })
+    };
+    assert_eq!(done(cx), ([false, true, false, false, false], true));
+    let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace("ws".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let plan = crate::plan::tests_store_path("ws");
+    fs::create_dir_all(plan.parent().unwrap()).unwrap();
+    fs::write(
+        &plan,
+        r##"{"versions":[{"id":"t1","text":"# Plan"}],"approved":0}"##,
+    )
+    .unwrap();
+    on(cx, &|s, w, cx| {
+        s.deps = vec![crate::deps::Dep {
+            name: "git",
+            ok: true,
+            fix: "",
+            detail: String::new(),
+        }];
+        s.state.opened_pr = true;
+        s.enter_home(w, cx);
+    });
+    assert_eq!(done(cx), ([true; 5], false), "all done: hidden");
+
+    on(cx, &|s, _, _| s.state.opened_pr = false);
+    assert!(done(cx).1);
+    on(cx, &|s, _, _| s.state.home_checklist_dismissed = true);
+    assert!(!done(cx).1, "dismissed");
     fs::remove_dir_all(&home).ok();
 }

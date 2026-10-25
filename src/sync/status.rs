@@ -761,12 +761,13 @@ pub fn github_url(remote: &str) -> Option<String> {
     Some(format!("https://github.com/{path}"))
 }
 
-/// `8s ago`, `2m ago`, `3h ago`.
+/// `8s ago`, `2m ago`, `3h ago`, `2d ago`.
 pub fn ago(d: std::time::Duration) -> String {
     match d.as_secs() {
         s @ 0..60 => format!("{s}s ago"),
         s @ 60..3600 => format!("{}m ago", s / 60),
-        s => format!("{}h ago", s / 3600),
+        s @ 3600..86400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86400),
     }
 }
 
@@ -784,6 +785,7 @@ mod tests {
         assert_eq!(super::ago(Duration::from_secs(8)), "8s ago");
         assert_eq!(super::ago(Duration::from_secs(150)), "2m ago");
         assert_eq!(super::ago(Duration::from_secs(7300)), "2h ago");
+        assert_eq!(super::ago(Duration::from_secs(200_000)), "2d ago");
         assert!(super::diverged(
             "git pull: fatal: Not possible to fast-forward, aborting."
         ));

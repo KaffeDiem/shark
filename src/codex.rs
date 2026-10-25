@@ -54,7 +54,7 @@ pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receive
     }
     let (agent, rx) = agent::start(
         cmd,
-        ws,
+        &ws.dir(),
         &chat.id,
         Some(agent::transcript_path(&chat.id)),
         Some(st),

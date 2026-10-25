@@ -11,7 +11,16 @@ pub fn run(dir: &Path, prog: &str, args: &[&str]) -> Result<Output, String> {
         .current_dir(dir)
         .args(args)
         .output()
-        .map_err(|e| format!("{prog}: {e}"))
+        .map_err(|e| spawn_err(dir, prog, e))
+}
+
+/// A missing program reads better than `git: No such file or directory`. `dir` is checked
+/// because a missing working directory fails the same way.
+pub(crate) fn spawn_err(dir: &Path, prog: &str, e: std::io::Error) -> String {
+    match e.kind() == std::io::ErrorKind::NotFound && dir.is_dir() {
+        true => format!("{prog} not found on PATH"),
+        false => format!("{prog}: {e}"),
+    }
 }
 
 fn finish(prog: &str, args: &[&str], out: Output) -> Result<String, String> {
@@ -42,16 +51,44 @@ pub fn cmd_bounded(dir: &Path, prog: &str, args: &[&str], secs: u64) -> Result<S
             "ssh -o BatchMode=yes -o ConnectTimeout=15",
         );
     }
+    c.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GH_PROMPT_DISABLED", "1");
+    wait_bounded(c, dir, prog, args, secs, false)
+}
+
+/// Runs `c` like `cmd_bounded`. With `group` it gets its own session (and process group), all
+/// of which a timeout kills: a shell's children would otherwise hold stdout open and the waiter
+/// with it. A session, not just a group: an interactive shell in a background group of the
+/// terminal Shark was started from stops on SIGTTOU.
+pub fn wait_bounded(
+    mut c: Command,
+    dir: &Path,
+    prog: &str,
+    args: &[&str],
+    secs: u64,
+    group: bool,
+) -> Result<String, String> {
+    if group {
+        unsafe extern "C" {
+            fn setsid() -> i32;
+        }
+        // SAFETY: setsid is async-signal-safe; it fails only for a group leader, which a
+        // freshly forked child isn't.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(&mut c, || {
+                setsid();
+                Ok(())
+            })
+        };
+    }
     let child = c
         .current_dir(dir)
         .args(args)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GH_PROMPT_DISABLED", "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .map_err(|e| format!("{prog}: {e}"))?;
+        .map_err(|e| spawn_err(dir, prog, e))?;
     let pid = child.id();
     let (tx, rx) = std::sync::mpsc::channel();
     // wait_with_output drains both pipes, so a big gh response can't fill one and deadlock.
@@ -59,7 +96,11 @@ pub fn cmd_bounded(dir: &Path, prog: &str, args: &[&str], secs: u64) -> Result<S
     match rx.recv_timeout(Duration::from_secs(secs)) {
         Ok(out) => finish(prog, args, out.map_err(|e| format!("{prog}: {e}"))?),
         Err(_) => {
-            term(pid); // the waiting thread reaps it
+            // The waiting thread reaps it. An interactive shell ignores TERM.
+            match group {
+                true => kill("-KILL", &format!("-{pid}")),
+                false => term(pid),
+            }
             Err(format!(
                 "{prog} {}: timed out after {secs}s",
                 args.join(" ")
@@ -74,9 +115,11 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 pub fn term(pid: u32) {
-    let _ = Command::new("kill")
-        .args(["-TERM", &pid.to_string()])
-        .status();
+    kill("-TERM", &pid.to_string())
+}
+
+fn kill(sig: &str, target: &str) {
+    let _ = Command::new("kill").args([sig, "--", target]).status();
 }
 
 /// Uncommitted changes; `Err` when `git status` fails.
@@ -98,7 +141,13 @@ fn worktree_list(src: &Path) -> Result<Vec<(String, Vec<String>)>, String> {
 }
 
 pub fn add_repo(path: &Path, existing: &[Repo]) -> Result<Repo, String> {
-    let root = PathBuf::from(git(path, &["rev-parse", "--show-toplevel"])?);
+    let root = git(path, &["rev-parse", "--show-toplevel"]).map_err(|e| {
+        match !path.is_dir() || e.contains("not a git repository") {
+            true => format!("Not a git repository: {}", path.display()),
+            false => e,
+        }
+    })?;
+    let root = PathBuf::from(root);
     let name = root.file_name().unwrap().to_string_lossy().to_string();
     if existing.iter().any(|r| r.name == name) {
         return Err(format!("a repo named `{name}` is already added"));
@@ -583,6 +632,32 @@ pub fn combined_diff(ws: &Workspace, dir: &Path) -> Result<String, String> {
 mod tests {
     use super::*;
 
+    /// A timeout kills the whole group: a background child holding stdout open dies too.
+    #[test]
+    fn group_timeout_kills_grandchildren() {
+        let pidfile = std::env::temp_dir().join(format!("shark-grp-{}", std::process::id()));
+        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
+        let started = std::time::Instant::now();
+        let c = Command::new("sh");
+        let e = wait_bounded(c, Path::new("/"), "sh", &["-c", &script], 1, true).unwrap_err();
+        assert!(
+            e.contains("timed out") && started.elapsed().as_secs() < 5,
+            "{e}"
+        );
+        let pid = fs::read_to_string(&pidfile).unwrap();
+        // Killed at once, but `kill -0` sees it until launchd reaps the orphan.
+        let alive = || {
+            let s = Command::new("kill").args(["-0", pid.trim()]).status();
+            s.unwrap().success()
+        };
+        let reaped = (0..40).any(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            !alive()
+        });
+        assert!(reaped, "sleep {pid} outlived the timeout");
+        fs::remove_file(&pidfile).ok();
+    }
+
     fn init_repo(root: &Path, name: &str) -> Repo {
         let p = root.join("src").join(name);
         fs::create_dir_all(&p).unwrap();
@@ -712,6 +787,17 @@ mod tests {
             .is_ok()
         );
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn readable_add_repo_errors() {
+        let dir = std::env::temp_dir().join(format!("shark-test-norepo-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let e = add_repo(&dir, &[]).err().unwrap();
+        assert_eq!(e, format!("Not a git repository: {}", dir.display()));
+        let e = run(&dir, "shark-no-such-prog", &[]).unwrap_err();
+        assert_eq!(e, "shark-no-such-prog not found on PATH");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

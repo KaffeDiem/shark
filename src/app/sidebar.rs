@@ -589,7 +589,9 @@ impl Shark {
                 })
                 .on_click({
                     let name = name.clone();
-                    cx.listener(move |this, _, w, cx| this.new_workspace(vec![name.clone()], w, cx))
+                    cx.listener(move |this, _, w, cx| {
+                        this.new_workspace(vec![name.clone()], None, w, cx)
+                    })
                 })
                 .on_mouse_down(
                     MouseButton::Right,
@@ -601,7 +603,7 @@ impl Shark {
                                 IconName::Plus,
                                 "New workspace…",
                                 on_shark(cx, move |s, w, cx| {
-                                    s.new_workspace(picked.clone(), w, cx)
+                                    s.new_workspace(picked.clone(), None, w, cx)
                                 }),
                             ),
                             Entry::Sep,
@@ -899,7 +901,8 @@ impl Shark {
                 )
             })
             .on_mouse_down(MouseButton::Right, new_section_menu());
-        // Mirrors the Workspaces header: hover shows +, right-click offers the same.
+        // Like the Workspaces header, but the + stays visible (dimmed) so a second repo is
+        // findable; right-click offers the same.
         let repo_header = h_flex()
             .id("repo-header")
             .group("repo-header")
@@ -910,8 +913,8 @@ impl Shark {
                 d.child(
                     div()
                         .mr_3()
-                        .invisible()
-                        .group_hover("repo-header", |s| s.visible())
+                        .opacity(0.5)
+                        .group_hover("repo-header", |s| s.opacity(1.))
                         .child(
                             Button::new("add-repo")
                                 .ghost()
@@ -982,6 +985,7 @@ impl Shark {
                     .flex_none()
                     .window_control_area(WindowControlArea::Drag),
             )
+            .child(self.render_home_row(rail, cx))
             .child(
                 // Children are indexed by `move_sel`: the header, then one per `side_rows` row.
                 v_flex()
@@ -994,7 +998,12 @@ impl Shark {
                     .children(items)
                     .when(
                         self.state.workspaces.is_empty() && self.state.sections.is_empty(),
-                        |d| d.child(hint("cmd-n to create")),
+                        |d| {
+                            d.child(hint(match self.state.repos.is_empty() {
+                                true => "Add a repo first",
+                                false => "cmd-n to create",
+                            }))
+                        },
                     )
                     .child(repo_header)
                     .children(repos)

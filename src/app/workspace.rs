@@ -19,12 +19,13 @@ impl NewWorkspaceForm {
     fn new(
         mut repos: Vec<Repo>,
         last: &[String],
+        first: Option<String>,
         shark: WeakEntity<Shark>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let branch = cx
-            .new(|cx| InputState::new(window, cx).placeholder("branch, e.g. kasper/eng-123-login"));
+            .new(|cx| InputState::new(window, cx).placeholder("branch, e.g. you/eng-123-login"));
         // Branch names can't contain spaces; turn them into dashes as you type.
         let _sub = cx.subscribe_in(&branch, window, |_, input, ev: &InputEvent, window, cx| {
             if let InputEvent::Change = ev {
@@ -33,6 +34,7 @@ impl NewWorkspaceForm {
                     let fixed = value.replace(' ', "-");
                     input.update(cx, |i, cx| i.set_value(fixed, window, cx));
                 }
+                cx.notify(); // the worktree path line
             }
         });
         let only = repos.len() == 1;
@@ -42,7 +44,9 @@ impl NewWorkspaceForm {
         NewWorkspaceForm {
             branch,
             prompt: cx.new(|cx| {
-                InputState::new(window, cx).placeholder("First message to the agent (optional)")
+                InputState::new(window, cx)
+                    .placeholder("First message to the agent (optional)")
+                    .default_value(first.unwrap_or_default())
             }),
             picker: cx.new(|cx| CommandState::new(window, cx)),
             repos,
@@ -150,6 +154,16 @@ impl Render for NewWorkspaceForm {
                 }
             }))
             .child(Input::new(&self.branch))
+            .child({
+                // As `create_workspace` names it.
+                let name = self.branch.read(cx).value().trim().replace('/', "-");
+                let dir = workspaces_dir().join(if name.is_empty() { "<name>" } else { &name });
+                div()
+                    .text_xs()
+                    .text_color(faint)
+                    .truncate()
+                    .child(format!("Worktrees go in {}", super::menus::tilde(&dir)))
+            })
             .child(
                 h_flex()
                     .text_xs()
@@ -252,6 +266,7 @@ impl Shark {
                 window,
                 move |this, _, ev: &SyncEvent, window, cx| match ev {
                     SyncEvent::Archive => this.remove_workspace(&name, false, window, cx),
+                    SyncEvent::PrsCreated => this.state.mark(|s| &mut s.opened_pr),
                 },
             ));
             self.syncs.insert(ws.name.clone(), sync);
@@ -303,9 +318,11 @@ impl Shark {
     }
 
     /// `picked` repos start ticked: the last-used ones, or the repo clicked in the sidebar.
+    /// `first` fills in the first message (Home's prompt box).
     pub(super) fn new_workspace(
         &mut self,
         picked: Vec<String>,
+        first: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -314,7 +331,7 @@ impl Shark {
         }
         let shark = cx.entity().downgrade();
         let repos = self.state.repos.clone();
-        let form = cx.new(|cx| NewWorkspaceForm::new(repos, &picked, shark, window, cx));
+        let form = cx.new(|cx| NewWorkspaceForm::new(repos, &picked, first, shark, window, cx));
         let input = form.read(cx).branch.clone();
         window.open_dialog(cx, move |d, _, _| {
             let f = form.clone();
@@ -340,14 +357,18 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         let name = branch.replace('/', "-");
+        // Nothing is saved this run, so the worktrees would be orphaned on restart.
+        if self.state.read_only {
+            return notify_err(window, cx, "Can't create workspaces: state.json couldn't be read");
+        }
         if self.state.workspaces.iter().any(|w| w.name == name) {
             return notify_err(window, cx, format!("workspace `{name}` already exists"));
         }
         self.state.last_repos = repos.iter().map(|r| r.name.clone()).collect();
         self.state.save();
-        window.push_notification(format!("Creating {name}…"), cx);
+        let dir = workspaces_dir().join(&name);
+        window.push_notification(format!("Creating {}…", tilde(&dir)), cx);
         cx.spawn_in(window, async move |this, cx| {
-            let dir = workspaces_dir().join(&name);
             let result = cx
                 .background_executor()
                 .spawn(async move { git::create_workspace(&dir, &name, &branch, &repos) })
@@ -358,6 +379,7 @@ impl Shark {
                     s.state.workspaces.push(ws);
                     s.state.save();
                     s.open_workspace(s.state.workspaces.len() - 1, window, cx);
+                    s.home_prompt_used(prompt.as_deref(), window, cx);
                     if let Some(p) = prompt
                         && s.active.as_ref() == Some(&name)
                         && let Some(chat) = s.active_chat().cloned()
@@ -373,22 +395,27 @@ impl Shark {
     }
 
     /// Launch: reopen the workspace and tab that were open at quit.
+    /// Nothing to reopen, or Home was shown at quit: Home.
     pub(super) fn restore_last_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some((name, tab)) = self.state.last_open.clone() else {
-            return;
-        };
-        let Some(ix) = self.state.workspaces.iter().position(|w| w.name == name) else {
-            return;
+        let last = self.state.last_open.clone();
+        let ix = last
+            .as_ref()
+            .and_then(|(name, _)| self.state.workspaces.iter().position(|w| &w.name == name));
+        let Some((ix, (_, tab))) = ix.zip(last) else {
+            return self.enter_home(window, cx);
         };
         self.open_workspace_now(ix, window, cx);
-        if tab == "diff" {
-            self.show(Tab::Diff, window, cx);
+        match tab.as_str() {
+            "diff" => self.show(Tab::Diff, window, cx),
+            "home" => self.enter_home(window, cx),
+            _ => {}
         }
     }
 
     /// Remembers the open workspace and tab in state.json, for the next launch.
     pub(super) fn remember_open(&mut self) {
         let tab = match self.tab {
+            _ if self.home.on => "home",
             Tab::Diff => "diff",
             Tab::Chat | Tab::File => "chat",
         };
@@ -529,6 +556,9 @@ impl Shark {
     pub(super) fn target(&self, window: &Window) -> Option<Workspace> {
         let name = match (self.sidebar_focus.is_focused(window), self.sel) {
             (true, SideRow::Ws(ix)) => self.state.workspaces.get(ix)?.name.clone(),
+            // A heading or repo row is under the cursor: not the open workspace (cmd-backspace).
+            (true, _) => return None,
+            _ if self.home.focus.is_focused(window) => self.home.sel.clone()?,
             _ => self.active.clone()?,
         };
         self.ws(&name).cloned()
@@ -657,6 +687,7 @@ impl Shark {
                     }
                 }
                 self.syncs.remove(name);
+                self.attn.forget(name);
                 self.state.workspaces.retain(|w| w.name != name);
                 for s in &mut self.state.sections {
                     s.workspaces.retain(|w| w != name);

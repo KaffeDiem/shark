@@ -16,7 +16,8 @@ pub struct State {
     /// Repo names picked for the last new workspace; the next dialog starts with them.
     #[serde(default)]
     pub last_repos: Vec<String>,
-    /// The workspace and tab (`chat`/`diff`) open at quit; restored on launch.
+    /// The workspace and tab (`chat`/`diff`, or `home` while Home was shown over it) open at
+    /// quit; restored on launch.
     #[serde(default)]
     pub last_open: Option<(String, String)>,
     #[serde(default)]
@@ -30,6 +31,27 @@ pub struct State {
     /// Keep the Mac from idle-sleeping while an agent works (`Shark::update_awake`).
     #[serde(default)]
     pub stay_awake: bool,
+    /// Where `load` moved an unreadable state.json, for the launch notice.
+    #[serde(skip)]
+    pub corrupt_backup: Option<PathBuf>,
+    /// state.json couldn't be read or moved aside: `save` leaves it alone this run.
+    #[serde(skip)]
+    pub read_only: bool,
+    /// Create PRs succeeded at least once; the Home checklist ticks it off.
+    #[serde(default)]
+    pub opened_pr: bool,
+    /// A plan was approved at least once; the Home checklist ticks it off.
+    #[serde(default)]
+    pub approved_plan: bool,
+    /// The Home "Get started" checklist was dismissed.
+    #[serde(default)]
+    pub home_checklist_dismissed: bool,
+    /// The palette was opened at least once; Home stops pointing at cmd-k.
+    #[serde(default)]
+    pub palette_used: bool,
+    /// The app version Home last told the user about; empty before the first launch.
+    #[serde(default)]
+    pub last_seen_version: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -277,15 +299,38 @@ fn set_list_at(path: &Path, key: &str, ws: &str, ids: &[String]) {
 
 impl State {
     pub fn load() -> State {
-        let path = state_file();
-        let Ok(bytes) = fs::read(&path) else {
-            return State::default();
+        Self::load_at(&state_file())
+    }
+
+    fn load_at(path: &Path) -> State {
+        let bytes = match fs::read(path) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return State::default(),
+            // Saving would replace a file we never read.
+            Err(_) => {
+                return State {
+                    read_only: true,
+                    ..State::default()
+                };
+            }
         };
         let mut state: State = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
-            // keep the unreadable file instead of overwriting it on the next save
-            let _ = fs::rename(&path, path.with_extension("json.bak"));
-            eprintln!("state.json unreadable ({e}), moved to state.json.bak");
-            State::default()
+            // Keep the unreadable file instead of overwriting it on the next save; numbered so
+            // a later corruption doesn't replace an earlier backup.
+            let bak = (0..)
+                .map(|n| path.with_extension(format!("json.bak-{n}")))
+                .find(|p| !p.exists())
+                .unwrap();
+            let moved = fs::rename(path, &bak);
+            eprintln!(
+                "state.json unreadable ({e}), moved to {}: {moved:?}",
+                bak.display()
+            );
+            State {
+                read_only: moved.is_err(),
+                corrupt_backup: moved.ok().map(|_| bak),
+                ..State::default()
+            }
         });
         state.workspaces.iter_mut().for_each(Workspace::migrate);
         state
@@ -335,11 +380,21 @@ impl State {
         }
     }
 
+    /// Sets a once-only flag, saving only when that changes it.
+    pub fn mark(&mut self, flag: impl FnOnce(&mut State) -> &mut bool) {
+        if !std::mem::replace(flag(self), true) {
+            self.save()
+        }
+    }
+
     pub fn save(&self) {
         self.save_at(&state_file())
     }
 
     fn save_at(&self, path: &Path) {
+        if self.read_only {
+            return;
+        }
         let mut v = serde_json::to_value(self).unwrap();
         let mut old = read(path);
         for key in [REVIEWED, MERGE_ORDER, DELETE_REMOTE] {
@@ -355,6 +410,49 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn corrupt_state_is_kept() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("shark-corrupt-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let baks = || {
+            let mut v: Vec<String> = (fs::read_dir(&dir).unwrap())
+                .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+                .filter(|n| n.starts_with("state.json.bak-"))
+                .collect();
+            v.sort();
+            v
+        };
+        fs::write(&path, "{ first").unwrap();
+        let st = State::load_at(&path);
+        let first = st.corrupt_backup.clone().unwrap();
+        assert!(!st.read_only && !path.exists());
+        assert_eq!(baks().len(), 1);
+        st.save_at(&path);
+        assert!(path.exists(), "a moved-aside file is saved over");
+
+        // Same second: the first backup stays.
+        fs::write(&path, "{ second").unwrap();
+        let second = State::load_at(&path).corrupt_backup.unwrap();
+        assert_ne!(first, second);
+        assert_eq!(fs::read_to_string(&first).unwrap(), "{ first");
+        assert_eq!(fs::read_to_string(&second).unwrap(), "{ second");
+
+        // Can't move it aside: nothing saves over it this run.
+        fs::write(&path, "{ third").unwrap();
+        let mode = |m| fs::set_permissions(&dir, fs::Permissions::from_mode(m)).unwrap();
+        mode(0o555);
+        let st = State::load_at(&path);
+        mode(0o755);
+        assert!(st.read_only && st.corrupt_backup.is_none());
+        st.save_at(&path);
+        assert_eq!(fs::read_to_string(&path).unwrap(), "{ third");
+        assert_eq!(baks().len(), 2);
+        fs::remove_dir_all(&dir).ok();
+    }
 
     #[test]
     fn reviewed_ids_survive_saves() {

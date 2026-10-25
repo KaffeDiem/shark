@@ -99,7 +99,7 @@ pub(super) const COMMANDS: &[Row] = &[
         IconName::Plus,
         Some(&NewWorkspace),
         "create branch",
-        |s, w, cx| s.new_workspace(s.state.last_repos.clone(), w, cx),
+        |s, w, cx| s.new_workspace(s.state.last_repos.clone(), None, w, cx),
     ),
     Row(
         "Open next workspace needing attention",
@@ -491,6 +491,20 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| s.with_section(w, cx, Shark::delete_section),
     ),
     Row(
+        "Go to Home",
+        IconName::House,
+        Some(&ToggleHome),
+        "start overview dashboard",
+        |s, w, cx| s.enter_home(w, cx),
+    ),
+    Row(
+        "Hide Get started",
+        IconName::CircleCheck,
+        None,
+        "checklist onboarding dismiss home",
+        |s, _, cx| s.dismiss_checklist(cx),
+    ),
+    Row(
         "Toggle sidebar",
         IconName::PanelLeft,
         Some(&ToggleSidebar),
@@ -527,6 +541,14 @@ pub(super) const COMMANDS: &[Row] = &[
     ),
 ];
 
+/// Rows that act on a workspace; left out while there's none to act on.
+const NEED_WORKSPACE: &[&str] = &[
+    "Add repo to workspace…",
+    "Archive workspace",
+    "Force archive workspace…",
+    "Reveal in Finder",
+];
+
 /// Rows that only a Claude chat can do; a Codex chat's palette leaves them out.
 const CLAUDE_ONLY: &[&str] = &["Ask a side question"];
 const CODEX_ONLY: &[&str] = &["Toggle fast mode"];
@@ -539,7 +561,7 @@ const GROUPS: &[(&str, &str)] = &[
     ("Files and diff", "Open file…"),
     ("Git", "Run next git step"),
     ("Sections", "New section"),
-    ("View", "Toggle sidebar"),
+    ("View", "Go to Home"),
     ("Shark", "Settings"),
 ];
 
@@ -558,6 +580,16 @@ fn shortcut(action: &dyn Action, window: &Window) -> Option<Keystroke> {
             [k] => Some(k.as_keystroke().clone()),
             _ => None,
         })
+}
+
+/// Each command with a shortcut from where `window` is focused, as (label, keystroke) like
+/// ("New workspace…", "cmd-n"): the live keymap for Home and Ask Shark.
+pub(crate) fn keymap_summary(window: &Window) -> Vec<(String, String)> {
+    (COMMANDS.iter())
+        .filter_map(|Row(label, _, action, ..)| {
+            Some((label.to_string(), shortcut((*action)?, window)?.unparse()))
+        })
+        .collect()
 }
 
 /// A palette row: icon and label, with the shortcut right-aligned in the muted colour.
@@ -650,6 +682,7 @@ impl Shark {
     }
 
     pub(super) fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.state.mark(|s| &mut s.palette_used);
         // Sidebar order with folded sections opened; cmd-n counts the shown rows only.
         let order = self.ws_order(true);
         let shown = self.ws_order(false);
@@ -658,6 +691,7 @@ impl Shark {
         let mut rows = vec![];
         // Xcode only where there's a project; the rest open the folder or ask which repo.
         let target = self.target(window);
+        let no_target = target.is_none();
         let mut apps: Vec<_> = (apps::installed().iter())
             .filter(|a| {
                 a.kind != Kind::Xcode
@@ -669,7 +703,9 @@ impl Shark {
             if let Some((heading, _)) = GROUPS.iter().find(|(_, first)| first == label) {
                 groups.push((Some(heading), vec![]));
             }
-            if (if codex { CLAUDE_ONLY } else { CODEX_ONLY }).contains(label) {
+            if (if codex { CLAUDE_ONLY } else { CODEX_ONLY }).contains(label)
+                || (no_target && NEED_WORKSPACE.contains(label))
+            {
                 continue;
             }
             rows.push(Pick::Cmd(ix));
@@ -721,7 +757,7 @@ mod tests {
         for (heading, first) in GROUPS {
             assert!(COMMANDS.iter().any(|r| r.0 == *first), "{heading}: no row {first}");
         }
-        for label in CLAUDE_ONLY.iter().chain(CODEX_ONLY) {
+        for label in CLAUDE_ONLY.iter().chain(CODEX_ONLY).chain(NEED_WORKSPACE) {
             assert!(COMMANDS.iter().any(|r| r.0 == *label), "no row {label}");
         }
     }

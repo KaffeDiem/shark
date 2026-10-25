@@ -151,7 +151,8 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
             IconName::Archive,
             "Archive",
             on_shark(cx, move |s, w, cx| s.archive_ws(n2.clone(), false, w, cx)),
-        ),
+        )
+        .hint("⌘⌫"),
         menu::item(
             IconName::ArchiveX,
             "Force archive…",

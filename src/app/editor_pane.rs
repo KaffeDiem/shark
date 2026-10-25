@@ -262,11 +262,7 @@ impl Shark {
                         )
                     })
                     .child(
-                        Button::new("close-file")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::X)
-                            .tooltip("Close file (cmd-w)")
+                        crate::settings::close_button("close-file", "Close file (cmd-w)")
                             .on_click(cx.listener(|this, _, w, cx| this.close_file(w, cx))),
                     ),
             )

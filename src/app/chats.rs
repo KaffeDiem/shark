@@ -32,8 +32,12 @@ impl Shark {
         });
         let (id, name) = (meta.id.clone(), ws.name.clone());
         // Busy also flips without a ChatEvent (background tasks, turns the CLI starts itself).
-        self._subs.push(cx.observe(&chat, |this, _, cx| {
+        self._subs.push(cx.observe(&chat, |this, chat, cx| {
             this.update_awake(cx);
+            // Home's "Approve a plan": approving notifies the chat.
+            if !this.state.approved_plan && chat.read(cx).plan.read(cx).approved.is_some() {
+                this.state.mark(|s| &mut s.approved_plan);
+            }
             cx.notify()
         }));
         self._subs.push(
@@ -46,6 +50,7 @@ impl Shark {
                     if this.active_chat() != Some(&chat) {
                         this.unread.insert(id.clone());
                     }
+                    this.refresh_home(Some(&name), cx);
                     this.turn_done(&name, cx);
                     cx.notify();
                 }
@@ -96,6 +101,11 @@ impl Shark {
         if self.tab == Tab::Diff {
             self.tab = Tab::Chat;
         }
+        // cmd-t, cmd-shift-t, next/prev chat on Home: show the chat they acted on.
+        if self.home.on {
+            self.home.on = false;
+            self.remember_open();
+        }
         chat.update(cx, |c, cx| c.focus_composer(window, cx));
         cx.notify();
     }
@@ -131,6 +141,10 @@ impl Shark {
     /// cmd-w: closes the shown chat, asking first if it's running. The last tab gives way to a
     /// fresh one, so a workspace always has a chat.
     pub(super) fn close_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        // The chat isn't on screen.
+        if self.home_shown() {
+            return;
+        }
         let Some(chat) = self.active_chat().cloned() else {
             return;
         };
@@ -282,7 +296,9 @@ impl Shark {
     }
 
     pub(super) fn stop(&mut self, cx: &mut Context<Self>) {
-        if let Some(chat) = self.active_chat() {
+        if self.home_shown() {
+            self.cancel_ask(cx); // ctrl-c on Home stops Ask Shark, not the chat behind it
+        } else if let Some(chat) = self.active_chat() {
             chat.update(cx, |c, cx| c.stop(cx));
         }
     }
@@ -304,7 +320,7 @@ impl Shark {
         let Some(chat) = self.active_chat().cloned() else {
             return notify_err(window, cx, "Open a workspace first");
         };
-        if self.tab != Tab::Chat {
+        if self.tab != Tab::Chat || self.home.on {
             self.show(Tab::Chat, window, cx);
         }
         chat.update(cx, |c, cx| f(c, window, cx));
@@ -464,11 +480,7 @@ impl Shark {
                     .child(div().max_w(px(180.)).truncate().child(label))
                     .when(many && current, |d| {
                         d.child(
-                            Button::new("close-chat")
-                                .ghost()
-                                .xsmall()
-                                .icon(IconName::X)
-                                .tooltip("Close chat (cmd-w)")
+                            crate::settings::close_button("close-chat", "Close chat (cmd-w)")
                                 .on_click(cx.listener(|this, _, window, cx| {
                                     cx.stop_propagation();
                                     this.close_chat(window, cx)

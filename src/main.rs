@@ -7,6 +7,7 @@ mod codex;
 #[cfg(test)]
 mod codex_live;
 mod complete;
+mod deps;
 mod editor;
 mod files;
 mod git;
@@ -102,6 +103,7 @@ actions!(
         SectionIcon,
         DeleteSection,
         CancelEdit,
+        ToggleHome,
     ]
 );
 
@@ -133,30 +135,19 @@ pub struct SetModel(pub usize);
 #[action(namespace = shark, no_json)]
 pub struct OpenWorkspace(pub usize);
 
-/// Apps launched from Finder get a minimal PATH; borrow the login shell's so claude/gh/git resolve.
-fn fix_path() {
-    let shell = std::env::var("SHELL").unwrap_or("/bin/zsh".into());
-    // Bounded: an rc file that blocks (pinentry, a network call) must not hang launch.
-    let probe = ["-lic", "printf '__P__%s' \"$PATH\""];
-    if let Ok(out) = git::cmd_bounded(std::path::Path::new("/"), &shell, &probe, 5)
-        && let Some(path) = out.split("__P__").nth(1)
-    {
-        // SAFETY: called first thing in main; the only other thread is cmd_bounded's waiter,
-        // which has already handed over the output and never reads the environment.
-        unsafe { std::env::set_var("PATH", path.trim()) };
-    }
-}
-
 fn bind_keys(cx: &mut App) {
     // Vim-style keys sit under `Vim`, which the root view carries while Vim mode is on
     // (Settings › General). The arrows, letters that name an action and cmd shortcuts work
     // either way. VimNormal: the editor in Vim's Normal mode.
-    const NAV: &str = "Sidebar || Transcript || DiffPane || FileTree || Queue || PlanPane || VimNormal";
-    const LIST: &str = "Sidebar || Transcript || FileTree || Queue";
+    const NAV: &str =
+        "Sidebar || Home || Transcript || DiffPane || FileTree || Queue || PlanPane || VimNormal";
+    const LIST: &str = "Sidebar || Home || Transcript || FileTree || Queue";
     // The diff's line cursor (src/app/review.rs) moves like a list. With Vim its arrows
     // scroll natively and j/k move the cursor; without, the arrows move it.
-    const MOVE: &str = "Sidebar || Transcript || FileTree || Queue || DiffPane || PlanPane";
-    const ARROWS: &str = "Sidebar || Transcript || FileTree || Queue || PlanPane || (Diff && !Vim)";
+    const MOVE: &str =
+        "Sidebar || Home || Transcript || FileTree || Queue || DiffPane || PlanPane";
+    const ARROWS: &str =
+        "Sidebar || Home || Transcript || FileTree || Queue || PlanPane || (Diff && !Vim)";
     let vim = |keys: &str, action: Box<dyn Action>, context: &str| {
         KeyBinding::load(
             keys,
@@ -174,6 +165,16 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-k", TogglePalette, None),
         KeyBinding::new("cmd-shift-p", TogglePalette, None),
         KeyBinding::new("cmd-n", NewWorkspace, None),
+        KeyBinding::new("cmd-o", AddRepo, None),
+        KeyBinding::new("cmd-0", ToggleHome, None),
+        // Home: esc goes back to the workspace (or stops an Ask Shark answer); tab switches
+        // the prompt between new workspace and Ask Shark; i/a jump from the list to it.
+        KeyBinding::new("escape", CancelEdit, Some("HomeView")),
+        KeyBinding::new("tab", SwitchField, Some("HomePrompt")),
+        KeyBinding::new("i", FocusComposer, Some("Home")),
+        KeyBinding::new("a", FocusComposer, Some("Home")),
+        // The workspace under the cursor, as in the row menu.
+        KeyBinding::new("cmd-backspace", ArchiveWorkspace, Some("Home || Sidebar")),
         // Not in the editor: Vim users leave insert mode with ctrl-c.
         KeyBinding::new("ctrl-c", StopAgent, Some("!FileEditor")),
         KeyBinding::new("cmd-alt-left", FocusLeft, None),
@@ -337,7 +338,14 @@ fn set_dock_icon() {
 }
 
 fn main() {
-    fix_path();
+    // Apps launched from Finder get a minimal PATH; borrow the login shell's so claude/gh/git
+    // resolve. The dependency check shows the error.
+    match deps::login_path() {
+        // SAFETY: first thing in main; the only other thread is cmd_bounded's waiter, which
+        // has already handed over the output and never reads the environment.
+        Ok(p) => unsafe { std::env::set_var("PATH", p) },
+        Err(e) => _ = deps::PATH_ERROR.set(e),
+    }
     // LaunchServices and the icons take a moment; the first menu shouldn't wait for them.
     std::thread::spawn(apps::installed);
     application()

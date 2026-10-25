@@ -39,6 +39,24 @@ fn store_path(chat: &str) -> PathBuf {
     support_dir().join("plans").join(format!("{chat}.json"))
 }
 
+fn load(chat: &str) -> Store {
+    std::fs::read(store_path(chat))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+/// The chat's latest plan is still waiting for the user's approval.
+pub fn unapproved(chat: &str) -> bool {
+    let s = load(chat);
+    !s.versions.is_empty() && s.approved != Some(s.versions.len() - 1)
+}
+
+/// The user approved one of the chat's plans.
+pub fn approved_any(chat: &str) -> bool {
+    load(chat).approved.is_some()
+}
+
 /// With the chat's transcript: a later chat with the same id starts with no plans.
 pub fn delete(chat: &str) {
     let _ = std::fs::remove_file(store_path(chat));
@@ -454,10 +472,7 @@ pub struct PlanPane {
 
 impl PlanPane {
     pub fn new(chat: &str, cx: &mut Context<Self>) -> Self {
-        let store: Store = std::fs::read(store_path(chat))
-            .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
+        let store = load(chat);
         let mut p = PlanPane {
             chat: chat.into(),
             shown: store.versions.len().saturating_sub(1),
