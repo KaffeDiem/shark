@@ -331,14 +331,7 @@ impl Render for Menu {
             .occlude()
             .w(window.bounds().size.width)
             .h(window.bounds().size.height)
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, _, w, cx| this.close(w, cx)),
-            )
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, _, w, cx| this.close(w, cx)),
-            )
+            .on_any_mouse_down(cx.listener(|this, _, w, cx| this.close(w, cx)))
             .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
             .child(
                 anchored()

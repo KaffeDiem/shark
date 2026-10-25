@@ -1,5 +1,6 @@
 //! Drives `claude -p` over its stream-json protocol, one long-lived process per chat.
 use crate::state::{ChatMeta, Workspace, support_dir};
+use gpui_kit::base::async_util::{Receiver, unbounded};
 use serde_json::{Value, json};
 use std::{
     borrow::Cow,
@@ -156,10 +157,7 @@ fn append(path: &Option<PathBuf>, line: &str) {
     }
 }
 
-pub fn spawn(
-    ws: &Workspace,
-    chat: &ChatMeta,
-) -> std::io::Result<(Agent, smol::channel::Receiver<Ev>)> {
+pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receiver<Ev>)> {
     let resume = chat.session_id.iter().flat_map(|id| ["--resume", id]);
     run(ws, chat, &chat.id, resume, Some(transcript_path(&chat.id)))
 }
@@ -170,10 +168,7 @@ const SIDE_PROMPT: &str = "The user is asking a quick side question about this c
 
 /// A side question: a throwaway fork of the chat's session with no tools, saved nowhere, so the
 /// chat itself never sees it. Works while the chat's own turn runs.
-pub fn spawn_side(
-    ws: &Workspace,
-    chat: &ChatMeta,
-) -> std::io::Result<(Agent, smol::channel::Receiver<Ev>)> {
+pub fn spawn_side(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receiver<Ev>)> {
     let fork = chat
         .session_id
         .iter()
@@ -201,7 +196,7 @@ fn run<'a>(
     log_name: &str,
     extra: impl IntoIterator<Item = &'a str>,
     transcript: Option<PathBuf>,
-) -> std::io::Result<(Agent, smol::channel::Receiver<Ev>)> {
+) -> std::io::Result<(Agent, Receiver<Ev>)> {
     let logs = support_dir().join("logs");
     fs::create_dir_all(&logs)?;
     fs::create_dir_all(support_dir().join("transcripts"))?;
@@ -234,7 +229,7 @@ fn run<'a>(
         .stdout(Stdio::piped())
         .stderr(File::create(&log)?) // a piped but unread stderr could block the child
         .spawn()?;
-    let (tx, rx) = smol::channel::unbounded();
+    let (tx, rx) = unbounded();
     let stdout = child.stdout.take().unwrap();
     let exited = Arc::new(AtomicBool::new(false));
     let reaped = exited.clone();
@@ -256,8 +251,8 @@ fn run<'a>(
         let status = child.wait().map(|s| s.to_string()).unwrap_or_default();
         reaped.store(true, Ordering::SeqCst);
         let err = fs::read_to_string(&log).unwrap_or_default();
-        let tail: Vec<&str> = err.lines().rev().take(5).collect();
-        let tail: Vec<&str> = tail.into_iter().rev().collect();
+        let lines: Vec<&str> = err.lines().collect();
+        let tail = &lines[lines.len().saturating_sub(5)..];
         let _ = tx.send_blocking(Ev::Exited(
             format!("claude exited ({status}) {}", tail.join("\n"))
                 .trim()
@@ -286,12 +281,9 @@ impl Agent {
 
     /// SIGTERM ends the turn and background tasks; the next send respawns with `--resume`.
     pub fn stop(&self) {
-        if self.exited.load(Ordering::SeqCst) {
-            return;
+        if !self.exited.load(Ordering::SeqCst) {
+            crate::git::term(self.pid);
         }
-        let _ = Command::new("kill")
-            .args(["-TERM", &self.pid.to_string()])
-            .status();
     }
 }
 
@@ -353,7 +345,9 @@ pub fn parse(line: &str) -> Vec<Ev> {
                 _ => None,
             })
             .collect(),
-        "user" if v["message"]["content"].is_string() => {
+        // Only the user's own messages: claude also replays ones it wrote itself, like
+        // background task notifications, and those carry an `origin`.
+        "user" if v["message"]["content"].is_string() && v["origin"].is_null() => {
             vec![Ev::User(s(&v["message"]["content"]))]
         }
         "user" => blocks(&v)
@@ -402,6 +396,7 @@ mod tests {
 {"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a1","task_type":"local_agent"},{"task_id":"b2","run_id":"r","task_type":"local_bash","description":"Run test suite"}]}
 {"type":"system","subtype":"background_tasks_changed","tasks":[]}
 {"type": "user", "message": {"role": "user", "content": "read a.txt"}, "parent_tool_use_id": null}
+{"type": "user", "message": {"role": "user", "content": "<task-notification>done</task-notification>"}, "origin": {"kind": "task-notification"}, "parent_tool_use_id": null}
 {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "/tmp/a.txt"}}]}, "parent_tool_use_id": null}
 {"type": "user", "message": {"role": "user", "content": [{"tool_use_id": "toolu_1", "type": "tool_result", "content": "1\thello\n2\t"}]}, "parent_tool_use_id": null}
 {"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user for tool use]"}]}, "parent_tool_use_id": null}

@@ -98,7 +98,7 @@ impl Shark {
     /// `space f f`: the picker over every tracked and untracked file of the open workspace.
     pub(super) fn open_any_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ws) = self.active_ws() else {
-            return Self::notify_err(window, cx, "Open a workspace first");
+            return notify_err(window, cx, "Open a workspace first");
         };
         let repos: Vec<_> = (ws.repos.iter())
             .map(|r| (r.name.clone(), ws.dir().join(&r.name)))
@@ -114,13 +114,10 @@ impl Shark {
     fn open_any_path(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ws) = self.active_ws() else { return };
         let abs = ws.dir().join(&path);
-        let text = std::fs::metadata(&abs)
-            .is_ok_and(|m| m.len() <= crate::editor::MAX_BYTES)
-            .then(|| std::fs::read(&abs).ok())
-            .flatten()
-            .is_some_and(|b| std::str::from_utf8(&b).is_ok());
+        let text = std::fs::metadata(&abs).is_ok_and(|m| m.len() <= crate::editor::MAX_BYTES)
+            && std::fs::read(&abs).is_ok_and(|b| std::str::from_utf8(&b).is_ok());
         if !text {
-            return Self::notify_err(
+            return notify_err(
                 window,
                 cx,
                 format!("{path} is binary, too large or unreadable; open it in Finder (space o f)"),

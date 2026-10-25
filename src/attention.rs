@@ -2,7 +2,7 @@
 //! next git step is the user's to take ("needs you"). Drives the sidebar row icons, the Dock
 //! badge, OS notifications and the jump to the next such workspace.
 use crate::app::Shark;
-use crate::sync::background;
+use crate::sync;
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
@@ -87,7 +87,7 @@ fn poll(cx: &mut Context<Shark>) -> Task<()> {
             let name = ws.name.clone();
             let result = cx
                 .background_executor()
-                .spawn(async move { background::check(&ws) })
+                .spawn(async move { sync::check_in_background(&ws) })
                 .await;
             let ok = this.update(cx, |s, cx| {
                 let now = Instant::now();

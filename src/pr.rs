@@ -1,5 +1,5 @@
 //! Coordinated PRs: one per repo with commits, each body linking all the others.
-use crate::git::{cmd_bounded, git};
+use crate::git::{cmd_bounded, dirty, git};
 use crate::state::Workspace;
 use std::path::Path;
 
@@ -8,7 +8,6 @@ const MARKER: &str = "<!-- shark:related -->";
 /// How new PRs are opened. The composer's first line is the title and the rest the body;
 /// empty falls back to `--fill` (commit info). `--fill` stays on, so a title alone still gets
 /// the commits as body: gh lets `--title`/`--body` override what it fills in.
-#[derive(Default)]
 pub struct NewPr {
     pub title: String,
     pub body: String,
@@ -55,15 +54,14 @@ pub fn merge_order(ws: &Workspace, saved: &[String]) -> Vec<String> {
     out
 }
 
-/// `order` with `name` moved one place earlier (`earlier`) or later; unchanged at the ends.
-pub fn move_in_order(mut order: Vec<String>, name: &str, earlier: bool) -> Vec<String> {
+/// Moves `name` one place earlier (`earlier`) or later in `order`; unchanged at the ends.
+pub fn move_in_order(order: &mut [String], name: &str, earlier: bool) {
     if let Some(i) = order.iter().position(|n| n == name) {
         let j = if earlier { i.wrapping_sub(1) } else { i + 1 };
         if j < order.len() {
             order.swap(i, j);
         }
     }
-    order
 }
 
 /// Returns `(repo, url)` for every PR created or found. `skip` names repos whose work already
@@ -78,11 +76,7 @@ pub fn create_linked_prs(
     let dirty: Vec<&str> = ws
         .repos
         .iter()
-        .filter(|r| {
-            !git(&dir.join(&r.name), &["status", "--porcelain"])
-                .unwrap_or_default()
-                .is_empty()
-        })
+        .filter(|r| dirty(&dir.join(&r.name)).unwrap_or(false))
         .map(|r| r.name.as_str())
         .collect();
     if !dirty.is_empty() {
@@ -209,9 +203,14 @@ mod tests {
         };
         let o = merge_order(&ws, &["ios".into(), "gone".into()]);
         assert_eq!(o, ["ios", "api", "web"]);
-        assert_eq!(move_in_order(o.clone(), "api", true), ["api", "ios", "web"]);
-        assert_eq!(move_in_order(o.clone(), "web", false), o, "already last");
-        assert_eq!(move_in_order(o.clone(), "ios", true), o, "already first");
+        let moved = |name: &str, earlier: bool| {
+            let mut o = o.clone();
+            move_in_order(&mut o, name, earlier);
+            o
+        };
+        assert_eq!(moved("api", true), ["api", "ios", "web"]);
+        assert_eq!(moved("web", false), o, "already last");
+        assert_eq!(moved("ios", true), o, "already first");
     }
 
     /// Real git against bare origins, a fake `gh` on PATH that logs its argv and runs `-q`
@@ -300,11 +299,11 @@ esac
         unsafe { std::env::set_var("PATH", path) };
 
         fs::write(dir.join("docs/stray.txt"), "").unwrap();
-        let err = create_linked_prs(&ws, &dir, &[], &NewPr::default()).unwrap_err();
+        let err = create_linked_prs(&ws, &dir, &[], &NewPr::new("", false)).unwrap_err();
         assert!(err.contains("docs"), "{err}");
         fs::remove_file(dir.join("docs/stray.txt")).unwrap();
 
-        let prs = create_linked_prs(&ws, &dir, &["ops".into()], &NewPr::default()).unwrap();
+        let prs = create_linked_prs(&ws, &dir, &["ops".into()], &NewPr::new("", false)).unwrap();
         assert_eq!(
             prs,
             [
@@ -332,7 +331,8 @@ esac
 
         // A failing create surfaces gh's error.
         fs::write(&fail, "").unwrap();
-        let err = create_linked_prs(&ws, &dir, &["ops".into()], &NewPr::default()).unwrap_err();
+        let err =
+            create_linked_prs(&ws, &dir, &["ops".into()], &NewPr::new("", false)).unwrap_err();
         assert!(err.contains("gh: boom"), "{err}");
         fs::remove_dir_all(&root).unwrap();
     }

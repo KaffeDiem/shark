@@ -14,11 +14,6 @@ pub fn run(dir: &Path, prog: &str, args: &[&str]) -> Result<Output, String> {
         .map_err(|e| format!("{prog}: {e}"))
 }
 
-/// Run a command, returning trimmed stdout, or stderr as the error on non-zero exit.
-pub fn cmd(dir: &Path, prog: &str, args: &[&str]) -> Result<String, String> {
-    finish(prog, args, run(dir, prog, args)?)
-}
-
 fn finish(prog: &str, args: &[&str], out: Output) -> Result<String, String> {
     if out.status.success() {
         Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
@@ -31,8 +26,8 @@ fn finish(prog: &str, args: &[&str], out: Output) -> Result<String, String> {
     }
 }
 
-/// `cmd` for network calls: never prompts for credentials, and is killed after `secs`
-/// so a hung fetch or gh can't stall whoever waits on it.
+/// Like `git`, for any `prog` making network calls: never prompts for credentials, and is killed
+/// after `secs` so a hung fetch or gh can't stall whoever waits on it.
 pub fn cmd_bounded(dir: &Path, prog: &str, args: &[&str], secs: u64) -> Result<String, String> {
     let mut c = Command::new(prog);
     // GIT_TERMINAL_PROMPT doesn't reach ssh, which asks for host keys and passphrases on
@@ -57,14 +52,14 @@ pub fn cmd_bounded(dir: &Path, prog: &str, args: &[&str], secs: u64) -> Result<S
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|e| format!("{prog}: {e}"))?;
-    let pid = child.id().to_string();
+    let pid = child.id();
     let (tx, rx) = std::sync::mpsc::channel();
     // wait_with_output drains both pipes, so a big gh response can't fill one and deadlock.
     std::thread::spawn(move || tx.send(child.wait_with_output()));
     match rx.recv_timeout(Duration::from_secs(secs)) {
         Ok(out) => finish(prog, args, out.map_err(|e| format!("{prog}: {e}"))?),
         Err(_) => {
-            let _ = Command::new("kill").args(["-TERM", &pid]).status(); // the waiting thread reaps it
+            term(pid); // the waiting thread reaps it
             Err(format!(
                 "{prog} {}: timed out after {secs}s",
                 args.join(" ")
@@ -73,8 +68,33 @@ pub fn cmd_bounded(dir: &Path, prog: &str, args: &[&str], secs: u64) -> Result<S
     }
 }
 
+/// Runs git, returning trimmed stdout, or stderr as the error on non-zero exit.
 pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
-    cmd(dir, "git", args)
+    finish("git", args, run(dir, "git", args)?)
+}
+
+pub fn term(pid: u32) {
+    let _ = Command::new("kill")
+        .args(["-TERM", &pid.to_string()])
+        .status();
+}
+
+/// Uncommitted changes; `Err` when `git status` fails.
+pub fn dirty(wt: &Path) -> Result<bool, String> {
+    git(wt, &["status", "--porcelain"]).map(|s| !s.is_empty())
+}
+
+/// `git worktree list --porcelain`: each worktree's path and its other lines.
+fn worktree_list(src: &Path) -> Result<Vec<(String, Vec<String>)>, String> {
+    let mut out: Vec<(String, Vec<String>)> = vec![];
+    for line in git(src, &["worktree", "list", "--porcelain"])?.lines() {
+        match (line.strip_prefix("worktree "), out.last_mut()) {
+            (Some(p), _) => out.push((p.into(), vec![])),
+            (None, Some((_, attrs))) => attrs.push(line.into()),
+            (None, None) => {}
+        }
+    }
+    Ok(out)
 }
 
 pub fn add_repo(path: &Path, existing: &[Repo]) -> Result<Repo, String> {
@@ -206,17 +226,15 @@ struct Plan {
 
 /// Checks a repo can take the branch and decides where it starts. Fetches, so it blocks.
 fn plan_worktree(branch: &str, r: &Repo) -> Result<Plan, String> {
-    let porcelain = git(&r.path, &["worktree", "list", "--porcelain"])?;
-    let mut path = "";
-    for line in porcelain.lines() {
-        if let Some(p) = line.strip_prefix("worktree ") {
-            path = p;
-        } else if line == format!("branch refs/heads/{branch}") {
-            return Err(format!(
-                "{}: branch `{branch}` is already checked out at {path}",
-                r.name
-            ));
-        }
+    let head = format!("branch refs/heads/{branch}");
+    if let Some((path, _)) = worktree_list(&r.path)?
+        .iter()
+        .find(|(_, attrs)| attrs.contains(&head))
+    {
+        return Err(format!(
+            "{}: branch `{branch}` is already checked out at {path}",
+            r.name
+        ));
     }
     // Best effort, may be offline or have no origin. --prune: a stale origin/<branch> would
     // make a merged, deleted branch look current.
@@ -350,14 +368,12 @@ fn claude_md(ws: &Workspace, dir: &Path) -> String {
 /// `--force` twice; we never do that), or it has submodules (needs `--force`).
 fn remove_blocker(src: &Path, wt: &Path, force: bool) -> Option<&'static str> {
     let canon = fs::canonicalize(wt).ok()?;
-    let porcelain = git(src, &["worktree", "list", "--porcelain"]).unwrap_or_default();
-    let mut here = false;
-    for line in porcelain.lines() {
-        if let Some(p) = line.strip_prefix("worktree ") {
-            here = fs::canonicalize(p).is_ok_and(|p| p == canon);
-        } else if here && (line == "locked" || line.starts_with("locked ")) {
-            return Some("locked (git worktree unlock)");
-        }
+    let locked =
+        |attrs: &[String]| (attrs.iter()).any(|l| l == "locked" || l.starts_with("locked "));
+    if (worktree_list(src).unwrap_or_default().into_iter())
+        .any(|(p, attrs)| locked(&attrs) && fs::canonicalize(p).is_ok_and(|p| p == canon))
+    {
+        return Some("locked (git worktree unlock)");
     }
     if force {
         return None;
@@ -395,7 +411,7 @@ pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), S
             .iter()
             .filter(|r| {
                 let wt = dir.join(&r.name);
-                wt.exists() && !git(&wt, &["status", "--porcelain"]).is_ok_and(|s| s.is_empty())
+                wt.exists() && dirty(&wt).unwrap_or(true)
             })
             .map(|r| r.name.as_str())
             .collect();
