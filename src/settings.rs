@@ -7,6 +7,7 @@ use crate::prompts::{self, PROMPTS};
 use crate::state::{Appearance, Mode, State};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::link::Link;
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectState};
@@ -92,6 +93,7 @@ pub fn open(state: &State, window: &mut Window, cx: &mut Context<Shark>) {
     window.open_dialog(cx, move |d, _, _| {
         // No dialog title: the page list and the page title say where you are.
         d.font_features(inter_features())
+            .entrance(DialogEntrance::None)
             .w(px(800.))
             .child(view.clone())
     });
@@ -102,6 +104,7 @@ pub fn open(state: &State, window: &mut Window, cx: &mut Context<Shark>) {
 pub fn about(window: &mut Window, cx: &mut App) {
     window.open_dialog(cx, |d, _, cx| {
         d.font_features(inter_features())
+            .entrance(DialogEntrance::None)
             .title("Shark")
             .w(px(640.))
             .child(

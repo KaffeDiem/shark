@@ -321,6 +321,7 @@ impl Shark {
             // Dialog binds enter to Confirm, which runs on_ok and closes when it returns true.
             // In the repo picker, the Command list takes enter first (it ticks a repo).
             d.font_features(inter_features())
+                .entrance(DialogEntrance::None)
                 .title("New workspace")
                 .w(px(520.))
                 .child(form.clone())

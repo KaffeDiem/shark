@@ -535,6 +535,7 @@ impl Shark {
             let (shark, input, ws, draft) =
                 (shark.clone(), input.clone(), ws.clone(), draft.clone());
             d.font_features(inter_features())
+                .entrance(DialogEntrance::None)
                 .title(title.clone())
                 .w(px(560.))
                 .child(Input::new(&input))
