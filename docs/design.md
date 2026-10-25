@@ -75,6 +75,14 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 - **Git button:** a `small` button plus a `ghost` `xsmall` chevron for the git menu. It is the header's one primary button: `primary` for a step to run, `outline` with a `warning_foreground` icon when something needs the agent or a human, `ghost` for a wait. Disabled while the agent runs if the step writes.
 - **Tabs:** 26px pills (`rounded_full`, `px_2p5`, 14px icon + `text_sm` label). Active: `secondary` + `foreground`. Inactive: `muted_foreground`, hover → `foreground`.
 - **Rows inside the island:** 28px for compact rows (tool calls, lists in dialogs). Transcript blocks are `px_4 py_1p5`.
+- **Agent activity in the transcript:** prose is what people read; tool calls are evidence.
+  - A run of tool calls between two pieces of prose is **one row**: chevron, a summary counted by verb ("Read 4 files, ran 2 commands"), `muted_foreground`. Add a verb to `group_summary` in `src/chat.rs` rather than listing tool names.
+  - While a call runs, the row also shows `· <Tool> <summary>` for the call in flight, and a `Spinner`.
+  - Failures show on the collapsed row as `X` + "N failed" in `danger_foreground`, so they're never hidden by collapsing.
+  - Expanded, each call is its own 28px row, indented 22px to line up with the summary text, and each opens to its output.
+  - Skills (`Skill`) and subagents (`Agent`/`Task`) are never grouped: they get their own row with a `BookOpen` / `Bot` icon, because they say *what* the agent is doing. Add a tool to `standalone()` only if it carries that kind of intent.
+  - Tool paths are shown relative to the workspace (`api/src/a.rs`).
+  - A turn ends with an info line: "done · 48s · $0.12".
 - **Radii:** `theme.radius` (8px) for rows, inputs and code blocks; `theme.radius_lg` (12px) for the island, cards and dialogs; `rounded_full()` for pills and dots.
 - **Borders, not shadows:** `shadow` is off. Separate with a 1px `border` or a surface change. Prefer fewer separators.
 - **Spacing:** the gpui scale only (`gap_1`=4px, `gap_1p5`=6px, `gap_2`=8px, `px_3`=12px, `px_4`=16px), plus the fixed sizes above.
@@ -92,6 +100,8 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 | Agent idle | `CircleDashed`, `muted_foreground` |
 | Agent running | `Spinner` (sidebar: `.icon(IconName::LoaderCircle).color(theme.primary)`); header dot in `primary` |
 | Tool pending / done / failed | `Spinner` / `Check` muted / `X` in `danger_foreground` |
+| Tool group with failures | `X` + "N failed" in `danger_foreground`, on the collapsed row |
+| Skill / subagent row | `BookOpen` / `Bot`, `muted_foreground`, before the tool name |
 | Collapsed / expanded | `ChevronRight` / `ChevronDown` |
 | Git step to run | Its own icon (`GitCommitHorizontal`, `ArrowUp`/`ArrowDown`, `GitPullRequestCreate`, `GitMerge`, …) in a `primary` button |
 | Git needs attention (conflicts, failing checks, detached HEAD, git error) | `TriangleAlert` in `warning_foreground`, `outline` button |

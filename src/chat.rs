@@ -15,21 +15,68 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
 
+struct Call {
+    id: String,
+    name: String,
+    summary: String,
+    result: Option<String>,
+    is_error: bool,
+    open: bool,
+}
+
 enum Block {
     User(String),
     Text {
         md: Entity<TextViewState>,
         done: bool,
     },
-    Tool {
-        id: String,
-        name: String,
-        summary: String,
-        result: Option<String>,
-        is_error: bool,
+    /// Consecutive tool calls between two pieces of prose, shown as one summary row.
+    Tools {
+        calls: Vec<Call>,
         open: bool,
     },
+    /// Skills and subagents stay visible on their own row: they say what the agent is doing.
+    Tool(Call),
     Info(String),
+}
+
+/// A transcript row: a block, or one call inside an expanded tool group.
+type Row = (usize, Option<usize>);
+
+fn standalone(name: &str) -> Option<IconName> {
+    match name {
+        "Skill" => Some(IconName::BookOpen),
+        "Agent" | "Task" => Some(IconName::Bot),
+        _ => None,
+    }
+}
+
+/// "Read 3 files, ran 2 commands" for a tool group, in first-use order.
+fn group_summary(calls: &[Call]) -> String {
+    let mut parts: Vec<(&str, &str, &str, usize)> = vec![];
+    for c in calls {
+        let (verb, one, many) = match c.name.as_str() {
+            "Read" => ("read", "file", "files"),
+            "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => ("edited", "file", "files"),
+            "Bash" => ("ran", "command", "commands"),
+            "Grep" | "Glob" => ("searched", "pattern", "patterns"),
+            "WebSearch" | "WebFetch" => ("looked up", "page", "pages"),
+            _ => ("used", "tool", "tools"),
+        };
+        match parts.iter_mut().find(|p| p.0 == verb) {
+            Some(p) => p.3 += 1,
+            None => parts.push((verb, one, many, 1)),
+        }
+    }
+    let s = parts
+        .iter()
+        .map(|&(v, one, many, n)| format!("{v} {n} {}", if n == 1 { one } else { many }))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut c = s.chars();
+    c.next()
+        .map(|f| f.to_uppercase().chain(c).collect())
+        .unwrap_or_default()
 }
 
 pub enum ChatEvent {
@@ -60,8 +107,9 @@ pub(crate) const MODELS: &[&str] = &["default", "fable", "opus", "sonnet", "haik
 
 impl EventEmitter<ChatEvent> for Chat {}
 
-fn summarize(input: &Value) -> String {
+fn summarize(input: &Value, root: &str) -> String {
     let field = [
+        "skill",
         "command",
         "file_path",
         "pattern",
@@ -76,6 +124,10 @@ fn summarize(input: &Value) -> String {
         .map(str::to_string)
         .unwrap_or_else(|| input.to_string());
     let s = s.lines().next().unwrap_or_default();
+    // Paths inside the workspace read better as repo/file.
+    let s = s
+        .strip_prefix(root)
+        .map_or(s, |r| r.trim_start_matches('/'));
     s.chars().take(120).collect()
 }
 
@@ -113,7 +165,7 @@ impl Chat {
             chat.apply(ev, cx);
         }
         chat.busy = false;
-        chat.sel = chat.blocks.len().saturating_sub(1);
+        chat.sel = chat.rows().len().saturating_sub(1);
         chat.scroll.scroll_to_bottom();
         chat
     }
@@ -205,7 +257,7 @@ impl Chat {
     fn sent(&mut self, text: String, cx: &mut Context<Self>) {
         self.busy = true;
         // Jump to the end so push follows the new message and the reply.
-        self.sel = self.blocks.len().saturating_sub(1);
+        self.sel = self.rows().len().saturating_sub(1);
         self.push(Block::User(text), cx);
     }
 
@@ -216,17 +268,37 @@ impl Chat {
         }
     }
 
-    fn push(&mut self, b: Block, cx: &mut Context<Self>) {
-        let follow = self.sel + 1 >= self.blocks.len();
-        self.blocks.push(b);
-        if follow {
-            self.sel = self.blocks.len() - 1;
+    fn rows(&self) -> Vec<Row> {
+        let mut rows = vec![];
+        for (ix, b) in self.blocks.iter().enumerate() {
+            rows.push((ix, None));
+            if let Block::Tools { calls, open: true } = b {
+                rows.extend((0..calls.len()).map(|j| (ix, Some(j))));
+            }
+        }
+        rows
+    }
+
+    /// Keeps the cursor and scroll on the newest row if the cursor was already on the last one.
+    fn follow(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Self, &mut Context<Self>)) {
+        let at_end = self.sel + 1 >= self.rows().len();
+        f(self, cx);
+        if at_end {
+            self.sel = self.rows().len().saturating_sub(1);
             self.scroll.scroll_to_bottom();
         }
         cx.notify();
     }
 
+    fn push(&mut self, b: Block, cx: &mut Context<Self>) {
+        self.follow(cx, |this, _| this.blocks.push(b));
+    }
+
     fn apply(&mut self, ev: Ev, cx: &mut Context<Self>) {
+        self.follow(cx, |this, cx| this.apply_inner(ev, cx));
+    }
+
+    fn apply_inner(&mut self, ev: Ev, cx: &mut Context<Self>) {
         match ev {
             Ev::Init(id) => {
                 if self.ws.session_id.as_ref() != Some(&id) {
@@ -234,15 +306,14 @@ impl Chat {
                     cx.emit(ChatEvent::SessionId(id));
                 }
             }
-            Ev::User(text) => self.push(Block::User(text), cx),
+            Ev::User(text) => self.blocks.push(Block::User(text)),
             Ev::TextDelta(s) => match self.blocks.last_mut() {
                 Some(Block::Text { md, done: false }) => {
                     md.update(cx, |m, cx| m.push_str(&s, cx));
-                    self.scroll.scroll_to_bottom();
                 }
                 _ => {
                     let md = cx.new(|cx| TextViewState::markdown(&s, cx));
-                    self.push(Block::Text { md, done: false }, cx);
+                    self.blocks.push(Block::Text { md, done: false });
                 }
             },
             Ev::Text(full) => match self.blocks.last_mut() {
@@ -252,79 +323,77 @@ impl Chat {
                 }
                 _ => {
                     let md = cx.new(|cx| TextViewState::markdown(&full, cx));
-                    self.push(Block::Text { md, done: true }, cx);
+                    self.blocks.push(Block::Text { md, done: true });
                 }
             },
             Ev::ToolUse { id, name, input } => {
-                let summary = summarize(&input);
-                self.push(
-                    Block::Tool {
-                        id,
-                        name,
-                        summary,
-                        result: None,
-                        is_error: false,
+                let call = Call {
+                    summary: summarize(&input, &self.ws.dir().to_string_lossy()),
+                    id,
+                    name,
+                    result: None,
+                    is_error: false,
+                    open: false,
+                };
+                match self.blocks.last_mut() {
+                    _ if standalone(&call.name).is_some() => self.blocks.push(Block::Tool(call)),
+                    Some(Block::Tools { calls, .. }) => calls.push(call),
+                    _ => self.blocks.push(Block::Tools {
+                        calls: vec![call],
                         open: false,
-                    },
-                    cx,
-                )
-            }
-            Ev::ToolResult {
-                id,
-                text,
-                is_error: err,
-            } => {
-                for b in self.blocks.iter_mut().rev() {
-                    if let Block::Tool {
-                        id: tid,
-                        result,
-                        is_error,
-                        ..
-                    } = b
-                        && *tid == id
-                    {
-                        *result = Some(text);
-                        *is_error = err;
-                        break;
-                    }
+                    }),
                 }
-                cx.notify();
+            }
+            Ev::ToolResult { id, text, is_error } => {
+                let call = self.blocks.iter_mut().rev().find_map(|b| match b {
+                    Block::Tool(c) => (c.id == id).then_some(c),
+                    Block::Tools { calls, .. } => calls.iter_mut().find(|c| c.id == id),
+                    _ => None,
+                });
+                if let Some(c) = call {
+                    c.result = Some(text);
+                    c.is_error = is_error;
+                }
             }
             Ev::Result {
                 is_error,
                 text,
                 cost,
+                secs,
             } => {
                 self.busy = false;
-                if is_error {
-                    self.push(Block::Info(format!("error: {text}")), cx);
+                let took = match secs {
+                    0..60 => format!("{secs}s"),
+                    _ => format!("{}m {}s", secs / 60, secs % 60),
+                };
+                self.blocks.push(Block::Info(if is_error {
+                    format!("error: {text}")
                 } else {
-                    self.push(Block::Info(format!("done · ${cost:.2}")), cx);
-                }
+                    format!("done · {took} · ${cost:.2}")
+                }));
                 cx.emit(ChatEvent::TurnDone);
             }
             Ev::Exited(msg) => {
                 self.agent = None;
                 if self.busy {
                     self.busy = false;
-                    self.push(Block::Info(msg), cx);
+                    self.blocks.push(Block::Info(msg));
                     cx.emit(ChatEvent::TurnDone);
                 }
-                cx.notify();
             }
         }
     }
 
     fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
-        self.sel = ix.min(self.blocks.len().saturating_sub(1));
+        self.sel = ix.min(self.rows().len().saturating_sub(1));
         self.scroll.scroll_to_item(self.sel);
         cx.notify();
     }
 
-    fn render_block(
+    fn render_row(
         &self,
         ix: usize,
-        b: &Block,
+        (bi, call): Row,
         focused: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -346,8 +415,70 @@ impl Chat {
             }));
         // A centered ~70-character column; long lines are harder to track back across.
         let column = || div().w_full().max_w(px(680.)).mx_auto();
-        let inner = match b {
-            Block::User(t) => column()
+        let icon = |name: IconName| Icon::new(name).with_size(px(14.));
+        let chevron = |open: bool| {
+            icon(if open {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            })
+        };
+        let status = |c: &Call| match (&c.result, c.is_error) {
+            (None, _) => Spinner::new().with_size(px(14.)).into_any_element(),
+            (Some(_), true) => icon(IconName::X)
+                .text_color(theme.danger_foreground)
+                .into_any_element(),
+            _ => icon(IconName::Check).into_any_element(),
+        };
+        let tool_row = |c: &Call| {
+            v_flex()
+                .child(
+                    h_flex()
+                        .h(px(28.))
+                        .gap_2()
+                        .text_color(theme.muted_foreground)
+                        .child(chevron(c.open))
+                        .when_some(standalone(&c.name), |d, i| d.child(icon(i)))
+                        .child(
+                            div()
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme.foreground)
+                                .child(c.name.clone()),
+                        )
+                        .child(div().flex_1().truncate().child(c.summary.clone()))
+                        .child(status(c)),
+                )
+                .when(c.open, |d| {
+                    let text: String = c
+                        .result
+                        .as_deref()
+                        .unwrap_or("(running)")
+                        .chars()
+                        .take(20_000)
+                        .collect();
+                    d.child(
+                        div()
+                            .mt_1()
+                            .px_3()
+                            .py_2()
+                            .rounded(theme.radius)
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.muted)
+                            .font_family(theme.mono_font_family.clone())
+                            .text_size(theme.mono_font_size)
+                            .line_height(relative(1.45))
+                            .text_color(if c.is_error {
+                                theme.danger_foreground
+                            } else {
+                                theme.foreground
+                            })
+                            .child(text),
+                    )
+                })
+        };
+        let inner = match (&self.blocks[bi], call) {
+            (Block::User(t), _) => column()
                 .px_3()
                 .py_2()
                 .rounded(theme.radius_lg)
@@ -358,76 +489,46 @@ impl Chat {
                 .text_size(px(14.))
                 .line_height(relative(1.5))
                 .child(t.clone()),
-            Block::Text { md, .. } => column()
+            (Block::Text { md, .. }, _) => column()
                 .text_size(px(14.))
                 .line_height(relative(1.5))
                 .child(TextView::new(md).selectable(true)),
-            Block::Tool {
-                name,
-                summary,
-                result,
-                is_error,
-                open,
-                ..
-            } => {
-                let icon = |name: IconName| Icon::new(name).with_size(px(14.));
-                let status = match (result, is_error) {
-                    (None, _) => Spinner::new().with_size(px(14.)).into_any_element(),
-                    (Some(_), true) => icon(IconName::X)
-                        .text_color(theme.danger_foreground)
-                        .into_any_element(),
-                    _ => icon(IconName::Check).into_any_element(),
-                };
-                column()
-                    .text_sm()
-                    .child(
-                        h_flex()
-                            .h(px(28.))
-                            .gap_2()
-                            .text_color(theme.muted_foreground)
-                            .child(icon(if *open {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronRight
-                            }))
-                            .child(
-                                div()
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme.foreground)
-                                    .child(name.clone()),
-                            )
-                            .child(div().flex_1().truncate().child(summary.clone()))
-                            .child(status),
-                    )
-                    .when(*open, |d| {
-                        let text: String = result
-                            .as_deref()
-                            .unwrap_or("(running)")
-                            .chars()
-                            .take(20_000)
-                            .collect();
-                        d.child(
-                            div()
-                                .mt_1()
-                                .px_3()
-                                .py_2()
-                                .rounded(theme.radius)
-                                .border_1()
-                                .border_color(theme.border)
-                                .bg(theme.muted)
-                                .font_family(theme.mono_font_family.clone())
-                                .text_size(theme.mono_font_size)
-                                .line_height(relative(1.45))
-                                .text_color(if *is_error {
-                                    theme.danger_foreground
-                                } else {
-                                    theme.foreground
-                                })
-                                .child(text),
-                        )
-                    })
+            (Block::Tool(c), _) => column().text_sm().child(tool_row(c)),
+            // Calls sit under the group's summary text, past its chevron and gap.
+            (Block::Tools { calls, .. }, Some(j)) => {
+                column().text_sm().pl(px(22.)).child(tool_row(&calls[j]))
             }
-            Block::Info(t) => column()
+            (Block::Tools { calls, open }, None) => {
+                let running = calls.iter().rev().find(|c| c.result.is_none());
+                let failed = calls.iter().filter(|c| c.is_error).count();
+                column().text_sm().child(
+                    h_flex()
+                        .h(px(28.))
+                        .gap_2()
+                        .text_color(theme.muted_foreground)
+                        .child(chevron(*open))
+                        .child(div().flex_none().child(group_summary(calls)))
+                        // While running, the call in flight; the summary alone hides what's slow.
+                        .child(div().flex_1().truncate().when_some(running, |d, c| {
+                            d.child(format!("· {} {}", c.name, c.summary))
+                        }))
+                        .when(failed > 0, |d| {
+                            d.child(
+                                h_flex()
+                                    .gap_1()
+                                    .text_color(theme.danger_foreground)
+                                    .child(icon(IconName::X))
+                                    .child(format!("{failed} failed")),
+                            )
+                        })
+                        .child(match running {
+                            Some(c) => status(c),
+                            None if failed == 0 => icon(IconName::Check).into_any_element(),
+                            None => div().into_any_element(),
+                        }),
+                )
+            }
+            (Block::Info(t), _) => column()
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .child(t.clone()),
@@ -436,10 +537,16 @@ impl Chat {
     }
 
     fn toggle(&mut self, cx: &mut Context<Self>) {
-        if let Some(Block::Tool { open, .. }) = self.blocks.get_mut(self.sel) {
-            *open = !*open;
-            cx.notify();
+        let Some(&(bi, call)) = self.rows().get(self.sel) else {
+            return;
+        };
+        match (&mut self.blocks[bi], call) {
+            (Block::Tool(c), _) => c.open = !c.open,
+            (Block::Tools { calls, .. }, Some(j)) => calls[j].open = !calls[j].open,
+            (Block::Tools { open, .. }, None) => *open = !*open,
+            _ => return,
         }
+        cx.notify();
     }
 }
 
@@ -453,8 +560,8 @@ impl Render for Chat {
             theme.secondary,
             theme.muted_foreground,
         );
-        let blocks: Vec<AnyElement> = (0..self.blocks.len())
-            .map(|ix| self.render_block(ix, &self.blocks[ix], focused, cx))
+        let blocks: Vec<AnyElement> = (self.rows().into_iter().enumerate())
+            .map(|(ix, row)| self.render_row(ix, row, focused, cx))
             .collect();
         v_flex()
             .size_full()
@@ -536,6 +643,34 @@ impl Render for Chat {
                         ),
                 ),
             )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+
+    #[test]
+    fn summarizes_tool_groups() {
+        let call = |name: &str, err| Call {
+            id: String::new(),
+            name: name.into(),
+            summary: String::new(),
+            result: Some(String::new()),
+            is_error: err,
+            open: false,
+        };
+        let calls = ["Read", "Bash", "Read", "Edit", "Write", "mcp__x__y"].map(|n| call(n, false));
+        assert_eq!(
+            group_summary(&calls),
+            "Read 2 files, ran 1 command, edited 2 files, used 1 tool"
+        );
+        assert_eq!(group_summary(&[]), "");
+        let input = serde_json::json!({"file_path": "/ws/feat/api/src/a.rs"});
+        assert_eq!(summarize(&input, "/ws/feat"), "api/src/a.rs");
+        let skill = serde_json::json!({"skill": "pdf", "args": "x"});
+        assert_eq!(summarize(&skill, "/ws/feat"), "pdf");
     }
 }
 
