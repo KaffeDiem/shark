@@ -1,9 +1,10 @@
 //! Share to GitHub (07–08): one thread to its repo's PR as a reviewer note (`gh pr comment`)
 //! or a PR review (`gh pr review --comment`), previewed first. The AI context is untouched;
 //! a failed post keeps the comment and the dialog, to retry.
-use super::review::Comment;
+use super::review::{Comment, fence};
 use super::*;
 use crate::sync::Pr;
+use gpui_kit::component::radio::{Radio, RadioGroup};
 
 pub(super) struct Share {
     pub(super) id: u64,
@@ -11,7 +12,18 @@ pub(super) struct Share {
     pub(super) review: bool,
     pub(super) posting: bool,
     pub(super) error: Option<String>,
-    pub(super) focus: FocusHandle,
+}
+
+/// `s` without the indentation all its lines share, so an excerpt reads from the left.
+fn dedent(s: &str) -> String {
+    let lines = s.lines().filter(|l| !l.trim().is_empty());
+    let n = lines
+        .map(|l| l.len() - l.trim_start().len())
+        .min()
+        .unwrap_or(0);
+    (s.lines().map(|l| l.get(n..).unwrap_or("")))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// What GitHub receives for `comments`: path, side and range, the code as commented, the
@@ -19,17 +31,14 @@ pub(super) struct Share {
 pub(super) fn github_body(comments: &[Comment], note: &str) -> String {
     let mut out = String::new();
     for c in comments {
-        let f = if c.snapshot.contains("```") {
-            "````"
-        } else {
-            "```"
-        };
         out += &format!("**{}** · {} · {}\n\n", c.path, c.side(), c.lines());
         if !c.snapshot.is_empty() {
+            let f = fence(&c.snapshot);
             out += &format!("{f}\n{}\n{f}\n\n", c.snapshot);
         }
         out += &format!("{}\n\n", c.text);
         if let Some(s) = &c.suggestion {
+            let f = fence(s);
             out += &format!("Suggested change:\n{f}\n{s}\n{f}\n\n");
         }
     }
@@ -42,7 +51,10 @@ pub(super) fn github_body(comments: &[Comment], note: &str) -> String {
 /// An inline comment's text: GitHub shows a suggestion it can apply.
 fn inline_body(c: &Comment) -> String {
     match &c.suggestion {
-        Some(s) => format!("{}\n\n```suggestion\n{s}\n```", c.text),
+        Some(s) => {
+            let f = fence(s);
+            format!("{}\n\n{f}suggestion\n{s}\n{f}", c.text)
+        }
         None => c.text.clone(),
     }
 }
@@ -54,28 +66,31 @@ impl Shark {
         self.active_sync()?.read(cx).pr_for(repo)
     }
 
-    /// "Share to GitHub…" on a thread.
+    /// "Share to GitHub…" on a thread: the dialog (07) over the window.
     pub(super) fn open_share(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(c) = self.comment(id) else { return };
         if self.pr_of(c, cx).is_none() {
             let repo = c.path.split('/').next().unwrap_or_default().to_string();
             return notify_err(window, cx, format!("{repo} has no open PR to share to"));
         }
-        let focus = cx.focus_handle();
-        focus.focus(window, cx);
         self.review.share = Some(Share {
             id,
             review: false,
             posting: false,
             error: None,
-            focus,
         });
-        cx.notify();
+        let shark = cx.entity().downgrade();
+        window.open_dialog(cx, move |d, _, cx| match shark.upgrade() {
+            Some(s) => s.update(cx, |s, cx| s.share_dialog(d, cx)),
+            None => d,
+        });
     }
 
+    /// Closes the dialog, if it is open.
     pub(super) fn close_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.review.share = None;
-        self.diff.read(cx).focus_handle(cx).focus(window, cx);
+        if self.review.share.take().is_some() {
+            window.close_dialog(cx);
+        }
         cx.notify();
     }
 
@@ -147,7 +162,9 @@ impl Shark {
         let inline = (review && pushed && comments.len() == 1 && self.on_its_line(first))
             .then(|| Some((first.gh_anchor()?, inline_body(first))))
             .flatten();
+        // GitHub refuses a Comment review without a body: the note, else where it is.
         let body = match inline {
+            Some(_) if note.trim().is_empty() => first.place(),
             Some(_) => note.trim().to_string(),
             None => github_body(comments, note),
         };
@@ -204,130 +221,108 @@ impl Shark {
         .detach();
     }
 
-    /// The Share to GitHub dialog (07), over the diff.
-    pub(super) fn render_share(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let s = self.review.share.as_ref()?;
-        let c = self.comment(s.id)?;
-        let (pr, pushed) = self.pr_of(c, cx)?;
+    /// The Share to GitHub dialog's content (07); Enter posts, Esc closes.
+    fn share_dialog(&self, d: Dialog, cx: &mut Context<Self>) -> Dialog {
+        let Some(s) = &self.review.share else {
+            return d;
+        };
+        let (Some(c), Some(ws)) = (self.comment(s.id), self.active_ws()) else {
+            return d;
+        };
+        let Some((pr, pushed)) = self.pr_of(c, cx) else {
+            return d;
+        };
         let theme = cx.theme();
-        let repo = c.path.split('/').next().unwrap_or_default().to_string();
-        let ws = self.active_ws()?;
+        let repo = c.path.split('/').next().unwrap_or_default();
         let base = (ws.repos.iter().find(|r| r.name == repo))
             .map(|r| r.base.trim_start_matches("origin/").to_string())
             .unwrap_or_default();
-        let radio = |id: &'static str, label: &'static str, on: bool, review: bool| {
-            h_flex()
-                .id(id)
-                .flex_1()
-                .h(px(36.))
-                .px_3()
-                .gap_2()
-                .rounded(theme.radius)
-                .border_1()
-                .border_color(if on { theme.primary } else { theme.border })
-                .cursor_pointer()
-                .child(
-                    div()
-                        .size(px(12.))
-                        .rounded_full()
-                        .border_1()
-                        .border_color(if on {
-                            theme.primary
-                        } else {
-                            theme.muted_foreground
-                        })
-                        .when(on, |d| d.border_3()),
-                )
-                .child(label)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    if let Some(s) = &mut this.review.share {
-                        s.review = review;
-                    }
-                    cx.notify();
-                }))
-        };
-        let card = v_flex()
-            .id("share-dialog")
-            .key_context("ShareDialog")
-            .track_focus(&s.focus)
-            .on_action(cx.listener(|this, _: &CancelEdit, w, cx| this.close_share(w, cx)))
-            .on_action(cx.listener(|this, _: &SubmitForm, w, cx| this.post_share(w, cx)))
-            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+        let this = cx.entity().downgrade();
+        let gone = this.clone();
+        d.font_features(inter_features())
+            .entrance(DialogEntrance::None)
+            .title("Share to GitHub")
             .w(px(440.))
-            .p_5()
-            .gap_3()
-            .rounded(theme.radius_lg)
-            .border_1()
-            .border_color(theme.border)
-            .bg(theme.popover)
-            .shadow_lg()
-            .text_sm()
-            .child(
-                h_flex()
-                    .child(div().flex_1().text_lg().font_weight(FontWeight::SEMIBOLD).child("Share to GitHub"))
-                    .child(
-                        Button::new("share-close")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::X)
-                            .on_click(cx.listener(|this, _, w, cx| this.close_share(w, cx))),
-                    ),
-            )
+            .on_ok(move |_, w, cx| {
+                this.update(cx, |s, cx| s.post_share(w, cx)).ok();
+                false // closed when the post lands
+            })
+            .on_close(move |_, _, cx| {
+                gone.update(cx, |s, cx| {
+                    s.review.share = None;
+                    cx.notify();
+                })
+                .ok();
+            })
             .child(
                 v_flex()
+                    .gap_3()
+                    .text_sm()
                     .child(
-                        div()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(format!("{repo} · PR #{}", pr.number)),
+                        v_flex()
+                            .child(
+                                div()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(format!("{repo} · PR #{}", pr.number)),
+                            )
+                            .child(div().text_xs().text_color(theme.muted_foreground).child(
+                                format!(
+                                    "{} → {base} · Visible to everyone with PR access",
+                                    ws.branch
+                                ),
+                            )),
                     )
-                    .child(div().text_xs().text_color(theme.muted_foreground).child(format!(
-                        "{} → {base} · Visible to everyone with PR access",
-                        ws.branch
-                    ))),
-            )
-            .child(
-                h_flex()
-                    .gap_2()
-                    .child(radio("share-note", "Reviewer note", !s.review, false))
-                    .child(radio("share-review", "PR review", s.review, true)),
-            )
-            .child(div().text_xs().text_color(theme.muted_foreground).child(match s.review {
-                false => "Posts this comment to the PR conversation as a note for the reviewer. Your AI chat stays private.",
-                true => "Posts this comment as a Comment review on the PR, without approving or requesting changes. Your AI chat stays private.",
-            }))
-            .child(
-                v_flex()
-                    .p_3()
-                    .gap_2()
-                    .rounded(theme.radius)
-                    .border_1()
-                    .border_color(theme.border)
-                    .child(div().text_xs().text_color(theme.muted_foreground).child(format!(
-                        "{} · {} · {}",
-                        c.path.rsplit('/').next().unwrap_or(&c.path),
-                        if c.side() == "original" { "Original" } else { "Working copy" },
-                        c.lines()
-                    )))
-                    .when(!c.snapshot.is_empty(), |d| {
-                        d.child(
-                            div()
-                                .font_family(theme.mono_font_family.clone())
-                                .text_size(theme.mono_font_size)
-                                .child(c.snapshot.clone()),
-                        )
+                    .child(
+                        RadioGroup::horizontal("share-kind")
+                            .child(Radio::new("share-note").label("Reviewer note"))
+                            .child(Radio::new("share-review").label("PR review"))
+                            .selected_index(Some(s.review as usize))
+                            .on_click(cx.listener(|this, ix: &usize, _, cx| {
+                                if let Some(s) = &mut this.review.share {
+                                    s.review = *ix == 1;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().text_xs().text_color(theme.muted_foreground).child(match s.review {
+                        false => "Posts this comment to the PR conversation as a note for the reviewer. Your AI chat stays private.",
+                        true => "Posts this comment as a Comment review on the PR, without approving or requesting changes. Your AI chat stays private.",
+                    }))
+                    .child(
+                        v_flex()
+                            .p_3()
+                            .gap_2()
+                            .rounded(theme.radius)
+                            .border_1()
+                            .border_color(theme.border)
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(c.card_place()),
+                            )
+                            .when(!c.snapshot.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .font_family(theme.mono_font_family.clone())
+                                        .text_size(theme.mono_font_size)
+                                        .child(dedent(&c.snapshot)),
+                                )
+                            })
+                            .child(div().whitespace_normal().child(c.text.clone())),
+                    )
+                    .when(!pushed, |d| {
+                        d.child(div().text_xs().text_color(theme.warning_foreground).child(
+                            "These lines are not pushed yet. GitHub will receive the file path and code excerpt, without an inline anchor.",
+                        ))
                     })
-                    .child(div().whitespace_normal().child(c.text.clone())),
+                    .when_some(s.error.clone(), |d, e| {
+                        d.child(div().text_xs().text_color(theme.danger_foreground).child(e))
+                    }),
             )
-            .when(!pushed, |d| {
-                d.child(div().text_xs().text_color(theme.warning_foreground).child(
-                    "These lines are not pushed yet. GitHub will receive the file path and code excerpt, without an inline anchor.",
-                ))
-            })
-            .when_some(s.error.clone(), |d, e| {
-                d.child(div().text_xs().text_color(theme.danger_foreground).child(e))
-            })
-            .child(
+            .footer(
                 h_flex()
+                    .w_full()
                     .gap_2()
                     .justify_end()
                     .child(
@@ -349,23 +344,7 @@ impl Shark {
                             })
                             .on_click(cx.listener(|this, _, w, cx| this.post_share(w, cx))),
                     ),
-            );
-        Some(
-            div()
-                .id("share-overlay")
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(theme.overlay)
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(|this, _, w, cx| this.close_share(w, cx)),
-                )
-                .child(card)
-                .into_any_element(),
-        )
+            )
     }
 }
 
@@ -384,5 +363,17 @@ mod tests {
             github_body(&[c], " Thanks "),
             "**shark/src/app.rs** · working copy · 631–632\n\n```\n.size(px(400.))\n```\n\nKeep it aligned.\n\nThanks"
         );
+        // Each block gets a fence longer than the backticks in it, the suggestion its own.
+        let c: Comment = serde_json::from_str(
+            r#"{"path":"a/m.md","start":[false,1],"end":[false,1],"text":"t","snapshot":"````x","suggestion":"```y"}"#,
+        )
+        .unwrap();
+        let body = github_body(std::slice::from_ref(&c), "");
+        assert!(body.contains("\n`````\n````x\n`````\n"), "{body}");
+        assert!(
+            body.ends_with("Suggested change:\n````\n```y\n````"),
+            "{body}"
+        );
+        assert_eq!(inline_body(&c), "t\n\n````suggestion\n```y\n````");
     }
 }

@@ -203,9 +203,7 @@ fn review_api_args(n: &str, body: &str, a: &Anchor, text: &str) -> Vec<String> {
     v.push(format!("repos/{{owner}}/{{repo}}/pulls/{n}/reviews"));
     let mut field = |flag: &str, kv: String| v.extend([flag.to_string(), kv]);
     field("-f", "event=COMMENT".into());
-    if !body.is_empty() {
-        field("-f", format!("body={body}"));
-    }
+    field("-f", format!("body={body}"));
     field("-f", format!("comments[][path]={}", a.path));
     field("-F", format!("comments[][line]={}", a.line));
     field("-f", format!("comments[][side]={side}"));
@@ -230,11 +228,11 @@ mod tests {
             start: Some(631),
             left: false,
         };
-        let args = review_api_args("128", "", &a, "Keep it aligned.");
+        let args = review_api_args("128", "app.rs:631-632", &a, "Keep it aligned.");
         assert_eq!(
             args.join(" "),
             "api --method POST repos/{owner}/{repo}/pulls/128/reviews -f event=COMMENT \
-             -f comments[][path]=src/app.rs -F comments[][line]=632 -f comments[][side]=RIGHT \
+             -f body=app.rs:631-632 -f comments[][path]=src/app.rs -F comments[][line]=632 -f comments[][side]=RIGHT \
              -F comments[][start_line]=631 -f comments[][start_side]=RIGHT \
              -f comments[][body]=Keep it aligned. -q .html_url"
         );

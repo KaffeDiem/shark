@@ -7,6 +7,7 @@
 //! and scroll by putting a row at the top with `scroll_to_line`. A refresh puts the same row
 //! back. Mouse scrolling loses the model; `j/k` then scroll natively until the next jump.
 use super::*;
+use crate::chat::parse_reports;
 use crate::state::support_dir;
 use gpui_kit::component::diff::{DiffAnnotation, DiffLinePosition, DiffLineRange, DiffSide};
 use gpui_kit::component::input::{Enter, Escape, Textarea, TextareaState};
@@ -289,11 +290,8 @@ impl Comment {
     /// `app.rs · Working copy · lines 631–632`, as the chat card and GitHub preview say it.
     pub(super) fn card_place(&self) -> String {
         let name = self.path.rsplit('/').next().unwrap_or(&self.path);
-        let side = if self.end.0 {
-            "Original"
-        } else {
-            "Working copy"
-        };
+        let mut side = self.side().to_string();
+        side[..1].make_ascii_uppercase();
         let s = if self.start.1 == self.end.1 { "" } else { "s" };
         format!("{name} · {side} · line{s} {}", self.lines())
     }
@@ -339,7 +337,7 @@ fn side(old: bool) -> DiffSide {
 }
 
 /// A fence longer than any backtick run in `s`.
-fn fence(s: &str) -> String {
+pub(super) fn fence(s: &str) -> String {
     let mut f = "```".to_string();
     while s.contains(&f) {
         f.push('`');
@@ -382,26 +380,6 @@ pub(super) fn prompt(comments: &[Comment], note: &str) -> String {
          [c<id>] addressed: <what you changed, in one line>\n",
     );
     out
-}
-
-/// `[c<id>] addressed: <note>` lines of a reply, as `(id, note)`.
-pub(super) fn parse_reports(reply: &str) -> Vec<(u64, String)> {
-    reply
-        .lines()
-        .filter_map(|l| {
-            let l = l.trim().trim_start_matches(['-', '*', '`', ' ']);
-            let (id, rest) = l.strip_prefix("[c")?.split_once(']')?;
-            let rest = rest.trim_start();
-            let note = rest
-                .get(..10)
-                .filter(|p| p.eq_ignore_ascii_case("addressed:"))
-                .map(|_| &rest[10..])?;
-            Some((
-                id.parse().ok()?,
-                note.trim().trim_end_matches('`').trim().to_string(),
-            ))
-        })
-        .collect()
 }
 
 /// A sent comment after turn `turn` ended: reported → Addressed; its lines no longer read like
@@ -456,15 +434,38 @@ fn lines_now(dir: &Path, c: &Comment) -> Option<String> {
     Some(slice(&src, c.start.1, c.end.1))
 }
 
-/// Ids for comments saved before there were any (they load as 0); true if any got one.
-fn give_ids(c: &mut [Comment]) -> bool {
-    let mut next = c.iter().map(|c| c.id).max().unwrap_or(0);
+/// Ids for comments saved before there were any (they load as 0), counting on from `last`;
+/// true if any got one.
+fn give_ids(c: &mut [Comment], last: &mut u64) -> bool {
+    *last = c.iter().map(|c| c.id).fold(*last, u64::max);
     let fresh = c.iter().any(|c| c.id == 0);
     for c in c.iter_mut().filter(|c| c.id == 0) {
-        next += 1;
-        c.id = next;
+        *last += 1;
+        c.id = *last;
     }
     fresh
+}
+
+/// Comments waiting in a queue that is gone (shark quit, or `chat` closed) are pending again;
+/// true if any was.
+pub(super) fn unqueue(l: &mut [Comment], chat: Option<&str>) -> bool {
+    let mut any = false;
+    for c in l.iter_mut().filter(|c| c.status == Status::Queued) {
+        if chat.is_none_or(|id| c.chat.as_deref() == Some(id)) {
+            (c.status, c.chat) = (Status::Pending, None);
+            any = true;
+        }
+    }
+    any
+}
+
+/// comments/<ws>.json: the comments and the last id given out, so a deleted comment's id
+/// isn't reused (old review cards link to it). Older files are the list alone.
+#[derive(Serialize, Deserialize)]
+#[serde(untagged)]
+enum Store {
+    Ids { last: u64, comments: Vec<Comment> },
+    List(Vec<Comment>),
 }
 
 fn comments_path(ws: &str) -> PathBuf {
@@ -475,7 +476,7 @@ fn comments_path(ws: &str) -> PathBuf {
 pub(super) struct Composer {
     /// The comment being edited; `None` for a new one on `draft`'s lines.
     id: Option<u64>,
-    draft: Comment,
+    pub(super) draft: Comment,
     pub(super) input: Entity<TextareaState>,
     /// Suggest change (cmd-shift-s): the lines, to edit into the proposed code.
     pub(super) suggest: Option<Entity<TextareaState>>,
@@ -490,6 +491,8 @@ pub(super) struct Review {
     viewport: Rc<Cell<Pixels>>,
     /// Comments per workspace, loaded from disk on first use.
     pub(super) comments: HashMap<String, Vec<Comment>>,
+    /// The last comment id given out per workspace.
+    last_id: HashMap<String, u64>,
     pub(super) composer: Option<Composer>,
     pub(super) sheet: Option<review_send::Sheet>,
     pub(super) share: Option<review_share::Share>,
@@ -502,33 +505,57 @@ impl Review {
         self.view = Some((s.clone(), s));
     }
 
+    /// Writes the file whole (a temp file renamed over it), so a crash can't leave half.
     pub(super) fn save_comments(&self, ws: &str) {
-        let path = comments_path(ws);
-        match self.comments.get(ws).filter(|c| !c.is_empty()) {
-            None => {
-                let _ = std::fs::remove_file(path);
-            }
-            Some(c) => {
-                let _ = std::fs::create_dir_all(path.parent().unwrap());
-                let _ = std::fs::write(path, serde_json::to_vec(c).unwrap_or_default());
-            }
+        let (path, comments) = (comments_path(ws), self.comments.get(ws));
+        let last = self.last_id.get(ws).copied().unwrap_or(0);
+        let Ok(json) = serde_json::to_vec(&Store::Ids {
+            last,
+            comments: comments.cloned().unwrap_or_default(),
+        }) else {
+            return;
+        };
+        let tmp = path.with_extension("json.tmp");
+        let _ = std::fs::create_dir_all(path.parent().unwrap());
+        if std::fs::write(&tmp, json).is_ok() {
+            let _ = std::fs::rename(tmp, path);
         }
     }
 
-    /// Loads once; comments saved before ids get their own.
+    /// Loads once; comments saved before ids get their own, ones queued in a chat that is
+    /// gone now are pending. A file that doesn't parse is kept aside as `.json.bak`.
     pub(super) fn load_comments(&mut self, ws: &str) {
         if self.comments.contains_key(ws) {
             return;
         }
-        let mut c: Vec<Comment> = std::fs::read(comments_path(ws))
+        let path = comments_path(ws);
+        let store = std::fs::read(&path)
             .ok()
-            .and_then(|b| serde_json::from_slice(&b).ok())
-            .unwrap_or_default();
-        let fresh = give_ids(&mut c);
+            .map(|b| serde_json::from_slice(&b));
+        let (mut last, mut c) = match store {
+            Some(Ok(Store::Ids { last, comments })) => (last, comments),
+            Some(Ok(Store::List(c))) => (0, c),
+            Some(Err(_)) => {
+                let _ = std::fs::rename(&path, path.with_extension("json.bak"));
+                (0, vec![])
+            }
+            None => (0, vec![]),
+        };
+        let fresh = give_ids(&mut c, &mut last) | unqueue(&mut c, None);
         self.comments.insert(ws.to_string(), c);
+        self.last_id.insert(ws.to_string(), last);
         if fresh {
             self.save_comments(ws);
         }
+    }
+
+    /// A new comment id in workspace `ws`, never one given out before.
+    fn new_id(&mut self, ws: &str) -> u64 {
+        self.load_comments(ws);
+        let top = self.comments[ws].iter().map(|c| c.id).max().unwrap_or(0);
+        let last = self.last_id.entry(ws.to_string()).or_default();
+        *last = (*last).max(top) + 1;
+        *last
     }
 
     /// Edits workspace `ws`'s comments and saves them.
@@ -552,6 +579,27 @@ fn chip(label: String, color: Hsla, theme: &Theme) -> Div {
         .text_color(theme.muted_foreground)
         .child(div().size(px(6.)).rounded_full().bg(color))
         .child(label)
+}
+
+/// A composer box holding `text`, focused with the cursor at its end.
+fn textarea(
+    window: &mut Window,
+    text: String,
+    placeholder: &'static str,
+    cx: &mut Context<Shark>,
+) -> Entity<TextareaState> {
+    let t = cx.new(|cx| {
+        TextareaState::new(window, cx)
+            .auto_grow(1, 12)
+            .placeholder(placeholder)
+            .default_value(text)
+    });
+    t.update(cx, |i, cx| {
+        let end = i.value().len();
+        i.set_selected_range(end..end, cx);
+        i.focus(window, cx)
+    });
+    t
 }
 
 impl Shark {
@@ -842,8 +890,13 @@ impl Shark {
                 })
                 .unwrap_or_default(),
         };
+        // A file being edited in place shows its buffer, not what is on disk.
+        let edited = (self.editing.as_ref())
+            .filter(|e| !c.end.0 && c.start.0 == c.end.0 && *e.path == c.path)
+            .map(|e| slice(&e.buf.text(), c.start.1, c.end.1));
         let c = Comment { rev, ..c.clone() };
-        (lines_now(&ws.dir(), &c).unwrap_or_default(), c.rev)
+        let now = edited.or_else(|| lines_now(&ws.dir(), &c));
+        (now.unwrap_or_default(), c.rev)
     }
 
     /// `c`: the composer on the selected lines (the cursor line). A pending thread there is
@@ -859,47 +912,38 @@ impl Shark {
         let same = (self.ws_comments().iter())
             .find(|c| c.status == Status::Pending && c.place() == draft.place())
             .cloned();
-        match same {
-            Some(c) => self.open_composer(Some(c), window, cx),
-            None => {
-                let (snapshot, rev) = self.anchor_text(&draft);
-                let draft = Comment {
-                    snapshot,
-                    rev,
-                    ..draft
-                };
-                self.review.composer = None;
-                self.open_composer(Some(draft), window, cx)
+        let c = same.unwrap_or_else(|| {
+            let (snapshot, rev) = self.anchor_text(&draft);
+            Comment {
+                snapshot,
+                rev,
+                ..draft
             }
-        }
+        });
+        self.open_composer(c, window, cx)
     }
 
-    /// Opens the composer on `c`: an existing comment (id set) or a new draft.
-    fn open_composer(&mut self, c: Option<Comment>, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(c) = c else { return };
-        let mut textarea = |text: String, placeholder: &'static str, cx: &mut Context<Self>| {
-            cx.new(|cx| {
-                TextareaState::new(window, cx)
-                    .auto_grow(1, 8)
-                    .placeholder(placeholder)
-                    .default_value(text)
-            })
-        };
-        let input = textarea(c.text.clone(), "What should the agent change here?", cx);
-        let suggest = (c.suggestion.clone()).map(|s| textarea(s, "The code you propose", cx));
-        let focus = input.clone();
+    /// Opens the composer on `c`: an existing comment (id set) or a new draft, scrolled into
+    /// view above the review bar.
+    fn open_composer(&mut self, c: Comment, window: &mut Window, cx: &mut Context<Self>) {
+        // The text box last: it takes the focus.
+        let suggest =
+            (c.suggestion.clone()).map(|s| textarea(window, s, "The code you propose", cx));
+        let input = textarea(
+            window,
+            c.text.clone(),
+            "What should the agent change here?",
+            cx,
+        );
+        let anchor = Spot::Line(c.anchor());
         self.review.composer = Some(Composer {
             id: (c.id != 0).then_some(c.id),
             draft: c,
             input,
             suggest,
         });
-        focus.update(cx, |i, cx| {
-            let end = i.value().len();
-            i.set_selected_range(end..end, cx);
-            i.focus(window, cx)
-        });
-        cx.notify();
+        // ponytail: room for a composer of ~8 code rows; measure it if it grows.
+        self.reveal(&anchor, 8., window, cx);
     }
 
     /// cmd-shift-s: the Suggest change box, prefilled with the lines; again closes it.
@@ -911,18 +955,7 @@ impl Shark {
             Some(_) => comp.input.update(cx, |i, cx| i.focus(window, cx)),
             None => {
                 let text = comp.draft.snapshot.clone();
-                let s = cx.new(|cx| {
-                    TextareaState::new(window, cx)
-                        .auto_grow(1, 12)
-                        .placeholder("The code you propose")
-                        .default_value(text)
-                });
-                s.update(cx, |i, cx| {
-                    let end = i.value().len();
-                    i.set_selected_range(end..end, cx);
-                    i.focus(window, cx)
-                });
-                comp.suggest = Some(s);
+                comp.suggest = Some(textarea(window, text, "The code you propose", cx));
             }
         }
         cx.notify();
@@ -941,10 +974,11 @@ impl Shark {
         let order: HashMap<String, usize> = (self.diff_files.iter().enumerate())
             .map(|(i, f)| (f.path().to_string(), i))
             .collect();
+        let Some(ws) = self.active.clone() else {
+            return;
+        };
+        let id = comp.id.unwrap_or_else(|| self.review.new_id(&ws));
         self.edit_comments(cx, |list| {
-            let id = comp
-                .id
-                .unwrap_or_else(|| list.iter().map(|c| c.id).max().unwrap_or(0) + 1);
             let old = list.iter().position(|c| c.id == id).map(|i| list.remove(i));
             if !text.is_empty() {
                 list.push(Comment {
@@ -967,7 +1001,7 @@ impl Shark {
         cx.notify();
     }
 
-    fn focus_diff(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn focus_diff(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.diff.read(cx).focus_handle(cx).focus(window, cx);
     }
 
@@ -982,8 +1016,9 @@ impl Shark {
 
     /// `e`: edit the thread at the cursor.
     pub(super) fn edit_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let c = self.thread_at(cx).and_then(|id| self.comment(id).cloned());
-        self.open_composer(c, window, cx);
+        if let Some(c) = self.thread_at(cx).and_then(|id| self.comment(id).cloned()) {
+            self.open_composer(c, window, cx);
+        }
     }
 
     /// `x`: delete the thread at the cursor.
@@ -1048,21 +1083,24 @@ impl Shark {
         }
     }
 
+    /// Scrolls row `spot` into view with `below` code rows of room under it (for what is
+    /// annotated there), keeping the selected lines.
+    fn reveal(&mut self, spot: &Spot, below: f32, window: &mut Window, cx: &mut Context<Self>) {
+        let sel = self.diff.read(cx).selected_lines();
+        let rows = self.diff_rows(cx);
+        let cur = find(&rows, spot);
+        let top = (self.review.view.as_ref()).map_or(cur, |(t, _)| find(&rows, t));
+        let cap = (self.view_cap(window, cx) - below).max(SCROLLOFF * 2. + 1.);
+        self.apply_view(&rows, fit(&rows, top, cur, cap), cur, cx);
+        self.diff.update(cx, |d, cx| d.set_selected_lines(sel, cx));
+    }
+
     /// Puts the line cursor on comment `id`.
     pub(super) fn jump_to_comment(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(c) = self.comment(id).cloned() else {
             return;
         };
-        let spot = Spot::Line(c.anchor());
-        let rows = self.diff_rows(cx);
-        let cur = find(&rows, &spot);
-        let top = self
-            .review
-            .view
-            .as_ref()
-            .map_or(cur, |(t, _)| find(&rows, t));
-        let t = fit(&rows, top, cur, self.view_cap(window, cx));
-        self.apply_view(&rows, t, cur, cx);
+        self.reveal(&Spot::Line(c.anchor()), 0., window, cx);
         // `find` lands on the closest row; the thread's own line is what `e`/`x` read.
         let sel = DiffLineRange::new(c.path.clone(), side(c.end.0), c.end.1, c.end.1);
         self.diff
@@ -1159,23 +1197,26 @@ impl Shark {
         }
     }
 
-    /// Remove on a queued review card (`None`): its comments are pending again. Sent from
-    /// the chat (`Some(turn)`): read in that turn.
+    /// Chat `chat` sent comments `ids` (`Some(turn)`: read in that turn), or they never
+    /// went out (`None`: removed from its queue, or never read before its process ended) and
+    /// are pending again. Only comments still waiting in that chat change: an id may be gone.
     pub(super) fn review_delivered(
         &mut self,
         ws: &str,
+        chat: &str,
         ids: &[u64],
         turn: Option<usize>,
         cx: &mut Context<Self>,
     ) {
         self.review.edit(ws, |l| {
-            for c in l.iter_mut().filter(|c| ids.contains(&c.id)) {
-                c.status = match turn {
-                    Some(turn) => Status::Sent { turn },
-                    None => Status::Pending,
-                };
-                if turn.is_none() {
-                    c.chat = None;
+            let ours = |c: &Comment| ids.contains(&c.id) && c.chat.as_deref() == Some(chat);
+            for c in l.iter_mut().filter(|c| ours(c)) {
+                match (turn, &c.status) {
+                    (Some(turn), Status::Queued) => c.status = Status::Sent { turn },
+                    (None, Status::Queued | Status::Sent { .. }) => {
+                        (c.status, c.chat) = (Status::Pending, None)
+                    }
+                    _ => {}
                 }
             }
         });
@@ -1184,8 +1225,7 @@ impl Shark {
 
     /// "3 files · +5 −3": the diff as the review card shows it.
     pub(super) fn changes_label(&self) -> String {
-        let (a, d) = (self.diff_files.iter())
-            .fold((0, 0), |(a, d), f| (a + f.additions(), d + f.deletions()));
+        let (_, a, d) = self.changes_stats();
         let n = self.diff_files.len();
         format!("{n} file{} · +{a} −{d}", if n == 1 { "" } else { "s" })
     }
@@ -1332,6 +1372,12 @@ impl Shark {
         let snapshot =
             (!self.on_its_line(&c) && !c.snapshot.is_empty()).then(|| c.snapshot.clone());
         let posted = c.github.as_deref().map(posted_as);
+        let where_ = match (in_context, posted.is_some()) {
+            (true, true) => "In AI context · On GitHub",
+            (true, false) => "In AI context",
+            (false, true) => "On GitHub",
+            (false, false) => "",
+        };
         let mono = theme.mono_font_family.clone();
         v_flex()
             .mx(px(-12.))
@@ -1342,17 +1388,26 @@ impl Shark {
             .border_l_2()
             .border_color(color)
             .text_sm()
+            // Narrow, the place and where it went truncate; the pill and keys stay.
             .child(
                 h_flex()
                     .gap_2()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("You"))
-                    .child(div().text_color(theme.muted_foreground).child(format!(
-                        "{} · {}",
-                        c.lines(),
-                        c.side()
-                    )))
                     .child(
                         div()
+                            .flex_none()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .child("You"),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("{} · {}", c.lines(), c.side())),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
                             .px_1p5()
                             .rounded(theme.radius)
                             .text_xs()
@@ -1361,23 +1416,21 @@ impl Shark {
                             .child(pill),
                     )
                     .child(div().flex_1())
-                    .when(in_context, |d| {
-                        d.child(div().text_xs().text_color(theme.success_foreground).child(
-                            match posted.is_some() {
-                                true => "In AI context · On GitHub",
-                                false => "In AI context",
-                            },
-                        ))
-                    })
-                    .when(!in_context && posted.is_some(), |d| {
-                        d.child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.success_foreground)
-                                .child("On GitHub"),
-                        )
-                    })
-                    .child(div().text_xs().text_color(faint(theme)).child(hints)),
+                    .child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .text_xs()
+                            .text_color(theme.success_foreground)
+                            .child(where_),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_xs()
+                            .text_color(faint(theme))
+                            .child(hints),
+                    ),
             )
             .when_some(snapshot, |d, s| {
                 d.child(
@@ -1505,6 +1558,9 @@ impl Shark {
             _ if count(&|s| matches!(s, Status::Addressed { .. })) > 0 => {
                 Some(chip("Addressed".into(), theme.success_foreground, theme))
             }
+            _ if count(&|s| matches!(s, Status::Queued | Status::Sent { .. })) > 0 => {
+                Some(chip("Sent".into(), theme.primary, theme))
+            }
             _ => None,
         };
         let commenting =
@@ -1563,7 +1619,6 @@ impl Shark {
         let pending = count(&|s| *s == Status::Pending);
         let addressed = count(&|s| matches!(s, Status::Addressed { .. }));
         let outdated = count(&|s| *s == Status::Outdated);
-        let hints = "]c / [c thread · j / k move · v viewed";
         let bar = h_flex()
             .h(px(40.))
             .flex_none()
@@ -1573,16 +1628,6 @@ impl Shark {
             .border_color(theme.border)
             .text_xs()
             .text_color(theme.muted_foreground);
-        let dot = |c: Hsla| div().size(px(6.)).rounded_full().bg(c);
-        let lead = |label: String, c: Hsla| {
-            h_flex()
-                .gap_1p5()
-                .text_sm()
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme.foreground)
-                .child(dot(c))
-                .child(label)
-        };
         if let Some(s) = status {
             return bar.child(s).into_any_element();
         }
@@ -1591,66 +1636,73 @@ impl Shark {
                 .child("s split / unified · c comment · j / k move · ]c / [c change · v viewed")
                 .into_any_element();
         }
-        if pending > 0 {
-            let mut files: Vec<&str> = vec![];
-            for c in shown.iter().filter(|c| c.status == Status::Pending) {
-                let name = c.path.rsplit('/').next().unwrap_or(&c.path);
-                if !files.contains(&name) {
-                    files.push(name);
+        let (lead, color, summary) = match pending {
+            0 => (
+                "Review · sent".to_string(),
+                theme.success_foreground,
+                format!("{addressed} addressed · {outdated} outdated · 0 pending"),
+            ),
+            n => {
+                let mut files: Vec<&str> = vec![];
+                for c in shown.iter().filter(|c| c.status == Status::Pending) {
+                    let name = c.path.rsplit('/').next().unwrap_or(&c.path);
+                    if !files.contains(&name) {
+                        files.push(name);
+                    }
                 }
-            }
-            let files = match files.len() {
-                1 | 2 => files.join(" · "),
-                n => format!("{n} files"),
-            };
-            return bar
-                .child(lead(
-                    format!("Review · {pending} pending"),
+                let files = match files.len() {
+                    1 | 2 => files.join(" · "),
+                    n => format!("{n} files"),
+                };
+                (
+                    format!("Review · {n} pending"),
                     theme.warning_foreground,
-                ))
-                .child(files)
-                .child(div().text_color(faint(theme)).child(hints))
-                .child(div().flex_1())
-                .child(
-                    Button::new("review-discard")
-                        .ghost()
-                        .small()
-                        .label("Discard")
-                        .on_click(cx.listener(|this, _, _, cx| this.discard_pending(cx))),
+                    files,
                 )
-                .child(
-                    Button::new("review-send")
-                        .when(self.review.sheet.is_none(), |b| b.primary())
-                        .small()
-                        .label("Send review… ⇧C")
-                        .on_click(cx.listener(|this, _, w, cx| this.open_sheet(w, cx))),
-                )
-                .into_any_element();
-        }
-        bar.child(lead("Review · sent".into(), theme.success_foreground))
-            .child(format!(
-                "{addressed} addressed · {outdated} outdated · 0 pending"
-            ))
-            .child(div().text_color(faint(theme)).child(hints))
-            .child(div().flex_1())
-            .when(outdated > 0, |d| {
-                d.child(
-                    Button::new("review-requeue")
-                        .ghost()
-                        .small()
-                        .label("Re-queue outdated")
-                        .on_click(cx.listener(|this, _, _, cx| this.requeue_outdated(cx))),
-                )
-            })
-            .when(addressed > 0, |d| {
-                d.child(
-                    Button::new("review-resolve")
-                        .small()
-                        .label(format!("Resolve {addressed} addressed"))
-                        .on_click(cx.listener(|this, _, _, cx| this.resolve_addressed(cx))),
-                )
-            })
-            .into_any_element()
+            }
+        };
+        // Narrow, the summary and the keys truncate; the actions stay whole.
+        let text = |t: String| div().min_w_0().truncate().child(t);
+        let button = |id: &'static str, label: String| Button::new(id).small().label(label);
+        bar.child(
+            h_flex()
+                .flex_none()
+                .gap_1p5()
+                .text_sm()
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme.foreground)
+                .child(div().size(px(6.)).rounded_full().bg(color))
+                .child(lead),
+        )
+        .child(text(summary))
+        .child(text("[c / ]c jump · j / k change · v viewed".into()).text_color(faint(theme)))
+        .child(div().flex_1())
+        .when(outdated > 0, |d| {
+            d.child(
+                button("review-requeue", "Re-queue outdated".into())
+                    .ghost()
+                    .on_click(cx.listener(|this, _, _, cx| this.requeue_outdated(cx))),
+            )
+        })
+        .when(addressed > 0, |d| {
+            d.child(
+                button("review-resolve", format!("Resolve {addressed} addressed"))
+                    .on_click(cx.listener(|this, _, _, cx| this.resolve_addressed(cx))),
+            )
+        })
+        .when(pending > 0, |d| {
+            d.child(
+                button("review-discard", "Discard".into())
+                    .ghost()
+                    .on_click(cx.listener(|this, _, _, cx| this.discard_pending(cx))),
+            )
+            .child(
+                button("review-send", "Send review… ⇧C".into())
+                    .when(self.review.sheet.is_none(), |b| b.primary())
+                    .on_click(cx.listener(|this, _, w, cx| this.open_sheet(w, cx))),
+            )
+        })
+        .into_any_element()
     }
 }
 
@@ -1768,7 +1820,8 @@ mod tests {
 
     #[test]
     fn reports_and_judging() {
-        let reply = "Done.\n\n[c1] addressed: Ratio stored once.\n- `[c12] Addressed: renamed`\n[c3] skipped: no\n[cx] addressed: bad\n";
+        // The prompt's own instruction line, quoted back, is no report.
+        let reply = "Done.\n\n[c1] addressed: Ratio stored once.\n- `[c12] Addressed: renamed`\n[c3] skipped: no\n[cx] addressed: bad\n[c<id>] addressed: <what you changed, in one line>\n";
         assert_eq!(
             parse_reports(reply),
             [
@@ -1815,9 +1868,47 @@ mod tests {
             (0, &Status::Pending, (true, 3))
         );
         let mut c = c;
-        assert!(give_ids(&mut c));
+        let mut last = 0;
+        assert!(give_ids(&mut c, &mut last));
         assert_eq!(c.iter().map(|c| c.id).collect::<Vec<_>>(), [1, 2]);
-        assert!(!give_ids(&mut c), "only once");
+        assert!(!give_ids(&mut c, &mut last), "only once");
+        assert_eq!(last, 2);
+        // The list alone (older files) and with the last id both load.
+        let Ok(Store::List(l)) = serde_json::from_str(old) else {
+            panic!("old list")
+        };
+        assert_eq!(l.len(), 2);
+        let new = r#"{"last":9,"comments":[{"id":3,"path":"api/a","start":[false,1],"end":[false,1],"text":"x"}]}"#;
+        let Ok(Store::Ids { last, comments }) = serde_json::from_str(new) else {
+            panic!("new store")
+        };
+        assert_eq!((last, comments[0].id), (9, 3));
+        // A comment queued in a chat that is gone is pending again; others stay.
+        let mut l = vec![
+            Comment {
+                id: 1,
+                status: Status::Queued,
+                chat: Some("a".into()),
+                ..Default::default()
+            },
+            Comment {
+                id: 2,
+                status: Status::Queued,
+                chat: Some("b".into()),
+                ..Default::default()
+            },
+            Comment {
+                id: 3,
+                status: Status::Sent { turn: 1 },
+                chat: Some("a".into()),
+                ..Default::default()
+            },
+        ];
+        assert!(unqueue(&mut l, Some("a")));
+        assert_eq!((&l[0].status, &l[0].chat), (&Status::Pending, &None));
+        assert_eq!(l[1].status, Status::Queued);
+        assert_eq!(l[2].status, Status::Sent { turn: 1 });
+        assert!(unqueue(&mut l, None) && !unqueue(&mut l, None));
         let s = Status::Addressed {
             turn: 5,
             note: "n".into(),

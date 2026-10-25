@@ -76,6 +76,71 @@ pub struct ReviewCard {
     pub changes: String,
 }
 
+/// `[c<id>] addressed: <note>` lines of a reply, as `(id, note)`.
+pub fn parse_reports(reply: &str) -> Vec<(u64, String)> {
+    reply
+        .lines()
+        .filter_map(|l| {
+            let l = l.trim().trim_start_matches(['-', '*', '`', ' ']);
+            let (id, rest) = l.strip_prefix("[c")?.split_once(']')?;
+            let rest = rest.trim_start();
+            let note = rest
+                .get(..10)
+                .filter(|p| p.eq_ignore_ascii_case("addressed:"))
+                .map(|_| &rest[10..])?;
+            Some((
+                id.parse().ok()?,
+                note.trim().trim_end_matches('`').trim().to_string(),
+            ))
+        })
+        .collect()
+}
+
+/// The reply as shown: without its `[c<id>] addressed:` lines, which only feed the diff's
+/// threads (src/app/review.rs).
+fn hide_reports(reply: &str) -> String {
+    (reply.lines())
+        .filter(|l| parse_reports(l).is_empty())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// A review's prompt (review.rs `prompt`) back as its card, for a replayed transcript: each
+/// `[c<id>] <place>` and its quoted text. The diff it was sent with is unknown by then.
+fn card_of(prompt: &str) -> Option<ReviewCard> {
+    // A workspace note may come before it on the wire.
+    let prompt = &prompt[prompt.find("Review comments on the diff.")?..];
+    let (mut items, mut fence) = (Vec::<ReviewItem>::new(), None);
+    for l in prompt.lines() {
+        if let Some(f) = fence {
+            fence = (l != f).then_some(f);
+            continue;
+        }
+        if l.starts_with("```") {
+            fence = Some(l);
+        } else if let Some((id, rest)) = l.strip_prefix("[c").and_then(|l| l.split_once("] "))
+            && let Ok(id) = id.parse()
+        {
+            let place = rest.split(" · ").next().unwrap_or(rest).to_string();
+            items.push(ReviewItem {
+                id,
+                place,
+                text: String::new(),
+            });
+        } else if let (Some(t), Some(it)) = (l.strip_prefix("> "), items.last_mut()) {
+            if !it.text.is_empty() {
+                it.text.push('\n');
+            }
+            it.text.push_str(t);
+        }
+    }
+    (!items.is_empty()).then(|| ReviewCard {
+        prompt: prompt.to_string(),
+        items,
+        changes: String::new(),
+    })
+}
+
 /// One comment of a review card: its id, "app.rs · Working copy · lines 631–632", its text.
 pub struct ReviewItem {
     pub id: u64,
@@ -1529,13 +1594,19 @@ impl Chat {
         self.push(Block::Info("interrupting…".into()), cx);
     }
 
-    /// Messages claude never read, once its process is gone.
-    fn drop_unread(&mut self) {
+    /// Messages claude never read, once its process is gone; reviews among them say so.
+    fn drop_unread(&mut self, cx: &mut Context<Self>) {
         let n = self.unread.len();
         for bi in std::mem::take(&mut self.unread) {
-            if let Some(Block::User(_, queued) | Block::Review(_, queued)) = self.blocks.get_mut(bi)
-            {
-                *queued = false;
+            match self.blocks.get_mut(bi) {
+                Some(Block::User(_, queued)) => *queued = false,
+                Some(Block::Review(r, queued)) => {
+                    *queued = false;
+                    cx.emit(ChatEvent::ReviewRemoved(
+                        r.items.iter().map(|i| i.id).collect(),
+                    ));
+                }
+                _ => {}
             }
         }
         if n > 0 {
@@ -1547,14 +1618,14 @@ impl Chat {
     }
 
     /// The process is gone (or going): forget its state, end its calls, flag what it never read.
-    fn drop_process(&mut self) {
+    fn drop_process(&mut self, cx: &mut Context<Self>) {
         self.agent = None; // drop stops it
         self.background.clear();
         self.stopping = None;
         self.cut = false;
         self.steered = false;
         self.interrupt();
-        self.drop_unread();
+        self.drop_unread(cx);
     }
 
     /// Forgets the claude session and stops the agent; the next send starts a new conversation.
@@ -1564,8 +1635,8 @@ impl Chat {
         cx.emit(ChatEvent::Meta);
         self.reader = None; // its Exited would be about the old process
         self.busy = false;
-        self.follow(cx, |this, _| {
-            this.drop_process();
+        self.follow(cx, |this, cx| {
+            this.drop_process(cx);
             this.blocks.push(Block::Info("new conversation".into()));
         });
         if was_working {
@@ -1733,7 +1804,10 @@ impl Chat {
                             self.steered = false;
                         }
                     }
-                    None => self.blocks.push(Block::User(text, false)),
+                    None => self.blocks.push(match card_of(&text) {
+                        Some(card) => Block::Review(Rc::new(card), false),
+                        None => Block::User(text, false),
+                    }),
                 }
             }
             Ev::TextDelta(s) => match self.live_text() {
@@ -1756,14 +1830,14 @@ impl Chat {
             Ev::Text(full) => match self.live_text() {
                 Some(bi) => {
                     if let Block::Text { md, src, done } = &mut self.blocks[bi] {
-                        md.update(cx, |m, cx| m.set_text(&full, cx));
+                        md.update(cx, |m, cx| m.set_text(&hide_reports(&full), cx));
                         *src = full;
                         *done = true;
                     }
                     self.remeasure(bi);
                 }
                 None => {
-                    let md = cx.new(|cx| TextViewState::markdown(&full, cx));
+                    let md = cx.new(|cx| TextViewState::markdown(&hide_reports(&full), cx));
                     self.blocks.push(Block::Text {
                         md,
                         src: full,
@@ -1883,7 +1957,7 @@ impl Chat {
                 }
             }
             Ev::Exited(msg) => {
-                self.drop_process();
+                self.drop_process(cx);
                 if self.busy {
                     self.busy = false;
                     self.blocks.push(Block::Info(msg));
@@ -2904,6 +2978,30 @@ impl Render for Chat {
 mod tests {
     use super::*;
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+
+    /// A review prompt in a replayed transcript comes back as its card; report lines stay
+    /// out of the shown reply.
+    #[test]
+    fn review_cards_and_reports() {
+        let p = "note\n\nReview comments on the diff. Paths …:\n\n[c1] api/a.rs:12 · working tree\n````\n[c9] x\n> y\n````\n> rename\n> it\nSuggested change:\n```\nlet y;\n```\n\n[c4] api/b.rs:3-5 (old) · base 0123456789\n> keep\n\nEnd your reply with one line per comment you addressed, exactly like:\n[c<id>] addressed: <what you changed, in one line>\n";
+        let card = card_of(p).unwrap();
+        let items: Vec<_> = (card.items.iter())
+            .map(|i| (i.id, i.place.as_str(), i.text.as_str()))
+            .collect();
+        assert_eq!(
+            items,
+            [
+                (1, "api/a.rs:12", "rename\nit"),
+                (4, "api/b.rs:3-5 (old)", "keep")
+            ]
+        );
+        assert!(card.prompt.starts_with("Review comments"));
+        assert!(card_of("plain [c1] x\n> y").is_none());
+        assert_eq!(
+            hide_reports("Done.\n[c1] addressed: x\n- `[c2] addressed: y`\nBye"),
+            "Done.\nBye"
+        );
+    }
 
     #[test]
     fn summarizes_tool_groups() {

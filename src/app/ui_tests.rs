@@ -2375,6 +2375,7 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn review_queue(cx: &mut TestAppContext) {
+    use gpui_kit::component::diff::{DiffLineRange, DiffSide};
     use review::Status;
     let quiet = quiet_claude();
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -2451,6 +2452,12 @@ async fn review_queue(cx: &mut TestAppContext) {
     press(cx, &["x"]);
     let ids: Vec<u64> = comments(cx).iter().map(|c| c.0).collect();
     assert_eq!(ids, [1, 2], "x deleted the line-2 thread");
+    // A new thread there gets a fresh id: 3 was the deleted one's.
+    press(cx, &["c"]);
+    typing(cx, "fresh");
+    press(cx, &["cmd-enter"]);
+    assert!(comments(cx).iter().any(|c| c.0 == 4 && c.1 == "fresh"));
+    press(cx, &["x"]);
 
     // shift-c: the sheet; space unticks the first row, cmd-enter sends only the second.
     press(cx, &["shift-c"]);
@@ -2504,16 +2511,29 @@ async fn review_queue(cx: &mut TestAppContext) {
     fs::write(api.join("f"), "A\nb\nc\n").unwrap();
     reply(cx, "Done.");
     assert_eq!(comments(cx)[0].2, Status::Outdated);
-    // Resolve (r) the addressed one; R reopens the outdated one; re-queue does the rest.
+    // Re-queue puts the outdated one back; r resolves the addressed one; R reopens.
+    on(cx, &|s, _, cx| s.requeue_outdated(cx));
+    assert_eq!(comments(cx)[0].2, Status::Pending);
     on(cx, &|s, w, cx| s.jump_to_comment(2, w, cx));
     press(cx, &["r"]);
     assert_eq!(comments(cx)[1].2, Status::Resolved);
+    on(cx, &|s, _, cx| s.set_status(&[1], Status::Outdated, cx));
     on(cx, &|s, w, cx| s.jump_to_comment(1, w, cx));
     press(cx, &["shift-r"]);
     assert_eq!(comments(cx)[0].2, Status::Pending);
-    on(cx, &|s, _, cx| s.set_status(&[1], Status::Outdated, cx));
-    on(cx, &|s, _, cx| s.requeue_outdated(cx));
-    assert_eq!(comments(cx)[0].2, Status::Pending);
+    // r without a thread under the cursor refreshes the diff, as before.
+    fs::write(api.join("h"), "new\n").unwrap();
+    on(cx, &|s, _, cx| {
+        let two = DiffLineRange::new("api/f", DiffSide::Modified, 2, 2);
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(two), cx));
+    });
+    press(cx, &["r"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).diff_files.len() == 2
+    })
+    .await;
+    fs::remove_file(api.join("h")).unwrap();
 
     // A busy chat queues the review: the tab counts it, the card's Remove puts it back.
     // (The fake claude never echoes, so the reviews sent above still count as unread.)
@@ -2545,6 +2565,36 @@ async fn review_queue(cx: &mut TestAppContext) {
         Status::Addressed { turn: 3, .. }
     ));
     on(cx, &|s, _, cx| s.set_status(&[1], Status::Pending, cx));
+    // An event about a comment that isn't waiting in that chat changes nothing.
+    cx.update(|cx| {
+        chat.update(cx, |_, cx| {
+            cx.emit(ChatEvent::ReviewSent {
+                ids: vec![1],
+                turn: 9,
+            })
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(comments(cx)[0].2, Status::Pending);
+    // Sent but never read when the process goes (a new conversation): pending again.
+    on(cx, &|s, w, cx| s.send_review(&[1], "", false, w, cx));
+    assert!(matches!(comments(cx)[0].2, Status::Sent { .. }));
+    cx.update(|cx| chat.update(cx, |c, cx| c.new_conversation(cx)));
+    cx.run_until_parked();
+    assert_eq!(comments(cx)[0].2, Status::Pending);
+    // Queued in a chat that is closed: pending again.
+    cx.update(|cx| chat.update(cx, |c, _| c.busy = true));
+    on(cx, &|s, w, cx| s.send_review(&[1], "", false, w, cx));
+    assert_eq!(comments(cx)[0].2, Status::Queued);
+    cx.update(|cx| chat.update(cx, |c, _| c.busy = false));
+    on(cx, &|s, w, cx| s.close_chat(w, cx));
+    assert_eq!(
+        (
+            comments(cx)[0].2.clone(),
+            cx.update(|cx| shark.read(cx).comment(1).unwrap().chat.clone())
+        ),
+        (Status::Pending, None)
+    );
 
     // Share to GitHub through a fake gh: argv logged, URL kept; a failure keeps the comment.
     let bin = home.join("gh-bin");
@@ -2592,6 +2642,28 @@ async fn review_queue(cx: &mut TestAppContext) {
         ),
         "{argv}"
     );
+    // The sheet with Also publish: the chat gets it, and the PR a Comment review.
+    fs::write(&log, "").unwrap();
+    on(cx, &|s, w, cx| {
+        s.edit_comments(cx, |l| l[0].github = None);
+        s.open_sheet(w, cx);
+        s.review.sheet.as_mut().unwrap().publish = true;
+        s.sheet_send(w, cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark
+            .read(cx)
+            .comment(1)
+            .is_some_and(|c| c.github.is_some())
+    })
+    .await;
+    let argv = fs::read_to_string(&log).unwrap();
+    assert!(
+        argv.starts_with("pr|review|7|--comment|--body|**api/f**"),
+        "{argv}"
+    );
+    assert!(matches!(comments(cx)[0].2, Status::Sent { .. }));
+    on(cx, &|s, _, cx| s.set_status(&[1], Status::Pending, cx));
     // A PR review of pushed lines sits on them: gh api with the line.
     fs::write(&log, "").unwrap();
     on(cx, &|s, w, cx| {
@@ -2609,7 +2681,7 @@ async fn review_queue(cx: &mut TestAppContext) {
     .await;
     let argv = fs::read_to_string(&log).unwrap();
     assert!(
-        argv.starts_with("api|--method|POST|repos/{owner}/{repo}/pulls/7/reviews|-f|event=COMMENT|-f|comments[][path]=f|-F|comments[][line]=3|-f|comments[][side]=RIGHT|-f|comments[][body]=third line|"),
+        argv.starts_with("api|--method|POST|repos/{owner}/{repo}/pulls/7/reviews|-f|event=COMMENT|-f|body=api/f:3|-f|comments[][path]=f|-F|comments[][line]=3|-f|comments[][side]=RIGHT|-f|comments[][body]=third line|"),
         "{argv}"
     );
     assert!(github(cx, 2).is_some_and(|u| u.ends_with("#pullrequestreview-5")));
@@ -2681,6 +2753,43 @@ async fn review_queue(cx: &mut TestAppContext) {
     unsafe { std::env::remove_var("SHARK_GH") };
     on(cx, &|s, w, cx| s.close_share(w, cx));
 
+    // On a file being edited in place, a new thread quotes the buffer, not the disk.
+    on(cx, &|s, w, cx| {
+        s.edit_working_copy(Some("api/f".into()), w, cx)
+    });
+    on(cx, &|s, w, cx| {
+        s.editing.as_mut().unwrap().buf.lines[1] = "edited".into();
+        let two = DiffLineRange::new("api/f", DiffSide::Modified, 2, 2);
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(two), cx));
+        s.comment_dialog(w, cx);
+    });
+    cx.update(|cx| {
+        let comp = shark.read(cx).review.composer.as_ref().unwrap();
+        assert_eq!(comp.draft.snapshot, "edited");
+    });
+    on(cx, &|s, w, cx| {
+        s.cancel_composer(w, cx);
+        s.editing = None;
+    });
+
+    // A comments file that doesn't parse is kept aside, not overwritten; one queued in a
+    // chat from before a restart loads pending.
+    let dir = crate::state::support_dir().join("comments");
+    fs::write(dir.join("bad.json"), "{oops").unwrap();
+    on(cx, &|s, _, _| s.review.load_comments("bad"));
+    assert!(dir.join("bad.json.bak").exists() && !dir.join("bad.json").exists());
+    fs::write(
+        dir.join("old.json"),
+        r#"[{"id":5,"path":"api/f","start":[false,1],"end":[false,1],"text":"q","status":"Queued","chat":"c1"}]"#,
+    )
+    .unwrap();
+    on(cx, &|s, _, _| s.review.load_comments("old"));
+    cx.update(|cx| {
+        let c = &shark.read(cx).review.comments["old"][0];
+        assert_eq!((&c.status, &c.chat), (&Status::Pending, &None));
+    });
+
     // A thread whose file left the diff still shows, with its snapshot, below it.
     fs::remove_file(api.join("f")).unwrap();
     fs::write(api.join("g"), "x\n").unwrap();
@@ -2688,6 +2797,25 @@ async fn review_queue(cx: &mut TestAppContext) {
     on(cx, &|s, _, cx| {
         assert_eq!(s.diff_files.len(), 1);
         assert!(s.render_orphans(cx).is_some());
+    });
+
+    // Another workspace opens: the composer and the sheet were about this one's comments.
+    on(cx, &|s, w, cx| {
+        let one = DiffLineRange::new("api/g", DiffSide::Modified, 1, 1);
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(one), cx));
+        s.comment_dialog(w, cx);
+        s.open_sheet(w, cx);
+        assert!(s.review.composer.is_some() && s.review.sheet.is_some());
+        s.create_workspace("rq2".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.as_deref() == Some("rq2")
+    })
+    .await;
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert!(s.review.composer.is_none() && s.review.sheet.is_none());
     });
     fs::remove_dir_all(&home).ok();
 }

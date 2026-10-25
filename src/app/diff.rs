@@ -610,7 +610,6 @@ impl Shark {
                 d.child(self.render_review_bar(status.map(Into::into), cx))
             })
             .children(self.render_sheet(window, cx))
-            .children(self.render_share(cx))
             .into_any_element()
     }
 

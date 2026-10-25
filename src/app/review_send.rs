@@ -46,7 +46,7 @@ impl Shark {
 
     pub(super) fn close_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.review.sheet = None;
-        self.diff.read(cx).focus_handle(cx).focus(window, cx);
+        self.focus_diff(window, cx);
         cx.notify();
     }
 
@@ -163,12 +163,12 @@ impl Shark {
                 let name = c.path.rsplit('/').next().unwrap_or(&c.path);
                 format!("{name}:{}", c.lines().replace('–', "-"))
             });
-            let text = c.map_or(String::new(), |c| match &c.suggestion {
-                Some(sug) => format!(
-                    "Suggested change · {}",
-                    sug.lines().next().unwrap_or_default().trim()
-                ),
-                None => c.text.lines().next().unwrap_or_default().to_string(),
+            let text = c.map_or(String::new(), |c| {
+                let first = c.text.lines().next().unwrap_or_default();
+                match c.suggestion {
+                    Some(_) => format!("Suggested change · {first}"),
+                    None => first.to_string(),
+                }
             });
             h_flex()
                 .id(("sheet-row", ix))
@@ -211,187 +211,191 @@ impl Shark {
             p
         });
         let n = s.rows.len();
-        Some(
-            v_flex()
-                .id("review-sheet")
-                .absolute()
-                .right(px(16.))
-                .bottom(px(48.))
-                .w(px(500.))
-                .rounded(theme.radius_lg)
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.popover)
-                .shadow_lg()
-                .text_sm()
-                // In the note: cmd-enter sends and Esc closes, as everywhere in the sheet.
-                .capture_action(cx.listener(|this, a: &Enter, w, cx| {
-                    if a.secondary {
-                        cx.stop_propagation();
-                        this.sheet_send(w, cx);
-                    }
-                }))
-                .capture_action(cx.listener(|this, _: &Escape, w, cx| {
+        let sheet = v_flex()
+            .id("review-sheet")
+            .absolute()
+            .right(px(16.))
+            .bottom(px(48.))
+            .w(px(500.))
+            .rounded(theme.radius_lg)
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.popover)
+            .shadow_lg()
+            .text_sm()
+            .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            // In the note: cmd-enter sends and Esc closes, as everywhere in the sheet.
+            .capture_action(cx.listener(|this, a: &Enter, w, cx| {
+                if a.secondary {
                     cx.stop_propagation();
-                    this.close_sheet(w, cx);
-                }))
-                .child(
-                    h_flex()
-                        .px_4()
-                        .pt_3()
-                        .pb_2()
-                        .gap_2()
-                        .child(div().font_weight(FontWeight::SEMIBOLD).child("Send review"))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(theme.muted_foreground)
-                                .child(format!(
-                                    "{n} comment{} · {} file{}",
-                                    if n == 1 { "" } else { "s" },
-                                    files.len(),
-                                    if files.len() == 1 { "" } else { "s" }
-                                )),
-                        )
-                        .child(div().flex_1())
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(faint(theme))
-                                .child("space toggle · ↵ open"),
-                        ),
-                )
-                // The keys live on the list, so the note below types j, k and space.
-                .child(
-                    v_flex()
-                        .id("sheet-rows")
-                        .key_context("ReviewSheet")
-                        .track_focus(&s.focus)
-                        .px_2()
-                        .pb_2()
-                        .on_action(cx.listener(|this, _: &ToggleRow, _, cx| this.sheet_toggle(cx)))
-                        .on_action(
-                            cx.listener(|this, _: &SelectNext, _, cx| this.sheet_move(1, cx)),
-                        )
-                        .on_action(
-                            cx.listener(|this, _: &SelectPrev, _, cx| this.sheet_move(-1, cx)),
-                        )
-                        .on_action(cx.listener(|this, _: &Confirm, w, cx| this.sheet_open(w, cx)))
-                        .on_action(
-                            cx.listener(|this, _: &CancelEdit, w, cx| this.close_sheet(w, cx)),
-                        )
-                        .on_action(
-                            cx.listener(|this, _: &SubmitForm, w, cx| this.sheet_send(w, cx)),
-                        )
-                        .children(rows),
-                )
-                .child(
-                    v_flex()
-                        .px_4()
-                        .py_3()
-                        .gap_2()
-                        .border_t_1()
-                        .border_color(theme.border)
-                        .child(Input::new(&s.note))
-                        .child(
+                    this.sheet_send(w, cx);
+                }
+            }))
+            .capture_action(cx.listener(|this, _: &Escape, w, cx| {
+                cx.stop_propagation();
+                this.close_sheet(w, cx);
+            }))
+            .child(
+                h_flex()
+                    .px_4()
+                    .pt_3()
+                    .pb_2()
+                    .gap_2()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Send review"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(format!(
+                                "{n} comment{} · {} file{}",
+                                if n == 1 { "" } else { "s" },
+                                files.len(),
+                                if files.len() == 1 { "" } else { "s" }
+                            )),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(faint(theme))
+                            .child("space toggle · ↵ open"),
+                    ),
+            )
+            // The keys live on the list, so the note below types j, k and space.
+            .child(
+                v_flex()
+                    .id("sheet-rows")
+                    .key_context("ReviewSheet")
+                    .track_focus(&s.focus)
+                    .px_2()
+                    .pb_2()
+                    .on_action(cx.listener(|this, _: &ToggleRow, _, cx| this.sheet_toggle(cx)))
+                    .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.sheet_move(1, cx)))
+                    .on_action(cx.listener(|this, _: &SelectPrev, _, cx| this.sheet_move(-1, cx)))
+                    .on_action(cx.listener(|this, _: &Confirm, w, cx| this.sheet_open(w, cx)))
+                    .on_action(cx.listener(|this, _: &CancelEdit, w, cx| this.close_sheet(w, cx)))
+                    .on_action(cx.listener(|this, _: &SubmitForm, w, cx| this.sheet_send(w, cx)))
+                    .children(rows),
+            )
+            .child(
+                v_flex()
+                    .px_4()
+                    .py_3()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(Input::new(&s.note))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .size(px(10.))
+                                    .rounded_full()
+                                    .border_3()
+                                    .border_color(theme.primary),
+                            )
+                            .child("Send as the next message in this chat"),
+                    )
+                    .when_some(pr, |d, number| {
+                        d.child(
                             h_flex()
                                 .gap_2()
                                 .child(
-                                    div()
-                                        .size(px(10.))
-                                        .rounded_full()
-                                        .border_3()
-                                        .border_color(theme.primary),
+                                    Checkbox::new("sheet-publish")
+                                        .small()
+                                        .checked(s.publish)
+                                        .label(format!(
+                                            "Also publish to PR #{number} as a Comment review"
+                                        ))
+                                        .on_click(cx.listener(|this, on: &bool, _, cx| {
+                                            if let Some(s) = &mut this.review.sheet {
+                                                s.publish = *on;
+                                            }
+                                            cx.notify();
+                                        })),
                                 )
-                                .child("Send as the next message in this chat"),
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("preview first"),
+                                ),
                         )
-                        .when_some(pr, |d, number| {
-                            d.child(
-                                h_flex()
-                                    .gap_2()
-                                    .child(
-                                        Checkbox::new("sheet-publish")
-                                            .small()
-                                            .checked(s.publish)
-                                            .label(format!(
-                                                "Also publish to PR #{number} as a Comment review"
-                                            ))
-                                            .on_click(cx.listener(|this, on: &bool, _, cx| {
-                                                if let Some(s) = &mut this.review.sheet {
-                                                    s.publish = *on;
-                                                }
-                                                cx.notify();
-                                            })),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child("preview first"),
-                                    ),
-                            )
-                        }),
-                )
-                .when_some(preview, |d, p| {
-                    d.child(
-                        div()
-                            .id("sheet-preview")
-                            .max_h(px(220.))
-                            .overflow_y_scroll()
-                            .px_4()
-                            .py_2()
-                            .border_t_1()
-                            .border_color(theme.border)
-                            .bg(theme.muted)
-                            .font_family(theme.mono_font_family.clone())
-                            .text_xs()
-                            .whitespace_normal()
-                            .child(p),
-                    )
-                })
-                .child(
-                    h_flex()
+                    }),
+            )
+            .when_some(preview, |d, p| {
+                d.child(
+                    div()
+                        .id("sheet-preview")
+                        .max_h(px(220.))
+                        .overflow_y_scroll()
                         .px_4()
                         .py_2()
-                        .gap_2()
                         .border_t_1()
                         .border_color(theme.border)
-                        .child(
-                            Button::new("sheet-preview-toggle")
-                                .ghost()
-                                .small()
-                                .label(if s.preview {
-                                    "Hide prompt"
-                                } else {
-                                    "Preview prompt"
-                                })
-                                .on_click(cx.listener(|this, _, _, cx| {
-                                    if let Some(s) = &mut this.review.sheet {
-                                        s.preview = !s.preview;
-                                    }
-                                    cx.notify();
-                                })),
-                        )
-                        .child(div().flex_1())
-                        .child(
-                            Button::new("sheet-esc")
-                                .ghost()
-                                .small()
-                                .label("Esc")
-                                .on_click(cx.listener(|this, _, w, cx| this.close_sheet(w, cx))),
-                        )
-                        .child(
-                            Button::new("sheet-send")
-                                .primary()
-                                .small()
-                                .disabled(ticked == 0)
-                                .label(format!(
-                                    "Send {ticked} comment{} ⌘↵",
-                                    if ticked == 1 { "" } else { "s" }
-                                ))
-                                .on_click(cx.listener(|this, _, w, cx| this.sheet_send(w, cx))),
-                        ),
+                        .bg(theme.muted)
+                        .font_family(theme.mono_font_family.clone())
+                        .text_xs()
+                        .whitespace_normal()
+                        .child(p),
                 )
+            })
+            .child(
+                h_flex()
+                    .px_4()
+                    .py_2()
+                    .gap_2()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(
+                        Button::new("sheet-preview-toggle")
+                            .ghost()
+                            .small()
+                            .label(if s.preview {
+                                "Hide prompt"
+                            } else {
+                                "Preview prompt"
+                            })
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                if let Some(s) = &mut this.review.sheet {
+                                    s.preview = !s.preview;
+                                }
+                                cx.notify();
+                            })),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("sheet-esc")
+                            .ghost()
+                            .small()
+                            .label("Esc")
+                            .on_click(cx.listener(|this, _, w, cx| this.close_sheet(w, cx))),
+                    )
+                    .child(
+                        Button::new("sheet-send")
+                            .primary()
+                            .small()
+                            .disabled(ticked == 0)
+                            .label(format!(
+                                "Send {ticked} comment{} ⌘↵",
+                                if ticked == 1 { "" } else { "s" }
+                            ))
+                            .on_click(cx.listener(|this, _, w, cx| this.sheet_send(w, cx))),
+                    ),
+            );
+        // The diff dims behind it; a click there closes it.
+        Some(
+            div()
+                .id("review-sheet-backdrop")
+                .absolute()
+                .inset_0()
+                .bg(theme.overlay)
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _, w, cx| this.close_sheet(w, cx)),
+                )
+                .child(sheet)
                 .into_any_element(),
         )
     }

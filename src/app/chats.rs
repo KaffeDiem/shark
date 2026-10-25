@@ -72,9 +72,9 @@ impl Shark {
                     this.show(Tab::Diff, window, cx);
                     this.jump_to_comment(*id, window, cx);
                 }
-                ChatEvent::ReviewRemoved(ids) => this.review_delivered(&name, ids, None, cx),
+                ChatEvent::ReviewRemoved(ids) => this.review_delivered(&name, &id, ids, None, cx),
                 ChatEvent::ReviewSent { ids, turn } => {
-                    this.review_delivered(&name, ids, Some(*turn), cx)
+                    this.review_delivered(&name, &id, ids, Some(*turn), cx)
                 }
             },
         ));
@@ -211,6 +211,10 @@ impl Shark {
             crate::plan::delete(&m.id);
         }
         self.unread.remove(&meta.id);
+        // Its queue goes with it: reviews waiting there are pending again.
+        self.review.edit(&name, |l| {
+            review::unqueue(l, Some(&meta.id));
+        });
         if let Some(chat) = self.chats.remove(&meta.id)
             && let Some(sync) = self.syncs.get(&name)
         {

@@ -243,6 +243,10 @@ impl Shark {
             self.collapsed_dirs.clear();
             self.tree_sel = 0;
             self.lose_view();
+            // They act on the open workspace's comments: not another one's.
+            self.review.composer = None;
+            self.review.sheet = None;
+            self.close_share(window, cx);
         }
         self.sel = SideRow::Ws(ix);
         if let Some(i) = self.section_of(&ws.name)
