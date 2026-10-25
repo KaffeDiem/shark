@@ -515,7 +515,7 @@ type Cmd = fn(&mut Shark, &mut Window, &mut Context<Shark>);
 
 const COMMANDS: &[(&str, IconName, Cmd)] = &[
     ("New workspace", IconName::Plus, |s, w, cx| {
-        s.new_workspace(w, cx)
+        s.new_workspace(s.state.last_repos.clone(), w, cx)
     }),
     ("Add repo", IconName::FolderPlus, |s, w, cx| {
         s.add_repo(w, cx)
@@ -1628,28 +1628,32 @@ impl Shark {
             let Ok(Ok(Some(paths))) = paths.await else {
                 return;
             };
-            this.update_in(cx, |s, window, cx| {
-                for p in paths {
-                    match git::add_repo(&p, &s.state.repos) {
-                        Ok(r) => s.state.repos.push(r),
-                        Err(e) => Self::notify_err(window, cx, e),
-                    }
-                }
-                s.state.save();
-                cx.notify();
-            })
-            .ok();
+            this.update_in(cx, |s, window, cx| s.add_repo_paths(&paths, window, cx))
+                .ok();
         })
         .detach();
     }
 
-    fn new_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// From the folder picker or folders dropped on the sidebar.
+    fn add_repo_paths(&mut self, paths: &[PathBuf], window: &mut Window, cx: &mut Context<Self>) {
+        for p in paths {
+            match git::add_repo(p, &self.state.repos) {
+                Ok(r) => self.state.repos.push(r),
+                Err(e) => Self::notify_err(window, cx, e),
+            }
+        }
+        self.state.save();
+        cx.notify();
+    }
+
+    /// `picked` repos start ticked: the last-used ones, or the repo clicked in the sidebar.
+    fn new_workspace(&mut self, picked: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
         if self.state.repos.is_empty() {
             return Self::notify_err(window, cx, "Add a repo first (space r a)");
         }
         let shark = cx.entity().downgrade();
-        let (repos, last) = (self.state.repos.clone(), self.state.last_repos.clone());
-        let form = cx.new(|cx| NewWorkspaceForm::new(repos, &last, shark, window, cx));
+        let repos = self.state.repos.clone();
+        let form = cx.new(|cx| NewWorkspaceForm::new(repos, &picked, shark, window, cx));
         let input = form.read(cx).branch.clone();
         window.open_dialog(cx, move |d, _, _| {
             let f = form.clone();
@@ -2630,11 +2634,24 @@ impl Shark {
                 .when(rail, |d| {
                     d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
                 })
+                .on_click({
+                    let name = name.clone();
+                    cx.listener(move |this, _, w, cx| this.new_workspace(vec![name.clone()], w, cx))
+                })
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, e: &MouseDownEvent, w, cx| {
                         let (p1, p2, p3) = (path.clone(), path.clone(), path.clone());
+                        let picked = vec![name.clone()];
                         let entries = vec![
+                            menu::item(
+                                IconName::Plus,
+                                "New Workspace",
+                                on_shark(cx, move |s, w, cx| {
+                                    s.new_workspace(picked.clone(), w, cx)
+                                }),
+                            ),
+                            Entry::Sep,
                             menu::item(IconName::FolderOpen, "Reveal in Finder", move |_, cx| {
                                 cx.reveal_path(&p1)
                             }),
@@ -2914,8 +2931,60 @@ impl Shark {
                 )
             })
             .on_mouse_down(MouseButton::Right, new_section_menu());
+        // Mirrors the Workspaces header: hover shows +, right-click offers the same.
+        let repo_header = h_flex()
+            .id("repo-header")
+            .group("repo-header")
+            .justify_between()
+            .items_end()
+            .child(header("Repos"))
+            .when(!rail, |d| {
+                d.child(
+                    div()
+                        .mr_3()
+                        .invisible()
+                        .group_hover("repo-header", |s| s.visible())
+                        .child(
+                            Button::new("add-repo")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Plus)
+                                .tooltip("Add repo (space r a), or drop folders here")
+                                .on_click(cx.listener(|this, _, w, cx| this.add_repo(w, cx))),
+                        ),
+                )
+            })
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, e: &MouseDownEvent, w, cx| {
+                    let entries = vec![menu::item(
+                        IconName::FolderPlus,
+                        "Add Repo…",
+                        on_shark(cx, |s, w, cx| s.add_repo(w, cx)),
+                    )];
+                    this.show_menu(e.position, entries, w, cx);
+                }),
+            );
+        let add_repo_row = row()
+            .id("add-repo-row")
+            .text_color(theme.muted_foreground)
+            .hover(|d| d.bg(theme.sidebar_accent))
+            .child(Icon::new(IconName::FolderPlus).with_size(px(14.)))
+            .when(!rail, |d| {
+                d.child(div().flex_1().child("Add repo…"))
+                    .child(div().text_xs().text_color(faint(theme)).child("space r a"))
+            })
+            .when(rail, |d| {
+                d.tooltip(|w, cx| Tooltip::new("Add repo").build(w, cx))
+            })
+            .on_click(cx.listener(|this, _, w, cx| this.add_repo(w, cx)));
         v_flex()
             .id("sidebar")
+            // Folders dragged in from Finder are added as repos.
+            .drag_over::<ExternalPaths>(move |d, _, _, _| d.bg(accent))
+            .on_drop(
+                cx.listener(|this, p: &ExternalPaths, w, cx| this.add_repo_paths(p.paths(), w, cx)),
+            )
             .key_context("Sidebar")
             .track_focus(&self.sidebar_focus)
             .w(px(if rail { 48. } else { 244. }))
@@ -2959,11 +3028,9 @@ impl Shark {
                         self.state.workspaces.is_empty() && self.state.sections.is_empty(),
                         |d| d.child(hint("space w n to create")),
                     )
-                    .child(header("Repos"))
+                    .child(repo_header)
                     .children(repos)
-                    .when(self.state.repos.is_empty(), |d| {
-                        d.child(hint("space r a to add"))
-                    })
+                    .when(self.state.repos.is_empty(), |d| d.child(add_repo_row))
                     // The empty space below takes a right-click too.
                     .child(
                         div()
@@ -3893,7 +3960,9 @@ impl Render for Shark {
             .text_color(theme.foreground)
             .font_features(inter_features())
             .on_action(cx.listener(|this, _: &TogglePalette, w, cx| this.toggle_palette(w, cx)))
-            .on_action(cx.listener(|this, _: &NewWorkspace, w, cx| this.new_workspace(w, cx)))
+            .on_action(cx.listener(|this, _: &NewWorkspace, w, cx| {
+                this.new_workspace(this.state.last_repos.clone(), w, cx)
+            }))
             .on_action(cx.listener(|this, _: &ArchiveWorkspace, w, cx| this.archive(false, w, cx)))
             .on_action(
                 cx.listener(|this, _: &ForceArchiveWorkspace, w, cx| this.archive(true, w, cx)),
@@ -4669,6 +4738,35 @@ pub(crate) mod ui_tests {
             shark.read(cx).state.workspaces.is_empty()
         })
         .await;
+
+        // Clicking a repo in the sidebar starts a workspace with only that repo ticked.
+        let on = on_app(window, shark.clone());
+        on(cx, &|s, w, cx| s.new_workspace(vec!["web".into()], w, cx));
+        cx.update_window(window, |_, w, cx| w.input("only web", cx))
+            .unwrap();
+        press(cx, &["enter"]);
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).active.as_deref() == Some("only-web")
+        })
+        .await;
+        let ws_dir = home.join("shark/workspaces/only-web");
+        assert!(ws_dir.join("web").exists() && !ws_dir.join("api").exists());
+
+        // Folders dropped on the sidebar become repos; one already added is refused.
+        let cli = home.join("src/cli");
+        init_repo(&cli);
+        let dropped = [cli, home.join("src/api")];
+        on(cx, &|s, w, cx| s.add_repo_paths(&dropped, w, cx));
+        cx.update(|cx| {
+            let names: Vec<_> = shark
+                .read(cx)
+                .state
+                .repos
+                .iter()
+                .map(|r| r.name.clone())
+                .collect();
+            assert_eq!(names, ["api", "web", "cli"]);
+        });
 
         // Quick bars are bare menus: no dialog close X.
         press(cx, &["cmd-k"]);
