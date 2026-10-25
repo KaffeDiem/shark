@@ -9,7 +9,7 @@ One workspace = one feature = N git worktrees on a shared branch, e.g. `~/shark/
 brew tap KaffeDiem/shark https://github.com/KaffeDiem/shark
 brew install --cask KaffeDiem/shark/shark
 ```
-Or [Download Shark 0.0.0](https://github.com/KaffeDiem/shark/releases/download/v0.0.0/Shark-0.0.0.dmg) (Apple Silicon), open it and drag Shark to Applications. The app isn't notarized: on first launch, open it, then allow it in System Settings → Privacy & Security → Open Anyway, or run `xattr -dr com.apple.quarantine /Applications/Shark.app`.
+Or [Download Shark 0.1.0](https://github.com/KaffeDiem/shark/releases/download/v0.1.0/Shark-0.1.0.dmg) (Apple Silicon), open it and drag Shark to Applications. The app isn't notarized: on first launch, open it, then allow it in System Settings → Privacy & Security → Open Anyway, or run `xattr -dr com.apple.quarantine /Applications/Shark.app`.
 
 Releases: merge a PR with the `release` label. CI (which builds every merge to `master`) builds the DMG (`make release`), publishes a GitHub release, and commits the new version to `Cargo.toml`, `Casks/shark.rb` and this section. The version is the one in `Cargo.toml`, or its next patch if that is already released.
 
