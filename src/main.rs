@@ -7,6 +7,7 @@ mod editor;
 mod files;
 mod git;
 mod menu;
+mod menubar;
 mod plan;
 mod pr;
 mod prompts;
@@ -353,15 +354,29 @@ fn main() {
             gpui_kit::init(cx);
             install_fonts(cx);
             bind_keys(cx);
+            menubar::init(cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
                 titlebar: Some(TitleBar::title_bar_options()),
                 ..Default::default()
             };
-            open_window(options, cx, |window, cx| {
+            let (window, shark) = open_window(options, cx, |window, cx| {
                 cx.new(|cx| app::Shark::new(window, cx))
             })
             .unwrap();
+            // Global, not on Shark's root: an open dialog isn't inside Shark, and quitting
+            // from it must still confirm unsaved edits. Deferred, like `menubar::in_window`.
+            let shark = shark.downgrade();
+            cx.on_action(move |_: &menubar::Quit, cx| {
+                let shark = shark.clone();
+                cx.defer(move |cx| {
+                    let asked =
+                        window.update(cx, |_, w, cx| shark.update(cx, |s, cx| s.quit(w, cx)));
+                    if !matches!(asked, Ok(Ok(()))) {
+                        cx.quit()
+                    }
+                });
+            });
             cx.activate(true);
         });
 }

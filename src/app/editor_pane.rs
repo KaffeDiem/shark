@@ -98,6 +98,11 @@ impl Shark {
     }
 
     /// Runs `then` now, or after the user agrees to drop unsaved edits in the open file.
+    /// Quit, asking first if the open file has unsaved edits.
+    pub fn quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_discard(window, cx, |_, _, cx| cx.quit())
+    }
+
     pub(super) fn confirm_discard(
         &mut self,
         window: &mut Window,
@@ -174,11 +179,6 @@ impl Shark {
             .size_full()
             .border_l_1()
             .border_color(theme.border)
-            .on_action(cx.listener(|this, _: &SaveFile, w, cx| {
-                if let Some(e) = this.editor.clone() {
-                    e.update(cx, |e, cx| e.save(false, w, cx))
-                }
-            }))
             .child(
                 h_flex()
                     .h(px(36.))

@@ -78,14 +78,15 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 - **Sections:** groups inside the Workspaces list, above the ungrouped workspaces. A header is a 28px row: section icon (14px, picked from `SECTION_ICONS`, default `Folder`), name in `MEDIUM`, the count (`text_xs`) only while folded, then `ChevronDown`/`ChevronRight` (12px); all `muted_foreground`. Its workspaces indent 16px. New and renamed sections are named in place: the row turns into an `Input` with the focus ring, `enter` saves, `esc` cancels, clicking away saves. Drag a workspace onto a header to move it in, or onto a workspace to take its slot (in that workspace's section); drag a header onto another to reorder sections. A drop target shows the `primary` border. Deleting a section doesn't confirm (nothing is lost); in the rail a header is just its icon.
 - **Sidebar rail:** `cmd-b` shrinks the sidebar to 48px icons with tooltips; opening a file does it automatically and closing the file undoes it unless the user toggled it. The header then pads left to clear the traffic lights.
 - **File tree:** 260px column on the right of the Diff and file views, `Files` header with "n/m viewed", 28px rows indented 12px per level, then the `v` checkbox (a folder's box is ticked when all its files are viewed and toggles them all). Folders first; single-child folders are joined.
-- **Context menus:** right-click on sidebar rows opens `src/menu.rs`, drawn after Linear's menus (gpui-kit's `PopupMenu` hard-codes 26px rows, 2px separators and full-colour icons):
+- **Context menus** (right-click, not the menu bar): right-click on sidebar rows opens `src/menu.rs`, drawn after Linear's menus (gpui-kit's `PopupMenu` hard-codes 26px rows, 2px separators and full-colour icons):
   - `popover` surface, `radius` 8px, `p(4px)`, 200–340px wide, a 10% `foreground` ring plus a soft shadow instead of a border. 13px text.
   - 28px rows, `px(8px) gap(8px)`, highlight an inset 4px-radius pill in 7% `foreground`; the text color doesn't change. Mouse and arrow keys share one highlight.
   - 14px icons in `muted_foreground`; separators are 1px, full width, 4px space above and below.
   - No header row: say what an item acts on with a right-aligned muted hint instead (the branch on `Copy Branch Name`, the `~/…` path on each path row).
   - At most three groups: open/reveal (`Reveal in Finder`, `Open in Terminal`, `Copy Path`, one submenu each with "Workspace folder" plus one row per repo), then git (`Open Pull Requests`, hidden when there are none), then destructive (`Archive`, `Force Archive…`) last, in normal text like Linear's Delete.
-  - Hide items that don't apply instead of disabling them. No shortcuts in the menu; every item also exists in the palette.
+  - Hide items that don't apply instead of disabling them. No shortcuts in these menus; every item also exists in the palette.
   - Title Case labels; an ellipsis only when the item asks for confirmation.
+- **Menu bar** (`src/menubar.rs`): items dispatch existing actions, so their shortcuts come from the keymap. Every Shark command in it also exists in the palette; the macOS standard items (Hide, Quit, Minimize, Zoom, Services, Edit) don't need to. Edit uses gpui-kit's input actions with an `os_action`, so it works in any text field.
 - **Header:** 44px, `px_3`, `border_b_1` in `border`. Tabs on the left; on the right: branch (12px `GitBranch` + `text_xs`), the git button (`src/sync/`), optional badges, then status (6px `rounded_full` dot + "Running"/"Idle").
 - **Git button:** a `small` button plus a `ghost` `xsmall` chevron for the git menu. It is the header's one primary button: `primary` for a step to run, `outline` with a `warning_foreground` icon when something needs the agent or a human, `ghost` for a wait. Disabled while the agent runs if the step writes.
 - **Tabs:** 26px pills (`rounded_full`, `px_2p5`, 14px icon + `text_sm` label). Active: `secondary` + `foreground`. Inactive: `muted_foreground`, hover → `foreground`.
@@ -196,6 +197,7 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
   - an `actions!` entry;
   - a leader binding `space <group> <key>` in `NAV`;
   - a `COMMANDS` row;
+  - a menu-bar item where it fits;
   - a line in the README keys table.
 - **Row actions** act on the cursor row of the focused list, otherwise on the open item (see `archive`). They get a single-key binding in the list's context plus a palette row.
 

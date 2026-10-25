@@ -241,6 +241,9 @@ pub(super) const COMMANDS: &[(&str, IconName, Cmd)] = &[
     ("Settings…", IconName::Settings, |s, w, cx| {
         crate::settings::open(&s.state, w, cx)
     }),
+    ("About Shark", IconName::Info, |_, w, cx| {
+        crate::settings::about(w, cx)
+    }),
 ];
 
 impl Shark {
