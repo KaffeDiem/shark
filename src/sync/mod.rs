@@ -2,7 +2,7 @@
 //! and runs the next step toward a merged PR. `status` decides what that step is; this file
 //! polls, renders and executes. The app only embeds the entity and forwards three actions.
 mod status;
-pub use status::Kind;
+pub use status::{Kind, github_url};
 
 use crate::app::{inter_features, notify_err, open_menu};
 use crate::menu::{self, Entry};
@@ -14,6 +14,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::base::async_util::{Receiver, Sender, unbounded};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::command::CommandItem;
+use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{ActiveTheme, Disableable as _, Icon, Sizable as _, WindowExt, h_flex};
@@ -523,6 +524,7 @@ impl GitSync {
         window.open_alert_dialog(cx, move |d, _, _| {
             let (sync, a) = (sync.clone(), a.clone());
             d.font_features(inter_features())
+                .entrance(DialogEntrance::None)
                 .title(title.clone())
                 .description(body.clone())
                 .ok_text(ok)

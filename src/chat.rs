@@ -211,6 +211,16 @@ pub struct Chat {
     menu_scroll: ScrollHandle,
     indexing: Option<Task<()>>,
     probing: Option<Task<()>>,
+    /// PRs of every repo, as last listed; cached on disk per workspace.
+    prs: Vec<complete::Pr>,
+    pr_items: Vec<Item>,
+    fetching_prs: Option<Task<()>>,
+    /// Repos whose PR list hasn't landed yet in the running fetch.
+    prs_left: usize,
+    /// `(repo, reason)` for each repo the last fetch couldn't list.
+    prs_errs: Vec<(String, String)>,
+    /// When the last fetch that listed every repo finished.
+    prs_at: Option<Instant>,
     /// User blocks claude hasn't echoed yet, oldest first.
     unread: VecDeque<usize>,
     /// The turn was interrupted; its result reads "interrupted".
@@ -415,6 +425,7 @@ impl Chat {
             }
         });
         let ws_name = ws.name.clone();
+        let prs = complete::cached_prs(&ws_name);
         let plan = cx.new(|cx| PlanPane::new(&meta.id, cx));
         let plan_open = meta.plan;
         let mut chat = Chat {
@@ -446,6 +457,12 @@ impl Chat {
             menu_scroll: ScrollHandle::new(),
             indexing: None,
             probing: None,
+            pr_items: complete::pr_items(&prs),
+            prs,
+            fetching_prs: None,
+            prs_left: 0,
+            prs_errs: vec![],
+            prs_at: None,
             unread: VecDeque::new(),
             cut: false,
             stopping: None,
@@ -791,6 +808,65 @@ impl Chat {
         }));
     }
 
+    /// Re-lists every repo's PRs in the background, at most once a minute: every `# heading` opens
+    /// the menu. Each repo's list replaces its cached rows as it lands, so the menu shows progress
+    /// per repo, and a repo that fails keeps its cached rows.
+    fn refetch_prs(&mut self, cx: &mut Context<Self>) {
+        let fresh = (self.prs_at).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60));
+        if self.fetching_prs.is_some() || fresh || cfg!(test) {
+            return;
+        }
+        let dir = self.ws.dir();
+        let repos: Vec<_> = (self.ws.repos.iter())
+            .map(|r| (r.name.clone(), dir.join(&r.name)))
+            .collect();
+        let n = repos.len();
+        (self.prs_left, self.prs_errs) = (n, vec![]);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let bg = cx.background_executor().clone();
+        bg.spawn(async move {
+            crate::git::par_map(&repos, |(name, dir)| {
+                let _ = tx.send((name.clone(), complete::fetch_prs(name, dir)));
+            });
+        })
+        .detach();
+        self.fetching_prs = Some(cx.spawn(async move |this, cx| {
+            let mut rx = rx;
+            for _ in 0..n {
+                let (got, back) = bg.spawn(async move { (rx.recv(), rx) }).await;
+                rx = back;
+                let Ok((repo, res)) = got else { break };
+                this.update(cx, |c, cx| {
+                    c.prs_left = c.prs_left.saturating_sub(1);
+                    match res {
+                        Ok(list) => {
+                            c.prs.retain(|p| p.repo != repo);
+                            c.prs.extend(list);
+                            c.pr_items = complete::pr_items(&c.prs);
+                        }
+                        Err(e) => c.prs_errs.push((repo, e)),
+                    }
+                    c.update_menu(cx);
+                })
+                .ok();
+            }
+            this.update(cx, |c, cx| {
+                c.fetching_prs = None;
+                c.prs_left = 0;
+                if c.prs_errs.is_empty() {
+                    c.prs_at = Some(Instant::now());
+                }
+                // A repo that left the workspace takes its PRs with it.
+                let repos = &c.ws.repos;
+                c.prs.retain(|p| repos.iter().any(|r| r.name == p.repo));
+                c.pr_items = complete::pr_items(&c.prs);
+                complete::save_prs(&c.ws.name, &c.prs);
+                c.update_menu(cx);
+            })
+            .ok();
+        }));
+    }
+
     /// Dropped or pasted files: copied into the workspace off the main thread, then mentioned at
     /// the cursor in drop order. Pasted image bytes come as `(bytes, ext)`.
     fn attach(
@@ -1131,6 +1207,7 @@ impl Chat {
             None => note,
         });
         self.reindex(cx);
+        self.prs_at = None; // the next `#` lists the new repo's PRs
     }
 
     fn sent(&mut self, text: String, cx: &mut Context<Self>) {
@@ -3419,6 +3496,40 @@ exec cat >/dev/null
                 !chat.read(cx).focus.is_focused(w),
                 "and stays in the composer"
             )
+        });
+
+        // `#` lists PRs; enter picks only what the query names outright.
+        let prs: Vec<complete::Pr> = serde_json::from_str(
+            r#"[{"repo":"api","number":12,"title":"Login page","author":{"login":"kim"},
+                 "url":"https://github.com/o/api/pull/12","state":"OPEN","updatedAt":"1"},
+                {"repo":"web","number":7,"title":"Fix endpoint","author":null,
+                 "url":"https://github.com/o/web/pull/7","state":"MERGED","updatedAt":"2"}]"#,
+        )
+        .unwrap();
+        cx.update(|cx| {
+            chat.update(cx, |c, _| {
+                c.pr_items = complete::pr_items(&prs);
+                c.prs = prs.clone();
+            })
+        });
+        let armed =
+            |cx: &mut TestAppContext| cx.update(|cx| chat.read(cx).menu.as_ref().map(|m| m.armed));
+        // Fuzzily "Fix endpoint", like `#endif` or `#[test]` might match in code.
+        act(cx, &|w, cx| w.input(" #fixend", cx));
+        assert_eq!(menu(cx), Some((1, 0)));
+        assert_eq!(armed(cx), Some(false), "a fuzzy match isn't picked by enter");
+        act(cx, &|w, cx| w.press("escape", cx));
+        act(cx, &|w, cx| w.input(" #12", cx));
+        assert_eq!(armed(cx), Some(true));
+        act(cx, &|w, cx| w.press("enter", cx));
+        assert!(
+            value(cx).ends_with(" https://github.com/o/api/pull/12 "),
+            "{}",
+            value(cx)
+        );
+        cx.update(|cx| {
+            let c = chat.read(cx).composer.read(cx);
+            assert_eq!(c.tokens().last().unwrap().token().label(), "api#12");
         });
         std::fs::remove_dir_all(root).unwrap();
     }

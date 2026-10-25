@@ -1,22 +1,30 @@
-//! The composer's `@` file and `/` command completion menu.
+//! The composer's `@` file, `/` command and `#` PR completion menu.
 use super::*;
 use crate::complete::Kind;
 use gpui_kit::component::input::InlineToken;
 
-/// The open `@`/`/` completion menu.
+/// The open `@`/`/`/`#` completion menu.
 pub(super) struct Menu {
     /// Bytes of the `@query` in the composer that a pick replaces.
     range: std::ops::Range<usize>,
-    command: bool,
+    /// The trigger character: `@`, `/` or `#`.
+    src: char,
     pub(super) matches: Vec<usize>,
     pub(super) sel: usize,
+    /// Whether enter picks the highlighted row. A `#` query that only fuzzily matches a PR
+    /// (`#endif`) leaves it off, so enter sends the text; moving the highlight turns it on.
+    pub(super) armed: bool,
 }
 
 const MENU_ROWS: usize = 50;
 
 impl Chat {
-    fn source(&self, command: bool) -> &[Item] {
-        if command { &self.commands } else { &self.files }
+    fn source(&self, src: char) -> &[Item] {
+        match src {
+            '/' => &self.commands,
+            '#' => &self.pr_items,
+            _ => &self.files,
+        }
     }
 
     pub(super) fn close_menu(&mut self, cx: &mut Context<Self>) {
@@ -39,28 +47,37 @@ impl Chat {
                 .iter()
                 .any(|t| t.range().start < r.end && r.start < t.range().end)
         });
-        let Some((range, command)) = found else {
+        let Some((range, src)) = found else {
             return self.close_menu(cx);
         };
-        let opening = self.menu.as_ref().is_none_or(|m| m.command != command);
+        let opening = self.menu.as_ref().is_none_or(|m| m.src != src);
         if opening {
             // Sources may have changed since the last menu; refresh behind the cached list.
-            match command {
-                true => self.reprobe(cx),
-                false => self.reindex(cx),
+            match src {
+                '/' => self.reprobe(cx),
+                '#' => self.refetch_prs(cx),
+                _ => self.reindex(cx),
             }
         }
         let query = &text[range.start + 1..range.end];
-        let matches = complete::rank(self.source(command), query, MENU_ROWS);
-        let sel = match &self.menu {
-            Some(m) if !opening && m.matches == matches => m.sel,
-            _ => 0,
+        let items = self.source(src);
+        let matches = match src {
+            '#' => complete::rank_prs(items, query, MENU_ROWS),
+            _ => complete::rank(items, query, MENU_ROWS),
         };
+        let (sel, armed) = match &self.menu {
+            Some(m) if !opening && m.matches == matches => (m.sel, m.armed),
+            _ => (0, false),
+        };
+        let armed = src != '#'
+            || armed
+            || (matches.first()).is_some_and(|&i| complete::names_pr(&items[i], query));
         self.menu = Some(Menu {
             range,
-            command,
+            src,
             matches,
             sel,
+            armed,
         });
         self.menu_scroll.scroll_to_item(sel);
         cx.notify();
@@ -68,7 +85,7 @@ impl Chat {
 
     fn menu_item(&self, ix: usize) -> Option<&Item> {
         let m = self.menu.as_ref()?;
-        self.source(m.command).get(*m.matches.get(ix)?)
+        self.source(m.src).get(*m.matches.get(ix)?)
     }
 
     pub(super) fn move_menu(&mut self, d: isize, cx: &mut Context<Self>) {
@@ -76,15 +93,16 @@ impl Chat {
             && !m.matches.is_empty()
         {
             m.sel = (m.sel as isize + d).rem_euclid(m.matches.len() as isize) as usize;
+            m.armed = true;
             self.menu_scroll.scroll_to_item(m.sel);
             cx.notify();
         }
     }
 
-    /// Picks the highlighted match; false when the menu is closed or has none.
+    /// Picks the highlighted match; false when the menu is closed, has none, or isn't armed.
     pub(super) fn pick_selected(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(sel) = (self.menu.as_ref())
-            .filter(|m| !m.matches.is_empty())
+            .filter(|m| m.armed && !m.matches.is_empty())
             .map(|m| m.sel)
         else {
             return false;
@@ -104,6 +122,7 @@ impl Chat {
             Kind::File | Kind::Dir if self.ws.repos.len() > 1 && !item.detail.is_empty() => {
                 format!("{} · {}", item.label, item.badge)
             }
+            Kind::Pr if self.ws.repos.len() > 1 => format!("{}{}", item.badge, item.label),
             _ => item.label.clone(),
         };
         self.composer
@@ -143,6 +162,7 @@ impl Chat {
                     Kind::File => IconName::File,
                     Kind::Dir => IconName::Folder,
                     Kind::Command => IconName::Slash,
+                    Kind::Pr => IconName::GitPullRequestArrow,
                 };
                 let badge = match it.kind {
                     Kind::Command => (!it.badge.is_empty()).then(|| {
@@ -179,11 +199,15 @@ impl Chat {
                         .px_2()
                         .gap_2()
                         .rounded(px(4.))
-                        .when(ix == m.sel, |d| d.bg(crate::menu::highlight(theme)))
+                        .when(ix == m.sel && m.armed, |d| {
+                            d.bg(crate::menu::highlight(theme))
+                        })
                         // The mouse moves the one highlight, as in the other menus.
                         .on_mouse_move(cx.listener(move |this, _, _, cx| {
-                            if let Some(m) = this.menu.as_mut().filter(|m| m.sel != ix) {
-                                m.sel = ix;
+                            if let Some(m) =
+                                (this.menu.as_mut()).filter(|m| m.sel != ix || !m.armed)
+                            {
+                                (m.sel, m.armed) = (ix, true);
                                 cx.notify();
                             }
                         }))
@@ -219,17 +243,53 @@ impl Chat {
                 )
             })
             .collect();
-        let empty = match (m.command, rows.is_empty()) {
+        let loading_prs = self.prs_left > 0;
+        let empty: Option<SharedString> = match (m.src, rows.is_empty()) {
             (_, false) => None,
-            (true, _) if self.probing.is_some() && self.commands.is_empty() => {
-                Some("Loading skills…")
+            ('/', _) if self.probing.is_some() && self.commands.is_empty() => {
+                Some("Loading skills…".into())
             }
-            (false, _) if self.indexing.is_some() && self.files.is_empty() => {
-                Some("Indexing files…")
+            ('/', _) => Some("No matching skills or commands".into()),
+            ('#', _) if self.pr_items.is_empty() && loading_prs => {
+                Some("Loading pull requests…".into())
             }
-            (true, _) => Some("No matching skills or commands"),
-            (false, _) => Some("No matching files"),
+            ('#', _) if self.pr_items.is_empty() && !self.prs_errs.is_empty() => {
+                Some("Couldn't list pull requests".into())
+            }
+            ('#', _) if self.pr_items.is_empty() => Some("No pull requests".into()),
+            ('#', _) => Some("No matching pull requests".into()),
+            _ if self.indexing.is_some() && self.files.is_empty() => Some("Indexing files…".into()),
+            _ => Some("No matching files".into()),
         };
+        // `#` lists come from the network: say what is still loading and what failed.
+        let n = self.ws.repos.len();
+        let status = (m.src == '#').then(|| {
+            let errs = self.prs_errs.iter().map(|(repo, e)| match n {
+                1 => e.clone(),
+                _ => format!("{repo}: {e}"),
+            });
+            let errs = errs.collect::<Vec<_>>().join(" · ");
+            h_flex()
+                .px_2()
+                .pt_1()
+                .gap_2()
+                .text_xs()
+                .text_color(theme.muted_foreground)
+                .when(loading_prs, |d| {
+                    d.child(Spinner::new().with_size(px(12.))).child(match n {
+                        1 => "Refreshing pull requests…".to_string(),
+                        _ => format!(
+                            "Refreshing pull requests… {} of {n} repos",
+                            n - self.prs_left
+                        ),
+                    })
+                })
+                .when(!errs.is_empty(), |d| {
+                    d.child(Icon::new(IconName::TriangleAlert).with_size(px(12.)))
+                        .child(div().min_w_0().truncate().child(errs))
+                })
+        });
+        let status = status.filter(|_| loading_prs || !self.prs_errs.is_empty());
         Some(
             crate::menu::chrome(theme)
                 .id("completions")
@@ -259,6 +319,7 @@ impl Chat {
                             )
                         }),
                 )
+                .children(status)
                 .child(
                     h_flex()
                         .px_2()
@@ -267,9 +328,9 @@ impl Chat {
                         .text_xs()
                         .text_color(faint)
                         .child(hint("up down", "navigate"))
-                        .child(hint("enter", "add"))
+                        .child(hint("enter", if m.armed { "add" } else { "send" }))
                         .child(hint("escape", "close"))
-                        .when(!m.command && multi, |d| {
+                        .when(m.src != '/' && multi, |d| {
                             d.child(div().flex_1())
                                 .child("Type repo/ to search one repo")
                         }),
