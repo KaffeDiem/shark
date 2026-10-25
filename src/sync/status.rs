@@ -18,7 +18,8 @@ pub struct Local {
     /// `None` when HEAD is detached (also mid-rebase).
     pub branch: Option<String>,
     pub head: String,
-    pub origin: bool,
+    /// `origin`'s URL; `None` if the repo has no origin remote.
+    pub origin: Option<String>,
     /// `(ahead, behind)` vs `origin/<branch>`; `None` if it isn't on the remote. Not `@{u}`:
     /// a fresh worktree may track its base, and a deleted remote branch keeps a stale upstream.
     pub remote: Option<(u32, u32)>,
@@ -129,7 +130,7 @@ pub fn probe(wt: &Path, branch: &str, base: &str) -> Result<Local, String> {
         .zip(OPS)
         .find(|(p, _)| Path::new(p).exists())
         .map(|(_, (_, op))| op);
-    l.origin = git(wt, &["remote", "get-url", "origin"]).is_ok();
+    l.origin = git(wt, &["remote", "get-url", "origin"]).ok();
     let remote = format!("refs/remotes/origin/{branch}");
     if let Ok(oid) = git(wt, &["rev-parse", "--verify", "--quiet", &remote]) {
         l.remote_head = oid;
@@ -283,6 +284,17 @@ impl Repo {
 
     pub fn open_pr(&self) -> Option<&Pr> {
         self.pr().filter(|p| p.state == PrState::Open)
+    }
+
+    /// `branch` on GitHub, e.g. `https://github.com/o/r/tree/feat`; `None` unless origin is
+    /// GitHub and the branch is pushed (an unpushed branch would 404).
+    pub fn branch_url(&self, branch: &str) -> Option<String> {
+        let l = self.local.as_ref().ok()?;
+        l.remote?;
+        Some(format!(
+            "{}/tree/{branch}",
+            github_url(l.origin.as_deref()?)?
+        ))
     }
 
     /// Its work is exactly what a merged PR landed.
@@ -476,7 +488,7 @@ pub fn next_action(repos: &[Repo], branch: &str) -> Action {
             false,
         );
     }
-    let remoteless = names(&|_, l| !l.origin && l.base.0 > 0);
+    let remoteless = names(&|_, l| l.origin.is_none() && l.base.0 > 0);
     if !remoteless.is_empty() {
         return act(
             label("No origin remote", &remoteless),
@@ -648,8 +660,68 @@ pub fn pr_head_moved(repos: &[Repo]) -> bool {
         .any(|r| r.open_pr().is_some_and(|p| head_moved(r, p)))
 }
 
+/// The web URL of a GitHub remote, from its https, scp-style or ssh form.
+pub fn github_url(remote: &str) -> Option<String> {
+    let path = [
+        "https://github.com/",
+        "git@github.com:",
+        "ssh://git@github.com/",
+    ]
+    .iter()
+    .find_map(|p| remote.strip_prefix(p))?;
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    Some(format!("https://github.com/{path}"))
+}
+
+/// `8s ago`, `2m ago`, `3h ago`.
+pub fn ago(d: std::time::Duration) -> String {
+    match d.as_secs() {
+        s @ 0..60 => format!("{s}s ago"),
+        s @ 60..3600 => format!("{}m ago", s / 60),
+        s => format!("{}h ago", s / 3600),
+    }
+}
+
+/// A failed `pull --ff-only` because local and remote both have new commits.
+pub fn diverged(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("not possible to fast-forward") || e.contains("diverg")
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ago_and_diverged() {
+        use std::time::Duration;
+        assert_eq!(super::ago(Duration::from_secs(8)), "8s ago");
+        assert_eq!(super::ago(Duration::from_secs(150)), "2m ago");
+        assert_eq!(super::ago(Duration::from_secs(7300)), "2h ago");
+        assert!(super::diverged(
+            "git pull: fatal: Not possible to fast-forward, aborting."
+        ));
+        assert!(super::diverged("hint: You have divergent branches"));
+        assert!(!super::diverged(
+            "git pull: fatal: unable to access 'https://x': timeout"
+        ));
+    }
+
+    #[test]
+    fn github_urls() {
+        for r in [
+            "https://github.com/o/r.git",
+            "https://github.com/o/r",
+            "git@github.com:o/r.git",
+            "ssh://git@github.com/o/r.git",
+        ] {
+            assert_eq!(
+                super::github_url(r).as_deref(),
+                Some("https://github.com/o/r"),
+                "{r}"
+            );
+        }
+        assert_eq!(super::github_url("git@gitlab.com:o/r.git"), None);
+    }
+
     use super::*;
 
     #[test]
@@ -714,7 +786,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         Local {
             branch: Some("feat".into()),
             head: "h".into(),
-            origin: true,
+            origin: Some("git@github.com:o/r.git".into()),
             remote: (ahead > 0).then_some((0, 0)),
             base: (ahead, 0),
             ..Default::default()
@@ -833,7 +905,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         assert!(
             one(
                 Local {
-                    origin: false,
+                    origin: None,
                     remote: None,
                     ..clean(1)
                 },
@@ -996,7 +1068,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
 
         let l = p();
         assert_eq!(
-            (l.branch.as_deref(), l.remote, l.base, l.origin),
+            (l.branch.as_deref(), l.remote, l.base, l.origin.is_some()),
             (Some("feat"), None, (0, 0), true)
         );
         assert!(

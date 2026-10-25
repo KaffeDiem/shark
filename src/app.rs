@@ -11,8 +11,10 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
 use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::diff::{Diff, DiffFile, DiffFileStatus, DiffMode, DiffState};
+use gpui_kit::component::hover_card::HoverCard;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
+use gpui_kit::component::link::Link;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
@@ -1570,7 +1572,6 @@ impl Shark {
                 )
                 .into_any_element();
         };
-        let (busy, background) = (chat.read(cx).working(), chat.read(cx).background);
         let tab = |label: String, icon: IconName, t: Tab| {
             let on = self.tab == t;
             h_flex()
@@ -1637,35 +1638,11 @@ impl Shark {
                         d.child(tab(name, IconName::FileCode, Tab::File))
                     })
                     .child(div().flex_1())
-                    .child(
-                        h_flex()
-                            .gap_1p5()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(Icon::new(IconName::GitBranch).with_size(px(12.)))
-                            .child(ws_name),
-                    )
+                    .child(self.render_branch(ws_name, cx))
                     .when_some(self.active_sync().cloned(), |d, sync| {
                         d.child(div().pl_3().child(sync))
                     })
-                    .child(
-                        h_flex()
-                            .pl_3()
-                            .gap_1p5()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(div().size(px(6.)).rounded_full().bg(if busy {
-                                theme.primary
-                            } else {
-                                faint(theme)
-                            }))
-                            .child(match (chat.read(cx).busy, background) {
-                                (true, 0) => "Running".into(),
-                                (true, n) => format!("Running · {n} in background"),
-                                (false, 0) => "Idle".into(),
-                                (false, n) => format!("{n} in background"),
-                            }),
-                    ),
+                    .child(self.render_status(&chat, cx)),
             )
             .child(match self.tab {
                 Tab::Chat => div().flex_1().min_h_0().child(chat).into_any_element(),
@@ -1692,6 +1669,129 @@ impl Shark {
                     .into_any_element(),
             })
             .into_any_element()
+    }
+
+    /// The header's agent status, naming the call in flight; hovering shows the turn's details
+    /// and what runs in the background.
+    fn render_status(&self, chat: &Entity<Chat>, cx: &App) -> impl IntoElement {
+        let theme = cx.theme();
+        let c = chat.read(cx);
+        let running = match c.running_tool() {
+            Some(t) => format!("Running · {t}"),
+            None => "Running".into(),
+        };
+        let text = match (c.busy, c.background.len()) {
+            (true, 0) => running,
+            (true, n) => format!("{running} · {n} in background"),
+            (false, 0) => "Idle".into(),
+            (false, n) => format!("{n} in background"),
+        };
+        let (busy, started, model) = (c.busy, c.started, c.model().to_string());
+        let (queued, steered, tasks) = (c.queued(), c.steered, c.background.clone());
+        HoverCard::new("status-card")
+            .anchor(Anchor::TopRight)
+            .trigger(
+                h_flex()
+                    .id("status")
+                    .pl_3()
+                    .gap_1p5()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(div().size(px(6.)).rounded_full().bg(if c.working() {
+                        theme.primary
+                    } else {
+                        faint(theme)
+                    }))
+                    .child(div().max_w(px(360.)).truncate().child(text)),
+            )
+            .content(move |_, _, cx| {
+                let theme = cx.theme();
+                let line = |t: String| div().child(t);
+                v_flex()
+                    .gap_1()
+                    .text_xs()
+                    .max_w(px(420.))
+                    .when_some(started.filter(|_| busy), |d, t| {
+                        d.child(line(format!(
+                            "Turn running for {}",
+                            crate::chat::duration(t.elapsed().as_secs())
+                        )))
+                    })
+                    .child(line(format!("Model {model}")))
+                    .when(queued > 0, |d| d.child(line(format!("{queued} queued"))))
+                    .when(steered, |d| {
+                        d.child(line("Message sent mid-turn, not read yet".into()))
+                    })
+                    .when(!tasks.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .pt_1()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("{} in background", tasks.len())),
+                        )
+                        .children(tasks.iter().map(|t| {
+                            h_flex()
+                                .gap_1p5()
+                                .child(Icon::new(IconName::Bot).with_size(px(12.)))
+                                .child(t.clone())
+                        }))
+                    })
+            })
+    }
+
+    /// The header's branch label; hovering lists each repo's branch, linked to GitHub once pushed.
+    fn render_branch(&self, ws_name: String, cx: &App) -> impl IntoElement {
+        let theme = cx.theme();
+        let branch = self
+            .active_ws()
+            .map(|w| w.branch.clone())
+            .unwrap_or_default();
+        let links = self
+            .active_sync()
+            .map(|s| s.read(cx).branch_urls())
+            .unwrap_or_default();
+        HoverCard::new("branch-card")
+            .anchor(Anchor::TopRight)
+            .trigger(
+                h_flex()
+                    .id("branch")
+                    .gap_1p5()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(Icon::new(IconName::GitBranch).with_size(px(12.)))
+                    .child(ws_name),
+            )
+            .content(move |_, _, cx| {
+                let theme = cx.theme();
+                v_flex()
+                    .gap_1()
+                    .text_xs()
+                    .child(
+                        div()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("Branch {branch}")),
+                    )
+                    .children(links.iter().enumerate().map(|(ix, (repo, url))| {
+                        h_flex()
+                            .gap_1p5()
+                            .child(Icon::new(IconName::FolderGit2).with_size(px(12.)))
+                            .child(match url {
+                                Some(u) => Link::new(("branch-link", ix))
+                                    .href(u.clone())
+                                    .child(repo.clone())
+                                    .into_any_element(),
+                                None => h_flex()
+                                    .gap_1p5()
+                                    .child(repo.clone())
+                                    .child(
+                                        div()
+                                            .text_color(theme.muted_foreground)
+                                            .child("not on GitHub"),
+                                    )
+                                    .into_any_element(),
+                            })
+                    }))
+            })
     }
 
     fn render_diff(&self, cx: &mut Context<Self>) -> AnyElement {

@@ -17,7 +17,13 @@ const PERMISSION_MODE: &str = "bypassPermissions";
 
 #[derive(Debug, PartialEq)]
 pub enum Ev {
-    Init(String),
+    /// The session as the CLI reports it at the start of each turn.
+    Init {
+        session_id: String,
+        model: String,
+        permission_mode: String,
+        mcp: Vec<String>,
+    },
     User(String),
     TextDelta(String),
     Text(String),
@@ -37,8 +43,8 @@ pub enum Ev {
         cost: f64,
         secs: u64,
     },
-    /// Count of backgrounded tasks (subagents, shells) still running after the turn's result.
-    Background(usize),
+    /// Backgrounded tasks (subagents, shells) still running after the turn's result, by description.
+    Background(Vec<String>),
     Exited(String),
 }
 
@@ -177,10 +183,22 @@ pub fn parse(line: &str) -> Vec<Ev> {
     }
     let s = |v: &Value| v.as_str().unwrap_or_default().to_string();
     match v["type"].as_str().unwrap_or_default() {
-        "system" if v["subtype"] == "init" => vec![Ev::Init(s(&v["session_id"]))],
-        "system" if v["subtype"] == "background_tasks_changed" => {
-            vec![Ev::Background(v["tasks"].as_array().map_or(0, Vec::len))]
-        }
+        "system" if v["subtype"] == "init" => vec![Ev::Init {
+            session_id: s(&v["session_id"]),
+            model: s(&v["model"]),
+            permission_mode: s(&v["permissionMode"]),
+            mcp: blocks_of(&v["mcp_servers"])
+                .map(|m| s(&m["name"]))
+                .collect(),
+        }],
+        "system" if v["subtype"] == "background_tasks_changed" => vec![Ev::Background(
+            blocks_of(&v["tasks"])
+                .map(|t| match t["description"].as_str() {
+                    Some(d) => d.to_string(),
+                    None => format!("{} {}", s(&t["task_type"]), s(&t["task_id"])),
+                })
+                .collect(),
+        )],
         "stream_event" if v["event"]["delta"]["type"] == "text_delta" => {
             vec![Ev::TextDelta(s(&v["event"]["delta"]["text"]))]
         }
@@ -221,7 +239,11 @@ pub fn parse(line: &str) -> Vec<Ev> {
 }
 
 fn blocks(v: &Value) -> impl Iterator<Item = &Value> {
-    v["message"]["content"].as_array().into_iter().flatten()
+    blocks_of(&v["message"]["content"])
+}
+
+fn blocks_of(v: &Value) -> impl Iterator<Item = &Value> {
+    v.as_array().into_iter().flatten()
 }
 
 #[cfg(test)]
@@ -230,8 +252,8 @@ mod tests {
 
     // Recorded from claude 2.1.309, trimmed.
     const SESSION: &str = r#"{"type": "system", "subtype": "hook_started", "session_id": "s1"}
-{"type": "system", "subtype": "init", "session_id": "s1"}
-{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a1","task_type":"local_agent"}]}
+{"type": "system", "subtype": "init", "session_id": "s1", "model": "claude-opus-5-5[1m]", "permissionMode": "bypassPermissions", "mcp_servers": [{"name": "mobbin", "status": "pending", "source": "user"}, {"name": "paper", "status": "failed", "source": "user"}]}
+{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a1","task_type":"local_agent"},{"task_id":"b2","run_id":"r","task_type":"local_bash","description":"Run test suite"}]}
 {"type":"system","subtype":"background_tasks_changed","tasks":[]}
 {"type": "user", "message": {"role": "user", "content": "read a.txt"}, "parent_tool_use_id": null}
 {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "/tmp/a.txt"}}]}, "parent_tool_use_id": null}
@@ -250,9 +272,14 @@ not json"#;
         assert_eq!(
             evs,
             vec![
-                Ev::Init("s1".into()),
-                Ev::Background(1),
-                Ev::Background(0),
+                Ev::Init {
+                    session_id: "s1".into(),
+                    model: "claude-opus-5-5[1m]".into(),
+                    permission_mode: "bypassPermissions".into(),
+                    mcp: vec!["mobbin".into(), "paper".into()],
+                },
+                Ev::Background(vec!["local_agent a1".into(), "Run test suite".into()]),
+                Ev::Background(vec![]),
                 Ev::User("read a.txt".into()),
                 Ev::ToolUse {
                     id: "toolu_1".into(),
