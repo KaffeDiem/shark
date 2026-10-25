@@ -9,8 +9,8 @@ use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectState};
 use gpui_kit::component::{
-    ActiveTheme, Icon, IndexPath, Sizable as _, Theme, ThemeMode, ThemeRegistry, WindowExt, h_flex,
-    v_flex,
+    ActiveTheme, IndexPath, Selectable as _, Sizable as _, Theme, ThemeMode, ThemeRegistry,
+    WindowExt, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -262,7 +262,7 @@ impl Settings {
             .gap_1()
             .children(modes.iter().map(|(m, label, icon)| {
                 let m = *m;
-                pill(theme, label, label, Some(*icon), m == mode).on_click(
+                pill(label, label, Some(*icon), m == mode).on_click(
                     cx.listener(move |this, _, _, cx| this.appearance(cx, |a| a.mode = m)),
                 )
             }));
@@ -404,31 +404,14 @@ impl Settings {
     }
 }
 
-/// Header-style tab pill (design.md "Tabs"); `accent` shows on both the island and cards.
-fn pill(
-    theme: &Theme,
-    id: &'static str,
-    label: &'static str,
-    icon: Option<IconName>,
-    active: bool,
-) -> Stateful<Div> {
-    let fg = theme.foreground;
-    h_flex()
-        .id(id)
-        .h(px(26.))
-        .px_2p5()
-        .gap_1p5()
-        .rounded_full()
-        .text_sm()
-        .cursor_pointer()
-        .when_some(icon, |p, i| p.child(Icon::new(i).with_size(px(14.))))
-        .child(label)
-        .map(|p| match active {
-            true => p.bg(theme.accent).text_color(fg),
-            false => p
-                .text_color(theme.muted_foreground)
-                .hover(move |h| h.text_color(fg)),
-        })
+/// A ghost button that shows its selection, so tabs and mode are tab stops with enter/space.
+fn pill(id: &'static str, label: &'static str, icon: Option<IconName>, active: bool) -> Button {
+    Button::new(id)
+        .ghost()
+        .small()
+        .label(label)
+        .when_some(icon, |b, i| b.icon(i))
+        .selected(active)
 }
 
 fn section(theme: &Theme, label: &'static str) -> impl IntoElement {
@@ -493,12 +476,12 @@ impl Render for Settings {
                             .iter()
                             .enumerate()
                             .map(|(i, label)| {
-                                pill(cx.theme(), label, label, None, i == self.tab).on_click(
-                                    cx.listener(move |this, _, _, cx| {
+                                pill(label, label, None, i == self.tab).on_click(cx.listener(
+                                    move |this, _, _, cx| {
                                         this.tab = i;
                                         cx.notify();
-                                    }),
-                                )
+                                    },
+                                ))
                             }),
                     ),
             )

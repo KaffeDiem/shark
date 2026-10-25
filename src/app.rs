@@ -2479,6 +2479,7 @@ mod ui_tests {
             let saved = State::load();
             assert_eq!(saved.appearance.dark, "Sequoia");
             assert_eq!(saved.prompts["commit"], "ship {repos}");
+            assert_eq!(crate::prompts::render("commit", "api", "b"), "ship api");
 
             view.update(cx, |v, cx| {
                 v.appearance(cx, |a| a.mode = Mode::Light);
@@ -2488,6 +2489,7 @@ mod ui_tests {
             // The font override survives the mode switch.
             assert_eq!(mono(&cx.theme().light_theme).as_deref(), Some("Menlo"));
             assert!(State::load().prompts.is_empty());
+            assert!(crate::prompts::render("commit", "api", "b").starts_with("Commit and push"));
         })
         .unwrap();
     }

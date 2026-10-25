@@ -119,21 +119,13 @@ pub fn render(id: &str, repos: &str, branch: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Overrides are covered by `settings_apply_and_save`, under the UI tests' lock;
+    /// the global is shared with them, so this test only reads an id they never edit.
     #[test]
-    fn override_and_fill() {
+    fn fills_repos_and_branch() {
         let p = super::render("review", "api", "b");
         assert!(p.contains("in: api.") && p.contains("repos/{owner}/{repo}"));
-        let o = [(
-            "detached".to_string(),
-            "fix {repos} on {branch}".to_string(),
-        )]
-        .into();
-        super::set_overrides(&o);
-        assert_eq!(
-            super::render("detached", "api, web", "feat"),
-            "fix api, web on feat"
-        );
-        super::set_overrides(&Default::default());
-        assert!(super::render("detached", "x", "y").starts_with("HEAD is detached in: x."));
+        let p = super::render("detached", "api, web", "feat");
+        assert!(p.starts_with("HEAD is detached in: api, web.") && p.contains("`feat`"));
     }
 }
