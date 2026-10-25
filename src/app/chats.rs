@@ -322,6 +322,27 @@ impl Shark {
         chat.update(cx, |c, cx| f(c, window, cx));
     }
 
+    /// Approves the shown chat's plan and builds it in a new chat that gets only the plan, so
+    /// the planning back-and-forth stays behind.
+    pub(super) fn build_plan_in_new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(from) = self.active_chat().cloned() else {
+            return notify_err(window, cx, "Open a workspace first");
+        };
+        let Some(plan) = (from.read(cx).plan.read(cx).latest()).map(|v| v.text.clone()) else {
+            return notify_err(window, cx, "No plan yet; the agent submits one in plan mode");
+        };
+        self.new_chat(window, cx);
+        let Some(to) = self.active_chat().cloned().filter(|c| *c != from) else {
+            return;
+        };
+        if self.tab != Tab::Chat {
+            self.show(Tab::Chat, window, cx);
+        }
+        if to.update(cx, |c, cx| c.build_plan(&plan, window, cx)) {
+            from.update(cx, |c, cx| c.plan_approved(cx));
+        }
+    }
+
     /// The no-menu fast path, so confirm the switch in a toast.
     pub(super) fn set_model(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(chat), Some(m)) = (self.active_chat().cloned(), MODELS.get(ix)) else {

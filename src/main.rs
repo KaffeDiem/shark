@@ -108,6 +108,7 @@ actions!(
         TogglePlanMode,
         TogglePlan,
         ApprovePlan,
+        BuildPlanInNewChat,
         PlanOlder,
         PlanNewer,
         TogglePlanChanges
@@ -271,6 +272,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("space l l", TogglePlanMode, Some(NAV)),
         KeyBinding::new("space l v", TogglePlan, Some(NAV)),
         KeyBinding::new("space l a", ApprovePlan, Some(NAV)),
+        KeyBinding::new("space l n", BuildPlanInNewChat, Some(NAV)),
         KeyBinding::new("j", SelectNext, Some("PlanPane")),
         KeyBinding::new("k", SelectPrev, Some("PlanPane")),
         KeyBinding::new("g g", SelectFirst, Some("PlanPane")),
@@ -283,6 +285,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("l", PlanNewer, Some("PlanPane")),
         KeyBinding::new("d", TogglePlanChanges, Some("PlanPane")),
         KeyBinding::new("a", ApprovePlan, Some("PlanPane")),
+        KeyBinding::new("n", BuildPlanInNewChat, Some("PlanPane")),
         KeyBinding::new("i", FocusComposer, Some("PlanPane")),
         KeyBinding::new("shift-c", SendComments, Some("DiffPane")),
     ]);

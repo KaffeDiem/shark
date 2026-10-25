@@ -202,6 +202,8 @@ const ENTER_PLAN: &str = "Only the user turns plan mode on in this app (shift-ta
 const NEEDS_APPROVAL: &str = "This needs the user's approval, which this app can't ask for. Do \
     without it, or tell the user what to run.";
 const APPROVED: &str = "I approve the plan. Plan mode is off: implement it now.";
+const BUILD_FRESH: &str = "Implement this plan. It was made and approved in another chat, so you \
+    have none of that chat's context: read the code it touches before you change it.";
 
 /// How long an interrupt may take before the process is stopped instead.
 const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -498,13 +500,28 @@ impl Chat {
             let was = self.meta.plan;
             self.set_plan_mode(false, cx);
             if self.ask(APPROVED, window, cx) {
-                self.plan.update(cx, |p, cx| p.approve(cx));
+                self.plan_approved(cx);
+                self.focus_composer(window, cx);
             } else {
                 self.set_plan_mode(was, cx);
             }
             return;
         };
         self.push(Block::Info(why.into()), cx);
+    }
+
+    /// Marks the latest plan approved and closes the pane: there is nothing left to review.
+    pub fn plan_approved(&mut self, cx: &mut Context<Self>) {
+        self.plan.update(cx, |p, cx| p.approve(cx));
+        self.plan_open = false;
+        cx.notify();
+    }
+
+    /// The first message of a chat that builds another chat's plan: the plan and nothing else,
+    /// titled after the plan.
+    pub fn build_plan(&mut self, plan: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.meta.title = title_of(&plan::title(plan));
+        self.ask(&format!("{BUILD_FRESH}\n\n{plan}"), window, cx)
     }
 
     /// `space l v`: shows the plan pane and focuses it, or hides it.
@@ -2223,8 +2240,18 @@ exec cat >/dev/null
         cx.update(|cx| {
             let c = chat.read(cx);
             assert!(!c.meta.plan, "approving ends plan mode");
+            assert!(!c.plan_open, "and closes the plan pane");
             assert_eq!(c.plan.read(cx).approved, Some(1));
             assert!(matches!(c.blocks.last(), Some(Block::User(t, _)) if t == APPROVED));
+        });
+        act(cx, &|w, cx| {
+            chat.update(cx, |c, cx| {
+                c.busy = false;
+                assert!(c.build_plan("# Cache\n\nUse an LRU map.\n", w, cx));
+                assert_eq!(c.meta.title, "Cache", "titled after the plan, not the preamble");
+                let want = format!("{BUILD_FRESH}\n\n# Cache\n\nUse an LRU map.\n");
+                assert!(matches!(c.blocks.last(), Some(Block::User(t, _)) if *t == want));
+            })
         });
         cx.update(|cx| chat.update(cx, |c, _| c.agent = None));
         let _ = std::fs::remove_file(super::plan::tests_store_path(&ws.name));
