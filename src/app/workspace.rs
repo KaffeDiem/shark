@@ -476,12 +476,15 @@ impl Shark {
         if raced {
             git::write_claude_md(&ws);
         }
-        let rules = match ws.dir().join(&r.name).join("CLAUDE.md").exists() {
-            true => format!(" Read {}/CLAUDE.md for its rules.", r.name),
-            false => String::new(),
+        let rules = match ["AGENTS.md", "CLAUDE.md"]
+            .into_iter()
+            .find(|f| ws.dir().join(&r.name).join(f).exists())
+        {
+            Some(f) => format!(" Read {}/{f} for its rules.", r.name),
+            None => String::new(),
         };
         let note = format!(
-            "[shark] Repo `{0}` joined this workspace: `{0}/` is a git worktree of {1} on branch `{2}` (base `{3}`), and the root CLAUDE.md now lists it.{rules}",
+            "[shark] Repo `{0}` joined this workspace: `{0}/` is a git worktree of {1} on branch `{2}` (base `{3}`), and the root CLAUDE.md and AGENTS.md now list it.{rules}",
             r.name,
             r.src.display(),
             ws.branch,

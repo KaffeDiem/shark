@@ -206,8 +206,17 @@ const APPROVED: &str = "I approve the plan. Plan mode is off: implement it now."
 /// How long an interrupt may take before the process is stopped instead.
 const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// `default` means "no --model flag".
-pub(crate) const MODELS: &[&str] = &["default", "fable", "opus", "sonnet", "haiku"];
+/// `default` means "no --model flag". `codex…` runs `codex app-server` (see `codex::is_codex`).
+pub(crate) const MODELS: &[&str] = &[
+    "default",
+    "fable",
+    "opus",
+    "sonnet",
+    "haiku",
+    "codex",
+    "codex:gpt-6.1-sol",
+    "codex:gpt-6-astra",
+];
 
 impl EventEmitter<ChatEvent> for Chat {}
 
@@ -450,6 +459,10 @@ impl Chat {
         self.meta.model.as_deref().unwrap_or(MODELS[0])
     }
 
+    fn codex(&self) -> bool {
+        codex::is_codex(self.meta.model.as_deref())
+    }
+
     /// The tab label.
     pub fn title(&self) -> SharedString {
         match self.meta.title.is_empty() {
@@ -462,6 +475,17 @@ impl Chat {
     pub fn set_model(&mut self, m: &str, cx: &mut Context<Self>) {
         let model = (m != MODELS[0]).then(|| m.to_string());
         if self.meta.model != model {
+            let codex = codex::is_codex(model.as_deref());
+            // A session belongs to one CLI: the other can't resume it.
+            if codex != codex::is_codex(self.meta.model.as_deref())
+                && self.meta.session_id.is_some()
+            {
+                self.meta.session_id = None;
+                self.push(Block::Info(format!("{m} starts a new conversation")), cx);
+            }
+            if codex {
+                self.set_plan_mode(false, cx);
+            }
             self.meta.model = model;
             cx.emit(ChatEvent::Meta);
             cx.notify();
@@ -472,6 +496,10 @@ impl Chat {
     /// switches as it starts.
     pub fn set_plan_mode(&mut self, on: bool, cx: &mut Context<Self>) {
         if self.meta.plan == on {
+            return;
+        }
+        if on && self.codex() {
+            self.push(Block::Info("plan mode needs a Claude model".into()), cx);
             return;
         }
         self.meta.plan = on;
@@ -866,7 +894,7 @@ impl Chat {
                     self.reader = Some(Self::read_events(rx, Self::apply, cx));
                 }
                 Err(e) => {
-                    self.push(Block::Info(format!("failed to start claude: {e}")), cx);
+                    self.push(Block::Info(format!("failed to start the agent: {e}")), cx);
                     return false;
                 }
             }
@@ -1113,7 +1141,12 @@ impl Chat {
                 permission_mode,
                 mcp,
             } => {
-                if self.meta.session_id.as_ref() != Some(&id) {
+                // A process of the backend the chat just switched away from: its session
+                // can't be resumed by the new one.
+                let stale = !self.replaying
+                    && codex::is_codex(self.agent_model.as_deref())
+                        != codex::is_codex(self.meta.model.as_deref());
+                if !stale && self.meta.session_id.as_ref() != Some(&id) {
                     self.meta.session_id = Some(id);
                     if !self.replaying {
                         cx.emit(ChatEvent::Meta);
@@ -1136,14 +1169,26 @@ impl Chat {
             Ev::Interrupted => self.cut = true,
             // claude's echo: the oldest message it hadn't read is now part of the turn.
             // `ends_with`: a workspace `note` may have been put before the text on the wire.
-            Ev::User(text) => match self.unread.front().map(|&bi| &mut self.blocks[bi]) {
-                Some(Block::User(t, queued)) if text.ends_with(t.as_str()) => {
-                    *queued = false;
-                    let bi = self.unread.pop_front().unwrap();
-                    self.remeasure(bi);
+            // Not just the oldest: one the CLI refused (a failed codex turn/start) is never echoed.
+            Ev::User(text) => {
+                let read = (self.unread.iter()).position(
+                    |&bi| matches!(&self.blocks[bi], Block::User(t, _) if text.ends_with(t.as_str())),
+                );
+                match read {
+                    Some(k) => {
+                        let bi = self.unread.remove(k).unwrap();
+                        if let Block::User(_, queued) = &mut self.blocks[bi] {
+                            *queued = false;
+                        }
+                        self.remeasure(bi);
+                        // codex reads a steer into the running turn, with no new init after.
+                        if self.unread.is_empty() {
+                            self.steered = false;
+                        }
+                    }
+                    None => self.blocks.push(Block::User(text, false)),
                 }
-                _ => self.blocks.push(Block::User(text, false)),
-            },
+            }
             Ev::TextDelta(s) => match self.live_text() {
                 Some(bi) => {
                     if let Block::Text { md, .. } = &self.blocks[bi] {
@@ -1230,7 +1275,7 @@ impl Chat {
                     && let Err(e) = a.deny(&request_id, reason)
                 {
                     self.blocks
-                        .push(Block::Info(format!("answering claude failed: {e}")));
+                        .push(Block::Info(format!("answering the agent failed: {e}")));
                 }
             }
             Ev::Result {
@@ -1799,7 +1844,7 @@ impl Render for Chat {
                                     .gap_2()
                                     .text_xs()
                                     .text_color(muted)
-                                    .child(
+                                    .when(!self.codex(), |d| d.child(
                                         Button::new("plan-mode")
                                             .ghost()
                                             .xsmall()
@@ -1814,7 +1859,7 @@ impl Render for Chat {
                                             .on_click(cx.listener(|this, _, _, cx| {
                                                 this.set_plan_mode(!this.meta.plan, cx)
                                             })),
-                                    )
+                                    ))
                                     .child(
                                         Button::new("model")
                                             .ghost()
@@ -2321,6 +2366,90 @@ exec cat >/dev/null
             })
             .unwrap();
         chat
+    }
+
+    /// A codex model starts a new conversation (claude's session can't carry over) and has no
+    /// plan mode; another codex model keeps the thread.
+    #[gpui_kit::test]
+    fn codex_models_switch_backend(cx: &mut TestAppContext) {
+        let chat = open_chat("codex", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.meta.session_id = Some("s1".into());
+                c.set_plan_mode(true, cx);
+                c.set_model("codex:gpt-6-astra", cx);
+                assert_eq!(c.meta.session_id, None);
+                assert!(!c.meta.plan, "plan mode ends");
+                c.set_plan_mode(true, cx);
+                assert!(!c.meta.plan, "and can't come back");
+                c.meta.session_id = Some("th1".into());
+                c.set_model("codex:gpt-6.1-sol", cx);
+                assert_eq!(c.meta.session_id.as_deref(), Some("th1"));
+                c.set_model("opus", cx);
+                assert_eq!(c.meta.session_id, None);
+                // The codex process still running reports its thread: not opus's to resume.
+                c.agent_model = Some("codex:gpt-6.1-sol".into());
+                let init =
+                    r#"{"method":"turn/started","params":{"threadId":"th1","turn":{"id":"t1"}}}"#;
+                for ev in agent::parse(init) {
+                    c.apply(ev, cx);
+                }
+                assert_eq!(c.meta.session_id, None);
+            })
+        });
+    }
+
+    /// A codex turn as the chat sees it: a message sent mid-turn joins the running turn with no
+    /// new init, and once read nothing stays unread or steered. One codex refuses is never
+    /// echoed, and doesn't hold up the next.
+    #[gpui_kit::test]
+    fn codex_turn_reads_mid_turn_messages(cx: &mut TestAppContext) {
+        let chat = open_chat("codex-turn", cx);
+        let play = |c: &mut Chat, lines: &[&str], cx: &mut Context<Chat>| {
+            for l in lines {
+                for ev in agent::parse(l) {
+                    c.apply(ev, cx);
+                }
+            }
+        };
+        let echo = |t: &str| {
+            format!(
+                r#"{{"method":"item/started","params":{{"item":{{"type":"userMessage","id":"u","content":[{{"type":"text","text":"{t}"}}]}}}}}}"#
+            )
+        };
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.meta.model = Some("codex:gpt-6-astra".into());
+                c.agent_model = c.meta.model.clone();
+                c.sent("first".into(), cx);
+                c.steered = true; // what a cmd-enter send does mid-turn
+                c.sent("second".into(), cx);
+                play(c, &[
+                    r#"{"method":"turn/started","params":{"threadId":"th9","turn":{"id":"t1"}}}"#,
+                    &echo("first"),
+                    r#"{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"m","text":"FIRST"}}}"#,
+                    &echo("second"),
+                    r#"{"method":"turn/completed","params":{"threadId":"th9","turn":{"id":"t1","items":[],"status":"completed","durationMs":2000}}}"#,
+                ], cx);
+                assert_eq!(c.meta.session_id.as_deref(), Some("th9"));
+                assert!(!c.busy && c.unread.is_empty() && !c.steered);
+                c.sent("refused".into(), cx);
+                play(c, &[r#"{"id":3,"error":{"code":-32600,"message":"bad input"}}"#], cx);
+                c.sent("next".into(), cx);
+                play(c, &[&echo("next")], cx);
+                let users: Vec<(&str, bool)> = (c.blocks.iter())
+                    .filter_map(|b| match b {
+                        Block::User(t, q) => Some((t.as_str(), *q)),
+                        _ => None,
+                    })
+                    .collect();
+                assert_eq!(
+                    users,
+                    [("first", false), ("second", false), ("refused", false), ("next", false)],
+                    "read in place, none twice"
+                );
+            })
+        });
     }
 
     /// Calls cut off by an exit stop spinning; a missing session is dropped, an early exit isn't.

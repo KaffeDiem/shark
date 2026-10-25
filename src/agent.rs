@@ -1,4 +1,6 @@
-//! Drives `claude -p` over its stream-json protocol, one long-lived process per chat.
+//! Drives `claude -p` over its stream-json protocol, one long-lived process per chat. Chats on a
+//! codex model run `codex app-server` instead (`crate::codex`), mapped onto the same `Ev`s.
+use crate::codex;
 use crate::state::{ChatMeta, Workspace, support_dir};
 use gpui_kit::base::async_util::{Receiver, unbounded};
 use serde_json::{Value, json};
@@ -9,7 +11,7 @@ use std::{
     path::PathBuf,
     process::{ChildStdin, Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
 };
@@ -64,20 +66,23 @@ pub struct Agent {
     pid: u32,
     /// Set once the reader thread has reaped the child, so we never signal a reused pid.
     exited: Arc<AtomicBool>,
-    stdin: ChildStdin,
+    /// Shared with the reader thread, which answers codex's handshake.
+    stdin: Arc<Mutex<ChildStdin>>,
+    /// Set for a `codex app-server` process.
+    codex: Option<Arc<Mutex<codex::State>>>,
 }
 
 /// Characters of tool output kept, in memory and in the transcript; the UI shows no more.
-const MAX_OUTPUT: usize = 20_000;
+pub(crate) const MAX_OUTPUT: usize = 20_000;
 
 /// Byte offset of the `n`th character, if `s` is longer than that.
-fn cut(s: &str, n: usize) -> Option<usize> {
+pub(crate) fn cut(s: &str, n: usize) -> Option<usize> {
     s.char_indices().nth(n).map(|(i, _)| i)
 }
 
 /// A tool result's output as shown: clipped, saying so. `total_chars` marks lines `compact`
 /// already clipped.
-fn output(b: &Value) -> String {
+pub(crate) fn output(b: &Value) -> String {
     let text = text_of(&b["content"]);
     let total = b["total_chars"].as_u64();
     match (cut(&text, MAX_OUTPUT), total) {
@@ -94,7 +99,7 @@ fn output(b: &Value) -> String {
 /// Only the summary line is shown, and that comes from the start.
 const MAX_INPUT: usize = 2_000;
 
-fn clip_strings(v: &mut Value) -> bool {
+pub(crate) fn clip_strings(v: &mut Value) -> bool {
     match v {
         Value::String(s) => cut(s, MAX_INPUT).map(|i| s.truncate(i)).is_some(),
         Value::Array(a) => a.iter_mut().fold(false, |c, v| clip_strings(v) | c),
@@ -105,10 +110,16 @@ fn clip_strings(v: &mut Value) -> bool {
 
 /// The line as stored: tool results and inputs clipped, since the transcript is replayed on
 /// every open.
-fn compact(line: &str) -> Cow<'_, str> {
+pub(crate) fn compact(line: &str) -> Cow<'_, str> {
     let Ok(mut v) = serde_json::from_str::<Value>(line) else {
         return line.into();
     };
+    if v["type"].is_null() {
+        return match codex::compact(&mut v) {
+            true => v.to_string().into(),
+            false => line.into(),
+        };
+    }
     let mut changed = false;
     let kind = v["type"].clone();
     let Some(blocks) = v
@@ -135,6 +146,10 @@ fn compact(line: &str) -> Cow<'_, str> {
         true => v.to_string().into(),
         false => line.into(),
     }
+}
+
+fn logs_dir() -> PathBuf {
+    support_dir().join("logs")
 }
 
 pub fn transcript_path(chat: &str) -> PathBuf {
@@ -166,6 +181,9 @@ fn append(path: &Option<PathBuf>, line: &str) {
 }
 
 pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receiver<Ev>)> {
+    if codex::is_codex(chat.model.as_deref()) {
+        return codex::spawn(ws, chat);
+    }
     let resume = chat.session_id.iter().flat_map(|id| ["--resume", id]);
     // Tools that need a person (ExitPlanMode, AskUserQuestion) ask us instead of failing.
     let prompts = ["--permission-prompt-tool", "stdio"];
@@ -185,6 +203,9 @@ const SIDE_PROMPT: &str = "The user is asking a quick side question about this c
 /// A side question: a throwaway fork of the chat's session with no tools, saved nowhere, so the
 /// chat itself never sees it. Works while the chat's own turn runs.
 pub fn spawn_side(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receiver<Ev>)> {
+    if codex::is_codex(chat.model.as_deref()) {
+        return Err(std::io::Error::other("side questions need a Claude model"));
+    }
     let fork = chat
         .session_id
         .iter()
@@ -213,10 +234,6 @@ fn run<'a>(
     extra: impl IntoIterator<Item = &'a str>,
     transcript: Option<PathBuf>,
 ) -> std::io::Result<(Agent, Receiver<Ev>)> {
-    let logs = support_dir().join("logs");
-    fs::create_dir_all(&logs)?;
-    fs::create_dir_all(support_dir().join("transcripts"))?;
-    let log = logs.join(format!("{log_name}.stderr.log"));
     // SHARK_CLAUDE swaps in another binary; the UI tests use a fake that swallows stdin.
     let mut cmd = Command::new(std::env::var("SHARK_CLAUDE").unwrap_or("claude".into()));
     cmd.args([
@@ -239,6 +256,22 @@ fn run<'a>(
         cmd.args(["--model", m]);
     }
     cmd.args(extra);
+    start(cmd, ws, log_name, transcript, None)
+}
+
+/// Starts `cmd` in the workspace and turns its stdout lines into `Ev`s, storing them in
+/// `transcript`. `codex` holds a `codex app-server`'s state, which the reader keeps current.
+pub(crate) fn start(
+    mut cmd: Command,
+    ws: &Workspace,
+    log_name: &str,
+    transcript: Option<PathBuf>,
+    codex: Option<Arc<Mutex<codex::State>>>,
+) -> std::io::Result<(Agent, Receiver<Ev>)> {
+    let logs = logs_dir();
+    fs::create_dir_all(&logs)?;
+    fs::create_dir_all(support_dir().join("transcripts"))?;
+    let log = logs.join(format!("{log_name}.stderr.log"));
     let mut child = cmd
         .current_dir(ws.dir())
         .stdin(Stdio::piped())
@@ -249,13 +282,19 @@ fn run<'a>(
     let stdout = child.stdout.take().unwrap();
     let exited = Arc::new(AtomicBool::new(false));
     let reaped = exited.clone();
+    let stdin = Arc::new(Mutex::new(child.stdin.take().unwrap()));
     let agent = Agent {
         pid: child.id(),
         exited,
-        stdin: child.stdin.take().unwrap(),
+        stdin: stdin.clone(),
+        codex: codex.clone(),
     };
+    let (name, pid) = (if codex.is_some() { "codex" } else { "claude" }, child.id());
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if let Some(st) = &codex {
+                codex::track(st, &stdin, pid, &line);
+            }
             let evs = parse(&line);
             if (evs.iter()).any(|e| !matches!(e, Ev::TextDelta(_) | Ev::Permission { .. })) {
                 append(&transcript, &compact(&line)); // deltas are redundant with the full assistant message
@@ -270,7 +309,7 @@ fn run<'a>(
         let lines: Vec<&str> = err.lines().collect();
         let tail = &lines[lines.len().saturating_sub(5)..];
         let _ = tx.send_blocking(Ev::Exited(
-            format!("claude exited ({status}) {}", tail.join("\n"))
+            format!("{name} exited ({status}) {}", tail.join("\n"))
                 .trim()
                 .into(),
         ));
@@ -280,6 +319,9 @@ fn run<'a>(
 
 impl Agent {
     pub fn send(&mut self, text: &str) -> std::io::Result<()> {
+        if let Some(st) = &self.codex {
+            return codex::send(st, &self.stdin, text);
+        }
         let line = json!({"type": "user", "message": {"role": "user", "content": text}, "parent_tool_use_id": null});
         self.write(&line)
     }
@@ -287,11 +329,17 @@ impl Agent {
     /// Ends the current turn and keeps the process and its background tasks. claude rejects
     /// the call in flight and sends the turn's result.
     pub fn interrupt(&mut self) -> std::io::Result<()> {
+        if let Some(st) = &self.codex {
+            return codex::interrupt(st, &self.stdin);
+        }
         self.write(&json!({"type": "control_request", "request_id": "interrupt", "request": {"subtype": "interrupt"}}))
     }
 
     /// `plan`, or back to the mode the process started in. claude switches at once, mid-turn too.
     pub fn set_plan_mode(&mut self, on: bool) -> std::io::Result<()> {
+        if self.codex.is_some() {
+            return Err(std::io::Error::other("plan mode needs a Claude model"));
+        }
         let mode = if on { "plan" } else { PERMISSION_MODE };
         self.write(&json!({"type": "control_request", "request_id": format!("mode-{mode}"), "request": {"subtype": "set_permission_mode", "mode": mode}}))
     }
@@ -299,12 +347,18 @@ impl Agent {
     /// Answers an `Ev::Permission`: the tool doesn't run, and claude reads `message` as the
     /// reason.
     pub fn deny(&mut self, request_id: &str, message: &str) -> std::io::Result<()> {
+        if self.codex.is_some() {
+            return codex::deny(&self.stdin, request_id);
+        }
         self.write(&json!({"type": "control_response", "response": {"subtype": "success", "request_id": request_id, "response": {"behavior": "deny", "message": message}}}))
     }
 
     fn write(&mut self, v: &Value) -> std::io::Result<()> {
-        self.stdin.write_all(format!("{v}\n").as_bytes())?;
-        self.stdin.flush()
+        write(&self.stdin, v)
+    }
+
+    pub(crate) fn write_line(&self, v: &Value) -> std::io::Result<()> {
+        write(&self.stdin, v)
     }
 
     /// SIGTERM ends the turn and background tasks; the next send respawns with `--resume`.
@@ -315,13 +369,19 @@ impl Agent {
     }
 }
 
+pub(crate) fn write(stdin: &Mutex<ChildStdin>, v: &Value) -> std::io::Result<()> {
+    let mut stdin = stdin.lock().unwrap();
+    stdin.write_all(format!("{v}\n").as_bytes())?;
+    stdin.flush()
+}
+
 impl Drop for Agent {
     fn drop(&mut self) {
         self.stop();
     }
 }
 
-fn text_of(v: &Value) -> String {
+pub(crate) fn text_of(v: &Value) -> String {
     match v {
         Value::String(s) => s.clone(),
         Value::Array(a) => a
@@ -337,6 +397,10 @@ pub fn parse(line: &str) -> Vec<Ev> {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
         return vec![];
     };
+    // claude's lines all carry a `type`; codex's JSON-RPC never does.
+    if v["type"].is_null() {
+        return codex::parse(&v);
+    }
     // ponytail: subagent messages are dropped, nest them under their Task tool block when needed
     if !v["parent_tool_use_id"].is_null() {
         return vec![];
@@ -547,8 +611,23 @@ not json"#;
 #[test]
 #[ignore]
 fn live_claude() {
+    live(None);
+}
+
+/// The same through `codex app-server` and its `codex login`: `cargo test live_codex -- --ignored`.
+#[cfg(test)]
+#[test]
+#[ignore]
+fn live_codex() {
+    live(Some("codex:gpt-6.1-sol"));
+}
+
+/// Each repo's instructions reach the agent through the workspace's root docs.
+#[cfg(test)]
+fn live(model: Option<&str>) {
     use crate::{git, state::Repo};
-    let root = std::env::temp_dir().join(format!("shark-live-{}", std::process::id()));
+    let tag = model.map_or("claude", |_| "codex");
+    let root = std::env::temp_dir().join(format!("shark-live-{tag}-{}", std::process::id()));
     let mut repos = vec![];
     for (name, lang) in [("api", "Python"), ("web", "TypeScript")] {
         let p = root.join("src").join(name);
@@ -579,15 +658,24 @@ fn live_claude() {
         });
     }
     let mut ws = git::create_workspace(&root.join("ws/live"), "live", "live", &repos).unwrap();
-    ws.name = format!("live-test-{}", std::process::id());
+    ws.name = format!("live-test-{tag}-{}", std::process::id());
+    ws.chats[0].model = model.map(Into::into);
+    ws.chats[0].id = ws.name.clone(); // the default id would be a real chat's transcript
     std::os::unix::fs::symlink(
         root.join("ws/live"),
         crate::state::workspaces_dir().join(&ws.name),
     )
     .unwrap();
     let (mut agent, rx) = spawn(&ws, &ws.chats[0]).unwrap();
+    // claude has the repos' files imported; codex follows AGENTS.md's pointers to read them.
+    let how = match model {
+        None => "Without using any tools",
+        Some(_) => "Reading only what your instructions point you to",
+    };
     agent
-        .send("Without using any tools: which language is each repo written in? One line.")
+        .send(&format!(
+            "{how}: which language is each repo written in? One line."
+        ))
         .unwrap();
     let mut text = String::new();
     while let Ok(ev) = rx.recv_blocking() {
@@ -601,6 +689,7 @@ fn live_claude() {
     drop(agent);
     let _ = fs::remove_file(crate::state::workspaces_dir().join(&ws.name));
     let _ = fs::remove_file(transcript_path(&ws.chats[0].id));
+    let _ = fs::remove_file(logs_dir().join(format!("{}.stderr.log", ws.chats[0].id)));
     assert!(
         text.contains("Python") && text.contains("TypeScript"),
         "imports not loaded: {text}"
