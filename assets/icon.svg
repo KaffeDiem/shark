@@ -1,0 +1,44 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- Continuous-corner (squircle) body, 824px on the 1024 grid, fitted to Xcode's macOS 26 silhouette -->
+    <path id="body" d="M398.1 100 H625.9 C711.7 100 754.7 100 800.9 114.6 C851.3 133 891 172.7 909.4 223.1 C924 269.3 924 312.3 924 398.1 V625.9 C924 711.7 924 754.7 909.4 800.9 C891 851.3 851.3 891 800.9 909.4 C754.7 924 711.7 924 625.9 924 H398.1 C312.3 924 269.3 924 223.1 909.4 C172.7 891 133 851.3 114.6 800.9 C100 754.7 100 711.7 100 625.9 V398.1 C100 312.3 100 269.3 114.6 223.1 C133 172.7 172.7 133 223.1 114.6 C269.3 100 312.3 100 398.1 100Z"/>
+    <linearGradient id="bg" x1="0" y1="100" x2="0" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#2E9BFF"/>
+      <stop offset="1" stop-color="#1550C9"/>
+    </linearGradient>
+    <linearGradient id="rim" x1="0" y1="100" x2="0" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fff" stop-opacity=".55"/>
+      <stop offset=".25" stop-color="#fff" stop-opacity="0"/>
+      <stop offset=".8" stop-color="#fff" stop-opacity="0"/>
+      <stop offset="1" stop-color="#fff" stop-opacity=".3"/>
+    </linearGradient>
+    <linearGradient id="fin" x1="0" y1="283" x2="0" y2="606" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#fff"/>
+      <stop offset="1" stop-color="#EDF5FF"/>
+    </linearGradient>
+    <pattern id="minor" width="103" height="103" patternUnits="userSpaceOnUse" x="100" y="100">
+      <path d="M0 0 V103 M0 0 H103" fill="none" stroke="#fff" stroke-opacity=".08" stroke-width="3"/>
+    </pattern>
+    <clipPath id="above"><rect width="1024" height="606"/></clipPath>
+    <clipPath id="sq"><use href="#body"/></clipPath>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="8" stdDeviation="14" flood-color="#000" flood-opacity=".3"/>
+    </filter>
+  </defs>
+  <use href="#body" fill="url(#bg)" filter="url(#shadow)"/>
+  <g clip-path="url(#sq)" fill="none" stroke="#fff">
+    <rect x="100" y="100" width="824" height="824" fill="url(#minor)" stroke="none"/>
+    <!-- Xcode-style keylines: quarter lines centred on 512 plus an inner rounded keyline -->
+    <path d="M306 100 V924 M512 100 V924 M718 100 V924 M100 306 H924 M100 512 H924 M100 718 H924" stroke-opacity=".2" stroke-width="6"/>
+    <rect x="172" y="172" width="680" height="680" rx="128" stroke-opacity=".2" stroke-width="6"/>
+  </g>
+  <use href="#body" fill="none" stroke="url(#rim)" stroke-width="8" clip-path="url(#sq)"/>
+  <path d="M778 679 C 734 528, 594 325, 300 288 C 402 355, 445 485, 393 679 Z" fill="url(#fin)" stroke="url(#fin)" stroke-width="10" stroke-linejoin="round" clip-path="url(#above)"/>
+  <path d="M216 636 H 808" stroke="#fff" stroke-width="28" stroke-linecap="round"/>
+  <!-- wake trails behind the fin and fades with distance; solid tints so the grid doesn't show through -->
+  <g stroke-width="28" stroke-linecap="round">
+    <path d="M300 712 H 324" stroke="#6FA6EE"/>
+    <path d="M380 712 H 452" stroke="#8DB9F2"/>
+    <path d="M508 712 H 620" stroke="#A9C8F5"/>
+  </g>
+</svg>

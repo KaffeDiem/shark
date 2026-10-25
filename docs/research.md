@@ -57,3 +57,57 @@ Open-source GPUI apps in the same space, worth reading: **Arbor** (worktrees, te
 - `Issue.branchName` is the suggested branch name, so use it as the shared branch.
 - Putting "Part of ENG-123" in each PR keeps the issue open until the last PR merges. `attachmentLinkGitHubPR` adds rich links.
 - Auth: a personal API key or OAuth PKCE. Webhooks need a public URL, so a desktop app should poll for `assignee isMe` issues instead.
+
+## Editors & Mermaid (Oct 2026)
+Goal: Mermaid in markdown, a live-preview markdown editor (`# ` becomes a heading) for a notes/plans pane, and a better code editor. Stay native: no webview, no Zed GPL crates.
+
+### What gpui-kit 0.8 already gives us
+- **Markdown:** parsed by markdown-rs (mdast) with GFM and math. Math is parsed but not typeset.
+  - Custom blocks: `MarkdownPlugin` (`is_block`, `parse`, `render`) can claim a ```` ```mermaid ```` fence. Copy `FrontmatterPlugin` in `gpui-component/src/text/frontmatter.rs`.
+  - Documents up to 4 KiB parse synchronously on the UI thread (`MAX_SYNC_FULL_REPLACE_BYTES`, `gpui-base/src/text/state.rs`). `parse()` must only capture the source. Do the expensive work on a background task with a cache.
+- **SVG:** `img(Arc::new(Image::from_bytes(ImageFormat::Svg, bytes)))` renders through resvg 0.46. It is cached by a hash of the bytes. `svg()` tints everything one colour, which suits icons, not diagrams.
+- **Code editor:** `EditorState`/`Editor`.
+  - Rope buffer, about 200K lines, folding, search and replace, multi-cursor.
+  - LSP provider hooks: completion, hover, definition, code actions, semantic tokens.
+  - Highlighting via the `syntect` or `tree-sitter-<lang>` features, including `tree-sitter-markdown(-inline)`.
+  - There is no vim mode, but the movement actions are exported, so we can add a keymap.
+- **Decorations** only change colour, weight, italic, background, underline and strikethrough. They can't change font size or hide markers, so a Typora-style editor can't be built on `EditorState`.
+- **`gpui_kit::base::text::editor_host`:** we keep our own document and it renders mdast blocks and returns caret geometry. We own caret, IME and undo. This is the fallback for building a live-preview editor ourselves.
+- **WebView:** none in gpui-kit. `gpui-webview` 0.8 is a separate crate. It draws over GPUI popovers and has no keyboard or focus bridge.
+
+### Mermaid
+- **Pick: merman** (https://github.com/Latias94/merman). MIT/Apache, very active, 37 diagram types.
+  - Zed switched to it in May 2026 (zed#57644).
+  - Use `default-features = false, features = ["svg", "layout-cytoscape"]`. The default `elk` layout is EPL-2.0.
+  - Use its resvg-safe SVG mode, which avoids `foreignObject`.
+- **Zed's `mermaid_render` is GPL.** It does theme CSS, strips `foreignObject`, caps the pixmap size (zed#56468), and measures labels with gpui's text system (zed#65192). Reimplement these only when a diagram looks wrong.
+- **Rejected:**
+  - mermaid-rs-renderer: faster, but less accurate. Zed dropped it.
+  - mermaid.js in QuickJS/deno: needs a DOM shim.
+  - mmdc: ships Chromium.
+  - Hidden WKWebView: possible later, for full fidelity.
+
+### Live-preview markdown editor (notes/plans pane)
+- **Candidate: zorite-editor 0.11** (https://github.com/packetThrower/zorite, `crates/zorite-editor`). MIT, depends on `gpui-pre ^0.3`, not on gpui-component.
+  - Hides markers except near the caret.
+  - Headings, lists, tasks, tables as a grid, IME and undo.
+  - The app supplies the Mermaid, math and code-highlight renderers.
+  - Risks: one maintainer, a few hundred downloads, a `String` buffer, no vim. Its gpui-pre version must match ours [?]. Treat it as something we might fork.
+- **If we build our own** on `editor_host` + tree-sitter-md, use these as references: Velotype (Apache-2.0, https://github.com/manyougz/velotype) and Markion (MIT, https://github.com/willmove/markion).
+- **Never link Zed's `editor`, `markdown`, `rope`, `text` or `vim` crates.** They are GPL-3.0.
+- **Webview is the last resort** (CodeMirror 6 + `@replit/codemirror-vim`). Problems: z-order, focus bridging, about 50 MB per view [?].
+
+### Roadmap (not started)
+1. **Mermaid in chat.**
+   - Add `src/mermaid.rs`. Its plugin claims `lang == "mermaid"` fences only once they are closed.
+   - Cache rendered diagrams by source hash, as Pending, Svg or Err. Render on the background executor.
+   - Show the last good image while waiting, fall back to the code block on error, and cap the raster size.
+   - Register it in `src/chat.rs` via `TextView::plugin`.
+2. **Composer becomes an `EditorState`** with tree-sitter markdown: styled source, `auto_grow`, list continuation on Enter.
+3. **Notes/plans pane:** try zorite-editor, feeding it the same Mermaid cache. If that doesn't work out, build our own on `editor_host`.
+4. **Code view:** `Editor` with a few tree-sitter grammars and a vim normal-mode keymap. LSP later.
+
+Tests for the Mermaid work:
+- Closed vs. unclosed fence, cache hit, error fallback.
+- A headless UI test that a mermaid block renders an image.
+- `cargo run` with a diagram streamed in.

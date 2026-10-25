@@ -2,17 +2,29 @@
 use crate::chat::{Chat, ChatEvent};
 use crate::state::{Repo, State, workspaces_dir};
 use crate::*;
+use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
 use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::diff::{Diff, DiffFile, DiffMode, DiffState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{ActiveTheme, WindowExt, h_flex, v_flex};
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::{ActiveTheme, Icon, Sizable as _, Theme, WindowExt, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Hint text below the muted level; gpui-kit has no token for it. Never use it for content.
+pub(crate) fn faint(theme: &Theme) -> Hsla {
+    match theme.is_dark() {
+        true => rgb(0x6e6e71).into(),
+        false => rgb(0x9c9d9f).into(),
+    }
+}
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum Tab {
@@ -36,18 +48,36 @@ pub struct Shark {
 
 type Cmd = fn(&mut Shark, &mut Window, &mut Context<Shark>);
 
-const COMMANDS: &[(&str, Cmd)] = &[
-    ("New workspace", |s, w, cx| s.new_workspace(w, cx)),
-    ("Add repo", |s, w, cx| s.add_repo(w, cx)),
-    ("Archive workspace", |s, w, cx| s.archive(false, w, cx)),
-    ("Archive workspace (force, discards changes)", |s, w, cx| {
-        s.archive(true, w, cx)
+const COMMANDS: &[(&str, IconName, Cmd)] = &[
+    ("New workspace", IconName::Plus, |s, w, cx| {
+        s.new_workspace(w, cx)
     }),
-    ("Show chat", |s, w, cx| s.show(Tab::Chat, w, cx)),
-    ("Show diff", |s, w, cx| s.show(Tab::Diff, w, cx)),
-    ("Create / update linked PRs", |s, w, cx| s.create_prs(w, cx)),
-    ("Open PRs in browser", |s, w, cx| s.open_prs(w, cx)),
-    ("Stop agent", |s, _, cx| s.stop(cx)),
+    ("Add repo", IconName::FolderPlus, |s, w, cx| {
+        s.add_repo(w, cx)
+    }),
+    ("Archive workspace", IconName::Archive, |s, w, cx| {
+        s.archive(false, w, cx)
+    }),
+    (
+        "Archive workspace (force, discards changes)",
+        IconName::ArchiveX,
+        |s, w, cx| s.archive(true, w, cx),
+    ),
+    ("Show chat", IconName::MessageSquare, |s, w, cx| {
+        s.show(Tab::Chat, w, cx)
+    }),
+    ("Show diff", IconName::FileDiff, |s, w, cx| {
+        s.show(Tab::Diff, w, cx)
+    }),
+    (
+        "Create / update linked PRs",
+        IconName::GitPullRequest,
+        |s, w, cx| s.create_prs(w, cx),
+    ),
+    ("Open PRs in browser", IconName::ExternalLink, |s, w, cx| {
+        s.open_prs(w, cx)
+    }),
+    ("Stop agent", IconName::Square, |s, _, cx| s.stop(cx)),
 ];
 
 impl Shark {
@@ -380,30 +410,31 @@ impl Shark {
             .collect();
         let items: Vec<CommandItem> = COMMANDS
             .iter()
-            .map(|(label, _)| CommandItem::new().label(*label))
-            .chain(
-                workspaces
-                    .iter()
-                    .map(|w| CommandItem::new().label(format!("Open workspace: {w}"))),
-            )
+            .map(|(label, icon, _)| CommandItem::new().label(*label).icon(*icon))
+            .chain(workspaces.iter().map(|w| {
+                CommandItem::new()
+                    .label(format!("Open workspace: {w}"))
+                    .icon(IconName::GitBranch)
+            }))
             .collect();
         let state = palette.clone();
         window.open_dialog(cx, move |d, _, _| {
             let shark = shark.clone();
-            d.w(px(560.)).entrance(DialogEntrance::None).child(
-                Command::new(&state)
-                    .items(items.clone())
-                    .on_confirm(move |ix, window, cx| {
+            d.w(px(640.))
+                .margin_top(px(96.))
+                .entrance(DialogEntrance::None)
+                .child(Command::new(&state).items(items.clone()).on_confirm(
+                    move |ix, window, cx| {
                         window.close_dialog(cx);
                         let row = ix.row;
                         shark
                             .update(cx, |s, cx| match COMMANDS.get(row) {
-                                Some((_, f)) => f(s, window, cx),
+                                Some((_, _, f)) => f(s, window, cx),
                                 None => s.open_workspace(row - COMMANDS.len(), window, cx),
                             })
                             .ok();
-                    }),
-            )
+                    },
+                ))
         });
         palette.update(cx, |p, cx| p.focus(window, cx));
     }
@@ -413,70 +444,79 @@ impl Shark {
         let focused = self.sidebar_focus.is_focused(window);
         let header = |t: &'static str| {
             div()
-                .px_3()
-                .pt_3()
+                .px_4()
+                .pt_4()
                 .pb_1()
                 .text_xs()
+                .font_weight(FontWeight::MEDIUM)
                 .text_color(theme.muted_foreground)
                 .child(t)
         };
-        let repos = self
-            .state
-            .repos
-            .iter()
-            .map(|r| div().px_3().py_0p5().text_sm().child(r.name.clone()));
+        let hint = |t: &'static str| div().px_4().text_xs().text_color(faint(theme)).child(t);
+        let row = || {
+            h_flex()
+                .h(px(28.))
+                .flex_none()
+                .mx_2()
+                .px_2()
+                .gap_2()
+                .rounded(theme.radius)
+                .text_sm()
+        };
+        let repos = self.state.repos.iter().map(|r| {
+            row()
+                .text_color(theme.muted_foreground)
+                .child(Icon::new(IconName::FolderGit2).with_size(px(14.)))
+                .child(div().truncate().child(r.name.clone()))
+        });
         let workspaces = self.state.workspaces.iter().enumerate().map(|(ix, w)| {
             let busy = self.chats.get(&w.name).is_some_and(|c| c.read(cx).busy);
             let selected = ix == self.sel;
             let active = self.active.as_ref() == Some(&w.name);
-            h_flex()
+            row()
                 .id(ix)
-                .px_3()
-                .py_1()
-                .gap_2()
-                .text_sm()
                 .when(selected && focused, |d| d.bg(theme.list_active))
-                .when(selected && !focused, |d| d.bg(theme.list_hover))
+                .when(selected && !focused, |d| d.bg(theme.sidebar_accent))
+                .hover(|d| d.bg(theme.sidebar_accent))
                 .on_click(
                     cx.listener(move |this, _, window, cx| this.open_workspace(ix, window, cx)),
                 )
+                .child(match busy {
+                    true => Spinner::new()
+                        .icon(IconName::LoaderCircle)
+                        .color(theme.primary)
+                        .with_size(px(14.))
+                        .into_any_element(),
+                    false => Icon::new(IconName::CircleDashed)
+                        .with_size(px(14.))
+                        .text_color(theme.muted_foreground)
+                        .into_any_element(),
+                })
                 .child(
                     div()
-                        .text_color(if busy {
-                            theme.success
-                        } else {
-                            theme.muted_foreground
-                        })
-                        .child(if busy { "●" } else { "○" }),
+                        .flex_1()
+                        .truncate()
+                        .when(active, |d| d.font_weight(FontWeight::MEDIUM))
+                        .child(w.name.clone()),
                 )
                 .child(
-                    v_flex()
-                        .child(
-                            div()
-                                .when(active, |d| d.font_weight(FontWeight::SEMIBOLD))
-                                .child(w.name.clone()),
-                        )
-                        .child(
-                            div().text_xs().text_color(theme.muted_foreground).child(
-                                w.repos
-                                    .iter()
-                                    .map(|r| r.name.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(" · "),
-                            ),
-                        ),
+                    div().text_xs().text_color(faint(theme)).child(
+                        w.repos
+                            .iter()
+                            .map(|r| r.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" · "),
+                    ),
                 )
         });
         v_flex()
             .id("sidebar")
             .key_context("Sidebar")
             .track_focus(&self.sidebar_focus)
-            .w(px(240.))
+            .w(px(244.))
             .h_full()
             .flex_none()
-            .bg(theme.sidebar)
-            .border_r_1()
-            .border_color(theme.sidebar_border)
+            .text_color(theme.sidebar_foreground)
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| {
                 this.sel = (this.sel + 1).min(this.state.workspaces.len().saturating_sub(1));
                 cx.notify();
@@ -496,55 +536,86 @@ impl Shark {
             .on_action(cx.listener(|this, _: &Confirm, window, cx| {
                 this.open_workspace(this.sel, window, cx)
             }))
-            .child(header("REPOS"))
-            .children(repos)
-            .when(self.state.repos.is_empty(), |d| {
-                d.child(
-                    div()
-                        .px_3()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child("space r a to add"),
-                )
-            })
-            .child(header("WORKSPACES"))
+            // Room for the traffic lights; the transparent titlebar lets the sidebar run under them.
+            .child(
+                div()
+                    .h(px(36.))
+                    .flex_none()
+                    .window_control_area(WindowControlArea::Drag),
+            )
+            .child(header("Workspaces"))
             .children(workspaces)
             .when(self.state.workspaces.is_empty(), |d| {
-                d.child(
-                    div()
-                        .px_3()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child("space w n to create"),
-                )
+                d.child(hint("space w n to create"))
+            })
+            .child(header("Repos"))
+            .children(repos)
+            .when(self.state.repos.is_empty(), |d| {
+                d.child(hint("space r a to add"))
             })
     }
 
     fn render_main(&self, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let Some(chat) = self.active_chat().cloned() else {
+            let key = |k: &str| Kbd::new(Keystroke::parse(k).unwrap());
+            let tip = |keys: Vec<Kbd>, label: &'static str| {
+                h_flex()
+                    .gap_2()
+                    .child(h_flex().gap_1().children(keys))
+                    .child(label)
+            };
             return v_flex()
                 .flex_1()
+                .size_full()
                 .items_center()
                 .justify_center()
-                .gap_2()
+                .gap_3()
                 .text_color(theme.muted_foreground)
-                .child("No workspace open")
-                .child(div().text_sm().child(
-                    "j/k + enter to open · space w n new · space r a add repo · cmd-k commands",
-                ))
+                .child(
+                    Icon::new(IconName::Fish)
+                        .with_size(px(32.))
+                        .text_color(faint(theme)),
+                )
+                .child(
+                    div()
+                        .text_base()
+                        .text_color(theme.foreground)
+                        .child("No workspace open"),
+                )
+                .child(
+                    v_flex()
+                        .gap_1p5()
+                        .text_sm()
+                        .child(tip(
+                            vec![key("j"), key("k"), key("enter")],
+                            "open from sidebar",
+                        ))
+                        .child(tip(vec![key("space"), key("w"), key("n")], "new workspace"))
+                        .child(tip(vec![key("space"), key("r"), key("a")], "add repo"))
+                        .child(tip(vec![key("cmd-k")], "commands")),
+                )
                 .into_any_element();
         };
         let busy = chat.read(cx).busy;
-        let tab = |label: String, t: Tab| {
-            div()
+        let tab = |label: String, icon: IconName, t: Tab| {
+            let on = self.tab == t;
+            h_flex()
                 .id(label.clone())
-                .px_3()
-                .py_1()
-                .rounded_md()
+                .h(px(26.))
+                .px_2p5()
+                .gap_1p5()
+                .rounded_full()
                 .text_sm()
-                .when(self.tab == t, |d| d.bg(theme.tab_active))
+                .text_color(if on {
+                    theme.foreground
+                } else {
+                    theme.muted_foreground
+                })
+                .when(on, |d| d.bg(theme.secondary))
+                .hover(|d| d.text_color(theme.foreground))
                 .on_click(cx.listener(move |this, _, window, cx| this.show(t, window, cx)))
+                .child(Icon::new(icon).with_size(px(14.)))
                 .child(label)
         };
         let ws_name = self.active.clone().unwrap_or_default();
@@ -554,34 +625,39 @@ impl Shark {
             .h_full()
             .child(
                 h_flex()
-                    .px_2()
-                    .py_1()
+                    .h(px(44.))
+                    .flex_none()
+                    .px_3()
                     .gap_1()
                     .border_b_1()
                     .border_color(theme.border)
-                    .bg(theme.tab_bar)
-                    .child(tab("Chat".into(), Tab::Chat))
+                    .child(tab("Chat".into(), IconName::MessageSquare, Tab::Chat))
                     .child(tab(
-                        format!("Diff · {} files", self.diff_files.len()),
+                        format!("Diff · {}", self.diff_files.len()),
+                        IconName::FileDiff,
                         Tab::Diff,
                     ))
                     .child(div().flex_1())
                     .child(
-                        div()
+                        h_flex()
+                            .gap_1p5()
                             .text_xs()
                             .text_color(theme.muted_foreground)
+                            .child(Icon::new(IconName::GitBranch).with_size(px(12.)))
                             .child(ws_name),
                     )
                     .child(
-                        div()
-                            .px_2()
+                        h_flex()
+                            .pl_3()
+                            .gap_1p5()
                             .text_xs()
-                            .text_color(if busy {
-                                theme.success
+                            .text_color(theme.muted_foreground)
+                            .child(div().size(px(6.)).rounded_full().bg(if busy {
+                                theme.primary
                             } else {
-                                theme.muted_foreground
-                            })
-                            .child(if busy { "● running" } else { "idle" }),
+                                faint(theme)
+                            }))
+                            .child(if busy { "Running" } else { "Idle" }),
                     ),
             )
             .child(match self.tab {
@@ -628,11 +704,18 @@ impl Shark {
 
 impl Render for Shark {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
         h_flex()
             .key_context("Shark")
             .size_full()
-            .bg(cx.theme().background)
-            .text_color(cx.theme().foreground)
+            .bg(theme.sidebar)
+            .text_color(theme.foreground)
+            // Inter disambiguation (ss02 + cv05/cv08/zero): serifed I, tailed l, slashed 0 for paths and hashes.
+            .font_features(FontFeatures(Arc::new(
+                ["ss02", "cv05", "cv08", "zero"]
+                    .map(|f| (f.to_string(), 1))
+                    .to_vec(),
+            )))
             .on_action(cx.listener(|this, _: &TogglePalette, w, cx| this.toggle_palette(w, cx)))
             .on_action(cx.listener(|this, _: &NewWorkspace, w, cx| this.new_workspace(w, cx)))
             .on_action(cx.listener(|this, _: &ArchiveWorkspace, w, cx| this.archive(false, w, cx)))
@@ -654,7 +737,19 @@ impl Render for Shark {
                 this.show(tab, w, cx)
             }))
             .child(self.render_sidebar(window, cx))
-            .child(self.render_main(cx))
+            .child(
+                // Linear's "island": content floats on the sidebar color, inset and rounded.
+                div().flex_1().min_w_0().h_full().py_2().pr_2().child(
+                    h_flex()
+                        .size_full()
+                        .rounded(cx.theme().radius_lg)
+                        .border_1()
+                        .border_color(cx.theme().border)
+                        .bg(cx.theme().background)
+                        .overflow_hidden()
+                        .child(self.render_main(cx)),
+                ),
+            )
     }
 }
 

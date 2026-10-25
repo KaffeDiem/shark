@@ -2,11 +2,14 @@
 use crate::agent::{self, Agent, Ev};
 use crate::state::Workspace;
 use crate::*;
+use gpui_kit::assets::IconName;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::select::{Select, SelectEvent, SelectState};
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState};
-use gpui_kit::component::{ActiveTheme, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Icon, h_flex, v_flex};
 use gpui_kit::component::{IndexPath, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -300,7 +303,7 @@ impl Chat {
             .py_1p5()
             .border_l_2()
             .border_color(if focused && ix == self.sel {
-                theme.accent
+                theme.primary
             } else {
                 theme.transparent
             })
@@ -308,21 +311,24 @@ impl Chat {
                 this.sel = ix;
                 this.toggle(cx);
             }));
-        match b {
-            Block::User(t) => row
-                .child(
-                    div()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .bg(theme.secondary)
-                        .text_color(theme.secondary_foreground)
-                        .child(t.clone()),
-                )
-                .into_any_element(),
-            Block::Text { md, .. } => row
-                .child(TextView::new(md).selectable(true))
-                .into_any_element(),
+        // A centered ~70-character column; long lines are harder to track back across.
+        let column = || div().w_full().max_w(px(680.)).mx_auto();
+        let inner = match b {
+            Block::User(t) => column()
+                .px_3()
+                .py_2()
+                .rounded(theme.radius_lg)
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.secondary)
+                .text_color(theme.secondary_foreground)
+                .text_size(px(14.))
+                .line_height(relative(1.5))
+                .child(t.clone()),
+            Block::Text { md, .. } => column()
+                .text_size(px(14.))
+                .line_height(relative(1.5))
+                .child(TextView::new(md).selectable(true)),
             Block::Tool {
                 name,
                 summary,
@@ -331,20 +337,29 @@ impl Chat {
                 open,
                 ..
             } => {
+                let icon = |name: IconName| Icon::new(name).with_size(px(14.));
                 let status = match (result, is_error) {
-                    (None, _) => "…",
-                    (Some(_), true) => "✗",
-                    _ => "✓",
+                    (None, _) => Spinner::new().with_size(px(14.)).into_any_element(),
+                    (Some(_), true) => icon(IconName::X)
+                        .text_color(theme.danger)
+                        .into_any_element(),
+                    _ => icon(IconName::Check).into_any_element(),
                 };
-                row.text_sm()
+                column()
+                    .text_sm()
                     .child(
                         h_flex()
+                            .h(px(28.))
                             .gap_2()
                             .text_color(theme.muted_foreground)
-                            .child(if *open { "▾" } else { "▸" })
+                            .child(icon(if *open {
+                                IconName::ChevronDown
+                            } else {
+                                IconName::ChevronRight
+                            }))
                             .child(
                                 div()
-                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .font_weight(FontWeight::MEDIUM)
                                     .text_color(theme.foreground)
                                     .child(name.clone()),
                             )
@@ -361,11 +376,15 @@ impl Chat {
                         d.child(
                             div()
                                 .mt_1()
-                                .p_2()
-                                .rounded_md()
+                                .px_3()
+                                .py_2()
+                                .rounded(theme.radius)
+                                .border_1()
+                                .border_color(theme.border)
                                 .bg(theme.muted)
-                                .font_family("Menlo")
-                                .text_xs()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_size(theme.mono_font_size)
+                                .line_height(relative(1.45))
                                 .text_color(if *is_error {
                                     theme.danger
                                 } else {
@@ -374,14 +393,13 @@ impl Chat {
                                 .child(text),
                         )
                     })
-                    .into_any_element()
             }
-            Block::Info(t) => row
+            Block::Info(t) => column()
                 .text_xs()
                 .text_color(theme.muted_foreground)
-                .child(t.clone())
-                .into_any_element(),
-        }
+                .child(t.clone()),
+        };
+        row.child(inner).into_any_element()
     }
 
     fn toggle(&mut self, cx: &mut Context<Self>) {
@@ -395,6 +413,13 @@ impl Chat {
 impl Render for Chat {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let focused = self.focus.is_focused(window);
+        let theme = cx.theme();
+        let (radius, border, card, muted) = (
+            theme.radius_lg,
+            theme.border,
+            theme.secondary,
+            theme.muted_foreground,
+        );
         let blocks: Vec<AnyElement> = (0..self.blocks.len())
             .map(|ix| self.render_block(ix, &self.blocks[ix], focused, cx))
             .collect();
@@ -434,25 +459,38 @@ impl Render for Chat {
                     .children(blocks),
             )
             .child(
-                div()
-                    .key_context("Composer")
-                    .p_2()
-                    .border_t_1()
-                    .border_color(cx.theme().border)
-                    .on_action(cx.listener(|this, _: &FocusTranscript, window, cx| {
-                        this.focus.focus(window, cx);
-                        cx.notify();
-                    }))
-                    .child(Textarea::new(&self.composer))
-                    .child(
-                        h_flex()
-                            .pt_1()
-                            .gap_2()
-                            .text_xs()
-                            .text_color(cx.theme().muted_foreground)
-                            .child("Claude Code")
-                            .child(Select::new(&self.model_select).xsmall().w(px(120.))),
-                    ),
+                div().px_4().pb_4().pt_1().child(
+                    v_flex()
+                        .key_context("Composer")
+                        .w_full()
+                        .max_w(px(712.))
+                        .mx_auto()
+                        .p_2()
+                        .gap_1()
+                        .rounded(radius)
+                        .border_1()
+                        .border_color(border)
+                        .bg(card)
+                        .on_action(cx.listener(|this, _: &FocusTranscript, window, cx| {
+                            this.focus.focus(window, cx);
+                            cx.notify();
+                        }))
+                        .child(
+                            Textarea::new(&self.composer)
+                                .appearance(false)
+                                .text_size(px(14.)),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_2()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(Select::new(&self.model_select).xsmall().w(px(120.)))
+                                .child(div().flex_1())
+                                .child(Kbd::new(Keystroke::parse("enter").unwrap()))
+                                .child("send"),
+                        ),
+                ),
             )
     }
 }

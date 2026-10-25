@@ -8,6 +8,9 @@ gpui-kit = { version = "=0.8.0", features = ["syntect"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 smol = "2"
+objc2 = "0.6"
+objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData"] }
 
 [profile.dev.package."*"]
 opt-level = 3
