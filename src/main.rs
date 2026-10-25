@@ -45,6 +45,13 @@ actions!(
         ToggleDiffMode,
         RefreshDiff,
         PickModel,
+        RevealInFinder,
+        OpenInTerminal,
+        CopyPath,
+        CopyBranch,
+        ToggleRepo,
+        SwitchField,
+        SubmitForm,
     ]
 );
 
@@ -99,6 +106,16 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("space g g", GitNext, Some(NAV)),
         KeyBinding::new("space g m", GitMenu, Some(NAV)),
         KeyBinding::new("space g f", GitFetch, Some(NAV)),
+        KeyBinding::new("space o f", RevealInFinder, Some(NAV)),
+        KeyBinding::new("space o t", OpenInTerminal, Some(NAV)),
+        KeyBinding::new("space y p", CopyPath, Some(NAV)),
+        KeyBinding::new("space y b", CopyBranch, Some(NAV)),
+        // New workspace dialog: tab hops between branch and repo filter, space ticks the
+        // highlighted repo (names have no spaces), cmd-enter creates from either field.
+        KeyBinding::new("tab", SwitchField, Some("NewWorkspace")),
+        KeyBinding::new("shift-tab", SwitchField, Some("NewWorkspace")),
+        KeyBinding::new("space", ToggleRepo, Some("NewWorkspace > Command")),
+        KeyBinding::new("cmd-enter", SubmitForm, Some("NewWorkspace")),
         KeyBinding::new("cmd-/", PickModel, None),
         KeyBinding::new("space m m", PickModel, Some(NAV)),
         KeyBinding::new("] c", NextHunk, Some("DiffPane")),
