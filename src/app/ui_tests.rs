@@ -184,6 +184,88 @@ async fn settings_apply_and_save(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+/// Vim mode is one switch: off, j/k type nothing in lists and the arrows move; Settings turns
+/// it on for the lists and every chat at once. cmd-k acts on the sidebar's cursor row.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn vim_setting_and_palette_target(cx: &mut TestAppContext) {
+    use crate::settings::Settings;
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos(&home, &["api"]),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
+    let on = on_app(window, shark.clone());
+    for name in ["one", "two"] {
+        on(cx, &|s, w, cx| {
+            s.create_workspace(name.into(), repos.clone(), None, w, cx)
+        });
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).active.as_deref() == Some(name)
+        })
+        .await;
+    }
+    let press = |cx: &mut TestAppContext, keys: &[&str]| {
+        cx.update_window(window, |_, w, cx| keys.iter().for_each(|k| w.press(k, cx)))
+            .unwrap();
+        cx.run_until_parked();
+    };
+    let sel = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).sel.clone());
+    press(cx, &["escape", "cmd-alt-left"]);
+    cx.update_window(window, |_, w, cx| {
+        assert!(shark.read(cx).sidebar_focus.is_focused(w))
+    })
+    .unwrap();
+    press(cx, &["home"]);
+    let top = sel(cx);
+    press(cx, &["j"]);
+    assert_eq!(sel(cx), top, "j is a Vim key");
+    press(cx, &["down"]);
+    assert_ne!(sel(cx), top, "the arrows always move");
+    press(cx, &["up"]);
+
+    cx.update_window(window, |_, w, cx| {
+        let state = shark.read(cx).state.clone();
+        let view = cx.new(|cx| Settings::new(shark.downgrade(), &state, w, cx));
+        view.update(cx, |v, cx| v.set_vim(true, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(State::load().vim, "the switch is saved");
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert!(s.chats.values().all(|c| c.read(cx).vim_on), "every chat follows");
+    });
+    press(cx, &["j"]);
+    assert_ne!(sel(cx), top, "j moves with Vim on");
+
+    // The cursor is on a workspace that isn't open: cmd-k's archive takes that one.
+    let open = cx.update(|cx| shark.read(cx).active.clone().unwrap());
+    let name = |cx: &mut TestAppContext| {
+        let SideRow::Ws(ix) = sel(cx) else { panic!("cursor on a workspace") };
+        cx.update(|cx| shark.read(cx).state.workspaces[ix].name.clone())
+    };
+    if name(cx) == open {
+        press(cx, &["k"]);
+    }
+    assert_ne!(name(cx), open);
+    press(cx, &["cmd-k"]);
+    cx.update_window(window, |_, w, cx| w.input("archive workspace", cx))
+        .unwrap();
+    press(cx, &["enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).state.workspaces.len() == 1
+    })
+    .await;
+    cx.update(|cx| assert_eq!(shark.read(cx).state.workspaces[0].name, open));
+}
+
 /// Drives the real keymap headlessly: create a workspace, vim focus moves, tabs, archive.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)] // each test owns its thread; the lock only orders them
@@ -206,7 +288,12 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
             .unwrap()
     };
 
-    press(cx, &["space", "w", "n"]);
+    // Commands without a key run from cmd-k; dispatching the action is the same path.
+    let run = |cx: &mut TestAppContext, a: &dyn Action| {
+        cx.update_window(window, |_, w, cx| w.dispatch_action(a.boxed_clone(), cx))
+            .unwrap()
+    };
+    press(cx, &["cmd-n"]);
     cx.update_window(window, |_, w, cx| w.input("ui x", cx))
         .unwrap();
     press(cx, &["enter"]);
@@ -300,7 +387,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     // Model shortcuts work while typing and keep the draft. Let the New workspace
     // dialog's deferred focus restore run first (it targets the sidebar), then go back.
     cx.executor().advance_clock(Duration::from_secs(1));
-    press(cx, &["ctrl-w", "l", "i"]);
+    press(cx, &["cmd-alt-right", "i"]);
     let model = |cx: &mut TestAppContext| {
         cx.update(|cx| shark.read(cx).state.workspaces[0].chats[0].model.clone())
     };
@@ -326,18 +413,18 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         assert!(chat.read(cx).focus.is_focused(w), "escape -> transcript")
     })
     .unwrap();
-    press(cx, &["ctrl-w", "h"]);
+    press(cx, &["cmd-alt-left"]);
     cx.update_window(window, |_, w, cx| {
         assert!(
             shark.read(cx).sidebar_focus.is_focused(w),
-            "ctrl-w h -> sidebar"
+            "cmd-alt-left -> sidebar"
         )
     })
     .unwrap();
     assert_menus_reachable(cx, window, "sidebar");
-    press(cx, &["space", "d"]);
+    run(cx, &ShowDiff);
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Diff));
-    press(cx, &["space", "c"]);
+    run(cx, &ShowChat);
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Chat));
 
     // The git button follows the worktree: clean, then dirty within a poll tick.
@@ -359,7 +446,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         cx.update(|cx| shark.update(cx, |s, cx| s.refresh_diff(cx)));
         cx.run_until_parked();
     };
-    press(cx, &["space", "d"]);
+    run(cx, &ShowDiff);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).diff_files.len() == 1
     })
@@ -373,15 +460,15 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
             .collect();
         assert_eq!(names, ["api", "new.txt"]);
     });
-    press(cx, &["ctrl-w", "l"]);
+    press(cx, &["cmd-alt-right"]);
     cx.update_window(window, |_, w, cx| {
         assert!(
             shark.read(cx).tree_focus.is_focused(w),
-            "ctrl-w l from the diff -> tree"
+            "cmd-alt-right from the diff -> tree"
         )
     })
     .unwrap();
-    press(cx, &["j", "v"]);
+    press(cx, &["down", "v"]);
     let viewed = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).viewed(0));
     assert_eq!(viewed(cx), Viewed::Yes);
     assert!(
@@ -400,9 +487,9 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     })
     .await;
     // `v` on a folder ticks every file in it, then unticks them all.
-    press(cx, &["k", "v"]);
+    press(cx, &["up", "v"]);
     assert_eq!(viewed(cx), Viewed::Yes);
-    press(cx, &["v", "j"]);
+    press(cx, &["v", "down"]);
     assert_eq!(viewed(cx), Viewed::No);
 
     // `o` opens the file next to the chat and shrinks the sidebar to a rail.
@@ -463,11 +550,6 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     })
     .unwrap();
     assert_eq!(text(cx), "zx\ny!\n");
-    // Leader keys work in Normal mode: space t hides and shows the tree, typing nothing.
-    press(cx, &["space", "t"]);
-    cx.update(|cx| assert!(!shark.read(cx).show_tree, "space t in the editor"));
-    press(cx, &["space", "t"]);
-    assert_eq!(text(cx), "zx\ny!\n");
 
     // The agent writes the file while it has unsaved edits: offer reload, don't clobber.
     fs::write(&file, "agent\n").unwrap();
@@ -491,7 +573,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         assert!(shark.read(cx).tree_focus.is_focused(w))
     })
     .unwrap();
-    press(cx, &["space", "x"]);
+    run(cx, &CloseFile);
     cx.update(|cx| assert!(shark.read(cx).editor.is_some(), "close waits for confirm"));
     press(cx, &["enter"]);
     cx.update(|cx| {
@@ -499,7 +581,8 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         assert!(s.editor.is_none() && !s.rail && s.tab == Tab::Diff);
     });
 
-    press(cx, &["ctrl-w", "h", "ctrl-w", "h", "space", "w", "shift-d"]);
+    press(cx, &["ctrl-w", "h", "ctrl-w", "h"]);
+    run(cx, &ForceArchiveWorkspace);
     cx.update(|cx| {
         assert_eq!(
             shark.read(cx).state.workspaces.len(),
@@ -542,7 +625,8 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     });
 
     // Sections: name inline, move with `m`, fold with h/l, delete keeps the workspace.
-    press(cx, &["ctrl-w", "h", "space", "s", "n"]);
+    press(cx, &["ctrl-w", "h"]);
+    run(cx, &NewSection);
     cx.run_until_parked();
     cx.update_window(window, |_, w, cx| w.input("Later", cx))
         .unwrap();
@@ -567,10 +651,12 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
             "cmd-N skips folded workspaces"
         );
     });
-    press(cx, &["l", "space", "s", "d"]);
+    press(cx, &["l"]);
+    run(cx, &DeleteSection);
     assert!(sections(cx).is_empty());
     cx.update(|cx| assert_eq!(shark.read(cx).state.workspaces.len(), 1));
-    press(cx, &["ctrl-w", "h", "space", "w", "d"]);
+    press(cx, &["ctrl-w", "h"]);
+    run(cx, &ArchiveWorkspace);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).state.workspaces.is_empty()
     })
@@ -671,8 +757,8 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
                 .map(|r| r.path().to_string())
         })
     };
-    // A freshly loaded diff has a line cursor from the first `j`.
-    press(cx, "j");
+    // A freshly loaded diff has a line cursor from the first `down`.
+    press(cx, "down");
     assert_eq!(cursor(cx).as_deref(), Some("api/a"));
     press(cx, "}");
     press(cx, "v");
@@ -693,9 +779,9 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
     fs::write(api.join("0"), "new\n").unwrap();
     on(cx, &|s, _, cx| s.refresh_diff(cx));
     assert_eq!(at(cx), ("api/b".into(), true));
-    // j walks a line cursor (past the collapsed, viewed b); a refresh keeps it and `c` targets it.
-    press(cx, "j");
-    press(cx, "j");
+    // down walks a line cursor (past the collapsed, viewed b); a refresh keeps it and `c` targets it.
+    press(cx, "down");
+    press(cx, "down");
     assert_eq!(cursor(cx).as_deref(), Some("api/c"));
     fs::write(api.join("0"), "newer\n").unwrap();
     on(cx, &|s, _, cx| s.refresh_diff(cx));
@@ -738,9 +824,9 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
     });
     let row = COMMANDS
         .iter()
-        .position(|(l, ..)| l.starts_with("New conversation"))
+        .position(|r| r.0.starts_with("Start a new conversation"))
         .unwrap();
-    on(cx, &|s, w, cx| (COMMANDS[row].2)(s, w, cx));
+    on(cx, &|s, w, cx| (COMMANDS[row].4)(s, w, cx));
     assert_eq!(State::load().workspaces[0].chats[0].session_id, None);
 
     // Archive runs in the background, once.

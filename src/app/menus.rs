@@ -25,7 +25,7 @@ pub(super) fn copy(text: String, window: &mut Window, cx: &mut App) {
     cx.write_to_clipboard(ClipboardItem::new_string(text));
 }
 
-/// "Workspace folder" plus one row per repo, each with its path muted on the right.
+/// "Workspace folder", its path muted on the right, plus one row per repo.
 pub(super) fn path_submenu(
     icon: IconName,
     label: &'static str,
@@ -43,7 +43,9 @@ pub(super) fn path_submenu(
         } else {
             IconName::FolderGit2
         };
-        entries.push(menu::item(icon, name.clone(), move |w, cx| f(&p, w, cx)).hint(tilde(path)));
+        // The repo rows' labels already say which; only the folder row needs its path.
+        let item = menu::item(icon, name.clone(), move |w, cx| f(&p, w, cx));
+        entries.push(if ix == 0 { item.hint(tilde(path)) } else { item });
     }
     menu::sub(icon, label, entries)
 }
@@ -65,18 +67,20 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
         .unwrap_or_default();
     let branch = ws.branch.clone();
     let (n1, n2, n3) = (ws.name.clone(), ws.name.clone(), ws.name.clone());
-    let mut entries = vec![
+    let mut entries = vec![];
+    if this.active.as_deref() != Some(ws.name.as_str()) {
         // By name: the list can change under an open menu (a background auto-archive).
-        menu::item(
+        entries.push(menu::item(
             IconName::MessageSquare,
-            "Open Workspace",
+            "Open workspace",
             on_shark(cx, move |s, w, cx| {
                 if let Some(ix) = s.state.workspaces.iter().position(|w| w.name == n1) {
                     s.open_workspace(ix, w, cx)
                 }
             }),
-        ),
-        Entry::Sep,
+        ));
+    }
+    entries.extend([
         move_submenu(this, &ws.name, cx),
         Entry::Sep,
         path_submenu(
@@ -91,18 +95,19 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
             &paths,
             |p, _, _| open_terminal(p),
         ),
-        path_submenu(IconName::Copy, "Copy Path", &paths, |p, w, cx| {
+        path_submenu(IconName::Copy, "Copy path", &paths, |p, w, cx| {
             copy(p.display().to_string(), w, cx)
         }),
-        menu::item(IconName::GitBranch, "Copy Branch Name", move |w, cx| {
+        menu::item(IconName::GitBranch, "Copy branch name", move |w, cx| {
             copy(branch.clone(), w, cx)
         })
-        .hint(ws.branch.clone()),
-    ];
+        // The branch is usually the workspace's name; then the hint says nothing new.
+        .hint(if ws.branch == ws.name { "" } else { ws.branch.as_str() }.to_string()),
+    ]);
     if !pr_urls.is_empty() {
         let label = match pr_urls.len() {
-            1 => "Open Pull Request".to_string(),
-            n => format!("Open {n} Pull Requests"),
+            1 => "Open pull request".to_string(),
+            n => format!("Open {n} pull requests"),
         };
         entries.push(Entry::Sep);
         entries.push(menu::item(IconName::ExternalLink, label, move |_, cx| {
@@ -118,7 +123,7 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
         ),
         menu::item(
             IconName::ArchiveX,
-            "Force Archive…",
+            "Force archive…",
             on_shark(cx, move |s, w, cx| s.archive_ws(n3.clone(), true, w, cx)),
         ),
     ]);

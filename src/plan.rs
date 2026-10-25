@@ -691,7 +691,7 @@ impl Render for PlanPane {
                     .ghost()
                     .xsmall()
                     .icon(IconName::X)
-                    .tooltip("Hide plan (space l v)")
+                    .tooltip("Hide plan")
                     .on_click(|_, window, cx| window.dispatch_action(TogglePlan.boxed_clone(), cx)),
             );
         let body = match n {

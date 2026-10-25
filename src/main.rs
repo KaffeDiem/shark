@@ -104,7 +104,7 @@ actions!(
     ]
 );
 
-// Plan mode: shift-tab, the plan pane (`space l v`) and its keys.
+// Plan mode: shift-tab, the plan pane and its keys.
 actions!(
     shark,
     [
@@ -118,7 +118,7 @@ actions!(
     ]
 );
 
-// Editor and diff review: `space f f`, and `c` / `shift-c` in the diff.
+// Editor and diff review: cmd-p, and `c` / `shift-c` in the diff.
 actions!(shark, [OpenAnyFile, AddComment, SendComments, PlayMedia]);
 
 /// Switch the open workspace to `chat::MODELS[n]` without opening the menu.
@@ -146,30 +146,46 @@ fn fix_path() {
 }
 
 fn bind_keys(cx: &mut App) {
-    // VimNormal: the editor in Vim's Normal mode, where space types nothing.
-    const NAV: &str =
-        "Sidebar || Transcript || DiffPane || FileTree || Queue || PlanPane || VimNormal";
+    // Vim-style keys sit under `Vim`, which the root view carries while Vim mode is on
+    // (Settings › General). The arrows, letters that name an action and cmd shortcuts work
+    // either way. VimNormal: the editor in Vim's Normal mode.
+    const NAV: &str = "Sidebar || Transcript || DiffPane || FileTree || Queue || PlanPane || VimNormal";
     const LIST: &str = "Sidebar || Transcript || FileTree || Queue";
-    // The diff's line cursor (src/app/review.rs) moves like a list; h/l stay native there.
-    const MOVE: &str = "Sidebar || Transcript || FileTree || Queue || DiffPane";
+    // The diff's line cursor (src/app/review.rs) moves like a list. With Vim its arrows
+    // scroll natively and j/k move the cursor; without, the arrows move it.
+    const MOVE: &str = "Sidebar || Transcript || FileTree || Queue || DiffPane || PlanPane";
+    const ARROWS: &str = "Sidebar || Transcript || FileTree || Queue || PlanPane || (Diff && !Vim)";
+    let vim = |keys: &str, action: Box<dyn Action>, context: &str| {
+        KeyBinding::load(
+            keys,
+            action,
+            Some(Rc::new(
+                KeyBindingContextPredicate::parse(&format!("Vim > ({context})")).unwrap(),
+            )),
+            false,
+            None,
+            &DummyKeyboardMapper,
+        )
+        .unwrap()
+    };
     cx.bind_keys([
         KeyBinding::new("cmd-k", TogglePalette, None),
         KeyBinding::new("cmd-shift-p", TogglePalette, None),
         KeyBinding::new("cmd-n", NewWorkspace, None),
         // Not in the editor: Vim users leave insert mode with ctrl-c.
         KeyBinding::new("ctrl-c", StopAgent, Some("!FileEditor")),
-        KeyBinding::new("ctrl-w h", FocusLeft, None),
-        KeyBinding::new("ctrl-w l", FocusRight, None),
+        KeyBinding::new("cmd-alt-left", FocusLeft, None),
+        KeyBinding::new("cmd-alt-right", FocusRight, None),
+        // Anywhere under the root while it carries `Vim`, like their cmd-alt twins.
+        KeyBinding::new("ctrl-w h", FocusLeft, Some("Vim")),
+        KeyBinding::new("ctrl-w l", FocusRight, Some("Vim")),
         KeyBinding::new("cmd-b", ToggleSidebar, None),
-        KeyBinding::new("space b", ToggleSidebar, Some(NAV)),
-        KeyBinding::new("space t", ToggleFileTree, Some(NAV)),
-        KeyBinding::new("space x", CloseFile, Some(NAV)),
         KeyBinding::new("ctrl-cmd-v", ToggleVim, None),
         // In the diff: the file last moved to with `}`/`{` or the tree.
         KeyBinding::new("v", ToggleViewed, Some("FileTree || DiffPane")),
         KeyBinding::new("o", OpenFile, Some("FileTree || DiffPane")),
-        KeyBinding::new("h", CollapseDir, Some("FileTree")),
-        KeyBinding::new("l", ExpandDir, Some("FileTree")),
+        KeyBinding::new("left", CollapseDir, Some("FileTree || Sidebar")),
+        KeyBinding::new("right", ExpandDir, Some("FileTree || Sidebar")),
         KeyBinding::new("cmd-s", SaveFile, Some("FileEditor")),
         KeyBinding::new("cmd-w", CloseFile, Some("FileEditor")),
         KeyBinding::new("cmd-t", NewChat, None),
@@ -181,67 +197,30 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-{", PrevChat, None),
         KeyBinding::new("ctrl-tab", NextChat, None),
         KeyBinding::new("ctrl-shift-tab", PrevChat, None),
-        KeyBinding::new("g t", NextChat, Some(NAV)),
-        KeyBinding::new("g shift-t", PrevChat, Some(NAV)),
         KeyBinding::new("cmd-shift-enter", AskSide, Some("Composer")),
-        KeyBinding::new("space ?", OpenSide, Some(NAV)),
-        KeyBinding::new("space shift-/", OpenSide, Some(NAV)),
         KeyBinding::new("escape", CloseSide, Some("SideAnswer")),
         KeyBinding::new("c", CopySide, Some("SideAnswer")),
         KeyBinding::new("enter", InsertSide, Some("SideAnswer")),
-        KeyBinding::new("j", SelectNext, Some(MOVE)),
-        KeyBinding::new("k", SelectPrev, Some(MOVE)),
-        KeyBinding::new("g g", SelectFirst, Some(MOVE)),
-        KeyBinding::new("shift-g", SelectLast, Some(MOVE)),
-        KeyBinding::new("ctrl-d", PageDown, Some(MOVE)),
-        KeyBinding::new("ctrl-u", PageUp, Some(MOVE)),
+        KeyBinding::new("down", SelectNext, Some(ARROWS)),
+        KeyBinding::new("up", SelectPrev, Some(ARROWS)),
+        KeyBinding::new("home", SelectFirst, Some(ARROWS)),
+        KeyBinding::new("end", SelectLast, Some(ARROWS)),
+        KeyBinding::new("pagedown", PageDown, Some(ARROWS)),
+        KeyBinding::new("pageup", PageUp, Some(ARROWS)),
         KeyBinding::new("enter", Confirm, Some(LIST)),
         KeyBinding::new("o", Confirm, Some("Transcript")),
         KeyBinding::new("i", FocusComposer, Some("Transcript")),
         KeyBinding::new("a", FocusComposer, Some("Transcript")),
         KeyBinding::new("escape", FocusTranscript, Some("Composer")),
-        KeyBinding::new("space q", FocusQueue, Some(NAV)),
-        KeyBinding::new("up", SelectPrev, Some("Queue")),
-        KeyBinding::new("down", SelectNext, Some("Queue")),
         KeyBinding::new("e", EditQueued, Some("Queue")),
         KeyBinding::new("d", DeleteQueued, Some("Queue")),
         KeyBinding::new("backspace", DeleteQueued, Some("Queue")),
-        KeyBinding::new("shift-k", MoveQueuedUp, Some("Queue")),
-        KeyBinding::new("shift-j", MoveQueuedDown, Some("Queue")),
         KeyBinding::new("alt-up", MoveQueuedUp, Some("Queue")),
         KeyBinding::new("alt-down", MoveQueuedDown, Some("Queue")),
         KeyBinding::new("escape", FocusComposer, Some("Queue")),
         KeyBinding::new("i", FocusComposer, Some("Queue")),
         KeyBinding::new("a", FocusComposer, Some("Queue")),
-        KeyBinding::new("space space", TogglePalette, Some(NAV)),
-        KeyBinding::new("space w n", NewWorkspace, Some(NAV)),
-        KeyBinding::new("space w d", ArchiveWorkspace, Some(NAV)),
-        KeyBinding::new("space w shift-d", ForceArchiveWorkspace, Some(NAV)),
-        KeyBinding::new("space r a", AddRepo, Some(NAV)),
-        KeyBinding::new("space w a", AddRepoToWorkspace, Some(NAV)),
-        KeyBinding::new("space c", ShowChat, Some(NAV)),
-        KeyBinding::new("space d", ShowDiff, Some(NAV)),
-        KeyBinding::new("space p r", CreatePrs, Some(NAV)),
-        KeyBinding::new("space p o", OpenPrs, Some(NAV)),
-        KeyBinding::new("space p d", CreateDraftPrs, Some(NAV)),
-        KeyBinding::new("space p k", MergeEarlier, Some(NAV)),
-        KeyBinding::new("space p j", MergeLater, Some(NAV)),
-        KeyBinding::new("space g g", GitNext, Some(NAV)),
-        KeyBinding::new("space g m", GitMenu, Some(NAV)),
-        KeyBinding::new("space g f", GitFetch, Some(NAV)),
-        KeyBinding::new("space o f", RevealInFinder, Some(NAV)),
-        KeyBinding::new("space o t", OpenInTerminal, Some(NAV)),
-        KeyBinding::new("space y p", CopyPath, Some(NAV)),
-        KeyBinding::new("space y b", CopyBranch, Some(NAV)),
         KeyBinding::new("cmd-j", NextAttention, None),
-        KeyBinding::new("space w j", NextAttention, Some(NAV)),
-        KeyBinding::new("space s n", NewSection, Some(NAV)),
-        KeyBinding::new("space s m", MoveToSection, Some(NAV)),
-        KeyBinding::new("space s r", RenameSection, Some(NAV)),
-        KeyBinding::new("space s i", SectionIcon, Some(NAV)),
-        KeyBinding::new("space s d", DeleteSection, Some(NAV)),
-        KeyBinding::new("h", CollapseDir, Some("Sidebar")),
-        KeyBinding::new("l", ExpandDir, Some("Sidebar")),
         KeyBinding::new("m", MoveToSection, Some("Sidebar")),
         // Inline section name in the sidebar: the Input lets escape through.
         KeyBinding::new("escape", CancelEdit, Some("SectionName")),
@@ -252,19 +231,16 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("space", ToggleRepo, Some("NewWorkspace > Command")),
         KeyBinding::new("cmd-enter", SubmitForm, Some("NewWorkspace")),
         KeyBinding::new("cmd-,", OpenSettings, None),
-        KeyBinding::new("space ,", OpenSettings, Some(NAV)),
         KeyBinding::new("ctrl-tab", SwitchField, Some("Settings")),
         KeyBinding::new("ctrl-shift-tab", SwitchField, Some("Settings")),
         KeyBinding::new("cmd-/", PickModel, None),
-        KeyBinding::new("space m m", PickModel, Some(NAV)),
-        KeyBinding::new("] c", NextHunk, Some("DiffPane")),
-        KeyBinding::new("[ c", PrevHunk, Some("DiffPane")),
+        KeyBinding::new("alt-down", NextHunk, Some("DiffPane || PlanPane")),
+        KeyBinding::new("alt-up", PrevHunk, Some("DiffPane || PlanPane")),
         KeyBinding::new("}", NextFile, Some("DiffPane")),
         KeyBinding::new("{", PrevFile, Some("DiffPane")),
         KeyBinding::new("s", ToggleDiffMode, Some("DiffPane")),
         KeyBinding::new("r", RefreshDiff, Some("DiffPane")),
         KeyBinding::new("p", PlayMedia, Some("DiffPane")),
-        KeyBinding::new("space f f", OpenAnyFile, Some(NAV)),
         KeyBinding::new("cmd-p", OpenAnyFile, None),
         KeyBinding::new("c", AddComment, Some("DiffPane")),
         // Plan mode; in the composer shift-tab is caught before the input outdents.
@@ -273,40 +249,44 @@ fn bind_keys(cx: &mut App) {
             TogglePlanMode,
             Some("Transcript || Queue || PlanPane"),
         ),
-        KeyBinding::new("space l l", TogglePlanMode, Some(NAV)),
-        KeyBinding::new("space l v", TogglePlan, Some(NAV)),
-        KeyBinding::new("space l a", ApprovePlan, Some(NAV)),
-        KeyBinding::new("space l n", BuildPlanInNewChat, Some(NAV)),
-        KeyBinding::new("j", SelectNext, Some("PlanPane")),
-        KeyBinding::new("k", SelectPrev, Some("PlanPane")),
-        KeyBinding::new("g g", SelectFirst, Some("PlanPane")),
-        KeyBinding::new("shift-g", SelectLast, Some("PlanPane")),
-        KeyBinding::new("ctrl-d", PageDown, Some("PlanPane")),
-        KeyBinding::new("ctrl-u", PageUp, Some("PlanPane")),
-        KeyBinding::new("] c", NextHunk, Some("PlanPane")),
-        KeyBinding::new("[ c", PrevHunk, Some("PlanPane")),
-        KeyBinding::new("h", PlanOlder, Some("PlanPane")),
-        KeyBinding::new("l", PlanNewer, Some("PlanPane")),
+        KeyBinding::new("left", PlanOlder, Some("PlanPane")),
+        KeyBinding::new("right", PlanNewer, Some("PlanPane")),
         KeyBinding::new("d", TogglePlanChanges, Some("PlanPane")),
         KeyBinding::new("a", ApprovePlan, Some("PlanPane")),
         KeyBinding::new("n", BuildPlanInNewChat, Some("PlanPane")),
         KeyBinding::new("i", FocusComposer, Some("PlanPane")),
         KeyBinding::new("shift-c", SendComments, Some("DiffPane")),
     ]);
-    // Direct picks, numbered like the model menu: ctrl-cmd-1 / space m 1 is the first row.
-    cx.bind_keys((0..chat::MODELS.len()).flat_map(|i| {
-        [
-            KeyBinding::new(&format!("ctrl-cmd-{}", i + 1), SetModel(i), None),
-            KeyBinding::new(&format!("space m {}", i + 1), SetModel(i), Some(NAV)),
-        ]
-    }));
+    cx.bind_keys([
+        vim("] c", Box::new(NextHunk), "DiffPane || PlanPane"),
+        vim("[ c", Box::new(PrevHunk), "DiffPane || PlanPane"),
+        vim("shift-k", Box::new(MoveQueuedUp), "Queue"),
+        vim("shift-j", Box::new(MoveQueuedDown), "Queue"),
+        vim("g t", Box::new(NextChat), NAV),
+        vim("g shift-t", Box::new(PrevChat), NAV),
+        vim("j", Box::new(SelectNext), MOVE),
+        vim("k", Box::new(SelectPrev), MOVE),
+        vim("g g", Box::new(SelectFirst), MOVE),
+        vim("shift-g", Box::new(SelectLast), MOVE),
+        vim("ctrl-d", Box::new(PageDown), MOVE),
+        vim("ctrl-u", Box::new(PageUp), MOVE),
+        vim("h", Box::new(CollapseDir), "FileTree || Sidebar"),
+        vim("l", Box::new(ExpandDir), "FileTree || Sidebar"),
+        vim("h", Box::new(PlanOlder), "PlanPane"),
+        vim("l", Box::new(PlanNewer), "PlanPane"),
+    ]);
+    // Direct picks, numbered like the model menu: ctrl-cmd-1 is the first row.
+    cx.bind_keys(
+        (0..chat::MODELS.len())
+            .map(|i| KeyBinding::new(&format!("ctrl-cmd-{}", i + 1), SetModel(i), None)),
+    );
     cx.bind_keys(
         (0..9).map(|i| KeyBinding::new(&format!("cmd-{}", i + 1), OpenWorkspace(i), None)),
     );
     // The Diff component's scroll actions are private; bind vim keys to them by name.
-    let diff = Rc::new(KeyBindingContextPredicate::parse("Diff").unwrap());
-    let vim = [("h", "diff::ScrollLeft"), ("l", "diff::ScrollRight")];
-    let bindings: Vec<KeyBinding> = vim
+    let diff = Rc::new(KeyBindingContextPredicate::parse("Vim > Diff").unwrap());
+    let scroll = [("h", "diff::ScrollLeft"), ("l", "diff::ScrollRight")];
+    let bindings: Vec<KeyBinding> = scroll
         .iter()
         .filter_map(|(k, name)| {
             let action = cx.build_action(name, None).ok()?;

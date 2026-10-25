@@ -24,8 +24,9 @@ impl Shark {
         }
         // Opened mid-archive (its row is still listed): sends stay refused.
         let archiving = self.archiving.contains(&ws.name);
+        let vim = self.state.vim;
         let chat = cx.new(|cx| {
-            let mut c = Chat::new(ws.clone(), meta.clone(), window, cx);
+            let mut c = Chat::new(ws.clone(), meta.clone(), vim, window, cx);
             c.archiving = archiving;
             c
         });
@@ -229,6 +230,7 @@ impl Shark {
             .collect();
         open_menu(
             cx.entity().downgrade(),
+            "Reopen a closed chat…",
             items,
             0,
             move |s, row, w, cx| s.reopen_chat(Some(n - 1 - row), w, cx),
@@ -293,7 +295,7 @@ impl Shark {
             .iter()
             .map(|m| {
                 CommandItem::new()
-                    .label(*m)
+                    .label(crate::chat::model_label(m))
                     .icon(IconName::Sparkles)
                     .checked(*m == current)
             })
@@ -301,6 +303,7 @@ impl Shark {
         let selected = MODELS.iter().position(|m| *m == current).unwrap_or(0);
         open_menu(
             cx.entity().downgrade(),
+            "Switch model…",
             items,
             selected,
             move |_, row, _, cx| chat.update(cx, |c, cx| c.set_model(MODELS[row], cx)),

@@ -40,7 +40,7 @@ pub(super) fn section_icon(name: &str) -> IconName {
         .map_or(IconName::Folder, |(_, i)| *i)
 }
 
-/// "Move to Section" in a workspace's right-click menu; ends with "New Section…", which moves it there.
+/// "Move to section" in a workspace's right-click menu; ends with "New section…", which moves it there.
 pub(super) fn move_submenu(this: &Shark, ws: &str, cx: &Context<Shark>) -> Entry {
     let current = this.section_of(ws);
     let mut entries = vec![];
@@ -51,16 +51,13 @@ pub(super) fn move_submenu(this: &Shark, ws: &str, cx: &Context<Shark>) -> Entry
             sec.name.clone(),
             on_shark(cx, move |s, _, cx| s.move_to_section(&ws, Some(i), cx)),
         );
-        entries.push(match current == Some(i) {
-            true => item.hint("✓"),
-            false => item,
-        });
+        entries.push(item.checked(current == Some(i)));
     }
     if current.is_some() {
         let ws = ws.to_string();
         entries.push(menu::item(
             IconName::FolderOutput,
-            "No Section",
+            "No section",
             on_shark(cx, move |s, _, cx| s.move_to_section(&ws, None, cx)),
         ));
     }
@@ -70,12 +67,12 @@ pub(super) fn move_submenu(this: &Shark, ws: &str, cx: &Context<Shark>) -> Entry
     let ws = ws.to_string();
     entries.push(menu::item(
         IconName::FolderPlus,
-        "New Section…",
+        "New section…",
         on_shark(cx, move |s, w, cx| {
             s.start_naming(None, Some(ws.clone()), w, cx)
         }),
     ));
-    menu::sub(IconName::FolderInput, "Move to Section", entries)
+    menu::sub(IconName::FolderInput, "Move to section", entries)
 }
 
 /// Right-click menu of a section header.
@@ -88,18 +85,18 @@ fn section_menu(i: usize, cx: &Context<Shark>) -> Vec<Entry> {
         ),
         menu::item(
             IconName::Shapes,
-            "Change Icon…",
+            "Change icon…",
             on_shark(cx, move |s, w, cx| s.pick_icon(i, w, cx)),
         ),
         menu::item(
             IconName::FolderPlus,
-            "New Section",
+            "New section",
             on_shark(cx, |s, w, cx| s.start_naming(None, None, w, cx)),
         ),
         Entry::Sep,
         menu::item(
             IconName::Trash,
-            "Delete Section",
+            "Delete section",
             on_shark(cx, move |s, w, cx| s.delete_section(i, w, cx)),
         ),
     ]
@@ -475,6 +472,7 @@ impl Shark {
             .unwrap_or(0);
         open_menu(
             cx.entity().downgrade(),
+            "Pick an icon…",
             items,
             selected,
             move |s, row, _, cx| {
@@ -523,6 +521,7 @@ impl Shark {
         let last = items.len() - 1;
         open_menu(
             cx.entity().downgrade(),
+            "Move to section…",
             items,
             current.unwrap_or(0),
             move |s, row, window, cx| match row {
@@ -600,7 +599,7 @@ impl Shark {
                         let entries = vec![
                             menu::item(
                                 IconName::Plus,
-                                "New Workspace",
+                                "New workspace…",
                                 on_shark(cx, move |s, w, cx| {
                                     s.new_workspace(picked.clone(), w, cx)
                                 }),
@@ -614,7 +613,7 @@ impl Shark {
                                 "Open in Terminal",
                                 move |_, _| open_terminal(&p2),
                             ),
-                            menu::item(IconName::Copy, "Copy Path", move |w, cx| {
+                            menu::item(IconName::Copy, "Copy path", move |w, cx| {
                                 copy(p3.display().to_string(), w, cx)
                             })
                             .hint(tilde(&path)),
@@ -869,7 +868,7 @@ impl Shark {
             cx.listener(|this, e: &MouseDownEvent, w, cx| {
                 let entries = vec![menu::item(
                     IconName::FolderPlus,
-                    "New Section",
+                    "New section",
                     on_shark(cx, |s, w, cx| s.start_naming(None, None, w, cx)),
                 )];
                 this.show_menu(e.position, entries, w, cx);
@@ -894,7 +893,7 @@ impl Shark {
                                 .ghost()
                                 .xsmall()
                                 .icon(IconName::FolderPlus)
-                                .tooltip("New section (space s n)")
+                                .tooltip("New section")
                                 .on_click(cx.listener(|this, _, w, cx| {
                                     this.start_naming(None, None, w, cx)
                                 })),
@@ -920,7 +919,7 @@ impl Shark {
                                 .ghost()
                                 .xsmall()
                                 .icon(IconName::Plus)
-                                .tooltip("Add repo (space r a), or drop folders here")
+                                .tooltip("Add repo, or drop folders here")
                                 .on_click(cx.listener(|this, _, w, cx| this.add_repo(w, cx))),
                         ),
                 )
@@ -930,7 +929,7 @@ impl Shark {
                 cx.listener(|this, e: &MouseDownEvent, w, cx| {
                     let entries = vec![menu::item(
                         IconName::FolderPlus,
-                        "Add Repo…",
+                        "Add repo…",
                         on_shark(cx, |s, w, cx| s.add_repo(w, cx)),
                     )];
                     this.show_menu(e.position, entries, w, cx);
@@ -943,7 +942,6 @@ impl Shark {
             .child(Icon::new(IconName::FolderPlus).with_size(px(14.)))
             .when(!rail, |d| {
                 d.child(div().flex_1().child("Add repo…"))
-                    .child(div().text_xs().text_color(faint(theme)).child("space r a"))
             })
             .when(rail, |d| {
                 d.tooltip(|w, cx| Tooltip::new("Add repo").build(w, cx))
@@ -998,7 +996,7 @@ impl Shark {
                     .children(items)
                     .when(
                         self.state.workspaces.is_empty() && self.state.sections.is_empty(),
-                        |d| d.child(hint("space w n to create")),
+                        |d| d.child(hint("cmd-n to create")),
                     )
                     .child(repo_header)
                     .children(repos)

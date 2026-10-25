@@ -302,7 +302,7 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         if self.state.repos.is_empty() {
-            return notify_err(window, cx, "Add a repo first (space r a)");
+            return notify_err(window, cx, "Add a repo first (Add repo in cmd-k)");
         }
         let shark = cx.entity().downgrade();
         let repos = self.state.repos.clone();
@@ -403,7 +403,7 @@ impl Shark {
             return notify_err(
                 window,
                 cx,
-                format!("{} has every repo; add another first (space r a)", ws.name),
+                format!("{} has every repo; add another first (Add repo in cmd-k)", ws.name),
             );
         }
         let items = missing
@@ -418,6 +418,7 @@ impl Shark {
         let name = ws.name.clone();
         open_menu(
             cx.entity().downgrade(),
+            "Add a repo to this workspace…",
             items,
             0,
             move |s, row, window, cx| {
@@ -677,7 +678,7 @@ impl Shark {
                 for chat in self.started_chats(name) {
                     chat.update(cx, |c, _| c.archiving = false);
                 }
-                notify_err(window, cx, format!("{e}\nUse space w D to force."))
+                notify_err(window, cx, format!("{e}\nUse Force archive workspace in cmd-k to discard them."))
             }
         }
         cx.notify();

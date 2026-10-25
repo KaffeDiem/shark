@@ -6,14 +6,15 @@ use crate::agent::{self, Agent, Ev};
 use crate::complete::{self, Item};
 use crate::plan::{self, PlanPane};
 use crate::state::{ChatMeta, Workspace};
+use crate::vim::{self, Vim};
 use crate::*;
 use completion::Menu;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
-    Enter, Escape, IndentInline, InputContent, InputEvent, MoveDown, MoveUp, OutdentInline,
-    Textarea, TextareaState,
+    Enter, Escape, IndentInline, InputContent, InputEvent, MoveDown, MoveUp, OutdentInline, Redo,
+    Textarea, TextareaState, Undo,
 };
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::notification::Notification;
@@ -153,6 +154,11 @@ pub struct Chat {
     note: Option<String>,
     agent: Option<Agent>,
     pub(crate) composer: Entity<TextareaState>,
+    /// Vim keys in the composer (`State::vim`); it starts each message in Insert mode.
+    pub vim: Vim,
+    pub vim_on: bool,
+    /// The key the interceptor just handled; its key-down still arrives and must not run twice.
+    vim_took: Option<Keystroke>,
     /// Model the running process was started with; a mismatch respawns it on the next send.
     agent_model: Option<String>,
     /// Virtualized: only visible rows render, which matters while a spinner redraws every frame.
@@ -221,6 +227,28 @@ pub(crate) const MODELS: &[&str] = &[
     "codex:gpt-6.1-sol",
     "codex:gpt-6-astra",
 ];
+
+/// A model id as people read it: "default" → "Default", "codex:gpt-6.1-sol" → "GPT-6.1 Sol".
+pub(crate) fn model_label(id: &str) -> String {
+    let cap = |w: &str| {
+        let mut w = w.to_string();
+        if let Some(c) = w.get_mut(..1) {
+            c.make_ascii_uppercase();
+        }
+        w
+    };
+    match id.strip_prefix("codex:") {
+        Some(m) => {
+            let mut words = m.split('-');
+            let head = match (words.next(), words.next()) {
+                (Some("gpt"), Some(v)) => format!("GPT-{v}"),
+                (a, b) => [a, b].into_iter().flatten().map(cap).collect::<Vec<_>>().join(" "),
+            };
+            std::iter::once(head).chain(words.map(cap)).collect::<Vec<_>>().join(" ")
+        }
+        None => cap(id),
+    }
+}
 
 impl EventEmitter<ChatEvent> for Chat {}
 
@@ -304,11 +332,17 @@ pub(crate) fn duration(secs: u64) -> String {
 }
 
 impl Chat {
-    pub fn new(ws: Workspace, meta: ChatMeta, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        ws: Workspace,
+        meta: ChatMeta,
+        vim_on: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 10)
-                .placeholder("Message the agent (@ to add files, / for skills, Enter to send, Esc for normal mode)")
+                .placeholder("Message the agent (@ to add files, / for skills)")
                 .submit_on_enter(true)
         });
         let _sub =
@@ -325,6 +359,21 @@ impl Chat {
                     _ => {}
                 },
             );
+        // Runs before key bindings, so Normal-mode keys never reach the input or the keymap.
+        let this = cx.entity().downgrade();
+        let _keys = cx.intercept_keystrokes(move |ev, window, cx| {
+            let Some(this) = this.upgrade() else { return };
+            // The second key of an app chord (`ctrl-w h`) belongs to the keymap.
+            if !window.has_pending_keystrokes()
+                && this.update(cx, |c, cx| {
+                    let took = c.vim_intercept(&ev.keystroke, window, cx);
+                    c.vim_took = took.then(|| ev.keystroke.clone());
+                    took
+                })
+            {
+                cx.stop_propagation();
+            }
+        });
         let ws_name = ws.name.clone();
         let plan = cx.new(|cx| PlanPane::new(&meta.id, cx));
         let plan_open = meta.plan;
@@ -342,6 +391,9 @@ impl Chat {
             note: None,
             agent: None,
             composer,
+            vim: insert_mode(),
+            vim_on,
+            vim_took: None,
             agent_model: None,
             list: ListState::new(0, ListAlignment::Top, px(400.)),
             focus: cx.focus_handle(),
@@ -367,7 +419,7 @@ impl Chat {
             plan_open,
             dropping: None,
             plan,
-            _subs: vec![_sub],
+            _subs: vec![_sub, _keys],
         };
         // Warm both sources now so the first `@` or `/` doesn't wait.
         chat.reindex(cx);
@@ -555,7 +607,7 @@ impl Chat {
         self.ask(&format!("{BUILD_FRESH}\n\n{plan}"), window, cx)
     }
 
-    /// `space l v`: shows the plan pane and focuses it, or hides it.
+    /// `TogglePlan`: shows the plan pane and focuses it, or hides it.
     pub fn toggle_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.plan_open = !self.plan_open;
         match self.plan_open {
@@ -569,8 +621,58 @@ impl Chat {
         self.plan_open && self.plan.read(cx).focus.is_focused(window)
     }
 
-    pub fn focus_composer(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.composer.update(cx, |c, cx| c.focus(window, cx));
+        self.reset_vim(cx); // `i` from the transcript or queue means type
+    }
+
+    /// Vim keys in the composer on or off; either way it is back in Insert mode.
+    pub fn set_vim(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.vim_on = on;
+        self.reset_vim(cx);
+    }
+
+    fn reset_vim(&mut self, cx: &mut Context<Self>) {
+        self.vim = insert_mode();
+        cx.notify();
+    }
+
+    /// A composer key for Vim; true when handled. Esc closes an open menu first; in idle
+    /// Normal mode Esc goes to the keymap (FocusTranscript) and Enter to the input (send).
+    fn vim_intercept(
+        &mut self,
+        ks: &Keystroke,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        if !self.vim_on
+            || self.menu.is_some()
+            || !self.composer.read(cx).focus_handle(cx).is_focused(window)
+        {
+            return false;
+        }
+        let idle = self.vim.mode == vim::Mode::Normal && self.vim.pending().is_empty();
+        // ctrl-c stops the agent here, and shift-tab toggles plan mode.
+        let app_key = (ks.key == "c" && ks.modifiers.control)
+            || ks.key == "tab"
+            || (idle && matches!(ks.key.as_str(), "escape" | "enter"));
+        let Some(key) = (!app_key).then(|| editor::vim_key(ks)).flatten() else {
+            return false;
+        };
+        let Some((_, cmd)) = editor::apply_vim_key(&mut self.vim, &self.composer, &key, window, cx)
+        else {
+            return false;
+        };
+        // Only undo and redo mean something in a draft.
+        match cmd {
+            Some(vim::Cmd::Undo) => window.dispatch_action(Box::new(Undo), cx),
+            Some(vim::Cmd::Redo) => window.dispatch_action(Box::new(Redo), cx),
+            _ => {}
+        }
+        // Completions belong to Insert: back in it, the query under the cursor reopens them.
+        self.update_menu(cx);
+        cx.notify();
+        true
     }
 
     /// Re-lists files in the background; the old list serves until it lands.
@@ -720,6 +822,7 @@ impl Chat {
         self.editing = None;
         self.composer
             .update(cx, |c, cx| c.set_value("", window, cx));
+        self.reset_vim(cx);
         if sent {
             self.drain(cx); // an edit that went straight out lets the rest follow
         }
@@ -1708,6 +1811,13 @@ impl Chat {
     }
 }
 
+/// A fresh Vim in Insert mode, so the composer types at once.
+fn insert_mode() -> Vim {
+    let mut v = Vim::default();
+    v.mode = vim::Mode::Insert;
+    v
+}
+
 impl Render for Chat {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The queue emptied (a turn ended, a git step finished) while it had focus.
@@ -1721,6 +1831,22 @@ impl Render for Chat {
             theme.secondary,
             theme.muted_foreground,
         );
+        // The editor's Vim pill, on `muted`: the card is already `secondary`.
+        let vim_pill = self.vim_on.then(|| {
+            let p = self.vim.pending();
+            div()
+                .px_2()
+                .h(px(20.))
+                .flex()
+                .items_center()
+                .rounded_full()
+                .font_family(theme.mono_font_family.clone())
+                .bg(theme.muted)
+                .child(match p.is_empty() {
+                    true => self.vim.status().to_string(),
+                    false => format!("{} {p}", self.vim.status()),
+                })
+        });
         let rows = list(
             self.list.clone(),
             cx.processor(|this, ix, window, cx| this.render_row(ix, window, cx)),
@@ -1813,6 +1939,17 @@ impl Render for Chat {
                     .child(
                         v_flex()
                             .key_context("Composer")
+                            // A key after a prefix that completes no binding (`ctrl-w j`) skips
+                            // interceptors; catch it here, before the input types it.
+                            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                                let took = this.vim_took.take() == Some(ev.keystroke.clone());
+                                if took
+                                    || (!window.has_pending_keystrokes()
+                                        && this.vim_intercept(&ev.keystroke, window, cx))
+                                {
+                                    cx.stop_propagation();
+                                }
+                            }))
                             .relative()
                             .w_full()
                             .max_w(px(712.))
@@ -1917,7 +2054,7 @@ impl Render for Chat {
                                             .ghost()
                                             .xsmall()
                                             .icon(IconName::Sparkles)
-                                            .label(self.model().to_string())
+                                            .label(crate::chat::model_label(self.model()))
                                             .dropdown_caret(true)
                                             .tooltip_with_action(
                                                 match &self.reported {
@@ -1931,6 +2068,7 @@ impl Render for Chat {
                                                 window.dispatch_action(PickModel.boxed_clone(), cx)
                                             }),
                                     )
+                                    .when_some(vim_pill, |d, p| d.child(p))
                                     .child(div().flex_1())
                                     .child(Kbd::new(Keystroke::parse("enter").unwrap()))
                                     .child(match (self.editing.is_some(), self.busy || self.hold) {
@@ -2158,7 +2296,7 @@ exec cat >/dev/null
         let (window, chat) = cx
             .update(|cx| {
                 gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
-                    cx.new(|cx| Chat::new(ws.clone(), meta, w, cx))
+                    cx.new(|cx| Chat::new(ws.clone(), meta, false, w, cx))
                 })
             })
             .unwrap();
@@ -2270,7 +2408,7 @@ exec cat >/dev/null
         let (window, chat) = cx
             .update(|cx| {
                 gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
-                    cx.new(|cx| Chat::new(ws.clone(), meta, w, cx))
+                    cx.new(|cx| Chat::new(ws.clone(), meta, false, w, cx))
                 })
             })
             .unwrap();
@@ -2379,7 +2517,9 @@ exec cat >/dev/null
         };
         let (window, chat) = cx
             .update(|cx| {
-                gpui_kit::open_window(options, cx, |w, cx| cx.new(|cx| Chat::new(ws, meta, w, cx)))
+                gpui_kit::open_window(options, cx, |w, cx| {
+                    cx.new(|cx| Chat::new(ws, meta, false, w, cx))
+                })
             })
             .unwrap();
         let frame = |cx: &mut TestAppContext| {
@@ -2441,7 +2581,7 @@ exec cat >/dev/null
         let (_, chat) = cx
             .update(|cx| {
                 gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
-                    cx.new(|cx| Chat::new(ws, meta, w, cx))
+                    cx.new(|cx| Chat::new(ws, meta, false, w, cx))
                 })
             })
             .unwrap();
@@ -2687,7 +2827,7 @@ exec cat >/dev/null
         let (window, chat) = cx
             .update(|cx| {
                 gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
-                    cx.new(|cx| Chat::new(ws, meta, w, cx))
+                    cx.new(|cx| Chat::new(ws, meta, false, w, cx))
                 })
             })
             .unwrap();
@@ -2748,11 +2888,11 @@ exec cat >/dev/null
         act(cx, &|w, cx| w.press("up", cx));
         assert!(in_queue(cx), "up from the composer enters the queue");
         assert_eq!(qsel(cx), 2, "on the row nearest the composer");
-        act(cx, &|w, cx| w.press("k", cx));
-        act(cx, &|w, cx| w.press("shift-k", cx));
+        act(cx, &|w, cx| w.press("up", cx));
+        act(cx, &|w, cx| w.press("alt-up", cx));
         assert_eq!(queue(cx), ["second", "first", "third"]);
         assert_eq!(qsel(cx), 0, "the cursor follows the moved row");
-        act(cx, &|w, cx| w.press("shift-k", cx));
+        act(cx, &|w, cx| w.press("alt-up", cx));
         assert_eq!(qsel(cx), 0, "the top row can't move up");
         act(cx, &|w, cx| w.press("alt-down", cx));
         assert_eq!(queue(cx), ["first", "second", "third"]);
@@ -2811,13 +2951,12 @@ exec cat >/dev/null
             act(cx, &|w, cx| w.press("enter", cx));
         }
         act(cx, &|w, cx| w.press("up", cx));
-        act(cx, &|w, cx| w.press("k", cx));
+        act(cx, &|w, cx| w.press("up", cx));
         act(cx, &|w, cx| w.press("e", cx));
         assert_eq!(value(cx), "b");
         act(cx, &|w, cx| w.press("escape", cx));
         act(cx, &|w, cx| chat.update(cx, |c, cx| c.focus_queue(w, cx)));
-        act(cx, &|w, cx| w.press("g", cx));
-        act(cx, &|w, cx| w.press("g", cx));
+        act(cx, &|w, cx| w.press("home", cx));
         act(cx, &|w, cx| w.press("enter", cx));
         assert_eq!(queue(cx), ["c"]);
         act(cx, &|w, cx| {
@@ -2859,7 +2998,7 @@ exec cat >/dev/null
         let (window, chat) = cx
             .update(|cx| {
                 gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
-                    cx.new(|cx| Chat::new(ws, meta, w, cx))
+                    cx.new(|cx| Chat::new(ws, meta, false, w, cx))
                 })
             })
             .unwrap();
@@ -2940,7 +3079,7 @@ exec cat >/dev/null
         let (window, chat) = cx
             .update(|cx| {
                 gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
-                    cx.new(|cx| Chat::new(ws, meta, w, cx))
+                    cx.new(|cx| Chat::new(ws, meta, false, w, cx))
                 })
             })
             .unwrap();
@@ -2992,5 +3131,105 @@ exec cat >/dev/null
             )
         });
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn vim_in_the_composer(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::bind_keys(cx);
+        });
+        let ws = Workspace {
+            name: format!("vim-test-{}", std::process::id()),
+            branch: "b".into(),
+            ..Default::default()
+        };
+        let meta = ChatMeta {
+            id: ws.name.clone(),
+            ..Default::default()
+        };
+        let (window, chat) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| Chat::new(ws, meta, true, w, cx))
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let act = |cx: &mut TestAppContext, f: &dyn Fn(&mut Window, &mut App)| {
+            cx.update_window(window, |_, w, cx| {
+                f(w, cx);
+                w.render_frame(cx); // the input binds its actions as it renders
+            })
+            .unwrap()
+        };
+        let keys = |cx: &mut TestAppContext, keys: &[&str]| {
+            act(cx, &|w, cx| keys.iter().for_each(|k| w.press(k, cx)))
+        };
+        let value = |cx: &mut TestAppContext| {
+            cx.update(|cx| chat.read(cx).composer.read(cx).value().to_string())
+        };
+        let mode = |cx: &mut TestAppContext| cx.update(|cx| chat.read(cx).vim.mode);
+        let in_transcript = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, w, cx| chat.read(cx).focus.is_focused(w))
+                .unwrap()
+        };
+        let queue = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                (chat.read(cx).queue.iter())
+                    .map(Queued::text)
+                    .collect::<Vec<_>>()
+            })
+        };
+        cx.update(|cx| chat.update(cx, |c, _| c.busy = true)); // Enter queues, no process
+        act(cx, &|w, cx| {
+            chat.update(cx, |c, cx| c.focus_composer(w, cx))
+        });
+
+        act(cx, &|w, cx| w.input("hello world", cx));
+        assert_eq!(value(cx), "hello world", "starts in Insert mode");
+        keys(cx, &["escape"]);
+        assert_eq!(mode(cx), vim::Mode::Normal);
+        assert!(
+            !in_transcript(cx),
+            "the first escape only leaves Insert mode"
+        );
+        keys(cx, &["0", "x"]);
+        assert_eq!(value(cx), "ello world");
+        keys(cx, &["u"]);
+        assert_eq!(value(cx), "hello world", "u undoes");
+        keys(cx, &["0", "x", "j", "q"]);
+        assert_eq!(value(cx), "ello world", "Normal mode edits, never types");
+        keys(cx, &["shift-a"]);
+        act(cx, &|w, cx| w.input("!", cx));
+        assert_eq!(value(cx), "ello world!");
+        keys(cx, &["enter"]);
+        assert_eq!(queue(cx), ["ello world!"], "enter sends from Insert mode");
+        assert_eq!(value(cx), "");
+
+        act(cx, &|w, cx| w.input("two", cx));
+        keys(cx, &["escape", "enter"]);
+        assert_eq!(queue(cx), ["ello world!", "two"], "and from Normal mode");
+        assert_eq!(
+            mode(cx),
+            vim::Mode::Insert,
+            "sending goes back to Insert mode"
+        );
+
+        keys(cx, &["escape", "escape"]);
+        assert!(
+            in_transcript(cx),
+            "escape in Normal mode leaves the composer"
+        );
+
+        // Off: escape leaves at once, and letters type.
+        cx.update(|cx| chat.update(cx, |c, cx| c.set_vim(false, cx)));
+        act(cx, &|w, cx| {
+            chat.update(cx, |c, cx| c.focus_composer(w, cx))
+        });
+        act(cx, &|w, cx| w.input("jk", cx));
+        keys(cx, &["escape"]);
+        assert_eq!(value(cx), "jk");
+        assert!(in_transcript(cx));
     }
 }

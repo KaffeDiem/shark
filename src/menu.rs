@@ -15,6 +15,8 @@ pub(crate) enum Entry {
         label: SharedString,
         /// Right-aligned and muted: the branch a copy will copy, the path an open will open.
         hint: Option<SharedString>,
+        /// A setting that's on, or the current choice: a check at the right end.
+        checked: bool,
         on_click: OnClick,
     },
     Sub {
@@ -34,6 +36,7 @@ pub(crate) fn item(
         icon: icon.into(),
         label: label.into(),
         hint: None,
+        checked: false,
         on_click: Rc::new(on_click),
     }
 }
@@ -47,9 +50,18 @@ pub(crate) fn sub(icon: IconName, label: impl Into<SharedString>, entries: Vec<E
 }
 
 impl Entry {
+    /// An empty `text` shows no hint.
     pub(crate) fn hint(mut self, text: impl Into<SharedString>) -> Self {
+        let text = text.into();
         if let Entry::Item { hint, .. } = &mut self {
-            *hint = Some(text.into());
+            *hint = (!text.is_empty()).then_some(text);
+        }
+        self
+    }
+
+    pub(crate) fn checked(mut self, on: bool) -> Self {
+        if let Entry::Item { checked, .. } = &mut self {
+            *checked = on;
         }
         self
     }
@@ -64,6 +76,18 @@ pub(crate) fn open(
     window: &mut Window,
     cx: &mut App,
 ) -> Entity<Menu> {
+    open_at(entries, pos, Anchor::TopLeft, window, cx)
+}
+
+/// [`open`] with the menu's `corner` at `pos`: a dropdown at the window's right edge hangs
+/// from its button's right end (`Anchor::TopRight`).
+pub(crate) fn open_at(
+    entries: Vec<Entry>,
+    pos: Point<Pixels>,
+    corner: Anchor,
+    window: &mut Window,
+    cx: &mut App,
+) -> Entity<Menu> {
     let prev = window.focused(cx);
     let focus = cx.focus_handle();
     // Deferred: the right-click is still bubbling, and the sidebar's `track_focus`
@@ -75,6 +99,7 @@ pub(crate) fn open(
     cx.new(|_| Menu {
         entries,
         pos,
+        corner,
         focus,
         prev,
         sel: None,
@@ -84,8 +109,9 @@ pub(crate) fn open(
     })
 }
 
+/// Pinned to the window's corner, so the click catcher covers the window wherever it's drawn.
 pub(crate) fn layer(menu: Entity<Menu>) -> impl IntoElement {
-    deferred(anchored().child(menu)).with_priority(POPUP_PRIORITY)
+    deferred(anchored().position(point(px(0.), px(0.))).child(menu)).with_priority(POPUP_PRIORITY)
 }
 
 const POPUP_PRIORITY: usize = 100;
@@ -93,6 +119,7 @@ const POPUP_PRIORITY: usize = 100;
 pub(crate) struct Menu {
     entries: Vec<Entry>,
     pos: Point<Pixels>,
+    corner: Anchor,
     focus: FocusHandle,
     prev: Option<FocusHandle>,
     /// Highlighted row; the mouse and the arrow keys share it, as in Linear.
@@ -226,18 +253,33 @@ impl Menu {
                         .into_any_element();
                 }
                 Entry::Item {
-                    icon, label, hint, ..
+                    icon,
+                    label,
+                    hint,
+                    checked,
+                    ..
                 } => (
                     *icon,
                     label,
-                    hint.as_ref().map(|h| {
-                        div()
-                            .max_w(px(180.))
-                            .truncate()
-                            .text_color(theme.muted_foreground)
-                            .child(h.clone())
-                            .into_any_element()
-                    }),
+                    Some(
+                        h_flex()
+                            .gap(px(8.))
+                            .children(hint.as_ref().map(|h| {
+                                div()
+                                    .max_w(px(180.))
+                                    .truncate()
+                                    .text_color(theme.muted_foreground)
+                                    .child(h.clone())
+                            }))
+                            .when(*checked, |d| {
+                                d.child(
+                                    Icon::new(IconName::Check)
+                                        .with_size(px(14.))
+                                        .text_color(theme.muted_foreground),
+                                )
+                            })
+                            .into_any_element(),
+                    ),
                 ),
                 Entry::Sub { icon, label, .. } => (
                     Some(*icon),
@@ -258,9 +300,7 @@ impl Menu {
                 .px(px(8.))
                 .gap(px(8.))
                 .rounded(px(4.))
-                .when(sel == Some(ix) || open, |d| {
-                    d.bg(theme.foreground.alpha(0.07))
-                })
+                .when(sel == Some(ix) || open, |d| d.bg(highlight(theme)))
                 .when(icons, |d| {
                     d.child(match icon {
                         Some(i) => Icon::new(i)
@@ -306,22 +346,30 @@ impl Menu {
 }
 
 fn surface(theme: &Theme) -> Div {
+    chrome(theme).occlude().min_w(px(200.)).max_w(px(340.))
+}
+
+/// The look every floating menu shares (this one and the composer's completions): `popover`,
+/// 4px inset, 8px corners, and a translucent ring instead of a border, so the shadow shows
+/// through the edge.
+pub(crate) fn chrome(theme: &Theme) -> Div {
     let ink = hsla(0., 0., 0., if theme.is_dark() { 0.5 } else { 0.12 });
     v_flex()
-        .occlude()
         .p(px(4.))
-        .min_w(px(200.))
-        .max_w(px(340.))
         .bg(theme.popover)
         .text_color(theme.popover_foreground)
-        .text_size(px(13.))
-        .rounded(px(8.))
-        // A translucent ring instead of a border, so the shadow shows through the edge.
+        .text_sm()
+        .rounded(theme.radius)
         .shadow(vec![
             BoxShadow::new(px(0.), px(0.), theme.foreground.alpha(0.1)).spread_radius(px(1.)),
             BoxShadow::new(px(0.), px(4.), ink).blur_radius(px(8.)),
             BoxShadow::new(px(0.), px(1.), ink.alpha(ink.a / 2.)).blur_radius(px(1.)),
         ])
+}
+
+/// The highlighted row: an inset 4px pill, the text colour unchanged.
+pub(crate) fn highlight(theme: &Theme) -> Hsla {
+    theme.foreground.alpha(0.07)
 }
 
 impl Render for Menu {
@@ -336,6 +384,7 @@ impl Render for Menu {
             .child(
                 anchored()
                     .position(self.pos)
+                    .anchor(self.corner)
                     .snap_to_window_with_margin(px(8.))
                     .child(
                         self.panel(&self.entries, self.sel, false, cx)

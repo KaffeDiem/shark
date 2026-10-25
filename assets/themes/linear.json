@@ -96,7 +96,7 @@
         "ring": "#5e6ad2",
         "caret": "#2f2f31",
         "selection.background": "#5e6ad240",
-        "overlay": "#00000040",
+        "overlay": "#0000001a",
         "window.border": "#dedede",
         "muted.background": "#f1f1f2",
         "muted.foreground": "#535355",

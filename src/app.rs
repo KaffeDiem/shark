@@ -509,12 +509,11 @@ impl Shark {
                         .gap_1p5()
                         .text_sm()
                         .child(tip(
-                            vec![kbd("j"), kbd("k"), kbd("enter")],
+                            vec![kbd("up"), kbd("down"), kbd("enter")],
                             "open from sidebar",
                         ))
-                        .child(tip(vec![kbd("space"), kbd("w"), kbd("n")], "new workspace"))
-                        .child(tip(vec![kbd("space"), kbd("r"), kbd("a")], "add repo"))
-                        .child(tip(vec![kbd("cmd-k")], "commands")),
+                        .child(tip(vec![kbd("cmd-n")], "new workspace"))
+                        .child(tip(vec![kbd("cmd-k")], "every command, like Add repo")),
                 )
                 .into_any_element();
         };
@@ -669,7 +668,8 @@ impl Render for Shark {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         h_flex()
-            .key_context("Shark")
+            // `Vim` turns on the Vim-style list keys (see `bind_keys`).
+            .key_context(if self.state.vim { "Shark Vim" } else { "Shark" })
             .size_full()
             .bg(theme.sidebar)
             .text_color(theme.foreground)

@@ -2,6 +2,7 @@
 use crate::files::fingerprint;
 use crate::vim::{self, Vim};
 use crate::*;
+use gpui_kit::base::input::{InputBaseState, InputModeKind};
 use gpui_kit::component::input::{
     Editor, EditorState, Indent, InputEvent, MovePageDown, MovePageUp, Outdent, Redo, Search, Undo,
 };
@@ -116,19 +117,11 @@ impl FileEditor {
             cx.emit(EditorEvent::Leave);
             return true;
         }
-        // Space starts a leader sequence (`space x`), bound under the VimNormal context.
-        if self.leader(ks) {
-            return false;
-        }
         self.vim_on && vim_key(ks).is_some_and(|k| self.vim_key(&k, window, cx))
     }
 
     fn idle(&self) -> bool {
         !self.vim_on || (self.vim.mode == vim::Mode::Normal && self.vim.pending().is_empty())
-    }
-
-    fn leader(&self, ks: &Keystroke) -> bool {
-        self.vim_on && self.idle() && ks.key == "space" && ks.modifiers.number_of_modifiers() == 0
     }
 
     pub fn is_focused(&self, window: &Window, cx: &App) -> bool {
@@ -286,36 +279,12 @@ impl FileEditor {
 
     /// Runs one key through Vim; returns whether it was consumed.
     fn vim_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let (text, cursor) = {
-            let i = self.input.read(cx);
-            (i.text().clone(), i.cursor())
-        };
-        // Only p/P need the clipboard; reading the pasteboard on every key is wasted work.
-        let clip = matches!(key, "p" | "P")
-            .then(|| cx.read_from_clipboard().and_then(|c| c.text()))
-            .flatten();
         let before = self.vim.mode;
-        let out = self.vim.key(key, &text, cursor, clip.as_deref());
-        if !out.handled {
+        let Some((edited, cmd)) = apply_vim_key(&mut self.vim, &self.input, key, window, cx) else {
             return false;
-        }
-        let edited = out.edit.is_some();
-        self.input.update(cx, |i, cx| {
-            if let Some((range, s)) = out.edit {
-                i.set_selected_range(range, cx);
-                i.replace(s, window, cx);
-            }
-            match (out.select, out.cursor) {
-                (Some(sel), _) => i.set_selected_range(sel, cx),
-                (None, Some(c)) => i.set_selected_range(c..c, cx),
-                (None, None) => {}
-            }
-        });
+        };
         self.dirty |= edited;
-        if let Some(y) = out.yank {
-            cx.write_to_clipboard(ClipboardItem::new_string(y));
-        }
-        if let Some(cmd) = out.cmd {
+        if let Some(cmd) = cmd {
             self.run(cmd, window, cx);
         }
         if self.vim.mode != before {
@@ -372,6 +341,45 @@ impl FileEditor {
     }
 }
 
+/// Runs one key through `vim` on `input` and applies the edit, cursor, selection and yank.
+/// `None` when Vim declined the key; else whether the text changed and the command to run.
+pub(crate) fn apply_vim_key<M: InputModeKind>(
+    vim: &mut Vim,
+    input: &Entity<InputBaseState<M>>,
+    key: &str,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<(bool, Option<vim::Cmd>)> {
+    let (text, cursor) = {
+        let i = input.read(cx);
+        (i.text().clone(), i.cursor())
+    };
+    // Only p/P need the clipboard; reading the pasteboard on every key is wasted work.
+    let clip = matches!(key, "p" | "P")
+        .then(|| cx.read_from_clipboard().and_then(|c| c.text()))
+        .flatten();
+    let out = vim.key(key, &text, cursor, clip.as_deref());
+    if !out.handled {
+        return None;
+    }
+    let edited = out.edit.is_some();
+    input.update(cx, |i, cx| {
+        if let Some((range, s)) = out.edit {
+            i.set_selected_range(range, cx);
+            i.replace(s, window, cx);
+        }
+        match (out.select, out.cursor) {
+            (Some(sel), _) => i.set_selected_range(sel, cx),
+            (None, Some(c)) => i.set_selected_range(c..c, cx),
+            (None, None) => {}
+        }
+    });
+    if let Some(y) = out.yank {
+        cx.write_to_clipboard(ClipboardItem::new_string(y));
+    }
+    Some((edited, out.cmd))
+}
+
 pub fn focus(editor: &Entity<FileEditor>, window: &mut Window, cx: &mut App) {
     let input = editor.read(cx).input.clone();
     input.update(cx, |i, cx| i.focus(window, cx));
@@ -387,7 +395,7 @@ pub fn language(path: &str) -> String {
 }
 
 /// The Vim name of a keystroke, or `None` when it belongs to the app (cmd-…, ctrl-w, …).
-fn vim_key(ks: &Keystroke) -> Option<String> {
+pub(crate) fn vim_key(ks: &Keystroke) -> Option<String> {
     let m = &ks.modifiers;
     // Nordic and German layouts need Option for `{ } [ ] | ~ @`.
     if m.alt && !(m.platform || m.control || m.function) {
@@ -421,15 +429,14 @@ fn vim_key(ks: &Keystroke) -> Option<String> {
 
 impl Render for FileEditor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // A key after a pending prefix that completes no binding (`space j`) skips interceptors;
+        // A key after a pending prefix that completes no binding (`ctrl-w j`) skips interceptors;
         // it arrives here once nothing is pending. Keys the interceptor handled never bubble here,
-        // and the ones it declined decline again. The replayed `space` itself is dropped: the
-        // Editor element resets the state's readonly each render, so it would type.
+        // and the ones it declined decline again.
         div()
             .size_full()
             .on_key_down(cx.listener(|e, ev: &KeyDownEvent, window, cx| {
                 let ks = &ev.keystroke;
-                if !window.has_pending_keystrokes() && (e.leader(ks) || e.intercept(ks, window, cx))
+                if !window.has_pending_keystrokes() && e.intercept(ks, window, cx)
                 {
                     cx.stop_propagation();
                 }
@@ -535,14 +542,14 @@ mod ui_tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// `space j` completes no leader binding: the `j` still moves Vim's cursor.
+    /// `ctrl-w j` completes no app chord: the `j` still moves Vim's cursor.
     #[gpui_kit::test]
-    async fn key_after_unbound_leader_reaches_vim(cx: &mut TestAppContext) {
-        let (dir, _, window, editor) = open_editor("leader", "one\ntwo\n", cx).await;
-        cx.update(|cx| cx.bind_keys([KeyBinding::new("space z", crate::OpenAnyFile, None)]));
+    async fn key_after_unbound_chord_reaches_vim(cx: &mut TestAppContext) {
+        let (dir, _, window, editor) = open_editor("chord", "one\ntwo\n", cx).await;
+        cx.update(|cx| cx.bind_keys([KeyBinding::new("ctrl-w z", crate::OpenAnyFile, None)]));
         cx.update_window(window, |_, w, cx| {
             focus(&editor, w, cx);
-            w.press("space", cx);
+            w.press("ctrl-w", cx);
             w.press("j", cx);
         })
         .unwrap();
