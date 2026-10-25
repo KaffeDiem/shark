@@ -6,8 +6,8 @@ use super::*;
 /// is type a branch, enter.
 pub(super) struct NewWorkspaceForm {
     branch: Entity<InputState>,
-    /// Optional first message, sent once the workspace is created.
-    prompt: Entity<InputState>,
+    /// Home's prompt, sent once the workspace is created.
+    first: Option<String>,
     picker: Entity<CommandState>,
     repos: Vec<Repo>,
     picked: Vec<bool>,
@@ -43,11 +43,7 @@ impl NewWorkspaceForm {
         let picked = repos.iter().map(was_picked).collect();
         NewWorkspaceForm {
             branch,
-            prompt: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .placeholder("First message to the agent (optional)")
-                    .default_value(first.unwrap_or_default())
-            }),
+            first,
             picker: cx.new(|cx| CommandState::new(window, cx)),
             repos,
             picked,
@@ -88,8 +84,7 @@ impl NewWorkspaceForm {
             }
             return false;
         }
-        let prompt = self.prompt.read(cx).value().trim().to_string();
-        let prompt = (!prompt.is_empty()).then_some(prompt);
+        let prompt = self.first.clone();
         self.shark
             .update(cx, |s, cx| {
                 s.create_workspace(branch, repos, prompt, window, cx)
@@ -103,8 +98,7 @@ impl Render for NewWorkspaceForm {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (muted, faint) = (theme.muted_foreground, faint(theme));
-        let in_branch = self.branch.read(cx).focus_handle(cx).is_focused(window)
-            || self.prompt.read(cx).focus_handle(cx).is_focused(window);
+        let in_branch = self.branch.read(cx).focus_handle(cx).is_focused(window);
         // A checkbox on every row, so it reads as multi-select before anything is ticked.
         let items = self.repos.iter().zip(&self.picked).enumerate().map(|(i, (r, &p))| {
             let name = r.name.clone();
@@ -133,13 +127,11 @@ impl Render for NewWorkspaceForm {
             .key_context("NewWorkspace")
             .gap_3()
             .on_action(cx.listener(|this, _: &SwitchField, window, cx| {
-                // branch -> repos -> first message -> branch
+                // branch <-> repos
                 if this.branch.read(cx).focus_handle(cx).is_focused(window) {
                     this.picker.update(cx, |p, cx| p.focus(window, cx))
-                } else if this.prompt.read(cx).focus_handle(cx).is_focused(window) {
-                    this.branch.update(cx, |i, cx| i.focus(window, cx))
                 } else {
-                    this.prompt.update(cx, |i, cx| i.focus(window, cx))
+                    this.branch.update(cx, |i, cx| i.focus(window, cx))
                 }
                 cx.notify();
             }))
@@ -183,7 +175,6 @@ impl Render for NewWorkspaceForm {
                         picker.update(cx, |p, cx| p.set_query("", window, cx));
                     }),
             )
-            .child(Input::new(&self.prompt))
             .child(
                 h_flex()
                     .gap_3()
