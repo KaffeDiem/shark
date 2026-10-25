@@ -80,6 +80,7 @@ pub(crate) fn open(
         sel: None,
         sub: None,
         sub_sel: None,
+        last_x: px(0.),
     })
 }
 
@@ -99,6 +100,7 @@ pub(crate) struct Menu {
     /// Open submenu, and its highlighted row once the keyboard has moved into it.
     sub: Option<usize>,
     sub_sel: Option<usize>,
+    last_x: Pixels,
 }
 
 impl EventEmitter<DismissEvent> for Menu {}
@@ -153,9 +155,14 @@ impl Menu {
         }
     }
 
-    fn hover(&mut self, ix: usize, cx: &mut Context<Self>) {
-        // ponytail: no safe triangle, so crossing a sibling row on the way into a
-        // submenu closes it; add Radix's 300ms grace area if that bites.
+    fn hover(&mut self, ix: usize, x: Pixels, cx: &mut Context<Self>) {
+        // Heading right is heading into the open submenu: crossing a sibling row on
+        // the way mustn't swap it. ponytail: x direction only, not Radix's triangle.
+        let toward_sub = self.sub.is_some_and(|s| s != ix) && x > self.last_x;
+        self.last_x = x;
+        if toward_sub {
+            return;
+        }
         let sub = matches!(self.entries[ix], Entry::Sub { .. }).then_some(ix);
         if self.sel == Some(ix) && self.sub == sub {
             return;
@@ -265,14 +272,14 @@ impl Menu {
                 })
                 .child(div().flex_1().min_w_0().truncate().child(label.clone()))
                 .children(right)
-                .on_mouse_move(cx.listener(move |this, _: &MouseMoveEvent, _, cx| {
+                .on_mouse_move(cx.listener(move |this, e: &MouseMoveEvent, _, cx| {
                     if in_sub {
                         if this.sub_sel != Some(ix) {
                             this.sub_sel = Some(ix);
                             cx.notify();
                         }
                     } else {
-                        this.hover(ix, cx);
+                        this.hover(ix, e.position.x, cx);
                     }
                 }))
                 .on_click(cx.listener(move |this, _, w, cx| this.activate(ix, in_sub, w, cx)))

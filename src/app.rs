@@ -299,7 +299,9 @@ fn move_submenu(this: &Shark, ws: &str, cx: &Context<Shark>) -> Entry {
     entries.push(menu::item(
         IconName::FolderPlus,
         "New Section…",
-        on_shark(cx, move |s, w, cx| s.start_naming(None, Some(ws.clone()), w, cx)),
+        on_shark(cx, move |s, w, cx| {
+            s.start_naming(None, Some(ws.clone()), w, cx)
+        }),
     ));
     menu::sub(IconName::FolderInput, "Move to Section", entries)
 }
