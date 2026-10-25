@@ -582,8 +582,7 @@ impl Shark {
                             }
                         })
                         .render_header_prefix(move |file, _, _| {
-                            // A prefix, not a suffix: the header is as wide as the longest line, so
-                            // a suffix scrolls out of view.
+                            // Viewed, before the name.
                             let path = file.path().clone();
                             let shark = shark.clone();
                             Checkbox::new(SharedString::from(format!("viewed:{path}")))

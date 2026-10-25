@@ -2691,3 +2691,88 @@ async fn review_queue(cx: &mut TestAppContext) {
     });
     fs::remove_dir_all(&home).ok();
 }
+
+/// A file card's header buttons stay at the diff's right edge, though a long line makes the
+/// rows wider than the view and the view scrolls sideways.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn card_header_pinned(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace("wide".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let long = format!("{}\n", "x".repeat(3000));
+    fs::write(home.join("shark/workspaces/wide/api/f.txt"), long).unwrap();
+    on(cx, &|s, w, cx| {
+        s.show(Tab::Diff, w, cx);
+        s.refresh_diff(cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        !shark.read(cx).diff_files.is_empty()
+    })
+    .await;
+    let check = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, w, cx| {
+            for _ in 0..3 {
+                w.render_frame(cx);
+            }
+            let (button, collapse) = (w.find("edit-working-copy"), w.find("collapse-file"));
+            let (b, body) = (button.bounds(), w.find("diff-body").bounds());
+            assert!(button.visible(), "{b:?} in {body:?}");
+            assert!(
+                b.right() <= body.right() && b.right() > body.right() - px(40.),
+                "{b:?} in {body:?}"
+            );
+            assert!(collapse.visible() && collapse.bounds().left() >= body.left());
+        })
+        .unwrap();
+    };
+    check(cx);
+    // Scrolled sideways (the rows' + moves left): the header stays.
+    let plus = |w: &Window| w.find(("add-annotation", 0usize)).bounds().left();
+    let before = cx
+        .update_window(window, |_, w, _| {
+            (plus(w), w.find("edit-working-copy").bounds())
+        })
+        .unwrap();
+    cx.update_window(window, |_, w, cx| {
+        let at = w.find("collapse-file").bounds().center() + point(px(0.), px(60.));
+        w.dispatch_event(
+            PlatformInput::ScrollWheel(ScrollWheelEvent {
+                position: at,
+                delta: ScrollDelta::Pixels(point(px(-400.), px(0.))),
+                ..Default::default()
+            }),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    check(cx);
+    let after = cx
+        .update_window(window, |_, w, _| {
+            (plus(w), w.find("edit-working-copy").bounds())
+        })
+        .unwrap();
+    assert!(
+        after.0 < before.0,
+        "the rows scrolled: {before:?} → {after:?}"
+    );
+    assert_eq!(after.1, before.1, "the header did not");
+    fs::remove_dir_all(&home).ok();
+}

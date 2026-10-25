@@ -530,6 +530,8 @@ fn render_diff(
         mode,
         content_width,
         left_width,
+        viewport_width: state.viewport().width,
+        scroll_x: -state.horizontal_scroll().offset().x,
         font_size,
         row_height,
         gutter_width,
@@ -782,6 +784,10 @@ struct CodePresentation {
     content_width: Pixels,
     /// The original column's width in Split mode; the modified one takes the rest.
     left_width: Pixels,
+    /// The body's painted width (zero before the first paint), and how far it is scrolled
+    /// right: file headers stay within it.
+    viewport_width: Pixels,
+    scroll_x: Pixels,
     font_size: Pixels,
     row_height: Pixels,
     gutter_width: Pixels,
@@ -1254,6 +1260,12 @@ fn render_file_header(
         .map(|headings| headings(document, window, cx));
     let state = code.state.clone();
     let name = document.path().clone();
+    // Rows are as wide as the longest line and scroll sideways; the header bar stays on the
+    // visible part, so its suffix is at the body's right edge.
+    let (bar_left, bar_width) = match code.viewport_width > px(0.) {
+        true => (code.scroll_x, code.viewport_width.min(code.content_width)),
+        false => (px(0.), code.content_width),
+    };
     v_flex()
         .id("file-header")
         .w_full()
@@ -1262,7 +1274,9 @@ fn render_file_header(
         .border_color(border)
         .child(
             h_flex()
-                .w_full()
+                .relative()
+                .left(bar_left)
+                .w(bar_width)
                 .min_w_0()
                 .pl_1()
                 .pr_3()

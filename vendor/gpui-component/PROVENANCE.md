@@ -30,6 +30,12 @@ All in `src/diff/`, tested in `src/diff/split_tests.rs` (new):
    other files' state (`set_files` resets them); `DiffState::show_line` expands
    the fold hiding a line and scrolls only as far as needed; `DiffState::scroll_top`
    reads the scroll position.
+6. **Pinned file headers** (`mod.rs` `render_file_header`): rows are as wide as
+   the longest line and scroll sideways, so a header's suffix sat at the far end
+   of the content. The header bar now takes the body's painted width and is
+   offset by the horizontal scroll, keeping prefix, name and suffix in view
+   (`CodePresentation::viewport_width` / `scroll_x`). Tested by Shark's
+   `card_header_pinned` UI test.
 
 The crate's own tests include files from the upstream monorepo
 (`../../assets`, `../../../base`, `../../../../themes`, …) that the package
