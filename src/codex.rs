@@ -176,14 +176,10 @@ pub fn deny(stdin: &Mutex<ChildStdin>, request_id: &str) -> std::io::Result<()> 
 
 /// Keeps `State` current from the server's lines, on the reader thread. A thread that can't
 /// start or resume ends the process, as claude's does: `parse` reports why, and the next
-/// message respawns it.
-pub fn track(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, pid: u32, line: &str) {
-    // Most lines are deltas and hooks: skip them before parsing or locking.
-    if !line.contains("\"id\"") && !line.contains("\"turn/") {
-        return;
-    }
+/// message respawns it. False for a sub-agent's line, which the chat doesn't show or store.
+pub fn track(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, pid: u32, line: &str) -> bool {
     let Ok(v) = serde_json::from_str::<Value>(line) else {
-        return;
+        return true;
     };
     let (id, method) = (v["id"].as_str(), v["method"].as_str());
     // A request nothing here can answer would hold up its turn: refuse it.
@@ -210,9 +206,16 @@ pub fn track(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, pid: u32, line: &str)
             }
         };
         let _ = agent::write(stdin, &reply);
-        return;
+        return true;
     }
     let mut s = st.lock().unwrap();
+    // Sub-agents run on threads of their own in the same server: their turns starting and
+    // ending aren't the chat's, which goes on until its own thread's turn completes.
+    if let (Some(t), Some(main)) = (v["params"]["threadId"].as_str(), &s.thread)
+        && t != main
+    {
+        return false;
+    }
     match (id, method) {
         (Some("start" | "resume"), _) if v["error"].is_object() => crate::git::term(pid),
         (Some("start" | "resume"), _) => {
@@ -226,6 +229,7 @@ pub fn track(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, pid: u32, line: &str)
         (_, Some("turn/completed")) => s.turn = None,
         _ => {}
     }
+    true
 }
 
 pub fn parse(v: &Value) -> Vec<Ev> {
@@ -260,6 +264,25 @@ pub fn parse(v: &Value) -> Vec<Ev> {
                 },
                 Ev::Plan { id, text },
             ]
+        }
+        // A sub-agent, as the row claude's Agent tool gets, open until the sub-agent ends.
+        // Its own thread's lines don't reach the chat (`track`).
+        (Some("item/completed"), Some("subAgentActivity")) => {
+            let id = s(&item["agentThreadId"]);
+            match item["kind"].as_str() {
+                // `/root/wait_twenty` → `wait twenty`
+                Some("started") => vec![Ev::ToolUse {
+                    id,
+                    name: "Agent".into(),
+                    input: json!({"description": s(&item["agentPath"]).rsplit('/').next().unwrap_or_default().replace('_', " ")}),
+                }],
+                Some(kind @ ("completed" | "interrupted")) => vec![Ev::ToolResult {
+                    id,
+                    text: String::new(),
+                    is_error: kind == "interrupted",
+                }],
+                _ => vec![],
+            }
         }
         (Some("item/started"), Some(kind)) => tool_use(kind, item).into_iter().collect(),
         (Some("item/completed"), Some(kind)) if tool_use(kind, item).is_some() => {
@@ -443,7 +466,11 @@ mod tests {
 {"method": "item/started", "params": {"item": {"type": "plan", "id": "t6-plan", "text": ""}, "threadId": "th1", "turnId": "t6"}}
 {"method": "item/plan/delta", "params": {"threadId": "th1", "turnId": "t6", "itemId": "t6-plan", "delta": "#"}}
 {"method": "item/tool/requestUserInput", "id": 0, "params": {"threadId": "th1", "turnId": "t6", "itemId": "call_1", "questions": [{"id": "filename", "header": "Filename", "question": "Which file?", "isOther": true, "isSecret": false, "options": [{"label": "hello.txt", "description": ""}]}], "isBlocking": true}}
-{"method": "item/completed", "params": {"item": {"type": "plan", "id": "t6-plan", "text": "# Add hello.txt\n\n1. Create it.\n"}, "threadId": "th1", "turnId": "t6"}}"##;
+{"method": "item/completed", "params": {"item": {"type": "plan", "id": "t6-plan", "text": "# Add hello.txt\n\n1. Create it.\n"}, "threadId": "th1", "turnId": "t6"}}
+{"method": "item/started", "params": {"item": {"type": "subAgentActivity", "model": "gpt-6.1-sol", "id": "call_9", "kind": "started", "agentThreadId": "sub1", "agentPath": "/root/wait_twenty"}, "threadId": "th1", "turnId": "t7"}}
+{"method": "item/completed", "params": {"item": {"type": "subAgentActivity", "model": "gpt-6.1-sol", "id": "call_9", "kind": "started", "agentThreadId": "sub1", "agentPath": "/root/wait_twenty"}, "threadId": "th1", "turnId": "t7"}}
+{"method": "item/started", "params": {"item": {"type": "collabAgentToolCall", "id": "call_a", "tool": "wait", "status": "inProgress", "senderThreadId": "th1", "receiverThreadIds": [], "agentsStates": {}}, "threadId": "th1", "turnId": "t7"}}
+{"method": "item/completed", "params": {"item": {"type": "subAgentActivity", "model": null, "id": "subagent-completed-x", "kind": "completed", "agentThreadId": "sub1", "agentPath": "/root/wait_twenty"}, "threadId": "th1", "turnId": "t7"}}"##;
 
     #[test]
     fn parses_app_server() {
@@ -522,6 +549,17 @@ mod tests {
                 Ev::Plan {
                     id: "t6-plan".into(),
                     text: "# Add hello.txt\n\n1. Create it.\n".into(),
+                },
+                // A sub-agent's row, by its thread, from its start to its end.
+                Ev::ToolUse {
+                    id: "sub1".into(),
+                    name: "Agent".into(),
+                    input: json!({"description": "wait twenty"}),
+                },
+                Ev::ToolResult {
+                    id: "sub1".into(),
+                    text: String::new(),
+                    is_error: false,
                 },
             ]
         );
@@ -630,6 +668,11 @@ while read -r l; do
     read -r reply
     case "$reply" in *'"id":9'*decline*) ;; *) echo "bad reply: $reply" >&2; exit 3;; esac
     echo '{"method":"item/started","params":{"item":{"type":"userMessage","id":"u","content":[{"type":"text","text":"hi"}]}}}'
+    echo '{"method":"item/completed","params":{"item":{"type":"subAgentActivity","id":"c","kind":"started","agentThreadId":"sub1","agentPath":"/root/helper"}}}'
+    echo '{"method":"turn/started","params":{"threadId":"sub1","turn":{"id":"s1"}}}'
+    echo '{"method":"item/completed","params":{"threadId":"sub1","item":{"type":"agentMessage","id":"sm","text":"sub done"}}}'
+    echo '{"method":"turn/completed","params":{"threadId":"sub1","turn":{"id":"s1","status":"completed","durationMs":1000}}}'
+    echo '{"method":"item/completed","params":{"item":{"type":"subAgentActivity","id":"d","kind":"completed","agentThreadId":"sub1","agentPath":"/root/helper"}}}'
     echo '{"method":"item/completed","params":{"item":{"type":"agentMessage","id":"m","text":"hello"}}}'
     echo '{"method":"turn/completed","params":{"threadId":"th1","turn":{"id":"t1","status":"completed","durationMs":2000}}}';;
   esac
@@ -697,6 +740,8 @@ done
     }
 
     #[cfg(feature = "test-support")] // shares the UI tests' home
+    /// A sub-agent's turn, on its own thread, neither ends the chat's turn nor shows in it
+    /// beyond its row.
     #[test]
     fn runs_a_turn() {
         let evs = run_fake(None, "turn", false);
@@ -710,6 +755,16 @@ done
                     mcp: vec![],
                 },
                 Ev::User("hi".into()),
+                Ev::ToolUse {
+                    id: "sub1".into(),
+                    name: "Agent".into(),
+                    input: json!({"description": "helper"}),
+                },
+                Ev::ToolResult {
+                    id: "sub1".into(),
+                    text: String::new(),
+                    is_error: false,
+                },
                 Ev::Text("hello".into()),
                 Ev::Result {
                     is_error: false,

@@ -563,3 +563,47 @@ fn codex_live_plan() {
     r.close();
     check_replay(&env, &r.evs);
 }
+
+/// A sub-agent's turn runs on its own thread: the chat's turn, its session and its one
+/// Result are the main thread's. Needs codex's `multi_agent` feature. Then the replay.
+#[test]
+#[ignore]
+fn codex_live_sub_agent() {
+    let env = Env::new("subagent", MODEL);
+    let mut r = env.spawn(None);
+    r.agent
+        .send("Spawn exactly one sub-agent that runs the shell command `sleep 10` and replies DONE. Wait for it, then run `sleep 5` yourself and reply with only the word FINISHED.")
+        .unwrap();
+    assert!(r.until(TURN, |e| is_result(e) || is_exit(e)), "no Result");
+    r.drain(5);
+    let sessions: std::collections::BTreeSet<&str> = (r.evs.iter())
+        .filter_map(|e| match e {
+            Ev::Init { session_id, .. } => Some(session_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    eprintln!(
+        "sessions {sessions:?}, results {}, text {:?}",
+        r.results(),
+        r.text()
+    );
+    assert_eq!(sessions.len(), 1, "a sub-agent's thread became the session");
+    assert_eq!(r.results(), 1, "a sub-agent's turn ended the chat's");
+    assert!(
+        r.text().contains("FINISHED"),
+        "Result came before the main turn's reply"
+    );
+    // Its row: started, and ended before the main turn did.
+    let Some(Ev::ToolUse { id, .. }) =
+        (r.evs.iter()).find(|e| matches!(e, Ev::ToolUse { name, .. } if name == "Agent"))
+    else {
+        panic!("no Agent row")
+    };
+    let end = (r.evs.iter()).position(|e| matches!(e, Ev::ToolResult { id: i, .. } if i == id));
+    assert!(
+        end.is_some_and(|e| e < r.evs.len() - 1),
+        "Agent row never ended"
+    );
+    r.close();
+    check_replay(&env, &r.evs);
+}
