@@ -32,7 +32,7 @@ pub struct State {
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Section {
     pub name: String,
-    /// Lucide icon name from `app::SECTION_ICONS`, e.g. `folder`.
+    /// Lucide icon name from `app::sidebar::SECTION_ICONS`, e.g. `folder`.
     pub icon: String,
     #[serde(default)]
     pub collapsed: bool,
@@ -50,7 +50,7 @@ pub enum Mode {
     Dark,
 }
 
-/// Theme families by name (`main::THEMES`); fonts `None` use the theme's.
+/// Theme families by name (`settings::THEMES`); fonts `None` use the theme's.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct Appearance {

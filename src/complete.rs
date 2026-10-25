@@ -212,19 +212,13 @@ fn greedy(q: &[char], s: &str) -> Option<i32> {
         if qi == q.len() {
             break;
         }
-        if c == q[qi] {
+        let hit = c == q[qi];
+        if hit {
             qi += 1;
-            score += 1 + if run { 4 } else { 0 };
-            score += if matches!(prev, '/' | '_' | '-' | '.' | ' ' | ':') {
-                3
-            } else {
-                0
-            };
-            run = true;
-        } else {
-            run = false;
+            let start = matches!(prev, '/' | '_' | '-' | '.' | ' ' | ':');
+            score += 1 + 4 * run as i32 + 3 * start as i32;
         }
-        prev = c;
+        (run, prev) = (hit, c);
     }
     (qi == q.len()).then_some(score)
 }

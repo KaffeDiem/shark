@@ -70,7 +70,7 @@ Goal: Mermaid in markdown, a live-preview markdown editor (`# ` becomes a headin
   - Rope buffer, about 200K lines, folding, search and replace, multi-cursor.
   - LSP provider hooks: completion, hover, definition, code actions, semantic tokens.
   - Highlighting via the `syntect` or `tree-sitter-<lang>` features, including `tree-sitter-markdown(-inline)`.
-  - There is no vim mode, but the movement actions are exported, so we can add a keymap.
+  - There is no built-in vim mode, but the movement actions are exported. Our Vim keys live in `src/vim.rs`, driven from `src/editor.rs`.
 - **Decorations** only change colour, weight, italic, background, underline and strikethrough. They can't change font size or hide markers, so a Typora-style editor can't be built on `EditorState`.
 - **`gpui_kit::base::text::editor_host`:** we keep our own document and it renders mdast blocks and returns caret geometry. We own caret, IME and undo. This is the fallback for building a live-preview editor ourselves.
 - **WebView:** none in gpui-kit. `gpui-webview` 0.8 is a separate crate. It draws over GPUI popovers and has no keyboard or focus bridge.
@@ -106,7 +106,8 @@ Goal: Mermaid in markdown, a live-preview markdown editor (`# ` becomes a headin
    - Register it in `src/chat.rs` via `TextView::plugin`.
 2. **Composer becomes an `EditorState`** with tree-sitter markdown: styled source, list continuation on Enter. `auto_grow` only exists on `TextareaState`, so content-based height is extra work.
 3. **Notes/plans pane:** try zorite-editor, feeding it the same Mermaid cache. If that doesn't work out, build our own on `editor_host`.
-4. **Code view:** `Editor` with a few tree-sitter grammars and a vim normal-mode keymap. LSP later.
+
+Done: the code view (`src/editor.rs`, an `Editor` with Vim keys from `src/vim.rs`). LSP later.
 
 Tests for the Mermaid work:
 - Closed vs. unclosed fence, cache hit, error fallback.

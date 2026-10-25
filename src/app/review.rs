@@ -56,7 +56,7 @@ pub(super) fn parse_hunks(chunk: &str) -> Vec<Hunk> {
 
 /// A row the cursor can sit on: a file header or a source line.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) enum Spot {
+enum Spot {
     File(SharedString),
     Line(DiffLinePosition),
 }
@@ -71,7 +71,7 @@ impl Spot {
 }
 
 #[derive(Debug)]
-pub(super) struct Row {
+struct Row {
     spot: Spot,
     changed: bool,
     /// Height in code rows; headers and hunk separators are taller than a line.
@@ -82,7 +82,7 @@ pub(super) struct Row {
 /// change's removed lines before its added ones, split mode pairs them. Collapsed (viewed)
 /// files are a header only.
 // ponytail: rebuilt per key, ~1ms per 50k patch lines; cache per refresh if it shows up.
-pub(super) fn rows(files: &[(SharedString, &[Hunk], bool)], split: bool) -> Vec<Row> {
+fn rows(files: &[(SharedString, &[Hunk], bool)], split: bool) -> Vec<Row> {
     let mut out = vec![];
     for (path, hunks, collapsed) in files {
         out.push(Row {
@@ -325,9 +325,7 @@ impl Shark {
         let (t, c) = (t.spot.clone(), c.spot.clone());
         if let Some(ix) = self.diff_files.iter().position(|f| f.path() == c.path()) {
             self.diff_file = ix; // `v`/`o` act on the cursor's file
-            if let Some(row) = self.tree_rows.iter().position(|r| r.file == Some(ix)) {
-                self.tree_sel = row;
-            }
+            self.follow_tree(ix);
         }
         self.diff.update(cx, |d, cx| {
             match &t {
@@ -489,10 +487,10 @@ impl Shark {
     /// saving it empty removes it.
     pub(super) fn comment_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ws) = self.active.clone() else {
-            return Self::notify_err(window, cx, "Open a workspace first");
+            return notify_err(window, cx, "Open a workspace first");
         };
         let Some(range) = self.diff.read(cx).selected_lines() else {
-            return Self::notify_err(window, cx, "Move to a line first (j/k), or select lines");
+            return notify_err(window, cx, "Move to a line first (j/k), or select lines");
         };
         let draft = Comment::from_range(&range);
         let text = (self.ws_comments().iter())
@@ -550,15 +548,15 @@ impl Shark {
     /// `shift-c`: sends every pending comment as one prompt, then clears them.
     pub(super) fn send_comments(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(ws), Some(chat)) = (self.active.clone(), self.active_chat().cloned()) else {
-            return Self::notify_err(window, cx, "Open a workspace first");
+            return notify_err(window, cx, "Open a workspace first");
         };
         let comments = self.ws_comments().to_vec();
         if comments.is_empty() {
-            return Self::notify_err(window, cx, "No comments yet (c on a diff line)");
+            return notify_err(window, cx, "No comments yet (c on a diff line)");
         }
         // Refused (on hold, archiving, spawn failed): the chat says why; the comments stay.
         if !chat.update(cx, |c, cx| c.ask(&prompt(&comments), window, cx)) {
-            return Self::notify_err(window, cx, "Comments not sent; the chat says why");
+            return notify_err(window, cx, "Comments not sent; the chat says why");
         }
         self.review.comments.insert(ws.clone(), vec![]);
         self.review.save_comments(&ws);
