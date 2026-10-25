@@ -19,6 +19,7 @@ use gpui_kit::component::{ActiveTheme, Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
+use std::collections::VecDeque;
 use std::time::Instant;
 
 struct Call {
@@ -27,13 +28,14 @@ struct Call {
     summary: String,
     /// The full input, one `key: value` per line and capped, for the row's tooltip.
     input: String,
-    result: Option<String>,
+    result: Option<SharedString>,
     is_error: bool,
     open: bool,
 }
 
 enum Block {
-    User(String),
+    /// `true` while queued: sent mid-turn, and claude hasn't read it yet.
+    User(String, bool),
     Text {
         md: Entity<TextViewState>,
         done: bool,
@@ -154,6 +156,8 @@ pub struct Chat {
     pub ws: Workspace,
     pub meta: ChatMeta,
     blocks: Vec<Block>,
+    /// What the list shows, derived from `blocks`; see `sync_rows`.
+    rows: Vec<Row>,
     sel: usize,
     pub busy: bool,
     /// Background tasks (subagents, shells) still running, by description; the turn can end
@@ -163,11 +167,16 @@ pub struct Chat {
     pub started: Option<Instant>,
     /// Set while a git step runs in these worktrees; sends wait for it.
     pub hold: bool,
+    /// Set while the workspace's worktrees are being removed; sends are refused.
+    pub archiving: bool,
+    /// Told to the agent with the next message (a repo joined the workspace mid-session).
+    note: Option<String>,
     agent: Option<Agent>,
     pub(crate) composer: Entity<TextareaState>,
     /// Model the running process was started with; a mismatch respawns it on the next send.
     agent_model: Option<String>,
-    scroll: ScrollHandle,
+    /// Virtualized: only visible rows render, which matters while a spinner redraws every frame.
+    list: ListState,
     pub focus: FocusHandle,
     reader: Option<Task<()>>,
     files: Vec<Item>,
@@ -176,6 +185,14 @@ pub struct Chat {
     menu_scroll: ScrollHandle,
     indexing: Option<Task<()>>,
     probing: Option<Task<()>>,
+    /// User blocks claude hasn't echoed yet, oldest first.
+    unread: VecDeque<usize>,
+    /// The turn was interrupted; its result reads "interrupted".
+    cut: bool,
+    /// SIGTERM fallback for an interrupt claude doesn't act on.
+    stopping: Option<Task<()>>,
+    /// Applying stored history: nothing is emitted to the app.
+    replaying: bool,
     queue: Vec<Queued>,
     qsel: usize,
     qfocus: FocusHandle,
@@ -190,6 +207,9 @@ pub struct Chat {
     side: Option<Side>,
     _subs: Vec<Subscription>,
 }
+
+/// How long an interrupt may take before the process is stopped instead.
+const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// `default` means "no --model flag".
 pub(crate) const MODELS: &[&str] = &["default", "fable", "opus", "sonnet", "haiku"];
@@ -291,15 +311,18 @@ impl Chat {
             ws,
             meta,
             blocks: vec![],
+            rows: vec![],
             sel: 0,
             busy: false,
             background: vec![],
             started: None,
             hold: false,
+            archiving: false,
+            note: None,
             agent: None,
             composer,
             agent_model: None,
-            scroll: ScrollHandle::new(),
+            list: ListState::new(0, ListAlignment::Top, px(400.)),
             focus: cx.focus_handle(),
             reader: None,
             commands: complete::cached_commands(&ws_name),
@@ -308,6 +331,10 @@ impl Chat {
             menu_scroll: ScrollHandle::new(),
             indexing: None,
             probing: None,
+            unread: VecDeque::new(),
+            cut: false,
+            stopping: None,
+            replaying: false,
             queue: vec![],
             qsel: 0,
             qfocus: cx.focus_handle(),
@@ -321,22 +348,72 @@ impl Chat {
         // Warm both sources now so the first `@` or `/` doesn't wait.
         chat.reindex(cx);
         chat.reprobe(cx);
-        // Replay history through the same path as live events.
-        let history =
-            std::fs::read_to_string(agent::transcript_path(&chat.meta.id)).unwrap_or_default();
-        for ev in history.lines().flat_map(agent::parse) {
-            chat.apply(ev, cx);
-        }
-        if chat.meta.title.is_empty()
-            && let Some(Block::User(t)) = chat.blocks.iter().find(|b| matches!(b, Block::User(_)))
-        {
-            chat.meta.title = title_of(t);
-        }
-        chat.busy = false;
-        chat.background.clear();
-        chat.sel = chat.rows().len().saturating_sub(1);
-        chat.scroll.scroll_to_bottom();
+        chat.list.set_follow_mode(FollowMode::Tail);
+        // Read history off the UI thread, up to its current end: a process started meanwhile
+        // appends to the same file, and its lines arrive live.
+        let path = agent::transcript_path(&chat.meta.id);
+        let len = std::fs::metadata(&path).map_or(0, |m| m.len());
+        cx.spawn(async move |this, cx| {
+            let evs = (cx.background_executor())
+                .spawn(async move { agent::read_history(&path, len) })
+                .await;
+            this.update(cx, |c, cx| c.load_history(evs, cx)).ok();
+        })
+        .detach();
         chat
+    }
+
+    /// Replays history through the same path as live events, ahead of anything that arrived
+    /// while it loaded, then lays out the rows once.
+    fn load_history(&mut self, evs: Vec<Ev>, cx: &mut Context<Self>) {
+        if evs.is_empty() {
+            return;
+        }
+        let live = std::mem::take(&mut self.blocks);
+        let unread = std::mem::take(&mut self.unread);
+        // state.json's session (it may have been reset), or the live process's
+        let kept = (
+            self.busy,
+            std::mem::take(&mut self.background),
+            self.started,
+            self.cut,
+            self.meta.session_id.clone(),
+        );
+        (self.busy, self.cut, self.replaying) = (false, false, true);
+        for ev in evs {
+            // A turn that never got its result was cut off by quitting (or a crash).
+            if matches!(ev, Ev::Init { .. }) && self.busy {
+                self.blocks.push(Block::Info("interrupted".into()));
+            }
+            self.apply_inner(ev, cx);
+        }
+        if self.busy {
+            self.blocks.push(Block::Info("interrupted".into()));
+        }
+        self.interrupt();
+        self.replaying = false;
+        (
+            self.busy,
+            self.background,
+            self.started,
+            self.cut,
+            self.meta.session_id,
+        ) = kept;
+        let n = self.blocks.len();
+        self.blocks.extend(live);
+        self.unread = unread.into_iter().map(|i| i + n).collect();
+        self.rows = self.build_rows();
+        self.list.reset(self.rows.len());
+        self.list.set_follow_mode(FollowMode::Tail);
+        self.sel = self.rows.len().saturating_sub(1);
+        if self.meta.title.is_empty()
+            && let Some(Block::User(t, _)) =
+                self.blocks.iter().find(|b| matches!(b, Block::User(..)))
+        {
+            self.meta.title = title_of(t);
+            cx.emit(ChatEvent::Meta);
+        }
+        cx.notify();
     }
 
     /// Whether anything is still going on: a turn, or tasks it left running in the background.
@@ -694,7 +771,8 @@ impl Chat {
         sent
     }
 
-    /// Returns whether the text went out; while a turn runs only if `steer`.
+    /// Returns whether the text went out; while a turn runs only if `steer`. Mid-turn, claude
+    /// holds it and reads it at its next step.
     fn send_text(&mut self, text: String, steer: bool, cx: &mut Context<Self>) -> bool {
         if text.is_empty() || (self.busy && !steer) {
             return false;
@@ -706,6 +784,13 @@ impl Chat {
             );
             return false;
         }
+        if self.archiving {
+            self.push(
+                Block::Info("this workspace is being archived; nothing was sent".into()),
+                cx,
+            );
+            return false;
+        }
         // Never mid-turn: a steer would kill the turn it means to steer.
         if self.agent.is_some()
             && self.agent_model != self.meta.model
@@ -713,6 +798,7 @@ impl Chat {
             && !self.steered
         {
             self.agent = None; // drop stops it; the respawn resumes the same session on the new model
+            self.background.clear(); // its reader is replaced below, so its Exited never arrives
         }
         if self.agent.is_none() {
             match agent::spawn(&self.ws, &self.meta) {
@@ -733,16 +819,34 @@ impl Chat {
                 }
             }
         }
-        if let Err(e) = self.agent.as_mut().unwrap().send(&text) {
+        let wire = match &self.note {
+            Some(n) => format!("{n}\n\n{text}"),
+            None => text.clone(),
+        };
+        if let Err(e) = self.agent.as_mut().unwrap().send(&wire) {
             self.push(Block::Info(format!("send failed: {e}")), cx);
             return false;
         }
+        self.note = None;
         self.sent(text, cx);
         true
     }
 
+    /// A repo joined the workspace: refresh `@` files, show it, and tell the agent next turn
+    /// (its CLAUDE.md was read at session start).
+    pub fn repos_changed(&mut self, ws: &Workspace, note: String, cx: &mut Context<Self>) {
+        self.ws.repos = ws.repos.clone();
+        self.push(Block::Info(note.clone()), cx);
+        self.note = Some(match self.note.take() {
+            Some(old) => format!("{old}\n{note}"),
+            None => note,
+        });
+        self.reindex(cx);
+    }
+
     fn sent(&mut self, text: String, cx: &mut Context<Self>) {
-        if !self.busy {
+        let queued = self.busy;
+        if !queued {
             self.started = Some(Instant::now());
         }
         self.busy = true;
@@ -751,8 +855,10 @@ impl Chat {
             cx.emit(ChatEvent::Meta);
         }
         // Jump to the end so push follows the new message and the reply.
-        self.sel = self.rows().len().saturating_sub(1);
-        self.push(Block::User(text), cx);
+        self.sel = self.rows.len().saturating_sub(1);
+        self.list.set_follow_mode(FollowMode::Tail);
+        self.unread.push_back(self.blocks.len());
+        self.push(Block::User(text, queued), cx);
     }
 
     /// cmd-shift-enter: asks the draft as a side question, or opens the card's own field when
@@ -899,14 +1005,105 @@ impl Chat {
         cx.notify();
     }
 
+    /// Interrupts a running turn and keeps the process warm; SIGTERM if claude doesn't stop
+    /// within `INTERRUPT_GRACE` (unless background tasks would die with it), or on a second press. With only background tasks left, stops
+    /// the process, since that is the only way to end them. Idle, does nothing.
     pub fn stop(&mut self, cx: &mut Context<Self>) {
-        if let Some(a) = &self.agent {
+        let working = self.working();
+        let Some(a) = &mut self.agent else {
+            return;
+        };
+        if !self.busy || self.stopping.is_some() {
+            if working {
+                a.stop();
+                self.push(Block::Info("stopping…".into()), cx);
+            }
+            return;
+        }
+        if a.interrupt().is_err() {
             a.stop();
-            self.push(Block::Info("stopping…".into()), cx);
+        }
+        self.stopping = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(INTERRUPT_GRACE).await;
+            this.update(cx, |c, cx| {
+                if let Some(a) = &c.agent
+                    && c.busy
+                {
+                    // SIGTERM also ends background tasks: with some running, let the user decide.
+                    if !c.background.is_empty() {
+                        let msg =
+                            "not responding; ctrl-c again to stop it and its background tasks";
+                        c.push(Block::Info(msg.into()), cx);
+                    } else {
+                        a.stop();
+                        c.push(Block::Info("not responding; stopping…".into()), cx);
+                    }
+                }
+            })
+            .ok();
+        }));
+        self.push(Block::Info("interrupting…".into()), cx);
+    }
+
+    /// Messages claude never read, once its process is gone.
+    fn drop_unread(&mut self) {
+        let n = self.unread.len();
+        for bi in std::mem::take(&mut self.unread) {
+            if let Some(Block::User(_, queued)) = self.blocks.get_mut(bi) {
+                *queued = false;
+            }
+        }
+        if n > 0 {
+            let s = if n == 1 { "" } else { "s" };
+            self.blocks.push(Block::Info(format!(
+                "{n} message{s} not delivered; send again"
+            )));
         }
     }
 
-    fn rows(&self) -> Vec<Row> {
+    /// Forgets the claude session and stops the agent; the next send starts a new conversation.
+    pub fn new_conversation(&mut self, cx: &mut Context<Self>) {
+        let was_working = self.working();
+        self.meta.session_id = None;
+        cx.emit(ChatEvent::Meta);
+        self.reader = None; // its Exited would be about the old process
+        self.agent = None; // drop stops it
+        self.busy = false;
+        self.background.clear();
+        self.stopping = None;
+        self.cut = false;
+        self.steered = false;
+        self.follow(cx, |this, _| {
+            this.interrupt();
+            this.drop_unread();
+            this.blocks.push(Block::Info("new conversation".into()));
+        });
+        if was_working {
+            cx.emit(ChatEvent::TurnDone);
+        }
+    }
+
+    /// Calls that never got a result once the process is gone.
+    fn interrupt(&mut self) {
+        for bi in 0..self.blocks.len() {
+            let calls = match &mut self.blocks[bi] {
+                Block::Tool(c) => std::slice::from_mut(c),
+                Block::Tools { calls, .. } => calls.as_mut_slice(),
+                _ => continue,
+            };
+            let mut touched = false;
+            for c in calls.iter_mut().filter(|c| c.result.is_none()) {
+                c.result = Some("(interrupted)".into());
+                c.is_error = true;
+                touched = true;
+            }
+            if touched {
+                self.remeasure(bi); // an open call's output changed height
+            }
+        }
+    }
+
+    fn build_rows(&self) -> Vec<Row> {
         let mut rows = vec![];
         for (ix, b) in self.blocks.iter().enumerate() {
             rows.push((ix, None));
@@ -917,13 +1114,38 @@ impl Chat {
         rows
     }
 
-    /// Keeps the cursor and scroll on the newest row if the cursor was already on the last one.
+    /// Re-derives the rows and tells the list which were added or removed. `touched` is a
+    /// block that changed in place: off-screen rows keep their measured height until told.
+    fn sync_rows(&mut self, touched: Option<usize>) {
+        let rows = self.build_rows();
+        let old = std::mem::replace(&mut self.rows, rows);
+        let new = &self.rows;
+        let pre = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+        let suf = (old[pre..].iter().rev())
+            .zip(new[pre..].iter().rev())
+            .take_while(|(a, b)| a == b)
+            .count();
+        self.list
+            .splice(pre..old.len() - suf, new.len() - pre - suf);
+        if let Some(bi) = touched {
+            self.remeasure(bi);
+        }
+    }
+
+    fn remeasure(&self, bi: usize) {
+        let start = self.rows.partition_point(|r| r.0 < bi);
+        let end = self.rows.partition_point(|r| r.0 <= bi);
+        self.list.remeasure_items(start..end);
+    }
+
+    /// Keeps the cursor on the newest row if it was already on the last one. The list itself
+    /// follows the tail only while scrolled to the bottom, so reading further up stays put.
     fn follow(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Self, &mut Context<Self>)) {
-        let at_end = self.sel + 1 >= self.rows().len();
+        let at_end = self.sel + 1 >= self.rows.len();
         f(self, cx);
+        self.sync_rows(self.blocks.len().checked_sub(1)); // streaming grows the last block
         if at_end {
-            self.sel = self.rows().len().saturating_sub(1);
-            self.scroll.scroll_to_bottom();
+            self.sel = self.rows.len().saturating_sub(1);
         }
         cx.notify();
     }
@@ -948,6 +1170,13 @@ impl Chat {
         }
     }
 
+    /// The streaming text block a reply continues: the last block, looking past messages
+    /// queued while it streams (they'd otherwise split the reply in two).
+    fn live_text(&self) -> Option<usize> {
+        let bi = (self.blocks.iter()).rposition(|b| !matches!(b, Block::User(_, true)))?;
+        matches!(self.blocks[bi], Block::Text { done: false, .. }).then_some(bi)
+    }
+
     fn apply_inner(&mut self, ev: Ev, cx: &mut Context<Self>) {
         match ev {
             Ev::Init {
@@ -958,7 +1187,9 @@ impl Chat {
             } => {
                 if self.meta.session_id.as_ref() != Some(&id) {
                     self.meta.session_id = Some(id);
-                    cx.emit(ChatEvent::Meta);
+                    if !self.replaying {
+                        cx.emit(ChatEvent::Meta);
+                    }
                 }
                 let mut r = format!("running {model} · permissions: {permission_mode}");
                 if !mcp.is_empty() {
@@ -974,22 +1205,38 @@ impl Chat {
                 self.steered = false;
             }
             Ev::Background(tasks) => self.background = tasks,
-            Ev::User(text) => self.blocks.push(Block::User(text)),
-            Ev::TextDelta(s) => match self.blocks.last_mut() {
-                Some(Block::Text { md, done: false }) => {
-                    md.update(cx, |m, cx| m.push_str(&s, cx));
+            Ev::Interrupted => self.cut = true,
+            // claude's echo: the oldest message it hadn't read is now part of the turn.
+            // `ends_with`: a workspace `note` may have been put before the text on the wire.
+            Ev::User(text) => match self.unread.front().map(|&bi| &mut self.blocks[bi]) {
+                Some(Block::User(t, queued)) if text.ends_with(t.as_str()) => {
+                    *queued = false;
+                    let bi = self.unread.pop_front().unwrap();
+                    self.remeasure(bi);
                 }
-                _ => {
+                _ => self.blocks.push(Block::User(text, false)),
+            },
+            Ev::TextDelta(s) => match self.live_text() {
+                Some(bi) => {
+                    if let Block::Text { md, .. } = &self.blocks[bi] {
+                        md.update(cx, |m, cx| m.push_str(&s, cx));
+                    }
+                    self.remeasure(bi);
+                }
+                None => {
                     let md = cx.new(|cx| TextViewState::markdown(&s, cx));
                     self.blocks.push(Block::Text { md, done: false });
                 }
             },
-            Ev::Text(full) => match self.blocks.last_mut() {
-                Some(Block::Text { md, done }) if !*done => {
-                    md.update(cx, |m, cx| m.set_text(&full, cx));
-                    *done = true;
+            Ev::Text(full) => match self.live_text() {
+                Some(bi) => {
+                    if let Block::Text { md, done } = &mut self.blocks[bi] {
+                        md.update(cx, |m, cx| m.set_text(&full, cx));
+                        *done = true;
+                    }
+                    self.remeasure(bi);
                 }
-                _ => {
+                None => {
                     let md = cx.new(|cx| TextViewState::markdown(&full, cx));
                     self.blocks.push(Block::Text { md, done: true });
                 }
@@ -1014,14 +1261,17 @@ impl Chat {
                 }
             }
             Ev::ToolResult { id, text, is_error } => {
-                let call = self.blocks.iter_mut().rev().find_map(|b| match b {
-                    Block::Tool(c) => (c.id == id).then_some(c),
-                    Block::Tools { calls, .. } => calls.iter_mut().find(|c| c.id == id),
+                let call = (self.blocks.iter_mut().enumerate().rev()).find_map(|(bi, b)| match b {
+                    Block::Tool(c) => (c.id == id).then_some((bi, c)),
+                    Block::Tools { calls, .. } => {
+                        calls.iter_mut().find(|c| c.id == id).map(|c| (bi, c))
+                    }
                     _ => None,
                 });
-                if let Some(c) = call {
-                    c.result = Some(text);
+                if let Some((bi, c)) = call {
+                    c.result = Some(text.into());
                     c.is_error = is_error;
+                    self.remeasure(bi); // an open call shows its output
                 }
             }
             Ev::Result {
@@ -1031,17 +1281,42 @@ impl Chat {
                 secs,
             } => {
                 self.busy = false;
+                if !self.replaying {
+                    self.stopping = None; // a live interrupt's fallback outlives history
+                }
+                let cut = std::mem::take(&mut self.cut);
+                // A pruned or deleted session: claude says so in the result and exits, and
+                // every resume would fail the same way. (Replay restores the session after.)
+                let gone = is_error && text.starts_with("No conversation found with session ID");
                 let took = duration(secs);
-                self.blocks.push(Block::Info(if is_error {
+                self.blocks.push(Block::Info(if cut {
+                    format!("interrupted · {took} · ${cost:.2}")
+                } else if is_error {
                     format!("error: {text}")
                 } else {
                     format!("done · {took} · ${cost:.2}")
                 }));
-                cx.emit(ChatEvent::TurnDone);
+                if gone {
+                    self.meta.session_id = None;
+                    self.blocks.push(Block::Info(
+                        "previous session not found; starting fresh, send again".into(),
+                    ));
+                }
+                if !self.replaying {
+                    if gone {
+                        cx.emit(ChatEvent::Meta);
+                    }
+                    cx.emit(ChatEvent::TurnDone);
+                }
             }
             Ev::Exited(msg) => {
                 self.agent = None;
                 self.background.clear();
+                self.stopping = None;
+                self.cut = false;
+                self.steered = false;
+                self.interrupt();
+                self.drop_unread();
                 if self.busy {
                     self.busy = false;
                     self.blocks.push(Block::Info(msg));
@@ -1056,19 +1331,23 @@ impl Chat {
         }
     }
 
+    /// On the last row the list follows new output again; elsewhere it holds still.
     fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
-        self.sel = ix.min(self.rows().len().saturating_sub(1));
-        self.scroll.scroll_to_item(self.sel);
+        self.sel = ix.min(self.rows.len().saturating_sub(1));
+        if self.sel + 1 >= self.rows.len() {
+            self.list.set_follow_mode(FollowMode::Tail);
+        } else {
+            self.list.pause_following_tail();
+            self.list.scroll_to_reveal_item(self.sel);
+        }
         cx.notify();
     }
 
-    fn render_row(
-        &self,
-        ix: usize,
-        (bi, call): Row,
-        focused: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_row(&self, ix: usize, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(&(bi, call)) = self.rows.get(ix) else {
+            return div().into_any_element();
+        };
+        let focused = self.focus.is_focused(window);
         let theme = cx.theme();
         let row = div()
             .id(ix)
@@ -1137,11 +1416,8 @@ impl Chat {
                         }),
                 )
                 .when(c.open, |d| {
-                    let full = c.result.as_deref().unwrap_or("(running)");
-                    let mut text: String = full.chars().take(20_000).collect();
-                    if text.len() < full.len() {
-                        text += &format!("\n… truncated, {} chars total", full.chars().count());
-                    }
+                    // Clipped, with a "truncated" note, when parsed (agent::MAX_OUTPUT).
+                    let text = c.result.clone().unwrap_or("(running)".into());
                     d.child(
                         div()
                             .mt_1()
@@ -1164,7 +1440,7 @@ impl Chat {
                 })
         };
         let inner = match (&self.blocks[bi], call) {
-            (Block::User(t), _) => column()
+            (Block::User(t, queued), _) => column()
                 .px_3()
                 .py_2()
                 .rounded(theme.radius_lg)
@@ -1174,7 +1450,17 @@ impl Chat {
                 .text_color(theme.secondary_foreground)
                 .text_size(px(14.))
                 .line_height(relative(1.5))
-                .child(t.clone()),
+                .child(t.clone())
+                .when(*queued, |d| {
+                    d.child(
+                        h_flex()
+                            .gap_1()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(Icon::new(IconName::Clock).with_size(px(12.)))
+                            .child("Queued · the agent reads it at its next step"),
+                    )
+                }),
             (Block::Text { md, .. }, _) => column()
                 .text_size(px(14.))
                 .line_height(relative(1.5))
@@ -1611,7 +1897,7 @@ impl Chat {
     }
 
     fn toggle(&mut self, cx: &mut Context<Self>) {
-        let Some(&(bi, call)) = self.rows().get(self.sel) else {
+        let Some(&(bi, call)) = self.rows.get(self.sel) else {
             return;
         };
         match (&mut self.blocks[bi], call) {
@@ -1620,6 +1906,7 @@ impl Chat {
             (Block::Tools { open, .. }, None) => *open = !*open,
             _ => return,
         }
+        self.sync_rows(Some(bi));
         cx.notify();
     }
 }
@@ -1630,7 +1917,6 @@ impl Render for Chat {
         if self.queue.is_empty() && self.qfocus.is_focused(window) {
             self.focus_composer(window, cx);
         }
-        let focused = self.focus.is_focused(window);
         let theme = cx.theme();
         let (radius, border, card, muted) = (
             theme.radius_lg,
@@ -1638,9 +1924,12 @@ impl Render for Chat {
             theme.secondary,
             theme.muted_foreground,
         );
-        let blocks: Vec<AnyElement> = (self.rows().into_iter().enumerate())
-            .map(|(ix, row)| self.render_row(ix, row, focused, cx))
-            .collect();
+        let rows = list(
+            self.list.clone(),
+            cx.processor(|this, ix, window, cx| this.render_row(ix, window, cx)),
+        )
+        .size_full()
+        .py_2();
         v_flex()
             .size_full()
             .child(
@@ -1648,12 +1937,9 @@ impl Render for Chat {
                     .id("transcript")
                     .key_context("Transcript")
                     .track_focus(&self.focus)
+                    .relative()
                     .flex_1()
                     .min_h_0()
-                    .py_2()
-                    .overflow_y_scroll()
-                    .track_scroll(&self.scroll)
-                    .vertical_scrollbar(&self.scroll)
                     .on_action(
                         cx.listener(|this, _: &SelectNext, _, cx| this.select(this.sel + 1, cx)),
                     )
@@ -1674,7 +1960,8 @@ impl Render for Chat {
                     .on_action(cx.listener(|this, _: &FocusComposer, window, cx| {
                         this.focus_composer(window, cx)
                     }))
-                    .children(blocks),
+                    .child(rows)
+                    .vertical_scrollbar(&self.list),
             )
             .child(
                 div()
@@ -1793,6 +2080,10 @@ impl Render for Chat {
                                         d.child(Kbd::new(Keystroke::parse("cmd-enter").unwrap()))
                                             .child("send now")
                                     })
+                                    .when(self.busy, |d| {
+                                        d.child(Kbd::new(Keystroke::parse("ctrl-c").unwrap()))
+                                            .child("interrupt")
+                                    })
                                     .child(Kbd::new(Keystroke::parse("cmd-shift-enter").unwrap()))
                                     .child("side question"),
                             ),
@@ -1813,7 +2104,7 @@ mod tests {
             name: name.into(),
             summary: String::new(),
             input: String::new(),
-            result: Some(String::new()),
+            result: Some("".into()),
             is_error: err,
             open: false,
         };
@@ -2046,15 +2337,184 @@ exec cat >/dev/null
             })
         });
         frame(cx);
+        let list = cx.update(|cx| chat.read(cx).list.clone());
+        let top = || list.logical_scroll_top().item_ix;
+        assert!(
+            list.is_following_tail() && top() > 0,
+            "overflows, at the bottom"
+        );
         cx.update(|cx| chat.update(cx, |c, cx| c.select(0, cx)));
         frame(cx);
-        let scroll = cx.update(|cx| chat.read(cx).scroll.clone());
-        assert!(scroll.max_offset().y > px(0.), "transcript must overflow");
-        assert_eq!(scroll.offset().y, px(0.), "scrolled to the top");
+        assert_eq!(top(), 0, "scrolled to the top");
+        // New output doesn't pull a reader back down.
+        cx.update(|cx| chat.update(cx, |c, cx| c.apply(Ev::Text("more".into()), cx)));
+        frame(cx);
+        assert_eq!(top(), 0, "still at the top");
 
         cx.update(|cx| chat.update(cx, |c, cx| c.sent("new".into(), cx)));
         frame(cx);
-        assert_eq!(scroll.offset().y, -scroll.max_offset().y, "at the bottom");
+        assert!(list.is_following_tail() && top() > 0, "at the bottom");
+
+        // Scrolling up by wheel, without moving the cursor, also stops following.
+        list.scroll_by(px(-100.));
+        frame(cx);
+        let read_at = top();
+        cx.update(|cx| chat.update(cx, |c, cx| c.apply(Ev::Text("reply".into()), cx)));
+        frame(cx);
+        assert!(
+            !list.is_following_tail() && top() == read_at,
+            "stays scrolled up"
+        );
+    }
+
+    /// A chat on a fresh workspace resuming session `s1`.
+    fn open_chat(tag: &str, cx: &mut TestAppContext) -> Entity<Chat> {
+        cx.update(gpui_kit::init);
+        let ws = Workspace {
+            name: format!("{tag}-test-{}", std::process::id()),
+            branch: "b".into(),
+            repos: vec![],
+            ..Default::default()
+        };
+        // Titled, so a first send emits nothing.
+        let meta = ChatMeta {
+            id: ws.name.clone(),
+            title: tag.into(),
+            session_id: Some("s1".into()),
+            ..Default::default()
+        };
+        let (_, chat) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| Chat::new(ws, meta, w, cx))
+                })
+            })
+            .unwrap();
+        chat
+    }
+
+    /// Calls cut off by an exit stop spinning; a missing session is dropped, an early exit isn't.
+    #[gpui_kit::test]
+    fn exits_end_calls_and_drop_missing_sessions(cx: &mut TestAppContext) {
+        let chat = open_chat("exit", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.busy = true;
+                let input = serde_json::json!({"command": "sleep 99"});
+                c.apply(
+                    Ev::ToolUse {
+                        id: "t".into(),
+                        name: "Bash".into(),
+                        input,
+                    },
+                    cx,
+                );
+                c.apply(Ev::Exited("claude exited (signal: 15)".into()), cx);
+                let Block::Tools { calls, .. } = &c.blocks[0] else {
+                    panic!()
+                };
+                assert_eq!(calls[0].result.as_deref(), Some("(interrupted)"));
+                assert!(calls[0].is_error);
+                assert_eq!(
+                    c.meta.session_id.as_deref(),
+                    Some("s1"),
+                    "an exit keeps the session"
+                );
+
+                c.busy = true;
+                let text = "No conversation found with session ID: s1".into();
+                c.apply(
+                    Ev::Result {
+                        is_error: true,
+                        text,
+                        cost: 0.,
+                        secs: 0,
+                    },
+                    cx,
+                );
+                assert_eq!(c.meta.session_id, None);
+
+                c.meta.session_id = Some("s2".into());
+                c.new_conversation(cx);
+                assert_eq!(c.meta.session_id, None);
+                assert!(!c.working());
+            })
+        });
+    }
+
+    /// A mid-turn send shows as queued until claude echoes it; replay marks a turn cut off
+    /// by quitting, goes ahead of live blocks, and emits nothing.
+    #[gpui_kit::test]
+    fn queues_mid_turn_and_replays_quietly(cx: &mut TestAppContext) {
+        let chat = open_chat("steer", cx);
+        let emitted = std::rc::Rc::new(std::cell::Cell::new(0));
+        let n = emitted.clone();
+        cx.update(|cx| {
+            cx.subscribe(&chat, move |_, _, _| n.set(n.get() + 1))
+                .detach()
+        });
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.sent("first".into(), cx);
+                c.sent("steer".into(), cx);
+                let queued = |c: &Chat| {
+                    (c.blocks.iter())
+                        .map(|b| matches!(b, Block::User(_, true)))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(queued(c), [false, true], "only the mid-turn send is queued");
+                c.apply(Ev::User("first".into()), cx);
+                c.blocks.remove(1);
+                c.unread.pop_back();
+                c.apply(Ev::TextDelta("Hel".into()), cx);
+                c.sent("steer".into(), cx);
+                c.apply(Ev::TextDelta("lo".into()), cx);
+                c.apply(Ev::Text("Hello".into()), cx);
+                assert!(
+                    matches!(&c.blocks[1], Block::Text { done: true, .. }),
+                    "a message queued mid-stream doesn't split the reply"
+                );
+                assert_eq!(c.blocks.len(), 3);
+                c.apply(Ev::User("steer".into()), cx);
+                assert_eq!(queued(c), [false, false, false], "echoes don't duplicate");
+                c.blocks.remove(1);
+
+                let call = Ev::ToolUse {
+                    id: "t".into(),
+                    name: "Bash".into(),
+                    input: serde_json::json!({}),
+                };
+                let init = Ev::Init {
+                    session_id: "old".into(),
+                    model: String::new(),
+                    permission_mode: String::new(),
+                    mcp: vec![],
+                };
+                let history = vec![init, Ev::User("old".into()), call];
+                c.load_history(history, cx);
+                let Block::Info(t) = &c.blocks[2] else {
+                    panic!()
+                };
+                assert_eq!(t, "interrupted");
+                assert!(matches!(&c.blocks[3], Block::User(t, _) if t == "first"));
+                assert_eq!(c.meta.session_id.as_deref(), Some("s1"));
+                assert!(c.busy, "the live turn still runs");
+
+                c.apply(Ev::Interrupted, cx);
+                let result = Ev::Result {
+                    is_error: true,
+                    text: String::new(),
+                    cost: 0.,
+                    secs: 3,
+                };
+                c.apply(result, cx);
+                let Some(Block::Info(t)) = c.blocks.last() else {
+                    panic!()
+                };
+                assert_eq!(t, "interrupted · 3s · $0.00");
+            })
+        });
+        assert_eq!(emitted.get(), 1, "only the live TurnDone");
     }
 
     /// While a turn runs Enter queues; the queue is driven from the keyboard, steers with
@@ -2074,6 +2534,7 @@ exec cat >/dev/null
             repos: vec![],
             ..Default::default()
         };
+        // The UI tests reset the test home; don't let one do that under this workspace.
         let meta = ChatMeta {
             id: ws.name.clone(),
             ..Default::default()
@@ -2114,7 +2575,7 @@ exec cat >/dev/null
             cx.update(|cx| {
                 (chat.read(cx).blocks.iter())
                     .filter_map(|b| match b {
-                        Block::User(t) => Some(t.clone()),
+                        Block::User(t, _) => Some(t.clone()),
                         _ => None,
                     })
                     .collect::<Vec<_>>()

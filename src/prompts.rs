@@ -83,6 +83,14 @@ Don't disable or skip checks.",
 commit and push, then summarize what you changed per comment.",
     },
     Prompt {
+        id: "comments",
+        title: "Address comments",
+        repos: "repos whose PR has new review comments",
+        default: "Reviewers left comments on the PRs in: {repos}. Read them (`gh pr view --comments` and \
+`gh api repos/{owner}/{repo}/pulls/<n>/comments`). Address the ones that ask for a change, \
+commit and push, then summarize per comment what you changed or why you left it.",
+    },
+    Prompt {
         id: "update_base",
         title: "Update from base",
         repos: "every repo, with its base",

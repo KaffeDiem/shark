@@ -99,7 +99,7 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
   - Expanded, each call is its own 28px row, indented 22px to line up with the summary text, and each opens to its output.
   - Skills (`Skill`) and subagents (`Agent`/`Task`) are never grouped: they get their own row with a `BookOpen` / `Bot` icon, because they say *what* the agent is doing. Add a tool to `standalone()` only if it carries that kind of intent.
   - Tool paths are shown relative to the workspace (`api/src/a.rs`).
-  - A turn ends with an info line: "done · 48s · $0.12".
+  - A turn ends with an info line: "done · 48s · $0.12", or "interrupted · 12s · $0.03" after `ctrl-c`. A turn cut off by quitting gets "interrupted" on replay.
 - **Composer completions** (`@` files, `/` skills; `src/complete.rs`):
   - The menu opens upward from the composer, at its width, over the transcript: `secondary` card, 1px `border`, `radius_lg`, `p_1`. It shows 8 rows of 28px and scrolls to more, with a `faint` key-hint footer.
   - Each row has a 14px `File` / `Folder` / `SquareSlash` icon, the name in `foreground`, the folder or description in `text_xs` `muted_foreground` (truncated), and on the right the repo (`FolderGit2` + name) when the workspace has more than one repo, or a command's argument hint in `faint`.
@@ -127,13 +127,18 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 |---|---|
 | Agent idle | `CircleDashed`, `muted_foreground` |
 | Agent running | `Spinner` (sidebar: `.icon(IconName::LoaderCircle).color(theme.primary)`); header dot in `primary` |
+| Workspace finished off screen (unread) | Sidebar `CircleCheck` in `success_foreground` until opened |
+| Workspace needs you (its git step is yours) | Sidebar `CircleAlert` in `warning_foreground`; the second line shows the step instead of the repos. The spinner outranks it, it outranks unread |
 | Tool pending / done / failed | `Spinner` / `Check` muted / `X` in `danger_foreground` |
 | Tool group with failures | `X` + "N failed" in `danger_foreground`, on the collapsed row |
+| Message queued for a busy agent | `Clock` 12px + "Queued · …" in `text_xs` `muted_foreground` inside the user card, until claude reads it |
 | Skill / subagent row | `BookOpen` / `Bot`, `muted_foreground`, before the tool name |
 | Collapsed / expanded | `ChevronRight` / `ChevronDown` |
 | Changed file added / deleted / other | `FilePlus` / `FileMinus` / `FileDiff`, `muted_foreground`; `+n` `success_foreground`, `−n` `danger_foreground` |
 | File viewed / changed since viewed | Checked `Checkbox` and the name in `muted_foreground` / 6px `warning_foreground` dot |
+| Diff loading / git failed / no changes | Empty state with a `faint` 32px `Spinner` / `TriangleAlert` in `warning_foreground` and git's error / `FileDiff` in `faint`; the tab reads `Diff` / `Diff · error` / `Diff · 0` |
 | Unsaved edits / changed on disk | 6px `foreground` dot after the file name / `TriangleAlert` in `warning_foreground` with Reload and Keep mine |
+| Pending diff comment | Annotation under its line: 14px `MessageSquare` in `muted_foreground`, the text in `foreground`; the diff cursor is the selected line |
 | Vim mode | Mono `text_xs` pill on `secondary`: `NORMAL`, `INSERT`, `VISUAL`, `V-LINE` plus pending keys; `VIM OFF` without the fill |
 | Git step to run | Its own icon (`GitCommitHorizontal`, `ArrowUp`/`ArrowDown`, `GitPullRequestCreate`, `GitMerge`, …) in a `primary` button |
 | Git needs attention (conflicts, failing checks, detached HEAD, git error) | `TriangleAlert` in `warning_foreground`, `outline` button |

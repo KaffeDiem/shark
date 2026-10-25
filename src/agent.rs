@@ -2,6 +2,7 @@
 use crate::state::{ChatMeta, Workspace, support_dir};
 use serde_json::{Value, json};
 use std::{
+    borrow::Cow,
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
     path::PathBuf,
@@ -45,6 +46,8 @@ pub enum Ev {
     },
     /// Backgrounded tasks (subagents, shells) still running after the turn's result, by description.
     Background(Vec<String>),
+    /// The turn was cut short by an `interrupt` control request; its result follows.
+    Interrupted,
     Exited(String),
 }
 
@@ -53,14 +56,96 @@ pub struct Agent {
     /// Set once the reader thread has reaped the child, so we never signal a reused pid.
     exited: Arc<AtomicBool>,
     stdin: ChildStdin,
-    /// `None` for a side question, which leaves no trace.
-    transcript: Option<PathBuf>,
+}
+
+/// Characters of tool output kept, in memory and in the transcript; the UI shows no more.
+const MAX_OUTPUT: usize = 20_000;
+
+/// Byte offset of the `n`th character, if `s` is longer than that.
+fn cut(s: &str, n: usize) -> Option<usize> {
+    s.char_indices().nth(n).map(|(i, _)| i)
+}
+
+/// A tool result's output as shown: clipped, saying so. `total_chars` marks lines `compact`
+/// already clipped.
+fn output(b: &Value) -> String {
+    let text = text_of(&b["content"]);
+    let total = b["total_chars"].as_u64();
+    match (cut(&text, MAX_OUTPUT), total) {
+        (None, None) => text,
+        (at, total) => format!(
+            "{}\n… truncated, {} chars total",
+            &text[..at.unwrap_or(text.len())],
+            total.unwrap_or(text.chars().count() as u64)
+        ),
+    }
+}
+
+/// Characters kept of each string in a stored tool input (Write's content, Edit's strings).
+/// Only the summary line is shown, and that comes from the start.
+const MAX_INPUT: usize = 2_000;
+
+fn clip_strings(v: &mut Value) -> bool {
+    match v {
+        Value::String(s) => cut(s, MAX_INPUT).map(|i| s.truncate(i)).is_some(),
+        Value::Array(a) => a.iter_mut().fold(false, |c, v| clip_strings(v) | c),
+        Value::Object(o) => o.values_mut().fold(false, |c, v| clip_strings(v) | c),
+        _ => false,
+    }
+}
+
+/// The line as stored: tool results and inputs clipped, since the transcript is replayed on
+/// every open.
+fn compact(line: &str) -> Cow<'_, str> {
+    let Ok(mut v) = serde_json::from_str::<Value>(line) else {
+        return line.into();
+    };
+    let mut changed = false;
+    let kind = v["type"].clone();
+    let Some(blocks) = v
+        .pointer_mut("/message/content")
+        .and_then(Value::as_array_mut)
+    else {
+        return line.into();
+    };
+    for b in blocks.iter_mut() {
+        match (kind.as_str(), b["type"].as_str()) {
+            (Some("assistant"), Some("tool_use")) => changed |= clip_strings(&mut b["input"]),
+            (Some("user"), Some("tool_result")) => {
+                let text = text_of(&b["content"]);
+                if let Some(i) = cut(&text, MAX_OUTPUT) {
+                    b["total_chars"] = text.chars().count().into();
+                    b["content"] = text[..i].into();
+                    changed = true;
+                }
+            }
+            _ => {}
+        }
+    }
+    match changed {
+        true => v.to_string().into(),
+        false => line.into(),
+    }
 }
 
 pub fn transcript_path(chat: &str) -> PathBuf {
     support_dir()
         .join("transcripts")
         .join(format!("{chat}.jsonl"))
+}
+
+/// Events stored in a transcript, up to `len` bytes: lines written after that belong to a
+/// process started while this was read, and arrive live.
+pub fn read_history(path: &PathBuf, len: u64) -> Vec<Ev> {
+    use std::io::Read as _;
+    let mut buf = vec![];
+    if let Ok(f) = File::open(path) {
+        let _ = f.take(len).read_to_end(&mut buf);
+    }
+    String::from_utf8_lossy(&buf)
+        .lines()
+        .flat_map(parse)
+        .collect()
 }
 
 fn append(path: &Option<PathBuf>, line: &str) {
@@ -133,6 +218,9 @@ fn run<'a>(
     .args([
         "--verbose",
         "--include-partial-messages",
+        // Echoes each user message when claude reads it: a message sent mid-turn is queued
+        // until then. The echo is what the transcript stores.
+        "--replay-user-messages",
         "--permission-mode",
         PERMISSION_MODE,
     ]);
@@ -154,13 +242,12 @@ fn run<'a>(
         pid: child.id(),
         exited,
         stdin: child.stdin.take().unwrap(),
-        transcript: transcript.clone(),
     };
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             let evs = parse(&line);
             if evs.iter().any(|e| !matches!(e, Ev::TextDelta(_))) {
-                append(&transcript, &line); // deltas are redundant with the full assistant message
+                append(&transcript, &compact(&line)); // deltas are redundant with the full assistant message
             }
             for ev in evs {
                 let _ = tx.send_blocking(ev);
@@ -182,14 +269,22 @@ fn run<'a>(
 
 impl Agent {
     pub fn send(&mut self, text: &str) -> std::io::Result<()> {
-        let line = json!({"type": "user", "message": {"role": "user", "content": text}, "parent_tool_use_id": null})
-            .to_string();
-        append(&self.transcript, &line); // stdout doesn't echo user turns, so record them for replay
-        self.stdin.write_all(format!("{line}\n").as_bytes())?;
+        let line = json!({"type": "user", "message": {"role": "user", "content": text}, "parent_tool_use_id": null});
+        self.write(&line)
+    }
+
+    /// Ends the current turn and keeps the process and its background tasks. claude rejects
+    /// the call in flight and sends the turn's result.
+    pub fn interrupt(&mut self) -> std::io::Result<()> {
+        self.write(&json!({"type": "control_request", "request_id": "interrupt", "request": {"subtype": "interrupt"}}))
+    }
+
+    fn write(&mut self, v: &Value) -> std::io::Result<()> {
+        self.stdin.write_all(format!("{v}\n").as_bytes())?;
         self.stdin.flush()
     }
 
-    /// SIGTERM ends the turn; the next send respawns with `--resume`.
+    /// SIGTERM ends the turn and background tasks; the next send respawns with `--resume`.
     pub fn stop(&self) {
         if self.exited.load(Ordering::SeqCst) {
             return;
@@ -262,11 +357,17 @@ pub fn parse(line: &str) -> Vec<Ev> {
             vec![Ev::User(s(&v["message"]["content"]))]
         }
         "user" => blocks(&v)
-            .filter(|b| b["type"] == "tool_result")
-            .map(|b| Ev::ToolResult {
-                id: s(&b["tool_use_id"]),
-                text: text_of(&b["content"]),
-                is_error: b["is_error"].as_bool().unwrap_or(false),
+            .filter_map(|b| match b["type"].as_str()? {
+                "tool_result" => Some(Ev::ToolResult {
+                    id: s(&b["tool_use_id"]),
+                    text: output(b),
+                    is_error: b["is_error"].as_bool().unwrap_or(false),
+                }),
+                // "[Request interrupted by user]" or "… for tool use]"
+                "text" if s(&b["text"]).starts_with("[Request interrupted by user") => {
+                    Some(Ev::Interrupted)
+                }
+                _ => None,
             })
             .collect(),
         "result" => vec![Ev::Result {
@@ -303,6 +404,7 @@ mod tests {
 {"type": "user", "message": {"role": "user", "content": "read a.txt"}, "parent_tool_use_id": null}
 {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "/tmp/a.txt"}}]}, "parent_tool_use_id": null}
 {"type": "user", "message": {"role": "user", "content": [{"tool_use_id": "toolu_1", "type": "tool_result", "content": "1\thello\n2\t"}]}, "parent_tool_use_id": null}
+{"type": "user", "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user for tool use]"}]}, "parent_tool_use_id": null}
 {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "text", "text": "nested"}]}, "parent_tool_use_id": "toolu_9"}
 {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "h"}}, "parent_tool_use_id": null}
 {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{"}}, "parent_tool_use_id": null}
@@ -336,6 +438,7 @@ not json"#;
                     text: "1\thello\n2\t".into(),
                     is_error: false
                 },
+                Ev::Interrupted,
                 Ev::TextDelta("h".into()),
                 Ev::Text("hello".into()),
                 Ev::Result {
@@ -352,6 +455,53 @@ not json"#;
                 },
             ]
         );
+    }
+
+    #[test]
+    fn clips_stored_tool_output() {
+        let long = "é".repeat(MAX_OUTPUT + 5);
+        let line = json!({"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "t", "content": [{"type": "text", "text": long}]}
+        ]}})
+        .to_string();
+        let note = format!("\n… truncated, {} chars total", MAX_OUTPUT + 5);
+        let [Ev::ToolResult { text: live, .. }] = &parse(&line)[..] else {
+            panic!("{line}");
+        };
+        let stored = compact(&line);
+        let [Ev::ToolResult { text, .. }] = &parse(&stored)[..] else {
+            panic!("{stored}");
+        };
+        assert_eq!(text, live, "replay shows what the live turn did");
+        assert_eq!(
+            text.strip_suffix(&note).unwrap().chars().count(),
+            MAX_OUTPUT
+        );
+        let short = SESSION.lines().nth(6).unwrap();
+        assert!(
+            matches!(compact(short), Cow::Borrowed(_)),
+            "short output is stored as-is"
+        );
+        let write = json!({"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "t", "name": "Write", "input": {"file_path": "/a", "content": "x".repeat(MAX_INPUT * 3)}}
+        ]}})
+        .to_string();
+        let stored = compact(&write);
+        let [Ev::ToolUse { input, .. }] = &parse(&stored)[..] else {
+            panic!("{stored}");
+        };
+        assert_eq!(input["content"].as_str().unwrap().len(), MAX_INPUT);
+        assert_eq!(input["file_path"], "/a");
+    }
+
+    #[test]
+    fn history_stops_at_the_snapshot_length() {
+        let path = std::env::temp_dir().join(format!("shark-hist-{}.jsonl", std::process::id()));
+        let first = SESSION.lines().nth(4).unwrap(); // the "read a.txt" user turn
+        fs::write(&path, format!("{first}\n{first}\n")).unwrap();
+        let evs = read_history(&path, first.len() as u64 + 1);
+        fs::remove_file(&path).unwrap();
+        assert_eq!(evs, vec![Ev::User("read a.txt".into())]);
     }
 }
 

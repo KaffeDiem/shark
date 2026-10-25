@@ -1,8 +1,9 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::{
     collections::{BTreeMap, HashMap},
     fs,
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -15,6 +16,9 @@ pub struct State {
     /// Repo names picked for the last new workspace; the next dialog starts with them.
     #[serde(default)]
     pub last_repos: Vec<String>,
+    /// The workspace and tab (`chat`/`diff`) open at quit; restored on launch.
+    #[serde(default)]
+    pub last_open: Option<(String, String)>,
     #[serde(default)]
     pub appearance: Appearance,
     /// Edited git-button prompts by id (`prompts::PROMPTS`); missing ids use the default.
@@ -178,9 +182,92 @@ impl Workspace {
     }
 }
 
+fn state_file() -> PathBuf {
+    support_dir().join("state.json")
+}
+
+/// Review IDs the git button already sent to the agent, per workspace name. They live in
+/// state.json beside `State`'s fields rather than among them: only the button reads or writes
+/// them, and `save` carries them over.
+const REVIEWED: &str = "reviewed";
+/// Repo names in the order the merge step merges them, per workspace name; same rules as REVIEWED.
+const MERGE_ORDER: &str = "merge_order";
+/// Opt-in: the merge step also deletes each PR's remote branch (`gh pr merge --delete-branch`).
+const DELETE_REMOTE: &str = "delete_remote_branches";
+
+fn read(path: &Path) -> Value {
+    fs::read(path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+fn write(path: &Path, v: &Value) {
+    if let Some(dir) = path.parent() {
+        let _ = fs::create_dir_all(dir);
+    }
+    let tmp = path.with_extension("json.tmp");
+    if fs::write(&tmp, serde_json::to_vec_pretty(v).unwrap()).is_ok() {
+        let _ = fs::rename(tmp, path);
+    }
+}
+
+pub fn reviewed(ws: &str) -> Vec<String> {
+    list_at(&state_file(), REVIEWED, ws)
+}
+
+pub fn set_reviewed(ws: &str, ids: &[String]) {
+    set_list_at(&state_file(), REVIEWED, ws, ids)
+}
+
+pub fn merge_order(ws: &str) -> Vec<String> {
+    list_at(&state_file(), MERGE_ORDER, ws)
+}
+
+pub fn set_merge_order(ws: &str, names: &[String]) {
+    set_list_at(&state_file(), MERGE_ORDER, ws, names)
+}
+
+pub fn delete_remote_branches() -> bool {
+    read(&state_file())[DELETE_REMOTE] == true
+}
+
+pub fn set_delete_remote_branches(on: bool) {
+    let path = state_file();
+    let mut v = read(&path);
+    if v.is_object() {
+        v[DELETE_REMOTE] = on.into();
+        write(&path, &v);
+    }
+}
+
+fn list_at(path: &Path, key: &str, ws: &str) -> Vec<String> {
+    serde_json::from_value(read(path)[key][ws].clone()).unwrap_or_default()
+}
+
+fn set_list_at(path: &Path, key: &str, ws: &str, ids: &[String]) {
+    let mut v = read(path);
+    if !v.is_object() {
+        return; // no state to attach to; a lone key would make state.json unreadable
+    }
+    let mut all: HashMap<String, Vec<String>> =
+        serde_json::from_value(v[key].take()).unwrap_or_default();
+    all.insert(ws.into(), ids.to_vec());
+    // Archived workspaces drop out here.
+    let live: Vec<&str> = v["workspaces"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|w| w["name"].as_str())
+        .collect();
+    all.retain(|k, _| live.contains(&k.as_str()));
+    v[key] = serde_json::to_value(all).unwrap();
+    write(path, &v);
+}
+
 impl State {
     pub fn load() -> State {
-        let path = support_dir().join("state.json");
+        let path = state_file();
         let Ok(bytes) = fs::read(&path) else {
             return State::default();
         };
@@ -239,18 +326,61 @@ impl State {
     }
 
     pub fn save(&self) {
-        let dir = support_dir();
-        let _ = fs::create_dir_all(&dir);
-        let tmp = dir.join("state.json.tmp");
-        if fs::write(&tmp, serde_json::to_vec_pretty(self).unwrap()).is_ok() {
-            let _ = fs::rename(tmp, dir.join("state.json"));
+        self.save_at(&state_file())
+    }
+
+    fn save_at(&self, path: &Path) {
+        let mut v = serde_json::to_value(self).unwrap();
+        let mut old = read(path);
+        for key in [REVIEWED, MERGE_ORDER, DELETE_REMOTE] {
+            let kept = old[key].take();
+            if !kept.is_null() {
+                v[key] = kept;
+            }
         }
+        write(path, &v);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reviewed_ids_survive_saves() {
+        let dir = std::env::temp_dir().join(format!("shark-state-{}", std::process::id()));
+        let path = dir.join("state.json");
+        let state = State {
+            workspaces: vec![ws("a"), ws("b")],
+            ..Default::default()
+        };
+        state.save_at(&path);
+        set_list_at(&path, REVIEWED, "a", &["r1".into()]);
+        set_list_at(&path, REVIEWED, "b", &["r2".into()]);
+        state.save_at(&path); // the app saving its own copy keeps them
+        assert_eq!(list_at(&path, REVIEWED, "a"), ["r1"]);
+        let st: State = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(st.workspaces.len(), 2, "state.json still loads");
+        State {
+            workspaces: vec![ws("a")],
+            ..Default::default()
+        }
+        .save_at(&path);
+        set_list_at(&path, REVIEWED, "a", &["r1".into(), "r3".into()]);
+        assert_eq!(
+            list_at(&path, REVIEWED, "b"),
+            Vec::<String>::new(),
+            "archived"
+        );
+        set_list_at(&path, MERGE_ORDER, "a", &["web".into(), "api".into()]);
+        state.save_at(&path);
+        assert_eq!(
+            list_at(&path, MERGE_ORDER, "a"),
+            ["web", "api"],
+            "side keys survive saves"
+        );
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     /// A pre-tabs workspace keeps its session, model and transcript as its first chat.
     #[test]
