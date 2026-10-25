@@ -2,7 +2,7 @@
 //! next git step is the user's to take ("needs you"). Drives the sidebar row icons, the Dock
 //! badge, OS notifications and the jump to the next such workspace.
 use crate::app::Shark;
-use crate::sync;
+use crate::sync::{self, Repo};
 use gpui_kit::component::WindowExt as _;
 use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 const BG_EVERY: Duration = Duration::from_secs(300);
 /// One workspace per tick, so the checks are spread out instead of all at once.
 const TICK: Duration = Duration::from_secs(20);
-/// After gh failed for two workspaces in a row, nothing is checked for this long.
+/// After gh failed for two workspaces in a row, gh isn't asked for this long.
 const BG_BACKOFF: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug, PartialEq)]
@@ -27,8 +27,9 @@ pub enum Attn {
 #[derive(Default)]
 pub struct Attention {
     unread: HashSet<String>,
-    /// Background checks: when, and the step label if it needs the user.
-    checked: HashMap<String, (Instant, Option<String>)>,
+    /// Background checks: when, the step label if it needs the user, and each repo's state
+    /// (empty until the first check landed).
+    checked: HashMap<String, (Instant, Option<String>, Vec<Repo>)>,
     paused_until: Option<Instant>,
     /// The workspace whose last check failed: one that isn't on GitHub shouldn't pause the rest.
     failed: Option<String>,
@@ -47,6 +48,12 @@ impl Attention {
         }
     }
 
+    /// An archived workspace: a later one with its name starts with nothing known.
+    pub fn forget(&mut self, name: &str) {
+        self.opened(name);
+        self.announced.remove(name);
+    }
+
     /// Opening a workspace reads it; its own GitSync polls from now on.
     pub fn opened(&mut self, name: &str) {
         self.unread.remove(name);
@@ -55,9 +62,6 @@ impl Attention {
 
     /// The workspace to check next: not shown, oldest check first, never-checked before all.
     fn due(&self, names: &[String], active: Option<&str>, now: Instant) -> Option<String> {
-        if self.paused_until.is_some_and(|t| now < t) {
-            return None;
-        }
         names
             .iter()
             .filter(|n| Some(n.as_str()) != active)
@@ -78,34 +82,43 @@ fn poll(cx: &mut Context<Shark>) -> Task<()> {
                     .map(|w| w.name.clone())
                     .filter(|n| !s.busy(n, cx))
                     .collect();
-                let name = s.attn.due(&names, s.active.as_deref(), Instant::now())?;
-                s.state.workspaces.iter().find(|w| w.name == name).cloned()
+                let now = Instant::now();
+                let name = s.attn.due(&names, s.active.as_deref(), now)?;
+                let ws = (s.state.workspaces.iter())
+                    .find(|w| w.name == name)
+                    .cloned()?;
+                let last = (s.attn.checked.get(&name)).map(|c| c.2.clone());
+                // Backing off skips gh only: local git state keeps refreshing.
+                let gh = s.attn.paused_until.is_none_or(|t| now >= t);
+                Some((ws, last.unwrap_or_default(), gh))
             }) else {
                 break;
             };
-            let Some(ws) = next else { continue };
+            let Some((ws, last, gh)) = next else { continue };
             let name = ws.name.clone();
-            let result = cx
+            let (label, repos) = cx
                 .background_executor()
-                .spawn(async move { sync::check_in_background(&ws) })
+                .spawn(async move { sync::check_in_background(&ws, &last, gh) })
                 .await;
             let ok = this.update(cx, |s, cx| {
                 let now = Instant::now();
-                let needs = match result {
-                    Ok(needs) => {
+                let needs = match label {
+                    Ok(l) => {
                         s.attn.failed = None;
-                        needs
+                        l
                     }
                     Err(_) => {
-                        if s.attn.failed.as_ref().is_some_and(|f| *f != name) {
-                            s.attn.paused_until = Some(now + BG_BACKOFF);
+                        if gh {
+                            if s.attn.failed.as_ref().is_some_and(|f| *f != name) {
+                                s.attn.paused_until = Some(now + BG_BACKOFF);
+                            }
+                            s.attn.failed = Some(name.clone());
                         }
-                        s.attn.failed = Some(name.clone());
                         s.attn.checked.get(&name).and_then(|c| c.1.clone())
                     }
                 };
                 if s.active.as_ref() != Some(&name) {
-                    s.attn.checked.insert(name, (now, needs));
+                    s.attn.checked.insert(name, (now, needs, repos));
                 }
                 s.refresh_attention(cx);
             });
@@ -139,13 +152,24 @@ impl Shark {
         if self.busy(name, cx) {
             return None;
         }
-        let own = || self.syncs.get(name)?.read(cx).needs_you();
-        match (
-            self.active.as_deref() == Some(name),
-            self.attn.checked.get(name),
-        ) {
-            (false, Some((_, needs))) => needs.clone(),
-            _ => own(),
+        match self.bg_checked(name) {
+            Some((_, needs, _)) => needs.clone(),
+            None => self.syncs.get(name)?.read(cx).needs_you(),
+        }
+    }
+
+    /// The background check's result, for a workspace other than the open one.
+    fn bg_checked(&self, name: &str) -> Option<&(Instant, Option<String>, Vec<Repo>)> {
+        let open = self.active.as_deref() == Some(name);
+        self.attn.checked.get(name).filter(|_| !open)
+    }
+
+    /// Each repo's local and PR state, for workspaces not opened this session too: the same
+    /// source as `needs_you`. `None` until a probe or background check landed.
+    pub(crate) fn overview_repos<'a>(&'a self, name: &str, cx: &'a App) -> Option<&'a [Repo]> {
+        match self.bg_checked(name) {
+            Some((_, _, repos)) if !repos.is_empty() => Some(repos),
+            _ => self.syncs.get(name)?.read(cx).repos(),
         }
     }
 
@@ -265,7 +289,7 @@ fn notify(_: &str, _: &str) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Attention, BG_EVERY, Instant, TICK};
+    use super::{Attention, BG_EVERY, Instant};
 
     #[test]
     fn checks_are_staggered_and_skip_the_shown_one() {
@@ -273,17 +297,16 @@ mod tests {
         let now = Instant::now() + BG_EVERY * 2;
         let mut at = Attention::default();
         assert_eq!(at.due(&names, Some("a"), now).as_deref(), Some("b"));
-        at.checked.insert("b".into(), (now, None));
+        at.checked.insert("b".into(), (now, None, vec![]));
         assert_eq!(at.due(&names, Some("a"), now).as_deref(), Some("c"));
-        at.checked.insert("c".into(), (now - BG_EVERY, None));
+        at.checked
+            .insert("c".into(), (now - BG_EVERY, None, vec![]));
         assert_eq!(
             at.due(&names, Some("a"), now).as_deref(),
             Some("c"),
             "old enough"
         );
-        at.checked.insert("c".into(), (now, None));
+        at.checked.insert("c".into(), (now, None, vec![]));
         assert_eq!(at.due(&names, Some("a"), now), None, "all fresh");
-        at.paused_until = Some(now + TICK);
-        assert_eq!(at.due(&names, None, now), None, "backing off");
     }
 }

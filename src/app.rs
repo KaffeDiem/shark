@@ -35,6 +35,7 @@ use std::sync::Arc;
 mod chats;
 mod diff;
 mod editor_pane;
+mod home;
 mod media;
 mod menus;
 mod palette;
@@ -155,6 +156,7 @@ enum Pane {
     Diff,
     Editor,
     Tree,
+    Home,
 }
 
 pub struct Shark {
@@ -212,28 +214,70 @@ pub struct Shark {
     pub(crate) attn: crate::attention::Attention,
     /// The open right-click menu, dropped when it dismisses.
     menu: Option<(Entity<menu::Menu>, Subscription)>,
+    /// The latest dependency check; empty until the first one lands.
+    pub(crate) deps: Vec<crate::deps::Dep>,
+    deps_check: Option<Task<()>>,
+    /// When the last dependency check started.
+    deps_at: Option<std::time::Instant>,
+    pub(crate) home: home::Home,
     _subs: Vec<Subscription>,
 }
 
 impl Shark {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let state = State::load();
+        let mut state = State::load();
         crate::prompts::set_overrides(&state.prompts);
         crate::settings::apply(&state.appearance, cx);
         let sidebar_focus = cx.focus_handle();
         sidebar_focus.focus(window, cx);
-        cx.defer_in(window, |s, window, cx| s.restore_last_open(window, cx));
+        let backup = state.corrupt_backup.take();
+        let read_only = state.read_only;
+        // A fresh install has nothing new to announce (Home's What's new line); an update
+        // from before the line existed has workspaces, and does.
+        if state.last_seen_version.is_empty() && state.workspaces.is_empty() {
+            state.last_seen_version = env!("CARGO_PKG_VERSION").into();
+            state.save();
+        }
+        let home = home::Home::new(window, cx);
+        cx.defer_in(window, move |s, window, cx| {
+            s.restore_last_open(window, cx);
+            s.check_deps(cx);
+            let msg = match (backup, read_only) {
+                (Some(bak), _) => Some(format!(
+                    "Couldn't read state.json; moved it to {}",
+                    bak.display()
+                )),
+                (None, true) => Some(
+                    "Couldn't read state.json or move it aside; nothing is saved until you fix it and restart Shark".into(),
+                ),
+                _ => None,
+            };
+            if let Some(msg) = msg {
+                let n = Notification::warning(msg).title("Saved state was reset");
+                window.push_notification(n.autohide(false), cx);
+            }
+        });
         cx.background_executor()
             .spawn(async { media::prune_cache() })
             .detach();
         let _subs = vec![
+            // Keys need a rendered target. A closing dialog gives focus back to what had it
+            // when it opened, which may be gone by then: a closed select's popover, or Home
+            // after what the dialog did (open a workspace) took Home away.
+            cx.on_focus_lost(window, |s, w, cx| s.focus_fallback(w, cx)),
             cx.observe_window_appearance(window, |s, _, cx| {
                 if s.state.appearance.mode == crate::state::Mode::System {
                     crate::settings::apply(&s.state.appearance, cx)
                 }
             }),
-            cx.observe_window_activation(window, |s, w, _| {
-                s.attn.window_active = w.is_window_active()
+            cx.observe_window_activation(window, |s, w, cx| {
+                s.attn.window_active = w.is_window_active();
+                // Back from installing something: check again, but only if anything was missing,
+                // and at most once a minute (the check runs a login shell).
+                let due = s.deps_at.is_none_or(|t| t.elapsed().as_secs() >= 60);
+                if s.attn.window_active && due && crate::deps::fixable(&s.deps) {
+                    s.check_deps(cx)
+                }
             }),
         ];
         Shark {
@@ -276,8 +320,31 @@ impl Shark {
             sidebar_focus,
             attn: crate::attention::Attention::new(cx),
             menu: None,
+            deps: vec![],
+            deps_check: None,
+            deps_at: None,
+            home,
             _subs,
         }
+    }
+
+    /// Runs `deps::check` in the background and stores the result.
+    fn check_deps(&mut self, cx: &mut Context<Self>) {
+        if cfg!(test) || self.deps_check.is_some() {
+            return; // the UI tests don't spawn gh; one check at a time
+        }
+        self.deps_at = Some(std::time::Instant::now());
+        self.deps_check = Some(cx.spawn(async move |this, cx| {
+            let deps = (cx.background_executor())
+                .spawn(async { crate::deps::check() })
+                .await;
+            this.update(cx, |s, cx| {
+                s.deps = deps;
+                s.deps_check = None;
+                cx.notify()
+            })
+            .ok();
+        }));
     }
 
     fn show_menu(
@@ -336,6 +403,7 @@ impl Shark {
 
     fn show(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
         self.tab = tab;
+        self.home.on = false;
         self.remember_open();
         match tab {
             Tab::Chat => {
@@ -373,6 +441,10 @@ impl Shark {
 
     fn panes(&self, cx: &App) -> Vec<Pane> {
         let mut v = vec![Pane::Sidebar];
+        if self.home_shown() {
+            v.push(Pane::Home);
+            return v;
+        }
         match self.tab {
             Tab::Chat => {
                 v.push(Pane::Chat);
@@ -395,6 +467,9 @@ impl Shark {
         }
         if self.tree_focus.is_focused(window) {
             return Some(Pane::Tree);
+        }
+        if self.home_shown() {
+            return self.home.has_focus(window, cx).then_some(Pane::Home);
         }
         if self
             .editor
@@ -424,6 +499,7 @@ impl Shark {
         match pane {
             Pane::Sidebar => self.sidebar_focus.focus(window, cx),
             Pane::Tree => self.tree_focus.focus(window, cx),
+            Pane::Home => self.home.focus.focus(window, cx),
             Pane::Diff => self.diff.read(cx).focus_handle(cx).focus(window, cx),
             Pane::Chat => {
                 if let Some(chat) = self.active_chat() {
@@ -455,7 +531,7 @@ impl Shark {
             None if delta < 0 => 0,
             None => 1.min(panes.len() - 1),
         };
-        if panes[to] == Pane::Sidebar || self.active.is_some() {
+        if panes[to] != Pane::Chat || self.active.is_some() {
             self.focus_pane(panes[to], window, cx);
         }
     }
@@ -478,46 +554,11 @@ impl Shark {
     }
 
     fn render_main(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(chat) = self.active_chat().cloned().filter(|_| !self.home_shown()) else {
+            return self.render_home(window, cx);
+        };
         let chat_tabs = self.render_chat_tabs(cx);
         let theme = cx.theme();
-        let Some(chat) = self.active_chat().cloned() else {
-            let tip = |keys: Vec<Kbd>, label: &'static str| {
-                h_flex()
-                    .gap_2()
-                    .child(h_flex().gap_1().children(keys))
-                    .child(label)
-            };
-            return v_flex()
-                .flex_1()
-                .size_full()
-                .items_center()
-                .justify_center()
-                .gap_3()
-                .text_color(theme.muted_foreground)
-                .child(
-                    Icon::new(IconName::Fish)
-                        .with_size(px(32.))
-                        .text_color(faint(theme)),
-                )
-                .child(
-                    div()
-                        .text_base()
-                        .text_color(theme.foreground)
-                        .child("No workspace open"),
-                )
-                .child(
-                    v_flex()
-                        .gap_1p5()
-                        .text_sm()
-                        .child(tip(
-                            vec![kbd("up"), kbd("down"), kbd("enter")],
-                            "open from sidebar",
-                        ))
-                        .child(tip(vec![kbd("cmd-n")], "new workspace"))
-                        .child(tip(vec![kbd("cmd-k")], "every command, like Add repo")),
-                )
-                .into_any_element();
-        };
         let tab = |label: String, icon: IconName, t: Tab| {
             pill(label.clone(), self.tab == t, theme)
                 .px_2p5()
@@ -676,13 +717,14 @@ impl Render for Shark {
             .font_features(inter_features())
             .on_action(cx.listener(|this, _: &TogglePalette, w, cx| this.toggle_palette(w, cx)))
             .on_action(cx.listener(|this, _: &NewWorkspace, w, cx| {
-                this.new_workspace(this.state.last_repos.clone(), w, cx)
+                this.new_workspace(this.state.last_repos.clone(), None, w, cx)
             }))
             .on_action(cx.listener(|this, _: &ArchiveWorkspace, w, cx| this.archive(false, w, cx)))
             .on_action(
                 cx.listener(|this, _: &ForceArchiveWorkspace, w, cx| this.archive(true, w, cx)),
             )
             .on_action(cx.listener(|this, _: &AddRepo, w, cx| this.add_repo(w, cx)))
+            .on_action(cx.listener(|this, _: &ToggleHome, w, cx| this.toggle_home(w, cx)))
             .on_action(cx.listener(|this, _: &AddRepoToWorkspace, w, cx| {
                 this.pick_repo_for_workspace(w, cx)
             }))
@@ -727,9 +769,11 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &ApprovePlan, w, cx| {
                 this.with_plan(w, cx, |c, w, cx| c.approve_plan(w, cx))
             }))
-            .on_action(cx.listener(|this, _: &BuildPlanInNewChat, w, cx| {
-                this.build_plan_in_new_chat(w, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &BuildPlanInNewChat, w, cx| {
+                    this.build_plan_in_new_chat(w, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &RevealInFinder, w, cx| {
                 this.with_target(w, cx, |ws, _, cx| cx.reveal_path(&ws.dir()))
             }))

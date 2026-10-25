@@ -365,7 +365,7 @@ fn full_input(input: &Value) -> String {
 }
 
 /// Keys (space-separated) and what they do, for a hint row.
-fn hint(keys: &str, label: &'static str) -> Div {
+pub(crate) fn hint(keys: &str, label: &'static str) -> Div {
     h_flex()
         .gap_1()
         .children(
@@ -1122,16 +1122,27 @@ impl Chat {
     /// Sends a host-written prompt (git steps). A draft in the composer rides along as extra
     /// instructions, so "Commit and push" can carry "…and mention the ticket".
     pub fn ask(&mut self, prompt: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let draft = self.composer.read(cx).value().trim().to_string();
+        let mut draft = self.composer.read(cx).value().trim().to_string();
+        // The same prompt put back below after a failed start: retrying must not send it twice.
+        if draft == prompt.trim() {
+            draft.clear();
+        }
         let text = match draft.is_empty() {
             true => prompt.to_string(),
             false => format!("{prompt}\n\nAlso: {draft}"),
         };
-        let sent = self.send_text(text, false, cx);
+        let sent = self.send_text(text.clone(), false, cx);
         if sent && !draft.is_empty() {
             self.editing = None;
             self.composer
                 .update(cx, |c, cx| c.set_value("", window, cx));
+        }
+        // The agent didn't start (refusals keep `hold`/`archiving` set): a new chat's first
+        // message, e.g. from New workspace, goes back to the composer instead of being lost.
+        let failed = !sent && self.agent.is_none() && !self.hold && !self.archiving;
+        if failed && draft.is_empty() && self.meta.session_id.is_none() {
+            self.composer
+                .update(cx, |c, cx| c.set_value(text, window, cx));
         }
         sent
     }
@@ -1179,7 +1190,11 @@ impl Chat {
                     self.reader = Some(Self::read_events(rx, Self::apply, cx));
                 }
                 Err(e) => {
-                    self.push(Block::Info(format!("failed to start the agent: {e}")), cx);
+                    let codex = crate::codex::is_codex(self.meta.model.as_deref());
+                    let prog = if codex { "codex" } else { "claude" };
+                    let why = crate::git::spawn_err(&self.ws.dir(), prog, e);
+                    let msg = format!("Couldn't start the agent: {why}. See Home for setup.");
+                    self.push(Block::Info(msg), cx);
                     return false;
                 }
             }
@@ -2254,6 +2269,26 @@ impl Render for Chat {
                         this.focus_composer(window, cx)
                     }))
                     .child(rows)
+                    .when(self.blocks.is_empty(), |d| {
+                        d.child(
+                            v_flex()
+                                .absolute()
+                                .inset_0()
+                                .items_center()
+                                .justify_center()
+                                .gap_2()
+                                .text_sm()
+                                .text_color(crate::app::faint(theme))
+                                .child("Describe a task and press enter.")
+                                .child(hint("shift-tab", "plan mode"))
+                                .child(
+                                    h_flex()
+                                        .gap_3()
+                                        .child(hint("c", "comment on a diff line"))
+                                        .child(hint("shift-c", "send comments")),
+                                ),
+                        )
+                    })
                     .vertical_scrollbar(&self.list),
             )
             .child(
@@ -2540,7 +2575,7 @@ mod tests {
 }
 
 #[cfg(all(test, feature = "test-support"))]
-mod ui_tests {
+pub(crate) mod ui_tests {
     use super::*;
 
     /// Feeds recorded protocol lines to the chat as its process would.
@@ -2555,10 +2590,10 @@ mod ui_tests {
     use gpui_kit::InputEvent as _;
     use gpui_kit::test::TestWindowExt as _;
 
-    /// A claude stand-in that swallows stdin. Side questions on a session (`--fork-session`)
-    /// get a canned answer, and their args are written next to the script.
+    /// A claude stand-in that swallows stdin. Side questions and Ask Shark (both
+    /// `--no-session-persistence`) get a canned answer, and their args are written next to it.
     const FAKE: &str = r#"#!/bin/sh
-case "$*" in *--fork-session*)
+case "$*" in *--no-session-persistence*)
   echo "$*" > "$0.args"
   read line
   echo '{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"Forty"}},"parent_tool_use_id":null}'
@@ -2570,7 +2605,7 @@ exec cat >/dev/null
 
     /// Installs the script once for the whole test run: tests run in parallel, and one must
     /// never exec a script another is still writing.
-    fn fake_claude() -> std::path::PathBuf {
+    pub(crate) fn fake_claude() -> std::path::PathBuf {
         static FAKE_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
         FAKE_PATH
             .get_or_init(|| {
@@ -2631,6 +2666,95 @@ exec cat >/dev/null
         );
         assert!(args.contains("--no-session-persistence"), "{args}");
         assert!(!agent::transcript_path(&meta.id).exists(), "no transcript");
+        let _ = std::fs::remove_file(ws.dir());
+    }
+
+    /// Ask Shark: a one-shot claude with the docs as its system prompt, no tools, saved nowhere.
+    #[test]
+    fn ask_process() {
+        let fake = fake_claude();
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (mut a, rx) = agent::spawn_ask(Some("haiku"), "the docs").unwrap();
+        a.send("what is x?").unwrap();
+        let mut text = String::new();
+        while let Ok(ev) = rx.recv_blocking() {
+            match ev {
+                Ev::Text(t) => text = t,
+                Ev::Result { .. } => break,
+                Ev::Exited(e) => panic!("{e}"),
+                _ => {}
+            }
+        }
+        assert_eq!(text, "Forty-two");
+        let args = std::fs::read_to_string(fake.with_extension("args")).unwrap();
+        assert!(args.contains("--model haiku"), "{args}");
+        assert!(
+            args.contains(
+                "--tools  --strict-mcp-config --safe-mode --no-session-persistence"
+            ),
+            "{args}"
+        );
+        assert!(args.contains("--append-system-prompt the docs"), "{args}");
+        assert!(!args.contains("--resume"), "{args}");
+    }
+
+    /// claude missing: the first message goes back to the composer and the error is readable.
+    #[gpui_kit::test]
+    fn first_message_survives_a_missing_claude(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let fake = fake_claude();
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct Restore(std::path::PathBuf);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: tests that spawn claude hold UI_LOCK, as this one does.
+                unsafe { std::env::set_var("SHARK_CLAUDE", &self.0) };
+            }
+        }
+        let _restore = Restore(fake);
+        // SAFETY: as above.
+        unsafe { std::env::set_var("SHARK_CLAUDE", "/nonexistent") };
+        let root = std::env::temp_dir().join(format!("shark-noclaude-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let ws = Workspace {
+            name: format!("noclaude-test-{}", std::process::id()),
+            ..Default::default()
+        };
+        let meta = ChatMeta {
+            id: ws.name.clone(),
+            ..Default::default()
+        };
+        std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
+        let _ = std::fs::remove_file(ws.dir());
+        std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
+        let (window, chat) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| Chat::new(ws.clone(), meta, false, w, cx))
+                })
+            })
+            .unwrap();
+        cx.update_window(window, |_, w, cx| {
+            let sent = chat.update(cx, |c, cx| c.ask("build the thing", w, cx));
+            assert!(!sent);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            let c = chat.read(cx);
+            assert_eq!(c.composer.read(cx).value().as_ref(), "build the thing");
+            let info = c.blocks.iter().find_map(|b| match b {
+                Block::Info(t) => Some(t.as_str()),
+                _ => None,
+            });
+            assert_eq!(
+                info,
+                Some("Couldn't start the agent: claude not found on PATH. See Home for setup.")
+            );
+        });
         let _ = std::fs::remove_file(ws.dir());
     }
 

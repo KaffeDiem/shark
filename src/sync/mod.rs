@@ -2,7 +2,7 @@
 //! and runs the next step toward a merged PR. `status` decides what that step is; this file
 //! polls, renders and executes. The app only embeds the entity and forwards three actions.
 mod status;
-pub use status::{Kind, github_url};
+pub use status::{Kind, PrState, Repo, ago, github_url};
 
 use crate::app::{inter_features, notify_err, open_menu};
 use crate::menu::{self, Entry};
@@ -21,8 +21,7 @@ use gpui_kit::component::{ActiveTheme, Disableable as _, Icon, Sizable as _, Win
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use status::{
-    Action, Local, Pr, Repo, ago, among, diverged, fetch_pr, next_action, pr_head_moved,
-    pr_settling, probe,
+    Action, Local, Pr, among, diverged, fetch_pr, next_action, pr_head_moved, pr_settling, probe,
 };
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -46,6 +45,8 @@ const FETCH_MOVED: Duration = Duration::from_secs(30);
 
 pub enum SyncEvent {
     Archive,
+    /// Create PRs succeeded.
+    PrsCreated,
 }
 
 pub struct GitSync {
@@ -152,18 +153,47 @@ fn run_job(job: &Job) -> Probed {
 /// (red CI, a review, conflicts) without opening it. It never fetches: that would fight the
 /// agent for refs, and what changes while nobody looks is GitHub's answer.
 ///
-/// Blocking: one `git status` and one `gh pr list` per repo, in parallel, each with its timeout.
-/// `Ok(label)` names the step when it is the user's to take; `Err` when gh failed for any repo
-/// (offline, logged out, rate limited), so the caller keeps the last answer and may back off.
-pub fn check_in_background(ws: &Workspace) -> Result<Option<String>, String> {
-    let p = run_job(&Job::prs(ws));
-    let prs = p.prs.unwrap_or_default();
-    if let Some(Err(e)) = prs.iter().find(|p| p.is_err()) {
-        return Err(e.clone());
+/// Blocking: one `git status` and, when `gh`, one `gh pr list` per repo, in parallel, each with
+/// its timeout. Returns the label (it names the step when it is the user's to take) and each
+/// repo's state. The local state is always fresh; a PR gh didn't give keeps `last`'s. The label
+/// is `Err` when gh wasn't asked or failed for any repo (offline, logged out, not GitHub), so
+/// the caller keeps the last label and may back off.
+pub fn check_in_background(
+    ws: &Workspace,
+    last: &[Repo],
+    gh: bool,
+) -> (Result<Option<String>, String>, Vec<Repo>) {
+    let p = run_job(&Job {
+        pr: gh,
+        ..Job::prs(ws)
+    });
+    background_answer(ws, p.locals, p.prs, last)
+}
+
+fn background_answer(
+    ws: &Workspace,
+    locals: Vec<Result<Local, String>>,
+    prs: Option<Vec<Result<Option<Pr>, String>>>,
+    last: &[Repo],
+) -> (Result<Option<String>, String>, Vec<Repo>) {
+    let failed = match &prs {
+        None => Some("GitHub not asked".to_string()),
+        Some(prs) => prs.iter().find_map(|p| p.as_ref().err().cloned()),
+    };
+    let prs = (prs.into_iter().flatten().map(Some)).chain(std::iter::repeat(None));
+    let mut repos = repos_from(ws, locals, prs);
+    for r in &mut repos {
+        let prev = (last.iter().find(|l| l.name == r.name)).and_then(|l| l.pr.clone());
+        r.pr = fresh_or_last(r.pr.as_ref(), &prev);
     }
-    let repos = repos_from(ws, p.locals, prs.into_iter().map(Some));
-    let a = next_action(&repos, &ws.branch, &crate::state::reviewed(&ws.name));
-    Ok(needs_you(&a).then_some(a.label))
+    let label = match failed {
+        Some(e) => Err(e),
+        None => {
+            let a = next_action(&repos, &ws.branch, &crate::state::reviewed(&ws.name));
+            Ok(needs_you(&a).then_some(a.label))
+        }
+    };
+    (label, repos)
 }
 
 /// Something is wrong (conflicts, failing checks, a git error), a review waits, or it can merge.
@@ -621,6 +651,9 @@ impl GitSync {
                         }
                     }
                     Ok((a, Outcome::Done(msg))) => {
+                        if creates {
+                            cx.emit(SyncEvent::PrsCreated);
+                        }
                         // The composer text became the PR title; clear it unless it was edited since.
                         if let Some(chat) =
                             title_chat.filter(|_| creates && !composer.trim().is_empty())
@@ -722,6 +755,11 @@ impl GitSync {
                     .then(|| (r.name.clone(), l.head.clone()))
             })
             .collect()
+    }
+
+    /// Each repo's state, once the first probe landed.
+    pub fn repos(&self) -> Option<&[Repo]> {
+        self.action.as_ref().map(|_| &self.repos[..])
     }
 
     /// The shown workspace's own answer to `check_in_background`, from its faster polling.
@@ -1201,7 +1239,7 @@ impl Render for GitSync {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, Kind, Pr, fresh_or_last, needs_you};
+    use super::{Action, Kind, Local, Pr, background_answer, fresh_or_last, needs_you};
 
     #[test]
     fn what_needs_you() {
@@ -1228,5 +1266,32 @@ mod tests {
         assert_eq!(fresh_or_last(Some(&err), &None), Some(err.clone()));
         let pr: Result<Option<Pr>, String> = Ok(None);
         assert_eq!(fresh_or_last(Some(&pr), &Some(err)), Some(pr));
+    }
+
+    #[test]
+    fn failed_gh_keeps_the_local_state() {
+        let ws = crate::state::Workspace {
+            name: "ws".into(),
+            repos: vec![crate::state::WsRepo {
+                name: "api".into(),
+                src: "/x".into(),
+                base: "origin/main".into(),
+            }],
+            ..Default::default()
+        };
+        let local = || {
+            vec![Ok(Local {
+                changed: 3,
+                ..Default::default()
+            })]
+        };
+        let err = Err("logged out".to_string());
+        let (label, repos) = background_answer(&ws, local(), Some(vec![err.clone()]), &[]);
+        assert!(label.is_err(), "the caller keeps the last label");
+        assert_eq!(repos[0].local.as_ref().map(|l| l.changed), Ok(3));
+        assert_eq!(repos[0].pr, Some(err));
+        let (label, repos) = background_answer(&ws, local(), None, &repos);
+        assert!(label.is_err(), "gh not asked");
+        assert!(matches!(repos[0].pr, Some(Err(_))), "the last PR stays");
     }
 }

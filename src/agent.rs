@@ -8,12 +8,13 @@ use std::{
     borrow::Cow,
     fs::{self, File, OpenOptions},
     io::{BufRead, BufReader, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
     process::{ChildStdin, Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
     },
+    time::SystemTime,
 };
 
 // ponytail: bypass because headless -p denies anything needing approval; add a host permission prompt in M2
@@ -163,16 +164,73 @@ pub fn transcript_path(chat: &str) -> PathBuf {
         .join(format!("{chat}.jsonl"))
 }
 
+/// When any of the workspace's chats last wrote to its transcript. Reads file metadata.
+pub(crate) fn last_activity(ws: &Workspace) -> Option<SystemTime> {
+    (ws.chats.iter())
+        .filter_map(|c| fs::metadata(transcript_path(&c.id)).ok()?.modified().ok())
+        .max()
+}
+
+pub const PLAN_TO_APPROVE: &str = "Plan to approve";
+pub const QUESTION: &str = "Question to answer";
+
+/// What one of the workspace's chats waits on the user for, by how its last turn ended: a plan
+/// to approve before a question. `None` while a turn runs. Reads each chat's transcript tail
+/// and plans: call it off the UI thread.
+pub(crate) fn waiting_on_user(ws: &Workspace) -> Option<&'static str> {
+    (ws.chats.iter())
+        .filter_map(|c| {
+            let plan = c.plan && crate::plan::unapproved(&c.id);
+            waiting(&read_tail(&transcript_path(&c.id)), plan)
+        })
+        .min_by_key(|l| *l != PLAN_TO_APPROVE)
+}
+
+/// How a chat's events end: a finished turn, with a plan pending or a question in its last text.
+fn waiting(evs: &[Ev], plan: bool) -> Option<&'static str> {
+    let (mut text, mut ended) = ("", false);
+    for ev in evs {
+        match ev {
+            Ev::User(_) | Ev::Init { .. } => (text, ended) = ("", false),
+            Ev::ToolUse { .. } | Ev::Interrupted => text = "",
+            Ev::Text(t) => text = t,
+            Ev::Result { is_error, .. } => ended = !is_error,
+            _ => {}
+        }
+    }
+    let asks = text.trim_end().trim_end_matches(['*', '_']).ends_with('?');
+    if !ended {
+        None
+    } else if plan {
+        Some(PLAN_TO_APPROVE)
+    } else {
+        asks.then_some(QUESTION)
+    }
+}
+
+/// The last events of a transcript, enough for its last turn's end.
+fn read_tail(path: &Path) -> Vec<Ev> {
+    let len = fs::metadata(path).map_or(0, |m| m.len());
+    // The result line repeats the final text, so the window holds two copies of it.
+    read_range(path, len.saturating_sub(128 * 1024), len)
+}
+
 /// Events stored in a transcript, up to `len` bytes: lines written after that belong to a
 /// process started while this was read, and arrive live.
 pub fn read_history(path: &PathBuf, len: u64) -> Vec<Ev> {
-    use std::io::Read as _;
+    read_range(path, 0, len)
+}
+
+fn read_range(path: &Path, start: u64, end: u64) -> Vec<Ev> {
+    use std::io::{Read as _, Seek as _, SeekFrom};
     let mut buf = vec![];
-    if let Ok(f) = File::open(path) {
-        let _ = f.take(len).read_to_end(&mut buf);
+    if let Ok(mut f) = File::open(path) {
+        let _ = f.seek(SeekFrom::Start(start));
+        let _ = f.take(end.saturating_sub(start)).read_to_end(&mut buf);
     }
-    String::from_utf8_lossy(&buf)
-        .lines()
+    // Read from the middle of the file: the first line is cut, drop it.
+    (String::from_utf8_lossy(&buf).lines())
+        .skip(usize::from(start > 0))
         .flat_map(parse)
         .collect()
 }
@@ -193,8 +251,8 @@ pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receive
     // Tools that need a person (ExitPlanMode, AskUserQuestion) ask us instead of failing.
     let prompts = ["--permission-prompt-tool", "stdio"];
     run(
-        ws,
-        chat,
+        &ws.dir(),
+        chat.model.as_deref(),
         &chat.id,
         prompts.into_iter().chain(resume),
         Some(transcript_path(&chat.id)),
@@ -224,17 +282,38 @@ pub fn spawn_side(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Re
         SIDE_PROMPT,
     ];
     run(
-        ws,
-        chat,
+        &ws.dir(),
+        chat.model.as_deref(),
         &format!("{}.side", chat.id),
         args.into_iter().chain(fork),
         None,
     )
 }
 
+/// Shark's user docs, for answering questions about the app itself.
+pub const README: &str = include_str!("../README.md");
+
+/// A one-shot question about Shark, outside any workspace: no tools, no MCP, saved nowhere.
+/// `system` is appended to claude's system prompt (e.g. `README` and the keymap).
+pub fn spawn_ask(model: Option<&str>, system: &str) -> std::io::Result<(Agent, Receiver<Ev>)> {
+    let args = [
+        "--tools",
+        "",
+        "--strict-mcp-config",
+        // No user hooks, skills, plugins or CLAUDE.md (`claude --help`, 2.1.309).
+        // Not `--setting-sources ""`: that also drops auth set in settings.json (apiKeyHelper,
+        // env), which --safe-mode keeps.
+        "--safe-mode",
+        "--no-session-persistence",
+        "--append-system-prompt",
+        system,
+    ];
+    run(&support_dir(), model, "ask", args, None)
+}
+
 fn run<'a>(
-    ws: &Workspace,
-    chat: &ChatMeta,
+    cwd: &Path,
+    model: Option<&str>,
     log_name: &str,
     extra: impl IntoIterator<Item = &'a str>,
     transcript: Option<PathBuf>,
@@ -257,18 +336,18 @@ fn run<'a>(
         "--permission-mode",
         PERMISSION_MODE,
     ]);
-    if let Some(m) = &chat.model {
+    if let Some(m) = model {
         cmd.args(["--model", m]);
     }
     cmd.args(extra);
-    start(cmd, ws, log_name, transcript, None)
+    start(cmd, cwd, log_name, transcript, None)
 }
 
-/// Starts `cmd` in the workspace and turns its stdout lines into `Ev`s, storing them in
+/// Starts `cmd` in `cwd` and turns its stdout lines into `Ev`s, storing them in
 /// `transcript`. `codex` holds a `codex app-server`'s state, which the reader keeps current.
 pub(crate) fn start(
     mut cmd: Command,
-    ws: &Workspace,
+    cwd: &Path,
     log_name: &str,
     transcript: Option<PathBuf>,
     codex: Option<Arc<Mutex<codex::State>>>,
@@ -278,7 +357,7 @@ pub(crate) fn start(
     fs::create_dir_all(support_dir().join("transcripts"))?;
     let log = logs.join(format!("{log_name}.stderr.log"));
     let mut child = cmd
-        .current_dir(ws.dir())
+        .current_dir(cwd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(File::create(&log)?) // a piped but unread stderr could block the child
@@ -502,6 +581,70 @@ fn blocks_of(v: &Value) -> impl Iterator<Item = &Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn waiting_on_user_by_how_the_turn_ended() {
+        let done = |is_error| Ev::Result {
+            is_error,
+            text: String::new(),
+            cost: 0.,
+            secs: 0,
+        };
+        let turn = |text: &str| vec![Ev::User("go".into()), Ev::Text(text.into()), done(false)];
+        assert_eq!(waiting(&turn("Shall I push it?"), false), Some(QUESTION));
+        assert_eq!(waiting(&turn("Want **both**?**"), false), Some(QUESTION));
+        assert_eq!(waiting(&turn("Done."), false), None);
+        assert_eq!(waiting(&turn("Plan's up?"), true), Some(PLAN_TO_APPROVE));
+        let mut running = turn("Shall I?");
+        running.push(Ev::User("yes".into()));
+        assert_eq!(waiting(&running, true), None, "a turn runs");
+        let mut follow_up = turn("Continue?");
+        follow_up.push(Ev::Init {
+            session_id: "s".into(),
+            model: "m".into(),
+            permission_mode: "p".into(),
+            mcp: vec![],
+        });
+        assert_eq!(waiting(&follow_up, false), None, "an automatic turn runs");
+        let failed = vec![Ev::Text("Why?".into()), done(true)];
+        assert_eq!(waiting(&failed, false), None);
+        let tooled = vec![
+            Ev::Text("Look?".into()),
+            Ev::ToolUse {
+                id: "t".into(),
+                name: "Read".into(),
+                input: Value::Null,
+            },
+            done(false),
+        ];
+        assert_eq!(
+            waiting(&tooled, false),
+            None,
+            "the question wasn't its last word"
+        );
+    }
+
+    #[test]
+    fn read_tail_drops_a_cut_line() {
+        let path = std::env::temp_dir().join(format!("shark-tail-{}.jsonl", std::process::id()));
+        // The tail starts inside this line; a cut user line must not reset the turn.
+        let long = format!(
+            r#"{{"type":"user","message":{{"role":"user","content":"{}"}}}}"#,
+            "x".repeat(160 * 1024)
+        );
+        let turn = [
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Shall I push?"}]}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"","total_cost_usd":0,"duration_ms":1}"#,
+        ];
+        fs::write(&path, format!("{long}\n{}\n", turn.join("\n"))).unwrap();
+        let evs = read_tail(&path);
+        assert!(!evs.iter().any(|e| matches!(e, Ev::User(_))), "{evs:?}");
+        assert_eq!(waiting(&evs, false), Some(QUESTION));
+        // Short files are read whole, first line included.
+        fs::write(&path, turn.join("\n")).unwrap();
+        assert_eq!(read_tail(&path).len(), 2);
+        fs::remove_file(&path).ok();
+    }
 
     // Recorded from claude 2.1.309, trimmed.
     const SESSION: &str = r#"{"type": "system", "subtype": "hook_started", "session_id": "s1"}
