@@ -92,9 +92,41 @@ impl Shark {
         self.publish(&[c], "", review, window, cx);
     }
 
-    /// Posts `comments` (with `note`) to their PR in the background: a review, else a reviewer
-    /// note. Each gets the URL; a failure says so and leaves them as they were.
+    /// Posts `comments` (with `note`) to their repos' PRs in the background, one post per
+    /// repo: a review, else a reviewer note. Each gets its URL; a failure, or a repo without
+    /// a PR, says so and leaves its comments as they were.
     pub(super) fn publish(
+        &mut self,
+        comments: &[Comment],
+        note: &str,
+        review: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let mut repos: Vec<&str> = vec![];
+        for c in comments {
+            let repo = c.path.split('/').next().unwrap_or_default();
+            if !repos.contains(&repo) {
+                repos.push(repo);
+            }
+        }
+        for repo in repos {
+            let group: Vec<Comment> = (comments.iter())
+                .filter(|c| c.path.split('/').next() == Some(repo))
+                .cloned()
+                .collect();
+            self.publish_repo(&group, note, review, window, cx);
+        }
+    }
+
+    /// The dialog is about one of `ids`, in workspace `ws`: it shows their post.
+    fn shares(&self, ws: &str, ids: &[u64]) -> bool {
+        self.active.as_deref() == Some(ws)
+            && (self.review.share.as_ref()).is_some_and(|sh| ids.contains(&sh.id))
+    }
+
+    /// `publish` for comments of one repo.
+    fn publish_repo(
         &mut self,
         comments: &[Comment],
         note: &str,
@@ -105,11 +137,11 @@ impl Shark {
         let (Some(first), Some(ws)) = (comments.first(), self.active_ws()) else {
             return;
         };
-        let Some((pr, pushed)) = self.pr_of(first, cx) else {
-            return notify_err(window, cx, "No open PR to publish to");
-        };
         let repo = first.path.split('/').next().unwrap_or_default();
-        let wt = ws.dir().join(repo);
+        let Some((pr, pushed)) = self.pr_of(first, cx) else {
+            return notify_err(window, cx, format!("{repo} has no open PR to publish to"));
+        };
+        let (wt, ws_name) = (ws.dir().join(repo), ws.name.clone());
         // A review of pushed lines sits on them; anything else goes as path and excerpt.
         // ponytail: one thread at a time; the sheet's multi-comment review stays text.
         let inline = (review && pushed && comments.len() == 1 && self.on_its_line(first))
@@ -120,7 +152,9 @@ impl Shark {
             None => github_body(comments, note),
         };
         let ids: Vec<u64> = comments.iter().map(|c| c.id).collect();
-        if let Some(s) = &mut self.review.share {
+        if self.shares(&ws_name, &ids)
+            && let Some(s) = &mut self.review.share
+        {
             s.posting = true;
             s.error = None;
         }
@@ -136,34 +170,34 @@ impl Shark {
                     }
                 })
                 .await;
-            this.update_in(cx, |s, window, cx| match res {
-                Ok(url) => {
-                    s.edit_comments(cx, |l| {
-                        for c in l.iter_mut().filter(|c| ids.contains(&c.id)) {
-                            c.github = Some(url.clone());
+            this.update_in(cx, |s, window, cx| {
+                let ours = s.shares(&ws_name, &ids);
+                match res {
+                    Ok(url) => {
+                        // Into the workspace they came from, even if another one is open now.
+                        s.review.edit(&ws_name, |l| {
+                            for c in l.iter_mut().filter(|c| ids.contains(&c.id)) {
+                                c.github = Some(url.clone());
+                            }
+                        });
+                        if ours {
+                            s.close_share(window, cx);
                         }
-                    });
-                    if s.review
-                        .share
-                        .as_ref()
-                        .is_some_and(|sh| ids.contains(&sh.id))
-                    {
-                        s.close_share(window, cx);
+                        window.push_notification("Posted to GitHub", cx);
                     }
-                    window.push_notification("Posted to GitHub", cx);
-                }
-                Err(e) => {
-                    if let Some(sh) = &mut s.review.share {
-                        sh.posting = false;
-                        sh.error = Some(e.clone());
+                    Err(e) => {
+                        if ours && let Some(sh) = &mut s.review.share {
+                            sh.posting = false;
+                            sh.error = Some(e.clone());
+                        }
+                        notify_err(
+                            window,
+                            cx,
+                            format!("GitHub post failed; the comment is kept: {e}"),
+                        );
                     }
-                    notify_err(
-                        window,
-                        cx,
-                        format!("GitHub post failed; the comment is kept: {e}"),
-                    );
-                    cx.notify();
                 }
+                cx.notify();
             })
             .ok();
         })

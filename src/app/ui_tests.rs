@@ -2635,6 +2635,49 @@ async fn review_queue(cx: &mut TestAppContext) {
         assert!(err.contains("gh: offline"), "{err}");
         assert_eq!(s.comment(1).unwrap().github, None);
     });
+    // The sheet publishes per repo: api's comment to api's PR; web has none, so its comment
+    // stays unshared. The URL lands in the workspace the post came from, though another
+    // one is open by the time gh answers.
+    fs::remove_file(&fail).unwrap();
+    fs::write(&log, "").unwrap();
+    let ws = cx.update(|cx| shark.read(cx).active.clone().unwrap());
+    on(cx, &|s, w, cx| {
+        s.close_share(w, cx);
+        let web: review::Comment = serde_json::from_str(
+            r#"{"id":99,"path":"web/x","start":[false,1],"end":[false,1],"text":"web note"}"#,
+        )
+        .unwrap();
+        s.edit_comments(cx, |l| l.push(web));
+        let both = [
+            s.comment(1).cloned().unwrap(),
+            s.comment(99).cloned().unwrap(),
+        ];
+        s.publish(&both, "", false, w, cx);
+        s.active = Some("elsewhere".into());
+    });
+    let github_in = |cx: &mut TestAppContext, id: u64| {
+        cx.update(|cx| {
+            let l = &shark.read(cx).review.comments[&ws];
+            l.iter().find(|c| c.id == id).unwrap().github.clone()
+        })
+    };
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).review.comments[&ws][0].github.is_some()
+    })
+    .await;
+    assert!(github_in(cx, 1).is_some());
+    assert_eq!(github_in(cx, 99), None);
+    let argv = fs::read_to_string(&log).unwrap();
+    assert_eq!(argv.matches("pr|comment|").count(), 1, "{argv}");
+    assert!(
+        argv.contains("**api/f**") && !argv.contains("web note"),
+        "{argv}"
+    );
+    cx.update(|cx| assert!(!shark.read(cx).review.comments.contains_key("elsewhere")));
+    on(cx, &|s, _, cx| {
+        s.active = Some(ws.clone());
+        s.edit_comments(cx, |l| l.retain(|c| c.id != 99));
+    });
     unsafe { std::env::remove_var("SHARK_GH") };
     on(cx, &|s, w, cx| s.close_share(w, cx));
 
