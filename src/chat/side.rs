@@ -106,7 +106,14 @@ impl Chat {
         let Some(side) = &mut self.side else { return };
         match ev {
             Ev::User(_) => side.asked = true,
-            Ev::TextDelta(_) | Ev::Text(_) | Ev::Result { .. } if !side.asked => return,
+            // An error before the echo (a missing session) is about the question too; keep it.
+            Ev::TextDelta(_)
+            | Ev::Text(_)
+            | Ev::Result {
+                is_error: false, ..
+            } if !side.asked => {
+                return;
+            }
             Ev::TextDelta(d) => {
                 side.text.push_str(&d);
                 side.answer.update(cx, |m, cx| m.push_str(&d, cx));

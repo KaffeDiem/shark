@@ -1811,6 +1811,24 @@ exec cat >/dev/null
             assert!(c.side.is_none());
             assert_eq!(c.composer.read(cx).value().as_ref(), "Forty-two");
         });
+
+        // An error before the echo (the fork's session is gone) still ends the card with it.
+        act(cx, &|w, cx| w.press("cmd-shift-enter", cx));
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.apply_side(
+                    Ev::Result {
+                        is_error: true,
+                        text: "No conversation found".into(),
+                        cost: 0.,
+                        secs: 0,
+                    },
+                    cx,
+                );
+                let side = c.side.as_ref().unwrap();
+                assert!(side.done && side.error.as_deref() == Some("No conversation found"));
+            })
+        });
         let _ = std::fs::remove_file(ws.dir());
     }
 
