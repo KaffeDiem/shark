@@ -18,7 +18,13 @@ const PERMISSION_MODE: &str = "bypassPermissions";
 
 #[derive(Debug, PartialEq)]
 pub enum Ev {
-    Init(String),
+    /// The session as the CLI reports it at the start of each turn.
+    Init {
+        session_id: String,
+        model: String,
+        permission_mode: String,
+        mcp: Vec<String>,
+    },
     User(String),
     TextDelta(String),
     Text(String),
@@ -38,8 +44,8 @@ pub enum Ev {
         cost: f64,
         secs: u64,
     },
-    /// Count of backgrounded tasks (subagents, shells) still running after the turn's result.
-    Background(usize),
+    /// Backgrounded tasks (subagents, shells) still running after the turn's result, by description.
+    Background(Vec<String>),
     /// The turn was cut short by an `interrupt` control request; its result follows.
     Interrupted,
     Exited(String),
@@ -60,8 +66,19 @@ fn cut(s: &str, n: usize) -> Option<usize> {
     s.char_indices().nth(n).map(|(i, _)| i)
 }
 
-fn clip(s: &str) -> &str {
-    &s[..cut(s, MAX_OUTPUT).unwrap_or(s.len())]
+/// A tool result's output as shown: clipped, saying so. `total_chars` marks lines `compact`
+/// already clipped.
+fn output(b: &Value) -> String {
+    let text = text_of(&b["content"]);
+    let total = b["total_chars"].as_u64();
+    match (cut(&text, MAX_OUTPUT), total) {
+        (None, None) => text,
+        (at, total) => format!(
+            "{}\n… truncated, {} chars total",
+            &text[..at.unwrap_or(text.len())],
+            total.unwrap_or(text.chars().count() as u64)
+        ),
+    }
 }
 
 /// Characters kept of each string in a stored tool input (Write's content, Edit's strings).
@@ -96,8 +113,9 @@ fn compact(line: &str) -> Cow<'_, str> {
             (Some("assistant"), Some("tool_use")) => changed |= clip_strings(&mut b["input"]),
             (Some("user"), Some("tool_result")) => {
                 let text = text_of(&b["content"]);
-                if clip(&text).len() < text.len() {
-                    b["content"] = clip(&text).into();
+                if let Some(i) = cut(&text, MAX_OUTPUT) {
+                    b["total_chars"] = text.chars().count().into();
+                    b["content"] = text[..i].into();
                     changed = true;
                 }
             }
@@ -141,7 +159,8 @@ pub fn spawn(ws: &Workspace) -> std::io::Result<(Agent, smol::channel::Receiver<
     fs::create_dir_all(&logs)?;
     fs::create_dir_all(support_dir().join("transcripts"))?;
     let log = logs.join(format!("{}.stderr.log", ws.name));
-    let mut cmd = Command::new("claude");
+    // SHARK_CLAUDE swaps in another binary; the UI tests use a fake that swallows stdin.
+    let mut cmd = Command::new(std::env::var("SHARK_CLAUDE").unwrap_or("claude".into()));
     cmd.args([
         "-p",
         "--input-format",
@@ -260,10 +279,22 @@ pub fn parse(line: &str) -> Vec<Ev> {
     }
     let s = |v: &Value| v.as_str().unwrap_or_default().to_string();
     match v["type"].as_str().unwrap_or_default() {
-        "system" if v["subtype"] == "init" => vec![Ev::Init(s(&v["session_id"]))],
-        "system" if v["subtype"] == "background_tasks_changed" => {
-            vec![Ev::Background(v["tasks"].as_array().map_or(0, Vec::len))]
-        }
+        "system" if v["subtype"] == "init" => vec![Ev::Init {
+            session_id: s(&v["session_id"]),
+            model: s(&v["model"]),
+            permission_mode: s(&v["permissionMode"]),
+            mcp: blocks_of(&v["mcp_servers"])
+                .map(|m| s(&m["name"]))
+                .collect(),
+        }],
+        "system" if v["subtype"] == "background_tasks_changed" => vec![Ev::Background(
+            blocks_of(&v["tasks"])
+                .map(|t| match t["description"].as_str() {
+                    Some(d) => d.to_string(),
+                    None => format!("{} {}", s(&t["task_type"]), s(&t["task_id"])),
+                })
+                .collect(),
+        )],
         "stream_event" if v["event"]["delta"]["type"] == "text_delta" => {
             vec![Ev::TextDelta(s(&v["event"]["delta"]["text"]))]
         }
@@ -285,7 +316,7 @@ pub fn parse(line: &str) -> Vec<Ev> {
             .filter_map(|b| match b["type"].as_str()? {
                 "tool_result" => Some(Ev::ToolResult {
                     id: s(&b["tool_use_id"]),
-                    text: clip(&text_of(&b["content"])).to_string(),
+                    text: output(b),
                     is_error: b["is_error"].as_bool().unwrap_or(false),
                 }),
                 // "[Request interrupted by user]" or "… for tool use]"
@@ -310,7 +341,11 @@ pub fn parse(line: &str) -> Vec<Ev> {
 }
 
 fn blocks(v: &Value) -> impl Iterator<Item = &Value> {
-    v["message"]["content"].as_array().into_iter().flatten()
+    blocks_of(&v["message"]["content"])
+}
+
+fn blocks_of(v: &Value) -> impl Iterator<Item = &Value> {
+    v.as_array().into_iter().flatten()
 }
 
 #[cfg(test)]
@@ -319,8 +354,8 @@ mod tests {
 
     // Recorded from claude 2.1.309, trimmed.
     const SESSION: &str = r#"{"type": "system", "subtype": "hook_started", "session_id": "s1"}
-{"type": "system", "subtype": "init", "session_id": "s1"}
-{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a1","task_type":"local_agent"}]}
+{"type": "system", "subtype": "init", "session_id": "s1", "model": "claude-opus-5-5[1m]", "permissionMode": "bypassPermissions", "mcp_servers": [{"name": "mobbin", "status": "pending", "source": "user"}, {"name": "paper", "status": "failed", "source": "user"}]}
+{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a1","task_type":"local_agent"},{"task_id":"b2","run_id":"r","task_type":"local_bash","description":"Run test suite"}]}
 {"type":"system","subtype":"background_tasks_changed","tasks":[]}
 {"type": "user", "message": {"role": "user", "content": "read a.txt"}, "parent_tool_use_id": null}
 {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "/tmp/a.txt"}}]}, "parent_tool_use_id": null}
@@ -340,9 +375,14 @@ not json"#;
         assert_eq!(
             evs,
             vec![
-                Ev::Init("s1".into()),
-                Ev::Background(1),
-                Ev::Background(0),
+                Ev::Init {
+                    session_id: "s1".into(),
+                    model: "claude-opus-5-5[1m]".into(),
+                    permission_mode: "bypassPermissions".into(),
+                    mcp: vec!["mobbin".into(), "paper".into()],
+                },
+                Ev::Background(vec!["local_agent a1".into(), "Run test suite".into()]),
+                Ev::Background(vec![]),
                 Ev::User("read a.txt".into()),
                 Ev::ToolUse {
                     id: "toolu_1".into(),
@@ -380,11 +420,19 @@ not json"#;
             {"type": "tool_result", "tool_use_id": "t", "content": [{"type": "text", "text": long}]}
         ]}})
         .to_string();
+        let note = format!("\n… truncated, {} chars total", MAX_OUTPUT + 5);
+        let [Ev::ToolResult { text: live, .. }] = &parse(&line)[..] else {
+            panic!("{line}");
+        };
         let stored = compact(&line);
         let [Ev::ToolResult { text, .. }] = &parse(&stored)[..] else {
             panic!("{stored}");
         };
-        assert_eq!(text.chars().count(), MAX_OUTPUT);
+        assert_eq!(text, live, "replay shows what the live turn did");
+        assert_eq!(
+            text.strip_suffix(&note).unwrap().chars().count(),
+            MAX_OUTPUT
+        );
         let short = SESSION.lines().nth(6).unwrap();
         assert!(
             matches!(compact(short), Cow::Borrowed(_)),

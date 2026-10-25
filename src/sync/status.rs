@@ -1,5 +1,6 @@
 //! Pure git/GitHub state per repo and the step it calls for. No gpui here, so it is unit tested.
 use crate::git::{cmd_bounded, git, run};
+use crate::prompts;
 use serde_json::Value;
 use std::path::Path;
 
@@ -17,7 +18,8 @@ pub struct Local {
     /// `None` when HEAD is detached (also mid-rebase).
     pub branch: Option<String>,
     pub head: String,
-    pub origin: bool,
+    /// `origin`'s URL; `None` if the repo has no origin remote.
+    pub origin: Option<String>,
     /// `(ahead, behind)` vs `origin/<branch>`; `None` if it isn't on the remote. Not `@{u}`:
     /// a fresh worktree may track its base, and a deleted remote branch keeps a stale upstream.
     pub remote: Option<(u32, u32)>,
@@ -143,7 +145,7 @@ pub fn probe(wt: &Path, branch: &str, base: &str, prev: Option<&Local>) -> Resul
         .zip(OPS)
         .find(|(p, _)| Path::new(p).exists())
         .map(|(_, (_, op))| op);
-    l.origin = git(wt, &["remote", "get-url", "origin"]).is_ok();
+    l.origin = git(wt, &["remote", "get-url", "origin"]).ok();
     let remote = format!("refs/remotes/origin/{branch}");
     if let Ok(oid) = git(wt, &["rev-parse", "--verify", "--quiet", &remote]) {
         if let Some(p) =
@@ -351,6 +353,17 @@ impl Repo {
         self.pr().filter(|p| p.state == PrState::Open)
     }
 
+    /// `branch` on GitHub, e.g. `https://github.com/o/r/tree/feat`; `None` unless origin is
+    /// GitHub and the branch is pushed (an unpushed branch would 404).
+    pub fn branch_url(&self, branch: &str) -> Option<String> {
+        let l = self.local.as_ref().ok()?;
+        l.remote?;
+        Some(format!(
+            "{}/tree/{branch}",
+            github_url(l.origin.as_deref()?)?
+        ))
+    }
+
     /// Its work is exactly what a merged PR landed.
     pub fn landed(&self) -> bool {
         let head = self
@@ -500,12 +513,7 @@ pub fn next_action(repos: &[Repo], branch: &str, handled: &[String]) -> Action {
     }
     let conflicted = names(&|_, l| l.conflicts > 0);
     if !conflicted.is_empty() {
-        let prompt = format!(
-            "These repos have unresolved conflicts: {}. In each, inspect `git status`, resolve every conflict \
-             keeping the intent of both sides, then finish the merge or rebase in progress \
-             (`git rebase --continue` or `git commit`). Abort only if resolving is impossible, and explain why.",
-            conflicted.join(", ")
-        );
+        let prompt = prompts::render("conflicts", &conflicted.join(", "), branch);
         return act(
             label("Resolve conflicts", &conflicted),
             Kind::Agent(prompt),
@@ -515,11 +523,7 @@ pub fn next_action(repos: &[Repo], branch: &str, handled: &[String]) -> Action {
     }
     let midway = names(&|_, l| l.op.is_some());
     if !midway.is_empty() {
-        let prompt = format!(
-            "A merge, rebase, cherry-pick or revert was left unfinished in: {}. Check `git status` in each and \
-             finish it (`git rebase --continue`, `git commit`, …), then report what you did.",
-            midway.join(", ")
-        );
+        let prompt = prompts::render("finish", &midway.join(", "), branch);
         return act(
             label("Finish operation", &midway),
             Kind::Agent(prompt),
@@ -529,11 +533,7 @@ pub fn next_action(repos: &[Repo], branch: &str, handled: &[String]) -> Action {
     }
     let detached = names(&|_, l| l.branch.is_none());
     if !detached.is_empty() {
-        let prompt = format!(
-            "HEAD is detached in: {}. Get back onto branch `{branch}` without losing commits \
-             (if HEAD has commits that aren't on `{branch}`, bring them over), then report what you did.",
-            detached.join(", ")
-        );
+        let prompt = prompts::render("detached", &detached.join(", "), branch);
         return act(
             label("Fix detached HEAD", &detached),
             Kind::Agent(prompt),
@@ -543,11 +543,7 @@ pub fn next_action(repos: &[Repo], branch: &str, handled: &[String]) -> Action {
     }
     let wrong = names(&|_, l| l.branch.as_deref() != Some(branch));
     if !wrong.is_empty() {
-        let prompt = format!(
-            "These repos are on a different branch than the workspace branch `{branch}`: {}. Switch them back to \
-             `{branch}` (bring over any commits made on the other branch), then report what you did.",
-            wrong.join(", ")
-        );
+        let prompt = prompts::render("wrong_branch", &wrong.join(", "), branch);
         return act(
             label("Switch to branch", &wrong),
             Kind::Agent(prompt),
@@ -557,14 +553,7 @@ pub fn next_action(repos: &[Repo], branch: &str, handled: &[String]) -> Action {
     }
     let dirty = names(&|_, l| l.changed > 0);
     if !dirty.is_empty() {
-        let prompt = format!(
-            "Commit and push the uncommitted changes in: {}. In each repo review the diff and stage the files that \
-             belong to this change. Never commit secrets or build output; if such files show up, add them to \
-             .gitignore instead. Write a concise commit message in the repo's style, commit, then \
-             `git push -u origin {branch}`. If the push is rejected because the remote moved, \
-             `git pull --rebase origin {branch}` and push again.",
-            dirty.join(", ")
-        );
+        let prompt = prompts::render("commit", &dirty.join(", "), branch);
         return act(
             label("Commit and push", &dirty),
             Kind::Agent(prompt),
@@ -572,7 +561,7 @@ pub fn next_action(repos: &[Repo], branch: &str, handled: &[String]) -> Action {
             false,
         );
     }
-    let remoteless = names(&|_, l| !l.origin && l.base.0 > 0);
+    let remoteless = names(&|_, l| l.origin.is_none() && l.base.0 > 0);
     if !remoteless.is_empty() {
         return act(
             label("No origin remote", &remoteless),
@@ -592,12 +581,7 @@ pub fn next_action(repos: &[Repo], branch: &str, handled: &[String]) -> Action {
     }
     let diverged = names(&|_, l| l.remote.is_some_and(|(a, b)| a > 0 && b > 0));
     if !diverged.is_empty() {
-        let prompt = format!(
-            "Branch `{branch}` has diverged from `origin/{branch}` in: {}. Rebase the local commits onto \
-             `origin/{branch}` (`git pull --rebase origin {branch}`), resolve any conflicts, run a quick sanity \
-             check, and push.",
-            diverged.join(", ")
-        );
+        let prompt = prompts::render("diverged", &diverged.join(", "), branch);
         return act(
             label("Sync with remote", &diverged),
             Kind::Agent(prompt),
@@ -639,11 +623,7 @@ pub fn next_action(repos: &[Repo], branch: &str, handled: &[String]) -> Action {
     let current = |f: &dyn Fn(&Pr) -> bool| prs(&|p, l| p.head == l.head && f(p));
     let conflicting = current(&|p| p.merge_state == "DIRTY");
     if !conflicting.is_empty() {
-        let prompt = format!(
-            "These PRs conflict with their base: {}. In each repo `git fetch origin`, merge the base into \
-             `{branch}`, resolve the conflicts, run a quick sanity check, commit and push.",
-            with_base(&conflicting)
-        );
+        let prompt = prompts::render("pr_conflicts", &with_base(&conflicting), branch);
         return act(
             label("Resolve PR conflicts", &conflicting),
             Kind::Agent(prompt),
@@ -661,12 +641,7 @@ pub fn next_action(repos: &[Repo], branch: &str, handled: &[String]) -> Action {
                 _ => None,
             })
             .collect();
-        let prompt = format!(
-            "CI checks fail on the PRs ({}). For each, read the failure (`gh pr checks`, then \
-             `gh run view <run-id> --log-failed` in that repo), fix the cause, commit and push. \
-             Don't disable or skip checks.",
-            failing.join("; ")
-        );
+        let prompt = prompts::render("checks", &failing.join("; "), branch);
         return act(label("Fix checks", &rs), Kind::Agent(prompt), rs, true);
     }
     let with_reviews =
@@ -686,12 +661,7 @@ pub fn next_action(repos: &[Repo], branch: &str, handled: &[String]) -> Action {
     };
     let changes = current(&|p| p.review == "CHANGES_REQUESTED" && unhandled(p));
     if !changes.is_empty() {
-        let prompt = format!(
-            "Reviewers requested changes on the PRs in: {}. Read the review comments \
-             (`gh pr view --comments` and `gh api repos/{{owner}}/{{repo}}/pulls/<n>/comments`), address each one, \
-             commit and push, then summarize what you changed per comment.",
-            changes.join(", ")
-        );
+        let prompt = prompts::render("review", &changes.join(", "), branch);
         // Its prompt reads every comment, so the comment-only reviews are handled too.
         return with_reviews("Address review", changes, prompt, &|p| {
             [p.change_requests.clone(), p.comments.clone()].concat()
@@ -700,12 +670,7 @@ pub fn next_action(repos: &[Repo], branch: &str, handled: &[String]) -> Action {
     let new_comments = |p: &Pr| p.comments.iter().any(|id| !handled.contains(id));
     let commented = current(&new_comments);
     if !commented.is_empty() {
-        let prompt = format!(
-            "Reviewers left comments on the PRs in: {}. Read them (`gh pr view --comments` and \
-             `gh api repos/{{owner}}/{{repo}}/pulls/<n>/comments`). Address the ones that ask for a change, \
-             commit and push, then summarize per comment what you changed or why you left it.",
-            commented.join(", ")
-        );
+        let prompt = prompts::render("comments", &commented.join(", "), branch);
         return with_reviews("Address comments", commented, prompt, &|p| {
             p.comments.clone()
         });
@@ -852,8 +817,68 @@ pub fn step_args(kind: &Kind, b: &str, r: &Repo) -> Result<Option<Vec<String>>, 
     }
 }
 
+/// The web URL of a GitHub remote, from its https, scp-style or ssh form.
+pub fn github_url(remote: &str) -> Option<String> {
+    let path = [
+        "https://github.com/",
+        "git@github.com:",
+        "ssh://git@github.com/",
+    ]
+    .iter()
+    .find_map(|p| remote.strip_prefix(p))?;
+    let path = path.trim_end_matches('/').trim_end_matches(".git");
+    Some(format!("https://github.com/{path}"))
+}
+
+/// `8s ago`, `2m ago`, `3h ago`.
+pub fn ago(d: std::time::Duration) -> String {
+    match d.as_secs() {
+        s @ 0..60 => format!("{s}s ago"),
+        s @ 60..3600 => format!("{}m ago", s / 60),
+        s => format!("{}h ago", s / 3600),
+    }
+}
+
+/// A failed `pull --ff-only` because local and remote both have new commits.
+pub fn diverged(err: &str) -> bool {
+    let e = err.to_lowercase();
+    e.contains("not possible to fast-forward") || e.contains("diverg")
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ago_and_diverged() {
+        use std::time::Duration;
+        assert_eq!(super::ago(Duration::from_secs(8)), "8s ago");
+        assert_eq!(super::ago(Duration::from_secs(150)), "2m ago");
+        assert_eq!(super::ago(Duration::from_secs(7300)), "2h ago");
+        assert!(super::diverged(
+            "git pull: fatal: Not possible to fast-forward, aborting."
+        ));
+        assert!(super::diverged("hint: You have divergent branches"));
+        assert!(!super::diverged(
+            "git pull: fatal: unable to access 'https://x': timeout"
+        ));
+    }
+
+    #[test]
+    fn github_urls() {
+        for r in [
+            "https://github.com/o/r.git",
+            "https://github.com/o/r",
+            "git@github.com:o/r.git",
+            "ssh://git@github.com/o/r.git",
+        ] {
+            assert_eq!(
+                super::github_url(r).as_deref(),
+                Some("https://github.com/o/r"),
+                "{r}"
+            );
+        }
+        assert_eq!(super::github_url("git@gitlab.com:o/r.git"), None);
+    }
+
     use super::*;
 
     #[test]
@@ -918,7 +943,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         Local {
             branch: Some("feat".into()),
             head: "h".into(),
-            origin: true,
+            origin: Some("git@github.com:o/r.git".into()),
             remote: (ahead > 0).then_some((0, 0)),
             base: (ahead, 0),
             ..Default::default()
@@ -1040,7 +1065,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         assert!(
             one(
                 Local {
-                    origin: false,
+                    origin: None,
                     remote: None,
                     ..clean(1)
                 },
@@ -1371,7 +1396,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
 
         let l = p();
         assert_eq!(
-            (l.branch.as_deref(), l.remote, l.base, l.origin),
+            (l.branch.as_deref(), l.remote, l.base, l.origin.is_some()),
             (Some("feat"), None, (0, 0), true)
         );
         assert!(

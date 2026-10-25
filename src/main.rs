@@ -7,11 +7,13 @@ mod editor;
 mod files;
 mod git;
 mod pr;
+mod prompts;
+mod settings;
 mod state;
 mod sync;
 mod vim;
 
-use gpui_kit::component::{Theme, ThemeConfig, ThemeRegistry, ThemeSet, TitleBar};
+use gpui_kit::component::{ThemeConfig, ThemeSet, TitleBar};
 use gpui_kit::*;
 use std::borrow::Cow;
 use std::rc::Rc;
@@ -71,6 +73,18 @@ actions!(
         SwitchField,
         SubmitForm,
         NextAttention,
+        OpenSettings,
+        EditQueued,
+        DeleteQueued,
+        MoveQueuedUp,
+        MoveQueuedDown,
+        FocusQueue,
+        NewSection,
+        MoveToSection,
+        RenameSection,
+        SectionIcon,
+        DeleteSection,
+        CancelEdit,
     ]
 );
 
@@ -82,10 +96,10 @@ actions!(shark, [OpenAnyFile, AddComment, SendComments]);
 #[action(namespace = shark, no_json)]
 pub struct SetModel(pub usize);
 
-/// Open the Nth workspace in the sidebar (cmd-1…9).
+/// Open the nth sidebar workspace (cmd-1 is the top one).
 #[derive(Clone, PartialEq, Debug, serde::Deserialize, Action)]
 #[action(namespace = shark, no_json)]
-pub struct OpenWorkspaceAt(pub usize);
+pub struct OpenWorkspace(pub usize);
 
 /// Apps launched from Finder get a minimal PATH; borrow the login shell's so claude/gh/git resolve.
 fn fix_path() {
@@ -103,8 +117,8 @@ fn fix_path() {
 
 fn bind_keys(cx: &mut App) {
     // VimNormal: the editor in Vim's Normal mode, where space types nothing.
-    const NAV: &str = "Sidebar || Transcript || DiffPane || FileTree || VimNormal";
-    const LIST: &str = "Sidebar || Transcript || FileTree";
+    const NAV: &str = "Sidebar || Transcript || DiffPane || FileTree || Queue || VimNormal";
+    const LIST: &str = "Sidebar || Transcript || FileTree || Queue";
     cx.bind_keys([
         KeyBinding::new("cmd-k", TogglePalette, None),
         KeyBinding::new("cmd-shift-p", TogglePalette, None),
@@ -136,6 +150,19 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("i", FocusComposer, Some("Transcript")),
         KeyBinding::new("a", FocusComposer, Some("Transcript")),
         KeyBinding::new("escape", FocusTranscript, Some("Composer")),
+        KeyBinding::new("space q", FocusQueue, Some(NAV)),
+        KeyBinding::new("up", SelectPrev, Some("Queue")),
+        KeyBinding::new("down", SelectNext, Some("Queue")),
+        KeyBinding::new("e", EditQueued, Some("Queue")),
+        KeyBinding::new("d", DeleteQueued, Some("Queue")),
+        KeyBinding::new("backspace", DeleteQueued, Some("Queue")),
+        KeyBinding::new("shift-k", MoveQueuedUp, Some("Queue")),
+        KeyBinding::new("shift-j", MoveQueuedDown, Some("Queue")),
+        KeyBinding::new("alt-up", MoveQueuedUp, Some("Queue")),
+        KeyBinding::new("alt-down", MoveQueuedDown, Some("Queue")),
+        KeyBinding::new("escape", FocusComposer, Some("Queue")),
+        KeyBinding::new("i", FocusComposer, Some("Queue")),
+        KeyBinding::new("a", FocusComposer, Some("Queue")),
         KeyBinding::new("space space", TogglePalette, Some(NAV)),
         KeyBinding::new("space w n", NewWorkspace, Some(NAV)),
         KeyBinding::new("space w d", ArchiveWorkspace, Some(NAV)),
@@ -158,12 +185,26 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("space y b", CopyBranch, Some(NAV)),
         KeyBinding::new("cmd-j", NextAttention, None),
         KeyBinding::new("space w j", NextAttention, Some(NAV)),
+        KeyBinding::new("space s n", NewSection, Some(NAV)),
+        KeyBinding::new("space s m", MoveToSection, Some(NAV)),
+        KeyBinding::new("space s r", RenameSection, Some(NAV)),
+        KeyBinding::new("space s i", SectionIcon, Some(NAV)),
+        KeyBinding::new("space s d", DeleteSection, Some(NAV)),
+        KeyBinding::new("h", CollapseDir, Some("Sidebar")),
+        KeyBinding::new("l", ExpandDir, Some("Sidebar")),
+        KeyBinding::new("m", MoveToSection, Some("Sidebar")),
+        // Inline section name in the sidebar: the Input lets escape through.
+        KeyBinding::new("escape", CancelEdit, Some("SectionName")),
         // New workspace dialog: tab hops between branch and repo filter, space ticks the
         // highlighted repo (names have no spaces), cmd-enter creates from either field.
         KeyBinding::new("tab", SwitchField, Some("NewWorkspace")),
         KeyBinding::new("shift-tab", SwitchField, Some("NewWorkspace")),
         KeyBinding::new("space", ToggleRepo, Some("NewWorkspace > Command")),
         KeyBinding::new("cmd-enter", SubmitForm, Some("NewWorkspace")),
+        KeyBinding::new("cmd-,", OpenSettings, None),
+        KeyBinding::new("space ,", OpenSettings, Some(NAV)),
+        KeyBinding::new("ctrl-tab", SwitchField, Some("Settings")),
+        KeyBinding::new("ctrl-shift-tab", SwitchField, Some("Settings")),
         KeyBinding::new("cmd-/", PickModel, None),
         KeyBinding::new("space m m", PickModel, Some(NAV)),
         KeyBinding::new("] c", NextHunk, Some("DiffPane")),
@@ -192,7 +233,7 @@ fn bind_keys(cx: &mut App) {
         ]
     }));
     cx.bind_keys(
-        (1..=9).map(|i| KeyBinding::new(&format!("cmd-{i}"), OpenWorkspaceAt(i - 1), None)),
+        (0..9).map(|i| KeyBinding::new(&format!("cmd-{}", i + 1), OpenWorkspace(i), None)),
     );
     // The Diff component's scroll actions are private; bind vim keys to them by name.
     let diff = Rc::new(KeyBindingContextPredicate::parse("Diff").unwrap());
@@ -215,7 +256,15 @@ fn bind_keys(cx: &mut App) {
     cx.bind_keys(bindings);
 }
 
-const THEMES: &str = include_str!("../assets/themes/linear.json");
+/// Theme families for Settings, each a dark and a light `ThemeConfig` named `<family> Dark/Light`.
+/// Linear is hand-tuned; the others are generated by `docs/themes.py`.
+pub const THEMES: &[(&str, &str)] = &[
+    ("Linear", include_str!("../assets/themes/linear.json")),
+    ("Roraima", include_str!("../assets/themes/roraima.json")),
+    ("Everest", include_str!("../assets/themes/everest.json")),
+    ("Sequoia", include_str!("../assets/themes/sequoia.json")),
+    ("Sakura", include_str!("../assets/themes/sakura.json")),
+];
 
 /// Embedded so the UI looks the same on every Mac; both are OFL (licenses next to the files).
 const FONTS: &[&[u8]] = &[
@@ -228,33 +277,21 @@ const FONTS: &[&[u8]] = &[
     include_bytes!("../assets/fonts/JetBrainsMonoNL-Bold.ttf"),
 ];
 
-fn linear_themes() -> Vec<ThemeConfig> {
-    serde_json::from_str::<ThemeSet>(THEMES)
-        .expect("assets/themes/linear.json")
-        .themes
+pub fn theme_configs() -> Vec<ThemeConfig> {
+    THEMES
+        .iter()
+        .flat_map(|(name, json)| {
+            serde_json::from_str::<ThemeSet>(json)
+                .unwrap_or_else(|e| panic!("{name} theme: {e}"))
+                .themes
+        })
+        .collect()
 }
 
-/// Installs the Linear light and dark themes and follows the system appearance.
-fn install_theme(cx: &mut App) {
+/// The theme itself is applied by `Shark::new` from the saved appearance (`settings::apply`).
+fn install_fonts(cx: &mut App) {
     let fonts = FONTS.iter().map(|f| Cow::Borrowed(*f)).collect();
     cx.text_system().add_fonts(fonts).expect("embedded fonts");
-    let registry = ThemeRegistry::global(cx);
-    let themes: Vec<Rc<ThemeConfig>> = linear_themes()
-        .into_iter()
-        .map(|mut t| {
-            // Syntax colors aren't restyled; borrow the stock ones of the same mode.
-            let stock = match t.mode.is_dark() {
-                true => registry.default_dark_theme(),
-                false => registry.default_light_theme(),
-            };
-            t.highlight = stock.highlight.clone();
-            Rc::new(t)
-        })
-        .collect();
-    Theme::update(cx, |theme| {
-        themes.iter().for_each(|t| theme.apply_config(t))
-    });
-    Theme::sync_system_appearance(None, cx);
 }
 
 /// `cargo run` isn't a bundle, so there's no Info.plist icon; set the Dock icon directly.
@@ -275,7 +312,7 @@ fn main() {
         .run(|cx| {
             set_dock_icon();
             gpui_kit::init(cx);
-            install_theme(cx);
+            install_fonts(cx);
             bind_keys(cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
@@ -283,11 +320,6 @@ fn main() {
                 ..Default::default()
             };
             open_window(options, cx, |window, cx| {
-                window
-                    .observe_window_appearance(|window, cx| {
-                        Theme::sync_system_appearance(Some(window), cx)
-                    })
-                    .detach();
                 cx.new(|cx| app::Shark::new(window, cx))
             })
             .unwrap();
@@ -301,10 +333,15 @@ mod tests {
 
     /// A typo in a key is silently ignored by serde, so check values that matter actually land.
     #[test]
-    fn linear_themes_parse() {
-        let themes = super::linear_themes();
-        let modes: Vec<ThemeMode> = themes.iter().map(|t| t.mode).collect();
-        assert_eq!(modes, [ThemeMode::Dark, ThemeMode::Light]);
+    fn themes_parse() {
+        let themes = super::theme_configs();
+        for (i, (family, _)) in super::THEMES.iter().enumerate() {
+            let pair = &themes[i * 2..i * 2 + 2];
+            assert_eq!(pair[0].mode, ThemeMode::Dark, "{family}");
+            assert_eq!(pair[1].mode, ThemeMode::Light, "{family}");
+            assert_eq!(pair[0].name.as_ref(), format!("{family} Dark"));
+            assert_eq!(pair[1].name.as_ref(), format!("{family} Light"));
+        }
         for t in &themes {
             let c = &t.colors;
             for key in [

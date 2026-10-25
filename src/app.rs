@@ -3,7 +3,7 @@ use crate::attention::Attn;
 use crate::chat::{Chat, ChatEvent, MODELS};
 use crate::editor::{EditorEvent, FileEditor};
 use crate::files::{self, Row};
-use crate::state::{Repo, State, Workspace, workspaces_dir};
+use crate::state::{Repo, Section, State, Workspace, move_item, workspaces_dir};
 use crate::sync::{GitSync, SyncEvent};
 use crate::*;
 use gpui_kit::assets::IconName;
@@ -12,8 +12,10 @@ use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::command::{Command, CommandItem, CommandState};
 use gpui_kit::component::dialog::{Dialog, DialogEntrance};
 use gpui_kit::component::diff::{Diff, DiffFile, DiffFileStatus, DiffMode, DiffState};
+use gpui_kit::component::hover_card::HoverCard;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
+use gpui_kit::component::link::Link;
 use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
@@ -44,11 +46,9 @@ pub(crate) fn inter_features() -> FontFeatures {
 }
 
 /// Hint text below the muted level; gpui-kit has no token for it. Never use it for content.
+/// `docs/themes.py` checks the same blend against the contrast floor.
 pub(crate) fn faint(theme: &Theme) -> Hsla {
-    match theme.is_dark() {
-        true => rgb(0x808083).into(),
-        false => rgb(0x9c9d9f).into(),
-    }
+    theme.muted_foreground.blend(theme.background.opacity(0.4))
 }
 
 /// `/Users/me/x` → `~/x`: paths in menus are read, so keep them short.
@@ -186,6 +186,7 @@ fn ws_menu(
                 }),
         )
         .separator();
+    let menu = move_submenu(menu, &ws.name, shark, window, cx).separator();
     let menu = path_submenu(
         menu,
         IconName::FolderOpen,
@@ -239,6 +240,194 @@ fn ws_menu(
                 .icon(IconName::ArchiveX)
                 .on_click(on(|s, name, w, cx| s.archive_ws(name, true, w, cx))),
         )
+}
+
+/// Icons a section can have, by Lucide name (what `Section::icon` stores).
+const SECTION_ICONS: &[(&str, IconName)] = &[
+    ("folder", IconName::Folder),
+    ("star", IconName::Star),
+    ("briefcase", IconName::Briefcase),
+    ("bug", IconName::Bug),
+    ("rocket", IconName::Rocket),
+    ("flame", IconName::Flame),
+    ("zap", IconName::Zap),
+    ("heart", IconName::Heart),
+    ("bookmark", IconName::Bookmark),
+    ("flag", IconName::Flag),
+    ("tag", IconName::Tag),
+    ("inbox", IconName::Inbox),
+    ("clock", IconName::Clock),
+    ("calendar", IconName::Calendar),
+    ("users", IconName::Users),
+    ("code", IconName::Code),
+    ("wrench", IconName::Wrench),
+    ("flask-conical", IconName::FlaskConical),
+    ("lightbulb", IconName::Lightbulb),
+    ("layers", IconName::Layers),
+    ("box", IconName::Box),
+    ("globe", IconName::Globe),
+    ("shield", IconName::Shield),
+    ("sparkles", IconName::Sparkles),
+    ("target", IconName::Target),
+    ("palette", IconName::Palette),
+    ("coffee", IconName::Coffee),
+    ("book-open", IconName::BookOpen),
+];
+
+fn section_icon(name: &str) -> IconName {
+    SECTION_ICONS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map_or(IconName::Folder, |(_, i)| *i)
+}
+
+/// "Move to Section" in a workspace's right-click menu; ends with "New Section…", which moves it there.
+fn move_submenu(
+    menu: PopupMenu,
+    ws: &str,
+    shark: &WeakEntity<Shark>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let Some(sh) = shark.upgrade() else {
+        return menu;
+    };
+    let sections: Vec<Section> = sh.read(cx).state.sections.clone();
+    let current = sh.read(cx).section_of(ws);
+    let (ws, shark) = (ws.to_string(), shark.clone());
+    menu.submenu_with_icon(
+        Some(IconName::FolderInput.into()),
+        "Move to Section",
+        window,
+        cx,
+        move |mut m, _, _| {
+            let to = |to: Option<usize>| {
+                let (shark, ws) = (shark.clone(), ws.clone());
+                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    shark
+                        .update(cx, |s, cx| s.move_to_section(&ws, to, cx))
+                        .ok();
+                }
+            };
+            for (i, sec) in sections.iter().enumerate() {
+                m = m.item(
+                    PopupMenuItem::new(sec.name.clone())
+                        .icon(section_icon(&sec.icon))
+                        .checked(current == Some(i))
+                        .on_click(to(Some(i))),
+                );
+            }
+            if current.is_some() {
+                m = m.item(
+                    PopupMenuItem::new("No Section")
+                        .icon(IconName::FolderOutput)
+                        .on_click(to(None)),
+                );
+            }
+            if !sections.is_empty() {
+                m = m.separator();
+            }
+            let (shark, ws) = (shark.clone(), ws.clone());
+            m.item(
+                PopupMenuItem::new("New Section…")
+                    .icon(IconName::FolderPlus)
+                    .on_click(move |_, window, cx| {
+                        shark
+                            .update(cx, |s, cx| {
+                                s.start_naming(None, Some(ws.clone()), window, cx)
+                            })
+                            .ok();
+                    }),
+            )
+        },
+    )
+}
+
+/// Right-click menu of a section header.
+fn section_menu(menu: PopupMenu, i: usize, name: &str, shark: &WeakEntity<Shark>) -> PopupMenu {
+    let on = |f: fn(&mut Shark, usize, &mut Window, &mut Context<Shark>)| {
+        let shark = shark.clone();
+        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            shark.update(cx, |s, cx| f(s, i, window, cx)).ok();
+        }
+    };
+    menu.label(format!("Section {name}"))
+        .separator()
+        .item(
+            PopupMenuItem::new("Rename")
+                .icon(IconName::Pencil)
+                .on_click(on(|s, i, w, cx| s.start_naming(Some(i), None, w, cx))),
+        )
+        .item(
+            PopupMenuItem::new("Change Icon…")
+                .icon(IconName::Shapes)
+                .on_click(on(|s, i, w, cx| s.pick_icon(i, w, cx))),
+        )
+        .item(
+            PopupMenuItem::new("New Section")
+                .icon(IconName::FolderPlus)
+                .on_click(on(|s, _, w, cx| s.start_naming(None, None, w, cx))),
+        )
+        .separator()
+        .item(
+            PopupMenuItem::new("Delete Section")
+                .icon(IconName::Trash)
+                .on_click(on(|s, i, w, cx| s.delete_section(i, w, cx))),
+        )
+}
+
+/// A sidebar row the cursor can sit on.
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum SideRow {
+    /// Index into `state.sections`.
+    Section(usize),
+    /// Index into `state.workspaces`.
+    Ws(usize),
+}
+
+/// The inline section name field in the sidebar.
+struct Naming {
+    /// The section being renamed; `None` adds one.
+    rename: Option<usize>,
+    /// Workspace to move into the new section ("Move to Section › New Section…").
+    then_move: Option<String>,
+    input: Entity<InputState>,
+    _sub: Subscription,
+}
+
+/// A workspace row being dragged: onto a header to move it in, onto a row to take its slot.
+#[derive(Clone)]
+struct DraggedWs(SharedString);
+
+/// A section header being dragged onto another to take its place.
+#[derive(Clone)]
+struct DraggedSection(usize, SharedString);
+
+impl Render for DraggedWs {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        drag_chip(self.0.clone(), cx)
+    }
+}
+
+impl Render for DraggedSection {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        drag_chip(self.1.clone(), cx)
+    }
+}
+
+fn drag_chip(label: SharedString, cx: &App) -> Div {
+    let theme = cx.theme();
+    div()
+        .px_2()
+        .py_1()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary)
+        .text_sm()
+        .text_color(theme.foreground)
+        .font_features(inter_features())
+        .child(label)
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -312,7 +501,8 @@ impl DiffData {
 
 pub struct Shark {
     pub(crate) state: State,
-    sel: usize,
+    sel: SideRow,
+    naming: Option<Naming>,
     pub(crate) active: Option<String>,
     pub(crate) chats: HashMap<String, Entity<Chat>>,
     tab: Tab,
@@ -438,6 +628,30 @@ const COMMANDS: &[(&str, IconName, Cmd)] = &[
     ("Git: fetch now", IconName::RefreshCw, |s, w, cx| {
         s.with_sync(w, cx, GitSync::fetch_now)
     }),
+    ("New section", IconName::FolderPlus, |s, w, cx| {
+        s.start_naming(None, None, w, cx)
+    }),
+    (
+        "Move workspace to section…",
+        IconName::FolderInput,
+        |s, w, cx| s.pick_section(w, cx),
+    ),
+    ("Rename section", IconName::Pencil, |s, w, cx| {
+        s.with_section(w, cx, |s, i, w, cx| s.start_naming(Some(i), None, w, cx))
+    }),
+    ("Change section icon…", IconName::Shapes, |s, w, cx| {
+        s.with_section(w, cx, Shark::pick_icon)
+    }),
+    (
+        "Collapse / expand section",
+        IconName::ChevronsUpDown,
+        |s, w, cx| s.with_section(w, cx, |s, i, _, cx| s.toggle_section(i, cx)),
+    ),
+    (
+        "Delete section (its workspaces stay)",
+        IconName::Trash,
+        |s, w, cx| s.with_section(w, cx, Shark::delete_section),
+    ),
     ("Toggle sidebar", IconName::PanelLeft, |s, _, cx| {
         s.toggle_sidebar(cx)
     }),
@@ -485,6 +699,11 @@ const COMMANDS: &[(&str, IconName, Cmd)] = &[
             None => Shark::notify_err(w, cx, "Open a workspace first"),
         },
     ),
+    (
+        "Manage queued messages",
+        IconName::ListOrdered,
+        |s, w, cx| s.focus_queue(w, cx),
+    ),
     ("Change model…", IconName::Sparkles, |s, w, cx| {
         s.pick_model(w, cx)
     }),
@@ -493,17 +712,33 @@ const COMMANDS: &[(&str, IconName, Cmd)] = &[
         IconName::CircleAlert,
         |s, w, cx| s.next_attention(w, cx),
     ),
+    ("Settings…", IconName::Settings, |s, w, cx| {
+        crate::settings::open(&s.state, w, cx)
+    }),
 ];
 
 impl Shark {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let state = State::load();
+        crate::prompts::set_overrides(&state.prompts);
+        crate::settings::apply(&state.appearance, cx);
         let sidebar_focus = cx.focus_handle();
         sidebar_focus.focus(window, cx);
         cx.defer_in(window, |s, window, cx| s.restore_last_open(window, cx));
+        let _subs = vec![
+            cx.observe_window_appearance(window, |s, _, cx| {
+                if s.state.appearance.mode == crate::state::Mode::System {
+                    crate::settings::apply(&s.state.appearance, cx)
+                }
+            }),
+            cx.observe_window_activation(window, |s, w, _| {
+                s.attn.window_active = w.is_window_active()
+            }),
+        ];
         Shark {
             state,
-            sel: 0,
+            sel: SideRow::Ws(0),
+            naming: None,
             active: None,
             chats: HashMap::new(),
             tab: Tab::Chat,
@@ -533,9 +768,7 @@ impl Shark {
             syncs: HashMap::new(),
             sidebar_focus,
             attn: crate::attention::Attention::new(cx),
-            _subs: vec![cx.observe_window_activation(window, |s, w, _| {
-                s.attn.window_active = w.is_window_active()
-            })],
+            _subs,
         }
     }
 
@@ -599,7 +832,13 @@ impl Shark {
             self.tree_sel = 0;
             self.lose_view();
         }
-        self.sel = ix;
+        self.sel = SideRow::Ws(ix);
+        if let Some(i) = self.section_of(&ws.name)
+            && self.state.sections[i].collapsed
+        {
+            self.state.sections[i].collapsed = false;
+            self.state.save();
+        }
         if !self.chats.contains_key(&ws.name) {
             // Opened mid-archive (its row is still listed): sends stay refused.
             let archiving = self.archiving.contains(&ws.name);
@@ -798,28 +1037,53 @@ impl Shark {
     }
 
     fn toggle_viewed(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(f) = self.diff_files.get(ix) else {
-            return;
-        };
-        let (path, fp) = (f.path().to_string(), self.diff_fps[ix]);
-        let on = self.viewed(ix) != Viewed::Yes;
+        if ix < self.diff_files.len() {
+            self.set_viewed(&[ix], self.viewed(ix) != Viewed::Yes, cx);
+        }
+    }
+
+    /// Files under folder `dir` of the tree.
+    fn dir_files(&self, dir: &str) -> Vec<usize> {
+        let prefix = format!("{dir}/");
+        (0..self.diff_files.len())
+            .filter(|&ix| self.diff_files[ix].path().starts_with(&prefix))
+            .collect()
+    }
+
+    /// A folder's box: ticks every file inside, or unticks them all when all are viewed.
+    fn toggle_viewed_dir(&mut self, dir: &str, cx: &mut Context<Self>) {
+        let files = self.dir_files(dir);
+        let on = !files.iter().all(|&ix| self.viewed(ix) == Viewed::Yes);
+        self.set_viewed(&files, on, cx);
+    }
+
+    fn set_viewed(&mut self, files: &[usize], on: bool, cx: &mut Context<Self>) {
         let Some(name) = self.active.clone() else {
             return;
         };
         let Some(ws) = self.state.workspaces.iter_mut().find(|w| w.name == name) else {
             return;
         };
-        match on {
-            true => ws.viewed.insert(path.clone(), fp),
-            false => ws.viewed.remove(&path),
-        };
+        for &ix in files {
+            let path = self.diff_files[ix].path().to_string();
+            match on {
+                true => ws.viewed.insert(path, self.diff_fps[ix]),
+                false => ws.viewed.remove(&path),
+            };
+        }
         // Forget files that left the diff so the map doesn't grow forever.
         let live: HashSet<&str> = self.diff_files.iter().map(|f| f.path().as_str()).collect();
         ws.viewed.retain(|p, _| live.contains(p.as_str()));
         self.state.save();
         self.recompute_viewed();
-        self.diff
-            .update(cx, |d, cx| d.set_file_collapsed(&path, on, cx));
+        let paths: Vec<SharedString> = files
+            .iter()
+            .map(|&ix| self.diff_files[ix].path().clone())
+            .collect();
+        // ponytail: the diff rebuilds once per file; add a batch setter to gpui-kit if big folders lag.
+        self.diff.update(cx, |d, cx| {
+            paths.iter().for_each(|p| d.set_file_collapsed(p, on, cx))
+        });
         cx.notify();
     }
 
@@ -1387,9 +1651,9 @@ impl Shark {
 
     /// Row actions hit the workspace under the sidebar cursor when the sidebar is focused, else the open one.
     fn target(&self, window: &Window) -> Option<Workspace> {
-        let name = match self.sidebar_focus.is_focused(window) {
-            true => self.state.workspaces.get(self.sel)?.name.clone(),
-            false => self.active.clone()?,
+        let name = match (self.sidebar_focus.is_focused(window), self.sel) {
+            (true, SideRow::Ws(ix)) => self.state.workspaces.get(ix)?.name.clone(),
+            _ => self.active.clone()?,
         };
         self.state
             .workspaces
@@ -1526,9 +1790,13 @@ impl Shark {
     ) {
         match result {
             Ok(deleted) => {
+                let pos = self.side_rows().iter().position(|r| *r == self.sel);
                 self.chats.remove(name);
                 self.syncs.remove(name);
                 self.state.workspaces.retain(|w| w.name != name);
+                for s in &mut self.state.sections {
+                    s.workspaces.retain(|w| w != name);
+                }
                 self.state.save();
                 // A later workspace with the same name must not replay or resume this conversation.
                 let _ = std::fs::remove_file(crate::agent::transcript_path(name));
@@ -1538,7 +1806,12 @@ impl Shark {
                     self.tab = Tab::Chat;
                     self.sidebar_focus.focus(window, cx);
                 }
-                self.sel = self.sel.min(self.state.workspaces.len().saturating_sub(1));
+                // The cursor stays at the same height, on whatever row moved up into it.
+                let rows = self.side_rows();
+                self.sel = pos
+                    .and_then(|p| rows.get(p.min(rows.len().saturating_sub(1))))
+                    .copied()
+                    .unwrap_or(SideRow::Ws(0));
                 let branch = match deleted.is_empty() {
                     true => "branch kept".to_string(),
                     false => format!("merged branch deleted in {}", deleted.join(", ")),
@@ -1577,6 +1850,13 @@ impl Shark {
 
     fn open_prs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.with_sync(window, cx, GitSync::open_prs)
+    }
+
+    fn focus_queue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(chat) = self.active_chat().cloned() {
+            self.show(Tab::Chat, window, cx);
+            chat.update(cx, |c, cx| c.focus_queue(window, cx));
+        }
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
@@ -1634,6 +1914,403 @@ impl Shark {
         };
         chat.update(cx, |c, cx| c.set_model(m, cx));
         window.push_notification(format!("Model: {m} (from the next message)"), cx);
+    }
+
+    fn section_of(&self, ws: &str) -> Option<usize> {
+        self.state
+            .sections
+            .iter()
+            .position(|s| s.workspaces.iter().any(|w| w == ws))
+    }
+
+    /// Sidebar rows top to bottom: each section, then its workspaces unless it is
+    /// collapsed; then the workspaces in no section.
+    fn side_rows(&self) -> Vec<SideRow> {
+        let ws = &self.state.workspaces;
+        let mut rows = vec![];
+        for (i, s) in self.state.sections.iter().enumerate() {
+            rows.push(SideRow::Section(i));
+            if !s.collapsed {
+                rows.extend(
+                    s.workspaces
+                        .iter()
+                        .filter_map(|n| ws.iter().position(|w| &w.name == n))
+                        .map(SideRow::Ws),
+                );
+            }
+        }
+        rows.extend(
+            (0..ws.len())
+                .filter(|&ix| self.section_of(&ws[ix].name).is_none())
+                .map(SideRow::Ws),
+        );
+        rows
+    }
+
+    /// Every workspace in sidebar order, folded sections included (`cmd-j` walks this).
+    pub(crate) fn sidebar_order(&self) -> Vec<usize> {
+        let ws = &self.state.workspaces;
+        let pos = |n: &String| ws.iter().position(|w| &w.name == n);
+        let mut order: Vec<usize> = self
+            .state
+            .sections
+            .iter()
+            .flat_map(|s| s.workspaces.iter().filter_map(pos))
+            .collect();
+        order.extend((0..ws.len()).filter(|&ix| self.section_of(&ws[ix].name).is_none()));
+        order
+    }
+
+    /// Visible workspaces in sidebar order; cmd-N opens the Nth.
+    fn ws_order(&self) -> Vec<usize> {
+        self.side_rows()
+            .into_iter()
+            .filter_map(|r| match r {
+                SideRow::Ws(ix) => Some(ix),
+                SideRow::Section(_) => None,
+            })
+            .collect()
+    }
+
+    /// Keeps the cursor on a visible row; a workspace hidden by collapsing hands it to its header.
+    fn fix_sel(&mut self) {
+        let rows = self.side_rows();
+        if rows.contains(&self.sel) {
+            return;
+        }
+        let header = match self.sel {
+            SideRow::Ws(ix) => self
+                .state
+                .workspaces
+                .get(ix)
+                .and_then(|w| self.section_of(&w.name)),
+            SideRow::Section(_) => None,
+        };
+        self.sel = header
+            .map(SideRow::Section)
+            .or(rows.first().copied())
+            .unwrap_or(SideRow::Ws(0));
+    }
+
+    fn move_sel(&mut self, to: impl FnOnce(usize, usize) -> usize, cx: &mut Context<Self>) {
+        let rows = self.side_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let at = rows.iter().position(|r| *r == self.sel).unwrap_or(0);
+        let to = to(at, rows.len()).min(rows.len() - 1);
+        self.sel = rows[to];
+        // Child 0 of the scrolled list is the Workspaces header.
+        self.sidebar_scroll.scroll_to_item(to + 1);
+        cx.notify();
+    }
+
+    /// Section actions hit the section under the sidebar cursor (or the cursor
+    /// workspace's section) when the sidebar is focused, else the open workspace's.
+    fn target_section(&self, window: &Window) -> Option<usize> {
+        if self.sidebar_focus.is_focused(window) {
+            return match self.sel {
+                SideRow::Section(i) => Some(i),
+                SideRow::Ws(ix) => self.section_of(&self.state.workspaces.get(ix)?.name),
+            };
+        }
+        self.section_of(self.active.as_ref()?)
+    }
+
+    fn with_section(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Self, usize, &mut Window, &mut Context<Self>),
+    ) {
+        match self.target_section(window) {
+            Some(i) => f(self, i, window, cx),
+            None => Self::notify_err(window, cx, "Put the sidebar cursor on a section first"),
+        }
+    }
+
+    fn set_collapsed(&mut self, i: usize, collapsed: bool, cx: &mut Context<Self>) {
+        if let Some(s) = self.state.sections.get_mut(i)
+            && s.collapsed != collapsed
+        {
+            s.collapsed = collapsed;
+            self.state.save();
+            self.fix_sel();
+            cx.notify();
+        }
+    }
+
+    fn toggle_section(&mut self, i: usize, cx: &mut Context<Self>) {
+        if let Some(s) = self.state.sections.get(i) {
+            self.set_collapsed(i, !s.collapsed, cx);
+        }
+    }
+
+    /// `h` in the sidebar: fold the cursor's section and park the cursor on its header.
+    fn collapse_at_cursor(&mut self, cx: &mut Context<Self>) {
+        let i = match self.sel {
+            SideRow::Section(i) => Some(i),
+            SideRow::Ws(ix) => self
+                .state
+                .workspaces
+                .get(ix)
+                .and_then(|w| self.section_of(&w.name)),
+        };
+        if let Some(i) = i {
+            self.sel = SideRow::Section(i);
+            self.set_collapsed(i, true, cx);
+            cx.notify();
+        }
+    }
+
+    fn move_to_section(&mut self, ws: &str, to: Option<usize>, cx: &mut Context<Self>) {
+        if self.section_of(ws) == to {
+            return;
+        }
+        for s in &mut self.state.sections {
+            s.workspaces.retain(|w| w != ws);
+        }
+        if let Some(s) = to.and_then(|i| self.state.sections.get_mut(i)) {
+            s.workspaces.push(ws.to_string());
+        }
+        self.state.save();
+        self.fix_sel();
+        cx.notify();
+    }
+
+    /// The workspace under the cursor, so a reorder that shifts indices can put it back.
+    fn sel_name(&self) -> Option<String> {
+        match self.sel {
+            SideRow::Ws(ix) => Some(self.state.workspaces.get(ix)?.name.clone()),
+            SideRow::Section(_) => None,
+        }
+    }
+
+    fn drop_ws(&mut self, ws: &str, target: &str, cx: &mut Context<Self>) {
+        let cursor = self.sel_name();
+        self.state.drop_ws(ws, target);
+        if let Some(ix) =
+            cursor.and_then(|n| self.state.workspaces.iter().position(|w| w.name == n))
+        {
+            self.sel = SideRow::Ws(ix);
+        }
+        self.state.save();
+        self.fix_sel();
+        cx.notify();
+    }
+
+    fn drop_section(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let n = self.state.sections.len();
+        if from == to || from >= n || to >= n {
+            return;
+        }
+        let cursor = match self.sel {
+            SideRow::Section(j) => Some(self.state.sections[j].name.clone()),
+            SideRow::Ws(_) => None,
+        };
+        move_item(&mut self.state.sections, from, to);
+        if let Some(j) = cursor.and_then(|c| self.state.sections.iter().position(|s| s.name == c)) {
+            self.sel = SideRow::Section(j);
+        }
+        if self.naming.as_ref().is_some_and(|n| n.rename.is_some()) {
+            self.naming = None; // its index moved
+        }
+        self.state.save();
+        cx.notify();
+    }
+
+    fn delete_section(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if i >= self.state.sections.len() {
+            return;
+        }
+        let s = self.state.sections.remove(i);
+        self.state.save();
+        self.naming = None;
+        if let SideRow::Section(j) = self.sel {
+            self.sel = SideRow::Section(if j > i { j - 1 } else { j });
+        }
+        self.fix_sel();
+        window.push_notification(
+            format!("Deleted section {} (its workspaces stay)", s.name),
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Opens the inline name field: on section `rename`, or below the sections for a new one.
+    fn start_naming(
+        &mut self,
+        rename: Option<usize>,
+        then_move: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let value = rename
+            .and_then(|i| self.state.sections.get(i))
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Section name")
+                .default_value(value)
+        });
+        let _sub = cx.subscribe_in(
+            &input,
+            window,
+            |this, _, ev: &InputEvent, window, cx| match ev {
+                InputEvent::PressEnter { .. } => this.commit_naming(true, window, cx),
+                InputEvent::Blur => this.commit_naming(false, window, cx),
+                _ => {}
+            },
+        );
+        // Deferred: a closing menu or palette restores focus first, which would blur the field.
+        let field = input.clone();
+        window.defer(cx, move |window, cx| {
+            field.update(cx, |i, cx| {
+                i.focus(window, cx);
+                i.select_all(window, cx);
+            })
+        });
+        self.rail = false;
+        self.naming = Some(Naming {
+            rename,
+            then_move,
+            input,
+            _sub,
+        });
+        cx.notify();
+    }
+
+    /// Enter saves (a taken name stays in the field); clicking away saves too.
+    /// An empty name changes nothing.
+    fn commit_naming(&mut self, enter: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(n) = &self.naming else {
+            return;
+        };
+        let name = n.input.read(cx).value().trim().to_string();
+        let taken = self
+            .state
+            .sections
+            .iter()
+            .enumerate()
+            .any(|(i, s)| s.name == name && Some(i) != n.rename);
+        if taken && enter {
+            return Self::notify_err(window, cx, format!("There is already a section {name}"));
+        }
+        let Some(n) = self.naming.take() else {
+            return;
+        };
+        if !name.is_empty() && !taken {
+            match n.rename {
+                Some(i) => {
+                    if let Some(s) = self.state.sections.get_mut(i) {
+                        s.name = name;
+                    }
+                }
+                None => {
+                    self.state.sections.push(Section {
+                        name,
+                        icon: "folder".into(),
+                        collapsed: false,
+                        workspaces: vec![],
+                    });
+                    let i = self.state.sections.len() - 1;
+                    self.sel = SideRow::Section(i);
+                    if let Some(ws) = n.then_move {
+                        self.move_to_section(&ws, Some(i), cx);
+                    }
+                }
+            }
+            self.state.save();
+        }
+        if enter {
+            self.sidebar_focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn cancel_naming(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.naming = None;
+        self.sidebar_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn pick_icon(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(current) = self.state.sections.get(i).map(|s| s.icon.clone()) else {
+            return;
+        };
+        // Named by keyword, so typing "bug" or "star" finds the icon.
+        let items = SECTION_ICONS
+            .iter()
+            .map(|(name, icon)| {
+                CommandItem::new()
+                    .label(name.replace('-', " "))
+                    .icon(*icon)
+                    .checked(*name == current)
+            })
+            .collect();
+        let selected = SECTION_ICONS
+            .iter()
+            .position(|(n, _)| *n == current)
+            .unwrap_or(0);
+        self.open_menu(
+            items,
+            selected,
+            move |s, row, _, cx| {
+                if let Some(sec) = s.state.sections.get_mut(i) {
+                    sec.icon = SECTION_ICONS[row].0.into();
+                    s.state.save();
+                    cx.notify();
+                }
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Sections, then "No section" when it is in one, then "New section…".
+    fn pick_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.target(window).map(|w| w.name) else {
+            return Self::notify_err(window, cx, "Open a workspace first");
+        };
+        let current = self.section_of(&ws);
+        let n = self.state.sections.len();
+        let mut items: Vec<CommandItem> = self
+            .state
+            .sections
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                CommandItem::new()
+                    .label(s.name.clone())
+                    .icon(section_icon(&s.icon))
+                    .checked(current == Some(i))
+            })
+            .collect();
+        if current.is_some() {
+            items.push(
+                CommandItem::new()
+                    .label("No section")
+                    .icon(IconName::FolderOutput),
+            );
+        }
+        items.push(
+            CommandItem::new()
+                .label("New section…")
+                .icon(IconName::FolderPlus),
+        );
+        let last = items.len() - 1;
+        self.open_menu(
+            items,
+            current.unwrap_or(0),
+            move |s, row, window, cx| match row {
+                _ if row == last => s.start_naming(None, Some(ws.clone()), window, cx),
+                _ if row < n => s.move_to_section(&ws, Some(row), cx),
+                _ => s.move_to_section(&ws, None, cx),
+            },
+            window,
+            cx,
+        );
     }
 
     fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1699,6 +2376,8 @@ impl Shark {
                 .text_sm()
                 .when(rail, |d| d.justify_center())
         };
+        let m = window.modifiers();
+        let cmd_held = m.platform && m.number_of_modifiers() == 1;
         let shark = cx.entity().downgrade();
         let repos = self.state.repos.iter().enumerate().map(|(ix, r)| {
             let (name, path) = (r.name.clone(), r.path.clone());
@@ -1733,19 +2412,29 @@ impl Shark {
                         )
                 })
         });
-        let workspaces = self.state.workspaces.iter().enumerate().map(|(ix, w)| {
+        let order = self.ws_order();
+        let (primary, accent) = (theme.primary, theme.sidebar_accent);
+        // Dropping a workspace on a header or on a row of a section moves it there.
+        let drop_on = |to: Option<usize>| {
+            cx.listener(move |this: &mut Shark, d: &DraggedWs, _, cx| {
+                this.move_to_section(&d.0, to, cx)
+            })
+        };
+        let ws_row = |ix: usize, w: &Workspace, section: Option<usize>| {
             let busy = self
                 .chats
                 .get(&w.name)
                 .is_some_and(|c| c.read(cx).working());
-            let selected = ix == self.sel;
+            let selected = self.sel == SideRow::Ws(ix);
             let active = self.active.as_ref() == Some(&w.name);
             let attn = self.attention_of(&w.name, cx);
+            let nth = order.iter().position(|&o| o == ix).filter(|&n| n < 9);
             let ws = w.clone();
             let shark = shark.clone();
             row()
                 .id(ix)
                 .h(px(44.))
+                .when(section.is_some() && !rail, |d| d.ml(px(24.)))
                 .border_1()
                 .border_color(theme.transparent)
                 // The tint alone is too subtle to find the cursor; the accent ring makes it visible.
@@ -1761,26 +2450,39 @@ impl Shark {
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, _, _, cx| {
-                        this.sel = ix;
+                        this.sel = SideRow::Ws(ix);
                         cx.notify();
                     }),
                 )
-                .child(if busy {
-                    Spinner::new()
+                .on_drag(DraggedWs(w.name.clone().into()), |d, _, _, cx| {
+                    cx.new(|_| d.clone())
+                })
+                .drag_over::<DraggedWs>(move |d, _, _, _| d.border_color(primary))
+                .on_drop({
+                    let target = w.name.clone();
+                    cx.listener(move |this, d: &DraggedWs, _, cx| this.drop_ws(&d.0, &target, cx))
+                })
+                .child(match (busy, nth) {
+                    (_, Some(n)) if cmd_held => {
+                        Kbd::new(Keystroke::parse(&format!("cmd-{}", n + 1)).unwrap())
+                            .into_any_element()
+                    }
+                    (true, _) => Spinner::new()
                         .icon(IconName::LoaderCircle)
                         .color(theme.primary)
                         .with_size(px(14.))
-                        .into_any_element()
-                } else {
-                    let (icon, color) = match &attn {
-                        Attn::Needs(_) => (IconName::CircleAlert, theme.warning_foreground),
-                        Attn::Unread => (IconName::CircleCheck, theme.success_foreground),
-                        Attn::None => (IconName::CircleDashed, theme.muted_foreground),
-                    };
-                    Icon::new(icon)
-                        .with_size(px(14.))
-                        .text_color(color)
-                        .into_any_element()
+                        .into_any_element(),
+                    (false, _) => {
+                        let (icon, color) = match &attn {
+                            Attn::Needs(_) => (IconName::CircleAlert, theme.warning_foreground),
+                            Attn::Unread => (IconName::CircleCheck, theme.success_foreground),
+                            Attn::None => (IconName::CircleDashed, theme.muted_foreground),
+                        };
+                        Icon::new(icon)
+                            .with_size(px(14.))
+                            .text_color(color)
+                            .into_any_element()
+                    }
                 })
                 .when(!rail, |d| {
                     d.child(
@@ -1816,7 +2518,169 @@ impl Shark {
                     d.tooltip(move |w, cx| Tooltip::new(name.clone()).build(w, cx))
                 })
                 .context_menu(move |menu, window, cx| ws_menu(menu, &ws, ix, &shark, window, cx))
-        });
+                .into_any_element()
+        };
+        let section_row =
+            |i: usize, sec: &Section| {
+                let selected = self.sel == SideRow::Section(i);
+                let (name, shark) = (sec.name.clone(), shark.clone());
+                let tip: SharedString = sec.name.clone().into();
+                // A folded section still shows that a workspace inside needs you.
+                let needs = sec.collapsed
+                    && sec
+                        .workspaces
+                        .iter()
+                        .any(|n| matches!(self.attention_of(n, cx), Attn::Needs(_)));
+                row()
+                    .id(("section", i))
+                    .border_1()
+                    .border_color(theme.transparent)
+                    .text_color(theme.muted_foreground)
+                    .when(selected && focused, |d| {
+                        d.bg(theme.list_active).border_color(theme.primary)
+                    })
+                    .when(selected && !focused, |d| d.bg(theme.sidebar_accent))
+                    .hover(|d| d.bg(theme.sidebar_accent))
+                    .drag_over::<DraggedWs>(move |d, _, _, _| d.bg(accent).border_color(primary))
+                    .on_drop(drop_on(Some(i)))
+                    .on_drag(DraggedSection(i, sec.name.clone().into()), |d, _, _, cx| {
+                        cx.new(|_| d.clone())
+                    })
+                    .drag_over::<DraggedSection>(move |d, _, _, _| d.border_color(primary))
+                    .on_drop(cx.listener(move |this, d: &DraggedSection, _, cx| {
+                        this.drop_section(d.0, i, cx)
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.sel = SideRow::Section(i);
+                        this.toggle_section(i, cx)
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, _, _, cx| {
+                            this.sel = SideRow::Section(i);
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        Icon::new(section_icon(&sec.icon))
+                            .with_size(px(14.))
+                            .when(needs, |i| i.text_color(theme.warning_foreground)),
+                    )
+                    .when(!rail, |d| {
+                        d.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(sec.name.clone()),
+                        )
+                        .when(sec.collapsed, |d| {
+                            d.child(div().text_xs().child(sec.workspaces.len().to_string()))
+                        })
+                        .child(
+                            Icon::new(match sec.collapsed {
+                                true => IconName::ChevronRight,
+                                false => IconName::ChevronDown,
+                            })
+                            .with_size(px(12.)),
+                        )
+                    })
+                    .when(rail, |d| {
+                        d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+                    })
+                    .context_menu(move |menu, _, _| section_menu(menu, i, &name, &shark))
+                    .into_any_element()
+            };
+        let name_row = |input: &Entity<InputState>, icon: IconName| {
+            row()
+                .key_context("SectionName")
+                .border_1()
+                .border_color(theme.primary)
+                .bg(theme.list_active)
+                .text_color(theme.muted_foreground)
+                .on_action(cx.listener(|this, _: &CancelEdit, w, cx| this.cancel_naming(w, cx)))
+                .child(Icon::new(icon).with_size(px(14.)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(theme.foreground)
+                        .child(Input::new(input).appearance(false).small()),
+                )
+                .into_any_element()
+        };
+        let mut items: Vec<AnyElement> = vec![];
+        let mut new_row = self
+            .naming
+            .as_ref()
+            .filter(|n| n.rename.is_none())
+            .map(|n| name_row(&n.input, IconName::Folder));
+        for r in self.side_rows() {
+            match r {
+                SideRow::Section(i) => {
+                    let sec = &self.state.sections[i];
+                    match &self.naming {
+                        Some(n) if n.rename == Some(i) => {
+                            items.push(name_row(&n.input, section_icon(&sec.icon)))
+                        }
+                        _ => items.push(section_row(i, sec)),
+                    }
+                }
+                SideRow::Ws(ix) => {
+                    let w = &self.state.workspaces[ix];
+                    let section = self.section_of(&w.name);
+                    if section.is_none() {
+                        // A new section's field goes below the existing sections.
+                        items.extend(new_row.take());
+                    }
+                    items.push(ws_row(ix, w, section));
+                }
+            }
+        }
+        items.extend(new_row.take());
+        let new_section_menu = {
+            let shark = shark.clone();
+            move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
+                let shark = shark.clone();
+                menu.item(
+                    PopupMenuItem::new("New Section")
+                        .icon(IconName::FolderPlus)
+                        .on_click(move |_, window, cx| {
+                            shark
+                                .update(cx, |s, cx| s.start_naming(None, None, window, cx))
+                                .ok();
+                        }),
+                )
+            }
+        };
+        let ws_header = h_flex()
+            .id("ws-header")
+            .group("ws-header")
+            .justify_between()
+            .items_end()
+            .drag_over::<DraggedWs>(move |d, _, _, _| d.bg(accent))
+            .on_drop(drop_on(None))
+            .child(header("Workspaces"))
+            .when(!rail, |d| {
+                d.child(
+                    div()
+                        .mr_3()
+                        .invisible()
+                        .group_hover("ws-header", |s| s.visible())
+                        .child(
+                            Button::new("new-section")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::FolderPlus)
+                                .tooltip("New section (space s n)")
+                                .on_click(cx.listener(|this, _, w, cx| {
+                                    this.start_naming(None, None, w, cx)
+                                })),
+                        ),
+                )
+            })
+            .context_menu(new_section_menu.clone());
         v_flex()
             .id("sidebar")
             .key_context("Sidebar")
@@ -1825,14 +2689,21 @@ impl Shark {
             .h_full()
             .flex_none()
             .text_color(theme.sidebar_foreground)
-            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.select_ws(this.sel + 1, cx)))
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_sel(|at, _| at + 1, cx)))
             .on_action(cx.listener(|this, _: &SelectPrev, _, cx| {
-                this.select_ws(this.sel.saturating_sub(1), cx)
+                this.move_sel(|at, _| at.saturating_sub(1), cx)
             }))
-            .on_action(cx.listener(|this, _: &SelectFirst, _, cx| this.select_ws(0, cx)))
-            .on_action(cx.listener(|this, _: &SelectLast, _, cx| this.select_ws(usize::MAX, cx)))
-            .on_action(cx.listener(|this, _: &Confirm, window, cx| {
-                this.open_workspace(this.sel, window, cx)
+            .on_action(cx.listener(|this, _: &SelectFirst, _, cx| this.move_sel(|_, _| 0, cx)))
+            .on_action(cx.listener(|this, _: &SelectLast, _, cx| this.move_sel(|_, n| n - 1, cx)))
+            .on_action(cx.listener(|this, _: &Confirm, window, cx| match this.sel {
+                SideRow::Ws(ix) => this.open_workspace(ix, window, cx),
+                SideRow::Section(i) => this.toggle_section(i, cx),
+            }))
+            .on_action(cx.listener(|this, _: &CollapseDir, _, cx| this.collapse_at_cursor(cx)))
+            .on_action(cx.listener(|this, _: &ExpandDir, _, cx| {
+                if let SideRow::Section(i) = this.sel {
+                    this.set_collapsed(i, false, cx)
+                }
             }))
             // Room for the traffic lights; the transparent titlebar lets the sidebar run under them.
             .child(
@@ -1842,31 +2713,33 @@ impl Shark {
                     .window_control_area(WindowControlArea::Drag),
             )
             .child(
-                // Children are indexed by `select_ws`: the header, then one per workspace.
+                // Children are indexed by `move_sel`: the header, then one per `side_rows` row.
                 v_flex()
                     .id("sidebar-rows")
                     .flex_1()
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.sidebar_scroll)
-                    .child(header("Workspaces"))
-                    .children(workspaces)
-                    .when(self.state.workspaces.is_empty(), |d| {
-                        d.child(hint("space w n to create"))
-                    })
+                    .child(ws_header)
+                    .children(items)
+                    .when(
+                        self.state.workspaces.is_empty() && self.state.sections.is_empty(),
+                        |d| d.child(hint("space w n to create")),
+                    )
                     .child(header("Repos"))
                     .children(repos)
                     .when(self.state.repos.is_empty(), |d| {
                         d.child(hint("space r a to add"))
-                    }),
+                    })
+                    // The empty space below takes a right-click too.
+                    .child(
+                        div()
+                            .id("sidebar-rest")
+                            .flex_1()
+                            .min_h(px(24.))
+                            .context_menu(new_section_menu),
+                    ),
             )
-    }
-
-    /// Moves the sidebar cursor (clamped) and scrolls it into view.
-    fn select_ws(&mut self, ix: usize, cx: &mut Context<Self>) {
-        self.sel = ix.min(self.state.workspaces.len().saturating_sub(1));
-        self.sidebar_scroll.scroll_to_item(self.sel + 1);
-        cx.notify();
     }
 
     fn render_main(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -1911,7 +2784,6 @@ impl Shark {
                 )
                 .into_any_element();
         };
-        let (busy, background) = (chat.read(cx).working(), chat.read(cx).background);
         let tab = |label: String, icon: IconName, t: Tab| {
             let on = self.tab == t;
             h_flex()
@@ -1932,10 +2804,6 @@ impl Shark {
                 .child(Icon::new(icon).with_size(px(14.)))
                 .child(label)
         };
-        let branch = self
-            .active_ws()
-            .map(|w| w.branch.clone())
-            .unwrap_or_default();
         let viewed = self.viewed_now.len();
         let file_tab = self.editor.as_ref().map(|e| {
             let path = &e.read(cx).path;
@@ -1983,36 +2851,11 @@ impl Shark {
                         d.child(tab(name, IconName::FileCode, Tab::File))
                     })
                     .child(div().flex_1())
-                    .child(
-                        h_flex()
-                            .min_w_0()
-                            .gap_1p5()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(Icon::new(IconName::GitBranch).with_size(px(12.)))
-                            .child(div().min_w_0().truncate().child(branch)),
-                    )
+                    .child(self.render_branch(cx))
                     .when_some(self.active_sync().cloned(), |d, sync| {
                         d.child(div().pl_3().child(sync))
                     })
-                    .child(
-                        h_flex()
-                            .pl_3()
-                            .gap_1p5()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(div().size(px(6.)).rounded_full().bg(if busy {
-                                theme.primary
-                            } else {
-                                faint(theme)
-                            }))
-                            .child(match (chat.read(cx).busy, background) {
-                                (true, 0) => "Running".into(),
-                                (true, n) => format!("Running · {n} in background"),
-                                (false, 0) => "Idle".into(),
-                                (false, n) => format!("{n} in background"),
-                            }),
-                    ),
+                    .child(self.render_status(&chat, cx)),
             )
             .child(match self.tab {
                 // Cached: the sidebar spinner redraws this view every frame, the chat only on change.
@@ -2093,6 +2936,130 @@ impl Shark {
                 )
                 .into_any_element(),
         )
+    }
+
+    /// The header's agent status, naming the call in flight; hovering shows the turn's details
+    /// and what runs in the background.
+    fn render_status(&self, chat: &Entity<Chat>, cx: &App) -> impl IntoElement {
+        let theme = cx.theme();
+        let c = chat.read(cx);
+        let running = match c.running_tool() {
+            Some(t) => format!("Running · {t}"),
+            None => "Running".into(),
+        };
+        let text = match (c.busy, c.background.len()) {
+            (true, 0) => running,
+            (true, n) => format!("{running} · {n} in background"),
+            (false, 0) => "Idle".into(),
+            (false, n) => format!("{n} in background"),
+        };
+        let (busy, started, model) = (c.busy, c.started, c.model().to_string());
+        let (queued, steered, tasks) = (c.queued(), c.steered, c.background.clone());
+        HoverCard::new("status-card")
+            .anchor(Anchor::TopRight)
+            .trigger(
+                h_flex()
+                    .id("status")
+                    .pl_3()
+                    .gap_1p5()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(div().size(px(6.)).rounded_full().bg(if c.working() {
+                        theme.primary
+                    } else {
+                        faint(theme)
+                    }))
+                    .child(div().max_w(px(360.)).truncate().child(text)),
+            )
+            .content(move |_, _, cx| {
+                let theme = cx.theme();
+                let line = |t: String| div().child(t);
+                v_flex()
+                    .gap_1()
+                    .text_xs()
+                    .max_w(px(420.))
+                    .when_some(started.filter(|_| busy), |d, t| {
+                        d.child(line(format!(
+                            "Turn running for {}",
+                            crate::chat::duration(t.elapsed().as_secs())
+                        )))
+                    })
+                    .child(line(format!("Model {model}")))
+                    .when(queued > 0, |d| d.child(line(format!("{queued} queued"))))
+                    .when(steered, |d| {
+                        d.child(line("Message sent mid-turn, not read yet".into()))
+                    })
+                    .when(!tasks.is_empty(), |d| {
+                        d.child(
+                            div()
+                                .pt_1()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("{} in background", tasks.len())),
+                        )
+                        .children(tasks.iter().map(|t| {
+                            h_flex()
+                                .gap_1p5()
+                                .child(Icon::new(IconName::Bot).with_size(px(12.)))
+                                .child(t.clone())
+                        }))
+                    })
+            })
+    }
+
+    /// The header's branch label; hovering lists each repo's branch, linked to GitHub once pushed.
+    fn render_branch(&self, cx: &App) -> impl IntoElement {
+        let theme = cx.theme();
+        let branch = self
+            .active_ws()
+            .map(|w| w.branch.clone())
+            .unwrap_or_default();
+        let links = self
+            .active_sync()
+            .map(|s| s.read(cx).branch_urls())
+            .unwrap_or_default();
+        HoverCard::new("branch-card")
+            .anchor(Anchor::TopRight)
+            .trigger(
+                h_flex()
+                    .id("branch")
+                    .min_w_0()
+                    .gap_1p5()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(Icon::new(IconName::GitBranch).with_size(px(12.)))
+                    .child(div().min_w_0().truncate().child(branch.clone())),
+            )
+            .content(move |_, _, cx| {
+                let theme = cx.theme();
+                v_flex()
+                    .gap_1()
+                    .text_xs()
+                    .child(
+                        div()
+                            .text_color(theme.muted_foreground)
+                            .child(format!("Branch {branch}")),
+                    )
+                    .children(links.iter().enumerate().map(|(ix, (repo, url))| {
+                        h_flex()
+                            .gap_1p5()
+                            .child(Icon::new(IconName::FolderGit2).with_size(px(12.)))
+                            .child(match url {
+                                Some(u) => Link::new(("branch-link", ix))
+                                    .href(u.clone())
+                                    .child(repo.clone())
+                                    .into_any_element(),
+                                None => h_flex()
+                                    .gap_1p5()
+                                    .child(repo.clone())
+                                    .child(
+                                        div()
+                                            .text_color(theme.muted_foreground)
+                                            .child("not on GitHub"),
+                                    )
+                                    .into_any_element(),
+                            })
+                    }))
+            })
     }
 
     fn render_diff(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2219,9 +3186,13 @@ impl Shark {
                 cx.listener(|this, _: &CollapseDir, _, cx| this.set_dir_open(Some(false), cx)),
             )
             .on_action(cx.listener(|this, _: &ExpandDir, _, cx| this.set_dir_open(Some(true), cx)))
-            .on_action(cx.listener(|this, _: &ToggleViewed, w, cx| {
-                if let Some(ix) = this.cursor_file(w, cx) {
-                    this.toggle_viewed(ix, cx)
+            .on_action(cx.listener(|this, _: &ToggleViewed, _, cx| {
+                let Some(r) = this.tree_rows.get(this.tree_sel) else {
+                    return;
+                };
+                match r.file {
+                    Some(ix) => this.toggle_viewed(ix, cx),
+                    None => this.toggle_viewed_dir(&r.path.clone(), cx),
                 }
             }))
             .on_action(cx.listener(|this, _: &OpenFile, w, cx| {
@@ -2303,7 +3274,8 @@ impl Shark {
                             })
                             .with_size(px(14.)),
                         )
-                        .child(div().flex_1().truncate().child(r.name.clone())),
+                        .child(div().flex_1().truncate().child(r.name.clone()))
+                        .child(self.dir_viewed_box(ix, &r.path, cx)),
                 )
                 .into_any_element();
         };
@@ -2377,6 +3349,25 @@ impl Shark {
                     ),
             );
         div().px_2().child(row).into_any_element()
+    }
+
+    fn dir_viewed_box(&self, ix: usize, dir: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let files = self.dir_files(dir);
+        let all = files.iter().all(|&f| self.viewed(f) == Viewed::Yes);
+        let dir = dir.to_string();
+        div()
+            .id(("dir-viewed-box", ix))
+            // The row's click folds the folder; this one only toggles.
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(
+                Checkbox::new(("dir-viewed", ix))
+                    .small()
+                    .checked(all)
+                    .tooltip("All viewed (v)")
+                    .on_click(
+                        cx.listener(move |this, _: &bool, _, cx| this.toggle_viewed_dir(&dir, cx)),
+                    ),
+            )
     }
 
     fn render_editor(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2584,6 +3575,7 @@ impl Render for Shark {
                 this.pick_repo_for_workspace(w, cx)
             }))
             .on_action(cx.listener(|this, _: &StopAgent, _, cx| this.stop(cx)))
+            .on_action(cx.listener(|this, _: &FocusQueue, w, cx| this.focus_queue(w, cx)))
             .on_action(cx.listener(|this, _: &ShowChat, w, cx| this.show(Tab::Chat, w, cx)))
             .on_action(cx.listener(|this, _: &ShowDiff, w, cx| this.show(Tab::Diff, w, cx)))
             .on_action(cx.listener(|this, _: &CreatePrs, w, cx| this.create_prs(w, cx)))
@@ -2620,10 +3612,27 @@ impl Render for Shark {
                 this.with_target(w, cx, |ws, w, cx| copy(ws.branch.clone(), w, cx))
             }))
             .on_action(cx.listener(|this, a: &SetModel, w, cx| this.set_model(a.0, w, cx)))
-            .on_action(
-                cx.listener(|this, a: &OpenWorkspaceAt, w, cx| this.open_workspace(a.0, w, cx)),
-            )
             .on_action(cx.listener(|this, _: &NextAttention, w, cx| this.next_attention(w, cx)))
+            .on_action(cx.listener(|this, a: &OpenWorkspace, w, cx| {
+                if let Some(ix) = this.ws_order().get(a.0).copied() {
+                    this.open_workspace(ix, w, cx)
+                }
+            }))
+            .on_action(
+                cx.listener(|this, _: &NewSection, w, cx| this.start_naming(None, None, w, cx)),
+            )
+            .on_action(cx.listener(|this, _: &MoveToSection, w, cx| this.pick_section(w, cx)))
+            .on_action(cx.listener(|this, _: &RenameSection, w, cx| {
+                this.with_section(w, cx, |s, i, w, cx| s.start_naming(Some(i), None, w, cx))
+            }))
+            .on_action(cx.listener(|this, _: &SectionIcon, w, cx| {
+                this.with_section(w, cx, Shark::pick_icon)
+            }))
+            .on_action(cx.listener(|this, _: &DeleteSection, w, cx| {
+                this.with_section(w, cx, Shark::delete_section)
+            }))
+            // The sidebar swaps status icons for cmd-N hints while cmd is held.
+            .on_modifiers_changed(cx.listener(|_, _, _, cx| cx.notify()))
             .on_action(cx.listener(|this, _: &FocusLeft, w, cx| this.move_focus(-1, w, cx)))
             .on_action(cx.listener(|this, _: &FocusRight, w, cx| this.move_focus(1, w, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
@@ -2631,6 +3640,9 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &ToggleVim, w, cx| this.toggle_vim(w, cx)))
             .on_action(cx.listener(|this, _: &CloseFile, w, cx| this.close_file(w, cx)))
             .on_action(cx.listener(|this, _: &OpenAnyFile, w, cx| this.open_any_file(w, cx)))
+            .on_action(cx.listener(|this, _: &OpenSettings, w, cx| {
+                crate::settings::open(&this.state, w, cx)
+            }))
             .child(self.render_sidebar(window, cx))
             .child(
                 // Linear's "island": content floats on the sidebar color, inset and rounded.
@@ -2836,7 +3848,7 @@ impl Render for NewWorkspaceForm {
 }
 
 #[cfg(all(test, feature = "test-support"))]
-mod ui_tests {
+pub(crate) mod ui_tests {
     use super::*;
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
@@ -2845,7 +3857,7 @@ mod ui_tests {
     use std::{fs, path::PathBuf, time::Duration};
 
     /// UI tests share the process-wide `TEST_HOME` and `state.json`, so they take turns.
-    static UI_LOCK: Mutex<()> = Mutex::new(());
+    pub(crate) static UI_LOCK: Mutex<()> = Mutex::new(());
 
     fn test_home() -> PathBuf {
         let home = crate::state::TEST_HOME
@@ -2906,6 +3918,49 @@ mod ui_tests {
         }
     }
 
+    /// Settings apply and persist at once; an edited prompt reaches the git button, reset drops it.
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn settings_apply_and_save(cx: &mut TestAppContext) {
+        use crate::settings::Settings;
+        use crate::state::Mode;
+        let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        test_home();
+        let (window, shark) = boot(cx, State::default());
+        cx.update_window(window, |_, w, cx| {
+            let state = shark.read(cx).state.clone();
+            let weak = shark.downgrade();
+            let view = cx.new(|cx| Settings::new(weak, &state, w, cx));
+            view.update(cx, |v, cx| {
+                v.appearance(cx, |a| {
+                    a.mode = Mode::Dark;
+                    a.dark = "Sequoia".into();
+                    a.mono_font = Some("Menlo".into());
+                });
+                v.set_prompt(0, Some("ship {repos}".into()), cx);
+            });
+            assert_eq!(cx.theme().theme_name().as_ref(), "Sequoia Dark");
+            // Headless tests have no system fonts, so check the config, not the resolved family.
+            let mono = |t: &gpui_kit::component::ThemeConfig| t.mono_font_family.clone();
+            assert_eq!(mono(&cx.theme().dark_theme).as_deref(), Some("Menlo"));
+            let saved = State::load();
+            assert_eq!(saved.appearance.dark, "Sequoia");
+            assert_eq!(saved.prompts["commit"], "ship {repos}");
+            assert_eq!(crate::prompts::render("commit", "api", "b"), "ship api");
+
+            view.update(cx, |v, cx| {
+                v.appearance(cx, |a| a.mode = Mode::Light);
+                v.reset_prompt(0, w, cx);
+            });
+            assert_eq!(cx.theme().theme_name().as_ref(), "Linear Light");
+            // The font override survives the mode switch.
+            assert_eq!(mono(&cx.theme().light_theme).as_deref(), Some("Menlo"));
+            assert!(State::load().prompts.is_empty());
+            assert!(crate::prompts::render("commit", "api", "b").starts_with("Commit and push"));
+        })
+        .unwrap();
+    }
+
     /// Drives the real keymap headlessly: create a workspace, vim focus moves, tabs, archive.
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)] // each test owns its thread; the lock only orders them
@@ -2951,6 +4006,10 @@ mod ui_tests {
             !ws_dir.join("web").exists(),
             "only the last-used repos start ticked"
         );
+
+        // cmd-N opens the Nth workspace; past the end does nothing.
+        press(cx, &["cmd-9", "cmd-1"]);
+        cx.update(|cx| assert_eq!(shark.read(cx).active.as_deref(), Some("ui-x")));
 
         // Opening a workspace focuses the composer: vim keys must type, not navigate.
         cx.update_window(window, |_, w, cx| w.input("jk g", cx))
@@ -3059,6 +4118,11 @@ mod ui_tests {
             shark.read(cx).viewed(0) == Viewed::Changed
         })
         .await;
+        // `v` on a folder ticks every file in it, then unticks them all.
+        press(cx, &["k", "v"]);
+        assert_eq!(viewed(cx), Viewed::Yes);
+        press(cx, &["v", "j"]);
+        assert_eq!(viewed(cx), Viewed::No);
 
         // `o` opens the file next to the chat and shrinks the sidebar to a rail.
         press(cx, &["o"]);
@@ -3194,6 +4258,34 @@ mod ui_tests {
             assert_eq!(names, ["web"]);
             assert_eq!(s.state.last_repos, ["web"]);
         });
+
+        // Sections: name inline, move with `m`, fold with h/l, delete keeps the workspace.
+        press(cx, &["ctrl-w", "h", "space", "s", "n"]);
+        cx.run_until_parked();
+        cx.update_window(window, |_, w, cx| w.input("Later", cx))
+            .unwrap();
+        press(cx, &["enter"]);
+        let sections =
+            |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.sections.clone());
+        assert_eq!(sections(cx)[0].name, "Later");
+        cx.update_window(window, |_, w, cx| {
+            let s = shark.read(cx);
+            assert!(s.sidebar_focus.is_focused(w) && s.sel == SideRow::Section(0));
+        })
+        .unwrap();
+        press(cx, &["j", "m"]);
+        cx.run_until_parked();
+        press(cx, &["enter"]);
+        assert_eq!(sections(cx)[0].workspaces, ["kb"]);
+        press(cx, &["j", "h"]);
+        cx.update(|cx| {
+            let s = shark.read(cx);
+            assert!(s.state.sections[0].collapsed && s.sel == SideRow::Section(0));
+            assert!(s.ws_order().is_empty(), "cmd-N skips folded workspaces");
+        });
+        press(cx, &["l", "space", "s", "d"]);
+        assert!(sections(cx).is_empty());
+        cx.update(|cx| assert_eq!(shark.read(cx).state.workspaces.len(), 1));
         press(cx, &["ctrl-w", "h", "space", "w", "d"]);
         cx.wait_for(window, Duration::from_secs(10), |_, cx| {
             shark.read(cx).state.workspaces.is_empty()
@@ -3517,8 +4609,11 @@ mod ui_tests {
             ms(t)
         ));
         assert_eq!(data.files.len(), 2001);
-        press(cx, "space");
-        press(cx, "d");
+        // Not `space d`: the new workspace's composer has focus and would take the keys.
+        cx.update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| s.show(Tab::Diff, w, cx))
+        })
+        .unwrap();
         let t = Instant::now();
         cx.update(|cx| shark.update(cx, |s, cx| s.apply_diff(data, cx)));
         frame(cx);
@@ -3535,6 +4630,8 @@ mod ui_tests {
         .unwrap();
         frame(cx);
         let n = 200;
+        // The tree cursor starts on the first file's row, not on its folders.
+        let start = cx.update(|cx| shark.read(cx).tree_sel);
         let t = Instant::now();
         for _ in 0..n {
             press(cx, "j");
@@ -3542,12 +4639,19 @@ mod ui_tests {
         }
         let tree_key = ms(t) / n as f64;
         report.push(format!("tree j + frame: {tree_key:.2} ms/key"));
+        cx.update(|cx| assert_eq!(shark.read(cx).tree_sel, start + n));
         let t = Instant::now();
         for _ in 0..20 {
             press(cx, "v");
             frame(cx);
         }
         report.push(format!("toggle viewed + frame: {:.2} ms", ms(t) / 20.));
+        cx.update(|cx| shark.update(cx, |s, cx| s.tree_select(0, cx)));
+        let t = Instant::now();
+        press(cx, "v");
+        frame(cx);
+        report.push(format!("toggle folder viewed + frame: {:.0} ms", ms(t)));
+        cx.update(|cx| assert_eq!(shark.read(cx).viewed_now.len(), 2001));
         let t = Instant::now();
         press(cx, "shift-g");
         press(cx, "k");

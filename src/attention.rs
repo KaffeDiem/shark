@@ -192,14 +192,19 @@ impl Shark {
 
     /// Opens the next workspace after the open one (in sidebar order) that needs you.
     pub(crate) fn next_attention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let n = self.state.workspaces.len();
+        let order = self.sidebar_order();
+        let n = order.len();
         let from = self
             .active
             .as_ref()
-            .and_then(|a| self.state.workspaces.iter().position(|w| &w.name == a))
+            .and_then(|a| {
+                order
+                    .iter()
+                    .position(|&ix| &self.state.workspaces[ix].name == a)
+            })
             .map_or(0, |i| i + 1);
-        let hit = (0..n).map(|i| (from + i) % n).find(|&i| {
-            let name = &self.state.workspaces[i].name;
+        let hit = (0..n).map(|i| order[(from + i) % n]).find(|&ix| {
+            let name = &self.state.workspaces[ix].name;
             self.active.as_ref() != Some(name) && self.attention_of(name, cx) != Attn::None
         });
         match hit {

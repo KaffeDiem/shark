@@ -4,6 +4,15 @@ A keyboard-first, native (GPUI) app for running Claude Code on features that spa
 
 One workspace = one feature = N git worktrees on a shared branch, e.g. `~/shark/workspaces/eng-123-login/{ios,backend}`. A single agent works across all of them. The diff view is combined, and PRs are cross-linked.
 
+## Install
+```sh
+brew tap KaffeDiem/shark https://github.com/KaffeDiem/shark
+brew install --cask KaffeDiem/shark/shark
+```
+Or [Download Shark 0.0.0](https://github.com/KaffeDiem/shark/releases/download/v0.0.0/Shark-0.0.0.dmg) (Apple Silicon), open it and drag Shark to Applications. The app isn't notarized: on first launch, open it, then allow it in System Settings → Privacy & Security → Open Anyway, or run `xattr -dr com.apple.quarantine /Applications/Shark.app`.
+
+Releases: merge a PR with the `release` label. CI builds the DMG (`make release`), publishes a GitHub release, and commits the new version to `Cargo.toml`, `Casks/shark.rb` and this section. The version is the one in `Cargo.toml`, or its next patch if that is already released.
+
 ## Run
 ```sh
 cargo run                                  # needs Xcode (Metal); Rust is pinned in rust-toolchain.toml
@@ -16,15 +25,17 @@ Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH.
 ## Keys
 | Where | Keys |
 |---|---|
-| anywhere | `cmd-k` palette · `cmd-n` new workspace · `ctrl-c` interrupt the agent's turn, again to stop the process (not in the editor) · `ctrl-w h/l` previous/next pane · `cmd-b` sidebar ↔ icon rail · `ctrl-cmd-v` Vim keys in the editor on/off · `cmd-/` model menu · `ctrl-cmd-1…5` default/fable/opus/sonnet/haiku · `cmd-1…9` open the Nth workspace · `cmd-j` next workspace that needs you · `cmd-p` open any file |
-| sidebar | `j/k` `gg` `G` · `enter` open |
-| transcript | `j/k` `gg` `G` `ctrl-d/u` · `enter`/`o` toggle tool output · `i`/`a` → composer |
-| composer | `enter` send (while the agent works: queue) · `shift-enter` newline · `esc` → normal mode · `@` add a file or folder (`repo/` to pick the repo) · `/` skills and commands at the start · in the menu `↑/↓` `enter`/`tab` `esc` |
-| leader (normal mode) | `space space` palette · `space w n/d/D` new/archive/force-archive · `space w a` add a repo to the workspace · `space w j` next workspace that needs you · `space r a` add repo · `space c/d` chat/diff · `space p r` create linked PRs · `space p d` create draft PRs · `space p o` open PRs · `space p k/j` move a repo earlier/later in the merge order · `space g g` next git step · `space g m` git menu · `space g f` fetch now · `space m m` model menu · `space m 1…5` pick model · `space o f/t` reveal in Finder / open in Terminal · `space y p/b` copy path / branch · `space b` sidebar rail · `space t` file tree · `space x` close file · `space f f` open any file (fuzzy) |
+| anywhere | `cmd-k` palette · `cmd-,` settings · `cmd-n` new workspace · `cmd-1…9` open the Nth workspace (hold `cmd` to see the numbers) · `cmd-j` next workspace that needs you · `cmd-p` open any file · `ctrl-c` interrupt the agent's turn, again to stop the process (not in the editor) · `ctrl-w h/l` previous/next pane · `cmd-b` sidebar ↔ icon rail · `ctrl-cmd-v` Vim keys in the editor on/off · `cmd-/` model menu · `ctrl-cmd-1…5` default/fable/opus/sonnet/haiku |
+| sidebar, transcript | `j/k` `gg` `G` `ctrl-d/u` · `enter` open / toggle tool output (`o` too in the transcript) · `i`/`a` → composer |
+| sidebar sections | `space s n` new section (named in place, `enter` saves, `esc` cancels) · `m` / `space s m` move workspace to a section · `h`/`l` fold/unfold · `enter` on a header toggles it · `space s r` rename · `space s i` icon · `space s d` delete (its workspaces stay) |
+| composer | `enter` send (queues while the agent runs) · `cmd-enter` send now, steering the running turn · `↑` on the first line → queue · `shift-enter` newline · `esc` → normal mode · `@` add a file or folder (`repo/` to pick the repo) · `/` skills and commands at the start · in the menu `↑/↓` `enter`/`tab` `esc` |
+| queue | `j/k` `↑/↓` `gg` `G` · `enter` send now · `e` edit (`enter` puts it back) · `d`/`backspace` delete · `shift-k/j` or `alt-↑/↓` move up/down · `esc`/`i`, or `↓` past the last row → composer |
+| leader (normal mode) | `space space` palette · `space ,` settings · `space q` queue · `space w n/d/D` new/archive/force-archive · `space w a` add a repo to the workspace · `space w j` next workspace that needs you · `space r a` add repo · `space c/d` chat/diff · `space p r` create linked PRs · `space p d` create draft PRs · `space p o` open PRs · `space p k/j` move a repo earlier/later in the merge order · `space g g` next git step · `space g m` git menu · `space g f` fetch now · `space m m` model menu · `space m 1…5` pick model · `space o f/t` reveal in Finder / open in Terminal · `space y p/b` copy path / branch · `space b` sidebar rail · `space t` file tree · `space x` close file · `space f f` open any file (fuzzy) |
 | new workspace | `enter` create (in branch or first message) · `tab` branch → repo filter → first message · type to filter · `enter` tick match · `space` tick/untick highlighted · `cmd-enter` create · last-used repos start ticked |
-| sidebar mouse | right-click a workspace: open, reveal in Finder / Terminal / copy path (per repo), copy branch, open PRs, archive |
+| sidebar mouse | right-click a workspace: open, move to section, reveal in Finder / Terminal / copy path (per repo), copy branch, open PRs, archive · drag a workspace onto a section header to move it in (onto Workspaces to ungroup), or onto another workspace to take its place · drag a section header onto another to reorder sections · hover Workspaces for **+** new section, or right-click it or the empty space below · click a section header to fold it; right-click it to rename, change icon, delete |
+| settings | `ctrl-tab` Appearance ↔ Prompts |
 | diff | `j/k` `gg` `G` `ctrl-d/u` move the line cursor (kept across refreshes) · `h/l` scroll sideways · `]c`/`[c` changes · `}`/`{` files · `v` viewed / `o` open the cursor's file · `c` comment on the cursor line or selected lines (edit: `c` again; empty removes) · `shift-c` send all comments to the agent · `s` split/unified · `r` refresh · viewed checkbox in each file header |
-| file tree | `j/k` `gg` `G` `ctrl-d/u` · `enter` show file / toggle folder · `h/l` collapse/expand · `v` viewed · `o` open in editor |
+| file tree | `j/k` `gg` `G` `ctrl-d/u` · `enter` show file / toggle folder · `h/l` collapse/expand · `v` viewed (on a folder: every file in it) · `o` open in editor |
 | editor | `cmd-s` save · `cmd-w` close · `esc` back to the tree · with Vim on: motions `hjkl w b e 0 ^ $ gg G { }` with counts, `i a I A o O` (`esc`/`ctrl-c` back to normal), `x dd yy cc D C p P J r ~`, `d/c/y/>/<` + motion, `v`/`V`, `u` / `ctrl-r`, `/ n N`, `:w`, and in Normal mode the leader keys (`space x`, `space f f`, …) |
 
 ## How it works
@@ -41,7 +52,7 @@ Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH.
   - One process per workspace: `claude -p --input-format stream-json --output-format stream-json`, with the workspace root as cwd.
   - Runs with `--permission-mode bypassPermissions`. Worktrees isolate branches, not the filesystem.
   - `ctrl-c` sends an `interrupt` control request: claude ends the turn and the process stays warm with its background tasks. If the turn hasn't ended after 5 s, or on a second `ctrl-c`, the process gets SIGTERM; when background tasks would die with it, only the second `ctrl-c` sends it. With only background tasks left, `ctrl-c` stops the process.
-  - A message sent while the agent works goes to claude's stdin right away and shows as queued; claude reads it at its next step, which can steer the running turn. `--replay-user-messages` makes claude echo each message when it reads it, which clears the label; the echo is what the transcript stores.
+  - **Queue:** a message sent while a turn runs waits in a queue above the composer, top first. The top one goes out when a turn ends without error; a stop or an error leaves the queue alone, and so does editing one of its messages. Send now writes the message to claude's stdin mid-turn: claude reads it at its next tool call, or as a new turn if the reply has no more tool calls. The queue is in memory only.
   - The transcript is stored in `~/Library/Application Support/shark/transcripts/` (tool output clipped to 20k characters, each tool-input string to 2k), and `--resume` continues the session after a restart. If claude no longer has the session, shark drops it and the next message starts a fresh one. The palette's "New conversation" drops it by hand. History is read and parsed off the UI thread and goes ahead of anything sent while it loads; a turn without a result (shark quit or claude crashed) is marked "interrupted".
 - **Diff:** one `git diff --merge-base <base>` per worktree, with paths prefixed by repo name. Untracked files are included by marking them intent-to-add in a throwaway copy of the index (`GIT_INDEX_FILE`), so the real index and the agent's `index.lock` are never touched.
 - **Files tree and viewed:** the changed files show as a tree to the right of the diff (and of an open file), folders first, single-child folders joined (`src/ui`). Marking a file viewed stores a fingerprint of its patch in `state.json`; when the patch changes the file is unviewed again and gets a dot.
@@ -55,9 +66,12 @@ Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH.
   - Before running, the step re-reads git, and GitHub for steps that act on it, and refuses if the state moved on (agent prompts and pull/push use the PR state on screen, so they don't wait for gh). Every step that writes waits for the agent to be idle. Merge and force push confirm first; merge uses each repo's allowed method with `--match-head-commit`, and stops at the first failure.
   - Merge order: repos merge in the order set with `space p k/j` (or "Merge order…" in the git menu), saved per workspace in `state.json`; repos never moved follow in the order they were added.
   - Branch cleanup: "Toggle deleting remote branches after merge" (palette or git menu, off by default, saved in `state.json`) adds `--delete-branch` to the merge. Run from the linked worktree, gh then deletes only the remote branch (it skips a local branch checked out in the current worktree); gh refuses `--delete-branch` on repos with a merge queue. Archive (not force-archive) then deletes the local branch in each source repo whose work landed in a merged PR or that has no commits of its own, and only while the branch still points at the commit found merged.
-- **Attention:** a sidebar row shows a check when a turn finished while the workspace wasn't on screen (cleared when you open it), and an alert with the step when the next git step is yours: conflicts, failing checks, a git error, a review or comments to address, or ready to merge. The Dock badge counts such workspaces.
+- **Attention:** a sidebar row shows a check when a turn finished while the workspace wasn't on screen (cleared when you open it), and an alert with the step when the next git step is yours: conflicts, failing checks, a git error, a review or comments to address, or ready to merge. A folded section's icon turns amber while a workspace in it needs you. The Dock badge counts such workspaces.
   - Workspaces that aren't shown get a slow check (`git status` plus `gh pr list`, no fetch): one every 20 s in turn, each at most every 5 min, sooner after its turn ends, never while its agent works or it is being archived. A gh failure keeps the last answer; after failures in two workspaces in a row, nothing is checked for 5 min.
   - A finished turn (off screen, or with the window in the background) and a workspace off screen that starts needing you raise a macOS notification through `osascript` (`UNUserNotificationCenter` needs an app bundle, which `cargo run` isn't), so it's listed under Script Editor in System Settings → Notifications.
+- **Settings** (`cmd-,`; `src/settings.rs`): changes apply and save to `state.json` at once.
+  - Appearance: mode (System/Light/Dark), a theme for light mode and one for dark mode (Linear, Roraima, Everest, Sequoia, Sakura), interface and code font (any installed font).
+  - Prompts: every prompt the git button sends to the agent (`src/prompts.rs`) can be edited; `{repos}` and `{branch}` are filled in. Only edits are saved, and "Reset to default" drops the edit.
 - **PRs:**
   - For each repo with commits: push, then `gh pr create --fill`. Text in the composer titles new PRs: the first line is the title and the rest the body (`--title`/`--body` override what `--fill` fills in); a dialog shows the title first, and the composer is cleared once the PRs exist.
   - "Create draft PRs" (`space p d`) opens them with `--draft`; the git button then offers "Ready for review".
@@ -65,3 +79,6 @@ Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH.
   - Refuses to run while any repo has uncommitted changes. Only an open PR is reused; after a merge, new commits get a new PR.
 
 Background and prior art: [docs/research.md](docs/research.md). UI theme, design rules and checklist: [docs/design.md](docs/design.md).
+
+## License
+GPL-3.0 with an attribution term: copies and derived works must keep the copyright notice and credit "Shark by Kasper Munch Jensen". See [LICENSE](LICENSE).

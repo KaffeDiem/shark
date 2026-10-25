@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     fs,
     path::{Path, PathBuf},
 };
@@ -19,6 +19,58 @@ pub struct State {
     /// The workspace and tab (`chat`/`diff`) open at quit; restored on launch.
     #[serde(default)]
     pub last_open: Option<(String, String)>,
+    #[serde(default)]
+    pub appearance: Appearance,
+    /// Edited git-button prompts by id (`prompts::PROMPTS`); missing ids use the default.
+    #[serde(default)]
+    pub prompts: BTreeMap<String, String>,
+    /// Sidebar groups of workspaces, in display order; ungrouped workspaces follow them.
+    #[serde(default)]
+    pub sections: Vec<Section>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
+pub struct Section {
+    pub name: String,
+    /// Lucide icon name from `app::SECTION_ICONS`, e.g. `folder`.
+    pub icon: String,
+    #[serde(default)]
+    pub collapsed: bool,
+    /// Workspace names, in the order they were added.
+    #[serde(default)]
+    pub workspaces: Vec<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Default, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum Mode {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+/// Theme families by name (`main::THEMES`); fonts `None` use the theme's.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct Appearance {
+    pub mode: Mode,
+    pub light: String,
+    pub dark: String,
+    pub ui_font: Option<String>,
+    pub mono_font: Option<String>,
+}
+
+impl Default for Appearance {
+    fn default() -> Self {
+        Appearance {
+            mode: Mode::System,
+            light: "Linear".into(),
+            dark: "Linear".into(),
+            ui_font: None,
+            mono_font: None,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -47,6 +99,12 @@ pub struct WsRepo {
     pub src: PathBuf,
     /// Ref the branch was cut from, e.g. `origin/main`.
     pub base: String,
+}
+
+/// Moves item `from` into slot `to`; the ones between shift over.
+pub fn move_item<T>(v: &mut Vec<T>, from: usize, to: usize) {
+    let x = v.remove(from);
+    v.insert(to, x);
 }
 
 /// Lets tests redirect app data without mutating the process environment.
@@ -174,6 +232,50 @@ impl State {
         })
     }
 
+    /// Drag-and-drop of workspace `ws` onto workspace `target`: `ws` takes the target's
+    /// slot in the target's section (or among the ungrouped), like a list reorder.
+    pub fn drop_ws(&mut self, ws: &str, target: &str) {
+        let section_of = |st: &State, n: &str| {
+            st.sections
+                .iter()
+                .position(|s| s.workspaces.iter().any(|w| w == n))
+        };
+        let (from, to) = (section_of(self, ws), section_of(self, target));
+        if ws == target {
+            return;
+        }
+        let pos = |v: &[String], n: &str| v.iter().position(|w| w == n);
+        match to {
+            Some(i) if from == to => {
+                let v = &mut self.sections[i].workspaces;
+                let (f, t) = (pos(v, ws).unwrap(), pos(v, target).unwrap());
+                move_item(v, f, t);
+            }
+            Some(i) => {
+                for s in &mut self.sections {
+                    s.workspaces.retain(|w| w != ws);
+                }
+                let v = &mut self.sections[i].workspaces;
+                let t = pos(v, target).unwrap();
+                v.insert(t, ws.to_string());
+            }
+            None => {
+                for s in &mut self.sections {
+                    s.workspaces.retain(|w| w != ws);
+                }
+                let v = &self.workspaces;
+                let f = v.iter().position(|w| w.name == ws).unwrap();
+                let t = v.iter().position(|w| w.name == target).unwrap();
+                // Coming from a section it lands before the target; within the list it takes the slot.
+                let t = match from {
+                    Some(_) if f < t => t - 1,
+                    _ => t,
+                };
+                move_item(&mut self.workspaces, f, t);
+            }
+        }
+    }
+
     pub fn save(&self) {
         self.save_at(&state_file())
     }
@@ -237,5 +339,51 @@ mod tests {
             "side keys survive saves"
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn ws(name: &str) -> Workspace {
+        Workspace {
+            name: name.into(),
+            branch: name.into(),
+            repos: vec![],
+            session_id: None,
+            model: None,
+            viewed: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn drop_ws_reorders() {
+        let mut st = State {
+            workspaces: ["a", "b", "c", "d"].map(ws).into(),
+            sections: vec![Section {
+                name: "S".into(),
+                icon: "folder".into(),
+                collapsed: false,
+                workspaces: vec!["c".into(), "d".into()],
+            }],
+            ..Default::default()
+        };
+        let names = |st: &State| {
+            st.workspaces
+                .iter()
+                .map(|w| w.name.clone())
+                .collect::<Vec<_>>()
+        };
+        st.drop_ws("a", "b"); // down within the ungrouped: takes b's slot
+        assert_eq!(names(&st), ["b", "a", "c", "d"]);
+        st.drop_ws("a", "b"); // and back up
+        assert_eq!(names(&st), ["a", "b", "c", "d"]);
+        st.drop_ws("d", "c"); // within a section
+        assert_eq!(st.sections[0].workspaces, ["d", "c"]);
+        st.drop_ws("a", "c"); // into a section, before the target
+        assert_eq!(st.sections[0].workspaces, ["d", "a", "c"]);
+        st.drop_ws("d", "b"); // out to the ungrouped, before the target
+        assert_eq!(st.sections[0].workspaces, ["a", "c"]);
+        let ungrouped: Vec<_> = names(&st)
+            .into_iter()
+            .filter(|n| !st.sections[0].workspaces.contains(n))
+            .collect();
+        assert_eq!(ungrouped, ["d", "b"]);
     }
 }

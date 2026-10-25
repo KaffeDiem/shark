@@ -2,6 +2,7 @@
 name = "shark"
 version = "0.1.0"
 edition = "2024"
+license-file = "LICENSE"
 
 [dependencies]
 gpui-kit = { version = "=0.8.0", features = ["syntect"] }
