@@ -23,6 +23,8 @@ pub(super) struct DiffData {
     error: Option<String>,
     hunks: HashMap<SharedString, Vec<review::Hunk>>,
     media: Vec<media::MediaFile>,
+    /// The file edited in place, as on disk when the refresh read it.
+    edited: Option<Vec<u8>>,
 }
 
 impl DiffData {
@@ -55,6 +57,7 @@ impl DiffData {
             error,
             hunks,
             media,
+            edited: None,
         }
     }
 }
@@ -66,11 +69,18 @@ impl Shark {
         };
         self.diff_gen += 1;
         let generation = self.diff_gen;
+        let edited = self.editing.as_ref().map(|e| e.abs.clone());
         cx.spawn(async move |this, cx| {
             let name = ws.name.clone();
             let data = cx
                 .background_executor()
-                .spawn(async move { DiffData::load(&ws) })
+                .spawn(async move {
+                    let edited = edited.and_then(|abs| std::fs::read(abs).ok());
+                    DiffData {
+                        edited,
+                        ..DiffData::load(&ws)
+                    }
+                })
                 .await;
             this.update(cx, |s, cx| {
                 if s.active.as_ref() != Some(&name) || s.diff_gen != generation {
@@ -87,6 +97,9 @@ impl Shark {
         let status_changed = !self.diff_loaded || data.error != self.diff_error;
         self.diff_loaded = true;
         self.diff_error = data.error;
+        if let Some(bytes) = data.edited.take() {
+            self.edit_disk(bytes, cx);
+        }
         // Turn ends and saves refresh often; an unchanged patch keeps scroll and expansion.
         if data.fp == self.diff_fp && !self.diff_files.is_empty() {
             if status_changed {
@@ -158,12 +171,21 @@ impl Shark {
         if first_load && let Some(f) = files.get(at) {
             self.review.at_file(f.path());
         }
-        // The keyboard view comes back to its line; otherwise the file last moved to.
-        if !in_place
-            && !self.restore_view(cx)
-            && let Some(f) = files.get(at)
-        {
-            self.diff.update(cx, |d, cx| d.scroll_to_file(f.path(), cx));
+        // Editing: the caret's line, so its input is drawn and keeps focus. Else the keyboard
+        // view comes back to its line, or the file last moved to.
+        let caret = (self.editing.as_ref()).map(|e| e.caret());
+        match caret {
+            _ if in_place => {}
+            Some(caret) => self.diff.update(cx, |d, cx| {
+                d.show_line(caret.clone(), cx);
+                d.scroll_to_line(caret, cx)
+            }),
+            None if self.restore_view(cx) => {}
+            None => {
+                if let Some(f) = files.get(at) {
+                    self.diff.update(cx, |d, cx| d.scroll_to_file(f.path(), cx));
+                }
+            }
         }
         cx.notify();
     }
@@ -235,16 +257,18 @@ impl Shark {
         }
     }
 
-    /// Files under folder `dir` of the tree.
+    /// Files under folder `dir` of the tree that the filter shows.
     fn dir_files(&self, dir: &str) -> Vec<usize> {
         let prefix = format!("{dir}/");
         (0..self.diff_files.len())
-            .filter(|&ix| self.diff_files[ix].path().starts_with(&prefix))
+            .map(|ix| (ix, self.diff_files[ix].path()))
+            .filter(|(_, p)| p.starts_with(&prefix) && p.to_lowercase().contains(&self.tree_query))
+            .map(|(ix, _)| ix)
             .collect()
     }
 
     /// A folder's box: ticks every file inside, or unticks them all when all are viewed.
-    fn toggle_viewed_dir(&mut self, dir: &str, cx: &mut Context<Self>) {
+    pub(super) fn toggle_viewed_dir(&mut self, dir: &str, cx: &mut Context<Self>) {
         let files = self.dir_files(dir);
         let on = !files.iter().all(|&ix| self.viewed(ix) == Viewed::Yes);
         self.set_viewed(&files, on, cx);
@@ -322,7 +346,7 @@ impl Shark {
         if (self.tree_rows.get(self.tree_sel)).is_some_and(|r| r.file.is_some()) {
             self.tree_confirm(self.tree_sel, window, cx);
             if self.tab == Tab::Diff {
-                self.diff.read(cx).focus_handle(cx).focus(window, cx);
+                self.focus_diff(window, cx);
             }
         }
     }
@@ -331,22 +355,25 @@ impl Shark {
     pub(super) fn toggle_diff_mode(&mut self, cx: &mut Context<Self>) {
         self.state.unified = !self.state.unified;
         self.state.save();
-        let mode = match self.state.unified {
-            true => DiffMode::Unified,
-            false => DiffMode::Split,
-        };
+        let mode = diff_mode(self.state.unified);
         self.diff.update(cx, |d, cx| d.set_mode(mode, cx));
         cx.notify();
     }
 
     /// Trailing controls of a file card's header, after its "+a −d": the review chip and
-    /// Comment button, then the edit buttons.
+    /// Comment button, then the edit buttons; only [Review] [Save ⌘S] while it is edited.
     fn card_header_suffix(&self, file: &DiffFile, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let editing = self.editing.as_ref().map(|e| (e.path.clone(), e.dirty));
-        vec![
-            self.review_chips(file.path(), cx),
-            inline_edit::edit_buttons(file, editing.as_ref(), cx.entity().downgrade()),
-        ]
+        let edited = editing.as_ref().is_some_and(|(p, _)| p == file.path());
+        (!edited)
+            .then(|| self.review_chips(file.path(), cx))
+            .into_iter()
+            .chain([inline_edit::edit_buttons(
+                file,
+                editing.as_ref(),
+                cx.entity().downgrade(),
+            )])
+            .collect()
     }
 
     /// Files shows beside Changes and the file view, not the chat.
@@ -403,7 +430,7 @@ impl Shark {
         cx.notify();
     }
 
-    fn set_dir_open(&mut self, open: Option<bool>, cx: &mut Context<Self>) {
+    pub(super) fn set_dir_open(&mut self, open: Option<bool>, cx: &mut Context<Self>) {
         let Some(r) = self.tree_rows.get(self.tree_sel) else {
             return;
         };
@@ -420,7 +447,8 @@ impl Shark {
         }
         let path = r.path.clone();
         let is_open = !self.collapsed_dirs.contains(&path);
-        if open.unwrap_or(!is_open) == is_open {
+        // A filter shows every folder open; folding would change hidden state only.
+        if open.unwrap_or(!is_open) == is_open || !self.tree_query.is_empty() {
             return;
         }
         match is_open {
@@ -512,11 +540,11 @@ impl Shark {
             .hunk_separator(DiffHunkSeparator::LineInfo)
             .flex_1()
             .min_h_0();
-        // Typing in the line input must not reach the pane's letter keys.
-        let typing = (self.editing.as_ref()).is_some_and(|e| e.focused(window, cx));
         let status = self.edit_status();
+        // The letter keys' bindings are `DiffPane && !Input`: typing in the line input or the
+        // composer never reaches them.
         let pane = v_flex()
-            .key_context(if typing { "DiffEdit" } else { "DiffPane" })
+            .key_context("DiffPane")
             .relative()
             .flex_1()
             .min_w_0()
@@ -698,6 +726,7 @@ impl Shark {
         let edited =
             (self.editing.as_ref()).map(|e| (e.path.clone(), self.working_heading(&e.path)));
         self.with_inline_edit(diff, cx)
+            .accent_working(self.editing.as_ref().map(|e| e.path.clone()))
             .side_headings(move |file, _, _| {
                 let repo = file.path().split('/').next().unwrap_or_default();
                 let base = bases.get(repo).map_or("base", |b| b.as_str());
@@ -1027,5 +1056,13 @@ impl Shark {
                 .scroll_to_item(row, ScrollStrategy::Nearest);
         }
         cx.notify();
+    }
+}
+
+/// The diff's mode for the persisted `unified` choice.
+pub(super) fn diff_mode(unified: bool) -> DiffMode {
+    match unified {
+        true => DiffMode::Unified,
+        false => DiffMode::Split,
     }
 }

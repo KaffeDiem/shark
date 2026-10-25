@@ -214,7 +214,7 @@ impl Shark {
         {
             return self.open_workspace_now(ix, window, cx);
         }
-        self.confirm_discard_all(window, cx, move |s, window, cx| {
+        self.confirm_discard(true, true, window, cx, move |s, window, cx| {
             s.drop_editor();
             s.open_workspace_now(ix, window, cx)
         });
@@ -619,7 +619,7 @@ impl Shark {
                 || self.editing.as_ref().is_some_and(|e| e.dirty))
         {
             let name = name.to_string();
-            return self.confirm_discard_all(window, cx, move |s, window, cx| {
+            return self.confirm_discard(true, true, window, cx, move |s, window, cx| {
                 s.remove_workspace(&name, force, window, cx)
             });
         }

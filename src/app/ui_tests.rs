@@ -536,6 +536,8 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
             .collect();
         assert_eq!(names, ["api", "new.txt"]);
     });
+    cx.update_window(window, |_, w, cx| shark.update(cx, |s, cx| s.toggle_tree(w, cx)))
+        .unwrap();
     press(cx, &["cmd-alt-right"]);
     cx.update_window(window, |_, w, cx| {
         assert!(
@@ -1372,7 +1374,10 @@ async fn perf_large_change(cx: &mut TestAppContext) {
     report.push(format!("unchanged refresh + frame: {:.0} ms", ms(t)));
 
     cx.update_window(window, |_, w, cx| {
-        shark.update(cx, |s, cx| s.focus_pane(Pane::Tree, w, cx))
+        shark.update(cx, |s, cx| {
+            s.show_tree = true;
+            s.focus_pane(Pane::Tree, w, cx)
+        })
     })
     .unwrap();
     frame(cx);
@@ -2059,9 +2064,11 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
         let s = shark.read(cx);
         assert_eq!(s.changes_stats(), (base.clone(), 6, 0));
         assert_eq!((s.viewed_now.len(), s.diff_files.len()), (0, 3));
-        assert!(s.tree_shown(), "Files is open beside Changes");
+        assert!(!s.tree_shown(), "Files is closed until asked for");
         assert_eq!(s.diff.read(cx).mode(), DiffMode::Split, "split by default");
     });
+    on(cx, &|s, w, cx| s.toggle_tree(w, cx));
+    cx.update(|cx| assert!(shark.read(cx).tree_shown(), "Files N opens it"));
 
     // `s` flips Split / Unified, and the choice persists.
     press(cx, &["s"]);
@@ -2111,13 +2118,17 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
         assert_eq!(s.tree_resize.read(cx).sizes()[1], px(333.));
     });
 
-    // A restart opens Files at the saved width, in the saved mode.
+    // After a restart Files is closed, and opens at the saved width; the saved mode stays.
     cx.update_window(window, |_, w, _| w.remove_window())
         .unwrap();
     let (window2, shark2) = open(cx, options());
     cx.run_until_parked();
-    cx.update_window(window2, |_, w, cx| w.render_frame(cx))
-        .unwrap();
+    cx.update_window(window2, |_, w, cx| {
+        assert!(!shark2.read(cx).tree_shown());
+        shark2.update(cx, |s, cx| s.toggle_tree(w, cx));
+        w.render_frame(cx)
+    })
+    .unwrap();
     cx.update(|cx| {
         let s = shark2.read(cx);
         assert!(s.tree_shown());
@@ -2774,5 +2785,289 @@ async fn card_header_pinned(cx: &mut TestAppContext) {
         "the rows scrolled: {before:?} → {after:?}"
     );
     assert_eq!(after.1, before.1, "the header did not");
+    fs::remove_dir_all(&home).ok();
+}
+
+/// In-place editing, round 2: the line input lines up with the code, owns tab and the
+/// letters, a click in it keeps its caret, a second ⌘S waits for the first, other writers
+/// are noticed, a refresh adding a file keeps the input's focus, the composer takes focus
+/// from it, and leaving edit mode or the workspace asks first.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn inline_edit_round2(cx: &mut TestAppContext) {
+    use gpui_kit::component::diff::{DiffLinePosition, DiffLineRange, DiffSide};
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let lines = |f: &dyn Fn(usize) -> String| (1..=300).map(f).collect::<String>();
+    fs::write(
+        repos[0].path.join("f.txt"),
+        lines(&|i| format!("line {i}\n")),
+    )
+    .unwrap();
+    git::git(&repos[0].path, &["add", "."]).unwrap();
+    let commit = ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "f"];
+    git::git(&repos[0].path, &commit).unwrap();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    for name in ["ed", "other"] {
+        on(cx, &|s, w, cx| {
+            s.create_workspace(name.into(), repos.clone(), None, w, cx)
+        });
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).active.as_deref() == Some(name)
+        })
+        .await;
+    }
+    on(cx, &|s, w, cx| {
+        let ix = (s.state.workspaces.iter()).position(|w| w.name == "ed").unwrap();
+        s.open_workspace(ix, w, cx)
+    });
+    let file = home.join("shark/workspaces/ed/api/f.txt");
+    // A change every ten lines: a diff many screens tall.
+    let changed = |i: usize| match i % 10 {
+        0 => format!("changed {i}\n"),
+        _ => format!("line {i}\n"),
+    };
+    fs::write(&file, lines(&changed)).unwrap();
+    on(cx, &|s, w, cx| {
+        s.show(Tab::Diff, w, cx);
+        s.diff.update(cx, |d, cx| d.set_mode(DiffMode::Split, cx));
+        s.refresh_diff(cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).diff_files.len() == 1
+    })
+    .await;
+    // Files is closed until asked for.
+    cx.update(|cx| assert!(!shark.read(cx).tree_shown()));
+    let draw = |cx: &mut TestAppContext| {
+        for _ in 0..3 {
+            cx.update_window(window, |_, w, cx| w.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        }
+    };
+    on(cx, &|s, w, cx| {
+        let line = DiffLineRange::new("api/f.txt", DiffSide::Modified, 250, 250);
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
+        s.edit_working_copy(Some("api/f.txt".into()), w, cx)
+    });
+    draw(cx);
+    let value = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let e = shark.read(cx).editing.as_ref().unwrap();
+            (e.buf.lines[e.buf.line].clone(), e.input.read(cx).value().to_string())
+        })
+    };
+    assert_eq!(value(cx).1, "changed 250");
+    let focused = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, w, cx| {
+            shark.read(cx).editing.as_ref().unwrap().focused(w, cx)
+        })
+        .unwrap()
+    };
+    assert!(focused(cx));
+    // The input sits where the line's code would, one row tall; the header has no Comment.
+    cx.update_window(window, |_, w, cx| {
+        let e = shark.read(cx).editing.as_ref().unwrap();
+        let input = w.find(("input", e.input.entity_id())).bounds();
+        let row = w.find_all(("line", 249usize))[0].bounds();
+        let code = (w.find_all("source").iter()).filter(|s| s.bounds().left() == input.left()).count();
+        assert_eq!(input.size.height, row.size.height, "{input:?} vs {row:?}");
+        assert!(code > 2, "{input:?} starts where the code does");
+    })
+    .unwrap();
+
+    // Letters are typed, not run as the diff's keys; tab indents and keeps focus.
+    let unified = cx.update(|cx| shark.read(cx).state.unified);
+    press(cx, &["s", "r", "c", "v", "x", "d", "e", "o", "i", "shift-c", "}"]);
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.state.unified, unified);
+        assert!(s.review.composer.is_none() && s.editor.is_none() && s.review.sheet.is_none());
+        assert!(s.viewed_now.is_empty() && s.editing.is_some());
+    });
+    cx.update_window(window, |_, w, cx| w.input("sr", cx)).unwrap();
+    press(cx, &["tab"]);
+    draw(cx);
+    let (buf, input) = value(cx);
+    assert_eq!(buf, input);
+    assert_eq!(buf, "changed 250srcvxdeoiC}sr\t");
+    assert!(focused(cx), "tab kept the focus");
+    // Home and end move in the line, not the diff.
+    press(cx, &["home"]);
+    let caret = |cx: &mut TestAppContext| {
+        cx.update(|cx| (shark.read(cx).editing.as_ref().unwrap().input.read(cx)).cursor())
+    };
+    assert!(focused(cx));
+    assert_eq!(caret(cx), 0);
+    press(cx, &["end"]);
+    assert_eq!(caret(cx), buf.len());
+
+    // A click on the line being edited leaves its caret and selection to the input.
+    on(cx, &|s, _, cx| {
+        let e = s.editing.as_ref().unwrap();
+        e.input.update(cx, |i, cx| i.set_selected_range(2..4, cx));
+    });
+    on(cx, &|s, w, cx| {
+        s.edit_click(&DiffLinePosition::new("api/f.txt", DiffSide::Modified, 250), w, cx)
+    });
+    cx.update(|cx| {
+        let e = shark.read(cx).editing.as_ref().unwrap();
+        assert_eq!(e.input.read(cx).selected_range(), 2..4);
+    });
+
+    // Unsaved: the editor won't open the same file; leaving the workspace asks.
+    on(cx, &|s, w, cx| s.open_path("api/f.txt".into(), w, cx));
+    cx.update(|cx| assert!(shark.read(cx).editor.is_none()));
+    on(cx, &|s, w, cx| {
+        s.home.sel = Some("other".into());
+        s.try_plan_mode(w, cx)
+    });
+    cx.update_window(window, |_, w, cx| {
+        assert!(w.has_active_dialog(cx), "asks before leaving");
+        w.close_dialog(cx);
+    })
+    .unwrap();
+    cx.update(|cx| assert_eq!(shark.read(cx).active.as_deref(), Some("ed")));
+
+    // Two ⌘S in a row: one write, no false "changed on disk".
+    on(cx, &|s, w, cx| {
+        s.save_edit(false, w, cx);
+        s.save_edit(false, w, cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).editing.as_ref().is_some_and(|e| e.saved)
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| assert!(!w.has_active_dialog(cx)))
+        .unwrap();
+    let want = cx.update(|cx| shark.read(cx).editing.as_ref().unwrap().buf.text());
+    assert_eq!(fs::read_to_string(&file).unwrap(), want);
+
+    // Someone else writes the file: a clean buffer takes it, the input too.
+    let theirs = want.replace("changed 250srcvxdeoiC}sr\t", "theirs changed 250").replace("line 3\n", "line 3!\n");
+    fs::write(&file, &theirs).unwrap();
+    on(cx, &|s, _, cx| s.refresh_diff(cx));
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).editing.as_ref().is_some_and(|e| e.buf.text() == theirs)
+    })
+    .await;
+    draw(cx);
+    assert_eq!(value(cx).1, "theirs changed 250");
+    // Under unsaved edits it is only marked, and ⌘S asks.
+    cx.update_window(window, |_, w, cx| w.input("!", cx)).unwrap();
+    draw(cx);
+    fs::write(&file, theirs.replace("line 5\n", "line 5!\n")).unwrap();
+    on(cx, &|s, _, cx| s.refresh_diff(cx));
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).editing.as_ref().is_some_and(|e| e.stale)
+    })
+    .await;
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.working_heading("api/f.txt"), "Working copy · changed on disk");
+        assert!(s.editing.as_ref().unwrap().dirty);
+    });
+    on(cx, &|s, w, cx| s.save_edit(false, w, cx));
+    for _ in 0..100 {
+        cx.run_until_parked();
+        let shown = cx.update_window(window, |_, w, cx| w.has_active_dialog(cx)).unwrap();
+        if shown {
+            break;
+        }
+        cx.background_executor.timer(Duration::from_millis(20)).await;
+    }
+    cx.update_window(window, |_, w, cx| w.close_dialog(cx)).unwrap();
+
+    // A new file reloads the diff; the line input keeps its focus.
+    on(cx, &|s, w, cx| s.focus_edit(w, cx));
+    draw(cx);
+    assert!(focused(cx));
+    fs::write(home.join("shark/workspaces/ed/api/g.txt"), "g\n").unwrap();
+    // As after a mouse scroll: no keyboard view to come back to.
+    on(cx, &|s, _, cx| {
+        s.lose_view();
+        s.refresh_diff(cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).diff_files.len() == 2
+    })
+    .await;
+    draw(cx);
+    assert!(focused(cx), "the refresh kept the input's focus");
+    // …and it is drawn, so typing reaches it.
+    cx.update_window(window, |_, w, cx| {
+        let e = shark.read(cx).editing.as_ref().unwrap();
+        let input = w.find_all(("input", e.input.entity_id()));
+        let top = shark.read(cx).diff.read(cx).scroll_top();
+        assert!(input.iter().any(|i| i.visible()), "{input:?} at {top:?}");
+    })
+    .unwrap();
+    let before = value(cx).0;
+    cx.update_window(window, |_, w, cx| w.input("Q", cx)).unwrap();
+    draw(cx);
+    assert_eq!(value(cx).0, format!("{before}Q"));
+
+    // A filter: a folder's box ticks only the files it shows.
+    on(cx, &|s, _, cx| {
+        s.filter_tree("g.txt".into(), cx);
+        s.toggle_viewed_dir("api", cx);
+        // Folding a folder the filter shows open would only change hidden state.
+        s.tree_sel = 0;
+        s.set_dir_open(Some(false), cx);
+        assert!(s.collapsed_dirs.is_empty());
+        s.filter_tree(String::new(), cx);
+    });
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.viewed_now.iter().map(|p| p.as_str()).collect::<Vec<_>>(), ["api/g.txt"]);
+    });
+
+    // The composer, opened while editing, takes the typing.
+    on(cx, &|s, w, cx| {
+        let line = DiffLineRange::new("api/f.txt", DiffSide::Original, 249, 249);
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
+        s.comment_dialog(w, cx)
+    });
+    draw(cx);
+    let before = value(cx);
+    cx.update_window(window, |_, w, cx| w.input("hello", cx)).unwrap();
+    draw(cx);
+    assert_eq!(value(cx), before);
+    cx.update(|cx| {
+        let c = shark.read(cx).review.composer.as_ref().unwrap();
+        assert_eq!(c.input.read(cx).value().as_ref(), "hello");
+    });
+    // The edited file's header: [Review] [Save ⌘S], no Comment.
+    on(cx, &|s, _, cx| s.diff.update(cx, |d, cx| d.scroll_to_file("api/f.txt", cx)));
+    draw(cx);
+    cx.update_window(window, |_, w, _| {
+        assert!(w.find_all("edit-save").len() == 1);
+        assert!(w.find_all("comment:api/f.txt").is_empty());
+    })
+    .unwrap();
+    // Back to reviewing: git's view as of now, not of the last refresh.
+    fs::write(&file, lines(&|i| format!("line {i}\n")) + "tail\n").unwrap();
+    on(cx, &|s, w, cx| {
+        s.editing.as_mut().unwrap().dirty = false;
+        s.leave_edit(w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        let s = shark.read(cx);
+        s.editing.is_none() && s.diff_files.iter().any(|f| f.additions() == 1 && f.deletions() == 0)
+    })
+    .await;
     fs::remove_dir_all(&home).ok();
 }

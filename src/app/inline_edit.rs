@@ -90,7 +90,10 @@ pub(super) fn patch(path: &str, base: &str, text: &str, added: bool) -> String {
         }
         return out;
     }
-    let diff = similar::TextDiff::from_lines(base, text);
+    // A deadline keeps a keystroke in a big file from stalling on a worst-case diff.
+    let diff = similar::TextDiff::configure()
+        .timeout(std::time::Duration::from_millis(30))
+        .diff_lines(base, text);
     out += &diff
         .unified_diff()
         .context_radius(base.lines().count().max(text.lines().count()))
@@ -115,7 +118,7 @@ pub(super) fn first_change(base: &str, text: &str) -> usize {
 /// One file of the diff open for editing in place.
 pub(super) struct InlineEdit {
     pub(super) path: SharedString,
-    abs: PathBuf,
+    pub(super) abs: PathBuf,
     /// The original side; every edit is compared against it.
     base: String,
     added: bool,
@@ -130,6 +133,11 @@ pub(super) struct InlineEdit {
     pub(super) dirty: bool,
     /// Saved, and not edited since.
     pub(super) saved: bool,
+    /// A save is being written.
+    saving: bool,
+    /// Something else wrote the file under unsaved edits.
+    pub(super) stale: bool,
+    window: AnyWindowHandle,
     pub(super) input: Entity<InputState>,
     _subs: Vec<Subscription>,
 }
@@ -146,7 +154,7 @@ impl InlineEdit {
         self.input.read(cx).focus_handle(cx).is_focused(window)
     }
 
-    fn caret(&self) -> DiffLinePosition {
+    pub(super) fn caret(&self) -> DiffLinePosition {
         DiffLinePosition::new(self.path.clone(), DiffSide::Modified, self.buf.line + 1)
     }
 }
@@ -202,6 +210,9 @@ impl Shark {
     pub(super) fn edit_status(&self) -> Option<&'static str> {
         let e = self.editing.as_ref()?;
         Some(match e.saved && !e.dirty {
+            _ if e.stale => {
+                "The file changed on disk · ⌘S asks before overwriting · esc then i reloads it"
+            }
             true => {
                 "Saved · Comparison updated in place · Divider widths and scroll position retained"
             }
@@ -212,6 +223,7 @@ impl Shark {
     /// The working-copy column heading of `path`.
     pub(super) fn working_heading(&self, path: &str) -> &'static str {
         match self.editing.as_ref().filter(|e| e.path == path) {
+            Some(e) if e.stale => "Working copy · changed on disk",
             Some(e) if e.dirty => "Working copy · unsaved",
             Some(e) if e.saved => "Working copy · saved just now",
             _ => "Working copy · saved",
@@ -265,7 +277,7 @@ impl Shark {
         let Some(file) = parse(&patch) else {
             return notify_err(window, cx, format!("{path} can't be compared"));
         };
-        self.confirm_discard_edit(window, cx, move |s, window, cx| {
+        self.confirm_discard(false, true, window, cx, move |s, window, cx| {
             let input = cx.new(|cx| InputState::new(window, cx));
             let shark = cx.entity().downgrade();
             let subs = vec![
@@ -297,6 +309,9 @@ impl Shark {
                 patch,
                 dirty: false,
                 saved: false,
+                saving: false,
+                stale: false,
+                window: window.window_handle(),
                 input,
                 _subs: subs,
             });
@@ -312,6 +327,13 @@ impl Shark {
     /// Puts the caret's line in the input, the caret at `col` (else the end), and shows the
     /// buffer in the diff.
     fn show_edit_at(&mut self, col: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        self.load_line(col, window, cx);
+        self.sync_edit(cx);
+        self.focus_edit(window, cx);
+    }
+
+    /// The caret's line into the input, the caret at `col` (else the end).
+    fn load_line(&mut self, col: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(e) = &self.editing else { return };
         let (line, input) = (e.buf.lines[e.buf.line].clone(), e.input.clone());
         input.update(cx, |i, cx| {
@@ -322,8 +344,46 @@ impl Shark {
             }
             i.set_selected_range(col..col, cx);
         });
-        self.sync_edit(cx);
-        self.focus_edit(window, cx);
+    }
+
+    /// Runs `f` with the edit's window once the current update is over (refreshes come
+    /// without one).
+    pub(super) fn with_edit_window(
+        &self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Shark, &mut Window, &mut Context<Shark>) + 'static,
+    ) {
+        let Some(w) = self.editing.as_ref().map(|e| e.window) else {
+            return;
+        };
+        let this = cx.entity();
+        cx.defer(move |cx| {
+            w.update(cx, |_, window, cx| this.update(cx, |s, cx| f(s, window, cx)))
+                .ok();
+        });
+    }
+
+    /// The edited file as a refresh read it from disk. Written by someone else: a clean
+    /// buffer takes the new text, unsaved edits are marked stale (saving then asks).
+    pub(super) fn edit_disk(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
+        let Some(e) = self.editing.as_mut().filter(|e| !e.saving) else {
+            return;
+        };
+        let fp = crate::files::fingerprint(&bytes);
+        if fp == e.disk {
+            return;
+        }
+        let text = String::from_utf8(bytes).ok().filter(|t| !t.contains('\r'));
+        let (false, Some(text)) = (e.dirty, text) else {
+            e.stale = true;
+            return cx.notify();
+        };
+        let line = e.buf.line;
+        e.buf = Buffer::new(&text);
+        e.buf.line = line.min(e.buf.lines.len() - 1);
+        (e.disk, e.stale, e.saved) = (fp, false, false);
+        e.update_file();
+        self.with_edit_window(cx, |s, window, cx| s.load_line(None, window, cx));
     }
 
     pub(super) fn focus_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -369,6 +429,13 @@ impl Shark {
         let Some(e) = self.editing.as_mut().filter(|e| e.focused(window, cx)) else {
             return false;
         };
+        // Tab indents; it never moves focus out of the line (and onto the diff's letter keys).
+        if ks.key == "tab" && ks.modifiers.number_of_modifiers() == ks.modifiers.shift as u8 {
+            if !ks.modifiers.shift {
+                self.paste_lines("\t", window, cx);
+            }
+            return true;
+        }
         if ks.modifiers.number_of_modifiers() > 0 {
             return false;
         }
@@ -420,9 +487,12 @@ impl Shark {
 
     /// Back to reviewing; asks first when there are unsaved edits.
     pub(super) fn leave_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.confirm_discard_edit(window, cx, |s, window, cx| {
+        self.confirm_discard(false, true, window, cx, |s, window, cx| {
             s.end_edit(cx);
-            s.diff.read(cx).focus_handle(cx).focus(window, cx);
+            // git's view of the file, whatever was written while editing.
+            s.diff_fp = 0;
+            s.refresh_diff(cx);
+            s.focus_diff(window, cx);
             cx.notify();
         });
     }
@@ -451,7 +521,11 @@ impl Shark {
 
     /// Writes the buffer, unless the file changed on disk since it was read (then asks).
     pub(super) fn save_edit(&mut self, force: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(e) = &self.editing else { return };
+        // A second ⌘S while the first writes would find the file changed.
+        let Some(e) = self.editing.as_mut().filter(|e| !e.saving) else {
+            return;
+        };
+        e.saving = true;
         let (abs, expected, text, path) = (e.abs.clone(), e.disk, e.buf.text(), e.path.clone());
         cx.spawn_in(window, async move |this, cx| {
             let saved = text.clone();
@@ -459,13 +533,16 @@ impl Shark {
                 .spawn(async move { crate::editor::write_checked(&abs, expected, &text, force) })
                 .await;
             this.update_in(cx, |s, window, cx| {
+                if let Some(e) = s.editing.as_mut().filter(|e| e.path == path) {
+                    e.saving = false;
+                }
                 match result {
                     Ok(Some(fp)) => {
                         if let Some(e) = s.editing.as_mut().filter(|e| e.path == path) {
                             e.disk = fp;
                             // Typing during the write keeps the buffer dirty.
                             e.dirty = e.buf.text() != saved;
-                            e.saved = true;
+                            (e.saved, e.stale) = (true, false);
                         }
                         s.refresh_diff(cx);
                     }
@@ -486,37 +563,6 @@ impl Shark {
         .detach();
     }
 
-    /// Runs `then` now, or after the user agrees to drop unsaved in-place edits.
-    pub(super) fn confirm_discard_edit(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-        then: impl FnOnce(&mut Shark, &mut Window, &mut Context<Shark>) + 'static,
-    ) {
-        let Some(path) = (self.editing.as_ref())
-            .filter(|e| e.dirty)
-            .map(|e| e.path.clone())
-        else {
-            return then(self, window, cx);
-        };
-        let then = RefCell::new(Some(then));
-        confirm(
-            format!("Discard changes to {path}?"),
-            "Your edits are not saved. Cancel and press cmd-s to keep them.",
-            "Discard",
-            move |s, window, cx| {
-                if let Some(f) = then.borrow_mut().take() {
-                    if let Some(e) = &mut s.editing {
-                        e.dirty = false;
-                    }
-                    f(s, window, cx)
-                }
-            },
-            window,
-            cx,
-        );
-    }
-
     /// A click on a working-copy line of the edited file puts the caret there.
     pub(super) fn edit_click(
         &mut self,
@@ -527,7 +573,11 @@ impl Shark {
         let Some(e) = self.editing.as_mut().filter(|e| e.path == *pos.path()) else {
             return;
         };
-        if pos.side() == DiffSide::Modified && pos.line() <= e.buf.lines.len() {
+        // A click in the line's own input is the input's (caret, selection).
+        if pos.side() == DiffSide::Modified
+            && pos.line() <= e.buf.lines.len()
+            && pos.line() != e.buf.line + 1
+        {
             e.buf.line = pos.line() - 1;
             self.show_edit_at(None, window, cx);
         }
@@ -541,15 +591,23 @@ impl Shark {
         let (path, line, input) = (e.path.clone(), e.buf.line + 1, e.input.clone());
         let mono = cx.theme().mono_font_family.clone();
         let shark = cx.entity().downgrade();
-        diff.render_working_cell(move |p, l, _, _| {
+        diff.render_working_cell(move |p, l, window, cx| {
             (*p == path && l == line).then(|| {
                 let shark = shark.clone();
+                // The code's font and size, without the input's padding: the text stays put.
+                let size = window.rem_size() * (f32::from(cx.theme().mono_font_size) / 16.);
                 div()
                     .key_context("InlineEdit")
                     .w_full()
+                    .h(size * 1.6)
                     .child(
                         Input::new(&input)
                             .appearance(false)
+                            .xsmall()
+                            .p_0()
+                            .h(size * 1.6)
+                            .line_height(size * 1.6)
+                            .text_size(size)
                             .font_family(mono.clone())
                             .on_paste(move |item, window, cx| {
                                 let Some(text) = item.text().filter(|t| t.contains('\n')) else {
@@ -595,7 +653,7 @@ pub(super) fn edit_buttons(
             .gap_1()
             .child(
                 Button::new("edit-review")
-                    .ghost()
+                    .outline()
                     .xsmall()
                     .label("Review")
                     .tooltip("Back to reviewing (esc)")
@@ -605,12 +663,11 @@ pub(super) fn edit_buttons(
                 Button::new("edit-save")
                     .xsmall()
                     .label("Save ⌘S")
-                    .map(|b| if *dirty { b.primary() } else { b.ghost() })
+                    .map(|b| if *dirty { b.primary() } else { b.outline() })
                     .on_click(on(|s, _, w, cx| s.save_edit(false, w, cx))),
             )
             .into_any_element(),
         None => Button::new("edit-working-copy")
-            .ghost()
             .xsmall()
             .label("Edit working copy")
             .tooltip("Edit in place (i)")

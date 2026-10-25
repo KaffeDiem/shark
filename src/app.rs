@@ -252,14 +252,12 @@ impl Shark {
         }
         let home = home::Home::new(window, cx);
         let tree_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files…"));
-        let ratio = state.split_ratio.unwrap_or(0.5);
-        let mode = match state.unified {
-            true => DiffMode::Unified,
-            false => DiffMode::Split,
-        };
+        let (ratio, mode) = (state.split_ratio, diff::diff_mode(state.unified));
         let diff = cx.new(|cx| {
             let mut d = DiffState::new(vec![], cx).with_mode(mode);
-            d.set_split_ratio(ratio, cx);
+            if let Some(ratio) = ratio {
+                d.set_split_ratio(ratio, cx);
+            }
             d
         });
         cx.defer_in(window, move |s, window, cx| {
@@ -356,7 +354,8 @@ impl Shark {
             sidebar_scroll: ScrollHandle::new(),
             tab_scroll: ScrollHandle::new(),
             archiving: HashSet::new(),
-            show_tree: true,
+            // Closed by default (design 01); Files N in the Changes bar opens it.
+            show_tree: false,
             rail: false,
             rail_auto: false,
             editor: None,
@@ -650,10 +649,10 @@ impl Shark {
                     .children(chat_tabs)
                     .child(tab(
                         match viewed {
-                            _ if self.diff_error.is_some() => "Diff · error".into(),
-                            _ if !self.diff_loaded => "Diff".into(),
-                            0 => format!("Diff · {}", self.diff_files.len()),
-                            v => format!("Diff · {v}/{} viewed", self.diff_files.len()),
+                            _ if self.diff_error.is_some() => "Changes · error".into(),
+                            _ if !self.diff_loaded => "Changes".into(),
+                            0 => format!("Changes {}", self.diff_files.len()),
+                            v => format!("Changes {v}/{} viewed", self.diff_files.len()),
                         },
                         IconName::FileDiff,
                         Tab::Diff,

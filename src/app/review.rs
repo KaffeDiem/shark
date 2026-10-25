@@ -852,8 +852,14 @@ impl Shark {
         if self.active.is_none() {
             return notify_err(window, cx, "Open a workspace first");
         }
-        let Some(range) = self.diff.read(cx).selected_lines() else {
-            return notify_err(window, cx, "Move to a line first (j/k), or select lines");
+        // Code selected with the mouse, else the line cursor or selected lines.
+        let d = self.diff.read(cx);
+        let Some(range) = d.text_selection_lines(cx).or_else(|| d.selected_lines()) else {
+            return notify_err(
+                window,
+                cx,
+                "Select code or lines first, or move to a line (j/k)",
+            );
         };
         let draft = Comment::from_range(&range);
         let same = (self.ws_comments().iter())
@@ -967,7 +973,7 @@ impl Shark {
         cx.notify();
     }
 
-    fn focus_diff(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn focus_diff(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.diff.read(cx).focus_handle(cx).focus(window, cx);
     }
 
@@ -1522,7 +1528,7 @@ impl Shark {
             .when(button, |d| {
                 d.child(
                     Button::new(SharedString::from(format!("comment:{path}")))
-                        .ghost()
+                        .outline()
                         .xsmall()
                         .label(label)
                         .on_click(cx.listener(move |this, _, w, cx| this.comment_in(&path, w, cx))),

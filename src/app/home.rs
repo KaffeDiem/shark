@@ -537,13 +537,18 @@ impl Shark {
     }
 
     /// "Approve a plan": plan mode on in the cursor's (or the first) workspace.
-    fn try_plan_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn try_plan_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.home_rows(cx);
         let Some(r) = self.home_at(&rows).or((!rows.is_empty()).then_some(0)) else {
             return notify_err(window, cx, "Create a workspace first (cmd-n)");
         };
-        self.open_workspace_now(rows[r].ix, window, cx);
-        self.with_plan(window, cx, |c, _, cx| c.set_plan_mode(true, cx));
+        let ix = rows[r].ix;
+        // Leaving the open workspace asks about unsaved edits first; plan mode comes after.
+        let leaving = (self.state.workspaces.get(ix)).is_some_and(|w| self.active.as_ref() != Some(&w.name));
+        self.confirm_discard(leaving, leaving, window, cx, move |s, window, cx| {
+            s.open_workspace(ix, window, cx);
+            s.with_plan(window, cx, |c, _, cx| c.set_plan_mode(true, cx));
+        });
     }
 
     /// The Home row at the top of the sidebar.
