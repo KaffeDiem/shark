@@ -104,6 +104,8 @@ pub struct Chat {
     blocks: Vec<Block>,
     sel: usize,
     pub busy: bool,
+    /// Background tasks (subagents, shells) still running; the turn can end before they do.
+    pub background: usize,
     /// Set while a git step runs in these worktrees; sends wait for it.
     pub hold: bool,
     agent: Option<Agent>,
@@ -173,6 +175,7 @@ impl Chat {
             blocks: vec![],
             sel: 0,
             busy: false,
+            background: 0,
             hold: false,
             agent: None,
             composer,
@@ -198,9 +201,15 @@ impl Chat {
             chat.apply(ev, cx);
         }
         chat.busy = false;
+        chat.background = 0;
         chat.sel = chat.rows().len().saturating_sub(1);
         chat.scroll.scroll_to_bottom();
         chat
+    }
+
+    /// Whether anything is still going on: a turn, or tasks it left running in the background.
+    pub fn working(&self) -> bool {
+        self.busy || self.background > 0
     }
 
     pub fn model(&self) -> &str {
@@ -465,7 +474,11 @@ impl Chat {
                     self.ws.session_id = Some(id.clone());
                     cx.emit(ChatEvent::SessionId(id));
                 }
+                // Each turn starts with init, including ones the CLI starts itself when a
+                // background task finishes.
+                self.busy = true;
             }
+            Ev::Background(n) => self.background = n,
             Ev::User(text) => self.blocks.push(Block::User(text)),
             Ev::TextDelta(s) => match self.blocks.last_mut() {
                 Some(Block::Text { md, done: false }) => {
@@ -535,6 +548,7 @@ impl Chat {
             }
             Ev::Exited(msg) => {
                 self.agent = None;
+                self.background = 0;
                 if self.busy {
                     self.busy = false;
                     self.blocks.push(Block::Info(msg));
