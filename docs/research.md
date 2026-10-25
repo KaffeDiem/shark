@@ -78,7 +78,7 @@ Goal: Mermaid in markdown, a live-preview markdown editor (`# ` becomes a headin
 ### Mermaid
 - **Pick: merman** (https://github.com/Latias94/merman). MIT/Apache, very active, 37 diagram types.
   - Zed switched to it in May 2026 (zed#57644).
-  - Use `default-features = false, features = ["svg", "layout-cytoscape"]`. The default `elk` layout is EPL-2.0.
+  - Use `default-features = false, features = ["svg", "layout-cytoscape", "all-diagrams"]` (or individual `diagram-*` features; with defaults off, no diagram types are compiled in). The default `elk` layout is EPL-2.0.
   - Use its resvg-safe SVG mode, which avoids `foreignObject`.
 - **Zed's `mermaid_render` is GPL.** It does theme CSS, strips `foreignObject`, caps the pixmap size (zed#56468), and measures labels with gpui's text system (zed#65192). Reimplement these only when a diagram looks wrong.
 - **Rejected:**
@@ -101,9 +101,10 @@ Goal: Mermaid in markdown, a live-preview markdown editor (`# ` becomes a headin
 1. **Mermaid in chat.**
    - Add `src/mermaid.rs`. Its plugin claims `lang == "mermaid"` fences only once they are closed.
    - Cache rendered diagrams by source hash, as Pending, Svg or Err. Render on the background executor.
+   - When a render finishes, update the cache and call `cx.refresh_windows()`. `MarkdownPlugin::render` has no handle to the view to notify.
    - Show the last good image while waiting, fall back to the code block on error, and cap the raster size.
    - Register it in `src/chat.rs` via `TextView::plugin`.
-2. **Composer becomes an `EditorState`** with tree-sitter markdown: styled source, `auto_grow`, list continuation on Enter.
+2. **Composer becomes an `EditorState`** with tree-sitter markdown: styled source, list continuation on Enter. `auto_grow` only exists on `TextareaState`, so content-based height is extra work.
 3. **Notes/plans pane:** try zorite-editor, feeding it the same Mermaid cache. If that doesn't work out, build our own on `editor_host`.
 4. **Code view:** `Editor` with a few tree-sitter grammars and a vim normal-mode keymap. LSP later.
 

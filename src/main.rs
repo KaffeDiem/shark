@@ -40,8 +40,14 @@ actions!(
         PrevFile,
         ToggleDiffMode,
         RefreshDiff,
+        PickModel,
     ]
 );
+
+/// Switch the open workspace to `chat::MODELS[n]` without opening the menu.
+#[derive(Clone, PartialEq, Debug, serde::Deserialize, Action)]
+#[action(namespace = shark, no_json)]
+pub struct SetModel(pub usize);
 
 /// Apps launched from Finder get a minimal PATH; borrow the login shell's so claude/gh/git resolve.
 fn fix_path() {
@@ -86,6 +92,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("space d", ShowDiff, Some(NAV)),
         KeyBinding::new("space p r", CreatePrs, Some(NAV)),
         KeyBinding::new("space p o", OpenPrs, Some(NAV)),
+        KeyBinding::new("cmd-/", PickModel, None),
+        KeyBinding::new("space m m", PickModel, Some(NAV)),
         KeyBinding::new("] c", NextHunk, Some("DiffPane")),
         KeyBinding::new("[ c", PrevHunk, Some("DiffPane")),
         KeyBinding::new("}", NextFile, Some("DiffPane")),
@@ -93,6 +101,13 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("s", ToggleDiffMode, Some("DiffPane")),
         KeyBinding::new("r", RefreshDiff, Some("DiffPane")),
     ]);
+    // Direct picks, numbered like the model menu: ctrl-cmd-1 / space m 1 is the first row.
+    cx.bind_keys((0..chat::MODELS.len()).flat_map(|i| {
+        [
+            KeyBinding::new(&format!("ctrl-cmd-{}", i + 1), SetModel(i), None),
+            KeyBinding::new(&format!("space m {}", i + 1), SetModel(i), Some(NAV)),
+        ]
+    }));
     // The Diff component's scroll actions are private; bind vim keys to them by name.
     let diff = Rc::new(KeyBindingContextPredicate::parse("Diff").unwrap());
     let vim = [

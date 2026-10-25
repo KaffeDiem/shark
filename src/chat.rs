@@ -3,14 +3,14 @@ use crate::agent::{self, Agent, Ev};
 use crate::state::Workspace;
 use crate::*;
 use gpui_kit::assets::IconName;
+use gpui_kit::component::Sizable as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::scroll::ScrollableElement;
-use gpui_kit::component::select::{Select, SelectEvent, SelectState};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::{ActiveTheme, Icon, h_flex, v_flex};
-use gpui_kit::component::{IndexPath, Sizable as _};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
@@ -45,7 +45,6 @@ pub struct Chat {
     pub busy: bool,
     agent: Option<Agent>,
     pub(crate) composer: Entity<TextareaState>,
-    model_select: Entity<SelectState<Vec<&'static str>>>,
     /// Model the running process was started with; a mismatch respawns it on the next send.
     agent_model: Option<String>,
     scroll: ScrollHandle,
@@ -55,7 +54,7 @@ pub struct Chat {
 }
 
 /// `default` means "no --model flag".
-const MODELS: &[&str] = &["default", "fable", "opus", "sonnet", "haiku"];
+pub(crate) const MODELS: &[&str] = &["default", "fable", "opus", "sonnet", "haiku"];
 
 impl EventEmitter<ChatEvent> for Chat {}
 
@@ -86,24 +85,6 @@ impl Chat {
                 .placeholder("Message the agent (Enter to send, Shift-Enter for newline, Esc for normal mode)")
                 .submit_on_enter(true)
         });
-        let current = ws.model.as_deref().unwrap_or("default");
-        let ix = MODELS.iter().position(|m| *m == current).unwrap_or(0);
-        let model_select =
-            cx.new(|cx| SelectState::new(MODELS.to_vec(), Some(IndexPath::new(ix)), window, cx));
-        let model_sub = cx.subscribe(
-            &model_select,
-            |this, _, ev: &SelectEvent<Vec<&'static str>>, cx| {
-                let SelectEvent::Confirm(Some(m)) = ev else {
-                    return;
-                };
-                let model = (*m != "default").then(|| m.to_string());
-                if this.ws.model != model {
-                    this.ws.model = model.clone();
-                    cx.emit(ChatEvent::Model(model));
-                    cx.notify();
-                }
-            },
-        );
         let _sub = cx.subscribe_in(&composer, window, |this, _, ev: &InputEvent, window, cx| {
             if let InputEvent::PressEnter { shift: false, .. } = ev {
                 this.send(window, cx);
@@ -116,12 +97,11 @@ impl Chat {
             busy: false,
             agent: None,
             composer,
-            model_select,
             agent_model: None,
             scroll: ScrollHandle::new(),
             focus: cx.focus_handle(),
             reader: None,
-            _subs: vec![_sub, model_sub],
+            _subs: vec![_sub],
         };
         // Replay history through the same path as live events.
         let history =
@@ -133,6 +113,20 @@ impl Chat {
         chat.sel = chat.blocks.len().saturating_sub(1);
         chat.scroll.scroll_to_bottom();
         chat
+    }
+
+    pub fn model(&self) -> &str {
+        self.ws.model.as_deref().unwrap_or(MODELS[0])
+    }
+
+    /// Takes effect on the next send, which restarts the process on the new model.
+    pub fn set_model(&mut self, m: &str, cx: &mut Context<Self>) {
+        let model = (m != MODELS[0]).then(|| m.to_string());
+        if self.ws.model != model {
+            self.ws.model = model.clone();
+            cx.emit(ChatEvent::Model(model));
+            cx.notify();
+        }
     }
 
     pub fn focus_composer(&self, window: &mut Window, cx: &mut Context<Self>) {
@@ -485,7 +479,18 @@ impl Render for Chat {
                                 .gap_2()
                                 .text_xs()
                                 .text_color(muted)
-                                .child(Select::new(&self.model_select).xsmall().w(px(120.)))
+                                .child(
+                                    Button::new("model")
+                                        .ghost()
+                                        .xsmall()
+                                        .icon(IconName::Sparkles)
+                                        .label(self.model().to_string())
+                                        .dropdown_caret(true)
+                                        .tooltip_with_action("Change model", &PickModel, None)
+                                        .on_click(|_, window, cx| {
+                                            window.dispatch_action(PickModel.boxed_clone(), cx)
+                                        }),
+                                )
                                 .child(div().flex_1())
                                 .child(Kbd::new(Keystroke::parse("enter").unwrap()))
                                 .child("send"),

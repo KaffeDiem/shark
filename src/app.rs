@@ -1,5 +1,5 @@
 //! Root view: sidebar of repos and workspaces, Chat/Diff tabs, palette and dialogs.
-use crate::chat::{Chat, ChatEvent};
+use crate::chat::{Chat, ChatEvent, MODELS};
 use crate::state::{Repo, State, workspaces_dir};
 use crate::*;
 use gpui_kit::assets::IconName;
@@ -12,10 +12,13 @@ use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::{ActiveTheme, Icon, Sizable as _, Theme, WindowExt, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme, Icon, IndexPath, Sizable as _, Theme, WindowExt, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
 
 /// Inter disambiguation (ss02 + cv05/cv08/zero): serifed I, tailed l, slashed 0 for paths and hashes.
@@ -88,6 +91,9 @@ const COMMANDS: &[(&str, IconName, Cmd)] = &[
         s.open_prs(w, cx)
     }),
     ("Stop agent", IconName::Square, |s, _, cx| s.stop(cx)),
+    ("Change model…", IconName::Sparkles, |s, w, cx| {
+        s.pick_model(w, cx)
+    }),
 ];
 
 impl Shark {
@@ -411,9 +417,77 @@ impl Shark {
         }
     }
 
-    fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Opens a cmd-k style menu; `on_pick` gets the confirmed row.
+    fn open_menu(
+        &self,
+        items: Vec<CommandItem>,
+        selected: usize,
+        on_pick: impl Fn(&mut Shark, usize, &mut Window, &mut Context<Shark>) + 'static,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let palette = cx.new(|cx| CommandState::new(window, cx));
+        // The menu only learns its items when it renders; install them now so the
+        // highlight can start on `selected`. The dialog's renders keep it.
+        RenderOnce::render(Command::new(&palette).items(items.clone()), window, cx);
+        palette.update(cx, |p, cx| {
+            p.set_selected_index(Some(IndexPath::new(selected)), window, cx)
+        });
         let shark = cx.entity().downgrade();
+        let on_pick = Rc::new(on_pick);
+        let state = palette.clone();
+        window.open_dialog(cx, move |d, _, _| {
+            let (shark, on_pick) = (shark.clone(), on_pick.clone());
+            d.w(px(640.))
+                .font_features(inter_features())
+                .margin_top(px(96.))
+                .entrance(DialogEntrance::None)
+                .child(Command::new(&state).items(items.clone()).on_confirm(
+                    move |ix, window, cx| {
+                        window.close_dialog(cx);
+                        shark
+                            .update(cx, |s, cx| on_pick(s, ix.row, window, cx))
+                            .ok();
+                    },
+                ))
+        });
+        palette.update(cx, |p, cx| p.focus(window, cx));
+    }
+
+    fn pick_model(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self.active_chat().cloned() else {
+            return Self::notify_err(window, cx, "Open a workspace first");
+        };
+        let current = chat.read(cx).model().to_string();
+        let items = MODELS
+            .iter()
+            .map(|m| {
+                CommandItem::new()
+                    .label(*m)
+                    .icon(IconName::Sparkles)
+                    .checked(*m == current)
+            })
+            .collect();
+        let selected = MODELS.iter().position(|m| *m == current).unwrap_or(0);
+        self.open_menu(
+            items,
+            selected,
+            move |_, row, _, cx| chat.update(cx, |c, cx| c.set_model(MODELS[row], cx)),
+            window,
+            cx,
+        );
+    }
+
+    /// The no-menu fast path, so confirm the switch in a toast.
+    fn set_model(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(chat), Some(m)) = (self.active_chat().cloned(), MODELS.get(ix)) else {
+            return Self::notify_err(window, cx, "Open a workspace first");
+        };
+        chat.update(cx, |c, cx| c.set_model(m, cx));
+        window.push_notification(format!("Model: {m} (from the next message)"), cx);
+    }
+
+    fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let workspaces: Vec<String> = self
             .state
             .workspaces
@@ -429,27 +503,16 @@ impl Shark {
                     .icon(IconName::GitBranch)
             }))
             .collect();
-        let state = palette.clone();
-        window.open_dialog(cx, move |d, _, _| {
-            let shark = shark.clone();
-            d.w(px(640.))
-                .font_features(inter_features())
-                .margin_top(px(96.))
-                .entrance(DialogEntrance::None)
-                .child(Command::new(&state).items(items.clone()).on_confirm(
-                    move |ix, window, cx| {
-                        window.close_dialog(cx);
-                        let row = ix.row;
-                        shark
-                            .update(cx, |s, cx| match COMMANDS.get(row) {
-                                Some((_, _, f)) => f(s, window, cx),
-                                None => s.open_workspace(row - COMMANDS.len(), window, cx),
-                            })
-                            .ok();
-                    },
-                ))
-        });
-        palette.update(cx, |p, cx| p.focus(window, cx));
+        self.open_menu(
+            items,
+            0,
+            |s, row, window, cx| match COMMANDS.get(row) {
+                Some((_, _, f)) => f(s, window, cx),
+                None => s.open_workspace(row - COMMANDS.len(), window, cx),
+            },
+            window,
+            cx,
+        );
     }
 
     fn render_sidebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -741,6 +804,8 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &ShowDiff, w, cx| this.show(Tab::Diff, w, cx)))
             .on_action(cx.listener(|this, _: &CreatePrs, w, cx| this.create_prs(w, cx)))
             .on_action(cx.listener(|this, _: &OpenPrs, w, cx| this.open_prs(w, cx)))
+            .on_action(cx.listener(|this, _: &PickModel, w, cx| this.pick_model(w, cx)))
+            .on_action(cx.listener(|this, a: &SetModel, w, cx| this.set_model(a.0, w, cx)))
             .on_action(cx.listener(|this, _: &FocusSidebar, w, cx| {
                 this.sidebar_focus.focus(w, cx);
                 cx.notify();
@@ -924,6 +989,30 @@ mod ui_tests {
         cx.update_window(window, |_, w, cx| w.input("jk g", cx))
             .unwrap();
         let chat = cx.update(|cx| shark.read(cx).chats["ui-x"].clone());
+        cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
+
+        // Model shortcuts work while typing and keep the draft. Let the New workspace
+        // dialog's deferred focus restore run first (it targets the sidebar), then go back.
+        cx.executor().advance_clock(Duration::from_secs(1));
+        press(cx, &["ctrl-w", "l", "i"]);
+        let model = |cx: &mut TestAppContext| {
+            cx.update(|cx| shark.read(cx).state.workspaces[0].model.clone())
+        };
+        press(cx, &["ctrl-cmd-3"]);
+        assert_eq!(model(cx).as_deref(), Some("opus"));
+        press(cx, &["cmd-/"]);
+        cx.run_until_parked();
+        press(cx, &["enter"]);
+        assert_eq!(
+            model(cx).as_deref(),
+            Some("opus"),
+            "menu opens on the current model"
+        );
+        press(cx, &["cmd-/"]);
+        cx.update_window(window, |_, w, cx| w.input("son", cx))
+            .unwrap();
+        press(cx, &["enter"]);
+        assert_eq!(model(cx).as_deref(), Some("sonnet"));
         cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
 
         press(cx, &["escape"]);
