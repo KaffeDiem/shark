@@ -384,8 +384,12 @@ fn header(ws: &Workspace) -> String {
         ws.name, ws.branch
     );
     for r in &ws.repos {
+        // A PR URL names the GitHub repo, which needn't match the folder.
+        let gh = (git(&r.src, &["remote", "get-url", "origin"]).ok())
+            .and_then(|o| crate::sync::github_url(&o))
+            .map_or(String::new(), |u| format!(", GitHub {u}"));
         s += &format!(
-            "- `{}/`: worktree of {} (base `{}`)\n",
+            "- `{}/`: worktree of {} (base `{}`{gh})\n",
             r.name,
             r.src.display(),
             r.base

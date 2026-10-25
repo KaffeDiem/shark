@@ -2,7 +2,7 @@
 //! and runs the next step toward a merged PR. `status` decides what that step is; this file
 //! polls, renders and executes. The app only embeds the entity and forwards three actions.
 mod status;
-pub use status::Kind;
+pub use status::{Kind, github_url};
 
 use crate::app::{inter_features, notify_err, open_menu};
 use crate::menu::{self, Entry};

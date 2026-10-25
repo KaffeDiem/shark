@@ -1,4 +1,4 @@
-//! Composer completions: `@` files across the workspace's repos, `/` skills and commands.
+//! Composer completions: `@` files across the workspace's repos, `/` skills and commands, `#` PRs.
 //! Sources load in the background; ranking runs per keystroke over the cached lists.
 use crate::state::support_dir;
 use serde::{Deserialize, Serialize};
@@ -18,16 +18,17 @@ pub enum Kind {
     File,
     Dir,
     Command,
+    Pr,
 }
 
 #[derive(Clone, Debug)]
 pub struct Item {
     pub kind: Kind,
-    /// Text that goes into the prompt, e.g. `@api/README.md` or `/review`.
+    /// Text that goes into the prompt, e.g. `@api/README.md`, `/review` or a PR's URL.
     pub insert: String,
     pub label: String,
     pub detail: String,
-    /// Repo name for files, argument hint for commands.
+    /// Repo name for files and PRs, argument hint for commands.
     pub badge: String,
     /// Lowercased match target, with the name part starting at `name_at`.
     key: String,
@@ -282,9 +283,157 @@ fn commands(cmds: Vec<Cmd>) -> Vec<Item> {
         .collect()
 }
 
-/// The `@query`, or a `/query` that starts the message, ending at the cursor:
-/// its byte range and whether it's a command.
-pub fn trigger(text: &str, cursor: usize) -> Option<(Range<usize>, bool)> {
+/// A PR as `gh pr list --json` gives it, and as cached on disk.
+#[derive(Serialize, Deserialize, Clone, Debug)]
+#[serde(rename_all = "camelCase")]
+pub struct Pr {
+    /// The workspace repo it was listed in; not from gh.
+    #[serde(default)]
+    pub repo: String,
+    number: u64,
+    title: String,
+    author: Option<Author>,
+    #[serde(default)]
+    head_ref_name: String,
+    url: String,
+    /// `OPEN`, `MERGED` or `CLOSED`.
+    state: String,
+    #[serde(default)]
+    is_draft: bool,
+    #[serde(default)]
+    updated_at: String,
+}
+
+#[derive(Serialize, Deserialize, Clone, Debug)]
+struct Author {
+    login: String,
+}
+
+const PR_ARGS: [&str; 10] = [
+    "pr",
+    "list",
+    "--state",
+    "all",
+    "--limit",
+    "50",
+    "--search",
+    "sort:updated-desc",
+    "--json",
+    "number,title,author,headRefName,url,state,isDraft,updatedAt",
+];
+
+/// The 50 most recently updated PRs of the repo at `dir`, any state, anyone's. None for a repo
+/// that isn't on GitHub; a short reason when gh can't answer.
+pub fn fetch_prs(repo: &str, dir: &Path) -> Result<Vec<Pr>, String> {
+    let json = crate::git::cmd_bounded(dir, "gh", &PR_ARGS, 15).or_else(|e| match e {
+        _ if e.contains("none of the git remotes") => Ok("[]".into()),
+        _ => Err(pr_error(&e)),
+    })?;
+    parse_prs(repo, &json)
+}
+
+fn parse_prs(repo: &str, json: &str) -> Result<Vec<Pr>, String> {
+    let mut prs: Vec<Pr> = serde_json::from_str(json).map_err(|e| format!("gh: {e}"))?;
+    for p in &mut prs {
+        p.repo = repo.to_string();
+    }
+    Ok(prs)
+}
+
+/// `cmd_bounded`'s error, minus the command line it starts with.
+fn pr_error(e: &str) -> String {
+    let stderr = e
+        .strip_prefix(&format!("gh {}: ", PR_ARGS.join(" ")))
+        .unwrap_or(e);
+    match stderr {
+        _ if e.starts_with("gh: ") => "gh isn't installed".into(),
+        _ if stderr.contains("gh auth login") => "not logged in: run gh auth login".into(),
+        _ if stderr.starts_with("timed out") => "GitHub didn't answer in 15s".into(),
+        _ => stderr.lines().last().unwrap_or("gh failed").to_string(),
+    }
+}
+
+fn prs_path(ws: &str) -> PathBuf {
+    support_dir().join("prs").join(format!("{ws}.json"))
+}
+
+/// PRs from the last fetch in this workspace, so `#` is instant after a restart.
+pub fn cached_prs(ws: &str) -> Vec<Pr> {
+    std::fs::read(prs_path(ws))
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_prs(ws: &str, prs: &[Pr]) {
+    let path = prs_path(ws);
+    if let (Some(dir), Ok(json)) = (path.parent(), serde_json::to_vec(prs)) {
+        let _ = std::fs::create_dir_all(dir);
+        let _ = std::fs::write(&path, json);
+    }
+}
+
+/// Menu rows, most recently updated first across repos. The key is `repo/number title author
+/// branch`, so `api/` scopes to a repo as it does for files.
+pub fn pr_items(prs: &[Pr]) -> Vec<Item> {
+    let mut prs: Vec<&Pr> = prs.iter().collect();
+    prs.sort_by(|a, b| b.updated_at.cmp(&a.updated_at));
+    prs.into_iter()
+        .map(|p| {
+            let author = p.author.as_ref().map_or("", |a| a.login.as_str());
+            let state = match (p.state.as_str(), p.is_draft) {
+                ("MERGED", _) => " · merged",
+                ("CLOSED", _) => " · closed",
+                (_, true) => " · draft",
+                _ => "",
+            };
+            let key = format!(
+                "{}/{} {} {author} {}",
+                p.repo, p.number, p.title, p.head_ref_name
+            )
+            .to_lowercase();
+            Item {
+                kind: Kind::Pr,
+                insert: p.url.clone(),
+                label: format!("#{}", p.number),
+                detail: format!("{} · {author}{state}", p.title),
+                badge: p.repo.clone(),
+                name_at: key.find('/').map_or(0, |i| i + 1),
+                key,
+            }
+        })
+        .collect()
+}
+
+/// Like `rank`, but an all-digit query puts that exact number first, so `#12` beats `#120`.
+pub fn rank_prs(items: &[Item], query: &str, limit: usize) -> Vec<usize> {
+    let mut ix = rank(items, query, limit);
+    if !query.is_empty() && query.bytes().all(|b| b.is_ascii_digit()) {
+        ix.sort_by_key(|&i| items[i].label[1..] != *query); // stable: ties keep their rank
+    }
+    ix
+}
+
+/// Whether `query` names this PR outright rather than fuzzily: its exact number, or the start of
+/// a word in its title, author or branch. Only then does enter pick it, so `#endif` or `#[test]`
+/// typed in code stays text.
+pub fn names_pr(item: &Item, query: &str) -> bool {
+    let q = query.to_lowercase();
+    let (scope, q) = q.split_once('/').unwrap_or(("", &q));
+    let name = &item.key[item.name_at..];
+    if q.is_empty() || !item.key[..item.name_at].starts_with(scope) {
+        return false;
+    }
+    if q.bytes().all(|b| b.is_ascii_digit()) {
+        return item.label[1..] == *q;
+    }
+    name.match_indices(q)
+        .any(|(i, _)| i == 0 || name[..i].ends_with([' ', '-', '_', '/', '.']))
+}
+
+/// The `@query`, `#query`, or a `/query` that starts the message, ending at the cursor:
+/// its byte range and its trigger character.
+pub fn trigger(text: &str, cursor: usize) -> Option<(Range<usize>, char)> {
     let before = text.get(..cursor)?;
     let start = before
         .char_indices()
@@ -292,9 +441,11 @@ pub fn trigger(text: &str, cursor: usize) -> Option<(Range<usize>, bool)> {
         .find(|(_, c)| c.is_whitespace())
         .map_or(0, |(i, c)| i + c.len_utf8());
     match before[start..].chars().next()? {
-        '@' => Some((start..cursor, false)),
+        '@' => Some((start..cursor, '@')),
         // Claude Code only expands a slash command at the start of the prompt.
-        '/' if before[..start].trim().is_empty() => Some((start..cursor, true)),
+        '/' if before[..start].trim().is_empty() => Some((start..cursor, '/')),
+        // `##` starts a heading, not a PR.
+        '#' if !before[start + 1..].starts_with('#') => Some((start..cursor, '#')),
         _ => None,
     }
 }
@@ -450,10 +601,14 @@ mod tests {
 
     #[test]
     fn finds_triggers() {
-        assert_eq!(trigger("see @api/RE", 11), Some((4..11, false)));
-        assert_eq!(trigger("@", 1), Some((0..1, false)));
+        assert_eq!(trigger("see @api/RE", 11), Some((4..11, '@')));
+        assert_eq!(trigger("@", 1), Some((0..1, '@')));
         assert_eq!(trigger("mail me@x.com", 13), None);
-        assert_eq!(trigger("  /rev", 6), Some((2..6, true)));
+        assert_eq!(trigger("  /rev", 6), Some((2..6, '/')));
+        assert_eq!(trigger("fix #1", 6), Some((4..6, '#')));
+        assert_eq!(trigger("#", 1), Some((0..1, '#')));
+        assert_eq!(trigger("## h", 2), None, "a heading");
+        assert_eq!(trigger("C#", 2), None);
         assert_eq!(trigger("a /rev", 6), None, "slash only starts a prompt");
         assert_eq!(trigger("@a done", 7), None);
         let cmds = commands(vec![Cmd {
@@ -463,6 +618,57 @@ mod tests {
         }]);
         assert_eq!(cmds[0].detail, "Review");
         assert_eq!(rank(&cmds, "review", 1), [0]);
+    }
+
+    #[test]
+    fn lists_and_ranks_prs() {
+        let pr = |n: u64, title: &str, updated: &str| {
+            format!(
+                r#"{{"number":{n},"title":"{title}","author":{{"login":"kim"}},"headRefName":"b{n}","url":"https://github.com/o/api/pull/{n}","state":"OPEN","isDraft":false,"updatedAt":"{updated}"}}"#
+            )
+        };
+        let api = format!(
+            "[{},{}]",
+            pr(120, "Fix endpoint", "1"),
+            pr(12, "Login page", "3")
+        );
+        let mut prs = parse_prs("api", &api).unwrap();
+        prs.extend(parse_prs("web", &format!("[{}]", pr(7, "Merged thing", "2"))).unwrap());
+        let items = pr_items(&prs);
+        // Newest first across repos.
+        assert_eq!(
+            inserts(&items, ""),
+            [
+                "https://github.com/o/api/pull/12",
+                "https://github.com/o/api/pull/7",
+                "https://github.com/o/api/pull/120"
+            ]
+        );
+        assert_eq!(items[0].label, "#12");
+        assert_eq!(items[1].badge, "web");
+        let top = |q: &str| items[rank_prs(&items, q, 50)[0]].label.clone();
+        assert_eq!(top("12"), "#12");
+        assert_eq!(top("120"), "#120");
+        assert_eq!(top("web/"), "#7");
+        // Enter only picks what the query names outright.
+        let named =
+            |q: &str| (rank_prs(&items, q, 50).first()).is_some_and(|&i| names_pr(&items[i], q));
+        assert!(named("12") && named("login") && named("kim") && named("api/end"));
+        assert!(!named("") && !named("1") && !named("web/"));
+        assert!(
+            !named("fe") && !rank_prs(&items, "fe", 50).is_empty(),
+            "fuzzy hit in Fix endpoint"
+        );
+        assert!(parse_prs("api", "").is_err());
+        assert_eq!(
+            pr_error("gh: No such file or directory (os error 2)"),
+            "gh isn't installed"
+        );
+        let e = format!(
+            "gh {}: To get started with GitHub CLI, please run:  gh auth login",
+            PR_ARGS.join(" ")
+        );
+        assert_eq!(pr_error(&e), "not logged in: run gh auth login");
     }
 
     /// Real CLI, no tokens: `cargo test live_probe -- --ignored`.
