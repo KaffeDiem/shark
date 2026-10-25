@@ -872,11 +872,11 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
     press(cx, "c");
     cx.update_window(window, |_, w, cx| w.input("rename this", cx))
         .unwrap();
-    press(cx, "enter");
+    press(cx, "cmd-enter");
     cx.run_until_parked();
     cx.update(|cx| {
-        let p = review::prompt(shark.read(cx).ws_comments());
-        assert!(p.contains("\napi/c:1\n> rename this\n"), "{p}");
+        let p = review::prompt(shark.read(cx).ws_comments(), "");
+        assert!(p.contains(" api/c:1 · working tree\n```\nx\n```\n> rename this\n"), "{p}");
     });
 
     // A git failure is not "no changes".

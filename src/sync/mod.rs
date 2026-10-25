@@ -2,7 +2,7 @@
 //! and runs the next step toward a merged PR. `status` decides what that step is; this file
 //! polls, renders and executes. The app only embeds the entity and forwards three actions.
 mod status;
-pub use status::{Kind, PrState, Repo, ago, github_url};
+pub use status::{Kind, Pr, PrState, Repo, ago, github_url};
 
 use crate::app::{inter_features, notify_err, open_menu};
 use crate::menu::{self, Entry};
@@ -21,7 +21,7 @@ use gpui_kit::component::{ActiveTheme, Disableable as _, Icon, Sizable as _, Win
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use status::{
-    Action, Local, Pr, among, diverged, fetch_pr, next_action, pr_head_moved, pr_settling, probe,
+    Action, Local, among, diverged, fetch_pr, next_action, pr_head_moved, pr_settling, probe,
 };
 use std::cell::Cell;
 use std::path::PathBuf;
@@ -426,6 +426,20 @@ impl GitSync {
             .iter()
             .map(|r| (r.name.clone(), r.branch_url(&self.ws.branch)))
             .collect()
+    }
+
+    /// `repo`'s open PR, and whether its lines are on GitHub: the PR's head is our HEAD and
+    /// nothing is uncommitted.
+    pub fn pr_for(&self, repo: &str) -> Option<(Pr, bool)> {
+        let r = self.repos.iter().find(|r| r.name == repo)?;
+        let pr = r.open_pr()?.clone();
+        let pushed = (r.local.as_ref()).is_ok_and(|l| l.head == pr.head && l.changed == 0);
+        Some((pr, pushed))
+    }
+
+    #[cfg(all(test, feature = "test-support"))]
+    pub fn set_repos(&mut self, repos: Vec<Repo>) {
+        self.repos = repos;
     }
 
     pub fn pr_urls(&self) -> Vec<String> {

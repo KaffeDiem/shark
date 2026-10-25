@@ -41,6 +41,8 @@ mod menus;
 mod palette;
 mod picker;
 mod review;
+mod review_send;
+mod review_share;
 mod sidebar;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod ui_tests;
@@ -641,7 +643,7 @@ impl Shark {
                 Tab::Diff => h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_diff(cx))
+                    .child(self.render_diff(window, cx))
                     .when(self.show_tree, |d| d.child(self.render_tree(window, cx)))
                     .into_any_element(),
             })

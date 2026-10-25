@@ -395,18 +395,17 @@ impl Shark {
         )
     }
 
-    pub(super) fn render_diff(&self, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_diff(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let viewed = self.viewed_now.clone();
         let shark = cx.entity().downgrade();
         let placeholder = self.diff_placeholder(cx);
         let empty = placeholder.is_some();
         let diff_with_annotations = self.with_comments(Diff::new(&self.diff), cx);
-        div()
+        let pane = div()
             .key_context("DiffPane")
             .relative()
             .flex_1()
-            .min_w_0()
-            .h_full()
+            .min_h_0()
             .child(self.viewport_probe())
             .on_scroll_wheel(cx.listener(|this, _, _, _| this.lose_view()))
             // The diff's own scrolling keys move it without the line cursor.
@@ -427,7 +426,16 @@ impl Shark {
                 cx.listener(|this, _: &SelectLast, w, cx| this.diff_move(0, Some(false), w, cx)),
             )
             .on_action(cx.listener(|this, _: &AddComment, w, cx| this.comment_dialog(w, cx)))
-            .on_action(cx.listener(|this, _: &SendComments, w, cx| this.send_comments(w, cx)))
+            .on_action(cx.listener(|this, _: &SendComments, w, cx| this.open_sheet(w, cx)))
+            .on_action(cx.listener(|this, _: &EditThread, w, cx| this.edit_thread(w, cx)))
+            .on_action(cx.listener(|this, _: &DeleteThread, _, cx| this.delete_thread(cx)))
+            .on_action(cx.listener(|this, _: &ViewChange, w, cx| this.view_change(w, cx)))
+            .on_action(cx.listener(|this, _: &ResolveThread, _, cx| this.resolve_thread(cx)))
+            .on_action(cx.listener(|this, _: &ReopenThread, _, cx| this.reopen_thread(cx)))
+            .on_action(cx.listener(|this, _: &NextThread, w, cx| this.thread_jump(true, w, cx)))
+            .on_action(cx.listener(|this, _: &PrevThread, w, cx| this.thread_jump(false, w, cx)))
+            .on_action(cx.listener(|this, _: &ResolveAddressed, _, cx| this.resolve_addressed(cx)))
+            .on_action(cx.listener(|this, _: &RequeueOutdated, _, cx| this.requeue_outdated(cx)))
             .on_action(cx.listener(|this, _: &NextHunk, w, cx| this.diff_change(true, w, cx)))
             .on_action(cx.listener(|this, _: &PrevHunk, w, cx| this.diff_change(false, w, cx)))
             .on_action(cx.listener(|this, _: &NextFile, _, cx| this.step_file(1, cx)))
@@ -472,7 +480,17 @@ impl Shark {
                             })
                     }),
                 )
-            })
+            });
+        v_flex()
+            .relative()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(pane)
+            .children(self.render_orphans(cx))
+            .when(!empty, |d| d.child(self.render_review_bar(None, cx)))
+            .children(self.render_sheet(window, cx))
+            .children(self.render_share(cx))
             .into_any_element()
     }
 

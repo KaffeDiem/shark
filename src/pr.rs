@@ -155,9 +155,94 @@ pub fn link_body(body: &str, prs: &[(String, String)], own: &str) -> String {
     out
 }
 
+/// gh, or `SHARK_GH` (tests point it at a fake, as `SHARK_CLAUDE` for claude).
+fn gh() -> String {
+    std::env::var("SHARK_GH").unwrap_or_else(|_| "gh".into())
+}
+
+/// Posts `body` to PR `number` of the repo at `wt` as a conversation comment (a reviewer
+/// note); returns its URL.
+pub fn publish_note(wt: &Path, number: u64, body: &str) -> Result<String, String> {
+    let n = number.to_string();
+    let out = cmd_bounded(wt, &gh(), &["pr", "comment", &n, "--body", body], 60)?;
+    Ok(out.lines().last().unwrap_or_default().to_string())
+}
+
+/// Where an inline review comment sits in a PR: repo-relative path, last (and first) line,
+/// and the side: the base's lines (`left`) or the head's.
+pub struct Anchor {
+    pub path: String,
+    pub line: usize,
+    pub start: Option<usize>,
+    pub left: bool,
+}
+
+/// Posts a Comment review (neither approves nor requests changes) to PR `number`: `body`
+/// alone, or with `inline` as a comment on its lines (then `body` is the review's note).
+/// Returns the review's URL when GitHub gives one.
+pub fn publish_review(
+    wt: &Path,
+    number: u64,
+    body: &str,
+    inline: Option<(&Anchor, &str)>,
+) -> Result<String, String> {
+    let n = number.to_string();
+    let Some((a, text)) = inline else {
+        let args = ["pr", "review", &n, "--comment", "--body", body];
+        return cmd_bounded(wt, &gh(), &args, 60).map(|_| String::new());
+    };
+    let args = review_api_args(&n, body, a, text);
+    let args: Vec<&str> = args.iter().map(String::as_str).collect();
+    cmd_bounded(wt, &gh(), &args, 60)
+}
+
+/// `gh api` for a review with one inline comment; gh fills in `{owner}/{repo}`.
+fn review_api_args(n: &str, body: &str, a: &Anchor, text: &str) -> Vec<String> {
+    let side = if a.left { "LEFT" } else { "RIGHT" };
+    let mut v: Vec<String> = ["api", "--method", "POST"].map(String::from).into();
+    v.push(format!("repos/{{owner}}/{{repo}}/pulls/{n}/reviews"));
+    let mut field = |flag: &str, kv: String| v.extend([flag.to_string(), kv]);
+    field("-f", "event=COMMENT".into());
+    if !body.is_empty() {
+        field("-f", format!("body={body}"));
+    }
+    field("-f", format!("comments[][path]={}", a.path));
+    field("-F", format!("comments[][line]={}", a.line));
+    field("-f", format!("comments[][side]={side}"));
+    if let Some(s) = a.start {
+        field("-F", format!("comments[][start_line]={s}"));
+        field("-f", format!("comments[][start_side]={side}"));
+    }
+    field("-f", format!("comments[][body]={text}"));
+    v.extend(["-q".into(), ".html_url".into()]);
+    v
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn inline_review_args() {
+        let a = Anchor {
+            path: "src/app.rs".into(),
+            line: 632,
+            start: Some(631),
+            left: false,
+        };
+        let args = review_api_args("128", "", &a, "Keep it aligned.");
+        assert_eq!(
+            args.join(" "),
+            "api --method POST repos/{owner}/{repo}/pulls/128/reviews -f event=COMMENT \
+             -f comments[][path]=src/app.rs -F comments[][line]=632 -f comments[][side]=RIGHT \
+             -F comments[][start_line]=631 -f comments[][start_side]=RIGHT \
+             -f comments[][body]=Keep it aligned. -q .html_url"
+        );
+        let one = Anchor { start: None, left: true, ..a };
+        let args = review_api_args("7", "note", &one, "x").join(" ");
+        assert!(args.contains("-f body=note") && args.contains("side]=LEFT"), "{args}");
+        assert!(!args.contains("start_line"));
+    }
 
     #[test]
     fn link_body_is_idempotent() {

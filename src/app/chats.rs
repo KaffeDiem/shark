@@ -40,8 +40,10 @@ impl Shark {
             }
             cx.notify()
         }));
-        self._subs.push(
-            cx.subscribe(&chat, move |this, chat, ev: &ChatEvent, cx| match ev {
+        self._subs.push(cx.subscribe_in(
+            &chat,
+            window,
+            move |this, chat, ev: &ChatEvent, window, cx| match ev {
                 ChatEvent::Meta => this.save_meta(&chat, cx),
                 ChatEvent::Picked => {
                     // The level the chat runs at, so an old chat with none doesn't clear it.
@@ -62,10 +64,20 @@ impl Shark {
                     }
                     this.refresh_home(Some(&name), cx);
                     this.turn_done(&name, cx);
+                    this.review_turn_done(&name, chat, cx);
                     cx.notify();
                 }
-            }),
-        );
+                ChatEvent::ShowChanges => this.show(Tab::Diff, window, cx),
+                ChatEvent::ShowComment(id) => {
+                    this.show(Tab::Diff, window, cx);
+                    this.jump_to_comment(*id, window, cx);
+                }
+                ChatEvent::ReviewRemoved(ids) => this.review_delivered(&name, ids, None, cx),
+                ChatEvent::ReviewSent { ids, turn } => {
+                    this.review_delivered(&name, ids, Some(*turn), cx)
+                }
+            },
+        ));
         if let Some(sync) = self.syncs.get(&ws.name) {
             sync.update(cx, |g, cx| g.add_chat(chat.clone(), cx));
         }
@@ -480,6 +492,11 @@ impl Shark {
                     (true, Some(c)) => c.title(),
                     (true, None) if meta.title.is_empty() => "New chat".into(),
                     (true, None) => meta.title.clone().into(),
+                };
+                // Comments of a review the agent hasn't read yet.
+                let label = match chat.map_or(0, |c| c.review_count()) {
+                    0 => label,
+                    n => format!("{label} · {n}").into(),
                 };
                 let icon = match (
                     chat.is_some_and(|c| c.working()),
