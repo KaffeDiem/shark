@@ -37,6 +37,8 @@ pub enum Ev {
         cost: f64,
         secs: u64,
     },
+    /// Count of backgrounded tasks (subagents, shells) still running after the turn's result.
+    Background(usize),
     Exited(String),
 }
 
@@ -175,6 +177,9 @@ pub fn parse(line: &str) -> Vec<Ev> {
     let s = |v: &Value| v.as_str().unwrap_or_default().to_string();
     match v["type"].as_str().unwrap_or_default() {
         "system" if v["subtype"] == "init" => vec![Ev::Init(s(&v["session_id"]))],
+        "system" if v["subtype"] == "background_tasks_changed" => {
+            vec![Ev::Background(v["tasks"].as_array().map_or(0, Vec::len))]
+        }
         "stream_event" if v["event"]["delta"]["type"] == "text_delta" => {
             vec![Ev::TextDelta(s(&v["event"]["delta"]["text"]))]
         }
@@ -225,6 +230,8 @@ mod tests {
     // Recorded from claude 2.1.309, trimmed.
     const SESSION: &str = r#"{"type": "system", "subtype": "hook_started", "session_id": "s1"}
 {"type": "system", "subtype": "init", "session_id": "s1"}
+{"type":"system","subtype":"background_tasks_changed","tasks":[{"task_id":"a1","task_type":"local_agent"}]}
+{"type":"system","subtype":"background_tasks_changed","tasks":[]}
 {"type": "user", "message": {"role": "user", "content": "read a.txt"}, "parent_tool_use_id": null}
 {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {"file_path": "/tmp/a.txt"}}]}, "parent_tool_use_id": null}
 {"type": "user", "message": {"role": "user", "content": [{"tool_use_id": "toolu_1", "type": "tool_result", "content": "1\thello\n2\t"}]}, "parent_tool_use_id": null}
@@ -243,6 +250,8 @@ not json"#;
             evs,
             vec![
                 Ev::Init("s1".into()),
+                Ev::Background(1),
+                Ev::Background(0),
                 Ev::User("read a.txt".into()),
                 Ev::ToolUse {
                     id: "toolu_1".into(),

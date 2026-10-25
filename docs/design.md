@@ -70,9 +70,15 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
   - A view of the open workspace becomes a header tab (add a `Tab` variant).
   - A view not tied to one workspace (settings, repo list) opens with `window.open_dialog`, `w(px(640.))`, like the palette.
   - Don't add a second sidebar or panes outside the island. Panes inside it (the file tree, the editor next to the chat) are columns separated by a 1px `border`.
+- **Sidebar row:** 28px tall, `mx_2 mb_1 px_2 gap_2` (the 4px gap keeps hover and selection backgrounds apart), `rounded(theme.radius)`, `text_sm`. Order: status icon (14px), name (`flex_1`, truncated), optional badge, metadata (`text_xs`, `muted_foreground`). Sidebar width 244px.
+  - Workspace rows are 44px with two lines: the name, then its repos (`text_xs`, `muted_foreground`, `api · web`), so you can see where an agent works without opening it.
 - **Sidebar rail:** `cmd-b` shrinks the sidebar to 48px icons with tooltips; opening a file does it automatically and closing the file undoes it unless the user toggled it. The header then pads left to clear the traffic lights.
 - **File tree:** 260px column on the right of the Diff and file views, `Files` header with "n/m viewed", 28px rows indented 12px per level, then the `v` checkbox. Folders first; single-child folders are joined.
-- **Sidebar row:** 28px tall, `mx_2 px_2 gap_2`, `rounded(theme.radius)`, `text_sm`. Order: status icon (14px), name (`flex_1`, truncated), optional badge, metadata (`text_xs`, `muted_foreground`). Sidebar width 244px.
+- **Context menus:** right-click on sidebar rows (`.context_menu(..)`, gpui-kit `PopupMenu`). Follow the Apple HIG:
+  - A disabled label first that says what the menu acts on (branch, or repo + path).
+  - At most three groups: open/reveal (`Reveal in Finder`, `Open in Terminal`, `Copy Path`, one submenu each with "Workspace folder" plus one row per repo, every row showing its `~/…` path), then git (`Open Pull Requests`, hidden when there are none), then destructive (`Archive`, `Force Archive…`) last.
+  - Hide items that don't apply instead of disabling them. No shortcuts in the menu; every item also exists in the palette.
+  - Title Case labels; an ellipsis only when the item asks for confirmation.
 - **Header:** 44px, `px_3`, `border_b_1` in `border`. Tabs on the left; on the right: branch (12px `GitBranch` + `text_xs`), the git button (`src/sync/`), optional badges, then status (6px `rounded_full` dot + "Running"/"Idle").
 - **Git button:** a `small` button plus a `ghost` `xsmall` chevron for the git menu. It is the header's one primary button: `primary` for a step to run, `outline` with a `warning_foreground` icon when something needs the agent or a human, `ghost` for a wait. Disabled while the agent runs if the step writes.
 - **Tabs:** 26px pills (`rounded_full`, `px_2p5`, 14px icon + `text_sm` label). Active: `secondary` + `foreground`. Inactive: `muted_foreground`, hover → `foreground`.
@@ -85,6 +91,12 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
   - Skills (`Skill`) and subagents (`Agent`/`Task`) are never grouped: they get their own row with a `BookOpen` / `Bot` icon, because they say *what* the agent is doing. Add a tool to `standalone()` only if it carries that kind of intent.
   - Tool paths are shown relative to the workspace (`api/src/a.rs`).
   - A turn ends with an info line: "done · 48s · $0.12".
+- **Composer completions** (`@` files, `/` skills; `src/complete.rs`):
+  - The menu opens upward from the composer, at its width, over the transcript: `secondary` card, 1px `border`, `radius_lg`, `p_1`. It shows 8 rows of 28px and scrolls to more, with a `faint` key-hint footer.
+  - Each row has a 14px `File` / `Folder` / `SquareSlash` icon, the name in `foreground`, the folder or description in `text_xs` `muted_foreground` (truncated), and on the right the repo (`FolderGit2` + name) when the workspace has more than one repo, or a command's argument hint in `faint`.
+  - The selected row is `list_active`, others hover `list_hover`. The first row starts selected. ↑/↓ move, Enter/Tab add, Esc closes and stays in the composer. With no match, Enter sends.
+  - A pick becomes an inline chip, an atomic `InlineToken` whose text is `@repo/path` and whose label is `name · repo`. Paths are workspace-relative, so the repo is part of what gets sent. Typing `repo/` scopes the search to one repo.
+  - Sources never block typing. Files come from `git ls-files` per repo and skills from claude's `initialize` control request. Both load when the chat opens and refresh in the background each time the menu opens; until a refresh lands, the old list (for skills, the on-disk cache) is used.
 - **Radii:** `theme.radius` (8px) for rows, inputs and code blocks; `theme.radius_lg` (12px) for the island, cards and dialogs; `rounded_full()` for pills and dots.
 - **Borders, not shadows:** `shadow` is off. Separate with a 1px `border` or a surface change. Prefer fewer separators.
 - **Spacing:** the gpui scale only (`gap_1`=4px, `gap_1p5`=6px, `gap_2`=8px, `px_3`=12px, `px_4`=16px), plus the fixed sizes above.
@@ -131,6 +143,8 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 | Keyboard hint | `Kbd::new(Keystroke::parse("cmd-k").unwrap())`, one chip per key of a chord |
 | Command palette entry | A row in `COMMANDS` in `src/app.rs`: label, `IconName`, handler |
 | Dialog with a form | `window.open_dialog` with a small `Render` entity (see `NewWorkspaceForm`) |
+| Right-click menu | `.context_menu(..)` with `PopupMenuItem::new(..).on_click(..)`; see `ws_menu` |
+| Multi-select from a list | `Command` embedded in the form, items `.checked(..)`, `on_confirm` toggles (see `NewWorkspaceForm`) |
 | Destructive confirm | `window.open_alert_dialog`, `ButtonVariant::Danger` |
 | Feedback | `window.push_notification(Notification::success/error(..))`. No custom toasts |
 | Text input | `Input` / `Textarea`; inside a card use `.appearance(false)` and let the card draw the border |

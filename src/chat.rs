@@ -1,11 +1,14 @@
 //! One agent conversation per workspace: transcript blocks, composer, and the claude process.
 use crate::agent::{self, Agent, Ev};
+use crate::complete::{self, Item, Kind};
 use crate::state::Workspace;
 use crate::*;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::input::{
+    Enter, Escape, IndentInline, InlineToken, InputEvent, MoveDown, MoveUp, Textarea, TextareaState,
+};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::spinner::Spinner;
@@ -79,6 +82,17 @@ fn group_summary(calls: &[Call]) -> String {
         .unwrap_or_default()
 }
 
+/// The open `@`/`/` completion menu.
+struct Menu {
+    /// Bytes of the `@query` in the composer that a pick replaces.
+    range: std::ops::Range<usize>,
+    command: bool,
+    matches: Vec<usize>,
+    sel: usize,
+}
+
+const MENU_ROWS: usize = 50;
+
 pub enum ChatEvent {
     SessionId(String),
     Model(Option<String>),
@@ -90,6 +104,8 @@ pub struct Chat {
     blocks: Vec<Block>,
     sel: usize,
     pub busy: bool,
+    /// Background tasks (subagents, shells) still running; the turn can end before they do.
+    pub background: usize,
     /// Set while a git step runs in these worktrees; sends wait for it.
     pub hold: bool,
     agent: Option<Agent>,
@@ -99,6 +115,12 @@ pub struct Chat {
     scroll: ScrollHandle,
     pub focus: FocusHandle,
     reader: Option<Task<()>>,
+    files: Vec<Item>,
+    commands: Vec<Item>,
+    menu: Option<Menu>,
+    menu_scroll: ScrollHandle,
+    indexing: Option<Task<()>>,
+    probing: Option<Task<()>>,
     _subs: Vec<Subscription>,
 }
 
@@ -136,19 +158,27 @@ impl Chat {
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 10)
-                .placeholder("Message the agent (Enter to send, Shift-Enter for newline, Esc for normal mode)")
+                .placeholder("Message the agent (@ to add files, / for skills, Enter to send, Esc for normal mode)")
                 .submit_on_enter(true)
         });
-        let _sub = cx.subscribe_in(&composer, window, |this, _, ev: &InputEvent, window, cx| {
-            if let InputEvent::PressEnter { shift: false, .. } = ev {
-                this.send(window, cx);
-            }
-        });
+        let _sub =
+            cx.subscribe_in(
+                &composer,
+                window,
+                |this, _, ev: &InputEvent, window, cx| match ev {
+                    InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
+                    InputEvent::Change => this.update_menu(cx),
+                    InputEvent::Blur => this.close_menu(cx),
+                    _ => {}
+                },
+            );
+        let ws_name = ws.name.clone();
         let mut chat = Chat {
             ws,
             blocks: vec![],
             sel: 0,
             busy: false,
+            background: 0,
             hold: false,
             agent: None,
             composer,
@@ -156,8 +186,17 @@ impl Chat {
             scroll: ScrollHandle::new(),
             focus: cx.focus_handle(),
             reader: None,
+            commands: complete::cached_commands(&ws_name),
+            files: vec![],
+            menu: None,
+            menu_scroll: ScrollHandle::new(),
+            indexing: None,
+            probing: None,
             _subs: vec![_sub],
         };
+        // Warm both sources now so the first `@` or `/` doesn't wait.
+        chat.reindex(cx);
+        chat.reprobe(cx);
         // Replay history through the same path as live events.
         let history =
             std::fs::read_to_string(agent::transcript_path(&chat.ws.name)).unwrap_or_default();
@@ -165,9 +204,15 @@ impl Chat {
             chat.apply(ev, cx);
         }
         chat.busy = false;
+        chat.background = 0;
         chat.sel = chat.rows().len().saturating_sub(1);
         chat.scroll.scroll_to_bottom();
         chat
+    }
+
+    /// Whether anything is still going on: a turn, or tasks it left running in the background.
+    pub fn working(&self) -> bool {
+        self.busy || self.background > 0
     }
 
     pub fn model(&self) -> &str {
@@ -186,6 +231,139 @@ impl Chat {
 
     pub fn focus_composer(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.composer.update(cx, |c, cx| c.focus(window, cx));
+    }
+
+    /// Re-lists files in the background; the old list serves until it lands.
+    fn reindex(&mut self, cx: &mut Context<Self>) {
+        if self.indexing.is_some() {
+            return;
+        }
+        let dir = self.ws.dir();
+        let repos: Vec<_> = (self.ws.repos.iter())
+            .map(|r| (r.name.clone(), dir.join(&r.name)))
+            .collect();
+        self.indexing = Some(cx.spawn(async move |this, cx| {
+            let files = cx
+                .background_executor()
+                .spawn(async move { complete::files(&repos) })
+                .await;
+            this.update(cx, |c, cx| {
+                c.indexing = None;
+                c.files = files;
+                c.update_menu(cx);
+            })
+            .ok();
+        }));
+    }
+
+    /// Asks claude for its current skills and commands in the background.
+    fn reprobe(&mut self, cx: &mut Context<Self>) {
+        if self.probing.is_some() || cfg!(test) {
+            return;
+        }
+        let (name, dir) = (self.ws.name.clone(), self.ws.dir());
+        self.probing = Some(cx.spawn(async move |this, cx| {
+            let cmds = cx
+                .background_executor()
+                .spawn(async move { complete::probe_commands(&name, &dir) })
+                .await;
+            this.update(cx, |c, cx| {
+                c.probing = None;
+                if let Some(cmds) = cmds {
+                    c.commands = cmds;
+                    c.update_menu(cx);
+                }
+            })
+            .ok();
+        }));
+    }
+
+    fn close_menu(&mut self, cx: &mut Context<Self>) {
+        if self.menu.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Opens, filters or closes the menu from the text before the cursor.
+    fn update_menu(&mut self, cx: &mut Context<Self>) {
+        let c = self.composer.read(cx);
+        let (text, cursor) = (c.value(), c.cursor());
+        let found = complete::trigger(&text, cursor).filter(|(r, _)| {
+            // Text right after a chip belongs to the chip, not to a new query.
+            !c.tokens()
+                .iter()
+                .any(|t| t.range().start < r.end && r.start < t.range().end)
+        });
+        let Some((range, command)) = found else {
+            return self.close_menu(cx);
+        };
+        let opening = self.menu.as_ref().is_none_or(|m| m.command != command);
+        if opening {
+            // Sources may have changed since the last menu; refresh behind the cached list.
+            match command {
+                true => self.reprobe(cx),
+                false => self.reindex(cx),
+            }
+        }
+        let items = if command { &self.commands } else { &self.files };
+        let matches = complete::rank(items, &text[range.start + 1..range.end], MENU_ROWS);
+        let sel = match &self.menu {
+            Some(m) if !opening && m.matches == matches => m.sel,
+            _ => 0,
+        };
+        self.menu = Some(Menu {
+            range,
+            command,
+            matches,
+            sel,
+        });
+        self.menu_scroll.scroll_to_item(sel);
+        cx.notify();
+    }
+
+    fn menu_item(&self, ix: usize) -> Option<&Item> {
+        let m = self.menu.as_ref()?;
+        let items = if m.command {
+            &self.commands
+        } else {
+            &self.files
+        };
+        items.get(*m.matches.get(ix)?)
+    }
+
+    fn move_menu(&mut self, d: isize, cx: &mut Context<Self>) {
+        if let Some(m) = &mut self.menu
+            && !m.matches.is_empty()
+        {
+            m.sel = (m.sel as isize + d).rem_euclid(m.matches.len() as isize) as usize;
+            self.menu_scroll.scroll_to_item(m.sel);
+            cx.notify();
+        }
+    }
+
+    /// Replaces the query with the picked item as a chip, plus a space to keep typing.
+    fn pick(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(item) = self.menu_item(ix).cloned() else {
+            return self.close_menu(cx);
+        };
+        let range = self.menu.take().unwrap().range;
+        // Two repos can both have README.md; the chip names the repo too.
+        let label = match item.kind {
+            Kind::File | Kind::Dir if self.ws.repos.len() > 1 && !item.detail.is_empty() => {
+                format!("{} · {}", item.label, item.badge)
+            }
+            _ => item.label.clone(),
+        };
+        let token = InlineToken::new(item.insert.clone(), item.insert.clone()).with_label(label);
+        self.composer.update(cx, |c, cx| {
+            c.set_selected_range(range, cx);
+            if c.replace_with_token(token, window, cx).is_err() {
+                // ponytail: tokens reject control characters; such a path goes in as plain text
+                c.replace(item.insert.clone(), window, cx);
+            }
+            c.insert(" ", window, cx);
+        });
+        cx.notify();
     }
 
     fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -305,7 +483,11 @@ impl Chat {
                     self.ws.session_id = Some(id.clone());
                     cx.emit(ChatEvent::SessionId(id));
                 }
+                // Each turn starts with init, including ones the CLI starts itself when a
+                // background task finishes.
+                self.busy = true;
             }
+            Ev::Background(n) => self.background = n,
             Ev::User(text) => self.blocks.push(Block::User(text)),
             Ev::TextDelta(s) => match self.blocks.last_mut() {
                 Some(Block::Text { md, done: false }) => {
@@ -375,6 +557,7 @@ impl Chat {
             }
             Ev::Exited(msg) => {
                 self.agent = None;
+                self.background = 0;
                 if self.busy {
                     self.busy = false;
                     self.blocks.push(Block::Info(msg));
@@ -536,6 +719,142 @@ impl Chat {
         row.child(inner).into_any_element()
     }
 
+    /// Opens upward over the transcript, like Slack's: the composer sits at the bottom.
+    fn render_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let m = self.menu.as_ref()?;
+        let theme = cx.theme();
+        let faint = crate::app::faint(theme);
+        let (fg, muted, active, hover) = (
+            theme.foreground,
+            theme.muted_foreground,
+            theme.list_active,
+            theme.list_hover,
+        );
+        let multi = self.ws.repos.len() > 1;
+        let rows: Vec<AnyElement> = (0..m.matches.len())
+            .filter_map(|ix| {
+                let it = self.menu_item(ix)?;
+                let icon = match it.kind {
+                    Kind::File => IconName::File,
+                    Kind::Dir => IconName::Folder,
+                    Kind::Command => IconName::SquareSlash,
+                };
+                let badge = match it.kind {
+                    Kind::Command => (!it.badge.is_empty())
+                        .then(|| div().flex_none().text_color(faint).child(it.badge.clone())),
+                    // The repo, so two README.md rows are told apart at a glance.
+                    _ => multi.then(|| {
+                        h_flex()
+                            .flex_none()
+                            .gap_1()
+                            .text_color(muted)
+                            .child(Icon::new(IconName::FolderGit2).with_size(px(12.)))
+                            .child(it.badge.clone())
+                    }),
+                };
+                Some(
+                    h_flex()
+                        .id(ix)
+                        .h(px(28.))
+                        .px_2()
+                        .gap_2()
+                        .rounded(theme.radius)
+                        .text_sm()
+                        .when(ix == m.sel, |d| d.bg(active))
+                        .when(ix != m.sel, |d| d.hover(|d| d.bg(hover)))
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _, window, cx| {
+                                this.pick(ix, window, cx);
+                                window.prevent_default(); // keep focus in the composer
+                            }),
+                        )
+                        .child(Icon::new(icon).with_size(px(14.)).text_color(muted))
+                        .child(div().flex_none().text_color(fg).child(it.label.clone()))
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_xs()
+                                .text_color(muted)
+                                .child(it.detail.clone()),
+                        )
+                        .children(badge.map(|b| b.text_xs()))
+                        .into_any_element(),
+                )
+            })
+            .collect();
+        let empty = match (m.command, rows.is_empty()) {
+            (_, false) => None,
+            (true, _) if self.probing.is_some() && self.commands.is_empty() => {
+                Some("Loading skills…")
+            }
+            (false, _) if self.indexing.is_some() && self.files.is_empty() => {
+                Some("Indexing files…")
+            }
+            (true, _) => Some("No matching skills or commands"),
+            (false, _) => Some("No matching files"),
+        };
+        let hint = |k: &str, label: &'static str| {
+            h_flex()
+                .gap_1()
+                .children(k.split(' ').map(|k| Kbd::new(Keystroke::parse(k).unwrap())))
+                .child(label)
+        };
+        Some(
+            v_flex()
+                .id("completions")
+                .absolute()
+                .left_0()
+                .right_0()
+                .bottom_full()
+                .mb_1()
+                .p_1()
+                .rounded(theme.radius_lg)
+                .border_1()
+                .border_color(theme.border)
+                .bg(theme.secondary)
+                .occlude()
+                .child(
+                    div()
+                        .id("completion-rows")
+                        .max_h(px(8. * 28.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.menu_scroll)
+                        .children(rows)
+                        .when_some(empty, |d, e| {
+                            d.child(
+                                div()
+                                    .h(px(28.))
+                                    .px_2()
+                                    .flex()
+                                    .items_center()
+                                    .text_sm()
+                                    .text_color(muted)
+                                    .child(e),
+                            )
+                        }),
+                )
+                .child(
+                    h_flex()
+                        .px_2()
+                        .pt_1()
+                        .gap_3()
+                        .text_xs()
+                        .text_color(faint)
+                        .child(hint("up down", "navigate"))
+                        .child(hint("enter", "add"))
+                        .child(hint("escape", "close"))
+                        .when(!m.command && multi, |d| {
+                            d.child(div().flex_1())
+                                .child("Type repo/ to search one repo")
+                        }),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn toggle(&mut self, cx: &mut Context<Self>) {
         let Some(&(bi, call)) = self.rows().get(self.sel) else {
             return;
@@ -602,6 +921,7 @@ impl Render for Chat {
                 div().px_4().pb_4().pt_1().child(
                     v_flex()
                         .key_context("Composer")
+                        .relative()
                         .w_full()
                         .max_w(px(712.))
                         .mx_auto()
@@ -615,6 +935,44 @@ impl Render for Chat {
                             this.focus.focus(window, cx);
                             cx.notify();
                         }))
+                        // While the menu is open, these keys drive it instead of the input.
+                        .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
+                            if this.menu.is_some() {
+                                this.move_menu(1, cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
+                            if this.menu.is_some() {
+                                this.move_menu(-1, cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .capture_action(cx.listener(|this, a: &Enter, window, cx| {
+                            // With no match, Enter sends what was typed.
+                            if let Some(m) = &this.menu
+                                && !a.shift
+                                && !m.matches.is_empty()
+                            {
+                                this.pick(m.sel, window, cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                            if let Some(m) = &this.menu
+                                && !m.matches.is_empty()
+                            {
+                                this.pick(m.sel, window, cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .capture_action(cx.listener(|this, _: &Escape, _, cx| {
+                            if this.menu.is_some() {
+                                this.close_menu(cx);
+                                cx.stop_propagation();
+                            }
+                        }))
+                        .when_some(self.render_menu(cx), |d, menu| d.child(menu))
                         .child(
                             Textarea::new(&self.composer)
                                 .appearance(false)
@@ -674,7 +1032,7 @@ mod tests {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 mod ui_tests {
     use super::*;
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
@@ -723,5 +1081,91 @@ mod ui_tests {
         cx.update(|cx| chat.update(cx, |c, cx| c.sent("new".into(), cx)));
         frame(cx);
         assert_eq!(scroll.offset().y, -scroll.max_offset().y, "at the bottom");
+    }
+
+    /// `@` opens the file menu; keys drive it and a pick leaves a repo-qualified chip.
+    #[gpui_kit::test]
+    fn at_mentions_pick_a_file(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::bind_keys(cx);
+        });
+        let root = std::env::temp_dir().join(format!("shark-at-{}", std::process::id()));
+        let mut repos = vec![];
+        for name in ["api", "web"] {
+            let dir = root.join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("README.md"), "").unwrap();
+            crate::git::git(&dir, &["init", "-q"]).unwrap();
+            repos.push((name.to_string(), dir));
+        }
+        let repo = |n: &str| crate::state::WsRepo {
+            name: n.into(),
+            src: root.join(n),
+            base: "origin/main".into(),
+        };
+        let ws = Workspace {
+            name: format!("at-test-{}", std::process::id()),
+            branch: "b".into(),
+            repos: vec![repo("api"), repo("web")],
+            session_id: None,
+            model: None,
+            viewed: Default::default(),
+        };
+        let (window, chat) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| Chat::new(ws, w, cx))
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            chat.update(cx, |c, _| {
+                c.files = complete::files(&repos);
+                c.indexing = Some(Task::ready(())); // the workspace dir doesn't exist; keep these
+            })
+        });
+        let act = |cx: &mut TestAppContext, f: &dyn Fn(&mut Window, &mut App)| {
+            cx.update_window(window, |_, w, cx| f(w, cx)).unwrap()
+        };
+        act(cx, &|w, cx| {
+            chat.update(cx, |c, cx| c.focus_composer(w, cx))
+        });
+        act(cx, &|w, cx| w.input("see @readme", cx));
+        let menu = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                chat.read(cx)
+                    .menu
+                    .as_ref()
+                    .map(|m| (m.matches.len(), m.sel))
+            })
+        };
+        assert_eq!(menu(cx), Some((2, 0)), "both READMEs");
+        act(cx, &|w, cx| w.press("down", cx));
+        assert_eq!(menu(cx), Some((2, 1)));
+        act(cx, &|w, cx| w.press("enter", cx));
+        let value = |cx: &mut TestAppContext| {
+            cx.update(|cx| chat.read(cx).composer.read(cx).value().to_string())
+        };
+        assert_eq!(
+            value(cx),
+            "see @web/README.md ",
+            "enter picks, doesn't send"
+        );
+        assert_eq!(menu(cx), None);
+        cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).tokens().len(), 1));
+
+        act(cx, &|w, cx| w.input("@ap", cx));
+        assert!(menu(cx).is_some());
+        act(cx, &|w, cx| w.press("escape", cx));
+        assert_eq!(menu(cx), None, "escape closes the menu");
+        act(cx, &|w, cx| {
+            assert!(
+                !chat.read(cx).focus.is_focused(w),
+                "and stays in the composer"
+            )
+        });
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

@@ -130,7 +130,7 @@ impl GitSync {
             })
             .collect();
         let _subs = vec![
-            cx.observe(&chat, |_, _, cx| cx.notify()), // busy toggles enable/disable the button
+            cx.observe(&chat, |_, _, cx| cx.notify()), // working toggles enable/disable the button
             cx.subscribe(&chat, |s, _, ev, cx| {
                 if let crate::chat::ChatEvent::TurnDone = ev {
                     s.kick(false, true, cx); // the agent may have committed, pushed or opened a PR
@@ -292,7 +292,7 @@ impl GitSync {
     }
 
     fn busy(&self, cx: &App) -> bool {
-        self.chat.read(cx).busy
+        self.chat.read(cx).working()
     }
 
     pub fn pr_urls(&self) -> Vec<String> {

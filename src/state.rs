@@ -8,6 +8,9 @@ pub struct State {
     /// Vim keys in the file editor.
     #[serde(default)]
     pub vim: bool,
+    /// Repo names picked for the last new workspace; the next dialog starts with them.
+    #[serde(default)]
+    pub last_repos: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]

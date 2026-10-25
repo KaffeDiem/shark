@@ -13,6 +13,7 @@ use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::diff::{Diff, DiffFile, DiffFileStatus, DiffMode, DiffState};
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
+use gpui_kit::component::menu::{ContextMenuExt as _, PopupMenu, PopupMenuItem};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{h_resizable, resizable_panel};
 use gpui_kit::component::spinner::Spinner;
@@ -24,6 +25,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -43,6 +45,56 @@ pub(crate) fn faint(theme: &Theme) -> Hsla {
         true => rgb(0x808083).into(),
         false => rgb(0x9c9d9f).into(),
     }
+}
+
+/// `/Users/me/x` → `~/x`: paths in menus are read, so keep them short.
+fn tilde(path: &Path) -> String {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_default();
+    match path.strip_prefix(&home) {
+        Ok(rest) if !home.as_os_str().is_empty() => format!("~/{}", rest.display()),
+        _ => path.display().to_string(),
+    }
+}
+
+// ponytail: always Terminal.app; add a setting if people want iTerm/Ghostty/Warp.
+fn open_terminal(path: &Path) {
+    let _ = std::process::Command::new("open")
+        .args(["-a", "Terminal"])
+        .arg(path)
+        .spawn();
+}
+
+fn copy(text: String, window: &mut Window, cx: &mut App) {
+    window.push_notification(format!("Copied {text}"), cx);
+    cx.write_to_clipboard(ClipboardItem::new_string(text));
+}
+
+/// "Workspace folder" plus one row per repo; `f` gets the picked path.
+fn path_submenu(
+    menu: PopupMenu,
+    icon: IconName,
+    label: &'static str,
+    paths: &[(String, PathBuf)],
+    f: fn(&Path, &mut Window, &mut App),
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let paths = paths.to_vec();
+    menu.submenu_with_icon(Some(icon.into()), label, window, cx, move |mut m, _, _| {
+        for (ix, (name, path)) in paths.iter().enumerate() {
+            if ix == 1 {
+                m = m.separator();
+            }
+            let path = path.clone();
+            m = m.item(
+                PopupMenuItem::new(format!("{name} — {}", tilde(&path)))
+                    .on_click(move |_, window, cx| f(&path, window, cx)),
+            );
+        }
+        m
+    })
 }
 
 /// Opens a cmd-k style menu over `target`; `on_pick` gets the confirmed row.
@@ -82,6 +134,105 @@ pub(crate) fn open_menu<T: 'static>(
             )
     });
     palette.update(cx, |p, cx| p.focus(window, cx));
+}
+
+/// Right-click menu of a sidebar workspace. Shows where everything lives on disk,
+/// and keeps the destructive items last. Shortcuts live in the palette, not here (Apple HIG).
+fn ws_menu(
+    menu: PopupMenu,
+    ws: &Workspace,
+    ix: usize,
+    shark: &WeakEntity<Shark>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let paths: Vec<(String, PathBuf)> = std::iter::once(("Workspace folder".into(), ws.dir()))
+        .chain(
+            ws.repos
+                .iter()
+                .map(|r| (r.name.clone(), ws.dir().join(&r.name))),
+        )
+        .collect();
+    let pr_urls = shark
+        .upgrade()
+        .and_then(|s| Some(s.read(cx).syncs.get(&ws.name)?.read(cx).pr_urls()))
+        .unwrap_or_default();
+    let on = |f: fn(&mut Shark, String, &mut Window, &mut Context<Shark>)| {
+        let (shark, name) = (shark.clone(), ws.name.clone());
+        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            shark
+                .update(cx, |s, cx| f(s, name.clone(), window, cx))
+                .ok();
+        }
+    };
+    let branch = ws.branch.clone();
+    let shark2 = shark.clone();
+    let menu = menu
+        .label(format!("Branch {}", ws.branch))
+        .separator()
+        .item(
+            PopupMenuItem::new("Open Workspace")
+                .icon(IconName::MessageSquare)
+                .on_click(move |_, window, cx| {
+                    shark2
+                        .update(cx, |s, cx| s.open_workspace(ix, window, cx))
+                        .ok();
+                }),
+        )
+        .separator();
+    let menu = path_submenu(
+        menu,
+        IconName::FolderOpen,
+        "Reveal in Finder",
+        &paths,
+        |p, _, cx| cx.reveal_path(p),
+        window,
+        cx,
+    );
+    let menu = path_submenu(
+        menu,
+        IconName::SquareTerminal,
+        "Open in Terminal",
+        &paths,
+        |p, _, _| open_terminal(p),
+        window,
+        cx,
+    );
+    let menu = path_submenu(
+        menu,
+        IconName::Copy,
+        "Copy Path",
+        &paths,
+        |p, w, cx| copy(p.display().to_string(), w, cx),
+        window,
+        cx,
+    )
+    .item(
+        PopupMenuItem::new("Copy Branch Name")
+            .icon(IconName::GitBranch)
+            .on_click(move |_, w, cx| copy(branch.clone(), w, cx)),
+    )
+    .when(!pr_urls.is_empty(), |m| {
+        m.separator().item(
+            PopupMenuItem::new(match pr_urls.len() {
+                1 => "Open Pull Request".to_string(),
+                n => format!("Open {n} Pull Requests"),
+            })
+            .icon(IconName::ExternalLink)
+            .on_click(move |_, _, cx| pr_urls.iter().for_each(|u| cx.open_url(u))),
+        )
+    });
+    menu.separator()
+        .item(
+            PopupMenuItem::new("Archive")
+                .icon(IconName::Archive)
+                .on_click(on(|s, name, w, cx| s.archive_ws(name, false, w, cx))),
+        )
+        .item(
+            PopupMenuItem::new("Force Archive…")
+                .icon(IconName::ArchiveX)
+                .on_click(on(|s, name, w, cx| s.archive_ws(name, true, w, cx))),
+        )
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -188,6 +339,24 @@ const COMMANDS: &[(&str, IconName, Cmd)] = &[
         IconName::ArchiveX,
         |s, w, cx| s.archive(true, w, cx),
     ),
+    (
+        "Reveal workspace in Finder",
+        IconName::FolderOpen,
+        |s, w, cx| s.with_target(w, cx, |ws, _, cx| cx.reveal_path(&ws.dir())),
+    ),
+    (
+        "Open workspace in Terminal",
+        IconName::SquareTerminal,
+        |s, w, cx| s.with_target(w, cx, |ws, _, _| open_terminal(&ws.dir())),
+    ),
+    ("Copy workspace path", IconName::Copy, |s, w, cx| {
+        s.with_target(w, cx, |ws, w, cx| {
+            copy(ws.dir().display().to_string(), w, cx)
+        })
+    }),
+    ("Copy branch name", IconName::GitBranch, |s, w, cx| {
+        s.with_target(w, cx, |ws, w, cx| copy(ws.branch.clone(), w, cx))
+    }),
     ("Show chat", IconName::MessageSquare, |s, w, cx| {
         s.show(Tab::Chat, w, cx)
     }),
@@ -331,6 +500,8 @@ impl Shark {
         if !self.chats.contains_key(&ws.name) {
             let chat = cx.new(|cx| Chat::new(ws.clone(), window, cx));
             let name = ws.name.clone();
+            // Busy also flips without a ChatEvent (background tasks, turns the CLI starts itself).
+            self._subs.push(cx.observe(&chat, |_, _, cx| cx.notify()));
             self._subs.push(
                 cx.subscribe(&chat, move |this, _, ev: &ChatEvent, cx| match ev {
                     ChatEvent::SessionId(id) => {
@@ -849,14 +1020,16 @@ impl Shark {
             return Self::notify_err(window, cx, "Add a repo first (space r a)");
         }
         let shark = cx.entity().downgrade();
-        let form = cx.new(|cx| NewWorkspaceForm::new(self.state.repos.clone(), shark, window, cx));
+        let (repos, last) = (self.state.repos.clone(), self.state.last_repos.clone());
+        let form = cx.new(|cx| NewWorkspaceForm::new(repos, &last, shark, window, cx));
         let input = form.read(cx).branch.clone();
         window.open_dialog(cx, move |d, _, _| {
             let f = form.clone();
             // Dialog binds enter to Confirm, which runs on_ok and closes when it returns true.
+            // In the repo picker, the Command list takes enter first (it ticks a repo).
             d.font_features(inter_features())
                 .title("New workspace")
-                .w(px(480.))
+                .w(px(520.))
                 .child(form.clone())
                 .on_ok(move |_, window, cx| f.update(cx, |f, cx| f.submit(window, cx)))
         });
@@ -874,6 +1047,8 @@ impl Shark {
         if self.state.workspaces.iter().any(|w| w.name == name) {
             return Self::notify_err(window, cx, format!("workspace `{name}` already exists"));
         }
+        self.state.last_repos = repos.iter().map(|r| r.name.clone()).collect();
+        self.state.save();
         window.push_notification(format!("Creating {name}…"), cx);
         cx.spawn_in(window, async move |this, cx| {
             let dir = workspaces_dir().join(&name);
@@ -894,15 +1069,45 @@ impl Shark {
         .detach();
     }
 
-    /// Archives the workspace under the sidebar cursor when the sidebar is focused, else the open one.
-    fn archive(&mut self, force: bool, window: &mut Window, cx: &mut Context<Self>) {
-        let target = if self.sidebar_focus.is_focused(window) {
-            self.state.workspaces.get(self.sel).map(|w| w.name.clone())
-        } else {
-            self.active.clone()
+    /// Row actions hit the workspace under the sidebar cursor when the sidebar is focused, else the open one.
+    fn target(&self, window: &Window) -> Option<Workspace> {
+        let name = match self.sidebar_focus.is_focused(window) {
+            true => self.state.workspaces.get(self.sel)?.name.clone(),
+            false => self.active.clone()?,
         };
-        let Some(name) = target else { return };
-        if self.chats.get(&name).is_some_and(|c| c.read(cx).busy) {
+        self.state
+            .workspaces
+            .iter()
+            .find(|w| w.name == name)
+            .cloned()
+    }
+
+    fn with_target(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&Workspace, &mut Window, &mut App),
+    ) {
+        match self.target(window) {
+            Some(ws) => f(&ws, window, cx),
+            None => Self::notify_err(window, cx, "Open a workspace first"),
+        }
+    }
+
+    fn archive(&mut self, force: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ws) = self.target(window) {
+            self.archive_ws(ws.name, force, window, cx)
+        }
+    }
+
+    fn archive_ws(
+        &mut self,
+        name: String,
+        force: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.chats.get(&name).is_some_and(|c| c.read(cx).working()) {
             return Self::notify_err(window, cx, "Agent is running; stop it first (ctrl-c)");
         }
         if !force {
@@ -1097,29 +1302,59 @@ impl Shark {
                 .h(px(28.))
                 .flex_none()
                 .mx_2()
+                .mb_1() // so a hovered row never touches the selected one
                 .px_2()
                 .gap_2()
                 .rounded(theme.radius)
                 .text_sm()
                 .when(rail, |d| d.justify_center())
         };
+        let shark = cx.entity().downgrade();
         let repos = self.state.repos.iter().enumerate().map(|(ix, r)| {
-            let name: SharedString = r.name.clone().into();
+            let (name, path) = (r.name.clone(), r.path.clone());
+            let tip: SharedString = name.clone().into();
             row()
                 .id(("repo", ix))
                 .text_color(theme.muted_foreground)
+                .hover(|d| d.bg(theme.sidebar_accent))
                 .child(Icon::new(IconName::FolderGit2).with_size(px(14.)))
-                .when(!rail, |d| d.child(div().truncate().child(name.clone())))
+                .when(!rail, |d| d.child(div().truncate().child(r.name.clone())))
                 .when(rail, |d| {
-                    d.tooltip(move |w, cx| Tooltip::new(name.clone()).build(w, cx))
+                    d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+                })
+                .context_menu(move |menu, _, _| {
+                    let (p1, p2, p3) = (path.clone(), path.clone(), path.clone());
+                    menu.label(format!("{name} — {}", tilde(&path)))
+                        .separator()
+                        .item(
+                            PopupMenuItem::new("Reveal in Finder")
+                                .icon(IconName::FolderOpen)
+                                .on_click(move |_, _, cx| cx.reveal_path(&p1)),
+                        )
+                        .item(
+                            PopupMenuItem::new("Open in Terminal")
+                                .icon(IconName::SquareTerminal)
+                                .on_click(move |_, _, _| open_terminal(&p2)),
+                        )
+                        .item(
+                            PopupMenuItem::new("Copy Path")
+                                .icon(IconName::Copy)
+                                .on_click(move |_, w, cx| copy(p3.display().to_string(), w, cx)),
+                        )
                 })
         });
         let workspaces = self.state.workspaces.iter().enumerate().map(|(ix, w)| {
-            let busy = self.chats.get(&w.name).is_some_and(|c| c.read(cx).busy);
+            let busy = self
+                .chats
+                .get(&w.name)
+                .is_some_and(|c| c.read(cx).working());
             let selected = ix == self.sel;
             let active = self.active.as_ref() == Some(&w.name);
+            let ws = w.clone();
+            let shark = shark.clone();
             row()
                 .id(ix)
+                .h(px(44.))
                 .border_1()
                 .border_color(theme.transparent)
                 // The tint alone is too subtle to find the cursor; the accent ring makes it visible.
@@ -1130,6 +1365,14 @@ impl Shark {
                 .hover(|d| d.bg(theme.sidebar_accent))
                 .on_click(
                     cx.listener(move |this, _, window, cx| this.open_workspace(ix, window, cx)),
+                )
+                // Right-click moves the cursor too, so it's clear which row the menu is for.
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, _, _, cx| {
+                        this.sel = ix;
+                        cx.notify();
+                    }),
                 )
                 .child(match busy {
                     true => Spinner::new()
@@ -1144,26 +1387,35 @@ impl Shark {
                 })
                 .when(!rail, |d| {
                     d.child(
-                        div()
+                        v_flex()
                             .flex_1()
-                            .truncate()
-                            .when(active, |d| d.font_weight(FontWeight::MEDIUM))
-                            .child(w.name.clone()),
-                    )
-                    .child(
-                        div().text_xs().text_color(theme.muted_foreground).child(
-                            w.repos
-                                .iter()
-                                .map(|r| r.name.as_str())
-                                .collect::<Vec<_>>()
-                                .join(" · "),
-                        ),
+                            .min_w_0()
+                            .child(
+                                div()
+                                    .truncate()
+                                    .when(active, |d| d.font_weight(FontWeight::MEDIUM))
+                                    .child(w.name.clone()),
+                            )
+                            .child(
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(
+                                        w.repos
+                                            .iter()
+                                            .map(|r| r.name.as_str())
+                                            .collect::<Vec<_>>()
+                                            .join(" · "),
+                                    ),
+                            ),
                     )
                 })
                 .when(rail, |d| {
                     let name: SharedString = w.name.clone().into();
                     d.tooltip(move |w, cx| Tooltip::new(name.clone()).build(w, cx))
                 })
+                .context_menu(move |menu, window, cx| ws_menu(menu, &ws, ix, &shark, window, cx))
         });
         v_flex()
             .id("sidebar")
@@ -1253,7 +1505,7 @@ impl Shark {
                 )
                 .into_any_element();
         };
-        let busy = chat.read(cx).busy;
+        let (busy, background) = (chat.read(cx).working(), chat.read(cx).background);
         let tab = |label: String, icon: IconName, t: Tab| {
             let on = self.tab == t;
             h_flex()
@@ -1342,7 +1594,12 @@ impl Shark {
                             } else {
                                 faint(theme)
                             }))
-                            .child(if busy { "Running" } else { "Idle" }),
+                            .child(match (chat.read(cx).busy, background) {
+                                (true, 0) => "Running".into(),
+                                (true, n) => format!("Running · {n} in background"),
+                                (false, 0) => "Idle".into(),
+                                (false, n) => format!("{n} in background"),
+                            }),
                     ),
             )
             .child(match self.tab {
@@ -1836,6 +2093,20 @@ impl Render for Shark {
                 cx.listener(|this, _: &GitFetch, w, cx| this.with_sync(w, cx, GitSync::fetch_now)),
             )
             .on_action(cx.listener(|this, _: &PickModel, w, cx| this.pick_model(w, cx)))
+            .on_action(cx.listener(|this, _: &RevealInFinder, w, cx| {
+                this.with_target(w, cx, |ws, _, cx| cx.reveal_path(&ws.dir()))
+            }))
+            .on_action(cx.listener(|this, _: &OpenInTerminal, w, cx| {
+                this.with_target(w, cx, |ws, _, _| open_terminal(&ws.dir()))
+            }))
+            .on_action(cx.listener(|this, _: &CopyPath, w, cx| {
+                this.with_target(w, cx, |ws, w, cx| {
+                    copy(ws.dir().display().to_string(), w, cx)
+                })
+            }))
+            .on_action(cx.listener(|this, _: &CopyBranch, w, cx| {
+                this.with_target(w, cx, |ws, w, cx| copy(ws.branch.clone(), w, cx))
+            }))
             .on_action(cx.listener(|this, a: &SetModel, w, cx| this.set_model(a.0, w, cx)))
             .on_action(cx.listener(|this, _: &FocusLeft, w, cx| this.move_focus(-1, w, cx)))
             .on_action(cx.listener(|this, _: &FocusRight, w, cx| this.move_focus(1, w, cx)))
@@ -1860,9 +2131,12 @@ impl Render for Shark {
     }
 }
 
-/// Contents of the New workspace dialog: a branch name and the repos to include.
+/// Contents of the New workspace dialog: a branch name and a filterable repo picker.
+/// Starts with the last-used repos ticked and floated to the top, so the common case
+/// is type a branch, enter.
 struct NewWorkspaceForm {
     branch: Entity<InputState>,
+    picker: Entity<CommandState>,
     repos: Vec<Repo>,
     picked: Vec<bool>,
     shark: WeakEntity<Shark>,
@@ -1871,7 +2145,8 @@ struct NewWorkspaceForm {
 
 impl NewWorkspaceForm {
     fn new(
-        repos: Vec<Repo>,
+        mut repos: Vec<Repo>,
+        last: &[String],
         shark: WeakEntity<Shark>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -1888,9 +2163,13 @@ impl NewWorkspaceForm {
                 }
             }
         });
-        let picked = vec![true; repos.len()];
+        let only = repos.len() == 1;
+        let was_picked = |r: &Repo| only || last.contains(&r.name);
+        repos.sort_by_key(|r| !was_picked(r)); // stable: picked first, otherwise in added order
+        let picked = repos.iter().map(was_picked).collect();
         NewWorkspaceForm {
             branch,
+            picker: cx.new(|cx| CommandState::new(window, cx)),
             repos,
             picked,
             shark,
@@ -1898,17 +2177,36 @@ impl NewWorkspaceForm {
         }
     }
 
-    /// Returns whether the form was valid (and the dialog may close).
-    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        let branch = self.branch.read(cx).value().trim().to_string();
-        let repos: Vec<Repo> = self
-            .repos
+    fn toggle(&mut self, ix: usize, cx: &mut Context<Self>) {
+        if let Some(p) = self.picked.get_mut(ix) {
+            *p = !*p;
+            cx.notify();
+        }
+    }
+
+    fn picked_repos(&self) -> Vec<Repo> {
+        self.repos
             .iter()
             .zip(&self.picked)
             .filter(|(_, p)| **p)
             .map(|(r, _)| r.clone())
-            .collect();
+            .collect()
+    }
+
+    /// Returns whether the form was valid (and the dialog may close).
+    fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let branch = self.branch.read(cx).value().trim().to_string();
+        let repos = self.picked_repos();
         if branch.is_empty() || repos.is_empty() {
+            let (msg, focus_branch) = match branch.is_empty() {
+                true => ("Name the branch first", true),
+                false => ("Pick at least one repo (space or enter ticks it)", false),
+            };
+            Shark::notify_err(window, cx, msg);
+            match focus_branch {
+                true => self.branch.update(cx, |i, cx| i.focus(window, cx)),
+                false => self.picker.update(cx, |p, cx| p.focus(window, cx)),
+            }
             return false;
         }
         self.shark
@@ -1919,30 +2217,88 @@ impl NewWorkspaceForm {
 }
 
 impl Render for NewWorkspaceForm {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (muted, faint) = (theme.muted_foreground, faint(theme));
+        let in_branch = self.branch.read(cx).focus_handle(cx).is_focused(window);
+        let items = self.repos.iter().zip(&self.picked).map(|(r, p)| {
+            CommandItem::new()
+                .label(r.name.clone())
+                .icon(IconName::FolderGit2)
+                .keywords([r.path.to_string_lossy().to_string()])
+                .checked(*p)
+        });
+        let entity = cx.entity().downgrade();
+        let picker = self.picker.clone();
+        let count = self.picked.iter().filter(|p| **p).count();
+        let key = |k: &str| Kbd::new(Keystroke::parse(k).unwrap());
+        let hint = |keys: Vec<Kbd>, label: &'static str| {
+            h_flex()
+                .gap_1()
+                .children(keys)
+                .child(div().pl_0p5().child(label))
+        };
         v_flex()
+            .key_context("NewWorkspace")
             .gap_3()
-            .child(Input::new(&self.branch))
-            .children(self.repos.iter().enumerate().map(|(i, r)| {
-                Checkbox::new(("repo", i))
-                    .label(r.name.clone())
-                    .checked(self.picked[i])
-                    .on_click(cx.listener(move |this, v: &bool, _, cx| {
-                        this.picked[i] = *v;
-                        cx.notify();
-                    }))
+            .on_action(cx.listener(|this, _: &SwitchField, window, cx| {
+                match this.branch.read(cx).focus_handle(cx).is_focused(window) {
+                    true => this.picker.update(cx, |p, cx| p.focus(window, cx)),
+                    false => this.branch.update(cx, |i, cx| i.focus(window, cx)),
+                }
+                cx.notify();
             }))
+            .on_action(cx.listener(|this, _: &ToggleRepo, _, cx| {
+                if let Some(ix) = this.picker.read(cx).selected_index() {
+                    this.toggle(ix.row, cx);
+                }
+            }))
+            .on_action(cx.listener(|this, _: &SubmitForm, window, cx| {
+                if this.submit(window, cx) {
+                    window.close_dialog(cx);
+                }
+            }))
+            .child(Input::new(&self.branch))
             .child(
-                h_flex().justify_end().child(
-                    Button::new("create")
-                        .primary()
-                        .label("Create")
-                        .on_click(cx.listener(|this, _, window, cx| {
-                            if this.submit(window, cx) {
-                                window.close_dialog(cx);
-                            }
-                        })),
-                ),
+                h_flex()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(div().flex_1().child("Repos"))
+                    .child(format!("{count} of {}", self.repos.len())),
+            )
+            .child(
+                Command::new(&self.picker)
+                    .items(items)
+                    .placeholder("Filter repos…")
+                    .bordered(true)
+                    .max_h(px(240.))
+                    // Enter ticks the highlighted repo and clears the filter for the next one.
+                    .on_confirm(move |ix, window, cx| {
+                        entity.update(cx, |f, cx| f.toggle(ix.row, cx)).ok();
+                        picker.update(cx, |p, cx| p.set_query("", window, cx));
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_3()
+                    .text_xs()
+                    .text_color(faint)
+                    .child(hint(vec![key("tab")], "switch field"))
+                    .child(match in_branch {
+                        true => hint(vec![key("enter")], "create"),
+                        false => hint(vec![key("space")], "tick repo"),
+                    })
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("create")
+                            .primary()
+                            .label("Create")
+                            .on_click(cx.listener(|this, _, window, cx| {
+                                if this.submit(window, cx) {
+                                    window.close_dialog(cx);
+                                }
+                            })),
+                    ),
             )
     }
 }
@@ -1993,15 +2349,21 @@ mod ui_tests {
     async fn keyboard_flow(cx: &mut TestAppContext) {
         let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let home = test_home();
-        let repo = home.join("src/api");
-        init_repo(&repo);
+        let repos: Vec<Repo> = ["api", "web"]
+            .map(|name| {
+                let path = home.join("src").join(name);
+                init_repo(&path);
+                Repo {
+                    name: name.into(),
+                    path,
+                }
+            })
+            .into();
         State {
-            repos: vec![Repo {
-                name: "api".into(),
-                path: repo,
-            }],
+            repos,
             workspaces: vec![],
             vim: false,
+            last_repos: vec!["api".into()],
         }
         .save();
 
@@ -2031,6 +2393,10 @@ mod ui_tests {
         .await;
         let ws_dir = home.join("shark/workspaces/ui-x");
         assert!(ws_dir.join("api").exists() && ws_dir.join("CLAUDE.md").exists());
+        assert!(
+            !ws_dir.join("web").exists(),
+            "only the last-used repos start ticked"
+        );
 
         // Opening a workspace focuses the composer: vim keys must type, not navigate.
         cx.update_window(window, |_, w, cx| w.input("jk g", cx))
@@ -2222,6 +2588,35 @@ mod ui_tests {
         cx.update(|cx| assert!(shark.read(cx).state.workspaces.is_empty()));
         assert!(!ws_dir.exists());
 
+        // Repo picker: tab to the filter, enter ticks the match, space unticks the
+        // highlighted (top) row, cmd-enter creates from the picker.
+        press(cx, &["cmd-n"]);
+        cx.run_until_parked();
+        cx.update_window(window, |_, w, cx| w.input("kb", cx))
+            .unwrap();
+        press(cx, &["tab"]);
+        cx.update_window(window, |_, w, cx| w.input("web", cx))
+            .unwrap();
+        press(cx, &["enter"]);
+        cx.run_until_parked();
+        press(cx, &["space", "cmd-enter"]);
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            !shark.read(cx).state.workspaces.is_empty()
+        })
+        .await;
+        cx.update(|cx| {
+            let s = shark.read(cx);
+            let names: Vec<&str> = s.state.workspaces[0]
+                .repos
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect();
+            assert_eq!(names, ["web"]);
+            assert_eq!(s.state.last_repos, ["web"]);
+        });
+        press(cx, &["ctrl-w", "h", "space", "w", "d"]);
+        cx.update(|cx| assert!(shark.read(cx).state.workspaces.is_empty()));
+
         // Quick bars are bare menus: no dialog close X.
         press(cx, &["cmd-k"]);
         cx.run_until_parked();
@@ -2252,6 +2647,7 @@ mod ui_tests {
             }],
             workspaces: vec![],
             vim: true,
+            ..Default::default()
         }
         .save();
         cx.update(|cx| {
