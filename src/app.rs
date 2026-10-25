@@ -661,28 +661,53 @@ impl Shark {
     }
 
     fn toggle_viewed(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Some(f) = self.diff_files.get(ix) else {
-            return;
-        };
-        let (path, fp) = (f.path().to_string(), self.diff_fps[ix]);
-        let on = self.viewed(ix) != Viewed::Yes;
+        if ix < self.diff_files.len() {
+            self.set_viewed(&[ix], self.viewed(ix) != Viewed::Yes, cx);
+        }
+    }
+
+    /// Files under folder `dir` of the tree.
+    fn dir_files(&self, dir: &str) -> Vec<usize> {
+        let prefix = format!("{dir}/");
+        (0..self.diff_files.len())
+            .filter(|&ix| self.diff_files[ix].path().starts_with(&prefix))
+            .collect()
+    }
+
+    /// A folder's box: ticks every file inside, or unticks them all when all are viewed.
+    fn toggle_viewed_dir(&mut self, dir: &str, cx: &mut Context<Self>) {
+        let files = self.dir_files(dir);
+        let on = !files.iter().all(|&ix| self.viewed(ix) == Viewed::Yes);
+        self.set_viewed(&files, on, cx);
+    }
+
+    fn set_viewed(&mut self, files: &[usize], on: bool, cx: &mut Context<Self>) {
         let Some(name) = self.active.clone() else {
             return;
         };
         let Some(ws) = self.state.workspaces.iter_mut().find(|w| w.name == name) else {
             return;
         };
-        match on {
-            true => ws.viewed.insert(path.clone(), fp),
-            false => ws.viewed.remove(&path),
-        };
+        for &ix in files {
+            let path = self.diff_files[ix].path().to_string();
+            match on {
+                true => ws.viewed.insert(path, self.diff_fps[ix]),
+                false => ws.viewed.remove(&path),
+            };
+        }
         // Forget files that left the diff so the map doesn't grow forever.
         let live: HashSet<&str> = self.diff_files.iter().map(|f| f.path().as_str()).collect();
         ws.viewed.retain(|p, _| live.contains(p.as_str()));
         self.state.save();
         self.recompute_viewed();
-        self.diff
-            .update(cx, |d, cx| d.set_file_collapsed(&path, on, cx));
+        let paths: Vec<SharedString> = files
+            .iter()
+            .map(|&ix| self.diff_files[ix].path().clone())
+            .collect();
+        // ponytail: the diff rebuilds once per file; add a batch setter to gpui-kit if big folders lag.
+        self.diff.update(cx, |d, cx| {
+            paths.iter().for_each(|p| d.set_file_collapsed(p, on, cx))
+        });
         cx.notify();
     }
 
@@ -1331,6 +1356,8 @@ impl Shark {
                 .text_sm()
                 .when(rail, |d| d.justify_center())
         };
+        let m = window.modifiers();
+        let cmd_held = m.platform && m.number_of_modifiers() == 1;
         let shark = cx.entity().downgrade();
         let repos = self.state.repos.iter().enumerate().map(|(ix, r)| {
             let (name, path) = (r.name.clone(), r.path.clone());
@@ -1397,6 +1424,10 @@ impl Shark {
                     }),
                 )
                 .child(match busy {
+                    _ if cmd_held && ix < 9 => {
+                        Kbd::new(Keystroke::parse(&format!("cmd-{}", ix + 1)).unwrap())
+                            .into_any_element()
+                    }
                     true => Spinner::new()
                         .icon(IconName::LoaderCircle)
                         .color(theme.primary)
@@ -1747,9 +1778,13 @@ impl Shark {
                 cx.listener(|this, _: &CollapseDir, _, cx| this.set_dir_open(Some(false), cx)),
             )
             .on_action(cx.listener(|this, _: &ExpandDir, _, cx| this.set_dir_open(Some(true), cx)))
-            .on_action(cx.listener(|this, _: &ToggleViewed, w, cx| {
-                if let Some(ix) = this.cursor_file(w, cx) {
-                    this.toggle_viewed(ix, cx)
+            .on_action(cx.listener(|this, _: &ToggleViewed, _, cx| {
+                let Some(r) = this.tree_rows.get(this.tree_sel) else {
+                    return;
+                };
+                match r.file {
+                    Some(ix) => this.toggle_viewed(ix, cx),
+                    None => this.toggle_viewed_dir(&r.path.clone(), cx),
                 }
             }))
             .on_action(cx.listener(|this, _: &OpenFile, w, cx| {
@@ -1831,7 +1866,8 @@ impl Shark {
                             })
                             .with_size(px(14.)),
                         )
-                        .child(div().flex_1().truncate().child(r.name.clone())),
+                        .child(div().flex_1().truncate().child(r.name.clone()))
+                        .child(self.dir_viewed_box(ix, &r.path, cx)),
                 )
                 .into_any_element();
         };
@@ -1905,6 +1941,25 @@ impl Shark {
                     ),
             );
         div().px_2().child(row).into_any_element()
+    }
+
+    fn dir_viewed_box(&self, ix: usize, dir: &str, cx: &mut Context<Self>) -> impl IntoElement {
+        let files = self.dir_files(dir);
+        let all = files.iter().all(|&f| self.viewed(f) == Viewed::Yes);
+        let dir = dir.to_string();
+        div()
+            .id(("dir-viewed-box", ix))
+            // The row's click folds the folder; this one only toggles.
+            .on_click(|_, _, cx| cx.stop_propagation())
+            .child(
+                Checkbox::new(("dir-viewed", ix))
+                    .small()
+                    .checked(all)
+                    .tooltip("All viewed (v)")
+                    .on_click(
+                        cx.listener(move |this, _: &bool, _, cx| this.toggle_viewed_dir(&dir, cx)),
+                    ),
+            )
     }
 
     fn render_editor(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -2130,6 +2185,11 @@ impl Render for Shark {
                 this.with_target(w, cx, |ws, w, cx| copy(ws.branch.clone(), w, cx))
             }))
             .on_action(cx.listener(|this, a: &SetModel, w, cx| this.set_model(a.0, w, cx)))
+            .on_action(
+                cx.listener(|this, a: &OpenWorkspace, w, cx| this.open_workspace(a.0, w, cx)),
+            )
+            // The sidebar swaps status icons for cmd-N hints while cmd is held.
+            .on_modifiers_changed(cx.listener(|_, _, _, cx| cx.notify()))
             .on_action(cx.listener(|this, _: &FocusLeft, w, cx| this.move_focus(-1, w, cx)))
             .on_action(cx.listener(|this, _: &FocusRight, w, cx| this.move_focus(1, w, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
@@ -2475,6 +2535,10 @@ mod ui_tests {
             "only the last-used repos start ticked"
         );
 
+        // cmd-N opens the Nth workspace; past the end does nothing.
+        press(cx, &["cmd-9", "cmd-1"]);
+        cx.update(|cx| assert_eq!(shark.read(cx).active.as_deref(), Some("ui-x")));
+
         // Opening a workspace focuses the composer: vim keys must type, not navigate.
         cx.update_window(window, |_, w, cx| w.input("jk g", cx))
             .unwrap();
@@ -2582,6 +2646,11 @@ mod ui_tests {
             shark.read(cx).viewed(0) == Viewed::Changed
         })
         .await;
+        // `v` on a folder ticks every file in it, then unticks them all.
+        press(cx, &["k", "v"]);
+        assert_eq!(viewed(cx), Viewed::Yes);
+        press(cx, &["v", "j"]);
+        assert_eq!(viewed(cx), Viewed::No);
 
         // `o` opens the file next to the chat and shrinks the sidebar to a rail.
         press(cx, &["o"]);
@@ -2806,8 +2875,11 @@ mod ui_tests {
             ms(t)
         ));
         assert_eq!(data.files.len(), 2001);
-        press(cx, "space");
-        press(cx, "d");
+        // Not `space d`: the new workspace's composer has focus and would take the keys.
+        cx.update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| s.show(Tab::Diff, w, cx))
+        })
+        .unwrap();
         let t = Instant::now();
         cx.update(|cx| shark.update(cx, |s, cx| s.apply_diff(data, cx)));
         frame(cx);
@@ -2831,12 +2903,19 @@ mod ui_tests {
         }
         let tree_key = ms(t) / n as f64;
         report.push(format!("tree j + frame: {tree_key:.2} ms/key"));
+        cx.update(|cx| assert_eq!(shark.read(cx).tree_sel, n));
         let t = Instant::now();
         for _ in 0..20 {
             press(cx, "v");
             frame(cx);
         }
         report.push(format!("toggle viewed + frame: {:.2} ms", ms(t) / 20.));
+        cx.update(|cx| shark.update(cx, |s, cx| s.tree_select(0, cx)));
+        let t = Instant::now();
+        press(cx, "v");
+        frame(cx);
+        report.push(format!("toggle folder viewed + frame: {:.0} ms", ms(t)));
+        cx.update(|cx| assert_eq!(shark.read(cx).viewed_now.len(), 2001));
         let t = Instant::now();
         press(cx, "shift-g");
         press(cx, "k");
