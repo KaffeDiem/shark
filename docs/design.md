@@ -1,0 +1,161 @@
+# Shark design rules
+
+Read this before adding or changing UI. Shark's look is modeled on Linear: a calm, dense, keyboard-first tool where people read for long stretches. If a rule here is wrong for your feature, change the rule here in the same change; don't silently diverge.
+
+## Principles
+1. **Reading comes first.** Most time is spent reading transcripts. Contrast, line length and font legibility beat decoration.
+2. **Keyboard first.** Every command is reachable from the keyboard and listed in the command palette. The mouse is optional.
+3. **Quiet chrome, one accent.** Neutral grays everywhere. Indigo (`primary`) means only three things: keyboard focus, "the agent is running", and the primary button. Status uses icon + text color, never colored fills.
+4. **Dark and light are equal.** Every change is checked in both. Never hard-code a color that works in only one mode.
+5. **Reuse before building.** Use the gpui-kit component or a pattern already in `src/app.rs` / `src/chat.rs` before writing a new one.
+
+## Theme
+- **Source of truth:** `assets/themes/linear.json`, one `ThemeSet` with `Linear Dark` and `Linear Light`. Change colors there, not in Rust. `install_theme` in `src/main.rs` loads it; `main()` re-syncs on system appearance changes.
+- **In code:** read colors from `cx.theme()` (`ActiveTheme`). No hex values in views; the only exception is `faint()` in `src/app.rs`, because gpui-kit has no token for it.
+
+### Color tokens
+| Token (`cx.theme().…`) | Dark | Light | Use for |
+|---|---|---|---|
+| `sidebar` | `#09090a` | `#efeff0` | Window chrome: sidebar and the frame around the content island |
+| `background` | `#121213` | `#f9f9fa` | The content island |
+| `border` | `#232426` | `#dedede` | Island edge, header divider, cards. Use sparingly |
+| `foreground` | `#e8e9eb` | `#2f2f31` | Body text, titles, active tab label |
+| `muted_foreground` | `#c8c8cb` | `#535355` | Secondary text people read: section headers, tool summaries, metadata, repo names |
+| `faint(theme)` | `#808083` | `#9c9d9f` | Hints (empty-state hints) and idle/decorative icons only. Never information |
+| `secondary` | `#1a1a1b` | `#ffffff` | Raised cards: user messages, composer, active tab pill |
+| `secondary_hover` | `#222324` | `#f5f5f5` | Hover on a card |
+| `muted` | `#161617` | `#f1f1f2` | Code and tool-output blocks |
+| `primary` | `#5e6ad2` | `#5e6ad2` | Focus ring and bar, running indicator, primary button (white text, 4.7:1) |
+| `list_active` | indigo 20% | indigo 6% | Keyboard-selected row while its list has focus (always together with a `primary` ring or bar) |
+| `list_hover` | `#1e1e20` | `#efeff0` | Row hover, and selected row of an unfocused list, **inside the island** |
+| `sidebar_accent` | `#18181a` | `#e7e7e8` | The same two states **in the sidebar** (light `list_hover` equals the sidebar color) |
+| `accent` | `#28292b` | `#efeff0` | gpui-kit's neutral menu-item hover. **Not** the brand color |
+| `danger_foreground`, `success_foreground`, `warning_foreground` | `#ff9b9b`, `#5fd39a`, `#f2c94c` | `#c42b2b`, `#1f7a50`, `#8a6800` | Status **text and icons** |
+| `danger`, `success`, `warning` | | | Fills only (danger button). Too low-contrast for text |
+| `link` | `#a8b1ff` | `#4061da` | Links in markdown |
+
+### Contrast rules
+Measure APCA (Lc) against **every surface the text can sit on**, including hover and selected rows (`background`, `sidebar`, `secondary`, `muted`, `list_active`, `list_hover`, `sidebar_accent`):
+
+| Text | Minimum | Current lowest |
+|---|---|---|
+| Prose and titles on `background` / cards | Lc 90 | 92.2 dark, 96.2 light |
+| Any other readable text: labels, metadata, `muted_foreground`, text in selected/hover rows | Lc 70 | 71.6 dark, 72.6 light |
+| Status text and links | Lc 60 | 61.3 dark, 61.2 light |
+| Hints (`faint`), never essential | Lc 30 | 33.0 dark, 38.5 light |
+
+Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pure white on near-black, and no font weight below 400.
+
+## Typography
+- **UI font:** Inter, embedded from `assets/fonts/` (400, 500, 600, 700, italic 400). Use only those weights.
+- **Mono font:** JetBrains Mono NL (no ligatures), 400 and 700. **Not inherited:** set `.font_family(theme.mono_font_family.clone()).text_size(theme.mono_font_size)` on code and tool output.
+- **Character variants:** `inter_features()` in `src/app.rs` turns on serifed I, tailed l and slashed 0 so paths and hashes are unambiguous. It is applied on the root view and must also be applied to every dialog (`d.font_features(inter_features())`), because dialogs, the palette and notifications render outside the root view.
+- **Sizes:** `font.size` is 15 and the window rem equals it:
+
+| Helper | Size | Use for |
+|---|---|---|
+| `text_xs()` | 11.25px | Metadata, section headers, info rows, status labels |
+| `text_sm()` | 13.1px | Default UI: sidebar rows, tabs, buttons, tool rows |
+| `text_size(px(14.))` + `line_height(relative(1.5))` | 14px | Transcript prose and user messages |
+| `text_base()` | 15px | Empty-state and dialog titles |
+
+- **Weights:** 400 for text; `FontWeight::MEDIUM` for emphasis (active sidebar item, tool names, section headers); `SEMIBOLD` for markdown headings only.
+- Sentence case for labels and headers ("Workspaces", not "WORKSPACES").
+- **Line length:** prose sits in a centered `max_w(px(680.))` column (~70 characters). The composer card is `max_w(px(712.))`.
+
+## Layout
+- **Inverted L:** the sidebar and the window's top edge share `sidebar`. Content sits in one island: inset 8px top, right and bottom, `rounded(theme.radius_lg)`, 1px `border`, `bg(background)`, `overflow_hidden()`.
+- **Titlebar:** transparent. The sidebar starts with a 36px drag area for the traffic lights; put no controls there.
+- **Where a new view goes:**
+  - A view of the open workspace becomes a header tab (add a `Tab` variant).
+  - A view not tied to one workspace (settings, repo list) opens with `window.open_dialog`, `w(px(640.))`, like the palette.
+  - Don't add a second sidebar or panes outside the island.
+- **Sidebar row:** 28px tall, `mx_2 px_2 gap_2`, `rounded(theme.radius)`, `text_sm`. Order: status icon (14px), name (`flex_1`, truncated), optional badge, metadata (`text_xs`, `muted_foreground`). Sidebar width 244px.
+- **Header:** 44px, `px_3`, `border_b_1` in `border`. Tabs on the left; on the right: branch (12px `GitBranch` + `text_xs`), optional badges, then status (6px `rounded_full` dot + "Running"/"Idle").
+- **Tabs:** 26px pills (`rounded_full`, `px_2p5`, 14px icon + `text_sm` label). Active: `secondary` + `foreground`. Inactive: `muted_foreground`, hover → `foreground`.
+- **Rows inside the island:** 28px for compact rows (tool calls, lists in dialogs). Transcript blocks are `px_4 py_1p5`.
+- **Radii:** `theme.radius` (8px) for rows, inputs and code blocks; `theme.radius_lg` (12px) for the island, cards and dialogs; `rounded_full()` for pills and dots.
+- **Borders, not shadows:** `shadow` is off. Separate with a 1px `border` or a surface change. Prefer fewer separators.
+- **Spacing:** the gpui scale only (`gap_1`=4px, `gap_1p5`=6px, `gap_2`=8px, `px_3`=12px, `px_4`=16px), plus the fixed sizes above.
+- **Empty state:** centered, `gap_3`. A 32px Lucide icon in `faint`, a `text_base` `foreground` title, then rows of `Kbd` chips with a `text_sm` `muted_foreground` label.
+
+## Icons and status
+- **Lucide** via `gpui_kit::assets::IconName`; the full catalog is embedded (`AllAssets`). File `circle-dashed.svg` maps to `IconName::CircleDashed`; browse them in `~/.cargo/registry/src/*/gpui-kit-assets-0.8.0/assets/icons/`.
+- **Sizes:** `Icon::new(..).with_size(px(14.))` in rows and tabs; 12px next to `text_xs`; 32px only in empty states.
+- **Color:** icons inherit the text color. Decorative icons are `muted_foreground` or `faint`; status icons use the status `*_foreground` tokens.
+- **No text glyphs as icons** (`●`, `▸`, `✓`).
+- **Status vocabulary.** Extend this table when you add a state, rather than inventing one ad hoc:
+
+| State | Element |
+|---|---|
+| Agent idle | `CircleDashed`, `muted_foreground` |
+| Agent running | `Spinner` (sidebar: `.icon(IconName::LoaderCircle).color(theme.primary)`); header dot in `primary` |
+| Tool pending / done / failed | `Spinner` / `Check` muted / `X` in `danger_foreground` |
+| Collapsed / expanded | `ChevronRight` / `ChevronDown` |
+
+  Only the agent-running state uses a spinner or `primary`. Other pending states (checks running, syncing) use a static icon.
+- **Badges** are a status icon (14px in rows, 12px in the header), optionally followed by a `text_xs` label. Don't use `Tag` or `Badge` fills in chrome.
+
+## Interaction states
+- **Focus:**
+  - Focused list row: `list_active` plus a 1px `primary` border (sidebar) or a 2px `primary` left bar (transcript). The tint alone is not visible enough.
+  - Inputs and buttons use gpui-kit's `ring`.
+- **Hover:** a background step (`list_hover` / `sidebar_accent` / `secondary_hover`) or, for tabs, text color. Never the only way to discover something.
+- **Disabled:** `muted_foreground` text and the component's `.disabled(true)`; no hover; not focusable.
+- **Motion:** none beyond `Spinner` and gpui-kit's built-ins. No custom animations or entrance effects (the palette uses `DialogEntrance::None`).
+- **Selection:** text selection is translucent indigo (`selection.background`); keep it translucent so selected text stays readable.
+
+## Components to reuse
+| Need | Use |
+|---|---|
+| Keyboard hint | `Kbd::new(Keystroke::parse("cmd-k").unwrap())`, one chip per key of a chord |
+| Command palette entry | A row in `COMMANDS` in `src/app.rs`: label, `IconName`, handler |
+| Dialog with a form | `window.open_dialog` with a small `Render` entity (see `NewWorkspaceForm`) |
+| Destructive confirm | `window.open_alert_dialog`, `ButtonVariant::Danger` |
+| Feedback | `window.push_notification(Notification::success/error(..))`. No custom toasts |
+| Text input | `Input` / `Textarea`; inside a card use `.appearance(false)` and let the card draw the border |
+| Markdown | `TextView` + `TextViewState::markdown` |
+| Primary action | `Button::new(..).primary()`, at most one per view |
+| Row action button | `Button::new(..).ghost().xsmall()` with an icon only, shown on the row |
+
+## Copy and destructive actions
+- **Confirm only when data is lost.** Archive doesn't confirm; force-archive does.
+- **Confirm dialogs:**
+  - Title `Verb {name}?`.
+  - The description states the consequence.
+  - `ok_text` is the verb; use `show_cancel(true)`.
+- **Errors name the fix**, including the key when there is one: "Add a repo first (space r a)".
+- **Progress notifications** end with an ellipsis: "Creating PRs…".
+
+## Keyboard and focus
+- **Focus handling:** every view that handles keys gets a `key_context(..)` and a `FocusHandle`.
+- **Bindings** go in `bind_keys` in `src/main.rs`:
+  - Add the new context to `NAV` so leader keys work in it.
+  - For lists, also add it to `LIST` and handle `SelectNext/Prev/First/Last/Confirm`, plus `PageDown/PageUp` where the list scrolls. The sidebar currently doesn't handle `PageDown/PageUp`.
+- **New global commands** need:
+  - an `actions!` entry;
+  - a leader binding `space <group> <key>` in `NAV`;
+  - a `COMMANDS` row;
+  - a line in the README keys table.
+- **Row actions** act on the cursor row of the focused list, otherwise on the open item (see `archive`). They get a single-key binding in the list's context plus a palette row.
+
+## Gotchas
+- **Unknown theme keys are silently ignored.** Copy key names from `ThemeConfigColors` in gpui-component's `theme/schema.rs` (the link color is `link`, not `link.foreground`). The `linear_themes_parse` test checks the core keys; extend it when you rely on a new one.
+- **`list.active.background` alpha is capped at 20%** by gpui-kit. Setting a higher alpha does nothing.
+- **The `tab.*` theme keys are unused;** the tabs draw with `secondary` / `foreground` / `muted_foreground`.
+- **`cx.theme()` borrows `cx`.** Copy the colors you need into locals before calling `cx.listener(..)` or other `&mut cx` methods (see the composer in `src/chat.rs`). Don't clone the whole `Theme` per render.
+
+## Checklist for a UI change
+1. Colors come from theme tokens (or `faint`), with no hex in views. Every new text pair meets the contrast rules.
+2. Sizes, radii, type and icons come from the tables above. Status uses the status vocabulary.
+3. The command is reachable by keyboard and listed in the palette and the README.
+4. Dialogs apply `inter_features()`.
+5. `cargo test --features test-support` passes (the headless keyboard test covers focus and key contexts).
+6. Checked by eye in both modes, without changing the system appearance:
+   ```sh
+   ./target/debug/shark &                                         # follows the system (dark here)
+   ./target/debug/shark -NSRequiresAquaSystemAppearance YES &     # forces light for this process
+   screencapture -x -o -l <window-id> .context/shot.png           # window id: CGWindowListCopyWindowInfo, owner PID
+   ```
+
+Sources: Linear's app code and design posts ("How we redesigned the Linear UI", "Behind the latest design refresh"), APCA, Wallace et al. 2022 on font legibility.
