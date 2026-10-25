@@ -9,7 +9,7 @@ Left out of the package: `.cargo-ok`, `.cargo_vcs_info.json`, `Cargo.toml.orig`.
 
 ## Patches
 
-All in `src/diff/`, tested in `src/diff/split_tests.rs` (new):
+All in `src/diff/` (and `src/checkbox.rs`, one string in `locales/ui.yml`), tested in `src/diff/split_tests.rs` (new):
 
 1. **Split ratio** (`state.rs`, `mod.rs`): `DiffState::split_ratio` /
    `set_split_ratio` (clamped 0.2–0.8, default 0.5). The original column is
@@ -27,7 +27,8 @@ All in `src/diff/`, tested in `src/diff/split_tests.rs` (new):
    its gutter, marker and background. `code_line` takes the window for it.
 5. **In-place file replacement** (`state.rs`): `DiffState::replace_file` swaps
    one file by path and splices the rows, keeping scrolling, collapse and the
-   other files' state (`set_files` resets them); `DiffState::show_line` expands
+   other files' state (`set_files` resets them) without measuring every line again (a
+   longer line widens the rows when painted); `DiffState::show_line` expands
    the fold hiding a line and scrolls only as far as needed; `DiffState::scroll_top`
    reads the scroll position.
 6. **Pinned file headers** (`mod.rs` `render_file_header`): rows are as wide as
@@ -36,12 +37,34 @@ All in `src/diff/`, tested in `src/diff/split_tests.rs` (new):
    offset by the horizontal scroll, keeping prefix, name and suffix in view
    (`CodePresentation::viewport_width` / `scroll_x`). Tested by Shark's
    `card_header_pinned` UI test.
+7. **Pinned annotations** (`mod.rs` `CodePresentation::pinned`, `annotation_elements`): line
+   and file annotations (review threads, the composer) likewise keep to the visible part of
+   their column, so only code scrolls sideways.
+8. **File cards** (`mod.rs` list rows, `render_file_header`): each file's rows form one
+   rounded, bordered card, 16 px in from the sides with 12 px between cards
+   (`CARD_INSET`, `CARD_GAP`); the header has a tinted bar; the outer border is gone.
+   `split_widths` is folded into `render_diff`.
+9. **Repaint after a resize** (`mod.rs` body canvas): the paint that records a new body
+   size asked for a new layout with `cx.notify()`, which GPUI drops while painting, so the
+   rows kept the old width until something else redrew. It now defers the notify.
+10. **Add-annotation button** (`mod.rs` `add_annotation_button`, `state.rs` `hovered`): drawn
+    for the hovered line only (tracked in the state, not a group-hover style that rows not
+    drawn again kept showing), one rem square over the change sign, clear of the code.
+11. **Editing accent** (`mod.rs`): `Diff::accent_working(path)` gives that file's modified
+    column a 2 px primary left border in Split mode.
+12. **Unchecked checkbox** (`src/checkbox.rs`): its border uses the muted text color (70 %)
+    instead of the input border, which was nearly invisible on dark themes.
+13. **Text selection lines** (`state.rs`): `DiffState::text_selection_lines` gives the lines a
+    mouse text selection over code touches, so an app can comment on them.
+14. **Copy**: the hunk separator reads "↑ N unchanged lines" (`locales/ui.yml`
+    `Diff.HiddenLines`).
 
 The crate's own tests include files from the upstream monorepo
 (`../../assets`, `../../../base`, `../../../../themes`, …) that the package
 leaves out, so they don't build here as-is. To run the diff tests, mirror this
 directory as `crates/gpui-component` with empty stand-ins for those files and
-run `cargo test --lib diff::` there.
+run `cargo test --lib --features test-support diff::` there (the feature lets the tests find
+elements by id).
 
 ## Upgrading
 

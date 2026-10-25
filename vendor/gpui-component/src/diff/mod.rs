@@ -221,6 +221,7 @@ pub struct Diff {
     on_line_hover: Option<HoverHandler>,
     side_headings: Option<SideHeadings>,
     working_cell: Option<WorkingCell>,
+    accent: Option<SharedString>,
 }
 
 fn file_renderer<F, E>(render: F) -> FileRenderer
@@ -252,6 +253,7 @@ impl Diff {
             on_line_hover: None,
             side_headings: None,
             working_cell: None,
+            accent: None,
         }
     }
     /// Shows the original and modified line-number lanes. Default is true.
@@ -454,6 +456,12 @@ impl Diff {
         self.working_cell = Some(Rc::new(render));
         self
     }
+    /// Marks the modified column of the file at `path` with an accent border, as being
+    /// edited (Split mode).
+    pub fn accent_working(mut self, path: Option<SharedString>) -> Self {
+        self.accent = path;
+        self
+    }
 }
 impl Styled for Diff {
     fn style(&mut self) -> &mut StyleRefinement {
@@ -519,11 +527,10 @@ fn render_diff(
         state.set_content_width(width);
     }
     state.sync_annotations(&props.annotations.items);
-    let (content_width, left_width) = split_widths(
-        state.content_width(),
-        state.viewport().width,
-        state.split_ratio(),
-    );
+    // Rows fill at least the cards' visible width; the width doesn't depend on the ratio, so
+    // the divider follows the pointer, and a column narrower than its longest line clips it.
+    let content_width = (state.content_width()).max(state.viewport().width - CARD_INSET * 2.);
+    let left_width = content_width * state.split_ratio();
     let code = Rc::new(CodePresentation {
         files: state.files().to_vec(),
         presentations: state.presentations().to_vec(),
@@ -553,9 +560,11 @@ fn render_diff(
         on_line_hover: props.on_line_hover,
         side_headings: props.side_headings,
         working_cell: props.working_cell,
+        accent: props.accent,
         selection: state.selection().clone(),
         selected_lines: state.selected_lines(),
         selected: state.selected_span(),
+        hovered: state.hovered.clone(),
         geometry: state.geometry().clone(),
         state: cx.entity(),
     });
@@ -586,13 +595,28 @@ fn render_diff(
                     &scrollbar,
                     list(scrollbar.clone(), move |ix, window, cx| {
                         let row = &rows[ix];
+                        let first = matches!(row, DisplayRow::File(_));
+                        let last = rows.get(ix + 1).is_none_or(|next| next.file() != row.file());
+                        let (radius, border) = (px(8.), cx.theme().border);
+                        // The rows of a file form one rounded card, with a gap between cards.
                         div()
-                            .id(("diff-file", row.file()))
                             .w_full()
-                            .child(render_row(row, code.clone(), window, cx))
+                            .px(CARD_INSET - px(1.))
+                            .when(first, |this| this.pt(CARD_GAP))
+                            .when(ix + 1 == rows.len(), |this| this.pb(CARD_GAP))
+                            .child(
+                                div()
+                                    .id(("diff-file", row.file()))
+                                    .w_full()
+                                    .border_x_1()
+                                    .border_color(border)
+                                    .when(first, |this| this.border_t_1().rounded_t(radius))
+                                    .when(last, |this| this.border_b_1().rounded_b(radius))
+                                    .child(render_row(row, code.clone(), window, cx)),
+                            )
                             .into_any_element()
                     })
-                    .w(content_width)
+                    .w(content_width + CARD_INSET * 2.)
                     .h_full(),
                 ))
                 .into_any_element(),
@@ -725,7 +749,7 @@ fn render_diff(
                 {
                     let state = cx.entity();
                     move |bounds, _, cx| {
-                        state.update(cx, |state, cx| {
+                        let changed = state.update(cx, |state, _| {
                             // Runs after the list's prepaint, which drops
                             // every row height when its width changes.
                             let rehinted = state.keep_row_height_hint();
@@ -737,10 +761,13 @@ fn render_diff(
                                 let painted = state.geometry().borrow().painted_width();
                                 code_width(painted, gutter_width, rem, mode)
                             };
-                            if state.record_paint(bounds.size, painted) || rehinted {
-                                cx.notify();
-                            }
+                            state.record_paint(bounds.size, painted) || rehinted
                         });
+                        // A notify while painting is dropped; ask for the next frame after it.
+                        if changed {
+                            let state = state.clone();
+                            cx.defer(move |cx| state.update(cx, |_, cx| cx.notify()));
+                        }
                     }
                 },
                 |_, _, _, _| {},
@@ -761,8 +788,6 @@ fn render_diff(
         .bg(cx.theme().background)
         .text_color(cx.theme().foreground)
         .text_sm()
-        .border_1()
-        .border_color(cx.theme().border)
         .child(body)
         .refine_style(&props.style)
         .into_any_element()
@@ -809,9 +834,11 @@ struct CodePresentation {
     on_line_hover: Option<HoverHandler>,
     side_headings: Option<SideHeadings>,
     working_cell: Option<WorkingCell>,
+    accent: Option<SharedString>,
     selection: gpui_base::TextSelectionHandle,
     selected_lines: Option<DiffLineRange>,
     selected: Option<SelectedLines>,
+    hovered: Option<DiffLinePosition>,
     geometry: Rc<std::cell::RefCell<selection::SelectionGeometry>>,
     state: Entity<DiffState>,
 }
@@ -826,6 +853,29 @@ impl CodePresentation {
         )
     }
 
+    /// Where `side`'s column of `file` lies in a row.
+    fn column(&self, file: usize, side: DiffSide) -> (Pixels, Pixels) {
+        let split = self.mode == DiffMode::Split && !self.files[file].is_single_column();
+        match (split, side) {
+            (true, DiffSide::Original) => (px(0.), self.left_width),
+            (true, DiffSide::Modified) => (self.left_width, self.content_width),
+            _ => (px(0.), self.content_width),
+        }
+    }
+
+    /// The part of row span `start..end` in view, as an offset from `start` and a width: rows
+    /// scroll sideways, but headers and annotations stay on what is visible. Never narrower
+    /// than 240 px (or the span), so off-screen ones don't wrap into tall rows.
+    fn pinned(&self, (start, end): (Pixels, Pixels)) -> (Pixels, Pixels) {
+        if self.viewport_width <= px(0.) {
+            return (px(0.), end - start);
+        }
+        let left = (self.scroll_x - CARD_INSET).max(start);
+        let right = (self.scroll_x + self.viewport_width - CARD_INSET).min(end);
+        let width = (right - left).max((end - start).min(px(240.)));
+        (left.min(end - width) - start, width)
+    }
+
     fn is_selected(&self, file: usize, side: DiffSide, ix: usize) -> bool {
         self.selected
             .as_ref()
@@ -833,13 +883,9 @@ impl CodePresentation {
     }
 }
 
-/// The row width and, in Split mode, the original column's share of it. The
-/// width doesn't depend on the ratio, so the divider follows the pointer; a
-/// column narrower than its longest line clips it.
-fn split_widths(measured: Pixels, viewport: Pixels, ratio: f32) -> (Pixels, Pixels) {
-    let width = measured.max(viewport);
-    (width, width * ratio)
-}
+/// Each file is a bordered card, this far in from each side of the list (gap and border).
+const CARD_INSET: Pixels = px(17.);
+const CARD_GAP: Pixels = px(12.);
 
 /// Total row width for code of `width` in the current mode.
 fn code_width(width: Pixels, gutter_width: Pixels, rem: Pixels, mode: DiffMode) -> Pixels {
@@ -1262,15 +1308,11 @@ fn render_file_header(
     let name = document.path().clone();
     // Rows are as wide as the longest line and scroll sideways; the header bar stays on the
     // visible part, so its suffix is at the body's right edge.
-    let (bar_left, bar_width) = match code.viewport_width > px(0.) {
-        true => (code.scroll_x, code.viewport_width.min(code.content_width)),
-        false => (px(0.), code.content_width),
-    };
+    let (bar_left, bar_width) = code.pinned((px(0.), code.content_width));
     v_flex()
         .id("file-header")
         .w_full()
-        .when(file > 0, |this| this.border_t_1())
-        .border_b_1()
+        .when(!collapsed, |this| this.border_b_1())
         .border_color(border)
         .child(
             h_flex()
@@ -1278,6 +1320,9 @@ fn render_file_header(
                 .left(bar_left)
                 .w(bar_width)
                 .min_w_0()
+                .rounded_t(px(7.))
+                .when(collapsed, |this| this.rounded_b(px(7.)))
+                .bg(cx.theme().muted.opacity(0.35))
                 .pl_1()
                 .pr_3()
                 .py_1()
@@ -1352,7 +1397,7 @@ fn file_annotations(
         .get(path)
         .cloned()
         .unwrap_or_default();
-    annotation_elements(&ixs, code, window, cx)
+    annotation_elements(&ixs, (px(0.), code.content_width), code, window, cx)
 }
 
 /// Summarizes a file without source rows: binary, metadata-only or empty.
@@ -1488,6 +1533,10 @@ fn render_cell(
         .when(side == DiffSide::Original, |this| {
             this.border_r_1().border_color(cx.theme().border)
         })
+        .when(
+            side == DiffSide::Modified && code.accent.as_ref() == Some(code.files[file].path()),
+            |this| this.border_l_2().border_color(cx.theme().primary),
+        )
         .when(ix.is_none(), |this| {
             this.bg(cx.theme().muted.opacity(0.3))
                 .child(div().h(code.row_height))
@@ -1651,24 +1700,26 @@ fn add_annotation_button(
         .selected
         .as_ref()
         .is_some_and(|selected| selected.is_last(&code.files, file, side, ix));
+    // Shown on the hovered line only: a hover style can outlive the pointer on rows that
+    // aren't drawn again.
+    if !at_selection_end && code.hovered.as_ref() != Some(&position) {
+        return None;
+    }
+    // Over the change sign, clear of the code.
     Some(
         div()
             .id(("add-annotation", ix))
             .test_support()
             .absolute()
-            .top_0()
+            .top((code.row_height - code.rem) / 2.)
             .left(left)
-            .size(code.row_height)
+            .size(code.rem)
             .flex()
             .items_center()
             .justify_center()
             .rounded(cx.theme().radius)
             .bg(cx.theme().primary)
             .text_color(cx.theme().primary_foreground)
-            .when(!at_selection_end, |this| {
-                this.opacity(0.)
-                    .group_hover("diff-line", |this| this.opacity(1.))
-            })
             .role(gpui::accesskit::Role::Button)
             .aria_label(t!("Diff.AddAnnotation", line = position.line()).to_string())
             .child(Icon::new(IconName::Plus).xsmall())
@@ -1798,7 +1849,6 @@ fn code_line(
         add_annotation_button(file, side, ix, gutters_width + code.rem / 2., &code, cx);
     h_flex()
         .id("line-row")
-        .group("diff-line")
         .relative()
         .w_full()
         .px_2()
@@ -1821,11 +1871,20 @@ fn code_line(
         .when(hover_line && !selected, |this| {
             this.hover(|this| this.bg(cx.theme().list_hover))
         })
-        .when_some(code.on_line_hover.clone(), |this, handler| {
-            let position = position.clone();
-            this.on_hover(move |hovered, window, cx| {
-                handler(hovered.then_some(&position), window, cx)
-            })
+        .on_hover({
+            let (handler, state) = (code.on_line_hover.clone(), code.state.clone());
+            let (position, at) = (position.clone(), code.position(file, side, ix));
+            move |hovered, window, cx| {
+                state.update(cx, |state, cx| {
+                    if *hovered || state.hovered.as_ref() == Some(&at) {
+                        state.hovered = hovered.then(|| at.clone());
+                        cx.notify();
+                    }
+                });
+                if let Some(handler) = &handler {
+                    handler(hovered.then_some(&position), window, cx)
+                }
+            }
         })
         .when(code.line_number, |this| {
             this.children(
@@ -1938,11 +1997,13 @@ fn line_annotations(
         .get(&position)
         .cloned()
         .unwrap_or_default();
-    annotation_elements(&ixs, code, window, cx)
+    annotation_elements(&ixs, code.column(file, side), code, window, cx)
 }
 
+/// Annotations under a line or header, kept on the visible part of row span `span`.
 fn annotation_elements(
     ixs: &[usize],
+    span: (Pixels, Pixels),
     code: &CodePresentation,
     window: &mut Window,
     cx: &mut App,
@@ -1950,12 +2011,15 @@ fn annotation_elements(
     let Some(render) = &code.annotation_content else {
         return Vec::new();
     };
+    let (left, width) = code.pinned(span);
     ixs.iter()
         .map(|ix| {
             let annotation = &code.annotations.items[*ix];
             div()
                 .id(annotation.id.clone())
-                .w_full()
+                .relative()
+                .left(left)
+                .w(width)
                 .px_3()
                 .py_3()
                 .border_t_1()

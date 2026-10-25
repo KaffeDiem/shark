@@ -2743,8 +2743,8 @@ async fn card_header_pinned(cx: &mut TestAppContext) {
         .unwrap();
     };
     check(cx);
-    // Scrolled sideways (the rows' + moves left): the header stays.
-    let plus = |w: &Window| w.find(("add-annotation", 0usize)).bounds().left();
+    // Scrolled sideways (the line numbers move left): the header stays.
+    let plus = |w: &Window| w.find(("line", 0usize)).bounds().left();
     let before = cx
         .update_window(window, |_, w, _| {
             (plus(w), w.find("edit-working-copy").bounds())

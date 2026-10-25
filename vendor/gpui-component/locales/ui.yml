@@ -509,7 +509,7 @@ Diff:
     zh-CN: 已复制
     zh-HK: 已複製
   HiddenLines:
-    en: "%{count} lines not in patch"
+    en: "↑ %{count} unchanged lines"
     zh-CN: "patch 中未包含 %{count} 行"
     zh-HK: "patch 中未包含 %{count} 行"
   ExpandAbove:

@@ -95,18 +95,6 @@ fn replace_file_keeps_scroll_and_shows_new_lines(cx: &mut TestAppContext) {
     });
 }
 
-#[test]
-fn split_widths_follow_the_ratio_at_any_content_width() {
-    for (measured, viewport) in [(px(400.), px(800.)), (px(1600.), px(800.))] {
-        let width = measured.max(viewport);
-        for ratio in [0.3, 0.5, 0.7] {
-            let (content, left) = super::split_widths(measured, viewport, ratio);
-            assert_eq!(content, width);
-            assert_eq!(left, width * ratio);
-        }
-    }
-}
-
 struct Host {
     state: Entity<DiffState>,
     calls: Rc<RefCell<Vec<(SharedString, usize)>>>,
@@ -195,4 +183,142 @@ fn dragging_the_divider_resizes_columns_and_reports_the_ratio(cx: &mut TestAppCo
         events.borrow().as_slice(),
         [DiffEvent::SplitRatioChanged(reported)] if *reported == ratio
     ));
+}
+
+/// A host whose width the test sets, with a note under modified line 10.
+struct Sized {
+    state: Entity<DiffState>,
+    width: Rc<std::cell::Cell<gpui::Pixels>>,
+}
+
+impl Render for Sized {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let note = super::DiffAnnotation::line(
+            "note",
+            DiffLinePosition::new("split.txt", DiffSide::Modified, 10),
+        );
+        div().w(self.width.get()).h(px(300.)).child(
+            Diff::new(&self.state)
+                .size_full()
+                .annotations([note])
+                .on_add_annotation(|_, _, _| {})
+                .render_annotation(|_, _, _| {
+                    use gpui::InteractiveElement as _;
+                    use gpui_base::TestSupportExt as _;
+                    div().id("note-body").test_support().h(px(20.))
+                }),
+        )
+    }
+}
+
+fn sized(
+    cx: &mut TestAppContext,
+    file: super::DiffFile,
+) -> (Entity<DiffState>, Rc<std::cell::Cell<gpui::Pixels>>, &mut VisualTestContext) {
+    cx.update(crate::init);
+    let state = cx.new(|cx| DiffState::new([file], cx).with_mode(DiffMode::Split));
+    let width = Rc::new(std::cell::Cell::new(px(400.)));
+    let (_, cx) = cx.add_window_view({
+        let (state, width) = (state.clone(), width.clone());
+        move |_, _| Sized { state, width }
+    });
+    for _ in 0..3 {
+        draw(cx);
+    }
+    (state, width, cx)
+}
+
+fn find(cx: &mut VisualTestContext, id: impl Into<gpui::ElementId>) -> Vec<gpui::Bounds<gpui::Pixels>> {
+    let id = id.into();
+    cx.update(|window, _| {
+        gpui_base::test_support::find_all(window, &[], &id)
+            .iter()
+            .filter(|e| e.visible())
+            .map(|e| e.bounds())
+            .collect()
+    })
+}
+
+#[gpui::test]
+fn a_resize_found_while_painting_lays_out_again(cx: &mut TestAppContext) {
+    let (state, width, cx) = sized(cx, two_hunks());
+    let notified = Rc::new(std::cell::Cell::new(0));
+    let _observe = cx.update(|_, cx| {
+        let notified = notified.clone();
+        cx.observe(&state, move |_, _| notified.set(notified.get() + 1))
+    });
+    width.set(px(600.));
+    cx.update(|window, _| window.refresh());
+    draw(cx);
+    // The paint saw the new width; the row layout must follow on a next frame of its own.
+    assert!(notified.get() > 0, "no frame was asked for");
+    assert_eq!(cx.update(|_, cx| state.read(cx).viewport().width), px(600.));
+}
+
+#[gpui::test]
+fn annotations_stay_in_view_when_rows_scroll_sideways(cx: &mut TestAppContext) {
+    let wide = format!("{}\n", "x".repeat(400));
+    let original = lines("line", 20);
+    let modified = original.replace("line 10\n", "changed 10\n") + &wide;
+    let (state, _, cx) = sized(cx, fixture::modified("split.txt", &original, &modified));
+    // The working column starts mid-view, then fills it: the note keeps to what is visible.
+    let half = cx.update(|_, cx| state.read(cx).content_width()) * 0.5;
+    for (x, from) in [(half - px(200.), px(200.)), (half + px(500.), px(0.))] {
+        cx.update(|_, cx| {
+            state.update(cx, |state, _| state.horizontal_scroll().set_offset(point(-x, px(0.))))
+        });
+        for _ in 0..2 {
+            draw(cx);
+        }
+        let note = find(cx, "note-body");
+        assert_eq!(note.len(), 1, "scrolled {x:?}");
+        // At least 240 px wide: past the view's edge when little of the column shows.
+        let fits = from > px(0.) || (note[0].right() <= px(400.) && note[0].size.width > px(300.));
+        assert!(
+            (note[0].left() - from).abs() < px(30.) && fits,
+            "scrolled {x:?}: {:?}",
+            note[0]
+        );
+    }
+}
+
+#[gpui::test]
+fn only_the_hovered_line_has_an_add_button(cx: &mut TestAppContext) {
+    let (state, _, cx) = sized(cx, two_hunks());
+    let rows = |cx: &mut VisualTestContext| {
+        (0..60usize)
+            .flat_map(|ix| find(cx, ("add-annotation", ix)))
+            .collect::<Vec<_>>()
+    };
+    assert!(rows(cx).is_empty());
+    let line = |cx: &mut VisualTestContext, n: usize| {
+        let at = DiffLinePosition::new("split.txt", DiffSide::Modified, n);
+        cx.update(|_, cx| {
+            state.update(cx, |state, cx| {
+                state.hovered = Some(at);
+                cx.notify()
+            })
+        });
+        draw(cx);
+        rows(cx)
+    };
+    assert_eq!(line(cx, 10).len(), 1);
+    let buttons = line(cx, 11);
+    assert_eq!(buttons.len(), 1, "the last line's button went");
+    // The button sits over the change sign, a rem wide, clear of the code.
+    assert!(buttons[0].size.width <= px(16.), "{buttons:?}");
+}
+
+#[test]
+fn a_text_selection_maps_to_the_lines_it_touches() {
+    let file = fixture::modified("t.txt", "a\n", "one\ntwo\nthree\n");
+    let lines = |range| {
+        let r = super::state::source_lines(&file, DiffSide::Modified, range).unwrap();
+        (r.side(), r.start(), r.end())
+    };
+    // "ne\ntw": lines 1–2; ending right after a newline stays on that line.
+    assert_eq!(lines(1..6), (DiffSide::Modified, 1, 2));
+    assert_eq!(lines(4..8), (DiffSide::Modified, 2, 2));
+    assert_eq!(lines(9..10), (DiffSide::Modified, 3, 3));
+    assert!(super::state::source_lines(&file, DiffSide::Modified, 40..41).is_none());
 }
