@@ -410,6 +410,11 @@ const COMMANDS: &[(&str, IconName, Cmd)] = &[
         s.toggle_vim(w, cx)
     }),
     ("Stop agent", IconName::Square, |s, _, cx| s.stop(cx)),
+    (
+        "Manage queued messages",
+        IconName::ListOrdered,
+        |s, w, cx| s.focus_queue(w, cx),
+    ),
     ("Change model…", IconName::Sparkles, |s, w, cx| {
         s.pick_model(w, cx)
     }),
@@ -1226,6 +1231,13 @@ impl Shark {
 
     fn open_prs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.with_sync(window, cx, GitSync::open_prs)
+    }
+
+    fn focus_queue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(chat) = self.active_chat().cloned() {
+            self.show(Tab::Chat, window, cx);
+            chat.update(cx, |c, cx| c.focus_queue(window, cx));
+        }
     }
 
     fn stop(&mut self, cx: &mut Context<Self>) {
@@ -2148,6 +2160,7 @@ impl Render for Shark {
             )
             .on_action(cx.listener(|this, _: &AddRepo, w, cx| this.add_repo(w, cx)))
             .on_action(cx.listener(|this, _: &StopAgent, _, cx| this.stop(cx)))
+            .on_action(cx.listener(|this, _: &FocusQueue, w, cx| this.focus_queue(w, cx)))
             .on_action(cx.listener(|this, _: &ShowChat, w, cx| this.show(Tab::Chat, w, cx)))
             .on_action(cx.listener(|this, _: &ShowDiff, w, cx| this.show(Tab::Diff, w, cx)))
             .on_action(cx.listener(|this, _: &CreatePrs, w, cx| this.create_prs(w, cx)))
