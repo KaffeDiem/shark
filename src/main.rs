@@ -107,12 +107,15 @@ actions!(
     ]
 );
 
-// Plan mode: shift-tab, the plan pane and its keys. Fast mode (codex): cmd-shift-f.
+// Plan mode: shift-tab, the plan pane and its keys. Fast mode (codex): cmd-shift-f. Thinking
+// level: cmd-shift-. up, cmd-shift-, down.
 actions!(
     shark,
     [
         TogglePlanMode,
         ToggleFastMode,
+        RaiseEffort,
+        LowerEffort,
         TogglePlan,
         ApprovePlan,
         BuildPlanInNewChat,
@@ -239,6 +242,10 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-shift-tab", SwitchField, Some("Settings")),
         KeyBinding::new("cmd-/", PickModel, None),
         KeyBinding::new("cmd-shift-f", ToggleFastMode, None),
+        KeyBinding::new("cmd-shift-.", RaiseEffort, None),
+        KeyBinding::new("cmd-shift-,", LowerEffort, None),
+        KeyBinding::new("cmd->", RaiseEffort, None),
+        KeyBinding::new("cmd-<", LowerEffort, None),
         KeyBinding::new("alt-down", NextHunk, Some("DiffPane || PlanPane")),
         KeyBinding::new("alt-up", PrevHunk, Some("DiffPane || PlanPane")),
         KeyBinding::new("}", NextFile, Some("DiffPane")),

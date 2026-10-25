@@ -167,6 +167,8 @@ impl Queued {
 pub enum ChatEvent {
     /// `meta` changed (session, model or title); the app saves it.
     Meta,
+    /// The user picked the model or thinking level (after `Meta`); new chats start on it.
+    Picked,
     TurnDone,
 }
 
@@ -199,8 +201,10 @@ pub struct Chat {
     /// The model menu, opening upward from the model button, whose bounds the last paint kept.
     model_menu: Option<(Entity<crate::menu::Menu>, Subscription)>,
     model_at: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
-    /// Model the running process was started with; a mismatch respawns it on the next send.
+    /// Model and (claude) thinking level the running process was started with; a mismatch
+    /// respawns it on the next send.
     agent_model: Option<String>,
+    agent_effort: &'static str,
     /// Virtualized: only visible rows render, which matters while a spinner redraws every frame.
     list: ListState,
     pub focus: FocusHandle,
@@ -268,19 +272,48 @@ const BUILD_FRESH: &str = "Implement this plan. It was made and approved in anot
 /// How long an interrupt may take before the process is stopped instead.
 const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// `default` means "no --model flag". `codex…` runs `codex app-server` (see `codex::is_codex`).
+/// Every chat names one: claude gets `--model`, `codex:<model id>` runs `codex app-server` with
+/// that model (see `codex::is_codex`).
 pub(crate) const MODELS: &[&str] = &[
-    "default",
     "fable",
     "opus",
     "sonnet",
     "haiku",
-    "codex",
     "codex:gpt-6.1-sol",
     "codex:gpt-6-astra",
 ];
 
-/// A model id as people read it: "default" → "Default", "codex:gpt-6.1-sol" → "GPT-6.1 Sol".
+/// Thinking levels, lowest first: claude's `--effort`, codex's `effort` (both models take all six,
+/// per `model/list`). Haiku takes `--effort` too.
+const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+const CODEX_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
+/// A chat's level until one is picked.
+const EFFORT: &str = "high";
+
+/// The thinking levels `model` takes, lowest first.
+pub(crate) fn efforts(model: &str) -> &'static [&'static str] {
+    match codex::is_codex(Some(model)) {
+        true => CODEX_EFFORTS,
+        false => CLAUDE_EFFORTS,
+    }
+}
+
+/// The level a chat runs at: its own (or `high`), the model's highest if it lacks that one.
+pub(crate) fn effort_of(meta: &ChatMeta) -> &'static str {
+    let levels = efforts(meta.model.as_deref().unwrap_or(MODELS[0]));
+    let want = meta.effort.as_deref().unwrap_or(EFFORT);
+    (levels.iter().find(|l| **l == want)).unwrap_or(levels.last().unwrap())
+}
+
+/// A thinking level as people read it: "xhigh" → "Extra high".
+pub(crate) fn effort_label(level: &str) -> String {
+    match level {
+        "xhigh" => "Extra high".into(),
+        l => model_label(l),
+    }
+}
+
+/// A model id as people read it: "opus" → "Opus", "codex:gpt-6.1-sol" → "GPT-6.1 Sol".
 pub(crate) fn model_label(id: &str) -> String {
     let cap = |w: &str| {
         let mut w = w.to_string();
@@ -450,6 +483,7 @@ impl Chat {
             model_menu: None,
             model_at: Default::default(),
             agent_model: None,
+            agent_effort: EFFORT,
             list: ListState::new(1, ListAlignment::Top, px(400.)), // the activity footer
             focus: cx.focus_handle(),
             reader: None,
@@ -579,8 +613,18 @@ impl Chat {
         }
     }
 
-    /// Takes effect on the next send, which restarts the process on the new model.
-    /// cmd-/ or the model button: the models, the current one checked; type a letter to jump.
+    /// The thinking level this chat runs at (see `effort_of`).
+    pub fn effort(&self) -> &'static str {
+        effort_of(&self.meta)
+    }
+
+    /// The levels this chat's model takes, lowest first.
+    pub fn efforts(&self) -> &'static [&'static str] {
+        efforts(self.model())
+    }
+
+    /// cmd-/ or the model button: the models, then the thinking levels, the current ones
+    /// checked; type a letter to jump. A pick takes effect on the next send.
     pub fn open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.model().to_string();
         let this = cx.entity().downgrade();
@@ -600,13 +644,17 @@ impl Chat {
                 this.update(cx, |c, cx| c.set_model(m, cx)).ok();
             });
             // The backend, where the name doesn't say it.
-            let hint = match (is_codex, m) {
-                (false, "default") => "Claude",
-                (true, "codex") => "Default",
-                (true, _) => "Codex",
-                _ => "",
-            };
+            let hint = if is_codex { "Codex" } else { "" };
             entries.push(item.hint(hint).checked(m == current));
+        }
+        entries.push(crate::menu::Entry::Sep);
+        let effort = self.effort();
+        for &l in self.efforts() {
+            let this = this.clone();
+            let item = crate::menu::item(None, effort_label(l), move |_, cx| {
+                this.update(cx, |c, cx| c.set_effort(l, cx)).ok();
+            });
+            entries.push(item.hint("Thinking").checked(l == effort));
         }
         let b = self.model_at.get();
         let at = point(b.left(), b.top() - px(4.));
@@ -620,8 +668,10 @@ impl Chat {
         cx.notify();
     }
 
+    /// The user's pick: the process restarts on it at the next send. A thinking level the new
+    /// model lacks becomes its highest.
     pub fn set_model(&mut self, m: &str, cx: &mut Context<Self>) {
-        let model = (m != MODELS[0]).then(|| m.to_string());
+        let model = Some(m.to_string());
         if self.meta.model != model {
             let codex = codex::is_codex(model.as_deref());
             // A session belongs to one CLI: the other can't resume it.
@@ -632,9 +682,39 @@ impl Chat {
                 self.push(Block::Info(format!("{m} starts a new conversation")), cx);
             }
             self.meta.model = model;
+            if self.meta.effort.is_some() {
+                self.meta.effort = Some(self.effort().into());
+            }
             cx.emit(ChatEvent::Meta);
             cx.notify();
         }
+        cx.emit(ChatEvent::Picked);
+    }
+
+    /// The user's pick of thinking level (one the model lacks becomes its highest). Claude
+    /// restarts on it at the next send, like a model change; codex sends it with the next
+    /// message.
+    pub fn set_effort(&mut self, level: &str, cx: &mut Context<Self>) {
+        let was = self.meta.effort.replace(level.into());
+        let level = self.effort();
+        self.meta.effort = Some(level.into());
+        if let Some(a) = &mut self.agent {
+            a.set_effort(level);
+        }
+        if was != self.meta.effort {
+            cx.emit(ChatEvent::Meta);
+            cx.notify();
+        }
+        cx.emit(ChatEvent::Picked);
+    }
+
+    /// One thinking level up (`d` > 0) or down, stopping at the ends; the level it's on now.
+    pub fn step_effort(&mut self, d: isize, cx: &mut Context<Self>) -> &'static str {
+        let levels = self.efforts();
+        let ix = levels.iter().position(|l| *l == self.effort()).unwrap_or(0);
+        let ix = ix.saturating_add_signed(d).min(levels.len() - 1);
+        self.set_effort(levels[ix], cx);
+        levels[ix]
     }
 
     /// Plan mode on or off. A running process switches at once, mid-turn too; a new one
@@ -1168,12 +1248,14 @@ impl Chat {
             return false;
         }
         // Never mid-turn: a steer would kill the turn it means to steer.
+        let stale = self.agent_model != self.meta.model
+            || (!self.codex() && self.agent_effort != self.effort());
         if self.agent.is_some()
-            && self.agent_model != self.meta.model
+            && stale
             && !self.busy
             && !self.steered
         {
-            self.agent = None; // drop stops it; the respawn resumes the same session on the new model
+            self.agent = None; // drop stops it; the respawn resumes the same session on the new model/level
             self.background.clear(); // its reader is replaced below, so its Exited never arrives
         }
         if self.agent.is_none() {
@@ -1187,6 +1269,7 @@ impl Chat {
                     }
                     self.agent = Some(a);
                     self.agent_model = self.meta.model.clone();
+                    self.agent_effort = self.effort();
                     self.reader = Some(Self::read_events(rx, Self::apply, cx));
                 }
                 Err(e) => {
@@ -2638,6 +2721,8 @@ exec cat >/dev/null
         let meta = ChatMeta {
             id: ws.name.clone(),
             session_id: Some("s1".into()),
+            model: Some("sonnet".into()),
+            effort: Some("max".into()),
             ..Default::default()
         };
         let _turn = crate::app::ui_tests::UI_LOCK
@@ -2665,6 +2750,8 @@ exec cat >/dev/null
             "no tools: {args}"
         );
         assert!(args.contains("--no-session-persistence"), "{args}");
+        assert!(args.contains("--model sonnet"), "the chat's model: {args}");
+        assert!(args.contains("--effort max"), "and level: {args}");
         assert!(!agent::transcript_path(&meta.id).exists(), "no transcript");
         let _ = std::fs::remove_file(ws.dir());
     }
@@ -2676,7 +2763,7 @@ exec cat >/dev/null
         let _turn = crate::app::ui_tests::UI_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let (mut a, rx) = agent::spawn_ask(Some("haiku"), "the docs").unwrap();
+        let (mut a, rx) = agent::spawn_ask("haiku", "the docs").unwrap();
         a.send("what is x?").unwrap();
         let mut text = String::new();
         while let Ok(ev) = rx.recv_blocking() {
@@ -3159,6 +3246,34 @@ exec cat >/dev/null
                     c.apply(ev, cx);
                 }
                 assert_eq!(c.meta.session_id, None);
+            })
+        });
+    }
+
+    /// Thinking levels: `high` until picked, stepping stops at the ends, and a level the model
+    /// lacks becomes its highest. A claude level change restarts the process at the next send;
+    /// codex's doesn't.
+    #[gpui_kit::test]
+    fn thinking_levels(cx: &mut TestAppContext) {
+        let chat = open_chat("effort", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.meta.model = Some("opus".into());
+                assert_eq!((c.effort(), c.efforts().len()), ("high", 5));
+                assert_eq!(c.step_effort(-1, cx), "medium");
+                assert_eq!(c.step_effort(-5, cx), "low");
+                c.set_model("codex:gpt-6.1-sol", cx);
+                assert_eq!(c.meta.effort.as_deref(), Some("low"), "kept across backends");
+                c.set_effort("ultra", cx);
+                assert_eq!(c.step_effort(1, cx), "ultra", "the top");
+                c.set_model("fable", cx);
+                assert_eq!(c.meta.effort.as_deref(), Some("max"), "clamped to claude's top");
+                c.set_effort("ultra", cx);
+                assert_eq!(c.effort(), "max");
+                // What the send checks: claude's process is stale on another level.
+                c.agent_model = c.meta.model.clone();
+                c.agent_effort = "high";
+                assert_ne!(c.agent_effort, c.effort());
             })
         });
     }
@@ -3870,9 +3985,7 @@ mod model_label_tests {
     #[test]
     fn labels_read_like_names() {
         let l = super::model_label;
-        assert_eq!(l("default"), "Default");
         assert_eq!(l("opus"), "Opus");
-        assert_eq!(l("codex"), "Codex");
         assert_eq!(l("codex:gpt-6.1-sol"), "GPT-6.1 Sol");
         assert_eq!(l("codex:gpt-6-astra"), "GPT-6 Astra");
     }

@@ -111,6 +111,8 @@ pub fn menus() -> Vec<Menu> {
                 MenuItem::action("Change Model…", PickModel),
                 MenuItem::action("Toggle Plan Mode", TogglePlanMode),
                 MenuItem::action("Toggle Fast Mode", ToggleFastMode),
+                MenuItem::action("Raise Thinking Level", RaiseEffort),
+                MenuItem::action("Lower Thinking Level", LowerEffort),
             ],
         ),
         menu(

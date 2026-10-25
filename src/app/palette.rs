@@ -225,6 +225,62 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| s.toggle_fast(w, cx),
     ),
     Row(
+        "Raise thinking level",
+        IconName::ChevronUp,
+        Some(&RaiseEffort),
+        "effort reasoning more",
+        |s, w, cx| s.step_effort(1, w, cx),
+    ),
+    Row(
+        "Lower thinking level",
+        IconName::ChevronDown,
+        Some(&LowerEffort),
+        "effort reasoning less",
+        |s, w, cx| s.step_effort(-1, w, cx),
+    ),
+    Row(
+        "Thinking: Low",
+        IconName::Brain,
+        None,
+        "effort reasoning level low",
+        |s, w, cx| s.set_effort("low", w, cx),
+    ),
+    Row(
+        "Thinking: Medium",
+        IconName::Brain,
+        None,
+        "effort reasoning level medium",
+        |s, w, cx| s.set_effort("medium", w, cx),
+    ),
+    Row(
+        "Thinking: High",
+        IconName::Brain,
+        None,
+        "effort reasoning level high",
+        |s, w, cx| s.set_effort("high", w, cx),
+    ),
+    Row(
+        "Thinking: Extra high",
+        IconName::Brain,
+        None,
+        "effort reasoning level xhigh",
+        |s, w, cx| s.set_effort("xhigh", w, cx),
+    ),
+    Row(
+        "Thinking: Max",
+        IconName::Brain,
+        None,
+        "effort reasoning level max",
+        |s, w, cx| s.set_effort("max", w, cx),
+    ),
+    Row(
+        "Thinking: Ultra",
+        IconName::Brain,
+        None,
+        "effort reasoning level ultra",
+        |s, w, cx| s.set_effort("ultra", w, cx),
+    ),
+    Row(
         "Interrupt agent",
         IconName::Square,
         Some(&StopAgent),
@@ -551,7 +607,7 @@ const NEED_WORKSPACE: &[&str] = &[
 
 /// Rows that only a Claude chat can do; a Codex chat's palette leaves them out.
 const CLAUDE_ONLY: &[&str] = &["Ask a side question"];
-const CODEX_ONLY: &[&str] = &["Toggle fast mode"];
+const CODEX_ONLY: &[&str] = &["Toggle fast mode", "Thinking: Ultra"];
 
 /// The palette's headings, each with the label of the row it starts at.
 const GROUPS: &[(&str, &str)] = &[

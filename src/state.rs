@@ -52,6 +52,11 @@ pub struct State {
     /// The app version Home last told the user about; empty before the first launch.
     #[serde(default)]
     pub last_seen_version: String,
+    /// The model and thinking level last picked in any chat; new chats start on them.
+    #[serde(default)]
+    pub last_model: Option<String>,
+    #[serde(default)]
+    pub last_effort: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -138,10 +143,14 @@ pub struct ChatMeta {
     pub title: String,
     #[serde(default)]
     pub session_id: Option<String>,
-    /// Claude model alias (`opus`, `fable`, …) or `codex[:<model id>]`; `None` uses the claude
-    /// CLI default.
+    /// Claude model alias (`opus`, `fable`, …) or `codex:<model id>`. Only chats saved before
+    /// every chat named one have `None` (the CLI default); `Workspace::fill_models` gives
+    /// them one.
     #[serde(default)]
     pub model: Option<String>,
+    /// Thinking level (`chat::efforts`); `None` until one is picked (`chat::effort_of`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort: Option<String>,
     /// Plan mode: the agent plans and edits nothing until the plan is approved.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub plan: bool,
@@ -202,6 +211,21 @@ impl Workspace {
             });
         }
         self.active_chat = self.active_chat.min(self.chats.len() - 1);
+    }
+
+    /// Chats without a model (an old one on the CLI default, a new workspace's first) get
+    /// `model` and `effort`; old ones on codex's default get the model it was.
+    pub fn fill_models(&mut self, model: &str, effort: Option<&String>) {
+        for c in self.chats.iter_mut().chain(&mut self.closed) {
+            match c.model.as_deref() {
+                None => {
+                    c.model = Some(model.into());
+                    c.effort = c.effort.take().or(effort.cloned());
+                }
+                Some("codex") => c.model = Some("codex:gpt-6.1-sol".into()),
+                _ => {}
+            }
+        }
     }
 
     /// A fresh chat id, unique among open and closed tabs: `<ws>~2`, `<ws>~3`, …
@@ -332,8 +356,29 @@ impl State {
                 ..State::default()
             }
         });
-        state.workspaces.iter_mut().for_each(Workspace::migrate);
+        let (model, effort) = (state.new_model(), state.last_effort.clone());
+        for ws in &mut state.workspaces {
+            ws.migrate();
+            ws.fill_models(&model, effort.as_ref());
+        }
         state
+    }
+
+    /// The model a new chat gets: the last one picked, else the first.
+    pub fn new_model(&self) -> String {
+        let models = crate::chat::MODELS;
+        let last = self.last_model.as_deref().filter(|m| models.contains(m));
+        last.unwrap_or(models[0]).into()
+    }
+
+    /// A new chat `id` on the last picked model and thinking level.
+    pub fn new_chat(&self, id: String) -> ChatMeta {
+        ChatMeta {
+            id,
+            model: Some(self.new_model()),
+            effort: self.last_effort.clone(),
+            ..Default::default()
+        }
     }
 
     /// Drag-and-drop of workspace `ws` onto workspace `target`: `ws` takes the target's
@@ -503,6 +548,7 @@ mod tests {
                 title: String::new(),
                 session_id: Some("s1".into()),
                 model: Some("opus".into()),
+                effort: None,
                 plan: false,
                 fast: None,
             }]
@@ -518,6 +564,40 @@ mod tests {
             saved.get("session_id").is_none(),
             "legacy fields aren't written back"
         );
+    }
+
+    /// Chats from before every chat named a model load on one: claude's default on the last
+    /// pick, codex's default on Sol. New chats take the last pick too.
+    #[test]
+    fn fills_models_and_new_chats() {
+        let dir = std::env::temp_dir().join(format!("shark-models-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let chats = r#"[{"id":"a"},{"id":"b","model":"codex"},{"id":"c","model":"opus","effort":"low"}]"#;
+        let ws = format!(r#"{{"name":"w","branch":"w","repos":[],"chats":{chats},"closed":[{{"id":"d"}}]}}"#);
+        let json = |last: &str| format!(r#"{{"repos":[],"workspaces":[{ws}]{last}}}"#);
+        fs::write(&path, json("")).unwrap();
+        let st = State::load_at(&path);
+        let models = |st: &State| {
+            let w = &st.workspaces[0];
+            (w.chats.iter().chain(&w.closed))
+                .map(|c| (c.model.clone().unwrap(), c.effort.clone()))
+                .collect::<Vec<_>>()
+        };
+        let m = |m: &str, e: Option<&str>| (m.to_string(), e.map(String::from));
+        let sol = "codex:gpt-6.1-sol";
+        assert_eq!(
+            models(&st),
+            [m("fable", None), m(sol, None), m("opus", Some("low")), m("fable", None)]
+        );
+        fs::write(&path, json(r#","last_model":"haiku","last_effort":"max""#)).unwrap();
+        let st = State::load_at(&path);
+        assert_eq!(models(&st)[0], m("haiku", Some("max")));
+        let new = st.new_chat("x".into());
+        assert_eq!((new.model.as_deref(), new.effort.as_deref()), (Some("haiku"), Some("max")));
+        let gone = State { last_model: Some("default".into()), ..State::default() };
+        assert_eq!(gone.new_model(), "fable", "a pick no longer listed");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     fn ws(name: &str) -> Workspace {

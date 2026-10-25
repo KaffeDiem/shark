@@ -252,11 +252,19 @@ pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receive
     let prompts = ["--permission-prompt-tool", "stdio"];
     run(
         &ws.dir(),
-        chat.model.as_deref(),
+        model_of(chat),
         &chat.id,
-        prompts.into_iter().chain(resume),
+        prompts.into_iter().chain(effort(chat)).chain(resume),
         Some(transcript_path(&chat.id)),
     )
+}
+
+fn model_of(chat: &ChatMeta) -> &str {
+    chat.model.as_deref().unwrap_or(crate::chat::MODELS[0])
+}
+
+fn effort(chat: &ChatMeta) -> [&'static str; 2] {
+    ["--effort", crate::chat::effort_of(chat)]
 }
 
 const SIDE_PROMPT: &str = "The user is asking a quick side question about this conversation. \
@@ -283,9 +291,9 @@ pub fn spawn_side(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Re
     ];
     run(
         &ws.dir(),
-        chat.model.as_deref(),
+        model_of(chat),
         &format!("{}.side", chat.id),
-        args.into_iter().chain(fork),
+        args.into_iter().chain(effort(chat)).chain(fork),
         None,
     )
 }
@@ -295,7 +303,7 @@ pub const README: &str = include_str!("../README.md");
 
 /// A one-shot question about Shark, outside any workspace: no tools, no MCP, saved nowhere.
 /// `system` is appended to claude's system prompt (e.g. `README` and the keymap).
-pub fn spawn_ask(model: Option<&str>, system: &str) -> std::io::Result<(Agent, Receiver<Ev>)> {
+pub fn spawn_ask(model: &str, system: &str) -> std::io::Result<(Agent, Receiver<Ev>)> {
     let args = [
         "--tools",
         "",
@@ -313,7 +321,7 @@ pub fn spawn_ask(model: Option<&str>, system: &str) -> std::io::Result<(Agent, R
 
 fn run<'a>(
     cwd: &Path,
-    model: Option<&str>,
+    model: &str,
     log_name: &str,
     extra: impl IntoIterator<Item = &'a str>,
     transcript: Option<PathBuf>,
@@ -335,10 +343,9 @@ fn run<'a>(
         "--replay-user-messages",
         "--permission-mode",
         PERMISSION_MODE,
+        "--model",
+        model,
     ]);
-    if let Some(m) = model {
-        cmd.args(["--model", m]);
-    }
     cmd.args(extra);
     start(cmd, cwd, log_name, transcript, None)
 }
@@ -437,6 +444,14 @@ impl Agent {
     pub fn set_fast(&mut self, on: bool) {
         if let Some(st) = &self.codex {
             st.lock().unwrap().fast = Some(on);
+        }
+    }
+
+    /// codex's thinking level, from the next message. claude takes `--effort` only at start, so
+    /// the chat restarts it instead.
+    pub fn set_effort(&mut self, level: &str) {
+        if let Some(st) = &self.codex {
+            st.lock().unwrap().effort = level.into();
         }
     }
 

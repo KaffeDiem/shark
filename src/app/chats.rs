@@ -43,6 +43,13 @@ impl Shark {
         self._subs.push(
             cx.subscribe(&chat, move |this, chat, ev: &ChatEvent, cx| match ev {
                 ChatEvent::Meta => this.save_meta(&chat, cx),
+                ChatEvent::Picked => {
+                    let (m, st) = (&chat.read(cx).meta, &mut this.state);
+                    if (&st.last_model, &st.last_effort) != (&m.model, &m.effort) {
+                        (st.last_model, st.last_effort) = (m.model.clone(), m.effort.clone());
+                        st.save();
+                    }
+                }
                 ChatEvent::TurnDone => {
                     if this.active.as_ref() == Some(&name) {
                         this.refresh_diff(cx);
@@ -118,20 +125,18 @@ impl Shark {
         }
     }
 
-    /// cmd-t: a new tab right of the current one, on the current chat's model and speed.
+    /// cmd-t: a new tab right of the current one, on the last picked model and thinking level
+    /// and the current chat's speed.
     pub(super) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let (model, fast) = (self.active_chat())
-            .map(|c| (c.read(cx).meta.model.clone(), c.read(cx).meta.fast))
-            .unwrap_or_default();
-        let Some(ws) = self.active_ws_mut() else {
+        let fast = self.active_chat().and_then(|c| c.read(cx).meta.fast);
+        let Some(id) = self.active_ws().map(Workspace::next_chat_id) else {
             return notify_err(window, cx, "Open a workspace first");
         };
         let meta = ChatMeta {
-            id: ws.next_chat_id(),
-            model,
             fast,
-            ..Default::default()
+            ..self.state.new_chat(id)
         };
+        let ws = self.active_ws_mut().unwrap();
         let at = ws.active_chat + 1;
         ws.chats.insert(at, meta);
         self.state.save();
@@ -162,6 +167,7 @@ impl Shark {
     }
 
     fn close_chat_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let fresh = self.state.new_chat(String::new());
         let Some(ws) = self.active_ws_mut() else {
             return;
         };
@@ -169,11 +175,7 @@ impl Shark {
         let meta = ws.chats.remove(ix);
         if ws.chats.is_empty() {
             let id = ws.next_chat_id();
-            ws.chats.push(ChatMeta {
-                id,
-                model: meta.model.clone(),
-                ..Default::default()
-            });
+            ws.chats.push(ChatMeta { id, ..fresh });
         }
         ws.active_chat = ix.min(ws.chats.len() - 1);
         let next = ws.active_chat;
@@ -366,7 +368,31 @@ impl Shark {
             return notify_err(window, cx, "Open a workspace first");
         };
         chat.update(cx, |c, cx| c.set_model(m, cx));
+        let m = crate::chat::model_label(m);
         window.push_notification(format!("Model: {m} (from the next message)"), cx);
+    }
+
+    /// Palette: the shown chat's thinking level, confirmed in a toast.
+    pub(super) fn set_effort(&mut self, level: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self.active_chat().cloned() else {
+            return notify_err(window, cx, "Open a workspace first");
+        };
+        chat.update(cx, |c, cx| c.set_effort(level, cx));
+        self.effort_toast(&chat, window, cx);
+    }
+
+    /// cmd-shift-. / cmd-shift-,: the shown chat's thinking level one up or down.
+    pub(super) fn step_effort(&mut self, d: isize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(chat) = self.active_chat().cloned() else {
+            return notify_err(window, cx, "Open a workspace first");
+        };
+        chat.update(cx, |c, cx| c.step_effort(d, cx));
+        self.effort_toast(&chat, window, cx);
+    }
+
+    fn effort_toast(&self, chat: &Entity<Chat>, window: &mut Window, cx: &mut Context<Self>) {
+        let l = crate::chat::effort_label(chat.read(cx).effort());
+        window.push_notification(format!("Thinking: {l} (from the next message)"), cx);
     }
 
     /// Where tab `ix` sits against the tab strip as of the last layout: `Less` hidden (partly
