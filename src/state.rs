@@ -79,18 +79,43 @@ pub struct Repo {
     pub path: PathBuf,
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Workspace {
     pub name: String,
     pub branch: String,
     pub repos: Vec<WsRepo>,
+    /// Pre-tabs single chat; `migrate` moves it into `chats`.
+    #[serde(default, skip_serializing)]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing)]
+    pub model: Option<String>,
+    /// Open chat tabs, left to right; never empty after `migrate`.
+    #[serde(default)]
+    pub chats: Vec<ChatMeta>,
+    /// Closed tabs, newest last, so cmd-shift-t can bring one back with its transcript.
+    #[serde(default)]
+    pub closed: Vec<ChatMeta>,
+    #[serde(default)]
+    pub active_chat: usize,
+    /// Diff path -> fingerprint of its patch when marked viewed; a new patch makes it unviewed.
+    #[serde(default)]
+    pub viewed: HashMap<String, u64>,
+}
+
+/// One conversation: its own claude process, session and transcript.
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
+pub struct ChatMeta {
+    /// Transcript and log file name. The first chat's id is the workspace name, which is
+    /// where the single pre-tabs transcript already lives.
+    pub id: String,
+    /// First line of the first message; empty until then.
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
     pub session_id: Option<String>,
     /// Claude model alias (`opus`, `fable`, …); `None` uses the CLI default.
     #[serde(default)]
     pub model: Option<String>,
-    /// Diff path -> fingerprint of its patch when marked viewed; a new patch makes it unviewed.
-    #[serde(default)]
-    pub viewed: HashMap<String, u64>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -132,6 +157,28 @@ pub fn workspaces_dir() -> PathBuf {
 impl Workspace {
     pub fn dir(&self) -> PathBuf {
         workspaces_dir().join(&self.name)
+    }
+
+    /// Gives a workspace saved before chat tabs (or a new one) its first chat.
+    pub fn migrate(&mut self) {
+        if self.chats.is_empty() {
+            self.chats.push(ChatMeta {
+                id: self.name.clone(),
+                session_id: self.session_id.take(),
+                model: self.model.take(),
+                ..Default::default()
+            });
+        }
+        self.active_chat = self.active_chat.min(self.chats.len() - 1);
+    }
+
+    /// A fresh chat id, unique among open and closed tabs: `<ws>~2`, `<ws>~3`, …
+    pub fn next_chat_id(&self) -> String {
+        let n = (self.chats.iter().chain(&self.closed))
+            .filter_map(|c| c.id.rsplit_once('~')?.1.parse::<u32>().ok())
+            .max()
+            .unwrap_or(1);
+        format!("{}~{}", self.name, n + 1)
     }
 }
 
@@ -224,12 +271,14 @@ impl State {
         let Ok(bytes) = fs::read(&path) else {
             return State::default();
         };
-        serde_json::from_slice(&bytes).unwrap_or_else(|e| {
+        let mut state: State = serde_json::from_slice(&bytes).unwrap_or_else(|e| {
             // keep the unreadable file instead of overwriting it on the next save
             let _ = fs::rename(&path, path.with_extension("json.bak"));
             eprintln!("state.json unreadable ({e}), moved to state.json.bak");
             State::default()
-        })
+        });
+        state.workspaces.iter_mut().for_each(Workspace::migrate);
+        state
     }
 
     /// Drag-and-drop of workspace `ws` onto workspace `target`: `ws` takes the target's
@@ -301,14 +350,6 @@ mod tests {
     fn reviewed_ids_survive_saves() {
         let dir = std::env::temp_dir().join(format!("shark-state-{}", std::process::id()));
         let path = dir.join("state.json");
-        let ws = |name: &str| Workspace {
-            name: name.into(),
-            branch: "b".into(),
-            repos: vec![],
-            session_id: None,
-            model: None,
-            viewed: Default::default(),
-        };
         let state = State {
             workspaces: vec![ws("a"), ws("b")],
             ..Default::default()
@@ -341,14 +382,40 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A pre-tabs workspace keeps its session, model and transcript as its first chat.
+    #[test]
+    fn migrates_single_chat() {
+        let json = r#"{"name":"feat","branch":"b","repos":[],"session_id":"s1","model":"opus"}"#;
+        let mut ws: Workspace = serde_json::from_str(json).unwrap();
+        ws.migrate();
+        assert_eq!(
+            ws.chats,
+            vec![ChatMeta {
+                id: "feat".into(),
+                title: String::new(),
+                session_id: Some("s1".into()),
+                model: Some("opus".into()),
+            }]
+        );
+        assert_eq!(ws.next_chat_id(), "feat~2");
+        ws.closed.push(ChatMeta {
+            id: "feat~7".into(),
+            ..Default::default()
+        });
+        assert_eq!(ws.next_chat_id(), "feat~8");
+        let saved = serde_json::to_value(&ws).unwrap();
+        assert!(
+            saved.get("session_id").is_none(),
+            "legacy fields aren't written back"
+        );
+    }
+
     fn ws(name: &str) -> Workspace {
         Workspace {
             name: name.into(),
             branch: name.into(),
             repos: vec![],
-            session_id: None,
-            model: None,
-            viewed: HashMap::new(),
+            ..Default::default()
         }
     }
 

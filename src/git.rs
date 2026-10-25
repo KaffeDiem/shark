@@ -128,14 +128,13 @@ pub fn create_workspace(
         })
         .into_iter()
         .collect::<Result<Vec<_>, _>>()?;
-        let ws = Workspace {
+        let mut ws = Workspace {
             name: name.into(),
             branch: branch.into(),
             repos: done,
-            session_id: None,
-            model: None,
-            viewed: Default::default(),
+            ..Default::default()
         };
+        ws.migrate();
         fs::write(dir.join("CLAUDE.md"), claude_md(&ws, dir)).map_err(|e| e.to_string())?;
         Ok(ws)
     })();

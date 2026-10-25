@@ -1,5 +1,5 @@
-//! Drives `claude -p` over its stream-json protocol, one long-lived process per workspace.
-use crate::state::{Workspace, support_dir};
+//! Drives `claude -p` over its stream-json protocol, one long-lived process per chat.
+use crate::state::{ChatMeta, Workspace, support_dir};
 use serde_json::{Value, json};
 use std::{
     borrow::Cow,
@@ -128,10 +128,10 @@ fn compact(line: &str) -> Cow<'_, str> {
     }
 }
 
-pub fn transcript_path(ws: &str) -> PathBuf {
+pub fn transcript_path(chat: &str) -> PathBuf {
     support_dir()
         .join("transcripts")
-        .join(format!("{ws}.jsonl"))
+        .join(format!("{chat}.jsonl"))
 }
 
 /// Events stored in a transcript, up to `len` bytes: lines written after that belong to a
@@ -148,17 +148,64 @@ pub fn read_history(path: &PathBuf, len: u64) -> Vec<Ev> {
         .collect()
 }
 
-fn append(path: &PathBuf, line: &str) {
-    if let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path) {
+fn append(path: &Option<PathBuf>, line: &str) {
+    if let Some(path) = path
+        && let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path)
+    {
         let _ = f.write_all(format!("{line}\n").as_bytes());
     }
 }
 
-pub fn spawn(ws: &Workspace) -> std::io::Result<(Agent, smol::channel::Receiver<Ev>)> {
+pub fn spawn(
+    ws: &Workspace,
+    chat: &ChatMeta,
+) -> std::io::Result<(Agent, smol::channel::Receiver<Ev>)> {
+    let resume = chat.session_id.iter().flat_map(|id| ["--resume", id]);
+    run(ws, chat, &chat.id, resume, Some(transcript_path(&chat.id)))
+}
+
+const SIDE_PROMPT: &str = "The user is asking a quick side question about this conversation. \
+    It is not part of the main task and you have no tools: answer briefly from what is already \
+    in the conversation, and say so if you would need to look something up.";
+
+/// A side question: a throwaway fork of the chat's session with no tools, saved nowhere, so the
+/// chat itself never sees it. Works while the chat's own turn runs.
+pub fn spawn_side(
+    ws: &Workspace,
+    chat: &ChatMeta,
+) -> std::io::Result<(Agent, smol::channel::Receiver<Ev>)> {
+    let fork = chat
+        .session_id
+        .iter()
+        .flat_map(|id| ["--resume", id, "--fork-session"]);
+    let args = [
+        "--tools",
+        "",
+        "--strict-mcp-config", // no MCP servers either
+        "--no-session-persistence",
+        "--append-system-prompt",
+        SIDE_PROMPT,
+    ];
+    run(
+        ws,
+        chat,
+        &format!("{}.side", chat.id),
+        args.into_iter().chain(fork),
+        None,
+    )
+}
+
+fn run<'a>(
+    ws: &Workspace,
+    chat: &ChatMeta,
+    log_name: &str,
+    extra: impl IntoIterator<Item = &'a str>,
+    transcript: Option<PathBuf>,
+) -> std::io::Result<(Agent, smol::channel::Receiver<Ev>)> {
     let logs = support_dir().join("logs");
     fs::create_dir_all(&logs)?;
     fs::create_dir_all(support_dir().join("transcripts"))?;
-    let log = logs.join(format!("{}.stderr.log", ws.name));
+    let log = logs.join(format!("{log_name}.stderr.log"));
     // SHARK_CLAUDE swaps in another binary; the UI tests use a fake that swallows stdin.
     let mut cmd = Command::new(std::env::var("SHARK_CLAUDE").unwrap_or("claude".into()));
     cmd.args([
@@ -177,12 +224,10 @@ pub fn spawn(ws: &Workspace) -> std::io::Result<(Agent, smol::channel::Receiver<
         "--permission-mode",
         PERMISSION_MODE,
     ]);
-    if let Some(m) = &ws.model {
+    if let Some(m) = &chat.model {
         cmd.args(["--model", m]);
     }
-    if let Some(id) = &ws.session_id {
-        cmd.args(["--resume", id]);
-    }
+    cmd.args(extra);
     let mut child = cmd
         .current_dir(ws.dir())
         .stdin(Stdio::piped())
@@ -191,7 +236,6 @@ pub fn spawn(ws: &Workspace) -> std::io::Result<(Agent, smol::channel::Receiver<
         .spawn()?;
     let (tx, rx) = smol::channel::unbounded();
     let stdout = child.stdout.take().unwrap();
-    let transcript = transcript_path(&ws.name);
     let exited = Arc::new(AtomicBool::new(false));
     let reaped = exited.clone();
     let agent = Agent {
@@ -504,7 +548,7 @@ fn live_claude() {
         crate::state::workspaces_dir().join(&ws.name),
     )
     .unwrap();
-    let (mut agent, rx) = spawn(&ws).unwrap();
+    let (mut agent, rx) = spawn(&ws, &ws.chats[0]).unwrap();
     agent
         .send("Without using any tools: which language is each repo written in? One line.")
         .unwrap();
@@ -519,7 +563,7 @@ fn live_claude() {
     }
     drop(agent);
     let _ = fs::remove_file(crate::state::workspaces_dir().join(&ws.name));
-    let _ = fs::remove_file(transcript_path(&ws.name));
+    let _ = fs::remove_file(transcript_path(&ws.chats[0].id));
     assert!(
         text.contains("Python") && text.contains("TypeScript"),
         "imports not loaded: {text}"

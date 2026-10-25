@@ -205,9 +205,7 @@ mod tests {
                     base: "origin/main".into(),
                 })
                 .into(),
-            session_id: None,
-            model: None,
-            viewed: Default::default(),
+            ..Default::default()
         };
         let o = merge_order(&ws, &["ios".into(), "gone".into()]);
         assert_eq!(o, ["ios", "api", "web"]);

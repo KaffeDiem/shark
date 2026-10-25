@@ -118,16 +118,21 @@ fn poll(cx: &mut Context<Shark>) -> Task<()> {
 
 impl Shark {
     pub(crate) fn attention_of(&self, name: &str, cx: &App) -> Attn {
-        match (self.needs_you(name, cx), self.attn.unread.contains(name)) {
+        match (self.needs_you(name, cx), self.unread_ws(name)) {
             (Some(l), _) => Attn::Needs(l),
             (None, true) => Attn::Unread,
             (None, false) => Attn::None,
         }
     }
 
+    /// A turn finished off screen, in the workspace or any of its chat tabs.
+    fn unread_ws(&self, name: &str) -> bool {
+        self.attn.unread.contains(name) || self.chat_unread(name)
+    }
+
     /// The agent is on it (mid-rebase looks like conflicts), or the workspace is going away.
     fn busy(&self, name: &str, cx: &App) -> bool {
-        self.archiving.contains(name) || self.chats.get(name).is_some_and(|c| c.read(cx).working())
+        self.archiving.contains(name) || self.running_chats(name, cx) > 0
     }
 
     fn needs_you(&self, name: &str, cx: &App) -> Option<String> {
@@ -172,7 +177,7 @@ impl Shark {
         let mut count = 0;
         for name in &names {
             let needs = self.needs_you(name, cx);
-            count += usize::from(needs.is_some() || self.attn.unread.contains(name));
+            count += usize::from(needs.is_some() || self.unread_ws(name));
             // Nothing known yet (never opened, not checked): no baseline to compare against.
             if !self.attn.checked.contains_key(name) && !self.syncs.contains_key(name) {
                 continue;

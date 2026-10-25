@@ -1,7 +1,7 @@
-//! One agent conversation per workspace: transcript blocks, composer, and the claude process.
+//! One agent conversation (a chat tab): transcript blocks, composer, and the claude process.
 use crate::agent::{self, Agent, Ev};
 use crate::complete::{self, Item, Kind};
-use crate::state::Workspace;
+use crate::state::{ChatMeta, Workspace};
 use crate::*;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::Sizable as _;
@@ -15,7 +15,7 @@ use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, Icon, h_flex, v_flex};
+use gpui_kit::component::{ActiveTheme, Icon, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
@@ -128,14 +128,33 @@ impl Queued {
 }
 
 pub enum ChatEvent {
-    /// `None`: the session is gone (not found, or "New conversation"); the next send starts fresh.
-    SessionId(Option<String>),
-    Model(Option<String>),
+    /// `meta` changed (session, model or title); the app saves it.
+    Meta,
     TurnDone,
+}
+
+/// A side question and its answer, in a card above the composer. A forked, tool-less claude
+/// answers it; neither the question nor the answer reaches the chat or its transcript.
+struct Side {
+    /// The card's own question field when opened empty; `None` once asked.
+    input: Option<Entity<TextareaState>>,
+    question: String,
+    answer: Entity<TextViewState>,
+    /// The answer as markdown, for copy and insert.
+    text: String,
+    done: bool,
+    error: Option<String>,
+    focus: FocusHandle,
+    scroll: ScrollHandle,
+    /// Dropping the card stops the process and its reader.
+    agent: Option<Agent>,
+    _reader: Option<Task<()>>,
+    _sub: Option<Subscription>,
 }
 
 pub struct Chat {
     pub ws: Workspace,
+    pub meta: ChatMeta,
     blocks: Vec<Block>,
     /// What the list shows, derived from `blocks`; see `sync_rows`.
     rows: Vec<Row>,
@@ -185,6 +204,7 @@ pub struct Chat {
     pub steered: bool,
     /// What the CLI reported at init: its model, permission mode and MCP servers.
     reported: Option<String>,
+    side: Option<Side>,
     _subs: Vec<Subscription>,
 }
 
@@ -218,6 +238,17 @@ fn summarize(input: &Value, root: &str) -> String {
         .strip_prefix(root)
         .map_or(s, |r| r.trim_start_matches('/'));
     s.chars().take(120).collect()
+}
+
+/// A tab title from a message: its first line, cut at a word near 40 characters.
+fn title_of(text: &str) -> String {
+    let line = text.trim().lines().next().unwrap_or_default();
+    if line.chars().count() <= 40 {
+        return line.to_string();
+    }
+    let cut: String = line.chars().take(40).collect();
+    let cut = cut.rsplit_once(' ').map_or(cut.as_str(), |(head, _)| head);
+    format!("{}…", cut.trim_end())
 }
 
 /// The first `n` chars, with "…" when cut.
@@ -254,7 +285,7 @@ pub(crate) fn duration(secs: u64) -> String {
 }
 
 impl Chat {
-    pub fn new(ws: Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(ws: Workspace, meta: ChatMeta, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 10)
@@ -278,6 +309,7 @@ impl Chat {
         let ws_name = ws.name.clone();
         let mut chat = Chat {
             ws,
+            meta,
             blocks: vec![],
             rows: vec![],
             sel: 0,
@@ -309,6 +341,7 @@ impl Chat {
             qscroll: ScrollHandle::new(),
             editing: None,
             steered: false,
+            side: None,
             reported: None,
             _subs: vec![_sub],
         };
@@ -318,7 +351,7 @@ impl Chat {
         chat.list.set_follow_mode(FollowMode::Tail);
         // Read history off the UI thread, up to its current end: a process started meanwhile
         // appends to the same file, and its lines arrive live.
-        let path = agent::transcript_path(&chat.ws.name);
+        let path = agent::transcript_path(&chat.meta.id);
         let len = std::fs::metadata(&path).map_or(0, |m| m.len());
         cx.spawn(async move |this, cx| {
             let evs = (cx.background_executor())
@@ -344,7 +377,7 @@ impl Chat {
             std::mem::take(&mut self.background),
             self.started,
             self.cut,
-            self.ws.session_id.clone(),
+            self.meta.session_id.clone(),
         );
         (self.busy, self.cut, self.replaying) = (false, false, true);
         for ev in evs {
@@ -364,7 +397,7 @@ impl Chat {
             self.background,
             self.started,
             self.cut,
-            self.ws.session_id,
+            self.meta.session_id,
         ) = kept;
         let n = self.blocks.len();
         self.blocks.extend(live);
@@ -373,6 +406,13 @@ impl Chat {
         self.list.reset(self.rows.len());
         self.list.set_follow_mode(FollowMode::Tail);
         self.sel = self.rows.len().saturating_sub(1);
+        if self.meta.title.is_empty()
+            && let Some(Block::User(t, _)) =
+                self.blocks.iter().find(|b| matches!(b, Block::User(..)))
+        {
+            self.meta.title = title_of(t);
+            cx.emit(ChatEvent::Meta);
+        }
         cx.notify();
     }
 
@@ -397,15 +437,23 @@ impl Chat {
     }
 
     pub fn model(&self) -> &str {
-        self.ws.model.as_deref().unwrap_or(MODELS[0])
+        self.meta.model.as_deref().unwrap_or(MODELS[0])
+    }
+
+    /// The tab label.
+    pub fn title(&self) -> SharedString {
+        match self.meta.title.is_empty() {
+            true => "New chat".into(),
+            false => self.meta.title.clone().into(),
+        }
     }
 
     /// Takes effect on the next send, which restarts the process on the new model.
     pub fn set_model(&mut self, m: &str, cx: &mut Context<Self>) {
         let model = (m != MODELS[0]).then(|| m.to_string());
-        if self.ws.model != model {
-            self.ws.model = model.clone();
-            cx.emit(ChatEvent::Model(model));
+        if self.meta.model != model {
+            self.meta.model = model;
+            cx.emit(ChatEvent::Meta);
             cx.notify();
         }
     }
@@ -744,16 +792,19 @@ impl Chat {
             return false;
         }
         // Never mid-turn: a steer would kill the turn it means to steer.
-        if self.agent.is_some() && self.agent_model != self.ws.model && !self.busy && !self.steered
+        if self.agent.is_some()
+            && self.agent_model != self.meta.model
+            && !self.busy
+            && !self.steered
         {
             self.agent = None; // drop stops it; the respawn resumes the same session on the new model
             self.background.clear(); // its reader is replaced below, so its Exited never arrives
         }
         if self.agent.is_none() {
-            match agent::spawn(&self.ws) {
+            match agent::spawn(&self.ws, &self.meta) {
                 Ok((a, rx)) => {
                     self.agent = Some(a);
-                    self.agent_model = self.ws.model.clone();
+                    self.agent_model = self.meta.model.clone();
                     self.reader = Some(cx.spawn(async move |this, cx| {
                         while let Ok(ev) = rx.recv().await {
                             if this.update(cx, |c, cx| c.apply(ev, cx)).is_err() {
@@ -799,11 +850,159 @@ impl Chat {
             self.started = Some(Instant::now());
         }
         self.busy = true;
+        if self.meta.title.is_empty() {
+            self.meta.title = title_of(&text);
+            cx.emit(ChatEvent::Meta);
+        }
         // Jump to the end so push follows the new message and the reply.
         self.sel = self.rows.len().saturating_sub(1);
         self.list.set_follow_mode(FollowMode::Tail);
         self.unread.push_back(self.blocks.len());
         self.push(Block::User(text, queued), cx);
+    }
+
+    /// cmd-shift-enter: asks the draft as a side question, or opens the card's own field when
+    /// the composer is empty.
+    fn ask_draft_aside(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let text = self.composer.read(cx).value().trim().to_string();
+        if text.is_empty() {
+            return self.open_side(window, cx);
+        }
+        self.composer
+            .update(cx, |c, cx| c.set_value("", window, cx));
+        self.ask_side(text, window, cx);
+    }
+
+    /// Opens the side-question card with an empty field, keeping any draft in the composer.
+    pub fn open_side(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let input = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(1, 4)
+                .placeholder("Ask a side question (the chat won't see it)")
+                .submit_on_enter(true)
+        });
+        let sub = cx.subscribe_in(
+            &input,
+            window,
+            |this, input, ev: &InputEvent, window, cx| {
+                if let InputEvent::PressEnter { shift: false, .. } = ev {
+                    let q = input.read(cx).value().trim().to_string();
+                    if !q.is_empty() {
+                        this.ask_side(q, window, cx);
+                    }
+                }
+            },
+        );
+        input.update(cx, |i, cx| i.focus(window, cx));
+        self.side = Some(Side {
+            input: Some(input),
+            question: String::new(),
+            answer: cx.new(|cx| TextViewState::markdown("", cx)),
+            text: String::new(),
+            done: false,
+            error: None,
+            focus: cx.focus_handle(),
+            scroll: ScrollHandle::new(),
+            agent: None,
+            _reader: None,
+            _sub: Some(sub),
+        });
+        cx.notify();
+    }
+
+    /// Replaces any earlier side question; only the latest is kept.
+    fn ask_side(&mut self, question: String, window: &mut Window, cx: &mut Context<Self>) {
+        let mut side = Side {
+            input: None,
+            question: question.clone(),
+            answer: cx.new(|cx| TextViewState::markdown("", cx)),
+            text: String::new(),
+            done: false,
+            error: None,
+            focus: cx.focus_handle(),
+            scroll: ScrollHandle::new(),
+            agent: None,
+            _reader: None,
+            _sub: None,
+        };
+        match agent::spawn_side(&self.ws, &self.meta) {
+            Ok((mut a, rx)) => match a.send(&question) {
+                Ok(()) => {
+                    side.agent = Some(a);
+                    side._reader = Some(cx.spawn(async move |this, cx| {
+                        while let Ok(ev) = rx.recv().await {
+                            if this.update(cx, |c, cx| c.apply_side(ev, cx)).is_err() {
+                                break;
+                            }
+                        }
+                    }));
+                }
+                Err(e) => (side.done, side.error) = (true, Some(format!("send failed: {e}"))),
+            },
+            Err(e) => {
+                (side.done, side.error) = (true, Some(format!("failed to start claude: {e}")))
+            }
+        }
+        side.focus.focus(window, cx);
+        self.side = Some(side);
+        cx.notify();
+    }
+
+    fn apply_side(&mut self, ev: Ev, cx: &mut Context<Self>) {
+        let Some(side) = &mut self.side else { return };
+        match ev {
+            Ev::TextDelta(d) => {
+                side.text.push_str(&d);
+                side.answer.update(cx, |m, cx| m.push_str(&d, cx));
+            }
+            Ev::Text(full) => {
+                side.text = full;
+                let t = side.text.clone();
+                side.answer.update(cx, |m, cx| m.set_text(&t, cx));
+            }
+            Ev::Result { is_error, text, .. } => {
+                side.done = true;
+                side.agent = None; // stays alive on stdin otherwise
+                if is_error {
+                    side.error = Some(text);
+                }
+            }
+            Ev::Exited(msg) if !side.done => (side.done, side.error) = (true, Some(msg)),
+            _ => return,
+        }
+        side.scroll.scroll_to_bottom();
+        cx.notify();
+    }
+
+    fn close_side(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.side.take().is_some() {
+            self.focus_composer(window, cx);
+            cx.notify();
+        }
+    }
+
+    fn copy_side(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(side) = &self.side
+            && !side.text.is_empty()
+        {
+            cx.write_to_clipboard(ClipboardItem::new_string(side.text.clone()));
+            window.push_notification("Copied the answer", cx);
+        }
+    }
+
+    /// Puts the answer into the composer after any draft, to send or edit.
+    fn insert_side(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(side) = self.side.take() else { return };
+        if !side.text.is_empty() {
+            self.composer.update(cx, |c, cx| {
+                let (draft, end) = (c.value().trim_end().len(), c.value().len());
+                let sep = if draft == 0 { "" } else { "\n\n" };
+                c.set_selected_range(draft..end, cx);
+                c.replace(format!("{sep}{}", side.text), window, cx);
+            });
+        }
+        self.focus_composer(window, cx);
+        cx.notify();
     }
 
     /// Interrupts a running turn and keeps the process warm; SIGTERM if claude doesn't stop
@@ -865,8 +1064,8 @@ impl Chat {
     /// Forgets the claude session and stops the agent; the next send starts a new conversation.
     pub fn new_conversation(&mut self, cx: &mut Context<Self>) {
         let was_working = self.working();
-        self.ws.session_id = None;
-        cx.emit(ChatEvent::SessionId(None));
+        self.meta.session_id = None;
+        cx.emit(ChatEvent::Meta);
         self.reader = None; // its Exited would be about the old process
         self.agent = None; // drop stops it
         self.busy = false;
@@ -986,10 +1185,10 @@ impl Chat {
                 permission_mode,
                 mcp,
             } => {
-                if self.ws.session_id.as_ref() != Some(&id) {
-                    self.ws.session_id = Some(id.clone());
+                if self.meta.session_id.as_ref() != Some(&id) {
+                    self.meta.session_id = Some(id);
                     if !self.replaying {
-                        cx.emit(ChatEvent::SessionId(Some(id)));
+                        cx.emit(ChatEvent::Meta);
                     }
                 }
                 let mut r = format!("running {model} · permissions: {permission_mode}");
@@ -1098,14 +1297,14 @@ impl Chat {
                     format!("done · {took} · ${cost:.2}")
                 }));
                 if gone {
-                    self.ws.session_id = None;
+                    self.meta.session_id = None;
                     self.blocks.push(Block::Info(
                         "previous session not found; starting fresh, send again".into(),
                     ));
                 }
                 if !self.replaying {
                     if gone {
-                        cx.emit(ChatEvent::SessionId(None));
+                        cx.emit(ChatEvent::Meta);
                     }
                     cx.emit(ChatEvent::TurnDone);
                 }
@@ -1307,6 +1506,109 @@ impl Chat {
                 .child(t.clone()),
         };
         row.child(inner).into_any_element()
+    }
+
+    /// The side-question card, just above the composer so the transcript stays in view.
+    fn render_side(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let side = self.side.as_ref()?;
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let hint = |k: &str, label: &'static str| {
+            h_flex()
+                .gap_1()
+                .child(Kbd::new(Keystroke::parse(k).unwrap()))
+                .child(label)
+        };
+        let focused = side.focus.is_focused(window)
+            || (side.input.as_ref()).is_some_and(|i| i.focus_handle(cx).is_focused(window));
+        let header = h_flex()
+            .gap_2()
+            .text_xs()
+            .text_color(muted)
+            .child(Icon::new(IconName::MessageCircleQuestionMark).with_size(px(14.)))
+            .child("Side question · not added to chat")
+            .child(div().flex_1())
+            .when(!side.done && side.input.is_none(), |d| {
+                d.child(Spinner::new().with_size(px(12.)))
+            })
+            .child(
+                Button::new("close-side")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::X)
+                    .tooltip("Dismiss (esc)")
+                    .on_click(cx.listener(|this, _, window, cx| this.close_side(window, cx))),
+            );
+        let body = match &side.input {
+            Some(input) => div()
+                .capture_action(cx.listener(|this, _: &Escape, window, cx| {
+                    this.close_side(window, cx);
+                    cx.stop_propagation();
+                }))
+                .child(Textarea::new(input).appearance(false).text_size(px(14.)))
+                .into_any_element(),
+            None => v_flex()
+                .gap_2()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme.foreground)
+                        .child(side.question.clone()),
+                )
+                .child(
+                    div()
+                        .id("side-answer")
+                        .key_context("SideAnswer")
+                        .track_focus(&side.focus)
+                        .max_h(px(280.))
+                        .overflow_y_scroll()
+                        .track_scroll(&side.scroll)
+                        .text_size(px(14.))
+                        .line_height(relative(1.5))
+                        .on_action(cx.listener(|this, _: &CloseSide, window, cx| {
+                            this.close_side(window, cx)
+                        }))
+                        .on_action(
+                            cx.listener(|this, _: &CopySide, window, cx| {
+                                this.copy_side(window, cx)
+                            }),
+                        )
+                        .on_action(cx.listener(|this, _: &InsertSide, window, cx| {
+                            this.insert_side(window, cx)
+                        }))
+                        .child(TextView::new(&side.answer).selectable(true))
+                        .when_some(side.error.clone(), |d, e| {
+                            d.child(div().text_xs().text_color(theme.danger_foreground).child(e))
+                        }),
+                )
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(hint("escape", "dismiss"))
+                        .child(hint("c", "copy"))
+                        .child(hint("enter", "insert into message")),
+                )
+                .into_any_element(),
+        };
+        Some(
+            v_flex()
+                .w_full()
+                .max_w(px(712.))
+                .mx_auto()
+                .mb_2()
+                .p_3()
+                .gap_2()
+                .rounded(theme.radius_lg)
+                .border_1()
+                .border_color(if focused { theme.primary } else { theme.border })
+                .bg(theme.muted)
+                .child(header)
+                .child(body)
+                .into_any_element(),
+        )
     }
 
     /// Opens upward over the transcript, like Slack's: the composer sits at the bottom.
@@ -1662,120 +1964,130 @@ impl Render for Chat {
                     .vertical_scrollbar(&self.list),
             )
             .child(
-                div().px_4().pb_4().pt_1().child(
-                    v_flex()
-                        .key_context("Composer")
-                        .relative()
-                        .w_full()
-                        .max_w(px(712.))
-                        .mx_auto()
-                        .p_2()
-                        .gap_1()
-                        .rounded(radius)
-                        .border_1()
-                        .border_color(border)
-                        .bg(card)
-                        .on_action(cx.listener(|this, _: &FocusTranscript, window, cx| {
-                            this.focus.focus(window, cx);
-                            cx.notify();
-                        }))
-                        // While the menu is open, these keys drive it instead of the input.
-                        .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
-                            if this.menu.is_some() {
-                                this.move_menu(1, cx);
-                                cx.stop_propagation();
-                            }
-                        }))
-                        .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
-                            if this.menu.is_some() {
-                                this.move_menu(-1, cx);
-                                cx.stop_propagation();
-                                return;
-                            }
-                            // Up from the first line goes to the queue, like Claude Code's.
-                            let c = this.composer.read(cx);
-                            let first_line = !c.value()[..c.cursor()].contains('\n');
-                            if first_line
-                                && !this.queue.is_empty()
-                                && c.focus_handle(cx).is_focused(window)
-                            {
-                                this.qsel = this.queue.len() - 1;
-                                this.focus_queue(window, cx);
-                                cx.stop_propagation();
-                            }
-                        }))
-                        .capture_action(cx.listener(|this, a: &Enter, window, cx| {
-                            // With no match, Enter sends what was typed.
-                            if let Some(m) = &this.menu
-                                && !a.shift
-                                && !m.matches.is_empty()
-                            {
-                                this.pick(m.sel, window, cx);
-                                cx.stop_propagation();
-                            }
-                        }))
-                        .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
-                            if let Some(m) = &this.menu
-                                && !m.matches.is_empty()
-                            {
-                                this.pick(m.sel, window, cx);
-                                cx.stop_propagation();
-                            }
-                        }))
-                        .capture_action(cx.listener(|this, _: &Escape, _, cx| {
-                            if this.menu.is_some() {
-                                this.close_menu(cx);
-                                cx.stop_propagation();
-                            }
-                        }))
-                        .when_some(self.render_menu(cx), |d, menu| d.child(menu))
-                        .when_some(self.render_queue(window, cx), |d, q| d.child(q))
-                        .child(
-                            Textarea::new(&self.composer)
-                                .appearance(false)
-                                .text_size(px(14.)),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_2()
-                                .text_xs()
-                                .text_color(muted)
-                                .child(
-                                    Button::new("model")
-                                        .ghost()
-                                        .xsmall()
-                                        .icon(IconName::Sparkles)
-                                        .label(self.model().to_string())
-                                        .dropdown_caret(true)
-                                        .tooltip_with_action(
-                                            match &self.reported {
-                                                Some(r) => format!("Change model · {r}"),
-                                                None => "Change model".into(),
-                                            },
-                                            &PickModel,
-                                            None,
-                                        )
-                                        .on_click(|_, window, cx| {
-                                            window.dispatch_action(PickModel.boxed_clone(), cx)
-                                        }),
-                                )
-                                .child(div().flex_1())
-                                .child(Kbd::new(Keystroke::parse("enter").unwrap()))
-                                .child(match (self.editing.is_some(), self.busy || self.hold) {
-                                    (true, true) => "save",
-                                    (false, true) => "queue",
-                                    _ => "send",
-                                })
-                                .when(self.busy && !self.hold, |d| {
-                                    d.child(Kbd::new(Keystroke::parse("cmd-enter").unwrap()))
-                                        .child("send now")
-                                })
-                                .when(self.busy, |d| {
-                                    d.child(Kbd::new(Keystroke::parse("ctrl-c").unwrap()))
-                                        .child("interrupt")
-                                }),
-                        ),
-                ),
+                div()
+                    .px_4()
+                    .pb_4()
+                    .pt_1()
+                    .children(self.render_side(window, cx))
+                    .child(
+                        v_flex()
+                            .key_context("Composer")
+                            .relative()
+                            .w_full()
+                            .max_w(px(712.))
+                            .mx_auto()
+                            .p_2()
+                            .gap_1()
+                            .rounded(radius)
+                            .border_1()
+                            .border_color(border)
+                            .bg(card)
+                            .on_action(cx.listener(|this, _: &FocusTranscript, window, cx| {
+                                this.focus.focus(window, cx);
+                                cx.notify();
+                            }))
+                            .on_action(cx.listener(|this, _: &AskSide, window, cx| {
+                                this.ask_draft_aside(window, cx)
+                            }))
+                            // While the menu is open, these keys drive it instead of the input.
+                            .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
+                                if this.menu.is_some() {
+                                    this.move_menu(1, cx);
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
+                                if this.menu.is_some() {
+                                    this.move_menu(-1, cx);
+                                    cx.stop_propagation();
+                                    return;
+                                }
+                                // Up from the first line goes to the queue, like Claude Code's.
+                                let c = this.composer.read(cx);
+                                let first_line = !c.value()[..c.cursor()].contains('\n');
+                                if first_line
+                                    && !this.queue.is_empty()
+                                    && c.focus_handle(cx).is_focused(window)
+                                {
+                                    this.qsel = this.queue.len() - 1;
+                                    this.focus_queue(window, cx);
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .capture_action(cx.listener(|this, a: &Enter, window, cx| {
+                                // With no match, Enter sends what was typed.
+                                if let Some(m) = &this.menu
+                                    && !a.shift
+                                    && !m.matches.is_empty()
+                                {
+                                    this.pick(m.sel, window, cx);
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                                if let Some(m) = &this.menu
+                                    && !m.matches.is_empty()
+                                {
+                                    this.pick(m.sel, window, cx);
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .capture_action(cx.listener(|this, _: &Escape, _, cx| {
+                                if this.menu.is_some() {
+                                    this.close_menu(cx);
+                                    cx.stop_propagation();
+                                }
+                            }))
+                            .when_some(self.render_menu(cx), |d, menu| d.child(menu))
+                            .when_some(self.render_queue(window, cx), |d, q| d.child(q))
+                            .child(
+                                Textarea::new(&self.composer)
+                                    .appearance(false)
+                                    .text_size(px(14.)),
+                            )
+                            .child(
+                                h_flex()
+                                    .gap_2()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(
+                                        Button::new("model")
+                                            .ghost()
+                                            .xsmall()
+                                            .icon(IconName::Sparkles)
+                                            .label(self.model().to_string())
+                                            .dropdown_caret(true)
+                                            .tooltip_with_action(
+                                                match &self.reported {
+                                                    Some(r) => format!("Change model · {r}"),
+                                                    None => "Change model".into(),
+                                                },
+                                                &PickModel,
+                                                None,
+                                            )
+                                            .on_click(|_, window, cx| {
+                                                window.dispatch_action(PickModel.boxed_clone(), cx)
+                                            }),
+                                    )
+                                    .child(div().flex_1())
+                                    .child(Kbd::new(Keystroke::parse("enter").unwrap()))
+                                    .child(match (self.editing.is_some(), self.busy || self.hold) {
+                                        (true, true) => "save",
+                                        (false, true) => "queue",
+                                        _ => "send",
+                                    })
+                                    .when(self.busy && !self.hold, |d| {
+                                        d.child(Kbd::new(Keystroke::parse("cmd-enter").unwrap()))
+                                            .child("send now")
+                                    })
+                                    .when(self.busy, |d| {
+                                        d.child(Kbd::new(Keystroke::parse("ctrl-c").unwrap()))
+                                            .child("interrupt")
+                                    })
+                                    .child(Kbd::new(Keystroke::parse("cmd-shift-enter").unwrap()))
+                                    .child("side question"),
+                            ),
+                    ),
             )
     }
 }
@@ -1818,6 +2130,177 @@ mod ui_tests {
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
     use gpui_kit::test::TestWindowExt as _;
 
+    /// A claude stand-in that swallows stdin. Side questions on a session (`--fork-session`)
+    /// get a canned answer, and their args are written next to the script.
+    const FAKE: &str = r#"#!/bin/sh
+case "$*" in *--fork-session*)
+  echo "$*" > "$0.args"
+  read line
+  echo '{"type":"stream_event","event":{"delta":{"type":"text_delta","text":"Forty"}},"parent_tool_use_id":null}'
+  echo '{"type":"assistant","message":{"content":[{"type":"text","text":"Forty-two"}]},"parent_tool_use_id":null}'
+  echo '{"type":"result","is_error":false,"result":"Forty-two","total_cost_usd":0,"duration_ms":1}'
+esac
+exec cat >/dev/null
+"#;
+
+    /// Installs the script once for the whole test run: tests run in parallel, and one must
+    /// never exec a script another is still writing.
+    fn fake_claude() -> std::path::PathBuf {
+        static FAKE_PATH: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+        FAKE_PATH
+            .get_or_init(|| {
+                let dir = std::env::temp_dir().join(format!("shark-fake-{}", std::process::id()));
+                std::fs::create_dir_all(&dir).unwrap();
+                let fake = dir.join("claude");
+                std::fs::write(&fake, FAKE).unwrap();
+                std::process::Command::new("chmod")
+                    .args(["+x"])
+                    .arg(&fake)
+                    .status()
+                    .unwrap();
+                // SAFETY: set once, before any test spawns claude.
+                unsafe { std::env::set_var("SHARK_CLAUDE", &fake) };
+                fake
+            })
+            .clone()
+    }
+
+    /// A side question forks the chat's session with no tools and nothing saved.
+    #[test]
+    fn side_question_process() {
+        let root = std::env::temp_dir().join(format!("shark-side-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fake = fake_claude();
+        let ws = Workspace {
+            name: format!("side-proc-{}", std::process::id()),
+            ..Default::default()
+        };
+        let meta = ChatMeta {
+            id: ws.name.clone(),
+            session_id: Some("s1".into()),
+            ..Default::default()
+        };
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
+        let _ = std::fs::remove_file(ws.dir());
+        std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
+        let (mut a, rx) = agent::spawn_side(&ws, &meta).unwrap();
+        a.send("what is x?").unwrap();
+        let mut text = String::new();
+        while let Ok(ev) = rx.recv_blocking() {
+            match ev {
+                Ev::Text(t) => text = t,
+                Ev::Result { .. } => break,
+                Ev::Exited(e) => panic!("{e}"),
+                _ => {}
+            }
+        }
+        assert_eq!(text, "Forty-two");
+        let args = std::fs::read_to_string(fake.with_extension("args")).unwrap();
+        assert!(args.contains("--resume s1 --fork-session"), "{args}");
+        assert!(
+            args.contains("--tools  --strict-mcp-config"),
+            "no tools: {args}"
+        );
+        assert!(args.contains("--no-session-persistence"), "{args}");
+        assert!(!agent::transcript_path(&meta.id).exists(), "no transcript");
+        let _ = std::fs::remove_file(ws.dir());
+    }
+
+    /// cmd-shift-enter asks the draft on the side: the answer streams into the card, the chat
+    /// never sees it, and enter puts the answer into the composer.
+    #[gpui_kit::test]
+    fn side_question(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::bind_keys(cx);
+        });
+        let root = std::env::temp_dir().join(format!("shark-side-ui-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        fake_claude();
+        let ws = Workspace {
+            name: format!("side-test-{}", std::process::id()),
+            ..Default::default()
+        };
+        // No session: the fake stays quiet, and the test plays the answer in (a reply from a
+        // real thread would trip the deterministic scheduler).
+        let meta = ChatMeta {
+            id: ws.name.clone(),
+            ..Default::default()
+        };
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
+        let _ = std::fs::remove_file(ws.dir());
+        std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
+        let (window, chat) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| Chat::new(ws.clone(), meta, w, cx))
+                })
+            })
+            .unwrap();
+        let act = |cx: &mut TestAppContext, f: &dyn Fn(&mut Window, &mut App)| {
+            cx.update_window(window, |_, w, cx| {
+                f(w, cx);
+                w.render_frame(cx);
+            })
+            .unwrap()
+        };
+        act(cx, &|w, cx| {
+            chat.update(cx, |c, cx| c.focus_composer(w, cx))
+        });
+        act(cx, &|w, cx| w.input("what is x?", cx));
+        act(cx, &|w, cx| w.press("cmd-shift-enter", cx));
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.apply_side(Ev::TextDelta("Forty".into()), cx);
+                c.apply_side(Ev::Text("Forty-two".into()), cx);
+                c.apply_side(
+                    Ev::Result {
+                        is_error: false,
+                        text: String::new(),
+                        cost: 0.,
+                        secs: 0,
+                    },
+                    cx,
+                );
+            })
+        });
+        act(cx, &|_, _| {});
+        cx.update(|cx| {
+            let c = chat.read(cx);
+            let side = c.side.as_ref().unwrap();
+            assert_eq!(side.question, "what is x?");
+            assert_eq!(side.text, "Forty-two");
+            assert!(side.done && side.agent.is_none() && side.error.is_none());
+            assert!(c.blocks.is_empty(), "the chat never sees the side question");
+            assert!(!c.busy);
+            assert_eq!(c.composer.read(cx).value().as_ref(), "");
+        });
+
+        act(cx, &|w, cx| w.press("enter", cx));
+        cx.update(|cx| {
+            let c = chat.read(cx);
+            assert!(c.side.is_none());
+            assert_eq!(c.composer.read(cx).value().as_ref(), "Forty-two");
+        });
+
+        // Opened empty, it has its own field; esc closes it and the draft stays.
+        act(cx, &|w, cx| chat.update(cx, |c, cx| c.open_side(w, cx)));
+        act(cx, &|w, cx| w.input("ignored", cx));
+        act(cx, &|w, cx| w.press("escape", cx));
+        cx.update(|cx| {
+            let c = chat.read(cx);
+            assert!(c.side.is_none());
+            assert_eq!(c.composer.read(cx).value().as_ref(), "Forty-two");
+        });
+        let _ = std::fs::remove_file(ws.dir());
+    }
+
     /// Sending jumps to the bottom even after scrolling the transcript up.
     #[gpui_kit::test]
     fn send_scrolls_to_bottom(cx: &mut TestAppContext) {
@@ -1826,9 +2309,11 @@ mod ui_tests {
             name: format!("scroll-test-{}", std::process::id()),
             branch: "b".into(),
             repos: vec![],
-            session_id: None,
-            model: None,
-            viewed: Default::default(),
+            ..Default::default()
+        };
+        let meta = ChatMeta {
+            id: ws.name.clone(),
+            ..Default::default()
         };
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(Bounds::new(
@@ -1839,7 +2324,7 @@ mod ui_tests {
         };
         let (window, chat) = cx
             .update(|cx| {
-                gpui_kit::open_window(options, cx, |w, cx| cx.new(|cx| Chat::new(ws, w, cx)))
+                gpui_kit::open_window(options, cx, |w, cx| cx.new(|cx| Chat::new(ws, meta, w, cx)))
             })
             .unwrap();
         let frame = |cx: &mut TestAppContext| {
@@ -1889,14 +2374,19 @@ mod ui_tests {
             name: format!("{tag}-test-{}", std::process::id()),
             branch: "b".into(),
             repos: vec![],
+            ..Default::default()
+        };
+        // Titled, so a first send emits nothing.
+        let meta = ChatMeta {
+            id: ws.name.clone(),
+            title: tag.into(),
             session_id: Some("s1".into()),
-            model: None,
-            viewed: Default::default(),
+            ..Default::default()
         };
         let (_, chat) = cx
             .update(|cx| {
                 gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
-                    cx.new(|cx| Chat::new(ws, w, cx))
+                    cx.new(|cx| Chat::new(ws, meta, w, cx))
                 })
             })
             .unwrap();
@@ -1926,7 +2416,7 @@ mod ui_tests {
                 assert_eq!(calls[0].result.as_deref(), Some("(interrupted)"));
                 assert!(calls[0].is_error);
                 assert_eq!(
-                    c.ws.session_id.as_deref(),
+                    c.meta.session_id.as_deref(),
                     Some("s1"),
                     "an exit keeps the session"
                 );
@@ -1942,11 +2432,11 @@ mod ui_tests {
                     },
                     cx,
                 );
-                assert_eq!(c.ws.session_id, None);
+                assert_eq!(c.meta.session_id, None);
 
-                c.ws.session_id = Some("s2".into());
+                c.meta.session_id = Some("s2".into());
                 c.new_conversation(cx);
-                assert_eq!(c.ws.session_id, None);
+                assert_eq!(c.meta.session_id, None);
                 assert!(!c.working());
             })
         });
@@ -2007,7 +2497,7 @@ mod ui_tests {
                 };
                 assert_eq!(t, "interrupted");
                 assert!(matches!(&c.blocks[3], Block::User(t, _) if t == "first"));
-                assert_eq!(c.ws.session_id.as_deref(), Some("s1"));
+                assert_eq!(c.meta.session_id.as_deref(), Some("s1"));
                 assert!(c.busy, "the live turn still runs");
 
                 c.apply(Ev::Interrupted, cx);
@@ -2037,34 +2527,28 @@ mod ui_tests {
         });
         let root = std::env::temp_dir().join(format!("shark-queue-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let fake = root.join("claude");
-        std::fs::write(&fake, "#!/bin/sh\nexec cat >/dev/null\n").unwrap();
-        std::process::Command::new("chmod")
-            .args(["+x"])
-            .arg(&fake)
-            .status()
-            .unwrap();
-        // SAFETY: no other test spawns claude or reads this variable.
-        unsafe { std::env::set_var("SHARK_CLAUDE", &fake) };
+        fake_claude();
         let ws = Workspace {
             name: format!("queue-test-{}", std::process::id()),
             branch: "b".into(),
             repos: vec![],
-            session_id: None,
-            model: None,
-            viewed: Default::default(),
+            ..Default::default()
         };
         // The UI tests reset the test home; don't let one do that under this workspace.
+        let meta = ChatMeta {
+            id: ws.name.clone(),
+            ..Default::default()
+        };
         let _turn = crate::app::ui_tests::UI_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
         std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
-        let (dir, transcript) = (ws.dir(), agent::transcript_path(&ws.name));
+        let (dir, transcript) = (ws.dir(), agent::transcript_path(&meta.id));
         let (window, chat) = cx
             .update(|cx| {
                 gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
-                    cx.new(|cx| Chat::new(ws, w, cx))
+                    cx.new(|cx| Chat::new(ws, meta, w, cx))
                 })
             })
             .unwrap();
@@ -2234,14 +2718,16 @@ mod ui_tests {
             name: format!("at-test-{}", std::process::id()),
             branch: "b".into(),
             repos: vec![repo("api"), repo("web")],
-            session_id: None,
-            model: None,
-            viewed: Default::default(),
+            ..Default::default()
+        };
+        let meta = ChatMeta {
+            id: ws.name.clone(),
+            ..Default::default()
         };
         let (window, chat) = cx
             .update(|cx| {
                 gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
-                    cx.new(|cx| Chat::new(ws, w, cx))
+                    cx.new(|cx| Chat::new(ws, meta, w, cx))
                 })
             })
             .unwrap();
