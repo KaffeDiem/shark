@@ -2,9 +2,9 @@
 use std::collections::{BTreeMap, HashSet};
 
 /// FNV-1a: stable across Rust releases, unlike `DefaultHasher`, so stored fingerprints stay valid.
-pub fn fingerprint(s: &str) -> u64 {
-    s.bytes().fold(0xcbf29ce484222325, |h, b| {
-        (h ^ b as u64).wrapping_mul(0x100000001b3)
+pub fn fingerprint(bytes: impl AsRef<[u8]>) -> u64 {
+    bytes.as_ref().iter().fold(0xcbf29ce484222325, |h, b| {
+        (h ^ *b as u64).wrapping_mul(0x100000001b3)
     })
 }
 

@@ -56,6 +56,9 @@ pub struct Vim {
     want: Option<usize>,
     /// Visual-mode anchor.
     anchor: usize,
+    /// Visual-mode cursor. The editor's caret sits at the selection's end, not on the
+    /// cursor, so Vim keeps its own while a selection is shown.
+    vcur: Option<usize>,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -111,10 +114,10 @@ impl Vim {
         let t = text;
         let cur = t.floor_char_boundary(cursor.min(t.len()));
         let esc = key == "escape" || key == "ctrl-[";
-        let cur = if self.mode == Mode::Insert {
-            cur
-        } else {
-            clamp(t, cur)
+        let cur = match (self.mode, self.vcur) {
+            (Mode::Insert, _) => cur,
+            (Mode::Visual | Mode::VisualLine, Some(v)) => clamp(t, v.min(t.len())),
+            _ => clamp(t, cur),
         };
         if self.mode == Mode::Insert {
             if !esc {
@@ -136,8 +139,10 @@ impl Vim {
             self.normal(key, esc, t, cur, clipboard)
         };
         out.handled = true;
+        self.vcur = None;
         if self.visual() {
             let c = *out.cursor.get_or_insert(cur);
+            self.vcur = Some(c);
             if out.select.is_none() {
                 out.select = Some(self.vis_range(t, c));
             }
@@ -1028,6 +1033,12 @@ mod tests {
     }
 
     fn run_with(src: &str, keys: &str, clip: Option<&str>) -> Run {
+        run_caret(src, keys, clip, false)
+    }
+
+    /// `editor_caret`: feed back the caret the way the editor reports it, at the end of the
+    /// shown selection, instead of `Out::cursor`.
+    fn run_caret(src: &str, keys: &str, clip: Option<&str>, editor_caret: bool) -> Run {
         let cur = src.find('|').expect("cursor");
         let mut rope = Rope::from(src.replacen('|', "", 1).as_str());
         let mut cur = cur;
@@ -1063,6 +1074,9 @@ mod tests {
             }
             if let Some(y) = &out.yank {
                 clip = Some(y.clone());
+            }
+            if editor_caret && let Some(sel) = &out.select {
+                cur = sel.end;
             }
             if vim.mode == Mode::Normal && cur < rope.len() && rope.byte(cur) == b'\n' {
                 assert!(
@@ -1474,5 +1488,19 @@ mod tests {
         let el = start.elapsed();
         println!("vim perf: 20000 keys on {} bytes in {el:?}", rope.len());
         assert!(el.as_millis() < 300, "too slow: {el:?}");
+    }
+
+    /// The editor reports its caret at the selection end; visual mode must not drift with it.
+    #[test]
+    fn visual_with_editor_caret() {
+        let e = |src: &str, keys: &str| {
+            let r = run_caret(src, keys, None, true);
+            (r.text, r.clip)
+        };
+        assert_eq!(e("a|bcd", "vd").0, "a|cd");
+        assert_eq!(e("|abcdef", "vld").0, "|cdef");
+        assert_eq!(e("|abcdef", "vlly").1.as_deref(), Some("abc"));
+        assert_eq!(e("abc|def", "vhhd").0, "a|ef");
+        assert_eq!(e("a\n|b\nc\n", "Vjd").0, "|a\n");
     }
 }

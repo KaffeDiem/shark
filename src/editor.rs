@@ -31,6 +31,9 @@ pub struct FileEditor {
     pub conflict: bool,
     pub vim: Vim,
     pub vim_on: bool,
+    /// A write is in flight; reloads started before it finished are stale.
+    saving: bool,
+    saves: u64,
     _subs: Vec<Subscription>,
     _poll: Task<()>,
 }
@@ -61,7 +64,8 @@ impl FileEditor {
             let Some(this) = this.upgrade() else { return };
             let ks = &ev.keystroke;
             let handled = this.update(cx, |e, cx| {
-                if !e.is_focused(window, cx) {
+                // The second key of an app chord (`ctrl-w h`) belongs to the keymap, not Vim.
+                if !e.is_focused(window, cx) || window.has_pending_keystrokes() {
                     return false;
                 }
                 let idle =
@@ -95,6 +99,8 @@ impl FileEditor {
             conflict: false,
             vim: Vim::default(),
             vim_on,
+            saving: false,
+            saves: 0,
             _subs: subs,
             _poll,
         };
@@ -116,37 +122,51 @@ impl FileEditor {
 
     /// Normal and visual mode must not let stray letters into the buffer.
     fn sync_readonly(&self, cx: &mut Context<Self>) {
-        let ro = self.vim_on && self.vim.mode != vim::Mode::Insert;
+        // Until the first read lands, typing would be lost when the file replaces the buffer.
+        let ro = !self.loaded || (self.vim_on && self.vim.mode != vim::Mode::Insert);
         self.input.update(cx, |i, cx| i.set_readonly(ro, cx));
     }
 
     /// Reads the file again: replaces a clean buffer, flags a conflict on a dirty one.
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let abs = self.abs.clone();
+        if self.saving {
+            return;
+        }
+        let (abs, saves) = (self.abs.clone(), self.saves);
         cx.spawn_in(window, async move |this, cx| {
             let text = cx
                 .background_executor()
-                .spawn(async move { std::fs::read_to_string(&abs) })
+                .spawn(async move { std::fs::read(&abs) })
                 .await;
             this.update_in(cx, |e, window, cx| {
-                let Ok(text) = text else { return };
-                let fp = fingerprint(&text);
-                if e.loaded && fp == e.disk {
+                if e.saving || e.saves != saves {
+                    return; // read before our own write landed
+                }
+                let fp = text.as_ref().map(fingerprint).ok();
+                if e.loaded && fp == Some(e.disk) {
                     return;
                 }
-                if e.dirty {
-                    e.conflict = true;
-                } else {
-                    e.disk = fp;
-                    e.conflict = false;
-                    e.input.update(cx, |i, cx| {
-                        let pos = i.cursor_position();
-                        i.set_value(text, window, cx);
-                        if e.loaded {
-                            i.set_cursor_position(pos, window, cx);
+                // Deleted or no longer UTF-8: keep the buffer and let the user decide.
+                let text = text.ok().and_then(|b| String::from_utf8(b).ok());
+                match (text, fp) {
+                    (Some(_), _) if e.dirty => e.conflict = true,
+                    (None, _) => e.conflict = e.loaded,
+                    (Some(text), Some(fp)) => {
+                        e.disk = fp;
+                        e.conflict = false;
+                        e.input.update(cx, |i, cx| {
+                            let pos = i.cursor_position();
+                            i.set_value(text, window, cx);
+                            if e.loaded {
+                                i.set_cursor_position(pos, window, cx);
+                            }
+                        });
+                        if !e.loaded {
+                            e.loaded = true;
+                            e.sync_readonly(cx);
                         }
-                    });
-                    e.loaded = true;
+                    }
+                    (Some(_), None) => {}
                 }
                 cx.notify();
             })
@@ -164,21 +184,29 @@ impl FileEditor {
 
     /// Writes the buffer unless someone else changed the file since it was read (then `force`).
     pub fn save(&mut self, force: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.loaded || self.saving {
+            return;
+        }
+        self.saving = true;
         let text = self.input.read(cx).value();
         let (abs, expected, saved) = (self.abs.clone(), self.disk, text.clone());
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let on_disk = std::fs::read_to_string(&abs).map(|t| fingerprint(&t));
-                    if !force && on_disk.is_ok_and(|fp| fp != expected) {
+                    // A missing or unreadable file counts as changed: never overwrite blind.
+                    let on_disk = std::fs::read(&abs).map(fingerprint);
+                    if !force && on_disk.map_or(true, |fp| fp != expected) {
                         return Ok(None);
                     }
                     // In place, not tmp+rename: keeps the file's mode, symlinks and inode.
-                    std::fs::write(&abs, text.as_bytes()).map(|_| Some(fingerprint(&text)))
+                    std::fs::write(&abs, text.as_bytes())
+                        .map(|_| Some(fingerprint(text.as_bytes())))
                 })
                 .await;
             this.update(cx, |e, cx| {
+                e.saving = false;
+                e.saves += 1;
                 match result {
                     Ok(Some(fp)) => {
                         e.disk = fp;

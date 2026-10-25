@@ -286,6 +286,8 @@ pub fn combined_diff(ws: &Workspace, dir: &Path) -> String {
             "diff",
             "--no-color",
             "--no-ext-diff",
+            // Full hashes: abbreviations grow with the repo and would change viewed fingerprints.
+            "--full-index",
             &src,
             &dst,
             "--merge-base",

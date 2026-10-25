@@ -301,6 +301,8 @@ pub struct Shark {
     diff_files: Vec<DiffFile>,
     diff_fps: Vec<u64>,
     diff_fp: u64,
+    /// Bumped per refresh, so a slow older refresh can't overwrite a newer one.
+    diff_gen: u64,
     diff_file: usize,
     /// Paths currently viewed (fingerprint still matches), for the diff headers.
     viewed_now: Rc<HashSet<SharedString>>,
@@ -428,6 +430,7 @@ impl Shark {
             diff_files: vec![],
             diff_fps: vec![],
             diff_fp: 0,
+            diff_gen: 0,
             diff_file: 0,
             viewed_now: Rc::default(),
             tree_rows: vec![],
@@ -578,6 +581,8 @@ impl Shark {
         else {
             return;
         };
+        self.diff_gen += 1;
+        let generation = self.diff_gen;
         cx.spawn(async move |this, cx| {
             let name = ws.name.clone();
             let data = cx
@@ -585,8 +590,8 @@ impl Shark {
                 .spawn(async move { DiffData::load(&ws) })
                 .await;
             this.update(cx, |s, cx| {
-                if s.active.as_ref() != Some(&name) {
-                    return; // a slower refresh for a workspace that is no longer shown
+                if s.active.as_ref() != Some(&name) || s.diff_gen != generation {
+                    return; // superseded: another workspace, or a newer refresh
                 }
                 s.apply_diff(data, cx);
             })
@@ -603,7 +608,7 @@ impl Shark {
         let was_viewed = self.viewed_now.clone();
         self.diff_fp = data.fp;
         self.diff_fps = data.fps;
-        self.diff_file = self.diff_file.min(data.files.len().saturating_sub(1));
+        self.diff_file = 0; // set_files scrolls back to the top
         self.diff_files = data.files;
         self.rebuild_tree();
         self.recompute_viewed();
@@ -745,8 +750,7 @@ impl Shark {
         }
     }
 
-    /// The file a row action applies to: the tree cursor when the tree has focus, else the
-    /// open file, else the diff's current file.
+    /// The file a row action applies to: the open file in the file view, else the tree cursor.
     fn cursor_file(&self, window: &Window, cx: &App) -> Option<usize> {
         if self.tree_focus.is_focused(window) {
             return self.tree_rows.get(self.tree_sel)?.file;
@@ -757,7 +761,8 @@ impl Shark {
             let path = &e.read(cx).path;
             return self.diff_files.iter().position(|f| f.path() == path);
         }
-        (!self.diff_files.is_empty()).then_some(self.diff_file)
+        // The diff can't say which file is on screen; the highlighted tree row is what the user sees.
+        self.tree_rows.get(self.tree_sel)?.file
     }
 
     fn open_file(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -1140,6 +1145,15 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Git only sees the disk; unsaved editor edits would vanish with the worktree.
+        if self.active.as_deref() == Some(name)
+            && self.editor.as_ref().is_some_and(|e| e.read(cx).dirty)
+        {
+            let name = name.to_string();
+            return self.confirm_discard(window, cx, move |s, window, cx| {
+                s.remove_workspace(&name, force, window, cx)
+            });
+        }
         let Some(ws) = self
             .state
             .workspaces
@@ -2544,6 +2558,24 @@ mod ui_tests {
         press(cx, &["j", "q"]);
         assert_eq!(text(cx), "zx\ny\n", "normal mode never types");
         press(cx, &["shift-a", "!", "escape"]);
+        assert_eq!(text(cx), "zx\ny!\n");
+        // App chords still work in normal mode: `h`/`l` after `ctrl-w` aren't Vim motions.
+        press(cx, &["ctrl-w", "l"]);
+        cx.update_window(window, |_, w, cx| {
+            assert!(
+                shark.read(cx).tree_focus.is_focused(w),
+                "ctrl-w l from the editor"
+            )
+        })
+        .unwrap();
+        press(cx, &["ctrl-w", "h"]);
+        cx.update_window(window, |_, w, cx| {
+            assert!(
+                editor.read(cx).is_focused(w, cx),
+                "ctrl-w h back to the editor"
+            )
+        })
+        .unwrap();
         assert_eq!(text(cx), "zx\ny!\n");
 
         // The agent writes the file while it has unsaved edits: offer reload, don't clobber.
