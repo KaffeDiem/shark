@@ -18,7 +18,7 @@ Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH.
 |---|---|
 | anywhere | `cmd-k` palette · `cmd-n` new workspace · `ctrl-c` stop agent · `ctrl-w h/l` sidebar/main · `cmd-/` model menu · `ctrl-cmd-1…5` default/fable/opus/sonnet/haiku |
 | sidebar, transcript | `j/k` `gg` `G` `ctrl-d/u` · `enter` open / toggle tool output · `i`/`a` → composer |
-| composer | `enter` send · `shift-enter` newline · `esc` → normal mode |
+| composer | `enter` send · `shift-enter` newline · `esc` → normal mode · `@` add a file or folder (`repo/` to pick the repo) · `/` skills and commands at the start · in the menu `↑/↓` `enter`/`tab` `esc` |
 | leader (normal mode) | `space space` palette · `space w n/d/D` new/archive/force-archive · `space r a` add repo · `space c/d` chat/diff · `space p r` create linked PRs · `space p o` open PRs · `space g g` next git step · `space g m` git menu · `space g f` fetch now · `space m m` model menu · `space m 1…5` pick model |
 | diff | `j/k/h/l` `gg` `G` `ctrl-d/u` scroll · `]c`/`[c` hunks · `}`/`{` files · `s` split/unified · `r` refresh |
 

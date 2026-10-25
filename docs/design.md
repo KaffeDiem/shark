@@ -83,6 +83,12 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
   - Skills (`Skill`) and subagents (`Agent`/`Task`) are never grouped: they get their own row with a `BookOpen` / `Bot` icon, because they say *what* the agent is doing. Add a tool to `standalone()` only if it carries that kind of intent.
   - Tool paths are shown relative to the workspace (`api/src/a.rs`).
   - A turn ends with an info line: "done · 48s · $0.12".
+- **Composer completions** (`@` files, `/` skills; `src/complete.rs`):
+  - The menu opens upward from the composer, at its width, over the transcript: `secondary` card, 1px `border`, `radius_lg`, `p_1`. It shows 8 rows of 28px and scrolls to more, with a `faint` key-hint footer.
+  - Each row has a 14px `File` / `Folder` / `SquareSlash` icon, the name in `foreground`, the folder or description in `text_xs` `muted_foreground` (truncated), and on the right the repo (`FolderGit2` + name) when the workspace has more than one repo, or a command's argument hint in `faint`.
+  - The selected row is `list_active`, others hover `list_hover`. The first row starts selected. ↑/↓ move, Enter/Tab add, Esc closes and stays in the composer. With no match, Enter sends.
+  - A pick becomes an inline chip, an atomic `InlineToken` whose text is `@repo/path` and whose label is `name · repo`. Paths are workspace-relative, so the repo is part of what gets sent. Typing `repo/` scopes the search to one repo.
+  - Sources never block typing. Files come from `git ls-files` per repo and skills from claude's `initialize` control request. Both load when the chat opens and refresh in the background each time the menu opens; until a refresh lands, the old list (for skills, the on-disk cache) is used.
 - **Radii:** `theme.radius` (8px) for rows, inputs and code blocks; `theme.radius_lg` (12px) for the island, cards and dialogs; `rounded_full()` for pills and dots.
 - **Borders, not shadows:** `shadow` is off. Separate with a 1px `border` or a surface change. Prefer fewer separators.
 - **Spacing:** the gpui scale only (`gap_1`=4px, `gap_1p5`=6px, `gap_2`=8px, `px_3`=12px, `px_4`=16px), plus the fixed sizes above.

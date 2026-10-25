@@ -1,6 +1,7 @@
 mod agent;
 mod app;
 mod chat;
+mod complete;
 mod git;
 mod pr;
 mod state;
