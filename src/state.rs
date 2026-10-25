@@ -5,6 +5,9 @@ use std::{fs, path::PathBuf};
 pub struct State {
     pub repos: Vec<Repo>,
     pub workspaces: Vec<Workspace>,
+    /// Repo names picked for the last new workspace; the next dialog starts with them.
+    #[serde(default)]
+    pub last_repos: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
