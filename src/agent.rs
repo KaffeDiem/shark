@@ -48,6 +48,14 @@ pub enum Ev {
     Background(Vec<String>),
     /// The turn was cut short by an `interrupt` control request; its result follows.
     Interrupted,
+    /// claude asks whether a tool may run (`--permission-prompt-tool stdio`) and waits for
+    /// `allow`/`deny`. Live only: never stored, since an old request can't be answered.
+    Permission {
+        request_id: String,
+        tool: String,
+        tool_use_id: String,
+        input: Value,
+    },
     Exited(String),
 }
 
@@ -161,7 +169,15 @@ pub fn spawn(
     chat: &ChatMeta,
 ) -> std::io::Result<(Agent, smol::channel::Receiver<Ev>)> {
     let resume = chat.session_id.iter().flat_map(|id| ["--resume", id]);
-    run(ws, chat, &chat.id, resume, Some(transcript_path(&chat.id)))
+    // Tools that need a person (ExitPlanMode, AskUserQuestion) ask us instead of failing.
+    let prompts = ["--permission-prompt-tool", "stdio"];
+    run(
+        ws,
+        chat,
+        &chat.id,
+        prompts.into_iter().chain(resume),
+        Some(transcript_path(&chat.id)),
+    )
 }
 
 const SIDE_PROMPT: &str = "The user is asking a quick side question about this conversation. \
@@ -246,7 +262,7 @@ fn run<'a>(
     std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
             let evs = parse(&line);
-            if evs.iter().any(|e| !matches!(e, Ev::TextDelta(_))) {
+            if (evs.iter()).any(|e| !matches!(e, Ev::TextDelta(_) | Ev::Permission { .. })) {
                 append(&transcript, &compact(&line)); // deltas are redundant with the full assistant message
             }
             for ev in evs {
@@ -277,6 +293,18 @@ impl Agent {
     /// the call in flight and sends the turn's result.
     pub fn interrupt(&mut self) -> std::io::Result<()> {
         self.write(&json!({"type": "control_request", "request_id": "interrupt", "request": {"subtype": "interrupt"}}))
+    }
+
+    /// `plan`, or back to the mode the process started in. claude switches at once, mid-turn too.
+    pub fn set_plan_mode(&mut self, on: bool) -> std::io::Result<()> {
+        let mode = if on { "plan" } else { PERMISSION_MODE };
+        self.write(&json!({"type": "control_request", "request_id": format!("mode-{mode}"), "request": {"subtype": "set_permission_mode", "mode": mode}}))
+    }
+
+    /// Answers an `Ev::Permission`: the tool doesn't run, and claude reads `message` as the
+    /// reason.
+    pub fn deny(&mut self, request_id: &str, message: &str) -> std::io::Result<()> {
+        self.write(&json!({"type": "control_response", "response": {"subtype": "success", "request_id": request_id, "response": {"behavior": "deny", "message": message}}}))
     }
 
     fn write(&mut self, v: &Value) -> std::io::Result<()> {
@@ -370,6 +398,12 @@ pub fn parse(line: &str) -> Vec<Ev> {
                 _ => None,
             })
             .collect(),
+        "control_request" if v["request"]["subtype"] == "can_use_tool" => vec![Ev::Permission {
+            request_id: s(&v["request_id"]),
+            tool: s(&v["request"]["tool_name"]),
+            tool_use_id: s(&v["request"]["tool_use_id"]),
+            input: v["request"]["input"].clone(),
+        }],
         "result" => vec![Ev::Result {
             is_error: v["is_error"].as_bool().unwrap_or(false),
             text: if v["result"].is_string() {
@@ -409,6 +443,8 @@ mod tests {
 {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "text_delta", "text": "h"}}, "parent_tool_use_id": null}
 {"type": "stream_event", "event": {"type": "content_block_delta", "index": 0, "delta": {"type": "input_json_delta", "partial_json": "{"}}, "parent_tool_use_id": null}
 {"type": "assistant", "message": {"role": "assistant", "content": [{"type": "thinking", "thinking": "x"}, {"type": "text", "text": "hello"}]}, "parent_tool_use_id": null}
+{"type":"control_request","request_id":"r1","request":{"subtype":"can_use_tool","tool_name":"ExitPlanMode","display_name":"ExitPlanMode","input":{"plan":"P","planFilePath":"/p.md"},"tool_use_id":"toolu_2","requires_user_interaction":true}}
+{"type":"control_response","response":{"subtype":"success","request_id":"mode-plan","response":{"mode":"plan"}}}
 {"type":"result","subtype":"success","is_error":false,"result":"hello","total_cost_usd":0.5,"duration_ms":48210,"session_id":"s1"}
 {"type":"result","subtype":"error_during_execution","is_error":true,"errors":["Invalid API key"],"total_cost_usd":0}
 not json"#;
@@ -441,6 +477,12 @@ not json"#;
                 Ev::Interrupted,
                 Ev::TextDelta("h".into()),
                 Ev::Text("hello".into()),
+                Ev::Permission {
+                    request_id: "r1".into(),
+                    tool: "ExitPlanMode".into(),
+                    tool_use_id: "toolu_2".into(),
+                    input: json!({"plan": "P", "planFilePath": "/p.md"}),
+                },
                 Ev::Result {
                     is_error: false,
                     text: "hello".into(),

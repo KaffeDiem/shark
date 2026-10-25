@@ -7,6 +7,7 @@ mod editor;
 mod files;
 mod git;
 mod menu;
+mod plan;
 mod pr;
 mod prompts;
 mod settings;
@@ -99,6 +100,19 @@ actions!(
     ]
 );
 
+// Plan mode: shift-tab, the plan pane (`space l v`) and its keys.
+actions!(
+    shark,
+    [
+        TogglePlanMode,
+        TogglePlan,
+        ApprovePlan,
+        PlanOlder,
+        PlanNewer,
+        TogglePlanChanges
+    ]
+);
+
 // Editor and diff review: `space f f`, and `c` / `shift-c` in the diff.
 actions!(shark, [OpenAnyFile, AddComment, SendComments]);
 
@@ -128,7 +142,8 @@ fn fix_path() {
 
 fn bind_keys(cx: &mut App) {
     // VimNormal: the editor in Vim's Normal mode, where space types nothing.
-    const NAV: &str = "Sidebar || Transcript || DiffPane || FileTree || Queue || VimNormal";
+    const NAV: &str =
+        "Sidebar || Transcript || DiffPane || FileTree || Queue || PlanPane || VimNormal";
     const LIST: &str = "Sidebar || Transcript || FileTree || Queue";
     cx.bind_keys([
         KeyBinding::new("cmd-k", TogglePalette, None),
@@ -251,6 +266,28 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-d", PageDown, Some("DiffPane")),
         KeyBinding::new("ctrl-u", PageUp, Some("DiffPane")),
         KeyBinding::new("c", AddComment, Some("DiffPane")),
+        // Plan mode; in the composer shift-tab is caught before the input outdents.
+        KeyBinding::new(
+            "shift-tab",
+            TogglePlanMode,
+            Some("Transcript || Queue || PlanPane"),
+        ),
+        KeyBinding::new("space l l", TogglePlanMode, Some(NAV)),
+        KeyBinding::new("space l v", TogglePlan, Some(NAV)),
+        KeyBinding::new("space l a", ApprovePlan, Some(NAV)),
+        KeyBinding::new("j", SelectNext, Some("PlanPane")),
+        KeyBinding::new("k", SelectPrev, Some("PlanPane")),
+        KeyBinding::new("g g", SelectFirst, Some("PlanPane")),
+        KeyBinding::new("shift-g", SelectLast, Some("PlanPane")),
+        KeyBinding::new("ctrl-d", PageDown, Some("PlanPane")),
+        KeyBinding::new("ctrl-u", PageUp, Some("PlanPane")),
+        KeyBinding::new("] c", NextHunk, Some("PlanPane")),
+        KeyBinding::new("[ c", PrevHunk, Some("PlanPane")),
+        KeyBinding::new("h", PlanOlder, Some("PlanPane")),
+        KeyBinding::new("l", PlanNewer, Some("PlanPane")),
+        KeyBinding::new("d", TogglePlanChanges, Some("PlanPane")),
+        KeyBinding::new("a", ApprovePlan, Some("PlanPane")),
+        KeyBinding::new("i", FocusComposer, Some("PlanPane")),
         KeyBinding::new("shift-c", SendComments, Some("DiffPane")),
     ]);
     // Direct picks, numbered like the model menu: ctrl-cmd-1 / space m 1 is the first row.
