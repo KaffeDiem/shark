@@ -132,10 +132,8 @@ pub fn send(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, text: &str) -> std::io
 // ponytail: top-level `service_tier` only; a profile or `-c` override isn't seen
 pub fn fast_by_config() -> bool {
     let home = std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from);
-    let home =
-        home.or_else(|| std::env::var_os("HOME").map(|h| std::path::Path::new(&h).join(".codex")));
-    let config = home.and_then(|h| std::fs::read_to_string(h.join("config.toml")).ok());
-    fast_in(&config.unwrap_or_default())
+    let home = home.unwrap_or_else(|| crate::state::home().join(".codex"));
+    fast_in(&std::fs::read_to_string(home.join("config.toml")).unwrap_or_default())
 }
 
 fn fast_in(config: &str) -> bool {

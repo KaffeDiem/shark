@@ -2542,6 +2542,15 @@ mod tests {
 #[cfg(all(test, feature = "test-support"))]
 mod ui_tests {
     use super::*;
+
+    /// Feeds recorded protocol lines to the chat as its process would.
+    fn play(c: &mut Chat, lines: &[&str], cx: &mut Context<Chat>) {
+        for l in lines {
+            for ev in agent::parse(l) {
+                c.apply(ev, cx);
+            }
+        }
+    }
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
     use gpui_kit::InputEvent as _;
     use gpui_kit::test::TestWindowExt as _;
@@ -3038,13 +3047,6 @@ exec cat >/dev/null
         let chat = open_chat("codex-plan", cx);
         let plan = r##"{"method":"item/completed","params":{"item":{"type":"plan","id":"t1-plan","text":"# Cache\n\nUse a map.\n"}}}"##;
         let started = r#"{"method":"item/started","params":{"item":{"type":"plan","id":"t1-plan","text":""}}}"#;
-        let play = |c: &mut Chat, lines: &[&str], cx: &mut Context<Chat>| {
-            for l in lines {
-                for ev in agent::parse(l) {
-                    c.apply(ev, cx);
-                }
-            }
-        };
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
                 c.set_model("codex:gpt-6.1-sol", cx);
@@ -3097,13 +3099,6 @@ exec cat >/dev/null
     #[gpui_kit::test]
     fn codex_turn_reads_mid_turn_messages(cx: &mut TestAppContext) {
         let chat = open_chat("codex-turn", cx);
-        let play = |c: &mut Chat, lines: &[&str], cx: &mut Context<Chat>| {
-            for l in lines {
-                for ev in agent::parse(l) {
-                    c.apply(ev, cx);
-                }
-            }
-        };
         let echo = |t: &str| {
             format!(
                 r#"{{"method":"item/started","params":{{"item":{{"type":"userMessage","id":"u","content":[{{"type":"text","text":"{t}"}}]}}}}}}"#

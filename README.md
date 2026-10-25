@@ -26,7 +26,7 @@ brew install --cask KaffeDiem/shark/shark
 ```
 Or [Download Shark 0.1.1](https://github.com/KaffeDiem/shark/releases/download/v0.1.1/Shark-0.1.1.dmg) (Apple Silicon), open it and drag Shark to Applications. The app isn't notarized: on first launch, open it, then allow it in System Settings → Privacy & Security → Open Anyway, or run `xattr -dr com.apple.quarantine /Applications/Shark.app`.
 
-Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH. For Codex models (`codex`, Sol, Astra), also `codex`, logged in with `codex login` (a ChatGPT plan works). Codex chats have no side questions. They have a **Fast** toggle (`cmd-shift-f`) for Codex's faster service tier, which uses more of your plan's usage; until you toggle it a chat follows `service_tier` in `~/.codex/config.toml`.
+Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH. For Codex models (`codex`, Sol, Astra), also `codex`, logged in with `codex login` (a ChatGPT plan works). Codex chats have no side questions. They have a **Fast** toggle for Codex's faster service tier, which uses more of your plan's usage.
 
 ## Quick start
 1. `cmd-n`, tick the repos, name the branch, and optionally type a first message. `enter` creates the workspace.

@@ -101,7 +101,7 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
   - Footer 44px: key hints in `text_xs`, then a `ghost` "Build in new chat" (`Plus`) and the view's one primary button, "Approve and build" (`Hammer`), on the newest version until it's approved, then `Check` + "Approved".
   - Empty state: `ClipboardList`, "No plan yet", what will appear, and `shift-tab` "plan mode on/off".
   - In the transcript a submitted plan is a standalone row: `ClipboardList`, **Plan**, `v2 · <title>`, `Check`; enter opens that version.
-  - The composer's **Plan** button is `ghost` `xsmall` and `selected` while plan mode is on. A Codex chat has a **Fast** button (`Zap`) next to it, styled the same; `cmd-shift-f` toggles it and toasts the new state, since the key has no button under the pointer.
+  - The composer's **Plan** button is `ghost` `xsmall` and `selected` while plan mode is on. A Codex chat has a **Fast** button (`Zap`) next to it, styled the same.
 - **Rows inside the island:** 28px for compact rows (tool calls, lists in dialogs). Transcript blocks are `px_4 py_1p5`.
 - **Agent activity in the transcript:** prose is what people read; tool calls are evidence.
   - A run of tool calls between two pieces of prose is **one row**: chevron, a summary counted by verb ("Read 4 files, ran 2 commands"), `muted_foreground`. Add a verb to `group_summary` in `src/chat.rs` rather than listing tool names.
