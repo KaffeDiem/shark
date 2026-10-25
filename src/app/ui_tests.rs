@@ -63,8 +63,65 @@ fn boot(
     cx.update(|cx| {
         gpui_kit::init(cx);
         crate::bind_keys(cx);
+        crate::menubar::init(cx);
     });
     open(cx, options)
+}
+
+/// Every menu-bar item without an `os_action` has a handler from the current focus `at`.
+fn assert_menus_reachable(cx: &mut TestAppContext, window: AnyWindowHandle, at: &str) {
+    fn walk<'a>(items: &'a [MenuItem], out: &mut Vec<(&'a str, &'a dyn Action)>) {
+        for item in items {
+            match item {
+                MenuItem::Action {
+                    name,
+                    action,
+                    os_action: None,
+                    ..
+                } => out.push((name.as_ref(), &**action)),
+                MenuItem::Submenu(m) => walk(&m.items, out),
+                _ => {}
+            }
+        }
+    }
+    let menus = crate::menubar::menus();
+    let mut items = vec![];
+    for m in &menus {
+        walk(&m.items, &mut items);
+    }
+    cx.update_window(window, |_, w, cx| {
+        // App-level handlers (Hide, About…) aren't on the window's dispatch path. Quit's
+        // global handler is registered in `main`, which the harness skips.
+        let missing: Vec<_> = (items.iter())
+            .filter(|(_, a)| !a.as_any().is::<crate::menubar::Quit>())
+            .filter(|(_, a)| !w.is_action_available(*a, cx) && !cx.is_action_available(*a))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(missing.is_empty(), "unreachable from {at}: {missing:?}");
+    })
+    .unwrap();
+}
+
+/// Shark > About Shark opens the About dialog.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn about_dialog(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, _) = boot(cx, State::default(), WindowOptions::default());
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        w.activate_window(); // About's global handler targets the active window
+        w.dispatch_action(Box::new(crate::menubar::About), cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.has_active_dialog(cx), "About opens a dialog");
+    })
+    .unwrap();
 }
 
 fn open(cx: &mut TestAppContext, options: WindowOptions) -> (AnyWindowHandle, Entity<Shark>) {
@@ -173,6 +230,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         .unwrap();
     let chat = cx.update(|cx| shark.read(cx).chats["ui-x"].clone());
     cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
+    assert_menus_reachable(cx, window, "composer");
 
     // Stay awake: caffeinate runs only while the setting is on and an agent works.
     let busy = |cx: &mut TestAppContext, on: bool| {
@@ -276,6 +334,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         )
     })
     .unwrap();
+    assert_menus_reachable(cx, window, "sidebar");
     press(cx, &["space", "d"]);
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Diff));
     press(cx, &["space", "c"]);
@@ -372,6 +431,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     })
     .await;
     assert_eq!(fs::read_to_string(&file).unwrap(), "zx\ny\n");
+    assert_menus_reachable(cx, window, "editor");
 
     // Vim keys: normal mode edits, never inserts; the toggle survives a restart.
     press(cx, &["ctrl-cmd-v"]);

@@ -753,6 +753,12 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &ToggleFileTree, w, cx| this.toggle_tree(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleVim, w, cx| this.toggle_vim(w, cx)))
             .on_action(cx.listener(|this, _: &CloseFile, w, cx| this.close_file(w, cx)))
+            // On the root, not the editor, so File > Save works with focus in the tree.
+            .on_action(cx.listener(|this, _: &SaveFile, w, cx| {
+                if let Some(e) = this.editor.clone() {
+                    e.update(cx, |e, cx| e.save(false, w, cx))
+                }
+            }))
             // `o` in the diff and the tree.
             .on_action(cx.listener(|this, _: &OpenFile, w, cx| {
                 if let Some(ix) = this.cursor_file(w, cx) {

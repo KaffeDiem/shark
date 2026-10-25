@@ -8,6 +8,7 @@ use crate::state::{Appearance, Mode, State};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
+use gpui_kit::component::link::Link;
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
@@ -95,6 +96,31 @@ pub fn open(state: &State, window: &mut Window, cx: &mut Context<Shark>) {
             .child(view.clone())
     });
     focus.focus(window, cx);
+}
+
+/// About dialog (Shark > About Shark): version, author, license and repo link.
+pub fn about(window: &mut Window, cx: &mut App) {
+    window.open_dialog(cx, |d, _, cx| {
+        d.font_features(inter_features())
+            .title("Shark")
+            .w(px(640.))
+            .child(
+                v_flex()
+                    .gap_1()
+                    .child(format!("Version {}", env!("CARGO_PKG_VERSION")))
+                    .child("Shark by Kasper Munch Jensen")
+                    .child(
+                        div()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("GPL-3.0"),
+                    )
+                    .child(
+                        Link::new("about-repo")
+                            .href("https://github.com/KaffeDiem/shark")
+                            .child("github.com/KaffeDiem/shark"),
+                    ),
+            )
+    });
 }
 
 type Choice = Entity<SelectState<SearchableVec<SharedString>>>;
