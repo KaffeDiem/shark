@@ -31,7 +31,7 @@ Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH. For Codex
 ## Quick start
 Shark opens on Home (`cmd-0`) when no workspace is open. It shows what's missing (git, gh, claude), every workspace grouped by what it needs from you (Needs you, Running, Unread, Idle), and a Get started checklist (one line once you have workspaces; Hide Get started in `cmd-k` removes it). Type what you want to build in its box and press `enter` to start a workspace with that as the first message, or press `tab` to ask Shark how to do something (a one-off Haiku answer from this README and the live keymap).
 
-1. `cmd-o` adds a repo. `cmd-n`, tick the repos, name the branch, and optionally type a first message. `enter` creates the workspace.
+1. `cmd-o` adds a repo. `cmd-n`, tick the repos, and name the branch. `enter` creates the workspace.
 2. `shift-tab` for plan mode. Revise the plan in the chat, then `a` in the plan pane to build.
 3. Click the Chat and Diff tabs, or pick Show chat / Show diff in `cmd-k`. `c` on a diff line leaves a comment, and `shift-c` sends all comments to the agent.
 4. Create or update PRs (`cmd-k` or the git menu) opens linked PRs. The git button (top right) takes it from there.
@@ -47,7 +47,7 @@ Shark opens on Home (`cmd-0`) when no workspace is open. It shows what's missing
 | Home | `↑/↓` `home`/`end` (Vim: `j/k` `gg` `G`) · `enter` open the workspace · `cmd-backspace` archive it (also in the sidebar) · right-click it for more · `i`/`a` → the prompt · in the prompt `enter` new workspace with it as the first message (Ask Shark: ask), `tab` new workspace ↔ Ask Shark · `esc`/`ctrl-c` stop an answer |
 | side question | `esc` dismiss · `c` copy the answer · `enter` put the answer into the composer |
 | `cmd-k` | every command, with its shortcut on the right: workspaces (archive, force archive, add a repo, reveal in Finder, open in Terminal or any other installed app, copy path/branch; only with a workspace open or under the cursor), chats, plan, files and diff, git (next step, git menu, fetch, create/draft/merge/open PRs, merge order), sections, view (Go to Home, Hide Get started), settings · the Help menu has Keyboard shortcuts (this palette), the README and Report an issue · type to filter; extra words match too (`pr`, `github`, `discard`) |
-| new workspace | `enter` create (in branch or first message) · `tab` branch → repo filter → first message · type to filter · `enter` tick match · `space` tick/untick highlighted · `cmd-enter` create · last-used repos start ticked |
+| new workspace | `enter` create (in branch) · `tab` branch ↔ repo filter · type to filter · `enter` tick match · `space` tick/untick highlighted · `cmd-enter` create · last-used repos start ticked |
 | sidebar mouse | right-click a workspace: open, move to section, reveal in Finder / open in an app / copy path (per repo), copy branch, open PRs, archive · drag a workspace onto a section header to move it in (onto Workspaces to ungroup), or onto another workspace to take its place · drag a section header onto another to reorder sections · hover Workspaces for **+** new section, or right-click it or the empty space below · click a section header to fold it; right-click it to rename, change icon, delete · click a repo: new workspace with it ticked · hover Repos for **+** add repo, or drag folders from Finder onto the sidebar |
 | plan mode | `shift-tab` (composer, transcript, queue, plan) plan mode on/off · Show or hide plan, Approve plan and build, Build plan in a new chat in `cmd-k` · in the pane `↑/↓` scroll (Vim: `j/k` `gg` `G` `ctrl-d/u`) · `←/→` (Vim: `h/l`) older/newer version · `alt-↓/↑` (Vim: `]c`/`[c`) next/previous change · `d` changes on/off · `a` approve · `n` build in a new chat · `i` → composer · `y` copy the shown version · `enter` on a transcript **Plan** row opens that version |
 | settings | `ctrl-tab`/`ctrl-shift-tab` next/previous page (General, Appearance, Prompts) |
@@ -59,7 +59,7 @@ Shark opens on Home (`cmd-0`) when no workspace is open. It shows what's missing
 - **Workspace creation:**
   - For each repo, `git worktree add --no-track -b <branch> <ws>/<repo> origin/HEAD`. Every repo is checked first, so a refusal leaves nothing behind: the branch is already checked out somewhere, or a local branch of that name exists that origin doesn't have (usually left from an archived workspace; pick another name or rename it). Offline or without an origin, the local branch is used.
   - A branch that only origin has starts at `origin/<branch>` (still `--no-track`); one both have uses the local branch.
-  - The dialog's optional first message is sent to the agent once the workspace is open.
+  - Started from Home's prompt, the dialog sends that text to the agent once the workspace is open.
   - **Add repo to workspace…** (`cmd-k`) adds a worktree for another repo on the same branch the same way, rewrites the root `CLAUDE.md`, and the agent is told about it with the next message.
   - Gitignored files that match `.worktreeinclude` (default `.env*`) are copied into the new worktree.
   - A root `CLAUDE.md` is written that lists the repos (with each one's GitHub URL, so a PR URL maps to its folder) and `@`-imports each repo's own CLAUDE.md.
