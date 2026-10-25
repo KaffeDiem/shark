@@ -94,13 +94,17 @@ impl Shark {
             }
             return;
         }
-        // The file edited in place shows its buffer, saved or not.
-        if let Some(e) = &self.editing
+        // The file edited in place shows its buffer, saved or not; git's comes back after.
+        if let Some(e) = &mut self.editing
             && let Some(f) = data.files.iter_mut().find(|f| *f.path() == e.path)
         {
-            *f = e.file.clone();
-            data.hunks
+            let hunks = data
+                .hunks
                 .insert(e.path.clone(), review::parse_hunks(&e.patch));
+            e.orig = (
+                std::mem::replace(f, e.file.clone()),
+                hunks.unwrap_or_default(),
+            );
         }
         // While editing, the same files are replaced one by one so the view stays put.
         let in_place = self.editing.is_some()

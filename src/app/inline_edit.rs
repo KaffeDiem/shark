@@ -69,7 +69,8 @@ impl Buffer {
     }
 }
 
-/// `text` against `base` as a git patch of `path`, with three lines of context.
+/// `text` against `base` as a git patch of `path`, with every line as context (the diff
+/// folds it), so any line can be edited, even with no changes left.
 pub(super) fn patch(path: &str, base: &str, text: &str, added: bool) -> String {
     let old = match added {
         true => "/dev/null".to_string(),
@@ -79,10 +80,20 @@ pub(super) fn patch(path: &str, base: &str, text: &str, added: bool) -> String {
     if added {
         out += "new file mode 100644\n";
     }
+    if base == text && !text.is_empty() {
+        // No hunk without a change: one of context only.
+        let n = text.lines().count();
+        out += &format!("--- {old}\n+++ b/{path}\n@@ -1,{n} +1,{n} @@\n");
+        text.lines().for_each(|l| out += &format!(" {l}\n"));
+        if !text.ends_with('\n') {
+            out += "\\ No newline at end of file\n";
+        }
+        return out;
+    }
     let diff = similar::TextDiff::from_lines(base, text);
     out += &diff
         .unified_diff()
-        .context_radius(3)
+        .context_radius(base.lines().count().max(text.lines().count()))
         .header(&old, &format!("b/{path}"))
         .to_string();
     out
@@ -111,6 +122,8 @@ pub(super) struct InlineEdit {
     pub(super) buf: Buffer,
     /// The buffer against `base`, as shown in the diff.
     pub(super) file: DiffFile,
+    /// The file and hunks as git has them, shown again when editing ends.
+    pub(super) orig: (DiffFile, Vec<review::Hunk>),
     pub(super) patch: String,
     /// Fingerprint of the file as last read or written, to notice other writers.
     disk: u64,
@@ -244,6 +257,10 @@ impl Shark {
             .map(|r| r.start().saturating_sub(1));
         buf.line =
             (selected.unwrap_or_else(|| first_change(&base, &text))).min(buf.lines.len() - 1);
+        let orig = (
+            file.clone(),
+            (self.review.hunks.get(&path).cloned()).unwrap_or_default(),
+        );
         let patch = patch(&path, &base, &text, added);
         let Some(file) = parse(&patch) else {
             return notify_err(window, cx, format!("{path} can't be compared"));
@@ -267,6 +284,7 @@ impl Shark {
                     }
                 }),
             ];
+            s.end_edit(cx);
             s.editing = Some(InlineEdit {
                 path,
                 abs,
@@ -275,6 +293,7 @@ impl Shark {
                 added,
                 buf,
                 file,
+                orig,
                 patch,
                 dirty: false,
                 saved: false,
@@ -402,16 +421,22 @@ impl Shark {
     /// Back to reviewing; asks first when there are unsaved edits.
     pub(super) fn leave_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.confirm_discard_edit(window, cx, |s, window, cx| {
-            if let Some(e) = s.editing.take()
-                && crate::files::fingerprint(e.buf.text()) != e.disk
-            {
-                // Discarded: the disk version comes back.
-                s.diff_fp = 0;
-                s.refresh_diff(cx);
-            }
+            s.end_edit(cx);
             s.diff.read(cx).focus_handle(cx).focus(window, cx);
             cx.notify();
         });
+    }
+
+    /// Ends in-place editing: the file shows as git has it again, without any discarded
+    /// buffer, and its header (the base's blob) is there to edit it again.
+    fn end_edit(&mut self, cx: &mut Context<Self>) {
+        let Some(e) = self.editing.take() else { return };
+        let (file, hunks) = e.orig;
+        self.review.hunks.insert(e.path.clone(), hunks);
+        if let Some(f) = self.diff_files.iter_mut().find(|f| *f.path() == e.path) {
+            *f = file.clone();
+        }
+        self.diff.update(cx, |d, cx| d.replace_file(file, cx));
     }
 
     /// ⌘S / File › Save: the file edited in the diff while it shows, else the editor's.
@@ -637,5 +662,18 @@ mod tests {
             .remove(0);
         assert_eq!(added.status(), DiffFileStatus::Added);
         assert_eq!(first_change("same\n", "same\n"), 0);
+
+        // Every line is there to edit: far from the change, and with no change at all.
+        let rows = |p: &str| review::parse_hunks(p).iter().flatten().count();
+        let long: String = (1..=20).map(|i| format!("{i}\n")).collect();
+        assert_eq!(
+            rows(&patch("api/f", &long, &long.replace("20\n", "x\n"), false)),
+            21
+        );
+        for text in ["a\nb\n", "a\nb"] {
+            let p = patch("api/f", text, text, false);
+            assert_eq!(rows(&p), 2, "{p}");
+            assert_eq!(DiffFile::parse(&p).unwrap()[0].additions(), 0);
+        }
     }
 }

@@ -2135,7 +2135,7 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
-    use gpui_kit::component::diff::{DiffEvent, DiffLineRange, DiffSide};
+    use gpui_kit::component::diff::{DiffEvent, DiffLinePosition, DiffLineRange, DiffSide};
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
     let repos = repos(&home, &["api"]);
@@ -2306,6 +2306,65 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
     // Escape goes back to reviewing without asking.
     press(cx, &["escape"]);
     cx.update(|cx| assert!(shark.read(cx).editing.is_none()));
+
+    // Back in: the base is the commit's blob, not empty (git's file shows again, with its
+    // index header).
+    let counts = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let f = &shark.read(cx).diff.read(cx).files()[0];
+            (f.additions(), f.deletions())
+        })
+    };
+    let git = counts(cx);
+    assert!(git.1 > 0, "{git:?}");
+    on(cx, &|s, w, cx| {
+        s.edit_working_copy(Some("api/f.txt".into()), w, cx)
+    });
+    draw(cx);
+    assert_eq!(counts(cx), git);
+    // Line 5 is far from any change, and still gets the input: the buffer is compared in
+    // full and the diff folds the rest.
+    on(cx, &|s, w, cx| {
+        let five = DiffLinePosition::new("api/f.txt", DiffSide::Modified, 5);
+        s.edit_click(&five, w, cx)
+    });
+    draw(cx);
+    cx.update_window(window, |_, w, cx| {
+        let e = shark.read(cx).editing.as_ref().unwrap();
+        assert!(
+            e.buf.line == 4 && e.focused(w, cx),
+            "line 5's input is drawn"
+        );
+    })
+    .unwrap();
+    // Dirty, then another file with Discard: f.txt shows the disk version, not the
+    // dropped buffer.
+    fs::write(home.join("shark/workspaces/ed/api/g.txt"), "g\n").unwrap();
+    on(cx, &|s, _, cx| s.refresh_diff(cx));
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).diff_files.len() == 2
+    })
+    .await;
+    // A new file reloads the diff; the caret's line comes back into view.
+    on(cx, &|s, w, cx| {
+        let five = DiffLinePosition::new("api/f.txt", DiffSide::Modified, 5);
+        s.edit_click(&five, w, cx)
+    });
+    draw(cx);
+    cx.update_window(window, |_, w, cx| w.input("Z", cx))
+        .unwrap();
+    draw(cx);
+    assert_eq!(counts(cx), (git.0 + 1, git.1 + 1));
+    on(cx, &|s, w, cx| {
+        s.edit_working_copy(Some("api/g.txt".into()), w, cx)
+    });
+    press(cx, &["enter"]);
+    draw(cx);
+    cx.update(|cx| {
+        let e = shark.read(cx).editing.as_ref().unwrap();
+        assert_eq!(e.path.as_str(), "api/g.txt");
+    });
+    assert_eq!(counts(cx), git);
     fs::remove_dir_all(&home).ok();
 }
 
