@@ -642,7 +642,9 @@ impl Render for Shark {
             .text_color(theme.foreground)
             .font_features(inter_features())
             .on_action(cx.listener(|this, _: &TogglePalette, w, cx| this.toggle_palette(w, cx)))
-            .on_action(cx.listener(|this, _: &NewWorkspace, w, cx| this.new_workspace(w, cx)))
+            .on_action(cx.listener(|this, _: &NewWorkspace, w, cx| {
+                this.new_workspace(this.state.last_repos.clone(), w, cx)
+            }))
             .on_action(cx.listener(|this, _: &ArchiveWorkspace, w, cx| this.archive(false, w, cx)))
             .on_action(
                 cx.listener(|this, _: &ForceArchiveWorkspace, w, cx| this.archive(true, w, cx)),

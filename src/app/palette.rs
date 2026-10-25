@@ -46,7 +46,7 @@ type Cmd = fn(&mut Shark, &mut Window, &mut Context<Shark>);
 
 pub(super) const COMMANDS: &[(&str, IconName, Cmd)] = &[
     ("New workspace", IconName::Plus, |s, w, cx| {
-        s.new_workspace(w, cx)
+        s.new_workspace(s.state.last_repos.clone(), w, cx)
     }),
     ("Add repo", IconName::FolderPlus, |s, w, cx| {
         s.add_repo(w, cx)

@@ -588,11 +588,24 @@ impl Shark {
                 .when(rail, |d| {
                     d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
                 })
+                .on_click({
+                    let name = name.clone();
+                    cx.listener(move |this, _, w, cx| this.new_workspace(vec![name.clone()], w, cx))
+                })
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, e: &MouseDownEvent, w, cx| {
                         let (p1, p2, p3) = (path.clone(), path.clone(), path.clone());
+                        let picked = vec![name.clone()];
                         let entries = vec![
+                            menu::item(
+                                IconName::Plus,
+                                "New Workspace",
+                                on_shark(cx, move |s, w, cx| {
+                                    s.new_workspace(picked.clone(), w, cx)
+                                }),
+                            ),
+                            Entry::Sep,
                             menu::item(IconName::FolderOpen, "Reveal in Finder", move |_, cx| {
                                 cx.reveal_path(&p1)
                             }),
@@ -889,8 +902,60 @@ impl Shark {
                 )
             })
             .on_mouse_down(MouseButton::Right, new_section_menu());
+        // Mirrors the Workspaces header: hover shows +, right-click offers the same.
+        let repo_header = h_flex()
+            .id("repo-header")
+            .group("repo-header")
+            .justify_between()
+            .items_end()
+            .child(header("Repos"))
+            .when(!rail, |d| {
+                d.child(
+                    div()
+                        .mr_3()
+                        .invisible()
+                        .group_hover("repo-header", |s| s.visible())
+                        .child(
+                            Button::new("add-repo")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Plus)
+                                .tooltip("Add repo (space r a), or drop folders here")
+                                .on_click(cx.listener(|this, _, w, cx| this.add_repo(w, cx))),
+                        ),
+                )
+            })
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, e: &MouseDownEvent, w, cx| {
+                    let entries = vec![menu::item(
+                        IconName::FolderPlus,
+                        "Add Repo…",
+                        on_shark(cx, |s, w, cx| s.add_repo(w, cx)),
+                    )];
+                    this.show_menu(e.position, entries, w, cx);
+                }),
+            );
+        let add_repo_row = row()
+            .id("add-repo-row")
+            .text_color(theme.muted_foreground)
+            .hover(|d| d.bg(theme.sidebar_accent))
+            .child(Icon::new(IconName::FolderPlus).with_size(px(14.)))
+            .when(!rail, |d| {
+                d.child(div().flex_1().child("Add repo…"))
+                    .child(div().text_xs().text_color(faint(theme)).child("space r a"))
+            })
+            .when(rail, |d| {
+                d.tooltip(|w, cx| Tooltip::new("Add repo").build(w, cx))
+            })
+            .on_click(cx.listener(|this, _, w, cx| this.add_repo(w, cx)));
         v_flex()
             .id("sidebar")
+            // Folders dragged in from Finder are added as repos.
+            .drag_over::<ExternalPaths>(move |d, _, _, _| d.bg(accent))
+            .on_drop(
+                cx.listener(|this, p: &ExternalPaths, w, cx| this.add_repo_paths(p.paths(), w, cx)),
+            )
             .key_context("Sidebar")
             .track_focus(&self.sidebar_focus)
             // The rail clears the traffic lights (x 9..61), so the content island never sits under them.
@@ -935,11 +1000,9 @@ impl Shark {
                         self.state.workspaces.is_empty() && self.state.sections.is_empty(),
                         |d| d.child(hint("space w n to create")),
                     )
-                    .child(header("Repos"))
+                    .child(repo_header)
                     .children(repos)
-                    .when(self.state.repos.is_empty(), |d| {
-                        d.child(hint("space r a to add"))
-                    })
+                    .when(self.state.repos.is_empty(), |d| d.child(add_repo_row))
                     // The empty space below takes a right-click too.
                     .child(
                         div()

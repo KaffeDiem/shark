@@ -493,6 +493,35 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     })
     .await;
 
+    // Clicking a repo in the sidebar starts a workspace with only that repo ticked.
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| s.new_workspace(vec!["web".into()], w, cx));
+    cx.update_window(window, |_, w, cx| w.input("only web", cx))
+        .unwrap();
+    press(cx, &["enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.as_deref() == Some("only-web")
+    })
+    .await;
+    let ws_dir = home.join("shark/workspaces/only-web");
+    assert!(ws_dir.join("web").exists() && !ws_dir.join("api").exists());
+
+    // Folders dropped on the sidebar become repos; one already added is refused.
+    let cli = home.join("src/cli");
+    init_repo(&cli);
+    let dropped = [cli, home.join("src/api")];
+    on(cx, &|s, w, cx| s.add_repo_paths(&dropped, w, cx));
+    cx.update(|cx| {
+        let names: Vec<_> = shark
+            .read(cx)
+            .state
+            .repos
+            .iter()
+            .map(|r| r.name.clone())
+            .collect();
+        assert_eq!(names, ["api", "web", "cli"]);
+    });
+
     // Quick bars are bare menus: no dialog close X.
     press(cx, &["cmd-k"]);
     cx.run_until_parked();

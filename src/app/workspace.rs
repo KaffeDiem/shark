@@ -271,28 +271,42 @@ impl Shark {
             let Ok(Ok(Some(paths))) = paths.await else {
                 return;
             };
-            this.update_in(cx, |s, window, cx| {
-                for p in paths {
-                    match git::add_repo(&p, &s.state.repos) {
-                        Ok(r) => s.state.repos.push(r),
-                        Err(e) => notify_err(window, cx, e),
-                    }
-                }
-                s.state.save();
-                cx.notify();
-            })
-            .ok();
+            this.update_in(cx, |s, window, cx| s.add_repo_paths(&paths, window, cx))
+                .ok();
         })
         .detach();
     }
 
-    pub(super) fn new_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// From the folder picker or folders dropped on the sidebar.
+    pub(super) fn add_repo_paths(
+        &mut self,
+        paths: &[PathBuf],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        for p in paths {
+            match git::add_repo(p, &self.state.repos) {
+                Ok(r) => self.state.repos.push(r),
+                Err(e) => notify_err(window, cx, e),
+            }
+        }
+        self.state.save();
+        cx.notify();
+    }
+
+    /// `picked` repos start ticked: the last-used ones, or the repo clicked in the sidebar.
+    pub(super) fn new_workspace(
+        &mut self,
+        picked: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.state.repos.is_empty() {
             return notify_err(window, cx, "Add a repo first (space r a)");
         }
         let shark = cx.entity().downgrade();
-        let (repos, last) = (self.state.repos.clone(), self.state.last_repos.clone());
-        let form = cx.new(|cx| NewWorkspaceForm::new(repos, &last, shark, window, cx));
+        let repos = self.state.repos.clone();
+        let form = cx.new(|cx| NewWorkspaceForm::new(repos, &picked, shark, window, cx));
         let input = form.read(cx).branch.clone();
         window.open_dialog(cx, move |d, _, _| {
             let f = form.clone();
