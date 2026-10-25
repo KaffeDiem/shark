@@ -2012,3 +2012,183 @@ async fn home_checklist(cx: &mut TestAppContext) {
     assert!(!done(cx).1, "dismissed");
     fs::remove_dir_all(&home).ok();
 }
+
+/// The split ratio persists and is shared; a file's working copy is edited in the diff: the
+/// comparison follows the unsaved buffer, line keys and paste edit it, it survives Chat ↔
+/// Changes, the view stays put, and cmd-s writes it.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
+    use gpui_kit::component::diff::{DiffEvent, DiffLineRange, DiffSide};
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let lines = |f: &dyn Fn(usize) -> String| (1..=300).map(f).collect::<String>();
+    fs::write(
+        repos[0].path.join("f.txt"),
+        lines(&|i| format!("line {i}\n")),
+    )
+    .unwrap();
+    git::git(&repos[0].path, &["add", "."]).unwrap();
+    let commit = [
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "f",
+    ];
+    git::git(&repos[0].path, &commit).unwrap();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| {
+        s.create_workspace("ed".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let file = home.join("shark/workspaces/ed/api/f.txt");
+    // A change every ten lines: a diff many screens tall.
+    let changed = |i: usize| match i % 10 {
+        0 => format!("changed {i}\n"),
+        _ => format!("line {i}\n"),
+    };
+    fs::write(&file, lines(&changed)).unwrap();
+    on(cx, &|s, w, cx| {
+        s.show(Tab::Diff, w, cx);
+        s.diff.update(cx, |d, cx| d.set_mode(DiffMode::Split, cx));
+    });
+
+    // A finished divider drag is saved, and a new window starts with it.
+    on(cx, &|s, _, cx| {
+        s.diff.update(cx, |d, cx| {
+            d.set_split_ratio(0.4, cx);
+            cx.emit(DiffEvent::SplitRatioChanged(0.4));
+        })
+    });
+    assert_eq!(State::load().split_ratio, Some(0.4));
+    let (_, again) = open(cx, WindowOptions::default());
+    cx.update(|cx| assert_eq!(again.read(cx).diff.read(cx).split_ratio(), 0.4));
+
+    // Edit from the selected working line, deep in the file.
+    on(cx, &|s, _, cx| {
+        let line = DiffLineRange::new("api/f.txt", DiffSide::Modified, 250, 250);
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
+    });
+    let draw = |cx: &mut TestAppContext| {
+        for _ in 0..3 {
+            cx.update_window(window, |_, w, cx| w.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        }
+    };
+    draw(cx);
+    press(cx, &["i"]);
+    draw(cx);
+    let top =
+        |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).diff.read(cx).scroll_top().item_ix);
+    let before = top(cx);
+    assert!(
+        before > 3,
+        "editing line 250 scrolled to it, not row {before}"
+    );
+    let buf = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let e = shark.read(cx).editing.as_ref().unwrap();
+            (e.buf.lines.clone(), e.buf.line)
+        })
+    };
+    assert_eq!(buf(cx).1, 249);
+    // ↓ then typing: the comparison has the unsaved line before any save.
+    press(cx, &["down"]);
+    cx.update_window(window, |_, w, cx| w.input("X", cx))
+        .unwrap();
+    draw(cx);
+    let (lines_now, at) = buf(cx);
+    assert_eq!((lines_now[250].as_str(), at), ("line 251X", 250));
+    cx.update_window(window, |_, w, cx| {
+        let s = shark.read(cx);
+        let e = s.editing.as_ref().unwrap();
+        assert!(e.focused(w, cx), "the line input keeps focus");
+        assert!(e.patch.contains("+line 251X\n"), "{}", e.patch);
+        assert_eq!(s.diff.read(cx).files()[0].additions(), 31);
+        assert_eq!(s.working_heading("api/f.txt"), "Working copy · unsaved");
+        assert!(
+            s.edit_status()
+                .unwrap()
+                .starts_with("Editing the working copy")
+        );
+    })
+    .unwrap();
+    assert!(
+        top(cx).abs_diff(before) <= 2,
+        "the view stays near row {before}"
+    );
+
+    // enter splits, backspace at column 0 joins, up moves, paste inserts lines.
+    press(cx, &["enter"]);
+    assert_eq!(
+        buf(cx).0[250..252],
+        ["line 251X".to_string(), String::new()]
+    );
+    press(cx, &["backspace"]);
+    assert_eq!(
+        (buf(cx).0[250].as_str(), buf(cx).0.len()),
+        ("line 251X", 300)
+    );
+    press(cx, &["up"]);
+    assert_eq!(buf(cx).1, 249);
+    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("p1\np2".into())));
+    press(cx, &["cmd-v"]);
+    let (lines_now, at) = buf(cx);
+    // The caret kept its column (9) moving up.
+    assert_eq!(
+        lines_now[249..251],
+        ["changed 2p1".to_string(), "p250".into()]
+    );
+    assert_eq!(at, 250);
+
+    // Chat and back: the unsaved edits are still there and still compared.
+    on(cx, &|s, w, cx| s.show(Tab::Chat, w, cx));
+    on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        let e = s.editing.as_ref().unwrap();
+        assert!(e.dirty && e.buf.lines[250] == "p250");
+        assert!(s.diff.read(cx).files()[0].additions() >= 31);
+    });
+
+    // cmd-s writes the buffer and the comparison stays.
+    on(cx, &|s, w, cx| s.focus_edit(w, cx));
+    press(cx, &["cmd-s"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).editing.as_ref().is_some_and(|e| e.saved)
+    })
+    .await;
+    let want = cx.update(|cx| shark.read(cx).editing.as_ref().unwrap().buf.text());
+    assert_eq!(fs::read_to_string(&file).unwrap(), want);
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(
+            s.working_heading("api/f.txt"),
+            "Working copy · saved just now"
+        );
+        assert!(s.edit_status().unwrap().starts_with("Saved · "));
+    });
+    // Escape goes back to reviewing without asking.
+    press(cx, &["escape"]);
+    cx.update(|cx| assert!(shark.read(cx).editing.is_none()));
+    fs::remove_dir_all(&home).ok();
+}

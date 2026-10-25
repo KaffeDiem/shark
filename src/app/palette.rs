@@ -401,11 +401,14 @@ pub(super) const COMMANDS: &[Row] = &[
         IconName::Save,
         Some(&SaveFile),
         "",
-        |s, w, cx| {
-            if let Some(e) = s.editor.clone() {
-                e.update(cx, |e, cx| e.save(false, w, cx))
-            }
-        },
+        |s, w, cx| s.save(w, cx),
+    ),
+    Row(
+        "Edit working copy",
+        IconName::Pencil,
+        Some(&EditWorkingCopy),
+        "diff inline edit in place",
+        |s, w, cx| s.edit_working_copy(None, w, cx),
     ),
     Row(
         "Close file",
