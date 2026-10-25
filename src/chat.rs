@@ -166,7 +166,13 @@ impl Chat {
         }
         self.composer
             .update(cx, |c, cx| c.set_value("", window, cx));
+        self.sent(text, cx);
+    }
+
+    fn sent(&mut self, text: String, cx: &mut Context<Self>) {
         self.busy = true;
+        // Jump to the end so push follows the new message and the reply.
+        self.sel = self.blocks.len().saturating_sub(1);
         self.push(Block::User(text), cx);
     }
 
@@ -497,5 +503,56 @@ impl Render for Chat {
                         ),
                 ),
             )
+    }
+}
+
+#[cfg(test)]
+mod ui_tests {
+    use super::*;
+    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+    use gpui_kit::test::TestWindowExt as _;
+
+    /// Sending jumps to the bottom even after scrolling the transcript up.
+    #[gpui_kit::test]
+    fn send_scrolls_to_bottom(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let ws = Workspace {
+            name: format!("scroll-test-{}", std::process::id()),
+            branch: "b".into(),
+            repos: vec![],
+            session_id: None,
+            model: None,
+        };
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(800.), px(400.)),
+            ))),
+            ..Default::default()
+        };
+        let (window, chat) = cx
+            .update(|cx| {
+                gpui_kit::open_window(options, cx, |w, cx| cx.new(|cx| Chat::new(ws, w, cx)))
+            })
+            .unwrap();
+        let frame = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, w, cx| w.render_frame(cx))
+                .unwrap()
+        };
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                (0..40).for_each(|i| c.apply(Ev::User(format!("message {i}")), cx))
+            })
+        });
+        frame(cx);
+        cx.update(|cx| chat.update(cx, |c, cx| c.select(0, cx)));
+        frame(cx);
+        let scroll = cx.update(|cx| chat.read(cx).scroll.clone());
+        assert!(scroll.max_offset().y > px(0.), "transcript must overflow");
+        assert_eq!(scroll.offset().y, px(0.), "scrolled to the top");
+
+        cx.update(|cx| chat.update(cx, |c, cx| c.sent("new".into(), cx)));
+        frame(cx);
+        assert_eq!(scroll.offset().y, -scroll.max_offset().y, "at the bottom");
     }
 }
