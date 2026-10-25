@@ -119,6 +119,9 @@ pub struct ChatMeta {
     /// Claude model alias (`opus`, `fable`, …); `None` uses the CLI default.
     #[serde(default)]
     pub model: Option<String>,
+    /// Plan mode: the agent plans and edits nothing until the plan is approved.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub plan: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -398,6 +401,7 @@ mod tests {
                 title: String::new(),
                 session_id: Some("s1".into()),
                 model: Some("opus".into()),
+                plan: false,
             }]
         );
         assert_eq!(ws.next_chat_id(), "feat~2");

@@ -640,6 +640,7 @@ impl Shark {
                         self.chats.remove(&c.id);
                         self.unread.remove(&c.id);
                         let _ = std::fs::remove_file(crate::agent::transcript_path(&c.id));
+                        crate::plan::delete(&c.id);
                     }
                 }
                 self.syncs.remove(name);
