@@ -298,11 +298,16 @@ pub(crate) fn efforts(model: &str) -> &'static [&'static str] {
     }
 }
 
-/// The level a chat runs at: its own (or `high`), the model's highest if it lacks that one.
+/// The level a chat runs at: its own (or `high`). One the model lacks is its highest if it was
+/// `ultra`, else `high`, so an unknown value never picks the costliest.
 pub(crate) fn effort_of(meta: &ChatMeta) -> &'static str {
     let levels = efforts(meta.model.as_deref().unwrap_or(MODELS[0]));
     let want = meta.effort.as_deref().unwrap_or(EFFORT);
-    (levels.iter().find(|l| **l == want)).unwrap_or(levels.last().unwrap())
+    match levels.iter().find(|l| **l == want) {
+        Some(l) => l,
+        None if want == "ultra" => levels.last().unwrap(),
+        None => levels.iter().find(|l| **l == EFFORT).unwrap_or(levels.last().unwrap()),
+    }
 }
 
 /// A thinking level as people read it: "xhigh" → "Extra high".
@@ -623,38 +628,46 @@ impl Chat {
         efforts(self.model())
     }
 
+    /// The model button's label: "Opus · High".
+    pub(crate) fn model_chip(&self) -> String {
+        format!("{} · {}", model_label(self.model()), effort_label(self.effort()))
+    }
+
     /// cmd-/ or the model button: the models, then the thinking levels, the current ones
-    /// checked; type a letter to jump. A pick takes effect on the next send.
+    /// checked; type a letter to jump (again to cycle). The highlight starts on the current
+    /// level, the pick changed most. A pick takes effect on the next send.
     pub fn open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.model().to_string();
         let this = cx.entity().downgrade();
         // Claude's models, then Codex's: switching between the two starts a new conversation.
         let mut entries = vec![];
-        let mut sel = 0;
-        for &m in MODELS {
+        for (i, &m) in MODELS.iter().enumerate() {
             let is_codex = codex::is_codex(Some(m));
             if is_codex && !entries.iter().any(|e| matches!(e, crate::menu::Entry::Sep)) {
                 entries.push(crate::menu::Entry::Sep);
-            }
-            if m == current {
-                sel = entries.len();
             }
             let this = this.clone();
             let item = crate::menu::item(None, model_label(m), move |_, cx| {
                 this.update(cx, |c, cx| c.set_model(m, cx)).ok();
             });
-            // The backend, where the name doesn't say it.
-            let hint = if is_codex { "Codex" } else { "" };
+            // The backend where the name doesn't say it, and the ctrl-cmd-N pick.
+            let keys = format!("⌃⌘{}", i + 1);
+            let hint = if is_codex { format!("Codex  {keys}") } else { keys };
             entries.push(item.hint(hint).checked(m == current));
         }
         entries.push(crate::menu::Entry::Sep);
         let effort = self.effort();
+        let mut sel = 0;
         for &l in self.efforts() {
+            if l == effort {
+                sel = entries.len();
+            }
             let this = this.clone();
             let item = crate::menu::item(None, effort_label(l), move |_, cx| {
                 this.update(cx, |c, cx| c.set_effort(l, cx)).ok();
             });
-            entries.push(item.hint("Thinking").checked(l == effort));
+            let hint = if matches!(l, "max" | "ultra") { "slower" } else { "" };
+            entries.push(item.hint(hint).checked(l == effort));
         }
         let b = self.model_at.get();
         let at = point(b.left(), b.top() - px(4.));
@@ -2363,7 +2376,15 @@ impl Render for Chat {
                                 .text_sm()
                                 .text_color(crate::app::faint(theme))
                                 .child("Describe a task and press enter.")
-                                .child(hint("shift-tab", "plan mode"))
+                                .child(
+                                    h_flex()
+                                        .gap_3()
+                                        .child(hint("shift-tab", "plan mode"))
+                                        // Side questions fork a claude session; codex has none.
+                                        .when(!self.codex(), |d| {
+                                            d.child(hint("cmd-shift-enter", "side question"))
+                                        }),
+                                )
                                 .child(
                                     h_flex()
                                         .gap_3()
@@ -2510,17 +2531,21 @@ impl Render for Chat {
                                             })),
                                     ))
                                     .child(
-                                        div().relative().child(
+                                        div().relative().min_w_0().child(
                                         Button::new("model")
                                             .ghost()
                                             .xsmall()
                                             .icon(IconName::Sparkles)
-                                            .label(crate::chat::model_label(self.model()))
+                                            .label(self.model_chip())
                                             .dropdown_caret(true)
+                                            // Shrinks to an ellipsis before the footer overflows.
+                                            .flex_shrink(1.)
+                                            .min_w_0()
+                                            .max_w_full()
                                             .tooltip_with_action(
                                                 match &self.reported {
-                                                    Some(r) => format!("Change model · {r}"),
-                                                    None => "Change model".into(),
+                                                    Some(r) => format!("Model and thinking · {r} · ⌘⇧. / ⌘⇧, raise or lower thinking"),
+                                                    None => "Model and thinking · ⌘⇧. / ⌘⇧, raise or lower thinking".into(),
                                                 },
                                                 &PickModel,
                                                 None,
@@ -2542,27 +2567,26 @@ impl Render for Chat {
                                         (self.model_menu.as_ref())
                                             .map(|(m, _)| crate::menu::layer(m.clone())),
                                     )
-                                    .when_some(vim_pill, |d, p| d.child(p))
-                                    .child(div().flex_1())
-                                    .child(Kbd::new(Keystroke::parse("enter").unwrap()))
-                                    .child(match (self.editing.is_some(), self.busy || self.hold) {
-                                        (true, true) => "save",
-                                        (false, true) => "queue",
-                                        _ => "send",
-                                    })
-                                    .when(self.busy && !self.hold, |d| {
-                                        d.child(Kbd::new(Keystroke::parse("cmd-enter").unwrap()))
-                                            .child("send now")
-                                    })
-                                    .when(self.busy, |d| {
-                                        d.child(Kbd::new(Keystroke::parse("ctrl-c").unwrap()))
-                                            .child("interrupt")
-                                    })
-                                    // Side questions fork a claude session; codex has none.
-                                    .when(!self.codex(), |d| {
-                                        d.child(Kbd::new(Keystroke::parse("cmd-shift-enter").unwrap()))
-                                            .child("side question")
-                                    }),
+                                    .when_some(vim_pill, |d, p| d.child(p.flex_none()))
+                                    // Idle shows no keys: enter sends. Clipped, not wrapped, when narrow.
+                                    .child(
+                                        h_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .overflow_hidden()
+                                            .justify_end()
+                                            .gap_3()
+                                            .when(self.busy || self.hold, |d| {
+                                                d.child(match self.editing {
+                                                    Some(_) => hint("enter", "save"),
+                                                    None => hint("enter", "queue"),
+                                                })
+                                            })
+                                            .when(self.busy && !self.hold, |d| {
+                                                d.child(hint("cmd-enter", "send now"))
+                                            })
+                                            .when(self.busy, |d| d.child(hint("ctrl-c", "interrupt"))),
+                                    ),
                             ),
                     ),
             )
@@ -3260,6 +3284,8 @@ exec cat >/dev/null
             chat.update(cx, |c, cx| {
                 c.meta.model = Some("opus".into());
                 assert_eq!((c.effort(), c.efforts().len()), ("high", 5));
+                let odd = |e: &str| effort_of(&ChatMeta { effort: Some(e.into()), ..c.meta.clone() });
+                assert_eq!((odd("minimal"), odd("ultra")), ("high", "max"), "never the costliest by accident");
                 assert_eq!(c.step_effort(-1, cx), "medium");
                 assert_eq!(c.step_effort(-5, cx), "low");
                 c.set_model("codex:gpt-6.1-sol", cx);

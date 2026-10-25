@@ -44,9 +44,12 @@ impl Shark {
             cx.subscribe(&chat, move |this, chat, ev: &ChatEvent, cx| match ev {
                 ChatEvent::Meta => this.save_meta(&chat, cx),
                 ChatEvent::Picked => {
-                    let (m, st) = (&chat.read(cx).meta, &mut this.state);
-                    if (&st.last_model, &st.last_effort) != (&m.model, &m.effort) {
-                        (st.last_model, st.last_effort) = (m.model.clone(), m.effort.clone());
+                    // The level the chat runs at, so an old chat with none doesn't clear it.
+                    let m = &chat.read(cx).meta;
+                    let pick = (m.model.clone(), Some(crate::chat::effort_of(m).to_string()));
+                    let st = &mut this.state;
+                    if (&st.last_model, &st.last_effort) != (&pick.0, &pick.1) {
+                        (st.last_model, st.last_effort) = pick;
                         st.save();
                     }
                 }

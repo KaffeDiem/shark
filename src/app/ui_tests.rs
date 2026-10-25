@@ -474,6 +474,15 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     });
     press(cx, &["cmd-w"]);
     cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
+    // The model button shows both; its menu opens on the level, and a letter typed again
+    // cycles the rows it starts: "h" is Haiku, then High.
+    cx.update(|cx| assert_eq!(chat.read(cx).model_chip(), "Sonnet · Extra high"));
+    press(cx, &["cmd-/"]);
+    cx.run_until_parked();
+    press(cx, &["h", "h", "enter"]);
+    assert_eq!(effort(cx).as_deref(), Some("high"));
+    assert_eq!(model(cx).as_deref(), Some("sonnet"));
+    cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
 
     press(cx, &["escape"]);
     cx.update_window(window, |_, w, cx| {

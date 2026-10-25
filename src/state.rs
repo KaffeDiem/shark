@@ -219,7 +219,9 @@ impl Workspace {
         for c in self.chats.iter_mut().chain(&mut self.closed) {
             match c.model.as_deref() {
                 None => {
-                    c.model = Some(model.into());
+                    // A claude session can't resume on codex.
+                    let claude = c.session_id.is_some() && crate::codex::is_codex(Some(model));
+                    c.model = Some(if claude { crate::chat::MODELS[0] } else { model }.into());
                     c.effort = c.effort.take().or(effort.cloned());
                 }
                 Some("codex") => c.model = Some("codex:gpt-6.1-sol".into()),
@@ -595,6 +597,13 @@ mod tests {
         assert_eq!(models(&st)[0], m("haiku", Some("max")));
         let new = st.new_chat("x".into());
         assert_eq!((new.model.as_deref(), new.effort.as_deref()), (Some("haiku"), Some("max")));
+        let mut w: Workspace = serde_json::from_str(
+            r#"{"name":"w","branch":"w","repos":[],"chats":[{"id":"a"},{"id":"b","session_id":"s"}]}"#,
+        )
+        .unwrap();
+        w.fill_models("codex:gpt-6-astra", None);
+        let picked: Vec<_> = w.chats.iter().map(|c| c.model.as_deref().unwrap()).collect();
+        assert_eq!(picked, ["codex:gpt-6-astra", "fable"], "a claude session stays on claude");
         let gone = State { last_model: Some("default".into()), ..State::default() };
         assert_eq!(gone.new_model(), "fable", "a pick no longer listed");
         fs::remove_dir_all(&dir).unwrap();
