@@ -63,8 +63,65 @@ fn boot(
     cx.update(|cx| {
         gpui_kit::init(cx);
         crate::bind_keys(cx);
+        crate::menubar::init(cx);
     });
     open(cx, options)
+}
+
+/// Every menu-bar item without an `os_action` has a handler from the current focus `at`.
+fn assert_menus_reachable(cx: &mut TestAppContext, window: AnyWindowHandle, at: &str) {
+    fn walk<'a>(items: &'a [MenuItem], out: &mut Vec<(&'a str, &'a dyn Action)>) {
+        for item in items {
+            match item {
+                MenuItem::Action {
+                    name,
+                    action,
+                    os_action: None,
+                    ..
+                } => out.push((name.as_ref(), &**action)),
+                MenuItem::Submenu(m) => walk(&m.items, out),
+                _ => {}
+            }
+        }
+    }
+    let menus = crate::menubar::menus();
+    let mut items = vec![];
+    for m in &menus {
+        walk(&m.items, &mut items);
+    }
+    cx.update_window(window, |_, w, cx| {
+        // App-level handlers (Hide, About…) aren't on the window's dispatch path. Quit's
+        // global handler is registered in `main`, which the harness skips.
+        let missing: Vec<_> = (items.iter())
+            .filter(|(_, a)| !a.as_any().is::<crate::menubar::Quit>())
+            .filter(|(_, a)| !w.is_action_available(*a, cx) && !cx.is_action_available(*a))
+            .map(|(name, _)| *name)
+            .collect();
+        assert!(missing.is_empty(), "unreachable from {at}: {missing:?}");
+    })
+    .unwrap();
+}
+
+/// Shark > About Shark opens the About dialog.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn about_dialog(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, _) = boot(cx, State::default(), WindowOptions::default());
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        w.activate_window(); // About's global handler targets the active window
+        w.dispatch_action(Box::new(crate::menubar::About), cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.has_active_dialog(cx), "About opens a dialog");
+    })
+    .unwrap();
 }
 
 fn open(cx: &mut TestAppContext, options: WindowOptions) -> (AnyWindowHandle, Entity<Shark>) {
@@ -173,6 +230,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         .unwrap();
     let chat = cx.update(|cx| shark.read(cx).chats["ui-x"].clone());
     cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
+    assert_menus_reachable(cx, window, "composer");
 
     // Stay awake: caffeinate runs only while the setting is on and an agent works.
     let busy = |cx: &mut TestAppContext, on: bool| {
@@ -276,6 +334,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         )
     })
     .unwrap();
+    assert_menus_reachable(cx, window, "sidebar");
     press(cx, &["space", "d"]);
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Diff));
     press(cx, &["space", "c"]);
@@ -372,6 +431,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     })
     .await;
     assert_eq!(fs::read_to_string(&file).unwrap(), "zx\ny\n");
+    assert_menus_reachable(cx, window, "editor");
 
     // Vim keys: normal mode edits, never inserts; the toggle survives a restart.
     press(cx, &["ctrl-cmd-v"]);
@@ -771,6 +831,290 @@ async fn add_repo_and_restore(cx: &mut TestAppContext) {
     .await;
     assert!(!ws_dir.exists());
     fs::remove_dir_all(&home).ok();
+}
+
+/// Tabs that outgrow the header scroll; a new or selected tab is scrolled into view.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn many_tabs_scroll(cx: &mut TestAppContext) {
+    use std::cmp::Ordering;
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(1000.), px(700.)),
+            ))),
+            ..Default::default()
+        },
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace("tabs".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    for _ in 0..20 {
+        on(cx, &|s, w, cx| s.new_chat(w, cx));
+    }
+    let hidden = |cx: &mut TestAppContext, ix: usize| cx.update(|cx| shark.read(cx).tab_hidden(ix));
+    cx.update(|cx| assert_eq!(shark.read(cx).active_ws().unwrap().active_chat, 20));
+    assert_eq!(hidden(cx, 20), Ordering::Equal, "the new tab is in view");
+    assert_eq!(hidden(cx, 0), Ordering::Less, "the first scrolled off");
+    on(cx, &|s, w, cx| s.select_chat(0, w, cx));
+    assert_eq!(hidden(cx, 0), Ordering::Equal);
+    assert_eq!(hidden(cx, 20), Ordering::Greater);
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Images and videos in the diff: before/after previews, made lazily for rows on screen,
+/// downscaled when big or not decodable by gpui, kept across refreshes.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn media_in_diff(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let src = &repos[0].path;
+    let icon = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets/icon.png");
+    let icon_size = imagesize::size(&icon).unwrap();
+    fs::copy(&icon, src.join("a.png")).unwrap();
+    fs::copy(&icon, src.join("del.png")).unwrap();
+    git::git(src, &["add", "."]).unwrap();
+    git::git(
+        src,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "media",
+        ],
+    )
+    .unwrap();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos,
+            ..Default::default()
+        },
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(1440.), px(900.)),
+            ))),
+            ..Default::default()
+        },
+    );
+    let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace("media".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let api = home.join("shark/workspaces/media/api");
+    let sips = |args: &[&str]| {
+        let ok = std::process::Command::new("sips")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(ok.status.success(), "sips {args:?}");
+    };
+    let p = |name: &str| api.join(name).to_string_lossy().to_string();
+    sips(&["-z", "64", "64", &p("a.png")]);
+    fs::remove_file(api.join("del.png")).unwrap();
+    sips(&[
+        "-z",
+        "3000",
+        "3000",
+        &icon.to_string_lossy(),
+        "--out",
+        &p("big.png"),
+    ]);
+    sips(&[
+        "-s",
+        "format",
+        "heic",
+        &icon.to_string_lossy(),
+        "--out",
+        &p("new.heic"),
+    ]);
+    let ffmpeg = std::process::Command::new("ffmpeg")
+        .args([
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc=size=640x360:rate=30",
+        ])
+        .args(["-t", "1", "-pix_fmt", "yuv420p", &p("clip.mp4")])
+        .status()
+        .is_ok_and(|s| s.success());
+    fs::write(api.join("notes.txt"), "text\n").unwrap();
+    fs::write(
+        api.join("wide.svg"),
+        r#"<svg xmlns="http://www.w3.org/2000/svg" width="8000" height="4000"><rect width="8000" height="4000" fill="teal"/></svg>"#,
+    )
+    .unwrap();
+    fs::write(api.join("empty.png"), "").unwrap();
+    fs::write(
+        api.join("lfs.png"),
+        "version https://git-lfs.github.com/spec/v1\noid sha256:00\nsize 1\n",
+    )
+    .unwrap();
+    sips(&[
+        "-z",
+        "500",
+        "500",
+        &icon.to_string_lossy(),
+        "--out",
+        &p("race.png"),
+    ]);
+    on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+    on(cx, &|s, _, cx| s.refresh_diff(cx));
+    let n = if ffmpeg { 10 } else { 9 };
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).diff_files.len() == n
+    })
+    .await;
+    let view = |cx: &mut TestAppContext, path: &str| {
+        cx.update(|cx| {
+            let s = shark.read(cx);
+            assert_eq!(s.media.len(), n - 1, "every file but notes.txt");
+            (s.media.iter().find(|(p, _)| p == path))
+                .unwrap_or_else(|| panic!("no media row for {path}"))
+                .1
+                .clone()
+        })
+    };
+    // Rows load as they come on screen: the first does, the last (new.heic) waits.
+    let first = view(cx, "api/a.png");
+    cx.wait_for(window, Duration::from_secs(20), |_, cx| {
+        first.read(cx).ready()
+    })
+    .await;
+    cx.update(|cx| assert!(!view_started(&shark, "api/new.heic", cx)));
+    let t = Instant::now();
+    for _ in 0..20 {
+        cx.update_window(window, |_, w, cx| w.render_frame(cx))
+            .unwrap();
+    }
+    let frame_ms = t.elapsed().as_secs_f64() * 1000. / 20.;
+    println!("diff frame with media rows: {frame_ms:.2} ms");
+    assert!(frame_ms < 50., "frame {frame_ms:.1} ms");
+    // Rewritten after the diff ran, before its row loads: not cached under the old hash.
+    sips(&["-z", "16", "16", &p("race.png")]);
+    for path in [
+        "api/big.png",
+        "api/clip.mp4",
+        "api/del.png",
+        "api/empty.png",
+        "api/lfs.png",
+        "api/new.heic",
+        "api/race.png",
+        "api/wide.svg",
+    ] {
+        if path.ends_with(".mp4") && !ffmpeg {
+            continue;
+        }
+        on(cx, &|s, _, cx| {
+            s.diff.update(cx, |d, cx| d.scroll_to_file(path, cx))
+        });
+        cx.wait_for(window, Duration::from_secs(20), |_, cx| {
+            view_ready(&shark, path, cx)
+        })
+        .await;
+    }
+    let shown = |cx: &mut TestAppContext, path: &str, side: usize| {
+        let v = view(cx, path);
+        cx.update(|cx| v.read(cx).shown(side))
+    };
+    let failed = |cx: &mut TestAppContext, path: &str| {
+        let v = view(cx, path);
+        cx.update(|cx| v.read(cx).failed(1))
+    };
+    assert_eq!(failed(cx, "api/empty.png").as_deref(), Some("empty file"));
+    assert!(failed(cx, "api/lfs.png").is_some_and(|e| e.contains("LFS")));
+    let race = failed(cx, "api/race.png");
+    assert!(
+        race.as_deref()
+            .is_some_and(|e| e.contains("changed on disk")),
+        "{race:?}"
+    );
+    let size = |p: &Option<PathBuf>| {
+        imagesize::size(p.as_ref().unwrap())
+            .map(|s| (s.width, s.height))
+            .unwrap()
+    };
+    // Small PNGs are drawn as they are; both sides are byte-exact copies named by blob hash.
+    let (old, old_size) = shown(cx, "api/a.png", 0).unwrap();
+    assert_eq!(old_size, Some((icon_size.width, icon_size.height)));
+    assert_eq!(fs::read(old.unwrap()).unwrap(), fs::read(&icon).unwrap());
+    assert_eq!(shown(cx, "api/a.png", 1).unwrap().1, Some((64, 64)));
+    // Big ones are downscaled, HEIC converted.
+    let (img, big) = shown(cx, "api/big.png", 1).unwrap();
+    assert_eq!(big, Some((3000, 3000)));
+    assert!(
+        img.as_ref()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".preview.png")
+    );
+    assert_eq!(size(&img), (1200, 1200));
+    // A big SVG is drawn down to 1200 px, keeping its shape.
+    let (svg, svg_size) = shown(cx, "api/wide.svg", 1).unwrap();
+    assert_eq!(svg_size, Some((8000, 4000)));
+    assert_eq!(size(&svg), (1200, 600));
+    let (heic, _) = shown(cx, "api/new.heic", 1).unwrap();
+    assert!(
+        heic.as_ref()
+            .unwrap()
+            .to_string_lossy()
+            .ends_with(".preview.png")
+    );
+    assert!(shown(cx, "api/new.heic", 0).is_none(), "added: no before");
+    assert!(shown(cx, "api/del.png", 1).is_none(), "deleted: no after");
+    assert!(shown(cx, "api/del.png", 0).is_some());
+    // Quick Look may not make posters (no window server); the tile then shows without one.
+    if ffmpeg && let (Some(poster), _) = shown(cx, "api/clip.mp4", 1).unwrap() {
+        let (w, h) = size(&Some(poster));
+        assert!(w > h && w <= 1200, "16:9 poster frame, {w}x{h}");
+    }
+    // A refresh keeps the rows of unchanged files; a changed file gets a new one.
+    sips(&["-z", "32", "32", &p("a.png")]);
+    on(cx, &|s, _, cx| s.refresh_diff(cx));
+    cx.run_until_parked();
+    assert!(view(cx, "api/big.png") == view(cx, "api/big.png"));
+    let again = view(cx, "api/a.png");
+    assert!(again != first, "a.png changed");
+    fs::remove_dir_all(&home).ok();
+}
+
+fn view_started(shark: &Entity<Shark>, path: &str, cx: &App) -> bool {
+    let s = shark.read(cx);
+    s.media
+        .iter()
+        .any(|(p, v)| p == path && v.read(cx).started())
+}
+
+fn view_ready(shark: &Entity<Shark>, path: &str, cx: &App) -> bool {
+    let s = shark.read(cx);
+    s.media.iter().any(|(p, v)| p == path && v.read(cx).ready())
 }
 
 /// Times the hot paths on a big change: 2000 changed files and a 50K-line file.

@@ -35,6 +35,7 @@ use std::sync::Arc;
 mod chats;
 mod diff;
 mod editor_pane;
+mod media;
 mod menus;
 mod palette;
 mod picker;
@@ -187,6 +188,8 @@ pub struct Shark {
     tree_focus: FocusHandle,
     tree_scroll: UniformListScrollHandle,
     sidebar_scroll: ScrollHandle,
+    /// The chat tab strip, which scrolls sideways once the tabs outgrow the header.
+    tab_scroll: ScrollHandle,
     /// Workspaces whose worktrees are being removed in the background.
     pub(crate) archiving: HashSet<String>,
     show_tree: bool,
@@ -198,6 +201,11 @@ pub struct Shark {
     editor_header: (bool, bool, &'static str, String),
     _editor_subs: Vec<Subscription>,
     review: review::Review,
+    /// The before/after row of each image or video in the diff, by path.
+    media: Vec<(SharedString, Entity<media::MediaView>)>,
+    media_cache: Entity<media::Lru>,
+    /// The diff pane's width: media rows fit it, not the diff's longest line.
+    media_width: Rc<std::cell::Cell<Pixels>>,
     pub(crate) syncs: HashMap<String, Entity<GitSync>>,
     sidebar_focus: FocusHandle,
     pub(crate) attn: crate::attention::Attention,
@@ -214,6 +222,9 @@ impl Shark {
         let sidebar_focus = cx.focus_handle();
         sidebar_focus.focus(window, cx);
         cx.defer_in(window, |s, window, cx| s.restore_last_open(window, cx));
+        cx.background_executor()
+            .spawn(async { media::prune_cache() })
+            .detach();
         let _subs = vec![
             cx.observe_window_appearance(window, |s, _, cx| {
                 if s.state.appearance.mode == crate::state::Mode::System {
@@ -248,6 +259,7 @@ impl Shark {
             tree_focus: cx.focus_handle(),
             tree_scroll: UniformListScrollHandle::new(),
             sidebar_scroll: ScrollHandle::new(),
+            tab_scroll: ScrollHandle::new(),
             archiving: HashSet::new(),
             show_tree: true,
             rail: false,
@@ -256,6 +268,9 @@ impl Shark {
             editor_header: Default::default(),
             _editor_subs: vec![],
             review: Default::default(),
+            media: vec![],
+            media_cache: media::Lru::new(cx),
+            media_width: Rc::default(),
             syncs: HashMap::new(),
             sidebar_focus,
             attn: crate::attention::Attention::new(cx),
@@ -711,6 +726,9 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &ApprovePlan, w, cx| {
                 this.with_plan(w, cx, |c, w, cx| c.approve_plan(w, cx))
             }))
+            .on_action(cx.listener(|this, _: &BuildPlanInNewChat, w, cx| {
+                this.build_plan_in_new_chat(w, cx)
+            }))
             .on_action(cx.listener(|this, _: &RevealInFinder, w, cx| {
                 this.with_target(w, cx, |ws, _, cx| cx.reveal_path(&ws.dir()))
             }))
@@ -753,6 +771,12 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &ToggleFileTree, w, cx| this.toggle_tree(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleVim, w, cx| this.toggle_vim(w, cx)))
             .on_action(cx.listener(|this, _: &CloseFile, w, cx| this.close_file(w, cx)))
+            // On the root, not the editor, so File > Save works with focus in the tree.
+            .on_action(cx.listener(|this, _: &SaveFile, w, cx| {
+                if let Some(e) = this.editor.clone() {
+                    e.update(cx, |e, cx| e.save(false, w, cx))
+                }
+            }))
             // `o` in the diff and the tree.
             .on_action(cx.listener(|this, _: &OpenFile, w, cx| {
                 if let Some(ix) = this.cursor_file(w, cx) {

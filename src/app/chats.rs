@@ -1,5 +1,14 @@
 //! Chat tabs of the open workspace, and the agent status in the header.
 use super::*;
+use std::cmp::Ordering;
+
+/// The accent dot on a tab or edge arrow: a finished turn you haven't looked at yet.
+fn dot(inset: f32, theme: &Theme) -> Div {
+    (div().absolute().top(px(inset)).right(px(inset)))
+        .size(px(6.))
+        .rounded_full()
+        .bg(theme.primary)
+}
 
 impl Shark {
     /// The chat entity for `meta`, started (transcript replayed) on first use.
@@ -77,6 +86,9 @@ impl Shark {
         let ws = self.active_ws().cloned().unwrap();
         let chat = self.ensure_chat(&ws, &meta, window, cx);
         self.unread.remove(&meta.id);
+        // Scrolled at the next layout; render again then so the edge arrows see where it landed.
+        self.tab_scroll.scroll_to_item(ix);
+        cx.on_next_frame(window, |_, _, cx| cx.notify());
         if let Some(sync) = self.syncs.get(&ws.name) {
             sync.update(cx, |g, cx| g.set_chat(chat.clone(), cx));
         }
@@ -313,6 +325,27 @@ impl Shark {
         chat.update(cx, |c, cx| f(c, window, cx));
     }
 
+    /// Approves the shown chat's plan and builds it in a new chat that gets only the plan, so
+    /// the planning back-and-forth stays behind.
+    pub(super) fn build_plan_in_new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(from) = self.active_chat().cloned() else {
+            return notify_err(window, cx, "Open a workspace first");
+        };
+        let Some(plan) = (from.read(cx).plan.read(cx).latest()).map(|v| v.text.clone()) else {
+            return notify_err(window, cx, "No plan yet; the agent submits one in plan mode");
+        };
+        self.new_chat(window, cx);
+        let Some(to) = self.active_chat().cloned().filter(|c| *c != from) else {
+            return;
+        };
+        if self.tab != Tab::Chat {
+            self.show(Tab::Chat, window, cx);
+        }
+        if to.update(cx, |c, cx| c.build_plan(&plan, window, cx)) {
+            from.update(cx, |c, cx| c.plan_approved(cx));
+        }
+    }
+
     /// The no-menu fast path, so confirm the switch in a toast.
     pub(super) fn set_model(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(chat), Some(m)) = (self.active_chat().cloned(), MODELS.get(ix)) else {
@@ -322,14 +355,79 @@ impl Shark {
         window.push_notification(format!("Model: {m} (from the next message)"), cx);
     }
 
+    /// Where tab `ix` sits against the tab strip as of the last layout: `Less` hidden (partly
+    /// counts) past the left edge, `Greater` past the right, `Equal` in view.
+    pub(super) fn tab_hidden(&self, ix: usize) -> Ordering {
+        let Some(b) = self.tab_scroll.bounds_for_item(ix) else {
+            return Ordering::Equal;
+        };
+        let (view, x) = (self.tab_scroll.bounds(), self.tab_scroll.offset().x);
+        if b.left() + x < view.left() - px(1.) {
+            Ordering::Less
+        } else if b.right() + x > view.right() + px(1.) {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        }
+    }
+
+    /// An arrow at an edge of the tab strip while tabs hide past it, dotted when one of them
+    /// finished a turn unseen; clicking brings that one (else the nearest hidden tab) into view.
+    fn tab_edge(
+        &self,
+        edge: Ordering,
+        ws: &Workspace,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let mut hidden: Vec<usize> = (0..ws.chats.len())
+            .filter(|&ix| self.tab_hidden(ix) == edge)
+            .collect();
+        if edge == Ordering::Less {
+            hidden.reverse(); // nearest first
+        }
+        let unread: Vec<usize> = (hidden.iter().copied())
+            .filter(|&ix| self.unread.contains(&ws.chats[ix].id))
+            .collect();
+        let to = *unread.first().or(hidden.first())?;
+        let theme = cx.theme();
+        let (id, icon) = match edge {
+            Ordering::Less => ("tabs-left", IconName::ChevronLeft),
+            _ => ("tabs-right", IconName::ChevronRight),
+        };
+        let tip = match unread.len() {
+            0 => format!("{} more", hidden.len()),
+            n => format!("{} more · {n} finished", hidden.len()),
+        };
+        Some(
+            div()
+                .relative()
+                .flex_none()
+                .child(
+                    Button::new(id)
+                        .ghost()
+                        .xsmall()
+                        .icon(icon)
+                        .tooltip(tip)
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.tab_scroll.scroll_to_item(to);
+                            cx.on_next_frame(window, |_, _, cx| cx.notify());
+                            cx.notify();
+                        })),
+                )
+                .when(!unread.is_empty(), |d| d.child(dot(2., theme)))
+                .into_any_element(),
+        )
+    }
+
     /// One pill per chat, like the Diff and file tabs; a single chat reads "Chat" as before.
+    /// Too many to fit, and the strip scrolls sideways between edge arrows.
     pub(super) fn render_chat_tabs(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let Some(ws) = self.active_ws() else {
             return vec![];
         };
         let theme = cx.theme();
         let many = ws.chats.len() > 1;
-        let mut tabs: Vec<AnyElement> = (ws.chats.iter().enumerate())
+        let pills: Vec<AnyElement> = (ws.chats.iter().enumerate())
             .map(|(ix, meta)| {
                 let chat = self.chats.get(&meta.id).map(|c| c.read(cx));
                 let on = ix == ws.active_chat && self.tab == Tab::Chat;
@@ -352,21 +450,11 @@ impl Shark {
                     (false, unread) => div()
                         .relative()
                         .child(Icon::new(IconName::MessageSquare).with_size(px(14.)))
-                        // A finished turn you haven't looked at yet.
-                        .when(unread, |d| {
-                            d.child(
-                                div()
-                                    .absolute()
-                                    .top(px(-2.))
-                                    .right(px(-2.))
-                                    .size(px(6.))
-                                    .rounded_full()
-                                    .bg(theme.primary),
-                            )
-                        })
+                        .when(unread, |d| d.child(dot(-2., theme)))
                         .into_any_element(),
                 };
                 pill(format!("chat-tab-{}", meta.id), on, theme)
+                    .flex_none()
                     .pl_2p5()
                     .when(!(many && current), |d| d.pr_2p5())
                     .when(many && current, |d| d.pr_1())
@@ -391,6 +479,18 @@ impl Shark {
                     })
                     .into_any_element()
             })
+            .collect();
+        let strip = h_flex()
+            .id("chat-tabs")
+            .min_w_0()
+            .gap_1()
+            .overflow_x_scroll()
+            .track_scroll(&self.tab_scroll)
+            .children(pills)
+            .into_any_element();
+        let mut tabs: Vec<AnyElement> = (self.tab_edge(Ordering::Less, ws, cx).into_iter())
+            .chain([strip])
+            .chain(self.tab_edge(Ordering::Greater, ws, cx))
             .collect();
         tabs.push(
             Button::new("new-chat")

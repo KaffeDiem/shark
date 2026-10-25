@@ -188,6 +188,8 @@ pub struct Chat {
     /// Plan versions and the pane that shows them, next to the transcript while `plan_open`.
     pub plan: Entity<PlanPane>,
     pub plan_open: bool,
+    /// Files from Finder being dragged over the pane.
+    dropping: Option<Vec<PathBuf>>,
     _subs: Vec<Subscription>,
 }
 
@@ -202,6 +204,8 @@ const ENTER_PLAN: &str = "Only the user turns plan mode on in this app (shift-ta
 const NEEDS_APPROVAL: &str = "This needs the user's approval, which this app can't ask for. Do \
     without it, or tell the user what to run.";
 const APPROVED: &str = "I approve the plan. Plan mode is off: implement it now.";
+const BUILD_FRESH: &str = "Implement this plan. It was made and approved in another chat, so you \
+    have none of that chat's context: read the code it touches before you change it.";
 
 /// How long an interrupt may take before the process is stopped instead.
 const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -361,6 +365,7 @@ impl Chat {
             side: None,
             reported: None,
             plan_open,
+            dropping: None,
             plan,
             _subs: vec![_sub],
         };
@@ -526,13 +531,28 @@ impl Chat {
             let was = self.meta.plan;
             self.set_plan_mode(false, cx);
             if self.ask(APPROVED, window, cx) {
-                self.plan.update(cx, |p, cx| p.approve(cx));
+                self.plan_approved(cx);
+                self.focus_composer(window, cx);
             } else {
                 self.set_plan_mode(was, cx);
             }
             return;
         };
         self.push(Block::Info(why.into()), cx);
+    }
+
+    /// Marks the latest plan approved and closes the pane: there is nothing left to review.
+    pub fn plan_approved(&mut self, cx: &mut Context<Self>) {
+        self.plan.update(cx, |p, cx| p.approve(cx));
+        self.plan_open = false;
+        cx.notify();
+    }
+
+    /// The first message of a chat that builds another chat's plan: the plan and nothing else,
+    /// titled after the plan.
+    pub fn build_plan(&mut self, plan: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        self.meta.title = title_of(&plan::title(plan));
+        self.ask(&format!("{BUILD_FRESH}\n\n{plan}"), window, cx)
     }
 
     /// `space l v`: shows the plan pane and focuses it, or hides it.
@@ -1709,6 +1729,7 @@ impl Render for Chat {
         .py_2();
         let drop_bg = theme.drop_target;
         let accent = theme.drag_border;
+        let (bg, fg) = (theme.background.opacity(0.85), theme.foreground);
         let main = v_flex()
             .id("chat-pane")
             .group("chat-pane")
@@ -1718,9 +1739,40 @@ impl Render for Chat {
                 this.focus_composer(window, cx)
             }))
             // Files from Finder anywhere on the pane are copied in and mentioned in the composer.
-            .on_drop(cx.listener(|this, p: &ExternalPaths, window, cx| {
-                this.attach(p.paths().to_vec(), None, window, cx)
+            // Not `drag_over`/`on_drop`: gpui checks hover for those, and hover is off while the
+            // last input was a key (a file drag doesn't count as the mouse), so a drag right
+            // after typing showed nothing and dropped nothing.
+            .on_drag_move(cx.listener(|this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
+                let over = (e.bounds.contains(&e.event.position)).then(|| e.drag(cx).paths().to_vec());
+                if over.is_some() != this.dropping.is_some() {
+                    cx.notify();
+                }
+                this.dropping = over;
             }))
+            .on_file_drop_exit(cx.listener(|this, _, _, cx| {
+                this.dropping = None;
+                cx.notify();
+            }))
+            .child({
+                let chat = cx.entity().downgrade();
+                canvas(|_, _, _| {}, move |_, _, window, _| {
+                    let chat = chat.clone();
+                    window.on_mouse_event(move |_: &MouseUpEvent, phase, window, cx| {
+                        if phase != DispatchPhase::Bubble {
+                            return;
+                        }
+                        chat.update(cx, |this, cx| {
+                            if let Some(paths) = this.dropping.take() {
+                                this.attach(paths, None, window, cx);
+                                cx.notify();
+                            }
+                        })
+                        .ok();
+                    });
+                })
+                .absolute()
+                .size_0()
+            })
             .child(
                 div()
                     .id("transcript")
@@ -1899,24 +1951,42 @@ impl Render for Chat {
                             ),
                     ),
             )
-            // No hitbox, so it never takes the drop or the mouse; shown only while files hover.
-            .child(
-                div()
+            // No hitbox, so it never takes the drop or the mouse. A drag that ends elsewhere
+            // leaves no active drag, so a missed exit can't leave it up.
+            .when(self.dropping.is_some() && cx.has_active_drag(), |d| d.child(
+                v_flex()
                     .absolute()
                     .inset_2()
-                    .invisible()
-                    .group_drag_over::<ExternalPaths>("chat-pane", |s| s.visible())
-                    .flex()
                     .items_center()
                     .justify_center()
+                    .gap_1()
                     .rounded(radius)
                     .border_2()
                     .border_dashed()
                     .border_color(accent)
-                    .bg(drop_bg)
-                    .text_color(muted)
-                    .child("Drop to attach"),
-            );
+                    .bg(bg)
+                    // The theme's drop tint over a faded transcript.
+                    .child(div().absolute().inset_0().rounded(radius).bg(drop_bg))
+                    .child(
+                        Icon::new(IconName::Paperclip)
+                            .with_size(px(32.))
+                            .text_color(accent)
+                            .mb_2(),
+                    )
+                    .child(
+                        div()
+                            .text_base()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg)
+                            .child("Drop to attach"),
+                    )
+                    .child(
+                        div()
+                            .text_sm()
+                            .text_color(muted)
+                            .child("Files and images are added to your message"),
+                    ),
+            ));
         if !self.plan_open {
             return main.into_any_element();
         }
@@ -2268,8 +2338,18 @@ exec cat >/dev/null
         cx.update(|cx| {
             let c = chat.read(cx);
             assert!(!c.meta.plan, "approving ends plan mode");
+            assert!(!c.plan_open, "and closes the plan pane");
             assert_eq!(c.plan.read(cx).approved, Some(1));
             assert!(matches!(c.blocks.last(), Some(Block::User(t, _)) if t == APPROVED));
+        });
+        act(cx, &|w, cx| {
+            chat.update(cx, |c, cx| {
+                c.busy = false;
+                assert!(c.build_plan("# Cache\n\nUse an LRU map.\n", w, cx));
+                assert_eq!(c.meta.title, "Cache", "titled after the plan, not the preamble");
+                let want = format!("{BUILD_FRESH}\n\n# Cache\n\nUse an LRU map.\n");
+                assert!(matches!(c.blocks.last(), Some(Block::User(t, _)) if *t == want));
+            })
         });
         cx.update(|cx| chat.update(cx, |c, _| c.agent = None));
         let _ = std::fs::remove_file(super::plan::tests_store_path(&ws.name));
@@ -2789,13 +2869,27 @@ exec cat >/dev/null
             let size = w.viewport_size();
             let position = point(size.width / 2., size.height / 2.);
             let paths = ExternalPaths(vec![shot.clone()].into());
+            // After a key the drag still shows the overlay: gpui's hover styles wouldn't.
+            w.dispatch_keystroke(Keystroke::parse("a").unwrap(), cx);
             w.dispatch_event(
                 FileDropEvent::Entered { position, paths }.to_platform_input(),
                 cx,
             );
+            w.dispatch_event(FileDropEvent::Pending { position }.to_platform_input(), cx);
+        })
+        .unwrap();
+        cx.update(|cx| {
+            assert!(
+                chat.read(cx).dropping.is_some(),
+                "overlay while files hover"
+            )
+        });
+        cx.update_window(window, |_, w, cx| {
+            let position = point(w.viewport_size().width / 2., w.viewport_size().height / 2.);
             w.dispatch_event(FileDropEvent::Submit { position }.to_platform_input(), cx);
         })
         .unwrap();
+        cx.update(|cx| assert!(chat.read(cx).dropping.is_none(), "gone after the drop"));
         cx.run_until_parked();
         cx.update(|cx| {
             let c = chat.read(cx).composer.read(cx);

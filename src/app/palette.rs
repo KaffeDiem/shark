@@ -233,6 +233,9 @@ pub(super) const COMMANDS: &[(&str, IconName, Cmd)] = &[
     ("Approve plan and build", IconName::Hammer, |s, w, cx| {
         s.with_plan(w, cx, |c, w, cx| c.approve_plan(w, cx))
     }),
+    ("Approve plan and build in a new chat", IconName::Hammer, |s, w, cx| {
+        s.build_plan_in_new_chat(w, cx)
+    }),
     (
         "Next workspace needing attention",
         IconName::CircleAlert,
@@ -240,6 +243,9 @@ pub(super) const COMMANDS: &[(&str, IconName, Cmd)] = &[
     ),
     ("Settings…", IconName::Settings, |s, w, cx| {
         crate::settings::open(&s.state, w, cx)
+    }),
+    ("About Shark", IconName::Info, |_, w, cx| {
+        crate::settings::about(w, cx)
     }),
 ];
 

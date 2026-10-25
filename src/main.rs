@@ -10,6 +10,7 @@ mod editor;
 mod files;
 mod git;
 mod menu;
+mod menubar;
 mod plan;
 mod pr;
 mod prompts;
@@ -110,6 +111,7 @@ actions!(
         TogglePlanMode,
         TogglePlan,
         ApprovePlan,
+        BuildPlanInNewChat,
         PlanOlder,
         PlanNewer,
         TogglePlanChanges
@@ -117,7 +119,7 @@ actions!(
 );
 
 // Editor and diff review: `space f f`, and `c` / `shift-c` in the diff.
-actions!(shark, [OpenAnyFile, AddComment, SendComments]);
+actions!(shark, [OpenAnyFile, AddComment, SendComments, PlayMedia]);
 
 /// Switch the open workspace to `chat::MODELS[n]` without opening the menu.
 #[derive(Clone, PartialEq, Debug, serde::Deserialize, Action)]
@@ -261,6 +263,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("{", PrevFile, Some("DiffPane")),
         KeyBinding::new("s", ToggleDiffMode, Some("DiffPane")),
         KeyBinding::new("r", RefreshDiff, Some("DiffPane")),
+        KeyBinding::new("p", PlayMedia, Some("DiffPane")),
         KeyBinding::new("space f f", OpenAnyFile, Some(NAV)),
         KeyBinding::new("cmd-p", OpenAnyFile, None),
         KeyBinding::new("c", AddComment, Some("DiffPane")),
@@ -273,6 +276,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("space l l", TogglePlanMode, Some(NAV)),
         KeyBinding::new("space l v", TogglePlan, Some(NAV)),
         KeyBinding::new("space l a", ApprovePlan, Some(NAV)),
+        KeyBinding::new("space l n", BuildPlanInNewChat, Some(NAV)),
         KeyBinding::new("j", SelectNext, Some("PlanPane")),
         KeyBinding::new("k", SelectPrev, Some("PlanPane")),
         KeyBinding::new("g g", SelectFirst, Some("PlanPane")),
@@ -285,6 +289,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("l", PlanNewer, Some("PlanPane")),
         KeyBinding::new("d", TogglePlanChanges, Some("PlanPane")),
         KeyBinding::new("a", ApprovePlan, Some("PlanPane")),
+        KeyBinding::new("n", BuildPlanInNewChat, Some("PlanPane")),
         KeyBinding::new("i", FocusComposer, Some("PlanPane")),
         KeyBinding::new("shift-c", SendComments, Some("DiffPane")),
     ]);
@@ -356,15 +361,29 @@ fn main() {
             gpui_kit::init(cx);
             install_fonts(cx);
             bind_keys(cx);
+            menubar::init(cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
                 titlebar: Some(TitleBar::title_bar_options()),
                 ..Default::default()
             };
-            open_window(options, cx, |window, cx| {
+            let (window, shark) = open_window(options, cx, |window, cx| {
                 cx.new(|cx| app::Shark::new(window, cx))
             })
             .unwrap();
+            // Global, not on Shark's root: an open dialog isn't inside Shark, and quitting
+            // from it must still confirm unsaved edits. Deferred, like `menubar::in_window`.
+            let shark = shark.downgrade();
+            cx.on_action(move |_: &menubar::Quit, cx| {
+                let shark = shark.clone();
+                cx.defer(move |cx| {
+                    let asked =
+                        window.update(cx, |_, w, cx| shark.update(cx, |s, cx| s.quit(w, cx)));
+                    if !matches!(asked, Ok(Ok(()))) {
+                        cx.quit()
+                    }
+                });
+            });
             cx.activate(true);
         });
 }
