@@ -631,6 +631,11 @@ impl Chat {
                 })
                 .await;
             this.update_in(cx, |c, window, cx| {
+                // The user may have selected text while it copied; insert beside it, not over it.
+                c.composer.update(cx, |c, cx| {
+                    let at = c.cursor();
+                    c.set_selected_range(at..at, cx)
+                });
                 for r in done {
                     match r {
                         Ok(p) => {

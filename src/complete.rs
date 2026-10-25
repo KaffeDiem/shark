@@ -8,6 +8,7 @@ use std::{
     ops::Range,
     path::{Path, PathBuf},
     process::{Command, Stdio},
+    sync::atomic::{AtomicUsize, Ordering},
     sync::mpsc,
     time::Duration,
 };
@@ -105,6 +106,12 @@ pub fn attach(ws: &Path, src: &Path) -> Result<String, String> {
     // ponytail: outside folders aren't copied (size, nested .git); the agent can read them in place
     if src.is_dir() || src.starts_with(&root) {
         let shown = src.strip_prefix(&root).unwrap_or(&src);
+        // The workspace itself is `./`; a bare `/` would be the filesystem root.
+        let shown = if shown.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            shown
+        };
         let slash = if src.is_dir() { "/" } else { "" };
         return Ok(format!("{}{slash}", shown.display()));
     }
@@ -112,19 +119,24 @@ pub fn attach(ws: &Path, src: &Path) -> Result<String, String> {
     let ext = src.extension().unwrap_or_default().to_string_lossy();
     // Claude can't read HEIC, and a bad image block can break the session; sips ships with macOS.
     if ext.eq_ignore_ascii_case("heic") || ext.eq_ignore_ascii_case("heif") {
-        let stem = src.file_stem().unwrap_or_default().to_string_lossy();
-        let (dest, _) = slot(ws, &format!("{stem}.jpg"), |_| false).map_err(err)?;
+        static N: AtomicUsize = AtomicUsize::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        // Converted to a temp file first, so the same HEIC dropped twice dedupes by JPEG bytes.
+        let tmp = std::env::temp_dir().join(format!("shark-heic-{}-{n}.jpg", std::process::id()));
         let ok = Command::new("sips")
             .args(["-s", "format", "jpeg"])
             .arg(&src)
             .arg("--out")
-            .arg(&dest)
+            .arg(&tmp)
             .output()
             .is_ok_and(|o| o.status.success());
-        if !ok {
+        let jpg = std::fs::read(&tmp);
+        let _ = std::fs::remove_file(&tmp);
+        let (true, Ok(jpg)) = (ok, jpg) else {
             return Err(format!("{}: couldn't convert to JPEG", src.display()));
-        }
-        return Ok(rel(&dest));
+        };
+        let stem = src.file_stem().unwrap_or_default().to_string_lossy();
+        return attach_bytes(ws, &format!("{stem}.jpg"), &jpg);
     }
     // Right away: screenshots dragged from the floating thumbnail are deleted within seconds.
     std::fs::read(&src)
@@ -149,7 +161,7 @@ fn rel(dest: &Path) -> String {
 }
 
 /// The attachment path for `name`: an existing file `same` accepts, else the first free one of
-/// `name`, `name (1)`, … like Finder. `true` when it already exists.
+/// `name`, `name (1)`, … like Finder, created empty. `true` when it already exists.
 fn slot(ws: &Path, name: &str, same: impl Fn(&Path) -> bool) -> std::io::Result<(PathBuf, bool)> {
     let dir = ws.join(ATTACHMENTS);
     std::fs::create_dir_all(&dir)?;
@@ -174,11 +186,13 @@ fn slot(ws: &Path, name: &str, same: impl Fn(&Path) -> bool) -> std::io::Result<
             0 => dir.join(&name),
             _ => dir.join(format!("{stem} ({n}){ext}")),
         };
-        if !cand.exists() {
-            return Ok((cand, false));
-        }
-        if same(&cand) {
-            return Ok((cand, true));
+        // create_new reserves the name, so two drops at once can't both pick it and overwrite.
+        match std::fs::File::create_new(&cand) {
+            Ok(_) => return Ok((cand, false)),
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e),
+            // A copy still being written reads as different, so it's never wrongly reused.
+            Err(_) if same(&cand) => return Ok((cand, true)),
+            Err(_) => {}
         }
     }
     unreachable!()
@@ -370,6 +384,7 @@ mod tests {
             "web/src/a.rs"
         );
         assert_eq!(attach(&ws, &ws.join("web")).unwrap(), "web/");
+        assert_eq!(attach(&ws, &ws).unwrap(), "./");
         assert_eq!(
             attach_bytes(&ws, "Pasted image.png", b"img").unwrap(),
             ".context/attachments/Pasted image.png"
