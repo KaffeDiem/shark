@@ -2105,6 +2105,8 @@ impl Render for Chat {
                                             let at = self.model_at.clone();
                                             canvas(move |b, _, _| at.set(b), |_, _, _, _| {})
                                                 .absolute()
+                                                .top_0()
+                                                .left_0()
                                                 .size_full()
                                         }),
                                     )

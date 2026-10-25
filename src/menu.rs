@@ -366,16 +366,23 @@ impl Menu {
                 .on_click(cx.listener(move |this, _, w, cx| this.activate(ix, in_sub, w, cx)))
                 .when(open, |d| {
                     let sub = self.panel(self.sub_entries(), self.sub_sel, true, cx);
+                    // A menu hanging from the window's right side opens its submenus leftward.
+                    let leftward = matches!(self.corner, Anchor::TopRight | Anchor::BottomRight);
                     d.child(
                         div()
                             .absolute()
                             .top(px(-4.))
-                            .left_full()
-                            .pl(px(4.))
+                            .when(!leftward, |d| d.left_full().pl(px(4.)))
+                            .when(leftward, |d| d.right_full().pr(px(4.)))
                             // Deferred above the main panel, so a submenu the window
                             // edge pushes back over it still gets the mouse.
                             .child(
-                                deferred(anchored().snap_to_window_with_margin(px(8.)).child(sub))
+                                deferred(
+                                    anchored()
+                                        .anchor(if leftward { Anchor::TopRight } else { Anchor::TopLeft })
+                                        .snap_to_window_with_margin(px(8.))
+                                        .child(sub),
+                                )
                                     .with_priority(POPUP_PRIORITY + 1),
                             ),
                     )

@@ -1188,6 +1188,8 @@ impl Render for GitSync {
                         let at = self.chevron.clone();
                         canvas(move |b, _, _| at.set(b), |_, _, _, _| {})
                             .absolute()
+                            .top_0()
+                            .left_0()
                             .size_full()
                     }),
             )
