@@ -572,8 +572,7 @@ impl Shark {
                     .child(self.render_branch(cx))
                     .when_some(self.active_sync().cloned(), |d, sync| {
                         d.child(div().pl_3().child(sync))
-                    })
-                    .child(self.render_status(&chat, cx)),
+                    }),
             )
             .child(match self.tab {
                 // Cached: the sidebar spinner redraws this view every frame, the chat only on change.
