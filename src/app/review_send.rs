@@ -202,7 +202,13 @@ impl Shark {
                 .filter(|r| r.1)
                 .filter_map(|r| comments.iter().find(|c| c.id == r.0).cloned())
                 .collect();
-            prompt(&picked, &s.note.read(cx).value())
+            let note = s.note.read(cx).value();
+            let mut p = prompt(&picked, &note);
+            if s.publish {
+                let body = super::review_share::github_body(&picked, &note);
+                p += &format!("\n— PR #{} Comment review —\n\n{body}", pr.unwrap_or(0));
+            }
+            p
         });
         let n = s.rows.len();
         Some(

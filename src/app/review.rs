@@ -744,9 +744,19 @@ impl Shark {
         let composer = (self.review.composer.as_ref())
             .map(|c| DiffAnnotation::line(("composer", 0usize), c.draft.anchor()));
         let (shark, chips) = (cx.entity().downgrade(), cx.entity().downgrade());
+        let add = shark.clone();
         diff.render_header_suffix(move |file, _, cx| {
             (chips.update(cx, |s, cx| s.review_chips(file.path(), cx)))
                 .unwrap_or_else(|_| div().into_any_element())
+        })
+        // The diff's + beside a line or a selection: the composer there.
+        .on_add_annotation(move |range, window, cx| {
+            add.update(cx, |s, cx| {
+                s.diff
+                    .update(cx, |d, cx| d.set_selected_lines(Some(range.clone()), cx));
+                s.comment_dialog(window, cx)
+            })
+            .ok();
         })
         .annotations(
             threads.chain(composer).chain(
