@@ -4,6 +4,15 @@ A keyboard-first, native (GPUI) app for running Claude Code on features that spa
 
 One workspace = one feature = N git worktrees on a shared branch, e.g. `~/shark/workspaces/eng-123-login/{ios,backend}`. A single agent works across all of them. The diff view is combined, and PRs are cross-linked.
 
+## Install
+```sh
+brew tap KaffeDiem/shark https://github.com/KaffeDiem/shark
+brew install --cask KaffeDiem/shark/shark
+```
+Or [Download Shark 0.0.0](https://github.com/KaffeDiem/shark/releases/download/v0.0.0/Shark-0.0.0.dmg) (Apple Silicon), open it and drag Shark to Applications. The app isn't notarized: on first launch, open it, then allow it in System Settings → Privacy & Security → Open Anyway, or run `xattr -dr com.apple.quarantine /Applications/Shark.app`.
+
+Releases: merge a PR with the `release` label. CI builds the DMG (`make release`), publishes a GitHub release, and commits the new version to `Cargo.toml`, `Casks/shark.rb` and this section. The version is the one in `Cargo.toml`, or its next patch if that is already released.
+
 ## Run
 ```sh
 cargo run                                  # needs Xcode (Metal); Rust is pinned in rust-toolchain.toml
@@ -56,3 +65,6 @@ Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH.
   - Refuses to run while any repo has uncommitted changes. Only an open PR is reused; after a merge, new commits get a new PR.
 
 Background and prior art: [docs/research.md](docs/research.md). UI theme, design rules and checklist: [docs/design.md](docs/design.md).
+
+## License
+GPL-3.0 with an attribution term: copies and derived works must keep the copyright notice and credit "Shark by Kasper Munch Jensen". See [LICENSE](LICENSE).
