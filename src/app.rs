@@ -35,6 +35,7 @@ use std::sync::Arc;
 mod chats;
 mod diff;
 mod editor_pane;
+mod media;
 mod menus;
 mod palette;
 mod picker;
@@ -200,6 +201,11 @@ pub struct Shark {
     editor_header: (bool, bool, &'static str, String),
     _editor_subs: Vec<Subscription>,
     review: review::Review,
+    /// The before/after row of each image or video in the diff, by path.
+    media: Vec<(SharedString, Entity<media::MediaView>)>,
+    media_cache: Entity<media::Lru>,
+    /// The diff pane's width: media rows fit it, not the diff's longest line.
+    media_width: Rc<std::cell::Cell<Pixels>>,
     pub(crate) syncs: HashMap<String, Entity<GitSync>>,
     sidebar_focus: FocusHandle,
     pub(crate) attn: crate::attention::Attention,
@@ -216,6 +222,9 @@ impl Shark {
         let sidebar_focus = cx.focus_handle();
         sidebar_focus.focus(window, cx);
         cx.defer_in(window, |s, window, cx| s.restore_last_open(window, cx));
+        cx.background_executor()
+            .spawn(async { media::prune_cache() })
+            .detach();
         let _subs = vec![
             cx.observe_window_appearance(window, |s, _, cx| {
                 if s.state.appearance.mode == crate::state::Mode::System {
@@ -259,6 +268,9 @@ impl Shark {
             editor_header: Default::default(),
             _editor_subs: vec![],
             review: Default::default(),
+            media: vec![],
+            media_cache: media::Lru::new(cx),
+            media_width: Rc::default(),
             syncs: HashMap::new(),
             sidebar_focus,
             attn: crate::attention::Attention::new(cx),
