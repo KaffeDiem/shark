@@ -7,7 +7,8 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{
-    Enter, Escape, IndentInline, InlineToken, InputEvent, MoveDown, MoveUp, Textarea, TextareaState,
+    Enter, Escape, IndentInline, InlineToken, InputContent, InputEvent, MoveDown, MoveUp, Textarea,
+    TextareaState,
 };
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::scroll::ScrollableElement;
@@ -93,6 +94,33 @@ struct Menu {
 
 const MENU_ROWS: usize = 50;
 
+/// A message typed while the agent runs. The top one goes out when a turn ends well; any can
+/// go out now to steer the running turn.
+struct Queued {
+    /// With its chips, so editing puts them back.
+    content: InputContent,
+    /// First line, capped, so a long paste isn't shaped on every frame.
+    preview: SharedString,
+}
+
+impl Queued {
+    fn new(content: InputContent) -> Self {
+        let first = content.text().trim().lines().next().unwrap_or_default();
+        let mut preview: String = first.chars().take(200).collect();
+        if preview.len() < content.text().trim().len() {
+            preview.push('…');
+        }
+        Queued {
+            content,
+            preview: preview.into(),
+        }
+    }
+
+    fn text(&self) -> String {
+        self.content.text().trim().to_string()
+    }
+}
+
 pub enum ChatEvent {
     SessionId(String),
     Model(Option<String>),
@@ -121,6 +149,15 @@ pub struct Chat {
     menu_scroll: ScrollHandle,
     indexing: Option<Task<()>>,
     probing: Option<Task<()>>,
+    queue: Vec<Queued>,
+    qsel: usize,
+    qfocus: FocusHandle,
+    qscroll: ScrollHandle,
+    /// The queue slot of the message being edited in the composer. The queue waits meanwhile,
+    /// so the message doesn't lose its turn.
+    editing: Option<usize>,
+    /// A message was sent into a running turn and claude may not have read it yet.
+    steered: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -166,7 +203,10 @@ impl Chat {
                 &composer,
                 window,
                 |this, _, ev: &InputEvent, window, cx| match ev {
-                    InputEvent::PressEnter { shift: false, .. } => this.send(window, cx),
+                    InputEvent::PressEnter {
+                        shift: false,
+                        secondary,
+                    } => this.send(*secondary, window, cx),
                     InputEvent::Change => this.update_menu(cx),
                     InputEvent::Blur => this.close_menu(cx),
                     _ => {}
@@ -192,6 +232,12 @@ impl Chat {
             menu_scroll: ScrollHandle::new(),
             indexing: None,
             probing: None,
+            queue: vec![],
+            qsel: 0,
+            qfocus: cx.focus_handle(),
+            qscroll: ScrollHandle::new(),
+            editing: None,
+            steered: false,
             _subs: vec![_sub],
         };
         // Warm both sources now so the first `@` or `/` doesn't wait.
@@ -366,12 +412,163 @@ impl Chat {
         cx.notify();
     }
 
-    fn send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let text = self.composer.read(cx).value().trim().to_string();
-        if self.send_text(text, cx) {
-            self.composer
-                .update(cx, |c, cx| c.set_value("", window, cx));
+    /// Enter: sends, or queues while a turn or git step runs. `now` (cmd-enter) steers the
+    /// running turn instead; claude reads it at its next tool call.
+    fn send(&mut self, now: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let content = self.composer.read(cx).content();
+        let text = content.text().trim().to_string();
+        if text.is_empty() {
+            // Clearing an edited message and pressing Enter deletes it.
+            if self.editing.take().is_some() {
+                self.drain(cx);
+                cx.notify();
+            }
+            return;
         }
+        let busy = self.busy;
+        let sent = !self.hold && (!busy || now) && self.send_text(text, now, cx);
+        self.steered |= sent && busy;
+        if !sent && (self.busy || self.hold) {
+            let at = self
+                .editing
+                .unwrap_or(self.queue.len())
+                .min(self.queue.len());
+            self.queue.insert(at, Queued::new(content));
+            self.qsel = at;
+        } else if !sent {
+            return; // spawn or write failed; the error is in the transcript, keep the draft
+        }
+        self.editing = None;
+        self.composer
+            .update(cx, |c, cx| c.set_value("", window, cx));
+        if sent {
+            self.drain(cx); // an edit that went straight out lets the rest follow
+        }
+        cx.notify();
+    }
+
+    /// Sends the top queued message if the agent is free.
+    pub fn drain(&mut self, cx: &mut Context<Self>) {
+        if self.busy || self.hold || self.editing.is_some() || self.queue.is_empty() {
+            return;
+        }
+        let q = self.queue.remove(0); // editing is None here
+        match self.send_text(q.text(), false, cx) {
+            true => self.qsel = self.qsel.saturating_sub(1),
+            false => self.queue.insert(0, q),
+        }
+        self.after_queue_change(cx);
+    }
+
+    /// Removes a queued message, keeping the slot of the one being edited in place.
+    fn take_queued(&mut self, ix: usize) -> Queued {
+        if let Some(e) = &mut self.editing
+            && *e > ix
+        {
+            *e -= 1;
+        }
+        self.queue.remove(ix)
+    }
+
+    fn after_queue_change(&mut self, cx: &mut Context<Self>) {
+        self.qsel = self.qsel.min(self.queue.len().saturating_sub(1));
+        self.qscroll.scroll_to_item(self.qsel);
+        cx.notify();
+    }
+
+    pub fn focus_queue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.queue.is_empty() {
+            return self.focus_composer(window, cx);
+        }
+        self.qfocus.focus(window, cx);
+        self.after_queue_change(cx);
+    }
+
+    fn queue_select(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        // The composer sits below the last row, so moving past it lands there.
+        if ix >= self.queue.len() {
+            return self.focus_composer(window, cx);
+        }
+        self.qsel = ix;
+        self.after_queue_change(cx);
+    }
+
+    /// Sends the selected message into the running turn.
+    fn steer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.qsel >= self.queue.len() {
+            return;
+        }
+        if self.hold {
+            self.push(
+                Block::Info("a git step is running; it stays queued".into()),
+                cx,
+            );
+            return;
+        }
+        let editing = self.editing;
+        let q = self.take_queued(self.qsel);
+        let busy = self.busy;
+        if self.send_text(q.text(), true, cx) {
+            // Claude may hold it unread until this turn ends; don't restart the process under it.
+            self.steered |= busy;
+        } else {
+            self.editing = editing;
+            self.queue.insert(self.qsel, q);
+        }
+        self.after_queue_change(cx);
+        if self.queue.is_empty() {
+            self.focus_composer(window, cx);
+        }
+    }
+
+    fn delete_queued(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.qsel >= self.queue.len() {
+            return;
+        }
+        self.take_queued(self.qsel);
+        self.after_queue_change(cx);
+        if self.queue.is_empty() {
+            self.focus_composer(window, cx);
+        }
+    }
+
+    fn move_queued(&mut self, d: isize, cx: &mut Context<Self>) {
+        let to = self.qsel as isize + d;
+        if to < 0 || to as usize >= self.queue.len() {
+            return;
+        }
+        self.queue.swap(self.qsel, to as usize);
+        self.qsel = to as usize;
+        self.after_queue_change(cx);
+    }
+
+    /// Loads the selected message into the composer; Enter puts it back in the same slot.
+    /// A draft already there is queued first, so nothing typed is lost.
+    fn edit_queued(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.qsel >= self.queue.len() {
+            return;
+        }
+        let mut ix = self.qsel;
+        let item = self.take_queued(ix);
+        let draft = self.composer.read(cx).content();
+        if !draft.text().trim().is_empty() {
+            let at = self
+                .editing
+                .unwrap_or(self.queue.len())
+                .min(self.queue.len());
+            self.queue.insert(at, Queued::new(draft));
+            if at <= ix {
+                ix += 1;
+            }
+        }
+        self.editing = Some(ix);
+        let end = item.content.text().len();
+        self.composer.update(cx, |c, cx| {
+            c.set_value(item.content, window, cx);
+            c.set_selected_range(end..end, cx);
+            c.focus(window, cx);
+        });
+        self.after_queue_change(cx);
     }
 
     /// Sends a host-written prompt (git steps). A draft in the composer rides along as extra
@@ -382,17 +579,18 @@ impl Chat {
             true => prompt.to_string(),
             false => format!("{prompt}\n\nAlso: {draft}"),
         };
-        let sent = self.send_text(text, cx);
+        let sent = self.send_text(text, false, cx);
         if sent && !draft.is_empty() {
+            self.editing = None;
             self.composer
                 .update(cx, |c, cx| c.set_value("", window, cx));
         }
         sent
     }
 
-    /// Returns whether the text went out; not while a turn is running.
-    fn send_text(&mut self, text: String, cx: &mut Context<Self>) -> bool {
-        if text.is_empty() || self.busy {
+    /// Returns whether the text went out; while a turn runs only if `steer`.
+    fn send_text(&mut self, text: String, steer: bool, cx: &mut Context<Self>) -> bool {
+        if text.is_empty() || (self.busy && !steer) {
             return false;
         }
         if self.hold {
@@ -402,7 +600,9 @@ impl Chat {
             );
             return false;
         }
-        if self.agent.is_some() && self.agent_model != self.ws.model {
+        // Never mid-turn: a steer would kill the turn it means to steer.
+        if self.agent.is_some() && self.agent_model != self.ws.model && !self.busy && !self.steered
+        {
             self.agent = None; // drop stops it; the respawn resumes the same session on the new model
         }
         if self.agent.is_none() {
@@ -473,7 +673,19 @@ impl Chat {
     }
 
     fn apply(&mut self, ev: Ev, cx: &mut Context<Self>) {
+        // Only a turn that ended well sends the next message; after a stop or an error the
+        // queue waits for the user.
+        let ok = matches!(
+            ev,
+            Ev::Result {
+                is_error: false,
+                ..
+            }
+        );
         self.follow(cx, |this, cx| this.apply_inner(ev, cx));
+        if ok {
+            self.drain(cx);
+        }
     }
 
     fn apply_inner(&mut self, ev: Ev, cx: &mut Context<Self>) {
@@ -486,6 +698,7 @@ impl Chat {
                 // Each turn starts with init, including ones the CLI starts itself when a
                 // background task finishes.
                 self.busy = true;
+                self.steered = false;
             }
             Ev::Background(n) => self.background = n,
             Ev::User(text) => self.blocks.push(Block::User(text)),
@@ -855,6 +1068,155 @@ impl Chat {
         )
     }
 
+    /// Queued messages above the input, in send order: the top row goes next.
+    fn render_queue(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.queue.is_empty() {
+            return None;
+        }
+        let focused = self.qfocus.is_focused(window);
+        let theme = cx.theme();
+        let faint = crate::app::faint(theme);
+        let (fg, muted, active, hover, primary, transparent, radius, border) = (
+            theme.foreground,
+            theme.muted_foreground,
+            theme.list_active,
+            theme.list_hover,
+            theme.primary,
+            theme.transparent,
+            theme.radius,
+            theme.border,
+        );
+        let action = |id: (&'static str, usize), icon: IconName, tip: &'static str| {
+            Button::new(id).ghost().xsmall().icon(icon).tooltip(tip)
+        };
+        let rows: Vec<AnyElement> = (self.queue.iter().enumerate())
+            .map(|(ix, q)| {
+                let sel = focused && ix == self.qsel;
+                h_flex()
+                    .id(("queued", ix))
+                    .h(px(28.))
+                    .pl_2()
+                    .gap_2()
+                    .rounded(radius)
+                    .border_l_2()
+                    .border_color(if sel { primary } else { transparent })
+                    .when(sel, |d| d.bg(active))
+                    .when(!sel, |d| d.hover(|d| d.bg(hover)))
+                    .on_click(cx.listener(move |this, _, window, cx| {
+                        this.qsel = ix;
+                        this.focus_queue(window, cx);
+                    }))
+                    .child(
+                        Icon::new(IconName::CornerDownRight)
+                            .with_size(px(14.))
+                            .text_color(muted),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_color(fg)
+                            .child(q.preview.clone()),
+                    )
+                    .child(
+                        action(("q-send", ix), IconName::ArrowUp, "Send now (enter)").on_click(
+                            cx.listener(move |this, _, window, cx| {
+                                this.qsel = ix;
+                                this.steer(window, cx);
+                                cx.stop_propagation(); // the row's own click would refocus the queue
+                            }),
+                        ),
+                    )
+                    .child(
+                        action(("q-edit", ix), IconName::Pencil, "Edit (e)").on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.qsel = ix;
+                                this.edit_queued(window, cx);
+                                cx.stop_propagation(); // the row's own click would refocus the queue
+                            },
+                        )),
+                    )
+                    .child(
+                        action(("q-del", ix), IconName::Trash, "Delete (d)").on_click(cx.listener(
+                            move |this, _, window, cx| {
+                                this.qsel = ix;
+                                this.delete_queued(window, cx);
+                                cx.stop_propagation(); // the row's own click would refocus the queue
+                            },
+                        )),
+                    )
+                    .into_any_element()
+            })
+            .collect();
+        let hint = |k: &str, label: &'static str| {
+            h_flex()
+                .gap_1()
+                .children(k.split(' ').map(|k| Kbd::new(Keystroke::parse(k).unwrap())))
+                .child(label)
+        };
+        let n = self.queue.len();
+        Some(
+            v_flex()
+                .id("queue")
+                .key_context("Queue")
+                .track_focus(&self.qfocus)
+                .pb_1()
+                .mb_1()
+                .border_b_1()
+                .border_color(border)
+                .text_sm()
+                .on_action(cx.listener(|this, _: &SelectNext, w, cx| {
+                    this.queue_select(this.qsel + 1, w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &SelectPrev, w, cx| {
+                    this.queue_select(this.qsel.saturating_sub(1), w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &SelectFirst, w, cx| this.queue_select(0, w, cx)))
+                .on_action(cx.listener(|this, _: &SelectLast, w, cx| {
+                    this.queue_select(this.queue.len().saturating_sub(1), w, cx)
+                }))
+                .on_action(cx.listener(|this, _: &Confirm, w, cx| this.steer(w, cx)))
+                .on_action(cx.listener(|this, _: &EditQueued, w, cx| this.edit_queued(w, cx)))
+                .on_action(cx.listener(|this, _: &DeleteQueued, w, cx| this.delete_queued(w, cx)))
+                .on_action(cx.listener(|this, _: &MoveQueuedUp, _, cx| this.move_queued(-1, cx)))
+                .on_action(cx.listener(|this, _: &MoveQueuedDown, _, cx| this.move_queued(1, cx)))
+                .on_action(cx.listener(|this, _: &FocusComposer, w, cx| this.focus_composer(w, cx)))
+                .child(
+                    h_flex()
+                        .h(px(24.))
+                        .px_2()
+                        .gap_3()
+                        .text_xs()
+                        .text_color(muted)
+                        .child(match self.editing.is_some() {
+                            true => format!("{n} queued · paused while you edit"),
+                            false => format!("{n} queued · sends when the turn ends"),
+                        })
+                        .child(div().flex_1())
+                        .when(focused, |d| {
+                            d.text_color(faint)
+                                .child(hint("enter", "send now"))
+                                .child(hint("e", "edit"))
+                                .child(hint("d", "delete"))
+                                .child(hint("shift-k shift-j", "reorder"))
+                        })
+                        .when(!focused, |d| {
+                            d.text_color(faint).child(hint("up", "manage"))
+                        }),
+                )
+                .child(
+                    div()
+                        .id("queue-rows")
+                        .max_h(px(5. * 28.))
+                        .overflow_y_scroll()
+                        .track_scroll(&self.qscroll)
+                        .children(rows),
+                )
+                .into_any_element(),
+        )
+    }
+
     fn toggle(&mut self, cx: &mut Context<Self>) {
         let Some(&(bi, call)) = self.rows().get(self.sel) else {
             return;
@@ -871,6 +1233,10 @@ impl Chat {
 
 impl Render for Chat {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // The queue emptied (a turn ended, a git step finished) while it had focus.
+        if self.queue.is_empty() && self.qfocus.is_focused(window) {
+            self.focus_composer(window, cx);
+        }
         let focused = self.focus.is_focused(window);
         let theme = cx.theme();
         let (radius, border, card, muted) = (
@@ -942,9 +1308,21 @@ impl Render for Chat {
                                 cx.stop_propagation();
                             }
                         }))
-                        .capture_action(cx.listener(|this, _: &MoveUp, _, cx| {
+                        .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
                             if this.menu.is_some() {
                                 this.move_menu(-1, cx);
+                                cx.stop_propagation();
+                                return;
+                            }
+                            // Up from the first line goes to the queue, like Claude Code's.
+                            let c = this.composer.read(cx);
+                            let first_line = !c.value()[..c.cursor()].contains('\n');
+                            if first_line
+                                && !this.queue.is_empty()
+                                && c.focus_handle(cx).is_focused(window)
+                            {
+                                this.qsel = this.queue.len() - 1;
+                                this.focus_queue(window, cx);
                                 cx.stop_propagation();
                             }
                         }))
@@ -973,6 +1351,7 @@ impl Render for Chat {
                             }
                         }))
                         .when_some(self.render_menu(cx), |d, menu| d.child(menu))
+                        .when_some(self.render_queue(window, cx), |d, q| d.child(q))
                         .child(
                             Textarea::new(&self.composer)
                                 .appearance(false)
@@ -997,7 +1376,15 @@ impl Render for Chat {
                                 )
                                 .child(div().flex_1())
                                 .child(Kbd::new(Keystroke::parse("enter").unwrap()))
-                                .child("send"),
+                                .child(match (self.editing.is_some(), self.busy || self.hold) {
+                                    (true, true) => "save",
+                                    (false, true) => "queue",
+                                    _ => "send",
+                                })
+                                .when(self.busy && !self.hold, |d| {
+                                    d.child(Kbd::new(Keystroke::parse("cmd-enter").unwrap()))
+                                        .child("send now")
+                                }),
                         ),
                 ),
             )
@@ -1081,6 +1468,184 @@ mod ui_tests {
         cx.update(|cx| chat.update(cx, |c, cx| c.sent("new".into(), cx)));
         frame(cx);
         assert_eq!(scroll.offset().y, -scroll.max_offset().y, "at the bottom");
+    }
+
+    /// While a turn runs Enter queues; the queue is driven from the keyboard, steers with
+    /// enter / cmd-enter, and drains on a good turn end but not after an error.
+    #[gpui_kit::test]
+    fn queue_while_running(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::bind_keys(cx);
+        });
+        let root = std::env::temp_dir().join(format!("shark-queue-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fake = root.join("claude");
+        std::fs::write(&fake, "#!/bin/sh\nexec cat >/dev/null\n").unwrap();
+        std::process::Command::new("chmod")
+            .args(["+x"])
+            .arg(&fake)
+            .status()
+            .unwrap();
+        // SAFETY: no other test spawns claude or reads this variable.
+        unsafe { std::env::set_var("SHARK_CLAUDE", &fake) };
+        let ws = Workspace {
+            name: format!("queue-test-{}", std::process::id()),
+            branch: "b".into(),
+            repos: vec![],
+            session_id: None,
+            model: None,
+            viewed: Default::default(),
+        };
+        std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
+        std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
+        let (dir, transcript) = (ws.dir(), agent::transcript_path(&ws.name));
+        let (window, chat) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| Chat::new(ws, w, cx))
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let act = |cx: &mut TestAppContext, f: &dyn Fn(&mut Window, &mut App)| {
+            cx.update_window(window, |_, w, cx| {
+                f(w, cx);
+                w.render_frame(cx); // the queue's focus target exists only once rendered
+            })
+            .unwrap()
+        };
+        let queue = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                (chat.read(cx).queue.iter())
+                    .map(Queued::text)
+                    .collect::<Vec<_>>()
+            })
+        };
+        let qsel = |cx: &mut TestAppContext| cx.update(|cx| chat.read(cx).qsel);
+        let value = |cx: &mut TestAppContext| {
+            cx.update(|cx| chat.read(cx).composer.read(cx).value().to_string())
+        };
+        let users = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                (chat.read(cx).blocks.iter())
+                    .filter_map(|b| match b {
+                        Block::User(t) => Some(t.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        let in_queue = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, w, cx| chat.read(cx).qfocus.is_focused(w))
+                .unwrap()
+        };
+        let result = |is_error| Ev::Result {
+            is_error,
+            text: String::new(),
+            cost: 0.,
+            secs: 1,
+        };
+
+        cx.update(|cx| chat.update(cx, |c, _| c.busy = true));
+        act(cx, &|w, cx| {
+            chat.update(cx, |c, cx| c.focus_composer(w, cx))
+        });
+        act(cx, &|w, cx| w.press("up", cx));
+        assert!(!in_queue(cx), "nothing queued: up stays in the composer");
+        for m in ["first", "second", "third"] {
+            act(cx, &|w, cx| w.input(m, cx));
+            act(cx, &|w, cx| w.press("enter", cx));
+        }
+        assert_eq!(queue(cx), ["first", "second", "third"]);
+        assert_eq!(value(cx), "", "a queued message leaves the composer");
+        assert!(users(cx).is_empty(), "nothing sent while running");
+
+        act(cx, &|w, cx| w.press("up", cx));
+        assert!(in_queue(cx), "up from the composer enters the queue");
+        assert_eq!(qsel(cx), 2, "on the row nearest the composer");
+        act(cx, &|w, cx| w.press("k", cx));
+        act(cx, &|w, cx| w.press("shift-k", cx));
+        assert_eq!(queue(cx), ["second", "first", "third"]);
+        assert_eq!(qsel(cx), 0, "the cursor follows the moved row");
+        act(cx, &|w, cx| w.press("shift-k", cx));
+        assert_eq!(qsel(cx), 0, "the top row can't move up");
+        act(cx, &|w, cx| w.press("alt-down", cx));
+        assert_eq!(queue(cx), ["first", "second", "third"]);
+
+        // Edit: back into the composer, then into the same slot.
+        act(cx, &|w, cx| w.press("e", cx));
+        assert!(!in_queue(cx));
+        assert_eq!(value(cx), "second");
+        assert_eq!(queue(cx), ["first", "third"]);
+        act(cx, &|w, cx| w.input(" edited", cx));
+        cx.update(|cx| chat.update(cx, |c, cx| c.apply(result(false), cx)));
+        assert!(
+            users(cx).is_empty(),
+            "the queue waits while a message is edited"
+        );
+        cx.update(|cx| chat.update(cx, |c, _| c.busy = true));
+        act(cx, &|w, cx| w.press("enter", cx));
+        assert_eq!(queue(cx), ["first", "second edited", "third"]);
+
+        act(cx, &|w, cx| w.press("up", cx));
+        act(cx, &|w, cx| w.press("d", cx));
+        assert_eq!(queue(cx), ["first", "second edited"]);
+        assert_eq!(qsel(cx), 1, "the cursor stays on the last row");
+        act(cx, &|w, cx| w.press("down", cx));
+        assert!(
+            !in_queue(cx),
+            "down past the last row returns to the composer"
+        );
+
+        // A good turn end sends the top message; an error doesn't.
+        cx.update(|cx| chat.update(cx, |c, cx| c.apply(result(false), cx)));
+        assert_eq!(users(cx), ["first"]);
+        assert_eq!(queue(cx), ["second edited"]);
+        cx.update(|cx| assert!(chat.read(cx).busy));
+        cx.update(|cx| chat.update(cx, |c, cx| c.apply(result(true), cx)));
+        assert_eq!(queue(cx), ["second edited"], "an error pauses the queue");
+
+        // Steer: enter on a row and cmd-enter in the composer send while the turn runs.
+        cx.update(|cx| chat.update(cx, |c, _| c.busy = true));
+        act(cx, &|w, cx| w.press("up", cx));
+        act(cx, &|w, cx| w.press("enter", cx));
+        assert_eq!(users(cx), ["first", "second edited"]);
+        assert!(queue(cx).is_empty());
+        assert!(
+            !in_queue(cx),
+            "an empty queue hands focus back to the composer"
+        );
+        act(cx, &|w, cx| w.input("now", cx));
+        act(cx, &|w, cx| w.press("cmd-enter", cx));
+        assert_eq!(users(cx), ["first", "second edited", "now"]);
+        cx.update(|cx| assert!(chat.read(cx).busy, "steering doesn't end the turn"));
+
+        // Sending a row above the one being edited keeps the edit's slot.
+        for m in ["a", "b", "c"] {
+            act(cx, &|w, cx| w.input(m, cx));
+            act(cx, &|w, cx| w.press("enter", cx));
+        }
+        act(cx, &|w, cx| w.press("up", cx));
+        act(cx, &|w, cx| w.press("k", cx));
+        act(cx, &|w, cx| w.press("e", cx));
+        assert_eq!(value(cx), "b");
+        act(cx, &|w, cx| w.press("escape", cx));
+        act(cx, &|w, cx| chat.update(cx, |c, cx| c.focus_queue(w, cx)));
+        act(cx, &|w, cx| w.press("g", cx));
+        act(cx, &|w, cx| w.press("g", cx));
+        act(cx, &|w, cx| w.press("enter", cx));
+        assert_eq!(queue(cx), ["c"]);
+        act(cx, &|w, cx| {
+            chat.update(cx, |c, cx| c.focus_composer(w, cx))
+        });
+        act(cx, &|w, cx| w.press("enter", cx));
+        assert_eq!(queue(cx), ["b", "c"], "b keeps its place ahead of c");
+
+        cx.update(|cx| chat.update(cx, |c, _| c.agent = None));
+        let _ = std::fs::remove_file(dir);
+        let _ = std::fs::remove_file(transcript);
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     /// `@` opens the file menu; keys drive it and a pick leaves a repo-qualified chip.

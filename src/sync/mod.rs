@@ -405,7 +405,10 @@ impl GitSync {
 
     fn exec(&mut self, a: Action, check: bool, window: &mut Window, cx: &mut Context<Self>) {
         self.running = Some(a.label.clone());
-        self.chat.update(cx, |c, _| c.hold = true);
+        self.chat.update(cx, |c, cx| {
+            c.hold = true;
+            cx.notify(); // the composer footer says Enter queues now
+        });
         cx.notify();
         let ws = self.ws.clone();
         let snapshot: Vec<_> = self.repos.iter().map(|r| r.pr.clone()).collect();
@@ -459,7 +462,10 @@ impl GitSync {
                 .await;
             this.update_in(cx, |s, window, cx| {
                 s.running = None;
-                s.chat.update(cx, |c, _| c.hold = false);
+                s.chat.update(cx, |c, cx| {
+                    c.hold = false;
+                    cx.notify();
+                });
                 match result {
                     Ok((_, Outcome::Ask(prompt))) => {
                         if !s.chat.update(cx, |c, cx| c.ask(&prompt, window, cx)) {
@@ -476,6 +482,8 @@ impl GitSync {
                     ),
                     Err(e) => notify_err(window, cx, e),
                 }
+                // Messages queued during the step go now, unless the step's prompt went first.
+                s.chat.update(cx, |c, cx| c.drain(cx));
                 s.kick(true, true, cx); // the step may have moved the branch on GitHub
                 cx.notify();
             })
