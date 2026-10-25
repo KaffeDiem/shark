@@ -521,7 +521,7 @@ impl Chat {
         self.meta.model.as_deref().unwrap_or(MODELS[0])
     }
 
-    fn codex(&self) -> bool {
+    pub(crate) fn codex(&self) -> bool {
         codex::is_codex(self.meta.model.as_deref())
     }
 
@@ -538,21 +538,34 @@ impl Chat {
     pub fn open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let current = self.model().to_string();
         let this = cx.entity().downgrade();
-        let entries = (MODELS.iter())
-            .map(|&m| {
-                let this = this.clone();
-                crate::menu::item(None, model_label(m), move |_, cx| {
-                    this.update(cx, |c, cx| c.set_model(m, cx)).ok();
-                })
-                .checked(m == current)
-            })
-            .collect();
+        // Claude's models, then Codex's: switching between the two starts a new conversation.
+        let mut entries = vec![];
+        let mut sel = 0;
+        for &m in MODELS {
+            let is_codex = codex::is_codex(Some(m));
+            if is_codex && !entries.iter().any(|e| matches!(e, crate::menu::Entry::Sep)) {
+                entries.push(crate::menu::Entry::Sep);
+            }
+            if m == current {
+                sel = entries.len();
+            }
+            let this = this.clone();
+            let item = crate::menu::item(None, model_label(m), move |_, cx| {
+                this.update(cx, |c, cx| c.set_model(m, cx)).ok();
+            });
+            // The backend, where the name doesn't say it.
+            let hint = match (is_codex, m) {
+                (false, "default") => "Claude",
+                (true, "codex") => "Default",
+                (true, _) => "Codex",
+                _ => "",
+            };
+            entries.push(item.hint(hint).checked(m == current));
+        }
         let b = self.model_at.get();
         let at = point(b.left(), b.top() - px(4.));
         let m = crate::menu::open_at(entries, at, Anchor::BottomLeft, window, cx);
-        if let Some(ix) = MODELS.iter().position(|m| *m == current) {
-            m.update(cx, |m, _| m.select(ix));
-        }
+        m.update(cx, |m, _| m.select(sel));
         let sub = cx.subscribe(&m, |c, _, _: &DismissEvent, cx| {
             c.model_menu = None;
             cx.notify();
@@ -2130,8 +2143,11 @@ impl Render for Chat {
                                         d.child(Kbd::new(Keystroke::parse("ctrl-c").unwrap()))
                                             .child("interrupt")
                                     })
-                                    .child(Kbd::new(Keystroke::parse("cmd-shift-enter").unwrap()))
-                                    .child("side question"),
+                                    // Side questions fork a claude session; codex has none.
+                                    .when(!self.codex(), |d| {
+                                        d.child(Kbd::new(Keystroke::parse("cmd-shift-enter").unwrap()))
+                                            .child("side question")
+                                    }),
                             ),
                     ),
             )
@@ -3277,5 +3293,20 @@ exec cat >/dev/null
         keys(cx, &["escape"]);
         assert_eq!(value(cx), "jk");
         assert!(in_transcript(cx));
+    }
+}
+
+#[cfg(test)]
+mod model_label_tests {
+    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+
+    #[test]
+    fn labels_read_like_names() {
+        let l = super::model_label;
+        assert_eq!(l("default"), "Default");
+        assert_eq!(l("opus"), "Opus");
+        assert_eq!(l("codex"), "Codex");
+        assert_eq!(l("codex:gpt-6.1-sol"), "GPT-6.1 Sol");
+        assert_eq!(l("codex:gpt-6-astra"), "GPT-6 Astra");
     }
 }

@@ -233,7 +233,7 @@ pub(super) const COMMANDS: &[Row] = &[
         "Start a new conversation",
         IconName::MessageSquarePlus,
         None,
-        "forget claude session reset",
+        "forget session thread reset claude codex",
         |s, w, cx| match s.active_chat().cloned() {
             Some(chat) => chat.update(cx, |c, cx| c.new_conversation(cx)),
             None => notify_err(w, cx, "Open a workspace first"),
@@ -511,6 +511,9 @@ pub(super) const COMMANDS: &[Row] = &[
     ),
 ];
 
+/// Rows that only a Claude chat can do; a Codex chat's palette leaves them out.
+const CLAUDE_ONLY: &[&str] = &["Ask a side question", "Toggle plan mode"];
+
 /// The palette's headings, each with the label of the row it starts at.
 const GROUPS: &[(&str, &str)] = &[
     ("Workspace", "New workspace…"),
@@ -569,11 +572,17 @@ impl Shark {
         // Sidebar order with folded sections opened; cmd-n counts the shown rows only.
         let order = self.ws_order(true);
         let shown = self.ws_order(false);
+        let codex = self.active_chat().is_some_and(|c| c.read(cx).codex());
         let mut groups: Vec<(Option<&'static str>, Vec<CommandItem>)> = vec![];
-        for Row(label, icon, action, words, _) in COMMANDS {
+        let mut rows = vec![];
+        for (ix, Row(label, icon, action, words, _)) in COMMANDS.iter().enumerate() {
             if let Some((heading, _)) = GROUPS.iter().find(|(_, first)| first == label) {
                 groups.push((Some(heading), vec![]));
             }
+            if codex && CLAUDE_ONLY.contains(label) {
+                continue;
+            }
+            rows.push(ix);
             let key = action.and_then(|a| shortcut(a, window));
             let item = row_item(*label, *icon, key).keywords(words.split_whitespace());
             groups.last_mut().expect("COMMANDS starts a group").1.push(item);
@@ -592,9 +601,10 @@ impl Shark {
             "Type a command or search…",
             groups,
             0,
-            move |s, row, window, cx| match COMMANDS.get(row) {
-                Some(Row(.., f)) => f(s, window, cx),
-                None => s.open_workspace(order[row - COMMANDS.len()], window, cx),
+            // Rows count the shown commands, then the workspaces.
+            move |s, row, window, cx| match rows.get(row) {
+                Some(&ix) => (COMMANDS[ix].4)(s, window, cx),
+                None => s.open_workspace(order[row - rows.len()], window, cx),
             },
             window,
             cx,
@@ -612,6 +622,9 @@ mod tests {
         assert_eq!(COMMANDS[0].0, GROUPS[0].1, "the first row starts a group");
         for (heading, first) in GROUPS {
             assert!(COMMANDS.iter().any(|r| r.0 == *first), "{heading}: no row {first}");
+        }
+        for label in CLAUDE_ONLY {
+            assert!(COMMANDS.iter().any(|r| r.0 == *label), "no row {label}");
         }
     }
 }
