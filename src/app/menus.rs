@@ -1,5 +1,6 @@
 //! Right-click menus and the path helpers they share.
 use super::*;
+use crate::apps::{self, Kind, OpenApp};
 
 /// `/Users/me/x` → `~/x`: paths in menus are read, so keep them short.
 pub(super) fn tilde(path: &Path) -> String {
@@ -12,12 +13,49 @@ pub(super) fn tilde(path: &Path) -> String {
     }
 }
 
-// ponytail: always Terminal.app; add a setting if people want iTerm/Ghostty/Warp.
-pub(super) fn open_terminal(path: &Path) {
-    let _ = std::process::Command::new("open")
-        .args(["-a", "Terminal"])
-        .arg(path)
-        .spawn();
+/// "Open in <app>" for each installed app with something to open in `folder` (the
+/// workspace's, if any) and `repos`: one target opens directly, several make a submenu.
+pub(super) fn open_in_entries(
+    folder: Option<&(String, PathBuf)>,
+    repos: &[(String, PathBuf)],
+) -> Vec<Entry> {
+    let mut entries = vec![];
+    for app in apps::installed() {
+        let mut targets = app.targets(folder, repos);
+        if targets.is_empty() {
+            continue;
+        }
+        let label = format!("Open in {}", app.name);
+        let image = app.icon.clone();
+        if targets.len() == 1 {
+            let (hint, path) = targets.remove(0);
+            let item = menu::item(app_icon(app), label, move |_, _| app.open(&path));
+            entries.push(item.hint(hint).image(image));
+            continue;
+        }
+        let rows = targets.into_iter().map(|(name, path)| {
+            let is_folder = folder.is_some_and(|f| f.1 == path);
+            let icon = match app.kind {
+                _ if is_folder => IconName::Folder,
+                Kind::Xcode => IconName::FileCode,
+                _ => IconName::FolderGit2,
+            };
+            let hint = if is_folder { tilde(&path) } else { String::new() };
+            menu::item(icon, name, move |_, _| app.open(&path)).hint(hint)
+        });
+        entries.push(menu::sub(app_icon(app), label, rows.collect()).image(image));
+    }
+    entries
+}
+
+/// Shown when AppKit has no icon for the app.
+pub(super) fn app_icon(app: &OpenApp) -> IconName {
+    match app.kind {
+        Kind::Terminal => IconName::SquareTerminal,
+        Kind::Folder => IconName::AppWindow,
+        Kind::Git => IconName::GitBranch,
+        Kind::Xcode => IconName::FileCode,
+    }
 }
 
 pub(super) fn copy(text: String, window: &mut Window, cx: &mut App) {
@@ -54,11 +92,7 @@ pub(super) fn path_submenu(
 /// and keeps the destructive items last. Shortcuts live in the palette, not here (Apple HIG).
 pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<Entry> {
     let paths: Vec<(String, PathBuf)> = std::iter::once(("Workspace folder".into(), ws.dir()))
-        .chain(
-            ws.repos
-                .iter()
-                .map(|r| (r.name.clone(), ws.dir().join(&r.name))),
-        )
+        .chain(super::palette::repo_paths(ws))
         .collect();
     let pr_urls = this
         .syncs
@@ -89,12 +123,9 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
             &paths,
             |p, _, cx| cx.reveal_path(p),
         ),
-        path_submenu(
-            IconName::SquareTerminal,
-            "Open in Terminal",
-            &paths,
-            |p, _, _| open_terminal(p),
-        ),
+    ]);
+    entries.extend(open_in_entries(Some(&paths[0]), &paths[1..]));
+    entries.extend([
         path_submenu(IconName::Copy, "Copy path", &paths, |p, w, cx| {
             copy(p.display().to_string(), w, cx)
         }),

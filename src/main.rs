@@ -1,5 +1,6 @@
 mod agent;
 mod app;
+mod apps;
 mod attention;
 mod chat;
 mod codex;
@@ -72,7 +73,6 @@ actions!(
         CloseFile,
         ToggleVim,
         RevealInFinder,
-        OpenInTerminal,
         CopyPath,
         CopyBranch,
         ToggleRepo,
@@ -336,6 +336,8 @@ fn set_dock_icon() {
 
 fn main() {
     fix_path();
+    // LaunchServices and the icons take a moment; the first menu shouldn't wait for them.
+    std::thread::spawn(apps::installed);
     application()
         .with_assets(gpui_kit::assets::AllAssets)
         .run(|cx| {

@@ -6,12 +6,15 @@ use gpui_kit::component::{ActiveTheme, Icon, Sizable as _, Theme, h_flex, v_flex
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::rc::Rc;
+use std::sync::Arc;
 
 type OnClick = Rc<dyn Fn(&mut Window, &mut App)>;
 
 pub(crate) enum Entry {
     Item {
         icon: Option<IconName>,
+        /// Drawn instead of `icon`: an app's own icon.
+        image: Option<Arc<Image>>,
         label: SharedString,
         /// Right-aligned and muted: the branch a copy will copy, the path an open will open.
         hint: Option<SharedString>,
@@ -21,6 +24,7 @@ pub(crate) enum Entry {
     },
     Sub {
         icon: IconName,
+        image: Option<Arc<Image>>,
         label: SharedString,
         hint: Option<SharedString>,
         entries: Vec<Entry>,
@@ -35,6 +39,7 @@ pub(crate) fn item(
 ) -> Entry {
     Entry::Item {
         icon: icon.into(),
+        image: None,
         label: label.into(),
         hint: None,
         checked: false,
@@ -45,6 +50,7 @@ pub(crate) fn item(
 pub(crate) fn sub(icon: IconName, label: impl Into<SharedString>, entries: Vec<Entry>) -> Entry {
     Entry::Sub {
         icon,
+        image: None,
         label: label.into(),
         hint: None,
         entries,
@@ -57,6 +63,14 @@ impl Entry {
         let text = text.into();
         if let Entry::Item { hint, .. } | Entry::Sub { hint, .. } = &mut self {
             *hint = (!text.is_empty()).then_some(text);
+        }
+        self
+    }
+
+    /// `None` keeps the icon.
+    pub(crate) fn image(mut self, img: Option<Arc<Image>>) -> Self {
+        if let Entry::Item { image, .. } | Entry::Sub { image, .. } = &mut self {
+            *image = img;
         }
         self
     }
@@ -276,11 +290,16 @@ impl Menu {
         cx: &Context<Self>,
     ) -> Div {
         let theme = cx.theme();
-        let icons = entries
-            .iter()
-            .any(|e| matches!(e, Entry::Item { icon: Some(_), .. } | Entry::Sub { .. }));
+        let icons = entries.iter().any(|e| {
+            matches!(
+                e,
+                Entry::Item { icon: Some(_), .. }
+                    | Entry::Item { image: Some(_), .. }
+                    | Entry::Sub { .. }
+            )
+        });
         let rows = entries.iter().enumerate().map(|(ix, e)| {
-            let (icon, label, right) = match e {
+            let (icon, image, label, right) = match e {
                 Entry::Sep => {
                     return div()
                         .h(px(1.))
@@ -291,12 +310,14 @@ impl Menu {
                 }
                 Entry::Item {
                     icon,
+                    image,
                     label,
                     hint,
                     checked,
                     ..
                 } => (
                     *icon,
+                    image.clone(),
                     label,
                     Some(
                         h_flex()
@@ -319,9 +340,14 @@ impl Menu {
                     ),
                 ),
                 Entry::Sub {
-                    icon, label, hint, ..
+                    icon,
+                    image,
+                    label,
+                    hint,
+                    ..
                 } => (
                     Some(*icon),
+                    image.clone(),
                     label,
                     Some(
                         h_flex()
@@ -343,12 +369,18 @@ impl Menu {
                 .rounded(px(4.))
                 .when(sel == Some(ix) || open, |d| d.bg(highlight(theme)))
                 .when(icons, |d| {
-                    d.child(match icon {
-                        Some(i) => Icon::new(i)
+                    d.child(match (image, icon) {
+                        // App icons have a margin built in; 16px matches a 14px glyph.
+                        (Some(app), _) => img(app)
+                            .size(px(16.))
+                            .mx(px(-1.))
+                            .flex_none()
+                            .into_any_element(),
+                        (None, Some(i)) => Icon::new(i)
                             .with_size(px(14.))
                             .text_color(theme.muted_foreground)
                             .into_any_element(),
-                        None => div().size(px(14.)).flex_none().into_any_element(),
+                        (None, None) => div().size(px(14.)).flex_none().into_any_element(),
                     })
                 })
                 .child(div().flex_1().min_w_0().truncate().child(label.clone()))

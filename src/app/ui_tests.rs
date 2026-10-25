@@ -1438,3 +1438,118 @@ async fn perf_large_change(cx: &mut TestAppContext) {
     );
     fs::remove_dir_all(&home).ok();
 }
+
+/// Open in an app: terminals take the workspace folder, Fork asks which repo, Xcode shows
+/// only where a repo has a project and opens it. Through cmd-k and the right-click menu.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn open_in_apps(cx: &mut TestAppContext) {
+    use crate::apps::OPENED;
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["ios", "web"]);
+    fs::create_dir_all(repos[0].path.join("App.xcodeproj")).unwrap();
+    fs::write(repos[0].path.join("App.xcodeproj/project.pbxproj"), "").unwrap();
+    git::git(&repos[0].path, &["add", "."]).unwrap();
+    git::git(&repos[0].path, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"])
+        .unwrap();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    for (name, picked) in [("web-only", &repos[1..]), ("both", &repos[..])] {
+        on(cx, &|s, w, cx| {
+            s.create_workspace(name.into(), picked.to_vec(), None, w, cx)
+        });
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).active.as_deref() == Some(name)
+        })
+        .await;
+    }
+    let ws_dir = home.join("shark/workspaces/both");
+    let press = |cx: &mut TestAppContext, keys: &[&str]| {
+        cx.update_window(window, |_, w, cx| keys.iter().for_each(|k| w.press(k, cx)))
+            .unwrap();
+        cx.run_until_parked();
+    };
+    let run = |cx: &mut TestAppContext, query: &str| {
+        press(cx, &["cmd-k"]);
+        cx.update_window(window, |_, w, cx| w.input(query, cx)).unwrap();
+        press(cx, &["enter"]);
+    };
+    let last = || OPENED.lock().unwrap().last().cloned();
+
+    // The right-click menu: (label, hint, submenu rows) per "Open in" entry.
+    let menu_of = |cx: &mut TestAppContext, ws: &str| {
+        shark.update(cx, |s, cx| {
+            let ws = s.ws(ws).unwrap().clone();
+            (ws_menu(s, &ws, cx).into_iter())
+                .filter_map(|e| match e {
+                    Entry::Item { label, hint, .. } if label.starts_with("Open in") => {
+                        Some((label.to_string(), hint.map(|h| h.to_string()), vec![]))
+                    }
+                    Entry::Sub { label, entries, .. } if label.starts_with("Open in") => {
+                        let rows = (entries.iter())
+                            .filter_map(|r| match r {
+                                Entry::Item { label, .. } => Some(label.to_string()),
+                                _ => None,
+                            })
+                            .collect();
+                        Some((label.to_string(), None, rows))
+                    }
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+    let all = s(&["Workspace folder", "ios", "web"]);
+    assert_eq!(
+        menu_of(cx, "both"),
+        [
+            ("Open in Terminal".into(), None, all.clone()),
+            ("Open in Code".into(), None, all),
+            ("Open in Fork".into(), None, s(&["ios", "web"])),
+            ("Open in Xcode".into(), Some("ios/App.xcodeproj".into()), vec![]),
+        ]
+    );
+    let web_only = menu_of(cx, "web-only");
+    assert!(web_only.iter().all(|e| e.0 != "Open in Xcode"), "no project, no Xcode");
+    assert!(
+        web_only.contains(&("Open in Fork".into(), Some("web".into()), vec![])),
+        "one repo opens directly"
+    );
+
+    // cmd-k on the open workspace.
+    run(cx, "open in terminal");
+    assert_eq!(last(), Some(("Terminal".into(), ws_dir.clone())));
+    run(cx, "open in xcode");
+    assert_eq!(last(), Some(("Xcode".into(), ws_dir.join("ios/App.xcodeproj"))));
+    run(cx, "open in fork");
+    assert_eq!(last().unwrap().0, "Xcode", "Fork asks first");
+    cx.update_window(window, |_, w, cx| w.input("web", cx)).unwrap();
+    press(cx, &["enter"]);
+    assert_eq!(last(), Some(("Fork".into(), ws_dir.join("web"))));
+
+    // A workspace without a project has no Xcode row.
+    on(cx, &|s, w, cx| {
+        let ix = s.state.workspaces.iter().position(|w| w.name == "web-only").unwrap();
+        s.open_workspace(ix, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.as_deref() == Some("web-only")
+    })
+    .await;
+    let before = OPENED.lock().unwrap().len();
+    run(cx, "open in xcode");
+    assert_eq!(OPENED.lock().unwrap().len(), before, "nothing matched, nothing opened");
+    press(cx, &["escape"]);
+    run(cx, "open in fork");
+    assert_eq!(last(), Some(("Fork".into(), home.join("shark/workspaces/web-only/web"))));
+    fs::remove_dir_all(&home).ok();
+}
