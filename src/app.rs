@@ -367,6 +367,8 @@ impl Shark {
         if !self.chats.contains_key(&ws.name) {
             let chat = cx.new(|cx| Chat::new(ws.clone(), window, cx));
             let name = ws.name.clone();
+            // Busy also flips without a ChatEvent (background tasks, turns the CLI starts itself).
+            self._subs.push(cx.observe(&chat, |_, _, cx| cx.notify()));
             self._subs.push(
                 cx.subscribe(&chat, move |this, _, ev: &ChatEvent, cx| match ev {
                     ChatEvent::SessionId(id) => {
@@ -578,7 +580,7 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.chats.get(&name).is_some_and(|c| c.read(cx).busy) {
+        if self.chats.get(&name).is_some_and(|c| c.read(cx).working()) {
             return Self::notify_err(window, cx, "Agent is running; stop it first (ctrl-c)");
         }
         if !force {
@@ -799,7 +801,7 @@ impl Shark {
                 })
         });
         let workspaces = self.state.workspaces.iter().enumerate().map(|(ix, w)| {
-            let busy = self.chats.get(&w.name).is_some_and(|c| c.read(cx).busy);
+            let busy = self.chats.get(&w.name).is_some_and(|c| c.read(cx).working());
             let selected = ix == self.sel;
             let active = self.active.as_ref() == Some(&w.name);
             let ws = w.clone();
@@ -951,7 +953,7 @@ impl Shark {
                 )
                 .into_any_element();
         };
-        let busy = chat.read(cx).busy;
+        let (busy, background) = (chat.read(cx).working(), chat.read(cx).background);
         let tab = |label: String, icon: IconName, t: Tab| {
             let on = self.tab == t;
             h_flex()
@@ -1014,7 +1016,12 @@ impl Shark {
                             } else {
                                 faint(theme)
                             }))
-                            .child(if busy { "Running" } else { "Idle" }),
+                            .child(match (chat.read(cx).busy, background) {
+                                (true, 0) => "Running".into(),
+                                (true, n) => format!("Running · {n} in background"),
+                                (false, 0) => "Idle".into(),
+                                (false, n) => format!("{n} in background"),
+                            }),
                     ),
             )
             .child(match self.tab {
