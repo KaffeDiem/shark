@@ -73,6 +73,12 @@ actions!(
         MoveQueuedUp,
         MoveQueuedDown,
         FocusQueue,
+        NewSection,
+        MoveToSection,
+        RenameSection,
+        SectionIcon,
+        DeleteSection,
+        CancelEdit,
     ]
 );
 
@@ -160,6 +166,16 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("space o t", OpenInTerminal, Some(NAV)),
         KeyBinding::new("space y p", CopyPath, Some(NAV)),
         KeyBinding::new("space y b", CopyBranch, Some(NAV)),
+        KeyBinding::new("space s n", NewSection, Some(NAV)),
+        KeyBinding::new("space s m", MoveToSection, Some(NAV)),
+        KeyBinding::new("space s r", RenameSection, Some(NAV)),
+        KeyBinding::new("space s i", SectionIcon, Some(NAV)),
+        KeyBinding::new("space s d", DeleteSection, Some(NAV)),
+        KeyBinding::new("h", CollapseDir, Some("Sidebar")),
+        KeyBinding::new("l", ExpandDir, Some("Sidebar")),
+        KeyBinding::new("m", MoveToSection, Some("Sidebar")),
+        // Inline section name in the sidebar: the Input lets escape through.
+        KeyBinding::new("escape", CancelEdit, Some("SectionName")),
         // New workspace dialog: tab hops between branch and repo filter, space ticks the
         // highlighted repo (names have no spaces), cmd-enter creates from either field.
         KeyBinding::new("tab", SwitchField, Some("NewWorkspace")),

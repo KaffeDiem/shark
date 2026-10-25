@@ -2,7 +2,7 @@
 use crate::chat::{Chat, ChatEvent, MODELS};
 use crate::editor::{EditorEvent, FileEditor};
 use crate::files::{self, Row};
-use crate::state::{Repo, State, Workspace, workspaces_dir};
+use crate::state::{Repo, Section, State, Workspace, move_item, workspaces_dir};
 use crate::sync::{GitSync, SyncEvent};
 use crate::*;
 use gpui_kit::assets::IconName;
@@ -180,6 +180,7 @@ fn ws_menu(
                 }),
         )
         .separator();
+    let menu = move_submenu(menu, &ws.name, shark, window, cx).separator();
     let menu = path_submenu(
         menu,
         IconName::FolderOpen,
@@ -233,6 +234,194 @@ fn ws_menu(
                 .icon(IconName::ArchiveX)
                 .on_click(on(|s, name, w, cx| s.archive_ws(name, true, w, cx))),
         )
+}
+
+/// Icons a section can have, by Lucide name (what `Section::icon` stores).
+const SECTION_ICONS: &[(&str, IconName)] = &[
+    ("folder", IconName::Folder),
+    ("star", IconName::Star),
+    ("briefcase", IconName::Briefcase),
+    ("bug", IconName::Bug),
+    ("rocket", IconName::Rocket),
+    ("flame", IconName::Flame),
+    ("zap", IconName::Zap),
+    ("heart", IconName::Heart),
+    ("bookmark", IconName::Bookmark),
+    ("flag", IconName::Flag),
+    ("tag", IconName::Tag),
+    ("inbox", IconName::Inbox),
+    ("clock", IconName::Clock),
+    ("calendar", IconName::Calendar),
+    ("users", IconName::Users),
+    ("code", IconName::Code),
+    ("wrench", IconName::Wrench),
+    ("flask-conical", IconName::FlaskConical),
+    ("lightbulb", IconName::Lightbulb),
+    ("layers", IconName::Layers),
+    ("box", IconName::Box),
+    ("globe", IconName::Globe),
+    ("shield", IconName::Shield),
+    ("sparkles", IconName::Sparkles),
+    ("target", IconName::Target),
+    ("palette", IconName::Palette),
+    ("coffee", IconName::Coffee),
+    ("book-open", IconName::BookOpen),
+];
+
+fn section_icon(name: &str) -> IconName {
+    SECTION_ICONS
+        .iter()
+        .find(|(n, _)| *n == name)
+        .map_or(IconName::Folder, |(_, i)| *i)
+}
+
+/// "Move to Section" in a workspace's right-click menu; ends with "New Section…", which moves it there.
+fn move_submenu(
+    menu: PopupMenu,
+    ws: &str,
+    shark: &WeakEntity<Shark>,
+    window: &mut Window,
+    cx: &mut Context<PopupMenu>,
+) -> PopupMenu {
+    let Some(sh) = shark.upgrade() else {
+        return menu;
+    };
+    let sections: Vec<Section> = sh.read(cx).state.sections.clone();
+    let current = sh.read(cx).section_of(ws);
+    let (ws, shark) = (ws.to_string(), shark.clone());
+    menu.submenu_with_icon(
+        Some(IconName::FolderInput.into()),
+        "Move to Section",
+        window,
+        cx,
+        move |mut m, _, _| {
+            let to = |to: Option<usize>| {
+                let (shark, ws) = (shark.clone(), ws.clone());
+                move |_: &ClickEvent, _: &mut Window, cx: &mut App| {
+                    shark
+                        .update(cx, |s, cx| s.move_to_section(&ws, to, cx))
+                        .ok();
+                }
+            };
+            for (i, sec) in sections.iter().enumerate() {
+                m = m.item(
+                    PopupMenuItem::new(sec.name.clone())
+                        .icon(section_icon(&sec.icon))
+                        .checked(current == Some(i))
+                        .on_click(to(Some(i))),
+                );
+            }
+            if current.is_some() {
+                m = m.item(
+                    PopupMenuItem::new("No Section")
+                        .icon(IconName::FolderOutput)
+                        .on_click(to(None)),
+                );
+            }
+            if !sections.is_empty() {
+                m = m.separator();
+            }
+            let (shark, ws) = (shark.clone(), ws.clone());
+            m.item(
+                PopupMenuItem::new("New Section…")
+                    .icon(IconName::FolderPlus)
+                    .on_click(move |_, window, cx| {
+                        shark
+                            .update(cx, |s, cx| {
+                                s.start_naming(None, Some(ws.clone()), window, cx)
+                            })
+                            .ok();
+                    }),
+            )
+        },
+    )
+}
+
+/// Right-click menu of a section header.
+fn section_menu(menu: PopupMenu, i: usize, name: &str, shark: &WeakEntity<Shark>) -> PopupMenu {
+    let on = |f: fn(&mut Shark, usize, &mut Window, &mut Context<Shark>)| {
+        let shark = shark.clone();
+        move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
+            shark.update(cx, |s, cx| f(s, i, window, cx)).ok();
+        }
+    };
+    menu.label(format!("Section {name}"))
+        .separator()
+        .item(
+            PopupMenuItem::new("Rename")
+                .icon(IconName::Pencil)
+                .on_click(on(|s, i, w, cx| s.start_naming(Some(i), None, w, cx))),
+        )
+        .item(
+            PopupMenuItem::new("Change Icon…")
+                .icon(IconName::Shapes)
+                .on_click(on(|s, i, w, cx| s.pick_icon(i, w, cx))),
+        )
+        .item(
+            PopupMenuItem::new("New Section")
+                .icon(IconName::FolderPlus)
+                .on_click(on(|s, _, w, cx| s.start_naming(None, None, w, cx))),
+        )
+        .separator()
+        .item(
+            PopupMenuItem::new("Delete Section")
+                .icon(IconName::Trash)
+                .on_click(on(|s, i, w, cx| s.delete_section(i, w, cx))),
+        )
+}
+
+/// A sidebar row the cursor can sit on.
+#[derive(PartialEq, Clone, Copy, Debug)]
+enum SideRow {
+    /// Index into `state.sections`.
+    Section(usize),
+    /// Index into `state.workspaces`.
+    Ws(usize),
+}
+
+/// The inline section name field in the sidebar.
+struct Naming {
+    /// The section being renamed; `None` adds one.
+    rename: Option<usize>,
+    /// Workspace to move into the new section ("Move to Section › New Section…").
+    then_move: Option<String>,
+    input: Entity<InputState>,
+    _sub: Subscription,
+}
+
+/// A workspace row being dragged: onto a header to move it in, onto a row to take its slot.
+#[derive(Clone)]
+struct DraggedWs(SharedString);
+
+/// A section header being dragged onto another to take its place.
+#[derive(Clone)]
+struct DraggedSection(usize, SharedString);
+
+impl Render for DraggedWs {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        drag_chip(self.0.clone(), cx)
+    }
+}
+
+impl Render for DraggedSection {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        drag_chip(self.1.clone(), cx)
+    }
+}
+
+fn drag_chip(label: SharedString, cx: &App) -> Div {
+    let theme = cx.theme();
+    div()
+        .px_2()
+        .py_1()
+        .rounded(theme.radius)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary)
+        .text_sm()
+        .text_color(theme.foreground)
+        .font_features(inter_features())
+        .child(label)
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -292,7 +481,8 @@ impl DiffData {
 
 pub struct Shark {
     pub(crate) state: State,
-    sel: usize,
+    sel: SideRow,
+    naming: Option<Naming>,
     pub(crate) active: Option<String>,
     pub(crate) chats: HashMap<String, Entity<Chat>>,
     tab: Tab,
@@ -384,6 +574,30 @@ const COMMANDS: &[(&str, IconName, Cmd)] = &[
     ("Git: fetch now", IconName::RefreshCw, |s, w, cx| {
         s.with_sync(w, cx, GitSync::fetch_now)
     }),
+    ("New section", IconName::FolderPlus, |s, w, cx| {
+        s.start_naming(None, None, w, cx)
+    }),
+    (
+        "Move workspace to section…",
+        IconName::FolderInput,
+        |s, w, cx| s.pick_section(w, cx),
+    ),
+    ("Rename section", IconName::Pencil, |s, w, cx| {
+        s.with_section(w, cx, |s, i, w, cx| s.start_naming(Some(i), None, w, cx))
+    }),
+    ("Change section icon…", IconName::Shapes, |s, w, cx| {
+        s.with_section(w, cx, Shark::pick_icon)
+    }),
+    (
+        "Collapse / expand section",
+        IconName::ChevronsUpDown,
+        |s, w, cx| s.with_section(w, cx, |s, i, _, cx| s.toggle_section(i, cx)),
+    ),
+    (
+        "Delete section (its workspaces stay)",
+        IconName::Trash,
+        |s, w, cx| s.with_section(w, cx, Shark::delete_section),
+    ),
     ("Toggle sidebar", IconName::PanelLeft, |s, _, cx| {
         s.toggle_sidebar(cx)
     }),
@@ -437,7 +651,8 @@ impl Shark {
         })];
         Shark {
             state,
-            sel: 0,
+            sel: SideRow::Ws(0),
+            naming: None,
             active: None,
             chats: HashMap::new(),
             tab: Tab::Chat,
@@ -514,7 +729,13 @@ impl Shark {
             self.collapsed_dirs.clear();
             self.tree_sel = 0;
         }
-        self.sel = ix;
+        self.sel = SideRow::Ws(ix);
+        if let Some(i) = self.section_of(&ws.name)
+            && self.state.sections[i].collapsed
+        {
+            self.state.sections[i].collapsed = false;
+            self.state.save();
+        }
         if !self.chats.contains_key(&ws.name) {
             let chat = cx.new(|cx| Chat::new(ws.clone(), window, cx));
             let name = ws.name.clone();
@@ -1116,9 +1337,9 @@ impl Shark {
 
     /// Row actions hit the workspace under the sidebar cursor when the sidebar is focused, else the open one.
     fn target(&self, window: &Window) -> Option<Workspace> {
-        let name = match self.sidebar_focus.is_focused(window) {
-            true => self.state.workspaces.get(self.sel)?.name.clone(),
-            false => self.active.clone()?,
+        let name = match (self.sidebar_focus.is_focused(window), self.sel) {
+            (true, SideRow::Ws(ix)) => self.state.workspaces.get(ix)?.name.clone(),
+            _ => self.active.clone()?,
         };
         self.state
             .workspaces
@@ -1205,9 +1426,13 @@ impl Shark {
         };
         match git::remove_workspace(&ws, &ws.dir(), force) {
             Ok(()) => {
+                let pos = self.side_rows().iter().position(|r| *r == self.sel);
                 self.chats.remove(name);
                 self.syncs.remove(name);
                 self.state.workspaces.retain(|w| w.name != name);
+                for s in &mut self.state.sections {
+                    s.workspaces.retain(|w| w != name);
+                }
                 self.state.save();
                 // A later workspace with the same name must not replay or resume this conversation.
                 let _ = std::fs::remove_file(crate::agent::transcript_path(name));
@@ -1216,7 +1441,12 @@ impl Shark {
                     self.drop_editor();
                     self.tab = Tab::Chat;
                 }
-                self.sel = self.sel.min(self.state.workspaces.len().saturating_sub(1));
+                // The cursor stays at the same height, on whatever row moved up into it.
+                let rows = self.side_rows();
+                self.sel = pos
+                    .and_then(|p| rows.get(p.min(rows.len().saturating_sub(1))))
+                    .copied()
+                    .unwrap_or(SideRow::Ws(0));
                 window.push_notification(
                     Notification::success(format!("Archived {name} (branch kept)")),
                     cx,
@@ -1305,6 +1535,386 @@ impl Shark {
         };
         chat.update(cx, |c, cx| c.set_model(m, cx));
         window.push_notification(format!("Model: {m} (from the next message)"), cx);
+    }
+
+    fn section_of(&self, ws: &str) -> Option<usize> {
+        self.state
+            .sections
+            .iter()
+            .position(|s| s.workspaces.iter().any(|w| w == ws))
+    }
+
+    /// Sidebar rows top to bottom: each section, then its workspaces unless it is
+    /// collapsed; then the workspaces in no section.
+    fn side_rows(&self) -> Vec<SideRow> {
+        let ws = &self.state.workspaces;
+        let mut rows = vec![];
+        for (i, s) in self.state.sections.iter().enumerate() {
+            rows.push(SideRow::Section(i));
+            if !s.collapsed {
+                rows.extend(
+                    s.workspaces
+                        .iter()
+                        .filter_map(|n| ws.iter().position(|w| &w.name == n))
+                        .map(SideRow::Ws),
+                );
+            }
+        }
+        rows.extend(
+            (0..ws.len())
+                .filter(|&ix| self.section_of(&ws[ix].name).is_none())
+                .map(SideRow::Ws),
+        );
+        rows
+    }
+
+    /// Visible workspaces in sidebar order; cmd-N opens the Nth.
+    fn ws_order(&self) -> Vec<usize> {
+        self.side_rows()
+            .into_iter()
+            .filter_map(|r| match r {
+                SideRow::Ws(ix) => Some(ix),
+                SideRow::Section(_) => None,
+            })
+            .collect()
+    }
+
+    /// Keeps the cursor on a visible row; a workspace hidden by collapsing hands it to its header.
+    fn fix_sel(&mut self) {
+        let rows = self.side_rows();
+        if rows.contains(&self.sel) {
+            return;
+        }
+        let header = match self.sel {
+            SideRow::Ws(ix) => self
+                .state
+                .workspaces
+                .get(ix)
+                .and_then(|w| self.section_of(&w.name)),
+            SideRow::Section(_) => None,
+        };
+        self.sel = header
+            .map(SideRow::Section)
+            .or(rows.first().copied())
+            .unwrap_or(SideRow::Ws(0));
+    }
+
+    fn move_sel(&mut self, to: impl FnOnce(usize, usize) -> usize, cx: &mut Context<Self>) {
+        let rows = self.side_rows();
+        if rows.is_empty() {
+            return;
+        }
+        let at = rows.iter().position(|r| *r == self.sel).unwrap_or(0);
+        self.sel = rows[to(at, rows.len()).min(rows.len() - 1)];
+        cx.notify();
+    }
+
+    /// Section actions hit the section under the sidebar cursor (or the cursor
+    /// workspace's section) when the sidebar is focused, else the open workspace's.
+    fn target_section(&self, window: &Window) -> Option<usize> {
+        if self.sidebar_focus.is_focused(window) {
+            return match self.sel {
+                SideRow::Section(i) => Some(i),
+                SideRow::Ws(ix) => self.section_of(&self.state.workspaces.get(ix)?.name),
+            };
+        }
+        self.section_of(self.active.as_ref()?)
+    }
+
+    fn with_section(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Self, usize, &mut Window, &mut Context<Self>),
+    ) {
+        match self.target_section(window) {
+            Some(i) => f(self, i, window, cx),
+            None => Self::notify_err(window, cx, "Put the sidebar cursor on a section first"),
+        }
+    }
+
+    fn set_collapsed(&mut self, i: usize, collapsed: bool, cx: &mut Context<Self>) {
+        if let Some(s) = self.state.sections.get_mut(i)
+            && s.collapsed != collapsed
+        {
+            s.collapsed = collapsed;
+            self.state.save();
+            self.fix_sel();
+            cx.notify();
+        }
+    }
+
+    fn toggle_section(&mut self, i: usize, cx: &mut Context<Self>) {
+        if let Some(s) = self.state.sections.get(i) {
+            self.set_collapsed(i, !s.collapsed, cx);
+        }
+    }
+
+    /// `h` in the sidebar: fold the cursor's section and park the cursor on its header.
+    fn collapse_at_cursor(&mut self, cx: &mut Context<Self>) {
+        let i = match self.sel {
+            SideRow::Section(i) => Some(i),
+            SideRow::Ws(ix) => self
+                .state
+                .workspaces
+                .get(ix)
+                .and_then(|w| self.section_of(&w.name)),
+        };
+        if let Some(i) = i {
+            self.sel = SideRow::Section(i);
+            self.set_collapsed(i, true, cx);
+            cx.notify();
+        }
+    }
+
+    fn move_to_section(&mut self, ws: &str, to: Option<usize>, cx: &mut Context<Self>) {
+        if self.section_of(ws) == to {
+            return;
+        }
+        for s in &mut self.state.sections {
+            s.workspaces.retain(|w| w != ws);
+        }
+        if let Some(s) = to.and_then(|i| self.state.sections.get_mut(i)) {
+            s.workspaces.push(ws.to_string());
+        }
+        self.state.save();
+        self.fix_sel();
+        cx.notify();
+    }
+
+    /// The workspace under the cursor, so a reorder that shifts indices can put it back.
+    fn sel_name(&self) -> Option<String> {
+        match self.sel {
+            SideRow::Ws(ix) => Some(self.state.workspaces.get(ix)?.name.clone()),
+            SideRow::Section(_) => None,
+        }
+    }
+
+    fn drop_ws(&mut self, ws: &str, target: &str, cx: &mut Context<Self>) {
+        let cursor = self.sel_name();
+        self.state.drop_ws(ws, target);
+        if let Some(ix) =
+            cursor.and_then(|n| self.state.workspaces.iter().position(|w| w.name == n))
+        {
+            self.sel = SideRow::Ws(ix);
+        }
+        self.state.save();
+        self.fix_sel();
+        cx.notify();
+    }
+
+    fn drop_section(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        let n = self.state.sections.len();
+        if from == to || from >= n || to >= n {
+            return;
+        }
+        let cursor = match self.sel {
+            SideRow::Section(j) => Some(self.state.sections[j].name.clone()),
+            SideRow::Ws(_) => None,
+        };
+        move_item(&mut self.state.sections, from, to);
+        if let Some(j) = cursor.and_then(|c| self.state.sections.iter().position(|s| s.name == c)) {
+            self.sel = SideRow::Section(j);
+        }
+        if self.naming.as_ref().is_some_and(|n| n.rename.is_some()) {
+            self.naming = None; // its index moved
+        }
+        self.state.save();
+        cx.notify();
+    }
+
+    fn delete_section(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if i >= self.state.sections.len() {
+            return;
+        }
+        let s = self.state.sections.remove(i);
+        self.state.save();
+        self.naming = None;
+        if let SideRow::Section(j) = self.sel {
+            self.sel = SideRow::Section(if j > i { j - 1 } else { j });
+        }
+        self.fix_sel();
+        window.push_notification(
+            format!("Deleted section {} (its workspaces stay)", s.name),
+            cx,
+        );
+        cx.notify();
+    }
+
+    /// Opens the inline name field: on section `rename`, or below the sections for a new one.
+    fn start_naming(
+        &mut self,
+        rename: Option<usize>,
+        then_move: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let value = rename
+            .and_then(|i| self.state.sections.get(i))
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        let input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("Section name")
+                .default_value(value)
+        });
+        let _sub = cx.subscribe_in(
+            &input,
+            window,
+            |this, _, ev: &InputEvent, window, cx| match ev {
+                InputEvent::PressEnter { .. } => this.commit_naming(true, window, cx),
+                InputEvent::Blur => this.commit_naming(false, window, cx),
+                _ => {}
+            },
+        );
+        // Deferred: a closing menu or palette restores focus first, which would blur the field.
+        let field = input.clone();
+        window.defer(cx, move |window, cx| {
+            field.update(cx, |i, cx| {
+                i.focus(window, cx);
+                i.select_all(window, cx);
+            })
+        });
+        self.rail = false;
+        self.naming = Some(Naming {
+            rename,
+            then_move,
+            input,
+            _sub,
+        });
+        cx.notify();
+    }
+
+    /// Enter saves (a taken name stays in the field); clicking away saves too.
+    /// An empty name changes nothing.
+    fn commit_naming(&mut self, enter: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(n) = &self.naming else {
+            return;
+        };
+        let name = n.input.read(cx).value().trim().to_string();
+        let taken = self
+            .state
+            .sections
+            .iter()
+            .enumerate()
+            .any(|(i, s)| s.name == name && Some(i) != n.rename);
+        if taken && enter {
+            return Self::notify_err(window, cx, format!("There is already a section {name}"));
+        }
+        let Some(n) = self.naming.take() else {
+            return;
+        };
+        if !name.is_empty() && !taken {
+            match n.rename {
+                Some(i) => {
+                    if let Some(s) = self.state.sections.get_mut(i) {
+                        s.name = name;
+                    }
+                }
+                None => {
+                    self.state.sections.push(Section {
+                        name,
+                        icon: "folder".into(),
+                        collapsed: false,
+                        workspaces: vec![],
+                    });
+                    let i = self.state.sections.len() - 1;
+                    self.sel = SideRow::Section(i);
+                    if let Some(ws) = n.then_move {
+                        self.move_to_section(&ws, Some(i), cx);
+                    }
+                }
+            }
+            self.state.save();
+        }
+        if enter {
+            self.sidebar_focus.focus(window, cx);
+        }
+        cx.notify();
+    }
+
+    fn cancel_naming(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.naming = None;
+        self.sidebar_focus.focus(window, cx);
+        cx.notify();
+    }
+
+    fn pick_icon(&mut self, i: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(current) = self.state.sections.get(i).map(|s| s.icon.clone()) else {
+            return;
+        };
+        // Named by keyword, so typing "bug" or "star" finds the icon.
+        let items = SECTION_ICONS
+            .iter()
+            .map(|(name, icon)| {
+                CommandItem::new()
+                    .label(name.replace('-', " "))
+                    .icon(*icon)
+                    .checked(*name == current)
+            })
+            .collect();
+        let selected = SECTION_ICONS
+            .iter()
+            .position(|(n, _)| *n == current)
+            .unwrap_or(0);
+        self.open_menu(
+            items,
+            selected,
+            move |s, row, _, cx| {
+                if let Some(sec) = s.state.sections.get_mut(i) {
+                    sec.icon = SECTION_ICONS[row].0.into();
+                    s.state.save();
+                    cx.notify();
+                }
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// Sections, then "No section" when it is in one, then "New section…".
+    fn pick_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.target(window).map(|w| w.name) else {
+            return Self::notify_err(window, cx, "Open a workspace first");
+        };
+        let current = self.section_of(&ws);
+        let n = self.state.sections.len();
+        let mut items: Vec<CommandItem> = self
+            .state
+            .sections
+            .iter()
+            .enumerate()
+            .map(|(i, s)| {
+                CommandItem::new()
+                    .label(s.name.clone())
+                    .icon(section_icon(&s.icon))
+                    .checked(current == Some(i))
+            })
+            .collect();
+        if current.is_some() {
+            items.push(
+                CommandItem::new()
+                    .label("No section")
+                    .icon(IconName::FolderOutput),
+            );
+        }
+        items.push(
+            CommandItem::new()
+                .label("New section…")
+                .icon(IconName::FolderPlus),
+        );
+        let last = items.len() - 1;
+        self.open_menu(
+            items,
+            current.unwrap_or(0),
+            move |s, row, window, cx| match row {
+                _ if row == last => s.start_naming(None, Some(ws.clone()), window, cx),
+                _ if row < n => s.move_to_section(&ws, Some(row), cx),
+                _ => s.move_to_section(&ws, None, cx),
+            },
+            window,
+            cx,
+        );
     }
 
     fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1406,18 +2016,28 @@ impl Shark {
                         )
                 })
         });
-        let workspaces = self.state.workspaces.iter().enumerate().map(|(ix, w)| {
+        let order = self.ws_order();
+        let (primary, accent) = (theme.primary, theme.sidebar_accent);
+        // Dropping a workspace on a header or on a row of a section moves it there.
+        let drop_on = |to: Option<usize>| {
+            cx.listener(move |this: &mut Shark, d: &DraggedWs, _, cx| {
+                this.move_to_section(&d.0, to, cx)
+            })
+        };
+        let ws_row = |ix: usize, w: &Workspace, section: Option<usize>| {
             let busy = self
                 .chats
                 .get(&w.name)
                 .is_some_and(|c| c.read(cx).working());
-            let selected = ix == self.sel;
+            let selected = self.sel == SideRow::Ws(ix);
             let active = self.active.as_ref() == Some(&w.name);
+            let nth = order.iter().position(|&o| o == ix).filter(|&n| n < 9);
             let ws = w.clone();
             let shark = shark.clone();
             row()
                 .id(ix)
                 .h(px(44.))
+                .when(section.is_some() && !rail, |d| d.ml(px(24.)))
                 .border_1()
                 .border_color(theme.transparent)
                 // The tint alone is too subtle to find the cursor; the accent ring makes it visible.
@@ -1433,21 +2053,29 @@ impl Shark {
                 .on_mouse_down(
                     MouseButton::Right,
                     cx.listener(move |this, _, _, cx| {
-                        this.sel = ix;
+                        this.sel = SideRow::Ws(ix);
                         cx.notify();
                     }),
                 )
-                .child(match busy {
-                    _ if cmd_held && ix < 9 => {
-                        Kbd::new(Keystroke::parse(&format!("cmd-{}", ix + 1)).unwrap())
+                .on_drag(DraggedWs(w.name.clone().into()), |d, _, _, cx| {
+                    cx.new(|_| d.clone())
+                })
+                .drag_over::<DraggedWs>(move |d, _, _, _| d.border_color(primary))
+                .on_drop({
+                    let target = w.name.clone();
+                    cx.listener(move |this, d: &DraggedWs, _, cx| this.drop_ws(&d.0, &target, cx))
+                })
+                .child(match (busy, nth) {
+                    (_, Some(n)) if cmd_held => {
+                        Kbd::new(Keystroke::parse(&format!("cmd-{}", n + 1)).unwrap())
                             .into_any_element()
                     }
-                    true => Spinner::new()
+                    (true, _) => Spinner::new()
                         .icon(IconName::LoaderCircle)
                         .color(theme.primary)
                         .with_size(px(14.))
                         .into_any_element(),
-                    false => Icon::new(IconName::CircleDashed)
+                    (false, _) => Icon::new(IconName::CircleDashed)
                         .with_size(px(14.))
                         .text_color(theme.muted_foreground)
                         .into_any_element(),
@@ -1483,7 +2111,159 @@ impl Shark {
                     d.tooltip(move |w, cx| Tooltip::new(name.clone()).build(w, cx))
                 })
                 .context_menu(move |menu, window, cx| ws_menu(menu, &ws, ix, &shark, window, cx))
-        });
+                .into_any_element()
+        };
+        let section_row =
+            |i: usize, sec: &Section| {
+                let selected = self.sel == SideRow::Section(i);
+                let (name, shark) = (sec.name.clone(), shark.clone());
+                let tip: SharedString = sec.name.clone().into();
+                row()
+                    .id(("section", i))
+                    .border_1()
+                    .border_color(theme.transparent)
+                    .text_color(theme.muted_foreground)
+                    .when(selected && focused, |d| {
+                        d.bg(theme.list_active).border_color(theme.primary)
+                    })
+                    .when(selected && !focused, |d| d.bg(theme.sidebar_accent))
+                    .hover(|d| d.bg(theme.sidebar_accent))
+                    .drag_over::<DraggedWs>(move |d, _, _, _| d.bg(accent).border_color(primary))
+                    .on_drop(drop_on(Some(i)))
+                    .on_drag(DraggedSection(i, sec.name.clone().into()), |d, _, _, cx| {
+                        cx.new(|_| d.clone())
+                    })
+                    .drag_over::<DraggedSection>(move |d, _, _, _| d.border_color(primary))
+                    .on_drop(cx.listener(move |this, d: &DraggedSection, _, cx| {
+                        this.drop_section(d.0, i, cx)
+                    }))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.sel = SideRow::Section(i);
+                        this.toggle_section(i, cx)
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, _, _, cx| {
+                            this.sel = SideRow::Section(i);
+                            cx.notify();
+                        }),
+                    )
+                    .child(Icon::new(section_icon(&sec.icon)).with_size(px(14.)))
+                    .when(!rail, |d| {
+                        d.child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(sec.name.clone()),
+                        )
+                        .when(sec.collapsed, |d| {
+                            d.child(div().text_xs().child(sec.workspaces.len().to_string()))
+                        })
+                        .child(
+                            Icon::new(match sec.collapsed {
+                                true => IconName::ChevronRight,
+                                false => IconName::ChevronDown,
+                            })
+                            .with_size(px(12.)),
+                        )
+                    })
+                    .when(rail, |d| {
+                        d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+                    })
+                    .context_menu(move |menu, _, _| section_menu(menu, i, &name, &shark))
+                    .into_any_element()
+            };
+        let name_row = |input: &Entity<InputState>, icon: IconName| {
+            row()
+                .key_context("SectionName")
+                .border_1()
+                .border_color(theme.primary)
+                .bg(theme.list_active)
+                .text_color(theme.muted_foreground)
+                .on_action(cx.listener(|this, _: &CancelEdit, w, cx| this.cancel_naming(w, cx)))
+                .child(Icon::new(icon).with_size(px(14.)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_color(theme.foreground)
+                        .child(Input::new(input).appearance(false).small()),
+                )
+                .into_any_element()
+        };
+        let mut items: Vec<AnyElement> = vec![];
+        let mut new_row = self
+            .naming
+            .as_ref()
+            .filter(|n| n.rename.is_none())
+            .map(|n| name_row(&n.input, IconName::Folder));
+        for r in self.side_rows() {
+            match r {
+                SideRow::Section(i) => {
+                    let sec = &self.state.sections[i];
+                    match &self.naming {
+                        Some(n) if n.rename == Some(i) => {
+                            items.push(name_row(&n.input, section_icon(&sec.icon)))
+                        }
+                        _ => items.push(section_row(i, sec)),
+                    }
+                }
+                SideRow::Ws(ix) => {
+                    let w = &self.state.workspaces[ix];
+                    let section = self.section_of(&w.name);
+                    if section.is_none() {
+                        // A new section's field goes below the existing sections.
+                        items.extend(new_row.take());
+                    }
+                    items.push(ws_row(ix, w, section));
+                }
+            }
+        }
+        items.extend(new_row.take());
+        let new_section_menu = {
+            let shark = shark.clone();
+            move |menu: PopupMenu, _: &mut Window, _: &mut Context<PopupMenu>| {
+                let shark = shark.clone();
+                menu.item(
+                    PopupMenuItem::new("New Section")
+                        .icon(IconName::FolderPlus)
+                        .on_click(move |_, window, cx| {
+                            shark
+                                .update(cx, |s, cx| s.start_naming(None, None, window, cx))
+                                .ok();
+                        }),
+                )
+            }
+        };
+        let ws_header = h_flex()
+            .id("ws-header")
+            .group("ws-header")
+            .justify_between()
+            .items_end()
+            .drag_over::<DraggedWs>(move |d, _, _, _| d.bg(accent))
+            .on_drop(drop_on(None))
+            .child(header("Workspaces"))
+            .when(!rail, |d| {
+                d.child(
+                    div()
+                        .mr_3()
+                        .invisible()
+                        .group_hover("ws-header", |s| s.visible())
+                        .child(
+                            Button::new("new-section")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::FolderPlus)
+                                .tooltip("New section (space s n)")
+                                .on_click(cx.listener(|this, _, w, cx| {
+                                    this.start_naming(None, None, w, cx)
+                                })),
+                        ),
+                )
+            })
+            .context_menu(new_section_menu.clone());
         v_flex()
             .id("sidebar")
             .key_context("Sidebar")
@@ -1492,24 +2272,21 @@ impl Shark {
             .h_full()
             .flex_none()
             .text_color(theme.sidebar_foreground)
-            .on_action(cx.listener(|this, _: &SelectNext, _, cx| {
-                this.sel = (this.sel + 1).min(this.state.workspaces.len().saturating_sub(1));
-                cx.notify();
-            }))
+            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_sel(|at, _| at + 1, cx)))
             .on_action(cx.listener(|this, _: &SelectPrev, _, cx| {
-                this.sel = this.sel.saturating_sub(1);
-                cx.notify();
+                this.move_sel(|at, _| at.saturating_sub(1), cx)
             }))
-            .on_action(cx.listener(|this, _: &SelectFirst, _, cx| {
-                this.sel = 0;
-                cx.notify();
+            .on_action(cx.listener(|this, _: &SelectFirst, _, cx| this.move_sel(|_, _| 0, cx)))
+            .on_action(cx.listener(|this, _: &SelectLast, _, cx| this.move_sel(|_, n| n - 1, cx)))
+            .on_action(cx.listener(|this, _: &Confirm, window, cx| match this.sel {
+                SideRow::Ws(ix) => this.open_workspace(ix, window, cx),
+                SideRow::Section(i) => this.toggle_section(i, cx),
             }))
-            .on_action(cx.listener(|this, _: &SelectLast, _, cx| {
-                this.sel = this.state.workspaces.len().saturating_sub(1);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|this, _: &Confirm, window, cx| {
-                this.open_workspace(this.sel, window, cx)
+            .on_action(cx.listener(|this, _: &CollapseDir, _, cx| this.collapse_at_cursor(cx)))
+            .on_action(cx.listener(|this, _: &ExpandDir, _, cx| {
+                if let SideRow::Section(i) = this.sel {
+                    this.set_collapsed(i, false, cx)
+                }
             }))
             // Room for the traffic lights; the transparent titlebar lets the sidebar run under them.
             .child(
@@ -1518,16 +2295,25 @@ impl Shark {
                     .flex_none()
                     .window_control_area(WindowControlArea::Drag),
             )
-            .child(header("Workspaces"))
-            .children(workspaces)
-            .when(self.state.workspaces.is_empty(), |d| {
-                d.child(hint("space w n to create"))
-            })
+            .child(ws_header)
+            .children(items)
+            .when(
+                self.state.workspaces.is_empty() && self.state.sections.is_empty(),
+                |d| d.child(hint("space w n to create")),
+            )
             .child(header("Repos"))
             .children(repos)
             .when(self.state.repos.is_empty(), |d| {
                 d.child(hint("space r a to add"))
             })
+            // The empty space below takes a right-click too.
+            .child(
+                div()
+                    .id("sidebar-rest")
+                    .flex_1()
+                    .min_h(px(24.))
+                    .context_menu(new_section_menu),
+            )
     }
 
     fn render_main(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -2298,9 +3084,24 @@ impl Render for Shark {
                 this.with_target(w, cx, |ws, w, cx| copy(ws.branch.clone(), w, cx))
             }))
             .on_action(cx.listener(|this, a: &SetModel, w, cx| this.set_model(a.0, w, cx)))
+            .on_action(cx.listener(|this, a: &OpenWorkspace, w, cx| {
+                if let Some(ix) = this.ws_order().get(a.0).copied() {
+                    this.open_workspace(ix, w, cx)
+                }
+            }))
             .on_action(
-                cx.listener(|this, a: &OpenWorkspace, w, cx| this.open_workspace(a.0, w, cx)),
+                cx.listener(|this, _: &NewSection, w, cx| this.start_naming(None, None, w, cx)),
             )
+            .on_action(cx.listener(|this, _: &MoveToSection, w, cx| this.pick_section(w, cx)))
+            .on_action(cx.listener(|this, _: &RenameSection, w, cx| {
+                this.with_section(w, cx, |s, i, w, cx| s.start_naming(Some(i), None, w, cx))
+            }))
+            .on_action(cx.listener(|this, _: &SectionIcon, w, cx| {
+                this.with_section(w, cx, Shark::pick_icon)
+            }))
+            .on_action(cx.listener(|this, _: &DeleteSection, w, cx| {
+                this.with_section(w, cx, Shark::delete_section)
+            }))
             // The sidebar swaps status icons for cmd-N hints while cmd is held.
             .on_modifiers_changed(cx.listener(|_, _, _, cx| cx.notify()))
             .on_action(cx.listener(|this, _: &FocusLeft, w, cx| this.move_focus(-1, w, cx)))
@@ -2893,6 +3694,34 @@ mod ui_tests {
             assert_eq!(names, ["web"]);
             assert_eq!(s.state.last_repos, ["web"]);
         });
+
+        // Sections: name inline, move with `m`, fold with h/l, delete keeps the workspace.
+        press(cx, &["ctrl-w", "h", "space", "s", "n"]);
+        cx.run_until_parked();
+        cx.update_window(window, |_, w, cx| w.input("Later", cx))
+            .unwrap();
+        press(cx, &["enter"]);
+        let sections =
+            |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.sections.clone());
+        assert_eq!(sections(cx)[0].name, "Later");
+        cx.update_window(window, |_, w, cx| {
+            let s = shark.read(cx);
+            assert!(s.sidebar_focus.is_focused(w) && s.sel == SideRow::Section(0));
+        })
+        .unwrap();
+        press(cx, &["j", "m"]);
+        cx.run_until_parked();
+        press(cx, &["enter"]);
+        assert_eq!(sections(cx)[0].workspaces, ["kb"]);
+        press(cx, &["j", "h"]);
+        cx.update(|cx| {
+            let s = shark.read(cx);
+            assert!(s.state.sections[0].collapsed && s.sel == SideRow::Section(0));
+            assert!(s.ws_order().is_empty(), "cmd-N skips folded workspaces");
+        });
+        press(cx, &["l", "space", "s", "d"]);
+        assert!(sections(cx).is_empty());
+        cx.update(|cx| assert_eq!(shark.read(cx).state.workspaces.len(), 1));
         press(cx, &["ctrl-w", "h", "space", "w", "d"]);
         cx.update(|cx| assert!(shark.read(cx).state.workspaces.is_empty()));
 
