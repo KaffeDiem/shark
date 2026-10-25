@@ -214,9 +214,6 @@ pub fn track(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, pid: u32, line: &str)
     if let (Some(t), Some(main)) = (v["params"]["threadId"].as_str(), &s.thread)
         && t != main
     {
-        if !v["id"].is_null() {
-            let _ = deny(stdin, &v["id"].to_string()); // an approval no one would see
-        }
         return false;
     }
     match (id, method) {
@@ -273,10 +270,11 @@ pub fn parse(v: &Value) -> Vec<Ev> {
         (Some("item/completed"), Some("subAgentActivity")) => {
             let id = s(&item["agentThreadId"]);
             match item["kind"].as_str() {
+                // `/root/wait_twenty` → `wait twenty`
                 Some("started") => vec![Ev::ToolUse {
                     id,
                     name: "Agent".into(),
-                    input: json!({"description": sub_agent_name(&s(&item["agentPath"]))}),
+                    input: json!({"description": s(&item["agentPath"]).rsplit('/').next().unwrap_or_default().replace('_', " ")}),
                 }],
                 Some(kind @ ("completed" | "interrupted")) => vec![Ev::ToolResult {
                     id,
@@ -345,14 +343,6 @@ pub fn parse(v: &Value) -> Vec<Ev> {
         }
         _ => vec![],
     }
-}
-
-/// `/root/wait_twenty` → `wait twenty`.
-fn sub_agent_name(path: &str) -> String {
-    path.rsplit('/')
-        .next()
-        .unwrap_or_default()
-        .replace('_', " ")
 }
 
 /// A failed turn's message, which is often the API's JSON error body.
