@@ -1,5 +1,6 @@
-//! Settings dialog (cmd-,): appearance (mode, light and dark theme, fonts) and the git button's
-//! agent prompts. Every change applies and saves at once; there is no Save button.
+//! Settings dialog (cmd-,): general (stay awake), appearance (mode, light and dark theme, fonts)
+//! and the git button's agent prompts. Every change applies and saves at once; there is no Save
+//! button.
 use crate::SwitchField;
 use crate::app::{Shark, faint, inter_features};
 use crate::prompts::{self, PROMPTS};
@@ -8,6 +9,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectState};
+use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
     ActiveTheme, IndexPath, Selectable as _, Sizable as _, Theme, ThemeConfig, ThemeMode,
     ThemeRegistry, ThemeSet, WindowExt, h_flex, v_flex,
@@ -89,7 +91,7 @@ pub fn open(state: &State, window: &mut Window, cx: &mut Context<Shark>) {
     window.open_dialog(cx, move |d, _, _| {
         d.font_features(inter_features())
             .title("Settings")
-            .w(px(640.))
+            .w(px(800.))
             .child(view.clone())
     });
     focus.focus(window, cx);
@@ -245,6 +247,17 @@ impl Settings {
         cx.notify();
     }
 
+    fn set_stay_awake(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.shark
+            .update(cx, |s, cx| {
+                s.state.stay_awake = on;
+                s.state.save();
+                s.update_awake(cx);
+            })
+            .ok();
+        cx.notify();
+    }
+
     /// `None` or the default text drops the override.
     pub(crate) fn set_prompt(&mut self, i: usize, text: Option<String>, cx: &mut Context<Self>) {
         let p = &PROMPTS[i];
@@ -269,6 +282,25 @@ impl Settings {
             .upgrade()
             .map(|s| s.read(cx).state.appearance.mode)
             .unwrap_or_default()
+    }
+
+    fn render_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let on = (self.shark.upgrade()).is_some_and(|s| s.read(cx).state.stay_awake);
+        let this = cx.entity().downgrade();
+        let theme = cx.theme();
+        v_flex().gap_3().child(section(theme, "Power")).child(
+            card(theme).child(row(
+                theme,
+                false,
+                "Stay awake while agents run",
+                "The Mac doesn't idle-sleep mid-turn; the display may still turn off",
+                Switch::new("stay-awake")
+                    .checked(on)
+                    .on_click(move |&v, _, cx| {
+                        this.update(cx, |s, cx| s.set_stay_awake(v, cx)).ok();
+                    }),
+            )),
+        )
     }
 
     fn render_appearance(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -425,6 +457,22 @@ impl Settings {
     }
 }
 
+/// Settings pages: nav icon, then title and the one line under it.
+const PAGES: &[(IconName, (&str, &str))] = &[
+    (
+        IconName::Settings,
+        ("General", "How Shark behaves while it works"),
+    ),
+    (
+        IconName::Palette,
+        ("Appearance", "Themes and fonts, applied as you pick them"),
+    ),
+    (
+        IconName::MessageSquareText,
+        ("Prompts", "What the git button asks the agent to do"),
+    ),
+];
+
 /// A ghost button that shows its selection, so tabs and mode are tab stops with enter/space.
 fn pill(label: &'static str, icon: Option<IconName>, active: bool) -> Button {
     Button::new(label)
@@ -478,35 +526,56 @@ fn row(
 impl Render for Settings {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let body = match self.tab {
-            0 => self.render_appearance(cx).into_any_element(),
+            0 => self.render_general(cx).into_any_element(),
+            1 => self.render_appearance(cx).into_any_element(),
             _ => self.render_prompts(cx).into_any_element(),
         };
-        v_flex()
+        let (title, desc) = PAGES[self.tab].1;
+        let theme = cx.theme();
+        // A page list on the left, the page on the right (FLORA, Teams, Braintrust on Mobbin).
+        h_flex()
             .key_context("Settings")
             .track_focus(&self.focus)
-            .gap_4()
+            .items_start()
+            .gap_6()
             .on_action(cx.listener(|this, _: &SwitchField, _, cx| {
-                this.tab = 1 - this.tab;
+                this.tab = (this.tab + 1) % PAGES.len();
                 cx.notify();
             }))
+            .child(v_flex().w(px(168.)).flex_none().gap_0p5().children(
+                PAGES.iter().enumerate().map(|(i, (icon, (label, _)))| {
+                    pill(label, Some(icon.clone()), i == self.tab)
+                        .w_full()
+                        .justify_start()
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.tab = i;
+                            cx.notify();
+                        }))
+                }),
+            ))
             .child(
-                h_flex()
-                    .gap_1()
-                    .children(
-                        ["Appearance", "Prompts"]
-                            .iter()
-                            .enumerate()
-                            .map(|(i, label)| {
-                                pill(label, None, i == self.tab).on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.tab = i;
-                                        cx.notify();
-                                    },
-                                ))
-                            }),
-                    ),
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_4()
+                    .child(
+                        v_flex()
+                            .gap_0p5()
+                            .child(
+                                div()
+                                    .text_base()
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(title),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(desc),
+                            ),
+                    )
+                    .child(body),
             )
-            .child(body)
     }
 }
 

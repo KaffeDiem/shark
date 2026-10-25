@@ -160,6 +160,8 @@ pub struct Shark {
     pub(crate) active: Option<String>,
     /// By chat id; created when a chat is first shown.
     chats: HashMap<String, Entity<Chat>>,
+    /// `caffeinate` while agents work and `stay_awake` is on.
+    awake: Option<std::process::Child>,
     /// Chats whose turn ended while another chat was shown.
     unread: HashSet<String>,
     tab: Tab,
@@ -226,6 +228,7 @@ impl Shark {
             naming: None,
             active: None,
             chats: HashMap::new(),
+            awake: None,
             unread: HashSet::new(),
             tab: Tab::Chat,
             diff: cx.new(|cx| DiffState::new(vec![], cx)),

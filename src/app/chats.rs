@@ -22,7 +22,10 @@ impl Shark {
         });
         let (id, name) = (meta.id.clone(), ws.name.clone());
         // Busy also flips without a ChatEvent (background tasks, turns the CLI starts itself).
-        self._subs.push(cx.observe(&chat, |_, _, cx| cx.notify()));
+        self._subs.push(cx.observe(&chat, |this, _, cx| {
+            this.update_awake(cx);
+            cx.notify()
+        }));
         self._subs.push(
             cx.subscribe(&chat, move |this, chat, ev: &ChatEvent, cx| match ev {
                 ChatEvent::Meta => this.save_meta(&chat, cx),
@@ -447,5 +450,26 @@ impl Shark {
                         }))
                     })
             })
+    }
+
+    /// Holds `caffeinate -i` while any agent works and the setting is on: no idle sleep, though
+    /// the display may sleep and closing the lid still sleeps. `-w` ends it with us, even on a crash.
+    pub(crate) fn update_awake(&mut self, cx: &App) {
+        let want = self.state.stay_awake && self.chats.values().any(|c| c.read(cx).working());
+        match (want, &mut self.awake) {
+            (true, None) => {
+                let pid = std::process::id().to_string();
+                self.awake = std::process::Command::new("caffeinate")
+                    .args(["-i", "-w", &pid])
+                    .spawn()
+                    .ok();
+            }
+            (false, Some(c)) => {
+                let _ = c.kill();
+                let _ = c.wait();
+                self.awake = None;
+            }
+            _ => {}
+        }
     }
 }

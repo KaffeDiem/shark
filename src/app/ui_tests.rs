@@ -174,6 +174,29 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     let chat = cx.update(|cx| shark.read(cx).chats["ui-x"].clone());
     cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
 
+    // Stay awake: caffeinate runs only while the setting is on and an agent works.
+    let busy = |cx: &mut TestAppContext, on: bool| {
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.busy = on;
+                cx.notify()
+            })
+        });
+        cx.run_until_parked();
+    };
+    let awake = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).awake.is_some());
+    busy(cx, true);
+    assert!(!awake(cx), "off by default");
+    cx.update(|cx| {
+        shark.update(cx, |s, cx| {
+            s.state.stay_awake = true;
+            s.update_awake(cx)
+        })
+    });
+    assert!(awake(cx));
+    busy(cx, false);
+    assert!(!awake(cx));
+
     // Chat tabs: cmd-t opens one next to the current chat, ctrl-tab cycles, cmd-w closes,
     // cmd-shift-t brings back a closed chat that had a session.
     let tabs = |cx: &mut TestAppContext| {

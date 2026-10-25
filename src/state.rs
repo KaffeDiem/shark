@@ -27,6 +27,9 @@ pub struct State {
     /// Sidebar groups of workspaces, in display order; ungrouped workspaces follow them.
     #[serde(default)]
     pub sections: Vec<Section>,
+    /// Keep the Mac from idle-sleeping while an agent works (`Shark::update_awake`).
+    #[serde(default)]
+    pub stay_awake: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
