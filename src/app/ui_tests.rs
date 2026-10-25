@@ -416,7 +416,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     let model = |cx: &mut TestAppContext| {
         cx.update(|cx| shark.read(cx).state.workspaces[0].chats[0].model.clone())
     };
-    press(cx, &["ctrl-cmd-3"]);
+    press(cx, &["ctrl-cmd-2"]);
     assert_eq!(model(cx).as_deref(), Some("opus"));
     press(cx, &["cmd-/"]);
     cx.run_until_parked();
@@ -443,15 +443,44 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     };
     press(cx, &["cmd-shift-f"]);
     assert_eq!(saved(cx), (None, false), "not on a claude model");
-    press(cx, &["ctrl-cmd-7"]);
+    press(cx, &["ctrl-cmd-5"]);
     assert_eq!(model(cx).as_deref(), Some("codex:gpt-6.1-sol"));
     let by_config = cx.update(|cx| chat.read(cx).fast()); // this machine's codex config
     press(cx, &["cmd-shift-f"]);
     assert_eq!(saved(cx), (Some(!by_config), false));
     press(cx, &["cmd-shift-f", "shift-tab"]);
     assert_eq!(saved(cx), (Some(by_config), true));
-    press(cx, &["shift-tab", "ctrl-cmd-4"]);
+    press(cx, &["shift-tab", "ctrl-cmd-3"]);
     assert_eq!(saved(cx), (Some(by_config), false));
+    assert_eq!(model(cx).as_deref(), Some("sonnet"));
+    cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
+
+    // Thinking level: cmd-shift-. / cmd-shift-, step it, stopping at the top. The last pick
+    // is remembered: cmd-t opens a chat on it.
+    let effort = |cx: &mut TestAppContext| {
+        cx.update(|cx| shark.read(cx).state.workspaces[0].chats[0].effort.clone())
+    };
+    press(cx, &["cmd-shift-.", "cmd-shift-.", "cmd-shift-.", "cmd-shift-,"]);
+    assert_eq!(effort(cx).as_deref(), Some("xhigh"));
+    cx.update(|cx| {
+        let st = &shark.read(cx).state;
+        assert_eq!(st.last_model.as_deref(), Some("sonnet"));
+        assert_eq!(st.last_effort.as_deref(), Some("xhigh"));
+    });
+    press(cx, &["cmd-t"]);
+    cx.update(|cx| {
+        let m = &shark.read(cx).state.workspaces[0].chats[1];
+        assert_eq!((m.model.as_deref(), m.effort.as_deref()), (Some("sonnet"), Some("xhigh")));
+    });
+    press(cx, &["cmd-w"]);
+    cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
+    // The model button shows both; its menu opens on the level, and a letter typed again
+    // cycles the rows it starts: "h" is Haiku, then High.
+    cx.update(|cx| assert_eq!(chat.read(cx).model_chip(), "Sonnet · Extra high"));
+    press(cx, &["cmd-/"]);
+    cx.run_until_parked();
+    press(cx, &["h", "h", "enter"]);
+    assert_eq!(effort(cx).as_deref(), Some("high"));
     assert_eq!(model(cx).as_deref(), Some("sonnet"));
     cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
 

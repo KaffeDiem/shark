@@ -365,7 +365,8 @@ impl Shark {
                 .spawn(async move { git::create_workspace(&dir, &name, &branch, &repos) })
                 .await;
             this.update_in(cx, |s, window, cx| match result {
-                Ok(ws) => {
+                Ok(mut ws) => {
+                    ws.fill_models(&s.state.new_model(), s.state.last_effort.as_ref());
                     let name = ws.name.clone();
                     s.state.workspaces.push(ws);
                     s.state.save();

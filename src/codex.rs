@@ -16,9 +16,9 @@ use std::{
 // common .git as a writable root when a sandbox is wanted
 const SANDBOX: &str = "danger-full-access";
 
-/// A codex model: `codex` (its configured default) or `codex:<model id>`.
+/// A codex model: `codex:<model id>`.
 pub fn is_codex(model: Option<&str>) -> bool {
-    model.is_some_and(|m| m == "codex" || m.starts_with("codex:"))
+    model.is_some_and(|m| m.starts_with("codex:"))
 }
 
 /// The thread messages go to, the running turn an interrupt names, and the settings each
@@ -34,10 +34,10 @@ pub struct State {
     pub plan: bool,
     /// The Fast service tier, on or off; `None` leaves the thread on what codex's config says.
     pub fast: Option<bool>,
-    /// The thread's model and reasoning effort, which a collaboration mode must name: a null
-    /// effort would drop the configured one.
+    /// The chat's thinking level, sent with every turn.
+    pub effort: String,
+    /// The thread's model, which a collaboration mode must name.
     model: String,
-    effort: Value,
 }
 
 pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receiver<Ev>)> {
@@ -47,6 +47,7 @@ pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receive
     let st = Arc::new(Mutex::new(State {
         plan: chat.plan,
         fast: chat.fast,
+        effort: crate::chat::effort_of(chat).into(),
         ..Default::default()
     }));
     if !ws.dir().join("AGENTS.md").exists() {
@@ -100,8 +101,8 @@ fn flush(s: &mut State, stdin: &Mutex<ChildStdin>) -> std::io::Result<()> {
     Ok(())
 }
 
-/// A `turn/start`'s params. Mode, sandbox and tier hold for later turns too; sent with a
-/// message that joins a running turn, they take effect from the next one.
+/// A `turn/start`'s params. Mode, sandbox, tier and effort hold for later turns too; sent with
+/// a message that joins a running turn, they take effect from the next one.
 fn turn_params(s: &State, thread: &str, text: &str) -> Value {
     let (mode, sandbox) = match s.plan {
         true => ("plan", json!({"type": "readOnly", "networkAccess": false})),
@@ -115,6 +116,7 @@ fn turn_params(s: &State, thread: &str, text: &str) -> Value {
         "input": [{"type": "text", "text": text}],
         "collaborationMode": {"mode": mode, "settings": settings},
         "sandboxPolicy": sandbox,
+        "effort": s.effort,
     });
     if let Some(fast) = s.fast {
         p["serviceTier"] = if fast { "priority" } else { "default" }.into();
@@ -222,7 +224,6 @@ pub fn track(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, pid: u32, line: &str)
             let r = &v["result"];
             s.thread = r["thread"]["id"].as_str().map(Into::into);
             s.model = r["model"].as_str().unwrap_or_default().into();
-            s.effort = r["reasoningEffort"].clone();
             let _ = flush(&mut s, stdin);
         }
         (_, Some("turn/started")) => s.turn = v["params"]["turn"]["id"].as_str().map(Into::into),
@@ -565,12 +566,13 @@ mod tests {
         );
     }
 
-    /// Each `turn/start` names the mode, sandbox and tier, and the thread's model and effort.
+    /// Each `turn/start` names the mode, sandbox, tier and the chat's effort, and the thread's
+    /// model.
     #[test]
     fn turns_carry_plan_mode_and_fast() {
         let mut s = State {
             model: "gpt-6.1-sol".into(),
-            effort: json!("high"),
+            effort: "high".into(),
             ..Default::default()
         };
         let p = turn_params(&s, "th1", "hi");
@@ -581,15 +583,18 @@ mod tests {
             json!({"mode": "default", "settings": {"model": "gpt-6.1-sol", "reasoning_effort": "high", "developer_instructions": null}})
         );
         assert_eq!(p["sandboxPolicy"], json!({"type": "dangerFullAccess"}));
+        assert_eq!(p["effort"], "high");
         assert!(p.get("serviceTier").is_none(), "codex's config decides");
         s.plan = true;
         s.fast = Some(true);
+        s.effort = "ultra".into();
         let p = turn_params(&s, "th1", "hi");
         assert_eq!(p["collaborationMode"]["mode"], "plan");
         assert_eq!(
             p["collaborationMode"]["settings"]["reasoning_effort"],
-            "high"
+            "ultra"
         );
+        assert_eq!(p["effort"], "ultra");
         assert_eq!(
             p["sandboxPolicy"],
             json!({"type": "readOnly", "networkAccess": false}),
@@ -652,7 +657,7 @@ while read -r l; do
   *'"thread/resume"'*) echo '{"id":"resume","error":{"code":-32600,"message":"no rollout found"}}';;
   *'"thread/start"'*) echo '{"id":"start","result":{"thread":{"id":"th1"},"model":"m1","reasoningEffort":"high","serviceTier":"priority"}}';;
   *'"turn/start"'*'"mode":"plan"'*)
-    for want in '"readOnly"' '"serviceTier":"default"' '"model":"m1"' '"reasoning_effort":"high"'; do
+    for want in '"readOnly"' '"serviceTier":"default"' '"model":"m1"' '"reasoning_effort":"xhigh"' '"effort":"xhigh"'; do
       case "$l" in *"$want"*) ;; *) echo "plan turn lacks $want: $l" >&2; exit 5;; esac
     done
     echo '{"method":"turn/started","params":{"threadId":"th1","turn":{"id":"t2"}}}'
@@ -708,6 +713,7 @@ done
             session_id: session_id.map(Into::into),
             plan,
             fast: plan.then_some(false),
+            effort: Some("xhigh".into()),
             ..Default::default()
         };
         let _turn = crate::app::ui_tests::UI_LOCK
@@ -816,7 +822,7 @@ done
 
     #[test]
     fn detects_codex_models() {
-        assert!(is_codex(Some("codex")) && is_codex(Some("codex:gpt-6-astra")));
-        assert!(!is_codex(None) && !is_codex(Some("opus")) && !is_codex(Some("codexx")));
+        assert!(is_codex(Some("codex:gpt-6-astra")));
+        assert!(!is_codex(None) && !is_codex(Some("opus")) && !is_codex(Some("codex")));
     }
 }

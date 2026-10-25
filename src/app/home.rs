@@ -437,7 +437,7 @@ impl Shark {
                 crate::git::spawn_err(Path::new("/"), "claude", e)
             )
         };
-        let started = agent::spawn_ask(Some("haiku"), &system)
+        let started = agent::spawn_ask("haiku", &system)
             .and_then(|(mut a, rx)| a.send(&question).map(|()| (a, rx)));
         match started {
             Ok((a, rx)) => {

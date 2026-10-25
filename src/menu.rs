@@ -164,27 +164,38 @@ fn step(entries: &[Entry], from: Option<usize>, down: bool) -> Option<usize> {
     None
 }
 
+/// The first row from `from` on, wrapping, whose label starts with `typed` (lowercase).
+fn find(entries: &[Entry], typed: &str, from: usize) -> Option<usize> {
+    let n = entries.len();
+    (0..n).map(|i| (from + i) % n).find(|&ix| match &entries[ix] {
+        Entry::Item { label, .. } | Entry::Sub { label, .. } => {
+            label.to_lowercase().starts_with(typed)
+        }
+        Entry::Sep => false,
+    })
+}
+
 impl Menu {
     /// Starts the highlight on `ix`, e.g. the current choice of a picker.
     pub(crate) fn select(&mut self, ix: usize) {
         self.sel = Some(ix);
     }
 
-    /// The first row whose label starts with what was typed, ignoring case.
+    /// The row whose label starts with what was typed, ignoring case. A new letter looks
+    /// past the highlight, so typing it again cycles through the rows it starts ("h": Haiku,
+    /// High); more letters narrow from the highlight on ("hi": High).
     fn jump(&mut self, ch: &str) -> bool {
-        self.typed.push_str(&ch.to_lowercase());
-        let find = |typed: &str| {
-            self.entries.iter().position(|e| match e {
-                Entry::Item { label, .. } | Entry::Sub { label, .. } => {
-                    label.to_lowercase().starts_with(typed)
-                }
-                Entry::Sep => false,
-            })
-        };
-        let hit = find(&self.typed).or_else(|| {
-            self.typed = ch.to_lowercase();
-            find(&self.typed)
-        });
+        let ch = ch.to_lowercase();
+        let more = !self.typed.is_empty();
+        self.typed.push_str(&ch);
+        let sel = self.sel;
+        let hit = more
+            .then(|| find(&self.entries, &self.typed, sel.unwrap_or(0)))
+            .flatten()
+            .or_else(|| {
+                self.typed = ch;
+                find(&self.entries, &self.typed, sel.map_or(0, |s| s + 1))
+            });
         if let Some(ix) = hit {
             self.sel = Some(ix);
             self.sub = None;
@@ -298,6 +309,8 @@ impl Menu {
                     | Entry::Sub { .. }
             )
         });
+        // A check column when any row has one, so the hints line up.
+        let checks = entries.iter().any(|e| matches!(e, Entry::Item { checked: true, .. }));
         let rows = entries.iter().enumerate().map(|(ix, e)| {
             let (icon, image, label, right) = match e {
                 Entry::Sep => {
@@ -336,6 +349,7 @@ impl Menu {
                                         .text_color(theme.muted_foreground),
                                 )
                             })
+                            .when(checks && !*checked, |d| d.child(div().size(px(14.)).flex_none()))
                             .into_any_element(),
                     ),
                 ),
@@ -489,5 +503,16 @@ mod tests {
         assert_eq!(step(&entries, Some(2), true), Some(0));
         assert_eq!(step(&entries, None, false), Some(2));
         assert_eq!(step(&[], None, true), None);
+    }
+
+    #[test]
+    fn find_wraps_from_the_highlight() {
+        let e = |l| item(None, l, |_, _| {});
+        let entries = [e("Haiku"), Entry::Sep, e("High"), e("Max")];
+        assert_eq!(find(&entries, "h", 0), Some(0));
+        assert_eq!(find(&entries, "h", 1), Some(2));
+        assert_eq!(find(&entries, "h", 3), Some(0));
+        assert_eq!(find(&entries, "hi", 0), Some(2));
+        assert_eq!(find(&entries, "x", 0), None);
     }
 }
