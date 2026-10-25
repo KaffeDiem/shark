@@ -102,12 +102,24 @@ impl Chat {
             }
             _ => item.label.clone(),
         };
-        let token = InlineToken::new(item.insert.clone(), item.insert.clone()).with_label(label);
+        self.composer
+            .update(cx, |c, cx| c.set_selected_range(range, cx));
+        self.insert_mention(item.insert, label, window, cx);
+    }
+
+    /// Puts `@path` in place of the selection as a chip, plus a space to keep typing.
+    pub(super) fn insert_mention(
+        &mut self,
+        text: String,
+        label: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let token = InlineToken::new(text.clone(), text.clone()).with_label(label);
         self.composer.update(cx, |c, cx| {
-            c.set_selected_range(range, cx);
             if c.replace_with_token(token, window, cx).is_err() {
                 // ponytail: tokens reject control characters; such a path goes in as plain text
-                c.replace(item.insert.clone(), window, cx);
+                c.replace(text, window, cx);
             }
             c.insert(" ", window, cx);
         });

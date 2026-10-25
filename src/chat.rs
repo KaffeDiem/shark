@@ -16,6 +16,7 @@ use gpui_kit::component::input::{
     Textarea, TextareaState,
 };
 use gpui_kit::component::kbd::Kbd;
+use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState};
@@ -26,6 +27,7 @@ use gpui_kit::*;
 use serde_json::Value;
 use side::Side;
 use std::collections::VecDeque;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 struct Call {
@@ -566,6 +568,82 @@ impl Chat {
             })
             .ok();
         }));
+    }
+
+    /// Dropped or pasted files: copied into the workspace off the main thread, then mentioned at
+    /// the cursor in drop order. Pasted image bytes come as `(bytes, ext)`.
+    fn attach(
+        &mut self,
+        paths: Vec<PathBuf>,
+        image: Option<(Vec<u8>, &'static str)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let dir = self.ws.dir();
+        cx.spawn_in(window, async move |this, cx| {
+            let done = cx
+                .background_executor()
+                .spawn(async move {
+                    let mut out: Vec<_> = paths.iter().map(|p| complete::attach(&dir, p)).collect();
+                    out.extend(image.map(|(b, ext)| {
+                        complete::attach_bytes(&dir, &format!("Pasted image.{ext}"), &b)
+                    }));
+                    out
+                })
+                .await;
+            this.update_in(cx, |c, window, cx| {
+                // The user may have selected text while it copied; insert beside it, not over it.
+                c.composer.update(cx, |c, cx| {
+                    let at = c.cursor();
+                    c.set_selected_range(at..at, cx)
+                });
+                for r in done {
+                    match r {
+                        Ok(p) => {
+                            let label = Path::new(&p).file_name().unwrap_or_default();
+                            let label = label.to_string_lossy().into_owned();
+                            c.insert_mention(complete::mention(&p), label, window, cx);
+                        }
+                        Err(e) => window.push_notification(Notification::error(e), cx),
+                    }
+                }
+                c.focus_composer(window, cx);
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// cmd-v of Finder files or image data attaches them; anything else pastes as text.
+    fn paste(&mut self, item: &ClipboardItem, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let entries = item.entries();
+        if let Some(p) = entries.iter().find_map(|e| match e {
+            ClipboardEntry::ExternalPaths(p) => Some(p.paths().to_vec()),
+            _ => None,
+        }) {
+            self.attach(p, None, window, cx);
+            return true;
+        }
+        // Text wins over a rendered image of it, as copied from a word processor.
+        if entries
+            .iter()
+            .any(|e| matches!(e, ClipboardEntry::String(_)))
+        {
+            return false;
+        }
+        let Some(img) = entries.iter().find_map(|e| match e {
+            ClipboardEntry::Image(i) => Some(i),
+            _ => None,
+        }) else {
+            return false;
+        };
+        self.attach(
+            vec![],
+            Some((img.bytes.clone(), img.format.extension())),
+            window,
+            cx,
+        );
+        true
     }
 
     /// Enter: sends, or queues while a turn or git step runs. `now` (cmd-enter) steers the
@@ -1584,10 +1662,19 @@ impl Render for Chat {
         )
         .size_full()
         .py_2();
+        let drop_bg = theme.drop_target;
+        let accent = theme.drag_border;
         let main = v_flex()
+            .id("chat-pane")
+            .group("chat-pane")
+            .relative()
             .size_full()
             .on_action(cx.listener(|this, _: &FocusComposer, window, cx| {
                 this.focus_composer(window, cx)
+            }))
+            // Files from Finder anywhere on the pane are copied in and mentioned in the composer.
+            .on_drop(cx.listener(|this, p: &ExternalPaths, window, cx| {
+                this.attach(p.paths().to_vec(), None, window, cx)
             }))
             .child(
                 div()
@@ -1697,6 +1784,13 @@ impl Render for Chat {
                             .when_some(self.render_queue(window, cx), |d, q| d.child(q))
                             .child(
                                 Textarea::new(&self.composer)
+                                    .on_paste({
+                                        let chat = cx.entity().downgrade();
+                                        move |item, window, cx| {
+                                            chat.update(cx, |c, cx| c.paste(item, window, cx))
+                                                .unwrap_or(false)
+                                        }
+                                    })
                                     .appearance(false)
                                     .text_size(px(14.)),
                             )
@@ -1759,6 +1853,24 @@ impl Render for Chat {
                                     .child("side question"),
                             ),
                     ),
+            )
+            // No hitbox, so it never takes the drop or the mouse; shown only while files hover.
+            .child(
+                div()
+                    .absolute()
+                    .inset_2()
+                    .invisible()
+                    .group_drag_over::<ExternalPaths>("chat-pane", |s| s.visible())
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(radius)
+                    .border_2()
+                    .border_dashed()
+                    .border_color(accent)
+                    .bg(drop_bg)
+                    .text_color(muted)
+                    .child("Drop to attach"),
             );
         if !self.plan_open {
             return main.into_any_element();
@@ -1819,6 +1931,7 @@ mod tests {
 mod ui_tests {
     use super::*;
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+    use gpui_kit::InputEvent as _;
     use gpui_kit::test::TestWindowExt as _;
 
     /// A claude stand-in that swallows stdin. Side questions on a session (`--fork-session`)
@@ -2511,6 +2624,66 @@ exec cat >/dev/null
     }
 
     /// `@` opens the file menu; keys drive it and a pick leaves a repo-qualified chip.
+    #[gpui_kit::test]
+    fn dropping_a_file_attaches_it(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::bind_keys(cx);
+        });
+        let ws = Workspace {
+            name: format!("drop-test-{}", std::process::id()),
+            branch: "b".into(),
+            ..Default::default()
+        };
+        let (dir, src) = (
+            ws.dir(),
+            std::env::temp_dir().join(format!("shark-drop-{}", std::process::id())),
+        );
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(&src).unwrap();
+        let shot = src.join("Shot at 10.22\u{202F}AM.png");
+        std::fs::write(&shot, "png").unwrap();
+        let meta = ChatMeta {
+            id: ws.name.clone(),
+            ..Default::default()
+        };
+        let (window, chat) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| Chat::new(ws, meta, w, cx))
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            let size = w.viewport_size();
+            let position = point(size.width / 2., size.height / 2.);
+            let paths = ExternalPaths(vec![shot.clone()].into());
+            w.dispatch_event(
+                FileDropEvent::Entered { position, paths }.to_platform_input(),
+                cx,
+            );
+            w.dispatch_event(FileDropEvent::Submit { position }.to_platform_input(), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let c = chat.read(cx).composer.read(cx);
+            assert_eq!(
+                c.value().as_ref() as &str,
+                "@\".context/attachments/Shot at 10.22 AM.png\" "
+            );
+            assert_eq!(c.tokens().len(), 1);
+        });
+        assert!(
+            dir.join(".context/attachments/Shot at 10.22 AM.png")
+                .exists()
+        );
+        std::fs::remove_dir_all(dir).unwrap();
+        std::fs::remove_dir_all(src).unwrap();
+    }
+
     #[gpui_kit::test]
     fn at_mentions_pick_a_file(cx: &mut TestAppContext) {
         cx.update(|cx| {
