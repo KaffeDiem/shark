@@ -1,12 +1,18 @@
 //! Coordinated PRs: one per repo with commits, each body linking all the others.
-use crate::git::{cmd, git};
+use crate::git::{cmd_bounded, git};
 use crate::state::Workspace;
 use std::path::Path;
 
 const MARKER: &str = "<!-- shark:related -->";
 
-/// Returns `(repo, url)` for every PR created or found.
-pub fn create_linked_prs(ws: &Workspace, dir: &Path) -> Result<Vec<(String, String)>, String> {
+/// Returns `(repo, url)` for every PR created or found. `skip` names repos whose work already
+/// landed: after a squash merge their commits still count as ahead of the base, and pushing
+/// them again would open a duplicate PR.
+pub fn create_linked_prs(
+    ws: &Workspace,
+    dir: &Path,
+    skip: &[String],
+) -> Result<Vec<(String, String)>, String> {
     let dirty: Vec<&str> = ws
         .repos
         .iter()
@@ -27,24 +33,40 @@ pub fn create_linked_prs(ws: &Workspace, dir: &Path) -> Result<Vec<(String, Stri
     for r in &ws.repos {
         let wt = dir.join(&r.name);
         let ahead = git(&wt, &["rev-list", "--count", &format!("{}..HEAD", r.base)])?;
-        if ahead == "0" {
+        if ahead == "0" || skip.contains(&r.name) {
             continue;
         }
-        git(&wt, &["push", "-u", "origin", &ws.branch])?;
-        let url = match cmd(
+        cmd_bounded(&wt, "git", &["push", "-u", "origin", &ws.branch], 120)?;
+        // Only an open PR from this repo is reused; `gh pr view <branch>` would also return a
+        // merged one, and new commits after a merge need a new PR.
+        let open = cmd_bounded(
             &wt,
             "gh",
-            &["pr", "view", &ws.branch, "--json", "url", "-q", ".url"],
-        ) {
-            Ok(url) => url,
-            Err(_) => {
+            &[
+                "pr",
+                "list",
+                "--head",
+                &ws.branch,
+                "--state",
+                "open",
+                "--json",
+                "url,isCrossRepository",
+                "-q",
+                "[.[] | select(.isCrossRepository | not)][0].url // empty",
+            ],
+            30,
+        )?;
+        let url = match open.is_empty() {
+            false => open,
+            true => {
                 let base = r.base.strip_prefix("origin/").unwrap_or(&r.base);
-                let out = cmd(
+                let out = cmd_bounded(
                     &wt,
                     "gh",
                     &[
                         "pr", "create", "--head", &ws.branch, "--base", base, "--fill",
                     ],
+                    60,
                 )?;
                 out.lines().last().unwrap_or_default().to_string()
             }
@@ -57,15 +79,17 @@ pub fn create_linked_prs(ws: &Workspace, dir: &Path) -> Result<Vec<(String, Stri
     if prs.len() > 1 {
         for (r, url) in &prs {
             let wt = dir.join(r);
-            let body = cmd(
+            let body = cmd_bounded(
                 &wt,
                 "gh",
                 &["pr", "view", url, "--json", "body", "-q", ".body"],
+                30,
             )?;
-            cmd(
+            cmd_bounded(
                 &wt,
                 "gh",
                 &["pr", "edit", url, "--body", &link_body(&body, &prs, url)],
+                30,
             )?;
         }
     }
