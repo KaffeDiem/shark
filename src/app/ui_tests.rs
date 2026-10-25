@@ -184,6 +184,26 @@ async fn settings_apply_and_save(cx: &mut TestAppContext) {
     .unwrap();
 }
 
+/// Clicking a theme card in Settings › Appearance picks that family for its mode.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn settings_theme_cards(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| crate::settings::open(&s.state, w, cx));
+        w.render_frame(cx);
+        w.press("ctrl-tab", cx); // General → Appearance
+        w.render_frame(cx);
+        w.click(("theme-dark", 2usize), cx);
+        assert_eq!(cx.theme().dark_theme.name.as_ref(), "Everest Dark");
+    })
+    .unwrap();
+    assert_eq!(State::load().appearance.dark, "Everest");
+}
+
 /// Vim mode is one switch: off, j/k type nothing in lists and the arrows move; Settings turns
 /// it on for the lists and every chat at once. cmd-k acts on the sidebar's cursor row.
 #[gpui_kit::test]

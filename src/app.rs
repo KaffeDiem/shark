@@ -88,6 +88,7 @@ pub(crate) fn confirm<T: 'static>(
     window.open_alert_dialog(cx, move |d, _, _| {
         let (target, ok) = (target.clone(), ok.clone());
         d.font_features(inter_features())
+            .entrance(DialogEntrance::None)
             .title(title.clone())
             .description(description)
             .ok_text(ok_text)

@@ -7,13 +7,14 @@ use crate::prompts::{self, PROMPTS};
 use crate::state::{Appearance, Mode, State};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::input::{InputEvent, Textarea, TextareaState};
 use gpui_kit::component::link::Link;
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
     ActiveTheme, IndexPath, Selectable as _, Sizable as _, Theme, ThemeConfig, ThemeMode,
-    ThemeRegistry, ThemeSet, WindowExt, h_flex, v_flex,
+    ThemeRegistry, ThemeSet, WindowExt, h_flex, try_parse_color, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -92,6 +93,7 @@ pub fn open(state: &State, window: &mut Window, cx: &mut Context<Shark>) {
     window.open_dialog(cx, move |d, _, _| {
         // No dialog title: the page list and the page title say where you are.
         d.font_features(inter_features())
+            .entrance(DialogEntrance::None)
             .w(px(800.))
             .child(view.clone())
     });
@@ -102,6 +104,7 @@ pub fn open(state: &State, window: &mut Window, cx: &mut Context<Shark>) {
 pub fn about(window: &mut Window, cx: &mut App) {
     window.open_dialog(cx, |d, _, cx| {
         d.font_features(inter_features())
+            .entrance(DialogEntrance::None)
             .title("Shark")
             .w(px(640.))
             .child(
@@ -125,12 +128,40 @@ pub fn about(window: &mut Window, cx: &mut App) {
 
 type Choice = Entity<SelectState<SearchableVec<SharedString>>>;
 
+/// A theme's colors for its preview card.
+struct Swatch {
+    bg: Hsla,
+    sidebar: Hsla,
+    border: Hsla,
+    fg: Hsla,
+    muted: Hsla,
+    primary: Hsla,
+}
+
+impl Swatch {
+    fn new(t: &ThemeConfig) -> Self {
+        let c = &t.colors;
+        let parse = |v: &Option<SharedString>| v.as_deref().and_then(|v| try_parse_color(v).ok());
+        let bg = parse(&c.background).unwrap_or(if t.mode.is_dark() { black() } else { white() });
+        let or_bg = |v| parse(v).unwrap_or(bg);
+        Swatch {
+            bg,
+            sidebar: or_bg(&c.sidebar),
+            border: or_bg(&c.border),
+            fg: or_bg(&c.foreground),
+            muted: or_bg(&c.muted_foreground),
+            primary: or_bg(&c.primary),
+        }
+    }
+}
+
 pub struct Settings {
     shark: WeakEntity<Shark>,
     tab: usize,
     focus: FocusHandle,
-    light: Choice,
-    dark: Choice,
+    /// Per `THEMES` family, in order.
+    light: Vec<Swatch>,
+    dark: Vec<Swatch>,
     ui_font: Choice,
     mono_font: Choice,
     prompts: Vec<Entity<TextareaState>>,
@@ -156,7 +187,15 @@ impl Settings {
             .collect();
         fonts.sort_by_key(|f| f.to_lowercase());
         fonts.dedup();
-        let families: Vec<SharedString> = THEMES.iter().map(|(n, _)| (*n).into()).collect();
+        let configs = theme_configs();
+        let swatches = |suffix: &str| {
+            (THEMES.iter())
+                .map(|(f, _)| {
+                    let name = format!("{f} {suffix}");
+                    Swatch::new(configs.iter().find(|t| t.name.as_ref() == name).unwrap())
+                })
+                .collect()
+        };
         let mut choice = |items: Vec<SharedString>, current: &str, searchable: bool| {
             let ix = items
                 .iter()
@@ -178,8 +217,6 @@ impl Settings {
                 .map(SharedString::from)
                 .collect::<Vec<_>>()
         };
-        let light = choice(families.clone(), &a.light, false);
-        let dark = choice(families, &a.dark, false);
         let ui_font = choice(
             font_items(DEFAULT_UI),
             a.ui_font.as_deref().unwrap_or(DEFAULT_UI),
@@ -205,16 +242,6 @@ impl Settings {
                 this.appearance(cx, |a| set(a, v));
             }
         };
-        subs.push(cx.subscribe_in(
-            &light,
-            window,
-            on_pick(|a, v| a.light = v.unwrap_or_default()),
-        ));
-        subs.push(cx.subscribe_in(
-            &dark,
-            window,
-            on_pick(|a, v| a.dark = v.unwrap_or_default()),
-        ));
         subs.push(cx.subscribe_in(&ui_font, window, on_pick(|a, v| a.ui_font = v)));
         subs.push(cx.subscribe_in(&mono_font, window, on_pick(|a, v| a.mono_font = v)));
 
@@ -245,8 +272,8 @@ impl Settings {
             shark,
             tab: 0,
             focus: cx.focus_handle(),
-            light,
-            dark,
+            light: swatches("Light"),
+            dark: swatches("Dark"),
             ui_font,
             mono_font,
             prompts,
@@ -309,11 +336,68 @@ impl Settings {
         self.set_prompt(i, None, cx);
     }
 
-    fn mode(&self, cx: &App) -> Mode {
+    fn saved_appearance(&self, cx: &App) -> Appearance {
         self.shark
             .upgrade()
-            .map(|s| s.read(cx).state.appearance.mode)
+            .map(|s| s.read(cx).state.appearance.clone())
             .unwrap_or_default()
+    }
+
+    /// A scrolling row of preview cards, one per family; clicking one picks it.
+    fn theme_strip(
+        &self,
+        dark: bool,
+        current: &str,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let theme = cx.theme();
+        let (id, swatches) = if dark {
+            ("theme-dark", &self.dark)
+        } else {
+            ("theme-light", &self.light)
+        };
+        // `apply` shows Linear for an empty or unknown family, so mark that one.
+        let current = (THEMES.iter().map(|(f, _)| *f))
+            .find(|f| *f == current)
+            .unwrap_or("Linear");
+        let cards = (THEMES.iter().zip(swatches).enumerate()).map(|(i, ((family, _), s))| {
+            let on = *family == current;
+            let name = div()
+                .text_xs()
+                .text_color(if on {
+                    theme.foreground
+                } else {
+                    theme.muted_foreground
+                })
+                .child(*family);
+            Button::new((id, i))
+                .text()
+                .w(px(120.))
+                .flex_none()
+                .child(
+                    v_flex()
+                        .w_full()
+                        .gap_1()
+                        .child(preview(theme, s, on))
+                        .child(name),
+                )
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    let family = family.to_string();
+                    this.appearance(cx, |a| {
+                        *if dark { &mut a.dark } else { &mut a.light } = family
+                    })
+                }))
+        });
+        h_flex()
+            .id(id)
+            .w_full()
+            .gap_2()
+            // Room for the focus ring, which sits outside the card and the strip clips.
+            .p_1()
+            .overflow_x_scroll()
+            // Wheel and trackpad move only their own axis, so the page and strips don't drag each other.
+            .restrict_scroll_to_axis()
+            .children(cards)
     }
 
     fn render_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -347,7 +431,10 @@ impl Settings {
     }
 
     fn render_appearance(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let mode = self.mode(cx);
+        let saved = self.saved_appearance(cx);
+        let mode = saved.mode;
+        let light = self.theme_strip(false, &saved.light, cx);
+        let dark = self.theme_strip(true, &saved.dark, cx);
         let theme = cx.theme();
         let modes = [
             (Mode::System, "System", IconName::Monitor),
@@ -383,20 +470,8 @@ impl Settings {
                         "System follows macOS",
                         mode_group,
                     ))
-                    .child(row(
-                        theme,
-                        true,
-                        "Light theme",
-                        "Used in light mode",
-                        Select::new(&self.light).small(),
-                    ))
-                    .child(row(
-                        theme,
-                        true,
-                        "Dark theme",
-                        "Used in dark mode",
-                        Select::new(&self.dark).small(),
-                    )),
+                    .child(stacked(theme, "Light theme", "Used in light mode", light))
+                    .child(stacked(theme, "Dark theme", "Used in dark mode", dark)),
             )
             .child(section(theme, "Fonts"))
             .child(
@@ -539,6 +614,54 @@ fn card(theme: &Theme) -> Div {
         .bg(theme.secondary)
 }
 
+/// A tiny mock of the app in a theme's colors: sidebar, text lines and a primary button.
+fn preview(theme: &Theme, s: &Swatch, on: bool) -> Div {
+    let bar = |color: Hsla, w: f32| div().h(px(4.)).w(px(w)).rounded_full().bg(color);
+    h_flex()
+        .h(px(64.))
+        .w_full()
+        .overflow_hidden()
+        .rounded(theme.radius)
+        .border_2()
+        .border_color(if on { theme.primary } else { theme.border })
+        .bg(s.bg)
+        .child(
+            div()
+                .w(px(28.))
+                .h_full()
+                .border_r_1()
+                .border_color(s.border)
+                .bg(s.sidebar),
+        )
+        .child(
+            v_flex()
+                .flex_1()
+                .h_full()
+                .p_2()
+                .gap_1p5()
+                .child(bar(s.fg, 44.))
+                .child(bar(s.muted, 60.))
+                .child(bar(s.muted, 36.))
+                .child(
+                    div()
+                        .mt_auto()
+                        .h(px(8.))
+                        .w(px(24.))
+                        .rounded_sm()
+                        .bg(s.primary),
+                ),
+        )
+}
+
+fn caption(theme: &Theme, label: &'static str, desc: &'static str) -> Div {
+    v_flex().child(div().text_sm().child(label)).child(
+        div()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(desc),
+    )
+}
+
 /// Label and description on the left, the control on the right (Linear's settings rows).
 fn row(
     theme: &Theme,
@@ -552,15 +675,24 @@ fn row(
         .px_3()
         .gap_3()
         .when(sep, |r| r.border_t_1().border_color(theme.border))
-        .child(
-            v_flex().flex_1().child(div().text_sm().child(label)).child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(desc),
-            ),
-        )
+        .child(caption(theme, label, desc).flex_1())
         .child(div().w(px(240.)).flex().justify_end().child(control))
+}
+
+/// A separated row with the label on top and a full-width control beneath.
+fn stacked(
+    theme: &Theme,
+    label: &'static str,
+    desc: &'static str,
+    control: impl IntoElement,
+) -> impl IntoElement {
+    v_flex()
+        .p_3()
+        .gap_2()
+        .border_t_1()
+        .border_color(theme.border)
+        .child(caption(theme, label, desc))
+        .child(control)
 }
 
 impl Render for Settings {
@@ -612,6 +744,7 @@ impl Render for Settings {
                     .min_w_0()
                     .h(px(520.))
                     .overflow_y_scroll()
+                    .restrict_scroll_to_axis()
                     .gap_4()
                     .child(
                         v_flex()
