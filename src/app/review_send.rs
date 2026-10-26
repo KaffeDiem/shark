@@ -13,7 +13,7 @@ pub(super) struct Sheet {
     pub(super) note: Entity<InputState>,
     /// Also post the ticked comments to the PR as a Comment review.
     pub(super) publish: bool,
-    preview: bool,
+    pub(super) preview: bool,
     pub(super) focus: FocusHandle,
 }
 
@@ -82,7 +82,9 @@ impl Shark {
     pub(super) fn sheet_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(s) = &self.review.sheet else { return };
         let ids: Vec<u64> = s.rows.iter().filter(|r| r.1).map(|r| r.0).collect();
-        let (note, publish) = (s.note.read(cx).value().to_string(), s.publish);
+        let note = s.note.read(cx).value().to_string();
+        // Also publish shows only while a ticked row's repo has a PR.
+        let publish = s.publish && !self.sheet_prs(cx).is_empty();
         self.send_review(&ids, &note, publish, window, cx);
     }
 
@@ -115,7 +117,11 @@ impl Shark {
                     text: c.text.clone(),
                 })
                 .collect(),
-            changes: self.changes_label(),
+            // "3 files · +5 −3"
+            changes: {
+                let ((_, a, d), n) = (self.changes_stats(), self.diff_files.len());
+                format!("{n} file{} · +{a} −{d}", if n == 1 { "" } else { "s" })
+            },
         };
         let chat_id = chat.read(cx).meta.id.clone();
         // Refused (archiving, spawn failed): the chat says why; the comments stay pending.
@@ -139,6 +145,33 @@ impl Shark {
         }
     }
 
+    /// The repo and PR number of each repo of the ticked rows with an open PR: where Also
+    /// publish posts.
+    pub(super) fn sheet_prs(&self, cx: &App) -> Vec<(String, u64)> {
+        let Some(s) = &self.review.sheet else {
+            return vec![];
+        };
+        let mut out: Vec<(String, u64)> = vec![];
+        for c in (s.rows.iter().filter(|r| r.1)).filter_map(|r| self.comment(r.0)) {
+            let repo = c.path.split('/').next().unwrap_or_default();
+            if !out.iter().any(|p| p.0 == repo)
+                && let Some((pr, _)) = self.pr_of(c, cx)
+            {
+                out.push((repo.to_string(), pr.number));
+            }
+        }
+        out
+    }
+
+    /// Ticks Also publish; the preview opens, so what GitHub gets is seen first.
+    pub(super) fn sheet_publish(&mut self, on: bool, cx: &mut Context<Self>) {
+        if let Some(s) = &mut self.review.sheet {
+            s.publish = on;
+            s.preview |= on;
+        }
+        cx.notify();
+    }
+
     /// The sheet, over the bottom right of the diff.
     pub(super) fn render_sheet(
         &self,
@@ -153,10 +186,17 @@ impl Shark {
             .collect();
         let ticked = s.rows.iter().filter(|r| r.1).count();
         let focused = s.focus.is_focused(window);
-        let pr = (s.rows.first())
-            .and_then(|r| comments.iter().find(|c| c.id == r.0))
-            .and_then(|c| self.pr_of(c, cx))
-            .map(|(pr, _)| pr.number);
+        let prs = self.sheet_prs(cx);
+        // One PR as the design says it; several by repo.
+        let to = match &prs[..] {
+            [] => None,
+            [(_, n)] => Some(format!("PR #{n}")),
+            more => Some(
+                (more.iter().map(|(repo, n)| format!("{repo} #{n}")))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        };
         let rows = s.rows.iter().enumerate().map(|(ix, &(id, on))| {
             let c = comments.iter().find(|c| c.id == id);
             let name = c.map_or(String::new(), |c| {
@@ -204,9 +244,9 @@ impl Shark {
                 .collect();
             let note = s.note.read(cx).value();
             let mut p = prompt(&picked, &note);
-            if s.publish {
+            if let Some(to) = to.as_ref().filter(|_| s.publish) {
                 let body = super::review_share::github_body(&picked, &note);
-                p += &format!("\n— PR #{} Comment review —\n\n{body}", pr.unwrap_or(0));
+                p += &format!("\n— {to} Comment review —\n\n{body}");
             }
             p
         });
@@ -297,7 +337,7 @@ impl Shark {
                             )
                             .child("Send as the next message in this chat"),
                     )
-                    .when_some(pr, |d, number| {
+                    .when_some(to.clone(), |d, to| {
                         d.child(
                             h_flex()
                                 .gap_2()
@@ -305,14 +345,9 @@ impl Shark {
                                     Checkbox::new("sheet-publish")
                                         .small()
                                         .checked(s.publish)
-                                        .label(format!(
-                                            "Also publish to PR #{number} as a Comment review"
-                                        ))
+                                        .label(format!("Also publish to {to} as a Comment review"))
                                         .on_click(cx.listener(|this, on: &bool, _, cx| {
-                                            if let Some(s) = &mut this.review.sheet {
-                                                s.publish = *on;
-                                            }
-                                            cx.notify();
+                                            this.sheet_publish(*on, cx)
                                         })),
                                 )
                                 .child(

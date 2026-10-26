@@ -3199,3 +3199,269 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
     .await;
     fs::remove_dir_all(&home).ok();
 }
+
+/// Review, round 3: keys leave a mouse selection behind; the composer at the bottom shows
+/// whole; the sheet publishes to the ticked rows' PRs and opens its preview; a review names
+/// a fresh chat; a turn judges what claude read, whatever the turn count; a closed chat hands
+/// back what it never read; a share posted under another dialog leaves that dialog open.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn review_round3(cx: &mut TestAppContext) {
+    use review::Status;
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos(&home, &["api"]),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| {
+        s.create_workspace("r3".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let api = home.join("shark/workspaces/r3/api");
+    let text: String = (1..=80).map(|i| format!("line {i}\n")).collect();
+    fs::write(api.join("f"), text).unwrap();
+    on(cx, &|s, w, cx| {
+        s.show(Tab::Diff, w, cx);
+        s.refresh_diff(cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).diff_files.len() == 1
+    })
+    .await;
+    let draw = |cx: &mut TestAppContext| {
+        for _ in 0..3 {
+            cx.update_window(window, |_, w, cx| w.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        }
+    };
+    let comments = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            (shark.read(cx).ws_comments().iter())
+                .map(|c| (c.id, c.status.clone()))
+                .collect::<Vec<_>>()
+        })
+    };
+    on(cx, &|s, _, _| s.review.at_file("api/f"));
+    draw(cx);
+
+    // Lines 3–5 dragged over with the mouse, then a key moves the cursor: c is about the
+    // cursor's line, not the selection left behind.
+    let (from, to) = cx
+        .update_window(window, |_, w, _| {
+            let mut code: Vec<_> = (w.find_all("source").iter()).map(|s| s.bounds()).collect();
+            let left = code[0].left();
+            code.retain(|b| b.left() == left);
+            code.sort_by(|a, b| a.top().partial_cmp(&b.top()).unwrap());
+            let at = |b: Bounds<Pixels>| point(b.left() + px(2.), b.center().y);
+            (at(code[2]), at(code[4]))
+        })
+        .unwrap();
+    let mouse = |cx: &mut TestAppContext, e: PlatformInput| {
+        cx.update_window(window, |_, w, cx| {
+            w.dispatch_event(e, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    let left = MouseButton::Left;
+    mouse(
+        cx,
+        PlatformInput::MouseDown(MouseDownEvent {
+            button: left,
+            position: from,
+            click_count: 1,
+            ..Default::default()
+        }),
+    );
+    mouse(
+        cx,
+        PlatformInput::MouseMove(MouseMoveEvent {
+            position: to,
+            pressed_button: Some(left),
+            ..Default::default()
+        }),
+    );
+    mouse(
+        cx,
+        PlatformInput::MouseUp(MouseUpEvent {
+            button: left,
+            position: to,
+            click_count: 1,
+            ..Default::default()
+        }),
+    );
+    let dragged = |cx: &mut TestAppContext| {
+        cx.update(|cx| shark.read(cx).diff.read(cx).text_selection_lines(cx))
+    };
+    let lines = dragged(cx).expect("a mouse selection");
+    assert_eq!(lines.start(), 3);
+    press(cx, &["down", "c"]);
+    assert!(dragged(cx).is_none(), "the key cleared it");
+    cx.update(|cx| {
+        let comp = shark.read(cx).review.composer.as_ref().unwrap();
+        assert_eq!(comp.draft.lines(), "1");
+    });
+    press(cx, &["escape"]);
+
+    // The composer near the end shows whole above the bar, measured once laid out: here
+    // with Suggest change open on ten lines, taller than a first guess.
+    on(cx, &|s, w, cx| {
+        s.diff_move(0, Some(false), w, cx);
+        let ten = gpui_kit::component::diff::DiffLineRange::new(
+            "api/f",
+            gpui_kit::component::diff::DiffSide::Modified,
+            70,
+            79,
+        );
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(ten), cx));
+        s.comment_dialog(w, cx);
+    });
+    draw(cx);
+    press(cx, &["cmd-shift-s"]);
+    draw(cx);
+    cx.update_window(window, |_, w, _| {
+        let (add, body) = (
+            w.find("composer-add").bounds(),
+            w.find("diff-body").bounds(),
+        );
+        assert!(add.bottom() <= body.bottom(), "{add:?} in {body:?}");
+    })
+    .unwrap();
+    press(cx, &["cmd-shift-s"]); // back to the text box
+    cx.update_window(window, |_, w, cx| w.input("last lines", cx))
+        .unwrap();
+    press(cx, &["cmd-enter"]);
+    assert_eq!(comments(cx), [(1, Status::Pending)]);
+
+    // The sheet's Also publish follows the ticked rows' repos; ticking it opens the preview.
+    on(cx, &|s, w, cx| {
+        s.active_sync()
+            .unwrap()
+            .update(cx, |g, _| g.set_pr("api", 7, false));
+        let web: review::Comment = serde_json::from_str(
+            r#"{"id":50,"path":"web/x","start":[false,1],"end":[false,1],"text":"web"}"#,
+        )
+        .unwrap();
+        s.edit_comments(cx, |l| l.push(web));
+        s.open_sheet(w, cx);
+        assert_eq!(s.sheet_prs(cx), [("api".to_string(), 7)]);
+        s.sheet_toggle(cx); // unticks api's row
+        assert!(s.sheet_prs(cx).is_empty(), "web has no PR");
+        s.sheet_toggle(cx);
+        s.sheet_publish(true, cx);
+        assert!(s.review.sheet.as_ref().unwrap().preview);
+        s.close_sheet(w, cx);
+        s.edit_comments(cx, |l| l.retain(|c| c.id != 50));
+    });
+
+    // A review as a chat's first message names it.
+    let chat = cx.update(|cx| shark.read(cx).active_chat().cloned().unwrap());
+    on(cx, &|s, w, cx| s.send_review(&[1], "", false, w, cx));
+    cx.update(|cx| assert_eq!(chat.read(cx).meta.title, "Review · 1 comment"));
+    let reply = |cx: &mut TestAppContext, t: &str| {
+        let lines = [
+            serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}, "parent_tool_use_id": null}).to_string(),
+            serde_json::json!({"type": "result", "is_error": false, "result": t, "total_cost_usd": 0, "duration_ms": 1}).to_string(),
+        ];
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                let lines: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+                crate::chat::ui_tests::play(c, &lines, cx)
+            })
+        });
+        cx.run_until_parked();
+    };
+    // Sent in a turn numbered past the chat's count (as after a restart replays fewer
+    // messages): its report still lands.
+    on(cx, &|s, _, cx| {
+        s.set_status(&[1], Status::Sent { turn: 99 }, cx)
+    });
+    reply(cx, "[c1] addressed: Done.");
+    assert!(matches!(comments(cx)[0].1, Status::Addressed { .. }));
+
+    // Steered into a running turn and not read yet: that turn's end doesn't judge it.
+    on(cx, &|s, _, cx| s.set_status(&[1], Status::Pending, cx));
+    cx.update(|cx| chat.update(cx, |c, _| c.busy = true));
+    on(cx, &|s, w, cx| s.send_review(&[1], "", false, w, cx));
+    assert_eq!(comments(cx)[0].1, Status::Queued);
+    on(cx, &|s, w, cx| s.show(Tab::Chat, w, cx));
+    cx.update_window(window, |_, w, cx| {
+        chat.update(cx, |c, cx| c.focus_queue(w, cx));
+        w.render_frame(cx);
+    })
+    .unwrap();
+    press(cx, &["enter"]);
+    assert!(matches!(comments(cx)[0].1, Status::Sent { .. }));
+    reply(cx, "[c1] addressed: Too early.");
+    assert!(
+        matches!(comments(cx)[0].1, Status::Sent { .. }),
+        "still unread"
+    );
+
+    // Closed before claude read it: pending again.
+    cx.update(|cx| chat.update(cx, |c, _| c.busy = false));
+    on(cx, &|s, w, cx| s.close_chat(w, cx));
+    assert_eq!(comments(cx)[0].1, Status::Pending);
+    on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+
+    // Posted while another dialog sits on the share dialog: that one stays open; the share
+    // dialog says it posted and closes from there.
+    let bin = home.join("gh-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\necho https://github.com/o/api/pull/7#issuecomment-9\n",
+    )
+    .unwrap();
+    std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(&gh)
+        .status()
+        .unwrap();
+    // SAFETY: tests that read SHARK_GH hold UI_LOCK.
+    unsafe { std::env::set_var("SHARK_GH", &gh) };
+    on(cx, &|s, w, cx| {
+        s.open_share(1, w, cx);
+        w.open_dialog(cx, |d, _, _| d.title("Other"));
+        s.post_share(w, cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark
+            .read(cx)
+            .comment(1)
+            .is_some_and(|c| c.github.is_some())
+    })
+    .await;
+    unsafe { std::env::remove_var("SHARK_GH") };
+    cx.update(|cx| {
+        assert!(
+            shark.read(cx).review.share.is_some(),
+            "not closed under Other"
+        )
+    });
+    on(cx, &|s, w, cx| {
+        w.close_dialog(cx); // Other
+        s.post_share(w, cx); // "Posted · Close"
+    });
+    cx.update_window(window, |_, w, cx| {
+        assert!(shark.read(cx).review.share.is_none() && !w.has_active_dialog(cx));
+    })
+    .unwrap();
+    fs::remove_dir_all(&home).ok();
+}

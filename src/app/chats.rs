@@ -211,9 +211,11 @@ impl Shark {
             crate::plan::delete(&m.id);
         }
         self.unread.remove(&meta.id);
-        // Its queue goes with it: reviews waiting there are pending again.
+        // Its queue goes with it, and claude with what it hadn't read: those are pending again.
+        let unread =
+            (self.chats.get(&meta.id)).map_or(vec![], |c| c.read(cx).unread_review_ids(false));
         self.review.edit(&name, |l| {
-            review::unqueue(l, Some(&meta.id));
+            review::unqueue(l, Some(&meta.id), &unread);
         });
         if let Some(chat) = self.chats.remove(&meta.id)
             && let Some(sync) = self.syncs.get(&name)

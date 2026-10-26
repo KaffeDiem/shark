@@ -76,33 +76,60 @@ pub struct ReviewCard {
     pub changes: String,
 }
 
-/// `[c<id>] addressed: <note>` lines of a reply, as `(id, note)`.
+impl ReviewCard {
+    pub fn ids(&self) -> Vec<u64> {
+        self.items.iter().map(|i| i.id).collect()
+    }
+}
+
+/// A `[c<id>] addressed: <note>` line, as `(id, note)`.
+fn report(l: &str) -> Option<(u64, String)> {
+    let l = l.trim().trim_start_matches(['-', '*', '`', ' ']);
+    let (id, rest) = l.strip_prefix("[c")?.split_once(']')?;
+    let rest = rest.trim_start();
+    let note = rest
+        .get(..10)
+        .filter(|p| p.eq_ignore_ascii_case("addressed:"))
+        .map(|_| &rest[10..])?;
+    Some((
+        id.parse().ok()?,
+        note.trim().trim_end_matches('`').trim().to_string(),
+    ))
+}
+
+/// The reply's lines (with their ends), each with its report when it is one; lines in a code
+/// block are none.
+fn report_lines(reply: &str) -> impl Iterator<Item = (&str, Option<(u64, String)>)> {
+    let mut fence: Option<&str> = None;
+    reply.split_inclusive('\n').map(move |l| {
+        let ticks = l.trim_start();
+        let ticks = &ticks[..ticks.len() - ticks.trim_start_matches('`').len()];
+        let inside = fence.is_some();
+        match fence {
+            None if ticks.len() >= 3 => fence = Some(ticks),
+            Some(f) if ticks.starts_with(f) && l.trim().len() == ticks.len() => fence = None,
+            _ => {}
+        }
+        (l, (!inside && fence.is_none()).then(|| report(l)).flatten())
+    })
+}
+
+/// The reply's `[c<id>] addressed: <note>` lines, as `(id, note)`.
 pub fn parse_reports(reply: &str) -> Vec<(u64, String)> {
-    reply
-        .lines()
-        .filter_map(|l| {
-            let l = l.trim().trim_start_matches(['-', '*', '`', ' ']);
-            let (id, rest) = l.strip_prefix("[c")?.split_once(']')?;
-            let rest = rest.trim_start();
-            let note = rest
-                .get(..10)
-                .filter(|p| p.eq_ignore_ascii_case("addressed:"))
-                .map(|_| &rest[10..])?;
-            Some((
-                id.parse().ok()?,
-                note.trim().trim_end_matches('`').trim().to_string(),
-            ))
-        })
-        .collect()
+    report_lines(reply).filter_map(|(_, r)| r).collect()
 }
 
 /// The reply as shown: without its `[c<id>] addressed:` lines, which only feed the diff's
 /// threads (src/app/review.rs).
 fn hide_reports(reply: &str) -> String {
-    (reply.lines())
-        .filter(|l| parse_reports(l).is_empty())
-        .collect::<Vec<_>>()
-        .join("\n")
+    (report_lines(reply).filter(|(_, r)| r.is_none()))
+        .map(|(l, _)| l)
+        .collect()
+}
+
+/// A reply that is only report lines: nothing to show.
+fn hidden_reply(src: &str) -> bool {
+    src.contains("[c") && hide_reports(src).trim().is_empty()
 }
 
 /// A review's prompt (review.rs `prompt`) back as its card, for a replayed transcript: each
@@ -478,6 +505,12 @@ fn title_of(text: &str) -> String {
     format!("{}…", cut.trim_end())
 }
 
+/// A chat started by a review: "Review · 3 comments".
+fn review_title(r: &ReviewCard) -> String {
+    let n = r.items.len();
+    format!("Review · {n} comment{}", if n == 1 { "" } else { "s" })
+}
+
 /// The first `n` chars, with "…" when cut.
 fn cap(s: &str, n: usize) -> String {
     let mut c: String = s.chars().take(n).collect();
@@ -686,11 +719,15 @@ impl Chat {
         self.list.reset(self.rows.len() + 1); // + the activity footer
         self.list.set_follow_mode(FollowMode::Tail);
         self.sel = self.rows.len().saturating_sub(1);
+        let first = (self.blocks.iter()).find_map(|b| match b {
+            Block::User(t, _) => Some(title_of(t)),
+            Block::Review(r, _) => Some(review_title(r)),
+            _ => None,
+        });
         if self.meta.title.is_empty()
-            && let Some(Block::User(t, _)) =
-                self.blocks.iter().find(|b| matches!(b, Block::User(..)))
+            && let Some(t) = first
         {
-            self.meta.title = title_of(t);
+            self.meta.title = t;
             cx.emit(ChatEvent::Meta);
         }
         cx.notify();
@@ -1291,9 +1328,7 @@ impl Chat {
             return;
         }
         if let Some(r) = self.take_queued(self.qsel).review {
-            cx.emit(ChatEvent::ReviewRemoved(
-                r.items.iter().map(|i| i.id).collect(),
-            ));
+            cx.emit(ChatEvent::ReviewRemoved(r.ids()));
         }
         self.after_queue_change(cx);
         if self.queue.is_empty() {
@@ -1440,7 +1475,7 @@ impl Chat {
             return false;
         }
         self.note = None;
-        let ids = (review.as_ref()).map(|r| r.items.iter().map(|i| i.id).collect());
+        let ids = review.as_ref().map(|r| r.ids());
         self.sent(text, review, cx);
         if let Some(ids) = ids {
             let turn = self.turns();
@@ -1462,6 +1497,11 @@ impl Chat {
                 ..Queued::new(card.prompt.clone().into())
             };
             self.queue.insert(0, q);
+            // The rows below it moved down one: the cursor and the edited slot follow them.
+            self.qsel += 1;
+            if let Some(e) = &mut self.editing {
+                *e += 1;
+            }
             self.after_queue_change(cx);
             return true;
         }
@@ -1491,6 +1531,18 @@ impl Chat {
         (self.blocks.iter())
             .filter(|b| matches!(b, Block::User(..) | Block::Review(..)))
             .count()
+    }
+
+    /// Comments of sent reviews claude hasn't echoed yet; with `held`, only ones sent mid-turn,
+    /// which the turn that is ending never read.
+    pub fn unread_review_ids(&self, held: bool) -> Vec<u64> {
+        (self.unread.iter())
+            .filter_map(|&bi| match self.blocks.get(bi) {
+                Some(Block::Review(r, queued)) if *queued || !held => Some(r.ids()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
     }
 
     /// Comments of reviews still waiting to be read: the tab shows "Chat · N".
@@ -1538,7 +1590,10 @@ impl Chat {
         }
         self.busy = true;
         if self.meta.title.is_empty() {
-            self.meta.title = title_of(&text);
+            self.meta.title = match &review {
+                Some(r) => review_title(r),
+                None => title_of(&text),
+            };
             cx.emit(ChatEvent::Meta);
         }
         // Jump to the end so push follows the new message and the reply.
@@ -1602,9 +1657,7 @@ impl Chat {
                 Some(Block::User(_, queued)) => *queued = false,
                 Some(Block::Review(r, queued)) => {
                     *queued = false;
-                    cx.emit(ChatEvent::ReviewRemoved(
-                        r.items.iter().map(|i| i.id).collect(),
-                    ));
+                    cx.emit(ChatEvent::ReviewRemoved(r.ids()));
                 }
                 _ => {}
             }
@@ -1813,13 +1866,18 @@ impl Chat {
             Ev::TextDelta(s) => match self.live_text() {
                 Some(bi) => {
                     if let Block::Text { md, src, .. } = &mut self.blocks[bi] {
-                        md.update(cx, |m, cx| m.push_str(&s, cx));
                         src.push_str(&s);
+                        // Reports come last; once one may be starting, the text is rebuilt
+                        // without them on each delta.
+                        match src.contains("[c") {
+                            true => md.update(cx, |m, cx| m.set_text(&hide_reports(src), cx)),
+                            false => md.update(cx, |m, cx| m.push_str(&s, cx)),
+                        }
                     }
                     self.remeasure(bi);
                 }
                 None => {
-                    let md = cx.new(|cx| TextViewState::markdown(&s, cx));
+                    let md = cx.new(|cx| TextViewState::markdown(&hide_reports(&s), cx));
                     self.blocks.push(Block::Text {
                         md,
                         src: s,
@@ -2056,6 +2114,11 @@ impl Chat {
         let Some(&(bi, call)) = self.rows.get(ix) else {
             return self.render_activity(cx).into_any_element();
         };
+        if let Block::Text { src, .. } = &self.blocks[bi]
+            && hidden_reply(src)
+        {
+            return div().id(ix).into_any_element();
+        }
         let focused = self.focus.is_focused(window);
         let theme = cx.theme();
         let row = div()
@@ -3001,6 +3064,12 @@ mod tests {
             hide_reports("Done.\n[c1] addressed: x\n- `[c2] addressed: y`\nBye"),
             "Done.\nBye"
         );
+        // One in a code block is an example, not a report.
+        let fenced = "See:\n```\n[c1] addressed: example\n```\n[c2] addressed: real";
+        assert_eq!(parse_reports(fenced), [(2, "real".to_string())]);
+        assert_eq!(hide_reports(fenced), "See:\n```\n[c1] addressed: example\n```\n");
+        assert!(hidden_reply("[c1] addressed: x\n"));
+        assert!(!hidden_reply("Done.\n[c1] addressed: x"));
     }
 
     #[test]
@@ -4045,6 +4114,22 @@ exec cat >/dev/null
         });
         act(cx, &|w, cx| w.press("enter", cx));
         assert_eq!(queue(cx), ["b", "c"], "b keeps its place ahead of c");
+
+        // A review queued in front moves the rows down: the cursor and an edited slot follow.
+        let review = |p: &str| ReviewCard {
+            prompt: p.into(),
+            items: vec![],
+            changes: String::new(),
+        };
+        act(cx, &|w, cx| chat.update(cx, |c, cx| c.focus_queue(w, cx)));
+        act(cx, &|w, cx| w.press("end", cx));
+        cx.update(|cx| chat.update(cx, |c, cx| c.send_review(review("R1"), cx)));
+        assert_eq!(queue(cx)[qsel(cx)], "c", "still on c");
+        act(cx, &|w, cx| w.press("e", cx));
+        assert_eq!(value(cx), "c");
+        cx.update(|cx| chat.update(cx, |c, cx| c.send_review(review("R2"), cx)));
+        act(cx, &|w, cx| w.press("enter", cx));
+        assert_eq!(queue(cx), ["R2", "R1", "b", "c"], "c back in its slot");
 
         cx.update(|cx| chat.update(cx, |c, _| c.agent = None));
         let _ = std::fs::remove_file(dir);
