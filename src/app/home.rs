@@ -557,22 +557,12 @@ impl Shark {
     /// The Home row at the top of the sidebar.
     pub(super) fn render_home_row(&self, rail: bool, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        h_flex()
+        side_row(theme)
             .id("home-row")
-            .h(px(28.))
-            .flex_none()
-            .mx_2()
-            .mb_1()
-            .px_2()
-            .gap_2()
-            .rounded(theme.radius)
-            .text_sm()
             .when(rail, super::sidebar::rail_button)
-            .when(self.home_shown(), |d| {
-                d.bg(theme.sidebar_accent).font_weight(FontWeight::MEDIUM)
-            })
-            .hover(|d| d.bg(theme.sidebar_accent))
-            .child(Icon::new(IconName::House).with_size(px(if rail { 16. } else { 14. })))
+            .map(|d| cursor_row(d, self.home_shown(), false, false, theme))
+            .when(self.home_shown(), |d| d.font_weight(FontWeight::MEDIUM))
+            .child(Icon::new(IconName::House).with_size(px(16.)))
             .when(!rail, |d| {
                 d.child(div().flex_1().child("Home")).child(
                     kbd("cmd-0")
@@ -1013,7 +1003,7 @@ impl Shark {
                         .py_2()
                         .gap_3()
                         .rounded(theme.radius)
-                        .map(|d| cursor_row(d, selected, focused, theme.list_hover, theme))
+                        .map(|d| list_cursor_row(d, selected, focused, theme))
                         .on_mouse_down(MouseButton::Left, {
                             let name = name.clone();
                             cx.listener(move |this, _, _, cx| {

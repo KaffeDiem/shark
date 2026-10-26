@@ -320,8 +320,8 @@ impl Menu {
                 Entry::Sep => {
                     return div()
                         .h(px(1.))
-                        .my(px(4.))
-                        .mx(px(-4.))
+                        .my(px(6.))
+                        .mx(px(-6.))
                         .bg(theme.foreground.alpha(0.08))
                         .into_any_element();
                 }
@@ -343,18 +343,19 @@ impl Menu {
                                 div()
                                     .max_w(px(180.))
                                     .truncate()
+                                    .text_sm()
                                     .text_color(theme.muted_foreground)
                                     .child(h.clone())
                             }))
                             .when(*checked, |d| {
                                 d.child(
                                     Icon::new(IconName::Check)
-                                        .with_size(px(14.))
+                                        .with_size(px(16.))
                                         .text_color(theme.muted_foreground),
                                 )
                             })
                             .when(checks && !*checked, |d| {
-                                d.child(div().size(px(14.)).flex_none())
+                                d.child(div().size(px(16.)).flex_none())
                             })
                             .into_any_element(),
                     ),
@@ -372,6 +373,7 @@ impl Menu {
                     Some(
                         h_flex()
                             .gap(px(8.))
+                            .text_sm()
                             .text_color(theme.muted_foreground)
                             .children(
                                 hint.as_ref()
@@ -386,24 +388,24 @@ impl Menu {
             h_flex()
                 .id(ix)
                 .relative()
-                .h(px(28.))
-                .px(px(8.))
+                .h(ROW_H)
+                .px(px(10.))
                 .gap(px(8.))
                 .rounded(px(4.))
                 .when(sel == Some(ix) || open, |d| d.bg(highlight(theme)))
                 .when(icons, |d| {
                     d.child(match (image, icon) {
-                        // App icons have a margin built in; 16px matches a 14px glyph.
+                        // App icons have a margin built in; 18px matches a 16px glyph.
                         (Some(app), _) => img(app)
-                            .size(px(16.))
+                            .size(px(18.))
                             .mx(px(-1.))
                             .flex_none()
                             .into_any_element(),
                         (None, Some(i)) => Icon::new(i)
-                            .with_size(px(14.))
-                            .text_color(theme.muted_foreground)
+                            .with_size(px(16.))
+                            .text_color(crate::app::faint(theme))
                             .into_any_element(),
-                        (None, None) => div().size(px(14.)).flex_none().into_any_element(),
+                        (None, None) => div().size(px(16.)).flex_none().into_any_element(),
                     })
                 })
                 .child(div().flex_1().min_w_0().truncate().child(label.clone()))
@@ -426,7 +428,7 @@ impl Menu {
                     d.child(
                         div()
                             .absolute()
-                            .top(px(-4.))
+                            .top(px(-6.))
                             .when(!leftward, |d| d.left_full().pl(px(4.)))
                             .when(leftward, |d| d.right_full().pr(px(4.)))
                             // Deferred above the main panel, so a submenu the window
@@ -457,15 +459,15 @@ fn surface(theme: &Theme) -> Div {
 }
 
 /// The look every floating menu shares (this one and the composer's completions): `popover`,
-/// 4px inset, 8px corners, and a translucent ring instead of a border, so the shadow shows
+/// 6px inset, 14px text, 8px corners, and a translucent ring instead of a border, so the shadow shows
 /// through the edge.
 pub(crate) fn chrome(theme: &Theme) -> Div {
     let ink = hsla(0., 0., 0., if theme.is_dark() { 0.5 } else { 0.12 });
     v_flex()
-        .p(px(4.))
+        .p(px(6.))
         .bg(theme.popover)
         .text_color(theme.popover_foreground)
-        .text_sm()
+        .text_size(px(14.))
         .rounded(theme.radius)
         .shadow(vec![
             BoxShadow::new(px(0.), px(0.), theme.foreground.alpha(0.1)).spread_radius(px(1.)),
@@ -473,6 +475,9 @@ pub(crate) fn chrome(theme: &Theme) -> Div {
             BoxShadow::new(px(0.), px(1.), ink.alpha(ink.a / 2.)).blur_radius(px(1.)),
         ])
 }
+
+/// A menu row's height; the composer's completions use it too.
+pub(crate) const ROW_H: Pixels = px(32.);
 
 /// The highlighted row: an inset 4px pill, the text colour unchanged.
 pub(crate) fn highlight(theme: &Theme) -> Hsla {
