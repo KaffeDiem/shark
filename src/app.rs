@@ -656,9 +656,22 @@ impl Shark {
                         },
                         IconName::FileDiff,
                         Tab::Diff,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, e: &MouseDownEvent, w, cx| {
+                            let entries = this.changes_menu(cx);
+                            this.show_menu(e.position, entries, w, cx);
+                        }),
                     ))
                     .when_some(file_tab, |d, name| {
-                        d.child(tab(name, IconName::FileCode, Tab::File))
+                        d.child(tab(name, IconName::FileCode, Tab::File).on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, e: &MouseDownEvent, w, cx| {
+                                let entries = this.editor_menu(cx);
+                                this.show_menu(e.position, entries, w, cx);
+                            }),
+                        ))
                     })
                     .child(div().flex_1())
                     // Narrow, the branch gives way before the sync buttons.

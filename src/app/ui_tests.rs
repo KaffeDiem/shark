@@ -1683,6 +1683,58 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
+/// A changed file's right-click menu, in the tree and on the open file's header.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn file_menu_labels(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace("fm".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    fs::write(home.join("shark/workspaces/fm/api/a.md"), "x\n").unwrap();
+    on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+    let labels = |entries: Vec<Entry>| {
+        (entries.into_iter())
+            .map(|e| match e {
+                Entry::Item { label, .. } | Entry::Sub { label, .. } => label.to_string(),
+                Entry::Sep => "-".into(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let file = [
+        "Comment",
+        "Viewed",
+        "-",
+        "Reveal in Finder",
+        "Open in Code",
+        "Copy path",
+        "Copy relative path",
+    ];
+    let menu = shark.update(cx, |s, cx| labels(s.file_menu("api/a.md", cx)));
+    assert_eq!(menu[..2], ["Open in editor", "Edit working copy"]);
+    assert_eq!(menu[2..], file);
+    on(cx, &|s, w, cx| s.open_path("api/a.md".into(), w, cx));
+    let menu = shark.update(cx, |s, cx| labels(s.editor_menu(cx)));
+    assert_eq!(menu[0], "Edit working copy", "already open");
+    assert_eq!(menu[1..], [&file[..], &["-", "Close file"]].concat()[..]);
+    fs::remove_dir_all(&home).ok();
+}
+
 /// Home shows while nothing is open; cmd-0 toggles it over a workspace, esc and opening a
 /// workspace leave it, the arrows and enter open a row, and a relaunch comes back to it.
 #[gpui_kit::test]

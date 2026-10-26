@@ -1750,7 +1750,7 @@ impl Shark {
     }
 
     /// The header's Comment: the selection when it is in `path`, else its first changed line.
-    fn comment_in(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn comment_in(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
         let here = self.picked_lines(cx).filter(|r| r.path() == path);
         let range = here.or_else(|| {
             let first = (self.review.hunks.get(path))
