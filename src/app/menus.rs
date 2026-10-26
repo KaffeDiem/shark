@@ -40,7 +40,11 @@ pub(super) fn open_in_entries(
                 Kind::Xcode => IconName::FileCode,
                 _ => IconName::FolderGit2,
             };
-            let hint = if is_folder { tilde(&path) } else { String::new() };
+            let hint = if is_folder {
+                tilde(&path)
+            } else {
+                String::new()
+            };
             menu::item(icon, name, move |_, _| app.open(&path)).hint(hint)
         });
         entries.push(menu::sub(app_icon(app), label, rows.collect()).image(image));
@@ -83,7 +87,11 @@ pub(super) fn path_submenu(
         };
         // The repo rows' labels already say which; only the folder row needs its path.
         let item = menu::item(icon, name.clone(), move |w, cx| f(&p, w, cx));
-        entries.push(if ix == 0 { item.hint(tilde(path)) } else { item });
+        entries.push(if ix == 0 {
+            item.hint(tilde(path))
+        } else {
+            item
+        });
     }
     menu::sub(icon, label, entries)
 }
@@ -135,11 +143,12 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
         ),
     ]);
     entries.extend(open_in_entries(Some(&paths[0]), &paths[1..]));
-    entries.extend([
-        path_submenu(IconName::Copy, "Copy path", &paths, |p, w, cx| {
-            copy(p.display().to_string(), w, cx)
-        }),
-    ]);
+    entries.extend([path_submenu(
+        IconName::Copy,
+        "Copy path",
+        &paths,
+        |p, w, cx| copy(p.display().to_string(), w, cx),
+    )]);
     entries.extend(branch_entries(this, ws, cx));
     entries.extend([
         Entry::Sep,
@@ -164,10 +173,17 @@ pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) 
     let sync = this.syncs.get(&ws.name).map(|s| s.read(cx));
     let branches = sync.map(|s| s.branches()).unwrap_or_default();
     // Not opened yet, so not probed: the branches the workspace put them on.
-    let saved = || ws.repos.iter().map(|r| (r.name.clone(), ws.branch_of(r).to_string()));
+    let saved = || {
+        ws.repos
+            .iter()
+            .map(|r| (r.name.clone(), ws.branch_of(r).to_string()))
+    };
     let pairs: Vec<(String, String)> = match branches.is_empty() {
         true => saved().collect(),
-        false => branches.iter().map(|b| (b.repo.clone(), b.name.clone())).collect(),
+        false => branches
+            .iter()
+            .map(|b| (b.repo.clone(), b.name.clone()))
+            .collect(),
     };
     let mut names: Vec<String> = pairs.iter().map(|(_, b)| b.clone()).collect();
     names.sort();
@@ -177,7 +193,11 @@ pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) 
         0 | 1 => {
             let b = names.pop().unwrap_or_else(|| ws.branch.clone());
             // The branch is usually the workspace's name; then the hint says nothing new.
-            let hint = if b == ws.name { String::new() } else { b.clone() };
+            let hint = if b == ws.name {
+                String::new()
+            } else {
+                b.clone()
+            };
             vec![(hint, String::new(), b)]
         }
         _ => (pairs.into_iter())
@@ -195,12 +215,17 @@ pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) 
     )
     .hint(base_hint(ws));
     let mut entries: Vec<Entry> = [
-        each_or_all(IconName::GitBranch, "Copy branch name", copies, |bs, w, cx| {
-            let mut bs = bs.to_vec();
-            bs.sort();
-            bs.dedup();
-            copy(bs.join("\n"), w, cx)
-        }),
+        each_or_all(
+            IconName::GitBranch,
+            "Copy branch name",
+            copies,
+            |bs, w, cx| {
+                let mut bs = bs.to_vec();
+                bs.sort();
+                bs.dedup();
+                copy(bs.join("\n"), w, cx)
+            },
+        ),
         each_or_all(IconName::Github, "Open branch on GitHub", links, open_urls),
         sync.and_then(pr_entry),
     ]
@@ -219,7 +244,12 @@ pub(crate) fn pr_entry(sync: &crate::sync::GitSync) -> Option<Entry> {
     let prs = (sync.pr_urls().into_iter())
         .map(|(repo, url)| (repo, String::new(), url))
         .collect();
-    each_or_all(IconName::GitPullRequest, "Open pull request", prs, open_urls)
+    each_or_all(
+        IconName::GitPullRequest,
+        "Open pull request",
+        prs,
+        open_urls,
+    )
 }
 
 fn open_urls(urls: &[String], _: &mut Window, cx: &mut App) {

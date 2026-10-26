@@ -3,7 +3,7 @@ use super::*;
 use std::cmp::Ordering;
 
 /// The accent dot on a tab or edge arrow: a finished turn you haven't looked at yet.
-fn dot(inset: f32, theme: &Theme) -> Div {
+pub(super) fn dot(inset: f32, theme: &Theme) -> Div {
     (div().absolute().top(px(inset)).right(px(inset)))
         .size(px(6.))
         .rounded_full()
@@ -369,7 +369,11 @@ impl Shark {
             return notify_err(window, cx, "Open a workspace first");
         };
         let Some(plan) = (from.read(cx).plan.read(cx).latest()).map(|v| v.text.clone()) else {
-            return notify_err(window, cx, "No plan yet; the agent submits one in plan mode");
+            return notify_err(
+                window,
+                cx,
+                "No plan yet; the agent submits one in plan mode",
+            );
         };
         self.new_chat(window, cx);
         let Some(to) = self.active_chat().cloned().filter(|c| *c != from) else {
@@ -547,6 +551,7 @@ impl Shark {
                                 })),
                         )
                     })
+                    .test_support()
                     .into_any_element()
             })
             .collect();
@@ -567,6 +572,7 @@ impl Shark {
                 .ghost()
                 .xsmall()
                 .icon(IconName::Plus)
+                .w(px(24.))
                 .tooltip("New chat (cmd-t)")
                 .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx)))
                 .into_any_element(),
@@ -595,9 +601,11 @@ impl Shark {
             ));
         }
         if let Some(id) = meta.session_id.clone() {
-            entries.push(menu::item(IconName::Copy, "Copy session ID", move |w, cx| {
-                copy(id.clone(), w, cx)
-            }));
+            entries.push(menu::item(
+                IconName::Copy,
+                "Copy session ID",
+                move |w, cx| copy(id.clone(), w, cx),
+            ));
         }
         let transcript = crate::agent::transcript_path(&meta.id);
         if transcript.exists() {

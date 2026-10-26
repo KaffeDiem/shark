@@ -2213,6 +2213,8 @@ dependencies = [
 [[package]]
 name = "gpui-component"
 version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4097e161cc81e86323b439664be0cdd4f7c56148e867ed6f67fd72b966b6c2d1"
 dependencies = [
  "anyhow",
  "chrono",
@@ -6442,6 +6444,11 @@ dependencies = [
  "serde",
  "serde_json",
  "similar",
+ "smallvec",
+ "syntect",
+ "two-face",
+ "unicode-segmentation",
+ "unicode-width",
 ]
 
 [[package]]

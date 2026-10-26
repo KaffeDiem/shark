@@ -167,12 +167,14 @@ fn step(entries: &[Entry], from: Option<usize>, down: bool) -> Option<usize> {
 /// The first row from `from` on, wrapping, whose label starts with `typed` (lowercase).
 fn find(entries: &[Entry], typed: &str, from: usize) -> Option<usize> {
     let n = entries.len();
-    (0..n).map(|i| (from + i) % n).find(|&ix| match &entries[ix] {
-        Entry::Item { label, .. } | Entry::Sub { label, .. } => {
-            label.to_lowercase().starts_with(typed)
-        }
-        Entry::Sep => false,
-    })
+    (0..n)
+        .map(|i| (from + i) % n)
+        .find(|&ix| match &entries[ix] {
+            Entry::Item { label, .. } | Entry::Sub { label, .. } => {
+                label.to_lowercase().starts_with(typed)
+            }
+            Entry::Sep => false,
+        })
 }
 
 impl Menu {
@@ -310,7 +312,9 @@ impl Menu {
             )
         });
         // A check column when any row has one, so the hints line up.
-        let checks = entries.iter().any(|e| matches!(e, Entry::Item { checked: true, .. }));
+        let checks = entries
+            .iter()
+            .any(|e| matches!(e, Entry::Item { checked: true, .. }));
         let rows = entries.iter().enumerate().map(|(ix, e)| {
             let (icon, image, label, right) = match e {
                 Entry::Sep => {
@@ -349,7 +353,9 @@ impl Menu {
                                         .text_color(theme.muted_foreground),
                                 )
                             })
-                            .when(checks && !*checked, |d| d.child(div().size(px(14.)).flex_none()))
+                            .when(checks && !*checked, |d| {
+                                d.child(div().size(px(14.)).flex_none())
+                            })
                             .into_any_element(),
                     ),
                 ),
@@ -367,7 +373,10 @@ impl Menu {
                         h_flex()
                             .gap(px(8.))
                             .text_color(theme.muted_foreground)
-                            .children(hint.as_ref().map(|h| div().max_w(px(180.)).truncate().child(h.clone())))
+                            .children(
+                                hint.as_ref()
+                                    .map(|h| div().max_w(px(180.)).truncate().child(h.clone())),
+                            )
                             .child(Icon::new(IconName::ChevronRight).with_size(px(12.)))
                             .into_any_element(),
                     ),
@@ -425,11 +434,15 @@ impl Menu {
                             .child(
                                 deferred(
                                     anchored()
-                                        .anchor(if leftward { Anchor::TopRight } else { Anchor::TopLeft })
+                                        .anchor(if leftward {
+                                            Anchor::TopRight
+                                        } else {
+                                            Anchor::TopLeft
+                                        })
                                         .snap_to_window_with_margin(px(8.))
                                         .child(sub),
                                 )
-                                    .with_priority(POPUP_PRIORITY + 1),
+                                .with_priority(POPUP_PRIORITY + 1),
                             ),
                     )
                 })

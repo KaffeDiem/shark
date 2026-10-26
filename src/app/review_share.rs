@@ -59,7 +59,7 @@ fn inline_body(c: &Comment) -> String {
 impl Shark {
     /// The open PR of `c`'s repo, and whether the lines are on GitHub (head pushed, clean).
     pub(super) fn pr_of(&self, c: &Comment, cx: &App) -> Option<(Pr, bool)> {
-        let repo = c.path.split('/').next()?;
+        let repo = c.repo();
         self.active_sync()?.read(cx).pr_for(repo)
     }
 
@@ -67,7 +67,7 @@ impl Shark {
     pub(super) fn open_share(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(c) = self.comment(id) else { return };
         if self.pr_of(c, cx).is_none() {
-            let repo = c.path.split('/').next().unwrap_or_default().to_string();
+            let repo = c.repo().to_string();
             return notify_err(window, cx, format!("{repo} has no open PR to share to"));
         }
         self.review.share = Some(Share {
@@ -117,7 +117,7 @@ impl Shark {
 
     /// Posts `comments` (with `note`) to their repos' PRs in the background, one post per
     /// repo: a review, else a reviewer note. Each gets its URL; a failure, or a repo without
-    /// a PR, says so and leaves its comments as they were.
+    /// a PR, says so and leaves its comments as they were. Ones already posted are skipped.
     pub(super) fn publish(
         &mut self,
         comments: &[Comment],
@@ -126,19 +126,13 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut repos: Vec<&str> = vec![];
-        for c in comments {
-            let repo = c.path.split('/').next().unwrap_or_default();
-            if !repos.contains(&repo) {
-                repos.push(repo);
-            }
-        }
-        for repo in repos {
-            let group: Vec<Comment> = (comments.iter())
-                .filter(|c| c.path.split('/').next() == Some(repo))
-                .cloned()
-                .collect();
-            self.publish_repo(&group, note, review, window, cx);
+        let mut todo: Vec<Comment> = (comments.iter())
+            .filter(|c| c.github.is_none())
+            .cloned()
+            .collect();
+        todo.sort_by(|a, b| a.repo().cmp(b.repo())); // stable: file order within a repo
+        for group in todo.chunk_by(|a, b| a.repo() == b.repo()) {
+            self.publish_repo(group, note, review, window, cx);
         }
     }
 
@@ -160,16 +154,24 @@ impl Shark {
         let (Some(first), Some(ws)) = (comments.first(), self.active_ws()) else {
             return;
         };
-        let repo = first.path.split('/').next().unwrap_or_default();
+        let repo = first.repo();
         let Some((pr, pushed)) = self.pr_of(first, cx) else {
-            return notify_err(window, cx, format!("{repo} has no open PR to publish to"));
+            // Also publish lists only repos with a PR: a note, not an error.
+            let msg = format!("{repo} has no open PR; its comments stay unpublished");
+            return window.push_notification(msg, cx);
         };
         let (wt, ws_name) = (ws.dir().join(repo), ws.name.clone());
         // A review of pushed lines sits on them; anything else goes as path and excerpt.
         // ponytail: one thread at a time; the sheet's multi-comment review stays text.
-        let inline = (review && pushed && comments.len() == 1 && self.on_its_line(first))
+        // GitHub wants both ends in one hunk of its diff. Not while the file is edited in
+        // place (its hunk is the whole file), nor on the old side of a file gone from disk:
+        // it may be a rename, which GitHub tracks and our `--no-renames` diff doesn't.
+        let edited = (self.editing.as_ref()).is_some_and(|e| *e.path == first.path);
+        let one = comments.len() == 1 && self.in_one_hunk(first) && !edited;
+        let inline = (review && pushed && one)
             .then(|| Some((first.gh_anchor()?, inline_body(first))))
-            .flatten();
+            .flatten()
+            .filter(|(a, _)| !a.left || wt.join(&a.path).exists());
         // GitHub refuses a Comment review without a body: the note, else where it is.
         let body = match inline {
             Some(_) if note.trim().is_empty() => first.place(),
@@ -189,8 +191,7 @@ impl Shark {
                 .spawn(async move {
                     let inline = inline.as_ref().map(|(a, t)| (a, t.as_str()));
                     match review {
-                        true => crate::pr::publish_review(&wt, pr.number, &body, inline)
-                            .map(|u| if u.is_empty() { pr.url } else { u }),
+                        true => crate::pr::publish_review(&wt, pr.number, &pr.head, &body, inline),
                         false => crate::pr::publish_note(&wt, pr.number, &body),
                     }
                 })
@@ -242,10 +243,10 @@ impl Shark {
             return d;
         };
         let theme = cx.theme();
-        let repo = c.path.split('/').next().unwrap_or_default();
+        let repo = c.repo();
         let wr = ws.repos.iter().find(|r| r.name == repo);
-        let base = (wr.map(|r| r.base.trim_start_matches("origin/").to_string()))
-            .unwrap_or_default();
+        let base =
+            (wr.map(|r| r.base.trim_start_matches("origin/").to_string())).unwrap_or_default();
         let branch = wr.map_or(ws.branch.clone(), |r| ws.branch_of(r).to_string());
         let this = cx.entity().downgrade();
         let gone = this.clone();

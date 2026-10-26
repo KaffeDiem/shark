@@ -1,7 +1,7 @@
 //! Editing a file's working copy in place in the diff, a line at a time; every edit compares
 //! the buffer against the base again, so the diff shows unsaved edits.
 use super::*;
-use gpui_kit::component::diff::{DiffLinePosition, DiffSide};
+use crate::diff_view::{DiffLinePosition, DiffSide};
 
 /// A working copy as lines, and the line the caret is on.
 #[derive(Clone, Debug, PartialEq)]
@@ -34,10 +34,12 @@ impl Buffer {
     /// The file's indent: a tab if a line starts with one, else its shortest run of two or
     /// more leading spaces, else four spaces.
     pub(super) fn indent(&self) -> String {
-        if self.lines.iter().any(|l| l.starts_with('\t')) {
+        // Blank lines' whitespace says nothing about the indent.
+        let lines = || self.lines.iter().filter(|l| !l.trim().is_empty());
+        if lines().any(|l| l.starts_with('\t')) {
             return "\t".into();
         }
-        let n = (self.lines.iter())
+        let n = lines()
             .map(|l| l.len() - l.trim_start_matches(' ').len())
             .filter(|&n| n >= 2)
             .min();
@@ -59,8 +61,11 @@ impl Buffer {
     /// Replaces bytes `range` of the caret's line with `text`, which may hold several lines;
     /// the caret ends after it. Returns the caret's column.
     pub(super) fn insert(&mut self, range: std::ops::Range<usize>, text: &str) -> usize {
-        let text = text.replace("\r\n", "\n");
+        let text = text.replace("\r\n", "\n").replace('\r', "\n");
         let cur = &self.lines[self.line];
+        // The input's range can outlive a reload of the line; keep it inside.
+        let end = cur.floor_char_boundary(range.end);
+        let range = cur.floor_char_boundary(range.start.min(end))..end;
         let after = cur[range.end..].to_string();
         let mut lines = text.split('\n');
         let first = format!("{}{}", &cur[..range.start], lines.next().unwrap_or(""));
@@ -88,7 +93,7 @@ pub(super) fn patch(path: &str, base: &str, text: &str, added: bool) -> String {
     if added {
         out += "new file mode 100644\n";
     }
-    if base == text && !text.is_empty() {
+    if base == text {
         // No hunk without a change: one of context only.
         let n = text.lines().count();
         out += &format!("--- {old}\n+++ b/{path}\n@@ -1,{n} +1,{n} @@\n");
@@ -179,6 +184,12 @@ fn load(ws: &Workspace, file: &DiffFile) -> Result<(String, String, bool), Strin
         return Err(format!("{path} is deleted or binary; it can't be edited"));
     }
     let abs = ws.dir().join(path.as_str());
+    // Saving would write through the link, to a file outside the diff.
+    if std::fs::symlink_metadata(&abs).is_ok_and(|m| m.is_symlink()) {
+        return Err(format!(
+            "{path} is a symlink; it can't be edited in the diff"
+        ));
+    }
     if std::fs::metadata(&abs).is_ok_and(|m| m.len() > crate::editor::MAX_BYTES) {
         return Err(format!("{path} is too large to edit in the diff"));
     }
@@ -186,12 +197,6 @@ fn load(ws: &Workspace, file: &DiffFile) -> Result<(String, String, bool), Strin
         .ok()
         .and_then(|b| String::from_utf8(b).ok())
         .ok_or(format!("{path} can't be read as text"))?;
-    // ponytail: CRLF files stay read-only here; keep each line's ending if they need editing.
-    if text.contains('\r') {
-        return Err(format!(
-            "{path} has CRLF line endings; open it with o to edit"
-        ));
-    }
     let headers = file.extended_headers();
     let added = headers.iter().any(|h| h.starts_with("new file mode"));
     let sha = (headers.iter())
@@ -217,6 +222,12 @@ fn load(ws: &Workspace, file: &DiffFile) -> Result<(String, String, bool), Strin
             String::from_utf8(out.stdout).map_err(|_| format!("{path}: the base isn't text"))?
         }
     };
+    // ponytail: CRLF files stay read-only here; keep each line's ending if they need editing.
+    if text.contains('\r') || base.contains('\r') {
+        return Err(format!(
+            "{path} has CRLF line endings; open it with o to edit"
+        ));
+    }
     Ok((base, text, added))
 }
 
@@ -245,14 +256,16 @@ impl Shark {
         }
     }
 
-    /// Edit the working copy of `path`, or of the file the cursor is on.
+    /// Edit the working copy of `path`, or of the selected line's file, or of the file the
+    /// cursor is on.
     pub(super) fn edit_working_copy(
         &mut self,
         path: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let path = path.or_else(|| {
+        let selected = (self.diff.read(cx).selected_lines()).filter(|_| self.tab == Tab::Diff);
+        let path = path.or(selected.map(|r| r.path().clone())).or_else(|| {
             let ix = self.cursor_file(window, cx)?;
             Some(self.diff_files[ix].path().clone())
         });
@@ -260,7 +273,7 @@ impl Shark {
             return;
         };
         if self.editing.as_ref().is_some_and(|e| e.path == path) {
-            return self.focus_edit(window, cx);
+            return self.show(Tab::Diff, window, cx);
         }
         let Some(file) = self.diff_files.iter().find(|f| *f.path() == path) else {
             return;
@@ -330,6 +343,9 @@ impl Shark {
                 input,
                 _subs: subs,
             });
+            if s.tab != Tab::Diff {
+                s.show(Tab::Diff, window, cx);
+            }
             s.show_edit_at(None, window, cx);
             // The caret's row to the top: revealing it at the bottom would go by the hinted
             // heights of rows never drawn and could miss, and an undrawn input loses focus.
@@ -347,6 +363,12 @@ impl Shark {
         self.focus_edit(window, cx);
     }
 
+    /// Moves the caret to its new line, the text unchanged: no new comparison.
+    fn move_caret(&mut self, col: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
+        self.load_line(col, window, cx);
+        self.focus_edit(window, cx);
+    }
+
     /// The caret's line into the input, the caret at `col` (else the end).
     fn load_line(&mut self, col: Option<usize>, window: &mut Window, cx: &mut Context<Self>) {
         let Some(e) = &self.editing else { return };
@@ -358,14 +380,21 @@ impl Shark {
         });
     }
 
-    /// The edited file as a refresh read it from disk. Written by someone else: a clean
-    /// buffer takes the new text, unsaved edits are marked stale (saving then asks).
-    pub(super) fn edit_disk(&mut self, bytes: Vec<u8>, cx: &mut Context<Self>) {
-        let Some(e) = self.editing.as_mut().filter(|e| !e.saving) else {
+    /// File `abs` as a refresh read it from disk, if it is still the one edited. Written by
+    /// someone else: a clean buffer takes the new text, unsaved edits are marked stale (saving
+    /// then asks); deleted, it is marked stale.
+    pub(super) fn edit_disk(&mut self, abs: &Path, bytes: Option<Vec<u8>>, cx: &mut Context<Self>) {
+        let Some(e) = (self.editing.as_mut()).filter(|e| !e.saving && e.abs == abs) else {
             return;
+        };
+        let Some(bytes) = bytes else {
+            e.stale = true;
+            return cx.notify();
         };
         let fp = crate::files::fingerprint(&bytes);
         if fp == e.disk {
+            // Back to what was read: saving no longer overwrites anything.
+            e.stale = false;
             return;
         }
         let text = String::from_utf8(bytes).ok().filter(|t| !t.contains('\r'));
@@ -389,8 +418,11 @@ impl Shark {
         });
     }
 
+    /// Focuses the line input, its row brought into view first: an undrawn input loses focus.
     pub(super) fn focus_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(e) = &self.editing {
+            let caret = e.caret();
+            self.diff.update(cx, |d, cx| d.show_line(caret, cx));
             e.input.read(cx).focus_handle(cx).focus(window, cx);
         }
         cx.notify();
@@ -458,12 +490,12 @@ impl Shark {
             },
             "up" if e.buf.line > 0 => {
                 e.buf.line -= 1;
-                self.show_edit_at(Some(col), window, cx);
+                self.move_caret(Some(col), window, cx);
                 return true;
             }
             "down" if e.buf.line + 1 < e.buf.lines.len() => {
                 e.buf.line += 1;
-                self.show_edit_at(Some(col), window, cx);
+                self.move_caret(Some(col), window, cx);
                 return true;
             }
             "up" | "down" => return true,
@@ -581,7 +613,7 @@ impl Shark {
             && pos.line() != e.buf.line + 1
         {
             e.buf.line = pos.line() - 1;
-            self.show_edit_at(None, window, cx);
+            self.move_caret(None, window, cx);
         }
     }
 
@@ -614,7 +646,8 @@ impl Shark {
                             .text_size(size)
                             .font_family(mono.clone())
                             .on_paste(move |item, window, cx| {
-                                let Some(text) = item.text().filter(|t| t.contains('\n')) else {
+                                let Some(text) = item.text().filter(|t| t.contains(['\n', '\r']))
+                                else {
                                     return false;
                                 };
                                 // The input is mid-update; edit the buffer once it's done.
@@ -634,10 +667,10 @@ impl Shark {
 }
 
 /// A file header's [Edit working copy], or [Review] [Save ⌘S] while it is edited; `editing`
-/// is the edited path and whether it has unsaved edits.
+/// is whether it has unsaved edits, if it is the edited file.
 pub(super) fn edit_buttons(
     file: &DiffFile,
-    editing: Option<&(SharedString, bool)>,
+    editing: Option<bool>,
     shark: WeakEntity<Shark>,
 ) -> AnyElement {
     if file.status() == DiffFileStatus::Deleted || file.is_binary() {
@@ -652,13 +685,16 @@ pub(super) fn edit_buttons(
                 .ok();
         }
     };
-    match editing.filter(|(p, _)| *p == path) {
-        Some((_, dirty)) => h_flex()
-            .gap_1()
+    match editing {
+        Some(dirty) => h_flex()
+            .gap(px(10.))
             .child(
                 Button::new("edit-review")
                     .outline()
                     .xsmall()
+                    .h(px(28.))
+                    .px(px(9.))
+                    .rounded(px(6.))
                     .label("Review")
                     .tooltip("Back to reviewing (esc)")
                     .on_click(on(|s, _, w, cx| s.leave_edit(w, cx))),
@@ -666,13 +702,19 @@ pub(super) fn edit_buttons(
             .child(
                 Button::new("edit-save")
                     .xsmall()
+                    .h(px(28.))
+                    .px(px(9.))
+                    .rounded(px(6.))
                     .label("Save ⌘S")
-                    .map(|b| if *dirty { b.primary() } else { b.outline() })
+                    .map(|b| if dirty { b.primary() } else { b.outline() })
                     .on_click(on(|s, _, w, cx| s.save_edit(false, w, cx))),
             )
             .into_any_element(),
         None => Button::new("edit-working-copy")
             .xsmall()
+            .h(px(28.))
+            .px(px(9.))
+            .rounded(px(6.))
             .label("Edit working copy")
             .tooltip("Edit in place (i)")
             .on_click(on(|s, p, w, cx| s.edit_working_copy(Some(p), w, cx)))
@@ -712,6 +754,17 @@ mod tests {
     }
 
     #[test]
+    fn indent_skips_blank_lines_and_insert_splits_lone_cr() {
+        assert_eq!(Buffer::new("a\n  \n\t\n    b\n").indent(), "    ");
+        let mut b = Buffer::new("x\n");
+        b.insert(1..1, "1\r2\r\n3");
+        assert_eq!(b.text(), "x1\n2\n3\n");
+        // A range past the line (an input not yet reloaded) stays inside it.
+        b.insert(5..9, "!");
+        assert_eq!(b.text(), "x1\n2\n3!\n");
+    }
+
+    #[test]
     fn patch_compares_buffer_with_base() {
         let base = "a\nb\nc\n";
         let mut b = Buffer::new(base);
@@ -747,7 +800,10 @@ mod tests {
         for (base, added) in [("", true), ("", false), ("a\nb\n", false)] {
             let p = patch("api/f", base, "", added);
             let hunks = review::parse_hunks(&p);
-            assert!(hunks.iter().flatten().any(|r| r.0 != b'-' && r.2 == 1), "{p}");
+            assert!(
+                hunks.iter().flatten().any(|r| r.0 != b'-' && r.2 == 1),
+                "{p}"
+            );
         }
     }
 }

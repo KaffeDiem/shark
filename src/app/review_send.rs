@@ -2,7 +2,7 @@
 //! PR review; what is ticked goes to the chat as one message, the rest stays pending.
 use super::review::{Comment, Status, prompt};
 use super::*;
-use crate::chat::{ReviewCard, ReviewItem};
+use crate::chat::{ReviewCard, ReviewItem, plural};
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::input::{Enter, Escape};
 
@@ -101,12 +101,22 @@ impl Shark {
         let Some(chat) = self.active_chat().cloned() else {
             return notify_err(window, cx, "Open a workspace first");
         };
+        if let Some(ws) = self.active.clone() {
+            self.reanchor_comments(&ws); // the lines as the agent will read them
+        }
         let comments: Vec<Comment> = (self.ws_comments().iter())
             .filter(|c| c.status == Status::Pending && ids.contains(&c.id))
             .cloned()
             .collect();
         if comments.is_empty() {
             return notify_err(window, cx, "Tick a comment to send (space)");
+        }
+        if let Some(c) = comments.iter().find(|c| self.unsaved_edit(c)) {
+            let msg = format!(
+                "Save {} first (⌘S): the agent reads the file on disk",
+                c.path
+            );
+            return notify_err(window, cx, msg);
         }
         let card = ReviewCard {
             prompt: prompt(&comments, note),
@@ -120,7 +130,7 @@ impl Shark {
             // "3 files · +5 −3"
             changes: {
                 let ((_, a, d), n) = (self.changes_stats(), self.diff_files.len());
-                format!("{n} file{} · +{a} −{d}", if n == 1 { "" } else { "s" })
+                format!("{n} file{} · +{a} −{d}", plural(n))
             },
         };
         let chat_id = chat.read(cx).meta.id.clone();
@@ -137,7 +147,7 @@ impl Shark {
             }
         });
         let n = comments.len();
-        let s = if n == 1 { "" } else { "s" };
+        let s = plural(n);
         window.push_notification(format!("Sent {n} comment{s} to the agent"), cx);
         self.close_sheet(window, cx);
         if publish {
@@ -153,7 +163,7 @@ impl Shark {
         };
         let mut out: Vec<(String, u64)> = vec![];
         for c in (s.rows.iter().filter(|r| r.1)).filter_map(|r| self.comment(r.0)) {
-            let repo = c.path.split('/').next().unwrap_or_default();
+            let repo = c.repo();
             if !out.iter().any(|p| p.0 == repo)
                 && let Some((pr, _)) = self.pr_of(c, cx)
             {
@@ -244,12 +254,21 @@ impl Shark {
                 .collect();
             let note = s.note.read(cx).value();
             let mut p = prompt(&picked, &note);
-            if let Some(to) = to.as_ref().filter(|_| s.publish) {
-                let body = super::review_share::github_body(&picked, &note);
-                p += &format!("\n— {to} Comment review —\n\n{body}");
+            // One review per repo, without the threads already on GitHub, as `publish` posts.
+            for (repo, n) in prs.iter().filter(|_| s.publish) {
+                let group: Vec<Comment> = (picked.iter())
+                    .filter(|c| c.repo() == repo && c.github.is_none())
+                    .cloned()
+                    .collect();
+                let body = super::review_share::github_body(&group, &note);
+                p += &format!("\n— {repo} PR #{n} Comment review —\n\n{body}");
             }
             p
         });
+        let unpushed = s.publish
+            && (s.rows.iter().filter(|r| r.1))
+                .filter_map(|r| self.comment(r.0))
+                .any(|c| self.pr_of(c, cx).is_some_and(|(_, pushed)| !pushed));
         let n = s.rows.len();
         let sheet = v_flex()
             .id("review-sheet")
@@ -288,9 +307,9 @@ impl Shark {
                             .text_color(theme.muted_foreground)
                             .child(format!(
                                 "{n} comment{} · {} file{}",
-                                if n == 1 { "" } else { "s" },
+                                plural(n),
                                 files.len(),
-                                if files.len() == 1 { "" } else { "s" }
+                                plural(files.len())
                             )),
                     )
                     .child(div().flex_1())
@@ -357,6 +376,11 @@ impl Shark {
                                         .child("preview first"),
                                 ),
                         )
+                    })
+                    .when(unpushed, |d| {
+                        d.child(div().text_xs().text_color(theme.warning_foreground).child(
+                            "Some lines are not pushed yet. GitHub will receive the file path and code excerpt, without an inline anchor.",
+                        ))
                     }),
             )
             .when_some(preview, |d, p| {
@@ -414,7 +438,7 @@ impl Shark {
                             .disabled(ticked == 0)
                             .label(format!(
                                 "Send {ticked} comment{} ⌘↵",
-                                if ticked == 1 { "" } else { "s" }
+                                plural(ticked)
                             ))
                             .on_click(cx.listener(|this, _, w, cx| this.sheet_send(w, cx))),
                     ),
@@ -426,6 +450,7 @@ impl Shark {
                 .absolute()
                 .inset_0()
                 .bg(theme.overlay)
+                .occlude() // clicks and scrolls stop here, not in the diff
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _, w, cx| this.close_sheet(w, cx)),

@@ -9,6 +9,11 @@ gpui-kit = { version = "=0.8.0", features = ["syntect"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 similar = "2"
+syntect = { version = "5.3", default-features = false, features = ["parsing", "regex-fancy"] }
+two-face = { version = "0.4.5", default-features = false, features = ["syntect-fancy"] }
+unicode-width = "0.2"
+smallvec = "1"
+unicode-segmentation = "1"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSImage", "NSResponder", "NSWorkspace", "NSImageRep", "NSBitmapImageRep", "NSGraphicsContext", "objc2-core-graphics"] }
 objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSString", "NSDictionary", "NSValue", "NSURL", "NSArray", "NSGeometry"] }
@@ -28,6 +33,3 @@ opt-level = 3
 # Headless UI tests: cargo test --features test-support
 test-support = ["gpui-kit/test-support"]
 
-# Vendored with a small split-diff patch; see vendor/gpui-component/PROVENANCE.md.
-[patch.crates-io]
-gpui-component = { path = "vendor/gpui-component" }

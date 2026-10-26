@@ -31,11 +31,7 @@ impl Shark {
             return self.show(Tab::File, window, cx);
         }
         if (self.editing.as_ref()).is_some_and(|e| e.path.as_str() == path && e.dirty) {
-            return notify_err(
-                window,
-                cx,
-                format!("{path} has unsaved edits in the diff"),
-            );
+            return notify_err(window, cx, format!("{path} has unsaved edits in the diff"));
         }
         let abs = ws.dir().join(&path);
         if std::fs::metadata(&abs).is_ok_and(|m| m.len() > crate::editor::MAX_BYTES) {
@@ -107,6 +103,19 @@ impl Shark {
     /// Quit, asking first if the open file has unsaved edits.
     pub fn quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.confirm_discard(true, true, window, cx, |_, _, cx| cx.quit())
+    }
+
+    /// The window's close button: true to close now; with unsaved edits it asks first, and
+    /// Discard closes the window.
+    pub(super) fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let ran = Rc::new(std::cell::Cell::new(false));
+        let later = ran.clone();
+        self.confirm_discard(true, true, window, cx, move |_, window, _| {
+            if later.replace(true) {
+                window.remove_window()
+            }
+        });
+        ran.replace(true)
     }
 
     /// Runs `then` now, or after the user agrees to drop the unsaved edits of the open file
@@ -273,23 +282,23 @@ impl Shark {
                     )
                     .when_some(vim, |d, vim| {
                         d.child(
-                        div()
-                            .id("vim-pill")
-                            .px_2()
-                            .h(px(20.))
-                            .flex()
-                            .items_center()
-                            .rounded_full()
-                            .text_xs()
-                            .font_family(theme.mono_font_family.clone())
-                            .text_color(theme.muted_foreground)
-                            .bg(theme.secondary)
-                            .hover(|d| d.text_color(theme.foreground))
-                            .child(vim)
-                            .tooltip(|w, cx| {
-                                Tooltip::new("Turn off Vim mode (ctrl-cmd-v)").build(w, cx)
-                            })
-                            .on_click(cx.listener(|this, _, w, cx| this.toggle_vim(w, cx))),
+                            div()
+                                .id("vim-pill")
+                                .px_2()
+                                .h(px(20.))
+                                .flex()
+                                .items_center()
+                                .rounded_full()
+                                .text_xs()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_color(theme.muted_foreground)
+                                .bg(theme.secondary)
+                                .hover(|d| d.text_color(theme.foreground))
+                                .child(vim)
+                                .tooltip(|w, cx| {
+                                    Tooltip::new("Turn off Vim mode (ctrl-cmd-v)").build(w, cx)
+                                })
+                                .on_click(cx.listener(|this, _, w, cx| this.toggle_vim(w, cx))),
                         )
                     })
                     .when_some(viewed, |d, v| {

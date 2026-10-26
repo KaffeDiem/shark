@@ -120,7 +120,9 @@ impl Shark {
             return notify_err(
                 window,
                 cx,
-                format!("{path} is binary, too large or unreadable; open it in Finder (Reveal in Finder in cmd-k)"),
+                format!(
+                    "{path} is binary, too large or unreadable; open it in Finder (Reveal in Finder in cmd-k)"
+                ),
             );
         }
         self.open_path(path, window, cx);

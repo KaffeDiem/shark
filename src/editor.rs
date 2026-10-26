@@ -444,8 +444,7 @@ impl Render for FileEditor {
             .size_full()
             .on_key_down(cx.listener(|e, ev: &KeyDownEvent, window, cx| {
                 let ks = &ev.keystroke;
-                if !window.has_pending_keystrokes() && e.intercept(ks, window, cx)
-                {
+                if !window.has_pending_keystrokes() && e.intercept(ks, window, cx) {
                     cx.stop_propagation();
                 }
             }))

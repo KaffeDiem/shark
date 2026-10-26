@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024">
+  <defs>
+    <!-- Match the release icon's silhouette, padding, and fin geometry. -->
+    <path id="body" d="M398.1 100 H625.9 C711.7 100 754.7 100 800.9 114.6 C851.3 133 891 172.7 909.4 223.1 C924 269.3 924 312.3 924 398.1 V625.9 C924 711.7 924 754.7 909.4 800.9 C891 851.3 851.3 891 800.9 909.4 C754.7 924 711.7 924 625.9 924 H398.1 C312.3 924 269.3 924 223.1 909.4 C172.7 891 133 851.3 114.6 800.9 C100 754.7 100 711.7 100 625.9 V398.1 C100 312.3 100 269.3 114.6 223.1 C133 172.7 172.7 133 223.1 114.6 C269.3 100 312.3 100 398.1 100Z"/>
+    <path id="fin" d="M792 668 C758 498 616 316 308 244 C446 344 488 520 424 668 Z"/>
+    <linearGradient id="blue" x1="0" y1="100" x2="0" y2="924" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#238BD6"/>
+      <stop offset="1" stop-color="#08469A"/>
+    </linearGradient>
+    <pattern id="grid" x="112" y="112" width="50" height="50" patternUnits="userSpaceOnUse">
+      <path d="M50 0 H0 V50" fill="none" stroke="#fff" stroke-opacity=".15" stroke-width="1.5"/>
+    </pattern>
+    <pattern id="major-grid" x="112" y="112" width="200" height="200" patternUnits="userSpaceOnUse">
+      <path d="M200 0 H0 V200" fill="none" stroke="#fff" stroke-opacity=".23" stroke-width="2"/>
+    </pattern>
+    <clipPath id="sq"><use href="#body"/></clipPath>
+    <filter id="shadow" x="-10%" y="-10%" width="120%" height="125%">
+      <feDropShadow dx="0" dy="8" stdDeviation="14" flood-color="#000" flood-opacity=".3"/>
+    </filter>
+  </defs>
+  <use href="#body" filter="url(#shadow)"/>
+  <use href="#body" fill="url(#blue)"/>
+  <g clip-path="url(#sq)">
+    <rect x="100" y="100" width="824" height="824" fill="url(#grid)"/>
+    <rect x="100" y="100" width="824" height="824" fill="url(#major-grid)"/>
+    <use href="#body" fill="none" stroke="#fff" stroke-opacity=".45" stroke-width="8"/>
+  </g>
+  <g transform="translate(0 36)" fill="#fff">
+    <use href="#fin"/>
+    <rect x="176" y="662" width="672" height="20" rx="10"/>
+    <path d="M190 570 L370 556 A12 12 0 0 1 370 580 Z"/>
+    <path d="M262 622 L390 612 A9 9 0 0 1 390 630 Z"/>
+  </g>
+</svg>

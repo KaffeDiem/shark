@@ -546,7 +546,8 @@ impl Shark {
         };
         let ix = rows[r].ix;
         // Leaving the open workspace asks about unsaved edits first; plan mode comes after.
-        let leaving = (self.state.workspaces.get(ix)).is_some_and(|w| self.active.as_ref() != Some(&w.name));
+        let leaving =
+            (self.state.workspaces.get(ix)).is_some_and(|w| self.active.as_ref() != Some(&w.name));
         self.confirm_discard(leaving, leaving, window, cx, move |s, window, cx| {
             s.open_workspace(ix, window, cx);
             s.with_plan(window, cx, |c, _, cx| c.set_plan_mode(true, cx));
@@ -566,12 +567,12 @@ impl Shark {
             .gap_2()
             .rounded(theme.radius)
             .text_sm()
-            .when(rail, |d| d.justify_center())
+            .when(rail, super::sidebar::rail_button)
             .when(self.home_shown(), |d| {
                 d.bg(theme.sidebar_accent).font_weight(FontWeight::MEDIUM)
             })
             .hover(|d| d.bg(theme.sidebar_accent))
-            .child(Icon::new(IconName::House).with_size(px(14.)))
+            .child(Icon::new(IconName::House).with_size(px(if rail { 16. } else { 14. })))
             .when(!rail, |d| {
                 d.child(div().flex_1().child("Home")).child(
                     kbd("cmd-0")
@@ -612,17 +613,6 @@ impl Shark {
                     .border_b_1()
                     .border_color(theme.border)
                     .window_control_area(WindowControlArea::Drag)
-                    .child(
-                        Button::new("toggle-sidebar")
-                            .ghost()
-                            .xsmall()
-                            .icon(match self.rail {
-                                true => IconName::PanelLeftOpen,
-                                false => IconName::PanelLeftClose,
-                            })
-                            .tooltip("Toggle sidebar (cmd-b)")
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
-                    )
                     .child(Icon::new(IconName::House).with_size(px(14.)))
                     .child(div().text_sm().child("Home"))
                     .child(div().flex_1())

@@ -164,13 +164,22 @@ mod tests {
         assert!(p.contains("in: api.") && p.contains("repos/{owner}/{repo}"));
         let p = super::render("detached", "api, web", "feat");
         assert!(p.starts_with("HEAD is detached in: api, web.") && p.contains("`feat`"));
-        let one = super::render_each("detached", [("api", "feat"), ("web", "feat")], |rs| rs.join(", "));
-        assert_eq!(one, p, "one branch, one prompt");
-        let two = super::render_each("detached", [("api", "a"), ("web", "b"), ("cli", "a")], |rs| {
+        let one = super::render_each("detached", [("api", "feat"), ("web", "feat")], |rs| {
             rs.join(", ")
         });
+        assert_eq!(one, p, "one branch, one prompt");
+        let two = super::render_each(
+            "detached",
+            [("api", "a"), ("web", "b"), ("cli", "a")],
+            |rs| rs.join(", "),
+        );
         let (a, b) = two.split_once("\n\n").unwrap();
-        assert!(a.starts_with("HEAD is detached in: api, cli.") && a.contains("`a`"), "{a}");
-        assert!(b.starts_with("HEAD is detached in: web.") && b.contains("`b`") && !b.contains("`a`"));
+        assert!(
+            a.starts_with("HEAD is detached in: api, cli.") && a.contains("`a`"),
+            "{a}"
+        );
+        assert!(
+            b.starts_with("HEAD is detached in: web.") && b.contains("`b`") && !b.contains("`a`")
+        );
     }
 }

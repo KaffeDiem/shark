@@ -734,7 +734,11 @@ impl Render for Settings {
                         .gap_2()
                         .rounded(theme.radius)
                         .text_sm()
-                        .text_color(if on { theme.foreground } else { theme.muted_foreground })
+                        .text_color(if on {
+                            theme.foreground
+                        } else {
+                            theme.muted_foreground
+                        })
                         .when(on, |d| d.bg(theme.accent))
                         .when(!on, |d| d.hover(|d| d.bg(theme.secondary_hover)))
                         .child(gpui_kit::component::Icon::new(icon.clone()).with_size(px(14.)))

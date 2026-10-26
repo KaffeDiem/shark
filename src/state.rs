@@ -60,9 +60,15 @@ pub struct State {
     /// Changes shows one column instead of Original | Working copy (`s`).
     #[serde(default)]
     pub unified: bool,
+    /// Compare the working tree to HEAD instead of the workspace base.
+    #[serde(default)]
+    pub uncommitted_only: bool,
     /// The Files panel's width, once dragged.
     #[serde(default)]
     pub tree_width: Option<f32>,
+    /// The expanded sidebar's width, once dragged.
+    #[serde(default)]
+    pub sidebar_width: Option<f32>,
     /// The original column's share of a Split diff, the same for every file; `None` is half.
     #[serde(default)]
     pub split_ratio: Option<f32>,
@@ -238,7 +244,14 @@ impl Workspace {
                 None => {
                     // A claude session can't resume on codex.
                     let claude = c.session_id.is_some() && crate::codex::is_codex(Some(model));
-                    c.model = Some(if claude { crate::chat::MODELS[0] } else { model }.into());
+                    c.model = Some(
+                        if claude {
+                            crate::chat::MODELS[0]
+                        } else {
+                            model
+                        }
+                        .into(),
+                    );
                     c.effort = c.effort.take().or(effort.cloned());
                 }
                 Some("codex") => c.model = Some("codex:gpt-6.1-sol".into()),
@@ -483,7 +496,11 @@ mod tests {
         let mut ws: Workspace = serde_json::from_str(old).unwrap();
         assert_eq!(ws.repos[0].branch, None);
         assert_eq!(ws.branch_of(&ws.repos[0]), "feat");
-        assert!(!serde_json::to_string(&ws).unwrap().contains("\"branch\":null"));
+        assert!(
+            !serde_json::to_string(&ws)
+                .unwrap()
+                .contains("\"branch\":null")
+        );
         ws.repos[0].branch = Some("kd/x".into());
         let back: Workspace = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
         assert_eq!(back.branch_of(&back.repos[0]), "kd/x");
@@ -606,8 +623,11 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("shark-models-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.json");
-        let chats = r#"[{"id":"a"},{"id":"b","model":"codex"},{"id":"c","model":"opus","effort":"low"}]"#;
-        let ws = format!(r#"{{"name":"w","branch":"w","repos":[],"chats":{chats},"closed":[{{"id":"d"}}]}}"#);
+        let chats =
+            r#"[{"id":"a"},{"id":"b","model":"codex"},{"id":"c","model":"opus","effort":"low"}]"#;
+        let ws = format!(
+            r#"{{"name":"w","branch":"w","repos":[],"chats":{chats},"closed":[{{"id":"d"}}]}}"#
+        );
         let json = |last: &str| format!(r#"{{"repos":[],"workspaces":[{ws}]{last}}}"#);
         fs::write(&path, json("")).unwrap();
         let st = State::load_at(&path);
@@ -621,21 +641,40 @@ mod tests {
         let sol = "codex:gpt-6.1-sol";
         assert_eq!(
             models(&st),
-            [m("fable", None), m(sol, None), m("opus", Some("low")), m("fable", None)]
+            [
+                m("fable", None),
+                m(sol, None),
+                m("opus", Some("low")),
+                m("fable", None)
+            ]
         );
         fs::write(&path, json(r#","last_model":"haiku","last_effort":"max""#)).unwrap();
         let st = State::load_at(&path);
         assert_eq!(models(&st)[0], m("haiku", Some("max")));
         let new = st.new_chat("x".into());
-        assert_eq!((new.model.as_deref(), new.effort.as_deref()), (Some("haiku"), Some("max")));
+        assert_eq!(
+            (new.model.as_deref(), new.effort.as_deref()),
+            (Some("haiku"), Some("max"))
+        );
         let mut w: Workspace = serde_json::from_str(
             r#"{"name":"w","branch":"w","repos":[],"chats":[{"id":"a"},{"id":"b","session_id":"s"}]}"#,
         )
         .unwrap();
         w.fill_models("codex:gpt-6-astra", None);
-        let picked: Vec<_> = w.chats.iter().map(|c| c.model.as_deref().unwrap()).collect();
-        assert_eq!(picked, ["codex:gpt-6-astra", "fable"], "a claude session stays on claude");
-        let gone = State { last_model: Some("default".into()), ..State::default() };
+        let picked: Vec<_> = w
+            .chats
+            .iter()
+            .map(|c| c.model.as_deref().unwrap())
+            .collect();
+        assert_eq!(
+            picked,
+            ["codex:gpt-6-astra", "fable"],
+            "a claude session stays on claude"
+        );
+        let gone = State {
+            last_model: Some("default".into()),
+            ..State::default()
+        };
         assert_eq!(gone.new_model(), "fable", "a pick no longer listed");
         fs::remove_dir_all(&dir).unwrap();
     }

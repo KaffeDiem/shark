@@ -5,7 +5,17 @@ use gpui_kit::component::input;
 
 actions!(
     shark,
-    [About, Quit, Hide, HideOthers, ShowAll, Minimize, Zoom, OpenReadme, ReportIssue]
+    [
+        About,
+        Quit,
+        Hide,
+        HideOthers,
+        ShowAll,
+        Minimize,
+        Zoom,
+        OpenReadme,
+        ReportIssue
+    ]
 );
 
 /// Call after `bind_keys`: the menu reads its shortcut labels from the keymap.
@@ -24,7 +34,9 @@ pub fn init(cx: &mut App) {
     cx.on_action(|_: &Minimize, cx| in_window(cx, |w, _| w.minimize_window()));
     cx.on_action(|_: &Zoom, cx| in_window(cx, |w, _| w.zoom_window()));
     cx.on_action(|_: &OpenReadme, cx| cx.open_url("https://github.com/KaffeDiem/shark#readme"));
-    cx.on_action(|_: &ReportIssue, cx| cx.open_url("https://github.com/KaffeDiem/shark/issues/new"));
+    cx.on_action(|_: &ReportIssue, cx| {
+        cx.open_url("https://github.com/KaffeDiem/shark/issues/new")
+    });
     cx.set_menus(menus());
 }
 
