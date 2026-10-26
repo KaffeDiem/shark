@@ -56,7 +56,7 @@ impl FilePicker {
 }
 
 fn rel(item: &Item) -> String {
-    item.insert.trim_start_matches('@').to_string()
+    format!("{}/{}", item.detail, item.label)
 }
 
 impl Render for FilePicker {
@@ -92,13 +92,14 @@ impl Render for FilePicker {
                 .ok();
             })
             .on_confirm(move |ix, window, cx| {
-                window.close_dialog(cx);
+                // Closing the dialog releases the picker, so read the selection first.
                 let Some((path, shark)) = pick
                     .upgrade()
                     .and_then(|p| Some((p.read(cx).path(ix.row)?, p.read(cx).shark.clone())))
                 else {
                     return;
                 };
+                window.close_dialog(cx);
                 shark
                     .update(cx, |s, cx| s.open_any_path(path, window, cx))
                     .ok();

@@ -151,7 +151,7 @@ impl Render for DraggedSection {
     }
 }
 
-fn drag_chip(label: SharedString, cx: &App) -> Div {
+pub(super) fn drag_chip(label: SharedString, cx: &App) -> Div {
     let theme = cx.theme();
     div()
         .px_2()

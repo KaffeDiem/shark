@@ -2,6 +2,19 @@
 use super::*;
 use std::cmp::Ordering;
 
+#[derive(Clone)]
+struct DraggedChat {
+    workspace: String,
+    id: String,
+    label: SharedString,
+}
+
+impl Render for DraggedChat {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        sidebar::drag_chip(self.label.clone(), cx)
+    }
+}
+
 /// The accent dot on a tab or edge arrow: a finished turn you haven't looked at yet.
 pub(super) fn dot(inset: f32, theme: &Theme) -> Div {
     (div().absolute().top(px(inset)).right(px(inset)))
@@ -137,6 +150,37 @@ impl Shark {
             self.remember_open();
         }
         chat.update(cx, |c, cx| c.focus_composer(window, cx));
+        cx.notify();
+    }
+
+    /// Move a tab into another tab's slot without changing the shown conversation.
+    pub(super) fn move_chat(
+        &mut self,
+        workspace: &str,
+        from: &str,
+        to: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ws) = self.active_ws_mut().filter(|ws| ws.name == workspace) else {
+            return;
+        };
+        let (Some(from), Some(to), Some(active)) = (
+            ws.chats.iter().position(|c| c.id == from),
+            ws.chats.iter().position(|c| c.id == to),
+            ws.chats.get(ws.active_chat).map(|c| c.id.clone()),
+        ) else {
+            return;
+        };
+        if from == to {
+            return;
+        }
+        move_item(&mut ws.chats, from, to);
+        ws.active_chat = ws.chats.iter().position(|c| c.id == active).unwrap();
+        let active = ws.active_chat;
+        self.state.save();
+        self.tab_scroll.scroll_to_item(active);
+        cx.on_next_frame(window, |_, _, cx| cx.notify());
         cx.notify();
     }
 
@@ -500,12 +544,19 @@ impl Shark {
 
     /// One pill per chat, like the Diff and file tabs; a single chat reads "Chat" as before.
     /// Too many to fit, and the strip scrolls sideways between edge arrows.
-    pub(super) fn render_chat_tabs(&self, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    pub(super) fn render_chat_tabs(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let Some(ws) = self.active_ws() else {
             return vec![];
         };
         let theme = cx.theme();
         let many = ws.chats.len() > 1;
+        let (accent, accent_foreground) = (theme.accent, theme.accent_foreground);
+        let m = window.modifiers();
+        let ctrl_held = m.control && m.number_of_modifiers() == 1;
         let pills: Vec<AnyElement> = (ws.chats.iter().enumerate())
             .map(|(ix, meta)| {
                 let chat = self.chats.get(&meta.id).map(|c| c.read(cx));
@@ -526,6 +577,7 @@ impl Shark {
                     chat.is_some_and(|c| c.working()),
                     self.unread.contains(&meta.id),
                 ) {
+                    _ if ctrl_held && ix < 9 => kbd(&format!("ctrl-{}", ix + 1)).into_any_element(),
                     // Waiting on answers to its questions.
                     _ if chat.is_some_and(|c| c.asking()) => {
                         Icon::new(IconName::MessageCircleQuestionMark)
@@ -549,6 +601,30 @@ impl Shark {
                     .pl_2p5()
                     .when(!(many && current), |d| d.pr_2p5())
                     .when(many && current, |d| d.pr_1())
+                    .on_drag(
+                        DraggedChat {
+                            workspace: ws.name.clone(),
+                            id: meta.id.clone(),
+                            label: label.clone(),
+                        },
+                        |d, _, _, cx| cx.new(|_| d.clone()),
+                    )
+                    .drag_over::<DraggedChat>({
+                        let (workspace, target) = (ws.name.clone(), meta.id.clone());
+                        move |style, drag, _, _| {
+                            if drag.workspace == workspace && drag.id != target {
+                                style.bg(accent).text_color(accent_foreground)
+                            } else {
+                                style
+                            }
+                        }
+                    })
+                    .on_drop({
+                        let target = meta.id.clone();
+                        cx.listener(move |this, drag: &DraggedChat, window, cx| {
+                            this.move_chat(&drag.workspace, &drag.id, &target, window, cx)
+                        })
+                    })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.select_chat(ix, window, cx);
                         this.show(Tab::Chat, window, cx);

@@ -1419,6 +1419,416 @@ async fn add_repo_and_restore(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
+/// Ctrl+digits chooses open chats; holding Control previews their current numbers.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn numbered_chat_shortcuts(cx: &mut TestAppContext) {
+    use gpui_kit::test::TestEventExt;
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    press(cx, &["ctrl-1", "ctrl-9"]);
+    cx.update(|cx| assert!(shark.read(cx).active.is_none()));
+    on(cx, &|s, w, cx| {
+        s.create_workspace(
+            "numbers".into(),
+            git::on_branch(&repos, "numbers"),
+            vec![],
+            None,
+            w,
+            cx,
+        )
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    press(cx, &["cmd-t", "cmd-t"]);
+    let selected =
+        |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).active_ws().unwrap().active_chat);
+    assert_eq!(selected(cx), 2);
+    press(cx, &["ctrl-1"]);
+    assert_eq!(selected(cx), 0);
+    let first = cx.update(|cx| shark.read(cx).active_chat().unwrap().clone());
+    cx.update_window(window, |_, w, cx| w.input("keep this draft", cx))
+        .unwrap();
+    press(cx, &["ctrl-2"]);
+    assert_eq!(selected(cx), 1);
+    let second = cx.update(|cx| shark.read(cx).active_chat().unwrap().clone());
+    cx.update_window(window, |_, w, cx| {
+        assert!(
+            second
+                .read(cx)
+                .composer
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(w)
+        );
+        assert_eq!(
+            first.read(cx).composer.read(cx).value().as_ref(),
+            "keep this draft"
+        );
+        w.input("second draft", cx);
+    })
+    .unwrap();
+    press(cx, &["ctrl-9", "ctrl-0"]);
+    assert_eq!(selected(cx), 1, "missing numbers do nothing");
+
+    // The same Kbd preview as the sidebar appears only for its exact modifier.
+    let mut visual = VisualTestContext::from_window(window, cx);
+    for (modifiers, chat_hints, workspace_hints) in [
+        (Modifiers::default(), false, false),
+        (
+            Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            true,
+            false,
+        ),
+        (
+            Modifiers {
+                control: true,
+                shift: true,
+                ..Default::default()
+            },
+            false,
+            false,
+        ),
+        (
+            Modifiers {
+                control: true,
+                alt: true,
+                ..Default::default()
+            },
+            false,
+            false,
+        ),
+        (
+            Modifiers {
+                control: true,
+                platform: true,
+                ..Default::default()
+            },
+            false,
+            false,
+        ),
+        (
+            Modifiers {
+                platform: true,
+                ..Default::default()
+            },
+            false,
+            true,
+        ),
+        (Modifiers::default(), false, false),
+    ] {
+        cx.update_window(window, |_, w, cx| {
+            w.change_modifiers(modifiers, cx);
+        })
+        .unwrap();
+        for hint in ["kbd:ctrl-1", "kbd:ctrl-2", "kbd:ctrl-3"] {
+            assert_eq!(visual.debug_bounds(hint).is_some(), chat_hints, "{hint}");
+        }
+        assert!(visual.debug_bounds("kbd:ctrl-4").is_none());
+        assert_eq!(visual.debug_bounds("kbd:cmd-1").is_some(), workspace_hints);
+    }
+    assert_eq!(selected(cx), 1, "preview alone never switches chats");
+    press(cx, &["ctrl-cmd-2"]);
+    cx.update(|cx| {
+        assert_eq!(shark.read(cx).active_ws().unwrap().active_chat, 1);
+        assert_eq!(second.read(cx).meta.model.as_deref(), Some("opus"));
+    });
+
+    // Closing removes a number, reopening restores it in the current visual order.
+    cx.update(|cx| {
+        second.update(cx, |c, cx| {
+            c.meta.session_id = Some("numbered-session".into());
+            cx.emit(ChatEvent::Meta);
+        })
+    });
+    let third = cx.update(|cx| shark.read(cx).active_ws().unwrap().chats[2].id.clone());
+    press(cx, &["cmd-w", "ctrl-2"]);
+    cx.update(|cx| {
+        assert_eq!(
+            shark.read(cx).active_chat().unwrap().read(cx).meta.id,
+            third
+        )
+    });
+    press(cx, &["cmd-shift-t", "ctrl-3"]);
+    cx.update(|cx| {
+        assert_eq!(
+            shark.read(cx).active_chat().unwrap().read(cx).meta.id,
+            second.read(cx).meta.id
+        )
+    });
+
+    // The shortcut works from a diff and from Vim's editor, preserving the file split.
+    on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+    press(cx, &["ctrl-1"]);
+    cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Chat));
+    fs::write(
+        home.join("shark/workspaces/numbers/api/note.txt"),
+        "file text\n",
+    )
+    .unwrap();
+    on(cx, &|s, w, cx| {
+        s.set_vim(true, cx);
+        s.open_path("api/note.txt".into(), w, cx);
+    });
+    let editor = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
+    press(cx, &["ctrl-2"]);
+    cx.update_window(window, |_, w, cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.tab, Tab::File);
+        assert_eq!(s.editor.as_ref(), Some(&editor));
+        assert_eq!(s.active_ws().unwrap().active_chat, 1);
+        assert!(
+            s.active_chat()
+                .unwrap()
+                .read(cx)
+                .composer
+                .read(cx)
+                .focus_handle(cx)
+                .is_focused(w)
+        );
+    })
+    .unwrap();
+
+    // Numbers refer to this workspace, while Cmd+digits still chooses workspaces.
+    on(cx, &|s, w, cx| {
+        s.create_workspace(
+            "other".into(),
+            git::on_branch(&repos, "other"),
+            vec![],
+            None,
+            w,
+            cx,
+        )
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.as_deref() == Some("other")
+    })
+    .await;
+    press(cx, &["cmd-t", "ctrl-1"]);
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.active.as_deref(), Some("other"));
+        assert_eq!(s.active_ws().unwrap().active_chat, 0);
+        assert_eq!(s.ws("numbers").unwrap().active_chat, 1);
+    });
+    press(cx, &["cmd-1"]);
+    cx.update(|cx| assert_eq!(shark.read(cx).active.as_deref(), Some("numbers")));
+    press(cx, &["ctrl-1"]);
+    cx.update(|cx| {
+        assert_eq!(
+            first.read(cx).composer.read(cx).value().as_ref(),
+            "keep this draft"
+        )
+    });
+
+    // Nine means ninth, even when a tenth chat exists; the tenth has no number.
+    on(cx, &|s, _, cx| s.set_vim(false, cx));
+    for _ in 0..7 {
+        press(cx, &["cmd-t"]);
+    }
+    for n in 1..=9 {
+        press(cx, &[&format!("ctrl-{n}")]);
+        assert_eq!(selected(cx), n - 1);
+    }
+    cx.update_window(window, |_, w, cx| {
+        w.change_modifiers(
+            Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            cx,
+        );
+    })
+    .unwrap();
+    assert!(visual.debug_bounds("kbd:ctrl-9").is_some());
+    assert!(visual.debug_bounds("kbd:ctrl-10").is_none());
+    cx.update_window(window, |_, w, cx| {
+        w.change_modifiers(Modifiers::default(), cx)
+    })
+    .unwrap();
+}
+
+/// Dragging tabs changes their order, not the selected conversation or its draft.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn drag_chat_tabs(cx: &mut TestAppContext) {
+    use gpui_kit::test::TestEventExt;
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| {
+        s.create_workspace(
+            "drag-tabs".into(),
+            git::on_branch(&repos, "drag-tabs"),
+            vec![],
+            None,
+            w,
+            cx,
+        )
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    press(cx, &["cmd-t", "cmd-t", "ctrl-2"]);
+    let ids = cx.update(|cx| {
+        shark
+            .read(cx)
+            .active_ws()
+            .unwrap()
+            .chats
+            .iter()
+            .map(|c| c.id.clone())
+            .collect::<Vec<_>>()
+    });
+    let chats = cx.update(|cx| {
+        ids.iter()
+            .map(|id| shark.read(cx).chats[id].clone())
+            .collect::<Vec<_>>()
+    });
+    cx.update_window(window, |_, w, cx| w.input("keep this draft", cx))
+        .unwrap();
+    let order = |cx: &mut TestAppContext, expected: &[usize]| {
+        cx.update(|cx| {
+            let s = shark.read(cx);
+            let ws = s.active_ws().unwrap();
+            assert_eq!(
+                ws.chats.iter().map(|c| &c.id).collect::<Vec<_>>(),
+                expected.iter().map(|&i| &ids[i]).collect::<Vec<_>>()
+            );
+            assert_eq!(s.active_chat(), Some(&chats[1]));
+            assert_eq!(
+                chats[1].read(cx).composer.read(cx).value().as_ref(),
+                "keep this draft"
+            );
+            for (id, chat) in ids.iter().zip(&chats) {
+                assert_eq!(
+                    s.chats.get(id),
+                    Some(chat),
+                    "reordering keeps chat instances"
+                );
+            }
+            let saved = State::load();
+            let saved = saved
+                .workspaces
+                .iter()
+                .find(|w| w.name == "drag-tabs")
+                .unwrap();
+            assert_eq!(
+                saved.chats.iter().map(|c| &c.id).collect::<Vec<_>>(),
+                expected.iter().map(|&i| &ids[i]).collect::<Vec<_>>()
+            );
+            assert_eq!(saved.chats[saved.active_chat].id, ids[1]);
+        });
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            let xs: Vec<_> = expected
+                .iter()
+                .map(|&i| {
+                    w.find(SharedString::from(format!("chat-tab-{}", ids[i])))
+                        .bounds()
+                        .origin
+                        .x
+                })
+                .collect();
+            assert!(
+                xs.windows(2).all(|pair| pair[0] < pair[1]),
+                "rendered order matches saved order"
+            );
+        })
+        .unwrap();
+    };
+    let drag = |cx: &mut TestAppContext, from: usize, to: Option<usize>| {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            let start = w
+                .find(SharedString::from(format!("chat-tab-{}", ids[from])))
+                .bounds()
+                .center();
+            let end = to
+                .map(|i| {
+                    w.find(SharedString::from(format!("chat-tab-{}", ids[i])))
+                        .bounds()
+                        .center()
+                })
+                .unwrap_or(point(px(30.), px(400.)));
+            w.pointer_down(start, MouseButton::Left, cx);
+            w.pointer_move(start + point(px(8.), px(0.)), Some(MouseButton::Left), cx);
+            w.pointer_move(end, Some(MouseButton::Left), cx);
+            w.pointer_up(end, MouseButton::Left, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    drag(cx, 1, Some(2));
+    order(cx, &[0, 2, 1]);
+    drag(cx, 0, Some(1));
+    order(cx, &[2, 1, 0]);
+    drag(cx, 0, Some(2));
+    order(cx, &[0, 2, 1]);
+    drag(cx, 1, Some(1));
+    order(cx, &[0, 2, 1]);
+    drag(cx, 0, None);
+    order(cx, &[0, 2, 1]);
+    // Payloads from another workspace or tabs closed during a drag cannot reorder this strip.
+    for (workspace, from, to) in [
+        ("other", ids[0].as_str(), ids[2].as_str()),
+        ("drag-tabs", "closed-chat", ids[2].as_str()),
+        ("drag-tabs", ids[0].as_str(), "closed-chat"),
+    ] {
+        on(cx, &|s, w, cx| s.move_chat(workspace, from, to, w, cx));
+        order(cx, &[0, 2, 1]);
+    }
+
+    // Number shortcuts follow the new visual order, with each draft still in its chat.
+    for (number, expected) in [(1, 0), (2, 2), (3, 1)] {
+        press(cx, &[&format!("ctrl-{number}")]);
+        cx.update(|cx| assert_eq!(shark.read(cx).active_chat(), Some(&chats[expected])));
+    }
+    order(cx, &[0, 2, 1]);
+    cx.update(|cx| {
+        chats[1].update(cx, |c, cx| {
+            c.meta.session_id = Some("reordered-session".into());
+            cx.emit(ChatEvent::Meta);
+        })
+    });
+    press(cx, &["cmd-w", "ctrl-1", "cmd-shift-t"]);
+    cx.update(|cx| {
+        let ws = shark.read(cx).active_ws().unwrap();
+        assert_eq!(
+            ws.chats.iter().map(|c| &c.id).collect::<Vec<_>>(),
+            ids.iter().collect::<Vec<_>>()
+        );
+        assert_eq!(ws.chats[ws.active_chat].id, ids[1]);
+    });
+}
+
 /// Tabs that outgrow the header scroll; a new or selected tab is scrolled into view.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -2223,6 +2633,232 @@ async fn file_menu_labels(cx: &mut TestAppContext) {
     assert_eq!(menu[0], "Edit working copy", "already open");
     assert_eq!(menu[1..], [&file[..], &["-", "Close file"]].concat()[..]);
     fs::remove_dir_all(&home).ok();
+}
+
+/// Cmd+P opens the highlighted workspace file, including unchanged and untracked files.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn file_picker_opens_selected_file(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api", "web"]);
+    for repo in &repos {
+        fs::write(
+            repo.path.join("shared.txt"),
+            format!("{} contents\n", repo.name),
+        )
+        .unwrap();
+        git::git(&repo.path, &["add", "."]).unwrap();
+        git::git(
+            &repo.path,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "file",
+            ],
+        )
+        .unwrap();
+    }
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| {
+        s.create_workspace(
+            "picker".into(),
+            git::on_branch(&repos, "picker"),
+            vec![],
+            None,
+            w,
+            cx,
+        )
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let dir = home.join("shark/workspaces/picker");
+    fs::write(dir.join("api/untracked.txt"), "untracked contents\n").unwrap();
+    fs::write(dir.join("api/file with spaces.txt"), "spaced contents\n").unwrap();
+    fs::write(dir.join("api/binary.bin"), [0xff, 0xfe]).unwrap();
+    let input = |cx: &mut TestAppContext, text: &str| {
+        cx.update_window(window, |_, w, cx| w.input(text, cx))
+            .unwrap();
+        cx.run_until_parked();
+    };
+    press(cx, &["cmd-p"]);
+    cx.wait_for(window, Duration::from_secs(10), |w, _| {
+        w.try_find(IndexPath::new(2)).is_some()
+    })
+    .await;
+    input(cx, "web/shared.txt");
+    press(cx, &["enter"]);
+    let editor = cx.update(|cx| {
+        shark
+            .read(cx)
+            .editor
+            .clone()
+            .expect("Cmd+P then Enter opens the selected file")
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        editor.read(cx).input.read(cx).value().as_ref() == "web contents\n"
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| {
+        assert!(!w.has_active_dialog(cx));
+        assert_eq!(shark.read(cx).tab, Tab::File);
+        assert_eq!(editor.read(cx).path, "web/shared.txt");
+        assert!(editor.read(cx).is_focused(w, cx));
+    })
+    .unwrap();
+
+    // Both navigation and clicking use the displayed, filtered row's full repo path.
+    for (query, path, contents, click) in [
+        (
+            "untracked.txt",
+            "api/untracked.txt",
+            "untracked contents\n",
+            true,
+        ),
+        ("shared.txt", "web/shared.txt", "web contents\n", false),
+        (
+            "file with spaces",
+            "api/file with spaces.txt",
+            "spaced contents\n",
+            false,
+        ),
+    ] {
+        press(cx, &["cmd-p"]);
+        cx.wait_for(window, Duration::from_secs(10), |w, _| {
+            w.try_find(IndexPath::new(0)).is_some()
+        })
+        .await;
+        input(cx, query);
+        if click {
+            cx.update_window(window, |_, w, cx| w.click(IndexPath::new(0), cx))
+                .unwrap();
+            cx.run_until_parked();
+        } else {
+            press(cx, &["down", "up", "down", "enter"]);
+        }
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).editor.as_ref().is_some_and(|e| {
+                e.read(cx).path == path && e.read(cx).input.read(cx).value().as_ref() == contents
+            })
+        })
+        .await;
+        cx.update_window(window, |_, w, cx| {
+            assert!(!w.has_active_dialog(cx));
+            assert!(
+                shark
+                    .read(cx)
+                    .editor
+                    .as_ref()
+                    .unwrap()
+                    .read(cx)
+                    .is_focused(w, cx)
+            );
+        })
+        .unwrap();
+    }
+    let kept = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
+    // No matches cannot open a stale row, and cancelling preserves the current editor.
+    press(cx, &["cmd-p"]);
+    cx.wait_for(window, Duration::from_secs(10), |w, _| {
+        w.try_find(IndexPath::new(0)).is_some()
+    })
+    .await;
+    input(cx, "no-such-file-987654321");
+    press(cx, &["enter"]);
+    cx.update_window(window, |_, w, cx| {
+        assert!(w.has_active_dialog(cx));
+        assert_eq!(shark.read(cx).editor.as_ref(), Some(&kept));
+    })
+    .unwrap();
+    press(cx, &["escape", "escape"]);
+    cx.update_window(window, |_, w, cx| {
+        assert!(!w.has_active_dialog(cx));
+        assert_eq!(shark.read(cx).editor.as_ref(), Some(&kept));
+    })
+    .unwrap();
+
+    // Unsupported bytes leave the editor intact.
+    press(cx, &["cmd-p"]);
+    cx.wait_for(window, Duration::from_secs(10), |w, _| {
+        w.try_find(IndexPath::new(0)).is_some()
+    })
+    .await;
+    input(cx, "binary.bin");
+    press(cx, &["enter"]);
+    cx.update_window(window, |_, w, cx| {
+        assert!(!w.has_active_dialog(cx));
+        assert_eq!(shark.read(cx).editor.as_ref(), Some(&kept));
+    })
+    .unwrap();
+
+    // Selecting another file must preserve the existing discard/cancel protection.
+    input(cx, "unsaved ");
+    cx.update(|cx| assert!(kept.read(cx).dirty));
+    press(cx, &["cmd-p"]);
+    cx.wait_for(window, Duration::from_secs(10), |w, _| {
+        w.try_find(IndexPath::new(0)).is_some()
+    })
+    .await;
+    input(cx, "file with spaces");
+    press(cx, &["enter"]);
+    cx.update_window(window, |_, w, cx| {
+        assert!(
+            !w.has_active_dialog(cx),
+            "reopening the same file needs no discard"
+        );
+        assert_eq!(shark.read(cx).editor.as_ref(), Some(&kept));
+        assert!(kept.read(cx).dirty);
+        assert!(kept.read(cx).input.read(cx).value().starts_with("unsaved "));
+    })
+    .unwrap();
+    for discard in [false, true] {
+        press(cx, &["cmd-p"]);
+        cx.wait_for(window, Duration::from_secs(10), |w, _| {
+            w.try_find(IndexPath::new(0)).is_some()
+        })
+        .await;
+        input(cx, "web/shared.txt");
+        press(cx, &["enter"]);
+        cx.update_window(window, |_, w, cx| {
+            assert!(
+                w.has_active_dialog(cx),
+                "unsaved edits require confirmation"
+            );
+            assert_eq!(shark.read(cx).editor.as_ref(), Some(&kept));
+            assert!(kept.read(cx).dirty);
+        })
+        .unwrap();
+        press(cx, &[if discard { "enter" } else { "escape" }]);
+        cx.update(|cx| {
+            let current = shark.read(cx).editor.as_ref().unwrap();
+            if discard {
+                assert_eq!(current.read(cx).path, "web/shared.txt");
+            } else {
+                assert_eq!(current, &kept);
+                assert!(kept.read(cx).input.read(cx).value().starts_with("unsaved "));
+            }
+        });
+    }
+    assert_eq!(
+        fs::read_to_string(dir.join("api/file with spaces.txt")).unwrap(),
+        "spaced contents\n",
+        "discard never saves the edit"
+    );
 }
 
 /// Home shows while nothing is open; cmd-0 toggles it over a workspace, esc and opening a
