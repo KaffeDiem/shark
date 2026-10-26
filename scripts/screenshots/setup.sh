@@ -84,6 +84,53 @@ wt eng-118-push-notifications ios
 wt eng-130-rate-limits backend; wt eng-130-rate-limits web
 wt eng-127-onboarding-copy web
 
+# A stack in ios, pushed: logic ← ui ← wiring. ui and wiring are workspaces (demo_state.py stack).
+st() { # branch file commit-message, content on stdin
+  g checkout -qb $1; mkdir -p "$(dirname $2)"; cat > $2; g add -A; g commit -qm "$3"; g push -qu origin $1; }
+cd $H/Developer/ios
+st eng-140-sync-logic App/Sync/SyncEngine.swift 'Add SyncEngine' <<'EOF'
+import Foundation
+
+actor SyncEngine {
+    private(set) var lastSync: Date?
+
+    func sync() async throws {
+        let changes = try await API.shared.changes(since: lastSync)
+        try await Store.shared.apply(changes)
+        lastSync = .now
+    }
+}
+EOF
+st eng-141-sync-ui App/Settings/SyncSettingsView.swift 'Add sync settings screen' <<'EOF'
+import SwiftUI
+
+struct SyncSettingsView: View {
+    @AppStorage("syncEnabled") var enabled = true
+    let lastSync: Date?
+
+    var body: some View {
+        Form {
+            Toggle("Sync across devices", isOn: $enabled)
+            if let lastSync { LabeledContent("Last synced", value: lastSync, format: .relative(presentation: .named)) }
+        }
+        .navigationTitle("Sync")
+    }
+}
+EOF
+st eng-142-sync-wiring App/AppModel.swift 'Run a sync on launch and from settings' <<'EOF'
+import Foundation
+
+@MainActor
+final class AppModel: ObservableObject {
+    let sync = SyncEngine()
+
+    func didLaunch() { Task { try? await sync.sync() } }
+}
+EOF
+g checkout -q main
+git worktree add -q $W/eng-141-sync-ui/ios eng-141-sync-ui
+git worktree add -q $W/eng-142-sync-wiring/ios eng-142-sync-wiring
+
 # The feature's changes, uncommitted.
 cd $W/eng-123-login/backend
 python3 - <<'EOF'

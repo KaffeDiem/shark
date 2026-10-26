@@ -5,9 +5,9 @@ for d in ('transcripts', 'plans'):
     os.makedirs(f'{S}/{d}', exist_ok=True)
 dev = H + '/Developer'
 
-def ws(name, repos, chats):
+def ws(name, repos, chats, base='origin/main'):
     return {'name': name, 'branch': name,
-            'repos': [{'name': r, 'src': f'{dev}/{r}', 'base': 'origin/main'} for r in repos],
+            'repos': [{'name': r, 'src': f'{dev}/{r}', 'base': base} for r in repos],
             'chats': chats, 'closed': [], 'active_chat': 0, 'viewed': {}}
 
 state = {
@@ -26,6 +26,12 @@ state = {
     'home_checklist_dismissed': True, 'palette_used': True, 'opened_pr': True, 'approved_plan': True,
     'last_seen_version': '9.9.9', 'last_model': 'fable', 'last_effort': 'high',
 }
+if sys.argv[2:] == ['stack']:  # run.sh's stack shot: two workspaces of setup.sh's ios stack
+    state['workspaces'] += [
+        ws('eng-141-sync-ui', ['ios'], [{'id': 'eng-141-sync-ui', 'model': 'fable'}], 'origin/eng-140-sync-logic'),
+        ws('eng-142-sync-wiring', ['ios'], [{'id': 'eng-142-sync-wiring', 'model': 'fable'}], 'origin/eng-141-sync-ui'),
+    ]
+    state['last_open'] = ['eng-141-sync-ui', 'chat']
 json.dump(state, open(f'{S}/state.json', 'w'), indent=1)
 
 def user(text, sid):

@@ -51,6 +51,7 @@ actions!(
         MergeLater,
         GitNext,
         GitMenu,
+        BranchMenu,
         GitFetch,
         SelectNext,
         SelectPrev,

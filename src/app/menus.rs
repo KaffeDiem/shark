@@ -210,6 +210,24 @@ pub(super) fn stacks(this: &Shark, ws: &Workspace, cx: &App) -> Vec<RepoStack> {
         .collect()
 }
 
+/// The header's `base ← branch`: the stacked repos' parent when they share one (a backend repo
+/// on `main` next to a stacked iOS repo still reads `logic ← ui`), else the base every repo
+/// shares, else the branch alone.
+pub(super) fn branch_label(this: &Shark, ws: &Workspace, cx: &App) -> String {
+    let probed = (this.syncs.get(&ws.name))
+        .and_then(|s| s.read(cx).repos().map(<[_]>::to_vec))
+        .unwrap_or_default();
+    let parents: Vec<&str> = probed.iter().filter_map(|r| r.stacked()).collect();
+    let bases: Vec<&str> = match parents.is_empty() {
+        false => parents,
+        true => (ws.repos.iter())
+            .filter(|r| r.base.starts_with("origin/"))
+            .map(|r| crate::sync::short(&r.base))
+            .collect(),
+    };
+    crate::stack::title(&ws.branch, &bases)
+}
+
 /// A stack's rows, newest on top, the workspace's own checked. A row opens its workspace,
 /// else its PR; a merged parent (gone from the open PRs) shows the PR the git button found.
 fn stack_rows(

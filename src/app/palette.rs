@@ -470,6 +470,13 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| s.with_sync(w, cx, GitSync::primary),
     ),
     Row(
+        "Branch menu…",
+        IconName::Layers,
+        Some(&BranchMenu),
+        "stack base parent copy",
+        |s, w, cx| s.open_branch_menu(w, cx),
+    ),
+    Row(
         "Git menu…",
         IconName::GitBranch,
         Some(&GitMenu),

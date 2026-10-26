@@ -14,13 +14,16 @@ export SHARK_DEMO=$D
 
 "$here/setup.sh"
 cargo build --manifest-path "$root/Cargo.toml"
-HOME=$D/home GIT_CONFIG_GLOBAL=/dev/null SHARK_GH="$here/gh" SHARK_CLAUDE=/usr/bin/false \
-    "$root/target/debug/shark" >"$D/app.log" 2>&1 &
-pid=$!
-trap 'kill $pid 2>/dev/null' EXIT
-
 win() { swift "$here/winid.swift" $pid | cut -d' ' -f1; }
-while [ -z "$(win)" ]; do sleep 1; done
+launch() {
+    HOME=$D/home GIT_CONFIG_GLOBAL=/dev/null SHARK_GH="$here/gh" SHARK_CLAUDE=/usr/bin/false \
+        "$root/target/debug/shark" >>"$D/app.log" 2>&1 &
+    pid=$!
+    while [ -z "$(win)" ]; do sleep 1; done
+    osascript -e "tell application \"System Events\" to tell (first process whose unix id is $pid) to set size of window 1 to {1440, 900}"
+}
+launch
+trap 'kill $pid 2>/dev/null' EXIT
 # key <key> [modifiers], e.g. key d "command down, shift down"; key code 53 is esc.
 key() {
     using=""; [ -n "${2:-}" ] && using="using {$2}"
@@ -32,7 +35,6 @@ end tell" >/dev/null
 }
 shot() { screencapture -o -x -l "$(win)" "$D/$1" && sips -Z 1600 "$D/$1" --out "$out/$1" >/dev/null; }
 
-osascript -e "tell application \"System Events\" to tell (first process whose unix id is $pid) to set size of window 1 to {1440, 900}"
 key 'keystroke "d"' "command down, shift down" # diff
 key 'keystroke "b"' "command down, option down" # Workspace tools
 sleep 2 # git status and the diff
@@ -52,4 +54,13 @@ key 'keystroke "n"' "command down"
 key 'keystroke "eng-131-sign-in-with-apple"'
 shot multi-repo.png
 key 'key code 53'
+# Stacked PRs: relaunch with setup.sh's ios stack as workspaces, the ui one open.
+kill $pid; wait $pid 2>/dev/null || true
+python3 "$here/demo_state.py" "$D/home" stack
+launch
+sleep 5 # probe and the open PRs (cached by eng-123-login's fetch above)
+key 'keystroke "k"' "command down" # Branch menu… from the palette hangs under the button
+key 'keystroke "Branch menu"'
+key 'key code 36'
+shot stack.png
 echo "Wrote $out"

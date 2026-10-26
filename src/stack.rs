@@ -82,7 +82,7 @@ pub fn chain(
     (down, ix)
 }
 
-/// The header's label: `logic ← ui` when every stacked repo has the same parent, else the branch.
+/// `logic ← ui` when all of `bases` are the same, else the branch.
 pub fn title(branch: &str, parents: &[&str]) -> String {
     let mut ps = parents.to_vec();
     ps.sort();

@@ -1,2 +1,10 @@
 #!/bin/sh
-case "$*" in *"pr list"*) echo '[]';; *) echo '[]';; esac
+# Open PRs only for the ios stack in setup.sh (logic #140 ← ui #141 ← wiring #142, a draft).
+case "$(pwd -P) $*" in
+*/Developer/ios\ pr\ list\ --state\ open\ *) cat <<'EOF';;
+[{"number":142,"title":"Run a sync on launch and from settings","author":{"login":"demo"},"headRefName":"eng-142-sync-wiring","baseRefName":"eng-141-sync-ui","url":"https://github.com/acme/ios/pull/142","state":"OPEN","isDraft":true,"updatedAt":"2026-10-24T09:12:00Z","isCrossRepository":false},
+ {"number":141,"title":"Sync settings screen","author":{"login":"demo"},"headRefName":"eng-141-sync-ui","baseRefName":"eng-140-sync-logic","url":"https://github.com/acme/ios/pull/141","state":"OPEN","isDraft":false,"updatedAt":"2026-10-23T15:40:00Z","isCrossRepository":false},
+ {"number":140,"title":"SyncEngine: pull changes since the last sync","author":{"login":"demo"},"headRefName":"eng-140-sync-logic","baseRefName":"main","url":"https://github.com/acme/ios/pull/140","state":"OPEN","isDraft":false,"updatedAt":"2026-10-22T11:05:00Z","isCrossRepository":false}]
+EOF
+*) echo '[]';;
+esac

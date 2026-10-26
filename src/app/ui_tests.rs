@@ -7125,7 +7125,10 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
         st.len() == 1 && st[0].me == 1 && st[0].nodes[0].pr.as_ref().is_some_and(|p| p.number == 1)
     })
     .await;
-    assert_eq!(crate::stack::title("ui", &["logic"]), "logic ← ui");
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(menus::branch_label(s, s.ws("ui").unwrap(), cx), "logic ← ui");
+    });
 
     // New workspace on top, from the branch menu, once ui is pushed.
     let wt = home.join("shark/workspaces/ui/api");
@@ -7153,8 +7156,11 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
     })
     .await;
 
-    // A stack row opens its workspace.
-    click_branch(cx);
+    // A stack row opens its workspace; "Branch menu…" opens the menu from the keyboard.
+    cx.update_window(window, |_, w, cx| w.dispatch_action(Box::new(crate::BranchMenu), cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| assert!(shark.read(cx).menu.is_some()));
     press(cx, &["u", "enter"]);
     cx.update(|cx| assert_eq!(shark.read(cx).active.as_deref(), Some("ui")));
 
@@ -7220,7 +7226,7 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
 
 /// alt-enter refuses what can't be a PR base (a branch not on origin, a fork's PR); enter
 /// (check out, review) replaces a stacked choice; in a two-repo workspace only the stacked repo
-/// targets the parent, and the header shows the branch alone since the bases differ.
+/// targets the parent, and the header names that parent.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn branch_from_refusals_and_mixed_repos(cx: &mut TestAppContext) {
@@ -7335,7 +7341,6 @@ async fn branch_from_refusals_and_mixed_repos(cx: &mut TestAppContext) {
     let ws = cx.update(|cx| shark.read(cx).ws("mixed").cloned().unwrap());
     let bases: Vec<&str> = ws.repos.iter().map(|r| r.base.as_str()).collect();
     assert_eq!(bases, ["origin/logic", "origin/main"]);
-    assert_eq!(crate::stack::title("mixed", &["logic", "main"]), "mixed");
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         let s = shark.read(cx);
         let st = menus::stacks(s, s.ws("mixed").unwrap(), cx);
@@ -7344,5 +7349,10 @@ async fn branch_from_refusals_and_mixed_repos(cx: &mut TestAppContext) {
             && st[0].nodes[0].pr.as_ref().is_some_and(|p| p.number == 4)
     })
     .await;
+    // web on main beside the stacked api: the header names the parent.
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(menus::branch_label(s, s.ws("mixed").unwrap(), cx), "logic ← mixed");
+    });
     fs::remove_dir_all(&home).ok();
 }

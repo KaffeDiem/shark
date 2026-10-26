@@ -372,6 +372,8 @@ pub struct Shark {
     pub(crate) attn: crate::attention::Attention,
     /// The open right-click menu, dropped when it dismisses.
     menu: Option<(Entity<menu::Menu>, Subscription)>,
+    /// The header's branch button as last painted: "Branch menu…" hangs its menu from it.
+    branch_at: Rc<std::cell::Cell<Bounds<Pixels>>>,
     /// The latest dependency check; empty until the first one lands.
     pub(crate) deps: Vec<crate::deps::Dep>,
     deps_check: Option<Task<()>>,
@@ -529,6 +531,7 @@ impl Shark {
             sidebar_focus,
             attn: crate::attention::Attention::new(cx),
             menu: None,
+            branch_at: Default::default(),
             deps: vec![],
             deps_check: None,
             deps_at: None,
@@ -564,6 +567,22 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         let m = menu::open(entries, pos, window, cx);
+        let sub = cx.subscribe(&m, |this, _, _: &DismissEvent, cx| {
+            this.menu = None;
+            cx.notify();
+        });
+        self.menu = Some((m, sub));
+        cx.notify();
+    }
+
+    /// "Branch menu…": the header's branch menu, hanging from the button, from the keyboard.
+    fn open_branch_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.active_ws() else {
+            return notify_err(window, cx, "Open a workspace first");
+        };
+        let entries = menus::branch_entries(self, ws, cx);
+        let b = self.branch_at.get();
+        let m = menu::open_at(entries, point(b.right(), b.bottom() + px(4.)), Anchor::TopRight, window, cx);
         let sub = cx.subscribe(&m, |this, _, _: &DismissEvent, cx| {
             this.menu = None;
             cx.notify();
@@ -895,11 +914,9 @@ impl Shark {
         let stacks = (self.active_ws())
             .map(|w| menus::stacks(self, w, cx))
             .unwrap_or_default();
-        let bases: Vec<&str> = (links.iter())
-            .filter(|b| b.base.starts_with("origin/"))
-            .map(|b| sync::short(&b.base))
-            .collect();
-        let label = crate::stack::title(&branch, &bases);
+        let label = (self.active_ws())
+            .map(|w| menus::branch_label(self, w, cx))
+            .unwrap_or_default();
         let place = |s: &menus::RepoStack| format!("{}/{}", s.me + 1, s.nodes.len());
         let position = stacks.first().map(place);
         let per_repo: Vec<(String, String)> =
@@ -924,6 +941,14 @@ impl Shark {
                     )
                     .child(div().min_w_0().truncate().child(label))
                     .children(position.map(|p| div().flex_shrink_0().child(p)))
+                    .child({
+                        let at = self.branch_at.clone();
+                        canvas(move |b, _, _| at.set(b), |_, _, _, _| {})
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                    })
                     .on_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, w, cx| {
                         if !matches!(e.button, MouseButton::Left | MouseButton::Right) {
                             return;
@@ -1048,6 +1073,7 @@ impl Render for Shark {
             .on_action(
                 cx.listener(|this, _: &GitMenu, w, cx| this.with_sync(w, cx, GitSync::open_menu)),
             )
+            .on_action(cx.listener(|this, _: &BranchMenu, w, cx| this.open_branch_menu(w, cx)))
             .on_action(
                 cx.listener(|this, _: &GitFetch, w, cx| this.with_sync(w, cx, GitSync::fetch_now)),
             )
