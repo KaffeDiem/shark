@@ -96,6 +96,14 @@ pub fn create_linked_prs(
     let mut prs = vec![];
     for r in &ws.repos {
         let wt = dir.join(&r.name);
+        // A stacked branch's PR merges into its parent, which must be on GitHub.
+        if git(&wt, &["rev-parse", "--verify", "--quiet", &r.base]).is_err() {
+            let b = r.base.strip_prefix("origin/").unwrap_or(&r.base);
+            return Err(format!(
+                "{}: its base `{b}` isn't on GitHub; push it first (from its workspace), or Change base…",
+                r.name
+            ));
+        }
         let ahead = git(&wt, &["rev-list", "--count", &format!("{}..HEAD", r.base)])?;
         if ahead == "0" || skip.contains(&r.name) {
             continue;
@@ -507,6 +515,32 @@ esac
         let err =
             create_linked_prs(&ws, &dir, &["ops".into()], &NewPr::new("", false)).unwrap_err();
         assert!(err.contains("gh: boom"), "{err}");
+        fs::remove_file(&fail).unwrap();
+
+        // Stacked: the PR targets the parent, which must be on GitHub first.
+        let mut stacked = ws.clone();
+        stacked.repos.retain(|r| r.name == "api");
+        stacked.repos[0].base = "origin/logic".into();
+        let before = fs::read_to_string(&log).unwrap();
+        let err = create_linked_prs(&stacked, &dir, &[], &NewPr::new("", false)).unwrap_err();
+        assert!(
+            err.contains("api: its base `logic` isn't on GitHub; push it first"),
+            "{err}"
+        );
+        assert_eq!(fs::read_to_string(&log).unwrap(), before, "no gh call");
+        let api = dir.join("api");
+        git(
+            &api,
+            &["push", "-q", "origin", "origin/main:refs/heads/logic"],
+        )
+        .unwrap();
+        git(&api, &["fetch", "-q", "origin"]).unwrap();
+        create_linked_prs(&stacked, &dir, &[], &NewPr::new("", false)).unwrap();
+        let log = fs::read_to_string(&log).unwrap();
+        assert!(
+            log.ends_with("api pr create --head kd/api --base logic --fill\n"),
+            "{log}"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 }

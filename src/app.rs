@@ -879,8 +879,9 @@ impl Shark {
             .into_any_element()
     }
 
-    /// The header's branch label; hovering lists each repo's branch, linked to GitHub once
-    /// pushed, and the base it targets. Either click opens copy, open, and change-base actions.
+    /// The header's branch label, `base ← branch`, with a stack icon and the branch's place in
+    /// its stack (`2/3`) when it is part of one; hovering lists each repo's branch, linked to
+    /// GitHub once pushed, and the base it targets. Either click opens the branch menu.
     fn render_branch(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let branch = self
@@ -891,6 +892,18 @@ impl Shark {
             .active_sync()
             .map(|s| s.read(cx).branches())
             .unwrap_or_default();
+        let stacks = (self.active_ws())
+            .map(|w| menus::stacks(self, w, cx))
+            .unwrap_or_default();
+        let bases: Vec<&str> = (links.iter())
+            .filter(|b| b.base.starts_with("origin/"))
+            .map(|b| sync::short(&b.base))
+            .collect();
+        let label = crate::stack::title(&branch, &bases);
+        let place = |s: &menus::RepoStack| format!("{}/{}", s.me + 1, s.nodes.len());
+        let position = stacks.first().map(place);
+        let per_repo: Vec<(String, String)> =
+            stacks.iter().map(|s| (s.repo.clone(), place(s))).collect();
         HoverCard::new("branch-card")
             .anchor(Anchor::TopRight)
             .trigger(
@@ -902,8 +915,15 @@ impl Shark {
                     .gap_1p5()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(Icon::new(IconName::GitBranch).with_size(px(12.)))
-                    .child(div().min_w_0().truncate().child(branch.clone()))
+                    .child(
+                        Icon::new(match position {
+                            Some(_) => IconName::Layers,
+                            None => IconName::GitBranch,
+                        })
+                        .with_size(px(12.)),
+                    )
+                    .child(div().min_w_0().truncate().child(label))
+                    .children(position.map(|p| div().flex_shrink_0().child(p)))
                     .on_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, w, cx| {
                         if !matches!(e.button, MouseButton::Left | MouseButton::Right) {
                             return;
@@ -942,11 +962,14 @@ impl Shark {
                                     )
                                     .into_any_element(),
                             })
-                            .child(
-                                div()
-                                    .text_color(theme.muted_foreground)
-                                    .child(format!("{} → {}", b.name, b.base)),
-                            )
+                            .child(div().text_color(theme.muted_foreground).child(
+                                match per_repo.iter().find(|(r, _)| *r == b.repo) {
+                                    Some((_, at)) => {
+                                        format!("{} → {} · stack {at}", b.name, b.base)
+                                    }
+                                    None => format!("{} → {}", b.name, b.base),
+                                },
+                            ))
                     }))
             })
     }

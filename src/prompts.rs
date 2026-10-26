@@ -106,6 +106,16 @@ then `git rebase --onto <new> $(git merge-base HEAD <old>)` so only this branch'
 Resolve conflicts keeping this branch's intent, run a quick sanity check, then \
 `git push --force-with-lease origin {branch}` if the branch is on origin.",
     },
+    Prompt {
+        id: "restack",
+        title: "Restack onto parent",
+        repos: "the stacked repos: where their commits go, and the parent commit they start after",
+        default: "Restack `{branch}` so it holds only its own commits on top of its parent ({repos}). The commits up to \
+the given one belong to the parent, which may have new commits, been rewritten or been squash-merged since. In each of \
+those repos: `git fetch origin`, then `git rebase --onto <onto> <after>`. Resolve conflicts keeping this branch's \
+intent, check that `git log --oneline <onto>..HEAD` lists only this branch's own commits, run a quick sanity check, \
+then `git push --force-with-lease origin {branch}` if the branch is on origin.",
+    },
 ];
 
 /// The user's edits, by id. A global because `next_action` is pure and runs off the main thread.

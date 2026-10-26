@@ -20,6 +20,7 @@ mod plan;
 mod pr;
 mod prompts;
 mod settings;
+mod stack;
 mod state;
 mod sync;
 mod vim;
@@ -84,6 +85,7 @@ actions!(
         SubmitForm,
         PickBranch,
         PickPullRequest,
+        BranchFromSource,
         RefreshWorkspaceSources,
         NextAttention,
         OpenSettings,
@@ -292,6 +294,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-enter", SubmitForm, Some("NewWorkspace")),
         KeyBinding::new("cmd-b", PickBranch, Some("NewWorkspace")),
         KeyBinding::new("cmd-p", PickPullRequest, Some("NewWorkspace")),
+        KeyBinding::new("alt-enter", BranchFromSource, Some("NewWorkspace")),
         KeyBinding::new("cmd-r", RefreshWorkspaceSources, Some("NewWorkspace")),
         KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("ctrl-tab", SwitchField, Some("Settings")),

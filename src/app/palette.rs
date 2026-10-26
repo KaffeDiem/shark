@@ -517,6 +517,43 @@ pub(super) const COMMANDS: &[Row] = &[
         },
     ),
     Row(
+        "New workspace on top…",
+        IconName::Layers,
+        None,
+        "stack stacked branch from child pr",
+        |s, w, cx| match s.target(w) {
+            Some(ws) => s.stack_from(ws.name, false, w, cx),
+            None => notify_err(w, cx, "Open a workspace first"),
+        },
+    ),
+    Row(
+        "Insert workspace below…",
+        IconName::ListPlus,
+        None,
+        "stack stacked between parent in-between pr",
+        |s, w, cx| match s.target(w) {
+            Some(ws) => s.stack_from(ws.name, true, w, cx),
+            None => notify_err(w, cx, "Open a workspace first"),
+        },
+    ),
+    Row(
+        "Rebase onto parent",
+        IconName::GitCompareArrows,
+        None,
+        "stack restack parent agent",
+        |s, w, cx| s.with_sync(w, cx, GitSync::restack_onto_parent),
+    ),
+    Row(
+        "Go to stack…",
+        IconName::Layers,
+        None,
+        "stack parent child pr navigate",
+        |s, w, cx| match s.target(w) {
+            Some(ws) => s.go_to_stack(ws.name, w, cx),
+            None => notify_err(w, cx, "Open a workspace first"),
+        },
+    ),
+    Row(
         "Create or update PRs",
         IconName::GitPullRequestCreate,
         Some(&CreatePrs),

@@ -2,7 +2,7 @@
 //! and runs the next step toward a merged PR. `status` decides what that step is; this file
 //! polls, renders and executes. The app only embeds the entity and forwards three actions.
 mod status;
-pub use status::{Kind, Pr, PrState, Repo, ago, github_url};
+pub use status::{Kind, Pr, PrState, Repo, ago, github_url, short};
 
 use crate::app::menus::{each_or_all, pr_entry};
 use crate::app::{inter_features, notify_err, open_menu};
@@ -46,6 +46,11 @@ const FETCH_MOVED: Duration = Duration::from_secs(30);
 
 pub enum SyncEvent {
     Archive,
+    /// A parent PR merged: Shark moves these `(repo, old base, new base)`, then sends `prompt`.
+    Restack {
+        moves: Vec<(String, String, String)>,
+        prompt: String,
+    },
     /// Create PRs succeeded.
     PrsCreated,
 }
@@ -86,6 +91,9 @@ pub struct GitSync {
     kicked: Receiver<()>,
     /// Polling runs only while the workspace is shown; dropping the task stops it.
     poll: Option<Task<()>>,
+    /// Open PRs per repo, for the stack around this workspace's branches; from the disk cache
+    /// the New workspace dialog shares, refreshed with each fetch.
+    pub stack_prs: std::collections::HashMap<String, Vec<crate::complete::Pr>>,
     /// The git menu, open under the chevron, whose bounds the last paint recorded.
     menu: Option<(Entity<menu::Menu>, Subscription)>,
     chevron: Rc<Cell<Bounds<Pixels>>>,
@@ -103,6 +111,8 @@ struct Job {
     pr: bool,
     /// The last probe per repo, so unchanged refs skip the costly comparisons.
     prev: Vec<Local>,
+    /// With `fetch`: `(repo, source)` whose open PRs to list, for the stack around the branch.
+    stack: Vec<(String, PathBuf)>,
 }
 
 impl Job {
@@ -113,6 +123,7 @@ impl Job {
             fetch: false,
             pr: true,
             prev: vec![],
+            stack: vec![],
         }
     }
 }
@@ -120,6 +131,10 @@ impl Job {
 struct Probed {
     locals: Vec<Result<Local, String>>,
     prs: Option<Vec<Result<Option<Pr>, String>>>,
+    /// Per repo, a stacked one's parent PR; `None` when not asked or gh failed (keep the last).
+    parents: Vec<Option<Option<Pr>>>,
+    /// Per `job.stack` repo, its open PRs; `None` when gh failed.
+    stack_prs: Vec<(String, Option<Vec<crate::complete::Pr>>)>,
     fetched: bool,
     fetch_error: Option<String>,
 }
@@ -135,22 +150,40 @@ fn run_job(job: &Job) -> Probed {
         let local = probe(wt, branch, base, job.prev.get(i));
         let head = local.as_ref().map(|l| l.head.as_str()).unwrap_or_default();
         let pr = job.pr.then(|| fetch_pr(wt, branch, head));
-        (local, pr, fetch_err)
+        let trunk = local.as_ref().map_or("", |l| l.trunk.as_str());
+        let parent = (crate::stack::parent_of(base, trunk).filter(|_| job.pr && !trunk.is_empty()))
+            .and_then(|p| status::fetch_parent(wt, p).ok());
+        (local, (pr, parent), fetch_err)
     });
     let mut locals = vec![];
     let mut prs = vec![];
+    let mut parents = vec![];
     let mut errs = vec![];
-    for ((local, pr, err), (wt, ..)) in results.into_iter().zip(&job.repos) {
+    for ((local, (pr, parent), err), (wt, ..)) in results.into_iter().zip(&job.repos) {
         locals.push(local);
         prs.extend(pr);
+        parents.push(parent);
         if let Some(e) = err {
             let name = wt.file_name().unwrap_or_default().to_string_lossy();
             errs.push(format!("{name}: {e}"));
         }
     }
+    // ponytail: every repo's open PRs on each fetch (one gh call per repo per 3 min); only
+    // stacked repos and ones with an open PR if that shows up in gh's rate limit.
+    let stack_prs = match job.fetch {
+        true => par_map(&job.stack, |(name, src)| {
+            (
+                name.clone(),
+                crate::complete::fetch_repo_prs(name, src, true).ok(),
+            )
+        }),
+        false => vec![],
+    };
     Probed {
         locals,
         prs: job.pr.then_some(prs),
+        parents,
+        stack_prs,
         fetched: job.fetch,
         fetch_error: (!errs.is_empty()).then(|| errs.join("\n")),
     }
@@ -174,13 +207,14 @@ pub fn check_in_background(
         pr: gh,
         ..Job::prs(ws)
     });
-    background_answer(ws, p.locals, p.prs, last)
+    background_answer(ws, p.locals, p.prs, p.parents, last)
 }
 
 fn background_answer(
     ws: &Workspace,
     locals: Vec<Result<Local, String>>,
     prs: Option<Vec<Result<Option<Pr>, String>>>,
+    parents: Vec<Option<Option<Pr>>>,
     last: &[Repo],
 ) -> (Result<Option<String>, String>, Vec<Repo>) {
     let failed = match &prs {
@@ -189,9 +223,12 @@ fn background_answer(
     };
     let prs = (prs.into_iter().flatten().map(Some)).chain(std::iter::repeat(None));
     let mut repos = repos_from(ws, locals, prs);
-    for r in &mut repos {
-        let prev = (last.iter().find(|l| l.name == r.name)).and_then(|l| l.pr.clone());
+    let parents = parents.into_iter().chain(std::iter::repeat(None));
+    for (r, parent) in repos.iter_mut().zip(parents) {
+        let last = last.iter().find(|l| l.name == r.name);
+        let prev = last.and_then(|l| l.pr.clone());
         r.pr = fresh_or_last(r.pr.as_ref(), &prev);
+        r.parent = parent.unwrap_or_else(|| last.and_then(|l| l.parent.clone()));
     }
     let label = match failed {
         Some(e) => Err(e),
@@ -221,7 +258,16 @@ impl GitSync {
                 s.kick(due(s.fetched, FETCH_ON_FOCUS), true);
             }
         })];
+        let stack_prs = (ws.repos.iter())
+            .map(|r| {
+                (
+                    r.name.clone(),
+                    crate::complete::cached_repo_prs(&r.name, &r.src, true),
+                )
+            })
+            .collect();
         GitSync {
+            stack_prs,
             reviewed: crate::state::reviewed(&ws.name),
             merge_order: pr::merge_order(&ws, &crate::state::merge_order(&ws.name)),
             ws,
@@ -268,10 +314,13 @@ impl GitSync {
             .repos
             .iter()
             .map(|r| match old.iter().position(|o| o.name == r.name) {
-                Some(i) => Repo {
+                // A new base has another parent; its PR is asked for again.
+                Some(i) if old[i].base != r.base => Repo {
                     base: r.base.clone(),
+                    parent: None,
                     ..old.swap_remove(i)
                 },
+                Some(i) => old.swap_remove(i),
                 None => Repo::fresh(r, &ws),
             })
             .collect();
@@ -353,6 +402,9 @@ impl GitSync {
                 .iter()
                 .map(|r| r.local.clone().unwrap_or_default())
                 .collect(),
+            stack: (self.ws.repos.iter())
+                .map(|r| (r.name.clone(), r.src.clone()))
+                .collect(),
         };
         self.want_fetch &= !job.fetch;
         self.want_pr = false;
@@ -362,6 +414,17 @@ impl GitSync {
     fn apply(&mut self, p: Probed, cx: &mut Context<Self>) {
         for (r, l) in self.repos.iter_mut().zip(p.locals) {
             r.local = l;
+        }
+        for (r, parent) in self.repos.iter_mut().zip(p.parents) {
+            if let Some(parent) = parent {
+                r.parent = parent;
+            }
+        }
+        for (name, prs) in p.stack_prs {
+            if let Some(prs) = prs {
+                self.stack_prs.insert(name, prs);
+                cx.notify();
+            }
         }
         if let Some(prs) = p.prs {
             self.gh_error = None;
@@ -475,6 +538,19 @@ impl GitSync {
         });
     }
 
+    /// Gives stacked `repo` a merged parent PR `number` with last commit `head` into `base`.
+    #[cfg(all(test, feature = "test-support"))]
+    pub fn set_merged_parent(&mut self, repo: &str, number: u64, head: &str, base: &str) {
+        let r = self.repos.iter_mut().find(|r| r.name == repo).unwrap();
+        r.parent = Some(Pr {
+            state: PrState::Merged,
+            head: head.into(),
+            base: base.into(),
+            ..open_pr(repo, number)
+        });
+        self.action = Some(next_action(&self.repos, &self.reviewed));
+    }
+
     /// `(repo, PR URL)` per repo with a PR.
     pub fn pr_urls(&self) -> Vec<(String, String)> {
         self.repos
@@ -548,6 +624,7 @@ impl GitSync {
             Kind::None => {}
             Kind::OpenPr => self.open_prs(window, cx),
             Kind::Archive => cx.emit(SyncEvent::Archive),
+            Kind::Restack => cx.emit(self.restack_event(&a.repos)),
             Kind::Merge | Kind::ForcePush => self.confirm(a, check, window, cx),
             // The composer turns public as the PR title; it may have been meant for the agent.
             Kind::CreatePr | Kind::CreateDraftPr if !self.composer(cx).trim().is_empty() => {
@@ -874,6 +951,48 @@ impl GitSync {
         self.run_kind(Kind::Agent(prompt), "Rebase onto new base", window, cx)
     }
 
+    /// The merged parents' repos onto their parents' bases, and the prompt that restacks them,
+    /// written now: the new base drops the parent, and with it the parent's last commit.
+    fn restack_event(&self, rs: &[String]) -> SyncEvent {
+        let moving: Vec<&Repo> = among(&self.repos, rs)
+            .filter(|r| r.parent_merged())
+            .collect();
+        let onto = |r: &Repo| format!("origin/{}", r.parent.as_ref().map_or("", |p| &p.base));
+        let moves = (moving.iter())
+            .map(|r| (r.name.clone(), r.base.clone(), onto(r)))
+            .collect();
+        let fill = |names: &[String]| {
+            (moving.iter().filter(|r| names.contains(&r.name)))
+                .map(|r| status::restack_line(r, &onto(r)))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        let pairs = moving.iter().map(|r| (&*r.name, &*r.branch));
+        let prompt = crate::prompts::render_each("restack", pairs, fill);
+        SyncEvent::Restack { moves, prompt }
+    }
+
+    /// Asks the agent to rebase every stacked repo onto its parent's latest commits.
+    pub fn restack_onto_parent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let stacked: Vec<&Repo> = self
+            .repos
+            .iter()
+            .filter(|r| r.stacked().is_some())
+            .collect();
+        if stacked.is_empty() {
+            return notify_err(window, cx, "Not stacked: its base is the trunk");
+        }
+        let fill = |names: &[String]| {
+            (stacked.iter().filter(|r| names.contains(&r.name)))
+                .map(|r| status::restack_line(r, &r.base))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        let pairs = stacked.iter().map(|r| (&*r.name, &*r.branch));
+        let prompt = crate::prompts::render_each("restack", pairs, fill);
+        self.run_kind(Kind::Agent(prompt), "Rebase onto parent", window, cx)
+    }
+
     /// Asks the agent to bring every repo up to date with its base.
     pub fn update_from_base(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let bases = |rs: &[String]| {
@@ -1023,6 +1142,7 @@ fn open_pr(repo: &str, number: u64) -> Pr {
         review: String::new(),
         checks: status::Checks::Passing,
         head: "h".into(),
+        base: "main".into(),
         change_requests: vec![],
         comments: vec![],
         contains_head: String::new(),
@@ -1183,7 +1303,7 @@ fn execute(
             )))
         }),
         // `run` handles these without a step.
-        Kind::Archive | Kind::OpenPr | Kind::None => unreachable!(),
+        Kind::Archive | Kind::Restack | Kind::OpenPr | Kind::None => unreachable!(),
     }
 }
 
@@ -1291,6 +1411,7 @@ fn icon(a: &Action) -> IconName {
         Kind::UpdateBranch => IconName::RefreshCw,
         Kind::Merge => IconName::GitMerge,
         Kind::Archive => IconName::Archive,
+        Kind::Restack => IconName::TriangleAlert,
         Kind::None if a.attention => IconName::TriangleAlert,
         Kind::None => IconName::Check,
     }
@@ -1415,6 +1536,7 @@ mod tests {
                 ..Default::default()
             }),
             pr: Some(Ok(Some(super::open_pr("api", 7)))),
+            parent: None,
         };
         for kind in [
             Kind::Push,
@@ -1450,6 +1572,7 @@ mod tests {
             branch: "feat".into(),
             local: Ok(Local::default()),
             pr: Some(Ok(pr.map(|n| super::open_pr(name, n)))),
+            parent: None,
         };
         let repos = [
             repo("api", Some(1)),
@@ -1528,6 +1651,7 @@ mod tests {
             fetch: false,
             pr: false,
             prev: vec![],
+            stack: vec![],
         };
         let probed = |job: &Job| {
             let p = run_job(job);
@@ -1597,11 +1721,11 @@ mod tests {
             })]
         };
         let err = Err("logged out".to_string());
-        let (label, repos) = background_answer(&ws, local(), Some(vec![err.clone()]), &[]);
+        let (label, repos) = background_answer(&ws, local(), Some(vec![err.clone()]), vec![], &[]);
         assert!(label.is_err(), "the caller keeps the last label");
         assert_eq!(repos[0].local.as_ref().map(|l| l.changed), Ok(3));
         assert_eq!(repos[0].pr, Some(err));
-        let (label, repos) = background_answer(&ws, local(), None, &repos);
+        let (label, repos) = background_answer(&ws, local(), None, vec![], &repos);
         assert!(label.is_err(), "gh not asked");
         assert!(matches!(repos[0].pr, Some(Err(_))), "the last PR stays");
     }

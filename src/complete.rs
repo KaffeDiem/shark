@@ -314,7 +314,7 @@ fn commands(cmds: Vec<Cmd>) -> Vec<Item> {
 }
 
 /// A PR as `gh pr list --json` gives it, and as cached on disk.
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct Pr {
     /// The workspace repo it was listed in; not from gh.
@@ -334,6 +334,9 @@ pub struct Pr {
     pub is_draft: bool,
     #[serde(default)]
     pub updated_at: String,
+    /// From a fork: its head branch isn't in this repo, so nothing can stack on it.
+    #[serde(default)]
+    pub is_cross_repository: bool,
 }
 
 impl Pr {
@@ -347,7 +350,7 @@ impl Pr {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, Debug)]
+#[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Author {
     pub login: String,
 }
@@ -362,7 +365,7 @@ const PR_ARGS: [&str; 10] = [
     "--search",
     "sort:updated-desc",
     "--json",
-    "number,title,author,headRefName,baseRefName,url,state,isDraft,updatedAt",
+    "number,title,author,headRefName,baseRefName,url,state,isDraft,updatedAt,isCrossRepository",
 ];
 
 /// Recent PRs for chat, or open PRs for checkout; successful fetches replace this repo's cache.

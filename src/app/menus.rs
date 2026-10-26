@@ -166,8 +166,118 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
     entries
 }
 
-/// "Copy branch name" and "Change base…", then a separator and "Open branch on GitHub" and
-/// "Open pull request" once there's something on GitHub. Shared by the sidebar's and the
+/// One repo's PR stack around the workspace's branch, trunk side first.
+pub(super) struct RepoStack {
+    pub repo: String,
+    pub nodes: Vec<crate::stack::Node>,
+    /// The workspace's own branch.
+    pub me: usize,
+}
+
+/// Each repo of `ws` that is part of a stack (a chain of two or more branches), from the
+/// local workspaces and the open PRs the git button keeps. Empty until the repo was probed.
+pub(super) fn stacks(this: &Shark, ws: &Workspace, cx: &App) -> Vec<RepoStack> {
+    let Some(sync) = this.syncs.get(&ws.name).map(|s| s.read(cx)) else {
+        return vec![];
+    };
+    let probed = sync.repos().unwrap_or_default();
+    (ws.repos.iter())
+        .filter_map(|r| {
+            let trunk = &probed
+                .iter()
+                .find(|p| p.name == r.name)?
+                .local
+                .as_ref()
+                .ok()?
+                .trunk;
+            if trunk.is_empty() {
+                return None;
+            }
+            let local: Vec<(String, String, String)> = (this.state.workspaces.iter())
+                .filter_map(|w| {
+                    let wr = w.repos.iter().find(|x| x.src == r.src)?;
+                    Some((w.name.clone(), w.branch_of(wr).to_string(), wr.base.clone()))
+                })
+                .collect();
+            let prs = sync.stack_prs.get(&r.name).map_or(&[][..], Vec::as_slice);
+            let (nodes, me) = crate::stack::chain(ws.branch_of(r), trunk, &local, prs);
+            (nodes.len() > 1).then(|| RepoStack {
+                repo: r.name.clone(),
+                nodes,
+                me,
+            })
+        })
+        .collect()
+}
+
+/// A stack's rows, newest on top, the workspace's own checked. A row opens its workspace,
+/// else its PR; a merged parent (gone from the open PRs) shows the PR the git button found.
+fn stack_rows(
+    this: &Shark,
+    ws: &Workspace,
+    s: &RepoStack,
+    prefix: bool,
+    cx: &Context<Shark>,
+) -> Vec<Entry> {
+    let sync = this.syncs.get(&ws.name).map(|g| g.read(cx));
+    let parent = (sync.and_then(|g| g.repos()))
+        .and_then(|rs| rs.iter().find(|r| r.name == s.repo))
+        .and_then(|r| Some((r.stacked()?.to_string(), r.parent.clone()?)));
+    (s.nodes.iter().enumerate().rev())
+        .map(|(i, n)| {
+            let merged = parent
+                .as_ref()
+                .filter(|(b, _)| *b == n.branch && n.pr.is_none());
+            let (icon, status, url) = match (&n.pr, merged) {
+                (Some(p), _) => {
+                    let icon = match p.status() {
+                        complete::PrStatus::Draft => IconName::GitPullRequestDraft,
+                        _ => IconName::GitPullRequest,
+                    };
+                    (
+                        icon,
+                        format!("#{} · {}", p.number, p.status().label()),
+                        Some(p.url.clone()),
+                    )
+                }
+                (None, Some((_, p))) => {
+                    let label = format!("#{} · {:?}", p.number, p.state).to_lowercase();
+                    (IconName::GitMerge, label, Some(p.url.clone()))
+                }
+                (None, None) if n.ws.is_some() => (IconName::GitBranch, "workspace".into(), None),
+                (None, None) => (IconName::GitBranch, String::new(), None),
+            };
+            let hint = match prefix {
+                true => [s.repo.as_str(), &status]
+                    .iter()
+                    .filter(|x| !x.is_empty())
+                    .copied()
+                    .collect::<Vec<_>>()
+                    .join(" · "),
+                false => status,
+            };
+            let target = n.ws.clone().filter(|w| *w != ws.name);
+            menu::item(
+                icon,
+                n.branch.clone(),
+                on_shark(cx, move |s, w, cx| match (&target, &url) {
+                    (Some(name), _) => {
+                        if let Some(ix) = s.state.workspaces.iter().position(|x| &x.name == name) {
+                            s.open_workspace(ix, w, cx)
+                        }
+                    }
+                    (None, Some(u)) => cx.open_url(u),
+                    _ => {}
+                }),
+            )
+            .hint(hint)
+            .checked(i == s.me)
+        })
+        .collect()
+}
+
+/// The stack rows (one repo's inline, several as a submenu each), then restack, new on top,
+/// insert below, copy and change base, then what's on GitHub. Shared by the sidebar's and the
 /// header's menus.
 pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<Entry> {
     let sync = this.syncs.get(&ws.name).map(|s| s.read(cx));
@@ -214,29 +324,139 @@ pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) 
         on_shark(cx, move |s, w, cx| s.change_base(name.clone(), w, cx)),
     )
     .hint(base_hint(ws));
-    let mut entries: Vec<Entry> = [
-        each_or_all(
-            IconName::GitBranch,
-            "Copy branch name",
-            copies,
-            |bs, w, cx| {
-                let mut bs = bs.to_vec();
-                bs.sort();
-                bs.dedup();
-                copy(bs.join("\n"), w, cx)
-            },
-        ),
+    let stacks = stacks(this, ws, cx);
+    let mut entries: Vec<Entry> = match &stacks[..] {
+        [one] => stack_rows(this, ws, one, ws.repos.len() > 1, cx),
+        many => (many.iter())
+            .map(|s| {
+                let rows = stack_rows(this, ws, s, false, cx);
+                let hint = format!("{} of {}", s.me + 1, s.nodes.len());
+                menu::sub(IconName::Layers, format!("Stack · {}", s.repo), rows).hint(hint)
+            })
+            .collect(),
+    };
+    if !entries.is_empty() {
+        entries.push(Entry::Sep);
+    }
+    entries.extend(stack_actions(ws, sync, cx));
+    entries.extend(
+        [
+            each_or_all(
+                IconName::GitBranch,
+                "Copy branch name",
+                copies,
+                |bs, w, cx| {
+                    let mut bs = bs.to_vec();
+                    bs.sort();
+                    bs.dedup();
+                    copy(bs.join("\n"), w, cx)
+                },
+            ),
+            Some(base),
+        ]
+        .into_iter()
+        .flatten(),
+    );
+    let github: Vec<Entry> = [
         each_or_all(IconName::Github, "Open branch on GitHub", links, open_urls),
         sync.and_then(pr_entry),
     ]
     .into_iter()
     .flatten()
     .collect();
-    entries.insert(1, base);
-    if entries.len() > 2 {
-        entries.insert(2, Entry::Sep);
+    if !github.is_empty() {
+        entries.push(Entry::Sep);
+        entries.extend(github);
     }
     entries
+}
+
+/// Restack onto the parent (the merged parent's base once it merged), new workspace on top,
+/// insert one below. Review checkouts get none of them.
+fn stack_actions(
+    ws: &Workspace,
+    sync: Option<&crate::sync::GitSync>,
+    cx: &Context<Shark>,
+) -> Vec<Entry> {
+    let repos = sync.and_then(|g| g.repos()).unwrap_or_default();
+    if repos
+        .iter()
+        .any(|r| r.local.as_ref().is_ok_and(|l| l.review))
+    {
+        return vec![];
+    }
+    let name = ws.name.clone();
+    let merged: Vec<String> = (repos.iter().filter(|r| r.parent_merged()))
+        .map(|r| r.name.clone())
+        .collect();
+    let stacked: Vec<&crate::sync::Repo> = repos.iter().filter(|r| r.stacked().is_some()).collect();
+    let mut out = vec![];
+    if let Some(onto) = (repos.iter().find(|r| r.parent_merged())).and_then(|r| r.parent.as_ref()) {
+        let (label, n) = (
+            format!("Parent merged · rebase onto {}", onto.base),
+            name.clone(),
+        );
+        out.push(
+            menu::item(
+                IconName::Layers,
+                label.clone(),
+                on_shark(cx, move |s, w, cx| {
+                    if let Some(g) = s.syncs.get(&n).cloned() {
+                        let (label, rs) = (label.clone(), merged.clone());
+                        g.update(cx, |g, cx| {
+                            g.run_kind_in(crate::sync::Kind::Restack, &label, rs, w, cx)
+                        });
+                    }
+                }),
+            )
+            .hint("Agent"),
+        );
+    } else if let Some(r) = stacked.first() {
+        let p = r.stacked().unwrap_or_default();
+        let label = match stacked.len() {
+            1 => format!("Rebase onto {p}"),
+            _ => "Rebase onto parent".to_string(),
+        };
+        let behind = r.local.as_ref().map_or(0, |l| l.base.1);
+        let n = name.clone();
+        out.push(
+            menu::item(
+                IconName::GitCompareArrows,
+                label,
+                on_shark(cx, move |s, w, cx| {
+                    if let Some(g) = s.syncs.get(&n).cloned() {
+                        g.update(cx, |g, cx| g.restack_onto_parent(w, cx));
+                    }
+                }),
+            )
+            .hint(match behind {
+                0 => "Agent".to_string(),
+                n => format!("{n} behind"),
+            }),
+        );
+    }
+    let (n1, n2) = (name.clone(), name.clone());
+    out.push(
+        menu::item(
+            IconName::Layers,
+            "New workspace on top…",
+            on_shark(cx, move |s, w, cx| s.stack_from(n1.clone(), false, w, cx)),
+        )
+        .hint(ws.branch.clone()),
+    );
+    let below = match stacked.first().and_then(|r| r.stacked()) {
+        Some(p) => format!("between {p} and {}", ws.branch),
+        None => format!("under {}", ws.branch),
+    };
+    out.push(
+        menu::item(
+            IconName::ListPlus,
+            "Insert workspace below…",
+            on_shark(cx, move |s, w, cx| s.stack_from(n2.clone(), true, w, cx)),
+        )
+        .hint(below),
+    );
+    out
 }
 
 /// "Open pull request" for each repo with one, or `None` before any PR.
