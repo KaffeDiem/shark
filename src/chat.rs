@@ -526,7 +526,12 @@ fn title_of(text: &str) -> String {
 /// A chat started by a review: "Review · 3 comments".
 fn review_title(r: &ReviewCard) -> String {
     let n = r.items.len();
-    format!("Review · {n} comment{}", if n == 1 { "" } else { "s" })
+    format!("Review · {n} comment{}", plural(n))
+}
+
+/// The "s" of `n` things.
+pub(crate) fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 /// The first `n` chars, with "…" when cut.
@@ -1222,6 +1227,10 @@ impl Chat {
             }
             return;
         }
+        // A review left queued by a stopped or failed turn goes out first, as its card says.
+        if !self.busy && self.queue.first().is_some_and(|q| q.review.is_some()) {
+            self.drain(cx);
+        }
         let busy = self.busy;
         let sent = !self.hold && (!busy || now) && self.send_text(text, now, cx);
         self.steered |= sent && busy;
@@ -1885,13 +1894,16 @@ impl Chat {
             Ev::TextDelta(s) => match self.live_text() {
                 Some(bi) => {
                     if let Block::Text { md, src, .. } = &mut self.blocks[bi] {
-                        // Reports come last; a delta on a line that may start one rebuilds
-                        // the text without them. Only its lines are checked, so a long reply
-                        // stays linear.
+                        // Reports come last. A line that may start one waits until it ends,
+                        // then the text is rebuilt without them: once per such line, not per
+                        // delta. Only its lines are checked, so a long reply stays linear.
                         let from = src.rfind('\n').map_or(0, |i| i + 1);
                         src.push_str(&s);
                         match may_report(&src[from..]) {
-                            true => md.update(cx, |m, cx| m.set_text(&hide_reports(src), cx)),
+                            true if s.contains('\n') => {
+                                md.update(cx, |m, cx| m.set_text(&hide_reports(src), cx))
+                            }
+                            true => {}
                             false => md.update(cx, |m, cx| m.push_str(&s, cx)),
                         }
                     }

@@ -1299,7 +1299,7 @@ impl Render for GitSync {
             None => Icon::new(IconName::RefreshCw), // static: only the agent gets a spinner
         };
         h_flex()
-            .gap_1()
+            .gap(px(12.))
             .child(
                 // A div, not Button::tooltip: that takes fixed text, and this is built on hover so
                 // the "ago" times are current.
@@ -1316,6 +1316,8 @@ impl Render for GitSync {
                     .child(
                         Button::new("git-next")
                             .small()
+                            .h(px(28.))
+                            .px(px(10.))
                             .icon(icon)
                             .label(label)
                             .map(|b| match (passive, attention) {

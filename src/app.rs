@@ -9,17 +9,18 @@ use crate::sync::{GitSync, SyncEvent};
 use crate::*;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
-use gpui_kit::component::checkbox::Checkbox;
+use crate::checkbox::Checkbox;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::dialog::{Dialog, DialogEntrance};
-use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffFileStatus, DiffMode, DiffState};
+use crate::diff_view::{Diff, DiffEvent, DiffFile, DiffFileStatus, DiffMode, DiffState};
 use gpui_kit::component::hover_card::HoverCard;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::link::Link;
 use gpui_kit::component::notification::Notification;
+use gpui_kit::base::{ResizeHandleRenderer, ResizeHandleState};
 use gpui_kit::component::resizable::{
-    ResizablePanelEvent, ResizableState, h_resizable, resizable_panel,
+    ResizablePanelEvent, ResizableState, h_resizable, resizable_panel, resize_handle_appearance,
 };
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
@@ -143,6 +144,26 @@ fn pill(id: impl Into<SharedString>, on: bool, theme: &Theme) -> Stateful<Div> {
         .hover(|d| d.text_color(theme.foreground))
 }
 
+/// A sidebar's show / hide button. Both sit at y 24..52, under the traffic lights and level with
+/// the island's tab bar bottom, 20px in from their window edge, in either state.
+fn side_toggle(id: &'static str, icon: IconName, tip: &'static str) -> Button {
+    Button::new(id)
+        .ghost()
+        .icon(icon)
+        .w(px(32.))
+        .h(px(28.))
+        .tooltip(tip)
+}
+
+/// The drag strip above a sidebar toggle; on the left the traffic lights sit in it.
+fn top_strip() -> Div {
+    div()
+        .h(px(24.))
+        .w_full()
+        .flex_none()
+        .window_control_area(WindowControlArea::Drag)
+}
+
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum Tab {
     Chat,
@@ -200,6 +221,8 @@ pub struct Shark {
     tree_query: String,
     /// The island | Files split, kept across tabs; its width also persists in `State`.
     tree_resize: Entity<ResizableState>,
+    /// The sidebar | rest split, while the sidebar isn't a rail; persisted like Files.
+    sidebar_resize: Entity<ResizableState>,
     sidebar_scroll: ScrollHandle,
     /// The chat tab strip, which scrolls sideways once the tabs outgrow the header.
     tab_scroll: ScrollHandle,
@@ -282,11 +305,23 @@ impl Shark {
             .spawn(async { media::prune_cache() })
             .detach();
         let tree_resize = cx.new(|_| ResizableState::default());
+        let sidebar_resize = cx.new(|_| ResizableState::default());
+        // The close button asks before unsaved edits go, as Quit does.
+        let this = cx.entity().downgrade();
+        window.on_window_should_close(cx, move |w, cx| {
+            (this.update(cx, |s, cx| s.close_window(w, cx))).unwrap_or(true)
+        });
         let _subs = vec![
-            // A drag of the Files edge: remember the width for the next launch.
+            // A drag of the Files or sidebar edge: remember the width for the next launch.
             cx.subscribe(&tree_resize, |s, r, _: &ResizablePanelEvent, cx| {
                 if let Some(w) = r.read(cx).sizes().get(1) {
                     s.state.tree_width = Some(w.as_f32());
+                    s.state.save();
+                }
+            }),
+            cx.subscribe(&sidebar_resize, |s, r, _: &ResizablePanelEvent, cx| {
+                if let Some(w) = r.read(cx).sizes().first() {
+                    s.state.sidebar_width = Some(w.as_f32());
                     s.state.save();
                 }
             }),
@@ -351,6 +386,7 @@ impl Shark {
             tree_filter,
             tree_query: String::new(),
             tree_resize,
+            sidebar_resize,
             sidebar_scroll: ScrollHandle::new(),
             tab_scroll: ScrollHandle::new(),
             archiving: HashSet::new(),
@@ -464,7 +500,10 @@ impl Shark {
             }
             Tab::Diff => {
                 self.refresh_diff(cx);
-                self.diff.read(cx).focus_handle(cx).focus(window, cx);
+                match self.editing {
+                    Some(_) => self.focus_edit(window, cx),
+                    None => self.diff.read(cx).focus_handle(cx).focus(window, cx),
+                }
             }
             Tab::File => match &self.editor {
                 Some(e) => crate::editor::focus(e, window, cx),
@@ -616,7 +655,6 @@ impl Shark {
                 .child(Icon::new(icon).with_size(px(14.)))
                 .child(label)
         };
-        let viewed = self.viewed_now.len();
         let file_tab = self.editor.as_ref().map(|e| {
             let path = &e.read(cx).path;
             path.rsplit('/').next().unwrap_or(path).to_string()
@@ -629,41 +667,12 @@ impl Shark {
                 h_flex()
                     .h(px(44.))
                     .flex_none()
-                    .px_3()
-                    .gap_1()
+                    .px(px(16.))
+                    .gap(px(12.))
                     .border_b_1()
                     .border_color(theme.border)
                     .window_control_area(WindowControlArea::Drag)
-                    .child(
-                        Button::new("toggle-sidebar")
-                            .ghost()
-                            .xsmall()
-                            .icon(if self.rail {
-                                IconName::PanelLeftOpen
-                            } else {
-                                IconName::PanelLeftClose
-                            })
-                            .tooltip("Toggle sidebar (cmd-b)")
-                            .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
-                    )
                     .children(chat_tabs)
-                    .child(tab(
-                        match viewed {
-                            _ if self.diff_error.is_some() => "Changes · error".into(),
-                            _ if !self.diff_loaded => "Changes".into(),
-                            0 => format!("Changes {}", self.diff_files.len()),
-                            v => format!("Changes {v}/{} viewed", self.diff_files.len()),
-                        },
-                        IconName::FileDiff,
-                        Tab::Diff,
-                    )
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, e: &MouseDownEvent, w, cx| {
-                            let entries = this.changes_menu(cx);
-                            this.show_menu(e.position, entries, w, cx);
-                        }),
-                    ))
                     .when_some(file_tab, |d, name| {
                         d.child(tab(name, IconName::FileCode, Tab::File).on_mouse_down(
                             MouseButton::Right,
@@ -681,9 +690,7 @@ impl Shark {
                             .overflow_hidden()
                             .child(self.render_branch(cx)),
                     )
-                    .when_some(self.active_sync().cloned(), |d, sync| {
-                        d.child(div().pl_3().child(sync))
-                    }),
+                    .when_some(self.active_sync().cloned(), |d, sync| d.child(sync)),
             )
             .child(match self.tab {
                 // Cached: the sidebar spinner redraws this view every frame, the chat only on change.
@@ -788,6 +795,21 @@ impl Shark {
 
 impl Render for Shark {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        // Toasts sit left of the right side, not over its buttons; a theme change resets this.
+        let side = match () {
+            _ if self.tree_shown() => (self.tree_resize.read(cx).sizes().get(1).copied())
+                .unwrap_or(px(self.state.tree_width.unwrap_or(244.))),
+            _ if self.right_rail_shown() => px(72.),
+            _ => px(0.),
+        };
+        if cx.theme().notification.margins.right != side + px(16.) {
+            Theme::global_mut(cx).notification.margins.right = side + px(16.);
+        }
+        if let Some(msg) = self.review.warning.take() {
+            cx.defer_in(window, move |_, w, cx| {
+                w.push_notification(Notification::warning(msg).autohide(false), cx)
+            });
+        }
         let theme = cx.theme();
         h_flex()
             // `Vim` turns on the Vim-style list keys (see `bind_keys`).
@@ -911,12 +933,17 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &OpenSettings, w, cx| {
                 crate::settings::open(&this.state, w, cx)
             }))
-            .child(self.render_sidebar(window, cx))
             .children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))
-            .child(
-                self.with_tree(
-                    // Linear's "island": content floats on the sidebar color, inset and rounded.
-                    div().size_full().py_2().pr_2().child(
+            .child({
+                // Linear's "island": content floats on the sidebar color, inset and rounded. It
+                // touches a rail; beside an expanded side (or no right side, on Home) an 8px gap
+                // holds the drag edge. Literal px: rem is 15px here.
+                let island = div()
+                    .size_full()
+                    .py(px(8.))
+                    .when(!self.rail, |d| d.pl(px(8.)))
+                    .when(!self.right_rail_shown(), |d| d.pr(px(8.)))
+                    .child(
                         h_flex()
                             .size_full()
                             .rounded(cx.theme().radius_lg)
@@ -925,10 +952,36 @@ impl Render for Shark {
                             .bg(cx.theme().background)
                             .overflow_hidden()
                             .child(self.render_main(window, cx)),
+                    );
+                let main = self.with_tree(island, window, cx).into_any_element();
+                let sidebar = self.render_sidebar(window, cx).into_any_element();
+                match self.rail {
+                    true => h_flex().size_full().child(sidebar).child(main),
+                    // Dragged like Files, between 200 and 480.
+                    false => h_flex().size_full().child(
+                        h_resizable("sidebar-panel")
+                            .with_state(&self.sidebar_resize)
+                            .with_handle_appearance(quiet_edge())
+                            .child(
+                                resizable_panel()
+                                    .size(px(self.state.sidebar_width.unwrap_or(244.)))
+                                    .size_range(px(200.)..px(480.))
+                                    .fixed()
+                                    .child(sidebar),
+                            )
+                            .child(resizable_panel().min_w_0().child(main)),
                     ),
-                    window,
-                    cx,
-                ),
-            )
+                }
+            })
     }
+}
+
+/// A side pane's drag edge: no hairline at rest, since the island's border already marks it;
+/// the usual line and pill while hovered or dragged.
+pub(super) fn quiet_edge() -> ResizeHandleRenderer {
+    let usual = resize_handle_appearance();
+    Rc::new(move |h, w, cx| match h.state() {
+        ResizeHandleState::Idle => Some(div().into_any_element()),
+        _ => usual(h, w, cx),
+    })
 }

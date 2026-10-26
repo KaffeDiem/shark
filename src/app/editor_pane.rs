@@ -109,6 +109,19 @@ impl Shark {
         self.confirm_discard(true, true, window, cx, |_, _, cx| cx.quit())
     }
 
+    /// The window's close button: true to close now; with unsaved edits it asks first, and
+    /// Discard closes the window.
+    pub(super) fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let ran = Rc::new(std::cell::Cell::new(false));
+        let later = ran.clone();
+        self.confirm_discard(true, true, window, cx, move |_, window, _| {
+            if later.replace(true) {
+                window.remove_window()
+            }
+        });
+        ran.replace(true)
+    }
+
     /// Runs `then` now, or after the user agrees to drop the unsaved edits of the open file
     /// (`editor`) and of the file edited in the diff (`edit`).
     pub(super) fn confirm_discard(

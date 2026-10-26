@@ -1,7 +1,7 @@
 //! The Diff tab and the file tree: loading, viewed marks, tree navigation.
 use super::*;
 use gpui_kit::component::Selectable as _;
-use gpui_kit::component::diff::DiffHunkSeparator;
+use crate::diff_view::DiffHunkSeparator;
 
 /// A changed file against the fingerprint stored when it was marked viewed.
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -23,8 +23,9 @@ pub(super) struct DiffData {
     error: Option<String>,
     hunks: HashMap<SharedString, Vec<review::Hunk>>,
     media: Vec<media::MediaFile>,
-    /// The file edited in place, as on disk when the refresh read it.
-    edited: Option<Vec<u8>>,
+    /// The file edited in place, and its bytes as on disk when the refresh read it (none:
+    /// gone or unreadable).
+    edited: Option<(PathBuf, Option<Vec<u8>>)>,
 }
 
 impl DiffData {
@@ -75,7 +76,7 @@ impl Shark {
             let data = cx
                 .background_executor()
                 .spawn(async move {
-                    let edited = edited.and_then(|abs| std::fs::read(abs).ok());
+                    let edited = edited.map(|abs| (abs.clone(), std::fs::read(abs).ok()));
                     DiffData {
                         edited,
                         ..DiffData::load(&ws)
@@ -97,8 +98,8 @@ impl Shark {
         let status_changed = !self.diff_loaded || data.error != self.diff_error;
         self.diff_loaded = true;
         self.diff_error = data.error;
-        if let Some(bytes) = data.edited.take() {
-            self.edit_disk(bytes, cx);
+        if let Some((abs, bytes)) = data.edited.take() {
+            self.edit_disk(&abs, bytes, cx);
         }
         // Turn ends and saves refresh often; an unchanged patch keeps scroll and expansion.
         if data.fp == self.diff_fp && !self.diff_files.is_empty() {
@@ -112,12 +113,22 @@ impl Shark {
         if let Some(e) = &self.editing
             && !data.files.iter().any(|f| *f.path() == e.path)
         {
-            match e.dirty {
+            // Saved back to the base by this edit: still editing.
+            match e.dirty || e.saved {
                 // git's last view of it, so `orig` stays git's and not the buffer.
+                // In tree order, so the same files stay in place.
                 true => {
-                    data.files.push(e.orig.0.clone());
+                    let paths: Vec<String> = (data.files.iter().map(|f| f.path().to_string()))
+                        .chain([e.path.to_string()])
+                        .collect();
+                    let order = files::tree_order(&paths);
+                    let at = order
+                        .iter()
+                        .position(|&i| i == paths.len() - 1)
+                        .unwrap_or(0);
+                    data.files.insert(at, e.orig.0.clone());
                     data.hunks.insert(e.path.clone(), e.orig.1.clone());
-                    data.fps.push(0);
+                    data.fps.insert(at, 0);
                 }
                 false => self.end_edit(cx),
             }
@@ -141,7 +152,7 @@ impl Shark {
         self.review.hunks = data.hunks;
         self.set_media(data.media, cx);
         if let Some(ws) = self.active.clone() {
-            self.review.load_comments(&ws);
+            self.reanchor_comments(&ws);
         }
         let was_viewed = self.viewed_now.clone();
         // set_files scrolls back to the top; come back to the file the user was on.
@@ -167,6 +178,8 @@ impl Shark {
         let viewed = self.viewed_now.clone();
         let at = self.diff_file;
         let fps = self.diff_fps.clone();
+        // A collapsed card would take the line input away.
+        let edited = self.editing.as_ref().map(|e| e.path.clone());
         self.diff.update(cx, |d, cx| {
             match in_place {
                 true => (files.iter().zip(fps.iter().zip(&old_fps)))
@@ -176,7 +189,7 @@ impl Shark {
             }
             for f in &files {
                 let path = f.path();
-                if viewed.contains(path) {
+                if viewed.contains(path) && edited.as_ref() != Some(path) {
                     d.set_file_collapsed(path, true, cx);
                 } else if was_viewed.contains(path) {
                     d.set_file_collapsed(path, false, cx);
@@ -308,9 +321,12 @@ impl Shark {
         ws.viewed.retain(|p, _| live.contains(p.as_str()));
         self.state.save();
         self.recompute_viewed();
+        // The file being edited stays open, or its line input would go.
+        let edited = self.editing.as_ref().map(|e| e.path.clone());
         let paths: Vec<SharedString> = files
             .iter()
             .map(|&ix| self.diff_files[ix].path().clone())
+            .filter(|p| !on || Some(p) != edited.as_ref())
             .collect();
         // ponytail: the diff rebuilds once per file; add a batch setter to gpui-kit if big folders lag.
         self.diff.update(cx, |d, cx| {
@@ -378,25 +394,30 @@ impl Shark {
     /// Trailing controls of a file card's header, after its "+a −d": the review chip and
     /// Comment button, then the edit buttons; only [Review] [Save ⌘S] while it is edited.
     fn card_header_suffix(&self, file: &DiffFile, cx: &mut Context<Self>) -> Vec<AnyElement> {
-        let editing = self.editing.as_ref().map(|e| (e.path.clone(), e.dirty));
-        let edited = editing.as_ref().is_some_and(|(p, _)| p == file.path());
-        (!edited)
+        let dirty = (self.editing.as_ref())
+            .filter(|e| e.path == *file.path())
+            .map(|e| e.dirty);
+        (dirty.is_none())
             .then(|| self.review_chips(file.path(), cx))
             .into_iter()
             .chain([inline_edit::edit_buttons(
                 file,
-                editing.as_ref(),
+                dirty,
                 cx.entity().downgrade(),
             )])
             .collect()
     }
 
-    /// Files shows beside Changes and the file view, not the chat.
+    /// The right side: Workspace tools expanded, else the rail. Beside every tab, not Home.
     pub(super) fn tree_shown(&self) -> bool {
-        self.show_tree && self.tab != Tab::Chat && self.active.is_some() && !self.home_shown()
+        self.show_tree && self.active.is_some() && !self.home_shown()
     }
 
-    /// `main` with the resizable Files panel on its right; the width persists.
+    pub(super) fn right_rail_shown(&self) -> bool {
+        !self.show_tree && self.active.is_some() && !self.home_shown()
+    }
+
+    /// `main` with the resizable Files panel on its right, or the rail; the width persists.
     pub(super) fn with_tree(
         &self,
         main: impl IntoElement,
@@ -404,20 +425,110 @@ impl Shark {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let shown = self.tree_shown();
-        let width = px(self.state.tree_width.unwrap_or(260.));
-        div().flex_1().min_w_0().h_full().child(
-            h_resizable("files-panel")
-                .with_state(&self.tree_resize)
-                .child(resizable_panel().min_w_0().child(main))
-                .child(
-                    resizable_panel()
-                        .visible(shown)
-                        .size(width)
-                        .size_range(px(200.)..px(560.))
-                        .fixed()
-                        .when(shown, |p| p.child(self.render_tree(window, cx))),
+        let width = px(self.state.tree_width.unwrap_or(244.));
+        h_flex()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(
+                div().flex_1().min_w_0().h_full().child(
+                    h_resizable("files-panel")
+                        .with_state(&self.tree_resize)
+                        .with_handle_appearance(super::quiet_edge())
+                        .child(resizable_panel().min_w_0().child(main))
+                        .child(
+                            resizable_panel()
+                                .visible(shown)
+                                .size(width)
+                                .size_range(px(200.)..px(560.))
+                                .fixed()
+                                .when(shown, |p| p.child(self.render_tree(window, cx))),
+                        ),
                 ),
-        )
+            )
+            .when(self.right_rail_shown(), |d| {
+                d.child(self.render_right_rail(cx))
+            })
+    }
+
+    /// The collapsed right side, the left rail's mirror: expand, then Diff and Commands.
+    fn render_right_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (n, viewed) = (self.diff_files.len(), self.viewed_now.len());
+        // What the Changes tab used to say, for the tooltip.
+        let tip: SharedString = match n {
+            _ if self.diff_error.is_some() => "Diff (cmd-shift-d) · could not load".into(),
+            _ if !self.diff_loaded => "Diff (cmd-shift-d)".into(),
+            0 => "Diff (cmd-shift-d) · no changes".into(),
+            n => format!("Diff (cmd-shift-d) · {viewed}/{n} viewed").into(),
+        };
+        let item = |id: &'static str, icon: IconName, on: bool| {
+            div()
+                .id(id)
+                .relative()
+                .w(px(40.))
+                .h(px(36.))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(theme.radius)
+                .text_color(theme.muted_foreground)
+                .hover(|d| d.bg(theme.sidebar_accent))
+                .when(on, |d| d.bg(theme.sidebar_accent))
+                .child(Icon::new(icon).with_size(px(16.)))
+        };
+        // A dot while files wait for review; amber when git failed.
+        let badge = match () {
+            _ if self.diff_error.is_some() => Some(theme.warning_foreground),
+            _ if self.diff_loaded && viewed < n => Some(theme.primary),
+            _ => None,
+        };
+        v_flex()
+            .id("right-rail")
+            .w(px(72.))
+            .h_full()
+            .flex_none()
+            .items_center()
+            .child(top_strip())
+            .child(
+                h_flex()
+                    .h(px(28.))
+                    .flex_none()
+                    .window_control_area(WindowControlArea::Drag)
+                    .child(
+                        side_toggle(
+                            "show-tree",
+                            IconName::PanelRightOpen,
+                            "Show workspace tools (cmd-alt-b)",
+                        )
+                        .on_click(cx.listener(|this, _, w, cx| this.toggle_tree(w, cx))),
+                    ),
+            )
+            .child(
+                v_flex()
+                    .pt(px(16.))
+                    .gap(px(8.))
+                    .child(
+                        item("rail-diff", IconName::FileDiff, self.tab == Tab::Diff)
+                            .when_some(badge, |d, c| d.child(super::chats::dot(6., theme).bg(c)))
+                            .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+                            .on_click(cx.listener(|this, _, w, cx| this.show(Tab::Diff, w, cx)))
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(|this, e: &MouseDownEvent, w, cx| {
+                                    let entries = this.changes_menu(cx);
+                                    this.show_menu(e.position, entries, w, cx);
+                                }),
+                            )
+                            .test_support(),
+                    )
+                    .child(
+                        item("rail-commands", IconName::Command, false)
+                            .tooltip(|w, cx| Tooltip::new("Commands (cmd-k)").build(w, cx))
+                            .on_click(cx.listener(|this, _, w, cx| this.toggle_palette(w, cx))),
+                    ),
+            )
+            .test_support()
     }
 
     /// Puts the tree cursor on file `ix`'s row, when it has one (not inside a folded folder).
@@ -481,6 +592,11 @@ impl Shark {
         match self.tree_rows.get(row).and_then(|r| r.file) {
             None => self.set_dir_open(None, cx),
             Some(ix) if self.tab == Tab::File => self.open_file(ix, window, cx),
+            // Beside the chat, a file shows in the diff.
+            Some(_) if self.tab == Tab::Chat => {
+                self.show(Tab::Diff, window, cx);
+                self.tree_select(row, cx);
+            }
             Some(_) => {}
         }
     }
@@ -594,7 +710,7 @@ impl Shark {
             .on_action(cx.listener(|this, _: &DeleteThread, w, cx| this.at_cursor(Self::delete_thread, w, cx)))
             .on_action(cx.listener(|this, _: &ViewChange, w, cx| this.at_cursor(Self::view_change, w, cx)))
             .on_action(cx.listener(|this, _: &ResolveThread, _, cx| this.resolve_thread(cx)))
-            .on_action(cx.listener(|this, _: &ReopenThread, _, cx| this.reopen_thread(cx)))
+            .on_action(cx.listener(|this, _: &ReopenThread, w, cx| this.reopen_thread(w, cx)))
             .on_action(cx.listener(|this, _: &NextThread, w, cx| this.thread_jump(true, w, cx)))
             .on_action(cx.listener(|this, _: &PrevThread, w, cx| this.thread_jump(false, w, cx)))
             .on_action(cx.listener(|this, _: &ResolveAddressed, _, cx| this.resolve_addressed(cx)))
@@ -622,7 +738,7 @@ impl Shark {
                         .render_header_suffix({
                             let shark = shark.clone();
                             move |file, _, cx| {
-                                h_flex().gap_1().children(
+                                h_flex().gap(px(10.)).children(
                                     (shark.update(cx, |s, cx| s.card_header_suffix(file, cx)))
                                         .unwrap_or_default(),
                                 )
@@ -678,10 +794,10 @@ impl Shark {
         let (base, adds, dels) = self.changes_stats();
         let n = self.diff_files.len();
         h_flex()
-            .h(px(40.))
+            .h(px(48.))
             .flex_none()
-            .px_4()
-            .gap_2()
+            .px(px(16.))
+            .gap(px(12.))
             .border_b_1()
             .border_color(theme.border)
             .text_xs()
@@ -721,6 +837,9 @@ impl Shark {
             .child(
                 Button::new("diff-mode")
                     .xsmall()
+                    .h(px(28.))
+                    .px(px(10.))
+                    .rounded(px(6.))
                     .label(if self.state.unified {
                         "Unified"
                     } else {
@@ -733,10 +852,13 @@ impl Shark {
             .child(
                 Button::new("files-toggle")
                     .xsmall()
+                    .h(px(28.))
+                    .px(px(10.))
+                    .rounded(px(6.))
                     .outline()
                     .selected(self.show_tree)
                     .label(format!("Files {n}"))
-                    .tooltip("Workspace tools")
+                    .tooltip("Workspace tools (cmd-alt-b)")
                     .on_click(cx.listener(|this, _, w, cx| this.toggle_tree(w, cx))),
             )
     }
@@ -744,25 +866,23 @@ impl Shark {
     /// Side headings and the line input of the file edited in place; its header buttons come
     /// through `card_header_suffix`.
     fn with_edit_parts(&self, diff: Diff, cx: &mut Context<Self>) -> Diff {
-        let bases: HashMap<String, String> = (self.active_ws().into_iter())
-            .flat_map(|ws| ws.repos.iter().map(|r| (r.name.clone(), r.base.clone())))
-            .collect();
-        let clicks = cx.entity().downgrade();
-        let edited =
-            (self.editing.as_ref()).map(|e| (e.path.clone(), self.working_heading(&e.path)));
+        let shark = cx.entity().downgrade();
+        let clicks = shark.clone();
         self.with_inline_edit(diff, cx)
             .accent_working(self.editing.as_ref().map(|e| e.path.clone()))
-            .side_headings(move |file, _, _| {
+            .side_headings(move |file, _, cx| {
                 let repo = file.path().split('/').next().unwrap_or_default();
-                let base = bases.get(repo).map_or("base", |b| b.as_str());
-                let working = match &edited {
-                    Some((path, heading)) if path == file.path() => heading,
-                    _ => "Working copy · saved",
-                };
-                (
-                    format!("Original · {base} · read only").into(),
-                    working.into(),
-                )
+                (shark.read_with(cx, |s, _| {
+                    let base = (s.active_ws().into_iter())
+                        .flat_map(|ws| &ws.repos)
+                        .find(|r| r.name == repo)
+                        .map_or("base", |r| r.base.as_str());
+                    (
+                        format!("Original · {base} · read only").into(),
+                        s.working_heading(file.path()).into(),
+                    )
+                }))
+                .unwrap_or_default()
             })
             // A click on a working line of the edited file moves the caret there.
             .on_line_click(move |pos, _, window, cx| {
@@ -775,33 +895,26 @@ impl Shark {
     pub(super) fn render_tree(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (border, muted, fg) = (theme.border, theme.muted_foreground, theme.foreground);
-        let (hover, on_bg, radius, hint) = (
-            theme.list_hover,
-            theme.secondary,
-            theme.radius,
-            faint(theme),
-        );
+        let (hover, hint) = (theme.list_hover, faint(theme));
         let focused = self.tree_focus.is_focused(window);
         let n = self.diff_files.len();
         let nav = |id: &'static str, icon: IconName, label: &'static str, on: bool| {
             h_flex()
                 .id(id)
-                .h(px(32.))
-                .px_2()
-                .gap_2()
-                .rounded(radius)
+                .h(px(36.))
+                .px(px(10.))
+                .gap(px(10.))
+                .rounded(px(6.))
                 .text_sm()
                 .hover(|d| d.bg(hover))
-                .when(on, |d| d.bg(on_bg))
+                .when(on, |d| d.bg(hover))
                 .child(Icon::new(icon).with_size(px(16.)).text_color(muted))
                 .child(div().flex_1().child(label))
         };
+        let badge = |t: String| div().text_size(px(11.)).child(t);
         let tools = v_flex()
-            .px_2()
-            .pb_2()
-            .gap_0p5()
-            .border_b_1()
-            .border_color(border)
+            .flex_none()
+            .gap(px(8.))
             .child(
                 nav(
                     "tools-diff",
@@ -809,12 +922,19 @@ impl Shark {
                     "Diff",
                     self.tab == Tab::Diff,
                 )
-                .child(div().text_xs().text_color(muted).child(n.to_string()))
-                .on_click(cx.listener(|this, _, w, cx| this.show(Tab::Diff, w, cx))),
+                .child(badge(n.to_string()))
+                .on_click(cx.listener(|this, _, w, cx| this.show(Tab::Diff, w, cx)))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(|this, e: &MouseDownEvent, w, cx| {
+                        let entries = this.changes_menu(cx);
+                        this.show_menu(e.position, entries, w, cx);
+                    }),
+                ),
             )
             .child(
                 nav("tools-commands", IconName::Command, "Commands", false)
-                    .child(div().text_xs().text_color(muted).child("⌘K"))
+                    .child(badge("⌘K".into()))
                     .on_click(cx.listener(|this, _, w, cx| this.toggle_palette(w, cx))),
             );
         let tree = v_flex()
@@ -868,30 +988,33 @@ impl Shark {
                     }),
                 )
                 .track_scroll(&self.tree_scroll)
-                .flex_1()
-                .pb_2(),
+                .flex_1(),
             );
         // The filter sits outside `FileTree`, whose letter keys would eat its typing.
+        // Header, nav and Files 16 apart; 8 in from the sides.
         v_flex()
             .size_full()
+            .px(px(8.))
             .text_color(fg)
+            // The hide button sits where the rail's show button was.
+            .child(top_strip())
             .child(
                 h_flex()
-                    .h(px(44.))
+                    .h(px(28.))
                     .flex_none()
-                    .pl_3()
-                    .pr_2()
-                    .text_sm()
-                    .text_color(muted)
+                    .mb(px(16.))
+                    .pl(px(8.))
+                    .pr(px(12.))
+                    .text_size(px(12.))
                     .window_control_area(WindowControlArea::Drag)
                     .child(div().flex_1().child("Workspace tools"))
                     .child(
-                        Button::new("hide-tree")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::PanelRightClose)
-                            .tooltip("Hide Files")
-                            .on_click(cx.listener(|this, _, w, cx| this.toggle_tree(w, cx))),
+                        side_toggle(
+                            "hide-tree",
+                            IconName::PanelRightClose,
+                            "Hide workspace tools (cmd-alt-b)",
+                        )
+                        .on_click(cx.listener(|this, _, w, cx| this.toggle_tree(w, cx))),
                     ),
             )
             .child(tools)
@@ -899,7 +1022,10 @@ impl Shark {
                 h_flex()
                     .h(px(36.))
                     .flex_none()
-                    .px_3()
+                    .mt(px(16.))
+                    .border_t_1()
+                    .border_color(border)
+                    .px(px(12.))
                     .gap_2()
                     .text_xs()
                     .text_color(muted)
@@ -913,22 +1039,20 @@ impl Shark {
                     .child(format!("{}/{n} viewed", self.viewed_now.len())),
             )
             .child(
-                div().px_2().pb_1().child(
-                    Input::new(&self.tree_filter)
-                        .small()
-                        .cleanable(true)
-                        .prefix(
-                            Icon::new(IconName::Search)
-                                .with_size(px(14.))
-                                .text_color(muted),
-                        ),
-                ),
+                Input::new(&self.tree_filter)
+                    .h(px(32.))
+                    .rounded(px(6.))
+                    .cleanable(true)
+                    .prefix(
+                        Icon::new(IconName::Search)
+                            .with_size(px(14.))
+                            .text_color(muted),
+                    ),
             )
             .child(tree)
             .child(
                 div()
-                    .px_3()
-                    .py_2()
+                    .p(px(12.))
                     .text_xs()
                     .text_color(hint)
                     .child("Enter jump to diff · v viewed"),
@@ -974,21 +1098,17 @@ impl Shark {
             );
         let Some(file) = r.file else {
             let open = !self.collapsed_dirs.contains(&r.path);
-            return div()
-                .px_2()
+            return (row.text_color(theme.muted_foreground))
                 .child(
-                    row.text_color(theme.muted_foreground)
-                        .child(
-                            Icon::new(if open {
-                                IconName::ChevronDown
-                            } else {
-                                IconName::ChevronRight
-                            })
-                            .with_size(px(14.)),
-                        )
-                        .child(div().flex_1().truncate().child(r.name.clone()))
-                        .child(self.dir_viewed_box(ix, &r.path, cx)),
+                    Icon::new(if open {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .with_size(px(14.)),
                 )
+                .child(div().flex_1().truncate().child(r.name.clone()))
+                .child(self.dir_viewed_box(ix, &r.path, cx))
                 .into_any_element();
         };
         let f = &self.diff_files[file];
@@ -1026,24 +1146,29 @@ impl Shark {
                         .tooltip(|w, cx| Tooltip::new("Changed since viewed").build(w, cx)),
                 )
             })
+            // Fixed right-aligned slots, so the counts line up down the tree.
             .child(
                 h_flex()
                     .gap_1()
                     .text_xs()
-                    .when(f.additions() > 0, |d| {
-                        d.child(
-                            div()
-                                .text_color(theme.success_foreground)
-                                .child(format!("+{}", f.additions())),
-                        )
-                    })
-                    .when(f.deletions() > 0, |d| {
-                        d.child(
-                            div()
-                                .text_color(theme.danger_foreground)
-                                .child(format!("−{}", f.deletions())),
-                        )
-                    }),
+                    .child(
+                        h_flex()
+                            .min_w(px(20.))
+                            .justify_end()
+                            .text_color(theme.success_foreground)
+                            .when(f.additions() > 0, |d| {
+                                d.child(format!("+{}", f.additions()))
+                            }),
+                    )
+                    .child(
+                        h_flex()
+                            .min_w(px(20.))
+                            .justify_end()
+                            .text_color(theme.danger_foreground)
+                            .when(f.deletions() > 0, |d| {
+                                d.child(format!("−{}", f.deletions()))
+                            }),
+                    ),
             )
             .child(
                 div()
@@ -1060,7 +1185,7 @@ impl Shark {
                             })),
                     ),
             );
-        div().px_2().child(row).into_any_element()
+        row.into_any_element()
     }
 
     fn dir_viewed_box(&self, ix: usize, dir: &str, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1209,7 +1334,7 @@ impl Shark {
         entries
     }
 
-    /// Right-click menu of the Changes tab and the changes bar.
+    /// Right-click menu of the Diff button and the changes bar.
     pub(super) fn changes_menu(&self, cx: &Context<Self>) -> Vec<Entry> {
         let mut entries = vec![
             menu::item(
@@ -1251,7 +1376,11 @@ impl Shark {
         self.diff_file = (self.diff_file as isize + delta).rem_euclid(n) as usize;
         let path = self.diff_files[self.diff_file].path().to_string();
         self.review.at_file(&path);
-        self.diff.update(cx, |d, cx| d.scroll_to_file(&path, cx));
+        // A line cursor left in the previous file would win over the new one for `i`.
+        self.diff.update(cx, |d, cx| {
+            d.set_selected_lines(None, cx);
+            d.scroll_to_file(&path, cx)
+        });
         if let Some(row) = self.follow_tree(self.diff_file) {
             self.tree_scroll
                 .scroll_to_item(row, ScrollStrategy::Nearest);

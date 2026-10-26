@@ -3,11 +3,13 @@ mod app;
 mod apps;
 mod attention;
 mod chat;
+mod checkbox;
 mod codex;
 #[cfg(test)]
 mod codex_live;
 mod complete;
 mod deps;
+mod diff_view;
 mod editor;
 mod files;
 mod git;
@@ -167,20 +169,20 @@ pub struct SetModel(pub usize);
 pub struct OpenWorkspace(pub usize);
 
 fn bind_keys(cx: &mut App) {
+    // First, so the bindings below take precedence, as when gpui-component bound them.
+    diff_view::init(cx);
     // Vim-style keys sit under `Vim`, which the root view carries while Vim mode is on
     // (Settings › General). The arrows, letters that name an action and cmd shortcuts work
     // either way. VimNormal: the editor in Vim's Normal mode.
-    const NAV: &str = concat!(
-        "Sidebar || Home || Transcript || (DiffPane && !Input) || FileTree || Queue || PlanPane",
-        " || VimNormal"
-    );
+    const NAV: &str =
+        "Sidebar || Home || Transcript || DiffPane || FileTree || Queue || PlanPane || VimNormal";
     const LIST: &str = "Sidebar || Home || Transcript || FileTree || Queue";
     // The diff's letter keys; not while typing in the review composer, which sits in the diff.
     const DIFF: &str = "DiffPane && !Input";
     // The diff's line cursor (src/app/review.rs) moves like a list. With Vim its arrows
     // scroll natively and j/k move the cursor; without, the arrows move it.
     const MOVE: &str =
-        "Sidebar || Home || Transcript || FileTree || Queue || (DiffPane && !Input) || PlanPane";
+        "Sidebar || Home || Transcript || FileTree || Queue || DiffPane || PlanPane";
     const ARROWS: &str =
         "Sidebar || Home || Transcript || FileTree || Queue || PlanPane || (Diff && !Vim)";
     // `!Input` sits outside `Vim > (…)`: inside it, `!` sees only the contexts down to the
@@ -219,6 +221,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl-w h", FocusLeft, Some("Vim")),
         KeyBinding::new("ctrl-w l", FocusRight, Some("Vim")),
         KeyBinding::new("cmd-b", ToggleSidebar, None),
+        KeyBinding::new("cmd-alt-b", ToggleFileTree, None),
+        KeyBinding::new("cmd-shift-d", ShowDiff, None),
         KeyBinding::new("ctrl-cmd-v", ToggleVim, None),
         // In the diff: the file last moved to with `}`/`{` or the tree.
         KeyBinding::new("v", ToggleViewed, Some("FileTree || (DiffPane && !Input)")),
@@ -297,7 +301,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("i", EditWorkingCopy, Some(DIFF)),
         // Back to reviewing, also when the line input lost focus.
         KeyBinding::new("escape", CancelEdit, Some(DIFF)),
-        KeyBinding::new("cmd-s", SaveFile, Some("InlineEdit")),
+        // Also when the line input lost focus (its row scrolled away).
+        KeyBinding::new("cmd-s", SaveFile, Some("DiffPane")),
         KeyBinding::new("c", AddComment, Some(DIFF)),
         // Plan mode; in the composer shift-tab is caught before the input outdents.
         KeyBinding::new(
@@ -332,16 +337,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("k", SelectPrev, Some("ReviewSheet")),
     ]);
     cx.bind_keys([
-        vim(
-            "] c",
-            Box::new(NextHunk),
-            "(DiffPane && !Input) || PlanPane",
-        ),
-        vim(
-            "[ c",
-            Box::new(PrevHunk),
-            "(DiffPane && !Input) || PlanPane",
-        ),
+        vim("] c", Box::new(NextHunk), "PlanPane"),
+        vim("[ c", Box::new(PrevHunk), "PlanPane"),
         // With threads in the diff, ]c / [c jump between them (the design's keys); without,
         // they still go to the next change. alt-down / alt-up always do.
         vim("] c", Box::new(NextThread), DIFF),
@@ -371,7 +368,7 @@ fn bind_keys(cx: &mut App) {
     );
     // The Diff component's scroll actions are private; bind vim keys to them by name.
     let diff = Rc::new(KeyBindingContextPredicate::parse("(Vim > Diff) && !Input").unwrap());
-    let scroll = [("h", "diff::ScrollLeft"), ("l", "diff::ScrollRight")];
+    let scroll = [("h", "shark_diff::ScrollLeft"), ("l", "shark_diff::ScrollRight")];
     let bindings: Vec<KeyBinding> = scroll
         .iter()
         .filter_map(|(k, name)| {
@@ -413,8 +410,12 @@ fn set_dock_icon() {
     use objc2_app_kit::{NSApplication, NSImage};
     use objc2_foundation::NSData;
     let mtm = MainThreadMarker::new().expect("main thread");
-    let data = NSData::with_bytes(include_bytes!("../assets/icon.png"));
-    let image = NSImage::initWithData(NSImage::alloc(), &data).expect("assets/icon.png");
+    #[cfg(debug_assertions)]
+    let icon = include_bytes!("../assets/icon-dev.png").as_slice();
+    #[cfg(not(debug_assertions))]
+    let icon = include_bytes!("../assets/icon.png").as_slice();
+    let data = NSData::with_bytes(icon);
+    let image = NSImage::initWithData(NSImage::alloc(), &data).expect("embedded app icon");
     unsafe { NSApplication::sharedApplication(mtm).setApplicationIconImage(Some(&image)) };
 }
 

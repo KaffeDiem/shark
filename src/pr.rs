@@ -200,41 +200,45 @@ pub struct Anchor {
     pub left: bool,
 }
 
-/// Posts a Comment review (neither approves nor requests changes) to PR `number`: `body`
-/// alone, or with `inline` as a comment on its lines (then `body` is the review's note).
-/// Returns the review's URL when GitHub gives one.
+/// Posts a Comment review (neither approves nor requests changes) to PR `number` at commit
+/// `head`: `body` alone, or with `inline` as a comment on its lines (then `body` is the
+/// review's note). Returns the review's URL.
 pub fn publish_review(
     wt: &Path,
     number: u64,
+    head: &str,
     body: &str,
     inline: Option<(&Anchor, &str)>,
 ) -> Result<String, String> {
-    let n = number.to_string();
-    let Some((a, text)) = inline else {
-        let args = ["pr", "review", &n, "--comment", "--body", body];
-        return gh_post(wt, &args).map(|_| String::new());
-    };
-    let args = review_api_args(&n, body, a, text);
+    let args = review_api_args(&number.to_string(), head, body, inline);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     gh_post(wt, &args)
 }
 
-/// `gh api` for a review with one inline comment; gh fills in `{owner}/{repo}`.
-fn review_api_args(n: &str, body: &str, a: &Anchor, text: &str) -> Vec<String> {
-    let side = if a.left { "LEFT" } else { "RIGHT" };
+/// `gh api` for a review, with one inline comment when given; gh fills in `{owner}/{repo}`.
+fn review_api_args(
+    n: &str,
+    head: &str,
+    body: &str,
+    inline: Option<(&Anchor, &str)>,
+) -> Vec<String> {
     let mut v: Vec<String> = ["api", "--method", "POST"].map(String::from).into();
     v.push(format!("repos/{{owner}}/{{repo}}/pulls/{n}/reviews"));
     let mut field = |flag: &str, kv: String| v.extend([flag.to_string(), kv]);
     field("-f", "event=COMMENT".into());
+    field("-f", format!("commit_id={head}"));
     field("-f", format!("body={body}"));
-    field("-f", format!("comments[][path]={}", a.path));
-    field("-F", format!("comments[][line]={}", a.line));
-    field("-f", format!("comments[][side]={side}"));
-    if let Some(s) = a.start {
-        field("-F", format!("comments[][start_line]={s}"));
-        field("-f", format!("comments[][start_side]={side}"));
+    if let Some((a, text)) = inline {
+        let side = if a.left { "LEFT" } else { "RIGHT" };
+        field("-f", format!("comments[][path]={}", a.path));
+        field("-F", format!("comments[][line]={}", a.line));
+        field("-f", format!("comments[][side]={side}"));
+        if let Some(s) = a.start {
+            field("-F", format!("comments[][start_line]={s}"));
+            field("-f", format!("comments[][start_side]={side}"));
+        }
+        field("-f", format!("comments[][body]={text}"));
     }
-    field("-f", format!("comments[][body]={text}"));
     v.extend(["-q".into(), ".html_url".into()]);
     v
 }
@@ -267,11 +271,12 @@ mod tests {
             start: Some(631),
             left: false,
         };
-        let args = review_api_args("128", "app.rs:631-632", &a, "Keep it aligned.");
+        let args = review_api_args("128", "abc", "app.rs:631-632", Some((&a, "Keep it aligned.")));
         assert_eq!(
             args.join(" "),
             "api --method POST repos/{owner}/{repo}/pulls/128/reviews -f event=COMMENT \
-             -f body=app.rs:631-632 -f comments[][path]=src/app.rs -F comments[][line]=632 -f comments[][side]=RIGHT \
+             -f commit_id=abc -f body=app.rs:631-632 -f comments[][path]=src/app.rs \
+             -F comments[][line]=632 -f comments[][side]=RIGHT \
              -F comments[][start_line]=631 -f comments[][start_side]=RIGHT \
              -f comments[][body]=Keep it aligned. -q .html_url"
         );
@@ -280,12 +285,15 @@ mod tests {
             left: true,
             ..a
         };
-        let args = review_api_args("7", "note", &one, "x").join(" ");
+        let args = review_api_args("7", "h", "note", Some((&one, "x"))).join(" ");
         assert!(
             args.contains("-f body=note") && args.contains("side]=LEFT"),
             "{args}"
         );
         assert!(!args.contains("start_line"));
+        // Without an inline comment: the review alone.
+        let args = review_api_args("7", "h", "note", None).join(" ");
+        assert!(args.ends_with("-f body=note -q .html_url"), "{args}");
     }
 
     #[test]

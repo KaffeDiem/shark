@@ -63,6 +63,9 @@ pub struct State {
     /// The Files panel's width, once dragged.
     #[serde(default)]
     pub tree_width: Option<f32>,
+    /// The expanded sidebar's width, once dragged.
+    #[serde(default)]
+    pub sidebar_width: Option<f32>,
     /// The original column's share of a Split diff, the same for every file; `None` is half.
     #[serde(default)]
     pub split_ratio: Option<f32>,

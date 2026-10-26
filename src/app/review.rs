@@ -9,7 +9,7 @@
 use super::*;
 use crate::chat::parse_reports;
 use crate::state::support_dir;
-use gpui_kit::component::diff::{DiffAnnotation, DiffLinePosition, DiffLineRange, DiffSide};
+use crate::diff_view::{DiffAnnotation, DiffLinePosition, DiffLineRange, DiffSide};
 use gpui_kit::component::input::{Enter, Escape, Textarea, TextareaState};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
@@ -261,6 +261,19 @@ pub(super) struct Comment {
     /// Posted to GitHub: the comment's (or review's) URL.
     #[serde(default)]
     pub(super) github: Option<String>,
+    /// The file text its working-copy lines were last read in.
+    #[serde(skip)]
+    seen: Seen,
+}
+
+/// Memory only, and not part of a comment's equality (that decides saving).
+#[derive(Clone, Debug, Default)]
+struct Seen(Option<String>);
+
+impl PartialEq for Seen {
+    fn eq(&self, _: &Self) -> bool {
+        true
+    }
 }
 
 impl Comment {
@@ -274,7 +287,7 @@ impl Comment {
         }
     }
 
-    /// `api/a.rs:12`, `api/a.rs:12-14`, `api/a.rs:7 (old)`.
+    /// `api/a.rs:12`, `api/a.rs:12-14`, `api/a.rs:7 (old)`; across sides `7 (old)-9 (new)`.
     pub(super) fn place(&self) -> String {
         let n = |(old, line): (bool, usize)| match old {
             true => format!("{line} (old)"),
@@ -285,8 +298,16 @@ impl Comment {
             false if self.start.0 == self.end.0 => {
                 format!("{}:{}-{}", self.path, self.start.1, n(self.end))
             }
-            false => format!("{}:{}-{}", self.path, n(self.start), n(self.end)),
+            false => {
+                let n = |(old, line)| format!("{line} ({})", if old { "old" } else { "new" });
+                format!("{}:{}-{}", self.path, n(self.start), n(self.end))
+            }
         }
+    }
+
+    /// The repo its path starts with.
+    pub(super) fn repo(&self) -> &str {
+        self.path.split('/').next().unwrap_or_default()
     }
 
     /// `631–632`, `12`.
@@ -308,9 +329,8 @@ impl Comment {
     /// `app.rs · Working copy · lines 631–632`, as the chat card and GitHub preview say it.
     pub(super) fn card_place(&self) -> String {
         let name = self.path.rsplit('/').next().unwrap_or(&self.path);
-        let mut side = self.side().to_string();
-        side[..1].make_ascii_uppercase();
-        let s = if self.start.1 == self.end.1 { "" } else { "s" };
+        let side = if self.end.0 { "Original" } else { "Working copy" };
+        let s = crate::chat::plural(self.start.1.abs_diff(self.end.1) + 1);
         format!("{name} · {side} · line{s} {}", self.lines())
     }
 
@@ -428,14 +448,56 @@ fn slice(src: &str, start: usize, end: usize) -> String {
         .join("\n")
 }
 
-/// The comment's lines as they are now: the working tree's on the new side, the base commit's
-/// (`rev`) on the old one. A deleted file reads empty; `None` for a range across both sides.
-fn lines_now(dir: &Path, c: &Comment) -> Option<String> {
+/// Moves a working-copy comment along with its lines from the text they were last read in to
+/// `src`: only when they are unchanged and shifted. Edited or gone, it stays, so judging finds
+/// them changed. Never read yet (loaded from disk), it goes to its snapshot only if `src` has
+/// it once.
+fn reanchor(c: &mut Comment, src: &str) {
+    if c.start.0 || c.end.0 {
+        return;
+    }
+    let (s, e) = (c.start.1.saturating_sub(1), c.end.1.saturating_sub(1));
+    let Some(old) = c.seen.0.replace(src.to_string()) else {
+        let want: Vec<&str> = c.snapshot.split('\n').collect();
+        let lines: Vec<&str> = src.lines().collect();
+        let mut found = (lines.windows(want.len()).enumerate())
+            .filter(|(_, w)| !c.snapshot.is_empty() && *w == &want[..])
+            .map(|(i, _)| i);
+        if let (Some(i), None) = (found.next(), found.next()) {
+            (c.start.1, c.end.1) = (i + 1, i + 1 + e - s);
+        }
+        return;
+    };
+    // ponytail: one copy of the file per thread; share per path if threads get many.
+    let diff = similar::TextDiff::configure()
+        .timeout(std::time::Duration::from_millis(30))
+        .diff_lines(old.as_str(), src);
+    let mut to = vec![None; diff.old_slices().len()];
+    for op in diff.ops() {
+        if let similar::DiffOp::Equal { old_index, new_index, len } = *op {
+            (0..len).for_each(|i| to[old_index + i] = Some(new_index + i));
+        }
+    }
+    if let Some(&Some(n)) = to.get(s)
+        && (s..=e).all(|i| to.get(i) == Some(&Some(n + i - s)))
+    {
+        (c.start.1, c.end.1) = (n + 1, n + 1 + e - s);
+    }
+}
+
+/// The comment's lines as they are now: the working tree's on the new side (the comment
+/// re-anchored to where they moved), the base commit's (`rev`) on the old one. A deleted file
+/// reads empty; `None` for a range across both sides.
+fn lines_now(dir: &Path, c: &mut Comment) -> Option<String> {
     if c.start.0 != c.end.0 {
         return None;
     }
     let src = match c.end.0 {
-        false => std::fs::read_to_string(dir.join(&c.path)).unwrap_or_default(),
+        false => {
+            let src = std::fs::read_to_string(dir.join(&c.path)).unwrap_or_default();
+            reanchor(c, &src);
+            src
+        }
         // No base known (merge-base failed): `git show :path` would read the index.
         true if c.rev.is_empty() => return None,
         true => {
@@ -504,8 +566,7 @@ pub(super) fn comments_path(ws: &str) -> PathBuf {
 
 /// The inline composer (A·01): under the commented lines, on their side.
 pub(super) struct Composer {
-    /// The comment being edited; `None` for a new one on `draft`'s lines.
-    id: Option<u64>,
+    /// The comment being edited; id 0 for a new one on its lines.
     pub(super) draft: Comment,
     pub(super) input: Entity<TextareaState>,
     /// Suggest change (cmd-shift-s): the lines, to edit into the proposed code.
@@ -525,9 +586,16 @@ pub(super) struct Review {
     pub(super) comments: HashMap<String, Vec<Comment>>,
     /// The last comment id given out per workspace.
     last_id: HashMap<String, u64>,
+    /// Workspaces whose comments file couldn't be read or moved aside: never saved over.
+    unsaved: Vec<String>,
+    /// Why, for the window to show once.
+    pub(super) warning: Option<String>,
     pub(super) composer: Option<Composer>,
     pub(super) sheet: Option<review_send::Sheet>,
     pub(super) share: Option<review_share::Share>,
+    /// The thread last jumped to, and the lines selected for it: while they stay selected it
+    /// is the thread there, though another one starts on the same line.
+    jumped: Option<(u64, DiffLineRange)>,
 }
 
 impl Review {
@@ -540,6 +608,9 @@ impl Review {
     /// Writes the file whole (a temp file renamed over it), so a crash can't leave half.
     pub(super) fn save_comments(&self, ws: &str) {
         let (path, comments) = (comments_path(ws), self.comments.get(ws));
+        if self.unsaved.iter().any(|w| w == ws) {
+            return;
+        }
         let last = self.last_id.get(ws).copied().unwrap_or(0);
         let Ok(json) = serde_json::to_vec(&Store::Ids {
             last,
@@ -555,20 +626,34 @@ impl Review {
     }
 
     /// Loads once; comments saved before ids get their own, ones queued in a chat that is
-    /// gone now are pending. A file that doesn't parse is kept aside as `.json.bak`.
+    /// gone now are pending. A file that doesn't parse is kept aside as `.json.<n>.bak`; one
+    /// that can't be read (or moved) is left alone and not saved over.
     pub(super) fn load_comments(&mut self, ws: &str) {
         if self.comments.contains_key(ws) {
             return;
         }
         let path = comments_path(ws);
-        let store = std::fs::read(&path)
-            .ok()
-            .map(|b| serde_json::from_slice(&b));
+        let (store, read) = match std::fs::read(&path) {
+            Ok(b) => (Some(serde_json::from_slice(&b).map_err(|e| e.to_string())), true),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, true),
+            Err(e) => (Some(Err(e.to_string())), false),
+        };
         let (mut last, mut c) = match store {
             Some(Ok(Store::Ids { last, comments })) => (last, comments),
             Some(Ok(Store::List(c))) => (0, c),
-            Some(Err(_)) => {
-                let _ = std::fs::rename(&path, path.with_extension("json.bak"));
+            Some(Err(e)) => {
+                let bak = (1..)
+                    .map(|n| path.with_extension(format!("json.{n}.bak")))
+                    .find(|p| !p.exists())
+                    .unwrap();
+                let file = path.display();
+                self.warning = Some(match read && std::fs::rename(&path, &bak).is_ok() {
+                    true => format!("Couldn't read {file} ({e}); moved it to {}", bak.display()),
+                    false => {
+                        self.unsaved.push(ws.to_string());
+                        format!("Couldn't read {file} ({e}); nothing is saved until it's fixed")
+                    }
+                });
                 (0, vec![])
             }
             None => (0, vec![]),
@@ -596,11 +681,15 @@ impl Review {
         let _ = std::fs::remove_file(comments_path(ws));
     }
 
-    /// Edits workspace `ws`'s comments and saves them.
+    /// Edits workspace `ws`'s comments and saves them if that changed them.
     pub(super) fn edit(&mut self, ws: &str, f: impl FnOnce(&mut Vec<Comment>)) {
         self.load_comments(ws);
-        f(self.comments.get_mut(ws).unwrap());
-        self.save_comments(ws);
+        let l = self.comments.get_mut(ws).unwrap();
+        let before = l.clone();
+        f(l);
+        if *l != before {
+            self.save_comments(ws);
+        }
     }
 }
 
@@ -711,10 +800,10 @@ impl Shark {
         }) else {
             // The mouse moved the diff: we don't know where it is, so scroll natively.
             let name = match (n > 0, n.abs() == 1) {
-                (true, true) => "diff::ScrollDown",
-                (false, true) => "diff::ScrollUp",
-                (true, false) => "diff::PageDown",
-                (false, false) => "diff::PageUp",
+                (true, true) => "shark_diff::ScrollDown",
+                (false, true) => "shark_diff::ScrollUp",
+                (true, false) => "shark_diff::PageDown",
+                (false, false) => "shark_diff::PageUp",
             };
             if let Ok(a) = cx.build_action(name, None) {
                 window.dispatch_action(a, cx);
@@ -816,11 +905,12 @@ impl Shark {
     /// the before/after row of each image or video under its header (not while folded). File
     /// headers get `review_chips` through `card_header_suffix`.
     pub(super) fn with_comments(&self, diff: Diff, cx: &mut Context<Self>) -> Diff {
-        let editing = self.review.composer.as_ref().and_then(|c| c.id);
+        let editing = self.review.composer.as_ref().map(|c| c.draft.id);
         let state = self.diff.read(cx);
-        let media: Vec<_> = (self.media.iter())
-            .filter(|(path, _)| !state.is_file_collapsed(path))
-            .map(|(path, _)| path.clone())
+        // Indexed as in `self.media`, which `render_annotation` reads.
+        let media: Vec<_> = (self.media.iter().enumerate())
+            .filter(|(_, (path, _))| !state.is_file_collapsed(path))
+            .map(|(i, (path, _))| (i, path.clone()))
             .collect();
         // On their line while the diff has it; else under their file's header (the rest show
         // below the diff, `render_orphans`).
@@ -850,11 +940,11 @@ impl Shark {
         .annotation_hints("Comment on working copy →", "← Comment on original")
         .annotations(
             threads.chain(composer).chain(
-                (media.iter().enumerate())
-                    .map(|(i, path)| DiffAnnotation::file(("media", i), path.clone())),
+                (media.iter())
+                    .map(|(i, path)| DiffAnnotation::file(("media", *i), path.clone())),
             ),
         )
-        .render_annotation(move |a, window, cx| {
+        .render_annotation(move |a, _, cx| {
             let (name, i) = match a.id() {
                 ElementId::NamedInteger(name, i) => (name.to_string(), *i as usize),
                 _ => (String::new(), 0),
@@ -863,7 +953,7 @@ impl Shark {
                 .update(cx, |s, cx| match name.as_str() {
                     "media" => (s.media.get(i).map(|(_, v)| v.clone().into_any_element()))
                         .unwrap_or_else(|| div().into_any_element()),
-                    "composer" => s.render_composer(window, cx),
+                    "composer" => s.render_composer(cx),
                     _ => s.render_thread(i as u64, cx),
                 })
                 .unwrap_or_else(|_| div().into_any_element())
@@ -872,17 +962,48 @@ impl Shark {
 
     /// Whether the diff shows the thread's line (in a hunk, on its side).
     pub(super) fn on_its_line(&self, c: &Comment) -> bool {
-        let line = c.end.1;
-        (self.review.hunks.get(c.path.as_str())).is_some_and(|h| {
-            h.iter().flatten().any(|&(k, old, new)| match c.end.0 {
+        self.hunk_of(c, c.end.1).is_some()
+    }
+
+    /// Whether one hunk of the diff shows all the thread's lines, as GitHub wants an inline
+    /// comment's.
+    pub(super) fn in_one_hunk(&self, c: &Comment) -> bool {
+        let h = self.hunk_of(c, c.end.1);
+        h.is_some() && self.hunk_of(c, c.start.1) == h
+    }
+
+    /// The hunk of the diff showing line `line` of the comment's side.
+    fn hunk_of(&self, c: &Comment, line: usize) -> Option<usize> {
+        (self.review.hunks.get(c.path.as_str()))?.iter().position(|h| {
+            h.iter().any(|&(k, old, new)| match c.end.0 {
                 true => k != b'+' && old == line,
                 false => k != b'-' && new == line,
             })
         })
     }
 
-    /// Threads whose file left the diff, below it, so none goes missing.
+    /// Moves workspace `ws`'s working-copy threads to where their lines are on disk now, so
+    /// lines added above one don't leave it beside other code.
+    pub(super) fn reanchor_comments(&mut self, ws: &str) {
+        let Some(dir) = self.ws(ws).map(Workspace::dir) else {
+            return;
+        };
+        // ponytail: reads each thread's file on every diff refresh; group by path if many.
+        self.review.edit(ws, |l| {
+            for c in l.iter_mut().filter(|c| c.shown() && !c.end.0) {
+                lines_now(&dir, c);
+            }
+        });
+    }
+
+    /// Threads whose file left the diff, below it, so none goes missing. Pending ones get
+    /// Edit and Delete there, as no line cursor reaches them; edited, the composer shows in
+    /// the card's place.
     pub(super) fn render_orphans(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        // No diff (yet, or git failed): every thread would look orphaned.
+        if !self.diff_loaded || self.diff_error.is_some() {
+            return None;
+        }
         let ids: Vec<u64> = (self.ws_comments().iter())
             .filter(|c| c.shown() && !self.diff_files.iter().any(|f| *f.path() == c.path))
             .map(|c| c.id)
@@ -898,11 +1019,34 @@ impl Shark {
         let cards: Vec<AnyElement> = (ids.iter())
             .map(|&id| {
                 let c = self.comment(id).map(|c| c.path.clone()).unwrap_or_default();
+                let pending = self.comment(id).is_some_and(|c| c.status == Status::Pending);
+                let editing = (self.review.composer.as_ref()).is_some_and(|c| c.draft.id == id);
+                let button = |name: &'static str, label: &'static str| {
+                    Button::new((name, id as usize)).ghost().xsmall().label(label)
+                };
                 v_flex()
                     .p_3()
                     .gap_1()
                     .child(div().text_xs().child(c))
-                    .child(self.render_thread(id, cx))
+                    .child(match editing {
+                        true => self.render_composer(cx),
+                        false => self.render_thread(id, cx),
+                    })
+                    .when(pending && !editing, |d| {
+                        d.child(
+                            h_flex()
+                                .gap_2()
+                                .justify_end()
+                                .child(button("orphan-edit", "Edit").on_click(cx.listener(
+                                    move |this, _, w, cx| this.edit_comment(id, w, cx),
+                                )))
+                                .child(button("orphan-delete", "Delete").on_click(cx.listener(
+                                    move |this, _, _, cx| {
+                                        this.edit_comments(cx, |l| l.retain(|c| c.id != id))
+                                    },
+                                ))),
+                        )
+                    })
                     .into_any_element()
             })
             .collect();
@@ -922,10 +1066,11 @@ impl Shark {
         )
     }
 
-    /// Lines `start..=end` of the comment's side, and the revision they are read at.
-    fn anchor_text(&self, c: &Comment) -> (String, String) {
+    /// The comment quoting its lines as they are now (`snapshot`), at the revision they are
+    /// read at (`rev`).
+    fn anchor_text(&self, c: &Comment) -> Comment {
         let Some(ws) = self.active_ws() else {
-            return Default::default();
+            return c.clone();
         };
         let rev = match c.end.0 {
             false => "working tree".to_string(),
@@ -942,9 +1087,12 @@ impl Shark {
         let edited = (self.editing.as_ref())
             .filter(|e| !c.end.0 && c.start.0 == c.end.0 && *e.path == c.path)
             .map(|e| slice(&e.buf.text(), c.start.1, c.end.1));
-        let c = Comment { rev, ..c.clone() };
-        let now = edited.or_else(|| lines_now(&ws.dir(), &c));
-        (now.unwrap_or_default(), c.rev)
+        let mut c = Comment { rev, ..c.clone() };
+        let now = edited.or_else(|| lines_now(&ws.dir(), &mut c));
+        Comment {
+            snapshot: now.unwrap_or_default(),
+            ..c
+        }
     }
 
     /// `c`: the composer on the selected lines (the cursor line). A pending thread there is
@@ -964,6 +1112,12 @@ impl Shark {
         self.comment_at(range, window, cx)
     }
 
+    /// `c` is on working-copy lines with unsaved edits in place: not what the agent reads.
+    pub(super) fn unsaved_edit(&self, c: &Comment) -> bool {
+        (!c.start.0 || !c.end.0)
+            && (self.editing.as_ref()).is_some_and(|e| e.dirty && *e.path == c.path)
+    }
+
     /// Code selected with the mouse, else the line cursor or selected lines.
     fn picked_lines(&self, cx: &App) -> Option<DiffLineRange> {
         let d = self.diff.read(cx);
@@ -980,18 +1134,35 @@ impl Shark {
     /// The composer on `range`, whatever is selected (the header's Comment, the diff's +).
     fn comment_at(&mut self, range: DiffLineRange, window: &mut Window, cx: &mut Context<Self>) {
         let draft = Comment::from_range(&range);
+        if self.unsaved_edit(&draft) {
+            return notify_err(window, cx, "Save first (⌘S): the agent reads the file on disk");
+        }
+        self.keep_draft(window, cx);
         let same = (self.ws_comments().iter())
-            .find(|c| c.status == Status::Pending && c.place() == draft.place())
+            .find(|c| {
+                c.status == Status::Pending
+                    && (&c.path, c.start, c.end) == (&draft.path, draft.start, draft.end)
+            })
             .cloned();
-        let c = same.unwrap_or_else(|| {
-            let (snapshot, rev) = self.anchor_text(&draft);
-            Comment {
-                snapshot,
-                rev,
-                ..draft
-            }
-        });
+        let c = same.unwrap_or_else(|| self.anchor_text(&draft));
         self.open_composer(c, window, cx)
+    }
+
+    /// A composer open elsewhere with text in it is added (or saved), not lost, before
+    /// another opens.
+    fn keep_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let typed = |c: &Composer| !c.input.read(cx).value().trim().is_empty();
+        if self.review.composer.as_ref().is_some_and(typed) {
+            self.submit_composer(window, cx);
+        }
+    }
+
+    /// `e`, an orphan card's Edit: the composer on thread `id`, keeping an open draft.
+    fn edit_comment(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        self.keep_draft(window, cx);
+        if let Some(c) = self.comment(id).cloned() {
+            self.open_composer(c, window, cx);
+        }
     }
 
     /// Opens the composer on `c`: an existing comment (id set) or a new draft, scrolled into
@@ -1008,14 +1179,17 @@ impl Shark {
         );
         let anchor = Spot::Line(c.anchor());
         self.review.composer = Some(Composer {
-            id: (c.id != 0).then_some(c.id),
             draft: c,
             input,
             suggest,
             height: Rc::default(),
         });
-        // Room for most of it, so it is laid out; then `render_composer` measures it.
-        self.reveal(&anchor, 8., window, cx);
+        // Room for most of it, so it is laid out; then `render_composer` measures it. An
+        // orphan's shows below the diff.
+        if self.diff_files.iter().any(|f| f.path() == anchor.path()) {
+            self.reveal(&anchor, 8., window, cx);
+        }
+        cx.notify();
     }
 
     /// The diff scrolls `by` down (in the diff's own steps, so a little more), the composer
@@ -1024,7 +1198,7 @@ impl Shark {
     fn scroll_diff(&mut self, by: Pixels, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(back), Ok(down)) = (
             window.focused(cx),
-            cx.build_action("diff::ScrollDown", None),
+            cx.build_action("shark_diff::ScrollDown", None),
         ) else {
             return;
         };
@@ -1067,7 +1241,10 @@ impl Shark {
         let Some(ws) = self.active.clone() else {
             return;
         };
-        let id = comp.id.unwrap_or_else(|| self.review.new_id(&ws));
+        let id = match comp.draft.id {
+            0 => self.review.new_id(&ws),
+            id => id,
+        };
         self.edit_comments(cx, |list| {
             let old = list.iter().position(|c| c.id == id).map(|i| list.remove(i));
             if !text.is_empty() {
@@ -1101,12 +1278,17 @@ impl Shark {
     }
 
     /// The shown thread under the line cursor (or the selection's last line).
-    fn thread_at(&self, cx: &App) -> Option<u64> {
+    pub(super) fn thread_at(&self, cx: &App) -> Option<u64> {
         let r = self.diff.read(cx).selected_lines()?;
         let at = DiffLinePosition::new(r.path().clone(), r.end_side(), r.end());
-        (self.ws_comments().iter())
-            .find(|c| c.shown() && c.covers(&at))
+        let here: Vec<u64> = (self.ws_comments().iter())
+            .filter(|c| c.shown() && c.covers(&at))
             .map(|c| c.id)
+            .collect();
+        (self.review.jumped.as_ref())
+            .filter(|(id, sel)| *sel == r && here.contains(id))
+            .map(|(id, _)| *id)
+            .or(here.first().copied())
     }
 
     /// Thread `id`, unless it waits in a chat's queued review card (that card would send it
@@ -1137,8 +1319,8 @@ impl Shark {
     }
 
     pub(super) fn edit_thread(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(c) = self.unqueued(id, window, cx) {
-            self.open_composer(c, window, cx);
+        if self.unqueued(id, window, cx).is_some() {
+            self.edit_comment(id, window, cx);
         }
     }
 
@@ -1156,17 +1338,21 @@ impl Shark {
         });
     }
 
-    /// `r`: resolve the thread at the cursor; with none, `r` refreshes the diff as before.
+    /// `r`: resolve the sent thread at the cursor (a pending one has no way back from hidden);
+    /// with none, `r` refreshes the diff as before.
     pub(super) fn resolve_thread(&mut self, cx: &mut Context<Self>) {
-        match self.thread_at(cx) {
-            Some(id) => self.set_status(&[id], Status::Resolved, cx),
+        let sent = |s: &Status| {
+            matches!(s, Status::Sent { .. } | Status::Addressed { .. } | Status::Outdated)
+        };
+        match (self.thread_at(cx).and_then(|id| self.comment(id))).filter(|c| sent(&c.status)) {
+            Some(c) => self.set_status(&[c.id], Status::Resolved, cx),
             None => cx.propagate(),
         }
     }
 
     /// `R`: back to pending, to send again.
-    pub(super) fn reopen_thread(&mut self, cx: &mut Context<Self>) {
-        if let Some(id) = self.thread_at(cx) {
+    pub(super) fn reopen_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = (self.thread_at(cx)).filter(|&id| self.unqueued(id, window, cx).is_some()) {
             self.set_status(&[id], Status::Pending, cx);
         }
     }
@@ -1178,9 +1364,22 @@ impl Shark {
             .collect()
     }
 
+    /// Outdated threads pending again, quoting their lines as they are now.
     pub(super) fn requeue_outdated(&mut self, cx: &mut Context<Self>) {
-        let ids = self.with_status(|s| *s == Status::Outdated);
-        self.set_status(&ids, Status::Pending, cx);
+        let mut now: HashMap<u64, Comment> = (self.ws_comments().iter())
+            .filter(|c| c.status == Status::Outdated)
+            .map(|c| (c.id, self.anchor_text(c)))
+            .collect();
+        self.edit_comments(cx, |l| {
+            for c in l.iter_mut() {
+                if let Some(n) = now.remove(&c.id) {
+                    *c = Comment {
+                        status: Status::Pending,
+                        ..n
+                    };
+                }
+            }
+        });
     }
 
     pub(super) fn resolve_addressed(&mut self, cx: &mut Context<Self>) {
@@ -1295,6 +1494,7 @@ impl Shark {
         let sel = DiffLineRange::new(c.path.clone(), side(c.end.0), c.end.1, c.end.1);
         self.diff
             .update(cx, |d, cx| d.set_selected_lines(Some(sel), cx));
+        self.review.jumped = self.diff.read(cx).selected_lines().map(|s| (id, s));
     }
 
     /// `]c` / `[c`: the next (previous) thread, wrapping; with none, the next change.
@@ -1304,19 +1504,25 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let order: HashMap<&str, usize> = (self.diff_files.iter().enumerate())
-            .map(|(i, f)| (f.path().as_str(), i))
-            .collect();
-        let key = |path: &str, line: usize| (order.get(path).copied().unwrap_or(usize::MAX), line);
-        let mut threads: Vec<((usize, usize), u64)> = (self.ws_comments().iter())
+        // Top to bottom as the diff shows them (files gone from it last); one row's by id.
+        let rows = self.diff_rows(cx);
+        let row = |l: DiffLinePosition| match self.diff_files.iter().any(|f| f.path() == l.path()) {
+            true => find(&rows, &Spot::Line(l)),
+            false => usize::MAX,
+        };
+        let mut threads: Vec<((usize, u64), u64)> = (self.ws_comments().iter())
             .filter(|c| c.shown())
-            .map(|c| (key(&c.path, c.end.1), c.id))
+            .map(|c| ((row(c.anchor()), c.id), c.id))
             .collect();
         if threads.is_empty() {
             return self.diff_change(forward, window, cx);
         }
         threads.sort();
-        let at = (self.diff.read(cx).selected_lines()).map(|r| key(r.path(), r.end()));
+        let here = self.thread_at(cx).unwrap_or(0);
+        let at = (self.diff.read(cx).selected_lines()).map(|r| {
+            let l = DiffLinePosition::new(r.path().clone(), r.end_side(), r.end());
+            (row(l), here)
+        });
         let next = match (forward, at) {
             (_, None) => threads.first(),
             (true, Some(at)) => threads.iter().find(|t| t.0 > at).or(threads.first()),
@@ -1400,12 +1606,12 @@ impl Shark {
     }
 
     /// The composer (A·01): lines and side, Suggest change, the text, Esc / Add to review.
-    fn render_composer(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn render_composer(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(comp) = &self.review.composer else {
             return div().into_any_element();
         };
         let theme = cx.theme();
-        let editing = comp.id.is_some();
+        let editing = comp.draft.id != 0;
         let (seen, vp) = (comp.height.clone(), self.review.viewport.clone());
         let shark = cx.entity().downgrade();
         // Measured after layout: taller than last time (opened, grew) and past the pane's
@@ -1418,7 +1624,7 @@ impl Shark {
                 seen.set(b.size.height);
                 let pane = vp.get();
                 let by = (b.bottom() - pane.bottom()).min(b.top() - pane.top());
-                if by > px(0.) {
+                if by > px(0.) && b.top() < pane.bottom() {
                     window.defer(cx, move |w, cx| {
                         (shark.update(cx, |s, cx| s.scroll_diff(by, w, cx))).ok();
                     });
@@ -1560,7 +1766,7 @@ impl Shark {
                 theme.warning_foreground,
                 "e edit · x delete",
             ),
-            Status::Queued => ("Queued".into(), theme.primary, "r resolve"),
+            Status::Queued => ("Queued".into(), theme.primary, ""),
             Status::Sent { .. } => ("Sent".into(), theme.primary, "r resolve · e edit"),
             Status::Addressed { turn, .. } => (
                 format!("Addressed · turn {turn}"),
@@ -1824,13 +2030,16 @@ impl Shark {
         };
         let (path, button) = (path.clone(), commenting || chip.is_none());
         h_flex()
-            .gap_2()
+            .gap(px(10.))
             .children(chip)
             .when(button, |d| {
                 d.child(
                     Button::new(SharedString::from(format!("comment:{path}")))
                         .outline()
                         .xsmall()
+                        .h(px(28.))
+                        .px(px(9.))
+                        .rounded(px(6.))
                         .label(label)
                         .on_click(cx.listener(move |this, _, w, cx| this.comment_in(&path, w, cx))),
                 )
@@ -1875,22 +2084,23 @@ impl Shark {
         let pending = count(&|s| *s == Status::Pending);
         let addressed = count(&|s| matches!(s, Status::Addressed { .. }));
         let outdated = count(&|s| *s == Status::Outdated);
+        // 28 tall with just a hint, 40 with the review's buttons.
         let bar = h_flex()
-            .h(px(40.))
             .flex_none()
-            .px_4()
+            .px(px(16.))
             .gap_3()
             .border_t_1()
             .border_color(theme.border)
             .text_xs()
             .text_color(theme.muted_foreground);
         if let Some(s) = status {
-            return bar.child(s).into_any_element();
+            return bar.h(px(28.)).child(s).into_any_element();
         }
         // Without Vim mode the arrows move the cursor, not j / k.
         let jk = if self.state.vim { "j / k" } else { "↑ / ↓" };
         if shown.is_empty() {
             return bar
+                .h(px(28.))
                 .child(format!("s split / unified · c comment · Drag divider to resize · {jk} move through changes"))
                 .into_any_element();
         }
@@ -1901,13 +2111,12 @@ impl Shark {
                 format!("{addressed} addressed · {outdated} outdated · 0 pending"),
             ),
             n => {
-                let mut files: Vec<&str> = vec![];
-                for c in shown.iter().filter(|c| c.status == Status::Pending) {
-                    let name = c.path.rsplit('/').next().unwrap_or(&c.path);
-                    if !files.contains(&name) {
-                        files.push(name);
-                    }
-                }
+                // In file order already, so a file's threads sit together.
+                let mut files: Vec<&str> = (shown.iter())
+                    .filter(|c| c.status == Status::Pending)
+                    .map(|c| c.path.rsplit('/').next().unwrap_or(&c.path))
+                    .collect();
+                files.dedup();
                 let files = match files.len() {
                     1 | 2 => files.join(" · "),
                     n => format!("{n} files"),
@@ -1922,6 +2131,7 @@ impl Shark {
         // Narrow, the lead, the summary and the keys truncate; the actions stay whole.
         let text = |t: String| div().min_w_0().truncate().child(t);
         let button = |id: &'static str, label: String| Button::new(id).small().label(label);
+        let bar = bar.h(px(40.));
         bar.child(
             h_flex()
                 .min_w_0()
@@ -2073,7 +2283,7 @@ mod tests {
             p.contains("\n[c2] api/a.rs:3-5 (old) · base 0123456789\n> keep\n> this\n"),
             "{p}"
         );
-        assert!(p.contains("\n[c3] api/a.rs:7 (old)-8\n"));
+        assert!(p.contains("\n[c3] api/a.rs:7 (old)-8 (new)\n"));
         assert!(p.contains("\nOverall: Run cargo test.\n"));
         assert!(p.contains("[c<id>] addressed: "));
         assert!(!prompt(&[], "  ").contains("Overall"));
@@ -2089,14 +2299,53 @@ mod tests {
         crate::git::git(&repo, &["init", "-q"]).unwrap();
         std::fs::write(repo.join("f"), "staged\n").unwrap();
         crate::git::git(&repo, &["add", "f"]).unwrap();
-        let c = Comment {
+        let mut c = Comment {
             path: "api/f".into(),
             start: (true, 1),
             end: (true, 1),
             ..Default::default()
         };
-        assert_eq!(lines_now(&dir, &c), None);
+        assert_eq!(lines_now(&dir, &mut c), None);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A working-copy thread follows its lines through edits above it. Its own line edited,
+    /// it stays, so it reads Outdated, though the same text is further down; never read, it
+    /// only goes to a snapshot found once.
+    #[test]
+    fn reanchors_through_the_diff() {
+        let file = |ten: &str, top: &str| {
+            let mut l: Vec<String> = (1..=20).map(|i| format!("l{i}")).collect();
+            (l[9], l[19]) = (ten.into(), "return None;".into());
+            format!("{top}{}\n", l.join("\n"))
+        };
+        let mut c = Comment {
+            start: (false, 10),
+            end: (false, 10),
+            snapshot: "return None;".into(),
+            ..Default::default()
+        };
+        reanchor(&mut c, &file("return None;", ""));
+        assert_eq!((c.start, c.end), ((false, 10), (false, 10)));
+        reanchor(&mut c, &file("return None;", "a\nb\n"));
+        assert_eq!((c.start, c.end), ((false, 12), (false, 12)));
+        let edited = file("return Some(1);", "a\nb\n");
+        reanchor(&mut c, &edited);
+        assert_eq!((c.start, c.end), ((false, 12), (false, 12)));
+        let now = slice(&edited, c.start.1, c.end.1);
+        let sent = Status::Sent { turn: 1 };
+        assert_eq!(judge(&sent, 1, None, Some(&now), &c.snapshot), Status::Outdated);
+        reanchor(&mut c, "gone\n");
+        assert_eq!((c.start, c.end), ((false, 12), (false, 12)));
+
+        let mut d = Comment {
+            start: (false, 2),
+            end: (false, 3),
+            snapshot: "l2\nl3".into(),
+            ..Default::default()
+        };
+        reanchor(&mut d, &file("x", "a\n"));
+        assert_eq!((d.start, d.end), ((false, 3), (false, 4)));
     }
 
     #[test]

@@ -3,7 +3,7 @@ use super::*;
 use std::cmp::Ordering;
 
 /// The accent dot on a tab or edge arrow: a finished turn you haven't looked at yet.
-fn dot(inset: f32, theme: &Theme) -> Div {
+pub(super) fn dot(inset: f32, theme: &Theme) -> Div {
     (div().absolute().top(px(inset)).right(px(inset)))
         .size(px(6.))
         .rounded_full()
@@ -547,6 +547,7 @@ impl Shark {
                                 })),
                         )
                     })
+                    .test_support()
                     .into_any_element()
             })
             .collect();
@@ -567,6 +568,7 @@ impl Shark {
                 .ghost()
                 .xsmall()
                 .icon(IconName::Plus)
+                .w(px(24.))
                 .tooltip("New chat (cmd-t)")
                 .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx)))
                 .into_any_element(),

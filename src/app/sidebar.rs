@@ -162,6 +162,16 @@ fn drag_chip(label: SharedString, cx: &App) -> Div {
         .child(label)
 }
 
+/// A sidebar row in the rail: Paper's 32px icon button, centered, 16 above the next.
+pub(super) fn rail_button<E: Styled>(e: E) -> E {
+    e.size(px(32.))
+        .mx_auto()
+        .mb(px(16.))
+        .px_0()
+        .justify_center()
+        .rounded(px(8.))
+}
+
 impl Shark {
     pub(super) fn section_of(&self, ws: &str) -> Option<usize> {
         self.state
@@ -548,9 +558,11 @@ impl Shark {
         let theme = cx.theme();
         let focused = self.sidebar_focus.is_focused(window);
         let rail = self.rail;
+        // The rail: 32px icon buttons, 16px icons, 16 apart.
+        let isz = px(if rail { 16. } else { 14. });
         let header = |t: &'static str| {
             div()
-                .when(rail, |d| d.invisible())
+                .when(rail, |d| d.hidden())
                 .px_4()
                 .pt_4()
                 .pb_1()
@@ -577,7 +589,7 @@ impl Shark {
                 .gap_2()
                 .rounded(theme.radius)
                 .text_sm()
-                .when(rail, |d| d.justify_center())
+                .when(rail, rail_button)
         };
         let m = window.modifiers();
         let cmd_held = m.platform && m.number_of_modifiers() == 1;
@@ -588,7 +600,7 @@ impl Shark {
                 .id(("repo", ix))
                 .text_color(theme.muted_foreground)
                 .hover(|d| d.bg(theme.sidebar_accent))
-                .child(Icon::new(IconName::FolderGit2).with_size(px(14.)))
+                .child(Icon::new(IconName::FolderGit2).with_size(isz))
                 .when(!rail, |d| d.child(div().truncate().child(r.name.clone())))
                 .when(rail, |d| {
                     d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
@@ -709,7 +721,7 @@ impl Shark {
                     (true, _) => Spinner::new()
                         .icon(IconName::LoaderCircle)
                         .color(theme.primary)
-                        .with_size(px(14.))
+                        .with_size(isz)
                         .into_any_element(),
                     (false, _) => {
                         let (icon, color) = match &attn {
@@ -718,7 +730,7 @@ impl Shark {
                             Attn::None => (IconName::CircleDashed, theme.muted_foreground),
                         };
                         Icon::new(icon)
-                            .with_size(px(14.))
+                            .with_size(isz)
                             .text_color(color)
                             .into_any_element()
                     }
@@ -821,7 +833,7 @@ impl Shark {
                     )
                     .child(
                         Icon::new(section_icon(&sec.icon))
-                            .with_size(px(14.))
+                            .with_size(isz)
                             .when(needs, |i| i.text_color(theme.warning_foreground)),
                     )
                     .when(!rail, |d| {
@@ -988,7 +1000,7 @@ impl Shark {
             .id("add-repo-row")
             .text_color(theme.muted_foreground)
             .hover(|d| d.bg(theme.sidebar_accent))
-            .child(Icon::new(IconName::FolderPlus).with_size(px(14.)))
+            .child(Icon::new(IconName::FolderPlus).with_size(isz))
             .when(!rail, |d| {
                 d.child(div().flex_1().child("Add repo…"))
             })
@@ -1006,7 +1018,11 @@ impl Shark {
             .key_context("Sidebar")
             .track_focus(&self.sidebar_focus)
             // The rail clears the traffic lights (x 9..61), so the content island never sits under them.
-            .w(px(if rail { 72. } else { 244. }))
+            // Expanded, it fills its resizable panel.
+            .map(|d| match rail {
+                true => d.w(px(72.)),
+                false => d.w_full(),
+            })
             .h_full()
             .flex_none()
             .text_color(theme.sidebar_foreground)
@@ -1027,11 +1043,25 @@ impl Shark {
                 }
             }))
             // Room for the traffic lights; the transparent titlebar lets the sidebar run under them.
+            .child(top_strip())
             .child(
-                div()
-                    .h(px(36.))
+                h_flex()
+                    .h(px(28.))
                     .flex_none()
-                    .window_control_area(WindowControlArea::Drag),
+                    .pl(px(20.))
+                    .mb(px(if rail { 16. } else { 4. }))
+                    .window_control_area(WindowControlArea::Drag)
+                    .child(
+                        side_toggle(
+                            "toggle-sidebar",
+                            match rail {
+                                true => IconName::PanelLeftOpen,
+                                false => IconName::PanelLeftClose,
+                            },
+                            "Toggle sidebar (cmd-b)",
+                        )
+                        .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                    ),
             )
             .child(self.render_home_row(rail, cx))
             .child(
@@ -1065,5 +1095,6 @@ impl Shark {
                             .on_mouse_down(MouseButton::Right, new_section_menu(true)),
                     ),
             )
+            .test_support()
     }
 }
