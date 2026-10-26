@@ -3163,6 +3163,89 @@ async fn narrow_column_comments(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
+/// A thread card's right-click menu follows its status; Delete stays last.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn thread_menu_labels(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace("tm".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    fs::write(home.join("shark/workspaces/tm/api/f"), "a\nb\n").unwrap();
+    on(cx, &|s, w, cx| {
+        s.show(Tab::Diff, w, cx);
+        s.refresh_diff(cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).diff_files.len() == 1
+    })
+    .await;
+    let thread = |id: u64, status: &str| -> review::Comment {
+        serde_json::from_str(&format!(
+            r#"{{"id":{id},"path":"api/f","start":[false,1],"end":[false,1],"text":"x","status":{status}}}"#
+        ))
+        .unwrap()
+    };
+    let (open, done) = (
+        thread(1, r#"{"Addressed":{"turn":1,"note":"n"}}"#),
+        thread(2, r#""Resolved""#),
+    );
+    on(cx, &|s, _, cx| {
+        s.edit_comments(cx, |l| l.extend([open.clone(), done.clone()]))
+    });
+    let labels = |cx: &mut TestAppContext, id: u64| {
+        shark.update(cx, |s, cx| {
+            (s.thread_menu(id, cx).into_iter())
+                .map(|e| match e {
+                    Entry::Item { label, .. } => label.to_string(),
+                    _ => "-".into(),
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(
+        labels(cx, 1),
+        [
+            "Edit",
+            "Resolve",
+            "Reopen",
+            "View change",
+            "Show chat",
+            "Share to GitHub…",
+            "Copy comment",
+            "-",
+            "Delete"
+        ]
+    );
+    assert_eq!(
+        labels(cx, 2),
+        [
+            "Edit",
+            "Reopen",
+            "Share to GitHub…",
+            "Copy comment",
+            "-",
+            "Delete"
+        ]
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
 /// In-place editing, round 2: the line input lines up with the code, owns tab and the
 /// letters, a click in it keeps its caret, a second ⌘S waits for the first, other writers
 /// are noticed, a refresh adding a file keeps the input's focus, the composer takes focus
