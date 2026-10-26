@@ -3915,3 +3915,52 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     });
     fs::remove_dir_all(&home).ok();
 }
+
+/// Change base: only the picked repo moves; the state, the root CLAUDE.md, the git button and
+/// the branch menu's hint all follow.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn change_base(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api", "web"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| s.create_workspace("rb".into(), repos.clone(), None, w, cx));
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let api = home.join("shark/workspaces/rb/api");
+    git::git(&api, &["update-ref", "refs/remotes/origin/release", "HEAD"]).unwrap();
+    assert!(
+        (git::remote_branches(&api).iter()).any(|(_, b)| b == "origin/release"),
+        "a fetched origin branch is offered"
+    );
+    let old = cx.update(|cx| shark.read(cx).ws("rb").unwrap().repos[0].base.clone());
+    on(cx, &|s, w, cx| {
+        let moves = [("api".into(), old.clone(), "origin/release".into())];
+        s.set_base("rb", &moves, false, w, cx)
+    });
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        let ws = s.ws("rb").unwrap();
+        assert_eq!(ws.repos[0].base, "origin/release");
+        assert_eq!(ws.repos[1].base, old, "web keeps its base");
+        assert_eq!(menus::base_hint(ws), "per repo");
+        let bases: Vec<String> = (s.syncs["rb"].read(cx).branches().into_iter())
+            .map(|b| b.base)
+            .collect();
+        assert_eq!(bases, ["origin/release".to_string(), old.clone()]);
+    });
+    let md = fs::read_to_string(home.join("shark/workspaces/rb/CLAUDE.md")).unwrap();
+    assert!(md.contains("base `origin/release`"), "{md}");
+    fs::remove_dir_all(&home).ok();
+}

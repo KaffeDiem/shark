@@ -49,6 +49,13 @@ pub enum SyncEvent {
     PrsCreated,
 }
 
+pub struct Branch {
+    pub repo: String,
+    pub name: String,
+    pub base: String,
+    pub url: Option<String>,
+}
+
 pub struct GitSync {
     ws: Workspace,
     /// Every open chat of the workspace; git writes wait for all of them.
@@ -253,14 +260,18 @@ impl GitSync {
         }
     }
 
-    /// A repo joined the workspace: track it too (known repos keep their state) and re-probe.
+    /// A repo joined the workspace or a base changed: track it too (known repos keep their
+    /// state) and re-probe.
     pub fn set_workspace(&mut self, ws: Workspace, cx: &mut Context<Self>) {
         let mut old = std::mem::take(&mut self.repos);
         self.repos = ws
             .repos
             .iter()
             .map(|r| match old.iter().position(|o| o.name == r.name) {
-                Some(i) => old.swap_remove(i),
+                Some(i) => Repo {
+                    base: r.base.clone(),
+                    ..old.swap_remove(i)
+                },
                 None => Repo::fresh(r),
             })
             .collect();
@@ -407,6 +418,14 @@ impl GitSync {
         cx.notify();
     }
 
+    /// Why a step can't start now: one is running, or (`idle`) the agent is.
+    pub fn blocked(&self, idle: bool, cx: &App) -> Option<String> {
+        if let Some(r) = &self.running {
+            return Some(format!("Still running: {r}"));
+        }
+        (idle && self.busy(cx)).then(|| "Agent is running; wait for it or stop it (ctrl-c)".into())
+    }
+
     fn busy(&self, cx: &App) -> bool {
         self.chats.iter().any(|c| c.read(cx).working())
     }
@@ -420,11 +439,19 @@ impl GitSync {
         }
     }
 
-    /// `(repo, branch on GitHub)` per repo; the URL is `None` until it is pushed to GitHub.
-    pub fn branch_urls(&self) -> Vec<(String, Option<String>)> {
+    /// Per repo: its checked-out branch, its base, and the workspace branch on GitHub (`None`
+    /// until it is pushed there).
+    pub fn branches(&self) -> Vec<Branch> {
         self.repos
             .iter()
-            .map(|r| (r.name.clone(), r.branch_url(&self.ws.branch)))
+            .map(|r| Branch {
+                repo: r.name.clone(),
+                name: (r.local.as_ref().ok())
+                    .and_then(|l| l.branch.clone())
+                    .unwrap_or_else(|| self.ws.branch.clone()),
+                base: r.base.clone(),
+                url: r.branch_url(&self.ws.branch),
+            })
             .collect()
     }
 
@@ -461,10 +488,11 @@ impl GitSync {
         });
     }
 
-    pub fn pr_urls(&self) -> Vec<String> {
+    /// `(repo, PR URL)` per repo with a PR.
+    pub fn pr_urls(&self) -> Vec<(String, String)> {
         self.repos
             .iter()
-            .filter_map(|r| Some(r.pr()?.url.clone()))
+            .filter_map(|r| Some((r.name.clone(), r.pr()?.url.clone())))
             .collect()
     }
 
@@ -473,7 +501,7 @@ impl GitSync {
         if urls.is_empty() {
             return notify_err(window, cx, "No PRs yet: create them from the git menu");
         }
-        urls.iter().for_each(|u| cx.open_url(u));
+        urls.iter().for_each(|(_, u)| cx.open_url(u));
     }
 
     /// The button: run whatever the workspace needs next.
@@ -510,15 +538,8 @@ impl GitSync {
     /// `check`: the step came from the button, so re-probe first and refuse if the state moved
     /// on in the meantime (the snapshot can be seconds old, and the agent may have acted).
     fn run(&mut self, a: Action, check: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(r) = &self.running {
-            return notify_err(window, cx, format!("Still running: {r}"));
-        }
-        if a.kind.needs_idle() && self.busy(cx) {
-            return notify_err(
-                window,
-                cx,
-                "Agent is running; wait for it or stop it (ctrl-c)",
-            );
+        if let Some(e) = self.blocked(a.kind.needs_idle(), cx) {
+            return notify_err(window, cx, e);
         }
         match &a.kind {
             Kind::None if a.attention => {
@@ -834,6 +855,21 @@ impl GitSync {
             lines.push(format!("GitHub: {e} (showing last good state)"));
         }
         lines.join("\n")
+    }
+
+    /// Asks the agent to move the branch onto a new base; `moves` is `(repo, old, new)`.
+    pub fn rebase_onto(
+        &mut self,
+        moves: &[(String, String, String)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let repos = (moves.iter())
+            .map(|(r, old, new)| format!("{r}: `{old}` → `{new}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let prompt = crate::prompts::render("rebase_base", &repos, &self.ws.branch);
+        self.run_kind(Kind::Agent(prompt), "Rebase onto new base", window, cx)
     }
 
     /// Asks the agent to bring every repo up to date with its base.
