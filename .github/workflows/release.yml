@@ -61,7 +61,17 @@ jobs:
 
       - name: Publish release
         if: env.RELEASE == 'true'
+        env:
+          RELEASE_DEPLOY_KEY: ${{ secrets.RELEASE_DEPLOY_KEY }}
         run: |
+          # The repository deploy key can bypass PR review, but not force-push or deletion rules.
+          : "${RELEASE_DEPLOY_KEY:?Missing release deploy key}"
+          key_dir=$(mktemp -d)
+          trap 'rm -rf "$key_dir"' EXIT
+          printf '%s\n' "$RELEASE_DEPLOY_KEY" > "$key_dir/key"
+          chmod 600 "$key_dir/key"
+          gh api meta --jq '.ssh_keys[] | "github.com " + .' > "$key_dir/known_hosts"
+          export GIT_SSH_COMMAND="ssh -F /dev/null -i '$key_dir/key' -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile='$key_dir/known_hosts'"
           sha=$(shasum -a 256 "target/release/Shark-$VERSION.dmg" | cut -d' ' -f1)
           sed -i '' -e "s/^  version \".*\"/  version \"$VERSION\"/" -e "s/^  sha256 \".*\"/  sha256 \"$sha\"/" Casks/shark.rb
           sed -i '' -E "s#(releases/download/v)[^/]+/Shark-[^)]+\.dmg#\1$VERSION/Shark-$VERSION.dmg#; s/Download Shark [0-9.]+/Download Shark $VERSION/" README.md
@@ -74,7 +84,7 @@ jobs:
           gh release create "v$VERSION" "target/release/Shark-$VERSION.dmg" --title "Shark $VERSION" --generate-notes --verify-tag
           # Then carry the version commit onto master; retry if more merges land meanwhile.
           for _ in 1 2 3 4 5; do
-            git pull --rebase origin master && git push origin HEAD:master && exit 0
+            git pull --rebase origin master && git push "git@github.com:$GITHUB_REPOSITORY.git" HEAD:master && exit 0
             sleep 5
           done
           exit 1
