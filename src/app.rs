@@ -661,7 +661,13 @@ impl Shark {
                         d.child(tab(name, IconName::FileCode, Tab::File))
                     })
                     .child(div().flex_1())
-                    .child(self.render_branch(cx))
+                    // Narrow, the branch gives way before the sync buttons.
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(self.render_branch(cx)),
+                    )
                     .when_some(self.active_sync().cloned(), |d, sync| {
                         d.child(div().pl_3().child(sync))
                     }),

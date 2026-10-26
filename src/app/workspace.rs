@@ -687,6 +687,7 @@ impl Shark {
                 }
                 self.syncs.remove(name);
                 self.attn.forget(name);
+                self.review.forget(name);
                 self.state.workspaces.retain(|w| w.name != name);
                 for s in &mut self.state.sections {
                     s.workspaces.retain(|w| w != name);

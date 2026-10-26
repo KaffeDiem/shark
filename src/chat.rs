@@ -127,9 +127,27 @@ fn hide_reports(reply: &str) -> String {
         .collect()
 }
 
-/// A reply that is only report lines: nothing to show.
+/// A reply that is only report lines: nothing to show. Stops at the first other line, so
+/// it is cheap per frame.
 fn hidden_reply(src: &str) -> bool {
-    src.contains("[c") && hide_reports(src).trim().is_empty()
+    let mut any = false;
+    for (l, r) in report_lines(src) {
+        match r {
+            Some(_) => any = true,
+            None if l.trim().is_empty() => {}
+            None => return false,
+        }
+    }
+    any
+}
+
+/// Some line of `text` starts like a report (`[c<digit>`), unlike `#[cfg(...)]`.
+fn may_report(text: &str) -> bool {
+    text.lines().any(|l| {
+        let l = l.trim_start().trim_start_matches(['-', '*', '`', ' ']);
+        l.strip_prefix("[c")
+            .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
+    })
 }
 
 /// A review's prompt (review.rs `prompt`) back as its card, for a replayed transcript: each
@@ -1693,6 +1711,7 @@ impl Chat {
             this.blocks.push(Block::Info("new conversation".into()));
         });
         if was_working {
+            self.keep_reply();
             cx.emit(ChatEvent::TurnDone);
         }
     }
@@ -1866,10 +1885,12 @@ impl Chat {
             Ev::TextDelta(s) => match self.live_text() {
                 Some(bi) => {
                     if let Block::Text { md, src, .. } = &mut self.blocks[bi] {
+                        // Reports come last; a delta on a line that may start one rebuilds
+                        // the text without them. Only its lines are checked, so a long reply
+                        // stays linear.
+                        let from = src.rfind('\n').map_or(0, |i| i + 1);
                         src.push_str(&s);
-                        // Reports come last; once one may be starting, the text is rebuilt
-                        // without them on each delta.
-                        match src.contains("[c") {
+                        match may_report(&src[from..]) {
                             true => md.update(cx, |m, cx| m.set_text(&hide_reports(src), cx)),
                             false => md.update(cx, |m, cx| m.push_str(&s, cx)),
                         }
@@ -2019,6 +2040,7 @@ impl Chat {
                 if self.busy {
                     self.busy = false;
                     self.blocks.push(Block::Info(msg));
+                    self.keep_reply();
                     cx.emit(ChatEvent::TurnDone);
                 } else {
                     let first = msg.lines().next().unwrap_or_default();
@@ -3069,7 +3091,11 @@ mod tests {
         assert_eq!(parse_reports(fenced), [(2, "real".to_string())]);
         assert_eq!(hide_reports(fenced), "See:\n```\n[c1] addressed: example\n```\n");
         assert!(hidden_reply("[c1] addressed: x\n"));
+        assert!(hidden_reply("\n- [c1] addressed: x\n[c2] addressed: y"));
         assert!(!hidden_reply("Done.\n[c1] addressed: x"));
+        assert!(!hidden_reply("") && !hidden_reply("#[cfg(test)]"));
+        assert!(may_report("x\n - `[c12] addr") && may_report("[c3"));
+        assert!(!may_report("#[cfg(test)]\n[cx] y\n[c"));
     }
 
     #[test]
@@ -3828,6 +3854,8 @@ exec cat >/dev/null
         let chat = open_chat("exit", cx);
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
+                // A turn ended by a crash or a new conversation has no reply of the last one.
+                c.last_reply = "old".into();
                 c.busy = true;
                 let input = serde_json::json!({"command": "sleep 99"});
                 c.apply(
@@ -3839,6 +3867,7 @@ exec cat >/dev/null
                     cx,
                 );
                 c.apply(Ev::Exited("claude exited (signal: 15)".into()), cx);
+                assert_eq!(c.last_reply, "");
                 let Block::Tools { calls, .. } = &c.blocks[0] else {
                     panic!()
                 };
@@ -3864,7 +3893,9 @@ exec cat >/dev/null
                 assert_eq!(c.meta.session_id, None);
 
                 c.meta.session_id = Some("s2".into());
+                (c.busy, c.last_reply) = (true, "old".into());
                 c.new_conversation(cx);
+                assert_eq!(c.last_reply, "");
                 assert_eq!(c.meta.session_id, None);
                 assert!(!c.working());
             })

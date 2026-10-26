@@ -436,6 +436,8 @@ fn lines_now(dir: &Path, c: &Comment) -> Option<String> {
     }
     let src = match c.end.0 {
         false => std::fs::read_to_string(dir.join(&c.path)).unwrap_or_default(),
+        // No base known (merge-base failed): `git show :path` would read the index.
+        true if c.rev.is_empty() => return None,
         true => {
             let (repo, rel) = c.path.split_once('/')?;
             let o = std::process::Command::new("git")
@@ -496,7 +498,7 @@ enum Store {
     List(Vec<Comment>),
 }
 
-fn comments_path(ws: &str) -> PathBuf {
+pub(super) fn comments_path(ws: &str) -> PathBuf {
     support_dir().join("comments").join(format!("{ws}.json"))
 }
 
@@ -585,6 +587,13 @@ impl Review {
         let last = self.last_id.entry(ws.to_string()).or_default();
         *last += 1;
         *last
+    }
+
+    /// A removed workspace's comments, so a later one of the same name starts with none.
+    pub(super) fn forget(&mut self, ws: &str) {
+        self.comments.remove(ws);
+        self.last_id.remove(ws);
+        let _ = std::fs::remove_file(comments_path(ws));
     }
 
     /// Edits workspace `ws`'s comments and saves them.
@@ -923,6 +932,8 @@ impl Shark {
             true => (c.path.split_once('/'))
                 .and_then(|(repo, _)| {
                     let base = &ws.repos.iter().find(|r| r.name == repo)?.base;
+                    // ponytail: merge-base (and lines_now's git show) block the UI thread as
+                    // the composer opens; move them to the background executor if big repos lag.
                     crate::git::git(&ws.dir().join(repo), &["merge-base", base, "HEAD"]).ok()
                 })
                 .unwrap_or_default(),
@@ -1059,11 +1070,16 @@ impl Shark {
         self.edit_comments(cx, |list| {
             let old = list.iter().position(|c| c.id == id).map(|i| list.remove(i));
             if !text.is_empty() {
+                let mut old = old.unwrap_or(comp.draft);
+                // New words the agent hasn't seen: pending again, to send.
+                if old.text != text || old.suggestion != suggestion {
+                    (old.status, old.chat) = (Status::Pending, None);
+                }
                 list.push(Comment {
                     id,
                     text,
                     suggestion,
-                    ..old.unwrap_or(comp.draft)
+                    ..old
                 });
                 // File order, then line, so the prompt reads top to bottom.
                 list.sort_by_key(|c| (order.get(&c.path).copied(), c.start.1));
@@ -1092,16 +1108,33 @@ impl Shark {
             .map(|c| c.id)
     }
 
+    /// The thread at the cursor, unless it waits in a chat's queued review card (that card
+    /// would send it as it was, or not at all).
+    fn unqueued_thread_at(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<u64> {
+        let c = self.thread_at(cx).and_then(|id| self.comment(id))?;
+        if c.status == Status::Queued {
+            notify_err(
+                window,
+                cx,
+                "Queued in a chat · remove the review from its queue first",
+            );
+            return None;
+        }
+        Some(c.id)
+    }
+
     /// `e`: edit the thread at the cursor.
     pub(super) fn edit_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(c) = self.thread_at(cx).and_then(|id| self.comment(id).cloned()) {
+        if let Some(c) =
+            (self.unqueued_thread_at(window, cx)).and_then(|id| self.comment(id).cloned())
+        {
             self.open_composer(c, window, cx);
         }
     }
 
     /// `x`: delete the thread at the cursor.
-    pub(super) fn delete_thread(&mut self, cx: &mut Context<Self>) {
-        if let Some(id) = self.thread_at(cx) {
+    pub(super) fn delete_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.unqueued_thread_at(window, cx) {
             self.edit_comments(cx, |l| l.retain(|c| c.id != id));
         }
     }
@@ -1431,7 +1464,7 @@ impl Shark {
                 theme.warning_foreground,
                 "e edit · x delete",
             ),
-            Status::Queued => ("Queued".into(), theme.primary, "r resolve · e edit"),
+            Status::Queued => ("Queued".into(), theme.primary, "r resolve"),
             Status::Sent { .. } => ("Sent".into(), theme.primary, "r resolve · e edit"),
             Status::Addressed { turn, .. } => (
                 format!("Addressed · turn {turn}"),
@@ -1584,8 +1617,10 @@ impl Shark {
                 )
             })
             .when(c.status != Status::Pending, |d| {
+                // A narrow column wraps the buttons rather than clipping them.
                 d.child(
                     h_flex()
+                        .flex_wrap()
                         .gap_2()
                         .justify_end()
                         .when(in_context, |d| {
@@ -1747,18 +1782,18 @@ impl Shark {
                 )
             }
         };
-        // Narrow, the summary and the keys truncate; the actions stay whole.
+        // Narrow, the lead, the summary and the keys truncate; the actions stay whole.
         let text = |t: String| div().min_w_0().truncate().child(t);
         let button = |id: &'static str, label: String| Button::new(id).small().label(label);
         bar.child(
             h_flex()
-                .flex_none()
+                .min_w_0()
                 .gap_1p5()
                 .text_sm()
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme.foreground)
-                .child(div().size(px(6.)).rounded_full().bg(color))
-                .child(lead),
+                .child(div().flex_none().size(px(6.)).rounded_full().bg(color))
+                .child(div().min_w_0().truncate().child(lead)),
         )
         .child(text(summary))
         .child(text("[c / ]c jump · j / k change · v viewed".into()).text_color(faint(theme)))
@@ -1906,6 +1941,25 @@ mod tests {
         assert!(p.contains("[c<id>] addressed: "));
         assert!(!prompt(&[], "  ").contains("Overall"));
         assert_eq!(fenced("a ``` b", "x"), "````x\na ``` b\n````");
+    }
+
+    /// An old-side comment without a base reads nothing, not the index (`git show :path`).
+    #[test]
+    fn old_lines_without_a_base() {
+        let dir = std::env::temp_dir().join(format!("shark-rev-{}", std::process::id()));
+        let repo = dir.join("api");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::git::git(&repo, &["init", "-q"]).unwrap();
+        std::fs::write(repo.join("f"), "staged\n").unwrap();
+        crate::git::git(&repo, &["add", "f"]).unwrap();
+        let c = Comment {
+            path: "api/f".into(),
+            start: (true, 1),
+            end: (true, 1),
+            ..Default::default()
+        };
+        assert_eq!(lines_now(&dir, &c), None);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

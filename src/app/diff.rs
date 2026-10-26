@@ -113,8 +113,10 @@ impl Shark {
             && !data.files.iter().any(|f| *f.path() == e.path)
         {
             match e.dirty {
+                // git's last view of it, so `orig` stays git's and not the buffer.
                 true => {
-                    data.files.push(e.file.clone());
+                    data.files.push(e.orig.0.clone());
+                    data.hunks.insert(e.path.clone(), e.orig.1.clone());
                     data.fps.push(0);
                 }
                 false => self.end_edit(cx),
@@ -589,7 +591,7 @@ impl Shark {
             }))
             .on_action(cx.listener(|this, _: &SendComments, w, cx| this.open_sheet(w, cx)))
             .on_action(cx.listener(|this, _: &EditThread, w, cx| this.edit_thread(w, cx)))
-            .on_action(cx.listener(|this, _: &DeleteThread, _, cx| this.delete_thread(cx)))
+            .on_action(cx.listener(|this, _: &DeleteThread, w, cx| this.delete_thread(w, cx)))
             .on_action(cx.listener(|this, _: &ViewChange, w, cx| this.view_change(w, cx)))
             .on_action(cx.listener(|this, _: &ResolveThread, _, cx| this.resolve_thread(cx)))
             .on_action(cx.listener(|this, _: &ReopenThread, _, cx| this.reopen_thread(cx)))

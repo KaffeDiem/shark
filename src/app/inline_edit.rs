@@ -44,13 +44,6 @@ impl Buffer {
         " ".repeat(n.unwrap_or(4))
     }
 
-    /// Enter at byte `col`: the rest of the line moves to a new line below, with the caret.
-    pub(super) fn split(&mut self, col: usize) {
-        let rest = self.lines[self.line].split_off(col);
-        self.line += 1;
-        self.lines.insert(self.line, rest);
-    }
-
     /// Backspace at column 0: joins the line to the one above. Returns the caret's column.
     pub(super) fn join_up(&mut self) -> Option<usize> {
         if self.line == 0 {
@@ -199,15 +192,17 @@ fn load(ws: &Workspace, file: &DiffFile) -> Result<(String, String, bool), Strin
             "{path} has CRLF line endings; open it with o to edit"
         ));
     }
-    let sha = (file.extended_headers().iter())
+    let headers = file.extended_headers();
+    let added = headers.iter().any(|h| h.starts_with("new file mode"));
+    let sha = (headers.iter())
         .find_map(|h| h.strip_prefix("index "))
         .and_then(|h| h.split_once(".."))
-        .map(|(old, _)| old.to_string())
-        .unwrap_or_default();
-    let added = sha.is_empty() || sha.bytes().all(|b| b == b'0');
-    let base = match added {
-        true => String::new(),
-        false => {
+        .map(|(old, _)| old.to_string());
+    let base = match sha {
+        _ if added => String::new(),
+        // A mode-only change: git prints no index line when the content is the same.
+        None => text.clone(),
+        Some(sha) => {
             let repo = ws.dir().join(path.split('/').next().unwrap_or(""));
             // ponytail: one blocking `git cat-file` on entering edit mode; move it off the UI
             // thread if big repos make it lag.
@@ -449,15 +444,14 @@ impl Shark {
         if ks.modifiers.number_of_modifiers() > 0 {
             return false;
         }
-        let (col, empty) = {
+        let (col, range) = {
             let i = e.input.read(cx);
-            (i.cursor(), i.selected_range().is_empty())
+            (i.cursor(), i.selected_range())
         };
+        let empty = range.is_empty();
         let col = match ks.key.as_str() {
-            "enter" => {
-                e.buf.split(col);
-                Some(0)
-            }
+            // The selection goes, the rest of the line moves to a new line below.
+            "enter" => Some(e.buf.insert(range, "\n")),
             "backspace" if col == 0 && empty => match e.buf.join_up() {
                 Some(col) => Some(col),
                 None => return true,
@@ -497,8 +491,6 @@ impl Shark {
     pub(super) fn leave_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.confirm_discard(false, true, window, cx, |s, window, cx| {
             s.end_edit(cx);
-            // git's view of the file, whatever was written while editing.
-            s.diff_fp = 0;
             s.refresh_diff(cx);
             s.focus_diff(window, cx);
             cx.notify();
@@ -509,6 +501,8 @@ impl Shark {
     /// buffer, and its header (the base's blob) is there to edit it again.
     pub(super) fn end_edit(&mut self, cx: &mut Context<Self>) {
         let Some(e) = self.editing.take() else { return };
+        // The next refresh shows git's view of the file, whatever was written while editing.
+        self.diff_fp = 0;
         let (file, hunks) = e.orig;
         self.review.hunks.insert(e.path.clone(), hunks);
         if let Some(f) = self.diff_files.iter_mut().find(|f| *f.path() == e.path) {
@@ -695,11 +689,15 @@ mod tests {
     fn buffer_splits_joins_and_pastes() {
         let mut b = Buffer::new("one\ntwo\n");
         assert_eq!(b.lines, ["one", "two"]);
-        b.split(1);
+        b.insert(1..1, "\n");
         assert_eq!(
             (b.lines.clone(), b.line),
             (vec!["o".into(), "ne".into(), "two".into()], 1)
         );
+        // Enter over a selection replaces it.
+        let mut s = Buffer::new("abcd\n");
+        assert_eq!(s.insert(1..3, "\n"), 0);
+        assert_eq!((s.text(), s.line), ("a\nd\n".into(), 1));
         assert_eq!(b.join_up(), Some(1));
         assert_eq!((b.text(), b.line), ("one\ntwo\n".into(), 0));
         assert_eq!(b.join_up(), None);
@@ -718,7 +716,7 @@ mod tests {
         let base = "a\nb\nc\n";
         let mut b = Buffer::new(base);
         b.line = 1;
-        b.split(1);
+        b.insert(1..1, "\n");
         let p = patch("api/f", base, &b.text(), false);
         assert!(p.starts_with("diff --git a/api/f b/api/f\n--- a/api/f\n+++ b/api/f\n"));
         let file = DiffFile::parse(&p).unwrap().remove(0);

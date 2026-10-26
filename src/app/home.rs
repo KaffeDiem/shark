@@ -230,6 +230,8 @@ impl Shark {
         match (self.home_shown(), self.home_rows(cx).is_empty()) {
             (true, true) => self.home.prompt.update(cx, |p, cx| p.focus(window, cx)),
             (true, false) => self.home.focus.focus(window, cx),
+            // A closed dialog gives the focus back to a line input that left with the edit.
+            _ if self.tab == Tab::Diff && self.active.is_some() => self.focus_diff(window, cx),
             (false, _) => self.sidebar_focus.focus(window, cx),
         }
     }

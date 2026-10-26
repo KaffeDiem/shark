@@ -924,7 +924,12 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
         shark.read(cx).state.workspaces.is_empty()
     })
     .await;
-    cx.update(|cx| assert!(shark.read(cx).archiving.is_empty()));
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert!(s.archiving.is_empty());
+        assert!(!s.review.comments.contains_key("st"), "its comments go too");
+    });
+    assert!(!review::comments_path("st").exists());
     assert!(!api.exists());
     fs::remove_dir_all(&home).ok();
 }
@@ -2575,6 +2580,11 @@ async fn review_queue(cx: &mut TestAppContext) {
     on(cx, &|s, w, cx| s.send_review(&[1], "", false, w, cx));
     assert_eq!(comments(cx)[0].2, Status::Queued);
     cx.update(|cx| assert_eq!(chat.read(cx).review_count(), unread + 1));
+    // Queued, e and x would orphan its card: neither runs.
+    on(cx, &|s, w, cx| s.jump_to_comment(1, w, cx));
+    press(cx, &["e", "x"]);
+    cx.update(|cx| assert!(shark.read(cx).review.composer.is_none()));
+    assert_eq!(comments(cx)[0].2, Status::Queued);
     cx.update_window(window, |_, w, cx| {
         chat.update(cx, |c, cx| c.remove_queued(0, w, cx))
     })
@@ -2597,6 +2607,18 @@ async fn review_queue(cx: &mut TestAppContext) {
         comments(cx)[0].2,
         Status::Addressed { turn: 3, .. }
     ));
+    // e with new text: pending again, out of the chat; unchanged text keeps the status.
+    on(cx, &|s, w, cx| s.jump_to_comment(1, w, cx));
+    press(cx, &["e"]);
+    typing(cx, "!");
+    press(cx, &["cmd-enter"]);
+    assert_eq!(comments(cx)[0].2, Status::Pending);
+    cx.update(|cx| assert_eq!(shark.read(cx).comment(1).unwrap().chat, None));
+    press(cx, &["e", "backspace", "cmd-enter"]);
+    assert_eq!(comments(cx)[0].1, "rename vars");
+    on(cx, &|s, _, cx| s.set_status(&[1], Status::Outdated, cx));
+    press(cx, &["e", "cmd-enter"]);
+    assert_eq!(comments(cx)[0].2, Status::Outdated);
     on(cx, &|s, _, cx| s.set_status(&[1], Status::Pending, cx));
     // An event about a comment that isn't waiting in that chat changes nothing.
     cx.update(|cx| {
@@ -3639,6 +3661,16 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     );
     press(cx, &["cmd-z"]);
     assert_eq!(line(cx).0, "    c();jkhlgG");
+    // Enter over a selection replaces it, then splits.
+    on(cx, &|s, _, cx| {
+        let input = s.editing.as_ref().unwrap().input.clone();
+        input.update(cx, |i, cx| i.set_selected_range(6..8, cx));
+    });
+    press(cx, &["enter"]);
+    cx.update(|cx| {
+        let e = shark.read(cx).editing.as_ref().unwrap();
+        assert_eq!(e.buf.lines[1..3], ["    c(", "jkhlgG"]);
+    });
 
     // The composer, opened while editing.
     on(cx, &|s, w, cx| {
@@ -3669,6 +3701,31 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     press(cx, &["escape"]);
     cx.update(|cx| assert!(shark.read(cx).editing.is_none()));
 
+    // Unsaved edits, Esc in the line, Discard: the diff has the focus again, for j/k.
+    on(cx, &|s, w, cx| {
+        s.edit_working_copy(Some("api/f.txt".into()), w, cx)
+    });
+    draw(cx);
+    cx.update_window(window, |_, w, cx| w.input("z", cx))
+        .unwrap();
+    press(cx, &["escape"]);
+    draw(cx);
+    press(cx, &["enter"]);
+    draw(cx);
+    cx.background_executor
+        .timer(Duration::from_millis(500))
+        .await;
+    draw(cx);
+    cx.update_window(window, |_, w, cx| {
+        let s = shark.read(cx);
+        assert!(s.editing.is_none(), "discarded");
+        assert!(
+            s.diff.read(cx).focus_handle(cx).is_focused(w),
+            "the diff has the focus"
+        );
+    })
+    .unwrap();
+
     // A save under way: leaving waits for it.
     on(cx, &|s, w, cx| {
         s.edit_working_copy(Some("api/f.txt".into()), w, cx)
@@ -3695,6 +3752,7 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     draw(cx);
     cx.update_window(window, |_, w, cx| w.input("!", cx))
         .unwrap();
+    press(cx, &["enter"]);
     git::git(&dir, &["checkout", "--", "f.txt"]).unwrap();
     on(cx, &|s, _, cx| s.refresh_diff(cx));
     for _ in 0..50 {
@@ -3705,14 +3763,23 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     }
     cx.update(|cx| {
         let s = shark.read(cx);
-        assert!(s.editing.as_ref().is_some_and(|e| e.dirty));
+        let e = s.editing.as_ref().unwrap();
+        assert!(e.dirty);
         assert!(s.diff_files.iter().any(|f| f.path() == "api/f.txt"));
+        // git's original stays, not the buffer (two added lines).
+        assert_eq!((e.file.additions(), e.orig.0.additions()), (2, 1));
     });
 
     // An emptied file: its one empty line is there to edit.
     on(cx, &|s, _, cx| {
         s.editing.as_mut().unwrap().dirty = false;
         s.end_edit(cx)
+    });
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        let f = s.diff_files.iter().find(|f| f.path() == "api/f.txt");
+        assert_eq!(f.map(|f| f.additions()), Some(1));
+        assert_eq!(s.diff_fp, 0, "the next refresh rebuilds");
     });
     fs::write(dir.join("h.txt"), "").unwrap();
     on(cx, &|s, _, cx| s.refresh_diff(cx));
@@ -3732,6 +3799,26 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
                 .flatten()
                 .any(|r| r.0 == b'+' && r.2 == 1)
         );
+    });
+
+    // A mode-only change: the base is the same text, not an empty added file.
+    on(cx, &|s, _, cx| s.end_edit(cx));
+    git::git(&dir, &["checkout", "--", "h.txt"]).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir.join("h.txt"), fs::Permissions::from_mode(0o755)).unwrap();
+    on(cx, &|s, _, cx| s.refresh_diff(cx));
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        let s = shark.read(cx);
+        (s.diff_files.iter()).any(|f| f.path() == "api/h.txt" && f.additions() == 0)
+    })
+    .await;
+    on(cx, &|s, w, cx| {
+        s.edit_working_copy(Some("api/h.txt".into()), w, cx)
+    });
+    cx.update(|cx| {
+        let e = shark.read(cx).editing.as_ref().unwrap();
+        assert_eq!(e.path.as_str(), "api/h.txt");
+        assert_eq!((e.file.additions(), e.file.deletions()), (0, 0));
     });
     fs::remove_dir_all(&home).ok();
 }
