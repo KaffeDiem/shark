@@ -122,7 +122,7 @@ impl Chat {
             Kind::File | Kind::Dir if self.ws.repos.len() > 1 && !item.detail.is_empty() => {
                 format!("{} · {}", item.label, item.badge)
             }
-            Kind::Pr if self.ws.repos.len() > 1 => format!("{}{}", item.badge, item.label),
+            Kind::Pr(_) if self.ws.repos.len() > 1 => format!("{}{}", item.badge, item.label),
             _ => item.label.clone(),
         };
         self.composer
@@ -159,10 +159,13 @@ impl Chat {
             .filter_map(|ix| {
                 let it = self.menu_item(ix)?;
                 let icon = match it.kind {
-                    Kind::File => IconName::File,
-                    Kind::Dir => IconName::Folder,
-                    Kind::Command => IconName::Slash,
-                    Kind::Pr => IconName::GitPullRequestArrow,
+                    Kind::Pr(status) => status.icon(theme),
+                    kind => Icon::new(match kind {
+                        Kind::Dir => IconName::Folder,
+                        Kind::Command => IconName::Slash,
+                        _ => IconName::File,
+                    })
+                    .text_color(theme.muted_foreground),
                 };
                 let file_icon = match it.kind {
                     Kind::File => crate::file_icon::file_icon(&it.label, theme.is_dark()),
@@ -203,6 +206,18 @@ impl Chat {
                 Some(
                     h_flex()
                         .id(ix)
+                        .when_some(
+                            match it.kind {
+                                Kind::Pr(status) => Some(format!(
+                                    "{} {} · {} pull request",
+                                    it.label,
+                                    it.detail,
+                                    status.label()
+                                )),
+                                _ => None,
+                            },
+                            |d, label| d.aria_label(label),
+                        )
                         .h(crate::menu::ROW_H)
                         .px_2()
                         .gap_2()
@@ -233,10 +248,7 @@ impl Chat {
                                 .mx(px(-1.))
                                 .flex_none()
                                 .into_any_element(),
-                            None => Icon::new(icon)
-                                .with_size(px(14.))
-                                .text_color(theme.muted_foreground)
-                                .into_any_element(),
+                            None => icon.with_size(px(14.)).into_any_element(),
                         })
                         .child(
                             div()

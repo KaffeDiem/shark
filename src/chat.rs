@@ -366,7 +366,7 @@ pub struct Chat {
     menu_scroll: ScrollHandle,
     indexing: Option<Task<()>>,
     probing: Option<Task<()>>,
-    /// PRs of every repo, as last listed; cached on disk per workspace.
+    /// PRs of every repo, as last listed; cached on disk per source repository.
     prs: Vec<complete::Pr>,
     pr_items: Vec<Item>,
     fetching_prs: Option<Task<()>>,
@@ -640,7 +640,11 @@ impl Chat {
             }
         });
         let ws_name = ws.name.clone();
-        let prs = complete::cached_prs(&ws_name);
+        let prs = ws
+            .repos
+            .iter()
+            .flat_map(|r| complete::cached_repo_prs(&r.name, &r.src, false))
+            .collect::<Vec<_>>();
         let plan = cx.new(|cx| PlanPane::new(&meta.id, cx));
         let plan_open = meta.plan;
         let mut chat = Chat {
@@ -1122,9 +1126,8 @@ impl Chat {
         if self.fetching_prs.is_some() || fresh || cfg!(test) {
             return;
         }
-        let dir = self.ws.dir();
         let repos: Vec<_> = (self.ws.repos.iter())
-            .map(|r| (r.name.clone(), dir.join(&r.name)))
+            .map(|r| (r.name.clone(), r.src.clone()))
             .collect();
         let n = repos.len();
         (self.prs_left, self.prs_errs) = (n, vec![]);
@@ -1132,7 +1135,7 @@ impl Chat {
         let bg = cx.background_executor().clone();
         bg.spawn(async move {
             crate::git::par_map(&repos, |(name, dir)| {
-                let _ = tx.send((name.clone(), complete::fetch_prs(name, dir)));
+                let _ = tx.send((name.clone(), complete::fetch_repo_prs(name, dir, false)));
             });
         })
         .detach();
@@ -1166,7 +1169,6 @@ impl Chat {
                 let repos = &c.ws.repos;
                 c.prs.retain(|p| repos.iter().any(|r| r.name == p.repo));
                 c.pr_items = complete::pr_items(&c.prs);
-                complete::save_prs(&c.ws.name, &c.prs);
                 c.update_menu(cx);
             })
             .ok();

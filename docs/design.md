@@ -161,6 +161,7 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 | Git step to run | Its own icon (`GitCommitHorizontal`, `ArrowUp`/`ArrowDown`, `GitPullRequestCreate`, `GitMerge`, …) in a `primary` button |
 | Git needs attention (conflicts, failing checks, detached HEAD, git error) | `TriangleAlert` in `warning_foreground`, `outline` button |
 | Git waiting (GitHub catching up, checks running, review) / reading / step running | `GitPullRequest` / static `RefreshCw`, `ghost` button |
+| PR picker: open / draft / merged / closed | `GitPullRequest` in `success_foreground` / `GitPullRequestDraft` muted / `GitMerge` muted / `GitPullRequestClosed` in `danger_foreground`; terminal state outranks draft, and state remains in text and accessibility labels |
 
   Only the agent-running state uses a spinner or `primary`. Other pending states (checks running, syncing) use a static icon.
 - **Badges** are a status icon (14px in rows, 12px in the header), optionally followed by a `text_xs` label. Don't use `Tag` or `Badge` fills in chrome.

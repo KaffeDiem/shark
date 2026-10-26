@@ -73,6 +73,14 @@ pub fn create_linked_prs(
     skip: &[String],
     new: &NewPr,
 ) -> Result<Vec<(String, String)>, String> {
+    for r in &ws.repos {
+        if crate::git::review_pr_url(&dir.join(&r.name), ws.branch_of(r)).is_some() {
+            return Err(format!(
+                "{} is a local PR review checkout; create a regular workspace to publish changes",
+                r.name
+            ));
+        }
+    }
     let dirty: Vec<&str> = ws
         .repos
         .iter()
@@ -448,6 +456,29 @@ esac
         let err = create_linked_prs(&ws, &dir, &[], &NewPr::new("", false)).unwrap_err();
         assert!(err.contains("docs"), "{err}");
         fs::remove_file(dir.join("docs/stray.txt")).unwrap();
+
+        git(
+            &dir.join("web"),
+            &[
+                "config",
+                "branch.feat.shark-pr-url",
+                "https://github.com/o/web/pull/7",
+            ],
+        )
+        .unwrap();
+        let err = create_linked_prs(&ws, &dir, &[], &NewPr::new("", false)).unwrap_err();
+        assert!(err.contains("local PR review checkout"), "{err}");
+        assert!(!log.exists(), "refuse before any PR is created or linked");
+        assert!(
+            git(&root.join("api.git"), &["branch", "--list", "kd/api"])
+                .unwrap()
+                .is_empty()
+        );
+        git(
+            &dir.join("web"),
+            &["config", "--unset", "branch.feat.shark-pr-url"],
+        )
+        .unwrap();
 
         let prs = create_linked_prs(&ws, &dir, &["ops".into()], &NewPr::new("", false)).unwrap();
         assert_eq!(

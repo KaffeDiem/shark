@@ -909,6 +909,7 @@ impl GitSync {
         };
         let rows = |f: &dyn Fn(&Repo) -> Option<String>| -> Vec<(String, String, String)> {
             (self.repos.iter())
+                .filter(|r| !r.local.as_ref().is_ok_and(|l| l.review))
                 .filter_map(|r| Some((r.name.clone(), f(r)?, r.name.clone())))
                 .collect()
         };
@@ -1054,6 +1055,15 @@ fn execute(
     let dir = ws.dir();
     let wanted = |r: &Repo| a.repos.is_empty() || a.repos.contains(&r.name);
     let mut targets: Vec<&Repo> = repos.iter().filter(|r| wanted(r)).collect();
+    if let Some(r) = targets
+        .iter()
+        .find(|r| r.local.as_ref().is_ok_and(|l| l.review))
+    {
+        return Err(format!(
+            "{}: this is a local PR review checkout; use the original PR on GitHub to manage it",
+            r.name
+        ));
+    }
     if a.kind == Kind::Merge {
         // A repo missing from the order goes last, not first (`None` sorts before `Some`).
         targets.sort_by_key(|r| {
@@ -1393,6 +1403,44 @@ mod tests {
         Action, Job, Kind, Local, Pr, background_answer, fresh_or_last, needs_you, repos_from,
         run_job, status,
     };
+
+    #[test]
+    fn review_checkout_refuses_git_lifecycle_actions() {
+        let repo = super::Repo {
+            name: "api".into(),
+            base: "origin/main".into(),
+            branch: "pr/7".into(),
+            local: Ok(Local {
+                review: true,
+                ..Default::default()
+            }),
+            pr: Some(Ok(Some(super::open_pr("api", 7)))),
+        };
+        for kind in [
+            Kind::Push,
+            Kind::Pull,
+            Kind::Merge,
+            Kind::CreatePr,
+            Kind::Ready,
+            Kind::Agent("commit and push".into()),
+        ] {
+            let action = Action {
+                kind,
+                label: String::new(),
+                repos: vec![],
+                attention: false,
+                reviews: vec![],
+            };
+            let result = super::execute(
+                &action,
+                &Default::default(),
+                std::slice::from_ref(&repo),
+                &[],
+                &crate::pr::NewPr::new("", false),
+            );
+            assert!(matches!(result, Err(e) if e.contains("local PR review checkout")));
+        }
+    }
 
     #[test]
     fn merge_confirm_counts_only_chosen_repos() {
