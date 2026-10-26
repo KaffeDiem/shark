@@ -4266,6 +4266,7 @@ exec cat >/dev/null
             name: n.into(),
             src: root.join(n),
             base: "origin/main".into(),
+            branch: None,
         };
         let ws = Workspace {
             name: format!("at-test-{}", std::process::id()),

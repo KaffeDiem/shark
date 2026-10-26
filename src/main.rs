@@ -79,6 +79,7 @@ actions!(
         ToggleRepo,
         SwitchField,
         SubmitForm,
+        PickBranch,
         NextAttention,
         OpenSettings,
         EditQueued,
@@ -264,11 +265,13 @@ fn bind_keys(cx: &mut App) {
         // Inline section name in the sidebar: the Input lets escape through.
         KeyBinding::new("escape", CancelEdit, Some("SectionName")),
         // New workspace dialog: tab hops between branch and repo filter, space ticks the
-        // highlighted repo (names have no spaces), cmd-enter creates from either field.
+        // highlighted repo (names have no spaces), cmd-b lists its branches, cmd-enter creates
+        // from either field.
         KeyBinding::new("tab", SwitchField, Some("NewWorkspace")),
         KeyBinding::new("shift-tab", SwitchField, Some("NewWorkspace")),
         KeyBinding::new("space", ToggleRepo, Some("NewWorkspace > Command")),
         KeyBinding::new("cmd-enter", SubmitForm, Some("NewWorkspace")),
+        KeyBinding::new("cmd-b", PickBranch, Some("NewWorkspace")),
         KeyBinding::new("cmd-,", OpenSettings, None),
         KeyBinding::new("ctrl-tab", SwitchField, Some("Settings")),
         KeyBinding::new("ctrl-shift-tab", SwitchField, Some("Settings")),

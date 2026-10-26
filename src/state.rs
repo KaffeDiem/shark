@@ -174,6 +174,9 @@ pub struct WsRepo {
     pub src: PathBuf,
     /// Ref the branch was cut from, e.g. `origin/main`.
     pub base: String,
+    /// Its own branch; set only when it differs from the workspace branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 /// Moves item `from` into slot `to`; the ones between shift over.
@@ -207,6 +210,11 @@ pub fn workspaces_dir() -> PathBuf {
 impl Workspace {
     pub fn dir(&self) -> PathBuf {
         workspaces_dir().join(&self.name)
+    }
+
+    /// The branch `r`'s worktree is on: its own, or the workspace's.
+    pub fn branch_of<'a>(&'a self, r: &'a WsRepo) -> &'a str {
+        r.branch.as_deref().unwrap_or(&self.branch)
     }
 
     /// Gives a workspace saved before chat tabs (or a new one) its first chat.

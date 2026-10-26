@@ -134,6 +134,19 @@ pub fn render(id: &str, repos: &str, branch: &str) -> String {
         .replace("{branch}", branch)
 }
 
+/// `{branch}` for `(repo, branch)` pairs: the name they share, else each repo's, as in
+/// ``api: `a`, web: `b` ``.
+pub fn branches<'a>(repos: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
+    let repos: Vec<_> = repos.into_iter().collect();
+    match repos.first() {
+        Some((_, b)) if repos.iter().all(|(_, o)| o == b) => b.to_string(),
+        _ => (repos.iter())
+            .map(|(r, b)| format!("{r}: `{b}`"))
+            .collect::<Vec<_>>()
+            .join(", "),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     /// Overrides are covered by `settings_apply_and_save`, under the UI tests' lock;

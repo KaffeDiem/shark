@@ -97,8 +97,8 @@ impl EventEmitter<SyncEvent> for GitSync {}
 /// Everything a background probe needs, detached from the entity.
 #[derive(Clone)]
 struct Job {
-    branch: String,
-    repos: Vec<(PathBuf, String)>,
+    /// `(worktree, base, branch)` per repo.
+    repos: Vec<(PathBuf, String, String)>,
     fetch: bool,
     pr: bool,
     /// The last probe per repo, so unchanged refs skip the costly comparisons.
@@ -109,7 +109,6 @@ impl Job {
     /// Every repo of `ws`, asking GitHub, not fetching.
     fn prs(ws: &Workspace) -> Job {
         Job {
-            branch: ws.branch.clone(),
             repos: worktrees(ws),
             fetch: false,
             pr: true,
@@ -127,21 +126,21 @@ struct Probed {
 
 /// Repos run in parallel, so one hung remote costs one timeout, not one per repo.
 fn run_job(job: &Job) -> Probed {
-    let results = par_map(job.repos.iter().enumerate(), |(i, (wt, base))| {
+    let results = par_map(job.repos.iter().enumerate(), |(i, (wt, base, branch))| {
         // Errors (offline, no origin) show in the tooltip and menu, not a toast every 3 min.
         let fetch_err = job
             .fetch
             .then(|| cmd_bounded(wt, "git", &["fetch", "--prune", "--quiet", "origin"], 60).err())
             .flatten();
-        let local = probe(wt, &job.branch, base, job.prev.get(i));
+        let local = probe(wt, branch, base, job.prev.get(i));
         let head = local.as_ref().map(|l| l.head.as_str()).unwrap_or_default();
-        let pr = job.pr.then(|| fetch_pr(wt, &job.branch, head));
+        let pr = job.pr.then(|| fetch_pr(wt, branch, head));
         (local, pr, fetch_err)
     });
     let mut locals = vec![];
     let mut prs = vec![];
     let mut errs = vec![];
-    for ((local, pr, err), (wt, _)) in results.into_iter().zip(&job.repos) {
+    for ((local, pr, err), (wt, ..)) in results.into_iter().zip(&job.repos) {
         locals.push(local);
         prs.extend(pr);
         if let Some(e) = err {
@@ -197,7 +196,7 @@ fn background_answer(
     let label = match failed {
         Some(e) => Err(e),
         None => {
-            let a = next_action(&repos, &ws.branch, &crate::state::reviewed(&ws.name));
+            let a = next_action(&repos, &crate::state::reviewed(&ws.name));
             Ok(needs_you(&a).then_some(a.label))
         }
     };
@@ -216,7 +215,7 @@ fn due(at: Option<Instant>, every: Duration) -> bool {
 impl GitSync {
     pub fn new(ws: Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (kick, kicked) = unbounded();
-        let repos = ws.repos.iter().map(Repo::fresh).collect();
+        let repos = ws.repos.iter().map(|r| Repo::fresh(r, &ws)).collect();
         let _subs = vec![cx.observe_window_activation(window, |s, window, _| {
             if window.is_window_active() {
                 s.kick(due(s.fetched, FETCH_ON_FOCUS), true);
@@ -273,7 +272,7 @@ impl GitSync {
                     base: r.base.clone(),
                     ..old.swap_remove(i)
                 },
-                None => Repo::fresh(r),
+                None => Repo::fresh(r, &ws),
             })
             .collect();
         self.merge_order = pr::merge_order(&ws, &self.merge_order);
@@ -344,7 +343,6 @@ impl GitSync {
             || due(self.fetched, FETCH_EVERY)
             || (pr_head_moved(&self.repos) && due(self.fetched, FETCH_MOVED));
         let job = Job {
-            branch: self.ws.branch.clone(),
             repos: worktrees(&self.ws),
             // Fetching rewrites refs/remotes; don't fight a pull or push (the agent's or a step's)
             // for the lock.
@@ -383,7 +381,7 @@ impl GitSync {
                 cx.notify();
             }
         }
-        let action = next_action(&self.repos, &self.ws.branch, &self.reviewed);
+        let action = next_action(&self.repos, &self.reviewed);
         if self.action.as_ref() != Some(&action) {
             self.action = Some(action);
             cx.notify();
@@ -440,8 +438,8 @@ impl GitSync {
         }
     }
 
-    /// Per repo: its checked-out branch, its base, and the workspace branch on GitHub (`None`
-    /// until it is pushed there).
+    /// Per repo: its checked-out branch, its base, and its own branch on GitHub (`None` until
+    /// it is pushed there).
     pub fn branches(&self) -> Vec<Branch> {
         self.repos
             .iter()
@@ -449,9 +447,9 @@ impl GitSync {
                 repo: r.name.clone(),
                 name: (r.local.as_ref().ok())
                     .and_then(|l| l.branch.clone())
-                    .unwrap_or_else(|| self.ws.branch.clone()),
+                    .unwrap_or_else(|| r.branch.clone()),
                 base: r.base.clone(),
-                url: r.branch_url(&self.ws.branch),
+                url: r.branch_url(&r.branch),
             })
             .collect()
     }
@@ -668,7 +666,7 @@ impl GitSync {
                             .map(|(i, last)| fresh_or_last(prs.get(i), last)),
                     );
                     if check {
-                        let now = next_action(&repos, &ws.branch, &handled);
+                        let now = next_action(&repos, &handled);
                         if now.kind != a.kind || now.repos != a.repos {
                             return Err(format!(
                                 "State changed; the next step is now “{}”",
@@ -875,7 +873,9 @@ impl GitSync {
             .map(|r| format!("{}: `{}`", r.name, r.base))
             .collect::<Vec<_>>()
             .join(", ");
-        let prompt = crate::prompts::render("update_base", &bases, &self.ws.branch);
+        let branch =
+            crate::prompts::branches(self.repos.iter().map(|r| (&*r.name, &*r.branch)));
+        let prompt = crate::prompts::render("update_base", &bases, &branch);
         self.run_kind(Kind::Agent(prompt), "Update from base", window, cx)
     }
 
@@ -1033,7 +1033,6 @@ fn execute(
     order: &[String],
     new_pr: &pr::NewPr,
 ) -> Result<Outcome, String> {
-    let b = ws.branch.as_str();
     let dir = ws.dir();
     let wanted = |r: &Repo| a.repos.is_empty() || a.repos.contains(&r.name);
     let mut targets: Vec<&Repo> = repos.iter().filter(|r| wanted(r)).collect();
@@ -1067,7 +1066,7 @@ fn execute(
             false => Ok(Outcome::Done(done.join("\n"))),
         }
     };
-    let planned = |r: &Repo| status::step_args(&a.kind, b, r);
+    let planned = |r: &Repo| status::step_args(&a.kind, r);
     match &a.kind {
         Kind::Agent(p) => Ok(Outcome::Ask(p.clone())),
         Kind::Pull | Kind::Push | Kind::ForcePush => each(&|wt, r| {
@@ -1160,12 +1159,12 @@ fn execute(
     }
 }
 
-/// `(worktree, base)` per repo of `ws`.
-fn worktrees(ws: &Workspace) -> Vec<(PathBuf, String)> {
+/// `(worktree, base, branch)` per repo of `ws`.
+fn worktrees(ws: &Workspace) -> Vec<(PathBuf, String, String)> {
     let dir = ws.dir();
     ws.repos
         .iter()
-        .map(|r| (dir.join(&r.name), r.base.clone()))
+        .map(|r| (dir.join(&r.name), r.base.clone(), ws.branch_of(r).into()))
         .collect()
 }
 
@@ -1182,7 +1181,7 @@ fn repos_from(
         .map(|((r, local), pr)| Repo {
             local,
             pr,
-            ..Repo::fresh(r)
+            ..Repo::fresh(r, ws)
         })
         .collect()
 }
@@ -1397,6 +1396,7 @@ mod tests {
                 name: "api".into(),
                 src: "/x".into(),
                 base: "origin/main".into(),
+                branch: None,
             }],
             ..Default::default()
         };
