@@ -70,6 +70,7 @@ pub fn menus() -> Vec<Menu> {
                 MenuItem::action("New Workspace", NewWorkspace),
                 MenuItem::action("New Chat", NewChat),
                 MenuItem::action("Open File…", OpenAnyFile),
+                MenuItem::action("Edit Working Copy", EditWorkingCopy),
                 sep(),
                 MenuItem::action("Add Repo…", AddRepo),
                 MenuItem::action("Add Repo to Workspace…", AddRepoToWorkspace),

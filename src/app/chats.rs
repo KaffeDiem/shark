@@ -40,9 +40,11 @@ impl Shark {
             }
             cx.notify()
         }));
-        self._subs.push(
-            cx.subscribe(&chat, move |this, chat, ev: &ChatEvent, cx| match ev {
-                ChatEvent::Meta => this.save_meta(&chat, cx),
+        self._subs.push(cx.subscribe_in(
+            &chat,
+            window,
+            move |this, chat, ev: &ChatEvent, window, cx| match ev {
+                ChatEvent::Meta => this.save_meta(chat, cx),
                 ChatEvent::Picked => {
                     // The level the chat runs at, so an old chat with none doesn't clear it.
                     let m = &chat.read(cx).meta;
@@ -57,15 +59,25 @@ impl Shark {
                     if this.active.as_ref() == Some(&name) {
                         this.refresh_diff(cx);
                     }
-                    if this.active_chat() != Some(&chat) {
+                    if this.active_chat() != Some(chat) {
                         this.unread.insert(id.clone());
                     }
                     this.refresh_home(Some(&name), cx);
                     this.turn_done(&name, cx);
+                    this.review_turn_done(&name, chat, cx);
                     cx.notify();
                 }
-            }),
-        );
+                ChatEvent::ShowChanges => this.show(Tab::Diff, window, cx),
+                ChatEvent::ShowComment(id) => {
+                    this.show(Tab::Diff, window, cx);
+                    this.jump_to_comment(*id, window, cx);
+                }
+                ChatEvent::ReviewRemoved(ids) => this.review_delivered(&name, &id, ids, None, cx),
+                ChatEvent::ReviewSent { ids, turn } => {
+                    this.review_delivered(&name, &id, ids, Some(*turn), cx)
+                }
+            },
+        ));
         if let Some(sync) = self.syncs.get(&ws.name) {
             sync.update(cx, |g, cx| g.add_chat(chat.clone(), cx));
         }
@@ -199,6 +211,12 @@ impl Shark {
             crate::plan::delete(&m.id);
         }
         self.unread.remove(&meta.id);
+        // Its queue goes with it, and claude with what it hadn't read: those are pending again.
+        let unread =
+            (self.chats.get(&meta.id)).map_or(vec![], |c| c.read(cx).unread_review_ids(false));
+        self.review.edit(&name, |l| {
+            review::unqueue(l, Some(&meta.id), &unread);
+        });
         if let Some(chat) = self.chats.remove(&meta.id)
             && let Some(sync) = self.syncs.get(&name)
         {
@@ -480,6 +498,11 @@ impl Shark {
                     (true, Some(c)) => c.title(),
                     (true, None) if meta.title.is_empty() => "New chat".into(),
                     (true, None) => meta.title.clone().into(),
+                };
+                // Comments of a review the agent hasn't read yet.
+                let label = match chat.map_or(0, |c| c.review_count()) {
+                    0 => label,
+                    n => format!("{label} · {n}").into(),
                 };
                 let icon = match (
                     chat.is_some_and(|c| c.working()),

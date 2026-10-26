@@ -390,22 +390,42 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| s.comment_dialog(w, cx),
     ),
     Row(
-        "Send diff comments to agent",
+        "Send review…",
         IconName::Send,
         Some(&SendComments),
-        "review",
-        |s, w, cx| s.send_comments(w, cx),
+        "review diff comments agent",
+        |s, w, cx| {
+            s.show(Tab::Diff, w, cx);
+            s.open_sheet(w, cx)
+        },
+    ),
+    Row(
+        "Resolve addressed",
+        IconName::Check,
+        Some(&ResolveAddressed),
+        "review comments threads",
+        |s, _, cx| s.resolve_addressed(cx),
+    ),
+    Row(
+        "Re-queue outdated",
+        IconName::RotateCcw,
+        Some(&RequeueOutdated),
+        "review comments threads pending",
+        |s, _, cx| s.requeue_outdated(cx),
     ),
     Row(
         "Save file",
         IconName::Save,
         Some(&SaveFile),
         "",
-        |s, w, cx| {
-            if let Some(e) = s.editor.clone() {
-                e.update(cx, |e, cx| e.save(false, w, cx))
-            }
-        },
+        |s, w, cx| s.save(w, cx),
+    ),
+    Row(
+        "Edit working copy",
+        IconName::Pencil,
+        Some(&EditWorkingCopy),
+        "diff inline edit in place",
+        |s, w, cx| s.edit_working_copy(None, w, cx),
     ),
     Row(
         "Close file",

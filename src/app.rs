@@ -12,13 +12,15 @@ use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::checkbox::Checkbox;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::dialog::{Dialog, DialogEntrance};
-use gpui_kit::component::diff::{Diff, DiffFile, DiffFileStatus, DiffMode, DiffState};
+use gpui_kit::component::diff::{Diff, DiffEvent, DiffFile, DiffFileStatus, DiffMode, DiffState};
 use gpui_kit::component::hover_card::HoverCard;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::link::Link;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::resizable::{h_resizable, resizable_panel};
+use gpui_kit::component::resizable::{
+    ResizablePanelEvent, ResizableState, h_resizable, resizable_panel,
+};
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
@@ -36,11 +38,14 @@ mod chats;
 mod diff;
 mod editor_pane;
 mod home;
+mod inline_edit;
 mod media;
 mod menus;
 mod palette;
 mod picker;
 mod review;
+mod review_send;
+mod review_share;
 mod sidebar;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod ui_tests;
@@ -190,6 +195,11 @@ pub struct Shark {
     tree_sel: usize,
     tree_focus: FocusHandle,
     tree_scroll: UniformListScrollHandle,
+    /// The Files panel's "Filter files…" box, and its text the tree filters by.
+    tree_filter: Entity<InputState>,
+    tree_query: String,
+    /// The island | Files split, kept across tabs; its width also persists in `State`.
+    tree_resize: Entity<ResizableState>,
     sidebar_scroll: ScrollHandle,
     /// The chat tab strip, which scrolls sideways once the tabs outgrow the header.
     tab_scroll: ScrollHandle,
@@ -203,6 +213,8 @@ pub struct Shark {
     /// What the editor header shows, to redraw only when it changes, not on every key.
     editor_header: (bool, bool, &'static str, String),
     _editor_subs: Vec<Subscription>,
+    /// The diff file whose working copy is edited in place.
+    editing: Option<inline_edit::InlineEdit>,
     review: review::Review,
     /// The before/after row of each image or video in the diff, by path.
     media: Vec<(SharedString, Entity<media::MediaView>)>,
@@ -239,6 +251,15 @@ impl Shark {
             state.save();
         }
         let home = home::Home::new(window, cx);
+        let tree_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files…"));
+        let (ratio, mode) = (state.split_ratio, diff::diff_mode(state.unified));
+        let diff = cx.new(|cx| {
+            let mut d = DiffState::new(vec![], cx).with_mode(mode);
+            if let Some(ratio) = ratio {
+                d.set_split_ratio(ratio, cx);
+            }
+            d
+        });
         cx.defer_in(window, move |s, window, cx| {
             s.restore_last_open(window, cx);
             s.check_deps(cx);
@@ -260,7 +281,31 @@ impl Shark {
         cx.background_executor()
             .spawn(async { media::prune_cache() })
             .detach();
+        let tree_resize = cx.new(|_| ResizableState::default());
         let _subs = vec![
+            // A drag of the Files edge: remember the width for the next launch.
+            cx.subscribe(&tree_resize, |s, r, _: &ResizablePanelEvent, cx| {
+                if let Some(w) = r.read(cx).sizes().get(1) {
+                    s.state.tree_width = Some(w.as_f32());
+                    s.state.save();
+                }
+            }),
+            cx.subscribe_in(
+                &tree_filter,
+                window,
+                |s, input, ev: &InputEvent, w, cx| match ev {
+                    InputEvent::Change => s.filter_tree(input.read(cx).value().to_string(), cx),
+                    InputEvent::PressEnter { .. } => s.filter_jump(w, cx),
+                    _ => {}
+                },
+            ),
+            // One ratio for every file and workspace, restored on launch.
+            cx.subscribe(&diff, |s, _, ev: &DiffEvent, _| {
+                if let DiffEvent::SplitRatioChanged(r) = ev {
+                    s.state.split_ratio = Some(*r);
+                    s.state.save();
+                }
+            }),
             // Keys need a rendered target. A closing dialog gives focus back to what had it
             // when it opened, which may be gone by then: a closed select's popover, or Home
             // after what the dialog did (open a workspace) took Home away.
@@ -289,7 +334,7 @@ impl Shark {
             awake: None,
             unread: HashSet::new(),
             tab: Tab::Chat,
-            diff: cx.new(|cx| DiffState::new(vec![], cx)),
+            diff,
             diff_files: vec![],
             diff_fps: vec![],
             diff_fp: 0,
@@ -303,15 +348,20 @@ impl Shark {
             tree_sel: 0,
             tree_focus: cx.focus_handle(),
             tree_scroll: UniformListScrollHandle::new(),
+            tree_filter,
+            tree_query: String::new(),
+            tree_resize,
             sidebar_scroll: ScrollHandle::new(),
             tab_scroll: ScrollHandle::new(),
             archiving: HashSet::new(),
-            show_tree: true,
+            // Closed by default (design 01); Files N in the Changes bar opens it.
+            show_tree: false,
             rail: false,
             rail_auto: false,
             editor: None,
             editor_header: Default::default(),
             _editor_subs: vec![],
+            editing: None,
             review: Default::default(),
             media: vec![],
             media_cache: media::Lru::new(cx),
@@ -455,7 +505,7 @@ impl Shark {
             Tab::Diff => v.push(Pane::Diff),
             Tab::File => v.extend([Pane::Chat, Pane::Editor]),
         }
-        if self.tab != Tab::Chat && self.show_tree && self.active.is_some() {
+        if self.tree_shown() {
             v.push(Pane::Tree);
         }
         v
@@ -599,10 +649,10 @@ impl Shark {
                     .children(chat_tabs)
                     .child(tab(
                         match viewed {
-                            _ if self.diff_error.is_some() => "Diff · error".into(),
-                            _ if !self.diff_loaded => "Diff".into(),
-                            0 => format!("Diff · {}", self.diff_files.len()),
-                            v => format!("Diff · {v}/{} viewed", self.diff_files.len()),
+                            _ if self.diff_error.is_some() => "Changes · error".into(),
+                            _ if !self.diff_loaded => "Changes".into(),
+                            0 => format!("Changes {}", self.diff_files.len()),
+                            v => format!("Changes {v}/{} viewed", self.diff_files.len()),
                         },
                         IconName::FileDiff,
                         Tab::Diff,
@@ -611,7 +661,13 @@ impl Shark {
                         d.child(tab(name, IconName::FileCode, Tab::File))
                     })
                     .child(div().flex_1())
-                    .child(self.render_branch(cx))
+                    // Narrow, the branch gives way before the sync buttons.
+                    .child(
+                        div()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .child(self.render_branch(cx)),
+                    )
                     .when_some(self.active_sync().cloned(), |d, sync| {
                         d.child(div().pl_3().child(sync))
                     }),
@@ -636,13 +692,11 @@ impl Shark {
                             )
                             .child(resizable_panel().child(self.render_editor(cx))),
                     )
-                    .when(self.show_tree, |d| d.child(self.render_tree(window, cx)))
                     .into_any_element(),
                 Tab::Diff => h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_diff(cx))
-                    .when(self.show_tree, |d| d.child(self.render_tree(window, cx)))
+                    .child(self.render_diff(window, cx))
                     .into_any_element(),
             })
             .into_any_element()
@@ -816,11 +870,10 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &ToggleVim, w, cx| this.toggle_vim(w, cx)))
             .on_action(cx.listener(|this, _: &CloseFile, w, cx| this.close_file(w, cx)))
             // On the root, not the editor, so File > Save works with focus in the tree.
-            .on_action(cx.listener(|this, _: &SaveFile, w, cx| {
-                if let Some(e) = this.editor.clone() {
-                    e.update(cx, |e, cx| e.save(false, w, cx))
-                }
-            }))
+            .on_action(cx.listener(|this, _: &SaveFile, w, cx| this.save(w, cx)))
+            .on_action(
+                cx.listener(|this, _: &EditWorkingCopy, w, cx| this.edit_working_copy(None, w, cx)),
+            )
             // `o` in the diff and the tree.
             .on_action(cx.listener(|this, _: &OpenFile, w, cx| {
                 if let Some(ix) = this.cursor_file(w, cx) {
@@ -834,16 +887,20 @@ impl Render for Shark {
             .child(self.render_sidebar(window, cx))
             .children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))
             .child(
-                // Linear's "island": content floats on the sidebar color, inset and rounded.
-                div().flex_1().min_w_0().h_full().py_2().pr_2().child(
-                    h_flex()
-                        .size_full()
-                        .rounded(cx.theme().radius_lg)
-                        .border_1()
-                        .border_color(cx.theme().border)
-                        .bg(cx.theme().background)
-                        .overflow_hidden()
-                        .child(self.render_main(window, cx)),
+                self.with_tree(
+                    // Linear's "island": content floats on the sidebar color, inset and rounded.
+                    div().size_full().py_2().pr_2().child(
+                        h_flex()
+                            .size_full()
+                            .rounded(cx.theme().radius_lg)
+                            .border_1()
+                            .border_color(cx.theme().border)
+                            .bg(cx.theme().background)
+                            .overflow_hidden()
+                            .child(self.render_main(window, cx)),
+                    ),
+                    window,
+                    cx,
                 ),
             )
     }

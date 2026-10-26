@@ -536,6 +536,10 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
             .collect();
         assert_eq!(names, ["api", "new.txt"]);
     });
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| s.toggle_tree(w, cx))
+    })
+    .unwrap();
     press(cx, &["cmd-alt-right"]);
     cx.update_window(window, |_, w, cx| {
         assert!(
@@ -872,11 +876,14 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
     press(cx, "c");
     cx.update_window(window, |_, w, cx| w.input("rename this", cx))
         .unwrap();
-    press(cx, "enter");
+    press(cx, "cmd-enter");
     cx.run_until_parked();
     cx.update(|cx| {
-        let p = review::prompt(shark.read(cx).ws_comments());
-        assert!(p.contains("\napi/c:1\n> rename this\n"), "{p}");
+        let p = review::prompt(shark.read(cx).ws_comments(), "");
+        assert!(
+            p.contains(" api/c:1 · working tree\n```\nx\n```\n> rename this\n"),
+            "{p}"
+        );
     });
 
     // A git failure is not "no changes".
@@ -917,7 +924,12 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
         shark.read(cx).state.workspaces.is_empty()
     })
     .await;
-    cx.update(|cx| assert!(shark.read(cx).archiving.is_empty()));
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert!(s.archiving.is_empty());
+        assert!(!s.review.comments.contains_key("st"), "its comments go too");
+    });
+    assert!(!review::comments_path("st").exists());
     assert!(!api.exists());
     fs::remove_dir_all(&home).ok();
 }
@@ -1369,7 +1381,10 @@ async fn perf_large_change(cx: &mut TestAppContext) {
     report.push(format!("unchanged refresh + frame: {:.0} ms", ms(t)));
 
     cx.update_window(window, |_, w, cx| {
-        shark.update(cx, |s, cx| s.focus_pane(Pane::Tree, w, cx))
+        shark.update(cx, |s, cx| {
+            s.show_tree = true;
+            s.focus_pane(Pane::Tree, w, cx)
+        })
     })
     .unwrap();
     frame(cx);
@@ -2010,5 +2025,1893 @@ async fn home_checklist(cx: &mut TestAppContext) {
     assert!(done(cx).1);
     on(cx, &|s, _, _| s.state.home_checklist_dismissed = true);
     assert!(!done(cx).1, "dismissed");
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Changes' toolbar and the Files panel: counts, Split / Unified, the filter and its Enter,
+/// viewed boxes, and a Files width that survives Chat ↔ Changes and a restart.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let options = || WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+            point(px(0.), px(0.)),
+            size(px(1440.), px(900.)),
+        ))),
+        ..Default::default()
+    };
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        options(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| {
+        s.create_workspace("tb".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let api = home.join("shark/workspaces/tb/api");
+    fs::create_dir_all(api.join("src")).unwrap();
+    fs::write(api.join("a.md"), "x\n").unwrap();
+    fs::write(api.join("src/b.rs"), "1\n2\n").unwrap();
+    fs::write(api.join("src/chat.rs"), "1\n2\n3\n").unwrap();
+    on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+    let base = cx.update(|cx| shark.read(cx).state.workspaces[0].repos[0].base.clone());
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.changes_stats(), (base.clone(), 6, 0));
+        assert_eq!((s.viewed_now.len(), s.diff_files.len()), (0, 3));
+        assert!(!s.tree_shown(), "Files is closed until asked for");
+        assert_eq!(s.diff.read(cx).mode(), DiffMode::Split, "split by default");
+    });
+    on(cx, &|s, w, cx| s.toggle_tree(w, cx));
+    cx.update(|cx| assert!(shark.read(cx).tree_shown(), "Files N opens it"));
+
+    // `s` flips Split / Unified, and the choice persists.
+    press(cx, &["s"]);
+    cx.update(|cx| assert_eq!(shark.read(cx).diff.read(cx).mode(), DiffMode::Unified));
+    assert!(State::load().unified);
+    press(cx, &["s"]);
+    assert!(!State::load().unified);
+
+    // The filter narrows the tree; its rows keep their file; Enter shows it in the diff.
+    let input = cx.update(|cx| shark.read(cx).tree_filter.read(cx).focus_handle(cx));
+    on(cx, &|_, w, cx| input.focus(w, cx));
+    cx.update_window(window, |_, w, cx| w.input("CHAT", cx))
+        .unwrap();
+    cx.run_until_parked();
+    let chat_ix = cx.update(|cx| {
+        let s = shark.read(cx);
+        let files: Vec<usize> = s.tree_rows.iter().filter_map(|r| r.file).collect();
+        assert_eq!(files.len(), 1, "only chat.rs matches");
+        assert_eq!(s.diff_files[files[0]].path().as_str(), "api/src/chat.rs");
+        files[0]
+    });
+    press(cx, &["enter"]);
+    cx.update_window(window, |_, w, cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.diff_file, chat_ix, "Enter jumps to the match");
+        assert!(s.diff.read(cx).focus_handle(cx).is_focused(w));
+    })
+    .unwrap();
+
+    // A viewed box ticks the file, and the counts follow.
+    on(cx, &|s, _, cx| s.toggle_viewed(chat_ix, cx));
+    cx.update(|cx| assert_eq!(shark.read(cx).viewed_now.len(), 1));
+
+    // The Files edge: a dragged width persists and survives Chat ↔ Changes.
+    let resize = cx.update(|cx| shark.read(cx).tree_resize.clone());
+    on(cx, &|_, w, cx| {
+        resize.update(cx, |r, cx| r.resize_panel(1, px(333.), w, cx))
+    });
+    assert_eq!(State::load().tree_width, Some(333.));
+    on(cx, &|s, w, cx| s.show(Tab::Chat, w, cx));
+    cx.update(|cx| assert!(!shark.read(cx).tree_shown(), "no Files beside the chat"));
+    on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.diff_file, chat_ix, "file selection kept");
+        assert_eq!(s.tree_query, "chat", "filter kept");
+        assert_eq!(s.tree_resize.read(cx).sizes()[1], px(333.));
+    });
+
+    // After a restart Files is closed, and opens at the saved width; the saved mode stays.
+    cx.update_window(window, |_, w, _| w.remove_window())
+        .unwrap();
+    let (window2, shark2) = open(cx, options());
+    cx.run_until_parked();
+    cx.update_window(window2, |_, w, cx| {
+        assert!(!shark2.read(cx).tree_shown());
+        shark2.update(cx, |s, cx| s.toggle_tree(w, cx));
+        w.render_frame(cx)
+    })
+    .unwrap();
+    cx.update(|cx| {
+        let s = shark2.read(cx);
+        assert!(s.tree_shown());
+        assert_eq!(s.tree_resize.read(cx).sizes()[1], px(333.));
+        assert_eq!(s.diff.read(cx).mode(), DiffMode::Split);
+    });
+    cx.update_window(window2, |_, w, _| w.remove_window())
+        .unwrap();
+    fs::remove_dir_all(&home).ok();
+}
+
+/// The split ratio persists and is shared; a file's working copy is edited in the diff: the
+/// comparison follows the unsaved buffer, line keys and paste edit it, it survives Chat ↔
+/// Changes, the view stays put, and cmd-s writes it.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
+    use gpui_kit::component::diff::{DiffEvent, DiffLinePosition, DiffLineRange, DiffSide};
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let lines = |f: &dyn Fn(usize) -> String| (1..=300).map(f).collect::<String>();
+    fs::write(
+        repos[0].path.join("f.txt"),
+        lines(&|i| format!("line {i}\n")),
+    )
+    .unwrap();
+    git::git(&repos[0].path, &["add", "."]).unwrap();
+    let commit = [
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "f",
+    ];
+    git::git(&repos[0].path, &commit).unwrap();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| {
+        s.create_workspace("ed".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let file = home.join("shark/workspaces/ed/api/f.txt");
+    // A change every ten lines: a diff many screens tall.
+    let changed = |i: usize| match i % 10 {
+        0 => format!("changed {i}\n"),
+        _ => format!("line {i}\n"),
+    };
+    fs::write(&file, lines(&changed)).unwrap();
+    on(cx, &|s, w, cx| {
+        s.show(Tab::Diff, w, cx);
+        s.diff.update(cx, |d, cx| d.set_mode(DiffMode::Split, cx));
+    });
+
+    // A finished divider drag is saved, and a new window starts with it.
+    on(cx, &|s, _, cx| {
+        s.diff.update(cx, |d, cx| {
+            d.set_split_ratio(0.4, cx);
+            cx.emit(DiffEvent::SplitRatioChanged(0.4));
+        })
+    });
+    assert_eq!(State::load().split_ratio, Some(0.4));
+    let (_, again) = open(cx, WindowOptions::default());
+    cx.update(|cx| assert_eq!(again.read(cx).diff.read(cx).split_ratio(), 0.4));
+
+    // Edit from the selected working line, deep in the file.
+    on(cx, &|s, _, cx| {
+        let line = DiffLineRange::new("api/f.txt", DiffSide::Modified, 250, 250);
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
+    });
+    let draw = |cx: &mut TestAppContext| {
+        for _ in 0..3 {
+            cx.update_window(window, |_, w, cx| w.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        }
+    };
+    // A comment on line 250 in Split: the original column hints at it across the gap
+    // (Unified has no gap).
+    on(cx, &|s, w, cx| s.comment_dialog(w, cx));
+    let hints = |cx: &mut TestAppContext| {
+        draw(cx);
+        cx.update_window(window, |_, w, _| w.find_all("annotation-hint").len())
+            .unwrap()
+    };
+    assert_eq!(hints(cx), 1);
+    on(cx, &|s, _, cx| {
+        s.diff.update(cx, |d, cx| d.set_mode(DiffMode::Unified, cx))
+    });
+    assert_eq!(hints(cx), 0);
+    on(cx, &|s, w, cx| {
+        s.cancel_composer(w, cx);
+        s.diff.update(cx, |d, cx| d.set_mode(DiffMode::Split, cx));
+        let line = DiffLineRange::new("api/f.txt", DiffSide::Modified, 250, 250);
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
+    });
+    draw(cx);
+    press(cx, &["i"]);
+    draw(cx);
+    let top =
+        |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).diff.read(cx).scroll_top().item_ix);
+    let before = top(cx);
+    assert!(
+        before > 3,
+        "editing line 250 scrolled to it, not row {before}"
+    );
+    let buf = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let e = shark.read(cx).editing.as_ref().unwrap();
+            (e.buf.lines.clone(), e.buf.line)
+        })
+    };
+    assert_eq!(buf(cx).1, 249);
+    // ↓ then typing: the comparison has the unsaved line before any save.
+    press(cx, &["down"]);
+    cx.update_window(window, |_, w, cx| w.input("X", cx))
+        .unwrap();
+    draw(cx);
+    let (lines_now, at) = buf(cx);
+    assert_eq!((lines_now[250].as_str(), at), ("line 251X", 250));
+    cx.update_window(window, |_, w, cx| {
+        let s = shark.read(cx);
+        let e = s.editing.as_ref().unwrap();
+        assert!(e.focused(w, cx), "the line input keeps focus");
+        assert!(e.patch.contains("+line 251X\n"), "{}", e.patch);
+        assert_eq!(s.diff.read(cx).files()[0].additions(), 31);
+        assert_eq!(s.working_heading("api/f.txt"), "Working copy · unsaved");
+        assert!(
+            s.edit_status()
+                .unwrap()
+                .starts_with("Editing the working copy")
+        );
+    })
+    .unwrap();
+    assert!(
+        top(cx).abs_diff(before) <= 2,
+        "the view stays near row {before}"
+    );
+
+    // enter splits, backspace at column 0 joins, up moves, paste inserts lines.
+    press(cx, &["enter"]);
+    assert_eq!(
+        buf(cx).0[250..252],
+        ["line 251X".to_string(), String::new()]
+    );
+    press(cx, &["backspace"]);
+    assert_eq!(
+        (buf(cx).0[250].as_str(), buf(cx).0.len()),
+        ("line 251X", 300)
+    );
+    press(cx, &["up"]);
+    assert_eq!(buf(cx).1, 249);
+    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string("p1\np2".into())));
+    press(cx, &["cmd-v"]);
+    let (lines_now, at) = buf(cx);
+    // The caret kept its column (9) moving up.
+    assert_eq!(
+        lines_now[249..251],
+        ["changed 2p1".to_string(), "p250".into()]
+    );
+    assert_eq!(at, 250);
+
+    // Chat and back: the unsaved edits are still there and still compared.
+    on(cx, &|s, w, cx| s.show(Tab::Chat, w, cx));
+    on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        let e = s.editing.as_ref().unwrap();
+        assert!(e.dirty && e.buf.lines[250] == "p250");
+        assert!(s.diff.read(cx).files()[0].additions() >= 31);
+    });
+
+    // cmd-s writes the buffer and the comparison stays.
+    on(cx, &|s, w, cx| s.focus_edit(w, cx));
+    press(cx, &["cmd-s"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).editing.as_ref().is_some_and(|e| e.saved)
+    })
+    .await;
+    let want = cx.update(|cx| shark.read(cx).editing.as_ref().unwrap().buf.text());
+    assert_eq!(fs::read_to_string(&file).unwrap(), want);
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(
+            s.working_heading("api/f.txt"),
+            "Working copy · saved just now"
+        );
+        assert!(s.edit_status().unwrap().starts_with("Saved · "));
+    });
+    // Escape goes back to reviewing without asking.
+    press(cx, &["escape"]);
+    cx.update(|cx| assert!(shark.read(cx).editing.is_none()));
+
+    // Back in: the base is the commit's blob, not empty (git's file shows again, with its
+    // index header).
+    let counts = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let f = &shark.read(cx).diff.read(cx).files()[0];
+            (f.additions(), f.deletions())
+        })
+    };
+    let git = counts(cx);
+    assert!(git.1 > 0, "{git:?}");
+    on(cx, &|s, w, cx| {
+        s.edit_working_copy(Some("api/f.txt".into()), w, cx)
+    });
+    draw(cx);
+    assert_eq!(counts(cx), git);
+    // Line 5 is far from any change, and still gets the input: the buffer is compared in
+    // full and the diff folds the rest.
+    on(cx, &|s, w, cx| {
+        let five = DiffLinePosition::new("api/f.txt", DiffSide::Modified, 5);
+        s.edit_click(&five, w, cx)
+    });
+    draw(cx);
+    cx.update_window(window, |_, w, cx| {
+        let e = shark.read(cx).editing.as_ref().unwrap();
+        assert!(
+            e.buf.line == 4 && e.focused(w, cx),
+            "line 5's input is drawn"
+        );
+    })
+    .unwrap();
+    // Dirty, then another file with Discard: f.txt shows the disk version, not the
+    // dropped buffer.
+    fs::write(home.join("shark/workspaces/ed/api/g.txt"), "g\n").unwrap();
+    on(cx, &|s, _, cx| s.refresh_diff(cx));
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).diff_files.len() == 2
+    })
+    .await;
+    // A new file reloads the diff; the caret's line comes back into view.
+    on(cx, &|s, w, cx| {
+        let five = DiffLinePosition::new("api/f.txt", DiffSide::Modified, 5);
+        s.edit_click(&five, w, cx)
+    });
+    draw(cx);
+    cx.update_window(window, |_, w, cx| w.input("Z", cx))
+        .unwrap();
+    draw(cx);
+    assert_eq!(counts(cx), (git.0 + 1, git.1 + 1));
+    on(cx, &|s, w, cx| {
+        s.edit_working_copy(Some("api/g.txt".into()), w, cx)
+    });
+    press(cx, &["enter"]);
+    draw(cx);
+    cx.update(|cx| {
+        let e = shark.read(cx).editing.as_ref().unwrap();
+        assert_eq!(e.path.as_str(), "api/g.txt");
+    });
+    assert_eq!(counts(cx), git);
+    fs::remove_dir_all(&home).ok();
+}
+
+/// The review queue end to end: compose (c), suggest, edit (e) and delete (x) threads, the
+/// send sheet (shift-c) sending only what is ticked, agent reports and changed lines judging
+/// the threads, resolve / reopen / re-queue, a review queued behind a busy turn and removed
+/// from its chat card, orphaned threads, and sharing to GitHub through a fake gh.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn review_queue(cx: &mut TestAppContext) {
+    use gpui_kit::component::diff::{DiffLineRange, DiffSide};
+    use review::Status;
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos(&home, &["api"]),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace("rq".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let api = home.join("shark/workspaces/rq/api");
+    fs::write(api.join("f"), "a\nb\nc\n").unwrap();
+    on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+    cx.update(|cx| assert_eq!(shark.read(cx).diff_files.len(), 1));
+    let press = press_in(window);
+    let comments = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            (shark.read(cx).ws_comments().iter())
+                .map(|c| (c.id, c.text.clone(), c.status.clone()))
+                .collect::<Vec<_>>()
+        })
+    };
+    let typing = |cx: &mut TestAppContext, t: &str| {
+        cx.update_window(window, |_, w, cx| w.input(t, cx)).unwrap();
+        cx.run_until_parked();
+    };
+
+    // c on line 1: the composer; its letters don't reach the diff's keys. cmd-shift-s opens
+    // Suggest change on the lines; cmd-enter adds a pending thread with the snapshot.
+    press(cx, &["down", "c"]);
+    cx.update(|cx| assert!(shark.read(cx).review.composer.is_some()));
+    typing(cx, "rename vars");
+    press(cx, &["cmd-shift-s"]);
+    typing(cx, "!");
+    press(cx, &["cmd-enter"]);
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert!(s.review.composer.is_none());
+        let c = &s.ws_comments()[0];
+        assert_eq!((c.id, c.text.as_str()), (1, "rename vars"));
+        assert_eq!(
+            (c.snapshot.as_str(), c.suggestion.as_deref()),
+            ("a", Some("a!"))
+        );
+        assert_eq!(c.status, Status::Pending);
+    });
+    // e edits the thread at the cursor; Esc leaves it as it was.
+    press(cx, &["e"]);
+    cx.update(|cx| {
+        let comp = shark.read(cx).review.composer.as_ref().unwrap();
+        assert_eq!(comp.input.read(cx).value().as_ref(), "rename vars");
+    });
+    press(cx, &["escape"]);
+    assert_eq!(comments(cx)[0].1, "rename vars");
+    // Two more threads, x deletes the one at the cursor (line 2).
+    press(cx, &["down", "down", "c"]);
+    typing(cx, "third line");
+    press(cx, &["cmd-enter", "up", "c"]);
+    typing(cx, "drop me");
+    press(cx, &["cmd-enter"]);
+    assert_eq!(comments(cx).len(), 3);
+    press(cx, &["x"]);
+    let ids: Vec<u64> = comments(cx).iter().map(|c| c.0).collect();
+    assert_eq!(ids, [1, 2], "x deleted the line-2 thread");
+    // A new thread there gets a fresh id: 3 was the deleted one's.
+    press(cx, &["c"]);
+    typing(cx, "fresh");
+    press(cx, &["cmd-enter"]);
+    assert!(comments(cx).iter().any(|c| c.0 == 4 && c.1 == "fresh"));
+    press(cx, &["x"]);
+
+    // shift-c: the sheet; space unticks the first row, cmd-enter sends only the second.
+    press(cx, &["shift-c"]);
+    cx.update(|cx| {
+        let s = shark.read(cx).review.sheet.as_ref().unwrap();
+        assert_eq!(s.rows, [(1, true), (2, true)]);
+    });
+    press(cx, &["space", "cmd-enter"]);
+    let chat = cx.update(|cx| shark.read(cx).active_chat().cloned().unwrap());
+    let sent = cx.update(|cx| chat.read(cx).sent_texts());
+    assert_eq!(sent.len(), 1);
+    assert!(
+        sent[0].contains("\n[c2] api/f:3 · working tree\n```\nc\n```\n> third line\n"),
+        "{}",
+        sent[0]
+    );
+    assert!(!sent[0].contains("rename vars"), "unticked stays out");
+    assert_eq!(
+        comments(cx).iter().map(|c| c.2.clone()).collect::<Vec<_>>(),
+        [Status::Pending, Status::Sent { turn: 1 }]
+    );
+    // The agent reports c2 addressed.
+    let said = |t: &str| {
+        [
+            serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}, "parent_tool_use_id": null}).to_string(),
+            serde_json::json!({"type": "result", "is_error": false, "result": t, "total_cost_usd": 0, "duration_ms": 1}).to_string(),
+        ]
+    };
+    let reply = |cx: &mut TestAppContext, t: &str| {
+        let lines = said(t);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                let lines: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+                crate::chat::ui_tests::play(c, &lines, cx)
+            })
+        });
+        cx.run_until_parked();
+    };
+    reply(cx, "Renamed it.\n\n[c2] addressed: Renamed the third line.");
+    assert_eq!(
+        comments(cx)[1].2,
+        Status::Addressed {
+            turn: 1,
+            note: "Renamed the third line.".into()
+        }
+    );
+
+    // c1 goes too; the agent rewrites line 1 without a report: Outdated.
+    press(cx, &["shift-c", "cmd-enter"]);
+    assert_eq!(comments(cx)[0].2, Status::Sent { turn: 2 });
+    fs::write(api.join("f"), "A\nb\nc\n").unwrap();
+    reply(cx, "Done.");
+    assert_eq!(comments(cx)[0].2, Status::Outdated);
+    // Re-queue puts the outdated one back; r resolves the addressed one; R reopens.
+    on(cx, &|s, _, cx| s.requeue_outdated(cx));
+    assert_eq!(comments(cx)[0].2, Status::Pending);
+    on(cx, &|s, w, cx| s.jump_to_comment(2, w, cx));
+    press(cx, &["r"]);
+    assert_eq!(comments(cx)[1].2, Status::Resolved);
+    on(cx, &|s, _, cx| s.set_status(&[1], Status::Outdated, cx));
+    on(cx, &|s, w, cx| s.jump_to_comment(1, w, cx));
+    press(cx, &["shift-r"]);
+    assert_eq!(comments(cx)[0].2, Status::Pending);
+    // r without a thread under the cursor refreshes the diff, as before.
+    fs::write(api.join("h"), "new\n").unwrap();
+    on(cx, &|s, _, cx| {
+        let two = DiffLineRange::new("api/f", DiffSide::Modified, 2, 2);
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(two), cx));
+    });
+    press(cx, &["r"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).diff_files.len() == 2
+    })
+    .await;
+    fs::remove_file(api.join("h")).unwrap();
+
+    // A busy chat queues the review: the tab counts it, the card's Remove puts it back.
+    // (The fake claude never echoes, so the reviews sent above still count as unread.)
+    let unread = cx.update(|cx| chat.read(cx).review_count());
+    cx.update(|cx| chat.update(cx, |c, _| c.busy = true));
+    on(cx, &|s, w, cx| s.send_review(&[1], "", false, w, cx));
+    assert_eq!(comments(cx)[0].2, Status::Queued);
+    cx.update(|cx| assert_eq!(chat.read(cx).review_count(), unread + 1));
+    // Queued, e and x would orphan its card: neither runs.
+    on(cx, &|s, w, cx| s.jump_to_comment(1, w, cx));
+    press(cx, &["e", "x"]);
+    cx.update(|cx| assert!(shark.read(cx).review.composer.is_none()));
+    assert_eq!(comments(cx)[0].2, Status::Queued);
+    cx.update_window(window, |_, w, cx| {
+        chat.update(cx, |c, cx| c.remove_queued(0, w, cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(comments(cx)[0].2, Status::Pending);
+    cx.update(|cx| assert_eq!(chat.read(cx).review_count(), unread));
+    // Queued again, it goes out when the turn ends, read in the next turn; claude's echo
+    // of it (the same text) marks it read.
+    on(cx, &|s, w, cx| s.send_review(&[1], "", false, w, cx));
+    reply(cx, "Busy work done.");
+    assert_eq!(comments(cx)[0].2, Status::Sent { turn: 3 });
+    let echo = cx.update(|cx| chat.read(cx).sent_texts().pop().unwrap());
+    let echo = serde_json::json!({"type": "user", "message": {"role": "user", "content": echo}})
+        .to_string();
+    cx.update(|cx| chat.update(cx, |c, cx| crate::chat::ui_tests::play(c, &[&echo], cx)));
+    cx.update(|cx| assert_eq!(chat.read(cx).review_count(), unread));
+    reply(cx, "[c1] addressed: Renamed.");
+    assert!(matches!(
+        comments(cx)[0].2,
+        Status::Addressed { turn: 3, .. }
+    ));
+    // e with new text: pending again, out of the chat; unchanged text keeps the status.
+    on(cx, &|s, w, cx| s.jump_to_comment(1, w, cx));
+    press(cx, &["e"]);
+    typing(cx, "!");
+    press(cx, &["cmd-enter"]);
+    assert_eq!(comments(cx)[0].2, Status::Pending);
+    cx.update(|cx| assert_eq!(shark.read(cx).comment(1).unwrap().chat, None));
+    press(cx, &["e", "backspace", "cmd-enter"]);
+    assert_eq!(comments(cx)[0].1, "rename vars");
+    on(cx, &|s, _, cx| s.set_status(&[1], Status::Outdated, cx));
+    press(cx, &["e", "cmd-enter"]);
+    assert_eq!(comments(cx)[0].2, Status::Outdated);
+    on(cx, &|s, _, cx| s.set_status(&[1], Status::Pending, cx));
+    // An event about a comment that isn't waiting in that chat changes nothing.
+    cx.update(|cx| {
+        chat.update(cx, |_, cx| {
+            cx.emit(ChatEvent::ReviewSent {
+                ids: vec![1],
+                turn: 9,
+            })
+        })
+    });
+    cx.run_until_parked();
+    assert_eq!(comments(cx)[0].2, Status::Pending);
+    // Sent but never read when the process goes (a new conversation): pending again.
+    on(cx, &|s, w, cx| s.send_review(&[1], "", false, w, cx));
+    assert!(matches!(comments(cx)[0].2, Status::Sent { .. }));
+    cx.update(|cx| chat.update(cx, |c, cx| c.new_conversation(cx)));
+    cx.run_until_parked();
+    assert_eq!(comments(cx)[0].2, Status::Pending);
+    // Queued in a chat that is closed: pending again.
+    cx.update(|cx| chat.update(cx, |c, _| c.busy = true));
+    on(cx, &|s, w, cx| s.send_review(&[1], "", false, w, cx));
+    assert_eq!(comments(cx)[0].2, Status::Queued);
+    cx.update(|cx| chat.update(cx, |c, _| c.busy = false));
+    on(cx, &|s, w, cx| s.close_chat(w, cx));
+    assert_eq!(
+        (
+            comments(cx)[0].2.clone(),
+            cx.update(|cx| shark.read(cx).comment(1).unwrap().chat.clone())
+        ),
+        (Status::Pending, None)
+    );
+
+    // Share to GitHub through a fake gh: argv logged, URL kept; a failure keeps the comment.
+    let bin = home.join("gh-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let (log, fail) = (bin.join("log"), bin.join("fail"));
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        format!(
+            "#!/bin/sh\nprintf '%s|' \"$@\" >> {log}\necho >> {log}\n[ -e {fail} ] && {{ echo 'gh: offline' >&2; exit 1; }}\ncase \"$1\" in api) echo https://github.com/o/api/pull/7#pullrequestreview-5 ;; *) echo https://github.com/o/api/pull/7#issuecomment-9 ;; esac\n",
+            log = log.display(),
+            fail = fail.display()
+        ),
+    )
+    .unwrap();
+    std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(&gh)
+        .status()
+        .unwrap();
+    // SAFETY: tests that read SHARK_GH hold UI_LOCK.
+    unsafe { std::env::set_var("SHARK_GH", &gh) };
+    let github = |cx: &mut TestAppContext, id: u64| {
+        cx.update(|cx| shark.read(cx).comment(id).and_then(|c| c.github.clone()))
+    };
+    on(cx, &|s, w, cx| {
+        s.active_sync()
+            .unwrap()
+            .update(cx, |g, _| g.set_pr("api", 7, false));
+        s.open_share(1, w, cx);
+        s.post_share(w, cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).review.share.is_none()
+    })
+    .await;
+    assert_eq!(
+        github(cx, 1).as_deref(),
+        Some("https://github.com/o/api/pull/7#issuecomment-9")
+    );
+    let argv = fs::read_to_string(&log).unwrap();
+    assert!(
+        argv.starts_with(
+            "pr|comment|7|--body|**api/f** · working copy · 1\n\n```\na\n```\n\nrename vars"
+        ),
+        "{argv}"
+    );
+    // The sheet with Also publish: the chat gets it, and the PR a Comment review.
+    fs::write(&log, "").unwrap();
+    on(cx, &|s, w, cx| {
+        s.edit_comments(cx, |l| l[0].github = None);
+        s.open_sheet(w, cx);
+        s.review.sheet.as_mut().unwrap().publish = true;
+        s.sheet_send(w, cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark
+            .read(cx)
+            .comment(1)
+            .is_some_and(|c| c.github.is_some())
+    })
+    .await;
+    let argv = fs::read_to_string(&log).unwrap();
+    assert!(
+        argv.starts_with("pr|review|7|--comment|--body|**api/f**"),
+        "{argv}"
+    );
+    assert!(matches!(comments(cx)[0].2, Status::Sent { .. }));
+    on(cx, &|s, _, cx| s.set_status(&[1], Status::Pending, cx));
+    // A PR review of pushed lines sits on them: gh api with the line.
+    fs::write(&log, "").unwrap();
+    on(cx, &|s, w, cx| {
+        s.set_status(&[2], Status::Pending, cx);
+        s.active_sync()
+            .unwrap()
+            .update(cx, |g, _| g.set_pr("api", 7, true));
+        s.open_share(2, w, cx);
+        s.review.share.as_mut().unwrap().review = true;
+        s.post_share(w, cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).review.share.is_none()
+    })
+    .await;
+    let argv = fs::read_to_string(&log).unwrap();
+    assert!(
+        argv.starts_with("api|--method|POST|repos/{owner}/{repo}/pulls/7/reviews|-f|event=COMMENT|-f|body=api/f:3|-f|comments[][path]=f|-F|comments[][line]=3|-f|comments[][side]=RIGHT|-f|comments[][body]=third line|"),
+        "{argv}"
+    );
+    assert!(github(cx, 2).is_some_and(|u| u.ends_with("#pullrequestreview-5")));
+    // gh fails: the dialog stays with the error, the comment unshared.
+    fs::write(&fail, "").unwrap();
+    on(cx, &|s, w, cx| {
+        s.edit_comments(cx, |l| l[0].github = None);
+        s.open_share(1, w, cx);
+        s.post_share(w, cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark
+            .read(cx)
+            .review
+            .share
+            .as_ref()
+            .is_some_and(|s| !s.posting)
+    })
+    .await;
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        let err = s.review.share.as_ref().unwrap().error.clone().unwrap();
+        assert!(err.contains("gh: offline"), "{err}");
+        assert_eq!(s.comment(1).unwrap().github, None);
+    });
+    // The sheet publishes per repo: api's comment to api's PR; web has none, so its comment
+    // stays unshared. The URL lands in the workspace the post came from, though another
+    // one is open by the time gh answers.
+    fs::remove_file(&fail).unwrap();
+    fs::write(&log, "").unwrap();
+    let ws = cx.update(|cx| shark.read(cx).active.clone().unwrap());
+    on(cx, &|s, w, cx| {
+        s.close_share(w, cx);
+        let web: review::Comment = serde_json::from_str(
+            r#"{"id":99,"path":"web/x","start":[false,1],"end":[false,1],"text":"web note"}"#,
+        )
+        .unwrap();
+        s.edit_comments(cx, |l| l.push(web));
+        let both = [
+            s.comment(1).cloned().unwrap(),
+            s.comment(99).cloned().unwrap(),
+        ];
+        s.publish(&both, "", false, w, cx);
+        s.active = Some("elsewhere".into());
+    });
+    let github_in = |cx: &mut TestAppContext, id: u64| {
+        cx.update(|cx| {
+            let l = &shark.read(cx).review.comments[&ws];
+            l.iter().find(|c| c.id == id).unwrap().github.clone()
+        })
+    };
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).review.comments[&ws][0].github.is_some()
+    })
+    .await;
+    assert!(github_in(cx, 1).is_some());
+    assert_eq!(github_in(cx, 99), None);
+    let argv = fs::read_to_string(&log).unwrap();
+    assert_eq!(argv.matches("pr|comment|").count(), 1, "{argv}");
+    assert!(
+        argv.contains("**api/f**") && !argv.contains("web note"),
+        "{argv}"
+    );
+    cx.update(|cx| assert!(!shark.read(cx).review.comments.contains_key("elsewhere")));
+    on(cx, &|s, _, cx| {
+        s.active = Some(ws.clone());
+        s.edit_comments(cx, |l| l.retain(|c| c.id != 99));
+    });
+    unsafe { std::env::remove_var("SHARK_GH") };
+    on(cx, &|s, w, cx| s.close_share(w, cx));
+
+    // On a file being edited in place, a new thread quotes the buffer, not the disk.
+    on(cx, &|s, w, cx| {
+        s.edit_working_copy(Some("api/f".into()), w, cx)
+    });
+    on(cx, &|s, w, cx| {
+        s.editing.as_mut().unwrap().buf.lines[1] = "edited".into();
+        let two = DiffLineRange::new("api/f", DiffSide::Modified, 2, 2);
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(two), cx));
+        s.comment_dialog(w, cx);
+    });
+    cx.update(|cx| {
+        let comp = shark.read(cx).review.composer.as_ref().unwrap();
+        assert_eq!(comp.draft.snapshot, "edited");
+    });
+    on(cx, &|s, w, cx| {
+        s.cancel_composer(w, cx);
+        s.editing = None;
+    });
+
+    // A comments file that doesn't parse is kept aside, not overwritten; one queued in a
+    // chat from before a restart loads pending.
+    let dir = crate::state::support_dir().join("comments");
+    fs::write(dir.join("bad.json"), "{oops").unwrap();
+    on(cx, &|s, _, _| s.review.load_comments("bad"));
+    assert!(dir.join("bad.json.bak").exists() && !dir.join("bad.json").exists());
+    fs::write(
+        dir.join("old.json"),
+        r#"[{"id":5,"path":"api/f","start":[false,1],"end":[false,1],"text":"q","status":"Queued","chat":"c1"}]"#,
+    )
+    .unwrap();
+    on(cx, &|s, _, _| s.review.load_comments("old"));
+    cx.update(|cx| {
+        let c = &shark.read(cx).review.comments["old"][0];
+        assert_eq!((&c.status, &c.chat), (&Status::Pending, &None));
+    });
+
+    // A thread whose file left the diff still shows, with its snapshot, below it.
+    fs::remove_file(api.join("f")).unwrap();
+    fs::write(api.join("g"), "x\n").unwrap();
+    on(cx, &|s, _, cx| s.refresh_diff(cx));
+    on(cx, &|s, _, cx| {
+        assert_eq!(s.diff_files.len(), 1);
+        assert!(s.render_orphans(cx).is_some());
+    });
+
+    // Another workspace opens: the composer and the sheet were about this one's comments.
+    on(cx, &|s, w, cx| {
+        let one = DiffLineRange::new("api/g", DiffSide::Modified, 1, 1);
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(one), cx));
+        s.comment_dialog(w, cx);
+        s.open_sheet(w, cx);
+        assert!(s.review.composer.is_some() && s.review.sheet.is_some());
+        s.create_workspace("rq2".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.as_deref() == Some("rq2")
+    })
+    .await;
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert!(s.review.composer.is_none() && s.review.sheet.is_none());
+    });
+    fs::remove_dir_all(&home).ok();
+}
+
+/// A file card's header buttons stay at the diff's right edge, though a long line is wider
+/// than the view and its code scrolls sideways.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn card_header_pinned(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace("wide".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let long = format!("{}\n", "x".repeat(3000));
+    fs::write(home.join("shark/workspaces/wide/api/f.txt"), long).unwrap();
+    on(cx, &|s, w, cx| {
+        s.show(Tab::Diff, w, cx);
+        s.refresh_diff(cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        !shark.read(cx).diff_files.is_empty()
+    })
+    .await;
+    let check = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, w, cx| {
+            for _ in 0..3 {
+                w.render_frame(cx);
+            }
+            let (button, collapse) = (w.find("edit-working-copy"), w.find("collapse-file"));
+            let (b, body) = (button.bounds(), w.find("diff-body").bounds());
+            assert!(button.visible(), "{b:?} in {body:?}");
+            assert!(
+                b.right() <= body.right() && b.right() > body.right() - px(40.),
+                "{b:?} in {body:?}"
+            );
+            assert!(collapse.visible() && collapse.bounds().left() >= body.left());
+        })
+        .unwrap();
+    };
+    check(cx);
+    // Scrolled sideways: the header stays.
+    let plus = |w: &Window| w.find(("line", 0usize)).bounds().left();
+    let before = cx
+        .update_window(window, |_, w, _| {
+            (plus(w), w.find("edit-working-copy").bounds())
+        })
+        .unwrap();
+    cx.update_window(window, |_, w, cx| {
+        let at = w.find("collapse-file").bounds().center() + point(px(0.), px(60.));
+        w.dispatch_event(
+            PlatformInput::ScrollWheel(ScrollWheelEvent {
+                position: at,
+                delta: ScrollDelta::Pixels(point(px(-400.), px(0.))),
+                ..Default::default()
+            }),
+            cx,
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    check(cx);
+    let after = cx
+        .update_window(window, |_, w, _| {
+            (plus(w), w.find("edit-working-copy").bounds())
+        })
+        .unwrap();
+    // Only the code scrolls: line numbers and the header stay.
+    assert_eq!(after, before);
+    fs::remove_dir_all(&home).ok();
+}
+
+/// A narrow working column (split at 0.8): the composer's buttons, and a posted, addressed
+/// thread's status pill, "On GitHub" and buttons stay inside the column.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn narrow_column_comments(cx: &mut TestAppContext) {
+    use gpui_kit::component::diff::{DiffLineRange, DiffSide};
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+            point(px(0.), px(0.)),
+            size(px(1000.), px(800.)),
+        ))),
+        ..Default::default()
+    };
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        options,
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace("nc".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    fs::write(home.join("shark/workspaces/nc/api/f"), "a\nb\nc\nd\n").unwrap();
+    on(cx, &|s, w, cx| {
+        s.show(Tab::Diff, w, cx);
+        s.refresh_diff(cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).diff_files.len() == 1
+    })
+    .await;
+    let posted: review::Comment = serde_json::from_str(
+        r#"{"id":1,"path":"api/f","start":[false,1],"end":[false,1],"text":"Use the shared constant",
+            "status":{"Addressed":{"turn":1,"note":"Pane ratio is now stored once and applied to every file block."}},
+            "github":"https://github.com/o/api/pull/7#issuecomment-1"}"#,
+    )
+    .unwrap();
+    on(cx, &|s, w, cx| {
+        s.diff.update(cx, |d, cx| d.set_split_ratio(0.8, cx));
+        s.edit_comments(cx, |l| l.push(posted.clone()));
+        let three = DiffLineRange::new("api/f", DiffSide::Modified, 3, 3);
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(three), cx));
+        s.comment_dialog(w, cx);
+    });
+    cx.update_window(window, |_, w, cx| {
+        for _ in 0..3 {
+            w.render_frame(cx);
+        }
+        let body = w.find("diff-body").bounds();
+        let inside = |card: ElementId, ids: &[ElementId]| {
+            let col = w.find(card.clone()).bounds();
+            assert!(col.size.width < body.size.width / 3., "{col:?} in {body:?}");
+            for id in ids {
+                let b = w.find(id.clone()).bounds();
+                assert!(
+                    b.left() >= col.left() && b.right() <= col.right() && b.size.width > px(0.),
+                    "{id:?} {b:?} in {card:?} {col:?}"
+                );
+            }
+        };
+        inside(
+            "composer-card".into(),
+            &[
+                "suggest-change".into(),
+                "composer-esc".into(),
+                "composer-add".into(),
+            ],
+        );
+        inside(
+            ("thread-card", 1usize).into(),
+            &[
+                ("thread-pill", 1usize).into(),
+                ("thread-where", 1usize).into(),
+                ("show-chat", 1usize).into(),
+                ("view-gh", 1usize).into(),
+            ],
+        );
+    })
+    .unwrap();
+    fs::remove_dir_all(&home).ok();
+}
+
+/// In-place editing, round 2: the line input lines up with the code, owns tab and the
+/// letters, a click in it keeps its caret, a second ⌘S waits for the first, other writers
+/// are noticed, a refresh adding a file keeps the input's focus, the composer takes focus
+/// from it, and leaving edit mode or the workspace asks first.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn inline_edit_round2(cx: &mut TestAppContext) {
+    use gpui_kit::component::diff::{DiffLinePosition, DiffLineRange, DiffSide};
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let lines = |f: &dyn Fn(usize) -> String| (1..=300).map(f).collect::<String>();
+    fs::write(
+        repos[0].path.join("f.txt"),
+        lines(&|i| format!("line {i}\n")),
+    )
+    .unwrap();
+    git::git(&repos[0].path, &["add", "."]).unwrap();
+    let commit = [
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "f",
+    ];
+    git::git(&repos[0].path, &commit).unwrap();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    for name in ["ed", "other"] {
+        on(cx, &|s, w, cx| {
+            s.create_workspace(name.into(), repos.clone(), None, w, cx)
+        });
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).active.as_deref() == Some(name)
+        })
+        .await;
+    }
+    on(cx, &|s, w, cx| {
+        let ix = (s.state.workspaces.iter())
+            .position(|w| w.name == "ed")
+            .unwrap();
+        s.open_workspace(ix, w, cx)
+    });
+    let file = home.join("shark/workspaces/ed/api/f.txt");
+    // A change every ten lines: a diff many screens tall.
+    let changed = |i: usize| match i % 10 {
+        0 => format!("changed {i}\n"),
+        _ => format!("line {i}\n"),
+    };
+    fs::write(&file, lines(&changed)).unwrap();
+    on(cx, &|s, w, cx| {
+        s.show(Tab::Diff, w, cx);
+        s.diff.update(cx, |d, cx| d.set_mode(DiffMode::Split, cx));
+        s.refresh_diff(cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).diff_files.len() == 1
+    })
+    .await;
+    // Files is closed until asked for.
+    cx.update(|cx| assert!(!shark.read(cx).tree_shown()));
+    let draw = |cx: &mut TestAppContext| {
+        for _ in 0..3 {
+            cx.update_window(window, |_, w, cx| w.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        }
+    };
+    on(cx, &|s, w, cx| {
+        let line = DiffLineRange::new("api/f.txt", DiffSide::Modified, 250, 250);
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
+        s.edit_working_copy(Some("api/f.txt".into()), w, cx)
+    });
+    draw(cx);
+    let value = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let e = shark.read(cx).editing.as_ref().unwrap();
+            (
+                e.buf.lines[e.buf.line].clone(),
+                e.input.read(cx).value().to_string(),
+            )
+        })
+    };
+    assert_eq!(value(cx).1, "changed 250");
+    let focused = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, w, cx| {
+            shark.read(cx).editing.as_ref().unwrap().focused(w, cx)
+        })
+        .unwrap()
+    };
+    assert!(focused(cx));
+    // The input sits where the line's code would, one row tall; the header has no Comment.
+    cx.update_window(window, |_, w, cx| {
+        let e = shark.read(cx).editing.as_ref().unwrap();
+        let input = w.find(("input", e.input.entity_id())).bounds();
+        let row = w.find_all(("line", 249usize))[0].bounds();
+        let code = (w.find_all("source").iter())
+            .filter(|s| s.bounds().left() == input.left())
+            .count();
+        assert_eq!(input.size.height, row.size.height, "{input:?} vs {row:?}");
+        assert!(code > 2, "{input:?} starts where the code does");
+    })
+    .unwrap();
+
+    // Letters are typed, not run as the diff's keys; tab indents and keeps focus.
+    let unified = cx.update(|cx| shark.read(cx).state.unified);
+    press(
+        cx,
+        &["s", "r", "c", "v", "x", "d", "e", "o", "i", "shift-c", "}"],
+    );
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.state.unified, unified);
+        assert!(s.review.composer.is_none() && s.editor.is_none() && s.review.sheet.is_none());
+        assert!(s.viewed_now.is_empty() && s.editing.is_some());
+    });
+    cx.update_window(window, |_, w, cx| w.input("sr", cx))
+        .unwrap();
+    press(cx, &["tab"]);
+    draw(cx);
+    let (buf, input) = value(cx);
+    assert_eq!(buf, input);
+    assert_eq!(buf, "changed 250srcvxdeoiC}sr    ");
+    assert!(focused(cx), "tab kept the focus");
+    // Home and end move in the line, not the diff.
+    press(cx, &["home"]);
+    let caret = |cx: &mut TestAppContext| {
+        cx.update(|cx| (shark.read(cx).editing.as_ref().unwrap().input.read(cx)).cursor())
+    };
+    assert!(focused(cx));
+    assert_eq!(caret(cx), 0);
+    press(cx, &["end"]);
+    assert_eq!(caret(cx), buf.len());
+
+    // A click on the line being edited leaves its caret and selection to the input.
+    on(cx, &|s, _, cx| {
+        let e = s.editing.as_ref().unwrap();
+        e.input.update(cx, |i, cx| i.set_selected_range(2..4, cx));
+    });
+    on(cx, &|s, w, cx| {
+        s.edit_click(
+            &DiffLinePosition::new("api/f.txt", DiffSide::Modified, 250),
+            w,
+            cx,
+        )
+    });
+    cx.update(|cx| {
+        let e = shark.read(cx).editing.as_ref().unwrap();
+        assert_eq!(e.input.read(cx).selected_range(), 2..4);
+    });
+
+    // Unsaved: the editor won't open the same file; leaving the workspace asks.
+    on(cx, &|s, w, cx| s.open_path("api/f.txt".into(), w, cx));
+    cx.update(|cx| assert!(shark.read(cx).editor.is_none()));
+    on(cx, &|s, w, cx| {
+        s.home.sel = Some("other".into());
+        s.try_plan_mode(w, cx)
+    });
+    cx.update_window(window, |_, w, cx| {
+        assert!(w.has_active_dialog(cx), "asks before leaving");
+        w.close_dialog(cx);
+    })
+    .unwrap();
+    cx.update(|cx| assert_eq!(shark.read(cx).active.as_deref(), Some("ed")));
+
+    // Two ⌘S in a row: one write, no false "changed on disk".
+    on(cx, &|s, w, cx| {
+        s.save_edit(false, w, cx);
+        s.save_edit(false, w, cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).editing.as_ref().is_some_and(|e| e.saved)
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| assert!(!w.has_active_dialog(cx)))
+        .unwrap();
+    let want = cx.update(|cx| shark.read(cx).editing.as_ref().unwrap().buf.text());
+    assert_eq!(fs::read_to_string(&file).unwrap(), want);
+
+    // Someone else writes the file: a clean buffer takes it, the input too.
+    let theirs = want
+        .replace("changed 250srcvxdeoiC}sr    ", "theirs changed 250")
+        .replace("line 3\n", "line 3!\n");
+    fs::write(&file, &theirs).unwrap();
+    on(cx, &|s, _, cx| s.refresh_diff(cx));
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark
+            .read(cx)
+            .editing
+            .as_ref()
+            .is_some_and(|e| e.buf.text() == theirs)
+    })
+    .await;
+    draw(cx);
+    assert_eq!(value(cx).1, "theirs changed 250");
+    // Under unsaved edits it is only marked, and ⌘S asks.
+    cx.update_window(window, |_, w, cx| w.input("!", cx))
+        .unwrap();
+    draw(cx);
+    fs::write(&file, theirs.replace("line 5\n", "line 5!\n")).unwrap();
+    on(cx, &|s, _, cx| s.refresh_diff(cx));
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).editing.as_ref().is_some_and(|e| e.stale)
+    })
+    .await;
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(
+            s.working_heading("api/f.txt"),
+            "Working copy · changed on disk"
+        );
+        assert!(s.editing.as_ref().unwrap().dirty);
+    });
+    on(cx, &|s, w, cx| s.save_edit(false, w, cx));
+    for _ in 0..100 {
+        cx.run_until_parked();
+        let shown = cx
+            .update_window(window, |_, w, cx| w.has_active_dialog(cx))
+            .unwrap();
+        if shown {
+            break;
+        }
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
+    }
+    cx.update_window(window, |_, w, cx| w.close_dialog(cx))
+        .unwrap();
+
+    // A new file reloads the diff; the line input keeps its focus.
+    on(cx, &|s, w, cx| s.focus_edit(w, cx));
+    draw(cx);
+    assert!(focused(cx));
+    fs::write(home.join("shark/workspaces/ed/api/g.txt"), "g\n").unwrap();
+    // As after a mouse scroll: no keyboard view to come back to.
+    on(cx, &|s, _, cx| {
+        s.lose_view();
+        s.refresh_diff(cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).diff_files.len() == 2
+    })
+    .await;
+    draw(cx);
+    assert!(focused(cx), "the refresh kept the input's focus");
+    // …and it is drawn, so typing reaches it.
+    cx.update_window(window, |_, w, cx| {
+        let e = shark.read(cx).editing.as_ref().unwrap();
+        let input = w.find_all(("input", e.input.entity_id()));
+        let top = shark.read(cx).diff.read(cx).scroll_top();
+        assert!(input.iter().any(|i| i.visible()), "{input:?} at {top:?}");
+    })
+    .unwrap();
+    let before = value(cx).0;
+    cx.update_window(window, |_, w, cx| w.input("Q", cx))
+        .unwrap();
+    draw(cx);
+    assert_eq!(value(cx).0, format!("{before}Q"));
+
+    // A filter: a folder's box ticks only the files it shows.
+    on(cx, &|s, _, cx| {
+        s.filter_tree("g.txt".into(), cx);
+        s.toggle_viewed_dir("api", cx);
+        // Folding a folder the filter shows open would only change hidden state.
+        s.tree_sel = 0;
+        s.set_dir_open(Some(false), cx);
+        assert!(s.collapsed_dirs.is_empty());
+        s.filter_tree(String::new(), cx);
+    });
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(
+            s.viewed_now.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+            ["api/g.txt"]
+        );
+    });
+
+    // The composer, opened while editing, takes the typing.
+    on(cx, &|s, w, cx| {
+        let line = DiffLineRange::new("api/f.txt", DiffSide::Original, 249, 249);
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
+        s.comment_dialog(w, cx)
+    });
+    draw(cx);
+    let before = value(cx);
+    cx.update_window(window, |_, w, cx| w.input("hello", cx))
+        .unwrap();
+    draw(cx);
+    assert_eq!(value(cx), before);
+    cx.update(|cx| {
+        let c = shark.read(cx).review.composer.as_ref().unwrap();
+        assert_eq!(c.input.read(cx).value().as_ref(), "hello");
+    });
+    // The edited file's header: [Review] [Save ⌘S], no Comment.
+    on(cx, &|s, _, cx| {
+        s.diff.update(cx, |d, cx| d.scroll_to_file("api/f.txt", cx))
+    });
+    draw(cx);
+    cx.update_window(window, |_, w, _| {
+        assert!(w.find_all("edit-save").len() == 1);
+        assert!(w.find_all("comment:api/f.txt").is_empty());
+    })
+    .unwrap();
+    // Back to reviewing: git's view as of now, not of the last refresh.
+    fs::write(&file, lines(&|i| format!("line {i}\n")) + "tail\n").unwrap();
+    on(cx, &|s, w, cx| {
+        s.editing.as_mut().unwrap().dirty = false;
+        s.leave_edit(w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        let s = shark.read(cx);
+        s.editing.is_none()
+            && s.diff_files
+                .iter()
+                .any(|f| f.additions() == 1 && f.deletions() == 0)
+    })
+    .await;
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Review, round 3: keys leave a mouse selection behind; the composer at the bottom shows
+/// whole; the sheet publishes to the ticked rows' PRs and opens its preview; a review names
+/// a fresh chat; a turn judges what claude read, whatever the turn count; a closed chat hands
+/// back what it never read; a share posted under another dialog leaves that dialog open.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn review_round3(cx: &mut TestAppContext) {
+    use review::Status;
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos(&home, &["api"]),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| {
+        s.create_workspace("r3".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let api = home.join("shark/workspaces/r3/api");
+    let text: String = (1..=80).map(|i| format!("line {i}\n")).collect();
+    fs::write(api.join("f"), text).unwrap();
+    on(cx, &|s, w, cx| {
+        s.show(Tab::Diff, w, cx);
+        s.refresh_diff(cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).diff_files.len() == 1
+    })
+    .await;
+    let draw = |cx: &mut TestAppContext| {
+        for _ in 0..3 {
+            cx.update_window(window, |_, w, cx| w.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        }
+    };
+    let comments = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            (shark.read(cx).ws_comments().iter())
+                .map(|c| (c.id, c.status.clone()))
+                .collect::<Vec<_>>()
+        })
+    };
+    on(cx, &|s, _, _| s.review.at_file("api/f"));
+    draw(cx);
+
+    // Lines 3–5 dragged over with the mouse, then a key moves the cursor: c is about the
+    // cursor's line, not the selection left behind.
+    let (from, to) = cx
+        .update_window(window, |_, w, _| {
+            let mut code: Vec<_> = (w.find_all("source").iter()).map(|s| s.bounds()).collect();
+            let left = code[0].left();
+            code.retain(|b| b.left() == left);
+            code.sort_by(|a, b| a.top().partial_cmp(&b.top()).unwrap());
+            let at = |b: Bounds<Pixels>| point(b.left() + px(2.), b.center().y);
+            (at(code[2]), at(code[4]))
+        })
+        .unwrap();
+    let mouse = |cx: &mut TestAppContext, e: PlatformInput| {
+        cx.update_window(window, |_, w, cx| {
+            w.dispatch_event(e, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    let left = MouseButton::Left;
+    mouse(
+        cx,
+        PlatformInput::MouseDown(MouseDownEvent {
+            button: left,
+            position: from,
+            click_count: 1,
+            ..Default::default()
+        }),
+    );
+    mouse(
+        cx,
+        PlatformInput::MouseMove(MouseMoveEvent {
+            position: to,
+            pressed_button: Some(left),
+            ..Default::default()
+        }),
+    );
+    mouse(
+        cx,
+        PlatformInput::MouseUp(MouseUpEvent {
+            button: left,
+            position: to,
+            click_count: 1,
+            ..Default::default()
+        }),
+    );
+    let dragged = |cx: &mut TestAppContext| {
+        cx.update(|cx| shark.read(cx).diff.read(cx).text_selection_lines(cx))
+    };
+    let lines = dragged(cx).expect("a mouse selection");
+    assert_eq!(lines.start(), 3);
+    press(cx, &["down", "c"]);
+    assert!(dragged(cx).is_none(), "the key cleared it");
+    cx.update(|cx| {
+        let comp = shark.read(cx).review.composer.as_ref().unwrap();
+        assert_eq!(comp.draft.lines(), "1");
+    });
+    press(cx, &["escape"]);
+
+    // The composer near the end shows whole above the bar, measured once laid out: here
+    // with Suggest change open on ten lines, taller than a first guess.
+    on(cx, &|s, w, cx| {
+        s.diff_move(0, Some(false), w, cx);
+        let ten = gpui_kit::component::diff::DiffLineRange::new(
+            "api/f",
+            gpui_kit::component::diff::DiffSide::Modified,
+            70,
+            79,
+        );
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(ten), cx));
+        s.comment_dialog(w, cx);
+    });
+    draw(cx);
+    press(cx, &["cmd-shift-s"]);
+    draw(cx);
+    cx.update_window(window, |_, w, _| {
+        let (add, body) = (
+            w.find("composer-add").bounds(),
+            w.find("diff-body").bounds(),
+        );
+        assert!(add.bottom() <= body.bottom(), "{add:?} in {body:?}");
+    })
+    .unwrap();
+    press(cx, &["cmd-shift-s"]); // back to the text box
+    cx.update_window(window, |_, w, cx| w.input("last lines", cx))
+        .unwrap();
+    press(cx, &["cmd-enter"]);
+    assert_eq!(comments(cx), [(1, Status::Pending)]);
+
+    // The sheet's Also publish follows the ticked rows' repos; ticking it opens the preview.
+    on(cx, &|s, w, cx| {
+        s.active_sync()
+            .unwrap()
+            .update(cx, |g, _| g.set_pr("api", 7, false));
+        let web: review::Comment = serde_json::from_str(
+            r#"{"id":50,"path":"web/x","start":[false,1],"end":[false,1],"text":"web"}"#,
+        )
+        .unwrap();
+        s.edit_comments(cx, |l| l.push(web));
+        s.open_sheet(w, cx);
+        assert_eq!(s.sheet_prs(cx), [("api".to_string(), 7)]);
+        s.sheet_toggle(cx); // unticks api's row
+        assert!(s.sheet_prs(cx).is_empty(), "web has no PR");
+        s.sheet_toggle(cx);
+        s.sheet_publish(true, cx);
+        assert!(s.review.sheet.as_ref().unwrap().preview);
+        s.close_sheet(w, cx);
+        s.edit_comments(cx, |l| l.retain(|c| c.id != 50));
+    });
+
+    // A review as a chat's first message names it.
+    let chat = cx.update(|cx| shark.read(cx).active_chat().cloned().unwrap());
+    on(cx, &|s, w, cx| s.send_review(&[1], "", false, w, cx));
+    cx.update(|cx| assert_eq!(chat.read(cx).meta.title, "Review · 1 comment"));
+    let reply = |cx: &mut TestAppContext, t: &str| {
+        let lines = [
+            serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}, "parent_tool_use_id": null}).to_string(),
+            serde_json::json!({"type": "result", "is_error": false, "result": t, "total_cost_usd": 0, "duration_ms": 1}).to_string(),
+        ];
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                let lines: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+                crate::chat::ui_tests::play(c, &lines, cx)
+            })
+        });
+        cx.run_until_parked();
+    };
+    // Sent in a turn numbered past the chat's count (as after a restart replays fewer
+    // messages): its report still lands.
+    on(cx, &|s, _, cx| {
+        s.set_status(&[1], Status::Sent { turn: 99 }, cx)
+    });
+    reply(cx, "[c1] addressed: Done.");
+    assert!(matches!(comments(cx)[0].1, Status::Addressed { .. }));
+
+    // Steered into a running turn and not read yet: that turn's end doesn't judge it.
+    on(cx, &|s, _, cx| s.set_status(&[1], Status::Pending, cx));
+    cx.update(|cx| chat.update(cx, |c, _| c.busy = true));
+    on(cx, &|s, w, cx| s.send_review(&[1], "", false, w, cx));
+    assert_eq!(comments(cx)[0].1, Status::Queued);
+    on(cx, &|s, w, cx| s.show(Tab::Chat, w, cx));
+    cx.update_window(window, |_, w, cx| {
+        chat.update(cx, |c, cx| c.focus_queue(w, cx));
+        w.render_frame(cx);
+    })
+    .unwrap();
+    press(cx, &["enter"]);
+    assert!(matches!(comments(cx)[0].1, Status::Sent { .. }));
+    reply(cx, "[c1] addressed: Too early.");
+    assert!(
+        matches!(comments(cx)[0].1, Status::Sent { .. }),
+        "still unread"
+    );
+
+    // Closed before claude read it: pending again.
+    cx.update(|cx| chat.update(cx, |c, _| c.busy = false));
+    on(cx, &|s, w, cx| s.close_chat(w, cx));
+    assert_eq!(comments(cx)[0].1, Status::Pending);
+    on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+
+    // Posted while another dialog sits on the share dialog: that one stays open; the share
+    // dialog says it posted and closes from there.
+    let bin = home.join("gh-bin");
+    fs::create_dir_all(&bin).unwrap();
+    let gh = bin.join("gh");
+    fs::write(
+        &gh,
+        "#!/bin/sh\necho https://github.com/o/api/pull/7#issuecomment-9\n",
+    )
+    .unwrap();
+    std::process::Command::new("chmod")
+        .arg("+x")
+        .arg(&gh)
+        .status()
+        .unwrap();
+    // SAFETY: tests that read SHARK_GH hold UI_LOCK.
+    unsafe { std::env::set_var("SHARK_GH", &gh) };
+    on(cx, &|s, w, cx| {
+        s.open_share(1, w, cx);
+        w.open_dialog(cx, |d, _, _| d.title("Other"));
+        s.post_share(w, cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark
+            .read(cx)
+            .comment(1)
+            .is_some_and(|c| c.github.is_some())
+    })
+    .await;
+    unsafe { std::env::remove_var("SHARK_GH") };
+    cx.update(|cx| {
+        assert!(
+            shark.read(cx).review.share.is_some(),
+            "not closed under Other"
+        )
+    });
+    on(cx, &|s, w, cx| {
+        w.close_dialog(cx); // Other
+        s.post_share(w, cx); // "Posted · Close"
+    });
+    cx.update_window(window, |_, w, cx| {
+        assert!(shark.read(cx).review.share.is_none() && !w.has_active_dialog(cx));
+    })
+    .unwrap();
+    fs::remove_dir_all(&home).ok();
+}
+
+/// In-place editing, round 3: with Vim on, its keys type in the line input, the composer
+/// and the Files filter; tab indents by the file's unit and ⌘Z undoes it; esc leaves even
+/// when the input lost focus; a file leaving the diff ends a clean edit and keeps a dirty
+/// one; an emptied file has a line to edit; leaving waits for a save under way.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn inline_edit_round3(cx: &mut TestAppContext) {
+    use gpui_kit::component::diff::{DiffLineRange, DiffSide};
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    fs::write(repos[0].path.join("f.txt"), "fn a() {\n    b();\n}\n").unwrap();
+    fs::write(repos[0].path.join("h.txt"), "h\n").unwrap();
+    git::git(&repos[0].path, &["add", "."]).unwrap();
+    let commit = [
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "f",
+    ];
+    git::git(&repos[0].path, &commit).unwrap();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            vim: true,
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| {
+        s.create_workspace("ed".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.as_deref() == Some("ed")
+    })
+    .await;
+    let dir = home.join("shark/workspaces/ed/api");
+    let file = dir.join("f.txt");
+    fs::write(&file, "fn a() {\n    c();\n}\n").unwrap();
+    let wait_files = async |cx: &mut TestAppContext, n: usize| {
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).diff_files.len() == n
+        })
+        .await
+    };
+    on(cx, &|s, w, cx| {
+        s.show(Tab::Diff, w, cx);
+        s.refresh_diff(cx);
+    });
+    wait_files(cx, 1).await;
+    let draw = |cx: &mut TestAppContext| {
+        for _ in 0..3 {
+            cx.update_window(window, |_, w, cx| w.render_frame(cx))
+                .unwrap();
+            cx.run_until_parked();
+        }
+    };
+    const VIM: [&str; 6] = ["j", "k", "h", "l", "g", "shift-g"];
+
+    // The Files filter.
+    on(cx, &|s, w, cx| s.toggle_tree(w, cx));
+    let filter = cx.update(|cx| shark.read(cx).tree_filter.clone());
+    on(cx, &|_, w, cx| {
+        filter.read(cx).focus_handle(cx).focus(w, cx)
+    });
+    press(cx, &VIM);
+    cx.update(|cx| assert_eq!(filter.read(cx).value().as_ref(), "jkhlgG"));
+    on(cx, &|s, w, cx| {
+        filter.update(cx, |i, cx| i.set_value("", w, cx));
+        s.filter_tree(String::new(), cx);
+    });
+
+    // The line input; tab indents by the file's four spaces, ⌘Z undoes it.
+    on(cx, &|s, w, cx| {
+        let line = DiffLineRange::new("api/f.txt", DiffSide::Modified, 2, 2);
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
+        s.edit_working_copy(Some("api/f.txt".into()), w, cx)
+    });
+    draw(cx);
+    let line = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let e = shark.read(cx).editing.as_ref().unwrap();
+            (
+                e.buf.lines[e.buf.line].clone(),
+                e.input.read(cx).value().to_string(),
+            )
+        })
+    };
+    press(cx, &VIM);
+    assert_eq!(line(cx).0, "    c();jkhlgG");
+    press(cx, &["tab"]);
+    assert_eq!(
+        line(cx),
+        ("    c();jkhlgG    ".into(), "    c();jkhlgG    ".into())
+    );
+    press(cx, &["cmd-z"]);
+    assert_eq!(line(cx).0, "    c();jkhlgG");
+    // Enter over a selection replaces it, then splits.
+    on(cx, &|s, _, cx| {
+        let input = s.editing.as_ref().unwrap().input.clone();
+        input.update(cx, |i, cx| i.set_selected_range(6..8, cx));
+    });
+    press(cx, &["enter"]);
+    cx.update(|cx| {
+        let e = shark.read(cx).editing.as_ref().unwrap();
+        assert_eq!(e.buf.lines[1..3], ["    c(", "jkhlgG"]);
+    });
+
+    // The composer, opened while editing.
+    on(cx, &|s, w, cx| {
+        let line = DiffLineRange::new("api/f.txt", DiffSide::Original, 1, 1);
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
+        s.comment_dialog(w, cx)
+    });
+    draw(cx);
+    press(cx, &VIM);
+    cx.update(|cx| {
+        let c = shark.read(cx).review.composer.as_ref().unwrap();
+        assert_eq!(c.input.read(cx).value().as_ref(), "jkhlgG");
+    });
+    // Esc in the composer closes only the composer.
+    press(cx, &["escape"]);
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert!(s.review.composer.is_none());
+        assert!(s.editing.is_some(), "still editing");
+    });
+
+    // Esc with the focus on the diff, not the input: back to reviewing.
+    on(cx, &|s, w, cx| {
+        s.editing.as_mut().unwrap().dirty = false;
+        s.focus_diff(w, cx)
+    });
+    press(cx, &["escape"]);
+    cx.update(|cx| assert!(shark.read(cx).editing.is_none()));
+
+    // Unsaved edits, Esc in the line, Discard: the diff has the focus again, for j/k.
+    on(cx, &|s, w, cx| {
+        s.edit_working_copy(Some("api/f.txt".into()), w, cx)
+    });
+    draw(cx);
+    cx.update_window(window, |_, w, cx| w.input("z", cx))
+        .unwrap();
+    press(cx, &["escape"]);
+    draw(cx);
+    press(cx, &["enter"]);
+    draw(cx);
+    cx.background_executor
+        .timer(Duration::from_millis(500))
+        .await;
+    draw(cx);
+    cx.update_window(window, |_, w, cx| {
+        let s = shark.read(cx);
+        assert!(s.editing.is_none(), "discarded");
+        assert!(
+            s.diff.read(cx).focus_handle(cx).is_focused(w),
+            "the diff has the focus"
+        );
+    })
+    .unwrap();
+
+    // A save under way: leaving waits for it.
+    on(cx, &|s, w, cx| {
+        s.edit_working_copy(Some("api/f.txt".into()), w, cx)
+    });
+    on(cx, &|s, w, cx| {
+        s.editing.as_mut().unwrap().saving = true;
+        s.leave_edit(w, cx);
+        s.editing.as_mut().unwrap().saving = false;
+    });
+    cx.update(|cx| assert!(shark.read(cx).editing.is_some()));
+
+    // The file leaves the diff: a clean edit ends…
+    git::git(&dir, &["checkout", "--", "f.txt"]).unwrap();
+    on(cx, &|s, _, cx| s.refresh_diff(cx));
+    wait_files(cx, 0).await;
+    cx.update(|cx| assert!(shark.read(cx).editing.is_none()));
+    // …a dirty one keeps its file.
+    fs::write(&file, "fn a() {\n    c();\n}\n").unwrap();
+    on(cx, &|s, _, cx| s.refresh_diff(cx));
+    wait_files(cx, 1).await;
+    on(cx, &|s, w, cx| {
+        s.edit_working_copy(Some("api/f.txt".into()), w, cx)
+    });
+    draw(cx);
+    cx.update_window(window, |_, w, cx| w.input("!", cx))
+        .unwrap();
+    press(cx, &["enter"]);
+    git::git(&dir, &["checkout", "--", "f.txt"]).unwrap();
+    on(cx, &|s, _, cx| s.refresh_diff(cx));
+    for _ in 0..50 {
+        cx.run_until_parked();
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
+    }
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        let e = s.editing.as_ref().unwrap();
+        assert!(e.dirty);
+        assert!(s.diff_files.iter().any(|f| f.path() == "api/f.txt"));
+        // git's original stays, not the buffer (two added lines).
+        assert_eq!((e.file.additions(), e.orig.0.additions()), (2, 1));
+    });
+
+    // An emptied file: its one empty line is there to edit.
+    on(cx, &|s, _, cx| {
+        s.editing.as_mut().unwrap().dirty = false;
+        s.end_edit(cx)
+    });
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        let f = s.diff_files.iter().find(|f| f.path() == "api/f.txt");
+        assert_eq!(f.map(|f| f.additions()), Some(1));
+        assert_eq!(s.diff_fp, 0, "the next refresh rebuilds");
+    });
+    fs::write(dir.join("h.txt"), "").unwrap();
+    on(cx, &|s, _, cx| s.refresh_diff(cx));
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        (shark.read(cx).diff_files.iter()).any(|f| f.path() == "api/h.txt")
+    })
+    .await;
+    on(cx, &|s, w, cx| {
+        s.edit_working_copy(Some("api/h.txt".into()), w, cx)
+    });
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.editing.as_ref().unwrap().path.as_str(), "api/h.txt");
+        assert!(
+            s.review.hunks["api/h.txt"]
+                .iter()
+                .flatten()
+                .any(|r| r.0 == b'+' && r.2 == 1)
+        );
+    });
+
+    // A mode-only change: the base is the same text, not an empty added file.
+    on(cx, &|s, _, cx| s.end_edit(cx));
+    git::git(&dir, &["checkout", "--", "h.txt"]).unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(dir.join("h.txt"), fs::Permissions::from_mode(0o755)).unwrap();
+    on(cx, &|s, _, cx| s.refresh_diff(cx));
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        let s = shark.read(cx);
+        (s.diff_files.iter()).any(|f| f.path() == "api/h.txt" && f.additions() == 0)
+    })
+    .await;
+    on(cx, &|s, w, cx| {
+        s.edit_working_copy(Some("api/h.txt".into()), w, cx)
+    });
+    cx.update(|cx| {
+        let e = shark.read(cx).editing.as_ref().unwrap();
+        assert_eq!(e.path.as_str(), "api/h.txt");
+        assert_eq!((e.file.additions(), e.file.deletions()), (0, 0));
+    });
     fs::remove_dir_all(&home).ok();
 }

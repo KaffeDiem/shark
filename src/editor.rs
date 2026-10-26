@@ -224,16 +224,7 @@ impl FileEditor {
         cx.spawn_in(window, async move |this, cx| {
             let result = cx
                 .background_executor()
-                .spawn(async move {
-                    // A missing or unreadable file counts as changed: never overwrite blind.
-                    let on_disk = std::fs::read(&abs).map(fingerprint);
-                    if !force && on_disk.map_or(true, |fp| fp != expected) {
-                        return Ok(None);
-                    }
-                    // In place, not tmp+rename: keeps the file's mode, symlinks and inode.
-                    std::fs::write(&abs, text.as_bytes())
-                        .map(|_| Some(fingerprint(text.as_bytes())))
-                })
+                .spawn(async move { write_checked(&abs, expected, &text, force) })
                 .await;
             this.update_in(cx, |e, window, cx| {
                 e.saving = false;
@@ -378,6 +369,23 @@ pub(crate) fn apply_vim_key<M: InputModeKind>(
         cx.write_to_clipboard(ClipboardItem::new_string(y));
     }
     Some((edited, out.cmd))
+}
+
+/// Writes `text` unless the file no longer has fingerprint `expected` (then only with `force`);
+/// `Ok(None)` when someone else changed it. Returns the new fingerprint. Blocking.
+pub fn write_checked(
+    abs: &std::path::Path,
+    expected: u64,
+    text: &str,
+    force: bool,
+) -> std::io::Result<Option<u64>> {
+    // A missing or unreadable file counts as changed: never overwrite blind.
+    let on_disk = std::fs::read(abs).map(fingerprint);
+    if !force && on_disk.map_or(true, |fp| fp != expected) {
+        return Ok(None);
+    }
+    // In place, not tmp+rename: keeps the file's mode, symlinks and inode.
+    std::fs::write(abs, text.as_bytes()).map(|_| Some(fingerprint(text.as_bytes())))
 }
 
 pub fn focus(editor: &Entity<FileEditor>, window: &mut Window, cx: &mut App) {

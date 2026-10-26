@@ -30,6 +30,13 @@ impl Shark {
         {
             return self.show(Tab::File, window, cx);
         }
+        if (self.editing.as_ref()).is_some_and(|e| e.path.as_str() == path && e.dirty) {
+            return notify_err(
+                window,
+                cx,
+                format!("{path} has unsaved edits in the diff"),
+            );
+        }
         let abs = ws.dir().join(&path);
         if std::fs::metadata(&abs).is_ok_and(|m| m.len() > crate::editor::MAX_BYTES) {
             return notify_err(
@@ -38,7 +45,7 @@ impl Shark {
                 format!("{path} is too large to edit; it shows in the diff only"),
             );
         }
-        self.confirm_discard(window, cx, move |s, window, cx| {
+        self.confirm_discard(true, false, window, cx, move |s, window, cx| {
             let vim = s.state.vim;
             let editor = cx.new(|cx| FileEditor::new(path, abs, vim, window, cx));
             s._editor_subs = vec![
@@ -80,7 +87,7 @@ impl Shark {
         if self.editor.is_none() {
             return;
         }
-        self.confirm_discard(window, cx, |s, window, cx| {
+        self.confirm_discard(true, false, window, cx, |s, window, cx| {
             s.drop_editor();
             if s.tab == Tab::File {
                 s.show(Tab::Diff, window, cx);
@@ -97,35 +104,47 @@ impl Shark {
         }
     }
 
-    /// Runs `then` now, or after the user agrees to drop unsaved edits in the open file.
     /// Quit, asking first if the open file has unsaved edits.
     pub fn quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.confirm_discard(window, cx, |_, _, cx| cx.quit())
+        self.confirm_discard(true, true, window, cx, |_, _, cx| cx.quit())
     }
 
+    /// Runs `then` now, or after the user agrees to drop the unsaved edits of the open file
+    /// (`editor`) and of the file edited in the diff (`edit`).
     pub(super) fn confirm_discard(
         &mut self,
+        editor: bool,
+        edit: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut Shark, &mut Window, &mut Context<Shark>) + 'static,
     ) {
-        let Some(path) = self
-            .editor
-            .as_ref()
-            .filter(|e| e.read(cx).dirty)
-            .map(|e| e.read(cx).path.clone())
-        else {
+        let open = (self.editor.as_ref())
+            .filter(|e| editor && e.read(cx).dirty)
+            .map(|e| e.read(cx).path.clone());
+        // A write under way would land after a Discard; wait for it.
+        if let Some(e) = self.editing.as_ref().filter(|e| edit && e.saving) {
+            return window.push_notification(format!("Saving {}…", e.path), cx);
+        }
+        let inline = (self.editing.as_ref())
+            .filter(|e| edit && e.dirty)
+            .map(|e| e.path.to_string());
+        let paths: Vec<String> = open.into_iter().chain(inline).collect();
+        if paths.is_empty() {
             return then(self, window, cx);
-        };
+        }
         let then = RefCell::new(Some(then));
         confirm(
-            format!("Discard changes to {path}?"),
+            format!("Discard changes to {}?", paths.join(" and ")),
             "Your edits are not saved. Cancel and press cmd-s to keep them.",
             "Discard",
             move |s, window, cx| {
                 if let Some(f) = then.borrow_mut().take() {
-                    if let Some(e) = &s.editor {
+                    if let Some(e) = s.editor.as_ref().filter(|_| editor) {
                         e.update(cx, |e, _| e.dirty = false);
+                    }
+                    if let Some(e) = s.editing.as_mut().filter(|_| edit) {
+                        e.dirty = false;
                     }
                     f(s, window, cx)
                 }

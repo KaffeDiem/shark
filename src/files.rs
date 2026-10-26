@@ -56,12 +56,27 @@ pub fn rows(paths: &[String], collapsed: &HashSet<String>) -> Vec<Row> {
         for (name, mut child) in &d.dirs {
             let mut name = name.clone();
             let mut path = format!("{prefix}{name}");
-            // Repos (depth 0) keep their own row so each repo stays visible.
-            while depth > 0 && child.files.is_empty() && child.dirs.len() == 1 {
+            // A repo (depth 0) shows as "repo / dir".
+            let sep = if depth == 0 { " / " } else { "/" };
+            while child.files.is_empty() && child.dirs.len() == 1 {
                 let (n, c) = child.dirs.iter().next().unwrap();
-                name = format!("{name}/{n}");
+                name = format!("{name}{sep}{n}");
                 path = format!("{path}/{n}");
                 child = c;
+            }
+            // A folder holding one file is that file's row ("app/sidebar.rs"); repos keep
+            // their own row so each stays visible.
+            if let (true, true, Some((f, &ix))) =
+                (depth > 0, child.dirs.is_empty(), child.files.iter().next())
+                && child.files.len() == 1
+            {
+                out.push(Row {
+                    depth,
+                    name: format!("{name}/{f}"),
+                    path: format!("{path}/{f}"),
+                    file: Some(ix),
+                });
+                continue;
             }
             let open = !collapsed.contains(&path);
             out.push(Row {
@@ -122,6 +137,9 @@ mod tests {
             "api/src/deep/only/x.rs",
             "api/src/a.rs",
             "web/index.ts",
+            "shark/src/app/sidebar.rs",
+            "shark/src/app.rs",
+            "shark/src/chat.rs",
         ]);
         let r = rows(&p, &HashSet::new());
         assert_eq!(
@@ -129,21 +147,24 @@ mod tests {
             [
                 "api",
                 "  src",
-                "    deep/only",
-                "      x.rs",
+                "    deep/only/x.rs",
                 "    a.rs",
                 "  README.md",
+                "shark / src",
+                "  app/sidebar.rs",
+                "  app.rs",
+                "  chat.rs",
                 "web",
                 "  index.ts"
             ]
         );
-        assert_eq!(r[2].path, "api/src/deep/only");
-        assert_eq!(r[3].file, Some(1));
-        assert_eq!(tree_order(&p), [1, 2, 0, 3]);
+        assert_eq!((r[2].path.as_str(), r[2].file), ("api/src/deep/only/x.rs", Some(1)));
+        assert_eq!(r[5].path, "shark/src");
+        assert_eq!(tree_order(&p), [1, 2, 0, 4, 5, 6, 3]);
 
         let collapsed = HashSet::from(["api/src".to_string()]);
         assert_eq!(
-            show(&rows(&p, &collapsed)),
+            show(&rows(&p[..4], &collapsed)),
             ["api", "  src", "  README.md", "web", "  index.ts"]
         );
     }
