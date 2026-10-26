@@ -243,9 +243,10 @@ impl Shark {
         };
         let theme = cx.theme();
         let repo = c.path.split('/').next().unwrap_or_default();
-        let base = (ws.repos.iter().find(|r| r.name == repo))
-            .map(|r| r.base.trim_start_matches("origin/").to_string())
+        let wr = ws.repos.iter().find(|r| r.name == repo);
+        let base = (wr.map(|r| r.base.trim_start_matches("origin/").to_string()))
             .unwrap_or_default();
+        let branch = wr.map_or(ws.branch.clone(), |r| ws.branch_of(r).to_string());
         let this = cx.entity().downgrade();
         let gone = this.clone();
         d.font_features(inter_features())
@@ -276,8 +277,7 @@ impl Shark {
                             )
                             .child(div().text_xs().text_color(theme.muted_foreground).child(
                                 format!(
-                                    "{} → {base} · Visible to everyone with PR access",
-                                    ws.branch
+                                    "{branch} → {base} · Visible to everyone with PR access"
                                 ),
                             )),
                     )

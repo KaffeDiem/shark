@@ -92,7 +92,8 @@ pub fn create_linked_prs(
         if ahead == "0" || skip.contains(&r.name) {
             continue;
         }
-        cmd_bounded(&wt, "git", &["push", "-u", "origin", &ws.branch], 120)?;
+        let branch = ws.branch_of(r);
+        cmd_bounded(&wt, "git", &["push", "-u", "origin", branch], 120)?;
         // Only an open PR from this repo is reused; `gh pr view <branch>` would also return a
         // merged one, and new commits after a merge need a new PR.
         let open = cmd_bounded(
@@ -102,7 +103,7 @@ pub fn create_linked_prs(
                 "pr",
                 "list",
                 "--head",
-                &ws.branch,
+                branch,
                 "--state",
                 "open",
                 "--json",
@@ -116,7 +117,7 @@ pub fn create_linked_prs(
             false => open,
             true => {
                 let base = r.base.strip_prefix("origin/").unwrap_or(&r.base);
-                let out = cmd_bounded(&wt, "gh", &new.args(&ws.branch, base), 60)?;
+                let out = cmd_bounded(&wt, "gh", &new.args(branch, base), 60)?;
                 out.lines().last().unwrap_or_default().to_string()
             }
         };
@@ -325,6 +326,7 @@ mod tests {
                     name: n.into(),
                     src: n.into(),
                     base: "origin/main".into(),
+                    branch: None,
                 })
                 .into(),
             ..Default::default()
@@ -378,7 +380,10 @@ mod tests {
             repos.push(add_repo(&src, &[]).unwrap());
         }
         let dir = root.join("ws/feat");
-        let ws = create_workspace(&dir, "feat", "feat", &repos).unwrap();
+        // api is on its own branch.
+        let mut on = crate::git::on_branch(&repos, "feat");
+        on[0].1 = "kd/api".into();
+        let ws = create_workspace(&dir, "feat", "feat", &on).unwrap();
         for name in ["api", "web", "ops"] {
             c(
                 &dir.join(name),
@@ -441,21 +446,17 @@ esac
         );
         assert_eq!(
             fs::read_to_string(&log).unwrap(),
-            "api pr list\napi pr create --head feat --base main --fill\nweb pr list\napi pr view\napi pr edit\nweb pr view\nweb pr edit\n"
+            "api pr list\napi pr create --head kd/api --base main --fill\nweb pr list\napi pr view\napi pr edit\nweb pr view\nweb pr edit\n"
         );
         let body = fs::read_to_string(root.join("api.body")).unwrap();
         assert!(
             body.starts_with("Body\n\n") && body.contains("- web: https://gh/web/7"),
             "{body}"
         );
-        let pushed = |name: &str| {
-            git(
-                &root.join(format!("{name}.git")),
-                &["branch", "--list", "feat"],
-            )
-            .unwrap()
+        let pushed = |name: &str, b: &str| {
+            git(&root.join(format!("{name}.git")), &["branch", "--list", b]).unwrap()
         };
-        assert!(!pushed("api").is_empty() && pushed("ops").is_empty());
+        assert!(!pushed("api", "kd/api").is_empty() && pushed("ops", "feat").is_empty());
 
         // A failing create surfaces gh's error.
         fs::write(&fail, "").unwrap();

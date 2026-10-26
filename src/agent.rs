@@ -832,7 +832,8 @@ fn live(model: Option<&str>) {
             path: p,
         });
     }
-    let mut ws = git::create_workspace(&root.join("ws/live"), "live", "live", &repos).unwrap();
+    let on = git::on_branch(&repos, "live");
+    let mut ws = git::create_workspace(&root.join("ws/live"), "live", "live", &on).unwrap();
     ws.name = format!("live-test-{tag}-{}", std::process::id());
     ws.chats[0].model = model.map(Into::into);
     ws.chats[0].id = ws.name.clone(); // the default id would be a real chat's transcript

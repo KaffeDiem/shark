@@ -49,7 +49,8 @@ impl Env {
                 path: p,
             });
         }
-        let mut ws = git::create_workspace(&root.join("ws/live"), "live", "live", &repos).unwrap();
+        let on = git::on_branch(&repos, "live");
+        let mut ws = git::create_workspace(&root.join("ws/live"), "live", "live", &on).unwrap();
         ws.name = format!("cxlive-{tag}-{}", std::process::id());
         // A unique transcript name: the default (`live`) would be a real chat's file.
         ws.chats[0].id = ws.name.clone();

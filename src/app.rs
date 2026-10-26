@@ -779,7 +779,7 @@ impl Shark {
                             .child(
                                 div()
                                     .text_color(theme.muted_foreground)
-                                    .child(format!("→ {}", b.base)),
+                                    .child(format!("{} → {}", b.name, b.base)),
                             )
                     }))
             })

@@ -174,6 +174,9 @@ pub struct WsRepo {
     pub src: PathBuf,
     /// Ref the branch was cut from, e.g. `origin/main`.
     pub base: String,
+    /// Its own branch; set only when it differs from the workspace branch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch: Option<String>,
 }
 
 /// Moves item `from` into slot `to`; the ones between shift over.
@@ -207,6 +210,11 @@ pub fn workspaces_dir() -> PathBuf {
 impl Workspace {
     pub fn dir(&self) -> PathBuf {
         workspaces_dir().join(&self.name)
+    }
+
+    /// The branch `r`'s worktree is on: its own, or the workspace's.
+    pub fn branch_of<'a>(&'a self, r: &'a WsRepo) -> &'a str {
+        r.branch.as_deref().unwrap_or(&self.branch)
     }
 
     /// Gives a workspace saved before chat tabs (or a new one) its first chat.
@@ -466,6 +474,20 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A repo saved before per-repo branches is on the workspace branch, and one on the
+    /// workspace branch doesn't save the field.
+    #[test]
+    fn repo_branch_is_optional() {
+        let old = r#"{"name":"w","branch":"feat","repos":[{"name":"api","src":"/x","base":"origin/main"}]}"#;
+        let mut ws: Workspace = serde_json::from_str(old).unwrap();
+        assert_eq!(ws.repos[0].branch, None);
+        assert_eq!(ws.branch_of(&ws.repos[0]), "feat");
+        assert!(!serde_json::to_string(&ws).unwrap().contains("\"branch\":null"));
+        ws.repos[0].branch = Some("kd/x".into());
+        let back: Workspace = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+        assert_eq!(back.branch_of(&back.repos[0]), "kd/x");
+    }
 
     #[test]
     fn corrupt_state_is_kept() {

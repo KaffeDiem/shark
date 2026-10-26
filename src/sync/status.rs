@@ -327,6 +327,8 @@ pub struct Repo {
     pub name: String,
     /// Ref the branch was cut from, e.g. `origin/main`.
     pub base: String,
+    /// The branch its worktree should be on.
+    pub branch: String,
     pub local: Result<Local, String>,
     /// `None` until GitHub was asked; `Some(Err)` when gh failed (offline, logged out, not GitHub).
     pub pr: Option<Result<Option<Pr>, String>>,
@@ -334,10 +336,11 @@ pub struct Repo {
 
 impl Repo {
     /// Known by name only: nothing probed yet.
-    pub fn fresh(r: &crate::state::WsRepo) -> Repo {
+    pub fn fresh(r: &crate::state::WsRepo, ws: &crate::state::Workspace) -> Repo {
         Repo {
             name: r.name.clone(),
             base: r.base.clone(),
+            branch: ws.branch_of(r).into(),
             local: Ok(Local::default()),
             pr: None,
         }
@@ -476,7 +479,7 @@ pub fn among<'a>(repos: &'a [Repo], rs: &'a [String]) -> impl Iterator<Item = &'
 /// remote ones, and within the PR phase actionable steps beat passive waits, so a
 /// "checks running" in one repo can't hide a "ready for review" in another. `handled`: review
 /// IDs already sent to the agent.
-pub fn next_action(repos: &[Repo], branch: &str, handled: &[String]) -> Action {
+pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
     let names = |f: &dyn Fn(&Repo, &Local) -> bool| -> Vec<String> {
         repos
             .iter()
@@ -498,9 +501,13 @@ pub fn next_action(repos: &[Repo], branch: &str, handled: &[String]) -> Action {
     let step = |verb: &str, kind: Kind, rs: Vec<String>, attention| {
         (!rs.is_empty()).then(|| act(label(verb, &rs), kind, rs, attention))
     };
-    // An agent step whose prompt `key` names the repos.
+    // Prompt `key` for the repos in `rs`, once per branch; `fill` gives `{repos}`.
+    let render = |key: &str, rs: &[String], fill: &dyn Fn(&[String]) -> String| {
+        prompts::render_each(key, among(repos, rs).map(|r| (&*r.name, &*r.branch)), fill)
+    };
+    // An agent step whose prompt `key` names the repos and their branch.
     let ask = |verb: &str, key: &str, rs: Vec<String>, attention| {
-        let prompt = prompts::render(key, &rs.join(", "), branch);
+        let prompt = render(key, &rs, &|rs| rs.join(", "));
         step(verb, Kind::Agent(prompt), rs, attention)
     };
     let with_reviews =
@@ -557,7 +564,7 @@ pub fn next_action(repos: &[Repo], branch: &str, handled: &[String]) -> Action {
             ask("Fix detached HEAD", "detached", rs, true)
         })
         .or_else(|| {
-            let rs = names(&|_, l| l.branch.as_deref() != Some(branch));
+            let rs = names(&|r, l| l.branch.as_deref() != Some(&r.branch));
             ask("Switch to branch", "wrong_branch", rs, true)
         })
         .or_else(|| {
@@ -594,18 +601,21 @@ pub fn next_action(repos: &[Repo], branch: &str, handled: &[String]) -> Action {
         })
         .or_else(|| {
             let rs = current(&|p| p.merge_state == "DIRTY");
-            let prompt = prompts::render("pr_conflicts", &with_base(&rs), branch);
+            let prompt = render("pr_conflicts", &rs, &with_base);
             step("Resolve PR conflicts", Kind::Agent(prompt), rs, true)
         })
         .or_else(|| {
             let rs = current(&|p| matches!(p.checks, Checks::Failing(_)));
-            let failing: Vec<String> = among(repos, &rs)
-                .filter_map(|r| match &r.open_pr()?.checks {
-                    Checks::Failing(n) => Some(format!("{}: {}", r.name, n.join(", "))),
-                    _ => None,
-                })
-                .collect();
-            let prompt = prompts::render("checks", &failing.join("; "), branch);
+            let failing = |rs: &[String]| {
+                among(repos, rs)
+                    .filter_map(|r| match &r.open_pr()?.checks {
+                        Checks::Failing(n) => Some(format!("{}: {}", r.name, n.join(", "))),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            let prompt = render("checks", &rs, &failing);
             step("Fix checks", Kind::Agent(prompt), rs, true)
         })
         .or_else(|| {
@@ -700,7 +710,8 @@ pub fn pr_head_moved(repos: &[Repo]) -> bool {
 /// ForcePush, `gh` args for Merge (minus the merge method). `Ok(None)` when the repo has nothing
 /// to do. Menu steps skip the next-step check, so these guards are what keeps them from moving
 /// the wrong commit.
-pub fn step_args(kind: &Kind, b: &str, r: &Repo) -> Result<Option<Vec<String>>, String> {
+pub fn step_args(kind: &Kind, r: &Repo) -> Result<Option<Vec<String>>, String> {
+    let b = r.branch.as_str();
     let local = || r.local.clone();
     let on_branch = || {
         let l = local()?;
@@ -866,6 +877,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         Repo {
             name: name.into(),
             base: "origin/main".into(),
+            branch: "feat".into(),
             local: Ok(l),
             pr: Some(Ok(pr)),
         }
@@ -900,11 +912,48 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
     }
 
     fn next(repos: &[Repo]) -> Action {
-        next_action(repos, "feat", &[])
+        next_action(repos, &[])
     }
 
     fn one(l: Local, p: Option<Pr>) -> Action {
         next(&[repo("a", l, p)])
+    }
+
+    /// Each repo is held to its own branch, and the prompt names that one.
+    #[test]
+    fn per_repo_branch() {
+        let own = |l: Local| Repo {
+            branch: "kd/x".into(),
+            ..repo("b", l, None)
+        };
+        let on_x = Local {
+            branch: Some("kd/x".into()),
+            ..clean(1)
+        };
+        let a = next(&[repo("a", clean(1), None), own(on_x)]);
+        assert!(!a.label.starts_with("Switch"), "{}", a.label);
+        let elsewhere = Local {
+            branch: Some("feat".into()),
+            ..clean(1)
+        };
+        let a = next(&[repo("a", clean(1), None), own(elsewhere)]);
+        assert_eq!(a.label, "Switch to branch · b");
+        let Kind::Agent(prompt) = a.kind else {
+            panic!("{:?}", a.kind)
+        };
+        assert!(prompt.contains("`kd/x`") && !prompt.contains("`feat`"), "{prompt}");
+        // Both off their branches: one instruction per branch, each naming its own.
+        let off = || Local {
+            branch: Some("other".into()),
+            ..clean(1)
+        };
+        let a = next(&[repo("a", off(), None), own(off())]);
+        let Kind::Agent(prompt) = a.kind else {
+            panic!("{:?}", a.kind)
+        };
+        let (fa, kb) = prompt.split_once("\n\n").unwrap();
+        assert!(fa.contains(": a.") && fa.contains("`feat`") && !fa.contains("kd/x"), "{fa}");
+        assert!(kb.contains(": b.") && kb.contains("`kd/x`") && !kb.contains("feat"), "{kb}");
     }
 
     #[test]
@@ -1009,6 +1058,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         let broken = Repo {
             name: "a".into(),
             base: "b".into(),
+            branch: "feat".into(),
             local: Err("gone".into()),
             pr: None,
         };
@@ -1177,7 +1227,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
             ..pr("BLOCKED", Checks::Passing)
         };
         let ask = |p: Pr, handled: &[String]| {
-            next_action(&[repo("a", clean(1), Some(p))], "feat", handled)
+            next_action(&[repo("a", clean(1), Some(p))], handled)
         };
         let a = ask(reviewed(&["r1"]), &[]);
         assert_eq!(
@@ -1208,7 +1258,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
             comments: vec!["c1".into()],
             ..pr("CLEAN", Checks::Passing)
         };
-        let ask = |h: &[String]| next_action(&[repo("a", clean(1), Some(p.clone()))], "feat", h);
+        let ask = |h: &[String]| next_action(&[repo("a", clean(1), Some(p.clone()))], h);
         let a = ask(&[]);
         assert_eq!(
             (a.label.as_str(), a.reviews),
@@ -1219,7 +1269,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
 
     #[test]
     fn step_guards() {
-        let args = |k: Kind, l: Local, p: Option<Pr>| step_args(&k, "feat", &repo("a", l, p));
+        let args = |k: Kind, l: Local, p: Option<Pr>| step_args(&k, &repo("a", l, p));
         let behind = Local {
             remote: Some((0, 2)),
             ..clean(1)
@@ -1322,7 +1372,8 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         git(&src, &["push", "-q", "-u", "origin", "main"]).unwrap();
         git(&src, &["remote", "set-head", "origin", "main"]).unwrap();
         let repo = crate::git::add_repo(&src, &[]).unwrap();
-        let ws = create_workspace(&root.join("ws/feat"), "feat", "feat", &[repo]).unwrap();
+        let on = crate::git::on_branch(&[repo], "feat");
+        let ws = create_workspace(&root.join("ws/feat"), "feat", "feat", &on).unwrap();
         let wt = root.join("ws/feat/api");
         let base = ws.repos[0].base.clone();
         let p = || probe(&wt, "feat", &base, None).unwrap();
@@ -1343,10 +1394,11 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         let r = |l: Local| Repo {
             name: "api".into(),
             base: base.clone(),
+            branch: "feat".into(),
             local: Ok(l),
             pr: Some(Ok(None)),
         };
-        assert_eq!(next_action(&[r(p())], "feat", &[]).kind, Kind::CreatePr);
+        assert_eq!(next_action(&[r(p())], &[]).kind, Kind::CreatePr);
 
         git(&wt, &["push", "-q", "-u", "origin", "feat"]).unwrap();
         assert_eq!(p().remote, Some((0, 0)));
@@ -1379,10 +1431,10 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
             Some((7, 7)),
             "unmoved refs reuse the last counts"
         );
-        let force = step_args(&Kind::ForcePush, "feat", &r(l.clone()))
+        let force = step_args(&Kind::ForcePush, &r(l.clone()))
             .unwrap()
             .unwrap();
-        assert_eq!(next_action(&[r(l)], "feat", &[]).kind, Kind::ForcePush);
+        assert_eq!(next_action(&[r(l)], &[]).kind, Kind::ForcePush);
         // Someone pushes after the probe: the lease on the probed commit must refuse.
         git(&src, &["push", "-qf", "origin", "main:feat"]).unwrap();
         let force: Vec<&str> = force.iter().map(String::as_str).collect();
@@ -1409,7 +1461,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         );
         let l = p();
         assert_eq!((l.op, l.conflicts), (Some(Op::Merge), 1));
-        assert_eq!(next_action(&[r(l)], "feat", &[]).label, "Resolve conflicts");
+        assert_eq!(next_action(&[r(l)], &[]).label, "Resolve conflicts");
         fs::remove_dir_all(&root).unwrap();
     }
 }

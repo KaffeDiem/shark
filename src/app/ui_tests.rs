@@ -233,7 +233,7 @@ async fn vim_setting_and_palette_target(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     for name in ["one", "two"] {
         on(cx, &|s, w, cx| {
-            s.create_workspace(name.into(), repos.clone(), None, w, cx)
+            s.create_workspace(name.into(), git::on_branch(&repos, name), None, w, cx)
         });
         cx.wait_for(window, Duration::from_secs(10), |_, cx| {
             shark.read(cx).active.as_deref() == Some(name)
@@ -289,6 +289,149 @@ async fn vim_setting_and_palette_target(cx: &mut TestAppContext) {
     })
     .await;
     cx.update(|cx| assert_eq!(shark.read(cx).state.workspaces[0].name, open));
+}
+
+/// The New workspace dialog's branch mode: cmd-b or the row label lists a repo's branches;
+/// enter picks one, tab goes back, a checked-out branch is refused, the first row restores
+/// the new branch, a fetch finds branches only origin has, and the branch name may be left
+/// empty when every ticked repo has an existing branch.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn branch_picker(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api", "web"]);
+    for r in &repos {
+        let origin = home.join(format!("{}.git", r.name));
+        git::git(&home, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
+        git::git(&r.path, &["remote", "add", "origin", &origin.to_string_lossy()]).unwrap();
+        git::git(&r.path, &["push", "-q", "origin", "main", "main:shared", "main:kd/a"]).unwrap();
+    }
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            last_repos: vec!["api".into(), "web".into()],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let press = |cx: &mut TestAppContext, keys: &[&str]| {
+        cx.update_window(window, |_, w, cx| keys.iter().for_each(|k| w.press(k, cx)))
+            .unwrap();
+        cx.run_until_parked();
+    };
+    let input = |cx: &mut TestAppContext, text: &str| {
+        cx.update_window(window, |_, w, cx| w.input(text, cx))
+            .unwrap();
+        cx.run_until_parked();
+    };
+    // What repo row `i` says it gets; `None` while the branch list is shown.
+    let gets = |cx: &mut TestAppContext, i: usize| {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            let row = w.try_find(("repo-branch", i))?;
+            Some(row.label()?.split(": ").nth(1)?.to_string())
+        })
+        .unwrap()
+    };
+    // Highlights repo `name` in the list and lists its branches, filtered by `filter`.
+    let branches_of = |cx: &mut TestAppContext, name: &str, filter: &str| {
+        input(cx, name);
+        press(cx, &["cmd-b"]);
+        input(cx, filter);
+    };
+    let on = |ws: &str, repo: &str| {
+        let wt = home.join("shark/workspaces").join(ws).join(repo);
+        git::git(&wt, &["branch", "--show-current"]).unwrap()
+    };
+    let count = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.workspaces.len());
+
+    // The row label says new or existing as the name is typed.
+    press(cx, &["cmd-n"]);
+    assert_eq!(gets(cx, 0).as_deref(), Some("new"));
+    input(cx, "shared");
+    assert_eq!((gets(cx, 0).as_deref(), gets(cx, 1).as_deref()), (Some("existing"), Some("existing")));
+
+    // A branch checked out in the source checkout is refused; tab goes back unpicked.
+    press(cx, &["cmd-a", "backspace"]);
+    input(cx, "x1");
+    press(cx, &["tab"]);
+    branches_of(cx, "api", "main");
+    assert_eq!(gets(cx, 0), None, "the branch list replaces the repos");
+    press(cx, &["enter"]);
+    assert_eq!(gets(cx, 0), None, "refused: still listing branches");
+    press(cx, &["tab"]);
+    assert_eq!(gets(cx, 0).as_deref(), Some("new"));
+    press(cx, &["cmd-enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.as_deref() == Some("x1")
+    })
+    .await;
+    assert_eq!((on("x1", "api"), on("x1", "web")), ("x1".into(), "x1".into()));
+
+    // Picking, then the first row puts the new branch back. Clicking the label lists too.
+    press(cx, &["cmd-n"]);
+    input(cx, "y1");
+    press(cx, &["tab"]);
+    branches_of(cx, "web", "shared");
+    press(cx, &["enter"]);
+    input(cx, "");
+    let web = (0..2).find(|&i| gets(cx, i).as_deref() == Some("shared")).unwrap();
+    // Back on the repos, the highlight is on web: space unticks and reticks web.
+    let ticked = |cx: &mut TestAppContext, i: usize| {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.find(("repo-pick", i)).checked()
+        })
+        .unwrap()
+    };
+    press(cx, &["space"]);
+    assert_eq!((ticked(cx, web), ticked(cx, 1 - web)), (Some(false), Some(true)));
+    press(cx, &["space"]);
+    assert_eq!(ticked(cx, web), Some(true));
+    cx.update_window(window, |_, w, cx| w.click(("repo-branch", web), cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(gets(cx, 0), None, "the click lists web's branches");
+    press(cx, &["enter"]);
+    assert_eq!(gets(cx, web).as_deref(), Some("new"));
+    press(cx, &["cmd-enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.as_deref() == Some("y1")
+    })
+    .await;
+    assert_eq!(on("y1", "web"), "y1");
+
+    // Without a name, every ticked repo needs a branch: one is not enough.
+    press(cx, &["cmd-n", "tab"]);
+    branches_of(cx, "api", "kd/a");
+    press(cx, &["enter"]);
+    press(cx, &["cmd-enter"]);
+    assert_eq!(count(cx), 2, "web has no branch and none was named");
+    // web gets one that only origin has, so far: the fetch on cmd-b finds it.
+    let web_origin = home.join("web.git");
+    git::git(&web_origin, &["branch", "fresh", "main"]).unwrap();
+    // The refusal focused the empty name; back to the list.
+    press(cx, &["tab"]);
+    input(cx, "web");
+    press(cx, &["cmd-b"]);
+    input(cx, "fresh");
+    press(cx, &["enter"]);
+    press(cx, &["cmd-enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.as_deref() == Some("kd-a")
+    })
+    .await;
+    assert_eq!((on("kd-a", "api"), on("kd-a", "web")), ("kd/a".into(), "fresh".into()));
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        let ws = s.ws("kd-a").unwrap();
+        assert_eq!(ws.branch, "kd/a", "named after the first picked branch");
+        let own: Vec<_> = ws.repos.iter().map(|r| r.branch.clone()).collect();
+        assert_eq!(own, [None, Some("fresh".into())]);
+    });
+    fs::remove_dir_all(&home).unwrap();
 }
 
 /// Drives the real keymap headlessly: create a workspace, vim focus moves, tabs, archive.
@@ -773,6 +916,45 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         assert_eq!(names, ["api", "web", "cli"]);
     });
 
+    // cmd-b lists the highlighted repo's branches; enter picks one for it and ticks it.
+    let (api, origin) = (home.join("src/api"), home.join("origin.git"));
+    git::git(&home, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
+    git::git(&api, &["remote", "add", "origin", &origin.to_string_lossy()]).unwrap();
+    git::git(&api, &["push", "-q", "origin", "main:remote-only"]).unwrap();
+    press(cx, &["cmd-n"]);
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| w.input("new-x", cx))
+        .unwrap();
+    press(cx, &["tab"]);
+    cx.update_window(window, |_, w, cx| w.input("api", cx))
+        .unwrap();
+    cx.run_until_parked();
+    press(cx, &["cmd-b"]);
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| w.input("remote", cx))
+        .unwrap();
+    cx.run_until_parked();
+    press(cx, &["enter"]);
+    cx.run_until_parked();
+    press(cx, &["cmd-enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.as_deref() == Some("new-x")
+    })
+    .await;
+    let on_branch = |r: &str| {
+        let wt = home.join("shark/workspaces/new-x").join(r);
+        git::git(&wt, &["branch", "--show-current"]).unwrap()
+    };
+    assert_eq!(on_branch("api"), "remote-only");
+    assert_eq!(on_branch("web"), "new-x", "the last-used repo gets the new branch");
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        let ws = s.ws("new-x").unwrap();
+        assert_eq!(ws.branch, "new-x");
+        let api = ws.repos.iter().find(|r| r.name == "api").unwrap();
+        assert_eq!(api.branch.as_deref(), Some("remote-only"));
+    });
+
     // Quick bars are bare menus: no dialog close X.
     press(cx, &["cmd-k"]);
     cx.run_until_parked();
@@ -804,7 +986,7 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
     let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace("st".into(), repos.clone(), None, w, cx)
+        s.create_workspace("st".into(), git::on_branch(&repos, "st"), None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -951,7 +1133,7 @@ async fn add_repo_and_restore(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace("grow".into(), repos[..1].to_vec(), None, w, cx)
+        s.create_workspace("grow".into(), git::on_branch(&repos[..1], "grow"), None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -1033,7 +1215,7 @@ async fn many_tabs_scroll(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace("tabs".into(), repos.clone(), None, w, cx)
+        s.create_workspace("tabs".into(), git::on_branch(&repos, "tabs"), None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -1069,7 +1251,7 @@ async fn chat_tab_menu(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace("tabs".into(), repos.clone(), None, w, cx)
+        s.create_workspace("tabs".into(), git::on_branch(&repos, "tabs"), None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -1138,7 +1320,7 @@ async fn media_in_diff(cx: &mut TestAppContext) {
     let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace("media".into(), repos.clone(), None, w, cx)
+        s.create_workspace("media".into(), git::on_branch(&repos, "media"), None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -1361,7 +1543,7 @@ async fn perf_large_change(cx: &mut TestAppContext) {
     let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
-            s.create_workspace("perf".into(), repos, None, w, cx)
+            s.create_workspace("perf".into(), git::on_branch(&repos, "perf"), None, w, cx)
         })
     })
     .unwrap();
@@ -1578,7 +1760,7 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     for (name, picked) in [("web-only", &repos[1..]), ("both", &repos[..])] {
         on(cx, &|s, w, cx| {
-            s.create_workspace(name.into(), picked.to_vec(), None, w, cx)
+            s.create_workspace(name.into(), git::on_branch(picked, name), None, w, cx)
         });
         cx.wait_for(window, Duration::from_secs(10), |_, cx| {
             shark.read(cx).active.as_deref() == Some(name)
@@ -1700,7 +1882,7 @@ async fn file_menu_labels(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace("fm".into(), repos.clone(), None, w, cx)
+        s.create_workspace("fm".into(), git::on_branch(&repos, "fm"), None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -1783,7 +1965,7 @@ async fn home_navigation(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     for name in ["one", "two"] {
         on(cx, &|s, w, cx| {
-            s.create_workspace(name.into(), repos.clone(), None, w, cx)
+            s.create_workspace(name.into(), git::on_branch(&repos, name), None, w, cx)
         });
         cx.wait_for(window, Duration::from_secs(10), |_, cx| {
             shark.read(cx).active.as_deref() == Some(name)
@@ -2024,7 +2206,7 @@ async fn home_prompt_and_chat_keys(cx: &mut TestAppContext) {
     on(cx, &|s, w, cx| {
         s.create_workspace(
             "one".into(),
-            repos.clone(),
+            git::on_branch(&repos, "one"),
             Some("add a login page".into()),
             w,
             cx,
@@ -2109,7 +2291,7 @@ async fn home_checklist(cx: &mut TestAppContext) {
     let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace("ws".into(), repos.clone(), None, w, cx)
+        s.create_workspace("ws".into(), git::on_branch(&repos, "ws"), None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -2167,7 +2349,7 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     let press = press_in(window);
     on(cx, &|s, w, cx| {
-        s.create_workspace("tb".into(), repos.clone(), None, w, cx)
+        s.create_workspace("tb".into(), git::on_branch(&repos, "tb"), None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -2299,7 +2481,7 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     let press = press_in(window);
     on(cx, &|s, w, cx| {
-        s.create_workspace("ed".into(), repos.clone(), None, w, cx)
+        s.create_workspace("ed".into(), git::on_branch(&repos, "ed"), None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -2543,7 +2725,7 @@ async fn review_queue(cx: &mut TestAppContext) {
     let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace("rq".into(), repos.clone(), None, w, cx)
+        s.create_workspace("rq".into(), git::on_branch(&repos, "rq"), None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -2975,7 +3157,7 @@ async fn review_queue(cx: &mut TestAppContext) {
         s.comment_dialog(w, cx);
         s.open_sheet(w, cx);
         assert!(s.review.composer.is_some() && s.review.sheet.is_some());
-        s.create_workspace("rq2".into(), repos.clone(), None, w, cx)
+        s.create_workspace("rq2".into(), git::on_branch(&repos, "rq2"), None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.as_deref() == Some("rq2")
@@ -3006,7 +3188,7 @@ async fn card_header_pinned(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace("wide".into(), repos.clone(), None, w, cx)
+        s.create_workspace("wide".into(), git::on_branch(&repos, "wide"), None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -3096,7 +3278,7 @@ async fn narrow_column_comments(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace("nc".into(), repos.clone(), None, w, cx)
+        s.create_workspace("nc".into(), git::on_branch(&repos, "nc"), None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -3180,7 +3362,7 @@ async fn thread_menu_labels(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace("tm".into(), repos.clone(), None, w, cx)
+        s.create_workspace("tm".into(), git::on_branch(&repos, "tm"), None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -3287,7 +3469,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
     let press = press_in(window);
     for name in ["ed", "other"] {
         on(cx, &|s, w, cx| {
-            s.create_workspace(name.into(), repos.clone(), None, w, cx)
+            s.create_workspace(name.into(), git::on_branch(&repos, name), None, w, cx)
         });
         cx.wait_for(window, Duration::from_secs(10), |_, cx| {
             shark.read(cx).active.as_deref() == Some(name)
@@ -3603,7 +3785,7 @@ async fn review_round3(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     let press = press_in(window);
     on(cx, &|s, w, cx| {
-        s.create_workspace("r3".into(), repos.clone(), None, w, cx)
+        s.create_workspace("r3".into(), git::on_branch(&repos, "r3"), None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -3882,7 +4064,7 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     let press = press_in(window);
     on(cx, &|s, w, cx| {
-        s.create_workspace("ed".into(), repos.clone(), None, w, cx)
+        s.create_workspace("ed".into(), git::on_branch(&repos, "ed"), None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.as_deref() == Some("ed")
@@ -4129,7 +4311,10 @@ async fn change_base(cx: &mut TestAppContext) {
         WindowOptions::default(),
     );
     let on = on_app(window, shark.clone());
-    on(cx, &|s, w, cx| s.create_workspace("rb".into(), repos.clone(), None, w, cx));
+    // api on its own branch.
+    let mut picked = git::on_branch(&repos, "rb");
+    picked[0].1 = "kd/x".into();
+    on(cx, &|s, w, cx| s.create_workspace("rb".into(), picked.clone(), None, w, cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
     })
@@ -4151,9 +4336,11 @@ async fn change_base(cx: &mut TestAppContext) {
         assert_eq!(ws.repos[0].base, "origin/release");
         assert_eq!(ws.repos[1].base, old, "web keeps its base");
         assert_eq!(menus::base_hint(ws), "per repo");
-        let bases: Vec<String> = (s.syncs["rb"].read(cx).branches().into_iter())
-            .map(|b| b.base)
-            .collect();
+        let (names, bases): (Vec<String>, Vec<String>) = (s.syncs["rb"].read(cx).branches())
+            .into_iter()
+            .map(|b| (b.name, b.base))
+            .unzip();
+        assert_eq!(names, ["kd/x", "rb"], "each repo's own branch");
         assert_eq!(bases, ["origin/release".to_string(), old.clone()]);
     });
     let md = fs::read_to_string(home.join("shark/workspaces/rb/CLAUDE.md")).unwrap();
