@@ -173,11 +173,30 @@ fn default_base(src: &Path) -> String {
 }
 
 /// `branch` is the workspace's own; each repo comes with the branch it gets, usually the same.
+#[cfg(test)]
 pub fn create_workspace(
     dir: &Path,
     name: &str,
     branch: &str,
     repos: &[(Repo, String)],
+) -> Result<Workspace, String> {
+    create_workspace_with_prs(dir, name, branch, repos, &[])
+}
+
+#[derive(Clone, Debug)]
+pub struct PullRequest {
+    pub number: u64,
+    pub url: String,
+    pub base: String,
+}
+
+/// PR selections use fresh local review branches, preserving colleagues' branches.
+pub fn create_workspace_with_prs(
+    dir: &Path,
+    name: &str,
+    branch: &str,
+    repos: &[(Repo, String)],
+    prs: &[(String, PullRequest)],
 ) -> Result<Workspace, String> {
     if repos.is_empty() {
         return Err("pick at least one repo".into());
@@ -190,9 +209,14 @@ pub fn create_workspace(
     }
     // Every repo is checked (and fetched) before any worktree is added, so a refusal in one
     // repo leaves nothing behind in the others.
-    let plans = par_map(repos, |(r, b)| plan_worktree(b, r))
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+    let plans = par_map(repos, |(r, b)| {
+        match prs.iter().find(|(name, _)| name == &r.name) {
+            Some((_, pr)) => plan_pr_worktree(b, r, pr),
+            None => plan_worktree(b, r),
+        }
+    })
+    .into_iter()
+    .collect::<Result<Vec<_>, _>>()?;
     fs::create_dir_all(dir).map_err(|e| e.to_string())?;
     let result = (|| {
         let done = par_map(repos.iter().zip(&plans), |((r, b), p)| {
@@ -372,6 +396,7 @@ fn has_ref(dir: &Path, rf: &str) -> bool {
 
 struct Plan {
     base: String,
+    pr_url: Option<String>,
     /// Where a new branch starts: `origin/<branch>` when only origin has it, the base when
     /// nobody does. None reuses the local branch: origin has it too, it holds unpushed work,
     /// or origin was unreachable.
@@ -445,7 +470,93 @@ fn plan_worktree(branch: &str, r: &Repo) -> Result<Plan, String> {
         (false, true) => Some(format!("origin/{branch}")),
         (false, false) => Some(base.clone()),
     };
-    Ok(Plan { base, from })
+    Ok(Plan {
+        base,
+        from,
+        pr_url: None,
+    })
+}
+
+/// A branch-local identity survives restarts without confusing same-named fork branches.
+pub fn review_pr_url(src: &Path, branch: &str) -> Option<String> {
+    git(
+        src,
+        &["config", "--get", &format!("branch.{branch}.shark-pr-url")],
+    )
+    .ok()
+    .filter(|s| !s.is_empty())
+}
+
+fn plan_pr_worktree(branch: &str, r: &Repo, pr: &PullRequest) -> Result<Plan, String> {
+    if pr.base.is_empty() {
+        return Err(
+            "Pull request base is missing; refresh pull requests and select it again".into(),
+        );
+    }
+    if has_ref(&r.path, &format!("refs/heads/{branch}")) {
+        return Err(format!(
+            "{}: review branch `{branch}` already exists; pick another branch name",
+            r.name
+        ));
+    }
+    let path = pr
+        .url
+        .strip_prefix("https://")
+        .ok_or("Invalid pull request URL")?;
+    let parts: Vec<_> = path.split('/').collect();
+    if parts.len() != 5
+        || parts[3] != "pull"
+        || parts[4].parse::<u64>().ok() != Some(pr.number)
+        || pr.number == 0
+        || parts[..3].iter().any(|p| {
+            p.is_empty()
+                || !p
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b".-_:".contains(&b))
+        })
+    {
+        return Err("Invalid pull request URL".into());
+    }
+    git(
+        &r.path,
+        &["check-ref-format", &format!("refs/heads/{}", pr.base)],
+    )?;
+    let repo = format!("{}/{}", parts[1], parts[2]);
+    let remote = format!("https://{}/{repo}.git", parts[0]);
+    let origin = git(&r.path, &["remote", "get-url", "origin"]).unwrap_or_default();
+    let origin = origin.trim_end_matches('/').trim_end_matches(".git");
+    let matching_origin = [
+        format!("https://{}/{repo}", parts[0]),
+        format!("git@{}:{repo}", parts[0]),
+        format!("ssh://git@{}/{repo}", parts[0]),
+    ]
+    .contains(&origin.to_string());
+    let remote = if matching_origin { "origin" } else { &remote };
+    // shortcut: review refs refresh during creation only; refresh them when review-update support is added.
+    let head = format!("refs/shark/pull/{}/head", pr.number);
+    let base = format!("refs/shark/pull/{}/base", pr.number);
+    cmd_bounded(
+        &r.path,
+        "git",
+        &[
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            remote,
+            &format!("+refs/pull/{}/head:{head}", pr.number),
+            &format!("+refs/heads/{}:{base}", pr.base),
+        ],
+        30,
+    )?;
+    let from = git(
+        &r.path,
+        &["rev-parse", "--verify", &format!("{head}^{{commit}}")],
+    )?;
+    Ok(Plan {
+        base,
+        from: Some(from),
+        pr_url: Some(pr.url.clone()),
+    })
 }
 
 fn add_worktree(dir: &Path, branch: &str, r: &Repo, plan: &Plan) -> Result<WsRepo, String> {
@@ -460,6 +571,12 @@ fn add_worktree(dir: &Path, branch: &str, r: &Repo, plan: &Plan) -> Result<WsRep
             &["worktree", "add", "--no-track", "-b", branch, &wt_s, from],
         )?,
     };
+    if let Some(url) = &plan.pr_url {
+        git(
+            &r.path,
+            &["config", &format!("branch.{branch}.shark-pr-url"), url],
+        )?;
+    }
     copy_included(&r.path, &wt)?;
     Ok(WsRepo {
         name: r.name.clone(),
@@ -850,6 +967,120 @@ mod tests {
         )
         .unwrap();
         add_repo(&p, &[]).unwrap()
+    }
+
+    #[test]
+    fn pr_checkout_uses_exact_tip_base_and_rolls_back() {
+        let root = std::env::temp_dir().join(format!("shark-pr-checkout-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let repo = init_repo(&root, "api");
+        let other = init_repo(&root, "web");
+        let remote = root.join("upstream.git");
+        git(&root, &["init", "-q", "--bare", &remote.to_string_lossy()]).unwrap();
+        let base = git(&repo.path, &["rev-parse", "HEAD"]).unwrap();
+        git(
+            &repo.path,
+            &[
+                "push",
+                "-q",
+                &remote.to_string_lossy(),
+                "HEAD:refs/heads/release",
+            ],
+        )
+        .unwrap();
+        git(
+            &repo.path,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "PR tip",
+            ],
+        )
+        .unwrap();
+        let tip = git(&repo.path, &["rev-parse", "HEAD"]).unwrap();
+        git(
+            &repo.path,
+            &[
+                "push",
+                "-q",
+                &remote.to_string_lossy(),
+                "HEAD:refs/pull/7/head",
+            ],
+        )
+        .unwrap();
+        git(
+            &repo.path,
+            &[
+                "config",
+                &format!("url.{}.insteadOf", remote.display()),
+                "https://github.com/o/upstream.git",
+            ],
+        )
+        .unwrap();
+        let pr = PullRequest {
+            number: 7,
+            url: "https://github.com/o/upstream/pull/7".into(),
+            base: "release".into(),
+        };
+        let picked = [(repo.clone(), "pr/7".into())];
+        let prs = [(repo.name.clone(), pr.clone())];
+        let dir = root.join("ws/review");
+        let ws = create_workspace_with_prs(&dir, "review", "pr/7", &picked, &prs).unwrap();
+        let wt = dir.join("api");
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), tip);
+        assert_eq!(git(&wt, &["rev-parse", &ws.repos[0].base]).unwrap(), base);
+        assert_eq!(review_pr_url(&wt, "pr/7"), Some(pr.url));
+        assert_eq!(
+            git(&repo.path, &["branch", "--show-current"]).unwrap(),
+            "main"
+        );
+        let collision = root.join("ws/collision");
+        assert!(
+            create_workspace_with_prs(&collision, "collision", "pr/7", &picked, &prs)
+                .err()
+                .unwrap()
+                .contains("already exists")
+        );
+        assert!(!collision.exists());
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), tip);
+        let missing = [(
+            repo.name.clone(),
+            PullRequest {
+                number: 404,
+                url: "https://github.com/o/upstream/pull/404".into(),
+                base: "release".into(),
+            },
+        )];
+        let failed = root.join("ws/missing");
+        assert!(
+            create_workspace_with_prs(
+                &failed,
+                "missing",
+                "pr/404",
+                &[(repo.clone(), "pr/404".into())],
+                &missing
+            )
+            .is_err()
+        );
+        assert!(!failed.exists() && !has_ref(&repo.path, "refs/heads/pr/404"));
+        git(&other.path, &["branch", "blocked"]).unwrap();
+        let failed = root.join("ws/rollback");
+        let picked = [
+            (repo.clone(), "review-again".into()),
+            (other, "blocked/child".into()),
+        ];
+        assert!(
+            create_workspace_with_prs(&failed, "rollback", "review-again", &picked, &prs).is_err()
+        );
+        assert!(!failed.exists() && !has_ref(&repo.path, "refs/heads/review-again"));
+        assert_eq!(review_pr_url(&repo.path, "review-again"), None);
+        fs::remove_dir_all(root).unwrap();
     }
 
     #[test]

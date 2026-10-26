@@ -15,6 +15,8 @@ pub enum Op {
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Local {
+    /// This branch is an isolated checkout for reviewing somebody else's PR.
+    pub review: bool,
     /// `None` when HEAD is detached (also mid-rebase).
     pub branch: Option<String>,
     pub head: String,
@@ -128,6 +130,7 @@ pub fn probe(wt: &Path, branch: &str, base: &str, prev: Option<&Local>) -> Resul
         return Err(String::from_utf8_lossy(&out.stderr).trim().to_string());
     }
     let mut l = parse_status(&out.stdout);
+    l.review = crate::git::review_pr_url(wt, branch).is_some();
     // Per-worktree state files; --git-path resolves them inside .git/worktrees/<name>/.
     const OPS: [(&str, Op); 6] = [
         ("rebase-merge", Op::Rebase),
@@ -258,6 +261,10 @@ pub fn parse_prs(json: &str) -> Option<Pr> {
         own.iter()
             .max_by_key(|p| p["updatedAt"].as_str().unwrap_or("").to_string())
     })?;
+    Some(parse_pr(pick))
+}
+
+fn parse_pr(pick: &Value) -> Pr {
     let s = |k: &str| pick[k].as_str().unwrap_or_default().to_string();
     let ids = |keep: &dyn Fn(&Value) -> bool| -> Vec<String> {
         pick["reviews"]
@@ -268,7 +275,7 @@ pub fn parse_prs(json: &str) -> Option<Pr> {
             .filter_map(|r| Some(r["id"].as_str()?.to_string()))
             .collect()
     };
-    Some(Pr {
+    Pr {
         url: s("url"),
         number: pick["number"].as_u64().unwrap_or(0),
         state: match pick["state"].as_str() {
@@ -287,13 +294,18 @@ pub fn parse_prs(json: &str) -> Option<Pr> {
             r["state"] == "COMMENTED" && r["author"]["login"] != pick["author"]["login"]
         }),
         contains_head: String::new(),
-    })
+    }
 }
 
 /// `Ok(None)` means the branch has no PR. Unlike `gh pr view`, "none" isn't an error exit,
 /// so it can't be confused with being offline or logged out.
 /// `head` is the local HEAD as just probed.
 pub fn fetch_pr(wt: &Path, branch: &str, head: &str) -> Result<Option<Pr>, String> {
+    if let Some(url) = crate::git::review_pr_url(wt, branch) {
+        let json = cmd_bounded(wt, "gh", &["pr", "view", &url, "--json", PR_FIELDS], 20)?;
+        let value = serde_json::from_str(&json).map_err(|e| format!("gh: {e}"))?;
+        return Ok(Some(parse_pr(&value)));
+    }
     let json = cmd_bounded(
         wt,
         "gh",
@@ -390,6 +402,7 @@ impl Repo {
             parts.push(format!("{} changed", l.changed));
         }
         match l.remote {
+            _ if l.review => parts.push("local PR review".into()),
             None if l.base.0 > 0 => parts.push(format!("{} commits not pushed", l.base.0)),
             Some((a, b)) if a + b > 0 => parts.push(format!("{a} to push, {b} to pull")),
             _ => {}
@@ -480,6 +493,29 @@ pub fn among<'a>(repos: &'a [Repo], rs: &'a [String]) -> impl Iterator<Item = &'
 /// "checks running" in one repo can't hide a "ready for review" in another. `handled`: review
 /// IDs already sent to the agent.
 pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
+    if repos
+        .iter()
+        .any(|r| r.local.as_ref().is_ok_and(|l| l.review))
+    {
+        let normal: Vec<_> = repos
+            .iter()
+            .filter(|r| !r.local.as_ref().is_ok_and(|l| l.review))
+            .cloned()
+            .collect();
+        if normal.is_empty() {
+            return act(
+                "Review PR",
+                Kind::OpenPr,
+                repos.iter().map(|r| r.name.clone()).collect(),
+                false,
+            );
+        }
+        let mut action = next_action(&normal, handled);
+        if action.repos.is_empty() {
+            action.repos = normal.iter().map(|r| r.name.clone()).collect();
+        }
+        return action;
+    }
     let names = |f: &dyn Fn(&Repo, &Local) -> bool| -> Vec<String> {
         repos
             .iter()
@@ -711,6 +747,9 @@ pub fn pr_head_moved(repos: &[Repo]) -> bool {
 /// to do. Menu steps skip the next-step check, so these guards are what keeps them from moving
 /// the wrong commit.
 pub fn step_args(kind: &Kind, r: &Repo) -> Result<Option<Vec<String>>, String> {
+    if r.local.as_ref().is_ok_and(|l| l.review) {
+        return Err(format!("{} is a local PR review checkout", r.name));
+    }
     let b = r.branch.as_str();
     let local = || r.local.clone();
     let on_branch = || {
@@ -871,6 +910,41 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
                        {"url":"u2","number":2,"state":"OPEN","updatedAt":"2026-01-01"}]"#;
         assert_eq!(parse_prs(json).unwrap().number, 2);
         assert_eq!(parse_prs("[]"), None);
+        let fork = serde_json::json!({"url":"https://github.com/o/r/pull/3","number":3,"state":"OPEN","isCrossRepository":true});
+        assert_eq!(
+            parse_pr(&fork).number,
+            3,
+            "an explicitly selected PR retains fork identity"
+        );
+    }
+
+    #[test]
+    fn review_checkouts_never_offer_publishing() {
+        let review = repo(
+            "review",
+            Local {
+                review: true,
+                changed: 1,
+                ..clean(2)
+            },
+            Some(pr("CLEAN", Checks::Passing)),
+        );
+        let action = next_action(&[review.clone()], &[]);
+        assert_eq!(action.label, "Review PR");
+        assert_eq!(action.kind, Kind::OpenPr);
+        for kind in [
+            Kind::Pull,
+            Kind::Push,
+            Kind::ForcePush,
+            Kind::Merge,
+            Kind::Reopen,
+        ] {
+            assert!(step_args(&kind, &review).is_err());
+        }
+        let normal = repo("work", clean(2), None);
+        let action = next_action(&[review, normal], &[]);
+        assert_eq!(action.kind, Kind::CreatePr);
+        assert_eq!(action.repos, ["work"]);
     }
 
     fn repo(name: &str, l: Local, pr: Option<Pr>) -> Repo {

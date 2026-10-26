@@ -1,5 +1,7 @@
 //! Creating, opening, growing and archiving workspaces.
 use super::*;
+use gpui_kit::base::Selectable as _;
+use std::time::{Duration, Instant};
 
 /// Contents of the New workspace dialog: a branch name and a filterable repo picker.
 /// Starts with the last-used repos ticked and floated to the top, so the common case
@@ -16,9 +18,13 @@ pub(super) struct NewWorkspaceForm {
     own: Vec<Option<String>>,
     /// Per repo: its branches, `None` until listed.
     branches: Vec<Option<Vec<git::Branch>>>,
-    /// Per repo: fetched once its branch list was opened.
-    fetched: Vec<bool>,
+    prs: Vec<Option<Vec<complete::Pr>>>,
+    chosen_pr: Vec<Option<complete::Pr>>,
+    refreshed_at: Vec<[Option<Instant>; 2]>,
+    loading: Vec<[bool; 2]>,
+    errors: Vec<[Option<String>; 2]>,
     mode: Mode,
+    pending_selection: Option<Option<IndexPath>>,
     shark: WeakEntity<Shark>,
     _sub: Subscription,
 }
@@ -28,6 +34,7 @@ pub(super) struct NewWorkspaceForm {
 enum Mode {
     Repos,
     Branches(usize),
+    Prs(usize),
 }
 
 impl NewWorkspaceForm {
@@ -83,8 +90,13 @@ impl NewWorkspaceForm {
             picked,
             own: vec![None; n],
             branches: vec![None; n],
-            fetched: vec![false; n],
+            prs: vec![None; n],
+            chosen_pr: vec![None; n],
+            refreshed_at: vec![[None; 2]; n],
+            loading: vec![[false; 2]; n],
+            errors: vec![[None, None]; n],
             mode: Mode::Repos,
+            pending_selection: None,
             shark,
             _sub,
         }
@@ -102,6 +114,7 @@ impl NewWorkspaceForm {
     /// aimed here, against the current list with its filter cleared.
     fn show(&mut self, mode: Mode, row: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.mode = mode;
+        self.pending_selection = None;
         self.picker.update(cx, |p, cx| {
             p.set_query("", window, cx);
             let row = if row < p.matched_count() { row } else { 0 };
@@ -111,24 +124,115 @@ impl NewWorkspaceForm {
         cx.notify();
     }
 
-    /// Lists repo `ix`'s branches; a fetch refreshes them the first time.
+    fn source_repo(&self, cx: &App) -> Option<usize> {
+        match self.mode {
+            Mode::Repos => self.picker.read(cx).selected_index().map(|i| i.row),
+            Mode::Branches(ix) | Mode::Prs(ix) => Some(ix),
+        }
+    }
+
     fn pick_branch(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.show(Mode::Branches(ix), 0, window, cx);
-        if !std::mem::replace(&mut self.fetched[ix], true) {
-            let src = self.repos[ix].path.clone();
-            cx.spawn_in(window, async move |this, cx| {
-                let list = (cx.background_executor())
-                    .spawn(async move {
-                        let fetch = ["fetch", "--quiet", "--prune", "origin"];
-                        let _ = git::cmd_bounded(&src, "git", &fetch, 30);
-                        git::branches(&src).ok()
-                    })
-                    .await;
-                this.update_in(cx, |f, window, cx| f.refreshed(ix, list, window, cx))
-                    .ok();
-            })
-            .detach();
+        self.refresh(false, window, cx);
+    }
+
+    fn pick_pr(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.prs[ix].is_none() {
+            let repo = &self.repos[ix];
+            self.prs[ix] = Some(complete::cached_repo_prs(&repo.name, &repo.path, true));
         }
+        self.show(Mode::Prs(ix), 0, window, cx);
+        self.refresh(false, window, cx);
+    }
+
+    fn refresh(&mut self, force: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let (ix, kind) = match self.mode {
+            Mode::Repos => return,
+            Mode::Branches(ix) => (ix, 0),
+            Mode::Prs(ix) => (ix, 1),
+        };
+        if self.loading[ix][kind]
+            || (!force
+                && self.refreshed_at[ix][kind]
+                    .is_some_and(|t| t.elapsed() < Duration::from_secs(60)))
+        {
+            return;
+        }
+        self.loading[ix][kind] = true;
+        self.errors[ix][kind] = None;
+        let repo = self.repos[ix].clone();
+        cx.spawn_in(window, async move |this, cx| {
+            let (branches, prs) = cx
+                .background_executor()
+                .spawn(async move {
+                    if kind == 0 {
+                        let fetch_error = git::cmd_bounded(
+                            &repo.path,
+                            "git",
+                            &["fetch", "--quiet", "--prune", "origin"],
+                            30,
+                        )
+                        .err();
+                        (Some((git::branches(&repo.path), fetch_error)), None)
+                    } else {
+                        (
+                            None,
+                            Some(complete::fetch_repo_prs(&repo.name, &repo.path, true)),
+                        )
+                    }
+                })
+                .await;
+            this.update_in(cx, |f, window, cx| {
+                f.loading[ix][kind] = false;
+                f.refreshed_at[ix][kind] = Some(Instant::now());
+                if let Some((result, fetch_error)) = branches {
+                    f.errors[ix][kind] = fetch_error;
+                    match result {
+                        Ok(list) => f.refreshed(ix, Some(list), window, cx),
+                        Err(e) => f.errors[ix][kind] = Some(e),
+                    }
+                }
+                if let Some(result) = prs {
+                    match result {
+                        Ok(list) => {
+                            if f.mode == Mode::Prs(ix) {
+                                let was = f
+                                    .picker
+                                    .read(cx)
+                                    .selected_index()
+                                    .and_then(|i| f.prs[ix].as_ref()?.get(i.row))
+                                    .map(|p| p.number);
+                                if let Some(number) = was {
+                                    let at = list
+                                        .iter()
+                                        .position(|p| p.number == number)
+                                        .map(IndexPath::new);
+                                    f.select_after_refresh(at, window, cx);
+                                }
+                            }
+                            f.prs[ix] = Some(list);
+                        }
+                        Err(e) => f.errors[ix][kind] = Some(e),
+                    }
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Restore selection only after Command installs the refreshed model.
+    fn select_after_refresh(
+        &mut self,
+        at: Option<IndexPath>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.picker
+            .update(cx, |p, cx| p.set_selected_index(None, window, cx));
+        self.pending_selection = Some(at);
     }
 
     /// Repo `ix`'s fetched branches. Newer ones may come first, so a highlighted branch is
@@ -151,8 +255,7 @@ impl NewWorkspaceForm {
             // Resolved against the list shown now; a row it filters out highlights nothing.
             let at = list.iter().position(|b| b.name == was);
             let at = at.map(|i| IndexPath::new(i + 1));
-            self.picker
-                .update(cx, |p, cx| p.set_selected_index(at, window, cx));
+            self.select_after_refresh(at, window, cx);
         }
         self.branches[ix] = Some(list);
         cx.notify();
@@ -160,17 +263,32 @@ impl NewWorkspaceForm {
 
     /// Back to the repo list, on the repo whose branches were listed.
     fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Mode::Branches(ix) = self.mode else {
-            return;
-        };
-        self.show(Mode::Repos, ix, window, cx);
+        if let Mode::Branches(ix) | Mode::Prs(ix) = self.mode {
+            self.show(Mode::Repos, ix, window, cx);
+        }
     }
 
     /// Enter on row `row`: ticks a repo, or picks a branch for the listed repo and goes back.
     fn choose(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let Mode::Branches(ix) = self.mode else {
-            self.toggle(row, cx);
-            return self.picker.update(cx, |p, cx| p.set_query("", window, cx));
+        let ix = match self.mode {
+            Mode::Repos => {
+                self.toggle(row, cx);
+                return self.picker.update(cx, |p, cx| p.set_query("", window, cx));
+            }
+            Mode::Prs(ix) => {
+                let Some(pr) = self.prs[ix]
+                    .as_ref()
+                    .and_then(|list| list.get(row))
+                    .cloned()
+                else {
+                    return;
+                };
+                self.own[ix] = Some(format!("pr/{}", pr.number));
+                self.chosen_pr[ix] = Some(pr);
+                self.picked[ix] = true;
+                return self.back(window, cx);
+            }
+            Mode::Branches(ix) => ix,
         };
         // Row 0 is the new branch.
         let b = (row.checked_sub(1))
@@ -188,6 +306,7 @@ impl NewWorkspaceForm {
             );
             return notify_err(window, cx, msg);
         }
+        self.chosen_pr[ix] = None;
         self.own[ix] = b.map(|b| b.name);
         self.picked[ix] = true;
         self.back(window, cx);
@@ -208,6 +327,9 @@ impl NewWorkspaceForm {
     /// What repo `ix` will be on, as its row says: the picked branch, or the typed one, `new`
     /// or `existing` there.
     fn gets(&self, ix: usize, cx: &App) -> String {
+        if let Some(pr) = &self.chosen_pr[ix] {
+            return format!("#{} · {}", pr.number, pr.head_ref_name);
+        }
         if let Some(b) = &self.own[ix] {
             return b.clone();
         }
@@ -221,11 +343,20 @@ impl NewWorkspaceForm {
     /// Returns whether the form was valid (and the dialog may close).
     fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let primary = self.primary(cx);
+        let typed = self.branch.read(cx).value().trim().to_string();
         let picked: Vec<(Repo, Option<String>)> = (self.repos.iter())
             .zip(&self.picked)
             .zip(&self.own)
-            .filter(|((_, p), _)| **p)
-            .map(|((r, _), o)| (r.clone(), o.clone()))
+            .zip(&self.chosen_pr)
+            .filter(|(((_, p), _), _)| **p)
+            .map(|(((r, _), o), pr)| {
+                let own = if pr.is_some() && !typed.is_empty() {
+                    Some(typed.clone())
+                } else {
+                    o.clone()
+                };
+                (r.clone(), own)
+            })
             .collect();
         let (Some(branch), false) = (primary.clone(), picked.is_empty()) else {
             let (msg, focus_branch) = match primary {
@@ -242,10 +373,27 @@ impl NewWorkspaceForm {
         let repos = (picked.into_iter())
             .map(|(r, o)| (r, o.unwrap_or_else(|| branch.clone())))
             .collect();
+        let prs = self
+            .repos
+            .iter()
+            .zip(&self.picked)
+            .zip(&self.chosen_pr)
+            .filter_map(|((repo, picked), pr)| {
+                let pr = pr.as_ref().filter(|_| *picked)?;
+                Some((
+                    repo.name.clone(),
+                    git::PullRequest {
+                        number: pr.number,
+                        url: pr.url.clone(),
+                        base: pr.base_ref_name.clone(),
+                    },
+                ))
+            })
+            .collect();
         let prompt = self.first.clone();
         self.shark
             .update(cx, |s, cx| {
-                s.create_workspace(branch, repos, prompt, window, cx)
+                s.create_workspace(branch, repos, prs, prompt, window, cx)
             })
             .ok();
         true
@@ -270,6 +418,7 @@ impl Render for NewWorkspaceForm {
                         .label(r.name.clone())
                         .keywords([r.path.to_string_lossy().to_string()])
                         .child(move |_, _| {
+                            let pr_entity = entity.clone();
                             let entity = entity.clone();
                             h_flex()
                                 .flex_1()
@@ -297,6 +446,19 @@ impl Render for NewWorkspaceForm {
                                         })
                                         .test_support(),
                                 )
+                                .child(
+                                    Button::new(("repo-prs", i))
+                                        .ghost()
+                                        .xsmall()
+                                        .label("Open PRs")
+                                        .tooltip("Open pull requests (cmd-p)")
+                                        .on_click(move |_, window, cx| {
+                                            cx.stop_propagation();
+                                            pr_entity
+                                                .update(cx, |f, cx| f.pick_pr(i, window, cx))
+                                                .ok();
+                                        }),
+                                )
                         })
                 })
                 .collect(),
@@ -304,7 +466,7 @@ impl Render for NewWorkspaceForm {
                 let list = self.branches[ix].clone().unwrap_or_default();
                 let new = CommandItem::new().label("New branch (workspace name)");
                 (std::iter::once(new))
-                    .chain(list.into_iter().map(|b| {
+                    .chain(list.into_iter().enumerate().map(|(i, b)| {
                         let tag = match &b.checked_out {
                             Some(at) => format!("checked out at {}", tilde(Path::new(at))),
                             None => (b.local.then_some("local").into_iter())
@@ -314,15 +476,17 @@ impl Render for NewWorkspaceForm {
                         };
                         let name = b.name.clone();
                         CommandItem::new().label(b.name).child(move |_, _| {
-                            h_flex()
+                            let tip = format!("{name}\n{tag}");
+                            v_flex()
+                                .id(("source-branch", i))
                                 .flex_1()
                                 .min_w_0()
-                                .gap_2()
-                                .child(div().min_w_0().truncate().child(name.clone()))
+                                .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+                                .child(div().w_full().truncate().child(name.clone()))
                                 .child(
                                     div()
-                                        .ml_auto()
-                                        .flex_none()
+                                        .w_full()
+                                        .truncate()
                                         .text_xs()
                                         .text_color(muted)
                                         .child(tag.clone()),
@@ -331,6 +495,66 @@ impl Render for NewWorkspaceForm {
                     }))
                     .collect()
             }
+            Mode::Prs(ix) => self.prs[ix]
+                .clone()
+                .unwrap_or_default()
+                .into_iter()
+                .enumerate()
+                .map(|(i, pr)| {
+                    let status = pr.status();
+                    let label = format!("#{} {}", pr.number, pr.title);
+                    let author = pr
+                        .author
+                        .as_ref()
+                        .map(|a| a.login.as_str())
+                        .unwrap_or("unknown author")
+                        .to_string();
+                    let detail = format!(
+                        "{} · {} · {} → {}",
+                        status.label(),
+                        author,
+                        pr.head_ref_name,
+                        pr.base_ref_name
+                    );
+                    CommandItem::new()
+                        .label(label.clone())
+                        .keywords([
+                            pr.head_ref_name,
+                            pr.base_ref_name,
+                            author,
+                            pr.number.to_string(),
+                        ])
+                        .child(move |_, cx| {
+                            let tip = format!("{label}\n{detail}");
+                            h_flex()
+                                .gap_2()
+                                .items_center()
+                                .flex_1()
+                                .min_w_0()
+                                .child(status.icon(cx.theme()))
+                                .child(
+                                    v_flex()
+                                        .id(("source-pr", i))
+                                        .flex_1()
+                                        .min_w_0()
+                                        .aria_label(tip.clone())
+                                        .test_support()
+                                        .tooltip(move |w, cx| {
+                                            Tooltip::new(tip.clone()).build(w, cx)
+                                        })
+                                        .child(div().w_full().truncate().child(label.clone()))
+                                        .child(
+                                            div()
+                                                .w_full()
+                                                .truncate()
+                                                .text_xs()
+                                                .text_color(muted)
+                                                .child(detail.clone()),
+                                        ),
+                                )
+                        })
+                })
+                .collect(),
         };
         let count = self.picked.iter().filter(|p| **p).count();
         let hint = |keys: Vec<Kbd>, label: &'static str| {
@@ -343,12 +567,27 @@ impl Render for NewWorkspaceForm {
             Mode::Repos => ("Repos".to_string(), "Filter repos…".to_string()),
             Mode::Branches(ix) => (
                 format!("Branch for {}", self.repos[ix].name),
-                match self.branches[ix].is_some() {
-                    true => "Filter branches…".to_string(),
-                    false => "Loading branches…".to_string(),
-                },
+                "Filter branches…".to_string(),
+            ),
+            Mode::Prs(ix) => (
+                format!("Pull requests for {}", self.repos[ix].name),
+                "Filter pull requests…".into(),
             ),
         };
+        let picker = Command::new(&self.picker)
+            .items(items)
+            .placeholder(placeholder)
+            .bordered(true)
+            .max_h(px(240.))
+            .on_confirm(move |ix, window, cx| {
+                entity.update(cx, |f, cx| f.choose(ix.row, window, cx)).ok();
+            });
+        // Install the new rows before resolving their filtered selection.
+        let picker = RenderOnce::render(picker, window, cx).into_any_element();
+        if let Some(at) = self.pending_selection.take() {
+            self.picker
+                .update(cx, |p, cx| p.set_selected_index(at, window, cx));
+        }
         v_flex()
             .key_context("NewWorkspace")
             .gap_3()
@@ -371,12 +610,20 @@ impl Render for NewWorkspaceForm {
                 }
             }))
             .on_action(cx.listener(|this, _: &PickBranch, window, cx| {
-                if this.mode == Mode::Repos
-                    && let Some(ix) = this.picker.read(cx).selected_index()
-                {
-                    this.pick_branch(ix.row, window, cx);
+                if let Some(ix) = this.source_repo(cx) {
+                    this.pick_branch(ix, window, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &PickPullRequest, window, cx| {
+                if let Some(ix) = this.source_repo(cx) {
+                    this.pick_pr(ix, window, cx);
+                }
+            }))
+            .on_action(
+                cx.listener(|this, _: &RefreshWorkspaceSources, window, cx| {
+                    this.refresh(true, window, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &SubmitForm, window, cx| {
                 if this.submit(window, cx) {
                     window.close_dialog(cx);
@@ -400,20 +647,73 @@ impl Render for NewWorkspaceForm {
                     .child(div().flex_1().child(heading))
                     .when(self.mode == Mode::Repos, |d| {
                         d.child(format!("{count} of {}", self.repos.len()))
+                    })
+                    .when(self.mode != Mode::Repos, |d| {
+                        d.gap_1()
+                            .child(
+                                Button::new("source-branches")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Branches")
+                                    .selected(matches!(self.mode, Mode::Branches(_)))
+                                    .tooltip("Branches (cmd-b)")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        if let Some(ix) = this.source_repo(cx) {
+                                            this.pick_branch(ix, window, cx);
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new("source-prs")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Pull requests")
+                                    .selected(matches!(self.mode, Mode::Prs(_)))
+                                    .tooltip("Pull requests (cmd-p)")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        if let Some(ix) = this.source_repo(cx) {
+                                            this.pick_pr(ix, window, cx);
+                                        }
+                                    })),
+                            )
+                            .child(
+                                Button::new("refresh-sources")
+                                    .ghost()
+                                    .xsmall()
+                                    .label("Refresh")
+                                    .tooltip("Refresh (cmd-r)")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.refresh(true, window, cx)
+                                    })),
+                            )
                     }),
             )
-            .child(
-                Command::new(&self.picker)
-                    .items(items)
-                    .placeholder(placeholder)
-                    .bordered(true)
-                    .max_h(px(240.))
-                    // Enter ticks the highlighted repo and clears the filter for the next one,
-                    // or picks the highlighted branch.
-                    .on_confirm(move |ix, window, cx| {
-                        entity.update(cx, |f, cx| f.choose(ix.row, window, cx)).ok();
-                    }),
-            )
+            .child(picker)
+            .when(self.mode != Mode::Repos, |d| {
+                let (ix, kind) = match self.mode {
+                    Mode::Branches(ix) => (ix, 0),
+                    Mode::Prs(ix) => (ix, 1),
+                    _ => unreachable!(),
+                };
+                let status = if self.loading[ix][kind] {
+                    Some("Refreshing…".to_string())
+                } else if let Some(error) = &self.errors[ix][kind] {
+                    Some(format!("Refresh failed: {error}. Showing cached results."))
+                } else if kind == 1 && self.prs[ix].as_ref().is_some_and(|p| p.is_empty()) {
+                    Some("No open pull requests".to_string())
+                } else {
+                    None
+                };
+                d.children(status.map(|text| {
+                    div()
+                        .id("source-status")
+                        .text_xs()
+                        .text_color(muted)
+                        .aria_label(text.clone())
+                        .child(text)
+                        .test_support()
+                }))
+            })
             .child(
                 h_flex()
                     .gap_3()
@@ -423,13 +723,17 @@ impl Render for NewWorkspaceForm {
                         (Mode::Branches(_), _) => d
                             .child(hint(vec![kbd("enter")], "pick branch"))
                             .child(hint(vec![kbd("tab")], "back")),
+                        (Mode::Prs(_), _) => d
+                            .child(hint(vec![kbd("enter")], "pick PR"))
+                            .child(hint(vec![kbd("tab")], "back")),
                         (Mode::Repos, true) => d
                             .child(hint(vec![kbd("tab")], "switch field"))
                             .child(hint(vec![kbd("enter")], "create")),
                         (Mode::Repos, false) => d
                             .child(hint(vec![kbd("tab")], "switch field"))
                             .child(hint(vec![kbd("space")], "tick repo"))
-                            .child(hint(vec![kbd("cmd-b")], "branch")),
+                            .child(hint(vec![kbd("cmd-b")], "branch"))
+                            .child(hint(vec![kbd("cmd-p")], "PR")),
                     })
                     .child(div().flex_1())
                     .child(
@@ -583,7 +887,7 @@ impl Shark {
             d.font_features(inter_features())
                 .entrance(DialogEntrance::None)
                 .title("New workspace")
-                .w(px(520.))
+                .w(px(640.))
                 .child(form.clone())
                 .on_ok(move |_, window, cx| f.update(cx, |f, cx| f.submit(window, cx)))
         });
@@ -595,6 +899,7 @@ impl Shark {
         &mut self,
         branch: String,
         repos: Vec<(Repo, String)>,
+        prs: Vec<(String, git::PullRequest)>,
         prompt: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -616,10 +921,12 @@ impl Shark {
         let dir = workspaces_dir().join(&name);
         window.push_notification(format!("Creating {}…", tilde(&dir)), cx);
         cx.spawn_in(window, async move |this, cx| {
-            let result = cx
-                .background_executor()
-                .spawn(async move { git::create_workspace(&dir, &name, &branch, &repos) })
-                .await;
+            let result =
+                cx.background_executor()
+                    .spawn(async move {
+                        git::create_workspace_with_prs(&dir, &name, &branch, &repos, &prs)
+                    })
+                    .await;
             this.update_in(cx, |s, window, cx| match result {
                 Ok(mut ws) => {
                     ws.fill_models(&s.state.new_model(), s.state.last_effort.as_ref());
