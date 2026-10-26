@@ -31,11 +31,7 @@ impl Shark {
             return self.show(Tab::File, window, cx);
         }
         if (self.editing.as_ref()).is_some_and(|e| e.path.as_str() == path && e.dirty) {
-            return notify_err(
-                window,
-                cx,
-                format!("{path} has unsaved edits in the diff"),
-            );
+            return notify_err(window, cx, format!("{path} has unsaved edits in the diff"));
         }
         let abs = ws.dir().join(&path);
         if std::fs::metadata(&abs).is_ok_and(|m| m.len() > crate::editor::MAX_BYTES) {
@@ -286,23 +282,23 @@ impl Shark {
                     )
                     .when_some(vim, |d, vim| {
                         d.child(
-                        div()
-                            .id("vim-pill")
-                            .px_2()
-                            .h(px(20.))
-                            .flex()
-                            .items_center()
-                            .rounded_full()
-                            .text_xs()
-                            .font_family(theme.mono_font_family.clone())
-                            .text_color(theme.muted_foreground)
-                            .bg(theme.secondary)
-                            .hover(|d| d.text_color(theme.foreground))
-                            .child(vim)
-                            .tooltip(|w, cx| {
-                                Tooltip::new("Turn off Vim mode (ctrl-cmd-v)").build(w, cx)
-                            })
-                            .on_click(cx.listener(|this, _, w, cx| this.toggle_vim(w, cx))),
+                            div()
+                                .id("vim-pill")
+                                .px_2()
+                                .h(px(20.))
+                                .flex()
+                                .items_center()
+                                .rounded_full()
+                                .text_xs()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_color(theme.muted_foreground)
+                                .bg(theme.secondary)
+                                .hover(|d| d.text_color(theme.foreground))
+                                .child(vim)
+                                .tooltip(|w, cx| {
+                                    Tooltip::new("Turn off Vim mode (ctrl-cmd-v)").build(w, cx)
+                                })
+                                .on_click(cx.listener(|this, _, w, cx| this.toggle_vim(w, cx))),
                         )
                     })
                     .when_some(viewed, |d, v| {

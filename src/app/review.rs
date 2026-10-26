@@ -8,8 +8,8 @@
 //! back. Mouse scrolling loses the model; `j/k` then scroll natively until the next jump.
 use super::*;
 use crate::chat::parse_reports;
-use crate::state::support_dir;
 use crate::diff_view::{DiffAnnotation, DiffLinePosition, DiffLineRange, DiffSide};
+use crate::state::support_dir;
 use gpui_kit::component::input::{Enter, Escape, Textarea, TextareaState};
 use serde::{Deserialize, Serialize};
 use std::cell::Cell;
@@ -329,7 +329,11 @@ impl Comment {
     /// `app.rs · Working copy · lines 631–632`, as the chat card and GitHub preview say it.
     pub(super) fn card_place(&self) -> String {
         let name = self.path.rsplit('/').next().unwrap_or(&self.path);
-        let side = if self.end.0 { "Original" } else { "Working copy" };
+        let side = if self.end.0 {
+            "Original"
+        } else {
+            "Working copy"
+        };
         let s = crate::chat::plural(self.start.1.abs_diff(self.end.1) + 1);
         format!("{name} · {side} · line{s} {}", self.lines())
     }
@@ -474,7 +478,12 @@ fn reanchor(c: &mut Comment, src: &str) {
         .diff_lines(old.as_str(), src);
     let mut to = vec![None; diff.old_slices().len()];
     for op in diff.ops() {
-        if let similar::DiffOp::Equal { old_index, new_index, len } = *op {
+        if let similar::DiffOp::Equal {
+            old_index,
+            new_index,
+            len,
+        } = *op
+        {
             (0..len).for_each(|i| to[old_index + i] = Some(new_index + i));
         }
     }
@@ -634,7 +643,10 @@ impl Review {
         }
         let path = comments_path(ws);
         let (store, read) = match std::fs::read(&path) {
-            Ok(b) => (Some(serde_json::from_slice(&b).map_err(|e| e.to_string())), true),
+            Ok(b) => (
+                Some(serde_json::from_slice(&b).map_err(|e| e.to_string())),
+                true,
+            ),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, true),
             Err(e) => (Some(Err(e.to_string())), false),
         };
@@ -938,12 +950,9 @@ impl Shark {
             .ok();
         })
         .annotation_hints("Comment on working copy →", "← Comment on original")
-        .annotations(
-            threads.chain(composer).chain(
-                (media.iter())
-                    .map(|(i, path)| DiffAnnotation::file(("media", *i), path.clone())),
-            ),
-        )
+        .annotations(threads.chain(composer).chain(
+            (media.iter()).map(|(i, path)| DiffAnnotation::file(("media", *i), path.clone())),
+        ))
         .render_annotation(move |a, _, cx| {
             let (name, i) = match a.id() {
                 ElementId::NamedInteger(name, i) => (name.to_string(), *i as usize),
@@ -974,12 +983,14 @@ impl Shark {
 
     /// The hunk of the diff showing line `line` of the comment's side.
     fn hunk_of(&self, c: &Comment, line: usize) -> Option<usize> {
-        (self.review.hunks.get(c.path.as_str()))?.iter().position(|h| {
-            h.iter().any(|&(k, old, new)| match c.end.0 {
-                true => k != b'+' && old == line,
-                false => k != b'-' && new == line,
+        (self.review.hunks.get(c.path.as_str()))?
+            .iter()
+            .position(|h| {
+                h.iter().any(|&(k, old, new)| match c.end.0 {
+                    true => k != b'+' && old == line,
+                    false => k != b'-' && new == line,
+                })
             })
-        })
     }
 
     /// Moves workspace `ws`'s working-copy threads to where their lines are on disk now, so
@@ -1019,10 +1030,15 @@ impl Shark {
         let cards: Vec<AnyElement> = (ids.iter())
             .map(|&id| {
                 let c = self.comment(id).map(|c| c.path.clone()).unwrap_or_default();
-                let pending = self.comment(id).is_some_and(|c| c.status == Status::Pending);
+                let pending = self
+                    .comment(id)
+                    .is_some_and(|c| c.status == Status::Pending);
                 let editing = (self.review.composer.as_ref()).is_some_and(|c| c.draft.id == id);
                 let button = |name: &'static str, label: &'static str| {
-                    Button::new((name, id as usize)).ghost().xsmall().label(label)
+                    Button::new((name, id as usize))
+                        .ghost()
+                        .xsmall()
+                        .label(label)
                 };
                 v_flex()
                     .p_3()
@@ -1037,9 +1053,9 @@ impl Shark {
                             h_flex()
                                 .gap_2()
                                 .justify_end()
-                                .child(button("orphan-edit", "Edit").on_click(cx.listener(
-                                    move |this, _, w, cx| this.edit_comment(id, w, cx),
-                                )))
+                                .child(button("orphan-edit", "Edit").on_click(
+                                    cx.listener(move |this, _, w, cx| this.edit_comment(id, w, cx)),
+                                ))
                                 .child(button("orphan-delete", "Delete").on_click(cx.listener(
                                     move |this, _, _, cx| {
                                         this.edit_comments(cx, |l| l.retain(|c| c.id != id))
@@ -1135,7 +1151,11 @@ impl Shark {
     fn comment_at(&mut self, range: DiffLineRange, window: &mut Window, cx: &mut Context<Self>) {
         let draft = Comment::from_range(&range);
         if self.unsaved_edit(&draft) {
-            return notify_err(window, cx, "Save first (⌘S): the agent reads the file on disk");
+            return notify_err(
+                window,
+                cx,
+                "Save first (⌘S): the agent reads the file on disk",
+            );
         }
         self.keep_draft(window, cx);
         let same = (self.ws_comments().iter())
@@ -1342,7 +1362,10 @@ impl Shark {
     /// with none, `r` refreshes the diff as before.
     pub(super) fn resolve_thread(&mut self, cx: &mut Context<Self>) {
         let sent = |s: &Status| {
-            matches!(s, Status::Sent { .. } | Status::Addressed { .. } | Status::Outdated)
+            matches!(
+                s,
+                Status::Sent { .. } | Status::Addressed { .. } | Status::Outdated
+            )
         };
         match (self.thread_at(cx).and_then(|id| self.comment(id))).filter(|c| sent(&c.status)) {
             Some(c) => self.set_status(&[c.id], Status::Resolved, cx),
@@ -1352,7 +1375,8 @@ impl Shark {
 
     /// `R`: back to pending, to send again.
     pub(super) fn reopen_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(id) = (self.thread_at(cx)).filter(|&id| self.unqueued(id, window, cx).is_some()) {
+        if let Some(id) = (self.thread_at(cx)).filter(|&id| self.unqueued(id, window, cx).is_some())
+        {
             self.set_status(&[id], Status::Pending, cx);
         }
     }
@@ -1425,11 +1449,7 @@ impl Shark {
             on_shark(cx, move |s, w, cx| f(s, id, w, cx))
         };
         let addressed = matches!(c.status, Status::Addressed { .. } | Status::Outdated);
-        let mut entries = vec![menu::item(
-            IconName::Pencil,
-            "Edit",
-            act(Self::edit_thread),
-        )];
+        let mut entries = vec![menu::item(IconName::Pencil, "Edit", act(Self::edit_thread))];
         if c.status != Status::Resolved {
             entries.push(menu::item(
                 IconName::CircleCheck,
@@ -2334,7 +2354,10 @@ mod tests {
         assert_eq!((c.start, c.end), ((false, 12), (false, 12)));
         let now = slice(&edited, c.start.1, c.end.1);
         let sent = Status::Sent { turn: 1 };
-        assert_eq!(judge(&sent, 1, None, Some(&now), &c.snapshot), Status::Outdated);
+        assert_eq!(
+            judge(&sent, 1, None, Some(&now), &c.snapshot),
+            Status::Outdated
+        );
         reanchor(&mut c, "gone\n");
         assert_eq!((c.start, c.end), ((false, 12), (false, 12)));
 

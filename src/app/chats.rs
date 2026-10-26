@@ -369,7 +369,11 @@ impl Shark {
             return notify_err(window, cx, "Open a workspace first");
         };
         let Some(plan) = (from.read(cx).plan.read(cx).latest()).map(|v| v.text.clone()) else {
-            return notify_err(window, cx, "No plan yet; the agent submits one in plan mode");
+            return notify_err(
+                window,
+                cx,
+                "No plan yet; the agent submits one in plan mode",
+            );
         };
         self.new_chat(window, cx);
         let Some(to) = self.active_chat().cloned().filter(|c| *c != from) else {
@@ -597,9 +601,11 @@ impl Shark {
             ));
         }
         if let Some(id) = meta.session_id.clone() {
-            entries.push(menu::item(IconName::Copy, "Copy session ID", move |w, cx| {
-                copy(id.clone(), w, cx)
-            }));
+            entries.push(menu::item(
+                IconName::Copy,
+                "Copy session ID",
+                move |w, cx| copy(id.clone(), w, cx),
+            ));
         }
         let transcript = crate::agent::transcript_path(&meta.id);
         if transcript.exists() {

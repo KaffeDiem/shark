@@ -271,7 +271,12 @@ mod tests {
             start: Some(631),
             left: false,
         };
-        let args = review_api_args("128", "abc", "app.rs:631-632", Some((&a, "Keep it aligned.")));
+        let args = review_api_args(
+            "128",
+            "abc",
+            "app.rs:631-632",
+            Some((&a, "Keep it aligned.")),
+        );
         assert_eq!(
             args.join(" "),
             "api --method POST repos/{owner}/{repo}/pulls/128/reviews -f event=COMMENT \

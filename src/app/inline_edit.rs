@@ -800,7 +800,10 @@ mod tests {
         for (base, added) in [("", true), ("", false), ("a\nb\n", false)] {
             let p = patch("api/f", base, "", added);
             let hunks = review::parse_hunks(&p);
-            assert!(hunks.iter().flatten().any(|r| r.0 != b'-' && r.2 == 1), "{p}");
+            assert!(
+                hunks.iter().flatten().any(|r| r.0 != b'-' && r.2 == 1),
+                "{p}"
+            );
         }
     }
 }

@@ -434,9 +434,13 @@ pub(super) const COMMANDS: &[Row] = &[
         "editor",
         |s, w, cx| s.close_file(w, cx),
     ),
-    Row("Play or pause video", IconName::Play, Some(&PlayMedia), "media movie diff", |s, w, cx| {
-        s.play_media(w, cx)
-    }),
+    Row(
+        "Play or pause video",
+        IconName::Play,
+        Some(&PlayMedia),
+        "media movie diff",
+        |s, w, cx| s.play_media(w, cx),
+    ),
     Row(
         "Run next git step",
         IconName::GitPullRequestArrow,
@@ -458,11 +462,21 @@ pub(super) const COMMANDS: &[Row] = &[
         "git sync",
         |s, w, cx| s.with_sync(w, cx, GitSync::fetch_now),
     ),
-    Row("Pull", IconName::ArrowDown, None, "git fast-forward", |s, w, cx| {
-        s.with_sync(w, cx, |g, w, cx| g.run_kind(sync::Kind::Pull, "Pull", w, cx))
-    }),
+    Row(
+        "Pull",
+        IconName::ArrowDown,
+        None,
+        "git fast-forward",
+        |s, w, cx| {
+            s.with_sync(w, cx, |g, w, cx| {
+                g.run_kind(sync::Kind::Pull, "Pull", w, cx)
+            })
+        },
+    ),
     Row("Push", IconName::ArrowUp, None, "git", |s, w, cx| {
-        s.with_sync(w, cx, |g, w, cx| g.run_kind(sync::Kind::Push, "Push", w, cx))
+        s.with_sync(w, cx, |g, w, cx| {
+            g.run_kind(sync::Kind::Push, "Push", w, cx)
+        })
     }),
     Row(
         "Update from base",
@@ -748,7 +762,11 @@ impl Shark {
             Kind::Git | Kind::Xcode => app.targets(None, &repo_paths(&ws)),
         };
         let (icon, ask, none) = match app.kind {
-            Kind::Xcode => (IconName::FileCode, "Open which project?", "No Xcode project"),
+            Kind::Xcode => (
+                IconName::FileCode,
+                "Open which project?",
+                "No Xcode project",
+            ),
             _ => (IconName::FolderGit2, "Open which repo?", "No repo"),
         };
         match &targets[..] {
@@ -811,8 +829,11 @@ impl Shark {
                 .filter(|&n| n < 9)
                 .and_then(|n| shortcut(&OpenWorkspace(n), window));
             let name = &self.state.workspaces[ix].name;
-            row_item(format!("Open {name}"), IconName::GitBranch, key)
-                .keywords(["go", "switch", "workspace"])
+            row_item(format!("Open {name}"), IconName::GitBranch, key).keywords([
+                "go",
+                "switch",
+                "workspace",
+            ])
         });
         groups.push((Some("Open workspace"), workspaces.collect()));
         open_grouped(
@@ -841,7 +862,10 @@ mod tests {
     fn every_group_starts_at_a_row() {
         assert_eq!(COMMANDS[0].0, GROUPS[0].1, "the first row starts a group");
         for (heading, first) in GROUPS {
-            assert!(COMMANDS.iter().any(|r| r.0 == *first), "{heading}: no row {first}");
+            assert!(
+                COMMANDS.iter().any(|r| r.0 == *first),
+                "{heading}: no row {first}"
+            );
         }
         for label in CLAUDE_ONLY.iter().chain(CODEX_ONLY).chain(NEED_WORKSPACE) {
             assert!(COMMANDS.iter().any(|r| r.0 == *label), "no row {label}");

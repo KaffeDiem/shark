@@ -181,8 +181,7 @@ fn bind_keys(cx: &mut App) {
     const DIFF: &str = "DiffPane && !Input";
     // The diff's line cursor (src/app/review.rs) moves like a list. With Vim its arrows
     // scroll natively and j/k move the cursor; without, the arrows move it.
-    const MOVE: &str =
-        "Sidebar || Home || Transcript || FileTree || Queue || DiffPane || PlanPane";
+    const MOVE: &str = "Sidebar || Home || Transcript || FileTree || Queue || DiffPane || PlanPane";
     const ARROWS: &str =
         "Sidebar || Home || Transcript || FileTree || Queue || PlanPane || (Diff && !Vim)";
     // `!Input` sits outside `Vim > (…)`: inside it, `!` sees only the contexts down to the
@@ -192,7 +191,9 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::load(
             keys,
             action,
-            Some(Rc::new(KeyBindingContextPredicate::parse(&predicate).unwrap())),
+            Some(Rc::new(
+                KeyBindingContextPredicate::parse(&predicate).unwrap(),
+            )),
             false,
             None,
             &DummyKeyboardMapper,
@@ -368,7 +369,10 @@ fn bind_keys(cx: &mut App) {
     );
     // The Diff component's scroll actions are private; bind vim keys to them by name.
     let diff = Rc::new(KeyBindingContextPredicate::parse("(Vim > Diff) && !Input").unwrap());
-    let scroll = [("h", "shark_diff::ScrollLeft"), ("l", "shark_diff::ScrollRight")];
+    let scroll = [
+        ("h", "shark_diff::ScrollLeft"),
+        ("l", "shark_diff::ScrollRight"),
+    ];
     let bindings: Vec<KeyBinding> = scroll
         .iter()
         .filter_map(|(k, name)| {

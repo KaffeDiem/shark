@@ -39,8 +39,8 @@ impl NewWorkspaceForm {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let branch = cx
-            .new(|cx| InputState::new(window, cx).placeholder("branch, e.g. you/eng-123-login"));
+        let branch =
+            cx.new(|cx| InputState::new(window, cx).placeholder("branch, e.g. you/eng-123-login"));
         // Branch names can't contain spaces; turn them into dashes as you type.
         let _sub = cx.subscribe_in(&branch, window, |_, input, ev: &InputEvent, window, cx| {
             if let InputEvent::Change = ev {
@@ -160,7 +160,9 @@ impl NewWorkspaceForm {
 
     /// Back to the repo list, on the repo whose branches were listed.
     fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Mode::Branches(ix) = self.mode else { return };
+        let Mode::Branches(ix) = self.mode else {
+            return;
+        };
         self.show(Mode::Repos, ix, window, cx);
     }
 
@@ -338,10 +340,7 @@ impl Render for NewWorkspaceForm {
                 .child(div().pl_0p5().child(label))
         };
         let (heading, placeholder) = match self.mode {
-            Mode::Repos => (
-                "Repos".to_string(),
-                "Filter repos…".to_string(),
-            ),
+            Mode::Repos => ("Repos".to_string(), "Filter repos…".to_string()),
             Mode::Branches(ix) => (
                 format!("Branch for {}", self.repos[ix].name),
                 match self.branches[ix].is_some() {
@@ -603,7 +602,11 @@ impl Shark {
         let name = branch.replace('/', "-");
         // Nothing is saved this run, so the worktrees would be orphaned on restart.
         if self.state.read_only {
-            return notify_err(window, cx, "Can't create workspaces: state.json couldn't be read");
+            return notify_err(
+                window,
+                cx,
+                "Can't create workspaces: state.json couldn't be read",
+            );
         }
         if self.state.workspaces.iter().any(|w| w.name == name) {
             return notify_err(window, cx, format!("workspace `{name}` already exists"));
@@ -684,7 +687,10 @@ impl Shark {
             return notify_err(
                 window,
                 cx,
-                format!("{} has every repo; add another first (Add repo in cmd-k)", ws.name),
+                format!(
+                    "{} has every repo; add another first (Add repo in cmd-k)",
+                    ws.name
+                ),
             );
         }
         let items = missing
@@ -741,7 +747,13 @@ impl Shark {
 
     /// Every chat of an opened workspace that has (or had) a conversation gets `note` and the
     /// new repo list; one never started reads the new root CLAUDE.md at its session start.
-    fn tell_chats(&mut self, ws: &Workspace, note: String, window: &mut Window, cx: &mut Context<Self>) {
+    fn tell_chats(
+        &mut self,
+        ws: &Workspace,
+        note: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if !self.syncs.contains_key(&ws.name) {
             return;
         }
@@ -757,7 +769,12 @@ impl Shark {
 
     /// "Change base…": which repos (when there are several), then the new base, then whether
     /// the agent rebases onto it.
-    pub(super) fn change_base(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn change_base(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(ws) = self.ws(&name).cloned() else {
             return;
         };
@@ -796,7 +813,13 @@ impl Shark {
     }
 
     /// The `origin/*` branches of `repos`, newest first; a branch only some have moves only those.
-    fn pick_base(&mut self, name: String, repos: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+    fn pick_base(
+        &mut self,
+        name: String,
+        repos: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(ws) = self.ws(&name).cloned() else {
             return;
         };
@@ -806,7 +829,11 @@ impl Shark {
             .filter(|r| repos.contains(&r.name))
             .map(|r| {
                 let own = ws.branch_of(r).to_string();
-                (r.name.clone(), own, git::remote_branches(&dir.join(&r.name)))
+                (
+                    r.name.clone(),
+                    own,
+                    git::remote_branches(&dir.join(&r.name)),
+                )
             })
             .collect();
         let choices = git::base_choices(&per_repo);
@@ -940,8 +967,10 @@ impl Shark {
                         })
                         .await;
                     if !errs.is_empty() {
-                        cx.update(|w, cx| notify_err(w, cx, format!("Retargeting PRs: {}", errs.join("; "))))
-                            .ok();
+                        cx.update(|w, cx| {
+                            notify_err(w, cx, format!("Retargeting PRs: {}", errs.join("; ")))
+                        })
+                        .ok();
                     }
                 })
                 .detach();
@@ -1173,7 +1202,11 @@ impl Shark {
                 for chat in self.started_chats(name) {
                     chat.update(cx, |c, _| c.archiving = false);
                 }
-                notify_err(window, cx, format!("{e}\nUse Force archive workspace in cmd-k to discard them."))
+                notify_err(
+                    window,
+                    cx,
+                    format!("{e}\nUse Force archive workspace in cmd-k to discard them."),
+                )
             }
         }
         cx.notify();

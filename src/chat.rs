@@ -13,11 +13,11 @@ use gpui_kit::assets::IconName;
 use gpui_kit::component::Sizable as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::clipboard::Clipboard;
+use gpui_kit::component::hover_card::HoverCard;
 use gpui_kit::component::input::{
     Enter, Escape, IndentInline, InputContent, InputEvent, MoveDown, MoveUp, OutdentInline, Redo,
     Textarea, TextareaState, Undo,
 };
-use gpui_kit::component::hover_card::HoverCard;
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement;
@@ -452,7 +452,10 @@ pub(crate) fn effort_of(meta: &ChatMeta) -> &'static str {
     match levels.iter().find(|l| **l == want) {
         Some(l) => l,
         None if want == "ultra" => levels.last().unwrap(),
-        None => levels.iter().find(|l| **l == EFFORT).unwrap_or(levels.last().unwrap()),
+        None => levels
+            .iter()
+            .find(|l| **l == EFFORT)
+            .unwrap_or(levels.last().unwrap()),
     }
 }
 
@@ -478,9 +481,17 @@ pub(crate) fn model_label(id: &str) -> String {
             let mut words = m.split('-');
             let head = match (words.next(), words.next()) {
                 (Some("gpt"), Some(v)) => format!("GPT-{v}"),
-                (a, b) => [a, b].into_iter().flatten().map(cap).collect::<Vec<_>>().join(" "),
+                (a, b) => [a, b]
+                    .into_iter()
+                    .flatten()
+                    .map(cap)
+                    .collect::<Vec<_>>()
+                    .join(" "),
             };
-            std::iter::once(head).chain(words.map(cap)).collect::<Vec<_>>().join(" ")
+            std::iter::once(head)
+                .chain(words.map(cap))
+                .collect::<Vec<_>>()
+                .join(" ")
         }
         None => cap(id),
     }
@@ -793,7 +804,11 @@ impl Chat {
 
     /// The model button's label: "Opus · High".
     pub(crate) fn model_chip(&self) -> String {
-        format!("{} · {}", model_label(self.model()), effort_label(self.effort()))
+        format!(
+            "{} · {}",
+            model_label(self.model()),
+            effort_label(self.effort())
+        )
     }
 
     /// cmd-/ or the model button: the models, then the thinking levels, the current ones
@@ -815,7 +830,11 @@ impl Chat {
             });
             // The backend where the name doesn't say it, and the ctrl-cmd-N pick.
             let keys = format!("⌃⌘{}", i + 1);
-            let hint = if is_codex { format!("Codex  {keys}") } else { keys };
+            let hint = if is_codex {
+                format!("Codex  {keys}")
+            } else {
+                keys
+            };
             entries.push(item.hint(hint).checked(m == current));
         }
         entries.push(crate::menu::Entry::Sep);
@@ -829,7 +848,11 @@ impl Chat {
             let item = crate::menu::item(None, effort_label(l), move |_, cx| {
                 this.update(cx, |c, cx| c.set_effort(l, cx)).ok();
             });
-            let hint = if matches!(l, "max" | "ultra") { "slower" } else { "" };
+            let hint = if matches!(l, "max" | "ultra") {
+                "slower"
+            } else {
+                ""
+            };
             entries.push(item.hint(hint).checked(l == effort));
         }
         let b = self.model_at.get();
@@ -901,7 +924,10 @@ impl Chat {
         }
         self.meta.plan = on;
         if self.busy && self.codex() {
-            self.push(Block::Info("codex switches plan mode from the next message".into()), cx);
+            self.push(
+                Block::Info("codex switches plan mode from the next message".into()),
+                cx,
+            );
         }
         if let Some(a) = &mut self.agent
             && let Err(e) = a.set_plan_mode(on)
@@ -1461,11 +1487,7 @@ impl Chat {
         // Never mid-turn: a steer would kill the turn it means to steer.
         let stale = self.agent_model != self.meta.model
             || (!self.codex() && self.agent_effort != self.effort());
-        if self.agent.is_some()
-            && stale
-            && !self.busy
-            && !self.steered
-        {
+        if self.agent.is_some() && stale && !self.busy && !self.steered {
             self.agent = None; // drop stops it; the respawn resumes the same session on the new model/level
             self.background.clear(); // its reader is replaced below, so its Exited never arrives
         }
@@ -2000,7 +2022,8 @@ impl Chat {
             // codex's turn goes on to its end by itself: there is no request to answer. The
             // pane keeps its versions, so history doesn't add them again.
             Ev::Plan { id, text } => {
-                let row = (self.blocks.iter()).rposition(|b| matches!(b, Block::Tool(c) if c.id == id));
+                let row =
+                    (self.blocks.iter()).rposition(|b| matches!(b, Block::Tool(c) if c.id == id));
                 if let Some(bi) = row
                     && let Block::Tool(c) = &mut self.blocks[bi]
                 {
@@ -3101,7 +3124,10 @@ mod tests {
         // One in a code block is an example, not a report.
         let fenced = "See:\n```\n[c1] addressed: example\n```\n[c2] addressed: real";
         assert_eq!(parse_reports(fenced), [(2, "real".to_string())]);
-        assert_eq!(hide_reports(fenced), "See:\n```\n[c1] addressed: example\n```\n");
+        assert_eq!(
+            hide_reports(fenced),
+            "See:\n```\n[c1] addressed: example\n```\n"
+        );
         assert!(hidden_reply("[c1] addressed: x\n"));
         assert!(hidden_reply("\n- [c1] addressed: x\n[c2] addressed: y"));
         assert!(!hidden_reply("Done.\n[c1] addressed: x"));
@@ -3258,9 +3284,7 @@ exec cat >/dev/null
         let args = std::fs::read_to_string(fake.with_extension("args")).unwrap();
         assert!(args.contains("--model haiku"), "{args}");
         assert!(
-            args.contains(
-                "--tools  --strict-mcp-config --safe-mode --no-session-persistence"
-            ),
+            args.contains("--tools  --strict-mcp-config --safe-mode --no-session-persistence"),
             "{args}"
         );
         assert!(args.contains("--append-system-prompt the docs"), "{args}");
@@ -3543,7 +3567,10 @@ exec cat >/dev/null
             chat.update(cx, |c, cx| {
                 c.busy = false;
                 assert!(c.build_plan("# Cache\n\nUse an LRU map.\n", w, cx));
-                assert_eq!(c.meta.title, "Cache", "titled after the plan, not the preamble");
+                assert_eq!(
+                    c.meta.title, "Cache",
+                    "titled after the plan, not the preamble"
+                );
                 let want = format!("{BUILD_FRESH}\n\n# Cache\n\nUse an LRU map.\n");
                 assert!(matches!(c.blocks.last(), Some(Block::User(t, _)) if *t == want));
             })
@@ -3593,7 +3620,10 @@ exec cat >/dev/null
         frame(cx);
         let list = cx.update(|cx| chat.read(cx).list.clone());
         let footer = |cx: &mut TestAppContext| {
-            assert_eq!(list.item_count(), cx.update(|cx| chat.read(cx).rows.len()) + 1)
+            assert_eq!(
+                list.item_count(),
+                cx.update(|cx| chat.read(cx).rows.len()) + 1
+            )
         };
         footer(cx);
         let top = || list.logical_scroll_top().item_ix;
@@ -3740,16 +3770,33 @@ exec cat >/dev/null
             chat.update(cx, |c, cx| {
                 c.meta.model = Some("opus".into());
                 assert_eq!((c.effort(), c.efforts().len()), ("high", 5));
-                let odd = |e: &str| effort_of(&ChatMeta { effort: Some(e.into()), ..c.meta.clone() });
-                assert_eq!((odd("minimal"), odd("ultra")), ("high", "max"), "never the costliest by accident");
+                let odd = |e: &str| {
+                    effort_of(&ChatMeta {
+                        effort: Some(e.into()),
+                        ..c.meta.clone()
+                    })
+                };
+                assert_eq!(
+                    (odd("minimal"), odd("ultra")),
+                    ("high", "max"),
+                    "never the costliest by accident"
+                );
                 assert_eq!(c.step_effort(-1, cx), "medium");
                 assert_eq!(c.step_effort(-5, cx), "low");
                 c.set_model("codex:gpt-6.1-sol", cx);
-                assert_eq!(c.meta.effort.as_deref(), Some("low"), "kept across backends");
+                assert_eq!(
+                    c.meta.effort.as_deref(),
+                    Some("low"),
+                    "kept across backends"
+                );
                 c.set_effort("ultra", cx);
                 assert_eq!(c.step_effort(1, cx), "ultra", "the top");
                 c.set_model("fable", cx);
-                assert_eq!(c.meta.effort.as_deref(), Some("max"), "clamped to claude's top");
+                assert_eq!(
+                    c.meta.effort.as_deref(),
+                    Some("max"),
+                    "clamped to claude's top"
+                );
                 c.set_effort("ultra", cx);
                 assert_eq!(c.effort(), "max");
                 // What the send checks: claude's process is stale on another level.
@@ -4364,7 +4411,11 @@ exec cat >/dev/null
         // Fuzzily "Fix endpoint", like `#endif` or `#[test]` might match in code.
         act(cx, &|w, cx| w.input(" #fixend", cx));
         assert_eq!(menu(cx), Some((1, 0)));
-        assert_eq!(armed(cx), Some(false), "a fuzzy match isn't picked by enter");
+        assert_eq!(
+            armed(cx),
+            Some(false),
+            "a fuzzy match isn't picked by enter"
+        );
         act(cx, &|w, cx| w.press("escape", cx));
         act(cx, &|w, cx| w.input(" #12", cx));
         assert_eq!(armed(cx), Some(true));

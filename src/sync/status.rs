@@ -941,7 +941,10 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         let Kind::Agent(prompt) = a.kind else {
             panic!("{:?}", a.kind)
         };
-        assert!(prompt.contains("`kd/x`") && !prompt.contains("`feat`"), "{prompt}");
+        assert!(
+            prompt.contains("`kd/x`") && !prompt.contains("`feat`"),
+            "{prompt}"
+        );
         // Both off their branches: one instruction per branch, each naming its own.
         let off = || Local {
             branch: Some("other".into()),
@@ -952,8 +955,14 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
             panic!("{:?}", a.kind)
         };
         let (fa, kb) = prompt.split_once("\n\n").unwrap();
-        assert!(fa.contains(": a.") && fa.contains("`feat`") && !fa.contains("kd/x"), "{fa}");
-        assert!(kb.contains(": b.") && kb.contains("`kd/x`") && !kb.contains("feat"), "{kb}");
+        assert!(
+            fa.contains(": a.") && fa.contains("`feat`") && !fa.contains("kd/x"),
+            "{fa}"
+        );
+        assert!(
+            kb.contains(": b.") && kb.contains("`kd/x`") && !kb.contains("feat"),
+            "{kb}"
+        );
     }
 
     #[test]
@@ -1226,9 +1235,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
             change_requests: ids.iter().map(|s| s.to_string()).collect(),
             ..pr("BLOCKED", Checks::Passing)
         };
-        let ask = |p: Pr, handled: &[String]| {
-            next_action(&[repo("a", clean(1), Some(p))], handled)
-        };
+        let ask = |p: Pr, handled: &[String]| next_action(&[repo("a", clean(1), Some(p))], handled);
         let a = ask(reviewed(&["r1"]), &[]);
         assert_eq!(
             (a.label.as_str(), a.reviews),
@@ -1431,9 +1438,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
             Some((7, 7)),
             "unmoved refs reuse the last counts"
         );
-        let force = step_args(&Kind::ForcePush, &r(l.clone()))
-            .unwrap()
-            .unwrap();
+        let force = step_args(&Kind::ForcePush, &r(l.clone())).unwrap().unwrap();
         assert_eq!(next_action(&[r(l)], &[]).kind, Kind::ForcePush);
         // Someone pushes after the probe: the lease on the probed commit must refuse.
         git(&src, &["push", "-qf", "origin", "main:feat"]).unwrap();

@@ -1,6 +1,8 @@
 //! Root view: sidebar of repos and workspaces, Chat/Diff tabs, palette and dialogs.
 use crate::attention::Attn;
 use crate::chat::{Chat, ChatEvent, MODELS};
+use crate::checkbox::Checkbox;
+use crate::diff_view::{Diff, DiffEvent, DiffFile, DiffFileStatus, DiffMode, DiffState};
 use crate::editor::{EditorEvent, FileEditor};
 use crate::files::{self, Row};
 use crate::menu::{self, Entry};
@@ -8,17 +10,15 @@ use crate::state::{ChatMeta, Repo, Section, State, Workspace, move_item, workspa
 use crate::sync::{GitSync, SyncEvent};
 use crate::*;
 use gpui_kit::assets::IconName;
+use gpui_kit::base::{ResizeHandleRenderer, ResizeHandleState};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
-use crate::checkbox::Checkbox;
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::dialog::{Dialog, DialogEntrance};
-use crate::diff_view::{Diff, DiffEvent, DiffFile, DiffFileStatus, DiffMode, DiffState};
 use gpui_kit::component::hover_card::HoverCard;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::link::Link;
 use gpui_kit::component::notification::Notification;
-use gpui_kit::base::{ResizeHandleRenderer, ResizeHandleState};
 use gpui_kit::component::resizable::{
     ResizablePanelEvent, ResizableState, h_resizable, resizable_panel, resize_handle_appearance,
 };

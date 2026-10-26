@@ -265,7 +265,10 @@ async fn vim_setting_and_palette_target(cx: &mut TestAppContext) {
     assert!(State::load().vim, "the switch is saved");
     cx.update(|cx| {
         let s = shark.read(cx);
-        assert!(s.chats.values().all(|c| c.read(cx).vim_on), "every chat follows");
+        assert!(
+            s.chats.values().all(|c| c.read(cx).vim_on),
+            "every chat follows"
+        );
     });
     press(cx, &["j"]);
     assert_ne!(sel(cx), top, "j moves with Vim on");
@@ -273,7 +276,9 @@ async fn vim_setting_and_palette_target(cx: &mut TestAppContext) {
     // The cursor is on a workspace that isn't open: cmd-k's archive takes that one.
     let open = cx.update(|cx| shark.read(cx).active.clone().unwrap());
     let name = |cx: &mut TestAppContext| {
-        let SideRow::Ws(ix) = sel(cx) else { panic!("cursor on a workspace") };
+        let SideRow::Ws(ix) = sel(cx) else {
+            panic!("cursor on a workspace")
+        };
         cx.update(|cx| shark.read(cx).state.workspaces[ix].name.clone())
     };
     if name(cx) == open {
@@ -304,8 +309,16 @@ async fn branch_picker(cx: &mut TestAppContext) {
     for r in &repos {
         let origin = home.join(format!("{}.git", r.name));
         git::git(&home, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
-        git::git(&r.path, &["remote", "add", "origin", &origin.to_string_lossy()]).unwrap();
-        git::git(&r.path, &["push", "-q", "origin", "main", "main:shared", "main:kd/a"]).unwrap();
+        git::git(
+            &r.path,
+            &["remote", "add", "origin", &origin.to_string_lossy()],
+        )
+        .unwrap();
+        git::git(
+            &r.path,
+            &["push", "-q", "origin", "main", "main:shared", "main:kd/a"],
+        )
+        .unwrap();
     }
     let (window, shark) = boot(
         cx,
@@ -351,7 +364,10 @@ async fn branch_picker(cx: &mut TestAppContext) {
     press(cx, &["cmd-n"]);
     assert_eq!(gets(cx, 0).as_deref(), Some("new"));
     input(cx, "shared");
-    assert_eq!((gets(cx, 0).as_deref(), gets(cx, 1).as_deref()), (Some("existing"), Some("existing")));
+    assert_eq!(
+        (gets(cx, 0).as_deref(), gets(cx, 1).as_deref()),
+        (Some("existing"), Some("existing"))
+    );
 
     // A branch checked out in the source checkout is refused; tab goes back unpicked.
     press(cx, &["cmd-a", "backspace"]);
@@ -368,7 +384,10 @@ async fn branch_picker(cx: &mut TestAppContext) {
         shark.read(cx).active.as_deref() == Some("x1")
     })
     .await;
-    assert_eq!((on("x1", "api"), on("x1", "web")), ("x1".into(), "x1".into()));
+    assert_eq!(
+        (on("x1", "api"), on("x1", "web")),
+        ("x1".into(), "x1".into())
+    );
 
     // Picking, then the first row puts the new branch back. Clicking the label lists too.
     press(cx, &["cmd-n"]);
@@ -377,7 +396,9 @@ async fn branch_picker(cx: &mut TestAppContext) {
     branches_of(cx, "web", "shared");
     press(cx, &["enter"]);
     input(cx, "");
-    let web = (0..2).find(|&i| gets(cx, i).as_deref() == Some("shared")).unwrap();
+    let web = (0..2)
+        .find(|&i| gets(cx, i).as_deref() == Some("shared"))
+        .unwrap();
     // Back on the repos, the highlight is on web: space unticks and reticks web.
     let ticked = |cx: &mut TestAppContext, i: usize| {
         cx.update_window(window, |_, w, cx| {
@@ -387,7 +408,10 @@ async fn branch_picker(cx: &mut TestAppContext) {
         .unwrap()
     };
     press(cx, &["space"]);
-    assert_eq!((ticked(cx, web), ticked(cx, 1 - web)), (Some(false), Some(true)));
+    assert_eq!(
+        (ticked(cx, web), ticked(cx, 1 - web)),
+        (Some(false), Some(true))
+    );
     press(cx, &["space"]);
     assert_eq!(ticked(cx, web), Some(true));
     cx.update_window(window, |_, w, cx| w.click(("repo-branch", web), cx))
@@ -423,7 +447,10 @@ async fn branch_picker(cx: &mut TestAppContext) {
         shark.read(cx).active.as_deref() == Some("kd-a")
     })
     .await;
-    assert_eq!((on("kd-a", "api"), on("kd-a", "web")), ("kd/a".into(), "fresh".into()));
+    assert_eq!(
+        (on("kd-a", "api"), on("kd-a", "web")),
+        ("kd/a".into(), "fresh".into())
+    );
     cx.update(|cx| {
         let s = shark.read(cx);
         let ws = s.ws("kd-a").unwrap();
@@ -603,7 +630,10 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     let effort = |cx: &mut TestAppContext| {
         cx.update(|cx| shark.read(cx).state.workspaces[0].chats[0].effort.clone())
     };
-    press(cx, &["cmd-shift-.", "cmd-shift-.", "cmd-shift-.", "cmd-shift-,"]);
+    press(
+        cx,
+        &["cmd-shift-.", "cmd-shift-.", "cmd-shift-.", "cmd-shift-,"],
+    );
     assert_eq!(effort(cx).as_deref(), Some("xhigh"));
     cx.update(|cx| {
         let st = &shark.read(cx).state;
@@ -613,7 +643,10 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     press(cx, &["cmd-t"]);
     cx.update(|cx| {
         let m = &shark.read(cx).state.workspaces[0].chats[1];
-        assert_eq!((m.model.as_deref(), m.effort.as_deref()), (Some("sonnet"), Some("xhigh")));
+        assert_eq!(
+            (m.model.as_deref(), m.effort.as_deref()),
+            (Some("sonnet"), Some("xhigh"))
+        );
     });
     press(cx, &["cmd-w"]);
     cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
@@ -919,7 +952,11 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     // cmd-b lists the highlighted repo's branches; enter picks one for it and ticks it.
     let (api, origin) = (home.join("src/api"), home.join("origin.git"));
     git::git(&home, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
-    git::git(&api, &["remote", "add", "origin", &origin.to_string_lossy()]).unwrap();
+    git::git(
+        &api,
+        &["remote", "add", "origin", &origin.to_string_lossy()],
+    )
+    .unwrap();
     git::git(&api, &["push", "-q", "origin", "main:remote-only"]).unwrap();
     press(cx, &["cmd-n"]);
     cx.run_until_parked();
@@ -946,7 +983,11 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         git::git(&wt, &["branch", "--show-current"]).unwrap()
     };
     assert_eq!(on_branch("api"), "remote-only");
-    assert_eq!(on_branch("web"), "new-x", "the last-used repo gets the new branch");
+    assert_eq!(
+        on_branch("web"),
+        "new-x",
+        "the last-used repo gets the new branch"
+    );
     cx.update(|cx| {
         let s = shark.read(cx);
         let ws = s.ws("new-x").unwrap();
@@ -1133,7 +1174,13 @@ async fn add_repo_and_restore(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace("grow".into(), git::on_branch(&repos[..1], "grow"), None, w, cx)
+        s.create_workspace(
+            "grow".into(),
+            git::on_branch(&repos[..1], "grow"),
+            None,
+            w,
+            cx,
+        )
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -1272,7 +1319,10 @@ async fn chat_tab_menu(cx: &mut TestAppContext) {
     on(cx, &|s, _, _| {
         s.active_ws_mut().unwrap().chats[0].session_id = Some("s1".into())
     });
-    assert_eq!(labels(cx), ["New chat", "Copy session ID", "-", "Close chat"]);
+    assert_eq!(
+        labels(cx),
+        ["New chat", "Copy session ID", "-", "Close chat"]
+    );
     fs::remove_dir_all(&home).ok();
 }
 
@@ -1747,8 +1797,19 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     fs::create_dir_all(repos[0].path.join("App.xcodeproj")).unwrap();
     fs::write(repos[0].path.join("App.xcodeproj/project.pbxproj"), "").unwrap();
     git::git(&repos[0].path, &["add", "."]).unwrap();
-    git::git(&repos[0].path, &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-qm", "x"])
-        .unwrap();
+    git::git(
+        &repos[0].path,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "x",
+        ],
+    )
+    .unwrap();
     let (window, shark) = boot(
         cx,
         State {
@@ -1771,7 +1832,8 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     let press = press_in(window);
     let run = |cx: &mut TestAppContext, query: &str| {
         press(cx, &["cmd-k"]);
-        cx.update_window(window, |_, w, cx| w.input(query, cx)).unwrap();
+        cx.update_window(window, |_, w, cx| w.input(query, cx))
+            .unwrap();
         press(cx, &["enter"]);
     };
     let last = || OPENED.lock().unwrap().last().cloned();
@@ -1807,7 +1869,11 @@ async fn open_in_apps(cx: &mut TestAppContext) {
             ("Open in Terminal".into(), None, all.clone()),
             ("Open in Code".into(), None, all),
             ("Open in Fork".into(), None, s(&["ios", "web"])),
-            ("Open in Xcode".into(), Some("ios/App.xcodeproj".into()), vec![]),
+            (
+                "Open in Xcode".into(),
+                Some("ios/App.xcodeproj".into()),
+                vec![]
+            ),
         ]
     );
     // "Add repo" lists only the repos the workspace lacks, and hides when there are none.
@@ -1830,7 +1896,10 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     assert_eq!(add_repo(cx, "web-only"), Some(s(&["ios"])));
     assert_eq!(add_repo(cx, "both"), None);
     let web_only = menu_of(cx, "web-only");
-    assert!(web_only.iter().all(|e| e.0 != "Open in Xcode"), "no project, no Xcode");
+    assert!(
+        web_only.iter().all(|e| e.0 != "Open in Xcode"),
+        "no project, no Xcode"
+    );
     assert!(
         web_only.contains(&("Open in Fork".into(), Some("web".into()), vec![])),
         "one repo opens directly"
@@ -1840,16 +1909,25 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     run(cx, "open in terminal");
     assert_eq!(last(), Some(("Terminal".into(), ws_dir.clone())));
     run(cx, "open in xcode");
-    assert_eq!(last(), Some(("Xcode".into(), ws_dir.join("ios/App.xcodeproj"))));
+    assert_eq!(
+        last(),
+        Some(("Xcode".into(), ws_dir.join("ios/App.xcodeproj")))
+    );
     run(cx, "open in fork");
     assert_eq!(last().unwrap().0, "Xcode", "Fork asks first");
-    cx.update_window(window, |_, w, cx| w.input("web", cx)).unwrap();
+    cx.update_window(window, |_, w, cx| w.input("web", cx))
+        .unwrap();
     press(cx, &["enter"]);
     assert_eq!(last(), Some(("Fork".into(), ws_dir.join("web"))));
 
     // A workspace without a project has no Xcode row.
     on(cx, &|s, w, cx| {
-        let ix = s.state.workspaces.iter().position(|w| w.name == "web-only").unwrap();
+        let ix = s
+            .state
+            .workspaces
+            .iter()
+            .position(|w| w.name == "web-only")
+            .unwrap();
         s.open_workspace(ix, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
@@ -1858,10 +1936,17 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     .await;
     let before = OPENED.lock().unwrap().len();
     run(cx, "open in xcode");
-    assert_eq!(OPENED.lock().unwrap().len(), before, "nothing matched, nothing opened");
+    assert_eq!(
+        OPENED.lock().unwrap().len(),
+        before,
+        "nothing matched, nothing opened"
+    );
     press(cx, &["escape"]);
     run(cx, "open in fork");
-    assert_eq!(last(), Some(("Fork".into(), home.join("shark/workspaces/web-only/web"))));
+    assert_eq!(
+        last(),
+        Some(("Fork".into(), home.join("shark/workspaces/web-only/web")))
+    );
     fs::remove_dir_all(&home).ok();
 }
 
@@ -2505,7 +2590,10 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
 
     // A toast at the top right stays clear of the rail.
     let toasts = cx.update_window(window, |_, w, cx| w.notifications(cx).len());
-    assert!(toasts.unwrap() > 0, "the test shows a toast over where the rail is");
+    assert!(
+        toasts.unwrap() > 0,
+        "the test shows a toast over where the rail is"
+    );
     // On the chat: the rail, with Diff; the top bar has no Changes tab any more.
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Chat));
     assert!(bounds(cx, "right-rail").is_some(), "the rail by the chat");
@@ -4890,9 +4978,7 @@ async fn review_followups(cx: &mut TestAppContext) {
         shark.read(cx).review.share.is_none()
     })
     .await;
-    assert!(
-        (comment(cx).github).is_some_and(|u| u.ends_with("#pullrequestreview-5"))
-    );
+    assert!((comment(cx).github).is_some_and(|u| u.ends_with("#pullrequestreview-5")));
     let argv = fs::read_to_string(&log).unwrap();
     assert_eq!(argv.lines().count(), 2, "{argv}");
     assert!(
@@ -4919,8 +5005,7 @@ async fn review_followups(cx: &mut TestAppContext) {
     let pick = |cx: &mut TestAppContext, line: usize| {
         on(cx, &|s, w, cx| {
             let r = DiffLineRange::new("api/f", DiffSide::Modified, line, line);
-            s.diff
-                .update(cx, |d, cx| d.set_selected_lines(Some(r), cx));
+            s.diff.update(cx, |d, cx| d.set_selected_lines(Some(r), cx));
             s.comment_dialog(w, cx);
         })
     };
@@ -4950,7 +5035,6 @@ async fn review_followups(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
-
 /// Change base: only the picked repo moves; the state, the root CLAUDE.md, the git button and
 /// the branch menu's hint all follow.
 #[gpui_kit::test]
@@ -4971,7 +5055,9 @@ async fn change_base(cx: &mut TestAppContext) {
     // api on its own branch.
     let mut picked = git::on_branch(&repos, "rb");
     picked[0].1 = "kd/x".into();
-    on(cx, &|s, w, cx| s.create_workspace("rb".into(), picked.clone(), None, w, cx));
+    on(cx, &|s, w, cx| {
+        s.create_workspace("rb".into(), picked.clone(), None, w, cx)
+    });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
     })

@@ -546,7 +546,8 @@ impl Shark {
         };
         let ix = rows[r].ix;
         // Leaving the open workspace asks about unsaved edits first; plan mode comes after.
-        let leaving = (self.state.workspaces.get(ix)).is_some_and(|w| self.active.as_ref() != Some(&w.name));
+        let leaving =
+            (self.state.workspaces.get(ix)).is_some_and(|w| self.active.as_ref() != Some(&w.name));
         self.confirm_discard(leaving, leaving, window, cx, move |s, window, cx| {
             s.open_workspace(ix, window, cx);
             s.with_plan(window, cx, |c, _, cx| c.set_plan_mode(true, cx));

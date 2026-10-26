@@ -1,7 +1,7 @@
 //! The Diff tab and the file tree: loading, viewed marks, tree navigation.
 use super::*;
-use gpui_kit::component::Selectable as _;
 use crate::diff_view::DiffHunkSeparator;
+use gpui_kit::component::Selectable as _;
 
 /// A changed file against the fingerprint stored when it was marked viewed.
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -701,14 +701,22 @@ impl Shark {
                 cx.listener(|this, _: &SelectLast, w, cx| this.diff_move(0, Some(false), w, cx)),
             )
             .on_action(cx.listener(|this, _: &AddComment, w, cx| this.comment_dialog(w, cx)))
-            .on_action(cx.listener(|this, _: &CancelEdit, w, cx| match this.editing {
-                Some(_) => this.leave_edit(w, cx),
-                None => cx.propagate(),
-            }))
+            .on_action(
+                cx.listener(|this, _: &CancelEdit, w, cx| match this.editing {
+                    Some(_) => this.leave_edit(w, cx),
+                    None => cx.propagate(),
+                }),
+            )
             .on_action(cx.listener(|this, _: &SendComments, w, cx| this.open_sheet(w, cx)))
-            .on_action(cx.listener(|this, _: &EditThread, w, cx| this.at_cursor(Self::edit_thread, w, cx)))
-            .on_action(cx.listener(|this, _: &DeleteThread, w, cx| this.at_cursor(Self::delete_thread, w, cx)))
-            .on_action(cx.listener(|this, _: &ViewChange, w, cx| this.at_cursor(Self::view_change, w, cx)))
+            .on_action(
+                cx.listener(|this, _: &EditThread, w, cx| this.at_cursor(Self::edit_thread, w, cx)),
+            )
+            .on_action(cx.listener(|this, _: &DeleteThread, w, cx| {
+                this.at_cursor(Self::delete_thread, w, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &ViewChange, w, cx| this.at_cursor(Self::view_change, w, cx)),
+            )
             .on_action(cx.listener(|this, _: &ResolveThread, _, cx| this.resolve_thread(cx)))
             .on_action(cx.listener(|this, _: &ReopenThread, w, cx| this.reopen_thread(w, cx)))
             .on_action(cx.listener(|this, _: &NextThread, w, cx| this.thread_jump(true, w, cx)))
@@ -1285,7 +1293,11 @@ impl Shark {
             }),
             // Relative to the repo, as its own tools and the agent's diffs name it.
             menu::item(IconName::Copy, "Copy relative path", move |w, cx| {
-                copy(p.split_once('/').map_or(&*p, |(_, rel)| rel).to_string(), w, cx)
+                copy(
+                    p.split_once('/').map_or(&*p, |(_, rel)| rel).to_string(),
+                    w,
+                    cx,
+                )
             }),
         ]);
         entries

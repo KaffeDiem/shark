@@ -326,7 +326,15 @@ pub(crate) fn par_map<T: Send, R: Send>(
 /// `origin/*` branches of `dir` as `(commit time, origin/name)`, newest first.
 pub fn remote_branches(dir: &Path) -> Vec<(i64, String)> {
     let fmt = "--format=%(committerdate:unix) %(refname:short)";
-    let out = git(dir, &["for-each-ref", "--sort=-committerdate", fmt, "refs/remotes/origin"]);
+    let out = git(
+        dir,
+        &[
+            "for-each-ref",
+            "--sort=-committerdate",
+            fmt,
+            "refs/remotes/origin",
+        ],
+    );
     (out.unwrap_or_default().lines())
         .filter_map(|l| {
             let (t, r) = l.split_once(' ')?;
@@ -539,7 +547,10 @@ fn agents_md(ws: &Workspace, dir: &Path) -> String {
 }
 
 fn header(ws: &Workspace) -> String {
-    let first = ws.repos.first().map_or(ws.branch.as_str(), |r| ws.branch_of(r));
+    let first = ws
+        .repos
+        .first()
+        .map_or(ws.branch.as_str(), |r| ws.branch_of(r));
     let shared = ws.repos.iter().all(|r| ws.branch_of(r) == first);
     let mut s = format!(
         "# Workspace `{}`\n\nThis directory is NOT a git repo. Each subdirectory is a git worktree{}:\n",
@@ -759,14 +770,29 @@ mod tests {
         let b = |t, n: &str| (t, format!("origin/{n}"));
         // web is on its own branch `x`; api's `feat` is still a base web may take.
         let repos = [
-            ("api".to_string(), "feat".to_string(), vec![b(9, "feat"), b(5, "main"), b(1, "old")]),
-            ("web".to_string(), "x".to_string(), vec![b(8, "feat"), b(7, "main"), b(3, "x")]),
+            (
+                "api".to_string(),
+                "feat".to_string(),
+                vec![b(9, "feat"), b(5, "main"), b(1, "old")],
+            ),
+            (
+                "web".to_string(),
+                "x".to_string(),
+                vec![b(8, "feat"), b(7, "main"), b(3, "x")],
+            ),
         ];
         let got = base_choices(&repos);
-        let names: Vec<_> = got.iter().map(|(n, rs)| (n.as_str(), rs.join(","))).collect();
+        let names: Vec<_> = got
+            .iter()
+            .map(|(n, rs)| (n.as_str(), rs.join(",")))
+            .collect();
         assert_eq!(
             names,
-            [("origin/feat", "web".into()), ("origin/main", "web,api".into()), ("origin/old", "api".into())]
+            [
+                ("origin/feat", "web".into()),
+                ("origin/main", "web,api".into()),
+                ("origin/old", "api".into())
+            ]
         );
     }
 
@@ -846,8 +872,13 @@ mod tests {
             "{agents}"
         );
         assert!(
-            create_workspace(&root.join("ws/other"), "other", "feat-x", &on_branch(&repos, "feat-x"))
-                .is_err(),
+            create_workspace(
+                &root.join("ws/other"),
+                "other",
+                "feat-x",
+                &on_branch(&repos, "feat-x")
+            )
+            .is_err(),
             "branch collision"
         );
         // `git init` + `remote add` leaves origin/HEAD unset; the base is still origin/main.
@@ -857,9 +888,13 @@ mod tests {
         git(api, &["remote", "add", "origin", &origin.to_string_lossy()]).unwrap();
         git(api, &["push", "-q", "origin", "main"]).unwrap();
         git(api, &["checkout", "-q", "-b", "side"]).unwrap();
-        let other =
-            create_workspace(&root.join("ws/other"), "other", "feat-y", &on_branch(&repos[..1], "feat-y"))
-                .unwrap();
+        let other = create_workspace(
+            &root.join("ws/other"),
+            "other",
+            "feat-y",
+            &on_branch(&repos[..1], "feat-y"),
+        )
+        .unwrap();
         assert_eq!(other.repos[0].base, "origin/main");
         remove_workspace(&other, &root.join("ws/other"), true).unwrap();
 
@@ -974,7 +1009,10 @@ mod tests {
         assert!(x.local && x.origin, "{x:?}");
         assert!(x.checked_out.unwrap().ends_with("ws/feat/api"));
         let main = get("main").unwrap();
-        assert!(main.local && main.origin && main.checked_out.is_some(), "{main:?}");
+        assert!(
+            main.local && main.origin && main.checked_out.is_some(),
+            "{main:?}"
+        );
         assert!(get("HEAD").is_none(), "origin/HEAD is dropped");
 
         // A branch checked out in the source checkout is refused; nothing is left behind.
@@ -986,9 +1024,18 @@ mod tests {
         )
         .err()
         .unwrap();
-        assert!(err.contains("api: branch `main` is already checked out"), "{err}");
+        assert!(
+            err.contains("api: branch `main` is already checked out"),
+            "{err}"
+        );
         assert!(!root.join("ws/m").exists());
-        assert!(git(&web.path, &["rev-parse", "--verify", "--quiet", "refs/heads/m"]).is_err());
+        assert!(
+            git(
+                &web.path,
+                &["rev-parse", "--verify", "--quiet", "refs/heads/m"]
+            )
+            .is_err()
+        );
 
         // A local branch behind origin is fast-forwarded first.
         let b = root.join("ws/b");
@@ -1003,7 +1050,13 @@ mod tests {
         let merged = [("api".into(), x_head), ("web".into(), "moved".into())];
         assert_eq!(delete_merged_branches(&ws, &merged), ["api"]);
         assert!(git(a, &["rev-parse", "--verify", "--quiet", "refs/heads/kd/x"]).is_err());
-        assert!(git(&web.path, &["rev-parse", "--verify", "--quiet", "refs/heads/feat"]).is_ok());
+        assert!(
+            git(
+                &web.path,
+                &["rev-parse", "--verify", "--quiet", "refs/heads/feat"]
+            )
+            .is_ok()
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 
@@ -1021,7 +1074,11 @@ mod tests {
         for r in [&api, &web] {
             let origin = root.join(format!("{}.git", r.name));
             git(&root, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
-            git(&r.path, &["remote", "add", "origin", &origin.to_string_lossy()]).unwrap();
+            git(
+                &r.path,
+                &["remote", "add", "origin", &origin.to_string_lossy()],
+            )
+            .unwrap();
             git(&r.path, &["push", "-q", "origin", "main", "main:shared"]).unwrap();
         }
         let a = &api.path;
@@ -1046,23 +1103,39 @@ mod tests {
             &s,
             "s",
             "s",
-            &[(api.clone(), "shared".into()), (web.clone(), "shared".into())],
+            &[
+                (api.clone(), "shared".into()),
+                (web.clone(), "shared".into()),
+            ],
         )
         .unwrap();
         for r in ["api", "web"] {
             let b = git(&s.join(r), &["branch", "--show-current"]).unwrap();
             assert_eq!(b, "shared");
         }
-        assert!(sws.repos.iter().all(|r| r.branch.as_deref() == Some("shared")));
+        assert!(
+            sws.repos
+                .iter()
+                .all(|r| r.branch.as_deref() == Some("shared"))
+        );
         let md = fs::read_to_string(s.join("CLAUDE.md")).unwrap();
-        assert!(md.contains("worktree on branch `shared`:") && !md.contains(" on `"), "{md}");
+        assert!(
+            md.contains("worktree on branch `shared`:") && !md.contains(" on `"),
+            "{md}"
+        );
         // A repo added later gets the workspace branch, and CLAUDE.md now tells them apart.
         let cli = init_repo(&root, "cli");
         sws = add_to_workspace(&sws, &s, &cli).unwrap();
-        assert_eq!(git(&s.join("cli"), &["branch", "--show-current"]).unwrap(), "s");
+        assert_eq!(
+            git(&s.join("cli"), &["branch", "--show-current"]).unwrap(),
+            "s"
+        );
         assert_eq!(sws.repos[2].branch, None);
         let md = fs::read_to_string(s.join("CLAUDE.md")).unwrap();
-        assert!(md.contains(" on `shared` ") && md.contains(" on `s` "), "{md}");
+        assert!(
+            md.contains(" on `shared` ") && md.contains(" on `s` "),
+            "{md}"
+        );
         remove_workspace(&sws, &s, true).unwrap();
 
         // A ref clash (`kd` exists, `kd/y` can't): everything is rolled back.
@@ -1079,7 +1152,16 @@ mod tests {
         assert!(err.contains("kd/y"), "{err}");
         assert!(!c.exists());
         let has = |r: &Repo, b: &str| {
-            git(&r.path, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{b}")]).is_ok()
+            git(
+                &r.path,
+                &[
+                    "rev-parse",
+                    "--verify",
+                    "--quiet",
+                    &format!("refs/heads/{b}"),
+                ],
+            )
+            .is_ok()
         };
         assert!(!has(&web, "c") && !has(&api, "kd/y"));
         for r in [&api, &web] {
@@ -1092,7 +1174,10 @@ mod tests {
             &root.join("ws/bad"),
             "bad",
             "ok",
-            &[(web.clone(), "ok".into()), (api.clone(), "bad..name".into())],
+            &[
+                (web.clone(), "ok".into()),
+                (api.clone(), "bad..name".into()),
+            ],
         )
         .err()
         .unwrap();

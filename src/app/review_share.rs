@@ -245,8 +245,8 @@ impl Shark {
         let theme = cx.theme();
         let repo = c.repo();
         let wr = ws.repos.iter().find(|r| r.name == repo);
-        let base = (wr.map(|r| r.base.trim_start_matches("origin/").to_string()))
-            .unwrap_or_default();
+        let base =
+            (wr.map(|r| r.base.trim_start_matches("origin/").to_string())).unwrap_or_default();
         let branch = wr.map_or(ws.branch.clone(), |r| ws.branch_of(r).to_string());
         let this = cx.entity().downgrade();
         let gone = this.clone();

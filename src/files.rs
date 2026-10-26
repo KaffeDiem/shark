@@ -158,7 +158,10 @@ mod tests {
                 "  index.ts"
             ]
         );
-        assert_eq!((r[2].path.as_str(), r[2].file), ("api/src/deep/only/x.rs", Some(1)));
+        assert_eq!(
+            (r[2].path.as_str(), r[2].file),
+            ("api/src/deep/only/x.rs", Some(1))
+        );
         assert_eq!(r[5].path, "shark/src");
         assert_eq!(tree_order(&p), [1, 2, 0, 4, 5, 6, 3]);
 

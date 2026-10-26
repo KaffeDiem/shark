@@ -80,7 +80,11 @@ fn section_menu(this: &Shark, i: usize, cx: &Context<Shark>) -> Vec<Entry> {
     let collapsed = this.state.sections.get(i).is_some_and(|s| s.collapsed);
     vec![
         menu::item(
-            if collapsed { IconName::ChevronDown } else { IconName::ChevronRight },
+            if collapsed {
+                IconName::ChevronDown
+            } else {
+                IconName::ChevronRight
+            },
             if collapsed { "Expand" } else { "Collapse" },
             on_shark(cx, move |s, _, cx| s.toggle_section(i, cx)),
         ),
@@ -643,7 +647,12 @@ impl Shark {
                                         IconName::MessageSquare,
                                         w.name.clone(),
                                         on_shark(cx, move |s, win, cx| {
-                                            s.add_repo_to_workspace(ws.clone(), repo.clone(), win, cx)
+                                            s.add_repo_to_workspace(
+                                                ws.clone(),
+                                                repo.clone(),
+                                                win,
+                                                cx,
+                                            )
                                         }),
                                     )
                                 })
@@ -1001,9 +1010,7 @@ impl Shark {
             .text_color(theme.muted_foreground)
             .hover(|d| d.bg(theme.sidebar_accent))
             .child(Icon::new(IconName::FolderPlus).with_size(isz))
-            .when(!rail, |d| {
-                d.child(div().flex_1().child("Add repo…"))
-            })
+            .when(!rail, |d| d.child(div().flex_1().child("Add repo…")))
             .when(rail, |d| {
                 d.tooltip(|w, cx| Tooltip::new("Add repo").build(w, cx))
             })

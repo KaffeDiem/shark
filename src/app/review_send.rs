@@ -112,7 +112,10 @@ impl Shark {
             return notify_err(window, cx, "Tick a comment to send (space)");
         }
         if let Some(c) = comments.iter().find(|c| self.unsaved_edit(c)) {
-            let msg = format!("Save {} first (⌘S): the agent reads the file on disk", c.path);
+            let msg = format!(
+                "Save {} first (⌘S): the agent reads the file on disk",
+                c.path
+            );
             return notify_err(window, cx, msg);
         }
         let card = ReviewCard {

@@ -187,7 +187,10 @@ impl Chat {
                 // The badge names the repo, so the folder starts inside it.
                 let detail = match it.kind {
                     Kind::File | Kind::Dir if multi => {
-                        let d = it.detail.strip_prefix(it.badge.as_str()).unwrap_or(&it.detail);
+                        let d = it
+                            .detail
+                            .strip_prefix(it.badge.as_str())
+                            .unwrap_or(&it.detail);
                         d.trim_start_matches('/').to_string()
                     }
                     _ => it.detail.clone(),

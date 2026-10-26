@@ -6,9 +6,9 @@ pub use status::{Kind, Pr, PrState, Repo, ago, github_url};
 
 use crate::app::menus::{each_or_all, pr_entry};
 use crate::app::{inter_features, notify_err, open_menu};
-use crate::menu::{self, Entry};
 use crate::chat::Chat;
 use crate::git::{cmd_bounded, par_map};
+use crate::menu::{self, Entry};
 use crate::pr;
 use crate::state::Workspace;
 use gpui_kit::assets::IconName;
@@ -903,7 +903,8 @@ impl GitSync {
             each_or_all(icon, label, rows, move |rs, w, cx| {
                 let rs = rs.to_vec();
                 let label = label.trim_end_matches('…');
-                this.update(cx, |s, cx| s.run_kind_in(k.clone(), label, rs, w, cx)).ok();
+                this.update(cx, |s, cx| s.run_kind_in(k.clone(), label, rs, w, cx))
+                    .ok();
             })
         };
         let rows = |f: &dyn Fn(&Repo) -> Option<String>| -> Vec<(String, String, String)> {
@@ -920,7 +921,11 @@ impl GitSync {
         let pull = kind(IconName::ArrowDown, Kind::Pull, "Pull", every.clone());
         entries.extend(
             [
-                Some(menu::item(IconName::RefreshCw, "Fetch now", run(Self::fetch_now))),
+                Some(menu::item(
+                    IconName::RefreshCw,
+                    "Fetch now",
+                    run(Self::fetch_now),
+                )),
                 pull.map(|e| e.hint("Fast-forward")),
                 kind(IconName::ArrowUp, Kind::Push, "Push", every.clone()),
                 Some(
@@ -970,7 +975,8 @@ impl GitSync {
                     let (this, name) = (this.clone(), name.clone());
                     moves.extend(ok.then(|| {
                         menu::item(icon, format!("Merge {name} {verb}"), move |_, cx| {
-                            this.update(cx, |s, cx| s.move_repo(&name, earlier, cx)).ok();
+                            this.update(cx, |s, cx| s.move_repo(&name, earlier, cx))
+                                .ok();
                         })
                     }));
                 }
@@ -988,7 +994,11 @@ impl GitSync {
             "Delete remote branches after merge",
             toggle_delete_remote,
         );
-        entries.push(if on { delete.checked(true) } else { delete.hint("Off") });
+        entries.push(if on {
+            delete.checked(true)
+        } else {
+            delete.hint("Off")
+        });
         let b = self.chevron.get();
         let at = point(b.right(), b.bottom() + px(4.));
         let m = menu::open_at(entries, at, Anchor::TopRight, window, cx);
@@ -1371,7 +1381,9 @@ impl Render for GitSync {
                     }),
             );
         // Outside `split`, whose clipping would cut off the menu.
-        div().child(split).children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))
+        div()
+            .child(split)
+            .children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))
     }
 }
 
@@ -1391,7 +1403,11 @@ mod tests {
             local: Ok(Local::default()),
             pr: Some(Ok(pr.map(|n| super::open_pr(name, n)))),
         };
-        let repos = [repo("api", Some(1)), repo("web", Some(2)), repo("docs", None)];
+        let repos = [
+            repo("api", Some(1)),
+            repo("web", Some(2)),
+            repo("docs", None),
+        ];
         assert_eq!(super::open_prs_in(&repos, &[]), 2, "empty is all");
         assert_eq!(super::open_prs_in(&repos, &["web".into()]), 1);
         assert_eq!(super::open_prs_in(&repos, &["docs".into()]), 0);
@@ -1434,12 +1450,23 @@ mod tests {
         let c = ["-c", "user.name=t", "-c", "user.email=t@t"];
         let mut repos = vec![];
         for name in ["api", "web"] {
-            let (origin, src) = (root.join(format!("{name}.git")), root.join("src").join(name));
+            let (origin, src) = (
+                root.join(format!("{name}.git")),
+                root.join("src").join(name),
+            );
             std::fs::create_dir_all(&src).unwrap();
             git(&root, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
             git(&src, &["init", "-q", "-b", "main"]).unwrap();
-            git(&src, &[&c[..], &["commit", "-q", "--allow-empty", "-m", "i"]].concat()).unwrap();
-            git(&src, &["remote", "add", "origin", &origin.to_string_lossy()]).unwrap();
+            git(
+                &src,
+                &[&c[..], &["commit", "-q", "--allow-empty", "-m", "i"]].concat(),
+            )
+            .unwrap();
+            git(
+                &src,
+                &["remote", "add", "origin", &origin.to_string_lossy()],
+            )
+            .unwrap();
             git(&src, &["push", "-q", "origin", "main", "main:kd/x"]).unwrap();
             repos.push((add_repo(&src, &[]).unwrap(), "feat".to_string()));
         }
@@ -1459,15 +1486,25 @@ mod tests {
             repos_from(&ws, p.locals, std::iter::repeat(None))
         };
         let rs = probed(&job);
-        let on: Vec<_> = rs.iter().map(|r| r.local.as_ref().unwrap().branch.clone()).collect();
+        let on: Vec<_> = rs
+            .iter()
+            .map(|r| r.local.as_ref().unwrap().branch.clone())
+            .collect();
         assert_eq!(on, [Some("kd/x".into()), Some("feat".into())]);
-        assert_eq!((rs[0].branch.as_str(), rs[1].branch.as_str()), ("kd/x", "feat"));
+        assert_eq!(
+            (rs[0].branch.as_str(), rs[1].branch.as_str()),
+            ("kd/x", "feat")
+        );
         let a = super::next_action(&rs, &[]);
         assert!(!a.label.starts_with("Switch"), "{}", a.label);
 
         // Push and pull go to the repo's own branch.
         let api = &dir.join("api");
-        git(api, &[&c[..], &["commit", "-q", "--allow-empty", "-m", "w"]].concat()).unwrap();
+        git(
+            api,
+            &[&c[..], &["commit", "-q", "--allow-empty", "-m", "w"]].concat(),
+        )
+        .unwrap();
         let rs = probed(&job);
         let push = status::step_args(&Kind::Push, &rs[0]).unwrap().unwrap();
         assert_eq!(push, ["push", "-u", "origin", "kd/x"]);
@@ -1478,9 +1515,18 @@ mod tests {
         let rs = probed(&job);
         let a = super::next_action(&rs, &[]);
         assert_eq!(a.label, "Switch to branch · web");
-        let Kind::Agent(prompt) = a.kind else { panic!() };
-        assert!(prompt.contains("`feat`") && !prompt.contains("kd/x"), "{prompt}");
-        assert!(status::step_args(&Kind::Push, &rs[1]).unwrap_err().contains("not on `feat`"));
+        let Kind::Agent(prompt) = a.kind else {
+            panic!()
+        };
+        assert!(
+            prompt.contains("`feat`") && !prompt.contains("kd/x"),
+            "{prompt}"
+        );
+        assert!(
+            status::step_args(&Kind::Push, &rs[1])
+                .unwrap_err()
+                .contains("not on `feat`")
+        );
         std::fs::remove_dir_all(&root).unwrap();
     }
 
