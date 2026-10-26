@@ -1052,6 +1052,48 @@ async fn many_tabs_scroll(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
+/// The chat tab's right-click menu: copy only with a session, close only beside another tab.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn chat_tab_menu(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace("tabs".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let labels = |cx: &mut TestAppContext| {
+        shark.update(cx, |s, cx| {
+            (s.chat_tab_menu(0, cx).into_iter())
+                .map(|e| match e {
+                    Entry::Item { label, .. } | Entry::Sub { label, .. } => label.to_string(),
+                    Entry::Sep => "-".into(),
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(labels(cx), ["New chat"]);
+    on(cx, &|s, w, cx| s.new_chat(w, cx));
+    on(cx, &|s, _, _| {
+        s.active_ws_mut().unwrap().chats[0].session_id = Some("s1".into())
+    });
+    assert_eq!(labels(cx), ["New chat", "Copy session ID", "-", "Close chat"]);
+    fs::remove_dir_all(&home).ok();
+}
+
 /// Images and videos in the diff: before/after previews, made lazily for rows on screen,
 /// downscaled when big or not decodable by gpui, kept across refreshes.
 #[gpui_kit::test]
