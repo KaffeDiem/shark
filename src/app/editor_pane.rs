@@ -241,11 +241,17 @@ impl Shark {
                     .border_b_1()
                     .border_color(theme.border)
                     .text_sm()
-                    .child(
-                        Icon::new(IconName::FileCode)
+                    .child(match crate::file_icon::file_icon(&name, theme.is_dark()) {
+                        Some(i) => img(i)
+                            .size(px(16.))
+                            .mx(px(-1.))
+                            .flex_none()
+                            .into_any_element(),
+                        None => Icon::new(IconName::File)
                             .with_size(px(14.))
-                            .text_color(theme.muted_foreground),
-                    )
+                            .text_color(theme.muted_foreground)
+                            .into_any_element(),
+                    })
                     .child(
                         h_flex()
                             .flex_1()

@@ -11,6 +11,7 @@ mod complete;
 mod deps;
 mod diff_view;
 mod editor;
+mod file_icon;
 mod files;
 mod git;
 mod menu;

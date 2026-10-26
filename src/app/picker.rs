@@ -61,10 +61,22 @@ fn rel(item: &Item) -> String {
 
 impl Render for FilePicker {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let dark = cx.theme().is_dark();
         let items = (self.hits.iter()).map(|&i| {
-            CommandItem::new()
-                .label(rel(&self.files[i]))
-                .icon(IconName::File)
+            let label: SharedString = rel(&self.files[i]).into();
+            let item = CommandItem::new().label(label.clone());
+            match crate::file_icon::file_icon(&self.files[i].label, dark) {
+                None => item.icon(IconName::File),
+                // As `app_item` in the palette: a custom row for an image icon.
+                Some(icon) => item.child(move |_, _| {
+                    h_flex()
+                        .flex_1()
+                        .gap_2()
+                        .items_center()
+                        .child(img(icon.clone()).size_4().flex_none())
+                        .child(div().flex_1().min_w_0().truncate().child(label.clone()))
+                }),
+            }
         });
         let (q, pick) = (cx.entity().downgrade(), cx.entity().downgrade());
         Command::new(&self.state)
