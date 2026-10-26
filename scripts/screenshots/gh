@@ -1,0 +1,2 @@
+#!/bin/sh
+case "$*" in *"pr list"*) echo '[]';; *) echo '[]';; esac
