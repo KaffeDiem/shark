@@ -2957,6 +2957,99 @@ async fn card_header_pinned(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
+/// A narrow working column (split at 0.8): the composer's buttons, and a posted, addressed
+/// thread's status pill, "On GitHub" and buttons stay inside the column.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn narrow_column_comments(cx: &mut TestAppContext) {
+    use gpui_kit::component::diff::{DiffLineRange, DiffSide};
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+            point(px(0.), px(0.)),
+            size(px(1000.), px(800.)),
+        ))),
+        ..Default::default()
+    };
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        options,
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace("nc".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    fs::write(home.join("shark/workspaces/nc/api/f"), "a\nb\nc\nd\n").unwrap();
+    on(cx, &|s, w, cx| {
+        s.show(Tab::Diff, w, cx);
+        s.refresh_diff(cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).diff_files.len() == 1
+    })
+    .await;
+    let posted: review::Comment = serde_json::from_str(
+        r#"{"id":1,"path":"api/f","start":[false,1],"end":[false,1],"text":"Use the shared constant",
+            "status":{"Addressed":{"turn":1,"note":"Pane ratio is now stored once and applied to every file block."}},
+            "github":"https://github.com/o/api/pull/7#issuecomment-1"}"#,
+    )
+    .unwrap();
+    on(cx, &|s, w, cx| {
+        s.diff.update(cx, |d, cx| d.set_split_ratio(0.8, cx));
+        s.edit_comments(cx, |l| l.push(posted.clone()));
+        let three = DiffLineRange::new("api/f", DiffSide::Modified, 3, 3);
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(three), cx));
+        s.comment_dialog(w, cx);
+    });
+    cx.update_window(window, |_, w, cx| {
+        for _ in 0..3 {
+            w.render_frame(cx);
+        }
+        let body = w.find("diff-body").bounds();
+        let inside = |card: ElementId, ids: &[ElementId]| {
+            let col = w.find(card.clone()).bounds();
+            assert!(col.size.width < body.size.width / 3., "{col:?} in {body:?}");
+            for id in ids {
+                let b = w.find(id.clone()).bounds();
+                assert!(
+                    b.left() >= col.left() && b.right() <= col.right() && b.size.width > px(0.),
+                    "{id:?} {b:?} in {card:?} {col:?}"
+                );
+            }
+        };
+        inside(
+            "composer-card".into(),
+            &[
+                "suggest-change".into(),
+                "composer-esc".into(),
+                "composer-add".into(),
+            ],
+        );
+        inside(
+            ("thread-card", 1usize).into(),
+            &[
+                ("thread-pill", 1usize).into(),
+                ("thread-where", 1usize).into(),
+                ("show-chat", 1usize).into(),
+                ("view-gh", 1usize).into(),
+            ],
+        );
+    })
+    .unwrap();
+    fs::remove_dir_all(&home).ok();
+}
+
 /// In-place editing, round 2: the line input lines up with the code, owns tab and the
 /// letters, a click in it keeps its caret, a second ⌘S waits for the first, other writers
 /// are noticed, a refresh adding a file keeps the input's focus, the composer takes focus

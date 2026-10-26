@@ -954,10 +954,11 @@ impl Shark {
             return notify_err(window, cx, "Open a workspace first");
         }
         let Some(range) = self.picked_lines(cx) else {
+            let keys = if self.state.vim { "j/k" } else { "↑/↓" };
             return notify_err(
                 window,
                 cx,
-                "Select code or lines first, or move to a line (j/k)",
+                format!("Select code or lines first, or move to a line ({keys})"),
             );
         };
         self.comment_at(range, window, cx)
@@ -1351,7 +1352,10 @@ impl Shark {
         .absolute()
         .size_full();
         v_flex()
+            .id("composer-card")
             .key_context("ReviewComposer")
+            .min_w_0()
+            .overflow_hidden()
             .mx(px(-12.))
             .my(px(-12.))
             .px_4()
@@ -1373,8 +1377,10 @@ impl Shark {
             }))
             .on_action(cx.listener(|this, _: &SuggestChange, w, cx| this.toggle_suggest(w, cx)))
             .child(probe)
+            // Narrow, the buttons wrap below rather than squeeze.
             .child(
                 h_flex()
+                    .flex_wrap()
                     .gap_2()
                     .child(
                         div()
@@ -1383,14 +1389,18 @@ impl Shark {
                     )
                     .child(
                         div()
+                            .min_w_0()
+                            .truncate()
                             .text_color(theme.muted_foreground)
                             .child(comp.draft.side()),
                     )
-                    .child(div().flex_1())
                     .child(
                         Button::new("suggest-change")
                             .outline()
                             .xsmall()
+                            .ml_auto()
+                            .flex_shrink_1()
+                            .min_w_0()
                             .label("Suggest change ⌘⇧S")
                             .on_click(cx.listener(|this, _, w, cx| this.toggle_suggest(w, cx))),
                     ),
@@ -1419,10 +1429,14 @@ impl Shark {
             })
             .child(
                 h_flex()
+                    .flex_wrap()
+                    .justify_end()
                     .gap_2()
                     .child(
                         div()
-                            .flex_1()
+                            .flex_grow(1.)
+                            .min_w_0()
+                            .whitespace_normal()
                             .text_xs()
                             .text_color(theme.muted_foreground)
                             .child(match editing {
@@ -1434,6 +1448,8 @@ impl Shark {
                         Button::new("composer-esc")
                             .ghost()
                             .xsmall()
+                            .flex_shrink_1()
+                            .min_w_0()
                             .label("Esc")
                             .on_click(cx.listener(|this, _, w, cx| this.cancel_composer(w, cx))),
                     )
@@ -1441,6 +1457,8 @@ impl Shark {
                         Button::new("composer-add")
                             .primary()
                             .xsmall()
+                            .flex_shrink_1()
+                            .min_w_0()
                             .label(if editing {
                                 "Save ⌘↵"
                             } else {
@@ -1449,6 +1467,7 @@ impl Shark {
                             .on_click(cx.listener(|this, _, w, cx| this.submit_composer(w, cx))),
                     ),
             )
+            .test_support()
             .into_any_element()
     }
 
@@ -1494,6 +1513,9 @@ impl Shark {
         };
         let mono = theme.mono_font_family.clone();
         v_flex()
+            .id(("thread-card", id as usize))
+            .min_w_0()
+            .overflow_hidden()
             .mx(px(-12.))
             .my(px(-12.))
             .px_4()
@@ -1502,10 +1524,12 @@ impl Shark {
             .border_l_2()
             .border_color(color)
             .text_sm()
-            // Narrow, where it went and the keys truncate; the lines and the pill stay.
+            // Narrow, the pill and where it went wrap to the next line rather than clip; the
+            // keys take what room is left on the last line, the lines truncate last.
             .child(
                 h_flex()
-                    .gap_2()
+                    .flex_wrap()
+                    .gap_x_2()
                     .child(
                         div()
                             .flex_none()
@@ -1514,33 +1538,40 @@ impl Shark {
                     )
                     .child(
                         div()
-                            .flex_none()
+                            .min_w_0()
+                            .truncate()
                             .text_color(theme.muted_foreground)
                             .child(format!("{} · {}", c.lines(), c.side())),
                     )
                     .child(
                         div()
-                            .flex_none()
+                            .id(("thread-pill", id as usize))
+                            .min_w_0()
+                            .truncate()
                             .px_1p5()
                             .rounded(theme.radius)
                             .text_xs()
                             .text_color(color)
                             .bg(color.opacity(0.12))
-                            .child(pill),
+                            .child(pill)
+                            .test_support(),
                     )
-                    .child(div().flex_1())
                     .child(
                         div()
+                            .id(("thread-where", id as usize))
                             .min_w_0()
-                            .truncate()
+                            .whitespace_normal()
                             .text_xs()
                             .text_color(theme.success_foreground)
-                            .child(where_),
+                            .child(where_)
+                            .test_support(),
                     )
                     .child(
                         div()
+                            .flex_1()
                             .min_w_0()
                             .truncate()
+                            .text_right()
                             .text_xs()
                             .text_color(faint(theme))
                             .child(hints),
@@ -1597,14 +1628,22 @@ impl Shark {
                 },
                 |d, note| {
                     d.child(
-                        h_flex()
+                        // One paragraph, so a narrow column wraps it like the body.
+                        div()
                             .pt_1p5()
-                            .gap_2()
                             .border_t_1()
                             .border_color(theme.border)
                             .text_xs()
-                            .child(div().font_weight(FontWeight::SEMIBOLD).child("Agent"))
-                            .child(div().text_color(theme.muted_foreground).child(note)),
+                            .whitespace_normal()
+                            .text_color(theme.muted_foreground)
+                            .child(StyledText::new(format!("Agent  {note}")).with_highlights([(
+                                0..5,
+                                HighlightStyle {
+                                    font_weight: Some(FontWeight::SEMIBOLD),
+                                    color: Some(theme.foreground),
+                                    ..Default::default()
+                                },
+                            )])),
                     )
                 },
             )
@@ -1628,6 +1667,8 @@ impl Shark {
                                 Button::new(("show-chat", id as usize))
                                     .ghost()
                                     .xsmall()
+                                    .flex_shrink_1()
+                                    .min_w_0()
                                     .label("Show chat ↗")
                                     .on_click(cx.listener(move |this, _, w, cx| {
                                         this.show_thread_chat(id, w, cx)
@@ -1638,11 +1679,15 @@ impl Shark {
                             Some(url) => Button::new(("view-gh", id as usize))
                                 .outline()
                                 .xsmall()
+                                .flex_shrink_1()
+                                .min_w_0()
                                 .label("View on GitHub ↗")
                                 .on_click(move |_, _, cx| cx.open_url(&url)),
                             None => Button::new(("share-gh", id as usize))
                                 .outline()
                                 .xsmall()
+                                .flex_shrink_1()
+                                .min_w_0()
                                 .label("Share to GitHub…")
                                 .on_click(
                                     cx.listener(move |this, _, w, cx| this.open_share(id, w, cx)),
@@ -1650,6 +1695,7 @@ impl Shark {
                         }),
                 )
             })
+            .test_support()
             .into_any_element()
     }
 
@@ -1752,9 +1798,11 @@ impl Shark {
         if let Some(s) = status {
             return bar.child(s).into_any_element();
         }
+        // Without Vim mode the arrows move the cursor, not j / k.
+        let jk = if self.state.vim { "j / k" } else { "↑ / ↓" };
         if shown.is_empty() {
             return bar
-                .child("s split / unified · c comment · Drag divider to resize · j / k move through changes")
+                .child(format!("s split / unified · c comment · Drag divider to resize · {jk} move through changes"))
                 .into_any_element();
         }
         let (lead, color, summary) = match pending {
@@ -1796,7 +1844,7 @@ impl Shark {
                 .child(div().min_w_0().truncate().child(lead)),
         )
         .child(text(summary))
-        .child(text("[c / ]c jump · j / k change · v viewed".into()).text_color(faint(theme)))
+        .child(text(format!("[c / ]c jump · {jk} change · v viewed")).text_color(faint(theme)))
         .child(div().flex_1())
         .when(outdated > 0, |d| {
             d.child(
