@@ -1319,9 +1319,8 @@ impl Render for GitSync {
             _ => theme.border,
         };
         // One split button: the chevron trails inside it, behind a hairline.
+        let radius = theme.radius;
         let split = h_flex()
-            .rounded(theme.radius)
-            .overflow_hidden()
             .child(
                 // A div, not Button::tooltip: that takes fixed text, and this is built on hover so
                 // the "ago" times are current.
@@ -1343,6 +1342,7 @@ impl Render for GitSync {
                             .icon(icon)
                             .label(label)
                             .rounded(ButtonRounded::None)
+                            .rounded_l(radius)
                             .map(variant)
                             .disabled(!clickable || blocked)
                             .on_click(cx.listener(|s, _, window, cx| s.primary(window, cx))),
@@ -1358,6 +1358,7 @@ impl Render for GitSync {
                             .px(px(6.))
                             .icon(IconName::ChevronDown)
                             .rounded(ButtonRounded::None)
+                            .rounded_r(radius)
                             .map(variant)
                             .tooltip("Git menu")
                             .on_click(cx.listener(|s, _, window, cx| s.open_menu(window, cx))),
@@ -1380,7 +1381,6 @@ impl Render for GitSync {
                             .size_full()
                     }),
             );
-        // Outside `split`, whose clipping would cut off the menu.
         div()
             .child(split)
             .children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))
