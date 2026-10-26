@@ -562,7 +562,10 @@ impl GitSync {
     fn confirm(&mut self, a: Action, check: bool, window: &mut Window, cx: &mut Context<Self>) {
         let (title, body, ok) = match a.kind {
             Kind::Merge => (
-                format!("Merge {} PRs?", open_prs_in(&self.repos, &a.repos).max(1)),
+                match open_prs_in(&self.repos, &a.repos) {
+                    0 | 1 => "Merge the PR?".to_string(),
+                    n => format!("Merge {n} PRs?"),
+                },
                 format!(
                     "Merges with each repo's allowed method in this order: {}, and stops at the \
                      first failure. {}Merging can't be undone from here.",

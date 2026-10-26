@@ -507,7 +507,7 @@ pub(super) const COMMANDS: &[Row] = &[
         },
     ),
     Row(
-        "Open PRs in browser",
+        "Open pull requests",
         IconName::ExternalLink,
         Some(&OpenPrs),
         "pull request github",
