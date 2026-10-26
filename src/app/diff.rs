@@ -1158,8 +1158,9 @@ impl Shark {
             menu::item(IconName::Copy, "Copy path", move |w, cx| {
                 copy(abs.display().to_string(), w, cx)
             }),
+            // Relative to the repo, as its own tools and the agent's diffs name it.
             menu::item(IconName::Copy, "Copy relative path", move |w, cx| {
-                copy(p.clone(), w, cx)
+                copy(p.split_once('/').map_or(&*p, |(_, rel)| rel).to_string(), w, cx)
             }),
         ]);
         entries
