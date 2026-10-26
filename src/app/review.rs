@@ -1111,7 +1111,7 @@ impl Shark {
 
     /// Thread `id`, unless it waits in a chat's queued review card (that card would send it
     /// as it was, or not at all).
-    fn unqueued(&self, id: u64, window: &mut Window, cx: &mut Context<Self>) -> Option<u64> {
+    fn unqueued(&self, id: u64, window: &mut Window, cx: &mut Context<Self>) -> Option<Comment> {
         let c = self.comment(id)?;
         if c.status == Status::Queued {
             notify_err(
@@ -1121,31 +1121,29 @@ impl Shark {
             );
             return None;
         }
-        Some(c.id)
+        Some(c.clone())
     }
 
-    /// `e`: edit the thread at the cursor.
-    pub(super) fn edit_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    /// Runs a thread action (`e`, `x`, `d`) on the thread at the cursor.
+    pub(super) fn at_cursor(
+        &mut self,
+        f: fn(&mut Self, u64, &mut Window, &mut Context<Self>),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if let Some(id) = self.thread_at(cx) {
-            self.edit_thread_id(id, window, cx);
+            f(self, id, window, cx);
         }
     }
 
-    fn edit_thread_id(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(c) = (self.unqueued(id, window, cx)).and_then(|id| self.comment(id).cloned()) {
+    pub(super) fn edit_thread(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(c) = self.unqueued(id, window, cx) {
             self.open_composer(c, window, cx);
         }
     }
 
-    /// `x`: delete the thread at the cursor.
-    pub(super) fn delete_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(id) = self.thread_at(cx) {
-            self.delete_thread_id(id, window, cx);
-        }
-    }
-
-    fn delete_thread_id(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(id) = self.unqueued(id, window, cx) {
+    pub(super) fn delete_thread(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.unqueued(id, window, cx).is_some() {
             self.edit_comments(cx, |l| l.retain(|c| c.id != id));
         }
     }
@@ -1206,20 +1204,14 @@ impl Shark {
         );
     }
 
-    /// `d`: the thread's file in the editor, to see what the agent made of it.
-    pub(super) fn view_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(id) = self.thread_at(cx) {
-            self.view_change_id(id, window, cx);
-        }
-    }
-
     /// The diff file thread `id` is on; none once its file left the diff.
     fn change_ix(&self, id: u64) -> Option<usize> {
         let path = &self.comment(id)?.path;
         self.diff_files.iter().position(|f| f.path() == path)
     }
 
-    fn view_change_id(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+    /// The thread's file in the editor, to see what the agent made of it.
+    pub(super) fn view_change(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.change_ix(id) {
             self.open_file(ix, window, cx);
         }
@@ -1237,7 +1229,7 @@ impl Shark {
         let mut entries = vec![menu::item(
             IconName::Pencil,
             "Edit",
-            act(Self::edit_thread_id),
+            act(Self::edit_thread),
         )];
         if c.status != Status::Resolved {
             entries.push(menu::item(
@@ -1254,7 +1246,7 @@ impl Shark {
             ));
         }
         if addressed && self.change_ix(id).is_some() {
-            let view = act(Self::view_change_id);
+            let view = act(Self::view_change);
             entries.push(menu::item(IconName::FileDiff, "View change", view));
         }
         if matches!(c.status, Status::Queued | Status::Sent { .. }) || addressed {
@@ -1275,7 +1267,7 @@ impl Shark {
                 copy(text.clone(), w, cx)
             }),
             Entry::Sep,
-            menu::item(IconName::Trash, "Delete", act(Self::delete_thread_id)),
+            menu::item(IconName::Trash, "Delete", act(Self::delete_thread)),
         ]);
         entries
     }

@@ -590,9 +590,9 @@ impl Shark {
                 None => cx.propagate(),
             }))
             .on_action(cx.listener(|this, _: &SendComments, w, cx| this.open_sheet(w, cx)))
-            .on_action(cx.listener(|this, _: &EditThread, w, cx| this.edit_thread(w, cx)))
-            .on_action(cx.listener(|this, _: &DeleteThread, w, cx| this.delete_thread(w, cx)))
-            .on_action(cx.listener(|this, _: &ViewChange, w, cx| this.view_change(w, cx)))
+            .on_action(cx.listener(|this, _: &EditThread, w, cx| this.at_cursor(Self::edit_thread, w, cx)))
+            .on_action(cx.listener(|this, _: &DeleteThread, w, cx| this.at_cursor(Self::delete_thread, w, cx)))
+            .on_action(cx.listener(|this, _: &ViewChange, w, cx| this.at_cursor(Self::view_change, w, cx)))
             .on_action(cx.listener(|this, _: &ResolveThread, _, cx| this.resolve_thread(cx)))
             .on_action(cx.listener(|this, _: &ReopenThread, _, cx| this.reopen_thread(cx)))
             .on_action(cx.listener(|this, _: &NextThread, w, cx| this.thread_jump(true, w, cx)))

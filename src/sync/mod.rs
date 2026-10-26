@@ -4,7 +4,7 @@
 mod status;
 pub use status::{Kind, Pr, PrState, Repo, ago, github_url};
 
-use crate::app::menus::each_or_all;
+use crate::app::menus::{each_or_all, pr_entry};
 use crate::app::{inter_features, notify_err, open_menu};
 use crate::menu::{self, Entry};
 use crate::chat::Chat;
@@ -909,12 +909,6 @@ impl GitSync {
             entries.push(menu::item(icon(&a), a.label.clone(), run(Self::primary)).hint("Next"));
             entries.push(Entry::Sep);
         }
-        let prs = (self.pr_urls().into_iter())
-            .map(|(repo, url)| (repo, String::new(), url))
-            .collect();
-        let open = |urls: &[String], _: &mut Window, cx: &mut App| {
-            urls.iter().for_each(|u| cx.open_url(u))
-        };
         let pull = kind(IconName::ArrowDown, Kind::Pull, "Pull", every.clone());
         entries.extend(
             [
@@ -942,7 +936,7 @@ impl GitSync {
                     "Create draft PRs",
                     every,
                 ),
-                each_or_all(IconName::GitPullRequest, "Open pull request", prs, open),
+                pr_entry(self),
                 kind(
                     IconName::GitMerge,
                     Kind::Merge,

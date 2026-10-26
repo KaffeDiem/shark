@@ -188,11 +188,6 @@ pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) 
         on_shark(cx, move |s, w, cx| s.change_base(name.clone(), w, cx)),
     )
     .hint(base_hint(ws));
-    let prs = (sync.map(|s| s.pr_urls()).unwrap_or_default().into_iter())
-        .map(|(repo, url)| (repo, String::new(), url))
-        .collect();
-    let open =
-        |urls: &[String], _: &mut Window, cx: &mut App| urls.iter().for_each(|u| cx.open_url(u));
     let mut entries: Vec<Entry> = [
         each_or_all(IconName::GitBranch, "Copy branch name", copies, |bs, w, cx| {
             let mut bs = bs.to_vec();
@@ -200,8 +195,8 @@ pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) 
             bs.dedup();
             copy(bs.join("\n"), w, cx)
         }),
-        each_or_all(IconName::Github, "Open branch on GitHub", links, open),
-        each_or_all(IconName::GitPullRequest, "Open pull request", prs, open),
+        each_or_all(IconName::Github, "Open branch on GitHub", links, open_urls),
+        sync.and_then(pr_entry),
     ]
     .into_iter()
     .flatten()
@@ -211,6 +206,18 @@ pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) 
         entries.insert(2, Entry::Sep);
     }
     entries
+}
+
+/// "Open pull request" for each repo with one, or `None` before any PR.
+pub(crate) fn pr_entry(sync: &crate::sync::GitSync) -> Option<Entry> {
+    let prs = (sync.pr_urls().into_iter())
+        .map(|(repo, url)| (repo, String::new(), url))
+        .collect();
+    each_or_all(IconName::GitPullRequest, "Open pull request", prs, open_urls)
+}
+
+fn open_urls(urls: &[String], _: &mut Window, cx: &mut App) {
+    urls.iter().for_each(|u| cx.open_url(u))
 }
 
 /// The base every repo targets, e.g. `origin/main`, or "per repo" when they differ.
