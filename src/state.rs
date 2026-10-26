@@ -60,6 +60,9 @@ pub struct State {
     /// Changes shows one column instead of Original | Working copy (`s`).
     #[serde(default)]
     pub unified: bool,
+    /// Compare the working tree to HEAD instead of the workspace base.
+    #[serde(default)]
+    pub uncommitted_only: bool,
     /// The Files panel's width, once dragged.
     #[serde(default)]
     pub tree_width: Option<f32>,

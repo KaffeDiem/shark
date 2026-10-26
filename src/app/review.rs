@@ -1095,7 +1095,12 @@ impl Shark {
                     let base = &ws.repos.iter().find(|r| r.name == repo)?.base;
                     // ponytail: merge-base (and lines_now's git show) block the UI thread as
                     // the composer opens; move them to the background executor if big repos lag.
-                    crate::git::git(&ws.dir().join(repo), &["merge-base", base, "HEAD"]).ok()
+                    let args = if self.state.uncommitted_only {
+                        vec!["rev-parse", "HEAD"]
+                    } else {
+                        vec!["merge-base", base, "HEAD"]
+                    };
+                    crate::git::git(&ws.dir().join(repo), &args).ok()
                 })
                 .unwrap_or_default(),
         };

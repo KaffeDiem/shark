@@ -29,8 +29,8 @@ pub(super) struct DiffData {
 }
 
 impl DiffData {
-    pub(super) fn load(ws: &Workspace) -> DiffData {
-        let (patch, error) = match git::combined_diff(ws, &ws.dir()) {
+    pub(super) fn load(ws: &Workspace, uncommitted_only: bool) -> DiffData {
+        let (patch, error) = match git::combined_diff(ws, &ws.dir(), uncommitted_only) {
             Ok(p) => (p, None),
             Err(e) => (String::new(), Some(e)),
         };
@@ -70,6 +70,7 @@ impl Shark {
         };
         self.diff_gen += 1;
         let generation = self.diff_gen;
+        let uncommitted_only = self.state.uncommitted_only;
         let edited = self.editing.as_ref().map(|e| e.abs.clone());
         cx.spawn(async move |this, cx| {
             let name = ws.name.clone();
@@ -79,7 +80,7 @@ impl Shark {
                     let edited = edited.map(|abs| (abs.clone(), std::fs::read(abs).ok()));
                     DiffData {
                         edited,
-                        ..DiffData::load(&ws)
+                        ..DiffData::load(&ws, uncommitted_only)
                     }
                 })
                 .await;
@@ -391,6 +392,17 @@ impl Shark {
         cx.notify();
     }
 
+    pub(super) fn toggle_uncommitted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.confirm_discard(false, true, window, cx, |s, window, cx| {
+            s.end_edit(cx);
+            s.state.uncommitted_only = !s.state.uncommitted_only;
+            s.state.save();
+            s.refresh_diff(cx);
+            s.focus_diff(window, cx);
+            cx.notify();
+        });
+    }
+
     /// Trailing controls of a file card's header, after its "+a −d": the review chip and
     /// Comment button, then the edit buttons; only [Review] [Save ⌘S] while it is edited.
     fn card_header_suffix(&self, file: &DiffFile, cx: &mut Context<Self>) -> Vec<AnyElement> {
@@ -638,7 +650,11 @@ impl Shark {
             ),
             None if self.diff_files.is_empty() => (
                 big(IconName::FileDiff, faint(theme)).into_any_element(),
-                "No changes",
+                if self.state.uncommitted_only {
+                    "No uncommitted changes"
+                } else {
+                    "No changes"
+                },
                 None,
             ),
             None => return None,
@@ -773,7 +789,7 @@ impl Shark {
             .flex_1()
             .min_w_0()
             .h_full()
-            .when(!empty, |d| d.child(self.render_changes_bar(cx)))
+            .child(self.render_changes_bar(cx))
             .child(pane)
             .children(self.render_orphans(cx))
             // One bottom bar: in edit mode it says what editing is doing.
@@ -793,10 +809,15 @@ impl Shark {
         bases.dedup();
         let (adds, dels) = (self.diff_files.iter())
             .fold((0, 0), |(a, d), f| (a + f.additions(), d + f.deletions()));
-        (bases.join(", "), adds, dels)
+        let base = if self.state.uncommitted_only {
+            "HEAD".into()
+        } else {
+            bases.join(", ")
+        };
+        (base, adds, dels)
     }
 
-    /// "All changes  origin/main → working tree   +a −d  n / m viewed  [Split] [Files n]".
+    /// Comparison scope, base, counts, and view controls.
     fn render_changes_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (base, adds, dels) = self.changes_stats();
@@ -818,11 +839,16 @@ impl Shark {
                 }),
             )
             .child(
-                div()
-                    .text_sm()
-                    .font_weight(FontWeight::MEDIUM)
-                    .text_color(theme.foreground)
-                    .child("All changes"),
+                Button::new("uncommitted-only")
+                    .xsmall()
+                    .h(px(28.))
+                    .px(px(10.))
+                    .rounded(px(6.))
+                    .outline()
+                    .selected(self.state.uncommitted_only)
+                    .label("Uncommitted only")
+                    .tooltip("Show staged, unstaged, and untracked changes against HEAD")
+                    .on_click(cx.listener(|this, _, w, cx| this.toggle_uncommitted(w, cx))),
             )
             .child(
                 div()
@@ -1349,6 +1375,12 @@ impl Shark {
     /// Right-click menu of the Diff button and the changes bar.
     pub(super) fn changes_menu(&self, cx: &Context<Self>) -> Vec<Entry> {
         let mut entries = vec![
+            menu::item(
+                IconName::FileDiff,
+                "Uncommitted only",
+                on_shark(cx, |s, w, cx| s.toggle_uncommitted(w, cx)),
+            )
+            .checked(self.state.uncommitted_only),
             menu::item(
                 IconName::Columns2,
                 "Unified",

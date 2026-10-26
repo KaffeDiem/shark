@@ -1633,7 +1633,7 @@ async fn perf_large_change(cx: &mut TestAppContext) {
 
     let ws = cx.update(|cx| shark.read(cx).active_ws().unwrap().clone());
     let t = Instant::now();
-    let data = DiffData::load(&ws);
+    let data = DiffData::load(&ws, false);
     report.push(format!(
         "diff load (git + parse, background): {:.0} ms",
         ms(t)
@@ -1649,7 +1649,7 @@ async fn perf_large_change(cx: &mut TestAppContext) {
     frame(cx);
     report.push(format!("apply diff + first frame: {:.0} ms", ms(t)));
     let t = Instant::now();
-    let data = DiffData::load(&ws);
+    let data = DiffData::load(&ws, false);
     cx.update(|cx| shark.update(cx, |s, cx| s.apply_diff(data, cx)));
     frame(cx);
     report.push(format!("unchanged refresh + frame: {:.0} ms", ms(t)));
@@ -2505,7 +2505,120 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
         assert_eq!(s.tree_resize.read(cx).sizes()[1], px(333.));
     });
 
-    // After a restart Files is closed, and opens at the saved width; the saved mode stays.
+    // Committed branch changes disappear in the HEAD comparison; local changes remain.
+    git::git(&api, &["add", "."]).unwrap();
+    git::git(
+        &api,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "branch changes",
+        ],
+    )
+    .unwrap();
+    fs::write(api.join("a.md"), "staged\n").unwrap();
+    git::git(&api, &["add", "a.md"]).unwrap();
+    fs::write(api.join("a.md"), "unstaged\n").unwrap();
+    fs::write(api.join("new.txt"), "untracked\n").unwrap();
+    fs::remove_file(api.join("src/b.rs")).unwrap();
+    let index = git::git(&api, &["ls-files", "--stage"]).unwrap();
+    let click_scope = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.click("uncommitted-only", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    click_scope(cx);
+    assert!(State::load().uncommitted_only);
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.changes_stats(), ("HEAD".into(), 2, 3));
+        let paths: Vec<_> = s.diff_files.iter().map(|f| f.path().as_str()).collect();
+        assert_eq!(paths, ["api/src/b.rs", "api/a.md", "api/new.txt"]);
+        let patch =
+            git::combined_diff(s.active_ws().unwrap(), api.parent().unwrap(), true).unwrap();
+        assert!(
+            patch.contains("-x\n+unstaged\n"),
+            "HEAD is the original side: {patch}"
+        );
+        assert!(!patch.contains("+staged\n"));
+    });
+    assert_eq!(
+        git::git(&api, &["ls-files", "--stage"]).unwrap(),
+        index,
+        "real index untouched"
+    );
+
+    // Original-side review comments quote HEAD, where a.md was first committed.
+    on(cx, &|s, w, cx| {
+        let line = crate::diff_view::DiffLineRange::new(
+            "api/a.md",
+            crate::diff_view::DiffSide::Original,
+            1,
+            1,
+        );
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
+        s.comment_dialog(w, cx);
+        let draft = &s.review.composer.as_ref().unwrap().draft;
+        assert_eq!(draft.snapshot, "x");
+        s.cancel_composer(w, cx);
+    });
+
+    // Switching scope cannot silently discard an inline edit or reuse its old base.
+    on(cx, &|s, w, cx| {
+        s.edit_working_copy(Some("api/a.md".into()), w, cx);
+        s.editing.as_mut().unwrap().dirty = true;
+        s.toggle_uncommitted(w, cx);
+        assert!(w.has_active_dialog(cx));
+        assert!(s.state.uncommitted_only && s.editing.is_some());
+    });
+    press(cx, &["escape"]);
+    on(cx, &|s, _, cx| {
+        s.editing.as_mut().unwrap().dirty = false;
+        s.end_edit(cx);
+    });
+
+    // A staged-only change is included too; committing everything leaves the toggle usable.
+    fs::write(api.join("a.md"), "staged\n").unwrap();
+    on(cx, &|s, _, cx| s.refresh_diff(cx));
+    cx.update(|cx| assert_eq!(shark.read(cx).diff_files.len(), 3));
+    git::git(&api, &["add", "."]).unwrap();
+    git::git(
+        &api,
+        &[
+            "-c",
+            "user.name=t",
+            "-c",
+            "user.email=t@t",
+            "commit",
+            "-qm",
+            "local changes",
+        ],
+    )
+    .unwrap();
+    on(cx, &|s, _, cx| s.refresh_diff(cx));
+    cx.update(|cx| assert!(shark.read(cx).diff_files.is_empty()));
+    click_scope(cx);
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert!(!s.state.uncommitted_only);
+        assert_eq!(
+            s.diff_files.len(),
+            3,
+            "branch changes restored from an empty view"
+        );
+        assert_eq!(s.changes_stats().0, base);
+    });
+    click_scope(cx);
+
+    // After a restart Files is closed, and opens at the saved width; the saved modes stay.
     cx.update_window(window, |_, w, _| w.remove_window())
         .unwrap();
     let (window2, shark2) = open(cx, options());
@@ -2521,6 +2634,8 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
         assert!(s.tree_shown());
         assert_eq!(s.tree_resize.read(cx).sizes()[1], px(333.));
         assert_eq!(s.diff.read(cx).mode(), DiffMode::Split);
+        assert!(s.state.uncommitted_only);
+        assert!(s.diff_files.is_empty());
     });
     cx.update_window(window2, |_, w, _| w.remove_window())
         .unwrap();

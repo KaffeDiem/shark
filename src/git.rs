@@ -707,7 +707,7 @@ pub fn delete_merged_branches(ws: &Workspace, merged: &[(String, String)]) -> Ve
 
 /// One unified patch for all repos. Every path is prefixed with the repo name.
 /// A failed `git diff` (e.g. a missing base) is an error naming the repo, not an empty patch.
-pub fn combined_diff(ws: &Workspace, dir: &Path) -> Result<String, String> {
+pub fn combined_diff(ws: &Workspace, dir: &Path, uncommitted_only: bool) -> Result<String, String> {
     static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let mut out = String::new();
     for r in &ws.repos {
@@ -734,7 +734,7 @@ pub fn combined_diff(ws: &Workspace, dir: &Path) -> Result<String, String> {
         let src = format!("--src-prefix=a/{}/", r.name);
         let dst = format!("--dst-prefix=b/{}/", r.name);
         // ponytail: untracked files are diffed whole, add a size cap when big binaries bite
-        let o = git_tmp(&[
+        let mut args = vec![
             "diff",
             "--no-color",
             "--no-ext-diff",
@@ -744,9 +744,13 @@ pub fn combined_diff(ws: &Workspace, dir: &Path) -> Result<String, String> {
             "--no-renames",
             &src,
             &dst,
-            "--merge-base",
-            &r.base,
-        ]);
+        ];
+        if uncommitted_only {
+            args.push("HEAD");
+        } else {
+            args.extend(["--merge-base", &r.base]);
+        }
+        let o = git_tmp(&args);
         let _ = fs::remove_file(&tmp);
         let o = o.map_err(|e| format!("{}: git diff: {e}", r.name))?;
         if !o.status.success() {
@@ -911,7 +915,7 @@ mod tests {
         fs::write(dir.join("web/new.txt"), "new\n").unwrap();
         fs::write(dir.join("web/résumé.txt"), "new\n").unwrap();
         git(&dir.join("web"), &["mv", "CLAUDE.md", "RULES.md"]).unwrap();
-        let diff = combined_diff(&ws, &dir).unwrap();
+        let diff = combined_diff(&ws, &dir, false).unwrap();
         assert!(diff.contains("+++ b/api/README.md"), "{diff}");
         assert!(
             diff.contains("--- a/web/CLAUDE.md") && diff.contains("+++ b/web/RULES.md"),
@@ -919,7 +923,11 @@ mod tests {
         );
         let mut bad = ws.clone();
         bad.repos[0].base = "origin/nope".into();
-        assert!(combined_diff(&bad, &dir).unwrap_err().starts_with("api: "));
+        assert!(
+            combined_diff(&bad, &dir, false)
+                .unwrap_err()
+                .starts_with("api: ")
+        );
         assert!(diff.contains("+++ b/web/new.txt"), "{diff}");
         assert!(diff.contains("b/web/r"), "{diff}");
         assert!(
