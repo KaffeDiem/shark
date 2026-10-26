@@ -67,6 +67,14 @@ impl Shark {
                     this.review_turn_done(&name, chat, cx);
                     cx.notify();
                 }
+                // A question off screen marks its tab; the workspace needs you until it's answered.
+                ChatEvent::Asking => {
+                    if this.active_chat() != Some(chat) && chat.read(cx).asking() {
+                        this.unread.insert(id.clone());
+                    }
+                    this.refresh_home(Some(&name), cx);
+                    this.refresh_attention(cx);
+                }
                 ChatEvent::ShowChanges => this.show(Tab::Diff, window, cx),
                 ChatEvent::ShowComment(id) => {
                     this.show(Tab::Diff, window, cx);
@@ -296,10 +304,16 @@ impl Shark {
     }
 
     /// How many of a workspace's chats have something going on.
+    /// Chats whose agent is at work. One waiting on answers to its questions isn't: it
+    /// needs you (`asking_chat`).
     pub(crate) fn running_chats(&self, ws: &str, cx: &App) -> usize {
         (self.started_chats(ws).iter())
-            .filter(|c| c.read(cx).working())
+            .filter(|c| c.read(cx).working() && !c.read(cx).asking())
             .count()
+    }
+
+    pub(crate) fn asking_chat(&self, ws: &str, cx: &App) -> bool {
+        (self.started_chats(ws).iter()).any(|c| c.read(cx).asking())
     }
 
     /// A workspace's open chat tabs that have been shown (and so have an entity).
@@ -512,6 +526,13 @@ impl Shark {
                     chat.is_some_and(|c| c.working()),
                     self.unread.contains(&meta.id),
                 ) {
+                    // Waiting on answers to its questions.
+                    _ if chat.is_some_and(|c| c.asking()) => {
+                        Icon::new(IconName::MessageCircleQuestionMark)
+                            .with_size(px(14.))
+                            .text_color(theme.warning_foreground)
+                            .into_any_element()
+                    }
                     (true, _) => Spinner::new()
                         .icon(IconName::LoaderCircle)
                         .color(theme.primary)

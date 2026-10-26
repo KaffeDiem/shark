@@ -3,7 +3,6 @@
 //! become the same `Ev`s claude's stream-json does; tool items take claude's tool names so the
 //! chat summarizes them the same way.
 use crate::agent::{self, Agent, Ev, MAX_OUTPUT, clip_strings, cut, output, text_of};
-use crate::chat::ASK_IN_TEXT;
 use crate::state::{ChatMeta, Workspace};
 use gpui_kit::base::async_util::Receiver;
 use serde_json::{Value, json};
@@ -170,10 +169,18 @@ const APPROVALS: [&str; 2] = [
     "item/fileChange/requestApproval",
 ];
 
+/// Questions for the user (plan mode's, and MCP tools'), shown in the chat as claude's
+/// AskUserQuestion is.
+const USER_INPUT: &str = "item/tool/requestUserInput";
+
 /// Declines an approval request.
 pub fn deny(stdin: &Mutex<ChildStdin>, request_id: &str) -> std::io::Result<()> {
+    reply(stdin, request_id, json!({"decision": "decline"}))
+}
+
+pub fn reply(stdin: &Mutex<ChildStdin>, request_id: &str, result: Value) -> std::io::Result<()> {
     let id: Value = serde_json::from_str(request_id).unwrap_or(request_id.into());
-    agent::write(stdin, &json!({"id": id, "result": {"decision": "decline"}}))
+    agent::write(stdin, &json!({"id": id, "result": result}))
 }
 
 /// Keeps `State` current from the server's lines, on the reader thread. A thread that can't
@@ -184,24 +191,21 @@ pub fn track(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, pid: u32, line: &str)
         return true;
     };
     let (id, method) = (v["id"].as_str(), v["method"].as_str());
+    // Questions reach the chat only from its own thread (codex lets only the root ask; a
+    // sub-agent's would be dropped below, unanswered, holding up its turn).
+    let main_thread = |v: &Value| {
+        let s = st.lock().unwrap();
+        v["params"]["threadId"].as_str().is_none_or(|t| s.thread.as_deref() == Some(t))
+    };
     // A request nothing here can answer would hold up its turn: refuse it.
     if let Some(m) = method
         && !v["id"].is_null()
         && !APPROVALS.contains(&m)
+        && !(m == USER_INPUT && main_thread(&v))
     {
         let reply = match m {
             "mcpServer/elicitation/request" => {
                 json!({"id": v["id"], "result": {"action": "decline"}})
-            }
-            // Plan mode asks its questions this way; claude's AskUserQuestion gets the same.
-            "item/tool/requestUserInput" => {
-                let answers: serde_json::Map<String, Value> = (v["params"]["questions"].as_array())
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|q| q["id"].as_str())
-                    .map(|id| (id.into(), json!({"answers": [ASK_IN_TEXT]})))
-                    .collect();
-                json!({"id": v["id"], "result": {"answers": answers}})
             }
             _ => {
                 json!({"id": v["id"], "error": {"code": -32601, "message": "not supported by shark"}})
@@ -309,6 +313,14 @@ pub fn parse(v: &Value) -> Vec<Ev> {
                 _ => vec![result(false, String::new())],
             }
         }
+        // Its questions take claude's AskUserQuestion shape where they share fields, plus
+        // `id` and `isOther`; the chat reads both.
+        (Some(USER_INPUT), _) => vec![Ev::Permission {
+            request_id: v["id"].to_string(),
+            tool: "AskUserQuestion".into(),
+            tool_use_id: s(&p["itemId"]),
+            input: json!({"questions": p["questions"]}),
+        }],
         (Some(method), _) if APPROVALS.contains(&method) => vec![Ev::Permission {
             request_id: v["id"].to_string(),
             tool: method.into(),
@@ -542,6 +554,13 @@ mod tests {
                     name: "ExitPlanMode".into(),
                     input: json!({"plan": ""}),
                 },
+                // Plan mode's question, for the chat to show and answer.
+                Ev::Permission {
+                    request_id: "0".into(),
+                    tool: "AskUserQuestion".into(),
+                    tool_use_id: "call_1".into(),
+                    input: json!({"questions": [{"id": "filename", "header": "Filename", "question": "Which file?", "isOther": true, "isSecret": false, "options": [{"label": "hello.txt", "description": ""}]}]}),
+                },
                 Ev::ToolResult {
                     id: "t6-plan".into(),
                     text: String::new(),
@@ -663,7 +682,7 @@ while read -r l; do
     echo '{"method":"turn/started","params":{"threadId":"th1","turn":{"id":"t2"}}}'
     echo '{"id":10,"method":"item/tool/requestUserInput","params":{"threadId":"th1","questions":[{"id":"q1","question":"Which?"}]}}'
     read -r reply
-    case "$reply" in *'"id":10'*'"q1"'*'Ask in plain'*) ;; *) echo "bad answer: $reply" >&2; exit 6;; esac
+    case "$reply" in *'"id":10'*'"q1"'*'"answers":["A"]'*) ;; *) echo "bad answer: $reply" >&2; exit 6;; esac
     echo '{"method":"item/started","params":{"item":{"type":"plan","id":"t2-plan","text":""}}}'
     echo '{"method":"item/completed","params":{"item":{"type":"plan","id":"t2-plan","text":"# P"}}}'
     echo '{"method":"turn/completed","params":{"threadId":"th1","turn":{"id":"t2","status":"completed","durationMs":1000}}}';;
@@ -734,6 +753,11 @@ done
                         ..
                     }
             );
+            // The chat's answer to plan mode's question.
+            if let Ev::Permission { request_id, .. } = &ev {
+                a.allow(request_id, json!({"answers": {"q1": {"answers": ["A"]}}}))
+                    .unwrap();
+            }
             evs.push(ev);
             if end {
                 break;
@@ -797,13 +821,13 @@ done
 
     #[cfg(feature = "test-support")] // shares the UI tests' home
     /// A chat in plan mode with Fast off starts its turns that way, and plan mode's question
-    /// is answered so the turn goes on to its plan.
+    /// waits for the chat's answer, then the turn goes on to its plan.
     #[test]
     fn plans_a_turn() {
         let evs = run_fake(None, "plan", true);
         assert!(
-            matches!(&evs[..], [Ev::Init { .. }, Ev::ToolUse { name, .. }, Ev::ToolResult { .. }, Ev::Plan { id, text }, Ev::Result { is_error: false, .. }]
-                if name == "ExitPlanMode" && id == "t2-plan" && text == "# P"),
+            matches!(&evs[..], [Ev::Init { .. }, Ev::Permission { tool, .. }, Ev::ToolUse { name, .. }, Ev::ToolResult { .. }, Ev::Plan { id, text }, Ev::Result { is_error: false, .. }]
+                if tool == "AskUserQuestion" && name == "ExitPlanMode" && id == "t2-plan" && text == "# P"),
             "{evs:?}"
         );
     }
