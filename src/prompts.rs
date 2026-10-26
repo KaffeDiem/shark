@@ -97,6 +97,15 @@ commit and push, then summarize per comment what you changed or why you left it.
         default: "Bring the latest base branch into `{branch}` in every repo that is behind it: `git fetch origin`, \
 merge the base ({repos}), resolve conflicts, run a quick sanity check, commit and push.",
     },
+    Prompt {
+        id: "rebase_base",
+        title: "Rebase onto new base",
+        repos: "the repos whose base changed, old → new",
+        default: "The base of `{branch}` changed ({repos}). In each of those repos: `git fetch origin`, \
+then `git rebase --onto <new> $(git merge-base HEAD <old>)` so only this branch's own commits move. \
+Resolve conflicts keeping this branch's intent, run a quick sanity check, then \
+`git push --force-with-lease origin {branch}` if the branch is on origin.",
+    },
 ];
 
 /// The user's edits, by id. A global because `next_action` is pure and runs off the main thread.

@@ -528,6 +528,14 @@ impl Shark {
                         this.select_chat(ix, window, cx);
                         this.show(Tab::Chat, window, cx);
                     }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |this, e: &MouseDownEvent, w, cx| {
+                            this.select_chat(ix, w, cx);
+                            let entries = this.chat_tab_menu(ix, cx);
+                            this.show_menu(e.position, entries, w, cx);
+                        }),
+                    )
                     .child(icon)
                     .child(div().max_w(px(180.)).truncate().child(label))
                     .when(many && current, |d| {
@@ -564,6 +572,52 @@ impl Shark {
                 .into_any_element(),
         );
         tabs
+    }
+
+    /// Right-click on the `ix`th chat tab; closing it is offered where its close button is.
+    pub(super) fn chat_tab_menu(&self, ix: usize, cx: &Context<Self>) -> Vec<Entry> {
+        let Some(ws) = self.active_ws() else {
+            return vec![];
+        };
+        let Some(meta) = ws.chats.get(ix) else {
+            return vec![];
+        };
+        let mut entries = vec![menu::item(
+            IconName::Plus,
+            "New chat",
+            on_shark(cx, |s, w, cx| s.new_chat(w, cx)),
+        )];
+        if !ws.closed.is_empty() {
+            entries.push(menu::item(
+                IconName::RotateCcw,
+                "Reopen closed chat…",
+                on_shark(cx, |s, w, cx| s.pick_closed_chat(w, cx)),
+            ));
+        }
+        if let Some(id) = meta.session_id.clone() {
+            entries.push(menu::item(IconName::Copy, "Copy session ID", move |w, cx| {
+                copy(id.clone(), w, cx)
+            }));
+        }
+        let transcript = crate::agent::transcript_path(&meta.id);
+        if transcript.exists() {
+            entries.push(menu::item(
+                IconName::FolderOpen,
+                "Reveal transcript in Finder",
+                move |_, cx| cx.reveal_path(&transcript),
+            ));
+        }
+        if ws.chats.len() > 1 {
+            entries.extend([
+                Entry::Sep,
+                menu::item(
+                    IconName::X,
+                    "Close chat",
+                    on_shark(cx, |s, w, cx| s.close_chat(w, cx)),
+                ),
+            ]);
+        }
+        entries
     }
 
     /// Holds `caffeinate -i` while any agent works and the setting is on: no idle sleep, though

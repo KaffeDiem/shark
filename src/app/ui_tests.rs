@@ -1052,6 +1052,48 @@ async fn many_tabs_scroll(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
+/// The chat tab's right-click menu: copy only with a session, close only beside another tab.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn chat_tab_menu(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace("tabs".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let labels = |cx: &mut TestAppContext| {
+        shark.update(cx, |s, cx| {
+            (s.chat_tab_menu(0, cx).into_iter())
+                .map(|e| match e {
+                    Entry::Item { label, .. } | Entry::Sub { label, .. } => label.to_string(),
+                    Entry::Sep => "-".into(),
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(labels(cx), ["New chat"]);
+    on(cx, &|s, w, cx| s.new_chat(w, cx));
+    on(cx, &|s, _, _| {
+        s.active_ws_mut().unwrap().chats[0].session_id = Some("s1".into())
+    });
+    assert_eq!(labels(cx), ["New chat", "Copy session ID", "-", "Close chat"]);
+    fs::remove_dir_all(&home).ok();
+}
+
 /// Images and videos in the diff: before/after previews, made lazily for rows on screen,
 /// downscaled when big or not decodable by gpui, kept across refreshes.
 #[gpui_kit::test]
@@ -1586,6 +1628,25 @@ async fn open_in_apps(cx: &mut TestAppContext) {
             ("Open in Xcode".into(), Some("ios/App.xcodeproj".into()), vec![]),
         ]
     );
+    // "Add repo" lists only the repos the workspace lacks, and hides when there are none.
+    let add_repo = |cx: &mut TestAppContext, ws: &str| {
+        shark.update(cx, |s, cx| {
+            let ws = s.ws(ws).unwrap().clone();
+            (ws_menu(s, &ws, cx).into_iter()).find_map(|e| match e {
+                Entry::Sub { label, entries, .. } if label == "Add repo" => Some(
+                    (entries.iter())
+                        .filter_map(|r| match r {
+                            Entry::Item { label, .. } => Some(label.to_string()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+        })
+    };
+    assert_eq!(add_repo(cx, "web-only"), Some(s(&["ios"])));
+    assert_eq!(add_repo(cx, "both"), None);
     let web_only = menu_of(cx, "web-only");
     assert!(web_only.iter().all(|e| e.0 != "Open in Xcode"), "no project, no Xcode");
     assert!(
@@ -1619,6 +1680,58 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     press(cx, &["escape"]);
     run(cx, "open in fork");
     assert_eq!(last(), Some(("Fork".into(), home.join("shark/workspaces/web-only/web"))));
+    fs::remove_dir_all(&home).ok();
+}
+
+/// A changed file's right-click menu, in the tree and on the open file's header.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn file_menu_labels(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace("fm".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    fs::write(home.join("shark/workspaces/fm/api/a.md"), "x\n").unwrap();
+    on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+    let labels = |entries: Vec<Entry>| {
+        (entries.into_iter())
+            .map(|e| match e {
+                Entry::Item { label, .. } | Entry::Sub { label, .. } => label.to_string(),
+                Entry::Sep => "-".into(),
+            })
+            .collect::<Vec<_>>()
+    };
+    let file = [
+        "Comment",
+        "Viewed",
+        "-",
+        "Reveal in Finder",
+        "Open in Code",
+        "Copy path",
+        "Copy relative path",
+    ];
+    let menu = shark.update(cx, |s, cx| labels(s.file_menu("api/a.md", cx)));
+    assert_eq!(menu[..2], ["Open in editor", "Edit working copy"]);
+    assert_eq!(menu[2..], file);
+    on(cx, &|s, w, cx| s.open_path("api/a.md".into(), w, cx));
+    let menu = shark.update(cx, |s, cx| labels(s.editor_menu(cx)));
+    assert_eq!(menu[0], "Edit working copy", "already open");
+    assert_eq!(menu[1..], [&file[..], &["-", "Close file"]].concat()[..]);
     fs::remove_dir_all(&home).ok();
 }
 
@@ -3050,6 +3163,89 @@ async fn narrow_column_comments(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
+/// A thread card's right-click menu follows its status; Delete stays last.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn thread_menu_labels(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace("tm".into(), repos.clone(), None, w, cx)
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    fs::write(home.join("shark/workspaces/tm/api/f"), "a\nb\n").unwrap();
+    on(cx, &|s, w, cx| {
+        s.show(Tab::Diff, w, cx);
+        s.refresh_diff(cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).diff_files.len() == 1
+    })
+    .await;
+    let thread = |id: u64, status: &str| -> review::Comment {
+        serde_json::from_str(&format!(
+            r#"{{"id":{id},"path":"api/f","start":[false,1],"end":[false,1],"text":"x","status":{status}}}"#
+        ))
+        .unwrap()
+    };
+    let (open, done) = (
+        thread(1, r#"{"Addressed":{"turn":1,"note":"n"}}"#),
+        thread(2, r#""Resolved""#),
+    );
+    on(cx, &|s, _, cx| {
+        s.edit_comments(cx, |l| l.extend([open.clone(), done.clone()]))
+    });
+    let labels = |cx: &mut TestAppContext, id: u64| {
+        shark.update(cx, |s, cx| {
+            (s.thread_menu(id, cx).into_iter())
+                .map(|e| match e {
+                    Entry::Item { label, .. } => label.to_string(),
+                    _ => "-".into(),
+                })
+                .collect::<Vec<_>>()
+        })
+    };
+    assert_eq!(
+        labels(cx, 1),
+        [
+            "Edit",
+            "Resolve",
+            "Reopen",
+            "View change",
+            "Show chat",
+            "Share to GitHub…",
+            "Copy comment",
+            "-",
+            "Delete"
+        ]
+    );
+    assert_eq!(
+        labels(cx, 2),
+        [
+            "Edit",
+            "Reopen",
+            "Share to GitHub…",
+            "Copy comment",
+            "-",
+            "Delete"
+        ]
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
 /// In-place editing, round 2: the line input lines up with the code, owns tab and the
 /// letters, a click in it keeps its caret, a second ⌘S waits for the first, other writers
 /// are noticed, a refresh adding a file keeps the input's focus, the composer takes focus
@@ -3913,5 +4109,54 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
         assert_eq!(e.path.as_str(), "api/h.txt");
         assert_eq!((e.file.additions(), e.file.deletions()), (0, 0));
     });
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Change base: only the picked repo moves; the state, the root CLAUDE.md, the git button and
+/// the branch menu's hint all follow.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn change_base(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api", "web"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| s.create_workspace("rb".into(), repos.clone(), None, w, cx));
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let api = home.join("shark/workspaces/rb/api");
+    git::git(&api, &["update-ref", "refs/remotes/origin/release", "HEAD"]).unwrap();
+    assert!(
+        (git::remote_branches(&api).iter()).any(|(_, b)| b == "origin/release"),
+        "a fetched origin branch is offered"
+    );
+    let old = cx.update(|cx| shark.read(cx).ws("rb").unwrap().repos[0].base.clone());
+    on(cx, &|s, w, cx| {
+        let moves = [("api".into(), old.clone(), "origin/release".into())];
+        s.set_base("rb", &moves, false, w, cx)
+    });
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        let ws = s.ws("rb").unwrap();
+        assert_eq!(ws.repos[0].base, "origin/release");
+        assert_eq!(ws.repos[1].base, old, "web keeps its base");
+        assert_eq!(menus::base_hint(ws), "per repo");
+        let bases: Vec<String> = (s.syncs["rb"].read(cx).branches().into_iter())
+            .map(|b| b.base)
+            .collect();
+        assert_eq!(bases, ["origin/release".to_string(), old.clone()]);
+    });
+    let md = fs::read_to_string(home.join("shark/workspaces/rb/CLAUDE.md")).unwrap();
+    assert!(md.contains("base `origin/release`"), "{md}");
     fs::remove_dir_all(&home).ok();
 }

@@ -40,7 +40,7 @@ mod editor_pane;
 mod home;
 mod inline_edit;
 mod media;
-mod menus;
+pub(crate) mod menus;
 mod palette;
 mod picker;
 mod review;
@@ -656,9 +656,22 @@ impl Shark {
                         },
                         IconName::FileDiff,
                         Tab::Diff,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, e: &MouseDownEvent, w, cx| {
+                            let entries = this.changes_menu(cx);
+                            this.show_menu(e.position, entries, w, cx);
+                        }),
                     ))
                     .when_some(file_tab, |d, name| {
-                        d.child(tab(name, IconName::FileCode, Tab::File))
+                        d.child(tab(name, IconName::FileCode, Tab::File).on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, e: &MouseDownEvent, w, cx| {
+                                let entries = this.editor_menu(cx);
+                                this.show_menu(e.position, entries, w, cx);
+                            }),
+                        ))
                     })
                     .child(div().flex_1())
                     // Narrow, the branch gives way before the sync buttons.
@@ -702,8 +715,9 @@ impl Shark {
             .into_any_element()
     }
 
-    /// The header's branch label; hovering lists each repo's branch, linked to GitHub once pushed.
-    fn render_branch(&self, cx: &App) -> impl IntoElement {
+    /// The header's branch label; hovering lists each repo's branch, linked to GitHub once
+    /// pushed, and the base it targets. Right-click copies or opens them, or changes the base.
+    fn render_branch(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let branch = self
             .active_ws()
@@ -711,7 +725,7 @@ impl Shark {
             .unwrap_or_default();
         let links = self
             .active_sync()
-            .map(|s| s.read(cx).branch_urls())
+            .map(|s| s.read(cx).branches())
             .unwrap_or_default();
         HoverCard::new("branch-card")
             .anchor(Anchor::TopRight)
@@ -723,7 +737,15 @@ impl Shark {
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(Icon::new(IconName::GitBranch).with_size(px(12.)))
-                    .child(div().min_w_0().truncate().child(branch.clone())),
+                    .child(div().min_w_0().truncate().child(branch.clone()))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|this, e: &MouseDownEvent, w, cx| {
+                            let Some(ws) = this.active_ws() else { return };
+                            let entries = menus::branch_entries(this, ws, cx);
+                            this.show_menu(e.position, entries, w, cx);
+                        }),
+                    ),
             )
             .content(move |_, _, cx| {
                 let theme = cx.theme();
@@ -735,18 +757,18 @@ impl Shark {
                             .text_color(theme.muted_foreground)
                             .child(format!("Branch {branch}")),
                     )
-                    .children(links.iter().enumerate().map(|(ix, (repo, url))| {
+                    .children(links.iter().enumerate().map(|(ix, b)| {
                         h_flex()
                             .gap_1p5()
                             .child(Icon::new(IconName::FolderGit2).with_size(px(12.)))
-                            .child(match url {
+                            .child(match &b.url {
                                 Some(u) => Link::new(("branch-link", ix))
                                     .href(u.clone())
-                                    .child(repo.clone())
+                                    .child(b.repo.clone())
                                     .into_any_element(),
                                 None => h_flex()
                                     .gap_1p5()
-                                    .child(repo.clone())
+                                    .child(b.repo.clone())
                                     .child(
                                         div()
                                             .text_color(theme.muted_foreground)
@@ -754,6 +776,11 @@ impl Shark {
                                     )
                                     .into_any_element(),
                             })
+                            .child(
+                                div()
+                                    .text_color(theme.muted_foreground)
+                                    .child(format!("→ {}", b.base)),
+                            )
                     }))
             })
     }

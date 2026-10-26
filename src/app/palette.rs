@@ -472,6 +472,16 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| s.with_sync(w, cx, GitSync::update_from_base),
     ),
     Row(
+        "Change base…",
+        IconName::Target,
+        None,
+        "git rebase retarget main target onto",
+        |s, w, cx| match s.target(w) {
+            Some(ws) => s.change_base(ws.name, w, cx),
+            None => notify_err(w, cx, "Open a workspace first"),
+        },
+    ),
+    Row(
         "Create or update PRs",
         IconName::GitPullRequestCreate,
         Some(&CreatePrs),
@@ -497,7 +507,7 @@ pub(super) const COMMANDS: &[Row] = &[
         },
     ),
     Row(
-        "Open PRs in browser",
+        "Open pull requests",
         IconName::ExternalLink,
         Some(&OpenPrs),
         "pull request github",

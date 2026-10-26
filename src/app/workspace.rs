@@ -492,6 +492,220 @@ impl Shark {
         .detach();
     }
 
+    /// Every chat of an opened workspace that has (or had) a conversation gets `note` and the
+    /// new repo list; one never started reads the new root CLAUDE.md at its session start.
+    fn tell_chats(&mut self, ws: &Workspace, note: String, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.syncs.contains_key(&ws.name) {
+            return;
+        }
+        let metas: Vec<ChatMeta> = (ws.chats.iter())
+            .filter(|m| self.chats.contains_key(&m.id) || m.session_id.is_some())
+            .cloned()
+            .collect();
+        for m in metas {
+            let chat = self.ensure_chat(ws, &m, window, cx);
+            chat.update(cx, |c, cx| c.repos_changed(ws, note.clone(), cx));
+        }
+    }
+
+    /// "Change base…": which repos (when there are several), then the new base, then whether
+    /// the agent rebases onto it.
+    pub(super) fn change_base(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.ws(&name).cloned() else {
+            return;
+        };
+        let repos: Vec<String> = ws.repos.iter().map(|r| r.name.clone()).collect();
+        if repos.len() < 2 {
+            return self.pick_base(name, repos, window, cx);
+        }
+        let items = std::iter::once(
+            CommandItem::new()
+                .label(format!("All repos · {}", menus::base_hint(&ws)))
+                .icon(IconName::Layers),
+        )
+        .chain(ws.repos.iter().map(|r| {
+            CommandItem::new()
+                .label(format!("{} · {}", r.name, r.base))
+                .icon(IconName::FolderGit2)
+        }))
+        .collect();
+        open_menu(
+            cx.entity().downgrade(),
+            "Change the base of…",
+            items,
+            0,
+            move |_, row, w, cx| {
+                let picked = match row {
+                    0 => repos.clone(),
+                    i => vec![repos[i - 1].clone()],
+                };
+                let name = name.clone();
+                // A new dialog once this one has closed.
+                cx.defer_in(w, move |s, w, cx| s.pick_base(name, picked, w, cx));
+            },
+            window,
+            cx,
+        );
+    }
+
+    /// The `origin/*` branches of `repos`, newest first; a branch only some have moves only those.
+    fn pick_base(&mut self, name: String, repos: Vec<String>, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.ws(&name).cloned() else {
+            return;
+        };
+        let dir = ws.dir();
+        // ponytail: for-each-ref on the UI thread; it's a local ref read, move to the background if it lags.
+        let per_repo: Vec<(String, Vec<(i64, String)>)> = (repos.iter())
+            .map(|r| (r.clone(), git::remote_branches(&dir.join(r))))
+            .collect();
+        let choices = git::base_choices(&per_repo, &ws.branch);
+        if choices.is_empty() {
+            return notify_err(window, cx, "No origin branches found; fetch first");
+        }
+        let current: Vec<&str> = (ws.repos.iter())
+            .filter(|r| repos.contains(&r.name))
+            .map(|r| r.base.as_str())
+            .collect();
+        let items = (choices.iter())
+            .map(|(b, have)| {
+                let label = match have.len() == repos.len() {
+                    true => b.clone(),
+                    false => format!("{b} · only {}", have.join(", ")),
+                };
+                CommandItem::new()
+                    .label(label)
+                    .icon(IconName::GitBranch)
+                    .checked(current.iter().all(|c| c == b))
+            })
+            .collect();
+        let selected = (choices.iter())
+            .position(|(b, _)| current.first() == Some(&b.as_str()))
+            .unwrap_or(0);
+        let old: Vec<(String, String)> = (ws.repos.iter())
+            .map(|r| (r.name.clone(), r.base.clone()))
+            .collect();
+        open_menu(
+            cx.entity().downgrade(),
+            "New base…",
+            items,
+            selected,
+            move |_, row, w, cx| {
+                let (new, have) = &choices[row];
+                let moves: Vec<(String, String, String)> = (old.iter())
+                    .filter(|(r, o)| have.contains(r) && o != new)
+                    .map(|(r, o)| (r.clone(), o.clone(), new.clone()))
+                    .collect();
+                let name = name.clone();
+                cx.defer_in(w, move |s, w, cx| s.pick_rebase(name, moves, w, cx));
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn pick_rebase(
+        &mut self,
+        name: String,
+        moves: Vec<(String, String, String)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((_, _, new)) = moves.first().cloned() else {
+            return notify_err(window, cx, "Already the base");
+        };
+        let items = vec![
+            CommandItem::new()
+                .label(format!("Rebase onto {new} with the agent"))
+                .icon(IconName::Sparkles),
+            CommandItem::new()
+                .label(format!("Only target {new}; leave the commits as they are"))
+                .icon(IconName::Target),
+        ];
+        open_menu(
+            cx.entity().downgrade(),
+            "Move the branch too?",
+            items,
+            0,
+            move |s, row, w, cx| s.set_base(&name, &moves, row == 0, w, cx),
+            window,
+            cx,
+        );
+    }
+
+    /// Records the new bases (`(repo, old, new)`), retargets open PRs on GitHub, tells the
+    /// chats, and with `rebase` asks the agent to move the commits.
+    pub(super) fn set_base(
+        &mut self,
+        name: &str,
+        moves: &[(String, String, String)],
+        rebase: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let sync = self.syncs.get(name).cloned();
+        if rebase {
+            let Some(sync) = &sync else {
+                return notify_err(window, cx, "Open the workspace to rebase it");
+            };
+            if let Some(e) = sync.read(cx).blocked(true, cx) {
+                return notify_err(window, cx, e);
+            }
+        }
+        let Some(slot) = self.ws_mut(name) else {
+            return;
+        };
+        for (repo, _, new) in moves {
+            if let Some(r) = slot.repos.iter_mut().find(|r| &r.name == repo) {
+                r.base = new.clone();
+            }
+        }
+        let ws = slot.clone();
+        self.state.save();
+        git::write_claude_md(&ws);
+        let changed = (moves.iter())
+            .map(|(r, o, n)| format!("`{r}` now targets `{n}` (was `{o}`)"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        self.tell_chats(&ws, format!("[shark] New base: {changed}."), window, cx);
+        if let Some(sync) = &sync {
+            let prs: Vec<(PathBuf, String, String)> = (moves.iter())
+                .filter_map(|(r, _, n)| {
+                    let url = sync.read(cx).pr_for(r)?.0.url;
+                    let b = n.strip_prefix("origin/").unwrap_or(n).to_string();
+                    Some((ws.dir().join(r), url, b))
+                })
+                .collect();
+            sync.update(cx, |g, cx| g.set_workspace(ws.clone(), cx));
+            if !prs.is_empty() {
+                cx.spawn_in(window, async move |_, cx| {
+                    let errs = (cx.background_executor())
+                        .spawn(async move {
+                            (prs.iter())
+                                .filter_map(|(wt, url, b)| {
+                                    let args = ["pr", "edit", url.as_str(), "--base", b.as_str()];
+                                    git::cmd_bounded(wt, "gh", &args, 30).err()
+                                })
+                                .collect::<Vec<_>>()
+                        })
+                        .await;
+                    if !errs.is_empty() {
+                        cx.update(|w, cx| notify_err(w, cx, format!("Retargeting PRs: {}", errs.join("; "))))
+                            .ok();
+                    }
+                })
+                .detach();
+            }
+            if rebase {
+                sync.update(cx, |g, cx| g.rebase_onto(moves, window, cx));
+            }
+        }
+        if self.active.as_deref() == Some(name) {
+            self.refresh_diff(cx);
+        }
+        window.push_notification(format!("New base: {changed}"), cx);
+        cx.notify();
+    }
+
     /// Saves the new repo list and tells the chat, the git button and the diff.
     fn repo_added(&mut self, ws: Workspace, window: &mut Window, cx: &mut Context<Self>) {
         let Some(slot) = self.ws_mut(&ws.name) else {
@@ -525,18 +739,7 @@ impl Shark {
             ws.branch,
             r.base
         );
-        // Every chat of an opened workspace that has (or had) a conversation is told; one never
-        // started reads the new root CLAUDE.md at its session start.
-        if self.syncs.contains_key(&ws.name) {
-            let metas: Vec<ChatMeta> = (ws.chats.iter())
-                .filter(|m| self.chats.contains_key(&m.id) || m.session_id.is_some())
-                .cloned()
-                .collect();
-            for m in metas {
-                let chat = self.ensure_chat(&ws, &m, window, cx);
-                chat.update(cx, |c, cx| c.repos_changed(&ws, note.clone(), cx));
-            }
-        }
+        self.tell_chats(&ws, note, window, cx);
         if let Some(sync) = self.syncs.get(&ws.name) {
             sync.update(cx, |g, cx| g.set_workspace(ws.clone(), cx));
         }

@@ -40,7 +40,7 @@ pub(super) fn section_icon(name: &str) -> IconName {
         .map_or(IconName::Folder, |(_, i)| *i)
 }
 
-/// "Move to section" in a workspace's right-click menu; ends with "New section…", which moves it there.
+/// "Move to section" in a workspace's right-click menu; ends with "New section", which moves it there.
 pub(super) fn move_submenu(this: &Shark, ws: &str, cx: &Context<Shark>) -> Entry {
     let current = this.section_of(ws);
     let mut entries = vec![];
@@ -67,7 +67,7 @@ pub(super) fn move_submenu(this: &Shark, ws: &str, cx: &Context<Shark>) -> Entry
     let ws = ws.to_string();
     entries.push(menu::item(
         IconName::FolderPlus,
-        "New section…",
+        "New section",
         on_shark(cx, move |s, w, cx| {
             s.start_naming(None, Some(ws.clone()), w, cx)
         }),
@@ -76,8 +76,14 @@ pub(super) fn move_submenu(this: &Shark, ws: &str, cx: &Context<Shark>) -> Entry
 }
 
 /// Right-click menu of a section header.
-fn section_menu(i: usize, cx: &Context<Shark>) -> Vec<Entry> {
+fn section_menu(this: &Shark, i: usize, cx: &Context<Shark>) -> Vec<Entry> {
+    let collapsed = this.state.sections.get(i).is_some_and(|s| s.collapsed);
     vec![
+        menu::item(
+            if collapsed { IconName::ChevronDown } else { IconName::ChevronRight },
+            if collapsed { "Expand" } else { "Collapse" },
+            on_shark(cx, move |s, _, cx| s.toggle_section(i, cx)),
+        ),
         menu::item(
             IconName::Pencil,
             "Rename",
@@ -487,7 +493,7 @@ impl Shark {
         );
     }
 
-    /// Sections, then "No section" when it is in one, then "New section…".
+    /// Sections, then "No section" when it is in one, then "New section".
     pub(super) fn pick_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ws) = self.target(window).map(|w| w.name) else {
             return notify_err(window, cx, "Open a workspace first");
@@ -515,7 +521,7 @@ impl Shark {
         }
         items.push(
             CommandItem::new()
-                .label("New section…")
+                .label("New section")
                 .icon(IconName::FolderPlus),
         );
         let last = items.len() - 1;
@@ -609,8 +615,34 @@ impl Shark {
                             Entry::Sep,
                             menu::item(IconName::FolderOpen, "Reveal in Finder", move |_, cx| {
                                 cx.reveal_path(&p1)
-                            }),
+                            })
+                            .hint(tilde(&path)),
                         ];
+                        // Active workspace first: the likeliest target.
+                        let mut targets: Vec<&Workspace> = (this.state.workspaces.iter())
+                            .filter(|w| !w.repos.iter().any(|r| r.name == name))
+                            .collect();
+                        targets.sort_by_key(|w| this.active.as_ref() != Some(&w.name));
+                        if let Some(repo) = this.state.repos.iter().find(|r| r.name == name) {
+                            let rows: Vec<Entry> = (targets.into_iter())
+                                .map(|w| {
+                                    let (ws, repo) = (w.name.clone(), repo.clone());
+                                    menu::item(
+                                        IconName::MessageSquare,
+                                        w.name.clone(),
+                                        on_shark(cx, move |s, win, cx| {
+                                            s.add_repo_to_workspace(ws.clone(), repo.clone(), win, cx)
+                                        }),
+                                    )
+                                })
+                                .collect();
+                            if !rows.is_empty() {
+                                entries.insert(
+                                    1,
+                                    menu::sub(IconName::FolderPlus, "Add to workspace", rows),
+                                );
+                            }
+                        }
                         entries.extend(open_in_entries(None, &[(name.clone(), path.clone())]));
                         entries.push(
                             menu::item(IconName::Copy, "Copy path", move |w, cx| {
@@ -783,7 +815,7 @@ impl Shark {
                         MouseButton::Right,
                         cx.listener(move |this, e: &MouseDownEvent, w, cx| {
                             this.sel = SideRow::Section(i);
-                            let entries = section_menu(i, cx);
+                            let entries = section_menu(this, i, cx);
                             this.show_menu(e.position, entries, w, cx);
                         }),
                     )
@@ -864,13 +896,29 @@ impl Shark {
             }
         }
         items.extend(new_row.take());
-        let new_section_menu = || {
-            cx.listener(|this, e: &MouseDownEvent, w, cx| {
-                let entries = vec![menu::item(
-                    IconName::FolderPlus,
-                    "New section",
-                    on_shark(cx, |s, w, cx| s.start_naming(None, None, w, cx)),
-                )];
+        let new_section_menu = |add_repo: bool| {
+            cx.listener(move |this, e: &MouseDownEvent, w, cx| {
+                let mut entries = vec![
+                    menu::item(
+                        IconName::Plus,
+                        "New workspace…",
+                        on_shark(cx, |s, w, cx| {
+                            s.new_workspace(s.state.last_repos.clone(), None, w, cx)
+                        }),
+                    ),
+                    menu::item(
+                        IconName::FolderPlus,
+                        "New section",
+                        on_shark(cx, |s, w, cx| s.start_naming(None, None, w, cx)),
+                    ),
+                ];
+                if add_repo {
+                    entries.push(menu::item(
+                        IconName::FolderGit2,
+                        "Add repo…",
+                        on_shark(cx, |s, w, cx| s.add_repo(w, cx)),
+                    ));
+                }
                 this.show_menu(e.position, entries, w, cx);
             })
         };
@@ -900,7 +948,7 @@ impl Shark {
                         ),
                 )
             })
-            .on_mouse_down(MouseButton::Right, new_section_menu());
+            .on_mouse_down(MouseButton::Right, new_section_menu(false));
         // Like the Workspaces header, but the + stays visible (dimmed) so a second repo is
         // findable; right-click offers the same.
         let repo_header = h_flex()
@@ -1014,7 +1062,7 @@ impl Shark {
                             .id("sidebar-rest")
                             .flex_1()
                             .min_h(px(24.))
-                            .on_mouse_down(MouseButton::Right, new_section_menu()),
+                            .on_mouse_down(MouseButton::Right, new_section_menu(true)),
                     ),
             )
     }

@@ -1109,10 +1109,10 @@ impl Shark {
             .map(|c| c.id)
     }
 
-    /// The thread at the cursor, unless it waits in a chat's queued review card (that card
-    /// would send it as it was, or not at all).
-    fn unqueued_thread_at(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<u64> {
-        let c = self.thread_at(cx).and_then(|id| self.comment(id))?;
+    /// Thread `id`, unless it waits in a chat's queued review card (that card would send it
+    /// as it was, or not at all).
+    fn unqueued(&self, id: u64, window: &mut Window, cx: &mut Context<Self>) -> Option<Comment> {
+        let c = self.comment(id)?;
         if c.status == Status::Queued {
             notify_err(
                 window,
@@ -1121,21 +1121,29 @@ impl Shark {
             );
             return None;
         }
-        Some(c.id)
+        Some(c.clone())
     }
 
-    /// `e`: edit the thread at the cursor.
-    pub(super) fn edit_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(c) =
-            (self.unqueued_thread_at(window, cx)).and_then(|id| self.comment(id).cloned())
-        {
+    /// Runs a thread action (`e`, `x`, `d`) on the thread at the cursor.
+    pub(super) fn at_cursor(
+        &mut self,
+        f: fn(&mut Self, u64, &mut Window, &mut Context<Self>),
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some(id) = self.thread_at(cx) {
+            f(self, id, window, cx);
+        }
+    }
+
+    pub(super) fn edit_thread(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(c) = self.unqueued(id, window, cx) {
             self.open_composer(c, window, cx);
         }
     }
 
-    /// `x`: delete the thread at the cursor.
-    pub(super) fn delete_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(id) = self.unqueued_thread_at(window, cx) {
+    pub(super) fn delete_thread(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if self.unqueued(id, window, cx).is_some() {
             self.edit_comments(cx, |l| l.retain(|c| c.id != id));
         }
     }
@@ -1180,19 +1188,88 @@ impl Shark {
         self.set_status(&ids, Status::Resolved, cx);
     }
 
-    pub(super) fn discard_pending(&mut self, cx: &mut Context<Self>) {
-        self.edit_comments(cx, |l| l.retain(|c| c.status != Status::Pending));
+    /// The review bar's Discard: every pending comment, once confirmed.
+    pub(super) fn discard_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let n = self.with_status(|s| *s == Status::Pending).len();
+        confirm(
+            format!(
+                "Discard {n} pending comment{}?",
+                if n == 1 { "" } else { "s" }
+            ),
+            "They have not been sent to a chat or GitHub.",
+            "Discard",
+            |s, _, cx| s.edit_comments(cx, |l| l.retain(|c| c.status != Status::Pending)),
+            window,
+            cx,
+        );
     }
 
-    /// `d`: the thread's file in the editor, to see what the agent made of it.
-    pub(super) fn view_change(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let path = self
-            .thread_at(cx)
-            .and_then(|id| self.comment(id))
-            .map(|c| c.path.clone());
-        if let Some(ix) = path.and_then(|p| self.diff_files.iter().position(|f| *f.path() == p)) {
+    /// The diff file thread `id` is on; none once its file left the diff.
+    fn change_ix(&self, id: u64) -> Option<usize> {
+        let path = &self.comment(id)?.path;
+        self.diff_files.iter().position(|f| f.path() == path)
+    }
+
+    /// The thread's file in the editor, to see what the agent made of it.
+    pub(super) fn view_change(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(ix) = self.change_ix(id) {
             self.open_file(ix, window, cx);
         }
+    }
+
+    /// A thread card's right-click menu. Shortcuts stay in the card's key hints.
+    pub(super) fn thread_menu(&self, id: u64, cx: &Context<Self>) -> Vec<Entry> {
+        let Some(c) = self.comment(id).cloned() else {
+            return vec![];
+        };
+        let act = |f: fn(&mut Self, u64, &mut Window, &mut Context<Self>)| {
+            on_shark(cx, move |s, w, cx| f(s, id, w, cx))
+        };
+        let addressed = matches!(c.status, Status::Addressed { .. } | Status::Outdated);
+        let mut entries = vec![menu::item(
+            IconName::Pencil,
+            "Edit",
+            act(Self::edit_thread),
+        )];
+        if c.status != Status::Resolved {
+            entries.push(menu::item(
+                IconName::CircleCheck,
+                "Resolve",
+                act(|s, id, _, cx| s.set_status(&[id], Status::Resolved, cx)),
+            ));
+        }
+        if addressed || c.status == Status::Resolved {
+            entries.push(menu::item(
+                IconName::CircleDashed,
+                "Reopen",
+                act(|s, id, _, cx| s.set_status(&[id], Status::Pending, cx)),
+            ));
+        }
+        if addressed && self.change_ix(id).is_some() {
+            let view = act(Self::view_change);
+            entries.push(menu::item(IconName::FileDiff, "View change", view));
+        }
+        if matches!(c.status, Status::Queued | Status::Sent { .. }) || addressed {
+            let show = act(Self::show_thread_chat);
+            entries.push(menu::item(IconName::MessageSquare, "Show chat", show));
+        }
+        if c.status != Status::Pending {
+            entries.push(match c.github {
+                Some(url) => menu::item(IconName::Github, "View on GitHub", move |_, cx| {
+                    cx.open_url(&url)
+                }),
+                None => menu::item(IconName::Github, "Share to GitHub…", act(Self::open_share)),
+            });
+        }
+        let text = c.text;
+        entries.extend([
+            menu::item(IconName::Copy, "Copy comment", move |w, cx| {
+                copy(text.clone(), w, cx)
+            }),
+            Entry::Sep,
+            menu::item(IconName::Trash, "Delete", act(Self::delete_thread)),
+        ]);
+        entries
     }
 
     /// Scrolls row `spot` into view with `below` code rows of room under it (for what is
@@ -1524,6 +1601,18 @@ impl Shark {
             .border_l_2()
             .border_color(color)
             .text_sm()
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, w, cx| {
+                    cx.stop_propagation();
+                    // Selects it like `]c`; a thread whose file left the diff has no line to select.
+                    if this.change_ix(id).is_some() {
+                        this.jump_to_comment(id, w, cx);
+                    }
+                    let entries = this.thread_menu(id, cx);
+                    this.show_menu(e.position, entries, w, cx);
+                }),
+            )
             // Narrow, the pill and where it went wrap to the next line rather than clip; the
             // keys take what room is left on the last line, the lines truncate last.
             .child(
@@ -1750,7 +1839,7 @@ impl Shark {
     }
 
     /// The header's Comment: the selection when it is in `path`, else its first changed line.
-    fn comment_in(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn comment_in(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
         let here = self.picked_lines(cx).filter(|r| r.path() == path);
         let range = here.or_else(|| {
             let first = (self.review.hunks.get(path))
@@ -1861,9 +1950,9 @@ impl Shark {
         })
         .when(pending > 0, |d| {
             d.child(
-                button("review-discard", "Discard".into())
+                button("review-discard", "Discard…".into())
                     .ghost()
-                    .on_click(cx.listener(|this, _, _, cx| this.discard_pending(cx))),
+                    .on_click(cx.listener(|this, _, w, cx| this.discard_pending(w, cx))),
             )
             .child(
                 button("review-send", "Send review… ⇧C".into())

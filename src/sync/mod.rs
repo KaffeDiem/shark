@@ -4,6 +4,7 @@
 mod status;
 pub use status::{Kind, Pr, PrState, Repo, ago, github_url};
 
+use crate::app::menus::{each_or_all, pr_entry};
 use crate::app::{inter_features, notify_err, open_menu};
 use crate::menu::{self, Entry};
 use crate::chat::Chat;
@@ -47,6 +48,13 @@ pub enum SyncEvent {
     Archive,
     /// Create PRs succeeded.
     PrsCreated,
+}
+
+pub struct Branch {
+    pub repo: String,
+    pub name: String,
+    pub base: String,
+    pub url: Option<String>,
 }
 
 pub struct GitSync {
@@ -253,14 +261,18 @@ impl GitSync {
         }
     }
 
-    /// A repo joined the workspace: track it too (known repos keep their state) and re-probe.
+    /// A repo joined the workspace or a base changed: track it too (known repos keep their
+    /// state) and re-probe.
     pub fn set_workspace(&mut self, ws: Workspace, cx: &mut Context<Self>) {
         let mut old = std::mem::take(&mut self.repos);
         self.repos = ws
             .repos
             .iter()
             .map(|r| match old.iter().position(|o| o.name == r.name) {
-                Some(i) => old.swap_remove(i),
+                Some(i) => Repo {
+                    base: r.base.clone(),
+                    ..old.swap_remove(i)
+                },
                 None => Repo::fresh(r),
             })
             .collect();
@@ -407,6 +419,14 @@ impl GitSync {
         cx.notify();
     }
 
+    /// Why a step can't start now: one is running, or (`idle`) the agent is.
+    pub fn blocked(&self, idle: bool, cx: &App) -> Option<String> {
+        if let Some(r) = &self.running {
+            return Some(format!("Still running: {r}"));
+        }
+        (idle && self.busy(cx)).then(|| "Agent is running; wait for it or stop it (ctrl-c)".into())
+    }
+
     fn busy(&self, cx: &App) -> bool {
         self.chats.iter().any(|c| c.read(cx).working())
     }
@@ -420,11 +440,19 @@ impl GitSync {
         }
     }
 
-    /// `(repo, branch on GitHub)` per repo; the URL is `None` until it is pushed to GitHub.
-    pub fn branch_urls(&self) -> Vec<(String, Option<String>)> {
+    /// Per repo: its checked-out branch, its base, and the workspace branch on GitHub (`None`
+    /// until it is pushed there).
+    pub fn branches(&self) -> Vec<Branch> {
         self.repos
             .iter()
-            .map(|r| (r.name.clone(), r.branch_url(&self.ws.branch)))
+            .map(|r| Branch {
+                repo: r.name.clone(),
+                name: (r.local.as_ref().ok())
+                    .and_then(|l| l.branch.clone())
+                    .unwrap_or_else(|| self.ws.branch.clone()),
+                base: r.base.clone(),
+                url: r.branch_url(&self.ws.branch),
+            })
             .collect()
     }
 
@@ -441,19 +469,7 @@ impl GitSync {
     #[cfg(all(test, feature = "test-support"))]
     pub fn set_pr(&mut self, repo: &str, number: u64, pushed: bool) {
         let r = self.repos.iter_mut().find(|r| r.name == repo).unwrap();
-        r.pr = Some(Ok(Some(Pr {
-            url: format!("https://github.com/o/{repo}/pull/{number}"),
-            number,
-            state: PrState::Open,
-            draft: false,
-            merge_state: "CLEAN".into(),
-            review: String::new(),
-            checks: status::Checks::Passing,
-            head: "h".into(),
-            change_requests: vec![],
-            comments: vec![],
-            contains_head: String::new(),
-        })));
+        r.pr = Some(Ok(Some(open_pr(repo, number))));
         let head = if pushed { "h" } else { "local" };
         r.local = Ok(Local {
             head: head.into(),
@@ -461,10 +477,11 @@ impl GitSync {
         });
     }
 
-    pub fn pr_urls(&self) -> Vec<String> {
+    /// `(repo, PR URL)` per repo with a PR.
+    pub fn pr_urls(&self) -> Vec<(String, String)> {
         self.repos
             .iter()
-            .filter_map(|r| Some(r.pr()?.url.clone()))
+            .filter_map(|r| Some((r.name.clone(), r.pr()?.url.clone())))
             .collect()
     }
 
@@ -473,7 +490,7 @@ impl GitSync {
         if urls.is_empty() {
             return notify_err(window, cx, "No PRs yet: create them from the git menu");
         }
-        urls.iter().for_each(|u| cx.open_url(u));
+        urls.iter().for_each(|(_, u)| cx.open_url(u));
     }
 
     /// The button: run whatever the workspace needs next.
@@ -492,10 +509,22 @@ impl GitSync {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.run_kind_in(kind, label, vec![], window, cx)
+    }
+
+    /// [`Self::run_kind`] on just `repos` (empty: all).
+    pub fn run_kind_in(
+        &mut self,
+        kind: Kind,
+        label: &str,
+        repos: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let a = Action {
             label: label.into(),
             kind,
-            repos: vec![],
+            repos,
             attention: false,
             reviews: vec![],
         };
@@ -510,15 +539,8 @@ impl GitSync {
     /// `check`: the step came from the button, so re-probe first and refuse if the state moved
     /// on in the meantime (the snapshot can be seconds old, and the agent may have acted).
     fn run(&mut self, a: Action, check: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(r) = &self.running {
-            return notify_err(window, cx, format!("Still running: {r}"));
-        }
-        if a.kind.needs_idle() && self.busy(cx) {
-            return notify_err(
-                window,
-                cx,
-                "Agent is running; wait for it or stop it (ctrl-c)",
-            );
+        if let Some(e) = self.blocked(a.kind.needs_idle(), cx) {
+            return notify_err(window, cx, e);
         }
         match &a.kind {
             Kind::None if a.attention => {
@@ -540,14 +562,10 @@ impl GitSync {
     fn confirm(&mut self, a: Action, check: bool, window: &mut Window, cx: &mut Context<Self>) {
         let (title, body, ok) = match a.kind {
             Kind::Merge => (
-                format!(
-                    "Merge {} PRs?",
-                    self.repos
-                        .iter()
-                        .filter(|r| r.open_pr().is_some())
-                        .count()
-                        .max(1)
-                ),
+                match open_prs_in(&self.repos, &a.repos) {
+                    0 | 1 => "Merge the PR?".to_string(),
+                    n => format!("Merge {n} PRs?"),
+                },
                 format!(
                     "Merges with each repo's allowed method in this order: {}, and stops at the \
                      first failure. {}Merging can't be undone from here.",
@@ -836,6 +854,21 @@ impl GitSync {
         lines.join("\n")
     }
 
+    /// Asks the agent to move the branch onto a new base; `moves` is `(repo, old, new)`.
+    pub fn rebase_onto(
+        &mut self,
+        moves: &[(String, String, String)],
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let repos = (moves.iter())
+            .map(|(r, old, new)| format!("{r}: `{old}` → `{new}`"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let prompt = crate::prompts::render("rebase_base", &repos, &self.ws.branch);
+        self.run_kind(Kind::Agent(prompt), "Rebase onto new base", window, cx)
+    }
+
     /// Asks the agent to bring every repo up to date with its base.
     pub fn update_from_base(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let bases = (self.ws.repos.iter())
@@ -856,51 +889,64 @@ impl GitSync {
                 this.update(cx, |s, cx| f(s, w, cx)).ok();
             }
         };
-        let kind = |k: Kind, label: &'static str| {
+        // One repo acts directly; several make a submenu of repos plus "All".
+        let kind = |icon, k: Kind, label: &'static str, rows| {
             let this = this.clone();
-            move |w: &mut Window, cx: &mut App| {
-                this.update(cx, |s, cx| s.run_kind(k.clone(), label, w, cx)).ok();
-            }
+            each_or_all(icon, label, rows, move |rs, w, cx| {
+                let rs = rs.to_vec();
+                let label = label.trim_end_matches('…');
+                this.update(cx, |s, cx| s.run_kind_in(k.clone(), label, rs, w, cx)).ok();
+            })
         };
+        let rows = |f: &dyn Fn(&Repo) -> Option<String>| -> Vec<(String, String, String)> {
+            (self.repos.iter())
+                .filter_map(|r| Some((r.name.clone(), f(r)?, r.name.clone())))
+                .collect()
+        };
+        let every = rows(&|_| Some(String::new()));
         let mut entries = vec![];
         if let Some(a) = self.action.clone().filter(|a| a.kind != Kind::None) {
             entries.push(menu::item(icon(&a), a.label.clone(), run(Self::primary)).hint("Next"));
             entries.push(Entry::Sep);
         }
-        entries.extend([
-            menu::item(IconName::RefreshCw, "Fetch now", run(Self::fetch_now)),
-            menu::item(IconName::ArrowDown, "Pull", kind(Kind::Pull, "Pull")).hint("Fast-forward"),
-            menu::item(IconName::ArrowUp, "Push", kind(Kind::Push, "Push")),
-            menu::item(
-                IconName::GitCompareArrows,
-                "Update from base",
-                run(Self::update_from_base),
-            )
-            .hint("Agent"),
-            Entry::Sep,
-            menu::item(
-                IconName::GitPullRequestCreate,
-                "Create or update PRs",
-                kind(Kind::CreatePr, "Create or update PRs"),
-            ),
-            menu::item(
-                IconName::GitPullRequestDraft,
-                "Create draft PRs",
-                kind(Kind::CreateDraftPr, "Create draft PRs"),
-            ),
-        ]);
-        if self.repos.iter().any(|r| r.open_pr().is_some()) {
-            entries.push(menu::item(
-                IconName::GitMerge,
-                "Merge PRs…",
-                kind(Kind::Merge, "Merge PRs"),
-            ));
-            entries.push(menu::item(
-                IconName::ExternalLink,
-                "Open PRs in browser",
-                kind(Kind::OpenPr, "Open PRs in browser"),
-            ));
-        }
+        let pull = kind(IconName::ArrowDown, Kind::Pull, "Pull", every.clone());
+        entries.extend(
+            [
+                Some(menu::item(IconName::RefreshCw, "Fetch now", run(Self::fetch_now))),
+                pull.map(|e| e.hint("Fast-forward")),
+                kind(IconName::ArrowUp, Kind::Push, "Push", every.clone()),
+                Some(
+                    menu::item(
+                        IconName::GitCompareArrows,
+                        "Update from base",
+                        run(Self::update_from_base),
+                    )
+                    .hint("Agent"),
+                ),
+                Some(Entry::Sep),
+                kind(
+                    IconName::GitPullRequestCreate,
+                    Kind::CreatePr,
+                    "Create or update PRs",
+                    every.clone(),
+                ),
+                kind(
+                    IconName::GitPullRequestDraft,
+                    Kind::CreateDraftPr,
+                    "Create draft PRs",
+                    every,
+                ),
+                pr_entry(self),
+                kind(
+                    IconName::GitMerge,
+                    Kind::Merge,
+                    "Merge PRs…",
+                    rows(&|r| Some(format!("#{}", r.open_pr()?.number))),
+                ),
+            ]
+            .into_iter()
+            .flatten(),
+        );
         if self.repos.len() > 1 {
             // Each repo's possible moves, in merge order: the first can't go earlier.
             let n = self.merge_order.len();
@@ -945,6 +991,30 @@ impl GitSync {
         self.menu = Some((m, sub));
         cx.notify();
     }
+}
+
+#[cfg(test)]
+fn open_pr(repo: &str, number: u64) -> Pr {
+    Pr {
+        url: format!("https://github.com/o/{repo}/pull/{number}"),
+        number,
+        state: PrState::Open,
+        draft: false,
+        merge_state: "CLEAN".into(),
+        review: String::new(),
+        checks: status::Checks::Passing,
+        head: "h".into(),
+        change_requests: vec![],
+        comments: vec![],
+        contains_head: String::new(),
+    }
+}
+
+/// Open PRs in the repos named in `rs` (empty: all), as [`execute`] targets them.
+fn open_prs_in(repos: &[Repo], rs: &[String]) -> usize {
+    (repos.iter())
+        .filter(|r| (rs.is_empty() || rs.contains(&r.name)) && r.open_pr().is_some())
+        .count()
 }
 
 enum Outcome {
@@ -1228,6 +1298,10 @@ impl Render for GitSync {
                 // the "ago" times are current.
                 div()
                     .id("git-next-tip")
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|s, _: &MouseDownEvent, w, cx| s.open_menu(w, cx)),
+                    )
                     .tooltip(move |w, cx| {
                         let text = this.upgrade().map(|s| s.read(cx).tooltip(cx));
                         Tooltip::new(text.unwrap_or_default()).build(w, cx)
@@ -1273,6 +1347,20 @@ impl Render for GitSync {
 #[cfg(test)]
 mod tests {
     use super::{Action, Kind, Local, Pr, background_answer, fresh_or_last, needs_you};
+
+    #[test]
+    fn merge_confirm_counts_only_chosen_repos() {
+        let repo = |name: &str, pr: Option<u64>| super::Repo {
+            name: name.into(),
+            base: "origin/main".into(),
+            local: Ok(Local::default()),
+            pr: Some(Ok(pr.map(|n| super::open_pr(name, n)))),
+        };
+        let repos = [repo("api", Some(1)), repo("web", Some(2)), repo("docs", None)];
+        assert_eq!(super::open_prs_in(&repos, &[]), 2, "empty is all");
+        assert_eq!(super::open_prs_in(&repos, &["web".into()]), 1);
+        assert_eq!(super::open_prs_in(&repos, &["docs".into()]), 0);
+    }
 
     #[test]
     fn what_needs_you() {

@@ -173,6 +173,23 @@ impl Shark {
         cx.notify();
     }
 
+    /// Right-click menu of the open file: the file's entries, then Close file.
+    pub(super) fn editor_menu(&self, cx: &Context<Self>) -> Vec<Entry> {
+        let Some(e) = &self.editor else {
+            return vec![];
+        };
+        let mut entries = self.file_menu(&e.read(cx).path.clone(), cx);
+        entries.extend([
+            Entry::Sep,
+            menu::item(
+                IconName::Close,
+                "Close file",
+                on_shark(cx, |s, w, cx| s.close_file(w, cx)),
+            ),
+        ]);
+        entries
+    }
+
     pub(super) fn render_editor(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(editor) = self.editor.clone() else {
             return div().into_any_element();
@@ -225,6 +242,13 @@ impl Shark {
                             .flex_1()
                             .min_w_0()
                             .overflow_hidden()
+                            .on_mouse_down(
+                                MouseButton::Right,
+                                cx.listener(|this, e: &MouseDownEvent, w, cx| {
+                                    let entries = this.editor_menu(cx);
+                                    this.show_menu(e.position, entries, w, cx);
+                                }),
+                            )
                             .child(
                                 div()
                                     .min_w_0()

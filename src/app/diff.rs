@@ -590,9 +590,9 @@ impl Shark {
                 None => cx.propagate(),
             }))
             .on_action(cx.listener(|this, _: &SendComments, w, cx| this.open_sheet(w, cx)))
-            .on_action(cx.listener(|this, _: &EditThread, w, cx| this.edit_thread(w, cx)))
-            .on_action(cx.listener(|this, _: &DeleteThread, w, cx| this.delete_thread(w, cx)))
-            .on_action(cx.listener(|this, _: &ViewChange, w, cx| this.view_change(w, cx)))
+            .on_action(cx.listener(|this, _: &EditThread, w, cx| this.at_cursor(Self::edit_thread, w, cx)))
+            .on_action(cx.listener(|this, _: &DeleteThread, w, cx| this.at_cursor(Self::delete_thread, w, cx)))
+            .on_action(cx.listener(|this, _: &ViewChange, w, cx| this.at_cursor(Self::view_change, w, cx)))
             .on_action(cx.listener(|this, _: &ResolveThread, _, cx| this.resolve_thread(cx)))
             .on_action(cx.listener(|this, _: &ReopenThread, _, cx| this.reopen_thread(cx)))
             .on_action(cx.listener(|this, _: &NextThread, w, cx| this.thread_jump(true, w, cx)))
@@ -686,6 +686,13 @@ impl Shark {
             .border_color(theme.border)
             .text_xs()
             .text_color(theme.muted_foreground)
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, e: &MouseDownEvent, w, cx| {
+                    let entries = this.changes_menu(cx);
+                    this.show_menu(e.position, entries, w, cx);
+                }),
+            )
             .child(
                 div()
                     .text_sm()
@@ -949,7 +956,22 @@ impl Shark {
                     (2, Some(file)) => this.open_file(file, w, cx),
                     _ => this.tree_confirm(ix, w, cx),
                 }
-            }));
+            }))
+            // Right-click moves the cursor too, so it's clear which row the menu is for.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, w, cx| {
+                    this.tree_select(ix, cx);
+                    let Some(r) = this.tree_rows.get(ix) else {
+                        return;
+                    };
+                    let entries = match r.file {
+                        Some(f) => this.file_menu(&this.diff_files[f].path().clone(), cx),
+                        None => this.dir_menu(&r.path.clone(), cx),
+                    };
+                    this.show_menu(e.position, entries, w, cx);
+                }),
+            );
         let Some(file) = r.file else {
             let open = !self.collapsed_dirs.contains(&r.path);
             return div()
@@ -1058,6 +1080,167 @@ impl Shark {
                         cx.listener(move |this, _: &bool, _, cx| this.toggle_viewed_dir(&dir, cx)),
                     ),
             )
+    }
+
+    /// Right-click menu of file `path` (`repo/…`): the tree's file rows, the editor header
+    /// and the File tab. By path, since the open file need not be in the diff.
+    pub(super) fn file_menu(&self, path: &str, cx: &Context<Self>) -> Vec<Entry> {
+        let Some(ws) = self.active_ws() else {
+            return vec![];
+        };
+        let abs = ws.dir().join(path);
+        let ix = self.diff_files.iter().position(|f| f.path() == path);
+        // Deleted and binary files show in the diff only, as `open_file` and `edit_buttons` say.
+        let on_disk = ix.is_none_or(|ix| {
+            let f = &self.diff_files[ix];
+            f.status() != DiffFileStatus::Deleted && !f.is_binary()
+        });
+        let open = (self.editor.as_ref()).is_some_and(|e| e.read(cx).path == path);
+        let p = path.to_string();
+        let mut entries = vec![];
+        if on_disk && !open {
+            let p = p.clone();
+            entries.push(menu::item(
+                IconName::FileCode,
+                "Open in editor",
+                on_shark(cx, move |s, w, cx| s.open_path(p.clone(), w, cx)),
+            ));
+        }
+        if let Some(ix) = ix {
+            if on_disk {
+                let p = p.clone();
+                entries.push(menu::item(
+                    IconName::Pencil,
+                    "Edit working copy",
+                    on_shark(cx, move |s, w, cx| {
+                        s.show(Tab::Diff, w, cx);
+                        s.edit_working_copy(Some(p.clone().into()), w, cx)
+                    }),
+                ));
+            }
+            let (p1, p2) = (p.clone(), p.clone());
+            entries.extend([
+                menu::item(
+                    IconName::MessageSquare,
+                    "Comment",
+                    on_shark(cx, move |s, w, cx| {
+                        s.show(Tab::Diff, w, cx);
+                        s.comment_in(&p1, w, cx)
+                    }),
+                ),
+                menu::item(
+                    IconName::Check,
+                    "Viewed",
+                    on_shark(cx, move |s, _, cx| s.toggle_viewed_path(&p2, cx)),
+                )
+                .checked(self.viewed(ix) == Viewed::Yes),
+            ]);
+        }
+        entries.push(Entry::Sep);
+        if on_disk {
+            let a = abs.clone();
+            entries.push(menu::item(
+                IconName::FolderOpen,
+                "Reveal in Finder",
+                move |_, cx| cx.reveal_path(&a),
+            ));
+            for app in crate::apps::installed() {
+                if app.kind != crate::apps::Kind::Folder {
+                    continue;
+                }
+                let a = abs.clone();
+                let label = format!("Open in {}", app.name);
+                let item = menu::item(super::menus::app_icon(app), label, move |_, _| app.open(&a));
+                entries.push(item.image(app.icon.clone()));
+            }
+        }
+        entries.extend([
+            menu::item(IconName::Copy, "Copy path", move |w, cx| {
+                copy(abs.display().to_string(), w, cx)
+            }),
+            // Relative to the repo, as its own tools and the agent's diffs name it.
+            menu::item(IconName::Copy, "Copy relative path", move |w, cx| {
+                copy(p.split_once('/').map_or(&*p, |(_, rel)| rel).to_string(), w, cx)
+            }),
+        ]);
+        entries
+    }
+
+    /// Right-click menu of folder `dir` in the tree; it is the tree cursor's row.
+    fn dir_menu(&self, dir: &str, cx: &Context<Self>) -> Vec<Entry> {
+        let Some(ws) = self.active_ws() else {
+            return vec![];
+        };
+        let abs = ws.dir().join(dir);
+        let files = self.dir_files(dir);
+        let all = files.iter().all(|&f| self.viewed(f) == Viewed::Yes);
+        let d = dir.to_string();
+        let mut entries = vec![
+            menu::item(
+                IconName::Check,
+                "All viewed",
+                on_shark(cx, move |s, _, cx| s.toggle_viewed_dir(&d, cx)),
+            )
+            .checked(all),
+        ];
+        // A filter shows every folder open, and folding does nothing then.
+        if self.tree_query.is_empty() {
+            let open = !self.collapsed_dirs.contains(dir);
+            entries.push(menu::item(
+                if open {
+                    IconName::ChevronRight
+                } else {
+                    IconName::ChevronDown
+                },
+                if open { "Collapse" } else { "Expand" },
+                on_shark(cx, move |s, _, cx| s.set_dir_open(Some(!open), cx)),
+            ));
+        }
+        let a = abs.clone();
+        entries.extend([
+            Entry::Sep,
+            menu::item(IconName::FolderOpen, "Reveal in Finder", move |_, cx| {
+                cx.reveal_path(&a)
+            }),
+            menu::item(IconName::Copy, "Copy path", move |w, cx| {
+                copy(abs.display().to_string(), w, cx)
+            }),
+        ]);
+        entries
+    }
+
+    /// Right-click menu of the Changes tab and the changes bar.
+    pub(super) fn changes_menu(&self, cx: &Context<Self>) -> Vec<Entry> {
+        let mut entries = vec![
+            menu::item(
+                IconName::Columns2,
+                "Unified",
+                on_shark(cx, |s, _, cx| s.toggle_diff_mode(cx)),
+            )
+            .checked(self.state.unified),
+            menu::item(
+                IconName::RefreshCw,
+                "Refresh",
+                on_shark(cx, |s, _, cx| s.refresh_diff(cx)),
+            ),
+            menu::item(
+                IconName::PanelRight,
+                "Show files",
+                on_shark(cx, |s, w, cx| s.toggle_tree(w, cx)),
+            )
+            .checked(self.show_tree),
+        ];
+        if (self.ws_comments().iter()).any(|c| c.status == review::Status::Pending) {
+            entries.extend([
+                Entry::Sep,
+                menu::item(
+                    IconName::Send,
+                    "Send review…",
+                    on_shark(cx, |s, w, cx| s.open_sheet(w, cx)),
+                ),
+            ]);
+        }
+        entries
     }
 
     fn step_file(&mut self, delta: isize, cx: &mut Context<Self>) {

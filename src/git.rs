@@ -261,6 +261,38 @@ pub(crate) fn par_map<T: Send, R: Send>(
     })
 }
 
+/// `origin/*` branches of `dir` as `(commit time, origin/name)`, newest first.
+pub fn remote_branches(dir: &Path) -> Vec<(i64, String)> {
+    let fmt = "--format=%(committerdate:unix) %(refname:short)";
+    let out = git(dir, &["for-each-ref", "--sort=-committerdate", fmt, "refs/remotes/origin"]);
+    (out.unwrap_or_default().lines())
+        .filter_map(|l| {
+            let (t, r) = l.split_once(' ')?;
+            Some((t.parse().ok()?, r.to_string()))
+        })
+        // `origin/HEAD` shortens to `origin`.
+        .filter(|(_, r)| r.starts_with("origin/") && r != "origin/HEAD")
+        .collect()
+}
+
+/// The bases to offer for `repos` (`(repo, remote_branches)`): every branch any of them has,
+/// newest first, with the repos that have it; `skip` (the workspace's own branch) left out.
+pub fn base_choices(repos: &[(String, Vec<(i64, String)>)], skip: &str) -> Vec<(String, Vec<String>)> {
+    let mut all: Vec<(i64, &str, &str)> = (repos.iter())
+        .flat_map(|(repo, bs)| bs.iter().map(move |(t, b)| (*t, b.as_str(), repo.as_str())))
+        .filter(|(_, b, _)| b.strip_prefix("origin/") != Some(skip))
+        .collect();
+    all.sort_by_key(|a| std::cmp::Reverse(a.0));
+    let mut out: Vec<(String, Vec<String>)> = vec![];
+    for (_, b, repo) in all {
+        match out.iter_mut().find(|(o, _)| o == b) {
+            Some((_, rs)) => rs.push(repo.to_string()),
+            None => out.push((b.to_string(), vec![repo.to_string()])),
+        }
+    }
+    out
+}
+
 fn has_ref(dir: &Path, rf: &str) -> bool {
     git(dir, &["rev-parse", "--verify", "--quiet", rf]).is_ok()
 }
@@ -631,6 +663,21 @@ pub fn combined_diff(ws: &Workspace, dir: &Path) -> Result<String, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base_choices_merge_newest_first() {
+        let b = |t, n: &str| (t, format!("origin/{n}"));
+        let repos = [
+            ("api".to_string(), vec![b(9, "feat"), b(5, "main"), b(1, "old")]),
+            ("web".to_string(), vec![b(7, "main"), b(3, "x")]),
+        ];
+        let got = base_choices(&repos, "feat");
+        let names: Vec<_> = got.iter().map(|(n, rs)| (n.as_str(), rs.join(","))).collect();
+        assert_eq!(
+            names,
+            [("origin/main", "web,api".into()), ("origin/x", "web".into()), ("origin/old", "api".into())]
+        );
+    }
 
     /// A timeout kills the whole group: a background child holding stdout open dies too.
     #[test]
