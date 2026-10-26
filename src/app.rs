@@ -40,7 +40,7 @@ mod editor_pane;
 mod home;
 mod inline_edit;
 mod media;
-mod menus;
+pub(crate) mod menus;
 mod palette;
 mod picker;
 mod review;

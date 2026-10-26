@@ -4,6 +4,7 @@
 mod status;
 pub use status::{Kind, Pr, PrState, Repo, ago, github_url};
 
+use crate::app::menus::each_or_all;
 use crate::app::{inter_features, notify_err, open_menu};
 use crate::menu::{self, Entry};
 use crate::chat::Chat;
@@ -468,19 +469,7 @@ impl GitSync {
     #[cfg(all(test, feature = "test-support"))]
     pub fn set_pr(&mut self, repo: &str, number: u64, pushed: bool) {
         let r = self.repos.iter_mut().find(|r| r.name == repo).unwrap();
-        r.pr = Some(Ok(Some(Pr {
-            url: format!("https://github.com/o/{repo}/pull/{number}"),
-            number,
-            state: PrState::Open,
-            draft: false,
-            merge_state: "CLEAN".into(),
-            review: String::new(),
-            checks: status::Checks::Passing,
-            head: "h".into(),
-            change_requests: vec![],
-            comments: vec![],
-            contains_head: String::new(),
-        })));
+        r.pr = Some(Ok(Some(open_pr(repo, number))));
         let head = if pushed { "h" } else { "local" };
         r.local = Ok(Local {
             head: head.into(),
@@ -520,10 +509,22 @@ impl GitSync {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.run_kind_in(kind, label, vec![], window, cx)
+    }
+
+    /// [`Self::run_kind`] on just `repos` (empty: all).
+    pub fn run_kind_in(
+        &mut self,
+        kind: Kind,
+        label: &str,
+        repos: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let a = Action {
             label: label.into(),
             kind,
-            repos: vec![],
+            repos,
             attention: false,
             reviews: vec![],
         };
@@ -561,14 +562,7 @@ impl GitSync {
     fn confirm(&mut self, a: Action, check: bool, window: &mut Window, cx: &mut Context<Self>) {
         let (title, body, ok) = match a.kind {
             Kind::Merge => (
-                format!(
-                    "Merge {} PRs?",
-                    self.repos
-                        .iter()
-                        .filter(|r| r.open_pr().is_some())
-                        .count()
-                        .max(1)
-                ),
+                format!("Merge {} PRs?", open_prs_in(&self.repos, &a.repos).max(1)),
                 format!(
                     "Merges with each repo's allowed method in this order: {}, and stops at the \
                      first failure. {}Merging can't be undone from here.",
@@ -892,51 +886,70 @@ impl GitSync {
                 this.update(cx, |s, cx| f(s, w, cx)).ok();
             }
         };
-        let kind = |k: Kind, label: &'static str| {
+        // One repo acts directly; several make a submenu of repos plus "All".
+        let kind = |icon, k: Kind, label: &'static str, rows| {
             let this = this.clone();
-            move |w: &mut Window, cx: &mut App| {
-                this.update(cx, |s, cx| s.run_kind(k.clone(), label, w, cx)).ok();
-            }
+            each_or_all(icon, label, rows, move |rs, w, cx| {
+                let rs = rs.to_vec();
+                let label = label.trim_end_matches('…');
+                this.update(cx, |s, cx| s.run_kind_in(k.clone(), label, rs, w, cx)).ok();
+            })
         };
+        let rows = |f: &dyn Fn(&Repo) -> Option<String>| -> Vec<(String, String, String)> {
+            (self.repos.iter())
+                .filter_map(|r| Some((r.name.clone(), f(r)?, r.name.clone())))
+                .collect()
+        };
+        let every = rows(&|_| Some(String::new()));
         let mut entries = vec![];
         if let Some(a) = self.action.clone().filter(|a| a.kind != Kind::None) {
             entries.push(menu::item(icon(&a), a.label.clone(), run(Self::primary)).hint("Next"));
             entries.push(Entry::Sep);
         }
-        entries.extend([
-            menu::item(IconName::RefreshCw, "Fetch now", run(Self::fetch_now)),
-            menu::item(IconName::ArrowDown, "Pull", kind(Kind::Pull, "Pull")).hint("Fast-forward"),
-            menu::item(IconName::ArrowUp, "Push", kind(Kind::Push, "Push")),
-            menu::item(
-                IconName::GitCompareArrows,
-                "Update from base",
-                run(Self::update_from_base),
-            )
-            .hint("Agent"),
-            Entry::Sep,
-            menu::item(
-                IconName::GitPullRequestCreate,
-                "Create or update PRs",
-                kind(Kind::CreatePr, "Create or update PRs"),
-            ),
-            menu::item(
-                IconName::GitPullRequestDraft,
-                "Create draft PRs",
-                kind(Kind::CreateDraftPr, "Create draft PRs"),
-            ),
-        ]);
-        if self.repos.iter().any(|r| r.open_pr().is_some()) {
-            entries.push(menu::item(
-                IconName::GitMerge,
-                "Merge PRs…",
-                kind(Kind::Merge, "Merge PRs"),
-            ));
-            entries.push(menu::item(
-                IconName::ExternalLink,
-                "Open PRs in browser",
-                kind(Kind::OpenPr, "Open PRs in browser"),
-            ));
-        }
+        let prs = (self.pr_urls().into_iter())
+            .map(|(repo, url)| (repo, String::new(), url))
+            .collect();
+        let open = |urls: &[String], _: &mut Window, cx: &mut App| {
+            urls.iter().for_each(|u| cx.open_url(u))
+        };
+        let pull = kind(IconName::ArrowDown, Kind::Pull, "Pull", every.clone());
+        entries.extend(
+            [
+                Some(menu::item(IconName::RefreshCw, "Fetch now", run(Self::fetch_now))),
+                pull.map(|e| e.hint("Fast-forward")),
+                kind(IconName::ArrowUp, Kind::Push, "Push", every.clone()),
+                Some(
+                    menu::item(
+                        IconName::GitCompareArrows,
+                        "Update from base",
+                        run(Self::update_from_base),
+                    )
+                    .hint("Agent"),
+                ),
+                Some(Entry::Sep),
+                kind(
+                    IconName::GitPullRequestCreate,
+                    Kind::CreatePr,
+                    "Create or update PRs",
+                    every.clone(),
+                ),
+                kind(
+                    IconName::GitPullRequestDraft,
+                    Kind::CreateDraftPr,
+                    "Create draft PRs",
+                    every,
+                ),
+                each_or_all(IconName::GitPullRequest, "Open pull request", prs, open),
+                kind(
+                    IconName::GitMerge,
+                    Kind::Merge,
+                    "Merge PRs…",
+                    rows(&|r| Some(format!("#{}", r.open_pr()?.number))),
+                ),
+            ]
+            .into_iter()
+            .flatten(),
+        );
         if self.repos.len() > 1 {
             // Each repo's possible moves, in merge order: the first can't go earlier.
             let n = self.merge_order.len();
@@ -981,6 +994,30 @@ impl GitSync {
         self.menu = Some((m, sub));
         cx.notify();
     }
+}
+
+#[cfg(test)]
+fn open_pr(repo: &str, number: u64) -> Pr {
+    Pr {
+        url: format!("https://github.com/o/{repo}/pull/{number}"),
+        number,
+        state: PrState::Open,
+        draft: false,
+        merge_state: "CLEAN".into(),
+        review: String::new(),
+        checks: status::Checks::Passing,
+        head: "h".into(),
+        change_requests: vec![],
+        comments: vec![],
+        contains_head: String::new(),
+    }
+}
+
+/// Open PRs in the repos named in `rs` (empty: all), as [`execute`] targets them.
+fn open_prs_in(repos: &[Repo], rs: &[String]) -> usize {
+    (repos.iter())
+        .filter(|r| (rs.is_empty() || rs.contains(&r.name)) && r.open_pr().is_some())
+        .count()
 }
 
 enum Outcome {
@@ -1264,6 +1301,10 @@ impl Render for GitSync {
                 // the "ago" times are current.
                 div()
                     .id("git-next-tip")
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(|s, _: &MouseDownEvent, w, cx| s.open_menu(w, cx)),
+                    )
                     .tooltip(move |w, cx| {
                         let text = this.upgrade().map(|s| s.read(cx).tooltip(cx));
                         Tooltip::new(text.unwrap_or_default()).build(w, cx)
@@ -1309,6 +1350,20 @@ impl Render for GitSync {
 #[cfg(test)]
 mod tests {
     use super::{Action, Kind, Local, Pr, background_answer, fresh_or_last, needs_you};
+
+    #[test]
+    fn merge_confirm_counts_only_chosen_repos() {
+        let repo = |name: &str, pr: Option<u64>| super::Repo {
+            name: name.into(),
+            base: "origin/main".into(),
+            local: Ok(Local::default()),
+            pr: Some(Ok(pr.map(|n| super::open_pr(name, n)))),
+        };
+        let repos = [repo("api", Some(1)), repo("web", Some(2)), repo("docs", None)];
+        assert_eq!(super::open_prs_in(&repos, &[]), 2, "empty is all");
+        assert_eq!(super::open_prs_in(&repos, &["web".into()]), 1);
+        assert_eq!(super::open_prs_in(&repos, &["docs".into()]), 0);
+    }
 
     #[test]
     fn what_needs_you() {
