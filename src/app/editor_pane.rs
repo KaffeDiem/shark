@@ -1,13 +1,36 @@
 //! The file editor next to the chat.
 use super::*;
 
+pub(super) struct FileTab {
+    pub(super) editor: Entity<FileEditor>,
+    header: (bool, bool, &'static str, String),
+    _subs: Vec<Subscription>,
+}
+
 impl Shark {
     pub(super) fn open_file(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_file_in_tab(ix, false, window, cx);
+    }
+
+    pub(super) fn open_file_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_file_in_tab(ix, true, window, cx);
+    }
+
+    fn open_file_in_tab(
+        &mut self,
+        ix: usize,
+        new_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(f) = self.diff_files.get(ix) else {
             return;
         };
         let path = f.path().to_string();
-        let open = (self.editor.as_ref()).is_some_and(|e| e.read(cx).path == path);
+        let open = self
+            .file_tabs
+            .iter()
+            .any(|t| t.editor.read(cx).path == path);
         if !open && (f.status() == DiffFileStatus::Deleted || f.is_binary()) {
             return notify_err(
                 window,
@@ -15,22 +38,44 @@ impl Shark {
                 format!("{path} is deleted or binary; it shows in the diff only"),
             );
         }
-        self.open_path(path, window, cx)
+        if new_tab {
+            self.open_path_tab(path, window, cx);
+        } else {
+            self.open_path(path, window, cx);
+        }
     }
 
-    /// Opens `repo/rel/path` of the open workspace in the editor next to the chat.
+    /// Opens `repo/rel/path`, replacing the selected file after confirming unsaved edits.
     pub(super) fn open_path(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws() else {
-            return;
-        };
-        if self
-            .editor
-            .as_ref()
-            .is_some_and(|e| e.read(cx).path == path)
+        self.open_path_in_tab(path, false, window, cx);
+    }
+
+    pub(super) fn open_path_tab(
+        &mut self,
+        path: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_path_in_tab(path, true, window, cx);
+    }
+
+    fn open_path_in_tab(
+        &mut self,
+        path: String,
+        new_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ws) = self.active_ws() else { return };
+        if let Some(ix) = self
+            .file_tabs
+            .iter()
+            .position(|t| t.editor.read(cx).path == path)
         {
-            return self.show(Tab::File, window, cx);
+            return self.select_file(ix, window, cx);
         }
-        if (self.editing.as_ref()).is_some_and(|e| e.path.as_str() == path && e.dirty) {
+        if (self.editing.as_ref()).is_some_and(|e| e.path.as_str() == path && (e.dirty || e.saving))
+        {
             return notify_err(window, cx, format!("{path} has unsaved edits in the diff"));
         }
         let abs = ws.dir().join(&path);
@@ -41,59 +86,128 @@ impl Shark {
                 format!("{path} is too large to edit; it shows in the diff only"),
             );
         }
-        self.confirm_discard(true, false, window, cx, move |s, window, cx| {
-            let vim = s.state.vim;
-            let editor = cx.new(|cx| FileEditor::new(path, abs, vim, window, cx));
-            s._editor_subs = vec![
-                cx.subscribe_in(
-                    &editor,
-                    window,
-                    |s, _, ev: &EditorEvent, window, cx| match ev {
-                        EditorEvent::Saved => s.refresh_diff(cx),
-                        EditorEvent::Leave => {
-                            let pane = if s.show_tree { Pane::Tree } else { Pane::Chat };
-                            s.focus_pane(pane, window, cx)
+        let replacing = (!new_tab).then(|| self.editor.clone()).flatten();
+        self.confirm_editors(
+            replacing.iter().cloned().collect(),
+            false,
+            window,
+            cx,
+            move |s, window, cx| {
+                let vim = s.state.vim;
+                let editor = cx.new(|cx| FileEditor::new(path, abs, vim, window, cx));
+                let subs = vec![
+                    cx.subscribe_in(
+                        &editor,
+                        window,
+                        |s, editor, ev: &EditorEvent, window, cx| match ev {
+                            EditorEvent::Saved => s.refresh_diff(cx),
+                            EditorEvent::Close => s.close_editor(editor.clone(), window, cx),
+                            EditorEvent::Leave if s.editor.as_ref() == Some(editor) => {
+                                let pane = if s.show_tree { Pane::Tree } else { Pane::Chat };
+                                s.focus_pane(pane, window, cx)
+                            }
+                            EditorEvent::Leave => {}
+                        },
+                    ),
+                    cx.observe(&editor, |s, editor, cx| {
+                        let Some(tab) = s.file_tabs.iter_mut().find(|t| t.editor == editor) else {
+                            return;
+                        };
+                        let e = editor.read(cx);
+                        let header = (
+                            e.dirty,
+                            e.conflict,
+                            e.vim.status(),
+                            e.vim.pending().to_string(),
+                        );
+                        if header != tab.header {
+                            tab.header = header;
+                            cx.notify();
                         }
-                    },
-                ),
-                cx.observe(&editor, |s, editor, cx| {
-                    let e = editor.read(cx);
-                    let header = (
-                        e.dirty,
-                        e.conflict,
-                        e.vim.status(),
-                        e.vim.pending().to_string(),
-                    );
-                    if header != s.editor_header {
-                        s.editor_header = header;
-                        cx.notify();
-                    }
-                }),
-            ];
-            s.editor = Some(editor);
-            if !s.rail {
-                s.rail = true;
-                s.rail_auto = true;
-            }
-            s.show(Tab::File, window, cx);
-        });
+                    }),
+                ];
+                let tab = FileTab {
+                    editor: editor.clone(),
+                    header: Default::default(),
+                    _subs: subs,
+                };
+                if let Some(ix) = s
+                    .file_tabs
+                    .iter()
+                    .position(|t| Some(&t.editor) == replacing.as_ref())
+                {
+                    s.file_tabs[ix] = tab;
+                } else {
+                    s.file_tabs.push(tab);
+                }
+                s.editor = Some(editor);
+                if !s.rail {
+                    s.rail = true;
+                    s.rail_auto = true;
+                }
+                s.show(Tab::File, window, cx);
+            },
+        );
+    }
+
+    pub(super) fn select_file(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(tab) = self.file_tabs.get(ix) else {
+            return;
+        };
+        let path = tab.editor.read(cx).path.clone();
+        if self
+            .editing
+            .as_ref()
+            .is_some_and(|e| e.path.as_str() == path && (e.dirty || e.saving))
+        {
+            return notify_err(window, cx, format!("{path} has unsaved edits in the diff"));
+        }
+        self.editor = Some(tab.editor.clone());
+        self.show(Tab::File, window, cx);
     }
 
     pub(super) fn close_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.editor.is_none() {
+        let Some(editor) = self.editor.clone() else {
             return;
-        }
-        self.confirm_discard(true, false, window, cx, |s, window, cx| {
-            s.drop_editor();
-            if s.tab == Tab::File {
-                s.show(Tab::Diff, window, cx);
-            }
-        });
+        };
+        self.close_editor(editor, window, cx);
+    }
+
+    pub(super) fn close_editor(
+        &mut self,
+        editor: Entity<FileEditor>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.confirm_editors(
+            vec![editor.clone()],
+            false,
+            window,
+            cx,
+            move |s, window, cx| {
+                let Some(ix) = s.file_tabs.iter().position(|t| t.editor == editor) else {
+                    return;
+                };
+                s.file_tabs.remove(ix);
+                if s.file_tabs.is_empty() {
+                    s.drop_editor();
+                    if s.tab == Tab::File {
+                        s.show(Tab::Diff, window, cx);
+                    }
+                } else if s.editor.as_ref() == Some(&editor) {
+                    s.editor = Some(s.file_tabs[ix.min(s.file_tabs.len() - 1)].editor.clone());
+                    if s.tab == Tab::File {
+                        s.show(Tab::File, window, cx);
+                    }
+                }
+                cx.notify();
+            },
+        );
     }
 
     pub(super) fn drop_editor(&mut self) {
         self.editor = None;
-        self._editor_subs.clear();
+        self.file_tabs.clear();
         if self.rail_auto {
             self.rail = false;
             self.rail_auto = false;
@@ -118,7 +232,7 @@ impl Shark {
         ran.replace(true)
     }
 
-    /// Runs `then` now, or after the user agrees to drop the unsaved edits of the open file
+    /// Runs `then` now, or after the user agrees to drop unsaved edits in all file tabs
     /// (`editor`) and of the file edited in the diff (`edit`).
     pub(super) fn confirm_discard(
         &mut self,
@@ -128,17 +242,38 @@ impl Shark {
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut Shark, &mut Window, &mut Context<Shark>) + 'static,
     ) {
-        let open = (self.editor.as_ref())
-            .filter(|e| editor && e.read(cx).dirty)
+        let editors = self
+            .file_tabs
+            .iter()
+            .filter(|_| editor)
+            .map(|t| t.editor.clone())
+            .collect();
+        self.confirm_editors(editors, edit, window, cx, then);
+    }
+
+    fn confirm_editors(
+        &mut self,
+        editors: Vec<Entity<FileEditor>>,
+        edit: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Shark, &mut Window, &mut Context<Shark>) + 'static,
+    ) {
+        let open = editors
+            .iter()
+            .filter(|e| e.read(cx).dirty)
             .map(|e| e.read(cx).path.clone());
         // A write under way would land after a Discard; wait for it.
+        if let Some(editor) = editors.iter().find(|e| e.read(cx).saving) {
+            return window.push_notification(format!("Saving {}…", editor.read(cx).path), cx);
+        }
         if let Some(e) = self.editing.as_ref().filter(|e| edit && e.saving) {
             return window.push_notification(format!("Saving {}…", e.path), cx);
         }
         let inline = (self.editing.as_ref())
             .filter(|e| edit && e.dirty)
             .map(|e| e.path.to_string());
-        let paths: Vec<String> = open.into_iter().chain(inline).collect();
+        let paths: Vec<String> = open.chain(inline).collect();
         if paths.is_empty() {
             return then(self, window, cx);
         }
@@ -149,7 +284,7 @@ impl Shark {
             "Discard",
             move |s, window, cx| {
                 if let Some(f) = then.borrow_mut().take() {
-                    if let Some(e) = s.editor.as_ref().filter(|_| editor) {
+                    for e in &editors {
                         e.update(cx, |e, _| e.dirty = false);
                     }
                     if let Some(e) = s.editing.as_mut().filter(|_| edit) {
@@ -173,8 +308,8 @@ impl Shark {
     pub(crate) fn set_vim(&mut self, on: bool, cx: &mut Context<Self>) {
         self.state.vim = on;
         self.state.save();
-        if let Some(e) = &self.editor {
-            e.update(cx, |e, cx| e.set_vim(on, cx));
+        for tab in &self.file_tabs {
+            tab.editor.update(cx, |e, cx| e.set_vim(on, cx));
         }
         for c in self.chats.values() {
             c.update(cx, |c, cx| c.set_vim(on, cx));

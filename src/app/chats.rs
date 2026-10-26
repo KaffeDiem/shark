@@ -24,6 +24,28 @@ pub(super) fn dot(inset: f32, theme: &Theme) -> Div {
 }
 
 impl Shark {
+    fn active_tab_index(&self) -> Option<usize> {
+        let ws = self.active_ws()?;
+        Some(match self.tab {
+            Tab::Chat => ws.active_chat,
+            Tab::Diff => ws.chats.len(),
+            Tab::File => {
+                ws.chats.len()
+                    + 1
+                    + self
+                        .file_tabs
+                        .iter()
+                        .position(|t| Some(&t.editor) == self.editor.as_ref())?
+            }
+        })
+    }
+
+    pub(super) fn reveal_tab(&self) {
+        if let Some(active) = self.active_tab_index() {
+            self.tab_scroll.scroll_to_item(active);
+        }
+    }
+
     /// The chat entity for `meta`, started (transcript replayed) on first use.
     pub(super) fn ensure_chat(
         &mut self,
@@ -192,6 +214,28 @@ impl Shark {
         }
     }
 
+    /// Ctrl-tab follows the visible strip: chats, Diff, then open files.
+    pub(super) fn cycle_tab(&mut self, d: isize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.home_shown() {
+            return self.cycle_chat(d, window, cx);
+        }
+        let Some(ws) = self.active_ws() else { return };
+        let chats = ws.chats.len();
+        let Some(active) = self.active_tab_index() else {
+            return;
+        };
+        let next =
+            (active as isize + d).rem_euclid((chats + 1 + self.file_tabs.len()) as isize) as usize;
+        if next < chats {
+            self.select_chat(next, window, cx);
+            self.show(Tab::Chat, window, cx);
+        } else if next == chats {
+            self.show(Tab::Diff, window, cx);
+        } else {
+            self.select_file(next - chats - 1, window, cx);
+        }
+    }
+
     /// cmd-t: a new tab right of the current one, on the last picked model and thinking level
     /// and the current chat's speed.
     pub(super) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -210,7 +254,18 @@ impl Shark {
         self.select_chat(at, window, cx);
     }
 
-    /// cmd-w: closes the shown chat, asking first if it's running. The last tab gives way to a
+    pub(super) fn close_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.home_shown() {
+            return;
+        }
+        match self.tab {
+            Tab::File => self.close_file(window, cx),
+            Tab::Diff => self.show(Tab::Chat, window, cx),
+            Tab::Chat => self.close_chat(window, cx),
+        }
+    }
+
+    /// Closes the shown chat, asking first if it's running. The last tab gives way to a
     /// fresh one, so a workspace always has a chat.
     pub(super) fn close_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // The chat isn't on screen.
@@ -502,14 +557,18 @@ impl Shark {
         ws: &Workspace,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let mut hidden: Vec<usize> = (0..ws.chats.len())
+        let mut hidden: Vec<usize> = (0..ws.chats.len() + 1 + self.file_tabs.len())
             .filter(|&ix| self.tab_hidden(ix) == edge)
             .collect();
         if edge == Ordering::Less {
             hidden.reverse(); // nearest first
         }
         let unread: Vec<usize> = (hidden.iter().copied())
-            .filter(|&ix| self.unread.contains(&ws.chats[ix].id))
+            .filter(|&ix| {
+                ws.chats
+                    .get(ix)
+                    .is_some_and(|c| self.unread.contains(&c.id))
+            })
             .collect();
         let to = *unread.first().or(hidden.first())?;
         let theme = cx.theme();
@@ -542,13 +601,8 @@ impl Shark {
         )
     }
 
-    /// One titlebar tab per chat; a single chat reads "Chat" as before.
-    /// Too many to fit, and the strip scrolls sideways between edge arrows.
-    pub(super) fn render_chat_tabs(
-        &self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> Vec<AnyElement> {
+    /// Chats, Diff and files share equal-width tabs; overflow scrolls between edge arrows.
+    pub(super) fn render_tabs(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let Some(ws) = self.active_ws() else {
             return vec![];
         };
@@ -557,7 +611,7 @@ impl Shark {
         let (accent, accent_foreground) = (theme.accent, theme.accent_foreground);
         let m = window.modifiers();
         let ctrl_held = m.control && m.number_of_modifiers() == 1;
-        let pills: Vec<AnyElement> = (ws.chats.iter().enumerate())
+        let mut pills: Vec<AnyElement> = (ws.chats.iter().enumerate())
             .map(|(ix, meta)| {
                 let chat = self.chats.get(&meta.id).map(|c| c.read(cx));
                 let on = ix == ws.active_chat && self.tab == Tab::Chat;
@@ -597,6 +651,7 @@ impl Shark {
                         .into_any_element(),
                 };
                 pill(format!("chat-tab-{}", meta.id), on, theme)
+                    .aria_label(label.clone())
                     .flex_none()
                     .pl_2p5()
                     .when(!(many && current), |d| d.pr_2p5())
@@ -638,7 +693,8 @@ impl Shark {
                         }),
                     )
                     .child(icon)
-                    .child(div().min_w_0().max_w(px(180.)).truncate().child(label))
+                    .child(tab_label(label.clone(), on, theme))
+                    .tooltip(move |w, cx| Tooltip::new(label.clone()).build(w, cx))
                     .when(many && current, |d| {
                         d.child(
                             crate::settings::close_button("close-chat", "Close chat (cmd-w)")
@@ -652,18 +708,107 @@ impl Shark {
                     .into_any_element()
             })
             .collect();
+        pills.push(
+            pill("diff-tab", self.tab == Tab::Diff, theme)
+                .aria_label("Diff")
+                .px_2p5()
+                .on_click(cx.listener(|this, _, w, cx| this.show(Tab::Diff, w, cx)))
+                .child(Icon::new(IconName::GitCompare).with_size(px(14.)))
+                .child(tab_label("Diff".into(), self.tab == Tab::Diff, theme))
+                .tooltip(|w, cx| Tooltip::new("Diff (cmd-shift-d)").build(w, cx))
+                .test_support()
+                .into_any_element(),
+        );
+        pills.extend(self.file_tabs.iter().enumerate().map(|(ix, file)| {
+            let e = file.editor.read(cx);
+            let path = e.path.clone();
+            let name: SharedString = path.rsplit('/').next().unwrap_or(&path).to_string().into();
+            let on = self.tab == Tab::File && self.editor.as_ref() == Some(&file.editor);
+            pill(format!("file-tab-{path}"), on, theme)
+                .aria_label(path.clone())
+                .pl_2p5()
+                .pr_1()
+                .on_click(cx.listener(move |this, _, w, cx| this.select_file(ix, w, cx)))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, e: &MouseDownEvent, w, cx| {
+                        this.select_file(ix, w, cx);
+                        let entries = this.editor_menu(cx);
+                        this.show_menu(e.position, entries, w, cx);
+                    }),
+                )
+                .child(Icon::new(IconName::FileCode).with_size(px(14.)))
+                .child(tab_label(name, on, theme))
+                .when(e.dirty, |d| {
+                    d.child(
+                        div()
+                            .flex_none()
+                            .size(px(6.))
+                            .rounded_full()
+                            .bg(theme.foreground),
+                    )
+                })
+                .child(
+                    crate::settings::close_button("close-file-tab", "Close file (cmd-w)").on_click(
+                        cx.listener(move |this, _, w, cx| {
+                            cx.stop_propagation();
+                            if let Some(editor) = this.file_tabs.get(ix).map(|t| t.editor.clone()) {
+                                this.close_editor(editor, w, cx);
+                            }
+                        }),
+                    ),
+                )
+                .tooltip(move |w, cx| Tooltip::new(path.clone()).build(w, cx))
+                .test_support()
+                .into_any_element()
+        }));
+        let (layout, scroll) = (self.tab_layout.clone(), self.tab_scroll.clone());
+        let active = self.active_tab_index().unwrap_or(0);
         let strip = h_flex()
+            .on_children_prepainted(move |children, window, cx| {
+                let next = (scroll.bounds().size.width, children.len());
+                if layout.replace(next) != next {
+                    // A resize or removed tab can hide the selection without changing it.
+                    let scroll = scroll.clone();
+                    window.defer(cx, move |window, _| {
+                        scroll.scroll_to_item(active);
+                        window.refresh();
+                    });
+                }
+            })
             .id("chat-tabs")
+            .role(Role::TabList)
+            .aria_label("Workspace tabs")
+            .test_support()
             .min_w_0()
             .gap_1()
             .overflow_x_scroll()
             .track_scroll(&self.tab_scroll)
             .children(pills)
             .into_any_element();
-        let mut tabs: Vec<AnyElement> = (self.tab_edge(Ordering::Less, ws, cx).into_iter())
-            .chain([strip])
-            .chain(self.tab_edge(Ordering::Greater, ws, cx))
-            .collect();
+        let left = self.tab_edge(Ordering::Less, ws, cx);
+        let right = self.tab_edge(Ordering::Greater, ws, cx);
+        let overflow = left.is_some() || right.is_some();
+        let mut tabs = vec![];
+        if overflow {
+            tabs.push(
+                div()
+                    .w(px(24.))
+                    .flex_none()
+                    .children(left)
+                    .into_any_element(),
+            );
+        }
+        tabs.push(strip);
+        if overflow {
+            tabs.push(
+                div()
+                    .w(px(24.))
+                    .flex_none()
+                    .children(right)
+                    .into_any_element(),
+            );
+        }
         tabs.push(
             Button::new("new-chat")
                 .ghost()

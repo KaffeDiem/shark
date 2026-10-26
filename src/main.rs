@@ -94,9 +94,12 @@ actions!(
         FocusQueue,
         NewChat,
         CloseChat,
+        CloseTab,
         ReopenChat,
         NextChat,
         PrevChat,
+        NextTab,
+        PrevTab,
         AskSide,
         OpenSide,
         CloseSide,
@@ -241,14 +244,14 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-s", SaveFile, Some("FileEditor")),
         KeyBinding::new("cmd-w", CloseFile, Some("FileEditor")),
         KeyBinding::new("cmd-t", NewChat, None),
-        KeyBinding::new("cmd-w", CloseChat, None),
+        KeyBinding::new("cmd-w", CloseTab, None),
         KeyBinding::new("cmd-shift-t", ReopenChat, None),
         KeyBinding::new("cmd-shift-]", NextChat, None),
         KeyBinding::new("cmd-shift-[", PrevChat, None),
         KeyBinding::new("cmd-}", NextChat, None),
         KeyBinding::new("cmd-{", PrevChat, None),
-        KeyBinding::new("ctrl-tab", NextChat, None),
-        KeyBinding::new("ctrl-shift-tab", PrevChat, None),
+        KeyBinding::new("ctrl-tab", NextTab, None),
+        KeyBinding::new("ctrl-shift-tab", PrevTab, None),
         KeyBinding::new("cmd-shift-enter", AskSide, Some("Composer")),
         KeyBinding::new("escape", CloseSide, Some("SideAnswer")),
         KeyBinding::new("c", CopySide, Some("SideAnswer")),
@@ -438,6 +441,11 @@ fn set_dock_icon() {
 }
 
 fn main() {
+    if cfg!(test) {
+        #[cfg(all(test, feature = "test-support"))]
+        app::ui_tests::chrome_tests::render_pixels();
+        return;
+    }
     // Apps launched from Finder get a minimal PATH; borrow the login shell's so claude/gh/git
     // resolve. The dependency check shows the error.
     match deps::login_path() {

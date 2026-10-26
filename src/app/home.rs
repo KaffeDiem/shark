@@ -555,16 +555,24 @@ impl Shark {
     }
 
     /// The Home row at the top of the sidebar.
-    pub(super) fn render_home_row(&self, rail: bool, cx: &Context<Self>) -> impl IntoElement {
+    pub(super) fn render_home_row(
+        &self,
+        rail: bool,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> impl IntoElement {
         let theme = cx.theme();
+        let modifiers = window.modifiers();
+        let cmd_held = modifiers.platform && modifiers.number_of_modifiers() == 1;
         side_row(theme)
             .id("home-row")
             .when(rail, super::sidebar::rail_button)
             .map(|d| cursor_row(d, self.home_shown(), false, false, theme))
             .when(self.home_shown(), |d| d.font_weight(FontWeight::MEDIUM))
             .child(Icon::new(IconName::House).with_size(px(16.)))
-            .when(!rail, |d| {
-                d.child(div().flex_1().child("Home")).child(
+            .when(!rail, |d| d.child("Home"))
+            .when(!rail && cmd_held, |d| {
+                d.child(
                     kbd("cmd-0")
                         .appearance(false)
                         .text_xs()

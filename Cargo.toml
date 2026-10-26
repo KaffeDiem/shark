@@ -33,3 +33,11 @@ opt-level = 3
 # Headless UI tests: cargo test --features test-support
 test-support = ["gpui-kit/test-support"]
 
+# Real Metal rendering needs the main thread; opt in with --test rendering.
+[[test]]
+name = "rendering"
+path = "tests/rendering.rs"
+harness = false
+test = false
+required-features = ["test-support"]
+

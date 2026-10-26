@@ -1046,10 +1046,10 @@ impl Shark {
                     .flex_none()
                     .when(rail, |d| d.pt(px(8.)))
                     .child(
-                        div()
+                        h_flex()
                             .flex_1()
                             .min_w_0()
-                            .child(self.render_home_row(rail, cx)),
+                            .child(self.render_home_row(rail, window, cx)),
                     )
                     .when(!rail, |d| {
                         d.child(

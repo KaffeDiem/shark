@@ -204,6 +204,27 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| s.cycle_chat(-1, w, cx),
     ),
     Row(
+        "Close tab",
+        IconName::X,
+        Some(&CloseTab),
+        "chat diff file",
+        |s, w, cx| s.close_tab(w, cx),
+    ),
+    Row(
+        "Next tab",
+        IconName::ChevronRight,
+        Some(&NextTab),
+        "chat diff file",
+        |s, w, cx| s.cycle_tab(1, w, cx),
+    ),
+    Row(
+        "Previous tab",
+        IconName::ChevronLeft,
+        Some(&PrevTab),
+        "chat diff file",
+        |s, w, cx| s.cycle_tab(-1, w, cx),
+    ),
+    Row(
         "Ask a side question",
         IconName::MessageCircleQuestionMark,
         Some(&OpenSide),
