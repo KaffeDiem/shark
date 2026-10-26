@@ -1586,6 +1586,25 @@ async fn open_in_apps(cx: &mut TestAppContext) {
             ("Open in Xcode".into(), Some("ios/App.xcodeproj".into()), vec![]),
         ]
     );
+    // "Add repo" lists only the repos the workspace lacks, and hides when there are none.
+    let add_repo = |cx: &mut TestAppContext, ws: &str| {
+        shark.update(cx, |s, cx| {
+            let ws = s.ws(ws).unwrap().clone();
+            (ws_menu(s, &ws, cx).into_iter()).find_map(|e| match e {
+                Entry::Sub { label, entries, .. } if label == "Add repo" => Some(
+                    (entries.iter())
+                        .filter_map(|r| match r {
+                            Entry::Item { label, .. } => Some(label.to_string()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>(),
+                ),
+                _ => None,
+            })
+        })
+    };
+    assert_eq!(add_repo(cx, "web-only"), Some(s(&["ios"])));
+    assert_eq!(add_repo(cx, "both"), None);
     let web_only = menu_of(cx, "web-only");
     assert!(web_only.iter().all(|e| e.0 != "Open in Xcode"), "no project, no Xcode");
     assert!(

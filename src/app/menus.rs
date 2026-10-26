@@ -96,7 +96,7 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
         .collect();
     let (n1, n2, n3) = (ws.name.clone(), ws.name.clone(), ws.name.clone());
     let mut entries = vec![];
-    if this.active.as_deref() != Some(ws.name.as_str()) {
+    if this.home_shown() || this.active.as_deref() != Some(ws.name.as_str()) {
         // By name: the list can change under an open menu (a background auto-archive).
         entries.push(menu::item(
             IconName::MessageSquare,
@@ -108,8 +108,24 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
             }),
         ));
     }
+    entries.push(move_submenu(this, &ws.name, cx));
+    let missing: Vec<Entry> = (this.state.repos.iter())
+        .filter(|r| !ws.repos.iter().any(|w| w.name == r.name))
+        .map(|r| {
+            let (name, repo) = (ws.name.clone(), r.clone());
+            menu::item(
+                IconName::FolderGit2,
+                r.name.clone(),
+                on_shark(cx, move |s, w, cx| {
+                    s.add_repo_to_workspace(name.clone(), repo.clone(), w, cx)
+                }),
+            )
+        })
+        .collect();
+    if !missing.is_empty() {
+        entries.push(menu::sub(IconName::FolderPlus, "Add repo", missing));
+    }
     entries.extend([
-        move_submenu(this, &ws.name, cx),
         Entry::Sep,
         path_submenu(
             IconName::FolderOpen,
@@ -131,8 +147,7 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
             IconName::Archive,
             "Archive",
             on_shark(cx, move |s, w, cx| s.archive_ws(n2.clone(), false, w, cx)),
-        )
-        .hint("⌘⌫"),
+        ),
         menu::item(
             IconName::ArchiveX,
             "Force archive…",
