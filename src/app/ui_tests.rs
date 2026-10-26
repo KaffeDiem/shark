@@ -1879,6 +1879,198 @@ async fn many_tabs_scroll(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
+/// Titlebar controls stay usable on Home and beside overflowing tabs, at either sidebar width.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn titlebar_controls(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    for width in [800., 1000., 1440.] {
+        let (window, shark) = boot(
+            cx,
+            State {
+                repos: repos.clone(),
+                ..Default::default()
+            },
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(width), px(700.)),
+                ))),
+                ..Default::default()
+            },
+        );
+        let press = press_in(window);
+        let on = on_app(window, shark.clone());
+        let check_controls =
+            |cx: &mut TestAppContext, rail: bool| {
+                cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                for id in ["toggle-sidebar", "new-workspace"] {
+                    let controls = w.find_all(id);
+                    assert_eq!(controls.len(), 1, "one {id}, rail={rail}, width={width}");
+                    assert!(
+                        controls[0].visible(),
+                        "visible {id}, rail={rail}, width={width}"
+                    );
+                }
+                let toggle = w.find("toggle-sidebar").bounds();
+                assert_eq!(toggle.origin, point(px(80.), px(8.)));
+                assert_eq!(toggle.size, size(px(32.), px(28.)));
+                let titlebar = w.find("workspace-titlebar").bounds();
+                assert_eq!(titlebar.top(), px(0.));
+                assert_eq!(titlebar.size.height, px(44.));
+                assert_eq!(w.find("content-island").bounds().top(), titlebar.bottom());
+                assert!(cx.theme().notification.margins.top >= titlebar.bottom() + px(44.),
+                    "toasts clear the titlebar and workspace toolbar");
+                let create = w.find("new-workspace").bounds();
+                if rail {
+                    assert_eq!(create.left(), px(116.));
+                    assert_eq!(create.center().y, toggle.center().y);
+                    assert!(create.left() >= toggle.right());
+                } else {
+                    assert!(
+                        create.top() >= px(44.),
+                        "expanded create control is below the titlebar"
+                    );
+                    assert!(create.right() <= w.find("sidebar").bounds().right());
+                    assert_eq!(create.center().y, w.find("home-row").bounds().center().y);
+                }
+                w.click("new-workspace", cx);
+                assert!(
+                    w.has_active_dialog(cx),
+                    "create opens New workspace, rail={rail}, width={width}, tab={:?}, tools={}",
+                    shark.read(cx).tab,
+                    shark.read(cx).tree_shown()
+                );
+                w.close_dialog(cx);
+            })
+            .unwrap();
+                cx.run_until_parked();
+            };
+        // The create action is available before a workspace exists, in both sidebar modes.
+        check_controls(cx, false);
+        press(cx, &["cmd-b"]);
+        check_controls(cx, true);
+        press(cx, &["cmd-b"]);
+        let name = format!("chrome-{}", width as usize);
+        on(cx, &|s, w, cx| {
+            s.create_workspace(
+                name.clone(),
+                git::on_branch(&repos, &name),
+                vec![],
+                None,
+                w,
+                cx,
+            )
+        });
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).active.as_deref() == Some(name.as_str())
+        })
+        .await;
+        for _ in 0..20 {
+            on(cx, &|s, w, cx| s.new_chat(w, cx));
+        }
+        for rail in [false, true] {
+            check_controls(cx, rail);
+            cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                let s = shark.read(cx);
+                let ws = s.active_ws().unwrap();
+                let tab = w.find(SharedString::from(format!(
+                    "chat-tab-{}",
+                    ws.chats[ws.active_chat].id
+                )));
+                let new_chat = w.find("new-chat");
+                assert_eq!(tab.bounds().top(), px(8.));
+                assert_eq!(tab.bounds().size.height, px(28.));
+                assert!(new_chat.visible(), "overflow leaves new-chat visible");
+                assert!(new_chat.bounds().left() >= tab.bounds().right());
+                assert!(new_chat.bounds().right() <= px(width - 72.));
+                if rail {
+                    assert!(tab.bounds().left() >= w.find("new-workspace").bounds().right());
+                }
+                assert_eq!(s.tab_hidden(ws.active_chat), std::cmp::Ordering::Equal);
+                w.click("new-chat", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update(|cx| {
+                let ws = shark.read(cx).active_ws().unwrap();
+                assert_eq!(ws.chats.len(), if rail { 23 } else { 22 });
+                assert_eq!(ws.active_chat, ws.chats.len() - 1);
+            });
+            if !rail {
+                press(cx, &["cmd-b"]);
+            }
+        }
+        let path = format!("api/{}.txt", "long-file-name-".repeat(10));
+        fs::write(
+            home.join("shark/workspaces").join(&name).join(&path),
+            "text\n",
+        )
+        .unwrap();
+        on(cx, &|s, w, cx| s.open_path(path.clone(), w, cx));
+        let chat_tab = cx.update(|cx| {
+            let ws = shark.read(cx).active_ws().unwrap();
+            SharedString::from(format!("chat-tab-{}", ws.chats[ws.active_chat].id))
+        });
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.simulate_next_frame(cx); // Native frames reveal the selected tab after the file changes its viewport.
+            w.render_frame(cx);
+            let file = w.find("file-tab");
+            assert!(file.visible(), "the file tab survives chat overflow");
+            assert_eq!(file.bounds().top(), px(8.));
+            assert_eq!(file.bounds().size.height, px(28.));
+            assert!(file.bounds().left() >= w.find("new-chat").bounds().right());
+            assert!(file.bounds().right() <= w.find("workspace-titlebar").bounds().right());
+            let active = shark.read(cx).active_ws().unwrap().active_chat;
+            assert_eq!(
+                shark.read(cx).tab_hidden(active),
+                std::cmp::Ordering::Equal,
+                "opening a file keeps the selected chat fully visible: chat {:?}, viewport {:?}",
+                w.find(chat_tab.clone()).bounds(),
+                shark.read(cx).tab_scroll.bounds()
+            );
+            w.click(chat_tab, cx);
+            assert_eq!(shark.read(cx).tab, Tab::Chat);
+            w.click("file-tab", cx);
+            assert_eq!(shark.read(cx).tab, Tab::File);
+            assert!(shark.read(cx).editor.is_some());
+        })
+        .unwrap();
+        on(cx, &|s, w, cx| s.toggle_tree(w, cx));
+        for rail in [true, false] {
+            check_controls(cx, rail);
+            cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                let titlebar = w.find("workspace-titlebar").bounds();
+                for id in ["file-tab", "new-chat"] {
+                    let control = w.find(id);
+                    assert!(control.visible(), "visible {id} with Workspace tools open");
+                    assert!(
+                        control.bounds().left() >= titlebar.left(),
+                        "{id} inside titlebar"
+                    );
+                    assert!(
+                        control.bounds().right() <= titlebar.right(),
+                        "{id} inside titlebar"
+                    );
+                }
+            })
+            .unwrap();
+            if rail {
+                press(cx, &["cmd-b"]);
+            }
+        }
+        cx.update_window(window, |_, w, _| w.remove_window())
+            .unwrap();
+    }
+    fs::remove_dir_all(&home).ok();
+}
+
 /// The chat tab's right-click menu: copy only with a session, close only beside another tab.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -3524,7 +3716,7 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
 }
 
 /// The right side beside every tab: a rail whose Diff button replaces the old Changes tab, and
-/// whose toggle expands Workspace tools in place; the sidebar toggle mirrors it, and the
+/// whose toggle expands Workspace tools in place; the sidebar toggle clears the traffic lights, and the
 /// expanded sidebar's dragged width survives a restart.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -3603,19 +3795,16 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
     assert!(bounds(cx, "Changes 1").is_none(), "no Changes tab");
     assert!(bounds(cx, "hide-tree").is_none());
 
-    // Both toggles clear the traffic lights; the expanded sidebar uses the rows' half-rem inset.
+    // The sidebar control shares the traffic-light row; Workspace tools keeps its old position.
     let (left, right) = (
         bounds(cx, "toggle-sidebar").unwrap(),
         bounds(cx, "show-tree").unwrap(),
     );
     assert_eq!(left.size, size(px(32.), px(28.)));
     assert_eq!(right.size, left.size);
-    assert_eq!(right.top(), left.top());
-    assert_eq!(left.top(), px(34.));
-    let row_inset = cx
-        .update_window(window, |_, w, _| w.rem_size() * 0.5)
-        .unwrap();
-    assert_eq!(left.left(), row_inset);
+    assert_eq!(left.top(), px(8.));
+    assert_eq!(left.left(), px(80.));
+    assert_eq!(right.top(), px(34.));
     assert_eq!(px(1440.) - right.right(), px(20.));
     let diff_button = bounds(cx, "rail-diff").unwrap();
     assert_eq!(right.center().x, diff_button.center().x);
@@ -3647,18 +3836,15 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
     press(cx, &["cmd-shift-d"]);
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Diff));
 
-    // Collapsed, the sidebar toggle centers over the rail's buttons; expanded, it follows the rows.
+    // The sidebar control stays put when it moves from the sidebar into the main titlebar.
     click(cx, "toggle-sidebar");
     cx.update(|cx| assert!(shark.read(cx).rail));
     let collapsed = bounds(cx, "toggle-sidebar").unwrap();
     assert_eq!(collapsed.size, left.size);
     assert_eq!(collapsed.top(), left.top());
-    assert_eq!(collapsed.left(), px(20.));
+    assert_eq!(collapsed, left);
     assert_eq!(bounds(cx, "sidebar").unwrap().size.width, px(72.));
-    assert_eq!(
-        collapsed.center().x,
-        bounds(cx, "sidebar").unwrap().center().x
-    );
+    assert!(collapsed.left() >= bounds(cx, "sidebar").unwrap().right());
     assert_eq!(bounds(cx, "show-tree"), Some(right));
     click(cx, "show-tree");
     assert_eq!(bounds(cx, "hide-tree"), Some(right));

@@ -542,7 +542,7 @@ impl Shark {
         )
     }
 
-    /// One pill per chat, like the Diff and file tabs; a single chat reads "Chat" as before.
+    /// One titlebar tab per chat; a single chat reads "Chat" as before.
     /// Too many to fit, and the strip scrolls sideways between edge arrows.
     pub(super) fn render_chat_tabs(
         &self,
@@ -638,7 +638,7 @@ impl Shark {
                         }),
                     )
                     .child(icon)
-                    .child(div().max_w(px(180.)).truncate().child(label))
+                    .child(div().min_w_0().max_w(px(180.)).truncate().child(label))
                     .when(many && current, |d| {
                         d.child(
                             crate::settings::close_button("close-chat", "Close chat (cmd-w)")

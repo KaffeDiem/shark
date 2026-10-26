@@ -1022,29 +1022,44 @@ impl Shark {
                     this.set_collapsed(i, false, cx)
                 }
             }))
-            // Room for the traffic lights; the transparent titlebar lets the sidebar run under them.
-            .child(top_strip())
             .child(
                 h_flex()
-                    .h(px(28.))
+                    .h(px(44.))
                     .flex_none()
-                    .pl_2()
-                    .when(rail, |d| d.pl(px(20.)))
-                    .mb(px(if rail { 16. } else { 4. }))
-                    .window_control_area(WindowControlArea::Drag)
                     .child(
-                        side_toggle(
-                            "toggle-sidebar",
-                            match rail {
-                                true => IconName::PanelLeftOpen,
-                                false => IconName::PanelLeftClose,
-                            },
-                            "Toggle sidebar (cmd-b)",
-                        )
-                        .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx))),
+                        div()
+                            .w(px(if rail { 72. } else { 80. }))
+                            .h_full()
+                            .flex_none()
+                            .window_control_area(WindowControlArea::Drag),
+                    )
+                    .when(!rail, |d| d.child(self.render_sidebar_toggle(cx)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .window_control_area(WindowControlArea::Drag),
                     ),
             )
-            .child(self.render_home_row(rail, cx))
+            .child(
+                h_flex()
+                    .flex_none()
+                    .when(rail, |d| d.pt(px(8.)))
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.render_home_row(rail, cx)),
+                    )
+                    .when(!rail, |d| {
+                        d.child(
+                            div()
+                                .mr(px(8.))
+                                .mb_0p5()
+                                .child(self.render_new_workspace(cx)),
+                        )
+                    }),
+            )
             .child(
                 // Children are indexed by `move_sel`: the header, then one per `side_rows` row.
                 v_flex()

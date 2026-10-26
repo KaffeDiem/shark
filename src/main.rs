@@ -458,7 +458,10 @@ fn main() {
             menubar::init(cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
-                titlebar: Some(TitleBar::title_bar_options()),
+                titlebar: Some(TitlebarOptions {
+                    traffic_light_position: Some(point(px(9.), px(15.))),
+                    ..TitleBar::title_bar_options()
+                }),
                 ..Default::default()
             };
             let (window, shark) = open_window(options, cx, |window, cx| {

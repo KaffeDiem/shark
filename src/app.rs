@@ -184,31 +184,35 @@ fn list_cursor_row<E: Styled + InteractiveElement>(
     }
 }
 
-/// A header tab: the Chat, Diff and file pills.
+/// A titlebar tab, raised above the window chrome.
 fn pill(id: impl Into<SharedString>, on: bool, theme: &Theme) -> Stateful<Div> {
     h_flex()
         .id(id.into())
-        .h(px(26.))
+        .h(px(28.))
         .gap_1p5()
-        .rounded_full()
+        .rounded(theme.radius)
         .text_sm()
         .text_color(if on {
             theme.foreground
         } else {
             theme.muted_foreground
         })
-        .when(on, |d| d.bg(theme.secondary))
-        .hover(|d| d.text_color(theme.foreground))
+        .bg(if on {
+            theme.secondary
+        } else {
+            theme.background
+        })
+        .hover(|d| d.bg(theme.secondary_hover).text_color(theme.foreground))
 }
 
-/// A sidebar's show / hide button. Both sit at y 34..62, below the traffic lights.
-/// The left follows the sidebar rows; the right stays 20px from the window edge.
+/// An icon control in the window chrome.
 fn side_toggle(id: &'static str, icon: IconName, tip: &'static str) -> Button {
     Button::new(id)
         .ghost()
         .icon(icon)
         .w(px(32.))
         .h(px(28.))
+        .accessibility_label(tip)
         .tooltip(tip)
 }
 
@@ -548,6 +552,15 @@ impl Shark {
         self.tab = tab;
         self.home.on = false;
         self.remember_open();
+        if let Some(ws) = self.active_ws() {
+            let (scroll, active) = (self.tab_scroll.clone(), ws.active_chat);
+            scroll.scroll_to_item(active);
+            // Adding the file tab changes the viewport; reveal again after that layout.
+            cx.on_next_frame(window, move |_, _, cx| {
+                scroll.scroll_to_item(active);
+                cx.notify();
+            });
+        }
         match tab {
             Tab::Chat => {
                 if let Some(chat) = self.active_chat() {
@@ -699,23 +712,93 @@ impl Shark {
         })
     }
 
+    fn render_sidebar_toggle(&self, cx: &Context<Self>) -> Button {
+        side_toggle(
+            "toggle-sidebar",
+            if self.rail {
+                IconName::PanelLeftOpen
+            } else {
+                IconName::PanelLeftClose
+            },
+            "Toggle sidebar (cmd-b)",
+        )
+        .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
+    }
+
+    fn render_new_workspace(&self, cx: &Context<Self>) -> Button {
+        side_toggle(
+            "new-workspace",
+            IconName::SquarePen,
+            "New workspace (cmd-n)",
+        )
+        .on_click(cx.listener(|this, _, window, cx| {
+            this.new_workspace(this.state.last_repos.clone(), None, window, cx)
+        }))
+    }
+
+    fn render_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let chat_tabs = if self.home_shown() {
+            vec![]
+        } else {
+            self.render_chat_tabs(window, cx)
+        };
+        let theme = cx.theme();
+        let file_tab = self
+            .editor
+            .as_ref()
+            .filter(|_| !self.home_shown())
+            .map(|e| {
+                let path = &e.read(cx).path;
+                path.rsplit('/').next().unwrap_or(path).to_string()
+            });
+        h_flex()
+            .id("workspace-titlebar")
+            .h(px(44.))
+            .flex_none()
+            .px(px(8.))
+            .gap(px(4.))
+            .when(self.rail, |d| {
+                d.child(self.render_sidebar_toggle(cx))
+                    .child(self.render_new_workspace(cx))
+            })
+            .children(chat_tabs)
+            .when_some(file_tab, |d, name| {
+                d.child(
+                    pill("file-tab", self.tab == Tab::File, theme)
+                        .min_w_0()
+                        .px_2p5()
+                        .max_w(px(220.))
+                        .on_click(
+                            cx.listener(|this, _, window, cx| this.show(Tab::File, window, cx)),
+                        )
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, e: &MouseDownEvent, w, cx| {
+                                let entries = this.editor_menu(cx);
+                                this.show_menu(e.position, entries, w, cx);
+                            }),
+                        )
+                        .child(Icon::new(IconName::FileCode).with_size(px(14.)))
+                        .child(div().min_w_0().truncate().child(name))
+                        .test_support(),
+                )
+            })
+            // Native dragging belongs only to unused space, so tabs keep their own drags.
+            .child(
+                div()
+                    .flex_1()
+                    .min_w(px(16.))
+                    .h_full()
+                    .window_control_area(WindowControlArea::Drag),
+            )
+            .test_support()
+    }
+
     fn render_main(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(chat) = self.active_chat().cloned().filter(|_| !self.home_shown()) else {
             return self.render_home(window, cx);
         };
-        let chat_tabs = self.render_chat_tabs(window, cx);
         let theme = cx.theme();
-        let tab = |label: String, icon: IconName, t: Tab| {
-            pill(label.clone(), self.tab == t, theme)
-                .px_2p5()
-                .on_click(cx.listener(move |this, _, window, cx| this.show(t, window, cx)))
-                .child(Icon::new(icon).with_size(px(14.)))
-                .child(label)
-        };
-        let file_tab = self.editor.as_ref().map(|e| {
-            let path = &e.read(cx).path;
-            path.rsplit('/').next().unwrap_or(path).to_string()
-        });
         v_flex()
             .flex_1()
             .min_w_0()
@@ -728,29 +811,17 @@ impl Shark {
                     .gap(px(12.))
                     .border_b_1()
                     .border_color(theme.border)
-                    .children(chat_tabs)
-                    .when_some(file_tab, |d, name| {
-                        d.child(tab(name, IconName::FileCode, Tab::File).on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(|this, e: &MouseDownEvent, w, cx| {
-                                let entries = this.editor_menu(cx);
-                                this.show_menu(e.position, entries, w, cx);
-                            }),
-                        ))
-                    })
-                    // Native window dragging must not capture chat-tab drags.
-                    .child(
-                        div()
-                            .flex_1()
-                            .h_full()
-                            .window_control_area(WindowControlArea::Drag),
-                    )
-                    // Narrow, the branch gives way before the sync buttons.
                     .child(
                         div()
                             .min_w_0()
                             .overflow_hidden()
                             .child(self.render_branch(cx)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .window_control_area(WindowControlArea::Drag),
                     )
                     .when_some(self.active_sync().cloned(), |d, sync| d.child(sync)),
             )
@@ -859,15 +930,19 @@ impl Shark {
 
 impl Render for Shark {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Toasts sit left of the right side, not over its buttons; a theme change resets this.
+        // Toasts clear the titlebar and toolbar, and sit left of the right pane's controls.
         let side = match () {
             _ if self.tree_shown() => (self.tree_resize.read(cx).sizes().get(1).copied())
                 .unwrap_or(px(self.state.tree_width.unwrap_or(244.))),
             _ if self.right_rail_shown() => px(72.),
             _ => px(0.),
         };
-        if cx.theme().notification.margins.right != side + px(16.) {
-            Theme::global_mut(cx).notification.margins.right = side + px(16.);
+        if cx.theme().notification.margins.right != side + px(16.)
+            || cx.theme().notification.margins.top != px(104.)
+        {
+            let margins = &mut Theme::global_mut(cx).notification.margins;
+            margins.right = side + px(16.);
+            margins.top = px(104.);
         }
         if let Some(msg) = self.review.warning.take() {
             cx.defer_in(window, move |_, w, cx| {
@@ -1000,25 +1075,31 @@ impl Render for Shark {
             }))
             .children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))
             .child({
-                // Linear's "island": content floats on the sidebar color, inset and rounded. It
-                // touches a rail; beside an expanded side (or no right side, on Home) an 8px gap
-                // holds the drag edge. Literal px: rem is 15px here.
+                // Content sits below the titlebar, touching a rail or inset 8px beside an expanded pane.
                 let island = div()
                     .size_full()
-                    .py(px(8.))
+                    .pb(px(8.))
+                    .min_h_0()
+                    .flex_1()
                     .when(!self.rail, |d| d.pl(px(8.)))
                     .when(!self.right_rail_shown(), |d| d.pr(px(8.)))
                     .child(
                         h_flex()
+                            .id("content-island")
                             .size_full()
                             .rounded(cx.theme().radius_lg)
                             .border_1()
                             .border_color(cx.theme().border)
                             .bg(cx.theme().background)
                             .overflow_hidden()
-                            .child(self.render_main(window, cx)),
+                            .child(self.render_main(window, cx))
+                            .test_support(),
                     );
-                let main = self.with_tree(island, window, cx).into_any_element();
+                let main = v_flex()
+                    .size_full()
+                    .child(self.render_titlebar(window, cx))
+                    .child(island);
+                let main = self.with_tree(main, window, cx).into_any_element();
                 let sidebar = self.render_sidebar(window, cx).into_any_element();
                 match self.rail {
                     true => h_flex().size_full().child(sidebar).child(main),

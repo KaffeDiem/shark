@@ -575,6 +575,7 @@ impl Shark {
                 d.tooltip(|w, cx| Tooltip::new("Home (cmd-0)").build(w, cx))
             })
             .on_click(cx.listener(|this, _, w, cx| this.enter_home(w, cx)))
+            .test_support()
     }
 
     pub(super) fn render_home(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
