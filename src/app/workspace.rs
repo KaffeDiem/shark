@@ -1132,7 +1132,7 @@ impl Shark {
         };
         let dir = ws.dir();
         // ponytail: for-each-ref on the UI thread; it's a local ref read, move to the background if it lags.
-        let per_repo: Vec<(String, String, Vec<(i64, String)>)> = (ws.repos.iter())
+        let per_repo: Vec<git::RepoBranches> = (ws.repos.iter())
             .filter(|r| repos.contains(&r.name))
             .map(|r| {
                 let own = ws.branch_of(r).to_string();

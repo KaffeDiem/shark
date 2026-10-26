@@ -63,10 +63,23 @@ pub(super) fn questions(input: &Value) -> Vec<Q> {
 }
 
 /// The questions answered, each with its picks and the user's own text joined with ", ".
-fn given<'a>(qs: &'a [Q], answers: &'a [Answer]) -> impl Iterator<Item = (&'a Q, &'a Answer, String)> {
+fn given<'a>(
+    qs: &'a [Q],
+    answers: &'a [Answer],
+) -> impl Iterator<Item = (&'a Q, &'a Answer, String)> {
     (qs.iter().zip(answers))
         .filter(|(_, a)| !a.0.is_empty() || a.1.is_some())
-        .map(|(q, a)| (q, a, a.0.iter().map(String::as_str).chain(a.1.as_deref()).collect::<Vec<_>>().join(", ")))
+        .map(|(q, a)| {
+            (
+                q,
+                a,
+                a.0.iter()
+                    .map(String::as_str)
+                    .chain(a.1.as_deref())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        })
 }
 
 /// What the agent gets back. claude: its input plus `answers` by question text. codex:
@@ -88,8 +101,9 @@ pub(super) fn reply(input: &Value, qs: &[Q], answers: &[Answer], codex: bool) ->
             .collect();
         return json!({ "answers": by_id });
     }
-    let by_text: serde_json::Map<String, Value> =
-        given(qs, answers).map(|(q, _, all)| (q.text.clone(), all.into())).collect();
+    let by_text: serde_json::Map<String, Value> = given(qs, answers)
+        .map(|(q, _, all)| (q.text.clone(), all.into()))
+        .collect();
     let mut updated = input.clone();
     updated["answers"] = by_text.into();
     updated
@@ -99,7 +113,13 @@ pub(super) fn reply(input: &Value, qs: &[Q], answers: &[Answer], codex: bool) ->
 fn pairs(qs: &[Q], answers: &[Answer]) -> String {
     let pairs: Vec<String> = given(qs, answers)
         // Only the agent gets a secret; the row shows that one was given.
-        .map(|(q, _, all)| format!("\"{}\"=\"{}\"", q.text, if q.secret { "••••" } else { &all }))
+        .map(|(q, _, all)| {
+            format!(
+                "\"{}\"=\"{}\"",
+                q.text,
+                if q.secret { "••••" } else { &all }
+            )
+        })
         .collect();
     match pairs.is_empty() {
         true => "No answers".into(),
@@ -216,19 +236,29 @@ impl Chat {
             (QuestionnaireState::new(items, cx).expect("unique names"))
                 .with_shortcuts(QuestionnaireShortcutMode::Numbers)
         });
-        let mut subs = vec![cx.subscribe_in(&form, window, |this, _, ev: &QuestionnaireEvent, window, cx| {
-            if let QuestionnaireEvent::Submit(s) = ev {
-                this.answer_asked(s, window, cx);
-            }
-        })];
+        let mut subs = vec![cx.subscribe_in(
+            &form,
+            window,
+            |this, _, ev: &QuestionnaireEvent, window, cx| {
+                if let QuestionnaireEvent::Submit(s) = ev {
+                    this.answer_asked(s, window, cx);
+                }
+            },
+        )];
         // The form's own enter doesn't reach it from inside the field (the input takes it).
         for other in others {
             let f = form.clone();
-            subs.push(cx.subscribe_in(&other, window, move |_, input, ev: &InputEvent, window, cx| {
-                if matches!(ev, InputEvent::PressEnter { .. }) && !input.read(cx).value().trim().is_empty() {
-                    f.update(cx, |f, cx| f.confirm_current(window, cx));
-                }
-            }));
+            subs.push(cx.subscribe_in(
+                &other,
+                window,
+                move |_, input, ev: &InputEvent, window, cx| {
+                    if matches!(ev, InputEvent::PressEnter { .. })
+                        && !input.read(cx).value().trim().is_empty()
+                    {
+                        f.update(cx, |f, cx| f.confirm_current(window, cx));
+                    }
+                },
+            ));
         }
         let c = self.composer.read(cx);
         let here = self.focus.is_focused(window)
@@ -248,7 +278,9 @@ impl Chat {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(asked) = self.asked.take() else { return };
+        let Some(asked) = self.asked.take() else {
+            return;
+        };
         let answers: Vec<Answer> = (0..asked.qs.len())
             .map(|i| {
                 let Some(a) = sub.answer(&i.to_string()) else {
@@ -274,13 +306,16 @@ impl Chat {
     /// esc on the card, or a message sent from the composer: the agent ends its turn and the
     /// user answers in the chat.
     pub(super) fn dismiss_asked(&mut self, cx: &mut Context<Self>) {
-        let Some(asked) = self.asked.take() else { return };
+        let Some(asked) = self.asked.take() else {
+            return;
+        };
         let res = match (asked.codex, self.agent.as_mut()) {
             (_, None) => Ok(()),
             (true, Some(a)) => {
                 let note = json!({"answers": [format!("user_note: {ANSWER_IN_CHAT}")]});
-                let by_id: serde_json::Map<String, Value> =
-                    (asked.qs.iter()).map(|q| (q.id.clone(), note.clone())).collect();
+                let by_id: serde_json::Map<String, Value> = (asked.qs.iter())
+                    .map(|q| (q.id.clone(), note.clone()))
+                    .collect();
                 a.allow(&asked.request_id, json!({ "answers": by_id }))
             }
             (false, Some(a)) => a.deny(&asked.request_id, ANSWER_IN_CHAT),
@@ -315,11 +350,18 @@ impl Chat {
     }
 
     /// The question card, just above the composer like the side-question card.
-    pub(super) fn render_asked(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(super) fn render_asked(
+        &self,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
         let asked = self.asked.as_ref()?;
         let form = asked.form.as_ref()?;
         let theme = cx.theme();
-        let (focused, at) = (asked.focused(window, cx), form.read(cx).current_ix().unwrap_or(0));
+        let (focused, at) = (
+            asked.focused(window, cx),
+            form.read(cx).current_ix().unwrap_or(0),
+        );
         let last = at + 1 == asked.qs.len();
         let q = &asked.qs[at.min(asked.qs.len() - 1)];
         let header = h_flex()
@@ -350,10 +392,12 @@ impl Chat {
             let name = i.to_string();
             QuestionnaireItem::new(form, name.clone())
                 .child(QuestionnaireTitle::new(form, name.clone()))
-                .child(QuestionnaireChoices::new(form, name.clone()).children(
-                    (0..q.options.len())
-                        .map(|j| QuestionnaireChoice::new(form, name.clone(), j.to_string())),
-                ))
+                .child(
+                    QuestionnaireChoices::new(form, name.clone()).children(
+                        (0..q.options.len())
+                            .map(|j| QuestionnaireChoice::new(form, name.clone(), j.to_string())),
+                    ),
+                )
                 .child(QuestionnaireInput::new(form, name.clone()))
                 .child(QuestionnaireError::new(form, name))
         });
@@ -430,7 +474,11 @@ mod tests {
             {"question": "Name?", "header": "Name", "multiSelect": false, "options": [{"label": "a", "description": ""}, {"label": "b", "description": ""}]},
         ]});
         let qs = questions(&input);
-        assert_eq!((qs.len(), qs[1].multi, qs[0].other), (3, true, true), "claude always takes text");
+        assert_eq!(
+            (qs.len(), qs[1].multi, qs[0].other),
+            (3, true, true),
+            "claude always takes text"
+        );
         assert_eq!(qs[0].options[0], ("Postgres".into(), "SQL".into()));
         let answers: Vec<Answer> = vec![
             (vec!["Postgres".into()], None),
@@ -438,7 +486,10 @@ mod tests {
             (vec![], None), // skipped
         ];
         let r = reply(&input, &qs, &answers, false);
-        assert_eq!(r["questions"], input["questions"], "claude needs its questions back");
+        assert_eq!(
+            r["questions"], input["questions"],
+            "claude needs its questions back"
+        );
         assert_eq!(
             r["answers"],
             json!({"Which DB?": "Postgres", "Which tests?": "Unit, E2E, smoke"})
@@ -453,9 +504,18 @@ mod tests {
             {"id": "ok", "header": "Run", "question": "Run it?", "isOther": false, "isSecret": true, "options": [{"label": "Accept", "description": ""}]},
         ]});
         let qs = questions(&input);
-        assert_eq!((qs[0].other, qs[1].other, qs[1].secret), (true, false, true));
-        let answers: Vec<Answer> = vec![(vec![], Some("b.txt".into())), (vec!["Accept".into()], None)];
-        assert_eq!(pairs(&qs, &answers), r#""Which file?"="b.txt", "Run it?"="••••""#);
+        assert_eq!(
+            (qs[0].other, qs[1].other, qs[1].secret),
+            (true, false, true)
+        );
+        let answers: Vec<Answer> = vec![
+            (vec![], Some("b.txt".into())),
+            (vec!["Accept".into()], None),
+        ];
+        assert_eq!(
+            pairs(&qs, &answers),
+            r#""Which file?"="b.txt", "Run it?"="••••""#
+        );
         assert_eq!(
             reply(&input, &qs, &answers, true),
             json!({"answers": {
@@ -484,9 +544,14 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         // `None`: the user closes the card.
-        let ask = |model: &str, plan: bool, prompt: &str, answer: Option<Answer>| -> (Vec<String>, String) {
+        let ask = |model: &str,
+                   plan: bool,
+                   prompt: &str,
+                   answer: Option<Answer>|
+         -> (Vec<String>, String) {
             let tag = model.replace(':', "-");
-            let root = std::env::temp_dir().join(format!("shark-live-{tag}-{}", std::process::id()));
+            let root =
+                std::env::temp_dir().join(format!("shark-live-{tag}-{}", std::process::id()));
             std::fs::create_dir_all(&root).unwrap();
             let ws = Workspace {
                 name: format!("live-{tag}-{}", std::process::id()),
@@ -510,7 +575,12 @@ mod tests {
             let (mut seen, mut text) = (vec![], String::new());
             while let Ok(ev) = rx.recv_blocking() {
                 match ev {
-                    Ev::Permission { request_id, tool, input, .. } if tool == "AskUserQuestion" => {
+                    Ev::Permission {
+                        request_id,
+                        tool,
+                        input,
+                        ..
+                    } if tool == "AskUserQuestion" => {
                         let qs = questions(&input);
                         seen.extend(qs.iter().map(|q| q.text.clone()));
                         let codex = model.starts_with("codex:");
@@ -522,7 +592,8 @@ mod tests {
                             }
                             // As `dismiss_asked` answers.
                             None if codex => {
-                                let note = json!({"answers": [format!("user_note: {ANSWER_IN_CHAT}")]});
+                                let note =
+                                    json!({"answers": [format!("user_note: {ANSWER_IN_CHAT}")]});
                                 let by_id: serde_json::Map<String, Value> =
                                     qs.iter().map(|q| (q.id.clone(), note.clone())).collect();
                                 a.allow(&request_id, json!({ "answers": by_id })).unwrap();
@@ -535,7 +606,9 @@ mod tests {
                     }
                     Ev::Text(t) => text.push_str(&t),
                     Ev::Plan { text: t, .. } => text.push_str(&t),
-                    Ev::Result { is_error, text: t, .. } => {
+                    Ev::Result {
+                        is_error, text: t, ..
+                    } => {
                         assert!(!is_error, "{model}: {t}");
                         break;
                     }
@@ -558,13 +631,19 @@ mod tests {
                 let (seen, text) = ask(model, plan, prompt, answer);
                 eprintln!("{model} said: {text}");
                 assert_eq!(seen.len(), 1, "{model} asked once: {seen:?}");
-                assert!(text.contains(want), "{model} used the answer {want}: {text}");
+                assert!(
+                    text.contains(want),
+                    "{model} used the answer {want}: {text}"
+                );
             }
             let (seen, text) = ask(model, plan, prompt, None);
             eprintln!("{model} after closing: {text}");
             assert_eq!(seen.len(), 1, "{model} doesn't ask again: {seen:?}");
             // It may ask again in plain text, but doesn't answer for the user.
-            assert!(!matches!(text.trim(), "Blue" | "Red"), "{model} assumed: {text}");
+            assert!(
+                !matches!(text.trim(), "Blue" | "Red"),
+                "{model} assumed: {text}"
+            );
         }
     }
 

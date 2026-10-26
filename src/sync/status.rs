@@ -929,7 +929,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
             },
             Some(pr("CLEAN", Checks::Passing)),
         );
-        let action = next_action(&[review.clone()], &[]);
+        let action = next_action(std::slice::from_ref(&review), &[]);
         assert_eq!(action.label, "Review PR");
         assert_eq!(action.kind, Kind::OpenPr);
         for kind in [
