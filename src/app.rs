@@ -144,8 +144,8 @@ fn pill(id: impl Into<SharedString>, on: bool, theme: &Theme) -> Stateful<Div> {
         .hover(|d| d.text_color(theme.foreground))
 }
 
-/// A sidebar's show / hide button. Both sit at y 24..52, under the traffic lights and level with
-/// the island's tab bar bottom, 20px in from their window edge, in either state.
+/// A sidebar's show / hide button. Both sit at y 34..62, below the traffic lights.
+/// The left follows the sidebar rows; the right stays 20px from the window edge.
 fn side_toggle(id: &'static str, icon: IconName, tip: &'static str) -> Button {
     Button::new(id)
         .ghost()
@@ -723,7 +723,7 @@ impl Shark {
     }
 
     /// The header's branch label; hovering lists each repo's branch, linked to GitHub once
-    /// pushed, and the base it targets. Right-click copies or opens them, or changes the base.
+    /// pushed, and the base it targets. Either click opens copy, open, and change-base actions.
     fn render_branch(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let branch = self
@@ -737,22 +737,24 @@ impl Shark {
         HoverCard::new("branch-card")
             .anchor(Anchor::TopRight)
             .trigger(
-                h_flex()
-                    .id("branch")
+                Button::new("branch")
+                    .ghost()
+                    .xsmall()
+                    .flex_shrink_1()
                     .min_w_0()
                     .gap_1p5()
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(Icon::new(IconName::GitBranch).with_size(px(12.)))
                     .child(div().min_w_0().truncate().child(branch.clone()))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(|this, e: &MouseDownEvent, w, cx| {
-                            let Some(ws) = this.active_ws() else { return };
-                            let entries = menus::branch_entries(this, ws, cx);
-                            this.show_menu(e.position, entries, w, cx);
-                        }),
-                    ),
+                    .on_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, w, cx| {
+                        if !matches!(e.button, MouseButton::Left | MouseButton::Right) {
+                            return;
+                        }
+                        let Some(ws) = this.active_ws() else { return };
+                        let entries = menus::branch_entries(this, ws, cx);
+                        this.show_menu(e.position, entries, w, cx);
+                    })),
             )
             .content(move |_, _, cx| {
                 let theme = cx.theme();

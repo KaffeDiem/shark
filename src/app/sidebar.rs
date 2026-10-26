@@ -1055,7 +1055,8 @@ impl Shark {
                 h_flex()
                     .h(px(28.))
                     .flex_none()
-                    .pl(px(20.))
+                    .pl_2()
+                    .when(rail, |d| d.pl(px(20.)))
                     .mb(px(if rail { 16. } else { 4. }))
                     .window_control_area(WindowControlArea::Drag)
                     .child(

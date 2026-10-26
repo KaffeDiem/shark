@@ -2600,7 +2600,7 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
     assert!(bounds(cx, "Changes 1").is_none(), "no Changes tab");
     assert!(bounds(cx, "hide-tree").is_none());
 
-    // The two toggles mirror each other: same size, same y, same distance from their edge.
+    // Both toggles clear the traffic lights; the expanded sidebar uses the rows' half-rem inset.
     let (left, right) = (
         bounds(cx, "toggle-sidebar").unwrap(),
         bounds(cx, "show-tree").unwrap(),
@@ -2608,7 +2608,15 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
     assert_eq!(left.size, size(px(32.), px(28.)));
     assert_eq!(right.size, left.size);
     assert_eq!(right.top(), left.top());
-    assert_eq!(px(1440.) - right.right(), left.left());
+    assert_eq!(left.top(), px(34.));
+    let row_inset = cx
+        .update_window(window, |_, w, _| w.rem_size() * 0.5)
+        .unwrap();
+    assert_eq!(left.left(), row_inset);
+    assert_eq!(px(1440.) - right.right(), px(20.));
+    let diff_button = bounds(cx, "rail-diff").unwrap();
+    assert_eq!(right.center().x, diff_button.center().x);
+    assert_eq!(diff_button.top() - right.bottom(), px(16.));
 
     // Diff shows the diff; the chat tab brings the chat back.
     click(cx, "rail-diff");
@@ -2622,6 +2630,7 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
     cx.update(|cx| assert!(shark.read(cx).tree_shown()));
     assert!(bounds(cx, "right-rail").is_none());
     assert_eq!(bounds(cx, "hide-tree"), Some(right));
+    assert_eq!(bounds(cx, "toggle-sidebar"), Some(left));
     click(cx, "hide-tree");
     cx.update(|cx| assert!(!shark.read(cx).tree_shown()));
     assert_eq!(bounds(cx, "show-tree"), Some(right));
@@ -2635,13 +2644,27 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
     press(cx, &["cmd-shift-d"]);
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Diff));
 
-    // The sidebar toggle stays put as the sidebar shrinks to a rail and back.
+    // Collapsed, the sidebar toggle centers over the rail's buttons; expanded, it follows the rows.
     click(cx, "toggle-sidebar");
     cx.update(|cx| assert!(shark.read(cx).rail));
-    assert_eq!(bounds(cx, "toggle-sidebar"), Some(left));
+    let collapsed = bounds(cx, "toggle-sidebar").unwrap();
+    assert_eq!(collapsed.size, left.size);
+    assert_eq!(collapsed.top(), left.top());
+    assert_eq!(collapsed.left(), px(20.));
     assert_eq!(bounds(cx, "sidebar").unwrap().size.width, px(72.));
+    assert_eq!(
+        collapsed.center().x,
+        bounds(cx, "sidebar").unwrap().center().x
+    );
+    assert_eq!(bounds(cx, "show-tree"), Some(right));
+    click(cx, "show-tree");
+    assert_eq!(bounds(cx, "hide-tree"), Some(right));
+    assert_eq!(bounds(cx, "toggle-sidebar"), Some(collapsed));
+    click(cx, "hide-tree");
+    assert_eq!(bounds(cx, "show-tree"), Some(right));
     click(cx, "toggle-sidebar");
     cx.update(|cx| assert!(!shark.read(cx).rail));
+    assert_eq!(bounds(cx, "toggle-sidebar"), Some(left));
 
     // The expanded sidebar's edge: a dragged width persists, and survives a restart.
     assert_eq!(bounds(cx, "sidebar").unwrap().size.width, px(244.));
@@ -2650,6 +2673,8 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
         resize.update(cx, |r, cx| r.resize_panel(0, px(300.), w, cx))
     });
     assert_eq!(State::load().sidebar_width, Some(300.));
+    assert_eq!(bounds(cx, "toggle-sidebar"), Some(left));
+    assert_eq!(bounds(cx, "show-tree"), Some(right));
     cx.update_window(window, |_, w, _| w.remove_window())
         .unwrap();
     let (window2, _) = open(cx, options());
@@ -5032,6 +5057,68 @@ async fn review_followups(cx: &mut TestAppContext) {
         assert!(s.render_orphans(cx).is_none());
         s.diff_error = None;
     });
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Both mouse buttons open the header's branch menu, which still dismisses and copies.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn branch_menu(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(1400.), px(900.)),
+            ))),
+            ..Default::default()
+        },
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace(
+            "branch-menu".into(),
+            git::on_branch(&repos, "branch-menu"),
+            None,
+            w,
+            cx,
+        )
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    for right in [false, true] {
+        for copy in [false, true] {
+            cx.update_window(window, |_, w, cx| {
+                if right {
+                    w.right_click("branch", cx);
+                } else {
+                    w.click("branch", cx);
+                }
+            })
+            .unwrap();
+            cx.update(|cx| assert!(shark.read(cx).menu.is_some(), "right-click: {right}"));
+            if copy {
+                cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(String::new())));
+                press_in(window)(cx, &["c", "enter"]);
+                assert_eq!(
+                    cx.update(|cx| cx.read_from_clipboard().and_then(|c| c.text())),
+                    Some("branch-menu".into())
+                );
+            } else {
+                press_in(window)(cx, &["escape"]);
+            }
+            cx.update(|cx| assert!(shark.read(cx).menu.is_none()));
+        }
+    }
     fs::remove_dir_all(&home).ok();
 }
 
