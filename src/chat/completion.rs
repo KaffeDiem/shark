@@ -164,6 +164,11 @@ impl Chat {
                     Kind::Command => IconName::Slash,
                     Kind::Pr => IconName::GitPullRequestArrow,
                 };
+                let file_icon = match it.kind {
+                    Kind::File => crate::file_icon::file_icon(&it.label, theme.is_dark()),
+                    Kind::Dir => crate::file_icon::folder_icon(&it.label, theme.is_dark()),
+                    _ => None,
+                };
                 let badge = match it.kind {
                     Kind::Command => (!it.badge.is_empty()).then(|| {
                         div()
@@ -221,11 +226,18 @@ impl Chat {
                                 window.prevent_default(); // keep focus in the composer
                             }),
                         )
-                        .child(
-                            Icon::new(icon)
+                        .child(match file_icon {
+                            // 16px matches a 14px glyph, as app icons in `menu.rs`.
+                            Some(i) => img(i)
+                                .size(px(16.))
+                                .mx(px(-1.))
+                                .flex_none()
+                                .into_any_element(),
+                            None => Icon::new(icon)
                                 .with_size(px(14.))
-                                .text_color(theme.muted_foreground),
-                        )
+                                .text_color(theme.muted_foreground)
+                                .into_any_element(),
+                        })
                         .child(
                             div()
                                 .flex_none()

@@ -114,7 +114,7 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
   - A turn ends with an info line: "done · 48s · $0.12", or "interrupted · 12s · $0.03" after `ctrl-c`. A turn cut off by quitting gets "interrupted" on replay.
 - **Composer completions** (`@` files, `/` skills; `src/complete.rs`):
   - The menu opens upward from the composer, at its width, over the transcript, on the menu surface (`menu::chrome`). It shows 8 rows of 28px and scrolls to more, with a `faint` key-hint footer.
-  - Each row has a 14px `File` / `Folder` / `SquareSlash` icon, the name in `foreground`, the folder or description in `text_xs` `muted_foreground` (truncated), and on the right the repo (`FolderGit2` + name) when the workspace has more than one repo, or a command's argument hint in `faint`.
+  - Each row has an icon: a file's or folder's colored icon (see Icons), else a 14px `File` / `Folder` / `SquareSlash`; the name in `foreground`, the folder or description in `text_xs` `muted_foreground` (truncated), and on the right the repo (`FolderGit2` + name) when the workspace has more than one repo, or a command's argument hint in `faint`.
   - The selected and hovered rows get the menu highlight (`menu::highlight`, a 4px-radius pill). The first row starts selected. ↑/↓ move, Enter/Tab add, Esc closes and stays in the composer. With no match, Enter sends.
   - A pick becomes an inline chip, an atomic `InlineToken` whose text is `@repo/path` and whose label is `name · repo`. Paths are workspace-relative, so the repo is part of what gets sent. Typing `repo/` scopes the search to one repo.
   - Sources never block typing. Files come from `git ls-files` per repo and skills from claude's `initialize` control request. Both load when the chat opens and refresh in the background each time the menu opens; until a refresh lands, the old list (for skills, the on-disk cache) is used.
@@ -133,6 +133,7 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 - **Sizes:** `Icon::new(..).with_size(px(14.))` in rows and tabs; 12px next to `text_xs`; 32px only in empty states.
 - **Color:** icons inherit the text color. Decorative icons are `muted_foreground` or `faint`; status icons use the status `*_foreground` tokens.
 - **No text glyphs as icons** (`●`, `▸`, `✓`).
+- **File-type and folder icons** (`src/file_icon.rs`) are the one full-color set: Material Icon Theme SVGs vendored in `assets/file-icons/` (MIT), drawn as a 16px `img` with `mx(px(-1.))` beside 14px glyphs (`size_4` in the cmd-p picker, as palette app icons). Used for file and folder rows in the `@` menu, the cmd-p picker and the editor header. An unknown type falls back to Lucide `File` / `Folder` in `muted_foreground`. Add a type or folder name to `file_icon.rs` (and its SVG to `assets/file-icons/`); add a `<name>_light.svg` when a glyph fades on a light background.
 - **Status vocabulary.** Extend this table when you add a state, rather than inventing one ad hoc:
 
 | State | Element |
