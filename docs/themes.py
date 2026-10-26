@@ -73,8 +73,11 @@ def build(name, mode, pal):
     island = [p["background"], p["secondary"], p["muted"], list_hover, list_active]
     chrome = [p["sidebar"], sidebar_accent]
     fg = lift(lift(fg, [p["background"], p["secondary"]], 90, dark), island + chrome, 70, dark)
-    mfg = lift(p["muted_fg"], island + chrome, 70, dark)
-    status = {k: lift(p[k], island + chrome, 60, dark) for k in ("danger", "success", "warning", "link")}
+    # `side_hover()` and `side_on()` in src/app.rs: the final `foreground` over `sidebar`.
+    side = [mix(p["sidebar"], fg, t) for t in ((0.07, 0.11) if dark else (0.03, 0.05))]
+    assert min(apca(fg, b) for b in side) >= 70, f"{name} {mode}: foreground on side rows"
+    mfg = lift(p["muted_fg"], island + chrome + side, 70, dark)
+    status = {k: lift(p[k], island + chrome + side, 60, dark) for k in ("danger", "success", "warning", "link")}
     white, ink = "#ffffff", "#101010"
     on_primary = white if apca(white, p["primary"]) >= apca(ink, p["primary"]) else ink
     pr = p["primary"]

@@ -203,7 +203,7 @@ impl Chat {
                 Some(
                     h_flex()
                         .id(ix)
-                        .h(px(28.))
+                        .h(crate::menu::ROW_H)
                         .px_2()
                         .gap_2()
                         .rounded(px(4.))
@@ -317,14 +317,14 @@ impl Chat {
                 .child(
                     div()
                         .id("completion-rows")
-                        .max_h(px(8. * 28.))
+                        .max_h(crate::menu::ROW_H * 8.)
                         .overflow_y_scroll()
                         .track_scroll(&self.menu_scroll)
                         .children(rows)
                         .when_some(empty, |d, e| {
                             d.child(
                                 div()
-                                    .h(px(28.))
+                                    .h(crate::menu::ROW_H)
                                     .px_2()
                                     .flex()
                                     .items_center()

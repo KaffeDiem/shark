@@ -562,19 +562,9 @@ impl Shark {
         let theme = cx.theme();
         let focused = self.sidebar_focus.is_focused(window);
         let rail = self.rail;
-        // The rail: 32px icon buttons, 16px icons, 16 apart.
-        let isz = px(if rail { 16. } else { 14. });
-        let header = |t: &'static str| {
-            div()
-                .when(rail, |d| d.hidden())
-                .px_4()
-                .pt_4()
-                .pb_1()
-                .text_xs()
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme.muted_foreground)
-                .child(t)
-        };
+        // 16px icons; the rail is 32px icon buttons, 16 apart.
+        let isz = px(16.);
+        let header = |t: &'static str| side_header(theme, t).when(rail, |d| d.hidden());
         let hint = |t: &'static str| {
             div()
                 .when(rail, |d| d.hidden())
@@ -583,18 +573,7 @@ impl Shark {
                 .text_color(faint(theme))
                 .child(t)
         };
-        let row = || {
-            h_flex()
-                .h(px(28.))
-                .flex_none()
-                .mx_2()
-                .mb_1() // so a hovered row never touches the selected one
-                .px_2()
-                .gap_2()
-                .rounded(theme.radius)
-                .text_sm()
-                .when(rail, rail_button)
-        };
+        let row = || side_row(theme).when(rail, rail_button);
         let m = window.modifiers();
         let cmd_held = m.platform && m.number_of_modifiers() == 1;
         let repos = self.state.repos.iter().enumerate().map(|(ix, r)| {
@@ -602,8 +581,7 @@ impl Shark {
             let tip: SharedString = name.clone().into();
             row()
                 .id(("repo", ix))
-                .text_color(theme.muted_foreground)
-                .hover(|d| d.bg(theme.sidebar_accent))
+                .hover(|d| d.bg(side_hover(theme)))
                 .child(Icon::new(IconName::FolderGit2).with_size(isz))
                 .when(!rail, |d| d.child(div().truncate().child(r.name.clone())))
                 .when(rail, |d| {
@@ -696,7 +674,7 @@ impl Shark {
                 // The rail shows only the icon, so rows keep the one-line height there.
                 .when(!rail, |d| d.h(px(44.)))
                 .when(section.is_some() && !rail, |d| d.ml(px(24.)))
-                .map(|d| cursor_row(d, selected, focused, theme.sidebar_accent, theme))
+                .map(|d| cursor_row(d, active, selected, focused, theme))
                 // The cursor moves on press, not release: a held or dragged row is the one ringed.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -817,8 +795,7 @@ impl Shark {
                         .any(|n| matches!(self.attention_of(n, cx), Attn::Needs(_)));
                 row()
                     .id(("section", i))
-                    .text_color(theme.muted_foreground)
-                    .map(|d| cursor_row(d, selected, focused, theme.sidebar_accent, theme))
+                    .map(|d| cursor_row(d, false, selected, focused, theme))
                     .drag_over::<DraggedWs>(move |d, _, _, _| d.bg(accent).border_color(primary))
                     .on_drop(drop_on(Some(i)))
                     .on_drag(DraggedSection(i, sec.name.clone().into()), |d, _, _, cx| {
@@ -848,15 +825,11 @@ impl Shark {
                     .when(!rail, |d| {
                         d.child(
                             div()
-                                .flex_1()
                                 .min_w_0()
                                 .truncate()
                                 .font_weight(FontWeight::MEDIUM)
                                 .child(sec.name.clone()),
                         )
-                        .when(sec.collapsed, |d| {
-                            d.child(div().text_xs().child(sec.workspaces.len().to_string()))
-                        })
                         .child(
                             Icon::new(match sec.collapsed {
                                 true => IconName::ChevronRight,
@@ -864,6 +837,10 @@ impl Shark {
                             })
                             .with_size(px(12.)),
                         )
+                        .child(div().flex_1())
+                        .when(sec.collapsed, |d| {
+                            d.child(div().text_xs().child(sec.workspaces.len().to_string()))
+                        })
                     })
                     .when(rail, |d| {
                         d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
@@ -875,10 +852,9 @@ impl Shark {
                 .key_context("SectionName")
                 .border_1()
                 .border_color(theme.primary)
-                .bg(theme.list_active)
-                .text_color(theme.muted_foreground)
+                .bg(side_on(theme))
                 .on_action(cx.listener(|this, _: &CancelEdit, w, cx| this.cancel_naming(w, cx)))
-                .child(Icon::new(icon).with_size(px(14.)))
+                .child(Icon::new(icon).with_size(isz))
                 .child(
                     div()
                         .flex_1()
@@ -970,8 +946,7 @@ impl Shark {
                 )
             })
             .on_mouse_down(MouseButton::Right, new_section_menu(false));
-        // Like the Workspaces header, but the + stays visible (dimmed) so a second repo is
-        // findable; right-click offers the same.
+        // Like the Workspaces header: the + shows on hover; right-click offers the same.
         let repo_header = h_flex()
             .id("repo-header")
             .group("repo-header")
@@ -982,8 +957,8 @@ impl Shark {
                 d.child(
                     div()
                         .mr_3()
-                        .opacity(0.5)
-                        .group_hover("repo-header", |s| s.opacity(1.))
+                        .invisible()
+                        .group_hover("repo-header", |s| s.visible())
                         .child(
                             Button::new("add-repo")
                                 .ghost()
@@ -1007,8 +982,7 @@ impl Shark {
             );
         let add_repo_row = row()
             .id("add-repo-row")
-            .text_color(theme.muted_foreground)
-            .hover(|d| d.bg(theme.sidebar_accent))
+            .hover(|d| d.bg(side_hover(theme)))
             .child(Icon::new(IconName::FolderPlus).with_size(isz))
             .when(!rail, |d| d.child(div().flex_1().child("Add repo…")))
             .when(rail, |d| {
@@ -1032,7 +1006,6 @@ impl Shark {
             })
             .h_full()
             .flex_none()
-            .text_color(theme.sidebar_foreground)
             .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_sel(|at, _| at + 1, cx)))
             .on_action(cx.listener(|this, _: &SelectPrev, _, cx| {
                 this.move_sel(|at, _| at.saturating_sub(1), cx)

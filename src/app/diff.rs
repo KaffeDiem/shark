@@ -475,18 +475,9 @@ impl Shark {
             n => format!("Diff (cmd-shift-d) · {viewed}/{n} viewed").into(),
         };
         let item = |id: &'static str, icon: IconName, on: bool| {
-            div()
-                .id(id)
-                .relative()
-                .w(px(40.))
-                .h(px(36.))
-                .flex()
-                .items_center()
-                .justify_center()
-                .rounded(theme.radius)
+            super::sidebar::rail_button(div().id(id).relative().flex().items_center())
                 .text_color(theme.muted_foreground)
-                .hover(|d| d.bg(theme.sidebar_accent))
-                .when(on, |d| d.bg(theme.sidebar_accent))
+                .map(|d| cursor_row(d, on, false, false, theme))
                 .child(Icon::new(icon).with_size(px(16.)))
         };
         // A dot while files wait for review; amber when git failed.
@@ -519,7 +510,6 @@ impl Shark {
             .child(
                 v_flex()
                     .pt(px(16.))
-                    .gap(px(8.))
                     .child(
                         item("rail-diff", IconName::FileDiff, self.tab == Tab::Diff)
                             .when_some(badge, |d, c| d.child(super::chats::dot(6., theme).bg(c)))
@@ -928,27 +918,20 @@ impl Shark {
 
     pub(super) fn render_tree(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (border, muted, fg) = (theme.border, theme.muted_foreground, theme.foreground);
-        let (hover, hint) = (theme.list_hover, faint(theme));
+        let (muted, fg, hint) = (theme.muted_foreground, theme.foreground, faint(theme));
         let focused = self.tree_focus.is_focused(window);
         let n = self.diff_files.len();
+        // The pane's 8px inset stands in for the row margin, so labels sit 16px in.
         let nav = |id: &'static str, icon: IconName, label: &'static str, on: bool| {
-            h_flex()
+            side_row(theme)
                 .id(id)
-                .h(px(36.))
-                .px(px(10.))
-                .gap(px(10.))
-                .rounded(px(6.))
-                .text_sm()
-                .hover(|d| d.bg(hover))
-                .when(on, |d| d.bg(hover))
+                .mx_0()
+                .map(|d| cursor_row(d, on, false, false, theme))
                 .child(Icon::new(icon).with_size(px(16.)).text_color(muted))
                 .child(div().flex_1().child(label))
         };
-        let badge = |t: String| div().text_size(px(11.)).child(t);
         let tools = v_flex()
             .flex_none()
-            .gap(px(8.))
             .child(
                 nav(
                     "tools-diff",
@@ -956,7 +939,7 @@ impl Shark {
                     "Diff",
                     self.tab == Tab::Diff,
                 )
-                .child(badge(n.to_string()))
+                .child(div().text_xs().text_color(muted).child(n.to_string()))
                 .on_click(cx.listener(|this, _, w, cx| this.show(Tab::Diff, w, cx)))
                 .on_mouse_down(
                     MouseButton::Right,
@@ -968,7 +951,7 @@ impl Shark {
             )
             .child(
                 nav("tools-commands", IconName::Command, "Commands", false)
-                    .child(badge("⌘K".into()))
+                    .child(kbd("cmd-k").appearance(false).text_xs().text_color(muted))
                     .on_click(cx.listener(|this, _, w, cx| this.toggle_palette(w, cx))),
             );
         let tree = v_flex()
@@ -1039,9 +1022,8 @@ impl Shark {
                     .mb(px(16.))
                     .pl(px(8.))
                     .pr(px(12.))
-                    .text_size(px(12.))
                     .window_control_area(WindowControlArea::Drag)
-                    .child(div().flex_1().child("Workspace tools"))
+                    .child(side_header(theme, "Workspace tools").p_0().flex_1())
                     .child(
                         side_toggle(
                             "hide-tree",
@@ -1054,28 +1036,19 @@ impl Shark {
             .child(tools)
             .child(
                 h_flex()
-                    .h(px(36.))
                     .flex_none()
-                    .mt(px(16.))
-                    .border_t_1()
-                    .border_color(border)
-                    .px(px(12.))
-                    .gap_2()
+                    .px(px(8.))
+                    .pt_4()
+                    .pb_1()
                     .text_xs()
                     .text_color(muted)
-                    .child(
-                        div()
-                            .flex_1()
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(fg)
-                            .child("Files"),
-                    )
+                    .child(side_header(theme, "Files").p_0().flex_1())
                     .child(format!("{}/{n} viewed", self.viewed_now.len())),
             )
             .child(
                 Input::new(&self.tree_filter)
                     .h(px(32.))
-                    .rounded(px(6.))
+                    .rounded(theme.radius)
                     .cleanable(true)
                     .prefix(
                         Icon::new(IconName::Search)
@@ -1098,16 +1071,15 @@ impl Shark {
         let r = &self.tree_rows[ix];
         let selected = ix == self.tree_sel;
         let open_file = self.editor.as_ref().map(|e| e.read(cx).path.clone());
-        let row = h_flex()
+        // `uniform_list` rows: no margin, so the 30px height is the pitch.
+        let row = side_row(theme)
             .id(("tree-row", ix))
-            .h(px(28.))
             .w_full()
+            .mx_0()
+            .mb_0()
             .pr_2()
-            .pl(px(8. + 12. * r.depth as f32))
-            .gap_1p5()
-            .rounded(theme.radius)
-            .text_sm()
-            .map(|d| cursor_row(d, selected, focused, theme.list_hover, theme))
+            .pl(px(7. + 12. * r.depth as f32))
+            .map(|d| cursor_row(d, selected, selected, focused, theme))
             .on_click(cx.listener(move |this, e: &ClickEvent, w, cx| {
                 this.tree_focus.focus(w, cx);
                 match (e.click_count(), this.tree_rows.get(ix).and_then(|r| r.file)) {
@@ -1132,14 +1104,17 @@ impl Shark {
             );
         let Some(file) = r.file else {
             let open = !self.collapsed_dirs.contains(&r.path);
-            return (row.text_color(theme.muted_foreground))
+            return row
+                // A 14px chevron in a 16px slot, so folder and file names line up.
                 .child(
-                    Icon::new(if open {
-                        IconName::ChevronDown
-                    } else {
-                        IconName::ChevronRight
-                    })
-                    .with_size(px(14.)),
+                    h_flex().size(px(16.)).flex_none().justify_center().child(
+                        Icon::new(if open {
+                            IconName::ChevronDown
+                        } else {
+                            IconName::ChevronRight
+                        })
+                        .with_size(px(14.)),
+                    ),
                 )
                 .child(div().flex_1().truncate().child(r.name.clone()))
                 .child(self.dir_viewed_box(ix, &r.path, cx))
@@ -1156,7 +1131,7 @@ impl Shark {
         let row = row
             .child(
                 Icon::new(icon)
-                    .with_size(px(14.))
+                    .with_size(px(16.))
                     .text_color(theme.muted_foreground),
             )
             .child(
