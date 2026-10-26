@@ -1251,7 +1251,7 @@ async fn chat_tab_menu(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace("tabs".into(), repos.clone(), None, w, cx)
+        s.create_workspace("tabs".into(), git::on_branch(&repos, "tabs"), None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -1882,7 +1882,7 @@ async fn file_menu_labels(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace("fm".into(), repos.clone(), None, w, cx)
+        s.create_workspace("fm".into(), git::on_branch(&repos, "fm"), None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -3362,7 +3362,7 @@ async fn thread_menu_labels(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace("tm".into(), repos.clone(), None, w, cx)
+        s.create_workspace("tm".into(), git::on_branch(&repos, "tm"), None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -4311,7 +4311,10 @@ async fn change_base(cx: &mut TestAppContext) {
         WindowOptions::default(),
     );
     let on = on_app(window, shark.clone());
-    on(cx, &|s, w, cx| s.create_workspace("rb".into(), repos.clone(), None, w, cx));
+    // api on its own branch.
+    let mut picked = git::on_branch(&repos, "rb");
+    picked[0].1 = "kd/x".into();
+    on(cx, &|s, w, cx| s.create_workspace("rb".into(), picked.clone(), None, w, cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
     })
@@ -4333,9 +4336,11 @@ async fn change_base(cx: &mut TestAppContext) {
         assert_eq!(ws.repos[0].base, "origin/release");
         assert_eq!(ws.repos[1].base, old, "web keeps its base");
         assert_eq!(menus::base_hint(ws), "per repo");
-        let bases: Vec<String> = (s.syncs["rb"].read(cx).branches().into_iter())
-            .map(|b| b.base)
-            .collect();
+        let (names, bases): (Vec<String>, Vec<String>) = (s.syncs["rb"].read(cx).branches())
+            .into_iter()
+            .map(|b| (b.name, b.base))
+            .unzip();
+        assert_eq!(names, ["kd/x", "rb"], "each repo's own branch");
         assert_eq!(bases, ["origin/release".to_string(), old.clone()]);
     });
     let md = fs::read_to_string(home.join("shark/workspaces/rb/CLAUDE.md")).unwrap();

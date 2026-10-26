@@ -859,11 +859,18 @@ impl GitSync {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let repos = (moves.iter())
-            .map(|(r, old, new)| format!("{r}: `{old}` → `{new}`"))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let prompt = crate::prompts::render("rebase_base", &repos, &self.ws.branch);
+        let fill = |rs: &[String]| {
+            (moves.iter().filter(|(r, ..)| rs.contains(r)))
+                .map(|(r, old, new)| format!("{r}: `{old}` → `{new}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let branch_of = |name: &str| {
+            let r = self.repos.iter().find(|r| r.name == name);
+            r.map_or(self.ws.branch.as_str(), |r| r.branch.as_str())
+        };
+        let repos = moves.iter().map(|(r, ..)| (r.as_str(), branch_of(r)));
+        let prompt = crate::prompts::render_each("rebase_base", repos, fill);
         self.run_kind(Kind::Agent(prompt), "Rebase onto new base", window, cx)
     }
 
@@ -1356,6 +1363,7 @@ mod tests {
         let repo = |name: &str, pr: Option<u64>| super::Repo {
             name: name.into(),
             base: "origin/main".into(),
+            branch: "feat".into(),
             local: Ok(Local::default()),
             pr: Some(Ok(pr.map(|n| super::open_pr(name, n)))),
         };

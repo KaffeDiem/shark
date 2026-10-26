@@ -163,10 +163,16 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
 pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<Entry> {
     let sync = this.syncs.get(&ws.name).map(|s| s.read(cx));
     let branches = sync.map(|s| s.branches()).unwrap_or_default();
-    let mut names: Vec<String> = branches.iter().map(|b| b.name.clone()).collect();
+    // Not opened yet, so not probed: the branches the workspace put them on.
+    let saved = || ws.repos.iter().map(|r| (r.name.clone(), ws.branch_of(r).to_string()));
+    let pairs: Vec<(String, String)> = match branches.is_empty() {
+        true => saved().collect(),
+        false => branches.iter().map(|b| (b.repo.clone(), b.name.clone())).collect(),
+    };
+    let mut names: Vec<String> = pairs.iter().map(|(_, b)| b.clone()).collect();
     names.sort();
     names.dedup();
-    // Every repo is on the workspace's branch unless one was switched by hand.
+    // One name when they share a branch, else one per repo.
     let copies = match names.len() {
         0 | 1 => {
             let b = names.pop().unwrap_or_else(|| ws.branch.clone());
@@ -174,8 +180,8 @@ pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) 
             let hint = if b == ws.name { String::new() } else { b.clone() };
             vec![(hint, String::new(), b)]
         }
-        _ => (branches.iter())
-            .map(|b| (b.repo.clone(), b.name.clone(), b.name.clone()))
+        _ => (pairs.into_iter())
+            .map(|(repo, b)| (repo, b.clone(), b))
             .collect(),
     };
     let links = (branches.into_iter())

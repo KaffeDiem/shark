@@ -337,12 +337,15 @@ pub fn remote_branches(dir: &Path) -> Vec<(i64, String)> {
         .collect()
 }
 
-/// The bases to offer for `repos` (`(repo, remote_branches)`): every branch any of them has,
-/// newest first, with the repos that have it; `skip` (the workspace's own branch) left out.
-pub fn base_choices(repos: &[(String, Vec<(i64, String)>)], skip: &str) -> Vec<(String, Vec<String>)> {
+/// The bases to offer for `repos` (`(repo, its own branch, remote_branches)`): every branch any
+/// of them has, newest first, with the repos that have it; a repo's own branch left out.
+pub fn base_choices(repos: &[(String, String, Vec<(i64, String)>)]) -> Vec<(String, Vec<String>)> {
     let mut all: Vec<(i64, &str, &str)> = (repos.iter())
-        .flat_map(|(repo, bs)| bs.iter().map(move |(t, b)| (*t, b.as_str(), repo.as_str())))
-        .filter(|(_, b, _)| b.strip_prefix("origin/") != Some(skip))
+        .flat_map(|(repo, own, bs)| {
+            (bs.iter())
+                .filter(move |(_, b)| b.strip_prefix("origin/") != Some(own))
+                .map(move |(t, b)| (*t, b.as_str(), repo.as_str()))
+        })
         .collect();
     all.sort_by_key(|a| std::cmp::Reverse(a.0));
     let mut out: Vec<(String, Vec<String>)> = vec![];
@@ -754,15 +757,16 @@ mod tests {
     #[test]
     fn base_choices_merge_newest_first() {
         let b = |t, n: &str| (t, format!("origin/{n}"));
+        // web is on its own branch `x`; api's `feat` is still a base web may take.
         let repos = [
-            ("api".to_string(), vec![b(9, "feat"), b(5, "main"), b(1, "old")]),
-            ("web".to_string(), vec![b(7, "main"), b(3, "x")]),
+            ("api".to_string(), "feat".to_string(), vec![b(9, "feat"), b(5, "main"), b(1, "old")]),
+            ("web".to_string(), "x".to_string(), vec![b(8, "feat"), b(7, "main"), b(3, "x")]),
         ];
-        let got = base_choices(&repos, "feat");
+        let got = base_choices(&repos);
         let names: Vec<_> = got.iter().map(|(n, rs)| (n.as_str(), rs.join(","))).collect();
         assert_eq!(
             names,
-            [("origin/main", "web,api".into()), ("origin/x", "web".into()), ("origin/old", "api".into())]
+            [("origin/feat", "web".into()), ("origin/main", "web,api".into()), ("origin/old", "api".into())]
         );
     }
 
