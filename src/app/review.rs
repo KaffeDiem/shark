@@ -838,6 +838,7 @@ impl Shark {
             })
             .ok();
         })
+        .annotation_hints("Comment on working copy →", "← Comment on original")
         .annotations(
             threads.chain(composer).chain(
                 (media.iter().enumerate())

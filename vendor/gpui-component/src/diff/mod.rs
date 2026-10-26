@@ -222,6 +222,7 @@ pub struct Diff {
     side_headings: Option<SideHeadings>,
     working_cell: Option<WorkingCell>,
     accent: Option<SharedString>,
+    annotation_hints: Option<[SharedString; 2]>,
 }
 
 fn file_renderer<F, E>(render: F) -> FileRenderer
@@ -254,6 +255,7 @@ impl Diff {
             side_headings: None,
             working_cell: None,
             accent: None,
+            annotation_hints: None,
         }
     }
     /// Shows the original and modified line-number lanes. Default is true.
@@ -462,6 +464,17 @@ impl Diff {
         self.accent = path;
         self
     }
+    /// In Split mode, the text shown in the original column beside an annotation on the
+    /// modified side (`on_original`), and in the modified column beside one on the original
+    /// side (`on_modified`), centered in the gap the annotation leaves.
+    pub fn annotation_hints(
+        mut self,
+        on_original: impl Into<SharedString>,
+        on_modified: impl Into<SharedString>,
+    ) -> Self {
+        self.annotation_hints = Some([on_original.into(), on_modified.into()]);
+        self
+    }
 }
 impl Styled for Diff {
     fn style(&mut self) -> &mut StyleRefinement {
@@ -574,6 +587,7 @@ fn render_diff(
         side_headings: props.side_headings,
         working_cell: props.working_cell,
         accent: props.accent,
+        annotation_hints: props.annotation_hints,
         selection: state.selection().clone(),
         selected_lines: state.selected_lines(),
         selected: state.selected_span(),
@@ -854,6 +868,7 @@ struct CodePresentation {
     side_headings: Option<SideHeadings>,
     working_cell: Option<WorkingCell>,
     accent: Option<SharedString>,
+    annotation_hints: Option<[SharedString; 2]>,
     selection: gpui_base::TextSelectionHandle,
     selected_lines: Option<DiffLineRange>,
     selected: Option<SelectedLines>,
@@ -1532,8 +1547,27 @@ fn render_cell(
             this.bg(cx.theme().muted.opacity(0.3))
                 .child(div().h(code.row_height))
         });
+    // Beside an annotation on the other side only: a hint centered in the gap it leaves.
+    let annotated = |side, ix: Option<usize>| {
+        let lines = &code.annotations.lines;
+        ix.is_some_and(|ix| lines.contains_key(&code.position(file, side, ix)))
+    };
+    let hint = (code.annotation_hints.as_ref())
+        .filter(|_| annotated(side.other(), other_ix) && !annotated(side, ix))
+        .map(|hints| {
+            div()
+                .id("annotation-hint")
+                .test_support()
+                .flex_1()
+                .flex()
+                .items_center()
+                .justify_center()
+                .text_xs()
+                .text_color(cx.theme().muted_foreground)
+                .child(hints[side as usize].clone())
+        });
     let Some(ix) = ix else {
-        return cell.into_any_element();
+        return cell.children(hint).into_any_element();
     };
     cell.id((
         if side == DiffSide::Original {
@@ -1556,6 +1590,7 @@ fn render_cell(
     .children(line_extras(
         file, side, ix, other_ix, changed, &code, window, cx,
     ))
+    .children(hint)
     .into_any_element()
 }
 

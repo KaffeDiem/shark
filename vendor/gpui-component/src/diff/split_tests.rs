@@ -202,6 +202,7 @@ impl Render for Sized {
                 .size_full()
                 .annotations([note])
                 .on_add_annotation(|_, _, _| {})
+                .annotation_hints("to the right", "to the left")
                 .render_annotation(|_, _, _| {
                     use gpui::InteractiveElement as _;
                     use gpui_base::TestSupportExt as _;
@@ -295,6 +296,26 @@ fn only_code_scrolls_sideways_and_the_narrow_column_reaches_its_longest_line(
     let end = long_end(cx);
     assert!(end <= before.0 && end > before.0 - px(60.), "end {end:?}, divider {:?}", before.0);
     assert_eq!(frame(cx), before);
+}
+
+#[gpui::test]
+fn the_other_column_hints_at_an_annotation_beside_its_gap(cx: &mut TestAppContext) {
+    let (_, _, cx) = sized(cx, two_hunks());
+    let (hint, note, divider) = (
+        find(cx, "annotation-hint"),
+        find(cx, "note-body"),
+        find(cx, "split-divider")[0],
+    );
+    assert_eq!(hint.len(), 1, "only beside the note");
+    assert!(
+        hint[0].right() <= divider.center().x,
+        "in the original column"
+    );
+    let middle = hint[0].center().y;
+    assert!(
+        note[0].top() <= middle && middle <= note[0].bottom(),
+        "{hint:?} {note:?}"
+    );
 }
 
 #[gpui::test]

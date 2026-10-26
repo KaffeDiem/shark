@@ -536,8 +536,10 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
             .collect();
         assert_eq!(names, ["api", "new.txt"]);
     });
-    cx.update_window(window, |_, w, cx| shark.update(cx, |s, cx| s.toggle_tree(w, cx)))
-        .unwrap();
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| s.toggle_tree(w, cx))
+    })
+    .unwrap();
     press(cx, &["cmd-alt-right"]);
     cx.update_window(window, |_, w, cx| {
         assert!(
@@ -2221,6 +2223,26 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
             cx.run_until_parked();
         }
     };
+    // A comment on line 250 in Split: the original column hints at it across the gap
+    // (Unified has no gap).
+    on(cx, &|s, w, cx| s.comment_dialog(w, cx));
+    let hints = |cx: &mut TestAppContext| {
+        draw(cx);
+        cx.update_window(window, |_, w, _| w.find_all("annotation-hint").len())
+            .unwrap()
+    };
+    assert_eq!(hints(cx), 1);
+    on(cx, &|s, _, cx| {
+        s.diff.update(cx, |d, cx| d.set_mode(DiffMode::Unified, cx))
+    });
+    assert_eq!(hints(cx), 0);
+    on(cx, &|s, w, cx| {
+        s.cancel_composer(w, cx);
+        s.diff.update(cx, |d, cx| d.set_mode(DiffMode::Split, cx));
+        let line = DiffLineRange::new("api/f.txt", DiffSide::Modified, 250, 250);
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
+    });
     draw(cx);
     press(cx, &["i"]);
     draw(cx);
@@ -2931,7 +2953,16 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
     )
     .unwrap();
     git::git(&repos[0].path, &["add", "."]).unwrap();
-    let commit = ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "f"];
+    let commit = [
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "f",
+    ];
     git::git(&repos[0].path, &commit).unwrap();
     let (window, shark) = boot(
         cx,
@@ -2953,7 +2984,9 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
         .await;
     }
     on(cx, &|s, w, cx| {
-        let ix = (s.state.workspaces.iter()).position(|w| w.name == "ed").unwrap();
+        let ix = (s.state.workspaces.iter())
+            .position(|w| w.name == "ed")
+            .unwrap();
         s.open_workspace(ix, w, cx)
     });
     let file = home.join("shark/workspaces/ed/api/f.txt");
@@ -2991,7 +3024,10 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
     let value = |cx: &mut TestAppContext| {
         cx.update(|cx| {
             let e = shark.read(cx).editing.as_ref().unwrap();
-            (e.buf.lines[e.buf.line].clone(), e.input.read(cx).value().to_string())
+            (
+                e.buf.lines[e.buf.line].clone(),
+                e.input.read(cx).value().to_string(),
+            )
         })
     };
     assert_eq!(value(cx).1, "changed 250");
@@ -3007,7 +3043,9 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
         let e = shark.read(cx).editing.as_ref().unwrap();
         let input = w.find(("input", e.input.entity_id())).bounds();
         let row = w.find_all(("line", 249usize))[0].bounds();
-        let code = (w.find_all("source").iter()).filter(|s| s.bounds().left() == input.left()).count();
+        let code = (w.find_all("source").iter())
+            .filter(|s| s.bounds().left() == input.left())
+            .count();
         assert_eq!(input.size.height, row.size.height, "{input:?} vs {row:?}");
         assert!(code > 2, "{input:?} starts where the code does");
     })
@@ -3015,14 +3053,18 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
 
     // Letters are typed, not run as the diff's keys; tab indents and keeps focus.
     let unified = cx.update(|cx| shark.read(cx).state.unified);
-    press(cx, &["s", "r", "c", "v", "x", "d", "e", "o", "i", "shift-c", "}"]);
+    press(
+        cx,
+        &["s", "r", "c", "v", "x", "d", "e", "o", "i", "shift-c", "}"],
+    );
     cx.update(|cx| {
         let s = shark.read(cx);
         assert_eq!(s.state.unified, unified);
         assert!(s.review.composer.is_none() && s.editor.is_none() && s.review.sheet.is_none());
         assert!(s.viewed_now.is_empty() && s.editing.is_some());
     });
-    cx.update_window(window, |_, w, cx| w.input("sr", cx)).unwrap();
+    cx.update_window(window, |_, w, cx| w.input("sr", cx))
+        .unwrap();
     press(cx, &["tab"]);
     draw(cx);
     let (buf, input) = value(cx);
@@ -3045,7 +3087,11 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
         e.input.update(cx, |i, cx| i.set_selected_range(2..4, cx));
     });
     on(cx, &|s, w, cx| {
-        s.edit_click(&DiffLinePosition::new("api/f.txt", DiffSide::Modified, 250), w, cx)
+        s.edit_click(
+            &DiffLinePosition::new("api/f.txt", DiffSide::Modified, 250),
+            w,
+            cx,
+        )
     });
     cx.update(|cx| {
         let e = shark.read(cx).editing.as_ref().unwrap();
@@ -3081,17 +3127,24 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
     assert_eq!(fs::read_to_string(&file).unwrap(), want);
 
     // Someone else writes the file: a clean buffer takes it, the input too.
-    let theirs = want.replace("changed 250srcvxdeoiC}sr    ", "theirs changed 250").replace("line 3\n", "line 3!\n");
+    let theirs = want
+        .replace("changed 250srcvxdeoiC}sr    ", "theirs changed 250")
+        .replace("line 3\n", "line 3!\n");
     fs::write(&file, &theirs).unwrap();
     on(cx, &|s, _, cx| s.refresh_diff(cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).editing.as_ref().is_some_and(|e| e.buf.text() == theirs)
+        shark
+            .read(cx)
+            .editing
+            .as_ref()
+            .is_some_and(|e| e.buf.text() == theirs)
     })
     .await;
     draw(cx);
     assert_eq!(value(cx).1, "theirs changed 250");
     // Under unsaved edits it is only marked, and ⌘S asks.
-    cx.update_window(window, |_, w, cx| w.input("!", cx)).unwrap();
+    cx.update_window(window, |_, w, cx| w.input("!", cx))
+        .unwrap();
     draw(cx);
     fs::write(&file, theirs.replace("line 5\n", "line 5!\n")).unwrap();
     on(cx, &|s, _, cx| s.refresh_diff(cx));
@@ -3101,19 +3154,27 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
     .await;
     cx.update(|cx| {
         let s = shark.read(cx);
-        assert_eq!(s.working_heading("api/f.txt"), "Working copy · changed on disk");
+        assert_eq!(
+            s.working_heading("api/f.txt"),
+            "Working copy · changed on disk"
+        );
         assert!(s.editing.as_ref().unwrap().dirty);
     });
     on(cx, &|s, w, cx| s.save_edit(false, w, cx));
     for _ in 0..100 {
         cx.run_until_parked();
-        let shown = cx.update_window(window, |_, w, cx| w.has_active_dialog(cx)).unwrap();
+        let shown = cx
+            .update_window(window, |_, w, cx| w.has_active_dialog(cx))
+            .unwrap();
         if shown {
             break;
         }
-        cx.background_executor.timer(Duration::from_millis(20)).await;
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
     }
-    cx.update_window(window, |_, w, cx| w.close_dialog(cx)).unwrap();
+    cx.update_window(window, |_, w, cx| w.close_dialog(cx))
+        .unwrap();
 
     // A new file reloads the diff; the line input keeps its focus.
     on(cx, &|s, w, cx| s.focus_edit(w, cx));
@@ -3140,7 +3201,8 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
     })
     .unwrap();
     let before = value(cx).0;
-    cx.update_window(window, |_, w, cx| w.input("Q", cx)).unwrap();
+    cx.update_window(window, |_, w, cx| w.input("Q", cx))
+        .unwrap();
     draw(cx);
     assert_eq!(value(cx).0, format!("{before}Q"));
 
@@ -3156,7 +3218,10 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
     });
     cx.update(|cx| {
         let s = shark.read(cx);
-        assert_eq!(s.viewed_now.iter().map(|p| p.as_str()).collect::<Vec<_>>(), ["api/g.txt"]);
+        assert_eq!(
+            s.viewed_now.iter().map(|p| p.as_str()).collect::<Vec<_>>(),
+            ["api/g.txt"]
+        );
     });
 
     // The composer, opened while editing, takes the typing.
@@ -3168,7 +3233,8 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
     });
     draw(cx);
     let before = value(cx);
-    cx.update_window(window, |_, w, cx| w.input("hello", cx)).unwrap();
+    cx.update_window(window, |_, w, cx| w.input("hello", cx))
+        .unwrap();
     draw(cx);
     assert_eq!(value(cx), before);
     cx.update(|cx| {
@@ -3176,7 +3242,9 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
         assert_eq!(c.input.read(cx).value().as_ref(), "hello");
     });
     // The edited file's header: [Review] [Save ⌘S], no Comment.
-    on(cx, &|s, _, cx| s.diff.update(cx, |d, cx| d.scroll_to_file("api/f.txt", cx)));
+    on(cx, &|s, _, cx| {
+        s.diff.update(cx, |d, cx| d.scroll_to_file("api/f.txt", cx))
+    });
     draw(cx);
     cx.update_window(window, |_, w, _| {
         assert!(w.find_all("edit-save").len() == 1);
@@ -3191,7 +3259,10 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         let s = shark.read(cx);
-        s.editing.is_none() && s.diff_files.iter().any(|f| f.additions() == 1 && f.deletions() == 0)
+        s.editing.is_none()
+            && s.diff_files
+                .iter()
+                .any(|f| f.additions() == 1 && f.deletions() == 0)
     })
     .await;
     fs::remove_dir_all(&home).ok();
@@ -3477,7 +3548,16 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     fs::write(repos[0].path.join("f.txt"), "fn a() {\n    b();\n}\n").unwrap();
     fs::write(repos[0].path.join("h.txt"), "h\n").unwrap();
     git::git(&repos[0].path, &["add", "."]).unwrap();
-    let commit = ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "-m", "f"];
+    let commit = [
+        "-c",
+        "user.name=t",
+        "-c",
+        "user.email=t@t",
+        "commit",
+        "-q",
+        "-m",
+        "f",
+    ];
     git::git(&repos[0].path, &commit).unwrap();
     let (window, shark) = boot(
         cx,
@@ -3490,7 +3570,9 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     );
     let on = on_app(window, shark.clone());
     let press = press_in(window);
-    on(cx, &|s, w, cx| s.create_workspace("ed".into(), repos.clone(), None, w, cx));
+    on(cx, &|s, w, cx| {
+        s.create_workspace("ed".into(), repos.clone(), None, w, cx)
+    });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.as_deref() == Some("ed")
     })
@@ -3521,7 +3603,9 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     // The Files filter.
     on(cx, &|s, w, cx| s.toggle_tree(w, cx));
     let filter = cx.update(|cx| shark.read(cx).tree_filter.clone());
-    on(cx, &|_, w, cx| filter.read(cx).focus_handle(cx).focus(w, cx));
+    on(cx, &|_, w, cx| {
+        filter.read(cx).focus_handle(cx).focus(w, cx)
+    });
     press(cx, &VIM);
     cx.update(|cx| assert_eq!(filter.read(cx).value().as_ref(), "jkhlgG"));
     on(cx, &|s, w, cx| {
@@ -3532,27 +3616,35 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     // The line input; tab indents by the file's four spaces, ⌘Z undoes it.
     on(cx, &|s, w, cx| {
         let line = DiffLineRange::new("api/f.txt", DiffSide::Modified, 2, 2);
-        s.diff.update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
         s.edit_working_copy(Some("api/f.txt".into()), w, cx)
     });
     draw(cx);
     let line = |cx: &mut TestAppContext| {
         cx.update(|cx| {
             let e = shark.read(cx).editing.as_ref().unwrap();
-            (e.buf.lines[e.buf.line].clone(), e.input.read(cx).value().to_string())
+            (
+                e.buf.lines[e.buf.line].clone(),
+                e.input.read(cx).value().to_string(),
+            )
         })
     };
     press(cx, &VIM);
     assert_eq!(line(cx).0, "    c();jkhlgG");
     press(cx, &["tab"]);
-    assert_eq!(line(cx), ("    c();jkhlgG    ".into(), "    c();jkhlgG    ".into()));
+    assert_eq!(
+        line(cx),
+        ("    c();jkhlgG    ".into(), "    c();jkhlgG    ".into())
+    );
     press(cx, &["cmd-z"]);
     assert_eq!(line(cx).0, "    c();jkhlgG");
 
     // The composer, opened while editing.
     on(cx, &|s, w, cx| {
         let line = DiffLineRange::new("api/f.txt", DiffSide::Original, 1, 1);
-        s.diff.update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
+        s.diff
+            .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
         s.comment_dialog(w, cx)
     });
     draw(cx);
@@ -3578,7 +3670,9 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     cx.update(|cx| assert!(shark.read(cx).editing.is_none()));
 
     // A save under way: leaving waits for it.
-    on(cx, &|s, w, cx| s.edit_working_copy(Some("api/f.txt".into()), w, cx));
+    on(cx, &|s, w, cx| {
+        s.edit_working_copy(Some("api/f.txt".into()), w, cx)
+    });
     on(cx, &|s, w, cx| {
         s.editing.as_mut().unwrap().saving = true;
         s.leave_edit(w, cx);
@@ -3595,14 +3689,19 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     fs::write(&file, "fn a() {\n    c();\n}\n").unwrap();
     on(cx, &|s, _, cx| s.refresh_diff(cx));
     wait_files(cx, 1).await;
-    on(cx, &|s, w, cx| s.edit_working_copy(Some("api/f.txt".into()), w, cx));
+    on(cx, &|s, w, cx| {
+        s.edit_working_copy(Some("api/f.txt".into()), w, cx)
+    });
     draw(cx);
-    cx.update_window(window, |_, w, cx| w.input("!", cx)).unwrap();
+    cx.update_window(window, |_, w, cx| w.input("!", cx))
+        .unwrap();
     git::git(&dir, &["checkout", "--", "f.txt"]).unwrap();
     on(cx, &|s, _, cx| s.refresh_diff(cx));
     for _ in 0..50 {
         cx.run_until_parked();
-        cx.background_executor.timer(Duration::from_millis(20)).await;
+        cx.background_executor
+            .timer(Duration::from_millis(20))
+            .await;
     }
     cx.update(|cx| {
         let s = shark.read(cx);
@@ -3621,11 +3720,18 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
         (shark.read(cx).diff_files.iter()).any(|f| f.path() == "api/h.txt")
     })
     .await;
-    on(cx, &|s, w, cx| s.edit_working_copy(Some("api/h.txt".into()), w, cx));
+    on(cx, &|s, w, cx| {
+        s.edit_working_copy(Some("api/h.txt".into()), w, cx)
+    });
     cx.update(|cx| {
         let s = shark.read(cx);
         assert_eq!(s.editing.as_ref().unwrap().path.as_str(), "api/h.txt");
-        assert!(s.review.hunks["api/h.txt"].iter().flatten().any(|r| r.0 == b'+' && r.2 == 1));
+        assert!(
+            s.review.hunks["api/h.txt"]
+                .iter()
+                .flatten()
+                .any(|r| r.0 == b'+' && r.2 == 1)
+        );
     });
     fs::remove_dir_all(&home).ok();
 }

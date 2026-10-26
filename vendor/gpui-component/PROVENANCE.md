@@ -60,6 +60,9 @@ All in `src/diff/` (and `src/checkbox.rs`, one string in `locales/ui.yml`), test
     mouse text selection over code touches, so an app can comment on them.
 14. **Copy**: the hunk separator reads "↑ N unchanged lines" (`locales/ui.yml`
     `Diff.HiddenLines`).
+15. **Annotation hints** (`mod.rs` `render_cell`): `Diff::annotation_hints(on_original,
+    on_modified)` centers a muted line of text in a Split column's gap beside a line annotation
+    on the other side. Tested by `the_other_column_hints_at_an_annotation_beside_its_gap`.
 
 The crate's own tests include files from the upstream monorepo
 (`../../assets`, `../../../base`, `../../../../themes`, …) that the package
