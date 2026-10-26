@@ -46,6 +46,11 @@ impl SelectionGeometry {
         self.runs.clear();
     }
 
+    #[cfg(test)]
+    pub fn run_bounds(&self) -> Vec<(DiffSide, usize, Bounds<Pixels>)> {
+        (self.runs.iter()).map(|r| (r.side, r.line_ix, r.bounds)).collect()
+    }
+
     /// The widest painted source line, measured from its first text run.
     pub fn painted_width(&self) -> Pixels {
         self.runs

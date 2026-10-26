@@ -256,30 +256,45 @@ fn a_resize_found_while_painting_lays_out_again(cx: &mut TestAppContext) {
 }
 
 #[gpui::test]
-fn annotations_stay_in_view_when_rows_scroll_sideways(cx: &mut TestAppContext) {
-    let wide = format!("{}\n", "x".repeat(400));
-    let original = lines("line", 20);
-    let modified = original.replace("line 10\n", "changed 10\n") + &wide;
+fn only_code_scrolls_sideways_and_the_narrow_column_reaches_its_longest_line(
+    cx: &mut TestAppContext,
+) {
+    // The long line is on the original side, in the narrower column.
+    let original = format!("{}\n", "x".repeat(400)) + &lines("line", 20);
+    let modified = lines("line", 20).replace("line 9\n", "changed 10\n");
     let (state, _, cx) = sized(cx, fixture::modified("split.txt", &original, &modified));
-    // The working column starts mid-view, then fills it: the note keeps to what is visible.
-    let half = cx.update(|_, cx| state.read(cx).content_width()) * 0.5;
-    for (x, from) in [(half - px(200.), px(200.)), (half + px(500.), px(0.))] {
-        cx.update(|_, cx| {
-            state.update(cx, |state, _| state.horizontal_scroll().set_offset(point(-x, px(0.))))
-        });
-        for _ in 0..2 {
-            draw(cx);
-        }
+    cx.update(|_, cx| state.update(cx, |state, cx| state.set_split_ratio(0.3, cx)));
+    draw(cx);
+    let frame = |cx: &mut VisualTestContext| {
+        let divider = find(cx, "split-divider")[0].left();
+        let gutter = find(cx, ("line", 9usize));
         let note = find(cx, "note-body");
-        assert_eq!(note.len(), 1, "scrolled {x:?}");
-        // At least 240 px wide: past the view's edge when little of the column shows.
-        let fits = from > px(0.) || (note[0].right() <= px(400.) && note[0].size.width > px(300.));
-        assert!(
-            (note[0].left() - from).abs() < px(30.) && fits,
-            "scrolled {x:?}: {:?}",
-            note[0]
-        );
+        assert_eq!(note.len(), 1);
+        (divider, gutter.iter().map(|b| b.left()).collect::<Vec<_>>(), note[0].left())
+    };
+    let before = frame(cx);
+    // Every line's code stays inside the 400 px view.
+    assert!(find(cx, "source").iter().all(|s| s.right() <= px(400.)));
+    let long_end = |cx: &mut VisualTestContext| {
+        cx.update(|_, cx| {
+            let geometry = state.read(cx).geometry().borrow().run_bounds();
+            (geometry.iter())
+                .filter(|(side, ix, _)| *side == DiffSide::Original && *ix == 0)
+                .map(|(_, _, b)| b.right())
+                .fold(px(0.), gpui::Pixels::max)
+        })
+    };
+    assert!(long_end(cx) > before.0, "the long line runs past its column");
+    // As far right as it goes: the long line's end is in its column; the frame didn't move.
+    cx.update(|_, cx| {
+        state.update(cx, |state, _| state.horizontal_scroll().set_offset(point(px(-10000.), px(0.))))
+    });
+    for _ in 0..3 {
+        draw(cx);
     }
+    let end = long_end(cx);
+    assert!(end <= before.0 && end > before.0 - px(60.), "end {end:?}, divider {:?}", before.0);
+    assert_eq!(frame(cx), before);
 }
 
 #[gpui::test]
