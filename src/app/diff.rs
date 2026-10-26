@@ -107,6 +107,19 @@ impl Shark {
             }
             return;
         }
+        // The edited file left the diff (say `git checkout -- f`): clean, editing ends; unsaved
+        // edits keep it in the diff.
+        if let Some(e) = &self.editing
+            && !data.files.iter().any(|f| *f.path() == e.path)
+        {
+            match e.dirty {
+                true => {
+                    data.files.push(e.file.clone());
+                    data.fps.push(0);
+                }
+                false => self.end_edit(cx),
+            }
+        }
         // The file edited in place shows its buffer, saved or not; git's comes back after.
         if let Some(e) = &mut self.editing
             && let Some(f) = data.files.iter_mut().find(|f| *f.path() == e.path)
@@ -176,10 +189,7 @@ impl Shark {
         let caret = (self.editing.as_ref()).map(|e| e.caret());
         match caret {
             _ if in_place => {}
-            Some(caret) => self.diff.update(cx, |d, cx| {
-                d.show_line(caret.clone(), cx);
-                d.scroll_to_line(caret, cx)
-            }),
+            Some(caret) => self.diff.update(cx, |d, cx| d.scroll_to_line(caret, cx)),
             None if self.restore_view(cx) => {}
             None => {
                 if let Some(f) = files.get(at) {
@@ -261,10 +271,13 @@ impl Shark {
     fn dir_files(&self, dir: &str) -> Vec<usize> {
         let prefix = format!("{dir}/");
         (0..self.diff_files.len())
-            .map(|ix| (ix, self.diff_files[ix].path()))
-            .filter(|(_, p)| p.starts_with(&prefix) && p.to_lowercase().contains(&self.tree_query))
-            .map(|(ix, _)| ix)
+            .filter(|&ix| self.diff_files[ix].path().starts_with(&prefix) && self.tree_match(ix))
             .collect()
+    }
+
+    /// File `ix` matches the "Filter files…" query.
+    fn tree_match(&self, ix: usize) -> bool {
+        (self.diff_files[ix].path().to_lowercase()).contains(&self.tree_query)
     }
 
     /// A folder's box: ticks every file inside, or unticks them all when all are viewed.
@@ -312,7 +325,7 @@ impl Shark {
 
     pub(super) fn rebuild_tree(&mut self) {
         let keep: Vec<usize> = (0..self.diff_files.len())
-            .filter(|&ix| (self.diff_files[ix].path().to_lowercase()).contains(&self.tree_query))
+            .filter(|&ix| self.tree_match(ix))
             .collect();
         let paths: Vec<String> = (keep.iter())
             .map(|&ix| self.diff_files[ix].path().to_string())
@@ -570,6 +583,10 @@ impl Shark {
                 cx.listener(|this, _: &SelectLast, w, cx| this.diff_move(0, Some(false), w, cx)),
             )
             .on_action(cx.listener(|this, _: &AddComment, w, cx| this.comment_dialog(w, cx)))
+            .on_action(cx.listener(|this, _: &CancelEdit, w, cx| match this.editing {
+                Some(_) => this.leave_edit(w, cx),
+                None => cx.propagate(),
+            }))
             .on_action(cx.listener(|this, _: &SendComments, w, cx| this.open_sheet(w, cx)))
             .on_action(cx.listener(|this, _: &EditThread, w, cx| this.edit_thread(w, cx)))
             .on_action(cx.listener(|this, _: &DeleteThread, _, cx| this.delete_thread(cx)))

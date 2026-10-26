@@ -182,13 +182,14 @@ fn bind_keys(cx: &mut App) {
         "Sidebar || Home || Transcript || FileTree || Queue || (DiffPane && !Input) || PlanPane";
     const ARROWS: &str =
         "Sidebar || Home || Transcript || FileTree || Queue || PlanPane || (Diff && !Vim)";
+    // `!Input` sits outside `Vim > (…)`: inside it, `!` sees only the contexts down to the
+    // match, not a focused Input below. The editor's Normal mode is an Input that types nothing.
     let vim = |keys: &str, action: Box<dyn Action>, context: &str| {
+        let predicate = format!("(Vim > ({context})) && (!Input || VimNormal)");
         KeyBinding::load(
             keys,
             action,
-            Some(Rc::new(
-                KeyBindingContextPredicate::parse(&format!("Vim > ({context})")).unwrap(),
-            )),
+            Some(Rc::new(KeyBindingContextPredicate::parse(&predicate).unwrap())),
             false,
             None,
             &DummyKeyboardMapper,
@@ -291,6 +292,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-p", OpenAnyFile, None),
         // Edit the cursor file's working copy in the diff; cmd-s saves it there.
         KeyBinding::new("i", EditWorkingCopy, Some(DIFF)),
+        // Back to reviewing, also when the line input lost focus.
+        KeyBinding::new("escape", CancelEdit, Some(DIFF)),
         KeyBinding::new("cmd-s", SaveFile, Some("InlineEdit")),
         KeyBinding::new("c", AddComment, Some(DIFF)),
         // Plan mode; in the composer shift-tab is caught before the input outdents.
@@ -364,7 +367,7 @@ fn bind_keys(cx: &mut App) {
         (0..9).map(|i| KeyBinding::new(&format!("cmd-{}", i + 1), OpenWorkspace(i), None)),
     );
     // The Diff component's scroll actions are private; bind vim keys to them by name.
-    let diff = Rc::new(KeyBindingContextPredicate::parse("Vim > (Diff && !Input)").unwrap());
+    let diff = Rc::new(KeyBindingContextPredicate::parse("(Vim > Diff) && !Input").unwrap());
     let scroll = [("h", "diff::ScrollLeft"), ("l", "diff::ScrollRight")];
     let bindings: Vec<KeyBinding> = scroll
         .iter()

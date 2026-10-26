@@ -122,6 +122,10 @@ impl Shark {
         let open = (self.editor.as_ref())
             .filter(|e| editor && e.read(cx).dirty)
             .map(|e| e.read(cx).path.clone());
+        // A write under way would land after a Discard; wait for it.
+        if let Some(e) = self.editing.as_ref().filter(|e| edit && e.saving) {
+            return window.push_notification(format!("Saving {}…", e.path), cx);
+        }
         let inline = (self.editing.as_ref())
             .filter(|e| edit && e.dirty)
             .map(|e| e.path.to_string());

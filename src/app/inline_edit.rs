@@ -31,6 +31,19 @@ impl Buffer {
         text
     }
 
+    /// The file's indent: a tab if a line starts with one, else its shortest run of two or
+    /// more leading spaces, else four spaces.
+    pub(super) fn indent(&self) -> String {
+        if self.lines.iter().any(|l| l.starts_with('\t')) {
+            return "\t".into();
+        }
+        let n = (self.lines.iter())
+            .map(|l| l.len() - l.trim_start_matches(' ').len())
+            .filter(|&n| n >= 2)
+            .min();
+        " ".repeat(n.unwrap_or(4))
+    }
+
     /// Enter at byte `col`: the rest of the line moves to a new line below, with the caret.
     pub(super) fn split(&mut self, col: usize) {
         let rest = self.lines[self.line].split_off(col);
@@ -76,6 +89,8 @@ pub(super) fn patch(path: &str, base: &str, text: &str, added: bool) -> String {
         true => "/dev/null".to_string(),
         false => format!("a/{path}"),
     };
+    // An empty buffer still has its one (empty) line to edit; git shows no row for it.
+    let text = if text.is_empty() { "\n" } else { text };
     let mut out = format!("diff --git a/{path} b/{path}\n");
     if added {
         out += "new file mode 100644\n";
@@ -134,7 +149,7 @@ pub(super) struct InlineEdit {
     /// Saved, and not edited since.
     pub(super) saved: bool,
     /// A save is being written.
-    saving: bool,
+    pub(super) saving: bool,
     /// Something else wrote the file under unsaved edits.
     pub(super) stale: bool,
     window: AnyWindowHandle,
@@ -152,6 +167,11 @@ impl InlineEdit {
 
     pub(super) fn focused(&self, window: &Window, cx: &App) -> bool {
         self.input.read(cx).focus_handle(cx).is_focused(window)
+    }
+
+    /// Edited since the last save.
+    fn touch(&mut self) {
+        (self.dirty, self.saved) = (true, false);
     }
 
     pub(super) fn caret(&self) -> DiffLinePosition {
@@ -338,28 +358,8 @@ impl Shark {
         let (line, input) = (e.buf.lines[e.buf.line].clone(), e.input.clone());
         input.update(cx, |i, cx| {
             i.set_value(line.clone(), window, cx);
-            let mut col = col.unwrap_or(line.len()).min(line.len());
-            while !line.is_char_boundary(col) {
-                col -= 1;
-            }
+            let col = line.floor_char_boundary(col.unwrap_or(line.len()));
             i.set_selected_range(col..col, cx);
-        });
-    }
-
-    /// Runs `f` with the edit's window once the current update is over (refreshes come
-    /// without one).
-    pub(super) fn with_edit_window(
-        &self,
-        cx: &mut Context<Self>,
-        f: impl FnOnce(&mut Shark, &mut Window, &mut Context<Shark>) + 'static,
-    ) {
-        let Some(w) = self.editing.as_ref().map(|e| e.window) else {
-            return;
-        };
-        let this = cx.entity();
-        cx.defer(move |cx| {
-            w.update(cx, |_, window, cx| this.update(cx, |s, cx| f(s, window, cx)))
-                .ok();
         });
     }
 
@@ -383,7 +383,15 @@ impl Shark {
         e.buf.line = line.min(e.buf.lines.len() - 1);
         (e.disk, e.stale, e.saved) = (fp, false, false);
         e.update_file();
-        self.with_edit_window(cx, |s, window, cx| s.load_line(None, window, cx));
+        // The new line into the input once this update is over, in the edit's window
+        // (refreshes come without one).
+        let (w, this) = (e.window, cx.entity());
+        cx.defer(move |cx| {
+            w.update(cx, |_, window, cx| {
+                this.update(cx, |s, cx| s.load_line(None, window, cx))
+            })
+            .ok();
+        });
     }
 
     pub(super) fn focus_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -401,8 +409,7 @@ impl Shark {
             return;
         }
         e.buf.lines[e.buf.line] = value;
-        e.dirty = true;
-        e.saved = false;
+        e.touch();
         self.sync_edit(cx);
     }
 
@@ -429,10 +436,13 @@ impl Shark {
         let Some(e) = self.editing.as_mut().filter(|e| e.focused(window, cx)) else {
             return false;
         };
-        // Tab indents; it never moves focus out of the line (and onto the diff's letter keys).
+        // Tab indents by the file's unit, through the input so ⌘Z undoes it; it never moves
+        // focus out of the line (and onto the diff's letter keys).
         if ks.key == "tab" && ks.modifiers.number_of_modifiers() == ks.modifiers.shift as u8 {
             if !ks.modifiers.shift {
-                self.paste_lines("\t", window, cx);
+                let unit = e.buf.indent();
+                e.input.update(cx, |i, cx| i.replace(unit, window, cx));
+                self.typed(cx);
             }
             return true;
         }
@@ -469,8 +479,7 @@ impl Shark {
             }
             _ => return false,
         };
-        e.dirty = true;
-        e.saved = false;
+        e.touch();
         self.show_edit_at(col, window, cx);
         true
     }
@@ -480,8 +489,7 @@ impl Shark {
         let Some(e) = &mut self.editing else { return };
         let range = e.input.read(cx).selected_range();
         let col = e.buf.insert(range, text);
-        e.dirty = true;
-        e.saved = false;
+        e.touch();
         self.show_edit_at(Some(col), window, cx);
     }
 
@@ -499,7 +507,7 @@ impl Shark {
 
     /// Ends in-place editing: the file shows as git has it again, without any discarded
     /// buffer, and its header (the base's blob) is there to edit it again.
-    fn end_edit(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn end_edit(&mut self, cx: &mut Context<Self>) {
         let Some(e) = self.editing.take() else { return };
         let (file, hunks) = e.orig;
         self.review.hunks.insert(e.path.clone(), hunks);
@@ -594,6 +602,8 @@ impl Shark {
         diff.render_working_cell(move |p, l, window, cx| {
             (*p == path && l == line).then(|| {
                 let shark = shark.clone();
+                // ponytail: the edited line is plain text, no syntax colors; a highlighted copy
+                // behind transparent input text drifts once the input scrolls a long line.
                 // The code's font and size, without the input's padding: the text stays put.
                 let size = window.rem_size() * (f32::from(cx.theme().mono_font_size) / 16.);
                 div()
@@ -698,6 +708,9 @@ mod tests {
         assert_eq!((b.text(), b.line), ("one\nta\nb\nco\n".into(), 3));
         assert_eq!(Buffer::new("x").text(), "x");
         assert_eq!(Buffer::new("").lines, [""]);
+        assert_eq!(Buffer::new("a\n\tb\n").indent(), "\t");
+        assert_eq!(Buffer::new("a\n * c\n  b\n    d\n").indent(), "  ");
+        assert_eq!(Buffer::new("a\n").indent(), "    ");
     }
 
     #[test]
@@ -731,6 +744,12 @@ mod tests {
             let p = patch("api/f", text, text, false);
             assert_eq!(rows(&p), 2, "{p}");
             assert_eq!(DiffFile::parse(&p).unwrap()[0].additions(), 0);
+        }
+        // An empty or emptied file keeps a working line to edit.
+        for (base, added) in [("", true), ("", false), ("a\nb\n", false)] {
+            let p = patch("api/f", base, "", added);
+            let hunks = review::parse_hunks(&p);
+            assert!(hunks.iter().flatten().any(|r| r.0 != b'-' && r.2 == 1), "{p}");
         }
     }
 }
