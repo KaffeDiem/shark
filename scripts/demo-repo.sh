@@ -3,7 +3,7 @@
 #
 #   scripts/demo-repo.sh [dir]      # default: a new temp dir; prints the repo path
 #
-# Then in Shark: cmd-o and pick the printed `shark` repo, cmd-n, name the branch
+# Then in Shark: cmd-o and pick the printed `shark` repo, ctrl-n, name the branch
 # `better-diff`, enter. The workspace starts on the pushed `better-diff` branch, so
 # Changes shows "origin/master → working tree" with the three files.
 set -eu

@@ -783,7 +783,7 @@ impl Shark {
         side_toggle(
             "new-workspace",
             IconName::SquarePen,
-            "New workspace (cmd-n)",
+            "New workspace (ctrl-n)",
         )
         .on_click(cx.listener(|this, _, window, cx| {
             this.new_workspace(this.state.last_repos.clone(), None, window, cx)
@@ -998,6 +998,7 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &FocusQueue, w, cx| this.focus_queue(w, cx)))
             .on_action(cx.listener(|this, _: &ShowChat, w, cx| this.show(Tab::Chat, w, cx)))
             .on_action(cx.listener(|this, _: &NewChat, w, cx| this.new_chat(w, cx)))
+            .on_action(cx.listener(|this, _: &NewTab, w, cx| this.new_tab(w, cx)))
             .on_action(cx.listener(|this, _: &CloseChat, w, cx| this.close_chat(w, cx)))
             .on_action(cx.listener(|this, _: &CloseTab, w, cx| this.close_tab(w, cx)))
             .on_action(cx.listener(|this, _: &ReopenChat, w, cx| this.reopen_chat(None, w, cx)))
@@ -1096,7 +1097,7 @@ impl Render for Shark {
                     this.open_file(ix, w, cx)
                 }
             }))
-            .on_action(cx.listener(|this, _: &OpenAnyFile, w, cx| this.open_any_file(w, cx)))
+            .on_action(cx.listener(|this, _: &OpenAnyFile, w, cx| this.open_any_file(false, w, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, w, cx| {
                 crate::settings::open(&this.state, w, cx)
             }))

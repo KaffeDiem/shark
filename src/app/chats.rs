@@ -236,6 +236,41 @@ impl Shark {
         }
     }
 
+    /// Cmd-n: choose a chat, the workspace diff, or an additional file tab.
+    pub(super) fn new_tab(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active_ws().is_none() {
+            return notify_err(window, cx, "Create a workspace first (ctrl-n)");
+        }
+        let items = [
+            ("New chat", IconName::MessageSquare),
+            ("Diff", IconName::GitCompare),
+            ("Open file…", IconName::File),
+        ]
+        .into_iter()
+        .map(|(label, icon)| CommandItem::new().label(label).icon(icon))
+        .collect();
+        open_menu(
+            cx.entity().downgrade(),
+            "New tab…",
+            items,
+            0,
+            |_, row, window, cx| {
+                // Let the chooser restore focus before opening or focusing the selected view.
+                cx.defer_in(window, move |s, window, cx| match row {
+                    0 => {
+                        s.show(Tab::Chat, window, cx);
+                        s.new_chat(window, cx);
+                    }
+                    1 => s.show(Tab::Diff, window, cx),
+                    2 => s.open_any_file(true, window, cx),
+                    _ => {}
+                });
+            },
+            window,
+            cx,
+        );
+    }
+
     /// cmd-t: a new tab right of the current one, on the last picked model and thinking level
     /// and the current chat's speed.
     pub(super) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -810,13 +845,13 @@ impl Shark {
             );
         }
         tabs.push(
-            Button::new("new-chat")
+            Button::new("new-tab")
                 .ghost()
                 .xsmall()
                 .icon(IconName::Plus)
                 .w(px(24.))
-                .tooltip("New chat (cmd-t)")
-                .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx)))
+                .tooltip("New tab (cmd-n)")
+                .on_click(cx.listener(|this, _, window, cx| this.new_tab(window, cx)))
                 .into_any_element(),
         );
         tabs
