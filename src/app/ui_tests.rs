@@ -291,6 +291,149 @@ async fn vim_setting_and_palette_target(cx: &mut TestAppContext) {
     cx.update(|cx| assert_eq!(shark.read(cx).state.workspaces[0].name, open));
 }
 
+/// The New workspace dialog's branch mode: cmd-b or the row label lists a repo's branches;
+/// enter picks one, tab goes back, a checked-out branch is refused, the first row restores
+/// the new branch, a fetch finds branches only origin has, and the branch name may be left
+/// empty when every ticked repo has an existing branch.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn branch_picker(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api", "web"]);
+    for r in &repos {
+        let origin = home.join(format!("{}.git", r.name));
+        git::git(&home, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
+        git::git(&r.path, &["remote", "add", "origin", &origin.to_string_lossy()]).unwrap();
+        git::git(&r.path, &["push", "-q", "origin", "main", "main:shared", "main:kd/a"]).unwrap();
+    }
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            last_repos: vec!["api".into(), "web".into()],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let press = |cx: &mut TestAppContext, keys: &[&str]| {
+        cx.update_window(window, |_, w, cx| keys.iter().for_each(|k| w.press(k, cx)))
+            .unwrap();
+        cx.run_until_parked();
+    };
+    let input = |cx: &mut TestAppContext, text: &str| {
+        cx.update_window(window, |_, w, cx| w.input(text, cx))
+            .unwrap();
+        cx.run_until_parked();
+    };
+    // What repo row `i` says it gets; `None` while the branch list is shown.
+    let gets = |cx: &mut TestAppContext, i: usize| {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            let row = w.try_find(("repo-branch", i))?;
+            Some(row.label()?.split(": ").nth(1)?.to_string())
+        })
+        .unwrap()
+    };
+    // Highlights repo `name` in the list and lists its branches, filtered by `filter`.
+    let branches_of = |cx: &mut TestAppContext, name: &str, filter: &str| {
+        input(cx, name);
+        press(cx, &["cmd-b"]);
+        input(cx, filter);
+    };
+    let on = |ws: &str, repo: &str| {
+        let wt = home.join("shark/workspaces").join(ws).join(repo);
+        git::git(&wt, &["branch", "--show-current"]).unwrap()
+    };
+    let count = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.workspaces.len());
+
+    // The row label says new or existing as the name is typed.
+    press(cx, &["cmd-n"]);
+    assert_eq!(gets(cx, 0).as_deref(), Some("new"));
+    input(cx, "shared");
+    assert_eq!((gets(cx, 0).as_deref(), gets(cx, 1).as_deref()), (Some("existing"), Some("existing")));
+
+    // A branch checked out in the source checkout is refused; tab goes back unpicked.
+    press(cx, &["cmd-a", "backspace"]);
+    input(cx, "x1");
+    press(cx, &["tab"]);
+    branches_of(cx, "api", "main");
+    assert_eq!(gets(cx, 0), None, "the branch list replaces the repos");
+    press(cx, &["enter"]);
+    assert_eq!(gets(cx, 0), None, "refused: still listing branches");
+    press(cx, &["tab"]);
+    assert_eq!(gets(cx, 0).as_deref(), Some("new"));
+    press(cx, &["cmd-enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.as_deref() == Some("x1")
+    })
+    .await;
+    assert_eq!((on("x1", "api"), on("x1", "web")), ("x1".into(), "x1".into()));
+
+    // Picking, then the first row puts the new branch back. Clicking the label lists too.
+    press(cx, &["cmd-n"]);
+    input(cx, "y1");
+    press(cx, &["tab"]);
+    branches_of(cx, "web", "shared");
+    press(cx, &["enter"]);
+    input(cx, "");
+    let web = (0..2).find(|&i| gets(cx, i).as_deref() == Some("shared")).unwrap();
+    // Back on the repos, the highlight is on web: space unticks and reticks web.
+    let ticked = |cx: &mut TestAppContext, i: usize| {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.find(("repo-pick", i)).checked()
+        })
+        .unwrap()
+    };
+    press(cx, &["space"]);
+    assert_eq!((ticked(cx, web), ticked(cx, 1 - web)), (Some(false), Some(true)));
+    press(cx, &["space"]);
+    assert_eq!(ticked(cx, web), Some(true));
+    cx.update_window(window, |_, w, cx| w.click(("repo-branch", web), cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert_eq!(gets(cx, 0), None, "the click lists web's branches");
+    press(cx, &["enter"]);
+    assert_eq!(gets(cx, web).as_deref(), Some("new"));
+    press(cx, &["cmd-enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.as_deref() == Some("y1")
+    })
+    .await;
+    assert_eq!(on("y1", "web"), "y1");
+
+    // Without a name, every ticked repo needs a branch: one is not enough.
+    press(cx, &["cmd-n", "tab"]);
+    branches_of(cx, "api", "kd/a");
+    press(cx, &["enter"]);
+    press(cx, &["cmd-enter"]);
+    assert_eq!(count(cx), 2, "web has no branch and none was named");
+    // web gets one that only origin has, so far: the fetch on cmd-b finds it.
+    let web_origin = home.join("web.git");
+    git::git(&web_origin, &["branch", "fresh", "main"]).unwrap();
+    // The refusal focused the empty name; back to the list.
+    press(cx, &["tab"]);
+    input(cx, "web");
+    press(cx, &["cmd-b"]);
+    input(cx, "fresh");
+    press(cx, &["enter"]);
+    press(cx, &["cmd-enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.as_deref() == Some("kd-a")
+    })
+    .await;
+    assert_eq!((on("kd-a", "api"), on("kd-a", "web")), ("kd/a".into(), "fresh".into()));
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        let ws = s.ws("kd-a").unwrap();
+        assert_eq!(ws.branch, "kd/a", "named after the first picked branch");
+        let own: Vec<_> = ws.repos.iter().map(|r| r.branch.clone()).collect();
+        assert_eq!(own, [None, Some("fresh".into())]);
+    });
+    fs::remove_dir_all(&home).unwrap();
+}
+
 /// Drives the real keymap headlessly: create a workspace, vim focus moves, tabs, archive.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)] // each test owns its thread; the lock only orders them

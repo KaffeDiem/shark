@@ -475,6 +475,20 @@ impl State {
 mod tests {
     use super::*;
 
+    /// A repo saved before per-repo branches is on the workspace branch, and one on the
+    /// workspace branch doesn't save the field.
+    #[test]
+    fn repo_branch_is_optional() {
+        let old = r#"{"name":"w","branch":"feat","repos":[{"name":"api","src":"/x","base":"origin/main"}]}"#;
+        let mut ws: Workspace = serde_json::from_str(old).unwrap();
+        assert_eq!(ws.repos[0].branch, None);
+        assert_eq!(ws.branch_of(&ws.repos[0]), "feat");
+        assert!(!serde_json::to_string(&ws).unwrap().contains("\"branch\":null"));
+        ws.repos[0].branch = Some("kd/x".into());
+        let back: Workspace = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+        assert_eq!(back.branch_of(&back.repos[0]), "kd/x");
+    }
+
     #[test]
     fn corrupt_state_is_kept() {
         use std::os::unix::fs::PermissionsExt as _;

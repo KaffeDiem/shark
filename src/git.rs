@@ -1003,6 +1003,100 @@ mod tests {
         fs::remove_dir_all(&root).unwrap();
     }
 
+    /// The edge cases of picking existing branches per repo.
+    #[test]
+    fn per_repo_branch_edges() {
+        let root = std::env::temp_dir().join(format!("shark-test-pre-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (api, web) = (init_repo(&root, "api"), init_repo(&root, "web"));
+        let commit = ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q"];
+        let empty_commit = |dir: &Path, msg: &str| {
+            git(dir, &[&commit[..], &["--allow-empty", "-m", msg]].concat()).unwrap();
+            git(dir, &["rev-parse", "HEAD"]).unwrap()
+        };
+        for r in [&api, &web] {
+            let origin = root.join(format!("{}.git", r.name));
+            git(&root, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
+            git(&r.path, &["remote", "add", "origin", &origin.to_string_lossy()]).unwrap();
+            git(&r.path, &["push", "-q", "origin", "main", "main:shared"]).unwrap();
+        }
+        let a = &api.path;
+
+        // Diverged: local and origin each have a commit; local is kept, not reset.
+        git(a, &["checkout", "-q", "-b", "div"]).unwrap();
+        let theirs = empty_commit(a, "theirs");
+        git(a, &["push", "-q", "origin", "div"]).unwrap();
+        git(a, &["reset", "-q", "--hard", "HEAD~1"]).unwrap();
+        let mine = empty_commit(a, "mine");
+        git(a, &["checkout", "-q", "main"]).unwrap();
+        let d = root.join("ws/d");
+        let dws = create_workspace(&d, "d", "div", &on_branch(&[api.clone()], "div")).unwrap();
+        assert_eq!(git(&d.join("api"), &["rev-parse", "HEAD"]).unwrap(), mine);
+        assert_eq!(git(a, &["rev-parse", "origin/div"]).unwrap(), theirs);
+        remove_workspace(&dws, &d, true).unwrap();
+
+        // The same existing branch in both repos, under another workspace name: each checks
+        // out its own, and CLAUDE.md names the one they share.
+        let s = root.join("ws/s");
+        let mut sws = create_workspace(
+            &s,
+            "s",
+            "s",
+            &[(api.clone(), "shared".into()), (web.clone(), "shared".into())],
+        )
+        .unwrap();
+        for r in ["api", "web"] {
+            let b = git(&s.join(r), &["branch", "--show-current"]).unwrap();
+            assert_eq!(b, "shared");
+        }
+        assert!(sws.repos.iter().all(|r| r.branch.as_deref() == Some("shared")));
+        let md = fs::read_to_string(s.join("CLAUDE.md")).unwrap();
+        assert!(md.contains("worktree on branch `shared`:") && !md.contains(" on `"), "{md}");
+        // A repo added later gets the workspace branch, and CLAUDE.md now tells them apart.
+        let cli = init_repo(&root, "cli");
+        sws = add_to_workspace(&sws, &s, &cli).unwrap();
+        assert_eq!(git(&s.join("cli"), &["branch", "--show-current"]).unwrap(), "s");
+        assert_eq!(sws.repos[2].branch, None);
+        let md = fs::read_to_string(s.join("CLAUDE.md")).unwrap();
+        assert!(md.contains(" on `shared` ") && md.contains(" on `s` "), "{md}");
+        remove_workspace(&sws, &s, true).unwrap();
+
+        // A ref clash (`kd` exists, `kd/y` can't): everything is rolled back.
+        git(a, &["branch", "kd"]).unwrap();
+        let c = root.join("ws/c");
+        let err = create_workspace(
+            &c,
+            "c",
+            "c",
+            &[(web.clone(), "c".into()), (api.clone(), "kd/y".into())],
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("kd/y"), "{err}");
+        assert!(!c.exists());
+        let has = |r: &Repo, b: &str| {
+            git(&r.path, &["rev-parse", "--verify", "--quiet", &format!("refs/heads/{b}")]).is_ok()
+        };
+        assert!(!has(&web, "c") && !has(&api, "kd/y"));
+        for r in [&api, &web] {
+            let wts = git(&r.path, &["worktree", "list"]).unwrap();
+            assert_eq!(wts.lines().count(), 1, "{wts}");
+        }
+
+        // An invalid name for any repo is refused before anything happens.
+        let err = create_workspace(
+            &root.join("ws/bad"),
+            "bad",
+            "ok",
+            &[(web.clone(), "ok".into()), (api.clone(), "bad..name".into())],
+        )
+        .err()
+        .unwrap();
+        assert!(err.contains("bad..name"), "{err}");
+        assert!(!has(&web, "ok"));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     #[test]
     fn readable_add_repo_errors() {
         let dir = std::env::temp_dir().join(format!("shark-test-norepo-{}", std::process::id()));

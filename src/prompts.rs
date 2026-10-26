@@ -48,7 +48,7 @@ finish it (`git rebase --continue`, `git commit`, …), then report what you did
         id: "wrong_branch",
         title: "Switch to branch",
         repos: "repos on another branch",
-        default: "These repos are on a different branch than the workspace branch `{branch}`: {repos}. Switch them back to \
+        default: "These repos are on a different branch than their workspace branch `{branch}`: {repos}. Switch them back to \
 `{branch}` (bring over any commits made on the other branch), then report what you did.",
     },
     Prompt {
@@ -134,17 +134,24 @@ pub fn render(id: &str, repos: &str, branch: &str) -> String {
         .replace("{branch}", branch)
 }
 
-/// `{branch}` for `(repo, branch)` pairs: the name they share, else each repo's, as in
-/// ``api: `a`, web: `b` ``.
-pub fn branches<'a>(repos: impl IntoIterator<Item = (&'a str, &'a str)>) -> String {
-    let repos: Vec<_> = repos.into_iter().collect();
-    match repos.first() {
-        Some((_, b)) if repos.iter().all(|(_, o)| o == b) => b.to_string(),
-        _ => (repos.iter())
-            .map(|(r, b)| format!("{r}: `{b}`"))
-            .collect::<Vec<_>>()
-            .join(", "),
+/// `render` for `(repo, branch)` pairs, once per branch they're on: `{branch}` sits inside git
+/// commands, so it must be one name. `fill` gives `{repos}` for each group's repos.
+pub fn render_each<'a>(
+    id: &str,
+    repos: impl IntoIterator<Item = (&'a str, &'a str)>,
+    fill: impl Fn(&[String]) -> String,
+) -> String {
+    let mut groups: Vec<(&str, Vec<String>)> = vec![];
+    for (r, b) in repos {
+        match groups.iter_mut().find(|(g, _)| *g == b) {
+            Some((_, rs)) => rs.push(r.into()),
+            None => groups.push((b, vec![r.into()])),
+        }
     }
+    (groups.iter())
+        .map(|(b, rs)| render(id, &fill(rs), b))
+        .collect::<Vec<_>>()
+        .join("\n\n")
 }
 
 #[cfg(test)]
@@ -157,5 +164,13 @@ mod tests {
         assert!(p.contains("in: api.") && p.contains("repos/{owner}/{repo}"));
         let p = super::render("detached", "api, web", "feat");
         assert!(p.starts_with("HEAD is detached in: api, web.") && p.contains("`feat`"));
+        let one = super::render_each("detached", [("api", "feat"), ("web", "feat")], |rs| rs.join(", "));
+        assert_eq!(one, p, "one branch, one prompt");
+        let two = super::render_each("detached", [("api", "a"), ("web", "b"), ("cli", "a")], |rs| {
+            rs.join(", ")
+        });
+        let (a, b) = two.split_once("\n\n").unwrap();
+        assert!(a.starts_with("HEAD is detached in: api, cli.") && a.contains("`a`"), "{a}");
+        assert!(b.starts_with("HEAD is detached in: web.") && b.contains("`b`") && !b.contains("`a`"));
     }
 }

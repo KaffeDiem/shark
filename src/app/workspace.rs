@@ -97,16 +97,26 @@ impl NewWorkspaceForm {
         }
     }
 
-    /// Lists repo `ix`'s branches; a fetch refreshes them the first time.
-    fn pick_branch(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.mode = Mode::Branches(ix);
+    /// Switches the list to `mode` with `row` highlighted, or the first row when the list
+    /// shown now is shorter. The highlight keeps its row number into the next list, so it is
+    /// aimed here, against the current list with its filter cleared.
+    fn show(&mut self, mode: Mode, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.mode = mode;
         self.picker.update(cx, |p, cx| {
             p.set_query("", window, cx);
+            let row = if row < p.matched_count() { row } else { 0 };
+            p.set_selected_index(Some(IndexPath::new(row)), window, cx);
             p.focus(window, cx)
         });
+        cx.notify();
+    }
+
+    /// Lists repo `ix`'s branches; a fetch refreshes them the first time.
+    fn pick_branch(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.show(Mode::Branches(ix), 0, window, cx);
         if !std::mem::replace(&mut self.fetched[ix], true) {
             let src = self.repos[ix].path.clone();
-            cx.spawn(async move |this, cx| {
+            cx.spawn_in(window, async move |this, cx| {
                 let list = (cx.background_executor())
                     .spawn(async move {
                         let fetch = ["fetch", "--quiet", "--prune", "origin"];
@@ -114,27 +124,44 @@ impl NewWorkspaceForm {
                         git::branches(&src).ok()
                     })
                     .await;
-                this.update(cx, |f, cx| {
-                    if list.is_some() {
-                        f.branches[ix] = list;
-                    }
-                    cx.notify();
-                })
-                .ok();
+                this.update_in(cx, |f, window, cx| f.refreshed(ix, list, window, cx))
+                    .ok();
             })
             .detach();
         }
+    }
+
+    /// Repo `ix`'s fetched branches. Newer ones may come first, so a highlighted branch is
+    /// followed to its new row; enter must not pick whatever moved under it.
+    fn refreshed(
+        &mut self,
+        ix: usize,
+        list: Option<Vec<git::Branch>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(list) = list else { return };
+        let row = self.picker.read(cx).selected_index().map(|i| i.row);
+        let was = (row.and_then(|r| r.checked_sub(1)))
+            .and_then(|i| self.branches[ix].as_ref()?.get(i))
+            .map(|b| b.name.clone());
+        if let (Mode::Branches(shown), Some(was)) = (self.mode, was)
+            && shown == ix
+        {
+            // Resolved against the list shown now; a row it filters out highlights nothing.
+            let at = list.iter().position(|b| b.name == was);
+            let at = at.map(|i| IndexPath::new(i + 1));
+            self.picker
+                .update(cx, |p, cx| p.set_selected_index(at, window, cx));
+        }
+        self.branches[ix] = Some(list);
         cx.notify();
     }
 
-    /// Back to the repo list.
+    /// Back to the repo list, on the repo whose branches were listed.
     fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.mode = Mode::Repos;
-        self.picker.update(cx, |p, cx| {
-            p.set_query("", window, cx);
-            p.focus(window, cx)
-        });
-        cx.notify();
+        let Mode::Branches(ix) = self.mode else { return };
+        self.show(Mode::Repos, ix, window, cx);
     }
 
     /// Enter on row `row`: ticks a repo, or picks a branch for the listed repo and goes back.
@@ -259,12 +286,14 @@ impl Render for NewWorkspaceForm {
                                         .text_color(muted)
                                         .cursor_pointer()
                                         .child(gets.clone())
+                                        .aria_label(format!("{name} branch: {gets}"))
                                         .on_click(move |_, window, cx| {
                                             cx.stop_propagation();
                                             entity
                                                 .update(cx, |f, cx| f.pick_branch(i, window, cx))
                                                 .ok();
-                                        }),
+                                        })
+                                        .test_support(),
                                 )
                         })
                 })

@@ -501,12 +501,13 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
     let step = |verb: &str, kind: Kind, rs: Vec<String>, attention| {
         (!rs.is_empty()).then(|| act(label(verb, &rs), kind, rs, attention))
     };
-    // `{branch}` for the repos in `rs`.
-    let branch =
-        |rs: &[String]| prompts::branches(among(repos, rs).map(|r| (&*r.name, &*r.branch)));
+    // Prompt `key` for the repos in `rs`, once per branch; `fill` gives `{repos}`.
+    let render = |key: &str, rs: &[String], fill: &dyn Fn(&[String]) -> String| {
+        prompts::render_each(key, among(repos, rs).map(|r| (&*r.name, &*r.branch)), fill)
+    };
     // An agent step whose prompt `key` names the repos and their branch.
     let ask = |verb: &str, key: &str, rs: Vec<String>, attention| {
-        let prompt = prompts::render(key, &rs.join(", "), &branch(&rs));
+        let prompt = render(key, &rs, &|rs| rs.join(", "));
         step(verb, Kind::Agent(prompt), rs, attention)
     };
     let with_reviews =
@@ -600,18 +601,21 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
         })
         .or_else(|| {
             let rs = current(&|p| p.merge_state == "DIRTY");
-            let prompt = prompts::render("pr_conflicts", &with_base(&rs), &branch(&rs));
+            let prompt = render("pr_conflicts", &rs, &with_base);
             step("Resolve PR conflicts", Kind::Agent(prompt), rs, true)
         })
         .or_else(|| {
             let rs = current(&|p| matches!(p.checks, Checks::Failing(_)));
-            let failing: Vec<String> = among(repos, &rs)
-                .filter_map(|r| match &r.open_pr()?.checks {
-                    Checks::Failing(n) => Some(format!("{}: {}", r.name, n.join(", "))),
-                    _ => None,
-                })
-                .collect();
-            let prompt = prompts::render("checks", &failing.join("; "), &branch(&rs));
+            let failing = |rs: &[String]| {
+                among(repos, rs)
+                    .filter_map(|r| match &r.open_pr()?.checks {
+                        Checks::Failing(n) => Some(format!("{}: {}", r.name, n.join(", "))),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            };
+            let prompt = render("checks", &rs, &failing);
             step("Fix checks", Kind::Agent(prompt), rs, true)
         })
         .or_else(|| {
@@ -938,10 +942,18 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
             panic!("{:?}", a.kind)
         };
         assert!(prompt.contains("`kd/x`") && !prompt.contains("`feat`"), "{prompt}");
-        assert_eq!(
-            prompts::branches([("a", "feat"), ("b", "kd/x")]),
-            "a: `feat`, b: `kd/x`"
-        );
+        // Both off their branches: one instruction per branch, each naming its own.
+        let off = || Local {
+            branch: Some("other".into()),
+            ..clean(1)
+        };
+        let a = next(&[repo("a", off(), None), own(off())]);
+        let Kind::Agent(prompt) = a.kind else {
+            panic!("{:?}", a.kind)
+        };
+        let (fa, kb) = prompt.split_once("\n\n").unwrap();
+        assert!(fa.contains(": a.") && fa.contains("`feat`") && !fa.contains("kd/x"), "{fa}");
+        assert!(kb.contains(": b.") && kb.contains("`kd/x`") && !kb.contains("feat"), "{kb}");
     }
 
     #[test]

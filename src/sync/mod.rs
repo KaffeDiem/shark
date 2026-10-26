@@ -869,13 +869,14 @@ impl GitSync {
 
     /// Asks the agent to bring every repo up to date with its base.
     pub fn update_from_base(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let bases = (self.ws.repos.iter())
-            .map(|r| format!("{}: `{}`", r.name, r.base))
-            .collect::<Vec<_>>()
-            .join(", ");
-        let branch =
-            crate::prompts::branches(self.repos.iter().map(|r| (&*r.name, &*r.branch)));
-        let prompt = crate::prompts::render("update_base", &bases, &branch);
+        let bases = |rs: &[String]| {
+            (self.repos.iter().filter(|r| rs.contains(&r.name)))
+                .map(|r| format!("{}: `{}`", r.name, r.base))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        let repos = self.repos.iter().map(|r| (&*r.name, &*r.branch));
+        let prompt = crate::prompts::render_each("update_base", repos, bases);
         self.run_kind(Kind::Agent(prompt), "Update from base", window, cx)
     }
 
@@ -1345,7 +1346,10 @@ impl Render for GitSync {
 
 #[cfg(test)]
 mod tests {
-    use super::{Action, Kind, Local, Pr, background_answer, fresh_or_last, needs_you};
+    use super::{
+        Action, Job, Kind, Local, Pr, background_answer, fresh_or_last, needs_you, repos_from,
+        run_job, status,
+    };
 
     #[test]
     fn merge_confirm_counts_only_chosen_repos() {
@@ -1386,6 +1390,66 @@ mod tests {
         assert_eq!(fresh_or_last(Some(&err), &None), Some(err.clone()));
         let pr: Result<Option<Pr>, String> = Ok(None);
         assert_eq!(fresh_or_last(Some(&pr), &Some(err)), Some(pr));
+    }
+
+    /// Real worktrees on different branches: each is probed on its own branch, and the
+    /// steps and prompts follow it.
+    #[test]
+    fn probes_each_repo_on_its_branch() {
+        use crate::git::{add_repo, create_workspace, git};
+        let root = std::env::temp_dir().join(format!("shark-sync-prb-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let c = ["-c", "user.name=t", "-c", "user.email=t@t"];
+        let mut repos = vec![];
+        for name in ["api", "web"] {
+            let (origin, src) = (root.join(format!("{name}.git")), root.join("src").join(name));
+            std::fs::create_dir_all(&src).unwrap();
+            git(&root, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
+            git(&src, &["init", "-q", "-b", "main"]).unwrap();
+            git(&src, &[&c[..], &["commit", "-q", "--allow-empty", "-m", "i"]].concat()).unwrap();
+            git(&src, &["remote", "add", "origin", &origin.to_string_lossy()]).unwrap();
+            git(&src, &["push", "-q", "origin", "main", "main:kd/x"]).unwrap();
+            repos.push((add_repo(&src, &[]).unwrap(), "feat".to_string()));
+        }
+        repos[0].1 = "kd/x".into();
+        let dir = root.join("ws/feat");
+        let ws = create_workspace(&dir, "feat", "feat", &repos).unwrap();
+        let job = Job {
+            repos: (ws.repos.iter())
+                .map(|r| (dir.join(&r.name), r.base.clone(), ws.branch_of(r).into()))
+                .collect(),
+            fetch: false,
+            pr: false,
+            prev: vec![],
+        };
+        let probed = |job: &Job| {
+            let p = run_job(job);
+            repos_from(&ws, p.locals, std::iter::repeat(None))
+        };
+        let rs = probed(&job);
+        let on: Vec<_> = rs.iter().map(|r| r.local.as_ref().unwrap().branch.clone()).collect();
+        assert_eq!(on, [Some("kd/x".into()), Some("feat".into())]);
+        assert_eq!((rs[0].branch.as_str(), rs[1].branch.as_str()), ("kd/x", "feat"));
+        let a = super::next_action(&rs, &[]);
+        assert!(!a.label.starts_with("Switch"), "{}", a.label);
+
+        // Push and pull go to the repo's own branch.
+        let api = &dir.join("api");
+        git(api, &[&c[..], &["commit", "-q", "--allow-empty", "-m", "w"]].concat()).unwrap();
+        let rs = probed(&job);
+        let push = status::step_args(&Kind::Push, &rs[0]).unwrap().unwrap();
+        assert_eq!(push, ["push", "-u", "origin", "kd/x"]);
+        assert!(status::step_args(&Kind::Push, &rs[1]).is_ok());
+
+        // web wanders off its branch: only web is asked back, to `feat`.
+        git(&dir.join("web"), &["switch", "-q", "-c", "other"]).unwrap();
+        let rs = probed(&job);
+        let a = super::next_action(&rs, &[]);
+        assert_eq!(a.label, "Switch to branch · web");
+        let Kind::Agent(prompt) = a.kind else { panic!() };
+        assert!(prompt.contains("`feat`") && !prompt.contains("kd/x"), "{prompt}");
+        assert!(status::step_args(&Kind::Push, &rs[1]).unwrap_err().contains("not on `feat`"));
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
