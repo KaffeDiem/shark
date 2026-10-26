@@ -354,13 +354,14 @@ fn side(old: bool) -> DiffSide {
     }
 }
 
-/// A fence longer than any backtick run in `s`.
-pub(super) fn fence(s: &str) -> String {
+/// `s` as a code block (`info` after the opening fence), its fence longer than any backtick
+/// run in it.
+pub(super) fn fenced(s: &str, info: &str) -> String {
     let mut f = "```".to_string();
     while s.contains(&f) {
         f.push('`');
     }
-    f
+    format!("{f}{info}\n{s}\n{f}")
 }
 
 /// The comments as one prompt, in file order, with the overall `note`. Each carries its id,
@@ -379,15 +380,13 @@ pub(super) fn prompt(comments: &[Comment], note: &str) -> String {
         };
         out.push_str(&format!("\n[c{}] {}{rev}\n", c.id, c.place()));
         if !c.snapshot.is_empty() {
-            let f = fence(&c.snapshot);
-            out.push_str(&format!("{f}\n{}\n{f}\n", c.snapshot));
+            out.push_str(&format!("{}\n", fenced(&c.snapshot, "")));
         }
         for l in c.text.lines() {
             out.push_str(&format!("> {l}\n"));
         }
         if let Some(s) = &c.suggestion {
-            let f = fence(s);
-            out.push_str(&format!("Suggested change:\n{f}\n{s}\n{f}\n"));
+            out.push_str(&format!("Suggested change:\n{}\n", fenced(s, "")));
         }
     }
     if !note.trim().is_empty() {
@@ -464,12 +463,23 @@ fn give_ids(c: &mut [Comment], last: &mut u64) -> bool {
     fresh
 }
 
-/// Comments waiting in a queue that is gone (shark quit, or `chat` closed) are pending again;
-/// true if any was.
-pub(super) fn unqueue(l: &mut [Comment], chat: Option<&str>) -> bool {
+/// Comments that never reached an agent are pending again; true if any was. With `chat`
+/// (closed): its queue and the reviews it hadn't read (`unread`). Without (loading, after a
+/// restart): every queue, and reviews sent to a chat that is gone.
+pub(super) fn unqueue(l: &mut [Comment], chat: Option<&str>, unread: &[u64]) -> bool {
     let mut any = false;
-    for c in l.iter_mut().filter(|c| c.status == Status::Queued) {
-        if chat.is_none_or(|id| c.chat.as_deref() == Some(id)) {
+    for c in l.iter_mut() {
+        let to = c.chat.as_deref();
+        let lost = match (&c.status, chat) {
+            (Status::Queued, None) => true,
+            (Status::Queued, Some(id)) => to == Some(id),
+            (Status::Sent { .. }, Some(id)) => to == Some(id) && unread.contains(&c.id),
+            (Status::Sent { .. }, None) => {
+                to.is_some_and(|id| !crate::agent::transcript_path(id).exists())
+            }
+            _ => false,
+        };
+        if lost {
             (c.status, c.chat) = (Status::Pending, None);
             any = true;
         }
@@ -498,6 +508,8 @@ pub(super) struct Composer {
     pub(super) input: Entity<TextareaState>,
     /// Suggest change (cmd-shift-s): the lines, to edit into the proposed code.
     pub(super) suggest: Option<Entity<TextareaState>>,
+    /// Its height as last laid out; when it grows, the diff scrolls it into view.
+    height: Rc<Cell<Pixels>>,
 }
 
 #[derive(Default)]
@@ -505,8 +517,8 @@ pub(super) struct Review {
     /// Top row and cursor of the keyboard view; `None` once the mouse scrolled.
     view: Option<(Spot, Spot)>,
     pub(super) hunks: HashMap<SharedString, Vec<Hunk>>,
-    /// Height of the diff pane as last painted.
-    viewport: Rc<Cell<Pixels>>,
+    /// The diff pane as last painted.
+    viewport: Rc<Cell<Bounds<Pixels>>>,
     /// Comments per workspace, loaded from disk on first use.
     pub(super) comments: HashMap<String, Vec<Comment>>,
     /// The last comment id given out per workspace.
@@ -559,7 +571,7 @@ impl Review {
             }
             None => (0, vec![]),
         };
-        let fresh = give_ids(&mut c, &mut last) | unqueue(&mut c, None);
+        let fresh = give_ids(&mut c, &mut last) | unqueue(&mut c, None, &[]);
         self.comments.insert(ws.to_string(), c);
         self.last_id.insert(ws.to_string(), last);
         if fresh {
@@ -570,9 +582,8 @@ impl Review {
     /// A new comment id in workspace `ws`, never one given out before.
     fn new_id(&mut self, ws: &str) -> u64 {
         self.load_comments(ws);
-        let top = self.comments[ws].iter().map(|c| c.id).max().unwrap_or(0);
         let last = self.last_id.entry(ws.to_string()).or_default();
-        *last = (*last).max(top) + 1;
+        *last += 1;
         *last
     }
 
@@ -662,9 +673,14 @@ impl Shark {
         cx.notify();
     }
 
+    /// A code row's height.
+    fn row_height(&self, window: &Window, cx: &App) -> Pixels {
+        window.rem_size() * (f32::from(cx.theme().mono_font_size) / 16.) * 1.6
+    }
+
     fn view_cap(&self, window: &Window, cx: &App) -> f32 {
-        let row = window.rem_size() * (f32::from(cx.theme().mono_font_size) / 16.) * 1.6;
-        (self.review.viewport.get() / row).max(SCROLLOFF * 2. + 1.)
+        let h = self.review.viewport.get().size.height;
+        (h / self.row_height(window, cx)).max(SCROLLOFF * 2. + 1.)
     }
 
     /// `j/k` (`n` = ±1), `ctrl-d/u` (± half a screen), `gg`/`G` (`to` = first/last row).
@@ -707,6 +723,7 @@ impl Shark {
             None => c.saturating_add_signed(n).min(rows.len() - 1),
         };
         let t = fit(&rows, t, c, cap);
+        self.drop_mouse_selection(window, cx);
         self.apply_view(&rows, t, c, cx);
     }
 
@@ -728,6 +745,7 @@ impl Shark {
             return;
         };
         let t = fit(&rows, find(&rows, &top), c, self.view_cap(window, cx));
+        self.drop_mouse_selection(window, cx);
         self.apply_view(&rows, t, c, cx);
     }
 
@@ -752,7 +770,7 @@ impl Shark {
         let (vp, width) = (self.review.viewport.clone(), self.media_width.clone());
         canvas(
             move |b, _, _| {
-                vp.set(b.size.height);
+                vp.set(b);
                 width.set(b.size.width);
             },
             |_, _, _, _| {},
@@ -923,9 +941,7 @@ impl Shark {
         if self.active.is_none() {
             return notify_err(window, cx, "Open a workspace first");
         }
-        // Code selected with the mouse, else the line cursor or selected lines.
-        let d = self.diff.read(cx);
-        let Some(range) = d.text_selection_lines(cx).or_else(|| d.selected_lines()) else {
+        let Some(range) = self.picked_lines(cx) else {
             return notify_err(
                 window,
                 cx,
@@ -933,6 +949,19 @@ impl Shark {
             );
         };
         self.comment_at(range, window, cx)
+    }
+
+    /// Code selected with the mouse, else the line cursor or selected lines.
+    fn picked_lines(&self, cx: &App) -> Option<DiffLineRange> {
+        let d = self.diff.read(cx);
+        d.text_selection_lines(cx).or_else(|| d.selected_lines())
+    }
+
+    /// A key moved the line cursor: a mouse selection left behind is no longer what `c` means.
+    fn drop_mouse_selection(&self, window: &mut Window, cx: &mut App) {
+        if self.diff.read(cx).text_selection_lines(cx).is_some() {
+            gpui_kit::base::TextSelection::clear(window, cx);
+        }
     }
 
     /// The composer on `range`, whatever is selected (the header's Comment, the diff's +).
@@ -970,9 +999,28 @@ impl Shark {
             draft: c,
             input,
             suggest,
+            height: Rc::default(),
         });
-        // ponytail: room for a composer of ~8 code rows; measure it if it grows.
+        // Room for most of it, so it is laid out; then `render_composer` measures it.
         self.reveal(&anchor, 8., window, cx);
+    }
+
+    /// The diff scrolls `by` down (in the diff's own steps, so a little more), the composer
+    /// with it. Threads and headers aren't the row model's height, so this goes by pixels.
+    /// The diff scrolls only while it has the focus: it borrows it from the composer.
+    fn scroll_diff(&mut self, by: Pixels, window: &mut Window, cx: &mut Context<Self>) {
+        let (Some(back), Ok(down)) = (
+            window.focused(cx),
+            cx.build_action("diff::ScrollDown", None),
+        ) else {
+            return;
+        };
+        let diff = self.diff.read(cx).focus_handle(cx);
+        diff.focus(window, cx);
+        for _ in 0..(by / (window.rem_size() * 1.5)).ceil() as usize {
+            diff.dispatch_action(&*down, window, cx);
+        }
+        back.focus(window, cx);
     }
 
     /// cmd-shift-s: the Suggest change box, prefilled with the lines; again closes it.
@@ -1129,6 +1177,7 @@ impl Shark {
         let Some(c) = self.comment(id).cloned() else {
             return;
         };
+        self.drop_mouse_selection(window, cx);
         self.reveal(&Spot::Line(c.anchor()), 0., window, cx);
         // `find` lands on the closest row; the thread's own line is what `e`/`x` read.
         let sel = DiffLineRange::new(c.path.clone(), side(c.end.0), c.end.1, c.end.1);
@@ -1193,37 +1242,23 @@ impl Shark {
         let c = chat.read(cx);
         let (turn, id) = (c.last_turn, c.meta.id.clone());
         let reports: HashMap<u64, String> = parse_reports(&c.last_reply).into_iter().collect();
+        // Sent mid-turn and not read yet: the next turn's to judge.
+        let held = c.unread_review_ids(true);
         let Some(dir) = self.ws(ws).map(Workspace::dir) else {
             return;
         };
-        self.review.load_comments(ws);
-        let list = self.review.comments.get_mut(ws).unwrap();
-        let mut changed = false;
-        for c in list.iter_mut() {
-            let Status::Sent { turn: sent } = c.status else {
-                continue;
-            };
-            // Another chat's, or still waiting in the queue: not this turn's to judge.
-            if c.chat.as_ref() != Some(&id) || sent > turn {
-                continue;
+        self.review.edit(ws, |list| {
+            for c in list.iter_mut() {
+                let ours = c.chat.as_ref() == Some(&id) && !held.contains(&c.id);
+                if !ours || !matches!(c.status, Status::Sent { .. }) {
+                    continue;
+                }
+                let now = (!c.end.0).then(|| lines_now(&dir, c)).flatten();
+                let report = reports.get(&c.id).map(|s| s.as_str());
+                c.status = judge(&c.status, turn, report, now.as_deref(), &c.snapshot);
             }
-            let now = (!c.end.0).then(|| lines_now(&dir, c)).flatten();
-            let s = judge(
-                &c.status,
-                turn,
-                reports.get(&c.id).map(|s| s.as_str()),
-                now.as_deref(),
-                &c.snapshot,
-            );
-            if s != c.status {
-                c.status = s;
-                changed = true;
-            }
-        }
-        if changed {
-            self.review.save_comments(ws);
-            cx.notify();
-        }
+        });
+        cx.notify();
     }
 
     /// Chat `chat` sent comments `ids` (`Some(turn)`: read in that turn), or they never
@@ -1252,13 +1287,6 @@ impl Shark {
         cx.notify();
     }
 
-    /// "3 files · +5 −3": the diff as the review card shows it.
-    pub(super) fn changes_label(&self) -> String {
-        let (_, a, d) = self.changes_stats();
-        let n = self.diff_files.len();
-        format!("{n} file{} · +{a} −{d}", if n == 1 { "" } else { "s" })
-    }
-
     /// The composer (A·01): lines and side, Suggest change, the text, Esc / Add to review.
     fn render_composer(&mut self, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
         let Some(comp) = &self.review.composer else {
@@ -1266,6 +1294,28 @@ impl Shark {
         };
         let theme = cx.theme();
         let editing = comp.id.is_some();
+        let (seen, vp) = (comp.height.clone(), self.review.viewport.clone());
+        let shark = cx.entity().downgrade();
+        // Measured after layout: taller than last time (opened, grew) and past the pane's
+        // bottom, the diff scrolls up to show it, but never its top out of view.
+        let probe = canvas(
+            move |b, window, cx| {
+                if b.size.height <= seen.get() {
+                    return;
+                }
+                seen.set(b.size.height);
+                let pane = vp.get();
+                let by = (b.bottom() - pane.bottom()).min(b.top() - pane.top());
+                if by > px(0.) {
+                    window.defer(cx, move |w, cx| {
+                        (shark.update(cx, |s, cx| s.scroll_diff(by, w, cx))).ok();
+                    });
+                }
+            },
+            |_, _, _, _| {},
+        )
+        .absolute()
+        .size_full();
         v_flex()
             .key_context("ReviewComposer")
             .mx(px(-12.))
@@ -1288,6 +1338,7 @@ impl Shark {
                 this.cancel_composer(w, cx);
             }))
             .on_action(cx.listener(|this, _: &SuggestChange, w, cx| this.toggle_suggest(w, cx)))
+            .child(probe)
             .child(
                 h_flex()
                     .gap_2()
@@ -1395,7 +1446,7 @@ impl Shark {
         };
         let in_context = matches!(
             c.status,
-            Status::Queued | Status::Sent { .. } | Status::Addressed { .. }
+            Status::Queued | Status::Sent { .. } | Status::Addressed { .. } | Status::Outdated
         );
         // Off its line (gone from the diff): the lines as they were, so it still reads.
         let snapshot =
@@ -1417,7 +1468,7 @@ impl Shark {
             .border_l_2()
             .border_color(color)
             .text_sm()
-            // Narrow, the place and where it went truncate; the pill and keys stay.
+            // Narrow, where it went and the keys truncate; the lines and the pill stay.
             .child(
                 h_flex()
                     .gap_2()
@@ -1429,8 +1480,7 @@ impl Shark {
                     )
                     .child(
                         div()
-                            .min_w_0()
-                            .truncate()
+                            .flex_none()
                             .text_color(theme.muted_foreground)
                             .child(format!("{} · {}", c.lines(), c.side())),
                     )
@@ -1455,7 +1505,8 @@ impl Shark {
                     )
                     .child(
                         div()
-                            .flex_none()
+                            .min_w_0()
+                            .truncate()
                             .text_xs()
                             .text_color(faint(theme))
                             .child(hints),
@@ -1618,9 +1669,7 @@ impl Shark {
 
     /// The header's Comment: the selection when it is in `path`, else its first changed line.
     fn comment_in(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let d = self.diff.read(cx);
-        let here = (d.text_selection_lines(cx).or_else(|| d.selected_lines()))
-            .filter(|r| r.path() == path);
+        let here = self.picked_lines(cx).filter(|r| r.path() == path);
         let range = here.or_else(|| {
             let first = (self.review.hunks.get(path))
                 .and_then(|h| h.iter().flatten().find(|l| l.0 != b' '))
@@ -1669,7 +1718,7 @@ impl Shark {
         }
         if shown.is_empty() {
             return bar
-                .child("s split / unified · c comment · j / k move · ]c / [c change · v viewed")
+                .child("s split / unified · c comment · Drag divider to resize · j / k move through changes")
                 .into_any_element();
         }
         let (lead, color, summary) = match pending {
@@ -1855,7 +1904,7 @@ mod tests {
         assert!(p.contains("\nOverall: Run cargo test.\n"));
         assert!(p.contains("[c<id>] addressed: "));
         assert!(!prompt(&[], "  ").contains("Overall"));
-        assert_eq!(fence("a ``` b"), "````");
+        assert_eq!(fenced("a ``` b", "x"), "````x\na ``` b\n````");
     }
 
     #[test]
@@ -1944,11 +1993,26 @@ mod tests {
                 ..Default::default()
             },
         ];
-        assert!(unqueue(&mut l, Some("a")));
+        assert!(unqueue(&mut l, Some("a"), &[]));
         assert_eq!((&l[0].status, &l[0].chat), (&Status::Pending, &None));
         assert_eq!(l[1].status, Status::Queued);
-        assert_eq!(l[2].status, Status::Sent { turn: 1 });
-        assert!(unqueue(&mut l, None) && !unqueue(&mut l, None));
+        assert_eq!(
+            l[2].status,
+            Status::Sent { turn: 1 },
+            "read before it closed"
+        );
+        // Closed before reading it: pending again.
+        l[2].status = Status::Sent { turn: 1 };
+        assert!(unqueue(&mut l, Some("a"), &[3]));
+        assert_eq!((&l[2].status, &l[2].chat), (&Status::Pending, &None));
+        // After a restart: sent to a chat that is gone (no transcript), pending again.
+        l[2].status = Status::Sent { turn: 1 };
+        l[2].chat = Some("no-such-chat-r3".into());
+        assert!(unqueue(&mut l, None, &[]) && !unqueue(&mut l, None, &[]));
+        assert_eq!(
+            (&l[1].status, &l[2].status),
+            (&Status::Pending, &Status::Pending)
+        );
         let s = Status::Addressed {
             turn: 5,
             note: "n".into(),

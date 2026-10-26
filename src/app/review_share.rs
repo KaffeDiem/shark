@@ -1,7 +1,7 @@
 //! Share to GitHub (07–08): one thread to its repo's PR as a reviewer note (`gh pr comment`)
 //! or a PR review (`gh pr review --comment`), previewed first. The AI context is untouched;
 //! a failed post keeps the comment and the dialog, to retry.
-use super::review::{Comment, fence};
+use super::review::{Comment, fenced};
 use super::*;
 use crate::sync::Pr;
 use gpui_kit::component::radio::{Radio, RadioGroup};
@@ -12,6 +12,8 @@ pub(super) struct Share {
     pub(super) review: bool,
     pub(super) posting: bool,
     pub(super) error: Option<String>,
+    /// The dialog's focus: while it holds it, the dialog is the top one.
+    dialog: Option<FocusHandle>,
 }
 
 /// `s` without the indentation all its lines share, so an excerpt reads from the left.
@@ -33,13 +35,11 @@ pub(super) fn github_body(comments: &[Comment], note: &str) -> String {
     for c in comments {
         out += &format!("**{}** · {} · {}\n\n", c.path, c.side(), c.lines());
         if !c.snapshot.is_empty() {
-            let f = fence(&c.snapshot);
-            out += &format!("{f}\n{}\n{f}\n\n", c.snapshot);
+            out += &format!("{}\n\n", fenced(&c.snapshot, ""));
         }
         out += &format!("{}\n\n", c.text);
         if let Some(s) = &c.suggestion {
-            let f = fence(s);
-            out += &format!("Suggested change:\n{f}\n{s}\n{f}\n\n");
+            out += &format!("Suggested change:\n{}\n\n", fenced(s, ""));
         }
     }
     if !note.trim().is_empty() {
@@ -51,10 +51,7 @@ pub(super) fn github_body(comments: &[Comment], note: &str) -> String {
 /// An inline comment's text: GitHub shows a suggestion it can apply.
 fn inline_body(c: &Comment) -> String {
     match &c.suggestion {
-        Some(s) => {
-            let f = fence(s);
-            format!("{}\n\n{f}suggestion\n{s}\n{f}", c.text)
-        }
+        Some(s) => format!("{}\n\n{}", c.text, fenced(s, "suggestion")),
         None => c.text.clone(),
     }
 }
@@ -78,17 +75,25 @@ impl Shark {
             review: false,
             posting: false,
             error: None,
+            dialog: None,
         });
         let shark = cx.entity().downgrade();
         window.open_dialog(cx, move |d, _, cx| match shark.upgrade() {
             Some(s) => s.update(cx, |s, cx| s.share_dialog(d, cx)),
             None => d,
         });
+        let focused = window.focused(cx);
+        if let Some(s) = &mut self.review.share {
+            s.dialog = focused;
+        }
     }
 
-    /// Closes the dialog, if it is open.
+    /// Closes the dialog, if it is open. Under another dialog it stays, showing it posted:
+    /// closing would close that one.
     pub(super) fn close_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.review.share.take().is_some() {
+        let on_top = |s: &Share| (s.dialog.as_ref()).is_none_or(|f| f.contains_focused(window, cx));
+        if self.review.share.as_ref().is_some_and(on_top) {
+            self.review.share = None;
             window.close_dialog(cx);
         }
         cx.notify();
@@ -104,6 +109,9 @@ impl Shark {
         let Some(c) = self.comment(id).cloned() else {
             return;
         };
+        if c.github.is_some() {
+            return self.close_share(window, cx); // posted while it sat under another dialog
+        }
         self.publish(&[c], "", review, window, cx);
     }
 
@@ -197,7 +205,8 @@ impl Shark {
                                 c.github = Some(url.clone());
                             }
                         });
-                        if ours {
+                        if ours && let Some(sh) = &mut s.review.share {
+                            sh.posting = false;
                             s.close_share(window, cx);
                         }
                         window.push_notification("Posted to GitHub", cx);
@@ -337,10 +346,11 @@ impl Shark {
                             .primary()
                             .small()
                             .loading(s.posting)
-                            .label(match (s.error.is_some(), s.review) {
-                                (true, _) => "Retry",
-                                (false, false) => "Post note to GitHub",
-                                (false, true) => "Post review",
+                            .label(match (c.github.is_some(), s.error.is_some(), s.review) {
+                                (true, _, _) => "Posted · Close",
+                                (_, true, _) => "Retry",
+                                (_, false, false) => "Post note to GitHub",
+                                (_, false, true) => "Post review",
                             })
                             .on_click(cx.listener(|this, _, w, cx| this.post_share(w, cx))),
                     ),
