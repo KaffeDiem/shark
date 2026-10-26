@@ -703,7 +703,7 @@ impl Shark {
         let Some(chat) = self.active_chat().cloned().filter(|_| !self.home_shown()) else {
             return self.render_home(window, cx);
         };
-        let chat_tabs = self.render_chat_tabs(cx);
+        let chat_tabs = self.render_chat_tabs(window, cx);
         let theme = cx.theme();
         let tab = |label: String, icon: IconName, t: Tab| {
             pill(label.clone(), self.tab == t, theme)
@@ -728,7 +728,6 @@ impl Shark {
                     .gap(px(12.))
                     .border_b_1()
                     .border_color(theme.border)
-                    .window_control_area(WindowControlArea::Drag)
                     .children(chat_tabs)
                     .when_some(file_tab, |d, name| {
                         d.child(tab(name, IconName::FileCode, Tab::File).on_mouse_down(
@@ -739,7 +738,13 @@ impl Shark {
                             }),
                         ))
                     })
-                    .child(div().flex_1())
+                    // Native window dragging must not capture chat-tab drags.
+                    .child(
+                        div()
+                            .flex_1()
+                            .h_full()
+                            .window_control_area(WindowControlArea::Drag),
+                    )
                     // Narrow, the branch gives way before the sync buttons.
                     .child(
                         div()
@@ -898,6 +903,7 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &ReopenChat, w, cx| this.reopen_chat(None, w, cx)))
             .on_action(cx.listener(|this, _: &NextChat, w, cx| this.cycle_chat(1, w, cx)))
             .on_action(cx.listener(|this, _: &PrevChat, w, cx| this.cycle_chat(-1, w, cx)))
+            .on_action(cx.listener(|this, a: &OpenChat, w, cx| this.select_chat(a.0, w, cx)))
             .on_action(cx.listener(|this, _: &OpenSide, w, cx| this.open_side(w, cx)))
             .on_action(cx.listener(|this, _: &ShowDiff, w, cx| this.show(Tab::Diff, w, cx)))
             .on_action(cx.listener(|this, _: &CreatePrs, w, cx| this.create_prs(w, cx)))
@@ -969,7 +975,7 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &DeleteSection, w, cx| {
                 this.with_section(w, cx, Shark::delete_section)
             }))
-            // The sidebar swaps status icons for cmd-N hints while cmd is held.
+            // Held modifiers reveal workspace and chat number shortcuts.
             .on_modifiers_changed(cx.listener(|_, _, _, cx| cx.notify()))
             .on_action(cx.listener(|this, _: &FocusLeft, w, cx| this.move_focus(-1, w, cx)))
             .on_action(cx.listener(|this, _: &FocusRight, w, cx| this.move_focus(1, w, cx)))
