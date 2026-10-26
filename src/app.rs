@@ -155,10 +155,10 @@ fn side_toggle(id: &'static str, icon: IconName, tip: &'static str) -> Button {
         .tooltip(tip)
 }
 
-/// The drag strip above a sidebar toggle; on the left the traffic lights sit in it.
+/// The drag strip above a sidebar toggle; on the left the traffic lights (y 9..23) sit in it with room below.
 fn top_strip() -> Div {
     div()
-        .h(px(24.))
+        .h(px(34.))
         .w_full()
         .flex_none()
         .window_control_area(WindowControlArea::Drag)

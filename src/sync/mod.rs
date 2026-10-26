@@ -13,7 +13,7 @@ use crate::pr;
 use crate::state::Workspace;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::async_util::{Receiver, Sender, unbounded};
-use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::command::CommandItem;
 use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::notification::Notification;
@@ -1298,8 +1298,20 @@ impl Render for GitSync {
             Some(a) => Icon::new(icon(a)).when(attention, |i| i.text_color(warning)),
             None => Icon::new(IconName::RefreshCw), // static: only the agent gets a spinner
         };
-        h_flex()
-            .gap(px(12.))
+        let variant = |b: Button| match (passive, attention) {
+            (true, _) => b.ghost(),
+            (false, true) => b.outline(),
+            (false, false) => b.primary(),
+        };
+        let theme = cx.theme();
+        let divider = match (passive, attention) {
+            (false, false) => theme.primary_foreground.opacity(0.3),
+            _ => theme.border,
+        };
+        // One split button: the chevron trails inside it, behind a hairline.
+        let split = h_flex()
+            .rounded(theme.radius)
+            .overflow_hidden()
             .child(
                 // A div, not Button::tooltip: that takes fixed text, and this is built on hover so
                 // the "ago" times are current.
@@ -1320,11 +1332,8 @@ impl Render for GitSync {
                             .px(px(10.))
                             .icon(icon)
                             .label(label)
-                            .map(|b| match (passive, attention) {
-                                (true, _) => b.ghost(),
-                                (false, true) => b.outline(),
-                                (false, false) => b.primary(),
-                            })
+                            .rounded(ButtonRounded::None)
+                            .map(variant)
                             .disabled(!clickable || blocked)
                             .on_click(cx.listener(|s, _, window, cx| s.primary(window, cx))),
                     ),
@@ -1334,11 +1343,23 @@ impl Render for GitSync {
                     .relative()
                     .child(
                         Button::new("git-menu")
-                            .ghost()
-                            .xsmall()
+                            .small()
+                            .h(px(28.))
+                            .px(px(6.))
                             .icon(IconName::ChevronDown)
+                            .rounded(ButtonRounded::None)
+                            .map(variant)
                             .tooltip("Git menu")
                             .on_click(cx.listener(|s, _, window, cx| s.open_menu(window, cx))),
+                    )
+                    .child(
+                        div()
+                            .absolute()
+                            .left_0()
+                            .top(px(6.))
+                            .bottom(px(6.))
+                            .w(px(1.))
+                            .bg(divider),
                     )
                     .child({
                         let at = self.chevron.clone();
@@ -1348,8 +1369,9 @@ impl Render for GitSync {
                             .left_0()
                             .size_full()
                     }),
-            )
-            .children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))
+            );
+        // Outside `split`, whose clipping would cut off the menu.
+        div().child(split).children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))
     }
 }
 
