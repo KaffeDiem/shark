@@ -1070,7 +1070,8 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.running_chats(&name, cx) > 0 {
+        // An agent waiting on answers is mid-turn too: it would go on in a removed worktree.
+        if self.running_chats(&name, cx) > 0 || self.asking_chat(&name, cx) {
             // ctrl-c stops the shown chat's agent only.
             let msg = match self.active.as_deref() == Some(name.as_str()) {
                 true => "An agent is running; stop it first (ctrl-c in each running chat)".into(),

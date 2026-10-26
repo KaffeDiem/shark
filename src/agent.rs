@@ -464,6 +464,15 @@ impl Agent {
         self.write(&json!({"type": "control_response", "response": {"subtype": "success", "request_id": request_id, "response": {"behavior": "deny", "message": message}}}))
     }
 
+    /// Answers an `Ev::Permission` by letting the tool run: claude's with `input` in place of
+    /// its own (AskUserQuestion's plus `answers`), codex's with `input` as the request's result.
+    pub fn allow(&mut self, request_id: &str, input: Value) -> std::io::Result<()> {
+        if self.codex.is_some() {
+            return codex::reply(&self.stdin, request_id, input);
+        }
+        self.write(&json!({"type": "control_response", "response": {"subtype": "success", "request_id": request_id, "response": {"behavior": "allow", "updatedInput": input}}}))
+    }
+
     fn write(&mut self, v: &Value) -> std::io::Result<()> {
         write(&self.stdin, v)
     }

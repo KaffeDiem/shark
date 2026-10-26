@@ -1,5 +1,6 @@
 //! One agent conversation (a chat tab): transcript blocks, composer, and the claude process.
 mod completion;
+mod question;
 mod side;
 
 use crate::agent::{self, Agent, Ev};
@@ -234,6 +235,8 @@ fn standalone(name: &str) -> Option<IconName> {
         "Agent" | "Task" => Some(IconName::Bot),
         // A submitted plan: its row opens the version in the plan pane.
         "ExitPlanMode" => Some(IconName::ClipboardList),
+        // The agent's questions: the row shows the answers.
+        "AskUserQuestion" => Some(IconName::MessageCircleQuestionMark),
         _ => None,
     }
 }
@@ -302,6 +305,8 @@ pub enum ChatEvent {
     /// The user picked the model or thinking level (after `Meta`); new chats start on it.
     Picked,
     TurnDone,
+    /// The agent started or stopped waiting on answers to its questions (`Chat::asking`).
+    Asking,
     /// A review card's "Review changes" row: show the diff.
     ShowChanges,
     /// A review card's comment link: show that comment in the diff.
@@ -393,6 +398,10 @@ pub struct Chat {
     /// codex's config puts threads on the Fast tier; `meta.fast` overrides it.
     fast_by_config: bool,
     side: Option<Side>,
+    /// Questions the agent waits on, in a card above the composer.
+    asked: Option<question::Asked>,
+    /// The question card had the focus at the last render: when it goes, the composer gets it.
+    asked_focused: bool,
     /// Plan versions and the pane that shows them, next to the transcript while `plan_open`.
     pub plan: Entity<PlanPane>,
     pub plan_open: bool,
@@ -405,8 +414,6 @@ pub struct Chat {
 const PLAN_SHOWN: &str = "The user now sees this plan in the app's plan panel, where they \
     approve it or reply with changes. End your turn with one short sentence, without repeating \
     the plan. If they ask for changes, update the plan file and call ExitPlanMode again.";
-pub(crate) const ASK_IN_TEXT: &str = "This app can't show questions like this one. Ask in plain \
-    text in your reply and end your turn.";
 const ENTER_PLAN: &str = "Only the user turns plan mode on in this app (shift-tab). Carry on, or \
     suggest it in your reply.";
 const NEEDS_APPROVAL: &str = "This needs the user's approval, which this app can't ask for. Do \
@@ -685,6 +692,8 @@ impl Chat {
             editing: None,
             steered: false,
             side: None,
+            asked: None,
+            asked_focused: false,
             reported: None,
             fast_by_config: codex::fast_by_config(),
             plan_open,
@@ -1253,6 +1262,11 @@ impl Chat {
             }
             return;
         }
+        // A message instead of answers: the agent ends its turn, and the message follows.
+        // (Not a queued message saved after an edit: that was written before the question.)
+        if self.editing.is_none() {
+            self.dismiss_asked(cx);
+        }
         // A review left queued by a stopped or failed turn goes out first, as its card says.
         if !self.busy && self.queue.first().is_some_and(|q| q.review.is_some()) {
             self.drain(cx);
@@ -1722,6 +1736,7 @@ impl Chat {
     /// The process is gone (or going): forget its state, end its calls, flag what it never read.
     fn drop_process(&mut self, cx: &mut Context<Self>) {
         self.agent = None; // drop stops it
+        self.drop_asked(cx);
         self.background.clear();
         self.stopping = None;
         self.cut = false;
@@ -1962,6 +1977,7 @@ impl Chat {
                 let call = Call {
                     summary: match name.as_str() {
                         "ExitPlanMode" => plan::title(input["plan"].as_str().unwrap_or_default()),
+                        "AskUserQuestion" => question::asked_summary(&input),
                         _ => summarize(&input, &self.ws.dir().to_string_lossy()),
                     },
                     input: full_input(&input),
@@ -2000,6 +2016,11 @@ impl Chat {
                 tool_use_id,
                 input,
             } => {
+                // Questions wait for the user's answers in a card; the turn holds meanwhile.
+                // (Replayed history has none: a request is only ever live.)
+                if tool == "AskUserQuestion" && !self.replaying {
+                    return self.show_asked(request_id, tool_use_id, input, cx);
+                }
                 // Plan mode's approval happens in the plan pane, after the turn: the agent is
                 // told the plan was shown, and the turn ends instead of waiting on a person.
                 let reason = match tool.as_str() {
@@ -2008,7 +2029,6 @@ impl Chat {
                         self.show_plan(tool_use_id, text, cx);
                         PLAN_SHOWN
                     }
-                    "AskUserQuestion" => ASK_IN_TEXT,
                     "EnterPlanMode" => ENTER_PLAN,
                     _ => NEEDS_APPROVAL,
                 };
@@ -2043,6 +2063,7 @@ impl Chat {
                 self.busy = false;
                 if !self.replaying {
                     self.stopping = None; // a live interrupt's fallback outlives history
+                    self.drop_asked(cx);
                 }
                 let cut = std::mem::take(&mut self.cut);
                 // A pruned or deleted session: claude says so in the result and exits, and
@@ -2109,11 +2130,12 @@ impl Chat {
             return line;
         }
         let text = match (self.busy, self.background.len()) {
+            _ if self.asking() => "Waiting for your answers".into(),
             (true, 0) => "Working".into(),
             (true, n) => format!("Working · {n} in background"),
             (false, n) => format!("{n} in background"),
         };
-        let (busy, started, model) = (self.busy, self.started, self.model().to_string());
+        let (busy, started, model) = (self.busy && !self.asking(), self.started, self.model().to_string());
         let (queued, steered, tasks) = (self.queued(), self.steered, self.background.clone());
         line.child(
             div().w_full().max_w(px(680.)).mx_auto().child(
@@ -2207,8 +2229,8 @@ impl Chat {
         let plan = self.plan.read(cx);
         let status = |c: &Call| match (&c.result, c.is_error) {
             (None, _) => Spinner::new().with_size(px(14.)).into_any_element(),
-            // Denied on purpose: approval happens in the plan pane.
-            (Some(_), true) if c.name != "ExitPlanMode" => icon(IconName::X)
+            // Denied on purpose: approval happens in the plan pane, answers in the chat.
+            (Some(_), true) if !matches!(c.name.as_str(), "ExitPlanMode" | "AskUserQuestion") => icon(IconName::X)
                 .text_color(theme.danger_foreground)
                 .into_any_element(),
             _ => icon(IconName::Check).into_any_element(),
@@ -2232,6 +2254,7 @@ impl Chat {
                                 .text_color(theme.foreground)
                                 .child(match c.name.as_str() {
                                     "ExitPlanMode" => "Plan".to_string(),
+                                    "AskUserQuestion" => "Question".to_string(),
                                     _ => c.name.clone(),
                                 }),
                         )
@@ -2242,6 +2265,10 @@ impl Chat {
                                 ("ExitPlanMode", Some(n)) => {
                                     format!("v{n} · {}", plan::title(&plan.versions[n - 1].text))
                                 }
+                                ("AskUserQuestion", _) => (c.result.as_deref())
+                                    .and_then(question::answered)
+                                    .unwrap_or(&c.summary)
+                                    .to_string(),
                                 _ => c.summary.clone(),
                             },
                         ))
@@ -2705,6 +2732,14 @@ impl Render for Chat {
         if self.queue.is_empty() && self.qfocus.is_focused(window) {
             self.focus_composer(window, cx);
         }
+        // Answered or gone (the turn ended) while it had the focus.
+        self.build_asked(window, cx);
+        if std::mem::take(&mut self.asked_focused) && self.asked.is_none() {
+            self.focus_composer(window, cx);
+        }
+        let asked_card = self.render_asked(window, cx);
+        self.asked_focused = asked_card.is_some()
+            && (self.asked.as_ref()).is_some_and(|a| a.focused(window, cx));
         let theme = cx.theme();
         let (radius, border, card, muted) = (
             theme.radius_lg,
@@ -2846,6 +2881,7 @@ impl Render for Chat {
                     .pb_4()
                     .pt_1()
                     .children(self.render_side(window, cx))
+                    .children(asked_card)
                     .child(
                         v_flex()
                             .key_context("Composer")
@@ -2893,6 +2929,15 @@ impl Render for Chat {
                                 // Up from the first line goes to the queue, like Claude Code's.
                                 let c = this.composer.read(cx);
                                 let first_line = !c.value()[..c.cursor()].contains('\n');
+                                // The agent's questions first: the way back to the card.
+                                if first_line
+                                    && let Some(f) = this.asked_form()
+                                    && c.focus_handle(cx).is_focused(window)
+                                {
+                                    f.read(cx).focus_handle().clone().focus(window, cx);
+                                    cx.stop_propagation();
+                                    return;
+                                }
                                 if first_line
                                     && !this.queue.is_empty()
                                     && c.focus_handle(cx).is_focused(window)
@@ -3578,6 +3623,167 @@ exec cat >/dev/null
         cx.update(|cx| chat.update(cx, |c, _| c.agent = None));
         let _ = std::fs::remove_file(super::plan::tests_store_path(&ws.name));
         let _ = std::fs::remove_file(ws.dir());
+    }
+
+    /// The agent's questions: a card the keys answer, its reply to the agent, and esc or a
+    /// message from the composer to answer in the chat instead.
+    #[gpui_kit::test]
+    fn answers_questions(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::init(cx);
+            crate::bind_keys(cx);
+        });
+        let ws = Workspace {
+            name: format!("ask-test-{}", std::process::id()),
+            ..Default::default()
+        };
+        let meta = ChatMeta {
+            id: ws.name.clone(),
+            title: "ask".into(),
+            // codex: its answers get a row the test can read (claude's come with its result).
+            model: Some("codex:gpt-6.1-sol".into()),
+            ..Default::default()
+        };
+        let (window, chat) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| Chat::new(ws, meta, false, w, cx))
+                })
+            })
+            .unwrap();
+        let act = |cx: &mut TestAppContext, f: &dyn Fn(&mut Window, &mut App)| {
+            cx.update_window(window, |_, w, cx| {
+                f(w, cx);
+                w.render_frame(cx);
+            })
+            .unwrap();
+            // A picked answer shows for a moment before the form goes on.
+            cx.executor().advance_clock(std::time::Duration::from_millis(500));
+            cx.run_until_parked();
+            cx.update_window(window, |_, w, cx| w.render_frame(cx)).unwrap();
+        };
+        let ask = |cx: &mut TestAppContext, id: &str| {
+            cx.update(|cx| {
+                chat.update(cx, |c, cx| {
+                    c.busy = true;
+                    c.agent_model = c.meta.model.clone(); // a codex process asks
+                    c.apply(
+                        Ev::Permission {
+                            request_id: id.into(),
+                            tool: "AskUserQuestion".into(),
+                            tool_use_id: format!("call-{id}"),
+                            input: serde_json::json!({"questions": [
+                                {"id": "db", "header": "DB", "question": "Which DB?", "isOther": true, "options": [{"label": "Postgres", "description": "SQL"}, {"label": "Redis", "description": "KV"}]},
+                                {"id": "tests", "header": "Tests", "question": "Which tests?", "isOther": true, "options": [{"label": "Unit", "description": ""}, {"label": "E2E", "description": ""}]},
+                            ]}),
+                        },
+                        cx,
+                    );
+                })
+            })
+        };
+        let last_row = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                let c = chat.read(cx);
+                match c.blocks.last() {
+                    Some(Block::Tool(t)) if t.name == "AskUserQuestion" => Some(t.summary.clone()),
+                    _ => None,
+                }
+            })
+        };
+        act(cx, &|w, cx| chat.update(cx, |c, cx| c.focus_composer(w, cx)));
+        ask(cx, "1");
+        act(cx, &|_, _| {});
+        cx.update_window(window, |_, w, cx| {
+            let c = chat.read(cx);
+            assert!(c.asking(), "the turn waits on the answers");
+            assert!(
+                c.asked.as_ref().unwrap().focused(w, cx),
+                "an empty composer hands the card the focus"
+            );
+        })
+        .unwrap();
+        act(cx, &|w, cx| w.press("2", cx)); // Redis, then the next question
+        act(cx, &|w, cx| w.press("1", cx)); // Unit, the last: submits
+        assert_eq!(
+            last_row(cx).as_deref(),
+            Some(r#""Which DB?"="Redis", "Which tests?"="Unit""#)
+        );
+        cx.update_window(window, |_, w, cx| {
+            let c = chat.read(cx);
+            assert!(!c.asking());
+            assert!(c.composer.read(cx).focus_handle(cx).is_focused(w), "back to the composer");
+        })
+        .unwrap();
+
+        // Your own text, enter in its field goes on; ↑ from the composer is the way back.
+        ask(cx, "5");
+        act(cx, &|_, _| {});
+        act(cx, &|w, cx| chat.update(cx, |c, cx| c.focus_composer(w, cx)));
+        act(cx, &|w, cx| w.press("up", cx));
+        cx.update_window(window, |_, w, cx| {
+            assert!(chat.read(cx).asked.as_ref().unwrap().focused(w, cx), "↑ reaches the card");
+        })
+        .unwrap();
+        act(cx, &|w, cx| {
+            let f = chat.read(cx).asked_form().unwrap();
+            f.update(cx, |f, cx| f.focus_input("0", w, cx));
+        });
+        act(cx, &|w, cx| w.input("Mongo", cx));
+        act(cx, &|w, cx| w.press("enter", cx));
+        act(cx, &|w, cx| w.press("1", cx));
+        assert_eq!(
+            last_row(cx).as_deref(),
+            Some(r#""Which DB?"="Mongo", "Which tests?"="Unit""#)
+        );
+
+        // esc: the agent is told the user answers in the chat.
+        ask(cx, "2");
+        act(cx, &|_, _| {});
+        act(cx, &|w, cx| w.press("escape", cx));
+        assert_eq!(last_row(cx).as_deref(), Some("Answered in the chat"));
+        cx.update_window(window, |_, w, cx| {
+            let c = chat.read(cx);
+            assert!(!c.asking());
+            assert!(c.composer.read(cx).focus_handle(cx).is_focused(w));
+        })
+        .unwrap();
+
+        // A draft keeps the focus; sending it answers in the chat, and it waits for the turn.
+        act(cx, &|w, cx| w.input("use sqlite", cx));
+        ask(cx, "3");
+        act(cx, &|_, _| {});
+        cx.update_window(window, |_, w, cx| {
+            let c = chat.read(cx);
+            assert!(c.composer.read(cx).focus_handle(cx).is_focused(w), "typing isn't cut off");
+        })
+        .unwrap();
+        act(cx, &|w, cx| w.press("enter", cx));
+        assert_eq!(last_row(cx).as_deref(), Some("Answered in the chat"));
+        cx.update(|cx| {
+            let c = chat.read(cx);
+            assert!(!c.asking());
+            assert_eq!(c.queued(), 1, "the message follows once the turn ends");
+        });
+
+        // The turn ending takes an unanswered card with it.
+        ask(cx, "4");
+        act(cx, &|_, _| {});
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.apply(
+                    Ev::Result {
+                        is_error: false,
+                        text: String::new(),
+                        cost: 0.,
+                        secs: 0,
+                    },
+                    cx,
+                );
+                assert!(!c.asking());
+                c.queue.clear();
+            })
+        });
     }
 
     /// Sending jumps to the bottom even after scrolling the transcript up.

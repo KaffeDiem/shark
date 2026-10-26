@@ -246,6 +246,9 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", CloseSide, Some("SideAnswer")),
         KeyBinding::new("c", CopySide, Some("SideAnswer")),
         KeyBinding::new("enter", InsertSide, Some("SideAnswer")),
+        // The agent's questions (src/chat/question.rs): the form takes its own keys; esc on
+        // its choices closes it so the user answers in the chat.
+        KeyBinding::new("escape", CancelEdit, Some("Questionnaire && !Input")),
         KeyBinding::new("down", SelectNext, Some(ARROWS)),
         KeyBinding::new("up", SelectPrev, Some(ARROWS)),
         KeyBinding::new("home", SelectFirst, Some(ARROWS)),

@@ -149,6 +149,9 @@ impl Shark {
     }
 
     fn needs_you(&self, name: &str, cx: &App) -> Option<String> {
+        if self.asking_chat(name, cx) {
+            return Some(crate::agent::QUESTION.into());
+        }
         if self.busy(name, cx) {
             return None;
         }
