@@ -21,36 +21,40 @@ impl Render for TreePreview {
 pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
-    for (mode, label) in [
-        (crate::state::Mode::Dark, "dark"),
-        (crate::state::Mode::Light, "light"),
-    ] {
-        for width in [800., 1440.] {
-            let mut state = State::default();
-            state.appearance.mode = mode;
-            state.save().unwrap();
-            let (window, shark) = cx
-                .update(|cx| {
-                    gpui_kit::open_window(
-                        WindowOptions {
-                            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
-                                point(px(0.), px(0.)),
-                                size(px(width), px(720.)),
-                            ))),
-                            focus: false,
-                            show: false,
-                            ..Default::default()
-                        },
-                        cx,
-                        |w, cx| cx.new(|cx| Shark::new(w, cx)),
-                    )
-                })
-                .unwrap();
-            cx.update_window(window, |_, w, cx| {
+    let mut sync_menu_width = None;
+    let mut sync_label_width = None;
+    for width in [1440., 800.] {
+        for (mode, label) in [
+            (crate::state::Mode::Dark, "dark"),
+            (crate::state::Mode::Light, "light"),
+        ] {
+            for rail in [true, false] {
+                let mut state = State::default();
+                state.appearance.mode = mode;
+                state.tree_width = Some(200.);
+                state.save().unwrap();
+                let (window, shark) = cx
+                    .update(|cx| {
+                        gpui_kit::open_window(
+                            WindowOptions {
+                                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                    point(px(0.), px(0.)),
+                                    size(px(width), px(720.)),
+                                ))),
+                                focus: false,
+                                show: false,
+                                ..Default::default()
+                            },
+                            cx,
+                            |w, cx| cx.new(|cx| Shark::new(w, cx)),
+                        )
+                    })
+                    .unwrap();
+                cx.update_window(window, |_, w, cx| {
                 shark.update(cx, |s, cx| {
                     let mut ws = Workspace {
                         name: "Features and artifacts".into(),
-                        branch: "ui-improv".into(),
+                        branch: "feature/a-very-long-branch-name-that-must-truncate-before-the-diff-controls".into(),
                         repos: vec![crate::state::WsRepo {
                             name: "shark".into(),
                             src: home.join("shark"),
@@ -65,6 +69,13 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         ..Default::default()
                     };
                     ws.normalize_tabs();
+                    let sync = cx.new(|cx| GitSync::new(ws.clone(), w, cx));
+                    sync.update(cx, |sync, _| {
+                        sync.set_merged_parent("shark", 1, "head", "main");
+                        sync.action.as_mut().unwrap().label = "Commit and push · frontend, api".into();
+                    });
+                    s.syncs.insert(ws.name.clone(), sync);
+                    s.rail = rail;
                     s.active = Some(ws.name.clone());
                     s.state.workspaces = vec![ws];
                     s.home.on = false;
@@ -94,40 +105,128 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 w.render_frame(cx);
             })
             .unwrap();
-            cx.update_window(window, |_, w, cx| {
-                w.render_frame(cx);
-                let rail = w.find("features-rail").bounds();
-                let island = w.find("content-island").bounds();
-                let files = w.find("file-tree").bounds();
-                assert_eq!(rail.size.width, px(72.));
-                assert_eq!(rail.right(), px(width));
-                assert!(w.find("feature-differ").visible());
-                assert!(w.find("diff-tab").visible());
-                assert!(w.find("file-tree").visible());
-                assert!(files.left() >= island.left() && files.right() <= island.right());
-                assert!(files.top() >= island.top() && files.bottom() <= island.bottom());
-                assert!(
-                    files.left() - island.left() > px(100.),
-                    "room for diff content"
-                );
-                assert!(island.right() <= rail.left());
-                assert!(w.try_find("show-tree").is_none());
-                assert!(w.try_find("hide-tree").is_none());
-                assert!(shark.read(cx).active_chat().is_none());
-            })
-            .unwrap();
-            let screenshot = cx
-                .capture_screenshot(window)
-                .expect("full Diff artifact renderer");
-            if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
-                let dir = PathBuf::from(dir);
-                fs::create_dir_all(&dir).unwrap();
-                screenshot
-                    .save(dir.join(format!("artifact-{label}-{}.png", width as usize)))
+                for uncommitted in [false, true] {
+                    cx.update_window(window, |_, _, cx| {
+                        shark.update(cx, |s, cx| {
+                            s.state.uncommitted_only = uncommitted;
+                            s.state.unified = uncommitted;
+                            s.diff.update(cx, |d, cx| {
+                                d.set_mode(
+                                    if uncommitted {
+                                        DiffMode::Unified
+                                    } else {
+                                        DiffMode::Split
+                                    },
+                                    cx,
+                                )
+                            });
+                            cx.notify();
+                        });
+                    })
                     .unwrap();
-            }
-            // Review is an artifact overlay, so a narrow diff column cannot clip it.
-            cx.update_window(window, |_, w, cx| {
+                    cx.update_window(window, |_, w, cx| {
+                        w.render_frame(cx);
+                        let features = w.find("features-rail").bounds();
+                        let island = w.find("content-island").bounds();
+                        let files = w.find("file-tree").bounds();
+                        assert_eq!(features.size.width, px(72.));
+                        assert_eq!(features.right(), px(width));
+                        assert!(w.find("feature-differ").visible());
+                        assert!(w.find("diff-tab").visible());
+                        assert!(w.find("file-tree").visible());
+                        assert!(files.left() >= island.left() && files.right() <= island.right());
+                        assert!(files.top() >= island.top() && files.bottom() <= island.bottom());
+                        assert!(
+                            files.left() - island.left() > px(100.),
+                            "room for diff content"
+                        );
+                        assert!(island.right() <= features.left());
+                        assert!(w.try_find("show-tree").is_none());
+                        assert!(w.try_find("hide-tree").is_none());
+                        let branch = w.find("branch").bounds();
+                        let scope = w.find("uncommitted-only").bounds();
+                        let layout = w.find("diff-mode").bounds();
+                        let toggle = w.find("files-toggle").bounds();
+                        let sync = w.find("git-next").bounds();
+                        let menu = w.find("git-menu").bounds();
+                        for id in [
+                            "branch",
+                            "uncommitted-only",
+                            "diff-mode",
+                            "files-toggle",
+                            "git-next",
+                            "git-menu",
+                        ] {
+                            let element = w.find(id);
+                            let b = element.bounds();
+                            assert!(element.visible(), "{label}, {width}, rail={rail}: {id}");
+                            assert!(
+                                b.left() >= island.left() && b.right() <= island.right(),
+                                "{label}, {width}, rail={rail}: {id} {b:?} outside {island:?}"
+                            );
+                            assert_eq!(b.size.height, px(28.), "{id}");
+                            assert_eq!(b.top(), scope.top(), "one row: {id}");
+                        }
+                        assert!(branch.size.width >= px(28.), "branch icon stays visible");
+                        assert!(branch.right() <= scope.left());
+                        assert_eq!(layout.size, size(px(28.), px(28.)));
+                        assert_eq!(scope.right() + px(8.), layout.left());
+                        assert_eq!(layout.right() + px(8.), toggle.left());
+                        assert_eq!(toggle.right() + px(8.), sync.left());
+                        assert_eq!(sync.right(), menu.left());
+                        assert_eq!(
+                            menu.size.width,
+                            *sync_menu_width.get_or_insert(menu.size.width),
+                            "Sync menu keeps its hit target at every width"
+                        );
+                        assert_eq!(
+                            w.find("git-next").label(),
+                            Some("Commit and push · frontend, api")
+                        );
+                        let full_label_width = *sync_label_width.get_or_insert(sync.size.width);
+                        if width == 800. && !rail {
+                            assert!(
+                                sync.size.width < full_label_width,
+                                "wide Sync label must truncate"
+                            );
+                        }
+                        assert!(w.try_find("files-change-scope").is_none());
+                        assert_eq!(shark.read(cx).tree_resize.read(cx).sizes()[1], px(200.));
+                        assert!(shark.read(cx).active_chat().is_none());
+                    })
+                    .unwrap();
+                    let screenshot = cx
+                        .capture_screenshot(window)
+                        .expect("full Diff artifact renderer");
+                    if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
+                        let dir = PathBuf::from(dir);
+                        fs::create_dir_all(&dir).unwrap();
+                        screenshot
+                            .save(dir.join(format!(
+                                "artifact-{label}-{}-rail-{rail}-uncommitted-{uncommitted}.png",
+                                width as usize
+                            )))
+                            .unwrap();
+                    }
+                    cx.update_window(window, |_, w, cx| w.click("git-menu", cx))
+                        .unwrap();
+                    cx.update_window(window, |_, w, cx| {
+                        w.render_frame(cx);
+                        assert!(
+                            w.find("menu-parent").visible(),
+                            "Sync menu remains clickable"
+                        );
+                        w.press("escape", cx);
+                    })
+                    .unwrap();
+                    cx.update_window(window, |_, w, cx| {
+                        w.render_frame(cx);
+                        assert!(w.try_find("menu-parent").is_none());
+                    })
+                    .unwrap();
+                }
+                // Review is an artifact overlay, so a narrow diff column cannot clip it.
+                cx.update_window(window, |_, w, cx| {
                 shark.update(cx, |s, cx| {
                     let comment = serde_json::from_str(r#"{"id":1,"path":"shark/src/main.rs","start":[false,2],"end":[false,2],"text":"Use the app name","status":"Pending"}"#).unwrap();
                     s.edit_comments(cx, |comments| comments.push(comment));
@@ -140,8 +239,9 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 assert!(sheet.left() >= island.left() && sheet.right() <= island.right());
                 assert!(send.left() >= sheet.left() && send.right() <= sheet.right());
             }).unwrap();
-            cx.update_window(window, |_, w, _| w.remove_window())
-                .unwrap();
+                cx.update_window(window, |_, w, _| w.remove_window())
+                    .unwrap();
+            }
         }
     }
     fs::remove_dir_all(&home).ok();

@@ -976,23 +976,36 @@ impl Shark {
                     .h(px(44.))
                     .flex_none()
                     .px(px(16.))
-                    .gap(px(12.))
+                    .gap(px(8.))
                     .border_b_1()
                     .border_color(theme.border)
                     .child(
                         div()
-                            .min_w_0()
+                            .flex_shrink_1()
+                            .min_w(px(28.))
                             .overflow_hidden()
                             .child(self.render_branch(cx)),
                     )
                     .child(
                         div()
                             .flex_1()
+                            .min_w_0()
                             .h_full()
                             .id("workspace-toolbar-empty")
                             .map(|d| self.draggable_chrome("workspace-toolbar-empty", d)),
                     )
-                    .when_some(self.active_sync().cloned(), |d, sync| d.child(sync)),
+                    .when(self.tab == Tab::Diff, |d| {
+                        d.child(self.render_diff_controls(cx))
+                    })
+                    .when_some(self.active_sync().cloned(), |d, sync| {
+                        d.child(
+                            div()
+                                .min_w_0()
+                                .flex_shrink_0()
+                                .when(self.tab == Tab::Diff, |d| d.max_w(relative(0.4)))
+                                .child(sync),
+                        )
+                    }),
             )
             .child(match self.tab {
                 // Cached: the sidebar spinner redraws this view every frame, the chat only on change.
@@ -1048,17 +1061,20 @@ impl Shark {
                 Button::new("branch")
                     .ghost()
                     .xsmall()
-                    .flex_shrink_1()
+                    .w_full()
+                    .h(px(28.))
                     .min_w_0()
                     .gap_1p5()
                     .text_xs()
                     .text_color(theme.muted_foreground)
+                    .accessibility_label(label.clone())
                     .child(
                         Icon::new(match position {
                             Some(_) => IconName::Layers,
                             None => IconName::GitBranch,
                         })
-                        .with_size(px(12.)),
+                        .with_size(px(12.))
+                        .flex_none(),
                     )
                     .child(div().min_w_0().truncate().child(label))
                     .children(position.map(|p| div().flex_shrink_0().child(p)))

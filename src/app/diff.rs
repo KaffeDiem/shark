@@ -506,7 +506,6 @@ impl Shark {
             .flex_1()
             .min_w_0()
             .h_full()
-            .child(self.render_changes_bar(cx))
             .child(
                 h_resizable("files-panel")
                     .with_state(&self.tree_resize)
@@ -803,22 +802,13 @@ impl Shark {
         (base, adds, dels)
     }
 
-    /// Comparison scope, base, counts, and view controls.
-    fn render_changes_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
+    /// Compact controls embedded in the branch/sync header.
+    pub(super) fn render_diff_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (base, adds, dels) = self.changes_stats();
         let n = self.diff_files.len();
         h_flex()
-            .min_h(px(48.))
-            .flex_wrap()
             .flex_none()
-            .px(px(16.))
-            .py_2()
-            .gap(px(12.))
-            .border_b_1()
-            .border_color(theme.border)
-            .text_xs()
-            .text_color(theme.muted_foreground)
+            .gap(px(8.))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(|this, e: &MouseDownEvent, w, cx| {
@@ -834,53 +824,57 @@ impl Shark {
                     .rounded(px(6.))
                     .outline()
                     .selected(self.state.uncommitted_only)
-                    .label("Uncommitted only")
-                    .tooltip("Show staged, unstaged, and untracked changes against HEAD")
+                    .toggled(self.state.uncommitted_only)
+                    .accessibility_label("Uncommitted changes only")
+                    .label(if self.state.uncommitted_only {
+                        "Uncommitted"
+                    } else {
+                        "All changes"
+                    })
+                    .tooltip(if self.state.uncommitted_only {
+                        "HEAD → working tree: staged, unstaged, and untracked changes. Click for all changes: workspace base → working tree.".to_string()
+                    } else {
+                        format!("Workspace base ({base}) → working tree: committed and uncommitted changes. Click for uncommitted changes: HEAD → working tree.")
+                    })
                     .on_click(cx.listener(|this, _, w, cx| this.toggle_uncommitted(w, cx))),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .truncate()
-                    .child(format!("{base} → working tree")),
-            )
-            .child(
-                div()
-                    .text_color(theme.success_foreground)
-                    .child(format!("+{adds}")),
-            )
-            .child(
-                div()
-                    .text_color(theme.danger_foreground)
-                    .child(format!("−{dels}")),
-            )
-            .child(format!("{} / {n} viewed", self.viewed_now.len()))
-            .child(
                 Button::new("diff-mode")
                     .xsmall()
-                    .h(px(28.))
-                    .px(px(10.))
+                    .size(px(28.))
+                    .px_0()
                     .rounded(px(6.))
-                    .label(if self.state.unified {
-                        "Unified"
+                    .icon(if self.state.unified {
+                        IconName::Rows2
                     } else {
-                        "Split"
+                        IconName::Columns2
                     })
-                    .dropdown_caret(true)
-                    .tooltip("Split / unified (s)")
+                    .toggled(self.state.unified)
+                    .accessibility_label("Unified diff")
+                    .tooltip(if self.state.unified {
+                        "Unified view · Click for Split (s)"
+                    } else {
+                        "Split view · Click for Unified (s)"
+                    })
                     .on_click(cx.listener(|this, _, _, cx| this.toggle_diff_mode(cx))),
             )
             .child(
                 Button::new("files-toggle")
                     .xsmall()
                     .h(px(28.))
-                    .px(px(10.))
                     .rounded(px(6.))
                     .outline()
                     .selected(self.show_tree)
-                    .label(format!("Files {n}"))
-                    .tooltip("Show or hide diff files (cmd-alt-b)")
+                    .w(px(28.))
+                    .px_0()
+                    .icon(IconName::PanelRight)
+                    .toggled(self.show_tree)
+                    .accessibility_label("Files")
+                    .tooltip(format!(
+                        "{} files (cmd-alt-b) · {n} files · {}/{n} viewed · +{adds} −{dels}",
+                        if self.show_tree { "Hide" } else { "Show" },
+                        self.viewed_now.len(),
+                    ))
                     .on_click(cx.listener(|this, _, w, cx| this.toggle_tree(w, cx))),
             )
     }
@@ -991,26 +985,6 @@ impl Shark {
                     .text_color(muted)
                     .child(side_header(theme, "Files").p_0().flex_1())
                     .child(format!("{}/{n} viewed", self.viewed_now.len())),
-            )
-            .child(
-                Button::new("files-change-scope")
-                    .xsmall()
-                    .h(px(28.))
-                    .w_full()
-                    .mb_2()
-                    .outline()
-                    .selected(self.state.uncommitted_only)
-                    .label(if self.state.uncommitted_only {
-                        "Uncommitted only"
-                    } else {
-                        "All changes"
-                    })
-                    .tooltip(if self.state.uncommitted_only {
-                        "Show all changes against the workspace base"
-                    } else {
-                        "Show only staged, unstaged, and untracked changes"
-                    })
-                    .on_click(cx.listener(|this, _, w, cx| this.toggle_uncommitted(w, cx))),
             )
             .child(
                 Input::new(&self.tree_filter)
@@ -1400,7 +1374,7 @@ impl Shark {
         entries
     }
 
-    /// Right-click menu of the Diff button and the changes bar.
+    /// Right-click menu of the Diff button and its header controls.
     pub(super) fn changes_menu(&self, cx: &Context<Self>) -> Vec<Entry> {
         let mut entries = vec![
             menu::item(
