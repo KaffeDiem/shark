@@ -437,12 +437,12 @@ impl Chat {
             let name = i.to_string();
             QuestionnaireItem::new(form, name.clone())
                 .child(QuestionnaireTitle::new(form, name.clone()))
-                .child(
-                    QuestionnaireChoices::new(form, name.clone()).children(
-                        (0..q.options.len())
-                            .map(|j| QuestionnaireChoice::new(form, name.clone(), j.to_string())),
-                    ),
-                )
+                .child(QuestionnaireChoices::new(form, name.clone()).children(
+                    (0..q.options.len()).map(|j| {
+                        QuestionnaireChoice::new(form, name.clone(), j.to_string())
+                            .content_style(StyleRefinement::default().min_w_0())
+                    }),
+                ))
                 .child(QuestionnaireInput::new(form, name.clone()))
                 .child(QuestionnaireError::new(form, name))
         });
@@ -510,6 +510,68 @@ impl Chat {
 mod tests {
     use super::*;
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+
+    #[cfg(feature = "test-support")]
+    #[gpui_kit::test]
+    fn long_choices_wrap_inside_the_question_card(cx: &mut TestAppContext) {
+        use gpui_kit::test::{TestQueryExt, TestWindowExt};
+
+        crate::state::TEST_HOME
+            .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cx.update(gpui_kit::init);
+        for width in [420., 800.] {
+            for multi in [false, true] {
+                let (window, chat) = cx
+                    .update(|cx| {
+                        gpui_kit::open_window(
+                            WindowOptions {
+                                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                    point(px(0.), px(0.)),
+                                    size(px(width), px(900.)),
+                                ))),
+                                ..Default::default()
+                            },
+                            cx,
+                            |w, cx| {
+                                cx.new(|cx| {
+                                    Chat::new(
+                                        Workspace::default(),
+                                        ChatMeta::default(),
+                                        false,
+                                        w,
+                                        cx,
+                                    )
+                                })
+                            },
+                        )
+                    })
+                    .unwrap();
+                cx.update_window(window, |_, w, cx| {
+                    chat.update(cx, |c, cx| {
+                        c.show_asked("wrap".into(), "wrap".into(), json!({"questions": [{
+                            "question": "What should the first release aim to deliver?",
+                            "multiSelect": multi,
+                            "options": [
+                                {"label": "Core IDE editing (Recommended)", "description": "Definition and back/forward, completion, hover, diagnostics, references, rename, formatting, and quick fixes."},
+                                {"label": "Navigation first", "description": "Short description."}
+                            ]
+                        }]}), cx);
+                        cx.notify();
+                    });
+                    w.render_frame(cx);
+                    let long = w.find_by_label("Core IDE editing (Recommended)").bounds();
+                    let short = w.find_by_label("Navigation first").bounds();
+                    assert!(long.left() >= px(0.) && long.right() <= px(width));
+                    assert!(long.size.width <= px(712.));
+                    assert!(long.size.height > short.size.height,
+                        "long descriptions must wrap at width {width}, multiple={multi}: {long:?} vs {short:?}");
+                }).unwrap();
+            }
+        }
+    }
 
     #[cfg(feature = "test-support")]
     #[gpui_kit::test]
