@@ -397,10 +397,7 @@ fn stack_actions(
     cx: &Context<Shark>,
 ) -> Vec<Entry> {
     let repos = sync.and_then(|g| g.repos()).unwrap_or_default();
-    if repos
-        .iter()
-        .any(|r| r.local.as_ref().is_ok_and(|l| l.review))
-    {
+    if repos.iter().any(|r| r.is_review()) {
         return vec![];
     }
     let name = ws.name.clone();

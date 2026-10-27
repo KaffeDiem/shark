@@ -64,6 +64,8 @@ pub enum Checks {
 #[derive(Clone, Debug, PartialEq)]
 pub struct Pr {
     pub url: String,
+    /// This answer belongs to a review checkout; a later config change must not authorize writes.
+    pub review_checkout: bool,
     pub number: u64,
     pub state: PrState,
     pub draft: bool,
@@ -118,10 +120,17 @@ fn counts(s: &str) -> (u32, u32) {
     (it.next().unwrap_or(0), it.next().unwrap_or(0))
 }
 
-/// Probes one worktree. Read-only: `--no-optional-locks` keeps `git status` from taking
+/// Probes one worktree. `--no-optional-locks` keeps `git status` from taking
 /// `index.lock`, which would make the agent's own git commands fail. `prev` is the last probe:
 /// while HEAD and `origin/<branch>` haven't moved, its remote counts still hold.
-pub fn probe(wt: &Path, branch: &str, base: &str, prev: Option<&Local>) -> Result<Local, String> {
+/// Only an authoritative base may advance or clear the recorded parent boundary.
+pub fn probe(
+    wt: &Path,
+    branch: &str,
+    base: &str,
+    prev: Option<&Local>,
+    allow_parent_update: bool,
+) -> Result<Local, String> {
     if !wt.exists() {
         return Err(format!("{} is missing", wt.display()));
     }
@@ -167,7 +176,8 @@ pub fn probe(wt: &Path, branch: &str, base: &str, prev: Option<&Local>) -> Resul
             prev.filter(|p| p.remote.is_some() && (&p.head, &p.remote_head) == (&l.head, &oid))
         {
             (l.remote, l.rewritten, l.remote_head) = (p.remote, p.rewritten, oid);
-            return base_counts(wt, base, l).map(|l| parent_tip(wt, branch, base, l));
+            return base_counts(wt, base, l)
+                .map(|l| parent_tip(wt, branch, base, l, allow_parent_update));
         }
         l.remote_head = oid;
         let range = format!("HEAD...{remote}");
@@ -191,13 +201,19 @@ pub fn probe(wt: &Path, branch: &str, base: &str, prev: Option<&Local>) -> Resul
         }
         l.remote = Some(ab);
     }
-    base_counts(wt, base, l).map(|l| parent_tip(wt, branch, base, l))
+    base_counts(wt, base, l).map(|l| parent_tip(wt, branch, base, l, allow_parent_update))
 }
 
 /// Reads the parent tip, and moves it to the base's tip once HEAD has all of the base (the
 /// branch was rebased or merged up): from then on, that is where its own commits start. The one
 /// write a probe makes, and only when the tip moves; `config.lock` isn't the agent's index.
-fn parent_tip(wt: &Path, branch: &str, base: &str, mut l: Local) -> Local {
+fn parent_tip(
+    wt: &Path,
+    branch: &str,
+    base: &str,
+    mut l: Local,
+    allow_parent_update: bool,
+) -> Local {
     let key = crate::git::parent_tip_key(branch);
     l.parent_tip = git(wt, &["config", &key]).unwrap_or_default();
     let stacked = crate::stack::parent_of(base, &l.trunk).is_some();
@@ -216,17 +232,38 @@ fn parent_tip(wt: &Path, branch: &str, base: &str, mut l: Local) -> Local {
     ) else {
         return l;
     };
-    let has = |a: &str, b: &str| git(wt, &["merge-base", "--is-ancestor", a, b]).is_ok();
+    let ancestor = |a: &str, b: &str| {
+        let out = run(wt, "git", &["merge-base", "--is-ancestor", "--", a, b]).ok()?;
+        match out.status.code() {
+            Some(0) => Some(true),
+            Some(1) => Some(false),
+            _ => None,
+        }
+    };
+    let in_head = ancestor(&l.parent_tip, "HEAD");
+    let in_base = ancestor(&l.parent_tip, &tip);
+    l.restack = !l.parent_tip.is_empty() && in_head == Some(true) && in_base == Some(false);
     if l.base.1 == 0 {
+        if !allow_parent_update {
+            return l;
+        }
+        // An old trunk (or a parent rewritten backwards) can be in HEAD before inherited work is removed.
+        if !l.parent_tip.is_empty() && in_base != Some(true) && in_head != Some(false) {
+            return l;
+        }
         if !stacked {
             // Restacked onto the trunk: nothing left to track.
-            let _ = git(wt, &["config", "--unset", &key]);
-            l.parent_tip.clear();
+            if git(
+                wt,
+                &["config", "--fixed-value", "--unset", &key, &l.parent_tip],
+            )
+            .is_ok()
+            {
+                l.parent_tip.clear();
+            }
         } else if l.parent_tip != tip && git(wt, &["config", &key, &tip]).is_ok() {
             l.parent_tip = tip;
         }
-    } else if !l.parent_tip.is_empty() && has(&l.parent_tip, "HEAD") && !has(&l.parent_tip, &tip) {
-        l.restack = true;
     }
     l
 }
@@ -335,6 +372,7 @@ fn parse_pr(pick: &Value) -> Pr {
     };
     Pr {
         url: s("url"),
+        review_checkout: false,
         number: pick["number"].as_u64().unwrap_or(0),
         state: match pick["state"].as_str() {
             Some("MERGED") => PrState::Merged,
@@ -370,20 +408,76 @@ pub fn fetch_parent(wt: &Path, parent: &str) -> Result<Option<Pr>, String> {
 /// so it can't be confused with being offline or logged out.
 /// `head` is the local HEAD as just probed.
 pub fn fetch_pr(wt: &Path, branch: &str, head: &str) -> Result<Option<Pr>, String> {
-    if let Some(url) = crate::git::review_pr_url(wt, branch) {
-        let json = cmd_bounded(wt, "gh", &["pr", "view", &url, "--json", PR_FIELDS], 20)?;
-        let value = serde_json::from_str(&json).map_err(|e| format!("gh: {e}"))?;
-        return Ok(Some(parse_pr(&value)));
+    let review = crate::git::review_pr_url(wt, branch);
+    // gh may default to a fork's upstream; branch ownership belongs to origin.
+    let origin = git(wt, &["config", "--get", "remote.origin.url"])
+        .ok()
+        .and_then(|url| github_url(&url));
+    let mut args = vec![
+        "pr", "list", "--head", branch, "--state", "all", "--json", PR_FIELDS,
+    ];
+    if let Some(origin) = &origin {
+        args.extend(["--repo", origin]);
     }
-    let json = cmd_bounded(
-        wt,
-        "gh",
-        &[
-            "pr", "list", "--head", branch, "--state", "all", "--json", PR_FIELDS,
-        ],
-        20,
-    )?;
-    let mut pr = parse_prs(&json);
+    let own = if review.is_none() || origin.is_some() {
+        let result = cmd_bounded(wt, "gh", &args, 20).and_then(|json| {
+            serde_json::from_str::<Vec<Value>>(&json).map_err(|e| format!("gh: {e}"))?;
+            Ok(parse_prs(&json))
+        });
+        match result {
+            Ok(pr) => pr,
+            // A private fork can be inaccessible while the original review is still readable.
+            Err(_) if review.is_some() => None,
+            Err(e) => return Err(e),
+        }
+    } else {
+        None
+    };
+    if let Some(url) = &review {
+        if let Some(pr) = own.as_ref().filter(|p| {
+            p.state == PrState::Open
+                && p.url != *url
+                && p.number != 0
+                && !p.base.is_empty()
+                && origin
+                    .as_ref()
+                    .is_some_and(|o| p.url == format!("{o}/pull/{}", p.number))
+                && !p.head.is_empty()
+                // Publishing establishes ownership even if GitHub has since advanced or rewritten it.
+                && ((git(wt, &["config", "--get", &format!("branch.{branch}.remote")]).as_deref()
+                    == Ok("origin")
+                    && git(wt, &["config", "--get", &format!("branch.{branch}.merge")]).as_deref()
+                        == Ok(format!("refs/heads/{branch}").as_str()))
+                    || git(
+                        wt,
+                        &["merge-base", "--is-ancestor", "--", &p.head, &format!("refs/heads/{branch}")],
+                    ).is_ok())
+        }) {
+            git(
+                wt,
+                &["check-ref-format", &format!("refs/heads/{}", pr.base)],
+            )?;
+            // Only remove the identity we read; another workspace may have changed it meanwhile.
+            git(
+                wt,
+                &[
+                    "config",
+                    "--fixed-value",
+                    "--unset",
+                    &format!("branch.{branch}.shark-pr-url"),
+                    url,
+                ],
+            )?;
+        } else {
+            let json = cmd_bounded(wt, "gh", &["pr", "view", &url, "--json", PR_FIELDS], 20)?;
+            let value = serde_json::from_str(&json).map_err(|e| format!("gh: {e}"))?;
+            return Ok(Some(Pr {
+                review_checkout: true,
+                ..parse_pr(&value)
+            }));
+        }
+    }
+    let mut pr = own;
     if let Some(p) = pr
         .as_mut()
         .filter(|p| p.state == PrState::Merged && !head.is_empty() && p.head != head)
@@ -432,6 +526,10 @@ impl Repo {
 
     pub fn pr(&self) -> Option<&Pr> {
         self.pr.as_ref()?.as_ref().ok()?.as_ref()
+    }
+
+    pub fn is_review(&self) -> bool {
+        self.local.as_ref().is_ok_and(|l| l.review) || self.pr().is_some_and(|p| p.review_checkout)
     }
 
     pub fn open_pr(&self) -> Option<&Pr> {
@@ -608,15 +706,8 @@ pub fn among<'a>(repos: &'a [Repo], rs: &'a [String]) -> impl Iterator<Item = &'
 /// "checks running" in one repo can't hide a "ready for review" in another. `handled`: review
 /// IDs already sent to the agent.
 pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
-    if repos
-        .iter()
-        .any(|r| r.local.as_ref().is_ok_and(|l| l.review))
-    {
-        let normal: Vec<_> = repos
-            .iter()
-            .filter(|r| !r.local.as_ref().is_ok_and(|l| l.review))
-            .cloned()
-            .collect();
+    if repos.iter().any(Repo::is_review) {
+        let normal: Vec<_> = repos.iter().filter(|r| !r.is_review()).cloned().collect();
         if normal.is_empty() {
             return act(
                 "Review PR",
@@ -918,7 +1009,7 @@ pub fn pr_head_moved(repos: &[Repo]) -> bool {
 /// to do. Menu steps skip the next-step check, so these guards are what keeps them from moving
 /// the wrong commit.
 pub fn step_args(kind: &Kind, r: &Repo) -> Result<Option<Vec<String>>, String> {
-    if r.local.as_ref().is_ok_and(|l| l.review) {
+    if r.is_review() {
         return Err(format!("{} is a local PR review checkout", r.name));
     }
     let b = r.branch.as_str();
@@ -1183,6 +1274,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
     fn pr(merge_state: &str, checks: Checks) -> Pr {
         Pr {
             url: "u".into(),
+            review_checkout: false,
             number: 1,
             state: PrState::Open,
             draft: false,
@@ -1832,6 +1924,110 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         );
     }
 
+    #[test]
+    fn parent_boundary_requires_verified_base_and_integrated_history() {
+        use std::fs;
+        let wt = std::env::temp_dir().join(format!("shark-parent-guard-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&wt);
+        fs::create_dir_all(&wt).unwrap();
+        git(&wt, &["init", "-q", "-b", "feature"]).unwrap();
+        let c = |args: &[&str]| {
+            git(
+                &wt,
+                &[&["-c", "user.name=t", "-c", "user.email=t@t"], args].concat(),
+            )
+            .unwrap()
+        };
+        let commit = |message| {
+            c(&["commit", "-qm", message, "--allow-empty"]);
+            git(&wt, &["rev-parse", "HEAD"]).unwrap()
+        };
+        let main = commit("main");
+        git(&wt, &["update-ref", "refs/remotes/origin/main", &main]).unwrap();
+        git(
+            &wt,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/main",
+            ],
+        )
+        .unwrap();
+        let parent = commit("parent");
+        let child = commit("child");
+        git(&wt, &["update-ref", "refs/remotes/origin/parent", &child]).unwrap();
+        let key = crate::git::parent_tip_key("feature");
+        git(&wt, &["config", &key, &parent]).unwrap();
+
+        for base in ["origin/main", "origin/parent"] {
+            let local = probe(&wt, "feature", base, None, false).unwrap();
+            assert_eq!(
+                local.parent_tip, parent,
+                "unverified base {base} must not change the boundary"
+            );
+            assert_eq!(git(&wt, &["config", &key]).unwrap(), parent);
+        }
+
+        let tree = git(&wt, &["rev-parse", "HEAD^{tree}"]).unwrap();
+        let rewritten = c(&["commit-tree", &tree, "-p", &main, "-m", "rewritten parent"]);
+        git(
+            &wt,
+            &["update-ref", "refs/remotes/origin/parent", &rewritten],
+        )
+        .unwrap();
+        let local = probe(&wt, "feature", "origin/parent", None, false).unwrap();
+        assert!(
+            local.restack,
+            "read-only probes still detect rewritten parents"
+        );
+        assert_eq!(local.parent_tip, parent);
+        assert_eq!(git(&wt, &["config", &key]).unwrap(), parent);
+
+        git(&wt, &["update-ref", "refs/remotes/origin/parent", &child]).unwrap();
+        let local = probe(&wt, "feature", "origin/parent", None, true).unwrap();
+        assert_eq!(
+            local.parent_tip, child,
+            "verified bases can advance the boundary"
+        );
+        assert_eq!(git(&wt, &["config", &key]).unwrap(), child);
+
+        // A retarget can arrive before main's squash merge is fetched.
+        git(&wt, &["config", &key, &parent]).unwrap();
+        let local = probe(&wt, "feature", "origin/main", None, true).unwrap();
+        assert_eq!(local.base.1, 0, "the stale trunk is already in HEAD");
+        assert!(local.restack);
+        assert_eq!(local.parent_tip, parent);
+        assert_eq!(git(&wt, &["config", &key]).unwrap(), parent);
+        let read_only = probe(&wt, "feature", "origin/main", Some(&local), false).unwrap();
+        assert!(
+            read_only.restack,
+            "read-only polls must retain the same restack verdict"
+        );
+        assert_eq!(read_only.parent_tip, parent);
+        assert_eq!(git(&wt, &["config", &key]).unwrap(), parent);
+        let squash = c(&["commit-tree", &tree, "-p", &main, "-m", "squashed parent"]);
+        git(&wt, &["update-ref", "refs/remotes/origin/main", &squash]).unwrap();
+        let local = probe(&wt, "feature", "origin/main", None, true).unwrap();
+        assert!(local.restack);
+        assert_eq!(local.parent_tip, parent);
+        assert_eq!(git(&wt, &["config", &key]).unwrap(), parent);
+
+        c(&["rebase", "-q", "--onto", "origin/main", &parent]);
+        let local = probe(&wt, "feature", "origin/main", None, true).unwrap();
+        assert!(local.parent_tip.is_empty());
+        assert!(git(&wt, &["config", &key]).is_err());
+
+        let missing = "0123456789012345678901234567890123456789";
+        git(&wt, &["config", &key, missing]).unwrap();
+        let local = probe(&wt, "feature", "origin/main", None, true).unwrap();
+        assert_eq!(
+            local.parent_tip, missing,
+            "missing history is not evidence of a rebase"
+        );
+        assert_eq!(git(&wt, &["config", &key]).unwrap(), missing);
+        fs::remove_dir_all(wt).unwrap();
+    }
+
     /// GitHub's Update branch would merge the parent in; a stack rebases onto it instead.
     #[test]
     fn behind_parent_rebases_instead_of_merging() {
@@ -1918,7 +2114,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         let wt = root.join("ws/ui/ios");
         assert_eq!(ws.repos[0].base, "origin/logic");
         let own = edit(&wt, "c.txt", "c");
-        let p = |base: &str| probe(&wt, "ui", base, None).unwrap();
+        let p = |base: &str| probe(&wt, "ui", base, None, true).unwrap();
         let l = p("origin/logic");
         assert_eq!(
             (l.trunk.as_str(), l.parent_tip.as_str(), l.base, l.restack),
@@ -1979,14 +2175,14 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         );
         // No comparison ref remains: do not let archive mistake unknown counts for no work.
         git(&src, &["update-ref", "-d", "refs/remotes/origin/main"]).unwrap();
-        let error = probe(&wt, "ui", "origin/logic", None).unwrap_err();
+        let error = probe(&wt, "ui", "origin/logic", None, true).unwrap_err();
         assert!(error.contains("Can't compare HEAD"), "{error}");
 
         // A genuinely unborn branch still has no commits of its own.
         let empty = root.join("empty");
         fs::create_dir_all(&empty).unwrap();
         git(&empty, &["init", "-q", "-b", "main"]).unwrap();
-        let unborn = probe(&empty, "main", "origin/main", None).unwrap();
+        let unborn = probe(&empty, "main", "origin/main", None, true).unwrap();
         assert_eq!(unborn.head, "(initial)");
         assert_eq!(unborn.base, (0, 0));
         let _ = fs::remove_dir_all(&root);
@@ -2035,7 +2231,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         let ws = create_workspace(&root.join("ws/feat"), "feat", "feat", &on).unwrap();
         let wt = root.join("ws/feat/api");
         let base = ws.repos[0].base.clone();
-        let p = || probe(&wt, "feat", &base, None).unwrap();
+        let p = || probe(&wt, "feat", &base, None, true).unwrap();
 
         let l = p();
         assert_eq!(
@@ -2087,7 +2283,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
             ..l.clone()
         };
         assert_eq!(
-            probe(&wt, "feat", &base, Some(&fake)).unwrap().remote,
+            probe(&wt, "feat", &base, Some(&fake), true).unwrap().remote,
             Some((7, 7)),
             "unmoved refs reuse the last counts"
         );
