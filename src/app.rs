@@ -207,8 +207,10 @@ fn pill(id: impl Into<SharedString>, on: bool, theme: &Theme) -> Stateful<Div> {
         .aria_selected(on)
         .h(px(28.))
         .w(px(200.))
-        .max_w_full()
-        .flex_none()
+        .min_w_0()
+        .flex_shrink_1()
+        .relative()
+        .overflow_hidden()
         .group("titlebar-tab")
         .gap_1p5()
         .rounded(theme.radius)
@@ -216,7 +218,7 @@ fn pill(id: impl Into<SharedString>, on: bool, theme: &Theme) -> Stateful<Div> {
         .text_color(if on {
             theme.foreground
         } else {
-            theme.muted_foreground
+            theme.sidebar_foreground
         })
         .bg(if on {
             theme.secondary
@@ -224,6 +226,27 @@ fn pill(id: impl Into<SharedString>, on: bool, theme: &Theme) -> Stateful<Div> {
             theme.background
         })
         .hover(|d| d.bg(theme.secondary_hover).text_color(theme.foreground))
+}
+
+/// Leave the left side selectable even when a tab is narrower than its close button.
+fn tab_close(button: Button, theme: &Theme) -> Div {
+    h_flex()
+        .absolute()
+        .top(px(2.))
+        .left(px(28.))
+        .right(px(2.))
+        .h(px(24.))
+        .justify_end()
+        .overflow_hidden()
+        .invisible()
+        .group_hover("titlebar-tab", |s| s.visible())
+        .child(
+            div()
+                .flex_none()
+                .bg(theme.secondary_hover)
+                .rounded(theme.radius)
+                .child(button),
+        )
 }
 
 /// An icon control in the window chrome.
@@ -314,9 +337,6 @@ pub struct Shark {
     /// The sidebar | rest split, while the sidebar isn't a rail; persisted like Files.
     sidebar_resize: Entity<ResizableState>,
     sidebar_scroll: ScrollHandle,
-    /// The workspace tabs scroll sideways once they outgrow the header.
-    tab_scroll: ScrollHandle,
-    tab_layout: Rc<std::cell::Cell<(Pixels, usize)>>,
     /// Workspaces whose worktrees are being removed in the background.
     pub(crate) archiving: HashSet<String>,
     creating: HashSet<String>,
@@ -494,8 +514,6 @@ impl Shark {
             tree_resize,
             sidebar_resize,
             sidebar_scroll: ScrollHandle::new(),
-            tab_scroll: ScrollHandle::new(),
-            tab_layout: Rc::default(),
             archiving: HashSet::new(),
             creating: HashSet::new(),
             adding_repos: HashSet::new(),
@@ -630,7 +648,6 @@ impl Shark {
         self.tab = tab;
         self.home.on = false;
         self.remember_open();
-        self.reveal_tab();
         match tab {
             Tab::Chat => {
                 if let Some(chat) = self.active_chat() {

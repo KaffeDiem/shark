@@ -13,9 +13,9 @@ pub(crate) mod chrome_tests;
 mod file_changes_tests;
 mod menu_pixels;
 mod navigation_pixels;
-mod tree_pixels;
 mod storage_tests;
 mod tab_tests;
+mod tree_pixels;
 mod workspace_picker_tests;
 
 /// UI tests share the process-wide `TEST_HOME` and `state.json`, so they take turns. Chat
@@ -1836,7 +1836,7 @@ async fn drag_chat_tabs(cx: &mut TestAppContext) {
         ("drag-tabs", "closed-chat", ids[2].as_str()),
         ("drag-tabs", ids[0].as_str(), "closed-chat"),
     ] {
-        on(cx, &|s, w, cx| s.move_chat(workspace, from, to, w, cx));
+        on(cx, &|s, _, cx| s.move_chat(workspace, from, to, cx));
         order(cx, &[0, 2, 1]);
     }
 
@@ -1863,11 +1863,10 @@ async fn drag_chat_tabs(cx: &mut TestAppContext) {
     });
 }
 
-/// Tabs that outgrow the header scroll; a new or selected tab is scrolled into view.
+/// Every tab stays in the header as tabs are added, selected, closed and resized.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn many_tabs_scroll(cx: &mut TestAppContext) {
-    use std::cmp::Ordering;
+async fn many_tabs_shrink(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
     let repos = repos(&home, &["api"]);
@@ -1903,54 +1902,57 @@ async fn many_tabs_scroll(cx: &mut TestAppContext) {
     for _ in 0..20 {
         on(cx, &|s, w, cx| s.new_chat(w, cx));
     }
-    let hidden = |cx: &mut TestAppContext, ix: usize| cx.update(|cx| shark.read(cx).tab_hidden(ix));
-    cx.update(|cx| assert_eq!(shark.read(cx).active_ws().unwrap().active_chat, 20));
-    assert_eq!(hidden(cx, 20), Ordering::Equal, "the new tab is in view");
-    assert_eq!(hidden(cx, 0), Ordering::Less, "the first scrolled off");
-    on(cx, &|s, w, cx| s.select_chat(0, w, cx));
-    assert_eq!(hidden(cx, 0), Ordering::Equal);
-    assert_eq!(hidden(cx, 20), Ordering::Greater);
-    // Edge buttons browse hidden tabs without selecting one or snapping back on redraw.
-    cx.update_window(window, |_, w, cx| {
-        for _ in 0..3 {
-            w.render_frame(cx);
-            w.simulate_next_frame(cx);
-        }
-    })
-    .unwrap();
-    cx.update_window(window, |_, w, cx| w.click("tabs-right", cx))
-        .unwrap();
-    cx.run_until_parked();
-    cx.update_window(window, |_, w, cx| {
-        for _ in 0..3 {
-            w.render_frame(cx);
-            w.simulate_next_frame(cx);
-        }
-        assert_eq!(shark.read(cx).active_ws().unwrap().active_chat, 0);
-        assert_eq!(
-            shark.read(cx).tab_hidden(0),
-            Ordering::Less,
-            "manual scrolling stays put"
-        );
-    })
-    .unwrap();
-    on(cx, &|s, w, cx| s.select_chat(20, w, cx));
     for width in [800., 1440., 900.] {
         cx.simulate_window_resize(window, size(px(width), px(700.)));
-        cx.run_until_parked();
-        cx.update_window(window, |_, w, cx| {
-            for _ in 0..3 {
+        for selected in [0, 20] {
+            on(cx, &|s, w, cx| s.select_chat(selected, w, cx));
+            cx.update_window(window, |_, w, cx| {
                 w.render_frame(cx);
-                w.simulate_next_frame(cx);
-            }
-            assert_eq!(
-                shark.read(cx).tab_hidden(20),
-                Ordering::Equal,
-                "selected tab follows resize to {width}"
-            );
-        })
-        .unwrap();
+                let strip = w.find("chat-tabs").bounds();
+                let ws = shark.read(cx).active_ws().unwrap();
+                assert_eq!(ws.active_chat, selected);
+                let mut previous = strip.left();
+                let mut widths = vec![];
+                for meta in &ws.chats {
+                    let tab = w.find(SharedString::from(format!("chat-tab-{}", meta.id)));
+                    let b = tab.bounds();
+                    assert!(tab.visible());
+                    assert!(b.left() >= previous);
+                    assert!(
+                        b.right() <= strip.right() + px(1.),
+                        "all tabs fit at {width}"
+                    );
+                    assert!(b.size.width > px(0.) && b.size.width < px(200.));
+                    previous = b.right();
+                    widths.push(b.size.width);
+                }
+                assert!(widths.iter().all(|w| (*w - widths[0]).abs() <= px(1.)));
+                assert!(w.find("new-chat").bounds().left() >= strip.right());
+                assert!(w.find_all("tabs-left").is_empty());
+                assert!(w.find_all("tabs-right").is_empty());
+            })
+            .unwrap();
+        }
     }
+    on(cx, &|s, w, cx| {
+        for _ in 0..19 {
+            s.close_chat(w, cx);
+        }
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        for meta in &shark.read(cx).active_ws().unwrap().chats {
+            let b = w
+                .find(SharedString::from(format!("chat-tab-{}", meta.id)))
+                .bounds();
+            assert_eq!(
+                b.size.width,
+                px(200.),
+                "tabs grow back to their preferred width"
+            );
+        }
+    })
+    .unwrap();
     fs::remove_dir_all(&home).ok();
 }
 
@@ -2083,7 +2085,6 @@ async fn titlebar_controls(cx: &mut TestAppContext) {
                 if rail {
                     assert!(tab.bounds().left() >= w.find("new-workspace").bounds().right());
                 }
-                assert_eq!(s.tab_hidden(ws.active_chat), std::cmp::Ordering::Equal);
                 w.click("new-chat", cx);
             })
             .unwrap();
@@ -2112,8 +2113,6 @@ async fn titlebar_controls(cx: &mut TestAppContext) {
         });
         cx.update_window(window, |_, w, cx| {
             w.render_frame(cx);
-            w.simulate_next_frame(cx); // Native frames reveal the selected tab after the file changes its viewport.
-            w.render_frame(cx);
             let file = w.find(file_tab.clone());
             assert_eq!(w.find("chat-tabs").role(), Some(Role::TabList));
             assert_eq!(file.role(), Some(Role::Tab));
@@ -2125,21 +2124,13 @@ async fn titlebar_controls(cx: &mut TestAppContext) {
             assert_eq!(file.bounds().top(), px(8.));
             assert_eq!(file.bounds().size.height, px(28.));
             assert!(file.bounds().right() <= w.find("new-chat").bounds().left());
-            assert_eq!(
-                file.bounds().size.width,
-                w.find("diff-tab").bounds().size.width
-            );
-            assert_eq!(
-                file.bounds().size.width,
-                w.find(chat_tab.clone()).bounds().size.width
-            );
+            for other in [SharedString::from("diff-tab"), chat_tab.clone()] {
+                assert!(
+                    (file.bounds().size.width - w.find(other).bounds().size.width).abs() <= px(1.),
+                    "tabs share the available width within pixel rounding"
+                );
+            }
             assert!(file.bounds().right() <= w.find("workspace-titlebar").bounds().right());
-            let file_ix = shark.read(cx).active_ws().unwrap().chats.len() + 1;
-            assert_eq!(
-                shark.read(cx).tab_hidden(file_ix),
-                std::cmp::Ordering::Equal,
-                "opening a file reveals its selected tab"
-            );
             assert_eq!(shark.read(cx).tab, Tab::File);
             assert!(shark.read(cx).editor.is_some());
         })
@@ -2555,7 +2546,6 @@ async fn command_click_file_tabs(cx: &mut TestAppContext) {
     click_file(cx, "api/b.txt", true);
     on(cx, &|s, w, cx| {
         s.select_file(0, w, cx);
-        s.tab_scroll.scroll_to_item(3);
         cx.notify();
     });
     cx.update_window(window, |_, w, cx| {

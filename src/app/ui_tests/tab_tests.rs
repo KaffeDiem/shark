@@ -154,7 +154,6 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
                 w.resize(size(px(width), px(700.)));
                 s.show_tree = false;
                 s.select_file(0, w, cx);
-                s.tab_scroll.scroll_to_item(0);
             });
             cx.update_window(window, |_, w, _| w.activate_window())
                 .unwrap();
@@ -173,7 +172,7 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
                     );
                     assert!(!shark.read(cx).panes(cx).contains(&Pane::Chat));
                     assert_eq!(w.is_window_active(), active);
-                    // Scroll each tab into view before hovering; only its close control appears.
+                    // Hover each tab; only its close control appears.
                     for (ix, (tab, close)) in [
                         (format!("chat-tab-{}", ids[0]), "close-chat"),
                         (format!("chat-tab-{}", ids[1]), "close-chat"),
@@ -183,12 +182,19 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
                     .into_iter()
                     .enumerate()
                     {
-                        shark.read(cx).tab_scroll.scroll_to_item(ix);
                         w.render_frame(cx);
                         w.pointer_move(point(px(0.), px(690.)), None, cx);
                         let before = w.within(SharedString::from(tab.clone())).find(close);
                         assert!(!before.visible(), "hidden: {tab}, active={active}");
                         let bounds = w.find(SharedString::from(tab.clone())).bounds();
+                        let label = w
+                            .within(SharedString::from(tab.clone()))
+                            .find("tab-label")
+                            .bounds();
+                        assert!(
+                            label.right() > before.bounds().left(),
+                            "hidden close button leaves its space available to the label: {tab}"
+                        );
                         w.pointer_move(bounds.center(), None, cx);
                         let after = w.within(SharedString::from(tab.clone())).find(close);
                         assert!(after.visible(), "hovered: {tab}, active={active}");
@@ -271,7 +277,6 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
     // Close an earlier background chat by clicking × without selecting it or moving focus.
     on(cx, &|s, w, cx| {
         s.select_chat(s.active_ws().unwrap().chats.len() - 1, w, cx);
-        s.tab_scroll.scroll_to_item(0);
     });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
@@ -287,7 +292,6 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
     // A running chat's confirmation remains tied to its ID even when reordered.
     on(cx, &|s, w, cx| {
         s.select_file(0, w, cx);
-        s.tab_scroll.scroll_to_item(0);
     });
     let running_tab = SharedString::from(format!("chat-tab-{}", ids[1]));
     let click_running = |cx: &mut TestAppContext| {
@@ -307,9 +311,9 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.update(|cx| assert!(shark.read(cx).chats.contains_key(&ids[1])));
     click_running(cx);
-    on(cx, &|s, w, cx| {
+    on(cx, &|s, _, cx| {
         let target = s.active_ws().unwrap().chats[0].id.clone();
-        s.move_chat("tabs-focus", &ids[1], &target, w, cx);
+        s.move_chat("tabs-focus", &ids[1], &target, cx);
         chat.update(cx, |c, _| c.meta.session_id = Some("recover-me".into()));
         s.active_ws_mut()
             .unwrap()

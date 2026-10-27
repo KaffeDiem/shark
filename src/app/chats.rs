@@ -1,6 +1,5 @@
 //! Chat tabs of the open workspace, and the agent status in the header.
 use super::*;
-use std::cmp::Ordering;
 
 /// The visible strip owns its ordering: chats, optional Diff, then files.
 struct VisibleTabs {
@@ -60,7 +59,7 @@ impl Render for DraggedChat {
     }
 }
 
-/// The accent dot on a tab or edge arrow: a finished turn you haven't looked at yet.
+/// The accent dot on a tab: a finished turn you haven't looked at yet.
 pub(super) fn dot(inset: f32, theme: &Theme) -> Div {
     (div().absolute().top(px(inset)).right(px(inset)))
         .size(px(6.))
@@ -89,12 +88,6 @@ impl Shark {
             ),
         };
         self.visible_tabs(ws).index(tab)
-    }
-
-    pub(super) fn reveal_tab(&self) {
-        if let Some(active) = self.active_tab_index() {
-            self.tab_scroll.scroll_to_item(active);
-        }
     }
 
     /// The chat entity for `meta`, started (transcript replayed) on first use.
@@ -210,9 +203,6 @@ impl Shark {
         let ws = self.active_ws().cloned().unwrap();
         let chat = self.ensure_chat(&ws, &meta, window, cx);
         self.unread.remove(&meta.id);
-        // Scrolled at the next layout; render again then so the edge arrows see where it landed.
-        self.tab_scroll.scroll_to_item(ix);
-        cx.on_next_frame(window, |_, _, cx| cx.notify());
         if let Some(sync) = self.syncs.get(&ws.name) {
             sync.update(cx, |g, cx| g.set_chat(chat.clone(), cx));
         }
@@ -227,7 +217,6 @@ impl Shark {
         workspace: &str,
         from: &str,
         to: &str,
-        window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         let Some(ws) = self.active_ws_mut().filter(|ws| ws.name == workspace) else {
@@ -245,10 +234,7 @@ impl Shark {
         }
         move_item(&mut ws.chats, from, to);
         ws.active_chat = ws.chats.iter().position(|c| c.id == active).unwrap();
-        let active = ws.active_chat;
         let _ = self.state.save();
-        self.tab_scroll.scroll_to_item(active);
-        cx.on_next_frame(window, |_, _, cx| cx.notify());
         cx.notify();
     }
 
@@ -654,75 +640,7 @@ impl Shark {
         window.push_notification(format!("Thinking: {l} (from the next message)"), cx);
     }
 
-    /// Where tab `ix` sits against the tab strip as of the last layout: `Less` hidden (partly
-    /// counts) past the left edge, `Greater` past the right, `Equal` in view.
-    pub(super) fn tab_hidden(&self, ix: usize) -> Ordering {
-        let Some(b) = self.tab_scroll.bounds_for_item(ix) else {
-            return Ordering::Equal;
-        };
-        let (view, x) = (self.tab_scroll.bounds(), self.tab_scroll.offset().x);
-        if b.left() + x < view.left() - px(1.) {
-            Ordering::Less
-        } else if b.right() + x > view.right() + px(1.) {
-            Ordering::Greater
-        } else {
-            Ordering::Equal
-        }
-    }
-
-    /// An arrow at an edge of the tab strip while tabs hide past it, dotted when one of them
-    /// finished a turn unseen; clicking brings that one (else the nearest hidden tab) into view.
-    fn tab_edge(
-        &self,
-        edge: Ordering,
-        ws: &Workspace,
-        cx: &mut Context<Self>,
-    ) -> Option<AnyElement> {
-        let mut hidden: Vec<usize> = (0..self.visible_tabs(ws).len())
-            .filter(|&ix| self.tab_hidden(ix) == edge)
-            .collect();
-        if edge == Ordering::Less {
-            hidden.reverse(); // nearest first
-        }
-        let unread: Vec<usize> = (hidden.iter().copied())
-            .filter(|&ix| {
-                ws.chats
-                    .get(ix)
-                    .is_some_and(|c| self.unread.contains(&c.id))
-            })
-            .collect();
-        let to = *unread.first().or(hidden.first())?;
-        let theme = cx.theme();
-        let (id, icon) = match edge {
-            Ordering::Less => ("tabs-left", IconName::ChevronLeft),
-            _ => ("tabs-right", IconName::ChevronRight),
-        };
-        let tip = match unread.len() {
-            0 => format!("{} more", hidden.len()),
-            n => format!("{} more · {n} finished", hidden.len()),
-        };
-        Some(
-            div()
-                .relative()
-                .flex_none()
-                .child(
-                    Button::new(id)
-                        .ghost()
-                        .xsmall()
-                        .icon(icon)
-                        .tooltip(tip)
-                        .on_click(cx.listener(move |this, _, window, cx| {
-                            this.tab_scroll.scroll_to_item(to);
-                            cx.on_next_frame(window, |_, _, cx| cx.notify());
-                            cx.notify();
-                        })),
-                )
-                .when(!unread.is_empty(), |d| d.child(dot(2., theme)))
-                .into_any_element(),
-        )
-    }
-
-    /// Chats, Diff and files share equal-width tabs; overflow scrolls between edge arrows.
+    /// Chats, Diff and files share equal-width tabs that shrink to fit the header.
     pub(super) fn render_tabs(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let Some(ws) = self.active_ws() else {
             return vec![];
@@ -772,7 +690,6 @@ impl Shark {
                 };
                 pill(format!("chat-tab-{}", meta.id), on, theme)
                     .aria_label(label.clone())
-                    .flex_none()
                     .pl_2p5()
                     .pr_1()
                     .on_drag(
@@ -795,8 +712,8 @@ impl Shark {
                     })
                     .on_drop({
                         let target = meta.id.clone();
-                        cx.listener(move |this, drag: &DraggedChat, window, cx| {
-                            this.move_chat(&drag.workspace, &drag.id, &target, window, cx)
+                        cx.listener(move |this, drag: &DraggedChat, _, cx| {
+                            this.move_chat(&drag.workspace, &drag.id, &target, cx)
                         })
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
@@ -811,24 +728,24 @@ impl Shark {
                         }),
                     )
                     .child(icon)
-                    .child(tab_label(label.clone(), on, theme))
-                    .tooltip(move |w, cx| Tooltip::new(label.clone()).build(w, cx))
                     .child(
-                        div()
-                            .flex_none()
-                            .invisible()
-                            .group_hover("titlebar-tab", |s| s.visible())
-                            .child(
-                                crate::settings::close_button("close-chat", "Close chat (cmd-w)")
-                                    .on_click({
-                                        let (workspace, id) = (ws.name.clone(), meta.id.clone());
-                                        cx.listener(move |this, _, window, cx| {
-                                            cx.stop_propagation();
-                                            this.close_chat_by_id(&workspace, &id, window, cx)
-                                        })
-                                    }),
-                            ),
+                        tab_label(label.clone(), on, theme)
+                            .id("tab-label")
+                            .test_support(),
                     )
+                    .tooltip(move |w, cx| Tooltip::new(label.clone()).build(w, cx))
+                    .child(tab_close(
+                        crate::settings::close_button("close-chat", "Close chat (cmd-w)").on_click(
+                            {
+                                let (workspace, id) = (ws.name.clone(), meta.id.clone());
+                                cx.listener(move |this, _, window, cx| {
+                                    cx.stop_propagation();
+                                    this.close_chat_by_id(&workspace, &id, window, cx)
+                                })
+                            },
+                        ),
+                        theme,
+                    ))
                     .test_support()
                     .into_any_element()
             })
@@ -848,20 +765,20 @@ impl Shark {
                             .with_size(px(14.))
                             .into_any_element()
                     })
-                    .child(tab_label("Diff".into(), self.tab == Tab::Diff, theme))
                     .child(
-                        div()
-                            .flex_none()
-                            .invisible()
-                            .group_hover("titlebar-tab", |s| s.visible())
-                            .child(
-                                crate::settings::close_button("close-diff", "Close Diff (cmd-w)")
-                                    .on_click(cx.listener(|this, _, w, cx| {
-                                        cx.stop_propagation();
-                                        this.close_diff(w, cx);
-                                    })),
-                            ),
+                        tab_label("Diff".into(), self.tab == Tab::Diff, theme)
+                            .id("tab-label")
+                            .test_support(),
                     )
+                    .child(tab_close(
+                        crate::settings::close_button("close-diff", "Close Diff (cmd-w)").on_click(
+                            cx.listener(|this, _, w, cx| {
+                                cx.stop_propagation();
+                                this.close_diff(w, cx);
+                            }),
+                        ),
+                        theme,
+                    ))
                     .tooltip(|w, cx| Tooltip::new("Diff (cmd-shift-d)").build(w, cx))
                     .test_support()
                     .into_any_element(),
@@ -893,7 +810,7 @@ impl Shark {
                         .with_size(px(14.))
                         .into_any_element()
                 })
-                .child(tab_label(name, on, theme))
+                .child(tab_label(name, on, theme).id("tab-label").test_support())
                 .when(e.dirty, |d| {
                     d.child(
                         div()
@@ -903,80 +820,38 @@ impl Shark {
                             .bg(theme.foreground),
                     )
                 })
-                .child(
-                    div()
-                        .flex_none()
-                        .invisible()
-                        .group_hover("titlebar-tab", |s| s.visible())
-                        .child(
-                            crate::settings::close_button("close-file-tab", "Close file (cmd-w)")
-                                .on_click(cx.listener(move |this, _, w, cx| {
-                                    cx.stop_propagation();
-                                    if let Some(editor) =
-                                        this.file_tabs.get(ix).map(|t| t.editor.clone())
-                                    {
-                                        this.close_editor(editor, w, cx);
-                                    }
-                                })),
-                        ),
-                )
+                .child(tab_close(
+                    crate::settings::close_button("close-file-tab", "Close file (cmd-w)").on_click(
+                        cx.listener(move |this, _, w, cx| {
+                            cx.stop_propagation();
+                            if let Some(editor) = this.file_tabs.get(ix).map(|t| t.editor.clone()) {
+                                this.close_editor(editor, w, cx);
+                            }
+                        }),
+                    ),
+                    theme,
+                ))
                 .tooltip(move |w, cx| Tooltip::new(path.clone()).build(w, cx))
                 .test_support()
                 .into_any_element()
         }));
-        let (layout, scroll) = (self.tab_layout.clone(), self.tab_scroll.clone());
-        let active = self.active_tab_index().unwrap_or(0);
         let strip = h_flex()
-            .on_children_prepainted(move |children, window, cx| {
-                let next = (scroll.bounds().size.width, children.len());
-                if layout.replace(next) != next {
-                    // A resize or removed tab can hide the selection without changing it.
-                    let scroll = scroll.clone();
-                    window.defer(cx, move |window, _| {
-                        scroll.scroll_to_item(active);
-                        window.refresh();
-                    });
-                }
-            })
             .id("chat-tabs")
             .role(Role::TabList)
             .aria_label("Workspace tabs")
             .test_support()
             .min_w_0()
             .gap_1()
-            .overflow_x_scroll()
-            .track_scroll(&self.tab_scroll)
             .children(pills)
             .into_any_element();
-        let left = self.tab_edge(Ordering::Less, ws, cx);
-        let right = self.tab_edge(Ordering::Greater, ws, cx);
-        let overflow = left.is_some() || right.is_some();
-        let mut tabs = vec![];
-        if overflow {
-            tabs.push(
-                div()
-                    .w(px(24.))
-                    .flex_none()
-                    .children(left)
-                    .into_any_element(),
-            );
-        }
-        tabs.push(strip);
-        if overflow {
-            tabs.push(
-                div()
-                    .w(px(24.))
-                    .flex_none()
-                    .children(right)
-                    .into_any_element(),
-            );
-        }
+        let mut tabs = vec![strip];
         tabs.push(
             Button::new("new-chat")
                 .ghost()
                 .xsmall()
                 .icon(IconName::Plus)
                 .w(px(24.))
+                .flex_none()
                 .tooltip("New chat (cmd-t)")
                 .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx)))
                 .into_any_element(),
