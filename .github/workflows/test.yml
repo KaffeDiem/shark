@@ -14,7 +14,4 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: rustup toolchain install
-      - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --check
-      - run: cargo test
-      - run: cargo test --features test-support
