@@ -567,17 +567,11 @@ pub fn review_pr_url(src: &Path, branch: &str) -> Option<String> {
     .filter(|s| !s.is_empty())
 }
 
-fn plan_pr_worktree(branch: &str, r: &Repo, pr: &PullRequest) -> Result<Plan, String> {
+fn pr_remote(src: &Path, pr: &PullRequest) -> Result<String, String> {
     if pr.base.is_empty() {
         return Err(
             "Pull request base is missing; refresh pull requests and select it again".into(),
         );
-    }
-    if has_ref(&r.path, &format!("refs/heads/{branch}")) {
-        return Err(format!(
-            "{}: review branch `{branch}` already exists; pick another branch name",
-            r.name
-        ));
     }
     let path = pr
         .url
@@ -598,12 +592,12 @@ fn plan_pr_worktree(branch: &str, r: &Repo, pr: &PullRequest) -> Result<Plan, St
         return Err("Invalid pull request URL".into());
     }
     git(
-        &r.path,
+        src,
         &["check-ref-format", &format!("refs/heads/{}", pr.base)],
     )?;
     let repo = format!("{}/{}", parts[1], parts[2]);
     let remote = format!("https://{}/{repo}.git", parts[0]);
-    let origin = git(&r.path, &["remote", "get-url", "origin"]).unwrap_or_default();
+    let origin = git(src, &["remote", "get-url", "origin"]).unwrap_or_default();
     let origin = origin.trim_end_matches('/').trim_end_matches(".git");
     let matching_origin = [
         format!("https://{}/{repo}", parts[0]),
@@ -611,8 +605,39 @@ fn plan_pr_worktree(branch: &str, r: &Repo, pr: &PullRequest) -> Result<Plan, St
         format!("ssh://git@{}/{repo}", parts[0]),
     ]
     .contains(&origin.to_string());
-    let remote = if matching_origin { "origin" } else { &remote };
-    // shortcut: review refs refresh during creation only; refresh them when review-update support is added.
+    Ok(if matching_origin {
+        "origin".into()
+    } else {
+        remote
+    })
+}
+
+/// Refresh only the review comparison ref, from the PR's target repository (possibly not origin).
+pub(crate) fn refresh_review_base(src: &Path, pr: &PullRequest) -> Result<(), String> {
+    let remote = pr_remote(src, pr)?;
+    cmd_bounded(
+        src,
+        "git",
+        &[
+            "fetch",
+            "--quiet",
+            "--no-tags",
+            &remote,
+            &format!("+refs/heads/{}:refs/shark/pull/{}/base", pr.base, pr.number),
+        ],
+        30,
+    )?;
+    Ok(())
+}
+
+fn plan_pr_worktree(branch: &str, r: &Repo, pr: &PullRequest) -> Result<Plan, String> {
+    if has_ref(&r.path, &format!("refs/heads/{branch}")) {
+        return Err(format!(
+            "{}: review branch `{branch}` already exists; pick another branch name",
+            r.name
+        ));
+    }
+    let remote = pr_remote(&r.path, pr)?;
     let head = format!("refs/shark/pull/{}/head", pr.number);
     let base = format!("refs/shark/pull/{}/base", pr.number);
     cmd_bounded(
@@ -622,7 +647,7 @@ fn plan_pr_worktree(branch: &str, r: &Repo, pr: &PullRequest) -> Result<Plan, St
             "fetch",
             "--quiet",
             "--no-tags",
-            remote,
+            &remote,
             &format!("+refs/pull/{}/head:{head}", pr.number),
             &format!("+refs/heads/{}:{base}", pr.base),
         ],
@@ -1499,6 +1524,146 @@ mod tests {
         );
         assert!(!failed.exists() && !has_ref(&repo.path, "refs/heads/review-again"));
         assert_eq!(review_pr_url(&repo.path, "review-again"), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn review_base_refresh_follows_target_and_preserves_worktree() {
+        let root =
+            std::env::temp_dir().join(format!("shark-review-refresh-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let repo = init_repo(&root, "api");
+        let upstream = root.join("upstream.git");
+        let fork = root.join("fork.git");
+        let initial = git(&repo.path, &["rev-parse", "HEAD"]).unwrap();
+        for (remote, url) in [
+            (&upstream, "https://github.com/o/upstream.git"),
+            (&fork, "https://github.com/me/fork.git"),
+        ] {
+            git(&root, &["init", "-q", "--bare", &remote.to_string_lossy()]).unwrap();
+            git(
+                &repo.path,
+                &[
+                    "push",
+                    "-q",
+                    &remote.to_string_lossy(),
+                    "HEAD:refs/heads/release",
+                ],
+            )
+            .unwrap();
+            git(
+                &repo.path,
+                &[
+                    "config",
+                    &format!("url.{}.insteadOf", remote.display()),
+                    url,
+                ],
+            )
+            .unwrap();
+        }
+        git(
+            &repo.path,
+            &["remote", "add", "origin", "https://github.com/me/fork.git"],
+        )
+        .unwrap();
+        git(&repo.path, &["fetch", "-q", "origin"]).unwrap();
+        git(
+            &repo.path,
+            &[
+                "push",
+                "-q",
+                &upstream.to_string_lossy(),
+                "HEAD:refs/pull/7/head",
+                "HEAD:refs/heads/other",
+            ],
+        )
+        .unwrap();
+        let mut pr = PullRequest {
+            number: 7,
+            url: "https://github.com/o/upstream/pull/7".into(),
+            base: "release".into(),
+        };
+        let dir = root.join("ws/review");
+        let ws = create_workspace_with_prs(
+            &dir,
+            "review",
+            "review-7",
+            &[(repo.clone(), "review-7".into())],
+            &[(repo.name.clone(), pr.clone())],
+            &[],
+        )
+        .unwrap();
+        let wt = dir.join("api");
+        fs::write(wt.join("README.md"), "staged\n").unwrap();
+        git(&wt, &["add", "README.md"]).unwrap();
+        fs::write(wt.join("README.md"), "unstaged\n").unwrap();
+        fs::write(wt.join("untracked.txt"), "keep me\n").unwrap();
+        let status = git(&wt, &["status", "--porcelain"]).unwrap();
+        let index = git(&wt, &["diff", "--cached"]).unwrap();
+        git(
+            &repo.path,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "advance",
+                "--allow-empty",
+            ],
+        )
+        .unwrap();
+        let advanced = git(&repo.path, &["rev-parse", "HEAD"]).unwrap();
+        git(
+            &repo.path,
+            &[
+                "push",
+                "-q",
+                &upstream.to_string_lossy(),
+                "HEAD:refs/heads/release",
+            ],
+        )
+        .unwrap();
+        refresh_review_base(&wt, &pr).unwrap();
+        assert_eq!(
+            git(&wt, &["rev-parse", &ws.repos[0].base]).unwrap(),
+            advanced
+        );
+        assert_eq!(git(&wt, &["rev-parse", "origin/release"]).unwrap(), initial);
+
+        pr.base = "other".into();
+        refresh_review_base(&wt, &pr).unwrap();
+        assert_eq!(
+            git(&wt, &["rev-parse", &ws.repos[0].base]).unwrap(),
+            initial
+        );
+        pr.base = "missing".into();
+        assert!(refresh_review_base(&wt, &pr).is_err());
+        assert_eq!(
+            git(&wt, &["rev-parse", &ws.repos[0].base]).unwrap(),
+            initial
+        );
+        pr.base = "../invalid".into();
+        assert!(refresh_review_base(&wt, &pr).is_err());
+        pr.base = "release".into();
+        pr.url = "https://github.com/o/upstream/pull/8".into();
+        assert!(refresh_review_base(&wt, &pr).is_err());
+        assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), initial);
+        assert_eq!(
+            git(&wt, &["rev-parse", "refs/shark/pull/7/head"]).unwrap(),
+            initial
+        );
+        assert_eq!(git(&wt, &["status", "--porcelain"]).unwrap(), status);
+        assert_eq!(git(&wt, &["diff", "--cached"]).unwrap(), index);
+        assert_eq!(
+            fs::read_to_string(wt.join("README.md")).unwrap(),
+            "unstaged\n"
+        );
+        assert_eq!(
+            fs::read_to_string(wt.join("untracked.txt")).unwrap(),
+            "keep me\n"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

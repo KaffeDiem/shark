@@ -1,6 +1,8 @@
 //! The header's git button: keeps every repo of the open workspace in sync with git and GitHub,
 //! and runs the next step toward a merged PR. `status` decides what that step is; this file
 //! polls, renders and executes. The app only embeds the entity and forwards three actions.
+#[cfg(all(test, feature = "test-support"))]
+mod base_tests;
 mod status;
 pub use status::{Kind, Pr, PrState, Repo, ago, github_url, short};
 
@@ -56,6 +58,8 @@ pub enum SyncEvent {
     },
     /// The PR target changed, or a fetch may have moved its base ref.
     DiffBaseChanged,
+    /// A former review checkout now owns a PR: persist `(repo, old base, new base)`.
+    PrBaseAdopted(Vec<(String, String, String)>),
     /// Create PRs succeeded.
     PrsCreated,
 }
@@ -115,8 +119,8 @@ struct Job {
     repos: Vec<(PathBuf, String, String)>,
     fetch: bool,
     pr: bool,
-    /// The last probe per repo, so unchanged refs skip the costly comparisons.
-    prev: Vec<Local>,
+    /// The last answer per repo, including its PR target between GitHub polls.
+    prev: Vec<Repo>,
     /// With `fetch`: `(repo, source)` whose open PRs to list, for the stack around the branch.
     stack: Vec<(String, PathBuf)>,
 }
@@ -148,18 +152,67 @@ struct Probed {
 
 /// Repos run in parallel, so one hung remote costs one timeout, not one per repo.
 fn run_job(job: &Job) -> Probed {
-    let results = par_map(job.repos.iter().enumerate(), |(i, (wt, base, branch))| {
+    let ask_pr = job.pr || job.fetch;
+    let results = par_map(job.repos.iter(), |(wt, saved_base, branch)| {
+        let previous = job.prev.iter().find(|r| {
+            wt.file_name().is_some_and(|name| name == r.name.as_str()) && r.branch == *branch
+        });
+        let prev_local = previous.and_then(|r| r.local.as_ref().ok());
+        let initial_base = previous
+            .and_then(repo_diff_base)
+            .unwrap_or_else(|| saved_base.clone());
         // Errors (offline, no origin) show in the tooltip and menu, not a toast every 3 min.
-        let fetch_err = job
+        let mut fetch_err = job
             .fetch
             .then(|| cmd_bounded(wt, "git", &["fetch", "--prune", "--quiet", "origin"], 60).err())
             .flatten();
-        let local = probe(wt, branch, base, job.prev.get(i));
+        let mut local = probe(wt, branch, &initial_base, prev_local);
         let head = local.as_ref().map(|l| l.head.as_str()).unwrap_or_default();
-        let pr = job.pr.then(|| fetch_pr(wt, branch, head));
+        let pr = ask_pr.then(|| fetch_pr(wt, branch, head));
+        let review = crate::git::review_pr_url(wt, branch).is_some();
+        let previous = previous.filter(|r| r.local.as_ref().is_ok_and(|l| l.review == review));
+        let selected = fresh_or_last(pr.as_ref(), &previous.and_then(|r| r.pr.clone()));
+        let selected = selected
+            .as_ref()
+            .and_then(|p| p.as_ref().ok())
+            .and_then(|p| p.as_ref());
+        let base = selected
+            .filter(|p| {
+                !review
+                    && (p.state == PrState::Open || saved_base.starts_with("refs/shark/pull/"))
+                    && !p.base.is_empty()
+            })
+            .map(|p| format!("origin/{}", p.base))
+            .unwrap_or_else(|| saved_base.clone());
+        if job.fetch && review {
+            if let Some(Ok(Some(p))) = &pr {
+                if p.state == PrState::Open {
+                    if let Err(e) = crate::git::refresh_review_base(
+                        wt,
+                        &crate::git::PullRequest {
+                            number: p.number,
+                            url: p.url.clone(),
+                            base: p.base.clone(),
+                        },
+                    ) {
+                        fetch_err = Some(match fetch_err {
+                            Some(previous) => format!("{previous}\n{e}"),
+                            None => e,
+                        });
+                    }
+                }
+            }
+        }
+        if base != initial_base
+            || job.fetch && review
+            || local.as_ref().is_ok_and(|l| l.review != review)
+        {
+            local = probe(wt, branch, &base, local.as_ref().ok());
+        }
         let trunk = local.as_ref().map_or("", |l| l.trunk.as_str());
-        let parent = (crate::stack::parent_of(base, trunk).filter(|_| job.pr && !trunk.is_empty()))
-            .map(|p| status::fetch_parent(wt, p));
+        let parent = (crate::stack::parent_of(&base, trunk)
+            .filter(|_| ask_pr && !trunk.is_empty()))
+        .map(|p| status::fetch_parent(wt, p));
         (local, (pr, parent), fetch_err)
     });
     let mut locals = vec![];
@@ -189,7 +242,7 @@ fn run_job(job: &Job) -> Probed {
     Probed {
         repos: job.repos.clone(),
         locals,
-        prs: job.pr.then_some(prs),
+        prs: ask_pr.then_some(prs),
         parents,
         stack_prs,
         fetched: job.fetch,
@@ -214,6 +267,7 @@ pub fn check_in_background(
 ) -> (Result<Option<String>, String>, Vec<Repo>) {
     let p = run_job(&Job {
         pr: gh,
+        prev: last.to_vec(),
         ..Job::prs(ws)
     });
     background_answer(ws, p.locals, p.prs, p.parents, last, reviewed)
@@ -417,11 +471,7 @@ impl GitSync {
             // for the lock.
             fetch: fetch && !self.busy(cx) && self.running.is_none(),
             pr: self.want_pr || due(self.pr_checked, pr_every),
-            prev: self
-                .repos
-                .iter()
-                .map(|r| r.local.clone().unwrap_or_default())
-                .collect(),
+            prev: self.repos.clone(),
             stack: (self.ws.repos.iter())
                 .map(|r| (r.name.clone(), r.src.clone()))
                 .collect(),
@@ -457,7 +507,32 @@ impl GitSync {
         }
         let bases: Vec<_> = self.repos.iter().map(repo_diff_base).collect();
         self.repos = repos_from(&self.ws, p.locals, p.prs, p.parents, &self.repos);
-        if p.fetched || !bases.into_iter().eq(self.repos.iter().map(repo_diff_base)) {
+        let adopted: Vec<_> = self
+            .ws
+            .repos
+            .iter_mut()
+            .filter_map(|saved| {
+                let repo = self.repos.iter().find(|r| r.name == saved.name)?;
+                if saved.base.starts_with("refs/shark/pull/")
+                    && !repo.base.starts_with("refs/shark/pull/")
+                    && repo.local.as_ref().is_ok_and(|l| !l.review)
+                {
+                    let old = std::mem::replace(&mut saved.base, repo.base.clone());
+                    Some((saved.name.clone(), old, repo.base.clone()))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        if !adopted.is_empty() {
+            cx.emit(SyncEvent::PrBaseAdopted(adopted));
+            self.kick(true, false);
+        }
+        let base_changed = !bases.into_iter().eq(self.repos.iter().map(repo_diff_base));
+        if base_changed {
+            self.kick(true, false);
+        }
+        if p.fetched || base_changed {
             cx.emit(SyncEvent::DiffBaseChanged);
         }
         let action = next_action(&self.repos, &self.reviewed);
@@ -786,7 +861,10 @@ impl GitSync {
             snapshot.retain(|r| a.repos.contains(&r.name));
         }
         let handled = self.reviewed.clone();
-        let all = Job::prs(&ws);
+        let all = Job {
+            prev: snapshot.clone(),
+            ..Job::prs(&ws)
+        };
         // Pull and push only need fresh git state.
         let pr_kinds = !matches!(a.kind, Kind::Pull | Kind::Push | Kind::ForcePush);
         let order = self.merge_order.clone();
@@ -1207,11 +1285,11 @@ impl GitSync {
 
 fn repo_diff_base(repo: &Repo) -> Option<String> {
     // Review checkouts have private refs from the target repository, which may not be origin.
-    repo.open_pr()
+    repo.pr()
         .filter(|p| {
-            !p.base.is_empty()
-                && !repo.base.starts_with("refs/shark/pull/")
-                && !repo.local.as_ref().is_ok_and(|l| l.review)
+            (p.state == PrState::Open || repo.base.starts_with("refs/shark/pull/"))
+                && !p.base.is_empty()
+                && repo.local.as_ref().is_ok_and(|l| !l.review)
         })
         .map(|pr| format!("origin/{}", pr.base))
 }
@@ -1435,17 +1513,26 @@ fn repos_from(
             let old = last
                 .iter()
                 .find(|old| old.name == r.name && old.branch == ws.branch_of(r));
-            Repo {
+            let same_identity = old.filter(|old| match (&old.local, &local) {
+                (Ok(old), Ok(local)) => old.review == local.review,
+                _ => true,
+            });
+            let pr = fresh_or_last(pr.as_ref(), &same_identity.and_then(|r| r.pr.clone()));
+            let mut repo = Repo {
                 local,
-                pr: fresh_or_last(pr.as_ref(), &old.and_then(|r| r.pr.clone())),
-                parent: match parent {
-                    Some(Ok(parent)) => parent,
-                    _ => old
-                        .filter(|old| old.base == r.base)
-                        .and_then(|r| r.parent.clone()),
-                },
+                pr,
                 ..Repo::fresh(r, ws)
+            };
+            if let Some(base) = repo_diff_base(&repo) {
+                repo.base = base;
             }
+            repo.parent = match parent {
+                Some(Ok(parent)) => parent,
+                _ => old
+                    .filter(|old| old.base == repo.base)
+                    .and_then(|r| r.parent.clone()),
+            };
+            repo
         })
         .collect()
 }
@@ -1997,7 +2084,14 @@ esac
         pr.base = "parent".into();
         r.pr = Some(Ok(Some(pr)));
         r.base = "refs/shark/pull/2/base".into();
+        r.local.as_mut().unwrap().review = true;
         assert_eq!(repo_diff_base(r), None);
+        r.local.as_mut().unwrap().review = false;
+        assert_eq!(
+            repo_diff_base(r).as_deref(),
+            Some("origin/parent"),
+            "an adopted branch follows its own PR"
+        );
         r.base = "release".into();
         assert_eq!(
             repo_diff_base(r).as_deref(),
@@ -2386,7 +2480,13 @@ esac
         let retained = repos_from(&ws, p.locals, p.prs, p.parents, &repos);
         assert_eq!(retained[0].parent, repos[0].parent);
         ws.repos[0].base = "origin/other".into();
-        let (_, p) = stacked_probe();
+        let (_, mut p) = stacked_probe();
+        p.prs.as_mut().unwrap()[0]
+            .as_mut()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .base = "other".into();
         let changed = repos_from(&ws, p.locals, p.prs, vec![None], &repos);
         assert_eq!(changed[0].parent, None);
     }

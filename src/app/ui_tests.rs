@@ -8,6 +8,7 @@ use std::time::Instant;
 use std::{fs, path::PathBuf, time::Duration};
 
 mod audit_tests;
+mod base_adoption_tests;
 pub(crate) mod chrome_tests;
 mod file_changes_tests;
 mod menu_pixels;

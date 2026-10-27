@@ -370,20 +370,66 @@ pub fn fetch_parent(wt: &Path, parent: &str) -> Result<Option<Pr>, String> {
 /// so it can't be confused with being offline or logged out.
 /// `head` is the local HEAD as just probed.
 pub fn fetch_pr(wt: &Path, branch: &str, head: &str) -> Result<Option<Pr>, String> {
-    if let Some(url) = crate::git::review_pr_url(wt, branch) {
-        let json = cmd_bounded(wt, "gh", &["pr", "view", &url, "--json", PR_FIELDS], 20)?;
-        let value = serde_json::from_str(&json).map_err(|e| format!("gh: {e}"))?;
-        return Ok(Some(parse_pr(&value)));
+    let review = crate::git::review_pr_url(wt, branch);
+    // gh may default to a fork's upstream; branch ownership belongs to origin.
+    let origin = git(wt, &["config", "--get", "remote.origin.url"])
+        .ok()
+        .and_then(|url| github_url(&url));
+    let mut args = vec![
+        "pr", "list", "--head", branch, "--state", "all", "--json", PR_FIELDS,
+    ];
+    if let Some(origin) = &origin {
+        args.extend(["--repo", origin]);
     }
-    let json = cmd_bounded(
-        wt,
-        "gh",
-        &[
-            "pr", "list", "--head", branch, "--state", "all", "--json", PR_FIELDS,
-        ],
-        20,
-    )?;
-    let mut pr = parse_prs(&json);
+    let own = if review.is_none() || origin.is_some() {
+        let result = cmd_bounded(wt, "gh", &args, 20).and_then(|json| {
+            serde_json::from_str::<Vec<Value>>(&json).map_err(|e| format!("gh: {e}"))?;
+            Ok(parse_prs(&json))
+        });
+        match result {
+            Ok(pr) => pr,
+            // A private fork can be inaccessible while the original review is still readable.
+            Err(_) if review.is_some() => None,
+            Err(e) => return Err(e),
+        }
+    } else {
+        None
+    };
+    if let Some(url) = &review {
+        if let Some(pr) = own.as_ref().filter(|p| {
+            p.state == PrState::Open
+                && p.url != *url
+                && p.number != 0
+                && !p.base.is_empty()
+                && origin
+                    .as_ref()
+                    .is_some_and(|o| p.url == format!("{o}/pull/{}", p.number))
+                // A fresh review branch can have the same name as an unrelated remote PR.
+                && !p.head.is_empty()
+                && git(wt, &["merge-base", "--is-ancestor", "--", &p.head, &format!("refs/heads/{branch}")]).is_ok()
+        }) {
+            git(
+                wt,
+                &["check-ref-format", &format!("refs/heads/{}", pr.base)],
+            )?;
+            // Only remove the identity we read; another workspace may have changed it meanwhile.
+            git(
+                wt,
+                &[
+                    "config",
+                    "--fixed-value",
+                    "--unset",
+                    &format!("branch.{branch}.shark-pr-url"),
+                    url,
+                ],
+            )?;
+        } else {
+            let json = cmd_bounded(wt, "gh", &["pr", "view", &url, "--json", PR_FIELDS], 20)?;
+            let value = serde_json::from_str(&json).map_err(|e| format!("gh: {e}"))?;
+            return Ok(Some(parse_pr(&value)));
+        }
+    }
+    let mut pr = own;
     if let Some(p) = pr
         .as_mut()
         .filter(|p| p.state == PrState::Merged && !head.is_empty() && p.head != head)
