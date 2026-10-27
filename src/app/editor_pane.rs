@@ -90,6 +90,7 @@ impl Shark {
         self.confirm_editors(
             replacing.iter().cloned().collect(),
             false,
+            true,
             window,
             cx,
             move |s, window, cx| {
@@ -182,6 +183,7 @@ impl Shark {
         self.confirm_editors(
             vec![editor.clone()],
             false,
+            true,
             window,
             cx,
             move |s, window, cx| {
@@ -220,15 +222,31 @@ impl Shark {
 
     /// Quit, asking first if the open file has unsaved edits.
     pub fn quit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.confirm_discard(true, true, window, cx, |_, _, cx| cx.quit())
+        if !self.storage_guard(true, window, cx) {
+            return;
+        }
+        let editors = self.file_tabs.iter().map(|t| t.editor.clone()).collect();
+        self.confirm_editors(editors, true, false, window, cx, |s, window, cx| {
+            // Background saves can fail while the discard dialog is open.
+            if s.storage_guard(true, window, cx) {
+                cx.quit();
+            }
+        })
     }
 
     /// The window's close button: true to close now; with unsaved edits it asks first, and
     /// Discard closes the window.
     pub(super) fn close_window(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !self.storage_guard(false, window, cx) {
+            return false;
+        }
         let ran = Rc::new(std::cell::Cell::new(false));
         let later = ran.clone();
-        self.confirm_discard(true, true, window, cx, move |_, window, _| {
+        let editors = self.file_tabs.iter().map(|t| t.editor.clone()).collect();
+        self.confirm_editors(editors, true, false, window, cx, move |s, window, cx| {
+            if !s.storage_guard(false, window, cx) {
+                return;
+            }
             if later.replace(true) {
                 window.remove_window()
             }
@@ -252,13 +270,14 @@ impl Shark {
             .filter(|_| editor)
             .map(|t| t.editor.clone())
             .collect();
-        self.confirm_editors(editors, edit, window, cx, then);
+        self.confirm_editors(editors, edit, true, window, cx, then);
     }
 
-    fn confirm_editors(
+    pub(super) fn confirm_editors(
         &mut self,
         editors: Vec<Entity<FileEditor>>,
         edit: bool,
+        clear_dirty: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut Shark, &mut Window, &mut Context<Shark>) + 'static,
@@ -288,11 +307,14 @@ impl Shark {
             "Discard",
             move |s, window, cx| {
                 if let Some(f) = then.borrow_mut().take() {
-                    for e in &editors {
-                        e.update(cx, |e, _| e.dirty = false);
-                    }
-                    if let Some(e) = s.editing.as_mut().filter(|_| edit) {
-                        e.dirty = false;
+                    // Closing may still be canceled by the final storage check.
+                    if clear_dirty {
+                        for e in &editors {
+                            e.update(cx, |e, _| e.dirty = false);
+                        }
+                        if let Some(e) = s.editing.as_mut().filter(|_| edit) {
+                            e.dirty = false;
+                        }
                     }
                     f(s, window, cx)
                 }
@@ -311,7 +333,7 @@ impl Shark {
     /// Vim mode everywhere: the editor, the composer and the list keys (the root's `Vim`).
     pub(crate) fn set_vim(&mut self, on: bool, cx: &mut Context<Self>) {
         self.state.vim = on;
-        self.state.save();
+        let _ = self.state.save();
         for tab in &self.file_tabs {
             tab.editor.update(cx, |e, cx| e.set_vim(on, cx));
         }

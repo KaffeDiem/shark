@@ -404,8 +404,10 @@ fn result_text(kind: &str, item: &Value) -> String {
             .map(|c| output(&json!({"content": c["diff"], "total_chars": c["total_chars"]})))
             .collect::<Vec<_>>()
             .join("\n"),
-        "mcpToolCall" if item["error"].is_object() => text_of(&item["error"]["message"]),
-        "mcpToolCall" => output(&json!({"content": item["result"]["content"]})),
+        "mcpToolCall" if item["error"].is_object() => output(
+            &json!({"content": item["error"]["message"], "total_chars": item["error"]["total_chars"]}),
+        ),
+        "mcpToolCall" => output(&item["result"]),
         _ => String::new(),
     }
 }
@@ -421,6 +423,23 @@ pub fn compact(v: &mut Value) -> bool {
         changed = true;
     }
     if let Some(item) = v.pointer_mut("/params/item") {
+        if item["type"] == "mcpToolCall" {
+            for (key, content) in [("result", "content"), ("error", "message")] {
+                if !item[key].is_null() {
+                    let old = item[key].clone();
+                    let text = text_of(&old[content]);
+                    let mut normalized = json!({content: text});
+                    if let Some(total) = old.get("total_chars") {
+                        normalized["total_chars"] = total.clone();
+                    }
+                    clip_output(&mut normalized, content);
+                    if normalized != old {
+                        item[key] = normalized;
+                        changed = true;
+                    }
+                }
+            }
+        }
         changed |= clip_output(item, "aggregatedOutput");
         for c in item["changes"].as_array_mut().into_iter().flatten() {
             changed |= clip_output(c, "diff");
@@ -486,6 +505,30 @@ mod tests {
 {"method": "item/completed", "params": {"item": {"type": "subAgentActivity", "model": "gpt-6.1-sol", "id": "call_9", "kind": "started", "agentThreadId": "sub1", "agentPath": "/root/wait_twenty"}, "threadId": "th1", "turnId": "t7"}}
 {"method": "item/started", "params": {"item": {"type": "collabAgentToolCall", "id": "call_a", "tool": "wait", "status": "inProgress", "senderThreadId": "th1", "receiverThreadIds": [], "agentsStates": {}}, "threadId": "th1", "turnId": "t7"}}
 {"method": "item/completed", "params": {"item": {"type": "subAgentActivity", "model": null, "id": "subagent-completed-x", "kind": "completed", "agentThreadId": "sub1", "agentPath": "/root/wait_twenty"}, "threadId": "th1", "turnId": "t7"}}"##;
+
+    #[test]
+    fn mcp_compaction_is_bounded_unicode_safe_and_idempotent() {
+        for key in ["result", "error"] {
+            let mut item = json!({"type":"mcpToolCall", "id":"call", "server":"s", "tool":"t", "status":"completed", "arguments":{"x":"y"}});
+            item[key] = if key == "result" {
+                json!({"content":[{"type":"text","text":"🦈".repeat(MAX_OUTPUT + 8)}, {"type":"image","data":"secret image"}], "structuredContent":{"large":"payload"}})
+            } else {
+                json!({"message":"🦈".repeat(MAX_OUTPUT + 8), "data":"unused"})
+            };
+            let live = result_text("mcpToolCall", &item);
+            let mut v = json!({"method":"item/completed", "params":{"item":item}});
+            assert!(compact(&mut v));
+            let stored = v.to_string();
+            assert!(!compact(&mut v));
+            assert_eq!(result_text("mcpToolCall", &v["params"]["item"]), live);
+            assert!(
+                !stored.contains("unused")
+                    && !stored.contains("payload")
+                    && !stored.contains("secret image")
+            );
+            assert!(live.ends_with(&format!("{} chars total", MAX_OUTPUT + 8)));
+        }
+    }
 
     #[test]
     fn parses_app_server() {

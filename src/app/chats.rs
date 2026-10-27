@@ -139,7 +139,7 @@ impl Shark {
                     let st = &mut this.state;
                     if (&st.last_model, &st.last_effort) != (&pick.0, &pick.1) {
                         (st.last_model, st.last_effort) = pick;
-                        st.save();
+                        let _ = st.save();
                     }
                 }
                 ChatEvent::TurnDone => {
@@ -190,7 +190,7 @@ impl Shark {
             && *slot != meta
         {
             *slot = meta;
-            self.state.save();
+            let _ = self.state.save();
         }
     }
 
@@ -204,7 +204,7 @@ impl Shark {
         };
         if ws.active_chat != ix {
             ws.active_chat = ix;
-            self.state.save();
+            let _ = self.state.save();
         }
         let ws = self.active_ws().cloned().unwrap();
         let chat = self.ensure_chat(&ws, &meta, window, cx);
@@ -245,7 +245,7 @@ impl Shark {
         move_item(&mut ws.chats, from, to);
         ws.active_chat = ws.chats.iter().position(|c| c.id == active).unwrap();
         let active = ws.active_chat;
-        self.state.save();
+        let _ = self.state.save();
         self.tab_scroll.scroll_to_item(active);
         cx.on_next_frame(window, |_, _, cx| cx.notify());
         cx.notify();
@@ -296,7 +296,7 @@ impl Shark {
         let ws = self.active_ws_mut().unwrap();
         let at = ws.active_chat + 1;
         ws.chats.insert(at, meta);
-        self.state.save();
+        let _ = self.state.save();
         self.select_chat(at, window, cx);
     }
 
@@ -353,6 +353,16 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(chat) = self.chats.get(id) {
+            chat.update(cx, |c, cx| c.retry_history(cx));
+            if chat.read(cx).history_save_error.is_some() {
+                return notify_err(
+                    window,
+                    cx,
+                    "Answer sent, but could not save it to history. Retry save before closing this chat.",
+                );
+            }
+        }
         let fresh = self.state.new_chat(String::new());
         let Some(ws) = self
             .state
@@ -391,7 +401,7 @@ impl Shark {
         // ponytail: keeps the 20 newest closed chats; a closed-chats browser can lift this
         let drop = ws.closed.len().saturating_sub(20);
         let evicted: Vec<ChatMeta> = ws.closed.drain(..drop).collect();
-        self.state.save();
+        let _ = self.state.save();
         for m in evicted.iter().chain(untouched.then_some(&meta)) {
             let _ = std::fs::remove_file(crate::agent::transcript_path(&m.id));
             crate::plan::delete(&m.id);
@@ -432,7 +442,7 @@ impl Shark {
             }
             s.end_edit(cx);
             s.active_ws_mut().unwrap().diff_closed = true;
-            s.state.save();
+            let _ = s.state.save();
             if s.tab == Tab::Diff {
                 let ix = s.active_ws().unwrap().active_chat;
                 s.select_chat(ix, w, cx);
@@ -457,7 +467,7 @@ impl Shark {
         let meta = ws.closed.remove(ix);
         let at = ws.active_chat + 1;
         ws.chats.insert(at, meta);
-        self.state.save();
+        let _ = self.state.save();
         self.select_chat(at, window, cx);
     }
 

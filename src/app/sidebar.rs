@@ -283,7 +283,7 @@ impl Shark {
             && s.collapsed != collapsed
         {
             s.collapsed = collapsed;
-            self.state.save();
+            let _ = self.state.save();
             self.fix_sel();
             cx.notify();
         }
@@ -314,7 +314,7 @@ impl Shark {
         if let Some(s) = to.and_then(|i| self.state.sections.get_mut(i)) {
             s.workspaces.push(ws.to_string());
         }
-        self.state.save();
+        let _ = self.state.save();
         self.fix_sel();
         cx.notify();
     }
@@ -331,7 +331,7 @@ impl Shark {
         {
             self.sel = SideRow::Ws(ix);
         }
-        self.state.save();
+        let _ = self.state.save();
         self.fix_sel();
         cx.notify();
     }
@@ -352,7 +352,7 @@ impl Shark {
         if self.naming.as_ref().is_some_and(|n| n.rename.is_some()) {
             self.naming = None; // its index moved
         }
-        self.state.save();
+        let _ = self.state.save();
         cx.notify();
     }
 
@@ -361,7 +361,7 @@ impl Shark {
             return;
         }
         let s = self.state.sections.remove(i);
-        self.state.save();
+        let _ = self.state.save();
         self.naming = None;
         if let SideRow::Section(j) = self.sel {
             self.sel = SideRow::Section(if j > i { j - 1 } else { j });
@@ -458,7 +458,7 @@ impl Shark {
                     }
                 }
             }
-            self.state.save();
+            let _ = self.state.save();
         }
         if enter {
             self.sidebar_focus.focus(window, cx);
@@ -498,7 +498,7 @@ impl Shark {
             move |s, row, _, cx| {
                 if let Some(sec) = s.state.sections.get_mut(i) {
                     sec.icon = SECTION_ICONS[row].0.into();
-                    s.state.save();
+                    let _ = s.state.save();
                     cx.notify();
                 }
             },

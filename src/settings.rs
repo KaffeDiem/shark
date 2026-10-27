@@ -283,9 +283,10 @@ impl Settings {
 
     fn with_state<R>(&self, cx: &mut App, f: impl FnOnce(&mut State) -> R) -> Option<R> {
         self.shark
-            .update(cx, |s, _| {
+            .update(cx, |s, cx| {
                 let r = f(&mut s.state);
-                s.state.save();
+                let _ = s.state.save();
+                cx.notify();
                 r
             })
             .ok()
@@ -305,7 +306,7 @@ impl Settings {
         self.shark
             .update(cx, |s, cx| {
                 s.state.stay_awake = on;
-                s.state.save();
+                let _ = s.state.save();
                 s.update_awake(cx);
             })
             .ok();

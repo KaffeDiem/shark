@@ -252,7 +252,7 @@ pub(super) struct Comment {
     pub(super) suggestion: Option<String>,
     /// What the lines were compared at: the base commit for the old side, else "working tree".
     #[serde(default)]
-    rev: String,
+    pub(super) rev: String,
     #[serde(default)]
     pub(super) status: Status,
     /// The chat it was sent to.
@@ -597,6 +597,7 @@ pub(super) struct Review {
     last_id: HashMap<String, u64>,
     /// Workspaces whose comments file couldn't be read or moved aside: never saved over.
     unsaved: Vec<String>,
+    pub(super) failed_saves: HashMap<String, String>,
     /// Why, for the window to show once.
     pub(super) warning: Option<String>,
     pub(super) composer: Option<Composer>,
@@ -615,22 +616,33 @@ impl Review {
     }
 
     /// Writes the file whole (a temp file renamed over it), so a crash can't leave half.
-    pub(super) fn save_comments(&self, ws: &str) {
-        let (path, comments) = (comments_path(ws), self.comments.get(ws));
-        if self.unsaved.iter().any(|w| w == ws) {
-            return;
-        }
-        let last = self.last_id.get(ws).copied().unwrap_or(0);
-        let Ok(json) = serde_json::to_vec(&Store::Ids {
-            last,
-            comments: comments.cloned().unwrap_or_default(),
-        }) else {
-            return;
+    pub(super) fn save_comments(&mut self, ws: &str) {
+        let path = comments_path(ws);
+        let result = if self.unsaved.iter().any(|w| w == ws) {
+            Err(std::io::Error::other(
+                "The unreadable comments store is protected",
+            ))
+        } else {
+            serde_json::to_vec(&Store::Ids {
+                last: self.last_id.get(ws).copied().unwrap_or(0),
+                comments: self.comments.get(ws).cloned().unwrap_or_default(),
+            })
+            .map_err(std::io::Error::other)
+            .and_then(|json| crate::state::write(&path, &json))
         };
-        let tmp = path.with_extension("json.tmp");
-        let _ = std::fs::create_dir_all(path.parent().unwrap());
-        if std::fs::write(&tmp, json).is_ok() {
-            let _ = std::fs::rename(tmp, path);
+        match result {
+            Ok(()) => {
+                self.failed_saves.remove(ws);
+            }
+            Err(e) => {
+                self.failed_saves.insert(ws.to_string(), e.to_string());
+            }
+        }
+    }
+
+    pub(super) fn retry_saves(&mut self) {
+        for ws in self.failed_saves.keys().cloned().collect::<Vec<_>>() {
+            self.save_comments(&ws);
         }
     }
 
@@ -690,6 +702,8 @@ impl Review {
     pub(super) fn forget(&mut self, ws: &str) {
         self.comments.remove(ws);
         self.last_id.remove(ws);
+        self.unsaved.retain(|w| w != ws);
+        self.failed_saves.remove(ws);
         let _ = std::fs::remove_file(comments_path(ws));
     }
 
@@ -699,7 +713,7 @@ impl Review {
         let l = self.comments.get_mut(ws).unwrap();
         let before = l.clone();
         f(l);
-        if *l != before {
+        if *l != before || self.failed_saves.contains_key(ws) {
             self.save_comments(ws);
         }
     }

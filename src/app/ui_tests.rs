@@ -7,9 +7,11 @@ use std::sync::Mutex;
 use std::time::Instant;
 use std::{fs, path::PathBuf, time::Duration};
 
+mod audit_tests;
 pub(crate) mod chrome_tests;
 mod file_changes_tests;
 mod menu_pixels;
+mod storage_tests;
 mod tab_tests;
 
 /// UI tests share the process-wide `TEST_HOME` and `state.json`, so they take turns. Chat
@@ -64,7 +66,7 @@ fn boot(
     state: State,
     options: WindowOptions,
 ) -> (AnyWindowHandle, Entity<Shark>) {
-    state.save();
+    state.save().unwrap();
     cx.update(|cx| {
         gpui_kit::init(cx);
         crate::bind_keys(cx);
@@ -4989,6 +4991,9 @@ async fn review_queue(cx: &mut TestAppContext) {
     let github = |cx: &mut TestAppContext, id: u64| {
         cx.update(|cx| shark.read(cx).comment(id).and_then(|c| c.github.clone()))
     };
+    let store = cx.update(|cx| review::comments_path(shark.read(cx).active.as_deref().unwrap()));
+    fs::remove_file(&store).unwrap();
+    fs::create_dir(&store).unwrap();
     on(cx, &|s, w, cx| {
         s.active_sync()
             .unwrap()
@@ -5011,6 +5016,32 @@ async fn review_queue(cx: &mut TestAppContext) {
         ),
         "{argv}"
     );
+    // Publication succeeded even though saving its URL failed. Retrying only writes locally.
+    on(cx, &|s, w, cx| {
+        assert!(
+            s.review
+                .failed_saves
+                .contains_key(s.active.as_deref().unwrap())
+        );
+        s.open_share(1, w, cx);
+        s.post_share(w, cx);
+    });
+    assert_eq!(
+        fs::read_to_string(&log).unwrap(),
+        argv,
+        "the comment is not reposted"
+    );
+    fs::remove_dir(&store).unwrap();
+    on(cx, &|s, _, cx| {
+        s.retry_saves(cx);
+        assert!(s.review.failed_saves.is_empty());
+    });
+    assert!(
+        fs::read_to_string(&store)
+            .unwrap()
+            .contains("issuecomment-9")
+    );
+    assert_eq!(fs::read_to_string(&log).unwrap(), argv);
     // The sheet with Also publish: the chat gets it, and the PR a Comment review.
     fs::write(&log, "").unwrap();
     on(cx, &|s, w, cx| {

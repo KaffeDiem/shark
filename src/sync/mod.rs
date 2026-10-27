@@ -45,6 +45,9 @@ const SETTLE_FOR: Duration = Duration::from_secs(600);
 const FETCH_MOVED: Duration = Duration::from_secs(30);
 
 pub enum SyncEvent {
+    Reviewed(Vec<String>),
+    MergeOrder(Vec<String>),
+    DeleteRemote(bool),
     Archive,
     /// A parent PR merged: Shark moves these `(repo, old base, new base)`, then sends `prompt`.
     Restack {
@@ -82,6 +85,7 @@ pub struct GitSync {
     fetch_error: Option<String>,
     /// Review IDs already sent to the agent; persisted in state.json.
     reviewed: Vec<String>,
+    pub(crate) delete_remote: bool,
     /// Repo names in the order Merge runs them; persisted in state.json.
     merge_order: Vec<String>,
     /// gh failed for every repo on the last ask.
@@ -206,12 +210,13 @@ pub fn check_in_background(
     ws: &Workspace,
     last: &[Repo],
     gh: bool,
+    reviewed: &[String],
 ) -> (Result<Option<String>, String>, Vec<Repo>) {
     let p = run_job(&Job {
         pr: gh,
         ..Job::prs(ws)
     });
-    background_answer(ws, p.locals, p.prs, p.parents, last)
+    background_answer(ws, p.locals, p.prs, p.parents, last, reviewed)
 }
 
 fn background_answer(
@@ -220,6 +225,7 @@ fn background_answer(
     prs: Option<Vec<Result<Option<Pr>, String>>>,
     parents: Vec<Option<Result<Option<Pr>, String>>>,
     last: &[Repo],
+    reviewed: &[String],
 ) -> (Result<Option<String>, String>, Vec<Repo>) {
     let failed = match &prs {
         None => Some("GitHub not asked".to_string()),
@@ -229,7 +235,7 @@ fn background_answer(
     let label = match failed {
         Some(e) => Err(e),
         None => {
-            let a = next_action(&repos, &crate::state::reviewed(&ws.name));
+            let a = next_action(&repos, reviewed);
             Ok(needs_you(&a).then_some(a.label))
         }
     };
@@ -246,6 +252,23 @@ fn due(at: Option<Instant>, every: Duration) -> bool {
 }
 
 impl GitSync {
+    pub(crate) fn restore_settings(&mut self, state: &crate::state::State) {
+        self.reviewed = state
+            .reviewed
+            .get(&self.ws.name)
+            .cloned()
+            .unwrap_or_default();
+        self.merge_order = pr::merge_order(
+            &self.ws,
+            state
+                .merge_order
+                .get(&self.ws.name)
+                .map(Vec::as_slice)
+                .unwrap_or_default(),
+        );
+        self.delete_remote = state.delete_remote_branches;
+    }
+
     pub fn new(ws: Workspace, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let (kick, kicked) = unbounded();
         let repos = ws.repos.iter().map(|r| Repo::fresh(r, &ws)).collect();
@@ -264,8 +287,9 @@ impl GitSync {
             .collect();
         GitSync {
             stack_prs,
-            reviewed: crate::state::reviewed(&ws.name),
-            merge_order: pr::merge_order(&ws, &crate::state::merge_order(&ws.name)),
+            reviewed: vec![],
+            delete_remote: false,
+            merge_order: pr::merge_order(&ws, &[]),
             ws,
             chats: vec![],
             chat: None,
@@ -450,7 +474,7 @@ impl GitSync {
         chat.update(cx, |c, _| c.hold = hold);
         self._subs.extend([
             cx.observe(&chat, |_, _, cx| cx.notify()), // working toggles enable/disable the button
-            cx.subscribe(&chat, |s, _, ev, _| match ev {
+            cx.subscribe(&chat, |s, _, ev, cx| match ev {
                 crate::chat::ChatEvent::TurnDone => {
                     s.kick(false, true); // the agent may have committed, pushed or opened a PR
                 }
@@ -460,7 +484,7 @@ impl GitSync {
                             s.reviewed.push(id.clone());
                         }
                     }
-                    crate::state::set_reviewed(&s.ws.name, &s.reviewed);
+                    cx.emit(SyncEvent::Reviewed(s.reviewed.clone()));
                 }
                 _ => {}
             }),
@@ -695,7 +719,7 @@ impl GitSync {
                     "Merges with each repo's allowed method in this order: {}, and stops at the \
                      first failure. {}Merging can't be undone from here.",
                     self.merge_order.join(", "),
-                    match crate::state::delete_remote_branches() {
+                    match self.delete_remote {
                         true => "Then deletes each PR's remote branch. ",
                         false => "",
                     }
@@ -755,13 +779,18 @@ impl GitSync {
         self.running = Some(a.label.clone());
         self.set_hold(true, cx);
         cx.notify();
-        let ws = self.ws.clone();
-        let snapshot = self.repos.clone();
+        let mut ws = self.ws.clone();
+        let mut snapshot = self.repos.clone();
+        if !check && matches!(a.kind, Kind::CreatePr | Kind::CreateDraftPr) && !a.repos.is_empty() {
+            ws.repos.retain(|r| a.repos.contains(&r.name));
+            snapshot.retain(|r| a.repos.contains(&r.name));
+        }
         let handled = self.reviewed.clone();
         let all = Job::prs(&ws);
         // Pull and push only need fresh git state.
         let pr_kinds = !matches!(a.kind, Kind::Pull | Kind::Push | Kind::ForcePush);
         let order = self.merge_order.clone();
+        let delete_remote = self.delete_remote;
         let creates = matches!(a.kind, Kind::CreatePr | Kind::CreateDraftPr);
         let composer = match creates {
             true => self.composer(cx),
@@ -789,7 +818,8 @@ impl GitSync {
                             ));
                         }
                     }
-                    execute(&a, &ws, &repos, &order, &new_pr).map(|msg| (a, msg))
+                    execute(&a, &ws, &repos, &order, &new_pr, delete_remote, check)
+                        .map(|msg| (a, msg))
                 })
                 .await;
             this.update_in(cx, |s, window, cx| {
@@ -834,7 +864,7 @@ impl GitSync {
     /// Moves `name` one place earlier or later in the merge order, and saves it.
     fn move_repo(&mut self, name: &str, earlier: bool, cx: &mut Context<Self>) {
         pr::move_in_order(&mut self.merge_order, name, earlier);
-        crate::state::set_merge_order(&self.ws.name, &self.merge_order);
+        cx.emit(SyncEvent::MergeOrder(self.merge_order.clone()));
         cx.notify();
     }
 
@@ -1145,11 +1175,18 @@ impl GitSync {
         }
         entries.push(Entry::Sep);
         // A setting: the check when it's on, "Off" when not, so it never reads as "delete now".
-        let on = crate::state::delete_remote_branches();
+        let on = self.delete_remote;
+        let owner = cx.entity().downgrade();
         let delete = menu::item(
             IconName::GitBranch,
             "Delete remote branches after merge",
-            toggle_delete_remote,
+            move |_, cx| {
+                owner
+                    .update(cx, |s, cx| {
+                        cx.emit(SyncEvent::DeleteRemote(!s.delete_remote))
+                    })
+                    .ok();
+            },
         );
         entries.push(if on {
             delete.checked(true)
@@ -1226,10 +1263,19 @@ fn execute(
     repos: &[Repo],
     order: &[String],
     new_pr: &pr::NewPr,
+    delete_remote: bool,
+    primary: bool,
 ) -> Result<String, String> {
     check_review_checkout(repos, &a.repos)?;
     let dir = ws.dir();
-    let wanted = |r: &Repo| a.repos.is_empty() || a.repos.contains(&r.name);
+    // The next-step button also links existing PRs after a partial creation; explicit scopes stay narrow.
+    let wanted = |r: &Repo| {
+        a.repos.is_empty()
+            || a.repos.contains(&r.name)
+            || (primary
+                && matches!(a.kind, Kind::CreatePr | Kind::CreateDraftPr)
+                && !r.local.as_ref().is_ok_and(|l| l.review))
+    };
     let mut targets: Vec<&Repo> = repos.iter().filter(|r| wanted(r)).collect();
     if a.kind == Kind::Merge {
         // A repo missing from the order goes last, not first (`None` sorts before `Some`).
@@ -1240,7 +1286,7 @@ fn execute(
                 .unwrap_or(usize::MAX)
         });
     }
-    let delete_remote = a.kind == Kind::Merge && crate::state::delete_remote_branches();
+    let delete_remote = a.kind == Kind::Merge && delete_remote;
     let each = |f: &Step| {
         let mut done = vec![];
         for r in targets.iter().copied() {
@@ -1286,7 +1332,11 @@ fn execute(
                 .filter(|r| r.landed())
                 .map(|r| r.name.clone())
                 .collect();
-            let prs = pr::create_linked_prs(ws, &dir, &landed, new_pr)?;
+            let mut selected = ws.clone();
+            selected
+                .repos
+                .retain(|r| targets.iter().any(|target| target.name == r.name));
+            let prs = pr::create_linked_prs(&selected, &dir, &landed, new_pr)?;
             Ok(prs
                 .iter()
                 .map(|(r, u)| format!("{r}: {u}"))
@@ -1433,17 +1483,6 @@ fn fresh_or_last(
         (None, last) | (Some(Err(_)), last @ Some(Ok(_))) => last.clone(),
         (Some(fresh), _) => Some(fresh.clone()),
     }
-}
-
-/// Flips the opt-in for deleting remote branches on merge (saved in state.json).
-pub fn toggle_delete_remote(window: &mut Window, cx: &mut App) {
-    let on = !crate::state::delete_remote_branches();
-    crate::state::set_delete_remote_branches(on);
-    let msg = match on {
-        true => "Merging now deletes each PR's remote branch",
-        false => "Merging now keeps the remote branches",
-    };
-    window.push_notification(msg, cx);
 }
 
 fn argv(v: &[String]) -> Vec<&str> {
@@ -1689,6 +1728,253 @@ mod tests {
         .unwrap();
     }
 
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn primary_pr_retry_links_existing_prs_but_explicit_scope_stays_narrow() {
+        use super::*;
+        use crate::git::git;
+        use std::{fs, os::unix::fs::PermissionsExt};
+        let _lock = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::state::TEST_HOME
+            .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
+        let name = format!("pr-retry-{}", std::process::id());
+        let root = std::env::temp_dir().join(&name);
+        let mut ws = Workspace {
+            name,
+            branch: "feature".into(),
+            ..Default::default()
+        };
+        let dir = ws.dir();
+        fs::create_dir_all(&root).unwrap();
+        for name in ["api", "web"] {
+            let wt = dir.join(name);
+            let origin = root.join(format!("{name}.git"));
+            fs::create_dir_all(&wt).unwrap();
+            git(&root, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
+            git(&wt, &["init", "-q", "-b", "main"]).unwrap();
+            let commit = |message| {
+                git(
+                    &wt,
+                    &[
+                        "-c",
+                        "user.name=t",
+                        "-c",
+                        "user.email=t@t",
+                        "commit",
+                        "--allow-empty",
+                        "-qm",
+                        message,
+                    ],
+                )
+                .unwrap();
+            };
+            commit("initial");
+            git(&wt, &["remote", "add", "origin", &origin.to_string_lossy()]).unwrap();
+            git(&wt, &["push", "-q", "origin", "main"]).unwrap();
+            git(&wt, &["checkout", "-qb", "feature"]).unwrap();
+            commit("work");
+            ws.repos.push(crate::state::WsRepo {
+                name: name.into(),
+                src: wt,
+                base: "origin/main".into(),
+                branch: None,
+            });
+        }
+        let previous = std::env::var_os("PATH").unwrap();
+        struct Restore(std::ffi::OsString);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe { std::env::set_var("PATH", &self.0) };
+            }
+        }
+        let _restore = Restore(previous.clone());
+        let gh = root.join("gh");
+        fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+case "$PWD" in */'{name}'/*) ;; *) PATH='{previous}' exec gh "$@" ;; esac
+repo=$(basename "$PWD")
+echo "$repo $1 $2" >> '{root}/calls'
+case "$1 $2" in
+"pr list") [ ! -f '{root}/'$repo.open ] || echo https://gh/$repo/1 ;;
+"pr create")
+  if [ "$repo" = web ] && [ -f '{root}/fail' ]; then echo 'gh: boom' >&2; exit 1; fi
+  touch '{root}/'$repo.open
+  echo https://gh/$repo/1 ;;
+"pr view") echo Body ;;
+"pr edit") echo "$5" > '{root}/'$repo.body ;;
+*) exit 1 ;;
+esac
+"#,
+                name = ws.name,
+                root = root.display(),
+                previous = previous.to_string_lossy()
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&gh, fs::Permissions::from_mode(0o755)).unwrap();
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                format!("{}:{}", root.display(), previous.to_string_lossy()),
+            )
+        };
+        let snapshot = || -> Vec<Repo> {
+            ws.repos
+                .iter()
+                .map(|r| {
+                    let local =
+                        status::probe(&dir.join(&r.name), "feature", &r.base, None).unwrap();
+                    let pr = root.join(format!("{}.open", r.name)).exists().then(|| Pr {
+                        head: local.head.clone(),
+                        ..open_pr(&r.name, 1)
+                    });
+                    Repo {
+                        local: Ok(local),
+                        pr: Some(Ok(pr)),
+                        ..Repo::fresh(r, &ws)
+                    }
+                })
+                .collect()
+        };
+        let repos = snapshot();
+        let action = next_action(&repos, &[]);
+        assert_eq!(action.kind, Kind::CreatePr);
+        assert_eq!(action.repos, ["api", "web"]);
+        fs::write(root.join("fail"), "").unwrap();
+        let new_pr = pr::NewPr::new("", false);
+        let error = execute(&action, &ws, &repos, &[], &new_pr, false, true).unwrap_err();
+        assert!(error.contains("boom"), "{error}");
+        assert!(root.join("api.open").exists() && !root.join("web.open").exists());
+        assert!(!root.join("api.body").exists());
+        fs::remove_file(root.join("fail")).unwrap();
+        let mut repos = snapshot();
+        // A mixed workspace must not publish its local PR review checkout.
+        ws.repos.push(crate::state::WsRepo {
+            name: "review".into(),
+            src: Default::default(),
+            base: "origin/main".into(),
+            branch: None,
+        });
+        repos.push(Repo {
+            local: Ok(Local {
+                review: true,
+                ..Default::default()
+            }),
+            ..Repo::fresh(ws.repos.last().unwrap(), &ws)
+        });
+        let retry = next_action(&repos, &[]);
+        assert_eq!(retry.kind, Kind::CreatePr);
+        assert_eq!(retry.repos, ["web"]);
+        execute(&retry, &ws, &repos, &[], &new_pr, false, true).unwrap();
+        for (repo, other) in [("api", "web"), ("web", "api")] {
+            assert!(
+                fs::read_to_string(root.join(format!("{repo}.body")))
+                    .unwrap()
+                    .contains(&format!("- {other}: https://gh/{other}/1"))
+            );
+        }
+        let web_body = fs::read(root.join("web.body")).unwrap();
+        let web_head = git(&root.join("web.git"), &["rev-parse", "feature"]).unwrap();
+        fs::write(dir.join("web/dirty"), "leave untouched").unwrap();
+        fs::write(root.join("calls"), "").unwrap();
+        let explicit = Action {
+            repos: vec!["api".into()],
+            ..retry
+        };
+        execute(&explicit, &ws, &repos, &[], &new_pr, false, false).unwrap();
+        let calls = fs::read_to_string(root.join("calls")).unwrap();
+        assert!(!calls.contains("web") && !calls.contains("review") && !calls.contains("pr edit"));
+        assert_eq!(fs::read(root.join("web.body")).unwrap(), web_body);
+        assert_eq!(
+            git(&root.join("web.git"), &["rev-parse", "feature"]).unwrap(),
+            web_head
+        );
+        fs::remove_dir_all(dir).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(feature = "test-support")]
+    #[test]
+    fn selected_pr_action_does_not_check_an_unselected_checkout() {
+        use super::*;
+        use std::fs;
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::state::TEST_HOME
+            .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
+        let ws = Workspace {
+            name: format!("scope-test-{}", std::process::id()),
+            branch: "main".into(),
+            repos: ["api", "web"]
+                .map(|n| crate::state::WsRepo {
+                    name: n.into(),
+                    src: Default::default(),
+                    base: "HEAD".into(),
+                    branch: None,
+                })
+                .into(),
+            ..Default::default()
+        };
+        let dir = ws.dir();
+        let api = dir.join("api");
+        fs::create_dir_all(&api).unwrap();
+        fs::create_dir(dir.join("web")).unwrap(); // deliberately unavailable repo
+        crate::git::git(&api, &["init", "-q", "-b", "main"]).unwrap();
+        crate::git::git(
+            &api,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "--allow-empty",
+                "-qm",
+                "initial",
+            ],
+        )
+        .unwrap();
+        let repos: Vec<_> = ws.repos.iter().map(|r| Repo::fresh(r, &ws)).collect();
+        let mut action = Action {
+            kind: Kind::CreateDraftPr,
+            label: "Create".into(),
+            repos: vec!["api".into()],
+            attention: false,
+            reviews: vec![],
+        };
+        let error = execute(
+            &action,
+            &ws,
+            &repos,
+            &[],
+            &pr::NewPr::new("", true),
+            false,
+            false,
+        )
+        .unwrap_err();
+        assert_eq!(error, "no repo has commits ahead of its base");
+        action.repos.clear();
+        assert!(
+            execute(
+                &action,
+                &ws,
+                &repos,
+                &[],
+                &pr::NewPr::new("", true),
+                false,
+                false
+            )
+            .unwrap_err()
+            .contains("web")
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn diff_base_follows_only_open_prs_and_keeps_review_refs() {
         use super::{PrState, repo_diff_base};
@@ -1863,6 +2149,8 @@ mod tests {
                 std::slice::from_ref(&repo),
                 &[],
                 &crate::pr::NewPr::new("", false),
+                false,
+                false,
             );
             assert!(matches!(result, Err(e) if e.contains("local PR review checkout")));
         }
@@ -2152,11 +2440,12 @@ mod tests {
             })]
         };
         let err = Err("logged out".to_string());
-        let (label, repos) = background_answer(&ws, local(), Some(vec![err.clone()]), vec![], &[]);
+        let (label, repos) =
+            background_answer(&ws, local(), Some(vec![err.clone()]), vec![], &[], &[]);
         assert!(label.is_err(), "the caller keeps the last label");
         assert_eq!(repos[0].local.as_ref().map(|l| l.changed), Ok(3));
         assert_eq!(repos[0].pr, Some(err));
-        let (label, repos) = background_answer(&ws, local(), None, vec![], &repos);
+        let (label, repos) = background_answer(&ws, local(), None, vec![], &repos, &[]);
         assert!(label.is_err(), "gh not asked");
         assert!(matches!(repos[0].pr, Some(Err(_))), "the last PR stays");
     }

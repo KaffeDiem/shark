@@ -8,6 +8,14 @@ use std::{
 
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct State {
+    #[serde(default, deserialize_with = "tolerant_lists")]
+    pub reviewed: HashMap<String, Vec<String>>,
+    #[serde(default, deserialize_with = "tolerant_lists")]
+    pub merge_order: HashMap<String, Vec<String>>,
+    #[serde(default, deserialize_with = "tolerant_bool")]
+    pub delete_remote_branches: bool,
+    #[serde(skip)]
+    pub save_error: std::cell::RefCell<Option<String>>,
     pub repos: Vec<Repo>,
     pub workspaces: Vec<Workspace>,
     /// Vim keys in the file editor.
@@ -277,83 +285,60 @@ fn state_file() -> PathBuf {
     support_dir().join("state.json")
 }
 
-/// Review IDs the git button already sent to the agent, per workspace name. They live in
-/// state.json beside `State`'s fields rather than among them: only the button reads or writes
-/// them, and `save` carries them over.
-const REVIEWED: &str = "reviewed";
-/// Repo names in the order the merge step merges them, per workspace name; same rules as REVIEWED.
-const MERGE_ORDER: &str = "merge_order";
-/// Opt-in: the merge step also deletes each PR's remote branch (`gh pr merge --delete-branch`).
-const DELETE_REMOTE: &str = "delete_remote_branches";
-
-fn read(path: &Path) -> Value {
-    fs::read(path)
-        .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
-        .unwrap_or_default()
-}
-
-fn write(path: &Path, v: &Value) {
-    if let Some(dir) = path.parent() {
-        let _ = fs::create_dir_all(dir);
-    }
-    let tmp = path.with_extension("json.tmp");
-    if fs::write(&tmp, serde_json::to_vec_pretty(v).unwrap()).is_ok() {
-        let _ = fs::rename(tmp, path);
-    }
-}
-
-pub fn reviewed(ws: &str) -> Vec<String> {
-    list_at(&state_file(), REVIEWED, ws)
-}
-
-pub fn set_reviewed(ws: &str, ids: &[String]) {
-    set_list_at(&state_file(), REVIEWED, ws, ids)
-}
-
-pub fn merge_order(ws: &str) -> Vec<String> {
-    list_at(&state_file(), MERGE_ORDER, ws)
-}
-
-pub fn set_merge_order(ws: &str, names: &[String]) {
-    set_list_at(&state_file(), MERGE_ORDER, ws, names)
-}
-
-pub fn delete_remote_branches() -> bool {
-    read(&state_file())[DELETE_REMOTE] == true
-}
-
-pub fn set_delete_remote_branches(on: bool) {
-    let path = state_file();
-    let mut v = read(&path);
-    if v.is_object() {
-        v[DELETE_REMOTE] = on.into();
-        write(&path, &v);
-    }
-}
-
-fn list_at(path: &Path, key: &str, ws: &str) -> Vec<String> {
-    serde_json::from_value(read(path)[key][ws].clone()).unwrap_or_default()
-}
-
-fn set_list_at(path: &Path, key: &str, ws: &str, ids: &[String]) {
-    let mut v = read(path);
-    if !v.is_object() {
-        return; // no state to attach to; a lone key would make state.json unreadable
-    }
-    let mut all: HashMap<String, Vec<String>> =
-        serde_json::from_value(v[key].take()).unwrap_or_default();
-    all.insert(ws.into(), ids.to_vec());
-    // Archived workspaces drop out here.
-    let live: Vec<&str> = v["workspaces"]
-        .as_array()
+fn tolerant_lists<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<HashMap<String, Vec<String>>, D::Error> {
+    let v = Value::deserialize(d)?;
+    Ok(v.as_object()
         .into_iter()
         .flatten()
-        .filter_map(|w| w["name"].as_str())
-        .collect();
-    all.retain(|k, _| live.contains(&k.as_str()));
-    v[key] = serde_json::to_value(all).unwrap();
-    write(path, &v);
+        .filter_map(|(k, v)| {
+            serde_json::from_value(v.clone())
+                .ok()
+                .map(|v| (k.clone(), v))
+        })
+        .collect())
+}
+
+fn tolerant_bool<'de, D: serde::Deserializer<'de>>(d: D) -> Result<bool, D::Error> {
+    Ok(Value::deserialize(d)?.as_bool().unwrap_or(false))
+}
+
+pub(crate) fn write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::{
+        io::Write,
+        os::unix::fs::OpenOptionsExt,
+        sync::atomic::{AtomicU64, Ordering},
+    };
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir)?;
+    }
+    let (tmp, mut file) = loop {
+        let tmp = path.with_extension(format!(
+            "tmp-{}-{}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&tmp)
+        {
+            Ok(file) => break (tmp, file),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    };
+    let result = file
+        .write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .and_then(|_| fs::rename(&tmp, path));
+    if result.is_err() {
+        let _ = fs::remove_file(tmp);
+    }
+    result
 }
 
 impl State {
@@ -463,27 +448,26 @@ impl State {
     /// Sets a once-only flag, saving only when that changes it.
     pub fn mark(&mut self, flag: impl FnOnce(&mut State) -> &mut bool) {
         if !std::mem::replace(flag(self), true) {
-            self.save()
+            let _ = self.save();
         }
     }
 
-    pub fn save(&self) {
+    pub fn save(&self) -> std::io::Result<()> {
         self.save_at(&state_file())
     }
 
-    fn save_at(&self, path: &Path) {
-        if self.read_only {
-            return;
-        }
-        let mut v = serde_json::to_value(self).unwrap();
-        let mut old = read(path);
-        for key in [REVIEWED, MERGE_ORDER, DELETE_REMOTE] {
-            let kept = old[key].take();
-            if !kept.is_null() {
-                v[key] = kept;
-            }
-        }
-        write(path, &v);
+    fn save_at(&self, path: &Path) -> std::io::Result<()> {
+        let result = if self.read_only {
+            Err(std::io::Error::other(
+                "state.json could not be read; the original store is protected",
+            ))
+        } else {
+            serde_json::to_vec_pretty(self)
+                .map_err(std::io::Error::other)
+                .and_then(|bytes| write(path, &bytes))
+        };
+        *self.save_error.borrow_mut() = result.as_ref().err().map(ToString::to_string);
+        result
     }
 }
 
@@ -529,7 +513,7 @@ mod tests {
         let first = st.corrupt_backup.clone().unwrap();
         assert!(!st.read_only && !path.exists());
         assert_eq!(baks().len(), 1);
-        st.save_at(&path);
+        st.save_at(&path).unwrap();
         assert!(path.exists(), "a moved-aside file is saved over");
 
         // Same second: the first backup stays.
@@ -546,46 +530,31 @@ mod tests {
         let st = State::load_at(&path);
         mode(0o755);
         assert!(st.read_only && st.corrupt_backup.is_none());
-        st.save_at(&path);
+        assert!(st.save_at(&path).is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), "{ third");
         assert_eq!(baks().len(), 2);
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn reviewed_ids_survive_saves() {
-        let dir = std::env::temp_dir().join(format!("shark-state-{}", std::process::id()));
+    fn auxiliary_values_and_failed_saves() {
+        let json = r#"{"repos":[],"workspaces":[],"reviewed":{"ok":["r1"],"bad":9},"merge_order":false,"delete_remote_branches":"bad"}"#;
+        let mut state: State = serde_json::from_str(json).unwrap();
+        assert_eq!(state.reviewed["ok"], ["r1"]);
+        assert!(state.merge_order.is_empty() && !state.delete_remote_branches);
+        let dir = std::env::temp_dir().join(format!("shark-state-retry-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.json");
-        let state = State {
-            workspaces: vec![ws("a"), ws("b")],
-            ..Default::default()
-        };
-        state.save_at(&path);
-        set_list_at(&path, REVIEWED, "a", &["r1".into()]);
-        set_list_at(&path, REVIEWED, "b", &["r2".into()]);
-        state.save_at(&path); // the app saving its own copy keeps them
-        assert_eq!(list_at(&path, REVIEWED, "a"), ["r1"]);
-        let st: State = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        assert_eq!(st.workspaces.len(), 2, "state.json still loads");
-        State {
-            workspaces: vec![ws("a")],
-            ..Default::default()
-        }
-        .save_at(&path);
-        set_list_at(&path, REVIEWED, "a", &["r1".into(), "r3".into()]);
-        assert_eq!(
-            list_at(&path, REVIEWED, "b"),
-            Vec::<String>::new(),
-            "archived"
-        );
-        set_list_at(&path, MERGE_ORDER, "a", &["web".into(), "api".into()]);
-        state.save_at(&path);
-        assert_eq!(
-            list_at(&path, MERGE_ORDER, "a"),
-            ["web", "api"],
-            "side keys survive saves"
-        );
-        fs::remove_dir_all(&dir).unwrap();
+        fs::create_dir(&path).unwrap();
+        state.reviewed.insert("ok".into(), vec!["latest".into()]);
+        assert!(state.save_at(&path).is_err());
+        assert!(state.save_error.borrow().is_some());
+        fs::remove_dir(&path).unwrap();
+        state.save_at(&path).unwrap();
+        assert!(state.save_error.borrow().is_none());
+        let saved = State::load_at(&path);
+        assert_eq!(saved.reviewed["ok"], ["latest"]);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     /// A pre-tabs workspace keeps its session, model and transcript as its first chat.

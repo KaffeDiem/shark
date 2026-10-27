@@ -212,35 +212,112 @@ fn waiting(evs: &[Ev], plan: bool) -> Option<&'static str> {
 fn read_tail(path: &Path) -> Vec<Ev> {
     let len = fs::metadata(path).map_or(0, |m| m.len());
     // The result line repeats the final text, so the window holds two copies of it.
-    read_range(path, len.saturating_sub(128 * 1024), len)
+    read_range(path, len.saturating_sub(128 * 1024), len, false)
 }
 
 /// Events stored in a transcript, up to `len` bytes: lines written after that belong to a
 /// process started while this was read, and arrive live.
 pub fn read_history(path: &Path, len: u64) -> Vec<Ev> {
-    read_range(path, 0, len)
+    read_range(path, 0, len, true)
 }
 
-fn read_range(path: &Path, start: u64, end: u64) -> Vec<Ev> {
+fn read_range(path: &Path, mut start: u64, end: u64, include_completed_answers: bool) -> Vec<Ev> {
     use std::io::{Read as _, Seek as _, SeekFrom};
-    let mut buf = vec![];
-    if let Ok(mut f) = File::open(path) {
-        let _ = f.seek(SeekFrom::Start(start));
-        let _ = f.take(end.saturating_sub(start)).read_to_end(&mut buf);
+    let wanted = end.saturating_sub(start);
+    loop {
+        let mut buf = vec![];
+        if let Ok(mut f) = File::open(path) {
+            let _ = f.seek(SeekFrom::Start(start));
+            let _ = f.take(end.saturating_sub(start)).read_to_end(&mut buf);
+        }
+        let (mut retained, mut skipped) = (0, false);
+        // Read from the middle of the file: the first line is cut, drop it.
+        let events = (String::from_utf8_lossy(&buf).lines())
+            .skip(usize::from(start > 0))
+            .filter_map(|line| {
+                let v: Value = serde_json::from_str(line).ok()?;
+                // Retried answers must neither change attention nor crowd the last turn out.
+                if !include_completed_answers && v["shark_completed_answer"] == true {
+                    skipped = true;
+                    None
+                } else {
+                    retained += line.len() as u64 + 1;
+                    Some(v)
+                }
+            })
+            .flat_map(parse_record)
+            .collect();
+        if start == 0 || !skipped || retained >= wanted {
+            return events;
+        }
+        start = end.saturating_sub(end.saturating_sub(start).saturating_mul(2));
     }
-    // Read from the middle of the file: the first line is cut, drop it.
-    (String::from_utf8_lossy(&buf).lines())
-        .skip(usize::from(start > 0))
-        .flat_map(parse)
-        .collect()
 }
+
+// Every transcript writer uses this lock; a failed rollback must be recovered before another append.
+static TRANSCRIPT_WRITES: std::sync::LazyLock<Mutex<std::collections::HashMap<PathBuf, u64>>> =
+    std::sync::LazyLock::new(|| Mutex::new(std::collections::HashMap::new()));
 
 fn append(path: &Option<PathBuf>, line: &str) {
-    if let Some(path) = path
-        && let Ok(mut f) = OpenOptions::new().create(true).append(true).open(path)
-    {
-        let _ = f.write_all(format!("{line}\n").as_bytes());
+    if let Some(path) = path {
+        let _ = append_records(path, &[line], None);
     }
+}
+
+pub(crate) fn append_answer(path: &Path, id: &str, records: &[String; 2]) -> std::io::Result<()> {
+    append_records(path, &[&records[0], &records[1]], Some(id))
+}
+
+fn append_records(path: &Path, records: &[&str], question: Option<&str>) -> std::io::Result<()> {
+    let mut recovery = TRANSCRIPT_WRITES
+        .lock()
+        .map_err(|_| std::io::Error::other("Transcript writer lock poisoned"))?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut file = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .read(true)
+        .open(path)?;
+    if let Some(len) = recovery.get(path).copied() {
+        file.set_len(len)?;
+        file.sync_all()?;
+        recovery.remove(path);
+    }
+    if let Some(id) = question {
+        let stored = fs::read_to_string(path)?;
+        if stored
+            .lines()
+            .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+            .any(|v| {
+                v["type"] == "user"
+                    && v["message"]["content"].as_array().is_some_and(|blocks| {
+                        blocks
+                            .iter()
+                            .any(|b| b["type"] == "tool_result" && b["tool_use_id"] == id)
+                    })
+            })
+        {
+            return Ok(());
+        }
+    }
+    let start = file.metadata()?.len();
+    let bytes = records.iter().map(|s| format!("{s}\n")).collect::<String>();
+    let result = file.write_all(bytes.as_bytes()).and_then(|_| {
+        if question.is_some() {
+            file.sync_all()
+        } else {
+            Ok(())
+        }
+    });
+    if result.is_err() {
+        recovery.insert(path.to_path_buf(), start);
+        if file.set_len(start).and_then(|_| file.sync_all()).is_ok() {
+            recovery.remove(path);
+        }
+    }
+    result
 }
 
 pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receiver<Ev>)> {
@@ -514,9 +591,12 @@ pub(crate) fn text_of(v: &Value) -> String {
 }
 
 pub fn parse(line: &str) -> Vec<Ev> {
-    let Ok(v) = serde_json::from_str::<Value>(line) else {
-        return vec![];
-    };
+    serde_json::from_str(line)
+        .map(parse_record)
+        .unwrap_or_default()
+}
+
+fn parse_record(v: Value) -> Vec<Ev> {
     // claude's lines all carry a `type`; codex's JSON-RPC never does.
     if v["type"].is_null() {
         return codex::parse(&v);
@@ -609,6 +689,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn completed_answer_appends_are_atomic_recoverable_and_deduplicated() {
+        let path =
+            std::env::temp_dir().join(format!("shark-answer-append-{}.jsonl", std::process::id()));
+        fs::write(&path, "").unwrap();
+        let pair = [
+            json!({"type":"assistant","message":{"content":[{"type":"tool_use","id":"q","name":"AskUserQuestion","input":{}}]}}).to_string(),
+            json!({"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"q","content":"redacted"}]}}).to_string(),
+        ];
+        // A partial append whose rollback previously failed must be removed before any writer runs.
+        fs::write(&path, format!("{}\n{{partial", pair[0])).unwrap();
+        TRANSCRIPT_WRITES.lock().unwrap().insert(path.clone(), 0);
+        let barrier = std::sync::Barrier::new(3);
+        std::thread::scope(|scope| {
+            for _ in 0..2 {
+                let barrier = &barrier;
+                let path = &path;
+                let pair = &pair;
+                scope.spawn(move || {
+                    barrier.wait();
+                    append_answer(path, "q", pair).unwrap();
+                });
+            }
+            barrier.wait();
+            append(
+                &Some(path.clone()),
+                r#"{"type":"assistant","message":{"content":[{"type":"text","text":"reader"}]}}"#,
+            );
+        });
+        let saved = fs::read_to_string(&path).unwrap();
+        assert!(saved.contains(&format!("{}\n{}\n", pair[0], pair[1])));
+        assert_eq!(saved.lines().count(), 3);
+        assert!(!saved.contains("partial"));
+        append_answer(&path, "q", &pair).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), saved);
+        fs::remove_file(path).unwrap();
+    }
+
+    #[test]
     fn waiting_on_user_by_how_the_turn_ended() {
         let done = |is_error| Ev::Result {
             is_error,
@@ -670,6 +788,53 @@ mod tests {
         fs::write(&path, turn.join("\n")).unwrap();
         assert_eq!(read_tail(&path).len(), 2);
         fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn retried_answers_preserve_attention_for_a_newer_question() {
+        let path = std::env::temp_dir().join(format!(
+            "shark-answer-attention-{}.jsonl",
+            std::process::id()
+        ));
+        let pair = [
+            json!({"type":"assistant","shark_completed_answer":true,"message":{"content":[{"type":"tool_use","id":"old-question","name":"AskUserQuestion","input":{}}]}}).to_string(),
+            json!({"type":"user","shark_completed_answer":true,"message":{"content":[{"type":"tool_result","tool_use_id":"old-question","content":"Answered"}]}}).to_string(),
+        ];
+        fs::create_dir(&path).unwrap();
+        assert!(append_answer(&path, "old-question", &pair).is_err());
+        fs::remove_dir(&path).unwrap();
+        fs::write(
+            &path,
+            concat!(
+                "{\"type\":\"assistant\",\"message\":{\"content\":[{\"type\":\"text\",\"text\":\"Should I proceed?\"}]}}\n",
+                "{\"type\":\"result\",\"is_error\":false}\n"
+            ),
+        )
+        .unwrap();
+        append_answer(&path, "old-question", &pair).unwrap();
+        assert_eq!(waiting(&read_tail(&path), false), Some(QUESTION));
+        let history = read_history(&path, u64::MAX);
+        assert!(matches!(&history[2], Ev::ToolUse { id, .. } if id == "old-question"));
+        assert!(matches!(&history[3], Ev::ToolResult { id, .. } if id == "old-question"));
+
+        // Several recovered answers can occupy the whole tail window.
+        for i in 0..8 {
+            let id = format!("long-question-{i}");
+            let pair = [
+                json!({"type":"assistant","shark_completed_answer":true,"message":{"content":[{"type":"tool_use","id":id,"name":"AskUserQuestion","input":{}}]}}).to_string(),
+                json!({"type":"user","shark_completed_answer":true,"message":{"content":[{"type":"tool_result","tool_use_id":id,"content":"x".repeat(MAX_OUTPUT)}]}}).to_string(),
+            ];
+            append_answer(&path, &id, &pair).unwrap();
+        }
+        assert_eq!(waiting(&read_tail(&path), false), Some(QUESTION));
+
+        // A real tool call still means the earlier question was not the agent's last word.
+        append(
+            &Some(path.clone()),
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","id":"live","name":"AskUserQuestion","input":{}}]}}"#,
+        );
+        assert_eq!(waiting(&read_tail(&path), false), None);
+        fs::remove_file(path).unwrap();
     }
 
     // Recorded from claude 2.1.309, trimmed.

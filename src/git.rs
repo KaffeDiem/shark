@@ -3,6 +3,8 @@ mod changes;
 pub use changes::{discard_file, uncommitted_files};
 use std::{
     fs,
+    io::{self, Write},
+    os::unix::fs::{MetadataExt, OpenOptionsExt},
     path::{Path, PathBuf},
     process::{Command, Output, Stdio},
     time::Duration,
@@ -224,14 +226,23 @@ pub fn create_workspace_with_prs(
     })
     .into_iter()
     .collect::<Result<Vec<_>, _>>()?;
-    fs::create_dir_all(dir).map_err(|e| e.to_string())?;
+    fs::create_dir_all(dir.parent().ok_or("Workspace has no parent")?)
+        .map_err(|e| e.to_string())?;
+    fs::create_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let root_identity = fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
+    let attempts = par_map(repos.iter().zip(&plans), |((r, b), p)| {
+        let mut owned = OwnedWorktree::default();
+        let result = add_worktree(dir, b, r, p, &mut owned).map(|w| WsRepo {
+            branch: (b != branch).then(|| b.clone()),
+            ..w
+        });
+        (result, owned)
+    });
     let result = (|| {
-        let done = par_map(repos.iter().zip(&plans), |((r, b), p)| {
-            let own = (b != branch).then(|| b.clone());
-            add_worktree(dir, b, r, p).map(|w| WsRepo { branch: own, ..w })
-        })
-        .into_iter()
-        .collect::<Result<Vec<_>, _>>()?;
+        let done = attempts
+            .iter()
+            .map(|(result, _)| result.clone())
+            .collect::<Result<Vec<_>, _>>()?;
         let mut ws = Workspace {
             name: name.into(),
             branch: branch.into(),
@@ -242,11 +253,18 @@ pub fn create_workspace_with_prs(
         write_root_docs(&ws, dir)?;
         Ok(ws)
     })();
-    if result.is_err() {
-        for ((r, b), p) in repos.iter().zip(&plans) {
-            undo_worktree(dir, b, r, p);
+    if let Err(error) = result {
+        let mut remaining = Vec::new();
+        for ((r, b), (_, owned)) in repos.iter().zip(&attempts) {
+            remaining.extend(undo_worktree(dir, b, r, owned));
         }
-        let _ = fs::remove_dir_all(dir);
+        if !fs::symlink_metadata(dir)
+            .is_ok_and(|m| m.dev() == root_identity.dev() && m.ino() == root_identity.ino())
+            || fs::remove_dir(dir).is_err()
+        {
+            remaining.push(dir.display().to_string());
+        }
+        return Err(rollback_error(error, remaining));
     }
     result
 }
@@ -268,13 +286,13 @@ pub fn add_to_workspace(ws: &Workspace, dir: &Path, r: &Repo) -> Result<Workspac
     }
     let plan = plan_worktree(&ws.branch, r, None)?;
     let mut ws = ws.clone();
-    let added = add_worktree(dir, &ws.branch, r, &plan).and_then(|wr| {
+    let mut owned = OwnedWorktree::default();
+    let added = add_worktree(dir, &ws.branch, r, &plan, &mut owned).and_then(|wr| {
         ws.repos.push(wr);
         write_root_docs(&ws, dir)
     });
     if let Err(e) = added {
-        undo_worktree(dir, &ws.branch, r, &plan);
-        return Err(e);
+        return Err(rollback_error(e, undo_worktree(dir, &ws.branch, r, &owned)));
     }
     Ok(ws)
 }
@@ -622,18 +640,39 @@ fn plan_pr_worktree(branch: &str, r: &Repo, pr: &PullRequest) -> Result<Plan, St
     })
 }
 
-fn add_worktree(dir: &Path, branch: &str, r: &Repo, plan: &Plan) -> Result<WsRepo, String> {
+#[derive(Default)]
+struct OwnedWorktree {
+    branch: Option<String>,
+    worktree: Option<(u64, u64, String)>,
+    untracked: Option<(u64, Vec<String>)>,
+}
+
+fn add_worktree(
+    dir: &Path,
+    branch: &str,
+    r: &Repo,
+    plan: &Plan,
+    owned: &mut OwnedWorktree,
+) -> Result<WsRepo, String> {
     let wt = dir.join(&r.name);
-    let wt_s = wt.to_string_lossy();
-    // --no-track: otherwise the branch tracks its base (or origin), and `git pull` would merge
-    // main; ahead/behind is measured against origin/<branch> by name instead.
-    match &plan.from {
-        None => git(&r.path, &["worktree", "add", &wt_s, branch])?,
-        Some(from) => git(
+    if let Some(from) = &plan.from {
+        let commit = git(
             &r.path,
-            &["worktree", "add", "--no-track", "-b", branch, &wt_s, from],
+            &["rev-parse", "--verify", &format!("{from}^{{commit}}")],
+        )?;
+        git(&r.path, &["branch", "--no-track", branch, &commit])?;
+        owned.branch = Some(commit);
+    }
+    let head = match &owned.branch {
+        Some(commit) => commit.clone(),
+        None => git(
+            &r.path,
+            &["rev-parse", "--verify", &format!("refs/heads/{branch}")],
         )?,
     };
+    git(&r.path, &["worktree", "add", &wt.to_string_lossy(), branch])?;
+    let metadata = fs::symlink_metadata(&wt).map_err(|e| e.to_string())?;
+    owned.worktree = Some((metadata.dev(), metadata.ino(), head));
     if let Some(tip) = &plan.tip {
         git(&r.path, &["config", &parent_tip_key(branch), tip])?;
     }
@@ -643,7 +682,10 @@ fn add_worktree(dir: &Path, branch: &str, r: &Repo, plan: &Plan) -> Result<WsRep
             &["config", &format!("branch.{branch}.shark-pr-url"), url],
         )?;
     }
-    copy_included(&r.path, &wt)?;
+    let copied = copy_included(&r.path, &wt)?;
+    owned.untracked = untracked_fingerprint(&wt, &copied)
+        .ok()
+        .map(|fp| (fp, copied));
     Ok(WsRepo {
         name: r.name.clone(),
         src: r.path.clone(),
@@ -652,22 +694,78 @@ fn add_worktree(dir: &Path, branch: &str, r: &Repo, plan: &Plan) -> Result<WsRep
     })
 }
 
-/// Best effort: removes a worktree `add_worktree` may have made, and the branch if it made one.
-fn undo_worktree(dir: &Path, branch: &str, r: &Repo, plan: &Plan) {
-    let wt = dir.join(&r.name);
-    let _ = git(
-        &r.path,
-        &["worktree", "remove", "--force", &wt.to_string_lossy()],
-    );
-    let _ = git(&r.path, &["worktree", "prune"]);
-    if plan.from.is_some() {
-        let _ = git(&r.path, &["branch", "-D", branch]);
+fn untracked_fingerprint(wt: &Path, copied: &[String]) -> Result<u64, String> {
+    use std::hash::{Hash, Hasher};
+    let mut hash = std::collections::hash_map::DefaultHasher::new();
+    let output = run(wt, "git", &["ls-files", "-z", "--others"])?;
+    if !output.status.success() {
+        return Err("Cannot inspect untracked files".into());
     }
+    let output = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
+    let paths: Vec<_> = output.split('\0').filter(|p| !p.is_empty()).collect();
+    if paths.len() != copied.len() || paths.iter().any(|p| !copied.iter().any(|c| c == p)) {
+        return Err("The worktree contains files this operation did not create".into());
+    }
+    for path in paths {
+        path.hash(&mut hash);
+        let path = wt.join(path);
+        let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
+        (metadata.dev(), metadata.ino(), metadata.mode()).hash(&mut hash);
+        if metadata.file_type().is_symlink() {
+            fs::read_link(path)
+                .map_err(|e| e.to_string())?
+                .hash(&mut hash);
+        } else if metadata.is_file() {
+            fs::read(path).map_err(|e| e.to_string())?.hash(&mut hash);
+        } else {
+            return Err(format!("Unexpected untracked file: {}", path.display()));
+        }
+    }
+    Ok(hash.finish())
+}
+
+fn rollback_error(error: String, remaining: Vec<String>) -> String {
+    if remaining.is_empty() {
+        error
+    } else {
+        format!("{error}\nPreserved resources: {}", remaining.join(", "))
+    }
+}
+
+fn undo_worktree(dir: &Path, branch: &str, r: &Repo, owned: &OwnedWorktree) -> Vec<String> {
+    let wt = dir.join(&r.name);
+    let mut remaining = Vec::new();
+    if let Some((dev, ino, head)) = &owned.worktree {
+        let unchanged = fs::symlink_metadata(&wt).is_ok_and(|m| m.dev() == *dev && m.ino() == *ino)
+            && git(&wt, &["rev-parse", "HEAD"]).is_ok_and(|tip| tip == *head)
+            && owned
+                .untracked
+                .as_ref()
+                .is_some_and(|(fp, copied)| untracked_fingerprint(&wt, copied).ok() == Some(*fp));
+        if !unchanged || git(&r.path, &["worktree", "remove", &wt.to_string_lossy()]).is_err() {
+            remaining.push(wt.display().to_string());
+        }
+    }
+    if let Some(commit) = &owned.branch {
+        let reference = format!("refs/heads/{branch}");
+        let unchecked = git(&r.path, &["worktree", "list", "--porcelain"])
+            .is_ok_and(|list| !list.lines().any(|l| l == format!("branch {reference}")));
+        if !unchecked || git(&r.path, &["update-ref", "-d", &reference, commit]).is_err() {
+            remaining.push(format!("{}:{reference}", r.path.display()));
+        } else if !has_ref(&r.path, &reference) {
+            let _ = git(
+                &r.path,
+                &["config", "--remove-section", &format!("branch.{branch}")],
+            );
+        }
+    }
+    remaining
 }
 
 /// Copy gitignored files like `.env` into the new worktree. Patterns come from
 /// `.worktreeinclude` (gitignore syntax), defaulting to `.env*`.
-fn copy_included(src: &Path, wt: &Path) -> Result<(), String> {
+fn copy_included(src: &Path, wt: &Path) -> Result<Vec<String>, String> {
+    let mut copied_files = Vec::new();
     let exclude = if src.join(".worktreeinclude").exists() {
         "--exclude-from=.worktreeinclude".to_string()
     } else {
@@ -678,13 +776,101 @@ fn copy_included(src: &Path, wt: &Path) -> Result<(), String> {
         .iter()
         .filter(|f| ignored.contains(f))
     {
-        let to = wt.join(f);
-        if let Some(p) = to.parent() {
-            fs::create_dir_all(p).map_err(|e| e.to_string())?;
+        use std::{
+            ffi::CString,
+            os::fd::{AsRawFd, FromRawFd},
+            os::unix::ffi::OsStrExt,
+        };
+        unsafe extern "C" {
+            fn openat(fd: i32, path: *const std::ffi::c_char, flags: i32, ...) -> i32;
+            fn mkdirat(fd: i32, path: *const std::ffi::c_char, mode: u16) -> i32;
+            fn unlinkat(fd: i32, path: *const std::ffi::c_char, flags: i32) -> i32;
         }
-        fs::copy(src.join(f), to).map_err(|e| format!("copy {f}: {e}"))?;
+        // Darwin flags, from sys/fcntl.h. Directory descriptors pin parents across renames.
+        const DIRECTORY_NOFOLLOW: i32 = 0x00100000 | 0x00000100;
+        let to = wt.join(f);
+        if fs::symlink_metadata(&to).is_ok() {
+            continue;
+        }
+        let mut parent = fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(DIRECTORY_NOFOLLOW)
+            .open(wt)
+            .map_err(|e| format!("copy {f}: {e}"))?;
+        for part in Path::new(f).parent().into_iter().flat_map(Path::components) {
+            if !matches!(part, std::path::Component::Normal(_)) {
+                return Err(format!("copy {f}: invalid parent"));
+            }
+            let name = CString::new(part.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
+            // SAFETY: valid directory fd and NUL-terminated single component, no borrowed fd is closed.
+            let fd = unsafe {
+                mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700);
+                openat(parent.as_raw_fd(), name.as_ptr(), DIRECTORY_NOFOLLOW)
+            };
+            if fd < 0 {
+                return Err(format!(
+                    "copy {f}: unsafe or inaccessible parent: {}",
+                    io::Error::last_os_error()
+                ));
+            }
+            parent = unsafe { fs::File::from_raw_fd(fd) };
+        }
+        if git(wt, &["check-ignore", "-q", "--", f]).is_err()
+            || !git(wt, &["ls-files", "--", f])?.is_empty()
+        {
+            continue;
+        }
+        let leaf = CString::new(
+            Path::new(f)
+                .file_name()
+                .ok_or("Missing file name")?
+                .as_bytes(),
+        )
+        .map_err(|e| e.to_string())?;
+        let mut source = fs::File::open(src.join(f)).map_err(|e| format!("copy {f}: {e}"))?;
+        let metadata = source.metadata().map_err(|e| e.to_string())?;
+        if !metadata.is_file() {
+            continue;
+        }
+        // O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, initially private.
+        let fd = unsafe {
+            openat(
+                parent.as_raw_fd(),
+                leaf.as_ptr(),
+                0x0001 | 0x0200 | 0x0800 | 0x0100,
+                0o600u32,
+            )
+        };
+        if fd < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::AlreadyExists {
+                continue;
+            }
+            return Err(format!("copy {f}: {e}"));
+        }
+        let mut dest = unsafe { fs::File::from_raw_fd(fd) };
+        let identity = dest.metadata().map_err(|e| e.to_string())?;
+        let copied = io::copy(&mut source, &mut dest)
+            .and_then(|_| dest.flush())
+            .and_then(|_| dest.set_permissions(metadata.permissions()));
+        if let Err(e) = copied {
+            let fd = unsafe { openat(parent.as_raw_fd(), leaf.as_ptr(), 0x0100) };
+            if fd >= 0 {
+                let current = unsafe { fs::File::from_raw_fd(fd) };
+                if current
+                    .metadata()
+                    .is_ok_and(|m| m.dev() == identity.dev() && m.ino() == identity.ino())
+                {
+                    unsafe {
+                        unlinkat(parent.as_raw_fd(), leaf.as_ptr(), 0);
+                    }
+                }
+            }
+            return Err(format!("copy {f}: {e}"));
+        }
+        copied_files.push(f.clone());
     }
-    Ok(())
+    Ok(copied_files)
 }
 
 /// Rewrites the root CLAUDE.md and AGENTS.md from the workspace's repo list; a failure only
@@ -951,6 +1137,145 @@ pub fn combined_diff(ws: &Workspace, dir: &Path, uncommitted_only: bool) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn included_secrets_require_absent_ignored_destination() {
+        use std::os::unix::fs::symlink;
+        let root = std::env::temp_dir().join(format!("shark-secret-copy-{}", std::process::id()));
+        let src = init_repo(&root, "src");
+        let dst = init_repo(&root, "dst");
+        fs::remove_file(dst.path.join(".env")).unwrap();
+        copy_included(&src.path, &dst.path).unwrap();
+        assert_eq!(fs::read(dst.path.join(".env")).unwrap(), b"SECRET=1\n");
+        assert!(
+            !git(&dst.path, &["status", "--porcelain"])
+                .unwrap()
+                .contains(".env\n")
+        );
+        fs::write(dst.path.join(".env"), "keep").unwrap();
+        copy_included(&src.path, &dst.path).unwrap();
+        assert_eq!(fs::read(dst.path.join(".env")).unwrap(), b"keep");
+        fs::remove_file(dst.path.join(".env")).unwrap();
+        let outside = root.join("outside");
+        fs::write(&outside, "outside").unwrap();
+        symlink(&outside, dst.path.join(".env")).unwrap();
+        copy_included(&src.path, &dst.path).unwrap();
+        assert_eq!(fs::read(&outside).unwrap(), b"outside");
+        fs::remove_file(dst.path.join(".env")).unwrap();
+        fs::create_dir(dst.path.join(".env")).unwrap();
+        copy_included(&src.path, &dst.path).unwrap();
+        assert!(dst.path.join(".env").is_dir());
+        fs::remove_dir(dst.path.join(".env")).unwrap();
+        fs::write(dst.path.join(".env"), "tracked").unwrap();
+        git(&dst.path, &["add", "-f", ".env"]).unwrap();
+        fs::remove_file(dst.path.join(".env")).unwrap();
+        copy_included(&src.path, &dst.path).unwrap();
+        assert!(
+            !dst.path.join(".env").exists(),
+            "tracked but missing is not a copy destination"
+        );
+        git(&dst.path, &["rm", "--cached", "-f", ".env"]).unwrap();
+        fs::write(dst.path.join(".gitignore"), "").unwrap();
+        copy_included(&src.path, &dst.path).unwrap();
+        assert!(!dst.path.join(".env").exists());
+        fs::write(src.path.join(".gitignore"), "nested/\n").unwrap();
+        fs::write(src.path.join(".worktreeinclude"), "nested/\n").unwrap();
+        fs::create_dir(src.path.join("nested")).unwrap();
+        fs::write(src.path.join("nested/secret"), "secret").unwrap();
+        fs::write(dst.path.join(".gitignore"), "nested/\n").unwrap();
+        symlink(&root, dst.path.join("nested")).unwrap();
+        assert!(copy_included(&src.path, &dst.path).is_err());
+        assert!(!root.join("secret").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rollback_only_deletes_owned_unchanged_refs() {
+        let root =
+            std::env::temp_dir().join(format!("shark-owned-rollback-{}", std::process::id()));
+        let repo = init_repo(&root, "api");
+        git(&repo.path, &["branch", "existing"]).unwrap();
+        assert!(undo_worktree(&root, "existing", &repo, &OwnedWorktree::default()).is_empty());
+        assert!(has_ref(&repo.path, "refs/heads/existing"));
+        let tip = git(&repo.path, &["rev-parse", "HEAD"]).unwrap();
+        let owned = OwnedWorktree {
+            branch: Some(tip.clone()),
+            worktree: None,
+            untracked: None,
+        };
+        git(&repo.path, &["branch", "owned"]).unwrap();
+        assert!(undo_worktree(&root, "owned", &repo, &owned).is_empty());
+        assert!(!has_ref(&repo.path, "refs/heads/owned"));
+        git(&repo.path, &["branch", "advanced"]).unwrap();
+        let owned = OwnedWorktree {
+            branch: Some("0000000000000000000000000000000000000001".into()),
+            worktree: None,
+            untracked: None,
+        };
+        assert!(!undo_worktree(&root, "advanced", &repo, &owned).is_empty());
+        assert_eq!(git(&repo.path, &["rev-parse", "advanced"]).unwrap(), tip);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rollback_preserves_changed_worktrees_and_cleanup_failures() {
+        let root =
+            std::env::temp_dir().join(format!("shark-owned-worktrees-{}", std::process::id()));
+        let repo = init_repo(&root, "api");
+        let dir = root.join("ws");
+        fs::create_dir(&dir).unwrap();
+        for (branch, change) in [
+            ("dirty", 0),
+            ("secret", 1),
+            ("advanced", 2),
+            ("locked", 3),
+            ("foreign", 4),
+        ] {
+            let plan = plan_worktree(branch, &repo, None).unwrap();
+            let mut owned = OwnedWorktree::default();
+            add_worktree(&dir, branch, &repo, &plan, &mut owned).unwrap();
+            let wt = dir.join("api");
+            match change {
+                0 => fs::write(wt.join("README.md"), "new edits").unwrap(),
+                1 => fs::write(wt.join(".env"), "changed secret").unwrap(),
+                2 => {
+                    git(
+                        &wt,
+                        &[
+                            "-c",
+                            "user.name=t",
+                            "-c",
+                            "user.email=t@t",
+                            "commit",
+                            "--allow-empty",
+                            "-qm",
+                            "advanced",
+                        ],
+                    )
+                    .unwrap();
+                }
+                3 => {
+                    git(&repo.path, &["worktree", "lock", &wt.to_string_lossy()]).unwrap();
+                }
+                _ => {
+                    fs::write(repo.path.join(".git/info/exclude"), "foreign\n").unwrap();
+                    fs::write(wt.join("foreign"), "another writer's ignored file").unwrap();
+                }
+            }
+            let remaining = undo_worktree(&dir, branch, &repo, &owned);
+            assert!(remaining.iter().any(|p| p == &wt.display().to_string()));
+            assert!(wt.exists() && has_ref(&repo.path, &format!("refs/heads/{branch}")));
+            if change == 3 {
+                git(&repo.path, &["worktree", "unlock", &wt.to_string_lossy()]).unwrap();
+            }
+            git(
+                &repo.path,
+                &["worktree", "remove", "--force", &wt.to_string_lossy()],
+            )
+            .unwrap();
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn base_choices_merge_newest_first() {

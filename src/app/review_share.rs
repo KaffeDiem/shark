@@ -178,6 +178,8 @@ impl Shark {
             Some(_) => note.trim().to_string(),
             None => github_body(comments, note),
         };
+        let fallback = github_body(comments, note);
+        let revision = first.rev.clone();
         let ids: Vec<u64> = comments.iter().map(|c| c.id).collect();
         if self.shares(&ws_name, &ids)
             && let Some(s) = &mut self.review.share
@@ -189,9 +191,30 @@ impl Shark {
         cx.spawn_in(window, async move |this, cx| {
             let res = (cx.background_executor())
                 .spawn(async move {
+                    let mut head = pr.head.clone();
+                    let mut body = body;
+                    let mut inline = inline;
+                    if inline.as_ref().is_some_and(|(a, _)| a.left) {
+                        let verified = crate::pr::verify_original_anchor(
+                            &wt,
+                            pr.number,
+                            &revision,
+                            &inline.as_ref().unwrap().0,
+                        );
+                        let valid = if let Some((captured, valid)) = verified {
+                            head = captured;
+                            valid
+                        } else {
+                            false
+                        };
+                        if !valid {
+                            inline = None;
+                            body = fallback;
+                        }
+                    }
                     let inline = inline.as_ref().map(|(a, t)| (a, t.as_str()));
                     match review {
-                        true => crate::pr::publish_review(&wt, pr.number, &pr.head, &body, inline),
+                        true => crate::pr::publish_review(&wt, pr.number, &head, &body, inline),
                         false => crate::pr::publish_note(&wt, pr.number, &body),
                     }
                 })
