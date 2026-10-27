@@ -944,6 +944,24 @@ impl Shark {
                     SyncEvent::DeleteRemote(on) => this.set_delete_remote(*on, cx),
                     SyncEvent::Archive => this.remove_workspace(&name, false, window, cx),
                     SyncEvent::PrsCreated => this.state.mark(|s| &mut s.opened_pr),
+                    SyncEvent::PrBaseAdopted(moves) => {
+                        if let Some(ws) = this.ws_mut(&name) {
+                            for (repo, old, new) in moves {
+                                if let Some(r) = ws
+                                    .repos
+                                    .iter_mut()
+                                    .find(|r| r.name == *repo && r.base == *old)
+                                {
+                                    r.base = new.clone();
+                                }
+                            }
+                            git::write_claude_md(ws);
+                        }
+                        let _ = this.state.save();
+                        if this.active.as_deref() == Some(name.as_str()) {
+                            this.refresh_diff(cx);
+                        }
+                    }
                     SyncEvent::DiffBaseChanged => {
                         if this.active.as_deref() == Some(name.as_str()) {
                             this.refresh_diff(cx);
