@@ -795,6 +795,12 @@ impl Shark {
         .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
     }
 
+    fn render_commands(&self, cx: &Context<Self>) -> Button {
+        side_toggle("commands", IconName::Command, "Commands (cmd-k)")
+            .text_color(cx.theme().sidebar_foreground)
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_palette(window, cx)))
+    }
+
     fn render_new_workspace(&self, cx: &Context<Self>) -> Button {
         side_toggle(
             "new-workspace",
@@ -821,6 +827,7 @@ impl Shark {
             .gap(px(4.))
             .when(self.rail, |d| {
                 d.child(self.render_sidebar_toggle(cx))
+                    .child(self.render_commands(cx))
                     .child(self.render_new_workspace(cx))
             })
             .children(tabs)

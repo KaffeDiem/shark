@@ -30,6 +30,7 @@ async fn sidebar_chrome_themes(cx: &mut TestAppContext) {
                 },
             );
             let on = on_app(window, shark.clone());
+            let press = press_in(window);
             let name = format!("chrome-{label}-{}", width as usize);
             on(cx, &|s, w, cx| {
                 s.create_workspace(
@@ -64,13 +65,32 @@ async fn sidebar_chrome_themes(cx: &mut TestAppContext) {
                         assert_eq!(right.bounds().top(), left.top());
                         assert_eq!(right.bounds().size.height, left.size.height);
                         assert_eq!(left.top(), px(8.));
+                        let commands = w.find("commands");
+                        assert!(commands.visible());
+                        let commands = commands.bounds();
+                        let create = w.find("new-workspace").bounds();
+                        assert_eq!(commands.right() + px(4.), create.left());
+                        assert_eq!(commands.top(), create.top());
+                        assert_eq!(commands.size, create.size);
+                        assert!(w.try_find("tools-commands").is_none());
+                        assert!(w.try_find("rail-commands").is_none());
                         let home = w.find("home-row").bounds();
                         if rail {
                             assert_eq!(home.size.width, px(32.));
+                            assert_eq!(left.right() + px(4.), commands.left());
                         } else {
                             assert!(home.size.width < px(140.), "Home fits its contents");
-                            assert!(home.right() < w.find("new-workspace").bounds().left());
+                            assert!(home.right() < commands.left());
                         }
+                        w.click("commands", cx);
+                        assert!(w.has_active_dialog(cx), "Commands opens the palette");
+                        w.close_dialog(cx);
+                    })
+                    .unwrap();
+                    press(cx, &["cmd-k"]);
+                    cx.update_window(window, |_, w, cx| {
+                        assert!(w.has_active_dialog(cx), "Cmd+K still opens the palette");
+                        w.close_dialog(cx);
                     })
                     .unwrap();
                 }

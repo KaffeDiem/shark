@@ -532,7 +532,7 @@ impl Shark {
             })
     }
 
-    /// The collapsed right side, the left rail's mirror: expand, then Diff and Commands.
+    /// The collapsed right side, the left rail's mirror: expand, then Diff.
     fn render_right_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (n, viewed) = (self.diff_files.len(), self.viewed_now.len());
@@ -576,27 +576,20 @@ impl Shark {
                     ),
             )
             .child(
-                v_flex()
-                    .pt(px(16.))
-                    .child(
-                        item("rail-diff", IconName::FileDiff, self.tab == Tab::Diff)
-                            .when_some(badge, |d, c| d.child(super::chats::dot(6., theme).bg(c)))
-                            .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
-                            .on_click(cx.listener(|this, _, w, cx| this.show(Tab::Diff, w, cx)))
-                            .on_mouse_down(
-                                MouseButton::Right,
-                                cx.listener(|this, e: &MouseDownEvent, w, cx| {
-                                    let entries = this.changes_menu(cx);
-                                    this.show_menu(e.position, entries, w, cx);
-                                }),
-                            )
-                            .test_support(),
-                    )
-                    .child(
-                        item("rail-commands", IconName::Command, false)
-                            .tooltip(|w, cx| Tooltip::new("Commands (cmd-k)").build(w, cx))
-                            .on_click(cx.listener(|this, _, w, cx| this.toggle_palette(w, cx))),
-                    ),
+                v_flex().pt(px(16.)).child(
+                    item("rail-diff", IconName::FileDiff, self.tab == Tab::Diff)
+                        .when_some(badge, |d, c| d.child(super::chats::dot(6., theme).bg(c)))
+                        .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+                        .on_click(cx.listener(|this, _, w, cx| this.show(Tab::Diff, w, cx)))
+                        .on_mouse_down(
+                            MouseButton::Right,
+                            cx.listener(|this, e: &MouseDownEvent, w, cx| {
+                                let entries = this.changes_menu(cx);
+                                this.show_menu(e.position, entries, w, cx);
+                            }),
+                        )
+                        .test_support(),
+                ),
             )
             .test_support()
     }
@@ -1014,30 +1007,23 @@ impl Shark {
                 .child(Icon::new(icon).with_size(px(16.)).text_color(muted))
                 .child(div().flex_1().child(label))
         };
-        let tools = v_flex()
-            .flex_none()
-            .child(
-                nav(
-                    "tools-diff",
-                    IconName::FileDiff,
-                    "Diff",
-                    self.tab == Tab::Diff,
-                )
-                .child(div().text_xs().text_color(muted).child(n.to_string()))
-                .on_click(cx.listener(|this, _, w, cx| this.show(Tab::Diff, w, cx)))
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(|this, e: &MouseDownEvent, w, cx| {
-                        let entries = this.changes_menu(cx);
-                        this.show_menu(e.position, entries, w, cx);
-                    }),
-                ),
+        let tools = v_flex().flex_none().child(
+            nav(
+                "tools-diff",
+                IconName::FileDiff,
+                "Diff",
+                self.tab == Tab::Diff,
             )
-            .child(
-                nav("tools-commands", IconName::Command, "Commands", false)
-                    .child(kbd("cmd-k").appearance(false).text_xs().text_color(muted))
-                    .on_click(cx.listener(|this, _, w, cx| this.toggle_palette(w, cx))),
-            );
+            .child(div().text_xs().text_color(muted).child(n.to_string()))
+            .on_click(cx.listener(|this, _, w, cx| this.show(Tab::Diff, w, cx)))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(|this, e: &MouseDownEvent, w, cx| {
+                    let entries = this.changes_menu(cx);
+                    this.show_menu(e.position, entries, w, cx);
+                }),
+            ),
+        );
         let tree = v_flex()
             .id("file-tree")
             .key_context("FileTree")

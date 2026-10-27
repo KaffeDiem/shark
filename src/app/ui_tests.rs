@@ -2017,7 +2017,7 @@ async fn titlebar_controls(cx: &mut TestAppContext) {
                 );
                 let create = w.find("new-workspace").bounds();
                 if rail {
-                    assert_eq!(create.left(), px(116.));
+                    assert_eq!(create.left(), px(152.));
                     assert_eq!(create.center().y, toggle.center().y);
                     assert!(create.left() >= toggle.right());
                 } else {

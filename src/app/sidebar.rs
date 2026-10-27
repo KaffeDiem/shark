@@ -1082,9 +1082,12 @@ impl Shark {
                     )
                     .when(!rail, |d| {
                         d.child(
-                            div()
+                            h_flex()
+                                .flex_none()
+                                .gap(px(4.))
                                 .mr(px(8.))
                                 .mb_0p5()
+                                .child(self.render_commands(cx))
                                 .child(self.render_new_workspace(cx)),
                         )
                     }),
