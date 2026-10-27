@@ -927,7 +927,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     press(cx, &["v", "down"]);
     assert_eq!(viewed(cx), Viewed::No);
 
-    // `o` opens the full-width file editor and shrinks the sidebar to a rail.
+    // `o` opens the full-width file editor without collapsing the sidebar.
     press(cx, &["o"]);
     let editor = cx.update(|cx| shark.read(cx).editor.clone().expect("editor opened"));
     let text = |cx: &mut TestAppContext| {
@@ -939,7 +939,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     .await;
     cx.update(|cx| {
         let s = shark.read(cx);
-        assert!(s.rail && s.tab == Tab::File);
+        assert!(!s.rail && s.tab == Tab::File);
     });
 
     // Plain editing and cmd-s.
@@ -2460,6 +2460,24 @@ async fn command_click_file_tabs(cx: &mut TestAppContext) {
         assert_eq!(shark.read(cx).tab, Tab::Diff);
         assert!(shark.read(cx).file_tabs.is_empty());
     });
+    // Opening, reselecting, and closing files preserve either sidebar state.
+    for rail in [false, true] {
+        on(cx, &|s, _, cx| {
+            if s.rail != rail {
+                s.toggle_sidebar(cx);
+            }
+        });
+        for path in ["api/a.txt", "api/b.txt", "api/a.txt"] {
+            click_file(cx, path, true);
+            cx.update(|cx| assert_eq!(shark.read(cx).rail, rail));
+        }
+        for _ in 0..2 {
+            on(cx, &|s, w, cx| s.close_file(w, cx));
+            cx.update(|cx| assert_eq!(shark.read(cx).rail, rail));
+        }
+        cx.update(|cx| assert!(shark.read(cx).file_tabs.is_empty()));
+    }
+    on(cx, &|s, _, cx| s.toggle_sidebar(cx));
     click_file(cx, "api/a.txt", true);
     let first = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
     click_file(cx, "api/b.txt", true);

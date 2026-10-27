@@ -145,10 +145,6 @@ impl Shark {
                     s.file_tabs.push(tab);
                 }
                 s.editor = Some(editor);
-                if !s.rail {
-                    s.rail = true;
-                    s.rail_auto = true;
-                }
                 s.show(Tab::File, window, cx);
             },
         );
@@ -220,10 +216,6 @@ impl Shark {
     pub(super) fn drop_editor(&mut self) {
         self.editor = None;
         self.file_tabs.clear();
-        if self.rail_auto {
-            self.rail = false;
-            self.rail_auto = false;
-        }
     }
 
     /// Quit, asking first if the open file has unsaved edits.

@@ -307,9 +307,8 @@ pub struct Shark {
     /// Workspaces whose worktrees are being removed in the background.
     pub(crate) archiving: HashSet<String>,
     show_tree: bool,
-    /// Sidebar shrunk to icons; `rail_auto` when opening a file did it, so closing undoes it.
+    /// Sidebar shrunk to icons by the user.
     rail: bool,
-    rail_auto: bool,
     editor: Option<Entity<FileEditor>>,
     file_tabs: Vec<editor_pane::FileTab>,
     /// The diff file whose working copy is edited in place.
@@ -472,7 +471,6 @@ impl Shark {
             // Closed by default (design 01); Files N in the Changes bar opens it.
             show_tree: false,
             rail: false,
-            rail_auto: false,
             editor: None,
             file_tabs: vec![],
             editing: None,
@@ -617,7 +615,6 @@ impl Shark {
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.rail = !self.rail;
-        self.rail_auto = false;
         cx.notify();
     }
 
