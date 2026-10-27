@@ -398,7 +398,11 @@ impl Shark {
             s.state.uncommitted_only = !s.state.uncommitted_only;
             s.state.save();
             s.refresh_diff(cx);
-            s.focus_diff(window, cx);
+            if s.tab == Tab::Diff {
+                s.focus_diff(window, cx);
+            } else {
+                s.tree_focus.focus(window, cx);
+            }
             cx.notify();
         });
     }
@@ -1042,6 +1046,26 @@ impl Shark {
                     .text_color(muted)
                     .child(side_header(theme, "Files").p_0().flex_1())
                     .child(format!("{}/{n} viewed", self.viewed_now.len())),
+            )
+            .child(
+                Button::new("files-change-scope")
+                    .xsmall()
+                    .h(px(28.))
+                    .w_full()
+                    .mb_2()
+                    .outline()
+                    .selected(self.state.uncommitted_only)
+                    .label(if self.state.uncommitted_only {
+                        "Uncommitted only"
+                    } else {
+                        "All changes"
+                    })
+                    .tooltip(if self.state.uncommitted_only {
+                        "Show all changes against the workspace base"
+                    } else {
+                        "Show only staged, unstaged, and untracked changes"
+                    })
+                    .on_click(cx.listener(|this, _, w, cx| this.toggle_uncommitted(w, cx))),
             )
             .child(
                 Input::new(&self.tree_filter)

@@ -174,10 +174,10 @@ pub struct SetModel(pub usize);
 #[action(namespace = shark, no_json)]
 pub struct OpenWorkspace(pub usize);
 
-/// Open the nth chat tab of the current workspace (ctrl-1 is the leftmost one).
+/// Open the nth tab of the current workspace (ctrl-1 is the leftmost one).
 #[derive(Clone, PartialEq, Debug, serde::Deserialize, Action)]
 #[action(namespace = shark, no_json)]
-pub struct OpenChat(pub usize);
+pub struct OpenTab(pub usize);
 
 fn bind_keys(cx: &mut App) {
     // First, so the bindings below take precedence, as when gpui-component bound them.
@@ -383,7 +383,7 @@ fn bind_keys(cx: &mut App) {
     cx.bind_keys(
         (0..9).map(|i| KeyBinding::new(&format!("cmd-{}", i + 1), OpenWorkspace(i), None)),
     );
-    cx.bind_keys((0..9).map(|i| KeyBinding::new(&format!("ctrl-{}", i + 1), OpenChat(i), None)));
+    cx.bind_keys((0..9).map(|i| KeyBinding::new(&format!("ctrl-{}", i + 1), OpenTab(i), None)));
     // The Diff component's scroll actions are private; bind vim keys to them by name.
     let diff = Rc::new(KeyBindingContextPredicate::parse("(Vim > Diff) && !Input").unwrap());
     let scroll = [

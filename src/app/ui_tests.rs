@@ -1423,10 +1423,10 @@ async fn add_repo_and_restore(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
-/// Ctrl+digits chooses open chats; holding Control previews their current numbers.
+/// Ctrl+digits chooses open tabs; holding Control previews their current numbers.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn numbered_chat_shortcuts(cx: &mut TestAppContext) {
+async fn numbered_tab_shortcuts(cx: &mut TestAppContext) {
     use gpui_kit::test::TestEventExt;
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
@@ -1496,7 +1496,7 @@ async fn numbered_chat_shortcuts(cx: &mut TestAppContext) {
         })
         .unwrap();
     let mut visual = VisualTestContext::from_window(window, cx);
-    for (modifiers, chat_hints, workspace_hints) in [
+    for (modifiers, tab_hints, workspace_hints) in [
         (Modifiers::default(), false, false),
         (
             Modifiers {
@@ -1547,10 +1547,10 @@ async fn numbered_chat_shortcuts(cx: &mut TestAppContext) {
             w.change_modifiers(modifiers, cx);
         })
         .unwrap();
-        for hint in ["kbd:ctrl-1", "kbd:ctrl-2", "kbd:ctrl-3"] {
-            assert_eq!(visual.debug_bounds(hint).is_some(), chat_hints, "{hint}");
+        for hint in ["kbd:ctrl-1", "kbd:ctrl-2", "kbd:ctrl-3", "kbd:ctrl-4"] {
+            assert_eq!(visual.debug_bounds(hint).is_some(), tab_hints, "{hint}");
         }
-        assert!(visual.debug_bounds("kbd:ctrl-4").is_none());
+        assert!(visual.debug_bounds("kbd:ctrl-5").is_none());
         assert_eq!(visual.debug_bounds("kbd:cmd-1").is_some(), workspace_hints);
         cx.update_window(window, |_, w, _| {
             let width = w.find("home-row").bounds().size.width;
@@ -1598,7 +1598,7 @@ async fn numbered_chat_shortcuts(cx: &mut TestAppContext) {
         )
     });
 
-    // The shortcut works from a diff and from Vim's editor, preserving the file split.
+    // The shortcut selects the chat from a diff or Vim editor, retaining open files.
     on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
     press(cx, &["ctrl-1"]);
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Chat));
@@ -1615,7 +1615,7 @@ async fn numbered_chat_shortcuts(cx: &mut TestAppContext) {
     press(cx, &["ctrl-2"]);
     cx.update_window(window, |_, w, cx| {
         let s = shark.read(cx);
-        assert_eq!(s.tab, Tab::File);
+        assert_eq!(s.tab, Tab::Chat);
         assert_eq!(s.editor.as_ref(), Some(&editor));
         assert_eq!(s.active_ws().unwrap().active_chat, 1);
         assert!(
@@ -2373,6 +2373,7 @@ async fn file_tabs_preserve_buffers(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn command_click_file_tabs(cx: &mut TestAppContext) {
+    use gpui_kit::test::TestEventExt;
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
     let repos = repos(&home, &["api"]);
@@ -2482,6 +2483,11 @@ async fn command_click_file_tabs(cx: &mut TestAppContext) {
         ("ctrl-tab", Tab::Chat, None),
         ("ctrl-shift-tab", Tab::File, Some("api/b.txt")),
         ("ctrl-shift-tab", Tab::File, Some("api/a.txt")),
+        ("ctrl-4", Tab::File, Some("api/b.txt")),
+        ("ctrl-2", Tab::Diff, None),
+        ("ctrl-1", Tab::Chat, None),
+        ("ctrl-3", Tab::File, Some("api/a.txt")),
+        ("ctrl-9", Tab::File, Some("api/a.txt")),
     ] {
         press(cx, &[key]);
         cx.update(|cx| {
@@ -2491,6 +2497,25 @@ async fn command_click_file_tabs(cx: &mut TestAppContext) {
             }
         });
     }
+    cx.update_window(window, |_, w, cx| {
+        w.change_modifiers(
+            Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            cx,
+        );
+    })
+    .unwrap();
+    let mut visual = VisualTestContext::from_window(window, cx);
+    for hint in ["kbd:ctrl-1", "kbd:ctrl-2", "kbd:ctrl-3", "kbd:ctrl-4"] {
+        assert!(visual.debug_bounds(hint).is_some(), "{hint}");
+    }
+    assert!(visual.debug_bounds("kbd:ctrl-5").is_none());
+    cx.update_window(window, |_, w, cx| {
+        w.change_modifiers(Modifiers::default(), cx);
+    })
+    .unwrap();
     // A background :wq completion closes its own editor, not the newly selected file.
     let second = cx.update(|cx| shark.read(cx).file_tabs[1].editor.clone());
     cx.update(|cx| second.update(cx, |_, cx| cx.emit(EditorEvent::Close)));
@@ -2546,8 +2571,9 @@ async fn command_click_file_tabs(cx: &mut TestAppContext) {
     .await;
     on(cx, &|s, w, cx| {
         s.editing.as_mut().unwrap().dirty = true;
-        s.select_file(0, w, cx);
+        s.show(Tab::Diff, w, cx);
     });
+    press(cx, &["ctrl-3"]);
     cx.update(|cx| {
         assert_eq!(
             shark.read(cx).tab,
@@ -4177,6 +4203,26 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
         assert_eq!(s.changes_stats().0, base);
     });
     click_scope(cx);
+
+    // The scope stays visible and usable beside Chat, even when no files are uncommitted.
+    on(cx, &|s, w, cx| s.show(Tab::Chat, w, cx));
+    for uncommitted_only in [false, true] {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.click("files-change-scope", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, w, cx| {
+            let s = shark.read(cx);
+            assert!(s.tab == Tab::Chat && s.tree_shown());
+            assert!(s.tree_focus.is_focused(w));
+            assert_eq!(s.state.uncommitted_only, uncommitted_only);
+            assert_eq!(s.diff_files.len(), if uncommitted_only { 0 } else { 3 });
+        })
+        .unwrap();
+        assert_eq!(State::load().uncommitted_only, uncommitted_only);
+    }
 
     // After a restart Files is closed, and opens at the saved width; the saved modes stay.
     cx.update_window(window, |_, w, _| w.remove_window())

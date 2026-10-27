@@ -226,13 +226,19 @@ impl Shark {
         };
         let next =
             (active as isize + d).rem_euclid((chats + 1 + self.file_tabs.len()) as isize) as usize;
-        if next < chats {
-            self.select_chat(next, window, cx);
+        self.select_tab(next, window, cx);
+    }
+
+    pub(super) fn select_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.active_ws() else { return };
+        let chats = ws.chats.len();
+        if ix < chats {
             self.show(Tab::Chat, window, cx);
-        } else if next == chats {
+            self.select_chat(ix, window, cx);
+        } else if ix == chats {
             self.show(Tab::Diff, window, cx);
         } else {
-            self.select_file(next - chats - 1, window, cx);
+            self.select_file(ix - chats - 1, window, cx);
         }
     }
 
@@ -713,7 +719,13 @@ impl Shark {
                 .aria_label("Diff")
                 .px_2p5()
                 .on_click(cx.listener(|this, _, w, cx| this.show(Tab::Diff, w, cx)))
-                .child(Icon::new(IconName::GitCompare).with_size(px(14.)))
+                .child(if ctrl_held && ws.chats.len() < 9 {
+                    kbd(&format!("ctrl-{}", ws.chats.len() + 1)).into_any_element()
+                } else {
+                    Icon::new(IconName::GitCompare)
+                        .with_size(px(14.))
+                        .into_any_element()
+                })
                 .child(tab_label("Diff".into(), self.tab == Tab::Diff, theme))
                 .tooltip(|w, cx| Tooltip::new("Diff (cmd-shift-d)").build(w, cx))
                 .test_support()
@@ -737,7 +749,13 @@ impl Shark {
                         this.show_menu(e.position, entries, w, cx);
                     }),
                 )
-                .child(Icon::new(IconName::FileCode).with_size(px(14.)))
+                .child(if ctrl_held && ws.chats.len() + 1 + ix < 9 {
+                    kbd(&format!("ctrl-{}", ws.chats.len() + 2 + ix)).into_any_element()
+                } else {
+                    Icon::new(IconName::FileCode)
+                        .with_size(px(14.))
+                        .into_any_element()
+                })
                 .child(tab_label(name, on, theme))
                 .when(e.dirty, |d| {
                     d.child(
