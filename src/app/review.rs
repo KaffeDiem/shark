@@ -1092,7 +1092,7 @@ impl Shark {
             false => "working tree".to_string(),
             true => (c.path.split_once('/'))
                 .and_then(|(repo, _)| {
-                    let base = &ws.repos.iter().find(|r| r.name == repo)?.base;
+                    let base = self.diff_base(repo);
                     // ponytail: merge-base (and lines_now's git show) block the UI thread as
                     // the composer opens; move them to the background executor if big repos lag.
                     let args = if self.state.uncommitted_only {

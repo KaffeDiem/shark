@@ -134,6 +134,7 @@ pub(super) struct InlineEdit {
     pub(super) abs: PathBuf,
     /// The original side; every edit is compared against it.
     base: String,
+    base_blob: Option<String>,
     added: bool,
     pub(super) buf: Buffer,
     /// The buffer against `base`, as shown in the diff.
@@ -156,6 +157,21 @@ pub(super) struct InlineEdit {
 }
 
 impl InlineEdit {
+    /// Refresh the original side without changing the unsaved working copy.
+    pub(super) fn rebase(&mut self, ws: &Workspace, file: &DiffFile) -> Result<(), String> {
+        if let Some(sha) = original_blob(file)
+            && self.base_blob.as_deref() == Some(sha)
+        {
+            return Ok(());
+        }
+        let (base, _, added) = load(ws, file)?;
+        self.base = base;
+        self.base_blob = original_blob(file).map(str::to_string);
+        self.added = added;
+        self.update_file();
+        Ok(())
+    }
+
     fn update_file(&mut self) {
         self.patch = patch(&self.path, &self.base, &self.buf.text(), self.added);
         if let Some(file) = parse(&self.patch) {
@@ -175,6 +191,14 @@ impl InlineEdit {
     pub(super) fn caret(&self) -> DiffLinePosition {
         DiffLinePosition::new(self.path.clone(), DiffSide::Modified, self.buf.line + 1)
     }
+}
+
+fn original_blob(file: &DiffFile) -> Option<&str> {
+    file.extended_headers()
+        .iter()
+        .find_map(|h| h.strip_prefix("index "))
+        .and_then(|h| h.split_once(".."))
+        .map(|(old, _)| old)
 }
 
 /// Reads the base and working text of `file` in `ws`, or why it can't be edited in place.
@@ -199,10 +223,7 @@ fn load(ws: &Workspace, file: &DiffFile) -> Result<(String, String, bool), Strin
         .ok_or(format!("{path} can't be read as text"))?;
     let headers = file.extended_headers();
     let added = headers.iter().any(|h| h.starts_with("new file mode"));
-    let sha = (headers.iter())
-        .find_map(|h| h.strip_prefix("index "))
-        .and_then(|h| h.split_once(".."))
-        .map(|(old, _)| old.to_string());
+    let sha = original_blob(file);
     let base = match sha {
         _ if added => String::new(),
         // A mode-only change: git prints no index line when the content is the same.
@@ -213,7 +234,7 @@ fn load(ws: &Workspace, file: &DiffFile) -> Result<(String, String, bool), Strin
             // thread if big repos make it lag.
             let out = std::process::Command::new("git")
                 .current_dir(&repo)
-                .args(["cat-file", "blob", &sha])
+                .args(["cat-file", "blob", sha])
                 .output()
                 .map_err(|e| e.to_string())?;
             if !out.status.success() {
@@ -334,6 +355,7 @@ impl Shark {
                 abs,
                 disk: crate::files::fingerprint(text.as_bytes()),
                 base,
+                base_blob: original_blob(&orig.0).map(str::to_string),
                 added,
                 buf,
                 file,

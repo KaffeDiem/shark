@@ -237,3 +237,176 @@ async fn uncommitted_dots_and_file_discard(cx: &mut TestAppContext) {
     });
     fs::remove_dir_all(home).unwrap();
 }
+
+/// A PR target learned after opening a workspace must replace the trunk diff immediately.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn stacked_pr_target_refreshes_diff_and_review_base(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let src = &repos[0].path;
+    let g = |dir: &Path, args: &[&str]| {
+        git::git(
+            dir,
+            &[&["-c", "user.name=t", "-c", "user.email=t@t"], args].concat(),
+        )
+        .unwrap()
+    };
+    fs::write(src.join("shared.txt"), "trunk\n").unwrap();
+    g(src, &["add", "."]);
+    g(src, &["commit", "-qm", "trunk"]);
+    g(src, &["update-ref", "refs/remotes/origin/main", "HEAD"]);
+    fs::write(src.join("shared.txt"), "parent\n").unwrap();
+    fs::write(src.join("parent.txt"), "parent only\n").unwrap();
+    g(src, &["add", "."]);
+    g(src, &["commit", "-qm", "parent"]);
+    let parent = g(src, &["rev-parse", "HEAD"]);
+    g(src, &["update-ref", "refs/remotes/origin/parent", "HEAD"]);
+    g(src, &["branch", "child"]);
+    let dir = home.join("shark/workspaces/pr-diff");
+    let ws =
+        git::create_workspace(&dir, "pr-diff", "child", &git::on_branch(&repos, "child")).unwrap();
+    let wt = dir.join("api");
+    fs::write(wt.join("shared.txt"), "child\n").unwrap();
+    g(&wt, &["add", "."]);
+    g(&wt, &["commit", "-qm", "child"]);
+    let head = g(&wt, &["rev-parse", "HEAD"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos,
+            workspaces: vec![ws],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| s.open_workspace(0, w, cx));
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).diff_loaded
+    })
+    .await;
+    let sync = cx.update(|cx| shark.read(cx).syncs["pr-diff"].clone());
+    sync.update(cx, |g, cx| g.set_active(false, cx));
+    cx.update(|cx| {
+        assert!(
+            shark
+                .read(cx)
+                .diff_files
+                .iter()
+                .any(|f| f.path() == "api/parent.txt")
+        )
+    });
+    sync.update(cx, |g, cx| {
+        g.set_pr("api", 7, false);
+        g.set_pr_base("api", "parent", cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).diff_base("api") == "origin/parent"
+    })
+    .await;
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert!(s.diff_error.is_none(), "{:?}", s.diff_error);
+        assert_eq!(
+            s.diff_files
+                .iter()
+                .map(|f| f.path().as_str())
+                .collect::<Vec<_>>(),
+            ["api/shared.txt"]
+        );
+        assert_eq!(s.changes_stats().0, "origin/parent");
+        assert_eq!(
+            s.active_ws().unwrap().repos[0].base,
+            "origin/main",
+            "configured lifecycle base is preserved"
+        );
+    });
+    // Re-quoting an old-side comment uses the displayed parent, not the configured trunk.
+    on(cx, &|s, _, cx| {
+        let c: review::Comment = serde_json::from_value(serde_json::json!({
+            "id": 1, "path": "api/shared.txt", "start": [true, 1], "end": [true, 1],
+            "text": "review", "status": "Outdated"
+        }))
+        .unwrap();
+        s.edit_comments(cx, |comments| comments.push(c));
+        s.requeue_outdated(cx);
+        let c = &s.ws_comments()[0];
+        assert_eq!(c.snapshot, "parent");
+        assert_eq!(serde_json::to_value(c).unwrap()["rev"], parent);
+    });
+    // Retargeting while editing updates the original while preserving the unsaved buffer.
+    on(cx, &|s, w, cx| {
+        s.edit_working_copy(Some("api/shared.txt".into()), w, cx);
+        s.paste_lines("unsaved", w, cx);
+    });
+    let buffer = cx.update(|cx| shark.read(cx).editing.as_ref().unwrap().buf.text());
+    sync.update(cx, |g, cx| g.set_pr_base("api", "main", cx));
+    cx.run_until_parked();
+    // Also apply a comparison that started before editing began.
+    on(cx, &|s, _, cx| {
+        let ws = s.active_ws().unwrap().clone();
+        s.apply_diff(DiffData::load(&ws, false), cx);
+        assert_eq!(s.diff_base("api"), "origin/main");
+        let e = s.editing.as_ref().unwrap();
+        assert_eq!(e.buf.text(), buffer);
+        assert!(e.dirty && e.patch.contains("-trunk"));
+        s.edit_comments(cx, |comments| comments[0].status = review::Status::Outdated);
+        s.requeue_outdated(cx);
+        assert_eq!(s.ws_comments()[0].snapshot, "trunk");
+    });
+    // A fetch can move the same target ref, including a rewritten parent.
+    let trunk = g(&wt, &["rev-parse", "origin/main"]);
+    for (revision, original) in [
+        (&parent, "parent"),
+        (&head, "child"), // The edited file leaves Git’s patch, then returns.
+        (&parent, "parent"),
+        (&trunk, "trunk"),
+    ] {
+        g(&wt, &["update-ref", "refs/remotes/origin/main", revision]);
+        on(cx, &|s, _, cx| s.refresh_diff(cx));
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark
+                .read(cx)
+                .editing
+                .as_ref()
+                .is_some_and(|e| e.patch.contains(&format!("-{original}")))
+        })
+        .await;
+        on(cx, &|s, _, cx| {
+            assert_eq!(s.diff_base("api"), "origin/main");
+            assert_eq!(s.editing.as_ref().unwrap().buf.text(), buffer);
+            s.edit_comments(cx, |comments| comments[0].status = review::Status::Outdated);
+            s.requeue_outdated(cx);
+            assert_eq!(s.ws_comments()[0].snapshot, original);
+        });
+    }
+    on(cx, &|s, w, cx| s.save_edit(false, w, cx));
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark
+            .read(cx)
+            .editing
+            .as_ref()
+            .is_some_and(|e| !e.dirty && !e.saving)
+    })
+    .await;
+    on(cx, &|s, w, cx| s.leave_edit(w, cx));
+    assert_eq!(fs::read_to_string(wt.join("shared.txt")).unwrap(), buffer);
+    // Saving and leaving keeps the new target, even though HEAD never moved.
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).diff_base("api") == "origin/main"
+    })
+    .await;
+    cx.update(|cx| {
+        assert!(
+            shark
+                .read(cx)
+                .diff_files
+                .iter()
+                .any(|f| f.path() == "api/parent.txt")
+        )
+    });
+    assert_eq!(g(&wt, &["rev-parse", "HEAD"]), head);
+    fs::remove_dir_all(home).unwrap();
+}

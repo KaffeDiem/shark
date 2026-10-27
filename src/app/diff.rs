@@ -16,6 +16,7 @@ pub(super) enum Viewed {
 pub(super) struct DiffData {
     /// Fingerprint of the whole patch; equal means nothing to redo.
     fp: u64,
+    bases: HashMap<String, String>,
     /// In tree order.
     pub(super) files: Vec<DiffFile>,
     fps: Vec<u64>,
@@ -68,6 +69,11 @@ impl DiffData {
         let mut slots: Vec<Option<(DiffFile, u64)>> = parsed.into_iter().map(Some).collect();
         let (files, fps) = order.into_iter().filter_map(|i| slots[i].take()).unzip();
         DiffData {
+            bases: ws
+                .repos
+                .iter()
+                .map(|r| (r.name.clone(), r.base.clone()))
+                .collect(),
             fp,
             files,
             fps,
@@ -82,9 +88,16 @@ impl DiffData {
 
 impl Shark {
     pub(super) fn refresh_diff(&mut self, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws().cloned() else {
+        let Some(mut ws) = self.active_ws().cloned() else {
             return;
         };
+        if let Some(sync) = self.syncs.get(&ws.name) {
+            for r in &mut ws.repos {
+                if let Some(base) = sync.read(cx).diff_base(&r.name) {
+                    r.base = base;
+                }
+            }
+        }
         self.diff_gen += 1;
         let generation = self.diff_gen;
         let uncommitted_only = self.state.uncommitted_only;
@@ -113,15 +126,40 @@ impl Shark {
     }
 
     pub(super) fn apply_diff(&mut self, mut data: DiffData, cx: &mut Context<Self>) {
-        let status_changed = !self.diff_loaded
-            || data.error != self.diff_error
-            || data.uncommitted != self.uncommitted;
-        self.diff_loaded = true;
-        self.diff_error = data.error;
-        self.uncommitted = data.uncommitted;
         if let Some((abs, bytes)) = data.edited.take() {
             self.edit_disk(&abs, bytes, cx);
         }
+        // The buffer stays intact when a PR is retargeted or its base ref moves.
+        if let (Some(ws), Some(e)) = (self.active_ws().cloned(), &mut self.editing) {
+            let error = if let Some(error) = &data.error {
+                Some(error.clone())
+            } else if data.fp != self.diff_fp {
+                let file = data
+                    .files
+                    .iter()
+                    .find(|f| *f.path() == e.path)
+                    .cloned()
+                    .or_else(|| {
+                        (e.dirty || e.saved).then(|| DiffFile::unchanged(e.path.clone(), ""))
+                    });
+                file.and_then(|f| e.rebase(&ws, &f).err())
+            } else {
+                None
+            };
+            if let Some(error) = error {
+                self.diff_error = Some(error);
+                cx.notify();
+                return;
+            }
+        }
+        let status_changed = !self.diff_loaded
+            || data.bases != self.diff_bases
+            || data.error != self.diff_error
+            || data.uncommitted != self.uncommitted;
+        self.diff_bases = data.bases;
+        self.diff_loaded = true;
+        self.diff_error = data.error;
+        self.uncommitted = data.uncommitted;
         // Turn ends and saves refresh often; an unchanged patch keeps scroll and expansion.
         if data.fp == self.diff_fp
             && !self.diff_files.is_empty()
@@ -820,10 +858,24 @@ impl Shark {
             .into_any_element()
     }
 
+    pub(super) fn diff_base(&self, repo: &str) -> &str {
+        self.diff_bases
+            .get(repo)
+            .map(String::as_str)
+            .or_else(|| {
+                self.active_ws()?
+                    .repos
+                    .iter()
+                    .find(|r| r.name == repo)
+                    .map(|r| r.base.as_str())
+            })
+            .unwrap_or("base")
+    }
+
     /// The bases the diff compares against, and its total added and deleted lines.
     pub(super) fn changes_stats(&self) -> (String, usize, usize) {
         let mut bases: Vec<&str> = (self.active_ws().into_iter())
-            .flat_map(|ws| ws.repos.iter().map(|r| r.base.as_str()))
+            .flat_map(|ws| ws.repos.iter().map(|r| self.diff_base(&r.name)))
             .collect();
         bases.sort_unstable();
         bases.dedup();
@@ -927,10 +979,11 @@ impl Shark {
             .side_headings(move |file, _, cx| {
                 let repo = file.path().split('/').next().unwrap_or_default();
                 (shark.read_with(cx, |s, _| {
-                    let base = (s.active_ws().into_iter())
-                        .flat_map(|ws| &ws.repos)
-                        .find(|r| r.name == repo)
-                        .map_or("base", |r| r.base.as_str());
+                    let base = if s.state.uncommitted_only {
+                        "HEAD"
+                    } else {
+                        s.diff_base(repo)
+                    };
                     (
                         format!("Original · {base} · read only").into(),
                         s.working_heading(file.path()).into(),

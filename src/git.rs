@@ -1043,6 +1043,27 @@ mod tests {
         let other = init_repo(&root, "web");
         let remote = root.join("upstream.git");
         git(&root, &["init", "-q", "--bare", &remote.to_string_lossy()]).unwrap();
+        // The fork's namesake target differs from the PR repository's target.
+        git(
+            &repo.path,
+            &["update-ref", "refs/remotes/origin/release", "HEAD"],
+        )
+        .unwrap();
+        fs::write(repo.path.join("parent.txt"), "parent change\n").unwrap();
+        git(&repo.path, &["add", "parent.txt"]).unwrap();
+        git(
+            &repo.path,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-qm",
+                "parent",
+            ],
+        )
+        .unwrap();
         let base = git(&repo.path, &["rev-parse", "HEAD"]).unwrap();
         git(
             &repo.path,
@@ -1054,6 +1075,8 @@ mod tests {
             ],
         )
         .unwrap();
+        fs::write(repo.path.join("child.txt"), "child change\n").unwrap();
+        git(&repo.path, &["add", "child.txt"]).unwrap();
         git(
             &repo.path,
             &[
@@ -1063,7 +1086,6 @@ mod tests {
                 "user.email=t@t",
                 "commit",
                 "-q",
-                "--allow-empty",
                 "-m",
                 "PR tip",
             ],
@@ -1101,6 +1123,10 @@ mod tests {
         let wt = dir.join("api");
         assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), tip);
         assert_eq!(git(&wt, &["rev-parse", &ws.repos[0].base]).unwrap(), base);
+        assert_eq!(ws.repos[0].base, "refs/shark/pull/7/base");
+        let patch = combined_diff(&ws, &dir, false).unwrap();
+        assert!(patch.contains("+++ b/api/child.txt"), "{patch}");
+        assert!(!patch.contains("parent.txt"), "{patch}");
         assert_eq!(review_pr_url(&wt, "pr/7"), Some(pr.url));
         assert_eq!(
             git(&repo.path, &["branch", "--show-current"]).unwrap(),
@@ -1148,6 +1174,96 @@ mod tests {
         );
         assert!(!failed.exists() && !has_ref(&repo.path, "refs/heads/review-again"));
         assert_eq!(review_pr_url(&repo.path, "review-again"), None);
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn stacked_diff_uses_target_merge_base_and_preserves_index() {
+        let root = std::env::temp_dir().join(format!("shark-stacked-diff-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let repo = init_repo(&root, "api");
+        let commit = |at: &Path, file: &str| {
+            fs::write(at.join(file), format!("{file}\n")).unwrap();
+            git(at, &["add", file]).unwrap();
+            git(
+                at,
+                &[
+                    "-c",
+                    "user.name=t",
+                    "-c",
+                    "user.email=t@t",
+                    "commit",
+                    "-qm",
+                    file,
+                ],
+            )
+            .unwrap();
+        };
+        git(&repo.path, &["checkout", "-qb", "parent"]).unwrap();
+        commit(&repo.path, "parent.txt");
+        git(
+            &repo.path,
+            &["update-ref", "refs/remotes/origin/parent", "HEAD"],
+        )
+        .unwrap();
+        let dir = root.join("ws/child");
+        let mut ws = create_workspace_with_prs(
+            &dir,
+            "child",
+            "child",
+            &on_branch(std::slice::from_ref(&repo), "child"),
+            &[],
+            &[("api".into(), "parent".into())],
+        )
+        .unwrap();
+        let wt = dir.join("api");
+        commit(&wt, "child.txt");
+        // Changes made only on the target must not appear as deletions in the PR.
+        commit(&repo.path, "target-only.txt");
+        git(
+            &repo.path,
+            &["update-ref", "refs/remotes/origin/parent", "HEAD"],
+        )
+        .unwrap();
+        fs::write(wt.join("README.md"), "unstaged\n").unwrap();
+        fs::write(wt.join("staged.txt"), "staged\n").unwrap();
+        git(&wt, &["add", "staged.txt"]).unwrap();
+        fs::write(wt.join("untracked.txt"), "untracked\n").unwrap();
+        let index = git(
+            &wt,
+            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        )
+        .unwrap();
+        let before = fs::read(&index).unwrap();
+        let patch = combined_diff(&ws, &dir, false).unwrap();
+        for file in ["child.txt", "README.md", "staged.txt", "untracked.txt"] {
+            assert!(patch.contains(&format!("+++ b/api/{file}")), "{patch}");
+        }
+        for file in ["parent.txt", "target-only.txt"] {
+            assert!(!patch.contains(file), "{patch}");
+        }
+        let local = combined_diff(&ws, &dir, true).unwrap();
+        assert!(!local.contains("child.txt"), "{local}");
+        for file in ["README.md", "staged.txt", "untracked.txt"] {
+            assert!(local.contains(&format!("+++ b/api/{file}")), "{local}");
+        }
+        assert_eq!(
+            fs::read(&index).unwrap(),
+            before,
+            "diff leaves staging intact"
+        );
+        ws.repos[0].base = "origin/missing-target".into();
+        assert!(
+            combined_diff(&ws, &dir, false)
+                .unwrap_err()
+                .starts_with("api: git diff:")
+        );
+        assert_eq!(combined_diff(&ws, &dir, true).unwrap(), local);
+        assert_eq!(
+            fs::read(&index).unwrap(),
+            before,
+            "errors leave staging intact"
+        );
         fs::remove_dir_all(root).unwrap();
     }
 

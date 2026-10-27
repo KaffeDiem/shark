@@ -865,6 +865,7 @@ impl Shark {
             // A fresh tree and diff for another workspace.
             self.editing = None;
             self.diff_fp = 0;
+            self.diff_bases.clear();
             self.diff_files.clear();
             self.diff_fps.clear();
             self.viewed_now = Rc::default();
@@ -897,6 +898,11 @@ impl Shark {
                 move |this, _, ev: &SyncEvent, window, cx| match ev {
                     SyncEvent::Archive => this.remove_workspace(&name, false, window, cx),
                     SyncEvent::PrsCreated => this.state.mark(|s| &mut s.opened_pr),
+                    SyncEvent::DiffBaseChanged => {
+                        if this.active.as_deref() == Some(name.as_str()) {
+                            this.refresh_diff(cx);
+                        }
+                    }
                     SyncEvent::Restack { moves, prompt } => {
                         this.restack(&name, moves, prompt.clone(), window, cx)
                     }
