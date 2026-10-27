@@ -491,6 +491,13 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| s.with_sync(w, cx, GitSync::fetch_now),
     ),
     Row(
+        "Commit and push",
+        IconName::GitCommitHorizontal,
+        None,
+        "git agent queue",
+        |s, w, cx| s.with_sync(w, cx, GitSync::commit_and_push),
+    ),
+    Row(
         "Pull",
         IconName::ArrowDown,
         None,

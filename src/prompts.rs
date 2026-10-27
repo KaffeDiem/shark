@@ -15,8 +15,9 @@ pub const PROMPTS: &[Prompt] = &[
     Prompt {
         id: "commit",
         title: "Commit and push",
-        repos: "repos with uncommitted changes",
-        default: "Commit and push the uncommitted changes in: {repos}. In each repo review the diff and stage the files that \
+        repos: "repos selected for committing (may still be clean when queued)",
+        default: "Commit and push changes in: {repos}. Check the current git state first; skip repos with nothing to commit or push. \
+In each repo review the diff and stage the files that \
 belong to this change. Never commit secrets or build output; if such files show up, add them to \
 .gitignore instead. Write a concise commit message in the repo's style, commit, then \
 `git push -u origin {branch}`. If the push is rejected because the remote moved, \

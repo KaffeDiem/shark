@@ -563,9 +563,9 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// Steps that change the worktree or the remote; they must not race a running agent.
+    /// Direct writes must not race an agent; agent prompts go through the chat queue.
     pub fn needs_idle(&self) -> bool {
-        !matches!(self, Kind::OpenPr | Kind::None)
+        !matches!(self, Kind::Agent(_) | Kind::OpenPr | Kind::None)
     }
 }
 
@@ -998,6 +998,29 @@ pub fn diverged(err: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_direct_writes_need_idle_agents() {
+        use super::Kind;
+        for kind in [Kind::Agent("commit".into()), Kind::OpenPr, Kind::None] {
+            assert!(!kind.needs_idle(), "{kind:?}");
+        }
+        for kind in [
+            Kind::Pull,
+            Kind::Push,
+            Kind::ForcePush,
+            Kind::CreatePr,
+            Kind::CreateDraftPr,
+            Kind::Restack,
+            Kind::Reopen,
+            Kind::UpdateBranch,
+            Kind::Ready,
+            Kind::Merge,
+            Kind::Archive,
+        ] {
+            assert!(kind.needs_idle(), "{kind:?}");
+        }
+    }
+
     #[test]
     fn ago_and_diverged() {
         use std::time::Duration;

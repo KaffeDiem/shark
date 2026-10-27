@@ -458,10 +458,19 @@ impl GitSync {
         chat.update(cx, |c, _| c.hold = hold);
         self._subs.extend([
             cx.observe(&chat, |_, _, cx| cx.notify()), // working toggles enable/disable the button
-            cx.subscribe(&chat, |s, _, ev, _| {
-                if let crate::chat::ChatEvent::TurnDone = ev {
+            cx.subscribe(&chat, |s, _, ev, _| match ev {
+                crate::chat::ChatEvent::TurnDone => {
                     s.kick(false, true); // the agent may have committed, pushed or opened a PR
                 }
+                crate::chat::ChatEvent::GitReviewsSent(ids) if !ids.is_empty() => {
+                    for id in ids {
+                        if !s.reviewed.contains(id) {
+                            s.reviewed.push(id.clone());
+                        }
+                    }
+                    crate::state::set_reviewed(&s.ws.name, &s.reviewed);
+                }
+                _ => {}
             }),
         ]);
         self.chats.push(chat);
@@ -610,9 +619,20 @@ impl GitSync {
         window.push_notification("Fetching…", cx);
     }
 
-    /// `check`: the step came from the button, so re-probe first and refuse if the state moved
-    /// on in the meantime (the snapshot can be seconds old, and the agent may have acted).
+    /// `check`: re-probe direct operations from the button; prompts retain the user's request.
     fn run(&mut self, a: Action, check: bool, window: &mut Window, cx: &mut Context<Self>) {
+        if let Kind::Agent(prompt) = &a.kind {
+            if let Err(e) = check_review_checkout(&self.repos, &a.repos) {
+                return notify_err(window, cx, e);
+            }
+            let Some(chat) = &self.chat else {
+                return notify_err(window, cx, "Open a chat to queue this step");
+            };
+            if !chat.update(cx, |c, cx| c.enqueue(prompt, a.reviews, cx)) {
+                return notify_err(window, cx, "This workspace is being archived");
+            }
+            return;
+        }
         if let Some(e) = self.blocked(a.kind.needs_idle(), cx) {
             return notify_err(window, cx, e);
         }
@@ -709,12 +729,8 @@ impl GitSync {
         let snapshot: Vec<_> = self.repos.iter().map(|r| r.pr.clone()).collect();
         let handled = self.reviewed.clone();
         let all = Job::prs(&ws);
-        // Only steps that act on GitHub ask it again; the rest re-check git and decide with the
-        // PR state already shown, so an agent prompt doesn't wait on a slow gh.
-        let pr_kinds = !matches!(
-            a.kind,
-            Kind::Agent(_) | Kind::Pull | Kind::Push | Kind::ForcePush
-        );
+        // Pull and push only need fresh git state.
+        let pr_kinds = !matches!(a.kind, Kind::Pull | Kind::Push | Kind::ForcePush);
         let order = self.merge_order.clone();
         let creates = matches!(a.kind, Kind::CreatePr | Kind::CreateDraftPr);
         let composer = match creates {
@@ -758,25 +774,7 @@ impl GitSync {
                 s.running = None;
                 s.set_hold(false, cx);
                 match result {
-                    Ok((a, Outcome::Ask(prompt))) => {
-                        let asked = (s.chat.clone())
-                            .is_some_and(|c| c.update(cx, |c, cx| c.ask(&prompt, window, cx)));
-                        if !asked {
-                            notify_err(
-                                window,
-                                cx,
-                                "Agent is running; wait for it or stop it (ctrl-c)",
-                            );
-                        } else if !a.reviews.is_empty() {
-                            for id in a.reviews {
-                                if !s.reviewed.contains(&id) {
-                                    s.reviewed.push(id);
-                                }
-                            }
-                            crate::state::set_reviewed(&s.ws.name, &s.reviewed);
-                        }
-                    }
-                    Ok((a, Outcome::Done(msg))) => {
+                    Ok((a, msg)) => {
                         if creates {
                             cx.emit(SyncEvent::PrsCreated);
                         }
@@ -799,7 +797,7 @@ impl GitSync {
                     }
                     Err(e) => notify_err(window, cx, e),
                 }
-                // Messages queued during the step go now, unless the step's prompt went first.
+                // Messages queued during the step can now go out.
                 for c in s.chats.clone() {
                     c.update(cx, |c, cx| c.drain(cx));
                 }
@@ -903,7 +901,9 @@ impl GitSync {
             (Some(r), _) => lines.push(format!("Running: {r}")),
             (None, Some(a)) => {
                 lines.push(a.label.clone());
-                if a.kind.needs_idle() && self.busy(cx) {
+                if matches!(a.kind, Kind::Agent(_)) {
+                    lines.push("Adds a prompt to the current chat's queue".into());
+                } else if a.kind.needs_idle() && self.busy(cx) {
                     lines.push("Waits for the agent to finish".into());
                 }
             }
@@ -993,6 +993,13 @@ impl GitSync {
         self.run_kind(Kind::Agent(prompt), "Rebase onto parent", window, cx)
     }
 
+    /// Available even before the agent has made any changes.
+    pub fn commit_and_push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let repos = self.repos.iter().map(|r| (&*r.name, &*r.branch));
+        let prompt = crate::prompts::render_each("commit", repos, |rs| rs.join(", "));
+        self.run_kind(Kind::Agent(prompt), "Commit and push", window, cx)
+    }
+
     /// Asks the agent to bring every repo up to date with its base.
     pub fn update_from_base(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let bases = |rs: &[String]| {
@@ -1046,6 +1053,14 @@ impl GitSync {
                     "Fetch now",
                     run(Self::fetch_now),
                 )),
+                Some(
+                    menu::item(
+                        IconName::GitCommitHorizontal,
+                        "Commit and push",
+                        run(Self::commit_and_push),
+                    )
+                    .hint("Queue"),
+                ),
                 pull.map(|e| e.hint("Fast-forward")),
                 kind(IconName::ArrowUp, Kind::Push, "Push", every.clone()),
                 Some(
@@ -1054,7 +1069,7 @@ impl GitSync {
                         "Update from base",
                         run(Self::update_from_base),
                     )
-                    .hint("Agent"),
+                    .hint("Queue"),
                 ),
                 Some(Entry::Sep),
                 kind(
@@ -1156,9 +1171,16 @@ fn open_prs_in(repos: &[Repo], rs: &[String]) -> usize {
         .count()
 }
 
-enum Outcome {
-    Ask(String),
-    Done(String),
+fn check_review_checkout(repos: &[Repo], rs: &[String]) -> Result<(), String> {
+    if let Some(r) = repos.iter().find(|r| {
+        (rs.is_empty() || rs.contains(&r.name)) && r.local.as_ref().is_ok_and(|l| l.review)
+    }) {
+        return Err(format!(
+            "{}: this is a local PR review checkout; use the original PR on GitHub to manage it",
+            r.name
+        ));
+    }
+    Ok(())
 }
 
 /// One repo's part of a step: `Ok(None)` when it has nothing to do.
@@ -1171,19 +1193,11 @@ fn execute(
     repos: &[Repo],
     order: &[String],
     new_pr: &pr::NewPr,
-) -> Result<Outcome, String> {
+) -> Result<String, String> {
+    check_review_checkout(repos, &a.repos)?;
     let dir = ws.dir();
     let wanted = |r: &Repo| a.repos.is_empty() || a.repos.contains(&r.name);
     let mut targets: Vec<&Repo> = repos.iter().filter(|r| wanted(r)).collect();
-    if let Some(r) = targets
-        .iter()
-        .find(|r| r.local.as_ref().is_ok_and(|l| l.review))
-    {
-        return Err(format!(
-            "{}: this is a local PR review checkout; use the original PR on GitHub to manage it",
-            r.name
-        ));
-    }
     if a.kind == Kind::Merge {
         // A repo missing from the order goes last, not first (`None` sorts before `Some`).
         targets.sort_by_key(|r| {
@@ -1211,12 +1225,11 @@ fn execute(
         }
         match done.is_empty() {
             true => Err("Nothing to do".into()),
-            false => Ok(Outcome::Done(done.join("\n"))),
+            false => Ok(done.join("\n")),
         }
     };
     let planned = |r: &Repo| status::step_args(&a.kind, r);
     match &a.kind {
-        Kind::Agent(p) => Ok(Outcome::Ask(p.clone())),
         Kind::Pull | Kind::Push | Kind::ForcePush => each(&|wt, r| {
             let Some(args) = planned(r)? else {
                 return Ok(None);
@@ -1241,12 +1254,11 @@ fn execute(
                 .map(|r| r.name.clone())
                 .collect();
             let prs = pr::create_linked_prs(ws, &dir, &landed, new_pr)?;
-            Ok(Outcome::Done(
-                prs.iter()
-                    .map(|(r, u)| format!("{r}: {u}"))
-                    .collect::<Vec<_>>()
-                    .join("\n"),
-            ))
+            Ok(prs
+                .iter()
+                .map(|(r, u)| format!("{r}: {u}"))
+                .collect::<Vec<_>>()
+                .join("\n"))
         }
         Kind::Reopen => each(&|wt, r| {
             gh_on_pr(
@@ -1303,7 +1315,9 @@ fn execute(
             )))
         }),
         // `run` handles these without a step.
-        Kind::Archive | Kind::Restack | Kind::OpenPr | Kind::None => unreachable!(),
+        Kind::Agent(_) | Kind::Archive | Kind::Restack | Kind::OpenPr | Kind::None => {
+            unreachable!()
+        }
     }
 }
 
@@ -1423,6 +1437,7 @@ impl Render for GitSync {
         let this = cx.entity().downgrade();
         let warning = cx.theme().warning_foreground;
         let (label, a) = match (&self.running, &self.action) {
+            (_, Some(a)) if matches!(a.kind, Kind::Agent(_)) => (a.label.clone(), Some(a.clone())),
             (Some(r), _) => (format!("{r}…"), None),
             (None, Some(a)) => (a.label.clone(), Some(a.clone())),
             (None, None) => ("Reading git…".into(), None),
@@ -1524,6 +1539,79 @@ mod tests {
         Action, Job, Kind, Local, Pr, background_answer, fresh_or_last, needs_you, repos_from,
         run_job, status,
     };
+
+    #[cfg(feature = "test-support")]
+    #[gpui_kit::test]
+    fn git_prompts_queue_while_busy(cx: &mut gpui_kit::TestAppContext) {
+        use super::*;
+        let _lock = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cx.update(gpui_kit::init);
+        let ws = crate::state::Workspace {
+            name: "git-queue-test".into(),
+            branch: "feature".into(),
+            repos: vec![crate::state::WsRepo {
+                name: "api".into(),
+                src: "/nonexistent".into(),
+                base: "origin/main".into(),
+                branch: None,
+            }],
+            ..Default::default()
+        };
+        let (window, sync) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| GitSync::new(ws.clone(), w, cx))
+                })
+            })
+            .unwrap();
+        cx.update_window(window, |_, w, cx| {
+            let chat =
+                cx.new(|cx| Chat::new(ws.clone(), crate::state::ChatMeta::default(), false, w, cx));
+            chat.update(cx, |c, cx| {
+                c.busy = true;
+                c.composer
+                    .update(cx, |t, cx| t.set_value("keep my draft", w, cx));
+            });
+            sync.update(cx, |s, cx| {
+                s.add_chat(chat.clone(), cx);
+                s.set_chat(chat.clone(), cx);
+                s.repos[0].local = Ok(Local {
+                    branch: Some("feature".into()),
+                    ..Default::default()
+                });
+                // Clean repos can be scheduled before the agent has written anything.
+                s.commit_and_push(w, cx);
+                assert_eq!(chat.read(cx).queued(), 1);
+                assert!(s.running.is_none(), "no probe or git operation starts");
+                s.repos[0].local.as_mut().unwrap().changed = 1;
+                s.action = Some(next_action(&s.repos, &[]));
+                s.running = Some("Pull".into());
+                s.set_hold(true, cx);
+                s.primary(w, cx);
+                s.update_from_base(w, cx);
+                assert_eq!(chat.read(cx).queued(), 3);
+                assert_eq!(s.running.as_deref(), Some("Pull"));
+                assert_eq!(
+                    chat.read(cx).composer.read(cx).value().as_ref(),
+                    "keep my draft"
+                );
+                // Direct operations still refuse to race either git or an agent.
+                s.run_kind(Kind::Push, "Push", w, cx);
+                assert_eq!(s.running.as_deref(), Some("Pull"));
+                s.running = None;
+                s.set_hold(false, cx);
+                s.run_kind(Kind::Pull, "Pull", w, cx);
+                assert!(s.running.is_none());
+                s.repos[0].local.as_mut().unwrap().review = true;
+                s.commit_and_push(w, cx);
+                assert_eq!(chat.read(cx).queued(), 3, "review checkouts stay protected");
+                assert!(chat.read(cx).sent_texts().is_empty());
+            });
+        })
+        .unwrap();
+    }
 
     #[test]
     fn review_checkout_refuses_git_lifecycle_actions() {

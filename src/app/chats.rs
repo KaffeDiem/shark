@@ -80,6 +80,7 @@ impl Shark {
             window,
             move |this, chat, ev: &ChatEvent, window, cx| match ev {
                 ChatEvent::Meta => this.save_meta(chat, cx),
+                ChatEvent::GitReviewsSent(_) => {} // GitSync records these.
                 ChatEvent::Picked => {
                     // The level the chat runs at, so an old chat with none doesn't clear it.
                     let m = &chat.read(cx).meta;
