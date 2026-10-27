@@ -646,7 +646,6 @@ impl Shark {
             return vec![];
         };
         let theme = cx.theme();
-        let many = ws.chats.len() > 1;
         let (accent, accent_foreground) = (theme.accent, theme.accent_foreground);
         let m = window.modifiers();
         let ctrl_held = m.control && m.number_of_modifiers() == 1;
@@ -654,11 +653,10 @@ impl Shark {
             .map(|(ix, meta)| {
                 let chat = self.chats.get(&meta.id).map(|c| c.read(cx));
                 let on = ix == ws.active_chat && self.tab == Tab::Chat;
-                let label: SharedString = match (many, chat) {
-                    (false, _) => "Chat".into(),
-                    (true, Some(c)) => c.title(),
-                    (true, None) if meta.title.is_empty() => "New chat".into(),
-                    (true, None) => meta.title.clone().into(),
+                let label: SharedString = match chat {
+                    Some(c) => c.title(),
+                    None if meta.title.is_empty() => "New chat".into(),
+                    None => meta.title.clone().into(),
                 };
                 // Comments of a review the agent hasn't read yet.
                 let label = match chat.map_or(0, |c| c.review_count()) {
