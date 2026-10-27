@@ -9,6 +9,7 @@ use std::{fs, path::PathBuf, time::Duration};
 
 pub(crate) mod chrome_tests;
 mod menu_pixels;
+mod tab_tests;
 
 /// UI tests share the process-wide `TEST_HOME` and `state.json`, so they take turns. Chat
 /// tests that make workspace dirs take it too: `test_home` wipes them.
@@ -926,7 +927,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     press(cx, &["v", "down"]);
     assert_eq!(viewed(cx), Viewed::No);
 
-    // `o` opens the file next to the chat and shrinks the sidebar to a rail.
+    // `o` opens the full-width file editor and shrinks the sidebar to a rail.
     press(cx, &["o"]);
     let editor = cx.update(|cx| shark.read(cx).editor.clone().expect("editor opened"));
     let text = |cx: &mut TestAppContext| {
@@ -2533,6 +2534,7 @@ async fn command_click_file_tabs(cx: &mut TestAppContext) {
     });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
+        w.pointer_move(w.find("file-tab-api/b.txt").bounds().center(), None, cx);
         w.within("file-tab-api/b.txt").click("close-file-tab", cx);
         assert_eq!(
             shark.read(cx).editor.as_ref(),

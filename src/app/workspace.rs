@@ -1137,7 +1137,9 @@ impl Shark {
         };
         self.open_workspace_now(ix, window, cx);
         match tab.as_str() {
-            "diff" => self.show(Tab::Diff, window, cx),
+            "diff" if self.active_ws().is_some_and(|ws| !ws.diff_closed) => {
+                self.show(Tab::Diff, window, cx)
+            }
             "home" => self.enter_home(window, cx),
             _ => {}
         }

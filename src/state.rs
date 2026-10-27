@@ -142,6 +142,9 @@ pub struct Workspace {
     pub closed: Vec<ChatMeta>,
     #[serde(default)]
     pub active_chat: usize,
+    /// Hidden until an explicit Diff action reopens it.
+    #[serde(default)]
+    pub diff_closed: bool,
     /// Diff path -> fingerprint of its patch when marked viewed; a new patch makes it unviewed.
     #[serde(default)]
     pub viewed: HashMap<String, u64>,
@@ -686,6 +689,21 @@ mod tests {
             repos: vec![],
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn diff_closure_defaults_and_round_trips() {
+        let legacy = r#"{"name":"legacy","branch":"main","repos":[]}"#;
+        let mut ws: Workspace = serde_json::from_str(legacy).unwrap();
+        assert!(!ws.diff_closed);
+        assert!(!Workspace::default().diff_closed);
+        ws.diff_closed = true;
+        let saved = serde_json::to_string(&ws).unwrap();
+        assert!(
+            serde_json::from_str::<Workspace>(&saved)
+                .unwrap()
+                .diff_closed
+        );
     }
 
     #[test]

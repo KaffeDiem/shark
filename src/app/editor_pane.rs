@@ -1,4 +1,4 @@
-//! The file editor next to the chat.
+//! Full-width file editor tabs.
 use super::*;
 
 pub(super) struct FileTab {
@@ -103,7 +103,11 @@ impl Shark {
                             EditorEvent::Saved => s.refresh_diff(cx),
                             EditorEvent::Close => s.close_editor(editor.clone(), window, cx),
                             EditorEvent::Leave if s.editor.as_ref() == Some(editor) => {
-                                let pane = if s.show_tree { Pane::Tree } else { Pane::Chat };
+                                let pane = if s.tree_shown() {
+                                    Pane::Tree
+                                } else {
+                                    Pane::Sidebar
+                                };
                                 s.focus_pane(pane, window, cx)
                             }
                             EditorEvent::Leave => {}
@@ -192,7 +196,7 @@ impl Shark {
                 if s.file_tabs.is_empty() {
                     s.drop_editor();
                     if s.tab == Tab::File {
-                        s.show(Tab::Diff, window, cx);
+                        s.show(s.file_fallback(), window, cx);
                     }
                 } else if s.editor.as_ref() == Some(&editor) {
                     s.editor = Some(s.file_tabs[ix.min(s.file_tabs.len() - 1)].editor.clone());
@@ -203,6 +207,14 @@ impl Shark {
                 cx.notify();
             },
         );
+    }
+
+    pub(super) fn file_fallback(&self) -> Tab {
+        if self.active_ws().is_some_and(|ws| ws.diff_closed) {
+            Tab::Chat
+        } else {
+            Tab::Diff
+        }
     }
 
     pub(super) fn drop_editor(&mut self) {
@@ -359,14 +371,14 @@ impl Shark {
         let normal =
             e.vim_on && e.vim.mode == crate::vim::Mode::Normal && e.vim.pending().is_empty();
         v_flex()
+            .id("file-editor-pane")
+            .test_support()
             .key_context(if normal {
                 "FileEditor VimNormal"
             } else {
                 "FileEditor"
             })
             .size_full()
-            .border_l_1()
-            .border_color(theme.border)
             .child(
                 h_flex()
                     .h(px(36.))

@@ -102,8 +102,10 @@ pub(crate) fn confirm<T: 'static>(
             .ok_variant(ButtonVariant::Danger)
             .show_cancel(true)
             .on_ok(move |_, window, cx| {
+                // Restore focus before the action can close or replace its original pane.
+                window.close_dialog(cx);
                 target.update(cx, |s, cx| ok(s, window, cx)).ok();
-                true
+                false
             })
     });
 }
@@ -243,7 +245,7 @@ fn tab_label(label: SharedString, on: bool, theme: &Theme) -> Div {
 enum Tab {
     Chat,
     Diff,
-    /// The open file next to the chat; only while `editor` is set.
+    /// The full-width file editor; only while `editor` is set.
     File,
 }
 
@@ -581,6 +583,12 @@ impl Shark {
     }
 
     fn show(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        if tab == Tab::Diff
+            && let Some(ws) = self.active_ws_mut().filter(|ws| ws.diff_closed)
+        {
+            ws.diff_closed = false;
+            self.state.save();
+        }
         self.tab = tab;
         self.home.on = false;
         self.remember_open();
@@ -601,7 +609,7 @@ impl Shark {
             }
             Tab::File => match &self.editor {
                 Some(e) => crate::editor::focus(e, window, cx),
-                None => return self.show(Tab::Diff, window, cx),
+                None => return self.show(self.file_fallback(), window, cx),
             },
         }
         cx.notify();
@@ -636,7 +644,7 @@ impl Shark {
                 }
             }
             Tab::Diff => v.push(Pane::Diff),
-            Tab::File => v.extend([Pane::Chat, Pane::Editor]),
+            Tab::File => v.push(Pane::Editor),
         }
         if self.tree_shown() {
             v.push(Pane::Tree);
@@ -829,16 +837,7 @@ impl Shark {
                 Tab::File => h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(
-                        h_resizable("chat-editor")
-                            .child(
-                                resizable_panel()
-                                    .size(px(420.))
-                                    .size_range(px(320.)..px(900.))
-                                    .child(chat.cached(StyleRefinement::default().size_full())),
-                            )
-                            .child(resizable_panel().child(self.render_editor(cx))),
-                    )
+                    .child(self.render_editor(cx))
                     .into_any_element(),
                 Tab::Diff => h_flex()
                     .flex_1()

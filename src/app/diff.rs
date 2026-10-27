@@ -928,6 +928,7 @@ impl Shark {
         let nav = |id: &'static str, icon: IconName, label: &'static str, on: bool| {
             side_row(theme)
                 .id(id)
+                .test_support()
                 .mx_0()
                 .map(|d| cursor_row(d, on, false, false, theme))
                 .child(Icon::new(icon).with_size(px(16.)).text_color(muted))
