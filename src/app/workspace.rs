@@ -1132,7 +1132,7 @@ impl Shark {
         };
         let dir = ws.dir();
         // ponytail: for-each-ref on the UI thread; it's a local ref read, move to the background if it lags.
-        let per_repo: Vec<(String, String, Vec<(i64, String)>)> = (ws.repos.iter())
+        let per_repo: Vec<git::RepoBranches> = (ws.repos.iter())
             .filter(|r| repos.contains(&r.name))
             .map(|r| {
                 let own = ws.branch_of(r).to_string();
@@ -1410,8 +1410,10 @@ impl Shark {
     ) {
         // Git only sees the disk; unsaved editor edits would vanish with the worktree.
         if self.active.as_deref() == Some(name)
-            && (self.editor.as_ref().is_some_and(|e| e.read(cx).dirty)
-                || self.editing.as_ref().is_some_and(|e| e.dirty))
+            && (self.file_tabs.iter().any(|t| {
+                let e = t.editor.read(cx);
+                e.dirty || e.saving
+            }) || self.editing.as_ref().is_some_and(|e| e.dirty || e.saving))
         {
             let name = name.to_string();
             return self.confirm_discard(true, true, window, cx, move |s, window, cx| {

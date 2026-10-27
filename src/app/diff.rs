@@ -398,7 +398,11 @@ impl Shark {
             s.state.uncommitted_only = !s.state.uncommitted_only;
             s.state.save();
             s.refresh_diff(cx);
-            s.focus_diff(window, cx);
+            if s.tab == Tab::Diff {
+                s.focus_diff(window, cx);
+            } else {
+                s.tree_focus.focus(window, cx);
+            }
             cx.notify();
         });
     }
@@ -492,10 +496,9 @@ impl Shark {
             .h_full()
             .flex_none()
             .items_center()
-            .child(top_strip())
             .child(
                 h_flex()
-                    .h(px(28.))
+                    .h(px(44.))
                     .flex_none()
                     .window_control_area(WindowControlArea::Drag)
                     .child(
@@ -1014,10 +1017,9 @@ impl Shark {
             .px(px(8.))
             .text_color(fg)
             // The hide button sits where the rail's show button was.
-            .child(top_strip())
             .child(
                 h_flex()
-                    .h(px(28.))
+                    .h(px(44.))
                     .flex_none()
                     .mb(px(16.))
                     .pl(px(8.))
@@ -1044,6 +1046,26 @@ impl Shark {
                     .text_color(muted)
                     .child(side_header(theme, "Files").p_0().flex_1())
                     .child(format!("{}/{n} viewed", self.viewed_now.len())),
+            )
+            .child(
+                Button::new("files-change-scope")
+                    .xsmall()
+                    .h(px(28.))
+                    .w_full()
+                    .mb_2()
+                    .outline()
+                    .selected(self.state.uncommitted_only)
+                    .label(if self.state.uncommitted_only {
+                        "Uncommitted only"
+                    } else {
+                        "All changes"
+                    })
+                    .tooltip(if self.state.uncommitted_only {
+                        "Show all changes against the workspace base"
+                    } else {
+                        "Show only staged, unstaged, and untracked changes"
+                    })
+                    .on_click(cx.listener(|this, _, w, cx| this.toggle_uncommitted(w, cx))),
             )
             .child(
                 Input::new(&self.tree_filter)
@@ -1074,6 +1096,7 @@ impl Shark {
         // `uniform_list` rows: no margin, so the 30px height is the pitch.
         let row = side_row(theme)
             .id(("tree-row", ix))
+            .test_support()
             .w_full()
             .mx_0()
             .mb_0()
@@ -1082,8 +1105,13 @@ impl Shark {
             .map(|d| cursor_row(d, selected, selected, focused, theme))
             .on_click(cx.listener(move |this, e: &ClickEvent, w, cx| {
                 this.tree_focus.focus(w, cx);
-                match (e.click_count(), this.tree_rows.get(ix).and_then(|r| r.file)) {
-                    (2, Some(file)) => this.open_file(file, w, cx),
+                match (
+                    e.modifiers().platform,
+                    e.click_count(),
+                    this.tree_rows.get(ix).and_then(|r| r.file),
+                ) {
+                    (true, _, Some(file)) => this.open_file_tab(file, w, cx),
+                    (_, 2, Some(file)) => this.open_file(file, w, cx),
                     _ => this.tree_confirm(ix, w, cx),
                 }
             }))

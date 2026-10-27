@@ -94,7 +94,7 @@ fn flush(s: &mut State, stdin: &Mutex<ChildStdin>) -> std::io::Result<()> {
         s.next += 1;
         agent::write(
             stdin,
-            &json!({"id": s.next, "method": "turn/start", "params": turn_params(&s, &thread, &text)}),
+            &json!({"id": s.next, "method": "turn/start", "params": turn_params(s, &thread, &text)}),
         )?;
     }
     Ok(())
@@ -195,7 +195,9 @@ pub fn track(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, pid: u32, line: &str)
     // sub-agent's would be dropped below, unanswered, holding up its turn).
     let main_thread = |v: &Value| {
         let s = st.lock().unwrap();
-        v["params"]["threadId"].as_str().is_none_or(|t| s.thread.as_deref() == Some(t))
+        v["params"]["threadId"]
+            .as_str()
+            .is_none_or(|t| s.thread.as_deref() == Some(t))
     };
     // A request nothing here can answer would hold up its turn: refuse it.
     if let Some(m) = method

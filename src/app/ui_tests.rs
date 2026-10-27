@@ -7,6 +7,8 @@ use std::sync::Mutex;
 use std::time::Instant;
 use std::{fs, path::PathBuf, time::Duration};
 
+pub(crate) mod chrome_tests;
+
 /// UI tests share the process-wide `TEST_HOME` and `state.json`, so they take turns. Chat
 /// tests that make workspace dirs take it too: `test_home` wipes them.
 pub(crate) static UI_LOCK: Mutex<()> = Mutex::new(());
@@ -139,10 +141,12 @@ fn press_in(window: AnyWindowHandle) -> impl Fn(&mut TestAppContext, &[&str]) {
     }
 }
 
+type AppUpdate<'a> = dyn Fn(&mut Shark, &mut Window, &mut Context<Shark>) + 'a;
+
 fn on_app(
     window: AnyWindowHandle,
     shark: Entity<Shark>,
-) -> impl Fn(&mut TestAppContext, &dyn Fn(&mut Shark, &mut Window, &mut Context<Shark>)) {
+) -> impl Fn(&mut TestAppContext, &AppUpdate<'_>) {
     move |cx, f| {
         cx.update_window(window, |_, w, cx| shark.update(cx, |s, cx| f(s, w, cx)))
             .unwrap();
@@ -248,7 +252,7 @@ async fn vim_setting_and_palette_target(cx: &mut TestAppContext) {
         .await;
     }
     let press = press_in(window);
-    let sel = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).sel.clone());
+    let sel = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).sel);
     press(cx, &["escape", "cmd-alt-left"]);
     cx.update_window(window, |_, w, cx| {
         assert!(shark.read(cx).sidebar_focus.is_focused(w))
@@ -710,7 +714,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     busy(cx, false);
     assert!(!awake(cx));
 
-    // Chat tabs: cmd-t opens one next to the current chat, ctrl-tab cycles, cmd-w closes,
+    // Chat tabs: cmd-t opens one next to the current chat, cmd-shift-] cycles, cmd-w closes,
     // cmd-shift-t brings back a closed chat that had a session.
     let tabs = |cx: &mut TestAppContext| {
         cx.update(|cx| {
@@ -721,10 +725,10 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     };
     press(cx, &["cmd-t"]);
     assert_eq!(tabs(cx), (vec!["ui-x".into(), "ui-x~2".into()], 1, 0));
-    press(cx, &["ctrl-tab"]);
+    press(cx, &["cmd-shift-]"]);
     assert_eq!(tabs(cx).1, 0);
     cx.update(|cx| assert_eq!(chat.read(cx).composer.read(cx).value().as_ref(), "jk g"));
-    press(cx, &["ctrl-tab"]);
+    press(cx, &["cmd-shift-]"]);
     let second = cx.update(|cx| shark.read(cx).chats["ui-x~2"].clone());
     cx.update(|cx| {
         second.update(cx, |c, cx| {
@@ -1419,10 +1423,10 @@ async fn add_repo_and_restore(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
-/// Ctrl+digits chooses open chats; holding Control previews their current numbers.
+/// Ctrl+digits chooses open tabs; holding Control previews their current numbers.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn numbered_chat_shortcuts(cx: &mut TestAppContext) {
+async fn numbered_tab_shortcuts(cx: &mut TestAppContext) {
     use gpui_kit::test::TestEventExt;
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
@@ -1485,8 +1489,14 @@ async fn numbered_chat_shortcuts(cx: &mut TestAppContext) {
     assert_eq!(selected(cx), 1, "missing numbers do nothing");
 
     // The same Kbd preview as the sidebar appears only for its exact modifier.
+    let home_width = cx
+        .update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.find("home-row").bounds().size.width
+        })
+        .unwrap();
     let mut visual = VisualTestContext::from_window(window, cx);
-    for (modifiers, chat_hints, workspace_hints) in [
+    for (modifiers, tab_hints, workspace_hints) in [
         (Modifiers::default(), false, false),
         (
             Modifiers {
@@ -1537,11 +1547,26 @@ async fn numbered_chat_shortcuts(cx: &mut TestAppContext) {
             w.change_modifiers(modifiers, cx);
         })
         .unwrap();
-        for hint in ["kbd:ctrl-1", "kbd:ctrl-2", "kbd:ctrl-3"] {
-            assert_eq!(visual.debug_bounds(hint).is_some(), chat_hints, "{hint}");
+        for hint in ["kbd:ctrl-1", "kbd:ctrl-2", "kbd:ctrl-3", "kbd:ctrl-4"] {
+            assert_eq!(visual.debug_bounds(hint).is_some(), tab_hints, "{hint}");
         }
-        assert!(visual.debug_bounds("kbd:ctrl-4").is_none());
+        assert!(visual.debug_bounds("kbd:ctrl-5").is_none());
         assert_eq!(visual.debug_bounds("kbd:cmd-1").is_some(), workspace_hints);
+        cx.update_window(window, |_, w, _| {
+            let width = w.find("home-row").bounds().size.width;
+            if workspace_hints {
+                assert!(
+                    width > home_width,
+                    "Home grows to show cmd-0 only while Command is held"
+                );
+            } else {
+                assert_eq!(
+                    width, home_width,
+                    "Home reserves no space for a hidden shortcut"
+                );
+            }
+        })
+        .unwrap();
     }
     assert_eq!(selected(cx), 1, "preview alone never switches chats");
     press(cx, &["ctrl-cmd-2"]);
@@ -1573,7 +1598,7 @@ async fn numbered_chat_shortcuts(cx: &mut TestAppContext) {
         )
     });
 
-    // The shortcut works from a diff and from Vim's editor, preserving the file split.
+    // The shortcut selects the chat from a diff or Vim editor, retaining open files.
     on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
     press(cx, &["ctrl-1"]);
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Chat));
@@ -1590,7 +1615,7 @@ async fn numbered_chat_shortcuts(cx: &mut TestAppContext) {
     press(cx, &["ctrl-2"]);
     cx.update_window(window, |_, w, cx| {
         let s = shark.read(cx);
-        assert_eq!(s.tab, Tab::File);
+        assert_eq!(s.tab, Tab::Chat);
         assert_eq!(s.editor.as_ref(), Some(&editor));
         assert_eq!(s.active_ws().unwrap().active_chat, 1);
         assert!(
@@ -1876,6 +1901,686 @@ async fn many_tabs_scroll(cx: &mut TestAppContext) {
     on(cx, &|s, w, cx| s.select_chat(0, w, cx));
     assert_eq!(hidden(cx, 0), Ordering::Equal);
     assert_eq!(hidden(cx, 20), Ordering::Greater);
+    // Edge buttons browse hidden tabs without selecting one or snapping back on redraw.
+    cx.update_window(window, |_, w, cx| {
+        for _ in 0..3 {
+            w.render_frame(cx);
+            w.simulate_next_frame(cx);
+        }
+    })
+    .unwrap();
+    cx.update_window(window, |_, w, cx| w.click("tabs-right", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        for _ in 0..3 {
+            w.render_frame(cx);
+            w.simulate_next_frame(cx);
+        }
+        assert_eq!(shark.read(cx).active_ws().unwrap().active_chat, 0);
+        assert_eq!(
+            shark.read(cx).tab_hidden(0),
+            Ordering::Less,
+            "manual scrolling stays put"
+        );
+    })
+    .unwrap();
+    on(cx, &|s, w, cx| s.select_chat(20, w, cx));
+    for width in [800., 1440., 900.] {
+        cx.simulate_window_resize(window, size(px(width), px(700.)));
+        cx.run_until_parked();
+        cx.update_window(window, |_, w, cx| {
+            for _ in 0..3 {
+                w.render_frame(cx);
+                w.simulate_next_frame(cx);
+            }
+            assert_eq!(
+                shark.read(cx).tab_hidden(20),
+                Ordering::Equal,
+                "selected tab follows resize to {width}"
+            );
+        })
+        .unwrap();
+    }
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Titlebar controls stay usable on Home and beside overflowing tabs, at either sidebar width.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn titlebar_controls(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    for width in [800., 1000., 1440.] {
+        let (window, shark) = boot(
+            cx,
+            State {
+                repos: repos.clone(),
+                ..Default::default()
+            },
+            WindowOptions {
+                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                    point(px(0.), px(0.)),
+                    size(px(width), px(700.)),
+                ))),
+                ..Default::default()
+            },
+        );
+        let press = press_in(window);
+        let on = on_app(window, shark.clone());
+        let check_controls = |cx: &mut TestAppContext, rail: bool| {
+            cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                for id in ["toggle-sidebar", "new-workspace"] {
+                    let controls = w.find_all(id);
+                    assert_eq!(controls.len(), 1, "one {id}, rail={rail}, width={width}");
+                    assert!(
+                        controls[0].visible(),
+                        "visible {id}, rail={rail}, width={width}"
+                    );
+                }
+                let toggle = w.find("toggle-sidebar").bounds();
+                if !rail {
+                    assert!(
+                        w.find("home-row").bounds().size.width < px(150.),
+                        "Home fits its label"
+                    );
+                }
+                for id in ["show-tree", "hide-tree"] {
+                    if let Some(right) = w.try_find(id) {
+                        assert_eq!(
+                            right.bounds().top(),
+                            toggle.top(),
+                            "{id} aligns with left toggle"
+                        );
+                        assert_eq!(right.bounds().size.height, toggle.size.height);
+                    }
+                }
+                assert_eq!(toggle.origin, point(px(80.), px(8.)));
+                assert_eq!(toggle.size, size(px(32.), px(28.)));
+                let titlebar = w.find("workspace-titlebar").bounds();
+                assert_eq!(titlebar.top(), px(0.));
+                assert_eq!(titlebar.size.height, px(44.));
+                assert_eq!(w.find("content-island").bounds().top(), titlebar.bottom());
+                assert!(
+                    cx.theme().notification.margins.top >= titlebar.bottom() + px(44.),
+                    "toasts clear the titlebar and workspace toolbar"
+                );
+                let create = w.find("new-workspace").bounds();
+                if rail {
+                    assert_eq!(create.left(), px(116.));
+                    assert_eq!(create.center().y, toggle.center().y);
+                    assert!(create.left() >= toggle.right());
+                } else {
+                    assert!(
+                        create.top() >= px(44.),
+                        "expanded create control is below the titlebar"
+                    );
+                    assert!(create.right() <= w.find("sidebar").bounds().right());
+                    assert_eq!(create.center().y, w.find("home-row").bounds().center().y);
+                }
+                w.click("new-workspace", cx);
+                assert!(
+                    w.has_active_dialog(cx),
+                    "create opens New workspace, rail={rail}, width={width}, tab={:?}, tools={}",
+                    shark.read(cx).tab,
+                    shark.read(cx).tree_shown()
+                );
+                w.close_dialog(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+        };
+        // The create action is available before a workspace exists, in both sidebar modes.
+        check_controls(cx, false);
+        press(cx, &["cmd-b"]);
+        check_controls(cx, true);
+        press(cx, &["cmd-b"]);
+        let name = format!("chrome-{}", width as usize);
+        on(cx, &|s, w, cx| {
+            s.create_workspace(
+                name.clone(),
+                git::on_branch(&repos, &name),
+                vec![],
+                None,
+                w,
+                cx,
+            )
+        });
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).active.as_deref() == Some(name.as_str())
+        })
+        .await;
+        for _ in 0..20 {
+            on(cx, &|s, w, cx| s.new_chat(w, cx));
+        }
+        for rail in [false, true] {
+            check_controls(cx, rail);
+            cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                let s = shark.read(cx);
+                let ws = s.active_ws().unwrap();
+                let tab = w.find(SharedString::from(format!(
+                    "chat-tab-{}",
+                    ws.chats[ws.active_chat].id
+                )));
+                let new_chat = w.find("new-chat");
+                assert_eq!(tab.bounds().top(), px(8.));
+                assert_eq!(tab.bounds().size.height, px(28.));
+                assert!(new_chat.visible(), "overflow leaves new-chat visible");
+                assert!(new_chat.bounds().left() >= tab.bounds().right());
+                assert!(new_chat.bounds().right() <= px(width - 72.));
+                if rail {
+                    assert!(tab.bounds().left() >= w.find("new-workspace").bounds().right());
+                }
+                assert_eq!(s.tab_hidden(ws.active_chat), std::cmp::Ordering::Equal);
+                w.click("new-chat", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update(|cx| {
+                let ws = shark.read(cx).active_ws().unwrap();
+                assert_eq!(ws.chats.len(), if rail { 23 } else { 22 });
+                assert_eq!(ws.active_chat, ws.chats.len() - 1);
+            });
+            if !rail {
+                press(cx, &["cmd-b"]);
+            }
+        }
+        let path = format!("api/{}.txt", "long-file-name-".repeat(10));
+        fs::write(
+            home.join("shark/workspaces").join(&name).join(&path),
+            "text\n",
+        )
+        .unwrap();
+        on(cx, &|s, w, cx| s.open_path(path.clone(), w, cx));
+        let file_tab = SharedString::from(format!("file-tab-{path}"));
+        let chat_tab = cx.update(|cx| {
+            let ws = shark.read(cx).active_ws().unwrap();
+            SharedString::from(format!("chat-tab-{}", ws.chats[ws.active_chat].id))
+        });
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.simulate_next_frame(cx); // Native frames reveal the selected tab after the file changes its viewport.
+            w.render_frame(cx);
+            let file = w.find(file_tab.clone());
+            assert_eq!(w.find("chat-tabs").role(), Some(Role::TabList));
+            assert_eq!(file.role(), Some(Role::Tab));
+            assert_eq!(file.selected(), Some(true));
+            assert_eq!(file.label(), Some(path.as_str()));
+            assert_eq!(w.find("diff-tab").selected(), Some(false));
+            assert_eq!(w.find(chat_tab.clone()).selected(), Some(false));
+            assert!(file.visible(), "the file tab survives chat overflow");
+            assert_eq!(file.bounds().top(), px(8.));
+            assert_eq!(file.bounds().size.height, px(28.));
+            assert!(file.bounds().right() <= w.find("new-chat").bounds().left());
+            assert_eq!(
+                file.bounds().size.width,
+                w.find("diff-tab").bounds().size.width
+            );
+            assert_eq!(
+                file.bounds().size.width,
+                w.find(chat_tab.clone()).bounds().size.width
+            );
+            assert!(file.bounds().right() <= w.find("workspace-titlebar").bounds().right());
+            let file_ix = shark.read(cx).active_ws().unwrap().chats.len() + 1;
+            assert_eq!(
+                shark.read(cx).tab_hidden(file_ix),
+                std::cmp::Ordering::Equal,
+                "opening a file reveals its selected tab"
+            );
+            assert_eq!(shark.read(cx).tab, Tab::File);
+            assert!(shark.read(cx).editor.is_some());
+        })
+        .unwrap();
+        on(cx, &|s, w, cx| {
+            let active = s.active_ws().unwrap().active_chat;
+            s.select_chat(active, w, cx);
+            s.show(Tab::Chat, w, cx);
+        });
+        cx.update_window(window, |_, w, cx| {
+            w.click(chat_tab.clone(), cx);
+            assert_eq!(shark.read(cx).tab, Tab::Chat);
+        })
+        .unwrap();
+        on(cx, &|s, w, cx| s.select_file(0, w, cx));
+        cx.update_window(window, |_, w, cx| {
+            w.click(file_tab.clone(), cx);
+            assert_eq!(shark.read(cx).tab, Tab::File);
+        })
+        .unwrap();
+        on(cx, &|s, w, cx| s.toggle_tree(w, cx));
+        for rail in [true, false] {
+            check_controls(cx, rail);
+            cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                let titlebar = w.find("workspace-titlebar").bounds();
+                for id in [file_tab.clone(), SharedString::from("new-chat")] {
+                    let control = w.find(id.clone());
+                    assert!(control.visible(), "visible {id} with Workspace tools open");
+                    assert!(
+                        control.bounds().left() >= titlebar.left(),
+                        "{id} inside titlebar, width={width}, rail={rail}: control={:?}, titlebar={titlebar:?}", control.bounds()
+                    );
+                    assert!(
+                        control.bounds().right() <= titlebar.right(),
+                        "{id} inside titlebar, width={width}, rail={rail}: control={:?}, titlebar={titlebar:?}", control.bounds()
+                    );
+                }
+            })
+            .unwrap();
+            if rail {
+                press(cx, &["cmd-b"]);
+            }
+        }
+        cx.update_window(window, |_, w, _| w.remove_window())
+            .unwrap();
+    }
+    fs::remove_dir_all(&home).ok();
+}
+
+/// File tabs keep independent buffers, and leaving a workspace protects hidden dirty files.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn file_tabs_preserve_buffers(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api", "web"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    for name in ["files", "other-files"] {
+        on(cx, &|s, w, cx| {
+            s.create_workspace(
+                name.into(),
+                git::on_branch(&repos, name),
+                vec![],
+                None,
+                w,
+                cx,
+            )
+        });
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).active.as_deref() == Some(name)
+        })
+        .await;
+    }
+    on(cx, &|s, w, cx| s.open_workspace(0, w, cx));
+    let dir = home.join("shark/workspaces/files");
+    for (path, text) in [
+        ("api/shared.txt", "api text\n"),
+        ("web/shared.txt", "web text\n"),
+        ("api/replacement.txt", "replacement\n"),
+        ("api/final.txt", "final\n"),
+    ] {
+        fs::write(dir.join(path), text).unwrap();
+    }
+    on(cx, &|s, w, cx| s.open_path("api/shared.txt".into(), w, cx));
+    let first = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        first.read(cx).input.read(cx).value().as_ref() == "api text\n"
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| w.input("unsaved ", cx))
+        .unwrap();
+    cx.update(|cx| assert!(first.read(cx).dirty));
+
+    // Same basename in another repository opens separately, without prompting about the first.
+    on(cx, &|s, w, cx| {
+        s.open_path_tab("web/shared.txt".into(), w, cx)
+    });
+    let second = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        second.read(cx).input.read(cx).value().as_ref() == "web text\n"
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| {
+        assert!(!w.has_active_dialog(cx));
+        assert_eq!(shark.read(cx).file_tabs.len(), 2);
+        assert_ne!(first, second);
+        assert_eq!(
+            first.read(cx).input.read(cx).value().as_ref(),
+            "unsaved api text\n"
+        );
+    })
+    .unwrap();
+    on(cx, &|s, w, cx| {
+        s.open_path_tab("api/shared.txt".into(), w, cx)
+    });
+    cx.update(|cx| {
+        assert_eq!(
+            shark.read(cx).file_tabs.len(),
+            2,
+            "opening an existing file deduplicates"
+        );
+        assert_eq!(shark.read(cx).editor.as_ref(), Some(&first));
+    });
+    on(cx, &|s, w, cx| s.select_file(1, w, cx));
+    on(cx, &|s, _, cx| s.set_vim(true, cx));
+    cx.update(|cx| assert!(first.read(cx).vim_on && second.read(cx).vim_on));
+    on(cx, &|s, _, cx| s.set_vim(false, cx));
+
+    // Ordinary opening replaces only the clean current tab, retaining a hidden dirty editor.
+    on(cx, &|s, w, cx| {
+        s.open_path("api/replacement.txt".into(), w, cx)
+    });
+    let replacement = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        replacement.read(cx).input.read(cx).value().as_ref() == "replacement\n"
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| {
+        assert!(
+            !w.has_active_dialog(cx),
+            "hidden dirty file is not being replaced"
+        );
+        assert_eq!(shark.read(cx).file_tabs.len(), 2);
+        w.input("edited ", cx);
+    })
+    .unwrap();
+    on(cx, &|s, w, cx| s.open_path("api/final.txt".into(), w, cx));
+    cx.update_window(window, |_, w, cx| assert!(w.has_active_dialog(cx)))
+        .unwrap();
+    press(cx, &["escape"]);
+    cx.update(|cx| assert_eq!(shark.read(cx).editor.as_ref(), Some(&replacement)));
+    on(cx, &|s, w, cx| s.open_path("api/final.txt".into(), w, cx));
+    press(cx, &["enter"]);
+    cx.update(|cx| {
+        assert_eq!(shark.read(cx).file_tabs.len(), 2);
+        assert_eq!(
+            shark.read(cx).editor.as_ref().unwrap().read(cx).path,
+            "api/final.txt"
+        );
+        assert!(
+            first.read(cx).dirty,
+            "discard replaces only the selected buffer"
+        );
+    });
+
+    // An in-flight save cannot be discarded by closing or leaving the workspace.
+    let saving = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
+    cx.update(|cx| saving.update(cx, |e, _| e.saving = true));
+    on(cx, &|s, w, cx| s.close_file(w, cx));
+    on(cx, &|s, w, cx| s.open_workspace(1, w, cx));
+    cx.update_window(window, |_, w, cx| {
+        assert!(
+            !w.has_active_dialog(cx),
+            "wait for the write instead of offering Discard"
+        );
+        assert_eq!(shark.read(cx).active.as_deref(), Some("files"));
+        assert_eq!(shark.read(cx).file_tabs.len(), 2);
+    })
+    .unwrap();
+    cx.update(|cx| saving.update(cx, |e, _| e.saving = false));
+    // Closing a clean tab reveals its neighbor; cancelling a dirty close retains it.
+    on(cx, &|s, w, cx| s.close_file(w, cx));
+    cx.update(|cx| {
+        assert_eq!(shark.read(cx).file_tabs.len(), 1);
+        assert_eq!(shark.read(cx).editor.as_ref(), Some(&first));
+        assert_eq!(shark.read(cx).tab, Tab::File);
+    });
+    on(cx, &|s, w, cx| s.close_file(w, cx));
+    press(cx, &["escape"]);
+    cx.update(|cx| assert_eq!(shark.read(cx).file_tabs.len(), 1));
+    on(cx, &|s, w, cx| {
+        s.open_path_tab("web/shared.txt".into(), w, cx)
+    });
+    on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+    on(cx, &|s, w, cx| {
+        s.edit_working_copy(Some("api/shared.txt".into()), w, cx)
+    });
+    cx.update(|cx| {
+        assert!(
+            shark.read(cx).editing.is_none(),
+            "inline editing refuses hidden unsaved buffers"
+        )
+    });
+    on(cx, &|s, w, cx| s.open_workspace(1, w, cx));
+    cx.update_window(window, |_, w, cx| assert!(w.has_active_dialog(cx)))
+        .unwrap();
+    press(cx, &["escape"]);
+    cx.update(|cx| {
+        assert_eq!(shark.read(cx).active.as_deref(), Some("files"));
+        assert!(first.read(cx).dirty);
+    });
+    on(cx, &|s, w, cx| s.open_workspace(1, w, cx));
+    press(cx, &["enter"]);
+    cx.update(|cx| {
+        assert_eq!(shark.read(cx).active.as_deref(), Some("other-files"));
+        assert!(shark.read(cx).file_tabs.is_empty());
+        assert!(shark.read(cx).editor.is_none());
+    });
+    assert_eq!(
+        fs::read_to_string(dir.join("api/shared.txt")).unwrap(),
+        "api text\n"
+    );
+    assert_eq!(
+        fs::read_to_string(dir.join("api/replacement.txt")).unwrap(),
+        "replacement\n"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Command-click opens a file tab from the tree, while ordinary click follows the current view.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn command_click_file_tabs(cx: &mut TestAppContext) {
+    use gpui_kit::test::TestEventExt;
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace(
+            "click-files".into(),
+            git::on_branch(&repos, "click-files"),
+            vec![],
+            None,
+            w,
+            cx,
+        )
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let dir = home.join("shark/workspaces/click-files/api");
+    fs::write(dir.join("a.txt"), "a\n").unwrap();
+    fs::write(dir.join("b.txt"), "b\n").unwrap();
+    on(cx, &|s, w, cx| {
+        s.show_tree = true;
+        s.show(Tab::Diff, w, cx);
+        s.refresh_diff(cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).diff_files.len() == 2
+    })
+    .await;
+    let click_file = |cx: &mut TestAppContext, path: &str, command: bool| {
+        let row = cx.update(|cx| {
+            shark
+                .read(cx)
+                .tree_rows
+                .iter()
+                .position(|r| r.path.as_str() == path)
+                .unwrap()
+        });
+        cx.update_window(window, |_, w, cx| {
+            w.click_with_modifiers(
+                ("tree-row", row),
+                Modifiers {
+                    platform: command,
+                    ..Default::default()
+                },
+                cx,
+            )
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    for rows in [1, 3] {
+        cx.update_window(window, |_, w, cx| {
+            w.click_with_modifiers(
+                ("tree-row", 0usize),
+                Modifiers {
+                    platform: true,
+                    ..Default::default()
+                },
+                cx,
+            );
+            assert!(
+                shark.read(cx).file_tabs.is_empty(),
+                "Command-clicking a folder only folds it"
+            );
+            assert_eq!(shark.read(cx).tree_rows.len(), rows);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+    click_file(cx, "api/a.txt", false);
+    cx.update(|cx| {
+        assert_eq!(shark.read(cx).tab, Tab::Diff);
+        assert!(shark.read(cx).file_tabs.is_empty());
+    });
+    click_file(cx, "api/a.txt", true);
+    let first = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
+    click_file(cx, "api/b.txt", true);
+    cx.update(|cx| {
+        assert_eq!(shark.read(cx).file_tabs.len(), 2);
+        assert_eq!(
+            shark.read(cx).editor.as_ref().unwrap().read(cx).path,
+            "api/b.txt"
+        );
+    });
+    click_file(cx, "api/a.txt", true);
+    cx.update(|cx| {
+        assert_eq!(shark.read(cx).file_tabs.len(), 2);
+        assert_eq!(shark.read(cx).editor.as_ref(), Some(&first));
+    });
+    // Ctrl+Tab follows the visual order and wraps through chat, Diff and both files.
+    let press = press_in(window);
+    on(cx, &|s, w, cx| s.show(Tab::Chat, w, cx));
+    for (key, tab, path) in [
+        ("ctrl-tab", Tab::Diff, None),
+        ("ctrl-tab", Tab::File, Some("api/a.txt")),
+        ("ctrl-tab", Tab::File, Some("api/b.txt")),
+        ("ctrl-tab", Tab::Chat, None),
+        ("ctrl-shift-tab", Tab::File, Some("api/b.txt")),
+        ("ctrl-shift-tab", Tab::File, Some("api/a.txt")),
+        ("ctrl-4", Tab::File, Some("api/b.txt")),
+        ("ctrl-2", Tab::Diff, None),
+        ("ctrl-1", Tab::Chat, None),
+        ("ctrl-3", Tab::File, Some("api/a.txt")),
+        ("ctrl-9", Tab::File, Some("api/a.txt")),
+    ] {
+        press(cx, &[key]);
+        cx.update(|cx| {
+            assert_eq!(shark.read(cx).tab, tab, "{key}");
+            if let Some(path) = path {
+                assert_eq!(shark.read(cx).editor.as_ref().unwrap().read(cx).path, path);
+            }
+        });
+    }
+    cx.update_window(window, |_, w, cx| {
+        w.change_modifiers(
+            Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            cx,
+        );
+    })
+    .unwrap();
+    let mut visual = VisualTestContext::from_window(window, cx);
+    for hint in ["kbd:ctrl-1", "kbd:ctrl-2", "kbd:ctrl-3", "kbd:ctrl-4"] {
+        assert!(visual.debug_bounds(hint).is_some(), "{hint}");
+    }
+    assert!(visual.debug_bounds("kbd:ctrl-5").is_none());
+    cx.update_window(window, |_, w, cx| {
+        w.change_modifiers(Modifiers::default(), cx);
+    })
+    .unwrap();
+    // A background :wq completion closes its own editor, not the newly selected file.
+    let second = cx.update(|cx| shark.read(cx).file_tabs[1].editor.clone());
+    cx.update(|cx| second.update(cx, |_, cx| cx.emit(EditorEvent::Close)));
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(shark.read(cx).file_tabs.len(), 1);
+        assert_eq!(shark.read(cx).editor.as_ref(), Some(&first));
+    });
+    click_file(cx, "api/b.txt", true);
+    on(cx, &|s, w, cx| {
+        s.select_file(0, w, cx);
+        s.tab_scroll.scroll_to_item(3);
+        cx.notify();
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.within("file-tab-api/b.txt").click("close-file-tab", cx);
+        assert_eq!(
+            shark.read(cx).editor.as_ref(),
+            Some(&first),
+            "closing a background tab preserves selection"
+        );
+        assert_eq!(shark.read(cx).file_tabs.len(), 1);
+    })
+    .unwrap();
+    click_file(cx, "api/b.txt", true);
+    // File tabs remain keyboard-closeable even after the tree takes focus.
+    on(cx, &|s, w, cx| s.focus_pane(Pane::Tree, w, cx));
+    press_in(window)(cx, &["cmd-w"]);
+    cx.update(|cx| {
+        assert_eq!(shark.read(cx).file_tabs.len(), 1);
+        assert_eq!(shark.read(cx).active_ws().unwrap().chats.len(), 1);
+    });
+    on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+    press(cx, &["cmd-w"]);
+    cx.update(|cx| {
+        assert_eq!(shark.read(cx).tab, Tab::Chat);
+        assert_eq!(
+            shark.read(cx).active_ws().unwrap().chats.len(),
+            1,
+            "closing Diff never closes the chat behind it"
+        );
+        assert_eq!(shark.read(cx).file_tabs.len(), 1);
+    });
+    // A clean retained editor cannot hide newer unsaved edits made in the diff.
+    on(cx, &|s, w, cx| {
+        s.show(Tab::Diff, w, cx);
+        s.edit_working_copy(Some("api/a.txt".into()), w, cx);
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).editing.is_some()
+    })
+    .await;
+    on(cx, &|s, w, cx| {
+        s.editing.as_mut().unwrap().dirty = true;
+        s.show(Tab::Diff, w, cx);
+    });
+    press(cx, &["ctrl-3"]);
+    cx.update(|cx| {
+        assert_eq!(
+            shark.read(cx).tab,
+            Tab::Diff,
+            "a tab switch must not bypass the inline-edit guard"
+        )
+    });
     fs::remove_dir_all(&home).ok();
 }
 
@@ -3499,6 +4204,26 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
     });
     click_scope(cx);
 
+    // The scope stays visible and usable beside Chat, even when no files are uncommitted.
+    on(cx, &|s, w, cx| s.show(Tab::Chat, w, cx));
+    for uncommitted_only in [false, true] {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.click("files-change-scope", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update_window(window, |_, w, cx| {
+            let s = shark.read(cx);
+            assert!(s.tab == Tab::Chat && s.tree_shown());
+            assert!(s.tree_focus.is_focused(w));
+            assert_eq!(s.state.uncommitted_only, uncommitted_only);
+            assert_eq!(s.diff_files.len(), if uncommitted_only { 0 } else { 3 });
+        })
+        .unwrap();
+        assert_eq!(State::load().uncommitted_only, uncommitted_only);
+    }
+
     // After a restart Files is closed, and opens at the saved width; the saved modes stay.
     cx.update_window(window, |_, w, _| w.remove_window())
         .unwrap();
@@ -3524,7 +4249,7 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
 }
 
 /// The right side beside every tab: a rail whose Diff button replaces the old Changes tab, and
-/// whose toggle expands Workspace tools in place; the sidebar toggle mirrors it, and the
+/// whose toggle expands Workspace tools in place; the sidebar toggle clears the traffic lights, and the
 /// expanded sidebar's dragged width survives a restart.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -3597,29 +4322,33 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
         toasts.unwrap() > 0,
         "the test shows a toast over where the rail is"
     );
-    // On the chat: the rail, with Diff; the top bar has no Changes tab any more.
+    // On the chat: the rail and the titlebar both offer Diff.
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Chat));
     assert!(bounds(cx, "right-rail").is_some(), "the rail by the chat");
     assert!(bounds(cx, "Changes 1").is_none(), "no Changes tab");
     assert!(bounds(cx, "hide-tree").is_none());
 
-    // Both toggles clear the traffic lights; the expanded sidebar uses the rows' half-rem inset.
+    // Both pane controls share the traffic-light row.
     let (left, right) = (
         bounds(cx, "toggle-sidebar").unwrap(),
         bounds(cx, "show-tree").unwrap(),
     );
     assert_eq!(left.size, size(px(32.), px(28.)));
     assert_eq!(right.size, left.size);
-    assert_eq!(right.top(), left.top());
-    assert_eq!(left.top(), px(34.));
-    let row_inset = cx
-        .update_window(window, |_, w, _| w.rem_size() * 0.5)
-        .unwrap();
-    assert_eq!(left.left(), row_inset);
+    assert_eq!(left.top(), px(8.));
+    assert_eq!(left.left(), px(80.));
+    assert_eq!(
+        right.top(),
+        left.top(),
+        "pane toggles share the titlebar row"
+    );
     assert_eq!(px(1440.) - right.right(), px(20.));
     let diff_button = bounds(cx, "rail-diff").unwrap();
     assert_eq!(right.center().x, diff_button.center().x);
-    assert_eq!(diff_button.top() - right.bottom(), px(16.));
+    assert_eq!(
+        diff_button.top(),
+        bounds(cx, "workspace-titlebar").unwrap().bottom() + px(16.)
+    );
 
     // Diff shows the diff; the chat tab brings the chat back.
     click(cx, "rail-diff");
@@ -3647,18 +4376,15 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
     press(cx, &["cmd-shift-d"]);
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Diff));
 
-    // Collapsed, the sidebar toggle centers over the rail's buttons; expanded, it follows the rows.
+    // The sidebar control stays put when it moves from the sidebar into the main titlebar.
     click(cx, "toggle-sidebar");
     cx.update(|cx| assert!(shark.read(cx).rail));
     let collapsed = bounds(cx, "toggle-sidebar").unwrap();
     assert_eq!(collapsed.size, left.size);
     assert_eq!(collapsed.top(), left.top());
-    assert_eq!(collapsed.left(), px(20.));
+    assert_eq!(collapsed, left);
     assert_eq!(bounds(cx, "sidebar").unwrap().size.width, px(72.));
-    assert_eq!(
-        collapsed.center().x,
-        bounds(cx, "sidebar").unwrap().center().x
-    );
+    assert!(collapsed.left() >= bounds(cx, "sidebar").unwrap().right());
     assert_eq!(bounds(cx, "show-tree"), Some(right));
     click(cx, "show-tree");
     assert_eq!(bounds(cx, "hide-tree"), Some(right));

@@ -278,7 +278,11 @@ impl Shark {
         let Some(file) = self.diff_files.iter().find(|f| *f.path() == path) else {
             return;
         };
-        if (self.editor.as_ref()).is_some_and(|e| e.read(cx).path == path && e.read(cx).dirty) {
+        if self
+            .file_tabs
+            .iter()
+            .any(|t| t.editor.read(cx).path == path && t.editor.read(cx).dirty)
+        {
             return notify_err(
                 window,
                 cx,

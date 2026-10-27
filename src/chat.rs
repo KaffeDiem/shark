@@ -2137,7 +2137,11 @@ impl Chat {
             (true, n) => format!("Working · {n} in background"),
             (false, n) => format!("{n} in background"),
         };
-        let (busy, started, model) = (self.busy && !self.asking(), self.started, self.model().to_string());
+        let (busy, started, model) = (
+            self.busy && !self.asking(),
+            self.started,
+            self.model().to_string(),
+        );
         let (queued, steered, tasks) = (self.queued(), self.steered, self.background.clone());
         line.child(
             div().w_full().max_w(px(680.)).mx_auto().child(
@@ -2232,9 +2236,11 @@ impl Chat {
         let status = |c: &Call| match (&c.result, c.is_error) {
             (None, _) => Spinner::new().with_size(px(14.)).into_any_element(),
             // Denied on purpose: approval happens in the plan pane, answers in the chat.
-            (Some(_), true) if !matches!(c.name.as_str(), "ExitPlanMode" | "AskUserQuestion") => icon(IconName::X)
-                .text_color(theme.danger_foreground)
-                .into_any_element(),
+            (Some(_), true) if !matches!(c.name.as_str(), "ExitPlanMode" | "AskUserQuestion") => {
+                icon(IconName::X)
+                    .text_color(theme.danger_foreground)
+                    .into_any_element()
+            }
             _ => icon(IconName::Check).into_any_element(),
         };
         let (mono, mono_size) = (theme.mono_font_family.clone(), theme.mono_font_size);
@@ -2260,20 +2266,25 @@ impl Chat {
                                     _ => c.name.clone(),
                                 }),
                         )
-                        .child(div().flex_1().truncate().child(
-                            match (c.name.as_str(), plan.number_of(&c.id)) {
-                                // The call's own input can be stale: claude fills
-                                // in the plan file when it asks, not when it calls.
-                                ("ExitPlanMode", Some(n)) => {
-                                    format!("v{n} · {}", plan::title(&plan.versions[n - 1].text))
-                                }
-                                ("AskUserQuestion", _) => (c.result.as_deref())
-                                    .and_then(question::answered)
-                                    .unwrap_or(&c.summary)
-                                    .to_string(),
-                                _ => c.summary.clone(),
-                            },
-                        ))
+                        .child(
+                            div().flex_1().truncate().child(
+                                match (c.name.as_str(), plan.number_of(&c.id)) {
+                                    // The call's own input can be stale: claude fills
+                                    // in the plan file when it asks, not when it calls.
+                                    ("ExitPlanMode", Some(n)) => {
+                                        format!(
+                                            "v{n} · {}",
+                                            plan::title(&plan.versions[n - 1].text)
+                                        )
+                                    }
+                                    ("AskUserQuestion", _) => (c.result.as_deref())
+                                        .and_then(question::answered)
+                                        .unwrap_or(&c.summary)
+                                        .to_string(),
+                                    _ => c.summary.clone(),
+                                },
+                            ),
+                        )
                         .child(status(c))
                         .tooltip(move |w, cx| {
                             let (input, mono) = (input.clone(), mono.clone());
@@ -2740,8 +2751,8 @@ impl Render for Chat {
             self.focus_composer(window, cx);
         }
         let asked_card = self.render_asked(window, cx);
-        self.asked_focused = asked_card.is_some()
-            && (self.asked.as_ref()).is_some_and(|a| a.focused(window, cx));
+        self.asked_focused =
+            asked_card.is_some() && (self.asked.as_ref()).is_some_and(|a| a.focused(window, cx));
         let theme = cx.theme();
         let (radius, border, card, muted) = (
             theme.radius_lg,
@@ -3660,9 +3671,11 @@ exec cat >/dev/null
             })
             .unwrap();
             // A picked answer shows for a moment before the form goes on.
-            cx.executor().advance_clock(std::time::Duration::from_millis(500));
+            cx.executor()
+                .advance_clock(std::time::Duration::from_millis(500));
             cx.run_until_parked();
-            cx.update_window(window, |_, w, cx| w.render_frame(cx)).unwrap();
+            cx.update_window(window, |_, w, cx| w.render_frame(cx))
+                .unwrap();
         };
         let ask = |cx: &mut TestAppContext, id: &str| {
             cx.update(|cx| {
@@ -3693,7 +3706,9 @@ exec cat >/dev/null
                 }
             })
         };
-        act(cx, &|w, cx| chat.update(cx, |c, cx| c.focus_composer(w, cx)));
+        act(cx, &|w, cx| {
+            chat.update(cx, |c, cx| c.focus_composer(w, cx))
+        });
         ask(cx, "1");
         act(cx, &|_, _| {});
         cx.update_window(window, |_, w, cx| {
@@ -3714,17 +3729,25 @@ exec cat >/dev/null
         cx.update_window(window, |_, w, cx| {
             let c = chat.read(cx);
             assert!(!c.asking());
-            assert!(c.composer.read(cx).focus_handle(cx).is_focused(w), "back to the composer");
+            assert!(
+                c.composer.read(cx).focus_handle(cx).is_focused(w),
+                "back to the composer"
+            );
         })
         .unwrap();
 
         // Your own text, enter in its field goes on; ↑ from the composer is the way back.
         ask(cx, "5");
         act(cx, &|_, _| {});
-        act(cx, &|w, cx| chat.update(cx, |c, cx| c.focus_composer(w, cx)));
+        act(cx, &|w, cx| {
+            chat.update(cx, |c, cx| c.focus_composer(w, cx))
+        });
         act(cx, &|w, cx| w.press("up", cx));
         cx.update_window(window, |_, w, cx| {
-            assert!(chat.read(cx).asked.as_ref().unwrap().focused(w, cx), "↑ reaches the card");
+            assert!(
+                chat.read(cx).asked.as_ref().unwrap().focused(w, cx),
+                "↑ reaches the card"
+            );
         })
         .unwrap();
         act(cx, &|w, cx| {
@@ -3757,7 +3780,10 @@ exec cat >/dev/null
         act(cx, &|_, _| {});
         cx.update_window(window, |_, w, cx| {
             let c = chat.read(cx);
-            assert!(c.composer.read(cx).focus_handle(cx).is_focused(w), "typing isn't cut off");
+            assert!(
+                c.composer.read(cx).focus_handle(cx).is_focused(w),
+                "typing isn't cut off"
+            );
         })
         .unwrap();
         act(cx, &|w, cx| w.press("enter", cx));

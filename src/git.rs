@@ -369,9 +369,12 @@ pub fn remote_branches(dir: &Path) -> Vec<(i64, String)> {
         .collect()
 }
 
+/// A repository, its own branch, and its timestamped remote branches.
+pub type RepoBranches = (String, String, Vec<(i64, String)>);
+
 /// The bases to offer for `repos` (`(repo, its own branch, remote_branches)`): every branch any
 /// of them has, newest first, with the repos that have it; a repo's own branch left out.
-pub fn base_choices(repos: &[(String, String, Vec<(i64, String)>)]) -> Vec<(String, Vec<String>)> {
+pub fn base_choices(repos: &[RepoBranches]) -> Vec<(String, Vec<String>)> {
     let mut all: Vec<(i64, &str, &str)> = (repos.iter())
         .flat_map(|(repo, own, bs)| {
             (bs.iter())
@@ -1278,8 +1281,13 @@ mod tests {
 
         // A local branch behind origin is fast-forwarded first.
         let b = root.join("ws/b");
-        let bws =
-            create_workspace(&b, "b", "behind", &on_branch(&[api.clone()], "behind")).unwrap();
+        let bws = create_workspace(
+            &b,
+            "b",
+            "behind",
+            &on_branch(std::slice::from_ref(&api), "behind"),
+        )
+        .unwrap();
         assert_eq!(git(&b.join("api"), &["rev-parse", "HEAD"]).unwrap(), tip);
         remove_workspace(&bws, &b, true).unwrap();
 
@@ -1330,7 +1338,13 @@ mod tests {
         let mine = empty_commit(a, "mine");
         git(a, &["checkout", "-q", "main"]).unwrap();
         let d = root.join("ws/d");
-        let dws = create_workspace(&d, "d", "div", &on_branch(&[api.clone()], "div")).unwrap();
+        let dws = create_workspace(
+            &d,
+            "d",
+            "div",
+            &on_branch(std::slice::from_ref(&api), "div"),
+        )
+        .unwrap();
         assert_eq!(git(&d.join("api"), &["rev-parse", "HEAD"]).unwrap(), mine);
         assert_eq!(git(a, &["rev-parse", "origin/div"]).unwrap(), theirs);
         remove_workspace(&dws, &d, true).unwrap();

@@ -741,7 +741,7 @@ impl Render for Settings {
                         })
                         .when(on, |d| d.bg(theme.accent))
                         .when(!on, |d| d.hover(|d| d.bg(theme.secondary_hover)))
-                        .child(gpui_kit::component::Icon::new(icon.clone()).with_size(px(14.)))
+                        .child(gpui_kit::component::Icon::new(*icon).with_size(px(14.)))
                         .child(*label)
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.tab = i;

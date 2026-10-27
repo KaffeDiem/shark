@@ -19,6 +19,8 @@ pub enum EditorEvent {
     Saved,
     /// Escape with nothing left to cancel: hand focus back to the file tree.
     Leave,
+    /// A completed :wq closes this editor even if another tab is now selected.
+    Close,
 }
 
 pub struct FileEditor {
@@ -37,7 +39,7 @@ pub struct FileEditor {
     pub vim: Vim,
     pub vim_on: bool,
     /// A write is in flight; reloads started before it finished are stale.
-    saving: bool,
+    pub(crate) saving: bool,
     saves: u64,
     /// `:wq` is waiting for its write to land.
     close_after_save: bool,
@@ -238,7 +240,7 @@ impl FileEditor {
                         e.conflict = false;
                         cx.emit(EditorEvent::Saved);
                         if close && !e.dirty {
-                            window.dispatch_action(Box::new(CloseFile), cx);
+                            cx.emit(EditorEvent::Close);
                         }
                     }
                     Ok(None) => e.conflict = true,

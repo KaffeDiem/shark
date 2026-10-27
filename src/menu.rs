@@ -1,6 +1,8 @@
 //! Right-click menus drawn after Linear's: 28px rows in an inset rounded highlight,
 //! muted 14px icons, 1px separators, metadata right-aligned in the muted colour.
 //! gpui-kit's `PopupMenu` hard-codes its row height, 2px separators and icon colour.
+#[cfg(test)]
+use core::prelude::v1::test;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::{ActiveTheme, Icon, Sizable as _, Theme, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
@@ -510,7 +512,6 @@ impl Render for Menu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
 
     #[test]
     fn step_skips_separators_and_wraps() {

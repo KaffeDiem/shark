@@ -217,7 +217,7 @@ fn read_tail(path: &Path) -> Vec<Ev> {
 
 /// Events stored in a transcript, up to `len` bytes: lines written after that belong to a
 /// process started while this was read, and arrive live.
-pub fn read_history(path: &PathBuf, len: u64) -> Vec<Ev> {
+pub fn read_history(path: &Path, len: u64) -> Vec<Ev> {
     read_range(path, 0, len)
 }
 

@@ -94,9 +94,12 @@ actions!(
         FocusQueue,
         NewChat,
         CloseChat,
+        CloseTab,
         ReopenChat,
         NextChat,
         PrevChat,
+        NextTab,
+        PrevTab,
         AskSide,
         OpenSide,
         CloseSide,
@@ -171,10 +174,10 @@ pub struct SetModel(pub usize);
 #[action(namespace = shark, no_json)]
 pub struct OpenWorkspace(pub usize);
 
-/// Open the nth chat tab of the current workspace (ctrl-1 is the leftmost one).
+/// Open the nth tab of the current workspace (ctrl-1 is the leftmost one).
 #[derive(Clone, PartialEq, Debug, serde::Deserialize, Action)]
 #[action(namespace = shark, no_json)]
-pub struct OpenChat(pub usize);
+pub struct OpenTab(pub usize);
 
 fn bind_keys(cx: &mut App) {
     // First, so the bindings below take precedence, as when gpui-component bound them.
@@ -241,14 +244,14 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-s", SaveFile, Some("FileEditor")),
         KeyBinding::new("cmd-w", CloseFile, Some("FileEditor")),
         KeyBinding::new("cmd-t", NewChat, None),
-        KeyBinding::new("cmd-w", CloseChat, None),
+        KeyBinding::new("cmd-w", CloseTab, None),
         KeyBinding::new("cmd-shift-t", ReopenChat, None),
         KeyBinding::new("cmd-shift-]", NextChat, None),
         KeyBinding::new("cmd-shift-[", PrevChat, None),
         KeyBinding::new("cmd-}", NextChat, None),
         KeyBinding::new("cmd-{", PrevChat, None),
-        KeyBinding::new("ctrl-tab", NextChat, None),
-        KeyBinding::new("ctrl-shift-tab", PrevChat, None),
+        KeyBinding::new("ctrl-tab", NextTab, None),
+        KeyBinding::new("ctrl-shift-tab", PrevTab, None),
         KeyBinding::new("cmd-shift-enter", AskSide, Some("Composer")),
         KeyBinding::new("escape", CloseSide, Some("SideAnswer")),
         KeyBinding::new("c", CopySide, Some("SideAnswer")),
@@ -380,7 +383,7 @@ fn bind_keys(cx: &mut App) {
     cx.bind_keys(
         (0..9).map(|i| KeyBinding::new(&format!("cmd-{}", i + 1), OpenWorkspace(i), None)),
     );
-    cx.bind_keys((0..9).map(|i| KeyBinding::new(&format!("ctrl-{}", i + 1), OpenChat(i), None)));
+    cx.bind_keys((0..9).map(|i| KeyBinding::new(&format!("ctrl-{}", i + 1), OpenTab(i), None)));
     // The Diff component's scroll actions are private; bind vim keys to them by name.
     let diff = Rc::new(KeyBindingContextPredicate::parse("(Vim > Diff) && !Input").unwrap());
     let scroll = [
@@ -438,6 +441,11 @@ fn set_dock_icon() {
 }
 
 fn main() {
+    if cfg!(test) {
+        #[cfg(all(test, feature = "test-support"))]
+        app::ui_tests::chrome_tests::render_pixels();
+        return;
+    }
     // Apps launched from Finder get a minimal PATH; borrow the login shell's so claude/gh/git
     // resolve. The dependency check shows the error.
     match deps::login_path() {
@@ -458,7 +466,10 @@ fn main() {
             menubar::init(cx);
             let options = WindowOptions {
                 window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
-                titlebar: Some(TitleBar::title_bar_options()),
+                titlebar: Some(TitlebarOptions {
+                    traffic_light_position: Some(point(px(9.), px(15.))),
+                    ..TitleBar::title_bar_options()
+                }),
                 ..Default::default()
             };
             let (window, shark) = open_window(options, cx, |window, cx| {
