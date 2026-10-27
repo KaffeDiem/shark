@@ -490,7 +490,22 @@ fn codex_live_queued() {
     let mut r = env.spawn(None);
     r.agent.send("Reply with the word ALPHA.").unwrap();
     r.agent.send("Also include the word BRAVO.").unwrap();
-    r.until(TURN, is_result);
+    assert!(
+        r.until(TURN, |e| matches!(e, Ev::Text(t) if t.contains("BRAVO"))),
+        "second queued reply never arrived"
+    );
+    assert!(r.until(TURN, |e| is_result(e) || is_exit(e)), "no Result");
+    assert!(
+        matches!(
+            r.evs.last(),
+            Some(Ev::Result {
+                is_error: false,
+                ..
+            })
+        ),
+        "queued reply did not complete successfully: {:?}",
+        r.evs.last()
+    );
     r.drain(20);
     let users: Vec<&Ev> = r.evs.iter().filter(|e| matches!(e, Ev::User(_))).collect();
     eprintln!(
@@ -519,7 +534,22 @@ fn codex_live_steer_at_end() {
     r.agent
         .send("Now reply with only the word TWO. Use no tools.")
         .unwrap();
-    r.until(TURN, |e| matches!(e, Ev::Text(t) if t.contains("TWO")));
+    assert!(
+        r.until(TURN, |e| matches!(e, Ev::Text(t) if t.contains("TWO"))),
+        "second reply never arrived"
+    );
+    assert!(r.until(TURN, |e| is_result(e) || is_exit(e)), "no Result");
+    assert!(
+        matches!(
+            r.evs.last(),
+            Some(Ev::Result {
+                is_error: false,
+                ..
+            })
+        ),
+        "second reply did not complete successfully: {:?}",
+        r.evs.last()
+    );
     r.drain(5);
     let users = r.evs.iter().filter(|e| matches!(e, Ev::User(_))).count();
     eprintln!(

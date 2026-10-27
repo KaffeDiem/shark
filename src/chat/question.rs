@@ -610,6 +610,191 @@ mod tests {
         fs::remove_file(path).unwrap();
     }
 
+    /// Real Codex reply through the form, including a failed local save and exact replay.
+    #[cfg(feature = "test-support")]
+    #[gpui_kit::test]
+    #[ignore]
+    fn live_completed_answer_retry(cx: &mut TestAppContext) {
+        use std::{
+            fs,
+            time::{Duration, Instant},
+        };
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("SHARK_CODEX");
+        }
+        crate::state::TEST_HOME.get_or_init(|| {
+            std::env::temp_dir().join(format!("shark-live-answer-{}", std::process::id()))
+        });
+        cx.update(gpui_kit::init);
+        let ws = Workspace {
+            name: format!("live-answer-{}", std::process::id()),
+            ..Default::default()
+        };
+        fs::create_dir_all(ws.dir()).unwrap();
+        let meta = ChatMeta {
+            id: ws.name.clone(),
+            model: Some("codex:gpt-6.1-sol".into()),
+            effort: Some("low".into()),
+            plan: true,
+            ..Default::default()
+        };
+        let path = agent::transcript_path(&meta.id);
+        fs::create_dir_all(&path).unwrap();
+        let (window, chat) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| Chat::new(ws.clone(), meta.clone(), false, w, cx))
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        // Separate wire records so the injected local-answer failure cannot lose live events.
+        let wire = ChatMeta {
+            id: format!("{}-wire", meta.id),
+            ..meta.clone()
+        };
+        let (mut process, rx) = agent::spawn(&ws, &wire).unwrap();
+        process.send("Use request_user_input exactly once to ask for a public synthetic test marker, offering options Red and Blue. The user will give their own text instead. Once answered, reply only with the final four digits of that marker. Never repeat the full marker or write it anywhere.").unwrap();
+        chat.update(cx, |c, _| {
+            c.agent = Some(process);
+            c.agent_model = meta.model.clone();
+        });
+        const SENTINEL: &str = "SHARK_SYNTHETIC_7391";
+        let end = Instant::now() + Duration::from_secs(180);
+        let (mut requests, mut completed, mut response) = (0, false, String::new());
+        while Instant::now() < end {
+            let ev = match rx.try_recv() {
+                Ok(ev) => ev,
+                Err(e) if e.is_closed() => panic!("live Codex channel closed before completion"),
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+            };
+            match &ev {
+                Ev::Text(text) | Ev::Plan { text, .. } => response.push_str(text),
+                Ev::Result { is_error, text, .. } => {
+                    assert!(!is_error, "{text}");
+                    completed = true;
+                }
+                Ev::Exited(error) => panic!("live Codex exited: {error}"),
+                _ => {}
+            }
+            chat.update(cx, |c, cx| c.apply(ev, cx));
+            if cx.update(|cx| chat.read(cx).asking()) {
+                requests += 1;
+                assert_eq!(requests, 1, "the service must ask exactly once");
+                cx.update_window(window, |_, w, cx| {
+                    chat.update(cx, |c, cx| {
+                        let asked = c.asked.as_ref().unwrap();
+                        assert_eq!(asked.qs.len(), 1);
+                        assert!(!asked.qs[0].secret, "this live question is public");
+                        c.build_asked(w, cx);
+                        c.asked_form().unwrap().update(cx, |form, cx| {
+                            form.set_answer(
+                                "0",
+                                QuestionnaireAnswer::new().with_freeform(SENTINEL),
+                                w,
+                                cx,
+                            )
+                            .unwrap();
+                            assert!(form.submit(w, cx));
+                        });
+                    });
+                })
+                .unwrap();
+                cx.run_until_parked();
+                chat.update(cx, |c, _| {
+                    assert!(
+                        !c.asking(),
+                        "production form submission answered the service"
+                    );
+                    assert!(c.history_save_error.is_some());
+                    assert_eq!(c.completed_answers.len(), 1);
+                });
+            }
+            if completed {
+                break;
+            }
+        }
+        chat.update(cx, |c, _| c.agent = None);
+        let stop_by = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < stop_by && !rx.is_closed() {
+            let _ = rx.try_recv();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(rx.is_closed(), "live Codex reader must stop before cleanup");
+        assert!(completed, "live Codex did not finish within 180 seconds");
+        assert_eq!(requests, 1);
+        assert_eq!(
+            response.trim(),
+            "7391",
+            "service must use the real answer without echoing it"
+        );
+        assert!(
+            !fs::read_to_string(agent::transcript_path(&wire.id))
+                .unwrap()
+                .contains(SENTINEL)
+        );
+        fs::remove_dir(&path).unwrap();
+        chat.update(cx, |c, cx| {
+            c.retry_history(cx);
+            c.retry_history(cx);
+            assert!(c.history_save_error.is_none());
+            assert!(c.completed_answers.is_empty());
+        });
+        let stored = fs::read_to_string(&path).unwrap();
+        assert!(
+            stored.contains(SENTINEL),
+            "public answers must be preserved"
+        );
+        assert_eq!(
+            stored.lines().count(),
+            2,
+            "retry must store the answer exactly once"
+        );
+        let history = agent::read_history(&path, u64::MAX);
+        chat.update(cx, |c, cx| {
+            let live = c
+                .blocks
+                .iter()
+                .find_map(|b| match b {
+                    Block::Tool(t) if t.name == "AskUserQuestion" => {
+                        Some((t.input.clone(), t.result.clone(), t.summary.clone()))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert!(live.2.contains(SENTINEL));
+            c.blocks.clear();
+            for ev in history {
+                c.apply(ev, cx);
+            }
+            let Block::Tool(replayed) = &c.blocks[0] else {
+                panic!("missing replayed answer")
+            };
+            assert_eq!(
+                (
+                    replayed.input.clone(),
+                    replayed.result.clone(),
+                    replayed.summary.clone()
+                ),
+                live
+            );
+        });
+        fs::remove_file(path).unwrap();
+        fs::remove_file(agent::transcript_path(&wire.id)).unwrap();
+        let _ = fs::remove_file(
+            crate::state::support_dir()
+                .join("logs")
+                .join(format!("{}.stderr.log", wire.id)),
+        );
+        fs::remove_dir_all(ws.dir()).unwrap();
+    }
+
     #[test]
     fn answers_go_back_in_each_agents_shape() {
         let input = json!({"questions": [
