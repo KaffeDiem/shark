@@ -357,6 +357,7 @@ pub(crate) fn render_pixels() {
     render_app_switcher_pixels(&mut cx);
     super::workspace_picker_tests::render_pixels(&mut cx);
     super::navigation_pixels::render_pixels(&mut cx);
+    super::tree_pixels::render_pixels(&mut cx);
 }
 
 /// Render the real Shark overlay, including scrolling the last app into a narrow window.

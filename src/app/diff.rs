@@ -1160,6 +1160,14 @@ impl Shark {
         let r = &self.tree_rows[ix];
         let selected = ix == self.tree_sel;
         let open_file = self.editor.as_ref().map(|e| e.read(cx).path.clone());
+        let depth = r.depth;
+        let next_depth = self.tree_rows.get(ix + 1).map_or(0, |r| r.depth);
+        let guide = theme.border;
+        let folder_color = if selected && focused {
+            theme.foreground
+        } else {
+            theme.sidebar_foreground
+        };
         // `uniform_list` rows: no margin, so the 30px height is the pitch.
         let row = side_row(theme)
             .id(("tree-row", ix))
@@ -1196,6 +1204,35 @@ impl Shark {
                     };
                     this.show_menu(e.position, entries, w, cx);
                 }),
+            )
+            .child(
+                // Paint only: no hitbox, and cover the row borders to keep virtualized segments joined.
+                canvas(
+                    |_, _, _| {},
+                    move |bounds, _, window, _| {
+                        for ancestor in 0..depth {
+                            let height: f32 = if next_depth > ancestor { 30. } else { 15. };
+                            let top = if selected && focused { 1. } else { 0. };
+                            let bottom = if selected && focused {
+                                height.min(29.)
+                            } else {
+                                height
+                            };
+                            window.paint_quad(fill(
+                                Bounds::new(
+                                    bounds.origin + point(px(16. + 12. * ancestor as f32), px(top)),
+                                    size(px(1.), px(bottom - top)),
+                                ),
+                                guide,
+                            ));
+                        }
+                    },
+                )
+                .absolute()
+                .top(px(-1.))
+                .left(px(-1.))
+                .w_full()
+                .h(px(30.)),
             );
         let Some(file) = r.file else {
             let open = !self.collapsed_dirs.contains(&r.path);
@@ -1208,10 +1245,19 @@ impl Shark {
                         } else {
                             IconName::ChevronRight
                         })
-                        .with_size(px(14.)),
+                        .with_size(px(14.))
+                        .text_color(folder_color),
                     ),
                 )
-                .child(div().flex_1().truncate().child(r.name.clone()))
+                .child(
+                    div()
+                        .id(("tree-label", ix))
+                        .test_support()
+                        .flex_1()
+                        .truncate()
+                        .text_color(folder_color)
+                        .child(r.name.clone()),
+                )
                 .child(self.dir_viewed_box(ix, &r.path, cx))
                 .into_any_element();
         };
@@ -1231,6 +1277,8 @@ impl Shark {
             )
             .child(
                 div()
+                    .id(("tree-label", ix))
+                    .test_support()
                     .flex_1()
                     .truncate()
                     .text_color(match state {
@@ -1238,7 +1286,19 @@ impl Shark {
                         _ => theme.foreground,
                     })
                     .when(is_open, |d| d.font_weight(FontWeight::MEDIUM))
-                    .child(r.name.clone()),
+                    .child(
+                        StyledText::new(r.name.clone()).with_highlights(r.name.rfind('/').map(
+                            |slash| {
+                                (
+                                    0..slash + 1,
+                                    HighlightStyle {
+                                        color: Some(theme.sidebar_foreground),
+                                        ..Default::default()
+                                    },
+                                )
+                            },
+                        )),
+                    ),
             )
             .when(self.uncommitted.contains(f.path().as_str()), |d| {
                 d.child(

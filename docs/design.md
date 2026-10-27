@@ -22,7 +22,7 @@ Read this before adding or changing UI. Shark's look is modeled on Linear: a cal
 | `background` | `#121213` | `#f9f9fa` | The content island |
 | `border` | `#232426` | `#dedede` | Island edge, header divider, cards. Use sparingly |
 | `foreground` | `#e8e9eb` | `#2f2f31` | Body text, titles, active tab label |
-| `sidebar_foreground` | `#8f8f91` | `#656567` | Inactive left-navigation labels, metadata, headers and ordinary icons, expanded or rail |
+| `sidebar_foreground` | `#8f8f91` | `#656567` | Inactive left-navigation labels, metadata, headers and ordinary icons, expanded or rail; right-pane folder labels, chevrons and file path prefixes |
 | `muted_foreground` | `#c8c8cb` | `#535355` | Secondary text people read: section headers, tool summaries, metadata, repo names |
 | `faint(theme)` | `#7f7f81` | `#959597` | `muted_foreground` 60% over `background`. Hints (empty-state hints) and idle/decorative icons only. Never information |
 | `side_hover(theme)` | `#19191a` | `#e9e9ea` | `foreground` 7% (dark) / 3% (light) over `sidebar`. Row hover in both side panes |
@@ -40,7 +40,7 @@ Read this before adding or changing UI. Shark's look is modeled on Linear: a cal
 | `link` | `#a8b1ff` | `#4061da` | Links in markdown |
 
 ### Contrast rules
-Except for dimmed left navigation, measure APCA (Lc) against **every surface the text can sit on**, including hover and selected rows (`background`, `sidebar`, `secondary`, `muted`, `list_active`, `list_hover`, `sidebar_accent`, `side_hover`, `side_on`):
+Except for dimmed navigation and file-tree paths, measure APCA (Lc) against **every surface the text can sit on**, including hover and selected rows (`background`, `sidebar`, `secondary`, `muted`, `list_active`, `list_hover`, `sidebar_accent`, `side_hover`, `side_on`):
 
 | Text | Minimum | Current lowest |
 |---|---|---|
@@ -49,7 +49,7 @@ Except for dimmed left navigation, measure APCA (Lc) against **every surface the
 | Status text and links | Lc 60 | 61.0 dark, 60.1 light |
 | Hints (`faint`), never essential | Lc 30 | 33.0 dark, 38.5 light |
 
-Left navigation uses `sidebar_foreground` at **WCAG 2 contrast ≥ 4.5:1** on normal, hover, selected and drop-target backgrounds. Generated themes blend `muted_foreground` 30% toward `sidebar`, then raise contrast to that floor. `python3 docs/themes.py` validates every theme, including Linear. This exception does not change the APCA rules elsewhere, including the right pane.
+Left navigation and right-pane file-tree folder labels, chevrons and path prefixes use `sidebar_foreground` at **WCAG 2 contrast ≥ 4.5:1** on normal, hover, selected and drop-target backgrounds. Generated themes blend `muted_foreground` 30% toward `sidebar`, then raise contrast to that floor. Both panes share these surfaces, so `python3 docs/themes.py` validates every theme, including Linear. This exception does not change the APCA rules for filenames or other text elsewhere.
 
 The displayed destination (Home or workspace) and keyboard-focused cursor rows use `foreground` for labels and ordinary icons; active/focused workspace metadata keeps `muted_foreground`. The cursor retains its focus ring, hover keeps its background, and inline naming fields use full foreground. Warning/unread icons and running spinners keep their status colors. Apply foreground colors locally, never whole-row opacity or shared side-row defaults.
 
@@ -87,6 +87,8 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 - **Sidebar rail:** `cmd-b` shrinks the sidebar to a 72px rail with 32px icon buttons and tooltips; opening, selecting, and closing files preserve the sidebar’s current state. The toggle moves into the titlebar at the same window position, followed by Commands and New workspace. Expanded, Commands and New workspace sit to the right of the content-sized Home button, with a 4px gap between them. Commands uses the Command icon and the “Commands (cmd-k)” tooltip and accessibility label. Home shows its `cmd-0` hint only while Command alone is held. Both create buttons run the existing `cmd-n` action.
 - **Workspace tools pane:** the right side pane, on `sidebar` like the left one: a `side_header`-styled title, then the Diff side row (the pill while its tab shows; badges `text_xs` `muted_foreground`), then the file tree. The expanded pane and rail each start with a 44px titlebar, centering the 28px toggle at the same height as the left toggle. The rail mirrors the left one with `rail_button`.
 - **File tree:** 260px column on the right of the Diff and file views, a `Files` header (`side_header` styling, "n/m viewed" right-aligned, no divider), 30px side rows indented 12px per level (16px icons; a folder's 14px chevron sits in a 16px slot), the selected row with the pill, then the `v` checkbox (a folder's box is ticked when all its files are viewed and toggles them all). Folders first; single-child folders are joined.
+  - Draw decorative 1px vertical guides in `border` at each ancestor's chevron center, from beneath its folder row to the center of its last visible descendant; no horizontal branches. Derive each virtualized row's segments from its depth and the next visible row's depth, including after filtering or folding.
+  - Folder labels and chevrons use `sidebar_foreground`, brightening to `foreground` only when selected with tree focus. Compact file labels dim everything through the final `/` with styled text inside the existing truncated label. Filenames keep their viewed color and open-file weight; status dots, counts, checkboxes, selection backgrounds and focus rings keep their existing treatment. Never dim a whole row.
 - **Menus** (right-click menus and dropdowns, not the menu bar): `src/menu.rs`, drawn after Linear's menus (gpui-kit's `PopupMenu` hard-codes 26px rows, 2px separators and full-colour icons). Right-click on sidebar rows opens one at the mouse. A dropdown hangs from the button that opens it (`menu::open_at` with the anchor corner): the git menu under its chevron, the model menu above the composer's model button (also cmd-/; Claude's models, a separator, then Codex's, with a hint naming the backend where the label doesn't), each starting on the current choice. Typing letters jumps to the row that starts with them, as in a Mac menu. The composer's completions use the same `menu::chrome` and `menu::highlight`.
   - `popover` surface, 12px `theme.radius_lg` corners, `p(6px)`, measured from contents and normally 200–440px wide, constrained to an 8px window margin. Keep the 10% `foreground` ring plus soft shadow instead of a border. Labels 14px; hints `text_sm` `muted_foreground`. Completion popups retain their existing `menu::chrome` corners.
   - 32px rows (`menu::ROW_H`), `px(10px) gap(8px)`, highlight an inset 8px `theme.radius` pill in 7% `foreground`; the text color doesn't change. Mouse and arrow keys share one highlight.
