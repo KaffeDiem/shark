@@ -1745,6 +1745,7 @@ impl Render for GitSync {
                 // the "ago" times are current.
                 div()
                     .id("git-next-tip")
+                    .min_w_0()
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(|s, _: &MouseDownEvent, w, cx| s.open_menu(w, cx)),
@@ -1755,6 +1756,8 @@ impl Render for GitSync {
                     })
                     .child(
                         Button::new("git-next")
+                            .w_full()
+                            .min_w_0()
                             .small()
                             .h(px(28.))
                             .px(px(10.))
@@ -1770,6 +1773,7 @@ impl Render for GitSync {
             .child(
                 div()
                     .relative()
+                    .flex_none()
                     .child(
                         Button::new("git-menu")
                             .small()

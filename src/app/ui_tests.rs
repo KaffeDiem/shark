@@ -4209,6 +4209,7 @@ async fn home_checklist(cx: &mut TestAppContext) {
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
+    use gpui_kit::test::TestEventExt;
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
     let repos = repos(&home, &["api"]);
@@ -4257,7 +4258,49 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
         assert!(s.tree_shown(), "Files opens inside the Diff artifact");
         assert_eq!(s.diff.read(cx).mode(), DiffMode::Split, "split by default");
     });
-    // `s` flips Split / Unified, and the choice persists.
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        for (id, name, pressed) in [
+            ("uncommitted-only", "Uncommitted changes only", false),
+            ("diff-mode", "Unified diff", false),
+            ("files-toggle", "Files", true),
+        ] {
+            let control = w.find(id);
+            assert_eq!(control.label(), Some(name));
+            assert_eq!(control.checked(), Some(pressed));
+        }
+        assert_eq!(w.find_all("uncommitted-only").len(), 1);
+        assert!(w.try_find("files-change-scope").is_none());
+        let empty = w.find("workspace-toolbar-empty").bounds();
+        assert!(empty.size.width > px(0.));
+        assert_eq!(empty.size.height, px(43.)); // 44px header minus its border
+        w.pointer_down(empty.center(), MouseButton::Left, cx);
+        assert_eq!(
+            shark.read(cx).chrome_pressed.get(),
+            Some("workspace-toolbar-empty")
+        );
+        w.pointer_up(empty.center(), MouseButton::Left, cx);
+        assert_eq!(shark.read(cx).chrome_pressed.get(), None);
+        w.click("diff-mode", cx);
+        w.render_frame(cx);
+        assert_eq!(w.find("diff-mode").checked(), Some(true));
+        w.click("diff-mode", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| w.right_click("uncommitted-only", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| assert!(shark.read(cx).menu.is_some()));
+    cx.update_window(window, |_, w, cx| w.render_frame(cx))
+        .unwrap();
+    press(cx, &["escape"]);
+    cx.update(|cx| {
+        assert!(shark.read(cx).menu.is_none());
+        assert!(!shark.read(cx).state.uncommitted_only);
+    });
+    // `s` flips Split / Unified from the diff, and the choice persists.
+    on(cx, &|s, w, cx| s.focus_diff(w, cx));
     press(cx, &["s"]);
     cx.update(|cx| assert_eq!(shark.read(cx).diff.read(cx).mode(), DiffMode::Unified));
     assert!(State::load().unified);
@@ -4330,6 +4373,11 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
         cx.update_window(window, |_, w, cx| {
             w.render_frame(cx);
             w.click("uncommitted-only", cx);
+            w.render_frame(cx);
+            assert_eq!(
+                w.find("uncommitted-only").checked(),
+                Some(shark.read(cx).state.uncommitted_only)
+            );
         })
         .unwrap();
         cx.run_until_parked();
@@ -4375,10 +4423,14 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
     on(cx, &|s, w, cx| {
         s.edit_working_copy(Some("api/a.md".into()), w, cx);
         s.editing.as_mut().unwrap().dirty = true;
-        s.toggle_uncommitted(w, cx);
-        assert!(w.has_active_dialog(cx));
-        assert!(s.state.uncommitted_only && s.editing.is_some());
     });
+    click_scope(cx);
+    cx.update_window(window, |_, w, cx| {
+        assert!(w.has_active_dialog(cx));
+        let s = shark.read(cx);
+        assert!(s.state.uncommitted_only && s.editing.is_some());
+    })
+    .unwrap();
     press(cx, &["escape"]);
     on(cx, &|s, _, cx| {
         s.editing.as_mut().unwrap().dirty = false;
@@ -4418,17 +4470,13 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
     });
     click_scope(cx);
 
-    // The internal scope remains usable even when no files are uncommitted.
+    // The single header scope works with Files hidden, including an empty diff.
+    press(cx, &["cmd-alt-b"]);
     for uncommitted_only in [false, true] {
-        cx.update_window(window, |_, w, cx| {
-            w.render_frame(cx);
-            w.click("files-change-scope", cx);
-        })
-        .unwrap();
-        cx.run_until_parked();
+        click_scope(cx);
         cx.update_window(window, |_, w, cx| {
             let s = shark.read(cx);
-            assert!(s.tab == Tab::Diff && s.tree_shown());
+            assert!(s.tab == Tab::Diff && !s.tree_shown());
             assert!(s.diff.read(cx).focus_handle(cx).is_focused(w));
             assert_eq!(s.state.uncommitted_only, uncommitted_only);
             assert_eq!(s.diff_files.len(), if uncommitted_only { 0 } else { 3 });
@@ -4542,7 +4590,9 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
         "hide-tree",
         "tools-diff",
         "file-tree",
-        "files-change-scope",
+        "uncommitted-only",
+        "diff-mode",
+        "files-toggle",
     ] {
         assert!(bounds(cx, id).is_none(), "absent on Chat: {id}");
     }
