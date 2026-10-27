@@ -2,6 +2,51 @@
 use super::*;
 use std::cmp::Ordering;
 
+/// The visible strip owns its ordering: chats, optional Diff, then files.
+struct VisibleTabs {
+    chats: usize,
+    diff: bool,
+    files: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum VisibleTab {
+    Chat(usize),
+    Diff,
+    File(usize),
+}
+
+impl VisibleTabs {
+    fn file_start(&self) -> usize {
+        self.chats + usize::from(self.diff)
+    }
+
+    fn len(&self) -> usize {
+        self.file_start() + self.files
+    }
+
+    fn get(&self, ix: usize) -> Option<VisibleTab> {
+        if ix < self.chats {
+            Some(VisibleTab::Chat(ix))
+        } else if self.diff && ix == self.chats {
+            Some(VisibleTab::Diff)
+        } else if ix < self.len() {
+            Some(VisibleTab::File(ix - self.file_start()))
+        } else {
+            None
+        }
+    }
+
+    fn index(&self, tab: VisibleTab) -> Option<usize> {
+        match tab {
+            VisibleTab::Chat(ix) if ix < self.chats => Some(ix),
+            VisibleTab::Diff if self.diff => Some(self.chats),
+            VisibleTab::File(ix) if ix < self.files => Some(self.file_start() + ix),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct DraggedChat {
     workspace: String,
@@ -24,20 +69,26 @@ pub(super) fn dot(inset: f32, theme: &Theme) -> Div {
 }
 
 impl Shark {
+    fn visible_tabs(&self, ws: &Workspace) -> VisibleTabs {
+        VisibleTabs {
+            chats: ws.chats.len(),
+            diff: !ws.diff_closed,
+            files: self.file_tabs.len(),
+        }
+    }
+
     fn active_tab_index(&self) -> Option<usize> {
         let ws = self.active_ws()?;
-        Some(match self.tab {
-            Tab::Chat => ws.active_chat,
-            Tab::Diff => ws.chats.len(),
-            Tab::File => {
-                ws.chats.len()
-                    + 1
-                    + self
-                        .file_tabs
-                        .iter()
-                        .position(|t| Some(&t.editor) == self.editor.as_ref())?
-            }
-        })
+        let tab = match self.tab {
+            Tab::Chat => VisibleTab::Chat(ws.active_chat),
+            Tab::Diff => VisibleTab::Diff,
+            Tab::File => VisibleTab::File(
+                self.file_tabs
+                    .iter()
+                    .position(|t| Some(&t.editor) == self.editor.as_ref())?,
+            ),
+        };
+        self.visible_tabs(ws).index(tab)
     }
 
     pub(super) fn reveal_tab(&self) {
@@ -80,6 +131,7 @@ impl Shark {
             window,
             move |this, chat, ev: &ChatEvent, window, cx| match ev {
                 ChatEvent::Meta => this.save_meta(chat, cx),
+                ChatEvent::GitReviewsSent(_) => {} // GitSync records these.
                 ChatEvent::Picked => {
                     // The level the chat runs at, so an old chat with none doesn't clear it.
                     let m = &chat.read(cx).meta;
@@ -163,14 +215,7 @@ impl Shark {
         if let Some(sync) = self.syncs.get(&ws.name) {
             sync.update(cx, |g, cx| g.set_chat(chat.clone(), cx));
         }
-        if self.tab == Tab::Diff {
-            self.tab = Tab::Chat;
-        }
-        // cmd-t, cmd-shift-t, next/prev chat on Home: show the chat they acted on.
-        if self.home.on {
-            self.home.on = false;
-            self.remember_open();
-        }
+        self.show(Tab::Chat, window, cx);
         chat.update(cx, |c, cx| c.focus_composer(window, cx));
         cx.notify();
     }
@@ -220,25 +265,20 @@ impl Shark {
             return self.cycle_chat(d, window, cx);
         }
         let Some(ws) = self.active_ws() else { return };
-        let chats = ws.chats.len();
         let Some(active) = self.active_tab_index() else {
             return;
         };
-        let next =
-            (active as isize + d).rem_euclid((chats + 1 + self.file_tabs.len()) as isize) as usize;
+        let next = (active as isize + d).rem_euclid(self.visible_tabs(ws).len() as isize) as usize;
         self.select_tab(next, window, cx);
     }
 
     pub(super) fn select_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ws) = self.active_ws() else { return };
-        let chats = ws.chats.len();
-        if ix < chats {
-            self.show(Tab::Chat, window, cx);
-            self.select_chat(ix, window, cx);
-        } else if ix == chats {
-            self.show(Tab::Diff, window, cx);
-        } else {
-            self.select_file(ix - chats - 1, window, cx);
+        match self.visible_tabs(ws).get(ix) {
+            Some(VisibleTab::Chat(ix)) => self.select_chat(ix, window, cx),
+            Some(VisibleTab::Diff) => self.show(Tab::Diff, window, cx),
+            Some(VisibleTab::File(ix)) => self.select_file(ix, window, cx),
+            None => {}
         }
     }
 
@@ -266,7 +306,7 @@ impl Shark {
         }
         match self.tab {
             Tab::File => self.close_file(window, cx),
-            Tab::Diff => self.show(Tab::Chat, window, cx),
+            Tab::Diff => self.close_diff(window, cx),
             Tab::Chat => self.close_chat(window, cx),
         }
     }
@@ -278,34 +318,67 @@ impl Shark {
         if self.home_shown() {
             return;
         }
-        let Some(chat) = self.active_chat().cloned() else {
-            return;
+        let Some(ws) = self.active_ws() else { return };
+        let (name, id) = (ws.name.clone(), ws.chats[ws.active_chat].id.clone());
+        self.close_chat_by_id(&name, &id, window, cx);
+    }
+
+    fn close_chat_by_id(
+        &mut self,
+        workspace: &str,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let chat = self.chats.get(id).filter(|chat| chat.read(cx).working());
+        let Some(chat) = chat else {
+            return self.close_chat_now(workspace, id, window, cx);
         };
-        if !chat.read(cx).working() {
-            return self.close_chat_now(window, cx);
-        }
+        let title = chat.read(cx).title();
+        let (workspace, id) = (workspace.to_string(), id.to_string());
         confirm(
-            format!("Stop and close “{}”?", chat.read(cx).title()),
+            format!("Stop and close “{title}”?"),
             "The agent is still running in this chat. Closing stops it; cmd-shift-t reopens the chat.",
             "Stop and close",
-            Self::close_chat_now,
+            move |s, w, cx| s.close_chat_now(&workspace, &id, w, cx),
             window,
             cx,
         );
     }
 
-    fn close_chat_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn close_chat_now(
+        &mut self,
+        workspace: &str,
+        id: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let fresh = self.state.new_chat(String::new());
-        let Some(ws) = self.active_ws_mut() else {
+        let Some(ws) = self
+            .state
+            .workspaces
+            .iter_mut()
+            .find(|ws| ws.name == workspace)
+        else {
             return;
         };
-        let ix = ws.active_chat;
+        let Some(ix) = ws.chats.iter().position(|c| c.id == id) else {
+            return;
+        };
+        let selected = ws.chats[ws.active_chat].id.clone();
+        let fresh_id = ws.next_chat_id();
         let meta = ws.chats.remove(ix);
         if ws.chats.is_empty() {
-            let id = ws.next_chat_id();
-            ws.chats.push(ChatMeta { id, ..fresh });
+            ws.chats.push(ChatMeta {
+                id: fresh_id,
+                ..fresh
+            });
         }
-        ws.active_chat = ix.min(ws.chats.len() - 1);
+        ws.active_chat = ws
+            .chats
+            .iter()
+            .position(|c| c.id == selected)
+            .unwrap_or_else(|| ix.min(ws.chats.len() - 1));
         let next = ws.active_chat;
         // No session can also mean one just dropped (a backend switch): the transcript tells.
         let untouched =
@@ -335,7 +408,37 @@ impl Shark {
         {
             sync.update(cx, |g, cx| g.remove_chat(&chat, cx)); // the last ref; dropping stops claude
         }
-        self.select_chat(next, window, cx);
+        if self.active.as_deref() == Some(workspace) && selected == id {
+            if self.tab == Tab::Chat && !self.home_shown() {
+                self.select_chat(next, window, cx);
+            } else {
+                let ws = self.active_ws().cloned().unwrap();
+                let chat = self.ensure_chat(&ws, &ws.chats[next], window, cx);
+                if let Some(sync) = self.syncs.get(workspace) {
+                    sync.update(cx, |g, cx| g.set_chat(chat, cx));
+                }
+            }
+        }
+        cx.notify();
+    }
+
+    pub(super) fn close_diff(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.active.clone() else {
+            return;
+        };
+        self.confirm_discard(false, true, window, cx, move |s, w, cx| {
+            if s.active.as_ref() != Some(&name) {
+                return;
+            }
+            s.end_edit(cx);
+            s.active_ws_mut().unwrap().diff_closed = true;
+            s.state.save();
+            if s.tab == Tab::Diff {
+                let ix = s.active_ws().unwrap().active_chat;
+                s.select_chat(ix, w, cx);
+            }
+            cx.notify();
+        });
     }
 
     /// cmd-shift-t: brings back the most recently closed chat, or a picked one.
@@ -394,9 +497,7 @@ impl Shark {
         let Some(chat) = self.active_chat().cloned() else {
             return notify_err(window, cx, "Open a workspace first");
         };
-        if self.tab == Tab::Diff {
-            self.tab = Tab::Chat;
-        }
+        self.show(Tab::Chat, window, cx);
         chat.update(cx, |c, cx| c.open_side(window, cx));
         cx.notify();
     }
@@ -563,7 +664,7 @@ impl Shark {
         ws: &Workspace,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let mut hidden: Vec<usize> = (0..ws.chats.len() + 1 + self.file_tabs.len())
+        let mut hidden: Vec<usize> = (0..self.visible_tabs(ws).len())
             .filter(|&ix| self.tab_hidden(ix) == edge)
             .collect();
         if edge == Ordering::Less {
@@ -621,7 +722,6 @@ impl Shark {
             .map(|(ix, meta)| {
                 let chat = self.chats.get(&meta.id).map(|c| c.read(cx));
                 let on = ix == ws.active_chat && self.tab == Tab::Chat;
-                let current = ix == ws.active_chat;
                 let label: SharedString = match (many, chat) {
                     (false, _) => "Chat".into(),
                     (true, Some(c)) => c.title(),
@@ -660,8 +760,7 @@ impl Shark {
                     .aria_label(label.clone())
                     .flex_none()
                     .pl_2p5()
-                    .when(!(many && current), |d| d.pr_2p5())
-                    .when(many && current, |d| d.pr_1())
+                    .pr_1()
                     .on_drag(
                         DraggedChat {
                             workspace: ws.name.clone(),
@@ -688,7 +787,6 @@ impl Shark {
                     })
                     .on_click(cx.listener(move |this, _, window, cx| {
                         this.select_chat(ix, window, cx);
-                        this.show(Tab::Chat, window, cx);
                     }))
                     .on_mouse_down(
                         MouseButton::Right,
@@ -701,36 +799,61 @@ impl Shark {
                     .child(icon)
                     .child(tab_label(label.clone(), on, theme))
                     .tooltip(move |w, cx| Tooltip::new(label.clone()).build(w, cx))
-                    .when(many && current, |d| {
-                        d.child(
-                            crate::settings::close_button("close-chat", "Close chat (cmd-w)")
-                                .on_click(cx.listener(|this, _, window, cx| {
-                                    cx.stop_propagation();
-                                    this.close_chat(window, cx)
-                                })),
-                        )
-                    })
+                    .child(
+                        div()
+                            .flex_none()
+                            .invisible()
+                            .group_hover("titlebar-tab", |s| s.visible())
+                            .child(
+                                crate::settings::close_button("close-chat", "Close chat (cmd-w)")
+                                    .on_click({
+                                        let (workspace, id) = (ws.name.clone(), meta.id.clone());
+                                        cx.listener(move |this, _, window, cx| {
+                                            cx.stop_propagation();
+                                            this.close_chat_by_id(&workspace, &id, window, cx)
+                                        })
+                                    }),
+                            ),
+                    )
                     .test_support()
                     .into_any_element()
             })
             .collect();
-        pills.push(
-            pill("diff-tab", self.tab == Tab::Diff, theme)
-                .aria_label("Diff")
-                .px_2p5()
-                .on_click(cx.listener(|this, _, w, cx| this.show(Tab::Diff, w, cx)))
-                .child(if ctrl_held && ws.chats.len() < 9 {
-                    kbd(&format!("ctrl-{}", ws.chats.len() + 1)).into_any_element()
-                } else {
-                    Icon::new(IconName::GitCompare)
-                        .with_size(px(14.))
-                        .into_any_element()
-                })
-                .child(tab_label("Diff".into(), self.tab == Tab::Diff, theme))
-                .tooltip(|w, cx| Tooltip::new("Diff (cmd-shift-d)").build(w, cx))
-                .test_support()
-                .into_any_element(),
-        );
+        let tabs = self.visible_tabs(ws);
+        if let Some(ix) = tabs.index(VisibleTab::Diff) {
+            pills.push(
+                pill("diff-tab", self.tab == Tab::Diff, theme)
+                    .aria_label("Diff")
+                    .pl_2p5()
+                    .pr_1()
+                    .on_click(cx.listener(|this, _, w, cx| this.show(Tab::Diff, w, cx)))
+                    .child(if ctrl_held && ix < 9 {
+                        kbd(&format!("ctrl-{}", ix + 1)).into_any_element()
+                    } else {
+                        Icon::new(IconName::GitCompare)
+                            .with_size(px(14.))
+                            .into_any_element()
+                    })
+                    .child(tab_label("Diff".into(), self.tab == Tab::Diff, theme))
+                    .child(
+                        div()
+                            .flex_none()
+                            .invisible()
+                            .group_hover("titlebar-tab", |s| s.visible())
+                            .child(
+                                crate::settings::close_button("close-diff", "Close Diff (cmd-w)")
+                                    .on_click(cx.listener(|this, _, w, cx| {
+                                        cx.stop_propagation();
+                                        this.close_diff(w, cx);
+                                    })),
+                            ),
+                    )
+                    .tooltip(|w, cx| Tooltip::new("Diff (cmd-shift-d)").build(w, cx))
+                    .test_support()
+                    .into_any_element(),
+            );
+        }
+        let file_start = tabs.file_start();
         pills.extend(self.file_tabs.iter().enumerate().map(|(ix, file)| {
             let e = file.editor.read(cx);
             let path = e.path.clone();
@@ -749,8 +872,8 @@ impl Shark {
                         this.show_menu(e.position, entries, w, cx);
                     }),
                 )
-                .child(if ctrl_held && ws.chats.len() + 1 + ix < 9 {
-                    kbd(&format!("ctrl-{}", ws.chats.len() + 2 + ix)).into_any_element()
+                .child(if ctrl_held && file_start + ix < 9 {
+                    kbd(&format!("ctrl-{}", file_start + ix + 1)).into_any_element()
                 } else {
                     Icon::new(IconName::FileCode)
                         .with_size(px(14.))
@@ -767,14 +890,21 @@ impl Shark {
                     )
                 })
                 .child(
-                    crate::settings::close_button("close-file-tab", "Close file (cmd-w)").on_click(
-                        cx.listener(move |this, _, w, cx| {
-                            cx.stop_propagation();
-                            if let Some(editor) = this.file_tabs.get(ix).map(|t| t.editor.clone()) {
-                                this.close_editor(editor, w, cx);
-                            }
-                        }),
-                    ),
+                    div()
+                        .flex_none()
+                        .invisible()
+                        .group_hover("titlebar-tab", |s| s.visible())
+                        .child(
+                            crate::settings::close_button("close-file-tab", "Close file (cmd-w)")
+                                .on_click(cx.listener(move |this, _, w, cx| {
+                                    cx.stop_propagation();
+                                    if let Some(editor) =
+                                        this.file_tabs.get(ix).map(|t| t.editor.clone())
+                                    {
+                                        this.close_editor(editor, w, cx);
+                                    }
+                                })),
+                        ),
                 )
                 .tooltip(move |w, cx| Tooltip::new(path.clone()).build(w, cx))
                 .test_support()
@@ -906,6 +1036,37 @@ impl Shark {
                 self.awake = None;
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tab_order_tests {
+    use super::{VisibleTab, VisibleTabs};
+
+    #[test]
+    fn visible_tab_indices_follow_the_strip() {
+        use VisibleTab::{Chat, Diff, File};
+        for (chats, diff, files, expected) in [
+            (0, false, 0, vec![]),
+            (1, true, 0, vec![Chat(0), Diff]),
+            (1, false, 0, vec![Chat(0)]),
+            (2, true, 2, vec![Chat(0), Chat(1), Diff, File(0), File(1)]),
+            (2, false, 2, vec![Chat(0), Chat(1), File(0), File(1)]),
+        ] {
+            let tabs = VisibleTabs { chats, diff, files };
+            assert_eq!(tabs.len(), expected.len());
+            for (ix, tab) in expected.into_iter().enumerate() {
+                assert_eq!(tabs.get(ix), Some(tab));
+                assert_eq!(tabs.index(tab), Some(ix));
+            }
+            assert_eq!(tabs.get(tabs.len()), None);
+            assert_eq!(tabs.get(usize::MAX), None);
+            assert_eq!(tabs.index(Chat(chats)), None);
+            assert_eq!(tabs.index(File(files)), None);
+            if !diff {
+                assert_eq!(tabs.index(Diff), None);
+            }
         }
     }
 }

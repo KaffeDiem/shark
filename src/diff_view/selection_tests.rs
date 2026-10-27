@@ -180,3 +180,17 @@ fn native_word_selection_crosses_render_chunks_and_respects_unicode_and_flank_bo
     assert_eq!(word_range(text, 7), Some(7..10));
     assert_eq!(word_range(text, text.len()), None);
 }
+
+#[test]
+fn a_text_selection_maps_to_the_lines_it_touches() {
+    let file = fixture::modified("t.txt", "a\n", "one\ntwo\nthree\n");
+    let lines = |range| {
+        let r = super::state::source_lines(&file, DiffSide::Modified, range).unwrap();
+        (r.side(), r.start(), r.end())
+    };
+    // "ne\ntw": lines 1–2; ending right after a newline stays on that line.
+    assert_eq!(lines(1..6), (DiffSide::Modified, 1, 2));
+    assert_eq!(lines(4..8), (DiffSide::Modified, 2, 2));
+    assert_eq!(lines(9..10), (DiffSide::Modified, 3, 3));
+    assert!(super::state::source_lines(&file, DiffSide::Modified, 40..41).is_none());
+}

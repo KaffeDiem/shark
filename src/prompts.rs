@@ -15,8 +15,9 @@ pub const PROMPTS: &[Prompt] = &[
     Prompt {
         id: "commit",
         title: "Commit and push",
-        repos: "repos with uncommitted changes",
-        default: "Commit and push the uncommitted changes in: {repos}. In each repo review the diff and stage the files that \
+        repos: "repos selected for committing (may still be clean when queued)",
+        default: "Commit and push changes in: {repos}. Check the current git state first; skip repos with nothing to commit or push. \
+In each repo review the diff and stage the files that \
 belong to this change. Never commit secrets or build output; if such files show up, add them to \
 .gitignore instead. Write a concise commit message in the repo's style, commit, then \
 `git push -u origin {branch}`. If the push is rejected because the remote moved, \
@@ -105,6 +106,16 @@ merge the base ({repos}), resolve conflicts, run a quick sanity check, commit an
 then `git rebase --onto <new> $(git merge-base HEAD <old>)` so only this branch's own commits move. \
 Resolve conflicts keeping this branch's intent, run a quick sanity check, then \
 `git push --force-with-lease origin {branch}` if the branch is on origin.",
+    },
+    Prompt {
+        id: "restack",
+        title: "Restack onto parent",
+        repos: "the stacked repos: where their commits go, and the parent commit they start after",
+        default: "Restack `{branch}` so it holds only its own commits on top of its parent ({repos}). The commits up to \
+the given one belong to the parent, which may have new commits, been rewritten or been squash-merged since. In each of \
+those repos: `git fetch origin`, then `git rebase --onto <onto> <after>`. Resolve conflicts keeping this branch's \
+intent, check that `git log --oneline <onto>..HEAD` lists only this branch's own commits, run a quick sanity check, \
+then `git push --force-with-lease origin {branch}` if the branch is on origin.",
     },
 ];
 

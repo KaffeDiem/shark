@@ -33,6 +33,14 @@ pub struct Local {
     pub rewritten: bool,
     /// `(ahead, behind)` vs the workspace base, e.g. `origin/main`.
     pub base: (u32, u32),
+    /// The repo's default branch, e.g. `origin/main`; a base other than it may be a stack.
+    pub trunk: String,
+    /// The parent commit this branch is built on (`git::parent_tip_key`); its commits after it
+    /// are its own. Empty when the branch was never stacked.
+    pub parent_tip: String,
+    /// HEAD holds parent commits the base doesn't: the parent was rewritten or squash-merged,
+    /// so what follows `parent_tip` must be rebased onto the base.
+    pub restack: bool,
     pub changed: u32,
     pub conflicts: u32,
     pub op: Option<Op>,
@@ -65,6 +73,8 @@ pub struct Pr {
     pub review: String,
     pub checks: Checks,
     pub head: String,
+    /// The branch it merges into, e.g. `main`.
+    pub base: String,
     /// IDs of the reviews that requested changes.
     pub change_requests: Vec<String>,
     /// IDs of comment-only reviews (inline comments come as one) by anyone but the PR's author.
@@ -149,13 +159,15 @@ pub fn probe(wt: &Path, branch: &str, base: &str, prev: Option<&Local>) -> Resul
         .find(|(p, _)| Path::new(p).exists())
         .map(|(_, (_, op))| op);
     l.origin = git(wt, &["remote", "get-url", "origin"]).ok();
+    l.trunk = (prev.map(|p| p.trunk.clone()).filter(|t| !t.is_empty()))
+        .unwrap_or_else(|| crate::git::default_base(wt));
     let remote = format!("refs/remotes/origin/{branch}");
     if let Ok(oid) = git(wt, &["rev-parse", "--verify", "--quiet", &remote]) {
         if let Some(p) =
             prev.filter(|p| p.remote.is_some() && (&p.head, &p.remote_head) == (&l.head, &oid))
         {
             (l.remote, l.rewritten, l.remote_head) = (p.remote, p.rewritten, oid);
-            return base_counts(wt, base, l);
+            return base_counts(wt, base, l).map(|l| parent_tip(wt, branch, base, l));
         }
         l.remote_head = oid;
         let range = format!("HEAD...{remote}");
@@ -179,26 +191,72 @@ pub fn probe(wt: &Path, branch: &str, base: &str, prev: Option<&Local>) -> Resul
         }
         l.remote = Some(ab);
     }
-    base_counts(wt, base, l)
+    base_counts(wt, base, l).map(|l| parent_tip(wt, branch, base, l))
+}
+
+/// Reads the parent tip, and moves it to the base's tip once HEAD has all of the base (the
+/// branch was rebased or merged up): from then on, that is where its own commits start. The one
+/// write a probe makes, and only when the tip moves; `config.lock` isn't the agent's index.
+fn parent_tip(wt: &Path, branch: &str, base: &str, mut l: Local) -> Local {
+    let key = crate::git::parent_tip_key(branch);
+    l.parent_tip = git(wt, &["config", &key]).unwrap_or_default();
+    let stacked = crate::stack::parent_of(base, &l.trunk).is_some();
+    if l.parent_tip.is_empty() && !stacked {
+        return l;
+    }
+    // Only the real base: a fallback (a pruned parent) says nothing about the boundary.
+    let Ok(tip) = git(
+        wt,
+        &[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{base}^{{commit}}"),
+        ],
+    ) else {
+        return l;
+    };
+    let has = |a: &str, b: &str| git(wt, &["merge-base", "--is-ancestor", a, b]).is_ok();
+    if l.base.1 == 0 {
+        if !stacked {
+            // Restacked onto the trunk: nothing left to track.
+            let _ = git(wt, &["config", "--unset", &key]);
+            l.parent_tip.clear();
+        } else if l.parent_tip != tip && git(wt, &["config", &key, &tip]).is_ok() {
+            l.parent_tip = tip;
+        }
+    } else if !l.parent_tip.is_empty() && has(&l.parent_tip, "HEAD") && !has(&l.parent_tip, &tip) {
+        l.restack = true;
+    }
+    l
 }
 
 fn base_counts(wt: &Path, base: &str, mut l: Local) -> Result<Local, String> {
-    // Fails on an unborn branch or a base that no longer resolves; (0, 0) is the honest answer then.
-    if let Ok(c) = git(
-        wt,
-        &[
-            "rev-list",
-            "--left-right",
-            "--count",
-            &format!("HEAD...{base}"),
-        ],
-    ) {
-        l.base = counts(&c);
+    // A stacked branch's parent may be gone from origin (merged and deleted) or not pushed yet:
+    // then count against the local parent, else the trunk. (0, 0) would read as "nothing of its
+    // own", and archive deletes such branches. Still (0, 0) on an unborn branch.
+    let parent = crate::stack::parent_of(base, &l.trunk).map(|p| format!("refs/heads/{p}"));
+    let tries = std::iter::once(base.to_string())
+        .chain(parent)
+        .chain([l.trunk.clone()]);
+    let mut error = format!("no base available for `{base}`");
+    for b in tries.filter(|b| !b.is_empty()) {
+        let range = format!("HEAD...{b}");
+        match git(wt, &["rev-list", "--left-right", "--count", &range]) {
+            Ok(c) => {
+                l.base = counts(&c);
+                return Ok(l);
+            }
+            Err(e) => error = e,
+        }
     }
-    Ok(l)
+    match l.head.as_str() {
+        "(initial)" => Ok(l),
+        _ => Err(format!("Can't compare HEAD with base `{base}`: {error}")),
+    }
 }
 
-const PR_FIELDS: &str = "url,number,state,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup,headRefOid,isCrossRepository,updatedAt,reviews,author";
+const PR_FIELDS: &str = "url,number,state,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup,headRefOid,baseRefName,isCrossRepository,updatedAt,reviews,author";
 
 fn checks(rollup: &Value) -> Checks {
     let items = rollup.as_array().into_iter().flatten();
@@ -288,6 +346,7 @@ fn parse_pr(pick: &Value) -> Pr {
         review: s("reviewDecision"),
         checks: checks(&pick["statusCheckRollup"]),
         head: s("headRefOid"),
+        base: s("baseRefName"),
         change_requests: ids(&|r| r["state"] == "CHANGES_REQUESTED"),
         // The author's own replies to threads are COMMENTED reviews too; they ask for nothing.
         comments: ids(&|r| {
@@ -295,6 +354,16 @@ fn parse_pr(pick: &Value) -> Pr {
         }),
         contains_head: String::new(),
     }
+}
+
+/// A stacked repo's parent PR, when it tells the parent's state: open, or merged or closed with
+/// the head origin still has (or origin dropped the branch). A long-lived base like `develop`
+/// with an old merged PR has moved on since; that PR isn't about it.
+pub fn fetch_parent(wt: &Path, parent: &str) -> Result<Option<Pr>, String> {
+    let pr = fetch_pr(wt, parent, "")?;
+    let remote = format!("refs/remotes/origin/{parent}");
+    let tip = git(wt, &["rev-parse", "--verify", "--quiet", &remote]).ok();
+    Ok(pr.filter(|p| p.state == PrState::Open || tip.as_ref().is_none_or(|t| *t == p.head)))
 }
 
 /// `Ok(None)` means the branch has no PR. Unlike `gh pr view`, "none" isn't an error exit,
@@ -344,6 +413,8 @@ pub struct Repo {
     pub local: Result<Local, String>,
     /// `None` until GitHub was asked; `Some(Err)` when gh failed (offline, logged out, not GitHub).
     pub pr: Option<Result<Option<Pr>, String>>,
+    /// Stacked only: the parent branch's PR, as last answered (kept while gh fails).
+    pub parent: Option<Pr>,
 }
 
 impl Repo {
@@ -355,6 +426,7 @@ impl Repo {
             branch: ws.branch_of(r).into(),
             local: Ok(Local::default()),
             pr: None,
+            parent: None,
         }
     }
 
@@ -366,6 +438,47 @@ impl Repo {
         self.pr().filter(|p| p.state == PrState::Open)
     }
 
+    /// The branch it is stacked on: its base is `origin/<parent>` and not the trunk.
+    pub fn stacked(&self) -> Option<&str> {
+        let trunk = self.local.as_ref().map(|l| l.trunk.as_str()).ok()?;
+        crate::stack::parent_of(&self.base, trunk).filter(|_| !trunk.is_empty())
+    }
+
+    /// Stacked on a parent whose PR is in `state`.
+    pub fn parent_is(&self, state: PrState) -> Option<&Pr> {
+        self.stacked()?;
+        self.parent.as_ref().filter(|p| p.state == state)
+    }
+
+    /// Its parent merged and its own work hasn't landed: time to move onto the parent's base.
+    pub fn parent_merged(&self) -> bool {
+        self.parent_is(PrState::Merged).is_some() && !self.landed()
+    }
+}
+
+/// One repo's part of the `restack` prompt: where its commits go and the parent commit they
+/// start after (the recorded tip; else a merged parent's last commit; else the merge base).
+pub fn restack_line(r: &Repo, onto: &str) -> String {
+    let tip = (r.local.as_ref()).map_or("", |l| l.parent_tip.as_str());
+    let after = match &r.parent {
+        _ if !tip.is_empty() => format!("`{tip}`"),
+        Some(p) if r.stacked().is_some() && p.state != PrState::Open && !p.head.is_empty() => {
+            format!(
+                "`{}` (the parent PR's last commit; `git fetch origin pull/{}/head` if it's missing)",
+                p.head, p.number
+            )
+        }
+        _ => format!("`$(git merge-base HEAD {})`", r.base),
+    };
+    format!("{}: onto `{onto}`, after {after}", r.name)
+}
+
+/// `origin/main` → `main`, for labels.
+pub fn short(base: &str) -> &str {
+    base.strip_prefix("origin/").unwrap_or(base)
+}
+
+impl Repo {
     /// `branch` on GitHub, e.g. `https://github.com/o/r/tree/feat`; `None` unless origin is
     /// GitHub and the branch is pushed (an unpushed branch would 404).
     pub fn branch_url(&self, branch: &str) -> Option<String> {
@@ -444,6 +557,8 @@ pub enum Kind {
     CreatePr,
     /// `CreatePr` with new PRs opened as drafts; only from the menu or palette.
     CreateDraftPr,
+    /// The parent PR merged: move the base to the parent's base, then restack with the agent.
+    Restack,
     Reopen,
     UpdateBranch,
     Ready,
@@ -455,9 +570,9 @@ pub enum Kind {
 }
 
 impl Kind {
-    /// Steps that change the worktree or the remote; they must not race a running agent.
+    /// Direct writes must not race an agent; agent prompts go through the chat queue.
     pub fn needs_idle(&self) -> bool {
-        !matches!(self, Kind::OpenPr | Kind::None)
+        !matches!(self, Kind::Agent(_) | Kind::OpenPr | Kind::None)
     }
 }
 
@@ -522,6 +637,19 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
             .filter(|r| r.local.as_ref().is_ok_and(|l| f(r, l)))
             .map(|r| r.name.clone())
             .collect()
+    };
+    // The `restack` prompt for `rs`, each onto its own base.
+    let restack = |rs: &[String]| {
+        let fill = |rs: &[String]| {
+            (among(repos, rs).map(|r| restack_line(r, &r.base)))
+                .collect::<Vec<_>>()
+                .join("; ")
+        };
+        prompts::render_each(
+            "restack",
+            among(repos, rs).map(|r| (&*r.name, &*r.branch)),
+            fill,
+        )
     };
     let label = |verb: &str, rs: &[String]| match repos.len() {
         1 => verb.to_string(),
@@ -623,6 +751,29 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
             let rs = names(&|_, l| l.remote.is_some_and(|(_, b)| b > 0));
             step("Pull", Kind::Pull, rs, false)
         })
+        // A stack's parent changed under it; before any PR step, so no PR carries its commits.
+        .or_else(|| {
+            let rs = names(&|r, _| r.parent_merged());
+            let onto = among(repos, &rs).find_map(|r| r.parent.as_ref());
+            let verb = onto.map(|p| format!("Parent merged · rebase onto {}", p.base));
+            step(&verb.unwrap_or_default(), Kind::Restack, rs, true)
+        })
+        .or_else(|| {
+            let rs = names(&|r, _| r.parent_is(PrState::Closed).is_some());
+            step("Parent PR closed", Kind::None, rs, true)
+        })
+        .or_else(|| {
+            let rs = names(&|_, l| l.restack);
+            let verb = among(repos, &rs)
+                .next()
+                .map(|r| format!("Restack onto {}", short(&r.base)));
+            step(
+                &verb.unwrap_or_default(),
+                Kind::Agent(restack(&rs)),
+                rs,
+                false,
+            )
+        })
         .or_else(|| {
             let rs = names(&|r, l| unopened(r, l) && at_head(r, l, PrState::Closed));
             step("Reopen PR", Kind::Reopen, rs, false)
@@ -666,8 +817,21 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
             with_reviews("Address comments", "comments", rs, &|p| p.comments.clone())
         })
         .or_else(|| {
-            let rs = current(&|p| p.merge_state == "BEHIND");
-            step("Update branch", Kind::UpdateBranch, rs, false)
+            // GitHub's Update branch merges the parent in; a stack rebases instead.
+            let behind = current(&|p| p.merge_state == "BEHIND");
+            let (stacked, rs): (Vec<String>, Vec<String>) = (behind.into_iter()).partition(|n| {
+                among(repos, std::slice::from_ref(n)).any(|r| r.stacked().is_some())
+            });
+            let verb = among(repos, &stacked)
+                .next()
+                .map(|r| format!("Rebase onto {}", short(&r.base)));
+            step(
+                &verb.unwrap_or_default(),
+                Kind::Agent(restack(&stacked)),
+                stacked,
+                false,
+            )
+            .or_else(|| step("Update branch", Kind::UpdateBranch, rs, false))
         })
         .or_else(|| step("Ready for review", Kind::Ready, prs(&|p, _| p.draft), false));
     if let Some(a) = actionable {
@@ -706,8 +870,15 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
             "Merge blocked"
         });
     }
-    if let Some(a) = step("Merge", Kind::Merge, prs(&|_, _| true), false) {
+    // A child merges after its parent; GitHub would otherwise merge it into the parent branch.
+    let waiting = |r: &Repo| r.parent_is(PrState::Open).is_some();
+    let mergeable = names(&|r, _| r.open_pr().is_some() && !waiting(r));
+    if let Some(a) = step("Merge", Kind::Merge, mergeable, false) {
         return a;
+    }
+    if let Some(r) = repos.iter().find(|r| r.open_pr().is_some() && waiting(r)) {
+        let p = r.parent.as_ref().map_or(0, |p| p.number);
+        return passive(&format!("Waiting on parent PR #{p}"));
     }
     if repos
         .iter()
@@ -785,6 +956,22 @@ pub fn step_args(kind: &Kind, r: &Repo) -> Result<Option<Vec<String>>, String> {
             let Some(p) = r.open_pr() else {
                 return Ok(None);
             };
+            for (state, reason) in [
+                (PrState::Open, "must merge first"),
+                (PrState::Merged, "has merged; restack onto its base first"),
+                (PrState::Closed, "is closed; choose a new base first"),
+            ] {
+                if let Some(parent) = r.parent_is(state) {
+                    return Err(format!("stacked on #{}, which {reason}", parent.number));
+                }
+            }
+            if p.base != short(&r.base) {
+                return Err(format!(
+                    "PR targets `{}`, but this workspace targets `{}`; retarget the PR before merging",
+                    p.base,
+                    short(&r.base)
+                ));
+            }
             let l = local()?;
             // Merge exactly what this workspace has: clean, pushed, and GitHub's head matching.
             if l.changed > 0 || l.remote != Some((0, 0)) || p.head != l.head {
@@ -829,6 +1016,29 @@ pub fn diverged(err: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_direct_writes_need_idle_agents() {
+        use super::Kind;
+        for kind in [Kind::Agent("commit".into()), Kind::OpenPr, Kind::None] {
+            assert!(!kind.needs_idle(), "{kind:?}");
+        }
+        for kind in [
+            Kind::Pull,
+            Kind::Push,
+            Kind::ForcePush,
+            Kind::CreatePr,
+            Kind::CreateDraftPr,
+            Kind::Restack,
+            Kind::Reopen,
+            Kind::UpdateBranch,
+            Kind::Ready,
+            Kind::Merge,
+            Kind::Archive,
+        ] {
+            assert!(kind.needs_idle(), "{kind:?}");
+        }
+    }
+
     #[test]
     fn ago_and_diverged() {
         use std::time::Duration;
@@ -954,6 +1164,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
             branch: "feat".into(),
             local: Ok(l),
             pr: Some(Ok(pr)),
+            parent: None,
         }
     }
 
@@ -979,6 +1190,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
             review: String::new(),
             checks,
             head: "h".into(),
+            base: "main".into(),
             change_requests: vec![],
             comments: vec![],
             contains_head: String::new(),
@@ -1144,6 +1356,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
             branch: "feat".into(),
             local: Err("gone".into()),
             pr: None,
+            parent: None,
         };
         assert!(next(&[broken]).attention);
         let offline = Repo {
@@ -1413,7 +1626,372 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         assert_eq!(args(Kind::Merge, clean(1), None), Ok(None));
     }
 
+    #[test]
+    fn merge_refuses_a_pr_whose_base_has_not_been_retargeted() {
+        let own = Pr {
+            base: "old-parent".into(),
+            ..pr("CLEAN", Checks::Passing)
+        };
+        let mut r = repo("api", clean(1), Some(own));
+        let error = step_args(&Kind::Merge, &r).unwrap_err();
+        assert!(
+            error.contains("old-parent") && error.contains("main"),
+            "{error}"
+        );
+        r.base = "origin/old-parent".into();
+        assert!(step_args(&Kind::Merge, &r).unwrap().is_some());
+    }
+
     /// The real thing: a linked worktree from `create_workspace` against a bare origin.
+    /// `ios` stacked on `logic` (trunk `origin/main`), clean with one commit of its own.
+    fn stacked(own: Option<Pr>, parent: Option<Pr>, l: impl FnOnce(&mut Local)) -> Repo {
+        let mut local = Local {
+            trunk: "origin/main".into(),
+            ..clean(1)
+        };
+        l(&mut local);
+        Repo {
+            name: "ios".into(),
+            base: "origin/logic".into(),
+            parent,
+            ..repo("ios", local, own)
+        }
+    }
+
+    fn parent(state: PrState) -> Pr {
+        Pr {
+            number: 5,
+            state,
+            head: "p".into(),
+            base: "main".into(),
+            ..pr("CLEAN", Checks::Passing)
+        }
+    }
+
+    /// The trunk, a review checkout and a branch off the trunk are never stacked, whatever a
+    /// stale parent PR says.
+    #[test]
+    fn only_origin_bases_off_the_trunk_are_stacked() {
+        let r = stacked(None, Some(parent(PrState::Merged)), |_| {});
+        assert_eq!(r.stacked(), Some("logic"));
+        assert!(r.parent_merged());
+        for base in ["origin/main", "refs/shark/pull/7/base"] {
+            let r = Repo {
+                base: base.into(),
+                ..r.clone()
+            };
+            assert_eq!(r.stacked(), None, "{base}");
+            assert!(!r.parent_merged());
+            assert_ne!(next(&[r]).kind, Kind::Restack);
+        }
+        let unknown = stacked(None, None, |l| l.trunk.clear());
+        assert_eq!(unknown.stacked(), None, "trunk not probed yet");
+    }
+
+    /// A merged parent comes before any PR step, names the parent's base and only the stacked
+    /// repo; uncommitted work still comes first, and a child that landed has nothing to move.
+    #[test]
+    fn parent_merged_restacks_first() {
+        let merged = Some(parent(PrState::Merged));
+        let a = next(&[stacked(None, merged.clone(), |_| {})]);
+        assert_eq!(
+            (a.label.as_str(), &a.kind, a.attention),
+            ("Parent merged · rebase onto main", &Kind::Restack, true)
+        );
+        let mid = Pr {
+            base: "core".into(),
+            ..parent(PrState::Merged)
+        };
+        let a = next(&[stacked(None, Some(mid), |_| {})]);
+        assert_eq!(
+            a.label, "Parent merged · rebase onto core",
+            "onto the grandparent"
+        );
+        let backend = repo("api", clean(1), Some(pr("CLEAN", Checks::Passing)));
+        let a = next(&[
+            backend.clone(),
+            stacked(Some(pr("CLEAN", Checks::Passing)), merged.clone(), |_| {}),
+        ]);
+        assert_eq!(
+            (a.label.as_str(), a.repos.clone()),
+            (
+                "Parent merged · rebase onto main · ios",
+                vec!["ios".to_string()]
+            )
+        );
+        let dirty = stacked(None, merged.clone(), |l| l.changed = 2);
+        assert_eq!(next(&[dirty]).label, "Commit and push");
+        let landed = Pr {
+            state: PrState::Merged,
+            ..pr("CLEAN", Checks::Passing)
+        };
+        let r = stacked(Some(landed), merged, |_| {});
+        assert!(r.landed() && !r.parent_merged());
+        assert_eq!(next(&[r]).kind, Kind::Archive);
+    }
+
+    #[test]
+    fn parent_closed_needs_a_human() {
+        let a = next(&[stacked(None, Some(parent(PrState::Closed)), |_| {})]);
+        assert_eq!(
+            (a.label.as_str(), &a.kind, a.attention),
+            ("Parent PR closed", &Kind::None, true)
+        );
+    }
+
+    /// A rewritten or squash-merged parent left its old commits in HEAD: restack what follows the
+    /// recorded tip onto the base, before opening or pushing a PR.
+    #[test]
+    fn pending_restack_rebases_after_the_tip() {
+        let r = stacked(None, Some(parent(PrState::Open)), |l| {
+            l.restack = true;
+            l.parent_tip = "t1".into();
+        });
+        let a = next(&[r]);
+        assert_eq!(a.label, "Restack onto logic");
+        let Kind::Agent(prompt) = &a.kind else {
+            panic!("{a:?}")
+        };
+        assert!(
+            prompt.contains("ios: onto `origin/logic`, after `t1`"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("git rebase --onto <onto> <after>") && prompt.contains("`feat`"),
+            "{prompt}"
+        );
+        // After set_base moved it to the trunk the restack is still owed.
+        let moved = Repo {
+            base: "origin/main".into(),
+            ..stacked(None, None, |l| {
+                l.restack = true;
+                l.parent_tip = "t1".into();
+            })
+        };
+        assert_eq!(next(&[moved]).label, "Restack onto main");
+    }
+
+    #[test]
+    fn restack_line_prefers_the_recorded_tip() {
+        let tip = stacked(None, Some(parent(PrState::Merged)), |l| {
+            l.parent_tip = "t1".into()
+        });
+        assert_eq!(
+            restack_line(&tip, "origin/main"),
+            "ios: onto `origin/main`, after `t1`"
+        );
+        let merged = stacked(None, Some(parent(PrState::Merged)), |_| {});
+        assert_eq!(
+            restack_line(&merged, "origin/main"),
+            "ios: onto `origin/main`, after `p` (the parent PR's last commit; `git fetch origin pull/5/head` if it's missing)"
+        );
+        let open = stacked(None, Some(parent(PrState::Open)), |_| {});
+        assert_eq!(
+            restack_line(&open, "origin/logic"),
+            "ios: onto `origin/logic`, after `$(git merge-base HEAD origin/logic)`"
+        );
+    }
+
+    /// A child merges after its parent, from the button and from the menu alike; the other repo
+    /// of the workspace merges meanwhile.
+    #[test]
+    fn child_waits_for_its_parent_to_merge() {
+        let own = Some(pr("CLEAN", Checks::Passing));
+        let ios = stacked(own.clone(), Some(parent(PrState::Open)), |_| {});
+        let a = next(std::slice::from_ref(&ios));
+        assert_eq!(
+            (a.label.as_str(), &a.kind),
+            ("Waiting on parent PR #5", &Kind::OpenPr)
+        );
+        for (state, reason) in [
+            (PrState::Open, "must merge first"),
+            (PrState::Merged, "restack onto its base first"),
+            (PrState::Closed, "choose a new base first"),
+        ] {
+            let r = stacked(own.clone(), Some(parent(state)), |_| {});
+            let e = step_args(&Kind::Merge, &r).unwrap_err();
+            assert!(e.contains("stacked on #5") && e.contains(reason), "{e}");
+        }
+        let api = repo("api", clean(1), own.clone());
+        let a = next(&[api, ios]);
+        assert_eq!(
+            (a.label.as_str(), a.repos),
+            ("Merge · api", vec!["api".to_string()])
+        );
+        let free = stacked(own, Some(parent(PrState::Merged)), |l| l.base = (1, 0));
+        assert!(
+            step_args(
+                &Kind::Merge,
+                &Repo {
+                    base: "origin/main".into(),
+                    ..free
+                }
+            )
+            .unwrap()
+            .is_some()
+        );
+    }
+
+    /// GitHub's Update branch would merge the parent in; a stack rebases onto it instead.
+    #[test]
+    fn behind_parent_rebases_instead_of_merging() {
+        let ios = stacked(
+            Some(pr("BEHIND", Checks::Passing)),
+            Some(parent(PrState::Open)),
+            |_| {},
+        );
+        let a = next(&[ios]);
+        assert_eq!(a.label, "Rebase onto logic");
+        assert!(
+            matches!(&a.kind, Kind::Agent(p) if p.contains("onto `origin/logic`")),
+            "{a:?}"
+        );
+        let plain = one(clean(1), Some(pr("BEHIND", Checks::Passing)));
+        assert_eq!(plain.kind, Kind::UpdateBranch);
+    }
+
+    #[test]
+    fn parses_base_ref() {
+        let v = serde_json::json!({"url":"u","number":4,"state":"MERGED","headRefOid":"abc","baseRefName":"logic"});
+        let p = parse_pr(&v);
+        assert_eq!(
+            (p.base.as_str(), p.head.as_str(), p.state),
+            ("logic", "abc", PrState::Merged)
+        );
+    }
+
+    /// Real git: the recorded parent tip follows the base while HEAD holds all of it, a missing
+    /// base still counts the branch's own commits, and after a squash merge the restack command
+    /// the prompt gives leaves exactly the child's own commit.
+    #[test]
+    fn parent_tip_tracks_and_restacks_after_a_squash() {
+        use crate::git::{create_workspace_with_prs, git};
+        use std::fs;
+        let root = std::env::temp_dir().join(format!("shark-stack-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (origin, src) = (root.join("origin.git"), root.join("src/ios"));
+        fs::create_dir_all(&src).unwrap();
+        git(
+            &root,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                &origin.to_string_lossy(),
+            ],
+        )
+        .unwrap();
+        let c = |dir: &Path, args: &[&str]| {
+            git(
+                dir,
+                &[&["-c", "user.name=t", "-c", "user.email=t@t"], args].concat(),
+            )
+            .unwrap()
+        };
+        let edit = |dir: &Path, file: &str, msg: &str| {
+            fs::write(dir.join(file), format!("{msg}\n")).unwrap();
+            c(dir, &["add", "."]);
+            c(dir, &["commit", "-qm", msg]);
+            git(dir, &["rev-parse", "HEAD"]).unwrap()
+        };
+        git(&src, &["init", "-q", "-b", "main"]).unwrap();
+        edit(&src, "README.md", "init");
+        git(
+            &src,
+            &["remote", "add", "origin", &origin.to_string_lossy()],
+        )
+        .unwrap();
+        git(&src, &["push", "-q", "origin", "main"]).unwrap();
+        git(&src, &["remote", "set-head", "origin", "main"]).unwrap();
+        c(&src, &["checkout", "-qb", "logic"]);
+        edit(&src, "a.txt", "a");
+        let b = edit(&src, "b.txt", "b");
+        git(&src, &["push", "-q", "origin", "logic"]).unwrap();
+        c(&src, &["checkout", "-q", "main"]);
+        let repo = crate::git::add_repo(&src, &[]).unwrap();
+        let on = crate::git::on_branch(&[repo], "ui");
+        let parents = [("ios".to_string(), "logic".to_string())];
+        let ws =
+            create_workspace_with_prs(&root.join("ws/ui"), "ui", "ui", &on, &[], &parents).unwrap();
+        let wt = root.join("ws/ui/ios");
+        assert_eq!(ws.repos[0].base, "origin/logic");
+        let own = edit(&wt, "c.txt", "c");
+        let p = |base: &str| probe(&wt, "ui", base, None).unwrap();
+        let l = p("origin/logic");
+        assert_eq!(
+            (l.trunk.as_str(), l.parent_tip.as_str(), l.base, l.restack),
+            ("origin/main", b.as_str(), (1, 0), false)
+        );
+
+        // The parent moves on: behind, nothing to restack, the tip stays until HEAD has it.
+        c(&src, &["checkout", "-q", "logic"]);
+        let d = edit(&src, "d.txt", "d");
+        git(&src, &["push", "-q", "origin", "logic"]).unwrap();
+        c(&src, &["checkout", "-q", "main"]);
+        git(&wt, &["fetch", "-q", "origin"]).unwrap();
+        let l = p("origin/logic");
+        assert_eq!(
+            (l.base, l.restack, l.parent_tip.as_str()),
+            ((1, 1), false, b.as_str())
+        );
+        c(&wt, &["rebase", "-q", "origin/logic"]);
+        let l = p("origin/logic");
+        assert_eq!((l.base, l.parent_tip.as_str()), ((1, 0), d.as_str()));
+        let key = crate::git::parent_tip_key("ui");
+        assert_eq!(
+            git(&src, &["config", &key]).unwrap(),
+            d,
+            "kept across restarts"
+        );
+
+        // Squash-merged and the branch deleted: the pruned base falls back to the local parent,
+        // then the trunk, never (0, 0).
+        c(&src, &["merge", "-q", "--squash", "logic"]);
+        c(&src, &["commit", "-qm", "logic (#5)"]);
+        git(&src, &["push", "-q", "origin", "main", ":logic"]).unwrap();
+        git(&wt, &["fetch", "-q", "--prune", "origin"]).unwrap();
+        let l = p("origin/logic");
+        assert_eq!(
+            (l.base.0, l.restack),
+            (1, false),
+            "against the local parent"
+        );
+        git(&src, &["branch", "-q", "-D", "logic"]).unwrap();
+        assert!(p("origin/logic").base.0 > 0, "against the trunk");
+
+        // Moved to the trunk, the restack is still owed; the prompt's command settles it.
+        let l = p("origin/main");
+        assert!(l.restack && l.parent_tip == d, "{l:?}");
+        c(&wt, &["rebase", "-q", "--onto", "origin/main", &d]);
+        let log = git(&wt, &["log", "--format=%s", "origin/main..HEAD"]).unwrap();
+        assert_eq!(log, "c", "only the child's own commit");
+        assert_ne!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), own);
+        let l = p("origin/main");
+        assert_eq!(
+            (l.base, l.restack, l.parent_tip.as_str()),
+            ((1, 0), false, "")
+        );
+        assert!(
+            git(&src, &["config", &key]).is_err(),
+            "nothing left to track"
+        );
+        // No comparison ref remains: do not let archive mistake unknown counts for no work.
+        git(&src, &["update-ref", "-d", "refs/remotes/origin/main"]).unwrap();
+        let error = probe(&wt, "ui", "origin/logic", None).unwrap_err();
+        assert!(error.contains("Can't compare HEAD"), "{error}");
+
+        // A genuinely unborn branch still has no commits of its own.
+        let empty = root.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        git(&empty, &["init", "-q", "-b", "main"]).unwrap();
+        let unborn = probe(&empty, "main", "origin/main", None).unwrap();
+        assert_eq!(unborn.head, "(initial)");
+        assert_eq!(unborn.base, (0, 0));
+        let _ = fs::remove_dir_all(&root);
+    }
+
     #[test]
     fn probes_a_linked_worktree() {
         use crate::git::{create_workspace, git};
@@ -1478,6 +2056,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
             branch: "feat".into(),
             local: Ok(l),
             pr: Some(Ok(None)),
+            parent: None,
         };
         assert_eq!(next_action(&[r(p())], &[]).kind, Kind::CreatePr);
 

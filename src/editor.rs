@@ -1,10 +1,11 @@
-//! A changed file opened for editing next to the chat, with optional Vim keys.
+//! A file opened in a full-width editor tab, with optional Vim keys.
 use crate::files::fingerprint;
 use crate::vim::{self, Vim};
 use crate::*;
 use gpui_kit::base::input::{InputBaseState, InputModeKind};
 use gpui_kit::component::input::{
-    Editor, EditorState, Indent, InputEvent, MovePageDown, MovePageUp, Outdent, Redo, Search, Undo,
+    Editor, EditorState, Escape, Indent, InputEvent, MovePageDown, MovePageUp, Outdent, Redo,
+    Search, Undo,
 };
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::{RopeExt as _, WindowExt as _};
@@ -17,7 +18,7 @@ pub const MAX_BYTES: u64 = 4 << 20;
 pub enum EditorEvent {
     /// The file on disk now matches the buffer; the diff should refresh.
     Saved,
-    /// Escape with nothing left to cancel: hand focus back to the file tree.
+    /// Escape with nothing left to cancel: focus the file tree or workspace sidebar.
     Leave,
     /// A completed :wq closes this editor even if another tab is now selected.
     Close,
@@ -116,8 +117,8 @@ impl FileEditor {
             return false;
         }
         if self.idle() && ks.key == "escape" && ks.modifiers.number_of_modifiers() == 0 {
-            cx.emit(EditorEvent::Leave);
-            return true;
+            // Let input cancellation run before the bubbled Escape leaves the editor.
+            return false;
         }
         self.vim_on && vim_key(ks).is_some_and(|k| self.vim_key(&k, window, cx))
     }
@@ -209,6 +210,7 @@ impl FileEditor {
 
     /// Throws the edits away and takes the disk version.
     pub fn discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.saves += 1; // Invalidate reads started before the discard.
         self.dirty = false;
         self.disk = 0;
         self.stat = None;
@@ -444,6 +446,13 @@ impl Render for FileEditor {
         // and the ones it declined decline again.
         div()
             .size_full()
+            .on_action(cx.listener(|e, _: &Escape, window, cx| {
+                if e.is_focused(window, cx) && e.idle() {
+                    cx.emit(EditorEvent::Leave);
+                } else {
+                    cx.propagate();
+                }
+            }))
             .on_key_down(cx.listener(|e, ev: &KeyDownEvent, window, cx| {
                 let ks = &ev.keystroke;
                 if !window.has_pending_keystrokes() && e.intercept(ks, window, cx) {

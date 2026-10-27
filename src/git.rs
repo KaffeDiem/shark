@@ -1,4 +1,6 @@
 use crate::state::{Repo, Workspace, WsRepo};
+mod changes;
+pub use changes::{discard_file, uncommitted_files};
 use std::{
     fs,
     path::{Path, PathBuf},
@@ -155,7 +157,7 @@ pub fn add_repo(path: &Path, existing: &[Repo]) -> Result<Repo, String> {
     Ok(Repo { name, path: root })
 }
 
-fn default_base(src: &Path) -> String {
+pub(crate) fn default_base(src: &Path) -> String {
     git(
         src,
         &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
@@ -180,7 +182,7 @@ pub fn create_workspace(
     branch: &str,
     repos: &[(Repo, String)],
 ) -> Result<Workspace, String> {
-    create_workspace_with_prs(dir, name, branch, repos, &[])
+    create_workspace_with_prs(dir, name, branch, repos, &[], &[])
 }
 
 #[derive(Clone, Debug)]
@@ -190,13 +192,15 @@ pub struct PullRequest {
     pub base: String,
 }
 
-/// PR selections use fresh local review branches, preserving colleagues' branches.
+/// PR selections use fresh local review branches, preserving colleagues' branches. `parents`
+/// `(repo, branch)` stack a repo's new branch on another branch: it starts there and targets it.
 pub fn create_workspace_with_prs(
     dir: &Path,
     name: &str,
     branch: &str,
     repos: &[(Repo, String)],
     prs: &[(String, PullRequest)],
+    parents: &[(String, String)],
 ) -> Result<Workspace, String> {
     if repos.is_empty() {
         return Err("pick at least one repo".into());
@@ -212,7 +216,10 @@ pub fn create_workspace_with_prs(
     let plans = par_map(repos, |(r, b)| {
         match prs.iter().find(|(name, _)| name == &r.name) {
             Some((_, pr)) => plan_pr_worktree(b, r, pr),
-            None => plan_worktree(b, r),
+            None => {
+                let parent = parents.iter().find(|(n, _)| n == &r.name);
+                plan_worktree(b, r, parent.map(|(_, p)| p.as_str()))
+            }
         }
     })
     .into_iter()
@@ -259,7 +266,7 @@ pub fn add_to_workspace(ws: &Workspace, dir: &Path, r: &Repo) -> Result<Workspac
     if dir.join(&r.name).exists() {
         return Err(format!("{} already exists", dir.join(&r.name).display()));
     }
-    let plan = plan_worktree(&ws.branch, r)?;
+    let plan = plan_worktree(&ws.branch, r, None)?;
     let mut ws = ws.clone();
     let added = add_worktree(dir, &ws.branch, r, &plan).and_then(|wr| {
         ws.repos.push(wr);
@@ -404,10 +411,13 @@ struct Plan {
     /// nobody does. None reuses the local branch: origin has it too, it holds unpushed work,
     /// or origin was unreachable.
     from: Option<String>,
+    /// Stacked: the parent commit it starts on.
+    tip: Option<String>,
 }
 
 /// Checks a repo can take the branch and decides where it starts. Fetches, so it blocks.
-fn plan_worktree(branch: &str, r: &Repo) -> Result<Plan, String> {
+/// With a `parent` branch, a new branch starts on it and the base is `origin/<parent>`.
+fn plan_worktree(branch: &str, r: &Repo, parent: Option<&str>) -> Result<Plan, String> {
     let head = format!("branch refs/heads/{branch}");
     if let Some((path, _)) = worktree_list(&r.path)?
         .iter()
@@ -427,7 +437,29 @@ fn plan_worktree(branch: &str, r: &Repo) -> Result<Plan, String> {
         30,
     )
     .is_ok();
-    let base = default_base(&r.path);
+    let base = match parent {
+        Some(p) => format!("origin/{p}"),
+        None => default_base(&r.path),
+    };
+    if let Some(p) = parent {
+        // An existing branch has its own history, not the parent's.
+        let exists = |rf: String| has_ref(&r.path, &rf);
+        if exists(format!("refs/heads/{branch}")) || exists(format!("refs/remotes/origin/{branch}"))
+        {
+            return Err(format!(
+                "{}: `{branch}` already exists; stacking on `{p}` needs a new branch name",
+                r.name
+            ));
+        }
+        let from = parent_start(r, p)?;
+        let tip = git(&r.path, &["rev-parse", &from])?;
+        return Ok(Plan {
+            base,
+            from: Some(from),
+            pr_url: None,
+            tip: Some(tip),
+        });
+    }
     let from = match (
         has_ref(&r.path, &format!("refs/heads/{branch}")),
         has_ref(&r.path, &format!("refs/remotes/origin/{branch}")),
@@ -477,7 +509,34 @@ fn plan_worktree(branch: &str, r: &Repo) -> Result<Plan, String> {
         base,
         from,
         pr_url: None,
+        tip: None,
     })
+}
+
+/// Where a branch stacked on `p` starts: `origin/<p>`, what its PR will be measured against.
+/// Unpushed commits of a local `p` would land in the child's PR, so `p` must be pushed first.
+fn parent_start(r: &Repo, p: &str) -> Result<String, String> {
+    let remote = format!("refs/remotes/origin/{p}");
+    match (
+        has_ref(&r.path, &remote),
+        has_ref(&r.path, &format!("refs/heads/{p}")),
+    ) {
+        (true, _) => Ok(format!("origin/{p}")),
+        (false, true) => Err(format!(
+            "{}: `{p}` isn't on GitHub yet; push it first (from its workspace)",
+            r.name
+        )),
+        (false, false) => Err(format!(
+            "{}: `{p}` isn't a branch here (a PR from a fork can't be stacked on)",
+            r.name
+        )),
+    }
+}
+
+/// The git config key holding the parent commit `branch` is built on: its commits after it are
+/// its own. Shark keeps it current (`status::probe`); restacks rebase what follows it.
+pub fn parent_tip_key(branch: &str) -> String {
+    format!("branch.{branch}.shark-parent-tip")
 }
 
 /// A branch-local identity survives restarts without confusing same-named fork branches.
@@ -559,6 +618,7 @@ fn plan_pr_worktree(branch: &str, r: &Repo, pr: &PullRequest) -> Result<Plan, St
         base,
         from: Some(from),
         pr_url: Some(pr.url.clone()),
+        tip: None,
     })
 }
 
@@ -574,6 +634,9 @@ fn add_worktree(dir: &Path, branch: &str, r: &Repo, plan: &Plan) -> Result<WsRep
             &["worktree", "add", "--no-track", "-b", branch, &wt_s, from],
         )?,
     };
+    if let Some(tip) = &plan.tip {
+        git(&r.path, &["config", &parent_tip_key(branch), tip])?;
+    }
     if let Some(url) = &plan.pr_url {
         git(
             &r.path,
@@ -1034,7 +1097,7 @@ mod tests {
         let picked = [(repo.clone(), "pr/7".into())];
         let prs = [(repo.name.clone(), pr.clone())];
         let dir = root.join("ws/review");
-        let ws = create_workspace_with_prs(&dir, "review", "pr/7", &picked, &prs).unwrap();
+        let ws = create_workspace_with_prs(&dir, "review", "pr/7", &picked, &prs, &[]).unwrap();
         let wt = dir.join("api");
         assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), tip);
         assert_eq!(git(&wt, &["rev-parse", &ws.repos[0].base]).unwrap(), base);
@@ -1045,7 +1108,7 @@ mod tests {
         );
         let collision = root.join("ws/collision");
         assert!(
-            create_workspace_with_prs(&collision, "collision", "pr/7", &picked, &prs)
+            create_workspace_with_prs(&collision, "collision", "pr/7", &picked, &prs, &[])
                 .err()
                 .unwrap()
                 .contains("already exists")
@@ -1067,7 +1130,8 @@ mod tests {
                 "missing",
                 "pr/404",
                 &[(repo.clone(), "pr/404".into())],
-                &missing
+                &missing,
+                &[]
             )
             .is_err()
         );
@@ -1079,7 +1143,8 @@ mod tests {
             (other, "blocked/child".into()),
         ];
         assert!(
-            create_workspace_with_prs(&failed, "rollback", "review-again", &picked, &prs).is_err()
+            create_workspace_with_prs(&failed, "rollback", "review-again", &picked, &prs, &[])
+                .is_err()
         );
         assert!(!failed.exists() && !has_ref(&repo.path, "refs/heads/review-again"));
         assert_eq!(review_pr_url(&repo.path, "review-again"), None);
@@ -1305,6 +1370,114 @@ mod tests {
             .is_ok()
         );
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// A new branch stacked on a parent starts at `origin/<parent>` (never the local parent's
+    /// unpushed commits), targets it, and records it as its parent tip; another repo of the same
+    /// workspace stays on its trunk. An unpushed or missing parent (a fork's PR) or an existing
+    /// branch name refuses and leaves nothing behind.
+    #[test]
+    fn stacks_new_branches_on_a_parent() {
+        let root = std::env::temp_dir().join(format!("shark-test-stack-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let (api, web) = (init_repo(&root, "api"), init_repo(&root, "web"));
+        let commit = ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q"];
+        let empty_commit = |dir: &Path, msg: &str| {
+            git(dir, &[&commit[..], &["--allow-empty", "-m", msg]].concat()).unwrap();
+            git(dir, &["rev-parse", "HEAD"]).unwrap()
+        };
+        for r in [&api, &web] {
+            let origin = root.join(format!("{}.git", r.name));
+            git(&root, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
+            (git(
+                &r.path,
+                &["remote", "add", "origin", &origin.to_string_lossy()],
+            ))
+            .unwrap();
+            git(&r.path, &["push", "-q", "origin", "main"]).unwrap();
+            git(&r.path, &["remote", "set-head", "origin", "main"]).unwrap();
+        }
+        let a = &api.path;
+        let branch = |name: &str, f: &dyn Fn()| {
+            git(a, &["checkout", "-q", "-b", name, "main"]).unwrap();
+            f();
+            git(a, &["checkout", "-q", "main"]).unwrap();
+        };
+        // Only on origin.
+        let mut remote_tip = String::new();
+        branch("remote", &|| {
+            empty_commit(a, "remote");
+        });
+        git(a, &["push", "-q", "origin", "remote"]).unwrap();
+        remote_tip.push_str(&git(a, &["rev-parse", "remote"]).unwrap());
+        git(a, &["branch", "-q", "-D", "remote"]).unwrap();
+        // Local is ahead of origin: your own parent workspace with an unpushed commit.
+        branch("ahead", &|| {
+            empty_commit(a, "pushed");
+            git(a, &["push", "-q", "origin", "ahead"]).unwrap();
+            empty_commit(a, "unpushed");
+        });
+        // Local is behind origin: someone pushed to the parent since.
+        branch("behind", &|| {
+            empty_commit(a, "old");
+            empty_commit(a, "new");
+            git(a, &["push", "-q", "origin", "behind"]).unwrap();
+            git(a, &["reset", "-q", "--hard", "HEAD~1"]).unwrap();
+        });
+        // Never pushed.
+        branch("local", &|| {
+            empty_commit(a, "local");
+        });
+        let head = |dir: &Path| git(dir, &["rev-parse", "HEAD"]).unwrap();
+        let cases = [
+            ("remote", remote_tip.clone()),
+            ("ahead", git(a, &["rev-parse", "origin/ahead"]).unwrap()),
+            ("behind", git(a, &["rev-parse", "origin/behind"]).unwrap()),
+        ];
+        for (parent, tip) in cases {
+            let name = format!("on-{parent}");
+            let dir = root.join("ws").join(&name);
+            let parents = [("api".to_string(), parent.to_string())];
+            let ws = create_workspace_with_prs(
+                &dir,
+                &name,
+                &name,
+                &on_branch(&[api.clone(), web.clone()], &name),
+                &[],
+                &parents,
+            )
+            .unwrap();
+            assert_eq!(head(&dir.join("api")), tip, "{parent}");
+            let key = parent_tip_key(&name);
+            assert_eq!(git(a, &["config", &key]).unwrap(), tip);
+            assert_eq!(ws.repos[0].base, format!("origin/{parent}"));
+            assert_eq!(ws.repos[1].base, "origin/main", "web isn't stacked");
+            assert_eq!(head(&dir.join("web")), head(&web.path));
+        }
+        for (parent, name, want) in [
+            ("fork-only", "on-fork", "`fork-only` isn't a branch here"),
+            (
+                "local",
+                "on-local",
+                "`local` isn't on GitHub yet; push it first",
+            ),
+            (
+                "remote",
+                "ahead",
+                "`ahead` already exists; stacking on `remote` needs a new",
+            ),
+        ] {
+            let dir = root.join("ws").join(name);
+            let parents = [("api".to_string(), parent.to_string())];
+            let picked = on_branch(&[web.clone(), api.clone()], name);
+            let err = create_workspace_with_prs(&dir, name, name, &picked, &[], &parents)
+                .err()
+                .unwrap();
+            assert!(err.contains(want), "{err}");
+            assert!(!dir.exists());
+            assert!(!has_ref(&web.path, &format!("refs/heads/{name}")));
+        }
+        let _ = fs::remove_dir_all(&root);
     }
 
     /// The edge cases of picking existing branches per repo.

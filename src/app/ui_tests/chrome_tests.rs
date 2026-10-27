@@ -126,14 +126,74 @@ impl Render for TabPixels {
     }
 }
 
+struct MenuPixels {
+    fade: bool,
+    selected: bool,
+}
+
+impl Render for MenuPixels {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let background = if self.selected {
+            theme.popover.blend(menu::highlight(theme))
+        } else {
+            theme.popover
+        };
+        let text = |id: &'static str, text: &'static str, width: f32| {
+            let label = if self.fade {
+                crate::overflow_fade::label(text.into(), background, None)
+            } else {
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .whitespace_nowrap()
+                    .child(text)
+            };
+            label.id(id).w(px(width)).flex_none().test_support()
+        };
+        div().size_full().p(px(8.)).bg(theme.background).child(
+            menu::chrome(theme)
+                .w(px(320.))
+                .rounded(theme.radius_lg)
+                .font_features(inter_features())
+                .children(
+                    [
+                        ("menu-fit-label", "Copy…", "menu-fit-hint", "main"),
+                        (
+                            "menu-long-label",
+                            "An exceptionally long action name keeps its intentional ellipsis…",
+                            "menu-long-hint",
+                            "feature/a-branch-with-a-long-name",
+                        ),
+                    ]
+                    .into_iter()
+                    .map(|(label_id, label, hint_id, hint)| {
+                        h_flex()
+                            .h(menu::ROW_H)
+                            .px(px(10.))
+                            .gap(px(8.))
+                            .rounded(theme.radius)
+                            .when(self.selected, |d| d.bg(menu::highlight(theme)))
+                            .child(Icon::new(IconName::GitBranch).with_size(px(16.)))
+                            .child(text(label_id, label, 152.))
+                            .child(text(hint_id, hint, 64.).text_color(theme.muted_foreground))
+                            .child(Icon::new(IconName::Check).with_size(px(16.)))
+                    }),
+                ),
+        )
+    }
+}
+
 /// Opt-in main-thread test: compare real glyph pixels with and without the production fade.
 pub(crate) fn render_pixels() {
-    use gpui_kit::{HeadlessAppContext, assets::Assets};
+    use gpui_kit::{HeadlessAppContext, assets::AllAssets};
     use std::sync::Arc;
 
     let mut cx = HeadlessAppContext::with_platform(
         gpui_kit::platform::current_platform(true).text_system(),
-        Arc::new(Assets),
+        Arc::new(AllAssets),
         gpui_kit::platform::current_headless_renderer,
     );
     cx.update(|cx| {
@@ -272,4 +332,133 @@ pub(crate) fn render_pixels() {
         }
     }
     println!("tab fade pixels: 12 passed (real offscreen renderer)");
+    render_menu_pixels(&mut cx);
+    super::menu_pixels::render_pixels(&mut cx);
+}
+
+fn render_menu_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
+    let (window, menu) = cx
+        .update(|cx| {
+            gpui_kit::open_window(
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(336.), px(100.)),
+                    ))),
+                    focus: false,
+                    show: false,
+                    ..Default::default()
+                },
+                cx,
+                |_, cx| {
+                    cx.new(|_| MenuPixels {
+                        fade: false,
+                        selected: false,
+                    })
+                },
+            )
+        })
+        .unwrap();
+    for (mode, mode_name) in [
+        (crate::state::Mode::Dark, "dark"),
+        (crate::state::Mode::Light, "light"),
+    ] {
+        cx.update(|cx| {
+            crate::settings::apply(
+                &crate::state::Appearance {
+                    mode,
+                    ..Default::default()
+                },
+                cx,
+            )
+        });
+        for selected in [false, true] {
+            let bounds = cx
+                .update_window(window, |_, w, cx| {
+                    menu.update(cx, |menu, cx| {
+                        menu.fade = false;
+                        menu.selected = selected;
+                        cx.notify();
+                    });
+                    w.render_frame(cx);
+                    [
+                        w.find("menu-long-label").bounds(),
+                        w.find("menu-long-hint").bounds(),
+                    ]
+                })
+                .unwrap();
+            let plain = cx
+                .capture_screenshot(window)
+                .expect("real offscreen renderer");
+            cx.update_window(window, |_, w, cx| {
+                menu.update(cx, |menu, cx| {
+                    menu.fade = true;
+                    cx.notify();
+                });
+                w.render_frame(cx);
+            })
+            .unwrap();
+            let faded = cx
+                .capture_screenshot(window)
+                .expect("real offscreen renderer");
+            let scale = plain.width() as f32 / 336.;
+            let strips = bounds.map(|b| {
+                (
+                    ((b.right() - px(24.)).as_f32() * scale).floor() as u32,
+                    (b.right().as_f32() * scale).ceil() as u32,
+                    (b.top().as_f32() * scale).floor() as u32,
+                    (b.bottom().as_f32() * scale).ceil() as u32,
+                )
+            });
+            for (x, y, before) in plain.enumerate_pixels() {
+                if !strips.iter().any(|&(start, end, top, bottom)| {
+                    x >= start && x < end && y >= top && y < bottom
+                }) {
+                    assert_eq!(
+                        before,
+                        faded.get_pixel(x, y),
+                        "menu fade changed fitting text or controls: {mode_name}, selected={selected}, ({x},{y})"
+                    );
+                }
+            }
+            for (start, end, top, bottom) in strips {
+                for x in start..end {
+                    assert!(
+                        (0..4).all(|channel| plain.get_pixel(x, top)[channel]
+                            .abs_diff(faded.get_pixel(x, top)[channel])
+                            <= 2),
+                        "menu fade background seam: {mode_name}, selected={selected}, ({x},{top})"
+                    );
+                }
+                let background = plain.get_pixel(end - 1, top);
+                let mut before_contrast = 0u64;
+                let mut after_contrast = 0u64;
+                for x in end - (6. * scale) as u32..end {
+                    for y in top..bottom {
+                        for channel in 0..3 {
+                            before_contrast +=
+                                plain.get_pixel(x, y)[channel].abs_diff(background[channel]) as u64;
+                            after_contrast +=
+                                faded.get_pixel(x, y)[channel].abs_diff(background[channel]) as u64;
+                        }
+                    }
+                }
+                assert!(
+                    before_contrast > 0 && after_contrast * 2 < before_contrast,
+                    "menu text must fade at the edge: {mode_name}, selected={selected}"
+                );
+            }
+            if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
+                let dir = PathBuf::from(dir);
+                fs::create_dir_all(&dir).unwrap();
+                faded
+                    .save(dir.join(format!(
+                        "menu-{mode_name}-{}.png",
+                        if selected { "selected" } else { "normal" }
+                    )))
+                    .unwrap();
+            }
+        }
+    }
+    println!("menu fade pixels: 4 passed (real offscreen renderer)");
 }

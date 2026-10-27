@@ -1,5 +1,7 @@
 //! One agent conversation (a chat tab): transcript blocks, composer, and the claude process.
 mod completion;
+#[cfg(all(test, feature = "test-support"))]
+pub(crate) mod completion_pixels;
 mod question;
 mod side;
 
@@ -278,6 +280,8 @@ struct Queued {
     preview: SharedString,
     /// A review waiting for the turn to end; it goes out as its card.
     review: Option<Rc<ReviewCard>>,
+    /// GitHub reviews are acknowledged only once this prompt is sent.
+    git_reviews: Vec<String>,
 }
 
 impl Queued {
@@ -291,6 +295,7 @@ impl Queued {
             content,
             preview: preview.into(),
             review: None,
+            git_reviews: vec![],
         }
     }
 
@@ -305,6 +310,7 @@ pub enum ChatEvent {
     /// The user picked the model or thinking level (after `Meta`); new chats start on it.
     Picked,
     TurnDone,
+    GitReviewsSent(Vec<String>),
     /// The agent started or stopped waiting on answers to its questions (`Chat::asking`).
     Asking,
     /// A review card's "Review changes" row: show the diff.
@@ -391,6 +397,7 @@ pub struct Chat {
     /// The queue slot of the message being edited in the composer. The queue waits meanwhile,
     /// so the message doesn't lose its turn.
     editing: Option<usize>,
+    editing_git_reviews: Vec<String>,
     /// A message was sent into a running turn and claude may not have read it yet.
     pub steered: bool,
     /// What the CLI reported at init: its model, permission mode and MCP servers.
@@ -472,6 +479,54 @@ pub(crate) fn effort_label(level: &str) -> String {
         "xhigh" => "Extra high".into(),
         l => model_label(l),
     }
+}
+
+/// Shared menu contents: production actions and preview fixtures use the same model/effort rules.
+pub(crate) fn model_entries(
+    meta: &ChatMeta,
+    choose_model: impl Fn(&'static str, &mut App) + Clone + 'static,
+    choose_effort: impl Fn(&'static str, &mut App) + Clone + 'static,
+) -> (Vec<crate::menu::Entry>, usize) {
+    let current = meta.model.as_deref().unwrap_or(MODELS[0]);
+    // Claude's models, then Codex's: switching between the two starts a new conversation.
+    let mut entries = vec![];
+    for (i, &m) in MODELS.iter().enumerate() {
+        let is_codex = codex::is_codex(Some(m));
+        if is_codex && !entries.iter().any(|e| matches!(e, crate::menu::Entry::Sep)) {
+            entries.push(crate::menu::Entry::Sep);
+        }
+        let choose = choose_model.clone();
+        let item = crate::menu::item(None, model_label(m), move |_, cx| {
+            choose(m, cx);
+        });
+        // The backend where the name doesn't say it, and the ctrl-cmd-N pick.
+        let keys = format!("⌃⌘{}", i + 1);
+        let hint = if is_codex {
+            format!("Codex  {keys}")
+        } else {
+            keys
+        };
+        entries.push(item.hint(hint).checked(m == current));
+    }
+    entries.push(crate::menu::Entry::Sep);
+    let effort = effort_of(meta);
+    let mut sel = 0;
+    for &l in efforts(current) {
+        if l == effort {
+            sel = entries.len();
+        }
+        let choose = choose_effort.clone();
+        let item = crate::menu::item(None, effort_label(l), move |_, cx| {
+            choose(l, cx);
+        });
+        let hint = if matches!(l, "max" | "ultra") {
+            "slower"
+        } else {
+            ""
+        };
+        entries.push(item.hint(hint).checked(l == effort));
+    }
+    (entries, sel)
 }
 
 /// A model id as people read it: "opus" → "Opus", "codex:gpt-6.1-sol" → "GPT-6.1 Sol".
@@ -694,6 +749,7 @@ impl Chat {
             qfocus: cx.focus_handle(),
             qscroll: ScrollHandle::new(),
             editing: None,
+            editing_git_reviews: vec![],
             steered: false,
             side: None,
             asked: None,
@@ -828,46 +884,17 @@ impl Chat {
     /// checked; type a letter to jump (again to cycle). The highlight starts on the current
     /// level, the pick changed most. A pick takes effect on the next send.
     pub fn open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let current = self.model().to_string();
-        let this = cx.entity().downgrade();
-        // Claude's models, then Codex's: switching between the two starts a new conversation.
-        let mut entries = vec![];
-        for (i, &m) in MODELS.iter().enumerate() {
-            let is_codex = codex::is_codex(Some(m));
-            if is_codex && !entries.iter().any(|e| matches!(e, crate::menu::Entry::Sep)) {
-                entries.push(crate::menu::Entry::Sep);
-            }
-            let this = this.clone();
-            let item = crate::menu::item(None, model_label(m), move |_, cx| {
-                this.update(cx, |c, cx| c.set_model(m, cx)).ok();
-            });
-            // The backend where the name doesn't say it, and the ctrl-cmd-N pick.
-            let keys = format!("⌃⌘{}", i + 1);
-            let hint = if is_codex {
-                format!("Codex  {keys}")
-            } else {
-                keys
-            };
-            entries.push(item.hint(hint).checked(m == current));
-        }
-        entries.push(crate::menu::Entry::Sep);
-        let effort = self.effort();
-        let mut sel = 0;
-        for &l in self.efforts() {
-            if l == effort {
-                sel = entries.len();
-            }
-            let this = this.clone();
-            let item = crate::menu::item(None, effort_label(l), move |_, cx| {
-                this.update(cx, |c, cx| c.set_effort(l, cx)).ok();
-            });
-            let hint = if matches!(l, "max" | "ultra") {
-                "slower"
-            } else {
-                ""
-            };
-            entries.push(item.hint(hint).checked(l == effort));
-        }
+        let model_chat = cx.entity().downgrade();
+        let effort_chat = model_chat.clone();
+        let (entries, sel) = model_entries(
+            &self.meta,
+            move |m, cx| {
+                model_chat.update(cx, |c, cx| c.set_model(m, cx)).ok();
+            },
+            move |l, cx| {
+                effort_chat.update(cx, |c, cx| c.set_effort(l, cx)).ok();
+            },
+        );
         let b = self.model_at.get();
         let at = point(b.left(), b.top() - px(4.));
         let m = crate::menu::open_at(entries, at, Anchor::BottomLeft, window, cx);
@@ -1259,6 +1286,7 @@ impl Chat {
         if text.is_empty() {
             // Clearing an edited message and pressing Enter deletes it.
             if self.editing.take().is_some() {
+                self.editing_git_reviews.clear();
                 self.drain(cx);
                 cx.notify();
             }
@@ -1278,10 +1306,21 @@ impl Chat {
         self.steered |= sent && busy;
         if !sent && (self.busy || self.hold) {
             let at = self.queue_slot();
-            self.queue.insert(at, Queued::new(content));
+            self.queue.insert(
+                at,
+                Queued {
+                    git_reviews: std::mem::take(&mut self.editing_git_reviews),
+                    ..Queued::new(content)
+                },
+            );
             self.qsel = at;
         } else if !sent {
             return; // spawn or write failed; the error is in the transcript, keep the draft
+        }
+        if sent {
+            cx.emit(ChatEvent::GitReviewsSent(std::mem::take(
+                &mut self.editing_git_reviews,
+            )));
         }
         self.editing = None;
         self.composer
@@ -1300,7 +1339,10 @@ impl Chat {
         }
         let q = self.queue.remove(0); // editing is None here
         match self.send_block(q.text(), false, q.review.clone(), cx) {
-            true => self.qsel = self.qsel.saturating_sub(1),
+            true => {
+                self.qsel = self.qsel.saturating_sub(1);
+                cx.emit(ChatEvent::GitReviewsSent(q.git_reviews));
+            }
             false => self.queue.insert(0, q),
         }
         self.after_queue_change(cx);
@@ -1364,6 +1406,7 @@ impl Chat {
         if self.send_block(q.text(), true, q.review.clone(), cx) {
             // Claude may hold it unread until this turn ends; don't restart the process under it.
             self.steered |= busy;
+            cx.emit(ChatEvent::GitReviewsSent(q.git_reviews));
         } else {
             self.editing = editing;
             self.queue.insert(self.qsel, q);
@@ -1426,12 +1469,19 @@ impl Chat {
         let draft = self.composer.read(cx).content();
         if !draft.text().trim().is_empty() {
             let at = self.queue_slot();
-            self.queue.insert(at, Queued::new(draft));
+            self.queue.insert(
+                at,
+                Queued {
+                    git_reviews: std::mem::take(&mut self.editing_git_reviews),
+                    ..Queued::new(draft)
+                },
+            );
             if at <= ix {
                 ix += 1;
             }
         }
         self.editing = Some(ix);
+        self.editing_git_reviews = item.git_reviews;
         let end = item.content.text().len();
         self.composer.update(cx, |c, cx| {
             c.set_value(item.content, window, cx);
@@ -1441,8 +1491,22 @@ impl Chat {
         self.after_queue_change(cx);
     }
 
-    /// Sends a host-written prompt (git steps). A draft in the composer rides along as extra
-    /// instructions, so "Commit and push" can carry "…and mention the ticket".
+    /// Appends a git prompt without changing the draft or an edit already in progress.
+    pub fn enqueue(&mut self, prompt: &str, reviews: Vec<String>, cx: &mut Context<Self>) -> bool {
+        if self.archiving {
+            return false;
+        }
+        self.queue.push(Queued {
+            git_reviews: reviews,
+            ..Queued::new(prompt.to_string().into())
+        });
+        self.qsel = self.queue.len() - 1;
+        self.drain(cx);
+        self.after_queue_change(cx);
+        true
+    }
+
+    /// Sends a host-written prompt together with any draft instructions.
     pub fn ask(&mut self, prompt: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let mut draft = self.composer.read(cx).value().trim().to_string();
         // The same prompt put back below after a failed start: retrying must not send it twice.
@@ -1455,6 +1519,9 @@ impl Chat {
         };
         let sent = self.send_text(text.clone(), false, cx);
         if sent && !draft.is_empty() {
+            cx.emit(ChatEvent::GitReviewsSent(std::mem::take(
+                &mut self.editing_git_reviews,
+            )));
             self.editing = None;
             self.composer
                 .update(cx, |c, cx| c.set_value("", window, cx));
@@ -3157,6 +3224,44 @@ mod tests {
     use super::*;
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
 
+    #[test]
+    fn model_menu_uses_supported_efforts_and_selects_the_effective_level() {
+        use crate::menu::Entry;
+        for (model, saved, selected, ultra) in [
+            ("sonnet", "xhigh", "Extra high", false),
+            ("sonnet", "ultra", "Max", false),
+            ("codex:gpt-6.1-sol", "ultra", "Ultra", true),
+        ] {
+            let meta = ChatMeta {
+                model: Some(model.into()),
+                effort: Some(saved.into()),
+                ..Default::default()
+            };
+            let (entries, sel) = model_entries(&meta, |_, _| {}, |_, _| {});
+            assert!(
+                matches!(&entries[sel], Entry::Item { label, checked: true, .. } if label == selected)
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|e| matches!(e, Entry::Item { checked: true, .. }))
+                    .count(),
+                2
+            );
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| matches!(e, Entry::Item { label, .. } if label == "Extra high"))
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .any(|e| matches!(e, Entry::Item { label, .. } if label == "Ultra")),
+                ultra
+            );
+        }
+    }
+
     /// A review prompt in a replayed transcript comes back as its card; report lines stay
     /// out of the shown reply.
     #[test]
@@ -3403,6 +3508,13 @@ exec cat >/dev/null
                 info,
                 Some("Couldn't start the agent: claude not found on PATH. See Home for setup.")
             );
+        });
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                assert!(c.enqueue("commit", vec![], cx));
+                assert_eq!(c.queue[0].text(), "commit", "failed sends stay queued");
+                assert_eq!(c.composer.read(cx).value().as_ref(), "build the thing");
+            })
         });
         let _ = std::fs::remove_file(ws.dir());
     }
@@ -4454,6 +4566,81 @@ exec cat >/dev/null
         cx.update(|cx| chat.update(cx, |c, cx| c.send_review(review("R2"), cx)));
         act(cx, &|w, cx| w.press("enter", cx));
         assert_eq!(queue(cx), ["R2", "R1", "b", "c"], "c back in its slot");
+
+        // Git prompts append, preserve drafts/edits, and wait behind a git hold.
+        let acknowledged = Rc::new(std::cell::RefCell::new(Vec::<String>::new()));
+        let _ack = cx.update(|cx| {
+            let acknowledged = acknowledged.clone();
+            cx.subscribe(&chat, move |_, ev, _| {
+                if let ChatEvent::GitReviewsSent(ids) = ev {
+                    acknowledged.borrow_mut().extend(ids.iter().cloned());
+                }
+            })
+        });
+        act(cx, &|w, cx| {
+            chat.update(cx, |c, cx| {
+                c.queue.clear();
+                c.composer.update(cx, |t, cx| t.set_value("draft", w, cx));
+                assert!(c.enqueue("commit", vec!["g1".into()], cx));
+                assert!(c.enqueue("fix checks", vec!["g2".into()], cx));
+            });
+        });
+        assert_eq!(queue(cx), ["commit", "fix checks"]);
+        assert!(
+            acknowledged.borrow().is_empty(),
+            "queuing does not acknowledge reviews"
+        );
+        assert_eq!(value(cx), "draft");
+        act(cx, &|w, cx| {
+            chat.update(cx, |c, cx| {
+                c.composer.update(cx, |t, cx| t.set_value("", w, cx));
+                c.qsel = 0;
+                c.edit_queued(w, cx);
+                c.busy = false;
+                assert!(c.enqueue("update base", vec![], cx));
+                assert_eq!(c.editing, Some(0));
+            });
+        });
+        assert_eq!(value(cx), "commit");
+        assert_eq!(queue(cx), ["fix checks", "update base"]);
+        act(cx, &|w, cx| {
+            chat.update(cx, |c, cx| {
+                c.hold = true;
+                c.send(false, w, cx);
+            });
+        });
+        assert_eq!(queue(cx), ["commit", "fix checks", "update base"]);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                assert!(c.enqueue("restack", vec![], cx));
+                c.hold = false;
+                c.drain(cx);
+            })
+        });
+        assert_eq!(users(cx).last().map(String::as_str), Some("commit"));
+        assert_eq!(*acknowledged.borrow(), ["g1"], "metadata survives an edit");
+        assert_eq!(queue(cx), ["fix checks", "update base", "restack"]);
+        cx.update(|cx| chat.update(cx, |c, cx| c.apply(result(false), cx)));
+        assert_eq!(users(cx).last().map(String::as_str), Some("fix checks"));
+        assert_eq!(*acknowledged.borrow(), ["g1", "g2"]);
+        act(cx, &|w, cx| {
+            chat.update(cx, |c, cx| {
+                c.enqueue("cancel me", vec!["g3".into()], cx);
+                c.delete_queued(w, cx);
+            })
+        });
+        assert_eq!(
+            *acknowledged.borrow(),
+            ["g1", "g2"],
+            "deleted reviews remain unhandled"
+        );
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.archiving = true;
+                assert!(!c.enqueue("must not queue", vec![], cx));
+            })
+        });
+        assert_eq!(queue(cx), ["update base", "restack"]);
 
         cx.update(|cx| chat.update(cx, |c, _| c.agent = None));
         let _ = std::fs::remove_file(dir);

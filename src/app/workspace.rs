@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 /// Contents of the New workspace dialog: a branch name and a filterable repo picker.
 /// Starts with the last-used repos ticked and floated to the top, so the common case
 /// is type a branch, enter. cmd-b swaps the list for a repo's branches, to check one out
-/// there instead of the new branch.
+/// there instead of the new branch, or (alt-enter) to branch from it: a stack.
 pub(super) struct NewWorkspaceForm {
     branch: Entity<InputState>,
     /// Home's prompt, sent once the workspace is created.
@@ -20,6 +20,10 @@ pub(super) struct NewWorkspaceForm {
     branches: Vec<Option<Vec<git::Branch>>>,
     prs: Vec<Option<Vec<complete::Pr>>>,
     chosen_pr: Vec<Option<complete::Pr>>,
+    /// Per repo: the branch the new branch is based on (stacked on), instead of the trunk.
+    from: Vec<Option<String>>,
+    /// "Insert workspace below…": the workspace to stack on the new one once it exists.
+    insert: Option<String>,
     refreshed_at: Vec<[Option<Instant>; 2]>,
     loading: Vec<[bool; 2]>,
     errors: Vec<[Option<String>; 2]>,
@@ -38,10 +42,15 @@ enum Mode {
 }
 
 impl NewWorkspaceForm {
+    /// `from` bases repos' new branch on another branch, `(repo, parent)`; `insert` names the
+    /// workspace that moves on top of the new one.
+    #[allow(clippy::too_many_arguments)]
     fn new(
         mut repos: Vec<Repo>,
         last: &[String],
         first: Option<String>,
+        from: &[(String, String)],
+        insert: Option<String>,
         shark: WeakEntity<Shark>,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -82,7 +91,16 @@ impl NewWorkspaceForm {
         })
         .detach();
         let n = repos.len();
+        let from = (repos.iter())
+            .map(|r| {
+                from.iter()
+                    .find(|(n, _)| *n == r.name)
+                    .map(|(_, p)| p.clone())
+            })
+            .collect();
         NewWorkspaceForm {
+            from,
+            insert,
             branch,
             first,
             picker: cx.new(|cx| CommandState::new(window, cx)),
@@ -261,6 +279,50 @@ impl NewWorkspaceForm {
         cx.notify();
     }
 
+    /// alt-enter on a branch or PR: the repo's new branch starts on it and its PR will target
+    /// it. The source must be on origin and in this repo (not a fork's PR).
+    fn branch_from(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(row) = self.picker.read(cx).selected_index().map(|i| i.row) else {
+            return;
+        };
+        let (ix, parent) = match self.mode {
+            Mode::Repos => return,
+            Mode::Branches(ix) => {
+                let Some(b) = (row.checked_sub(1)).and_then(|i| self.branches[ix].as_ref()?.get(i))
+                else {
+                    return;
+                };
+                if !b.origin {
+                    let msg = format!("`{}` isn't on GitHub yet; push it first", b.name);
+                    return notify_err(window, cx, msg);
+                }
+                (ix, b.name.clone())
+            }
+            Mode::Prs(ix) => {
+                let Some(pr) = self.prs[ix].as_ref().and_then(|l| l.get(row)) else {
+                    return;
+                };
+                if pr.is_cross_repository {
+                    let msg = format!(
+                        "#{} is from a fork; its branch isn't in this repo, so nothing can stack on it. Press enter to review it instead.",
+                        pr.number
+                    );
+                    return notify_err(window, cx, msg);
+                }
+                (ix, pr.head_ref_name.clone())
+            }
+        };
+        self.from[ix] = Some(parent);
+        self.own[ix] = None;
+        self.chosen_pr[ix] = None;
+        self.picked[ix] = true;
+        self.back(window, cx);
+        // Stacking needs a new branch; the name field is where it goes.
+        if self.branch.read(cx).value().trim().is_empty() {
+            self.branch.update(cx, |i, cx| i.focus(window, cx));
+        }
+    }
+
     /// Back to the repo list, on the repo whose branches were listed.
     fn back(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Mode::Branches(ix) | Mode::Prs(ix) = self.mode {
@@ -270,6 +332,9 @@ impl NewWorkspaceForm {
 
     /// Enter on row `row`: ticks a repo, or picks a branch for the listed repo and goes back.
     fn choose(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if let Mode::Branches(ix) | Mode::Prs(ix) = self.mode {
+            self.from[ix] = None;
+        }
         let ix = match self.mode {
             Mode::Repos => {
                 self.toggle(row, cx);
@@ -333,6 +398,9 @@ impl NewWorkspaceForm {
         if let Some(b) = &self.own[ix] {
             return b.clone();
         }
+        if let Some(p) = &self.from[ix] {
+            return format!("new · on {p}");
+        }
         let typed = self.branch.read(cx).value();
         let typed = typed.trim();
         let exists = (self.branches[ix].as_ref())
@@ -390,10 +458,14 @@ impl NewWorkspaceForm {
                 ))
             })
             .collect();
+        let parents = (self.repos.iter().zip(&self.picked).zip(&self.from))
+            .filter_map(|((r, p), f)| Some((r.name.clone(), f.clone().filter(|_| *p)?)))
+            .collect();
         let prompt = self.first.clone();
+        let insert = self.insert.clone();
         self.shark
             .update(cx, |s, cx| {
-                s.create_workspace(branch, repos, prs, prompt, window, cx)
+                s.create_workspace_on(branch, repos, prs, parents, insert, prompt, window, cx)
             })
             .ok();
         true
@@ -620,6 +692,9 @@ impl Render for NewWorkspaceForm {
                 }
             }))
             .on_action(
+                cx.listener(|this, _: &BranchFromSource, window, cx| this.branch_from(window, cx)),
+            )
+            .on_action(
                 cx.listener(|this, _: &RefreshWorkspaceSources, window, cx| {
                     this.refresh(true, window, cx);
                 }),
@@ -640,6 +715,11 @@ impl Render for NewWorkspaceForm {
                     .truncate()
                     .child(format!("Worktrees go in {}", super::menus::tilde(&dir)))
             })
+            .children(self.insert.as_ref().map(|child| {
+                div().text_xs().text_color(muted).child(format!(
+                    "Inserted below `{child}`: {child} will be stacked on it"
+                ))
+            }))
             .child(
                 h_flex()
                     .text_xs()
@@ -721,10 +801,12 @@ impl Render for NewWorkspaceForm {
                     .text_color(faint)
                     .map(|d| match (self.mode, in_branch) {
                         (Mode::Branches(_), _) => d
-                            .child(hint(vec![kbd("enter")], "pick branch"))
+                            .child(hint(vec![kbd("enter")], "check out"))
+                            .child(hint(vec![kbd("alt-enter")], "branch from it"))
                             .child(hint(vec![kbd("tab")], "back")),
                         (Mode::Prs(_), _) => d
-                            .child(hint(vec![kbd("enter")], "pick PR"))
+                            .child(hint(vec![kbd("enter")], "review"))
+                            .child(hint(vec![kbd("alt-enter")], "branch from it"))
                             .child(hint(vec![kbd("tab")], "back")),
                         (Mode::Repos, true) => d
                             .child(hint(vec![kbd("tab")], "switch field"))
@@ -789,6 +871,7 @@ impl Shark {
             self.diff_file = 0;
             self.diff_loaded = false;
             self.diff_error = None;
+            self.uncommitted.clear();
             self.tree_rows.clear();
             self.collapsed_dirs.clear();
             self.tree_sel = 0;
@@ -814,6 +897,9 @@ impl Shark {
                 move |this, _, ev: &SyncEvent, window, cx| match ev {
                     SyncEvent::Archive => this.remove_workspace(&name, false, window, cx),
                     SyncEvent::PrsCreated => this.state.mark(|s| &mut s.opened_pr),
+                    SyncEvent::Restack { moves, prompt } => {
+                        this.restack(&name, moves, prompt.clone(), window, cx)
+                    }
                 },
             ));
             self.syncs.insert(ws.name.clone(), sync);
@@ -876,9 +962,28 @@ impl Shark {
         if self.state.repos.is_empty() {
             return notify_err(window, cx, "Add a repo first (Add repo in cmd-k)");
         }
+        self.new_workspace_from(picked, first, vec![], None, window, cx)
+    }
+
+    /// The New workspace dialog with `from` `(repo, parent)` prefilled; `insert` names the
+    /// workspace to stack on the new one.
+    pub(super) fn new_workspace_from(
+        &mut self,
+        picked: Vec<String>,
+        first: Option<String>,
+        from: Vec<(String, String)>,
+        insert: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.repos.is_empty() {
+            return notify_err(window, cx, "Add a repo first (Add repo in cmd-k)");
+        }
         let shark = cx.entity().downgrade();
         let repos = self.state.repos.clone();
-        let form = cx.new(|cx| NewWorkspaceForm::new(repos, &picked, first, shark, window, cx));
+        let form = cx.new(|cx| {
+            NewWorkspaceForm::new(repos, &picked, first, &from, insert, shark, window, cx)
+        });
         let input = form.read(cx).branch.clone();
         window.open_dialog(cx, move |d, _, _| {
             let f = form.clone();
@@ -895,6 +1000,7 @@ impl Shark {
     }
 
     /// `prompt`, when set, is sent to the agent once the workspace is open.
+    #[cfg(test)]
     pub(super) fn create_workspace(
         &mut self,
         branch: String,
@@ -904,6 +1010,45 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.create_workspace_on(branch, repos, prs, vec![], None, prompt, window, cx)
+    }
+
+    /// `create_workspace` with repos' new branches stacked on `parents` `(repo, branch)`. With
+    /// `insert`, that workspace's repos based on the same parent move on top of the new one:
+    /// its (still empty) branch is pushed so their PRs can target it.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn create_workspace_on(
+        &mut self,
+        branch: String,
+        repos: Vec<(Repo, String)>,
+        prs: Vec<(String, git::PullRequest)>,
+        parents: Vec<(String, String)>,
+        insert: Option<String>,
+        prompt: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // `(repo, old base, new base)` of the inserted-below workspace.
+        let moves: Vec<(String, String, String)> = (insert.as_deref())
+            .and_then(|n| self.ws(n))
+            .map(|child| {
+                (child.repos.iter())
+                    .filter_map(|cr| {
+                        let (_, p) = parents.iter().find(|(n, _)| *n == cr.name)?;
+                        let (_, b) = repos.iter().find(|(r, _)| r.name == cr.name)?;
+                        (cr.base == format!("origin/{p}"))
+                            .then(|| (cr.name.clone(), cr.base.clone(), format!("origin/{b}")))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        if insert.is_some() && moves.is_empty() {
+            return notify_err(
+                window,
+                cx,
+                "Nothing to insert below: no repo shares its parent",
+            );
+        }
         let name = branch.replace('/', "-");
         // Nothing is saved this run, so the worktrees would be orphaned on restart.
         if self.state.read_only {
@@ -920,15 +1065,47 @@ impl Shark {
         self.state.save();
         let dir = workspaces_dir().join(&name);
         window.push_notification(format!("Creating {}…", tilde(&dir)), cx);
+        let pushes: Vec<(String, String)> = (moves.iter())
+            .filter_map(|(r, ..)| {
+                Some((
+                    r.clone(),
+                    repos.iter().find(|(x, _)| &x.name == r)?.1.clone(),
+                ))
+            })
+            .collect();
         cx.spawn_in(window, async move |this, cx| {
-            let result =
-                cx.background_executor()
-                    .spawn(async move {
-                        git::create_workspace_with_prs(&dir, &name, &branch, &repos, &prs)
-                    })
-                    .await;
+            let (result, pushed) = cx
+                .background_executor()
+                .spawn(async move {
+                    let ws = git::create_workspace_with_prs(
+                        &dir, &name, &branch, &repos, &prs, &parents,
+                    );
+                    // The base a PR targets must exist on GitHub.
+                    let pushed = ws.is_ok().then(|| {
+                        (pushes.iter())
+                            .map(|(r, b)| {
+                                let args = ["push", "-q", "-u", "origin", b.as_str()];
+                                git::cmd_bounded(&dir.join(r), "git", &args, 120)
+                                    .map_err(|e| format!("{r}: {e}"))
+                            })
+                            .collect::<Result<Vec<_>, _>>()
+                    });
+                    (ws, pushed)
+                })
+                .await;
             this.update_in(cx, |s, window, cx| match result {
                 Ok(mut ws) => {
+                    match (&insert, pushed) {
+                        (Some(child), Some(Ok(_))) => s.set_base(child, &moves, false, window, cx),
+                        (Some(child), Some(Err(e))) => notify_err(
+                            window,
+                            cx,
+                            format!(
+                                "Created, but `{child}` stays where it was; pushing failed: {e}"
+                            ),
+                        ),
+                        _ => {}
+                    }
                     ws.fill_models(&s.state.new_model(), s.state.last_effort.as_ref());
                     let name = ws.name.clone();
                     s.state.workspaces.push(ws);
@@ -961,7 +1138,9 @@ impl Shark {
         };
         self.open_workspace_now(ix, window, cx);
         match tab.as_str() {
-            "diff" => self.show(Tab::Diff, window, cx),
+            "diff" if self.active_ws().is_some_and(|ws| !ws.diff_closed) => {
+                self.show(Tab::Diff, window, cx)
+            }
             "home" => self.enter_home(window, cx),
             _ => {}
         }
@@ -1072,6 +1251,102 @@ impl Shark {
             let chat = self.ensure_chat(ws, &m, window, cx);
             chat.update(cx, |c, cx| c.repos_changed(ws, note.clone(), cx));
         }
+    }
+
+    /// "New workspace on top…": the New workspace dialog with this workspace's repos ticked,
+    /// each new branch based on this one's. With `insert` ("Insert workspace below…") they're
+    /// based on this one's base instead, and this workspace moves on top of the new one.
+    pub(super) fn stack_from(
+        &mut self,
+        name: String,
+        insert: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ws) = self.ws(&name).cloned() else {
+            return;
+        };
+        // A review checkout's base is a `refs/shark/…` ref, not a branch to stack on.
+        let from: Vec<(String, String)> = (ws.repos.iter())
+            .filter(|r| r.base.starts_with("origin/"))
+            .map(|r| match insert {
+                true => (r.name.clone(), sync::short(&r.base).to_string()),
+                false => (r.name.clone(), ws.branch_of(r).to_string()),
+            })
+            .collect();
+        if from.is_empty() {
+            return notify_err(window, cx, "A local PR review can't be stacked on");
+        }
+        let picked = from.iter().map(|(r, _)| r.clone()).collect();
+        self.new_workspace_from(picked, None, from, insert.then_some(name), window, cx);
+    }
+
+    /// "Go to stack…": every branch of the workspace's stacks, newest first; a pick opens its
+    /// workspace, else its PR.
+    pub(super) fn go_to_stack(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ws) = self.ws(&name).cloned() else {
+            return;
+        };
+        let stacks = menus::stacks(self, &ws, cx);
+        let several = stacks.len() > 1;
+        let rows: Vec<(String, Option<String>, Option<String>, bool)> = (stacks.iter())
+            .flat_map(|s| {
+                (s.nodes.iter().enumerate().rev()).map(move |(i, n)| {
+                    let pr =
+                        n.pr.as_ref()
+                            .map(|p| format!(" · #{} {}", p.number, p.title));
+                    let repo = if several {
+                        format!("{} · ", s.repo)
+                    } else {
+                        String::new()
+                    };
+                    let label = format!("{repo}{}{}", n.branch, pr.unwrap_or_default());
+                    (
+                        label,
+                        n.ws.clone(),
+                        n.pr.as_ref().map(|p| p.url.clone()),
+                        i == s.me,
+                    )
+                })
+            })
+            .collect();
+        if rows.is_empty() {
+            return notify_err(window, cx, "Not part of a stack");
+        }
+        let items = (rows.iter())
+            .map(|(label, ws, ..)| {
+                CommandItem::new()
+                    .label(label.clone())
+                    .icon(match ws {
+                        Some(_) => IconName::GitBranch,
+                        None => IconName::GitPullRequest,
+                    })
+                    .checked(rows.iter().any(|r| r.3 && &r.0 == label))
+            })
+            .collect();
+        let selected = rows.iter().position(|r| r.3).unwrap_or(0);
+        open_menu(
+            cx.entity().downgrade(),
+            "Go to a branch of the stack…",
+            items,
+            selected,
+            move |s, row, w, cx| match &rows[row] {
+                (_, Some(n), ..) => {
+                    if let Some(ix) = s.state.workspaces.iter().position(|x| &x.name == n) {
+                        s.open_workspace(ix, w, cx)
+                    }
+                }
+                (_, None, Some(u), _) => cx.open_url(u),
+                _ => {}
+            },
+            window,
+            cx,
+        );
     }
 
     /// "Change base…": which repos (when there are several), then the new base, then whether
@@ -1291,6 +1566,28 @@ impl Shark {
         }
         window.push_notification(format!("New base: {changed}"), cx);
         cx.notify();
+    }
+
+    /// A parent PR merged: its stacked repos target the parent's base from now on (their PRs
+    /// too), and the agent moves their own commits there.
+    pub(super) fn restack(
+        &mut self,
+        name: &str,
+        moves: &[(String, String, String)],
+        prompt: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(sync) = self.syncs.get(name).cloned() else {
+            return;
+        };
+        if let Some(e) = sync.read(cx).blocked(true, cx) {
+            return notify_err(window, cx, e);
+        }
+        self.set_base(name, moves, false, window, cx);
+        sync.update(cx, |g, cx| {
+            g.run_kind(sync::Kind::Agent(prompt), "Restack", window, cx)
+        });
     }
 
     /// Saves the new repo list and tells the chat, the git button and the diff.

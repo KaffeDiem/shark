@@ -470,6 +470,13 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| s.with_sync(w, cx, GitSync::primary),
     ),
     Row(
+        "Branch menu…",
+        IconName::Layers,
+        Some(&BranchMenu),
+        "stack base parent copy",
+        |s, w, cx| s.open_branch_menu(w, cx),
+    ),
+    Row(
         "Git menu…",
         IconName::GitBranch,
         Some(&GitMenu),
@@ -482,6 +489,13 @@ pub(super) const COMMANDS: &[Row] = &[
         Some(&GitFetch),
         "git sync",
         |s, w, cx| s.with_sync(w, cx, GitSync::fetch_now),
+    ),
+    Row(
+        "Commit and push",
+        IconName::GitCommitHorizontal,
+        None,
+        "git agent queue",
+        |s, w, cx| s.with_sync(w, cx, GitSync::commit_and_push),
     ),
     Row(
         "Pull",
@@ -513,6 +527,43 @@ pub(super) const COMMANDS: &[Row] = &[
         "git rebase retarget main target onto",
         |s, w, cx| match s.target(w) {
             Some(ws) => s.change_base(ws.name, w, cx),
+            None => notify_err(w, cx, "Open a workspace first"),
+        },
+    ),
+    Row(
+        "New workspace on top…",
+        IconName::Layers,
+        None,
+        "stack stacked branch from child pr",
+        |s, w, cx| match s.target(w) {
+            Some(ws) => s.stack_from(ws.name, false, w, cx),
+            None => notify_err(w, cx, "Open a workspace first"),
+        },
+    ),
+    Row(
+        "Insert workspace below…",
+        IconName::ListPlus,
+        None,
+        "stack stacked between parent in-between pr",
+        |s, w, cx| match s.target(w) {
+            Some(ws) => s.stack_from(ws.name, true, w, cx),
+            None => notify_err(w, cx, "Open a workspace first"),
+        },
+    ),
+    Row(
+        "Rebase onto parent",
+        IconName::GitCompareArrows,
+        None,
+        "stack restack parent agent",
+        |s, w, cx| s.with_sync(w, cx, GitSync::restack_onto_parent),
+    ),
+    Row(
+        "Go to stack…",
+        IconName::Layers,
+        None,
+        "stack parent child pr navigate",
+        |s, w, cx| match s.target(w) {
+            Some(ws) => s.go_to_stack(ws.name, w, cx),
             None => notify_err(w, cx, "Open a workspace first"),
         },
     ),

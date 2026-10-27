@@ -8,6 +8,9 @@ use std::time::Instant;
 use std::{fs, path::PathBuf, time::Duration};
 
 pub(crate) mod chrome_tests;
+mod file_changes_tests;
+mod menu_pixels;
+mod tab_tests;
 
 /// UI tests share the process-wide `TEST_HOME` and `state.json`, so they take turns. Chat
 /// tests that make workspace dirs take it too: `test_home` wipes them.
@@ -925,7 +928,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     press(cx, &["v", "down"]);
     assert_eq!(viewed(cx), Viewed::No);
 
-    // `o` opens the file next to the chat and shrinks the sidebar to a rail.
+    // `o` opens the full-width file editor without collapsing the sidebar.
     press(cx, &["o"]);
     let editor = cx.update(|cx| shark.read(cx).editor.clone().expect("editor opened"));
     let text = |cx: &mut TestAppContext| {
@@ -937,7 +940,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     .await;
     cx.update(|cx| {
         let s = shark.read(cx);
-        assert!(s.rail && s.tab == Tab::File);
+        assert!(!s.rail && s.tab == Tab::File);
     });
 
     // Plain editing and cmd-s.
@@ -2458,6 +2461,24 @@ async fn command_click_file_tabs(cx: &mut TestAppContext) {
         assert_eq!(shark.read(cx).tab, Tab::Diff);
         assert!(shark.read(cx).file_tabs.is_empty());
     });
+    // Opening, reselecting, and closing files preserve either sidebar state.
+    for rail in [false, true] {
+        on(cx, &|s, _, cx| {
+            if s.rail != rail {
+                s.toggle_sidebar(cx);
+            }
+        });
+        for path in ["api/a.txt", "api/b.txt", "api/a.txt"] {
+            click_file(cx, path, true);
+            cx.update(|cx| assert_eq!(shark.read(cx).rail, rail));
+        }
+        for _ in 0..2 {
+            on(cx, &|s, w, cx| s.close_file(w, cx));
+            cx.update(|cx| assert_eq!(shark.read(cx).rail, rail));
+        }
+        cx.update(|cx| assert!(shark.read(cx).file_tabs.is_empty()));
+    }
+    on(cx, &|s, _, cx| s.toggle_sidebar(cx));
     click_file(cx, "api/a.txt", true);
     let first = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
     click_file(cx, "api/b.txt", true);
@@ -2532,6 +2553,7 @@ async fn command_click_file_tabs(cx: &mut TestAppContext) {
     });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
+        w.pointer_move(w.find("file-tab-api/b.txt").bounds().center(), None, cx);
         w.within("file-tab-api/b.txt").click("close-file-tab", cx);
         assert_eq!(
             shark.read(cx).editor.as_ref(),
@@ -3324,6 +3346,8 @@ async fn file_menu_labels(cx: &mut TestAppContext) {
     let file = [
         "Comment",
         "Viewed",
+        "-",
+        "Discard uncommitted changes…",
         "-",
         "Reveal in Finder",
         "Open in Code",
@@ -6989,5 +7013,378 @@ async fn change_base(cx: &mut TestAppContext) {
     });
     let md = fs::read_to_string(home.join("shark/workspaces/rb/CLAUDE.md")).unwrap();
     assert!(md.contains("base `origin/release`"), "{md}");
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Stacks, end to end on real git: alt-enter on a branch in the New workspace dialog bases the
+/// new branch on it; New workspace on top and Insert workspace below from the branch menu; the
+/// stack rows open their workspace; a merged parent moves the base and asks the agent to
+/// restack after the recorded parent tip.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn stacked_workspaces(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt;
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let repos = repos(&home, &["api", "web"]);
+    let g = |dir: &std::path::Path, args: &[&str]| {
+        git::git(
+            dir,
+            &[&["-c", "user.name=t", "-c", "user.email=t@t"], args].concat(),
+        )
+        .unwrap()
+    };
+    for r in &repos {
+        let origin = home.join("origin").join(format!("{}.git", r.name));
+        g(
+            &home,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                &origin.to_string_lossy(),
+            ],
+        );
+        g(
+            &r.path,
+            &["remote", "add", "origin", &origin.to_string_lossy()],
+        );
+        g(&r.path, &["push", "-q", "origin", "main"]);
+        g(&r.path, &["remote", "set-head", "origin", "main"]);
+    }
+    let api = repos[0].path.clone();
+    g(&api, &["checkout", "-qb", "logic"]);
+    g(&api, &["commit", "-q", "--allow-empty", "-m", "logic"]);
+    g(&api, &["push", "-q", "origin", "logic"]);
+    g(&api, &["checkout", "-q", "main"]);
+    let logic = g(&api, &["rev-parse", "logic"]);
+    let open = serde_json::json!([{
+        "number": 1, "title": "Logic", "author": {"login": "me"}, "headRefName": "logic",
+        "baseRefName": "main", "url": "https://github.com/o/api/pull/1", "state": "OPEN",
+        "isDraft": false, "isCrossRepository": false,
+    }]);
+    let data = home.join("open.json");
+    fs::write(&data, open.to_string()).unwrap();
+    let fake = home.join("gh");
+    fs::write(&fake, format!("#!/bin/sh\ncat '{}'\n", data.display())).unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let _gh = GhGuard::set(&fake);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(1400.), px(900.)),
+            ))),
+            ..Default::default()
+        },
+    );
+    let press = press_in(window);
+    let on = on_app(window, shark.clone());
+    let input = |cx: &mut TestAppContext, text: &str| {
+        cx.update_window(window, |_, w, cx| w.input(text, cx))
+            .unwrap();
+        cx.run_until_parked();
+    };
+    let click_branch = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.click("branch", cx)
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    let ws = |cx: &mut TestAppContext, name: &str| {
+        cx.update(|cx| shark.read(cx).ws(name).cloned().unwrap())
+    };
+    let head = |name: &str| {
+        g(
+            &home.join("shark/workspaces").join(name).join("api"),
+            &["rev-parse", "HEAD"],
+        )
+    };
+
+    // alt-enter on a branch: api's new branch starts on `logic` and targets it; web, unticked,
+    // isn't in the workspace.
+    press(cx, &["cmd-n"]);
+    input(cx, "ui");
+    press(cx, &["tab", "cmd-b"]);
+    cx.wait_for(window, Duration::from_secs(10), |w, _| {
+        w.try_find("source-status").is_none()
+    })
+    .await;
+    input(cx, "logic");
+    press(cx, &["alt-enter"]);
+    let chosen = cx
+        .update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.find(("repo-branch", 0usize)).label().unwrap().to_string()
+        })
+        .unwrap();
+    assert_eq!(chosen, "api branch: new · on logic");
+    press(cx, &["cmd-enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.as_deref() == Some("ui")
+    })
+    .await;
+    let ui = ws(cx, "ui");
+    assert_eq!(
+        (ui.repos.len(), ui.repos[0].base.as_str()),
+        (1, "origin/logic")
+    );
+    assert_eq!(head("ui"), logic);
+    assert_eq!(g(&api, &["config", &git::parent_tip_key("ui")]), logic);
+    // The header's stack: logic (#1, open) under ui.
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        let s = shark.read(cx);
+        let st = menus::stacks(s, s.ws("ui").unwrap(), cx);
+        st.len() == 1 && st[0].me == 1 && st[0].nodes[0].pr.as_ref().is_some_and(|p| p.number == 1)
+    })
+    .await;
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(
+            menus::branch_label(s, s.ws("ui").unwrap(), cx),
+            "logic ← ui"
+        );
+    });
+
+    // New workspace on top, from the branch menu, once ui is pushed.
+    let wt = home.join("shark/workspaces/ui/api");
+    g(&wt, &["commit", "-q", "--allow-empty", "-m", "ui"]);
+    g(&wt, &["push", "-q", "-u", "origin", "ui"]);
+    let ui_head = head("ui");
+    click_branch(cx);
+    press(cx, &["n", "enter"]);
+    input(cx, "wiring");
+    press(cx, &["cmd-enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.as_deref() == Some("wiring")
+    })
+    .await;
+    assert_eq!(ws(cx, "wiring").repos[0].base, "origin/ui");
+    assert_eq!(head("wiring"), ui_head);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        let s = shark.read(cx);
+        let st = menus::stacks(s, s.ws("wiring").unwrap(), cx);
+        let names: Vec<&str> = st
+            .iter()
+            .flat_map(|s| s.nodes.iter().map(|n| n.branch.as_str()))
+            .collect();
+        names == ["logic", "ui", "wiring"] && st[0].me == 2
+    })
+    .await;
+
+    // A stack row opens its workspace; "Branch menu…" opens the menu from the keyboard.
+    cx.update_window(window, |_, w, cx| {
+        w.dispatch_action(Box::new(crate::BranchMenu), cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| assert!(shark.read(cx).menu.is_some()));
+    press(cx, &["u", "enter"]);
+    cx.update(|cx| assert_eq!(shark.read(cx).active.as_deref(), Some("ui")));
+
+    // Insert workspace below ui: based on logic, pushed, and ui moves on top of it.
+    click_branch(cx);
+    press(cx, &["i", "enter"]);
+    input(cx, "models");
+    press(cx, &["cmd-enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        let s = shark.read(cx);
+        s.active.as_deref() == Some("models")
+            && s.ws("ui").unwrap().repos[0].base == "origin/models"
+    })
+    .await;
+    assert_eq!(ws(cx, "models").repos[0].base, "origin/logic");
+    assert_eq!(head("models"), logic);
+    let origin = home.join("origin/api.git");
+    assert_eq!(
+        g(&origin, &["rev-parse", "models"]),
+        logic,
+        "pushed for ui's PR to target"
+    );
+    let md = fs::read_to_string(home.join("shark/workspaces/ui/CLAUDE.md")).unwrap();
+    assert!(md.contains("base `origin/models`"), "{md}");
+
+    // ui's PR merged: wiring moves onto its base and the agent restacks after ui's tip.
+    let ix = cx.update(|cx| {
+        shark
+            .read(cx)
+            .state
+            .workspaces
+            .iter()
+            .position(|w| w.name == "wiring")
+            .unwrap()
+    });
+    on(cx, &|s, w, cx| s.open_workspace(ix, w, cx));
+    let sync = cx.update(|cx| shark.read(cx).syncs["wiring"].clone());
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        (sync.read(cx).repos()).is_some_and(|r| r[0].stacked() == Some("ui"))
+    })
+    .await;
+    let tip = ui_head.clone();
+    cx.update(|cx| sync.update(cx, |g, _| g.set_merged_parent("api", 2, &tip, "logic")));
+    cx.update(|cx| {
+        let a = sync.read(cx).action.clone().unwrap();
+        assert_eq!(
+            (a.label.as_str(), a.kind),
+            ("Parent merged · rebase onto logic", sync::Kind::Restack)
+        );
+    });
+    on(cx, &|s, w, cx| s.with_sync(w, cx, GitSync::primary));
+    assert_eq!(ws(cx, "wiring").repos[0].base, "origin/logic");
+    let chat = cx.update(|cx| shark.read(cx).active_chat().cloned().unwrap());
+    let sent = cx.update(|cx| chat.read(cx).sent_texts());
+    let prompt = sent.last().expect("the agent was asked");
+    assert!(prompt.contains("Restack `wiring`"), "{prompt}");
+    assert!(
+        prompt.contains(&format!("api: onto `origin/logic`, after `{ui_head}`")),
+        "{prompt}"
+    );
+    fs::remove_dir_all(&home).ok();
+}
+
+/// alt-enter refuses what can't be a PR base (a branch not on origin, a fork's PR); enter
+/// (check out, review) replaces a stacked choice; in a two-repo workspace only the stacked repo
+/// targets the parent, and the header names that parent.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn branch_from_refusals_and_mixed_repos(cx: &mut TestAppContext) {
+    use std::os::unix::fs::PermissionsExt;
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api", "web"]);
+    let g = |dir: &std::path::Path, args: &[&str]| {
+        git::git(
+            dir,
+            &[&["-c", "user.name=t", "-c", "user.email=t@t"], args].concat(),
+        )
+        .unwrap()
+    };
+    for r in &repos {
+        let origin = home.join("origin").join(format!("{}.git", r.name));
+        g(
+            &home,
+            &[
+                "init",
+                "-q",
+                "--bare",
+                "-b",
+                "main",
+                &origin.to_string_lossy(),
+            ],
+        );
+        g(
+            &r.path,
+            &["remote", "add", "origin", &origin.to_string_lossy()],
+        );
+        g(&r.path, &["push", "-q", "origin", "main"]);
+        g(&r.path, &["remote", "set-head", "origin", "main"]);
+    }
+    let api = repos[0].path.clone();
+    g(&api, &["branch", "local-only"]);
+    g(&api, &["branch", "logic"]);
+    g(&api, &["push", "-q", "origin", "logic"]);
+    let pr = |n: u64, head: &str, fork: bool| {
+        serde_json::json!({
+            "number": n, "title": format!("PR {n}"), "author": {"login": "c"}, "headRefName": head,
+            "baseRefName": "main", "url": format!("https://github.com/o/api/pull/{n}"),
+            "state": "OPEN", "isDraft": false, "isCrossRepository": fork,
+        })
+    };
+    let data = home.join("open.json");
+    fs::write(
+        &data,
+        serde_json::json!([pr(3, "logic", true), pr(4, "logic", false)]).to_string(),
+    )
+    .unwrap();
+    let fake = home.join("gh");
+    fs::write(&fake, format!("#!/bin/sh\ncat '{}'\n", data.display())).unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let _gh = GhGuard::set(&fake);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let press = press_in(window);
+    let input = |cx: &mut TestAppContext, text: &str| {
+        cx.update_window(window, |_, w, cx| w.input(text, cx))
+            .unwrap();
+        cx.run_until_parked();
+    };
+    let chosen = |cx: &mut TestAppContext, row: usize| {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.find(("repo-branch", row)).label().unwrap().to_string()
+        })
+        .unwrap()
+    };
+    press(cx, &["cmd-n"]);
+    input(cx, "mixed");
+    press(cx, &["tab", "cmd-b"]);
+    cx.wait_for(window, Duration::from_secs(10), |w, _| {
+        w.try_find("source-status").is_none()
+    })
+    .await;
+    input(cx, "local-only");
+    press(cx, &["alt-enter", "tab"]);
+    assert_eq!(chosen(cx, 0), "api branch: new", "not on origin");
+    press(cx, &["cmd-p"]);
+    cx.wait_for(window, Duration::from_secs(10), |w, _| {
+        w.try_find("source-status").is_none()
+    })
+    .await;
+    input(cx, "PR 3");
+    press(cx, &["alt-enter", "tab"]);
+    assert_eq!(chosen(cx, 0), "api branch: new", "a fork's PR");
+    press(cx, &["cmd-p"]);
+    input(cx, "PR 4");
+    press(cx, &["alt-enter"]);
+    assert_eq!(chosen(cx, 0), "api branch: new · on logic");
+    // Checking out (row 0 is the new branch) drops it; branching from the PR again restores it.
+    press(cx, &["tab", "cmd-b", "enter"]);
+    assert_eq!(chosen(cx, 0), "api branch: new");
+    press(cx, &["cmd-p"]);
+    input(cx, "PR 4");
+    // Back on the repo list, on api: tick web too.
+    press(cx, &["alt-enter", "down", "space"]);
+    assert_eq!(chosen(cx, 1), "web branch: new");
+    press(cx, &["cmd-enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.as_deref() == Some("mixed")
+    })
+    .await;
+    let ws = cx.update(|cx| shark.read(cx).ws("mixed").cloned().unwrap());
+    let bases: Vec<&str> = ws.repos.iter().map(|r| r.base.as_str()).collect();
+    assert_eq!(bases, ["origin/logic", "origin/main"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        let s = shark.read(cx);
+        let st = menus::stacks(s, s.ws("mixed").unwrap(), cx);
+        st.len() == 1
+            && st[0].repo == "api"
+            && st[0].nodes[0].pr.as_ref().is_some_and(|p| p.number == 4)
+    })
+    .await;
+    // web on main beside the stacked api: the header names the parent.
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(
+            menus::branch_label(s, s.ws("mixed").unwrap(), cx),
+            "logic ← mixed"
+        );
+    });
     fs::remove_dir_all(&home).ok();
 }

@@ -38,6 +38,7 @@ use std::sync::Arc;
 mod chats;
 mod diff;
 mod editor_pane;
+mod file_changes;
 mod home;
 mod inline_edit;
 mod media;
@@ -102,8 +103,10 @@ pub(crate) fn confirm<T: 'static>(
             .ok_variant(ButtonVariant::Danger)
             .show_cancel(true)
             .on_ok(move |_, window, cx| {
+                // Restore focus before the action can close or replace its original pane.
+                window.close_dialog(cx);
                 target.update(cx, |s, cx| ok(s, window, cx)).ok();
-                true
+                false
             })
     });
 }
@@ -230,69 +233,24 @@ fn side_toggle(id: &'static str, icon: IconName, tip: &'static str) -> Button {
         .tooltip(tip)
 }
 
-/// Fade only overflowing text; the overlay follows the tab surface, including hover.
+/// The overflow overlay follows the tab surface, including hover.
 fn tab_label(label: SharedString, on: bool, theme: &Theme) -> Div {
-    let label: SharedString = label.replace(['\n', '\r'], " ").into();
-    let measure = label.clone();
-    div()
-        .relative()
-        .flex_1()
-        .min_w_0()
-        .overflow_hidden()
-        .whitespace_nowrap()
-        .child(label)
-        .child(
-            div()
-                .absolute()
-                .size_full()
-                .top_0()
-                .left_0()
-                .text_color(if on {
-                    theme.secondary
-                } else {
-                    theme.background
-                })
-                .group_hover("titlebar-tab", |d| d.text_color(theme.secondary_hover))
-                .child(
-                    canvas(
-                        move |bounds, window, _| {
-                            let style = window.text_style();
-                            let line = window.text_system().shape_line(
-                                measure.clone(),
-                                style.font_size.to_pixels(window.rem_size()),
-                                &[style.to_run(measure.len())],
-                                None,
-                            );
-                            line.width > bounds.size.width
-                        },
-                        |bounds, overflow, window, _| {
-                            if overflow {
-                                let color = window.text_style().color;
-                                let width = px(24.).min(bounds.size.width);
-                                window.paint_quad(fill(
-                                    Bounds::new(
-                                        point(bounds.right() - width, bounds.top()),
-                                        size(width, bounds.size.height),
-                                    ),
-                                    linear_gradient(
-                                        90.,
-                                        linear_color_stop(color.opacity(0.), 0.),
-                                        linear_color_stop(color, 1.),
-                                    ),
-                                ));
-                            }
-                        },
-                    )
-                    .size_full(),
-                ),
-        )
+    crate::overflow_fade::label(
+        label.replace(['\n', '\r'], " ").into(),
+        if on {
+            theme.secondary
+        } else {
+            theme.background
+        },
+        Some(("titlebar-tab", theme.secondary_hover)),
+    )
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum Tab {
     Chat,
     Diff,
-    /// The open file next to the chat; only while `editor` is set.
+    /// The full-width file editor; only while `editor` is set.
     File,
 }
 
@@ -333,6 +291,8 @@ pub struct Shark {
     /// False until the first refresh of the open workspace lands.
     diff_loaded: bool,
     diff_error: Option<String>,
+    /// Git status paths, independently of the diff's selected comparison base.
+    uncommitted: HashSet<String>,
     /// Paths currently viewed (fingerprint still matches), for the diff headers.
     viewed_now: Rc<HashSet<SharedString>>,
     tree_rows: Vec<Row>,
@@ -354,9 +314,8 @@ pub struct Shark {
     /// Workspaces whose worktrees are being removed in the background.
     pub(crate) archiving: HashSet<String>,
     show_tree: bool,
-    /// Sidebar shrunk to icons; `rail_auto` when opening a file did it, so closing undoes it.
+    /// Sidebar shrunk to icons by the user.
     rail: bool,
-    rail_auto: bool,
     editor: Option<Entity<FileEditor>>,
     file_tabs: Vec<editor_pane::FileTab>,
     /// The diff file whose working copy is edited in place.
@@ -372,6 +331,8 @@ pub struct Shark {
     pub(crate) attn: crate::attention::Attention,
     /// The open right-click menu, dropped when it dismisses.
     menu: Option<(Entity<menu::Menu>, Subscription)>,
+    /// The header's branch button as last painted: "Branch menu…" hangs its menu from it.
+    branch_at: Rc<std::cell::Cell<Bounds<Pixels>>>,
     /// The latest dependency check; empty until the first one lands.
     pub(crate) deps: Vec<crate::deps::Dep>,
     deps_check: Option<Task<()>>,
@@ -500,6 +461,7 @@ impl Shark {
             diff_file: 0,
             diff_loaded: false,
             diff_error: None,
+            uncommitted: HashSet::new(),
             viewed_now: Rc::default(),
             tree_rows: vec![],
             collapsed_dirs: HashSet::new(),
@@ -517,7 +479,6 @@ impl Shark {
             // Closed by default (design 01); Files N in the Changes bar opens it.
             show_tree: false,
             rail: false,
-            rail_auto: false,
             editor: None,
             file_tabs: vec![],
             editing: None,
@@ -529,6 +490,7 @@ impl Shark {
             sidebar_focus,
             attn: crate::attention::Attention::new(cx),
             menu: None,
+            branch_at: Default::default(),
             deps: vec![],
             deps_check: None,
             deps_at: None,
@@ -564,6 +526,28 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         let m = menu::open(entries, pos, window, cx);
+        let sub = cx.subscribe(&m, |this, _, _: &DismissEvent, cx| {
+            this.menu = None;
+            cx.notify();
+        });
+        self.menu = Some((m, sub));
+        cx.notify();
+    }
+
+    /// "Branch menu…": the header's branch menu, hanging from the button, from the keyboard.
+    fn open_branch_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.active_ws() else {
+            return notify_err(window, cx, "Open a workspace first");
+        };
+        let entries = menus::branch_entries(self, ws, cx);
+        let b = self.branch_at.get();
+        let m = menu::open_at(
+            entries,
+            point(b.right(), b.bottom() + px(4.)),
+            Anchor::TopRight,
+            window,
+            cx,
+        );
         let sub = cx.subscribe(&m, |this, _, _: &DismissEvent, cx| {
             this.menu = None;
             cx.notify();
@@ -611,6 +595,12 @@ impl Shark {
     }
 
     fn show(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
+        if tab == Tab::Diff
+            && let Some(ws) = self.active_ws_mut().filter(|ws| ws.diff_closed)
+        {
+            ws.diff_closed = false;
+            self.state.save();
+        }
         self.tab = tab;
         self.home.on = false;
         self.remember_open();
@@ -631,7 +621,7 @@ impl Shark {
             }
             Tab::File => match &self.editor {
                 Some(e) => crate::editor::focus(e, window, cx),
-                None => return self.show(Tab::Diff, window, cx),
+                None => return self.show(self.file_fallback(), window, cx),
             },
         }
         cx.notify();
@@ -639,7 +629,6 @@ impl Shark {
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.rail = !self.rail;
-        self.rail_auto = false;
         cx.notify();
     }
 
@@ -666,7 +655,7 @@ impl Shark {
                 }
             }
             Tab::Diff => v.push(Pane::Diff),
-            Tab::File => v.extend([Pane::Chat, Pane::Editor]),
+            Tab::File => v.push(Pane::Editor),
         }
         if self.tree_shown() {
             v.push(Pane::Tree);
@@ -859,16 +848,7 @@ impl Shark {
                 Tab::File => h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(
-                        h_resizable("chat-editor")
-                            .child(
-                                resizable_panel()
-                                    .size(px(420.))
-                                    .size_range(px(320.)..px(900.))
-                                    .child(chat.cached(StyleRefinement::default().size_full())),
-                            )
-                            .child(resizable_panel().child(self.render_editor(cx))),
-                    )
+                    .child(self.render_editor(cx))
                     .into_any_element(),
                 Tab::Diff => h_flex()
                     .flex_1()
@@ -879,8 +859,9 @@ impl Shark {
             .into_any_element()
     }
 
-    /// The header's branch label; hovering lists each repo's branch, linked to GitHub once
-    /// pushed, and the base it targets. Either click opens copy, open, and change-base actions.
+    /// The header's branch label, `base ← branch`, with a stack icon and the branch's place in
+    /// its stack (`2/3`) when it is part of one; hovering lists each repo's branch, linked to
+    /// GitHub once pushed, and the base it targets. Either click opens the branch menu.
     fn render_branch(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let branch = self
@@ -891,6 +872,16 @@ impl Shark {
             .active_sync()
             .map(|s| s.read(cx).branches())
             .unwrap_or_default();
+        let stacks = (self.active_ws())
+            .map(|w| menus::stacks(self, w, cx))
+            .unwrap_or_default();
+        let label = (self.active_ws())
+            .map(|w| menus::branch_label(self, w, cx))
+            .unwrap_or_default();
+        let place = |s: &menus::RepoStack| format!("{}/{}", s.me + 1, s.nodes.len());
+        let position = stacks.first().map(place);
+        let per_repo: Vec<(String, String)> =
+            stacks.iter().map(|s| (s.repo.clone(), place(s))).collect();
         HoverCard::new("branch-card")
             .anchor(Anchor::TopRight)
             .trigger(
@@ -902,8 +893,23 @@ impl Shark {
                     .gap_1p5()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(Icon::new(IconName::GitBranch).with_size(px(12.)))
-                    .child(div().min_w_0().truncate().child(branch.clone()))
+                    .child(
+                        Icon::new(match position {
+                            Some(_) => IconName::Layers,
+                            None => IconName::GitBranch,
+                        })
+                        .with_size(px(12.)),
+                    )
+                    .child(div().min_w_0().truncate().child(label))
+                    .children(position.map(|p| div().flex_shrink_0().child(p)))
+                    .child({
+                        let at = self.branch_at.clone();
+                        canvas(move |b, _, _| at.set(b), |_, _, _, _| {})
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full()
+                    })
                     .on_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, w, cx| {
                         if !matches!(e.button, MouseButton::Left | MouseButton::Right) {
                             return;
@@ -942,11 +948,14 @@ impl Shark {
                                     )
                                     .into_any_element(),
                             })
-                            .child(
-                                div()
-                                    .text_color(theme.muted_foreground)
-                                    .child(format!("{} → {}", b.name, b.base)),
-                            )
+                            .child(div().text_color(theme.muted_foreground).child(
+                                match per_repo.iter().find(|(r, _)| *r == b.repo) {
+                                    Some((_, at)) => {
+                                        format!("{} → {} · stack {at}", b.name, b.base)
+                                    }
+                                    None => format!("{} → {}", b.name, b.base),
+                                },
+                            ))
                     }))
             })
     }
@@ -1025,6 +1034,7 @@ impl Render for Shark {
             .on_action(
                 cx.listener(|this, _: &GitMenu, w, cx| this.with_sync(w, cx, GitSync::open_menu)),
             )
+            .on_action(cx.listener(|this, _: &BranchMenu, w, cx| this.open_branch_menu(w, cx)))
             .on_action(
                 cx.listener(|this, _: &GitFetch, w, cx| this.with_sync(w, cx, GitSync::fetch_now)),
             )

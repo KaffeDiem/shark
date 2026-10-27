@@ -81,25 +81,41 @@ pub fn create_linked_prs(
             ));
         }
     }
-    let dirty: Vec<&str> = ws
-        .repos
-        .iter()
-        .filter(|r| dirty(&dir.join(&r.name)).unwrap_or(false))
-        .map(|r| r.name.as_str())
-        .collect();
-    if !dirty.is_empty() {
+    let mut dirty_repos = vec![];
+    for r in &ws.repos {
+        if dirty(&dir.join(&r.name)).map_err(|e| format!("{}: {e}", r.name))? {
+            dirty_repos.push(r.name.as_str());
+        }
+    }
+    if !dirty_repos.is_empty() {
         return Err(format!(
             "uncommitted changes in: {} (ask the agent to commit first)",
-            dirty.join(", ")
+            dirty_repos.join(", ")
         ));
     }
-    let mut prs = vec![];
-    for r in &ws.repos {
+    // Validate every participating repo before pushing or creating any PR.
+    let mut pending = vec![];
+    for r in ws.repos.iter().filter(|r| !skip.contains(&r.name)) {
         let wt = dir.join(&r.name);
-        let ahead = git(&wt, &["rev-list", "--count", &format!("{}..HEAD", r.base)])?;
-        if ahead == "0" || skip.contains(&r.name) {
-            continue;
+        // A stacked branch's PR merges into its parent, which must be on GitHub.
+        if git(&wt, &["rev-parse", "--verify", "--quiet", &r.base]).is_err() {
+            let b = r.base.strip_prefix("origin/").unwrap_or(&r.base);
+            return Err(format!(
+                "{}: its base `{b}` isn't on GitHub; push it first (from its workspace), or Change base…",
+                r.name
+            ));
         }
+        let ahead = git(&wt, &["rev-list", "--count", &format!("{}..HEAD", r.base)])?;
+        if ahead != "0" {
+            pending.push(r);
+        }
+    }
+    if pending.is_empty() {
+        return Err("no repo has commits ahead of its base".into());
+    }
+    let mut prs = vec![];
+    for r in pending {
+        let wt = dir.join(&r.name);
         let branch = ws.branch_of(r);
         cmd_bounded(&wt, "git", &["push", "-u", "origin", branch], 120)?;
         // Only an open PR from this repo is reused; `gh pr view <branch>` would also return a
@@ -130,9 +146,6 @@ pub fn create_linked_prs(
             }
         };
         prs.push((r.name.clone(), url));
-    }
-    if prs.is_empty() {
-        return Err("no repo has commits ahead of its base".into());
     }
     if prs.len() > 1 {
         for (r, url) in &prs {
@@ -480,6 +493,31 @@ esac
         )
         .unwrap();
 
+        // A later repo's invalid base must not publish an earlier repo first.
+        let mut invalid = ws.clone();
+        invalid.repos[1].base = "origin/missing-parent".into();
+        let err = create_linked_prs(&invalid, &dir, &[], &NewPr::new("", false)).unwrap_err();
+        assert!(err.contains("web: its base `missing-parent`"), "{err}");
+        assert!(!log.exists(), "all bases are checked before GitHub writes");
+        assert!(
+            git(&root.join("api.git"), &["branch", "--list", "kd/api"])
+                .unwrap()
+                .is_empty(),
+            "all bases are checked before pushes"
+        );
+
+        // A failed status read is not a clean worktree, including for a skipped repo.
+        fs::rename(dir.join("ops"), dir.join("ops-away")).unwrap();
+        let err =
+            create_linked_prs(&ws, &dir, &["ops".into()], &NewPr::new("", false)).unwrap_err();
+        assert!(err.starts_with("ops:"), "{err}");
+        assert!(!log.exists(), "status errors refuse before publishing");
+        fs::rename(dir.join("ops-away"), dir.join("ops")).unwrap();
+
+        // A landed repo no longer needs its parent ref to publish the remaining repos.
+        let mut ws = ws;
+        ws.repos.iter_mut().find(|r| r.name == "ops").unwrap().base =
+            "origin/deleted-parent".into();
         let prs = create_linked_prs(&ws, &dir, &["ops".into()], &NewPr::new("", false)).unwrap();
         assert_eq!(
             prs,
@@ -507,6 +545,32 @@ esac
         let err =
             create_linked_prs(&ws, &dir, &["ops".into()], &NewPr::new("", false)).unwrap_err();
         assert!(err.contains("gh: boom"), "{err}");
+        fs::remove_file(&fail).unwrap();
+
+        // Stacked: the PR targets the parent, which must be on GitHub first.
+        let mut stacked = ws.clone();
+        stacked.repos.retain(|r| r.name == "api");
+        stacked.repos[0].base = "origin/logic".into();
+        let before = fs::read_to_string(&log).unwrap();
+        let err = create_linked_prs(&stacked, &dir, &[], &NewPr::new("", false)).unwrap_err();
+        assert!(
+            err.contains("api: its base `logic` isn't on GitHub; push it first"),
+            "{err}"
+        );
+        assert_eq!(fs::read_to_string(&log).unwrap(), before, "no gh call");
+        let api = dir.join("api");
+        git(
+            &api,
+            &["push", "-q", "origin", "origin/main:refs/heads/logic"],
+        )
+        .unwrap();
+        git(&api, &["fetch", "-q", "origin"]).unwrap();
+        create_linked_prs(&stacked, &dir, &[], &NewPr::new("", false)).unwrap();
+        let log = fs::read_to_string(&log).unwrap();
+        assert!(
+            log.ends_with("api pr create --head kd/api --base logic --fill\n"),
+            "{log}"
+        );
         fs::remove_dir_all(&root).unwrap();
     }
 }

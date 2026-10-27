@@ -433,22 +433,3 @@ fn showing_a_line_in_view_keeps_the_scroll(cx: &mut TestAppContext) {
         })
     });
 }
-
-#[test]
-fn a_text_selection_maps_to_the_lines_it_touches() {
-    let file = fixture::modified("t.txt", "a\n", "one\ntwo\nthree\n");
-    let lines = |range| {
-        let r = super::state::source_lines(&file, DiffSide::Modified, range).unwrap();
-        (r.side(), r.start(), r.end())
-    };
-    // "ne\ntw": lines 1–2; ending right after a newline stays on that line.
-    assert_eq!(lines(1..6), (DiffSide::Modified, 1, 2));
-    assert_eq!(lines(4..8), (DiffSide::Modified, 2, 2));
-    assert_eq!(lines(9..10), (DiffSide::Modified, 3, 3));
-    assert!(super::state::source_lines(&file, DiffSide::Modified, 40..41).is_none());
-}
-
-#[test]
-fn the_hunk_separator_counts_unchanged_lines() {
-    assert_eq!(t!("Diff.HiddenLines", count = 3), "↑ 3 unchanged lines");
-}
