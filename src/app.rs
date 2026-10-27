@@ -42,6 +42,7 @@ mod editor_pane;
 mod file_changes;
 mod home;
 mod inline_edit;
+mod interaction;
 mod media;
 pub(crate) mod menus;
 mod palette;
@@ -54,6 +55,7 @@ mod storage;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod ui_tests;
 mod workspace;
+mod workspace_picker;
 
 use diff::Viewed;
 use menus::{copy, on_shark, open_in_entries, tilde, ws_menu};
@@ -338,6 +340,8 @@ pub struct Shark {
     /// The open right-click menu, dropped when it dismisses.
     menu: Option<(Entity<menu::Menu>, Subscription)>,
     app_switcher: Option<app_switcher::AppSwitcher>,
+    content_focus: FocusHandle,
+    interaction_save: Option<Task<()>>,
     /// The header's branch button as last painted: "Branch menu…" hangs its menu from it.
     branch_at: Rc<std::cell::Cell<Bounds<Pixels>>>,
     /// The latest dependency check; empty until the first one lands.
@@ -402,7 +406,13 @@ impl Shark {
         window.on_window_should_close(cx, move |w, cx| {
             (this.update(cx, |s, cx| s.close_window(w, cx))).unwrap_or(true)
         });
+        let activity_owner = cx.entity().downgrade();
         let _subs = vec![
+            cx.intercept_keystrokes(move |ev, w, cx| {
+                activity_owner
+                    .update(cx, |s, cx| s.interaction_key(&ev.keystroke, w, cx))
+                    .ok();
+            }),
             // A drag of the Files or sidebar edge: remember the width for the next launch.
             cx.subscribe(&tree_resize, |s, r, _: &ResizablePanelEvent, cx| {
                 if let Some(w) = r.read(cx).sizes().get(1) {
@@ -504,6 +514,8 @@ impl Shark {
             attn: crate::attention::Attention::new(cx),
             menu: None,
             app_switcher: None,
+            content_focus: cx.focus_handle(),
+            interaction_save: None,
             branch_at: Default::default(),
             deps: vec![],
             deps_check: None,
@@ -1019,7 +1031,9 @@ impl Render for Shark {
                 cx.listener(|this, _: &CycleOpenApp, w, cx| this.cycle_open_app(false, w, cx)),
             )
             .on_action(
-                cx.listener(|this, _: &CycleOpenAppBack, w, cx| this.cycle_open_app(true, w, cx)),
+                cx.listener(|this, _: &OpenWorkspacePicker, w, cx| {
+                    this.open_workspace_picker(w, cx)
+                }),
             )
             .on_action(cx.listener(|this, _: &ToggleHome, w, cx| this.toggle_home(w, cx)))
             .on_action(cx.listener(|this, _: &AddRepoToWorkspace, w, cx| {
@@ -1182,6 +1196,7 @@ impl Render for Shark {
                     })
                     .child(island);
                 let main = self.with_tree(main, window, cx).into_any_element();
+                let main = self.interaction_content(main, cx);
                 let sidebar = self.render_sidebar(window, cx).into_any_element();
                 match self.rail {
                     true => h_flex().size_full().child(sidebar).child(main),

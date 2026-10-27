@@ -15,6 +15,7 @@ mod menu_pixels;
 mod navigation_pixels;
 mod storage_tests;
 mod tab_tests;
+mod workspace_picker_tests;
 
 /// UI tests share the process-wide `TEST_HOME` and `state.json`, so they take turns. Chat
 /// tests that make workspace dirs take it too: `test_home` wipes them.
@@ -3454,7 +3455,7 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     press(cx, &["enter"]);
     assert_eq!(last(), Some(("Fork".into(), ws_dir.join("web"))));
 
-    // Reverse opening starts at the last eligible app; no project means no Xcode.
+    // Reverse cycling reaches the last eligible app; no project means no Xcode.
     on(cx, &|s, w, cx| {
         let ix = s
             .state
@@ -3466,7 +3467,7 @@ async fn open_in_apps(cx: &mut TestAppContext) {
         s.sidebar_focus.focus(w, cx);
     });
     modifiers(cx, true);
-    press(cx, &["cmd-shift-o"]);
+    press(cx, &["cmd-o", "cmd-shift-o"]);
     cx.update(|cx| {
         let switcher = shark.read(cx).app_switcher.as_ref().unwrap();
         assert_eq!(

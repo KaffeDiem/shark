@@ -102,6 +102,13 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| s.new_workspace(s.state.last_repos.clone(), None, w, cx),
     ),
     Row(
+        "Open workspace…",
+        IconName::Search,
+        Some(&OpenWorkspacePicker),
+        "switch recent repository",
+        |s, w, cx| s.open_workspace_picker(w, cx),
+    ),
+    Row(
         "Open next workspace needing attention",
         IconName::CircleAlert,
         Some(&NextAttention),

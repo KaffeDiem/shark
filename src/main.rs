@@ -40,7 +40,7 @@ actions!(
         ForceArchiveWorkspace,
         AddRepo,
         CycleOpenApp,
-        CycleOpenAppBack,
+        OpenWorkspacePicker,
         AddRepoToWorkspace,
         StopAgent,
         FocusLeft,
@@ -222,7 +222,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-p", TogglePalette, None),
         KeyBinding::new("cmd-n", NewWorkspace, None),
         KeyBinding::new("cmd-o", CycleOpenApp, None),
-        KeyBinding::new("cmd-shift-o", CycleOpenAppBack, None),
+        KeyBinding::new("cmd-shift-o", OpenWorkspacePicker, None),
         KeyBinding::new("cmd-0", ToggleHome, None),
         // Home: esc goes back to the workspace (or stops an Ask Shark answer); tab switches
         // the prompt between new workspace and Ask Shark; i/a jump from the list to it.

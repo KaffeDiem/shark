@@ -203,7 +203,8 @@ impl Shark {
     }
 
     fn leave_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active.is_some() {
+        if let Some(name) = self.active.clone() {
+            self.record_interaction(&name, cx);
             let tab = self.tab;
             self.show(tab, window, cx); // clears `home.on`
         }

@@ -147,6 +147,9 @@ impl Shark {
                 }
                 s.editor = Some(editor);
                 s.show(Tab::File, window, cx);
+                if let Some(name) = s.active.clone() {
+                    s.record_interaction(&name, cx);
+                }
             },
         );
     }
@@ -165,6 +168,9 @@ impl Shark {
         }
         self.editor = Some(tab.editor.clone());
         self.show(Tab::File, window, cx);
+        if let Some(name) = self.active.clone() {
+            self.record_interaction(&name, cx);
+        }
     }
 
     pub(super) fn close_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {

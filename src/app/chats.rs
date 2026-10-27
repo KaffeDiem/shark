@@ -133,6 +133,7 @@ impl Shark {
                 ChatEvent::Meta => this.save_meta(chat, cx),
                 ChatEvent::GitReviewsSent(_) => {} // GitSync records these.
                 ChatEvent::Picked => {
+                    this.record_interaction(&name, cx);
                     // The level the chat runs at, so an old chat with none doesn't clear it.
                     let m = &chat.read(cx).meta;
                     let pick = (m.model.clone(), Some(crate::chat::effort_of(m).to_string()));
@@ -469,6 +470,9 @@ impl Shark {
         ws.chats.insert(at, meta);
         let _ = self.state.save();
         self.select_chat(at, window, cx);
+        if let Some(name) = self.active.clone() {
+            self.record_interaction(&name, cx);
+        }
     }
 
     pub(super) fn pick_closed_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {

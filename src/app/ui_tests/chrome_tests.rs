@@ -335,6 +335,7 @@ pub(crate) fn render_pixels() {
     render_menu_pixels(&mut cx);
     super::menu_pixels::render_pixels(&mut cx);
     render_app_switcher_pixels(&mut cx);
+    super::workspace_picker_tests::render_pixels(&mut cx);
     super::navigation_pixels::render_pixels(&mut cx);
 }
 

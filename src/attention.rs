@@ -40,6 +40,12 @@ pub struct Attention {
 }
 
 impl Attention {
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn set_checked(&mut self, name: &str, repos: Vec<Repo>) {
+        self.checked
+            .insert(name.into(), (Instant::now(), None, repos));
+    }
+
     pub fn new(cx: &mut Context<Shark>) -> Self {
         Attention {
             window_active: true,

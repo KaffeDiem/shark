@@ -134,6 +134,9 @@ pub struct Repo {
 
 #[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Workspace {
+    /// Last explicit user interaction, in Unix milliseconds; background work never updates it.
+    #[serde(default)]
+    pub last_interacted_at: Option<u64>,
     pub name: String,
     pub branch: String,
     pub repos: Vec<WsRepo>,

@@ -252,3 +252,12 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
    ```
 
 Sources: Linear's app code and design posts ("How we redesigned the Linear UI", "Behind the latest design refresh"), APCA, Wallace et al. 2022 on font legibility.
+
+### Workspace quick open
+
+- `cmd-shift-o`, File → Open workspace…, and the command palette open the dedicated picker in `src/app/workspace_picker.rs`. While the `cmd-o` app switcher is open, this shortcut still reverses its selection. Releasing Command never confirms the workspace picker.
+- Reuse `CommandState`, custom variable-height `CommandItem` rows, and the 640px `menu_dialog` surface, constrained to the viewport. Focus search immediately; arrows navigate, Enter/click opens, one Escape dismisses and restores focus. Footer: `↑↓ Navigate · ↵ Open · Esc Close`.
+- Include every live workspace, including folded sections. Score workspace and each repository name separately with the completion matcher, taking the best score, then recorded interaction recency, then sidebar order. With no query, select the most recent other workspace (most recent from Home). Query changes select the best match; background status updates preserve order and selected identity.
+- Each row shows the workspace name, Current when applicable, last user interaction with its exact time in a tooltip, and one compact line per repo. Show explicit Draft/Open/Merged/Closed/No PR/Not checked/Status unavailable labels from `overview_repos`; failing checks never hide Draft. Full names and statuses have accessible labels and overflow tooltips. Empty states distinguish no workspaces from no matches.
+- `Workspace.last_interacted_at` stores optional Unix milliseconds. Successful explicit navigation and keyboard/click/scroll activity in visible workspace content count; Home, picker browsing, startup restore, activation, agent output and polling do not. Successful workspace dialog actions count. Coalesce recency saves once per second and flush through the close/quit storage guard. Unknown timestamps sort last and display No recorded interaction.
+- Confirm destinations by name and resolve them again after unsaved-edit confirmation, before changing any buffers. Removed or archiving destinations preserve the current edits. Opening the current workspace preserves its view; canceled confirmation never records destination recency.

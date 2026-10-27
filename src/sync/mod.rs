@@ -2,6 +2,8 @@
 //! and runs the next step toward a merged PR. `status` decides what that step is; this file
 //! polls, renders and executes. The app only embeds the entity and forwards three actions.
 mod status;
+#[cfg(test)]
+pub(crate) use status::parse_prs;
 pub use status::{Kind, Pr, PrState, Repo, ago, github_url, short};
 
 use crate::app::menus::{each_or_all, pr_entry};
@@ -45,6 +47,8 @@ const SETTLE_FOR: Duration = Duration::from_secs(600);
 const FETCH_MOVED: Duration = Duration::from_secs(30);
 
 pub enum SyncEvent {
+    /// A user-requested Git operation completed successfully.
+    Interacted,
     Reviewed(Vec<String>),
     MergeOrder(Vec<String>),
     DeleteRemote(bool),
@@ -827,6 +831,7 @@ impl GitSync {
                 s.set_hold(false, cx);
                 match result {
                     Ok((a, msg)) => {
+                        cx.emit(SyncEvent::Interacted);
                         if creates {
                             cx.emit(SyncEvent::PrsCreated);
                         }

@@ -527,7 +527,7 @@ pub fn rank(items: &[Item], query: &str, limit: usize) -> Vec<usize> {
     hits.into_iter().take(limit).map(|(_, ix)| ix).collect()
 }
 
-fn score(q: &[char], key: &str, name_at: usize) -> Option<i32> {
+pub(crate) fn score(q: &[char], key: &str, name_at: usize) -> Option<i32> {
     if q.is_empty() {
         return Some(0);
     }

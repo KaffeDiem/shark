@@ -315,6 +315,7 @@ impl Shark {
             s.workspaces.push(ws.to_string());
         }
         let _ = self.state.save();
+        self.record_interaction(ws, cx);
         self.fix_sel();
         cx.notify();
     }
