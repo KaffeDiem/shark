@@ -6,7 +6,7 @@ use std::cmp::Reverse;
 
 pub(super) struct WorkspacePicker {
     pub(super) state: Entity<CommandState>,
-    workspaces: Vec<Workspace>,
+    workspaces: Vec<PickerWorkspace>,
     pub(super) hits: Vec<String>,
     query: String,
     current: Option<String>,
@@ -15,17 +15,59 @@ pub(super) struct WorkspacePicker {
     _updates: Subscription,
     sync_updates: HashMap<EntityId, Subscription>,
     _escape: Subscription,
+    command_dirty: bool,
+    viewport: Size<Pixels>,
+    minute: u64,
 }
 
-fn rank(workspaces: &[Workspace], query: &str) -> Vec<String> {
-    let q: Vec<char> = query.to_lowercase().chars().collect();
+#[derive(PartialEq)]
+pub(super) struct PickerWorkspace {
+    name: String,
+    repos: Vec<(
+        String,
+        (String, IconName, Option<crate::complete::PrStatus>),
+    )>,
+    last_interacted_at: Option<u64>,
+}
+
+impl PickerWorkspace {
+    fn new(ws: &Workspace, repos: Option<&[SyncRepo]>) -> Self {
+        Self {
+            name: ws.name.clone(),
+            repos: ws
+                .repos
+                .iter()
+                .map(|r| {
+                    (
+                        r.name.clone(),
+                        status(
+                            repos.and_then(|repos| repos.iter().find(|repo| repo.name == r.name)),
+                        ),
+                    )
+                })
+                .collect(),
+            last_interacted_at: ws.last_interacted_at,
+        }
+    }
+}
+
+fn search_key(name: &str) -> String {
+    name.to_lowercase()
+        .split(|c: char| c.is_whitespace() || matches!(c, '-' | '_' | '/' | '.'))
+        .filter(|word| !word.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn rank(workspaces: &[PickerWorkspace], query: &str) -> Vec<String> {
+    let q: Vec<char> = search_key(query.trim()).chars().collect();
     let mut hits: Vec<_> = workspaces
         .iter()
         .enumerate()
         .filter_map(|(order, ws)| {
             let score = std::iter::once(ws.name.as_str())
-                .chain(ws.repos.iter().map(|r| r.name.as_str()))
-                .filter_map(|name| crate::complete::score(&q, &name.to_lowercase(), 0))
+                .chain(ws.repos.iter().map(|(name, _)| name.as_str()))
+                .filter_map(|name| crate::complete::score(&q, &search_key(name), 0))
                 .max()?;
             Some((
                 Reverse(score),
@@ -83,70 +125,25 @@ fn interaction_time(at: Option<u64>, now: u64) -> (String, String) {
 }
 
 impl WorkspacePicker {
+    pub(super) fn snapshot(s: &Shark, cx: &App) -> Vec<PickerWorkspace> {
+        s.sidebar_order()
+            .into_iter()
+            .map(|ix| &s.state.workspaces[ix])
+            .filter(|ws| !s.archiving.contains(&ws.name))
+            .map(|ws| PickerWorkspace::new(ws, s.overview_repos(&ws.name, cx)))
+            .collect()
+    }
+
     pub(super) fn new(
-        workspaces: Vec<Workspace>,
+        workspaces: Vec<PickerWorkspace>,
         current: Option<String>,
         shark: WeakEntity<Shark>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
         let state = cx.new(|cx| CommandState::new(window, cx));
-        let updates = cx.observe(&shark.upgrade().unwrap(), |p, shark, cx| {
-            let syncs = shark.read(cx).syncs.values().cloned().collect::<Vec<_>>();
-            for sync in syncs {
-                p.sync_updates
-                    .entry(sync.entity_id())
-                    .or_insert_with(|| cx.observe(&sync, |_, _, cx| cx.notify()));
-            }
-            let s = shark.read(cx);
-            for ws in &mut p.workspaces {
-                if let Some(live) = s.ws(&ws.name) {
-                    ws.repos.clone_from(&live.repos);
-                    ws.last_interacted_at = live.last_interacted_at;
-                }
-            }
-            let selected = p
-                .select
-                .unwrap_or_else(|| p.state.read(cx).selected_index().map(|ix| ix.row))
-                .and_then(|row| p.hits.get(row))
-                .cloned();
-            let old_hits = p.hits.clone();
-            p.workspaces
-                .retain(|ws| s.ws(&ws.name).is_some() && !s.archiving.contains(&ws.name));
-            p.hits
-                .retain(|name| p.workspaces.iter().any(|ws| &ws.name == name));
-            for ix in s.sidebar_order() {
-                let ws = &s.state.workspaces[ix];
-                if !s.archiving.contains(&ws.name)
-                    && !p.workspaces.iter().any(|w| w.name == ws.name)
-                {
-                    p.workspaces.push(ws.clone());
-                    if !rank(std::slice::from_ref(ws), &p.query).is_empty() {
-                        p.hits.push(ws.name.clone());
-                    }
-                }
-            }
-            if p.hits != old_hits {
-                p.select = Some(
-                    selected
-                        .and_then(|name| p.hits.iter().position(|n| n == &name))
-                        .or_else(|| (!p.hits.is_empty()).then_some(0)),
-                );
-            }
-            cx.notify();
-        });
-        cx.defer_in(window, |p, _, cx| {
-            let syncs = p
-                .shark
-                .upgrade()
-                .map(|s| s.read(cx).syncs.values().cloned().collect::<Vec<_>>())
-                .unwrap_or_default();
-            for sync in syncs {
-                p.sync_updates
-                    .entry(sync.entity_id())
-                    .or_insert_with(|| cx.observe(&sync, |_, _, cx| cx.notify()));
-            }
-        });
+        let updates = cx.observe(&shark.upgrade().unwrap(), |p, _, cx| p.refresh(cx));
+        cx.defer_in(window, |p, _, cx| p.refresh(cx));
         let focus = state.focus_handle(cx);
         let escape = cx.intercept_keystrokes(move |ev, w, cx| {
             if ev.keystroke.key == "escape" && focus.contains_focused(w, cx) {
@@ -165,14 +162,78 @@ impl WorkspacePicker {
             sync_updates: HashMap::new(),
             _updates: updates,
             _escape: escape,
+            command_dirty: true,
+            viewport: window.viewport_size(),
+            minute: now_ms() / 60_000,
         };
         picker.rank();
         picker
     }
 
+    fn refresh(&mut self, cx: &mut Context<Self>) {
+        let Some(shark) = self.shark.upgrade() else {
+            return;
+        };
+        let syncs = shark.read(cx).syncs.values().cloned().collect::<Vec<_>>();
+        for sync in &syncs {
+            self.sync_updates
+                .entry(sync.entity_id())
+                .or_insert_with(|| cx.observe(sync, |p, _, cx| p.refresh(cx)));
+        }
+        let s = shark.read(cx);
+        let live: HashMap<_, _> = s
+            .state
+            .workspaces
+            .iter()
+            .filter(|ws| !s.archiving.contains(&ws.name))
+            .map(|ws| (ws.name.as_str(), ws))
+            .collect();
+        let known: HashSet<_> = self.workspaces.iter().map(|ws| ws.name.as_str()).collect();
+        let mut workspaces: Vec<_> = self
+            .workspaces
+            .iter()
+            .filter_map(|ws| live.get(ws.name.as_str()))
+            .map(|ws| PickerWorkspace::new(ws, s.overview_repos(&ws.name, cx)))
+            .collect();
+        let added: Vec<_> = s
+            .sidebar_order()
+            .into_iter()
+            .map(|ix| &s.state.workspaces[ix])
+            .filter(|ws| live.contains_key(ws.name.as_str()) && !known.contains(ws.name.as_str()))
+            .map(|ws| PickerWorkspace::new(ws, s.overview_repos(&ws.name, cx)))
+            .collect();
+        let selected = self
+            .select
+            .unwrap_or_else(|| self.state.read(cx).selected_index().map(|ix| ix.row))
+            .and_then(|ix| self.hits.get(ix))
+            .cloned();
+        let old_len = self.hits.len();
+        self.hits.retain(|name| live.contains_key(name.as_str()));
+        let removed = self.hits.len() != old_len;
+        let added_hits = rank(&added, &self.query);
+        let changed_hits = removed || !added_hits.is_empty();
+        self.hits.extend(added_hits);
+        workspaces.extend(added);
+        if changed_hits {
+            self.select = Some(
+                selected
+                    .and_then(|name| self.hits.iter().position(|n| n == &name))
+                    .or_else(|| (!self.hits.is_empty()).then_some(0)),
+            );
+        }
+        let minute = now_ms() / 60_000;
+        if self.workspaces != workspaces || self.minute != minute {
+            self.workspaces = workspaces;
+            self.minute = minute;
+            self.command_dirty = true;
+            cx.notify();
+        }
+    }
+
     fn rank(&mut self) {
+        self.command_dirty = true;
         self.hits = rank(&self.workspaces, &self.query);
-        self.select = Some(if self.query.is_empty() {
+        self.select = Some(if self.query.trim().is_empty() {
             self.hits
                 .iter()
                 .position(|name| Some(name) != self.current.as_ref())
@@ -183,25 +244,18 @@ impl WorkspacePicker {
     }
 
     fn command(&self, window: &Window, cx: &Context<Self>) -> Command {
-        let shark = self.shark.upgrade();
-        let s = shark.as_ref().map(|s| s.read(cx));
+        let by_name: HashMap<_, _> = self
+            .workspaces
+            .iter()
+            .map(|ws| (ws.name.as_str(), ws))
+            .collect();
         let now = now_ms();
         let items = self
             .hits
             .iter()
             .filter_map(|name| {
-                let ws = self.workspaces.iter().find(|ws| &ws.name == name)?;
-                let repos = s.and_then(|s| s.overview_repos(name, cx));
-                let rows: Vec<_> = ws
-                    .repos
-                    .iter()
-                    .map(|r| {
-                        (
-                            r.name.clone(),
-                            status(repos.and_then(|rs| rs.iter().find(|repo| repo.name == r.name))),
-                        )
-                    })
-                    .collect();
+                let ws = by_name.get(name.as_str())?;
+                let rows = ws.repos.clone();
                 let (time, exact) = interaction_time(ws.last_interacted_at, now);
                 let time = if self.current.as_ref() == Some(name) {
                     format!("Current · {time}")
@@ -347,8 +401,13 @@ impl WorkspacePicker {
 
 impl Render for WorkspacePicker {
     fn render(&mut self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let command = self.command(w, cx);
-        RenderOnce::render(command, w, cx);
+        // Custom Command children are remeasured for every model update, even when unchanged.
+        if self.command_dirty || self.viewport != w.viewport_size() {
+            let command = self.command(w, cx);
+            RenderOnce::render(command, w, cx);
+            self.command_dirty = false;
+            self.viewport = w.viewport_size();
+        }
         if let Some(selected) = self.select.take() {
             self.state.update(cx, |s, cx| {
                 s.set_selected_index(selected.map(IndexPath::new), w, cx)
@@ -363,13 +422,7 @@ impl Shark {
         if self.app_switcher.is_some() {
             return self.cycle_open_app(true, window, cx);
         }
-        let workspaces = self
-            .sidebar_order()
-            .into_iter()
-            .map(|ix| &self.state.workspaces[ix])
-            .filter(|ws| !self.archiving.contains(&ws.name))
-            .cloned()
-            .collect();
+        let workspaces = WorkspacePicker::snapshot(self, cx);
         let current = (!self.home.on).then(|| self.active.clone()).flatten();
         let owner = cx.entity().downgrade();
         let picker = cx.new(|cx| WorkspacePicker::new(workspaces, current, owner, window, cx));
@@ -389,18 +442,21 @@ mod tests {
     use super::*;
     use core::prelude::v1::test;
 
-    fn ws(name: &str, repo: &str, at: Option<u64>) -> Workspace {
-        Workspace {
-            name: name.into(),
-            last_interacted_at: at,
-            repos: vec![crate::state::WsRepo {
-                name: repo.into(),
-                src: PathBuf::new(),
-                base: "main".into(),
-                branch: None,
-            }],
-            ..Default::default()
-        }
+    fn ws(name: &str, repo: &str, at: Option<u64>) -> PickerWorkspace {
+        PickerWorkspace::new(
+            &Workspace {
+                name: name.into(),
+                last_interacted_at: at,
+                repos: vec![crate::state::WsRepo {
+                    name: repo.into(),
+                    src: PathBuf::new(),
+                    base: "main".into(),
+                    branch: None,
+                }],
+                ..Default::default()
+            },
+            None,
+        )
     }
 
     #[test]
@@ -437,6 +493,30 @@ mod tests {
     }
 
     #[test]
+    fn spaced_queries_match_words_in_workspace_and_repo_names() {
+        let workspaces = vec![
+            ws("eng-130-rate-limits", "web", Some(3)),
+            ws("rate_limits", "api", Some(2)),
+            ws("billing", "rate.limits", Some(1)),
+            ws("rate", "limits", Some(4)),
+        ];
+        for query in [
+            "rate limits",
+            "  RATE   LIMITS ",
+            "rate-limits",
+            "rate_limits",
+        ] {
+            let hits = rank(&workspaces, query);
+            assert_eq!(hits.len(), 3, "{query}: {hits:?}");
+            assert!(hits.iter().any(|name| name == "eng-130-rate-limits"));
+            assert!(
+                !hits.iter().any(|name| name == "rate"),
+                "never combine workspace and repo names"
+            );
+        }
+    }
+
+    #[test]
     fn timestamps_survive_serde_and_unknown_stays_unknown() {
         let old = r#"{"name":"old","branch":"old","repos":[]}"#;
         let mut ws: Workspace = serde_json::from_str(old).unwrap();
@@ -456,7 +536,16 @@ mod tests {
 
     #[test]
     fn explicit_pr_lifecycle_and_unavailable_states() {
-        let ws = ws("test", "api", None);
+        let ws = Workspace {
+            name: "test".into(),
+            repos: vec![crate::state::WsRepo {
+                name: "api".into(),
+                src: PathBuf::new(),
+                base: "main".into(),
+                branch: None,
+            }],
+            ..Default::default()
+        };
         let mut repo = SyncRepo::fresh(&ws.repos[0], &ws);
         assert_eq!(status(None).0, "Not checked");
         assert_eq!(status(Some(&repo)).0, "Not checked");

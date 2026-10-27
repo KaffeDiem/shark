@@ -18,6 +18,7 @@ mod storage_tests;
 mod tab_tests;
 mod tree_pixels;
 mod workspace_picker_tests;
+mod workspace_review_tests;
 
 /// UI tests share the process-wide `TEST_HOME` and `state.json`, so they take turns. Chat
 /// tests that make workspace dirs take it too: `test_home` wipes them.
@@ -4525,7 +4526,13 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
     let right = bounds(cx, "features-rail").unwrap();
     assert_eq!(right.size.width, px(72.));
     assert_eq!(right.right(), px(1440.));
-    for id in ["show-tree", "hide-tree", "tools-diff", "file-tree", "files-change-scope"] {
+    for id in [
+        "show-tree",
+        "hide-tree",
+        "tools-diff",
+        "file-tree",
+        "files-change-scope",
+    ] {
         assert!(bounds(cx, id).is_none(), "absent on Chat: {id}");
     }
     let left = bounds(cx, "toggle-sidebar").unwrap();
@@ -4534,7 +4541,10 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
     assert_eq!(left.left(), px(80.));
     let diff_button = bounds(cx, "feature-differ").unwrap();
     assert_eq!(right.center().x, diff_button.center().x);
-    assert_eq!(diff_button.top(), bounds(cx, "workspace-titlebar").unwrap().bottom() + px(16.));
+    assert_eq!(
+        diff_button.top(),
+        bounds(cx, "workspace-titlebar").unwrap().bottom() + px(16.)
+    );
 
     click(cx, "feature-differ");
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Diff));
@@ -4552,7 +4562,10 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
     press(cx, &["cmd-alt-b"]);
     cx.update(|cx| {
         assert_eq!(shark.read(cx).tab, Tab::Chat);
-        assert!(shark.read(cx).show_tree, "hidden artifact preference is unchanged");
+        assert!(
+            shark.read(cx).show_tree,
+            "hidden artifact preference is unchanged"
+        );
         assert!(!shark.read(cx).tree_shown());
     });
     on(cx, &|s, w, cx| s.focus_pane(Pane::Features, w, cx));
@@ -4560,22 +4573,27 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Diff));
 
     // Hiding a focused filter returns focus to Diff.
-    on(cx, &|s, w, cx| s.tree_filter.read(cx).focus_handle(cx).focus(w, cx));
+    on(cx, &|s, w, cx| {
+        s.tree_filter.read(cx).focus_handle(cx).focus(w, cx)
+    });
     press(cx, &["cmd-alt-b"]);
     cx.update_window(window, |_, w, cx| {
         let s = shark.read(cx);
         assert!(!s.tree_shown());
         assert!(s.diff.read(cx).focus_handle(cx).is_focused(w));
-    }).unwrap();
+    })
+    .unwrap();
     assert_eq!(bounds(cx, "features-rail"), Some(right));
     press(cx, &["cmd-alt-b", "cmd-alt-right"]);
     cx.update_window(window, |_, w, cx| {
         assert!(shark.read(cx).tree_focus.is_focused(w));
-    }).unwrap();
+    })
+    .unwrap();
     press(cx, &["cmd-alt-right"]);
     cx.update_window(window, |_, w, cx| {
         assert_eq!(shark.read(cx).focused_pane(w, cx), Some(Pane::Features));
-    }).unwrap();
+    })
+    .unwrap();
 
     // The sidebar control stays put when it moves from the sidebar into the main titlebar.
     click(cx, "toggle-sidebar");
@@ -4629,7 +4647,8 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
         assert!(w.find("feature-differ").visible());
         assert_eq!(shark3.read(cx).tab, Tab::Diff);
         w.remove_window();
-    }).unwrap();
+    })
+    .unwrap();
     fs::remove_dir_all(&home).ok();
 }
 

@@ -100,7 +100,7 @@ async fn workspace_picker_keeps_identity_during_updates(cx: &mut TestAppContext)
         .update_window(window, |_, w, cx| {
             let picker = cx.new(|cx| {
                 WorkspacePicker::new(
-                    shark.read(cx).state.workspaces.clone(),
+                    WorkspacePicker::snapshot(shark.read(cx), cx),
                     Some("current".into()),
                     shark.downgrade(),
                     w,

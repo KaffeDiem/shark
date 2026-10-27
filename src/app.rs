@@ -697,7 +697,11 @@ impl Shark {
         self.show_tree = !self.show_tree;
         if !self.show_tree
             && (self.tree_focus.is_focused(window)
-                || self.tree_filter.read(cx).focus_handle(cx).is_focused(window))
+                || self
+                    .tree_filter
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window))
         {
             self.focus_diff(window, cx);
         }
@@ -735,7 +739,11 @@ impl Shark {
         }
         if self.tree_shown()
             && (self.tree_focus.is_focused(window)
-                || self.tree_filter.read(cx).focus_handle(cx).is_focused(window))
+                || self
+                    .tree_filter
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window))
         {
             return Some(Pane::Tree);
         }
@@ -966,13 +974,15 @@ impl Shark {
             )
             .child(match self.tab {
                 // Cached: the sidebar spinner redraws this view every frame, the chat only on change.
-                Tab::Chat => div()
-                    .flex_1()
-                    .min_h_0()
-                    .children(self.active_chat().map(|chat| {
-                        chat.clone().cached(StyleRefinement::default().size_full())
-                    }))
-                    .into_any_element(),
+                Tab::Chat => {
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .children(self.active_chat().map(|chat| {
+                            chat.clone().cached(StyleRefinement::default().size_full())
+                        }))
+                        .into_any_element()
+                }
                 Tab::File => h_flex()
                     .flex_1()
                     .min_h_0()

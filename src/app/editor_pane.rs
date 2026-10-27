@@ -98,7 +98,15 @@ impl Shark {
                 if s.active.as_ref() != Some(&workspace) {
                     return;
                 }
-                let tab = s.make_file_tab(path.clone(), abs, None, window, cx);
+                // Restoration may have opened the target while the discard dialog was up.
+                let tab = match s
+                    .file_tabs
+                    .iter()
+                    .position(|t| t.editor.read(cx).path == path)
+                {
+                    Some(ix) => s.file_tabs.remove(ix),
+                    None => s.make_file_tab(path.clone(), abs, None, window, cx),
+                };
                 let editor = tab.editor.clone();
                 if let Some(ix) = s
                     .file_tabs

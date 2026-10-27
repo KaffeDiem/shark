@@ -378,3 +378,246 @@ async fn pending_restore_survives_closing_last_live_editor(cx: &mut TestAppConte
         );
     });
 }
+
+/// A background restore can finish while the replacement discard dialog is open.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn review_restored_target_during_discard_stays_unique(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let mut state = fixture(&home);
+    state.workspaces[0].close_tab(&TabId::File("api/b.txt".into()));
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).file_tabs.len() == 1
+    })
+    .await;
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| s.select_file(0, w, cx));
+    cx.update_window(window, |_, w, cx| w.input("unsaved ", cx))
+        .unwrap();
+    let source = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
+    let source_text = cx.update(|cx| source.read(cx).input.read(cx).value().to_string());
+    for discard in [false, true] {
+        on(cx, &|s, w, cx| {
+            assert!(source.read(cx).dirty);
+            // Resume a saved tab restore just before replacing the dirty tab.
+            s.active_ws_mut()
+                .unwrap()
+                .open_tab(TabId::File("api/b.txt".into()));
+            s.restore_file_tabs(w, cx);
+            s.open_path("api/b.txt".into(), w, cx);
+            assert!(w.has_active_dialog(cx));
+        });
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).file_tabs.len() == 2
+        })
+        .await;
+        let target = cx.update(|cx| {
+            let target = shark
+                .read(cx)
+                .file_tabs
+                .iter()
+                .find(|t| t.editor.read(cx).path == "api/b.txt")
+                .unwrap()
+                .editor
+                .clone();
+            target
+                .read(cx)
+                .input
+                .clone()
+                .update(cx, |i, cx| i.set_selected_range(1..3, cx));
+            target
+        });
+        press_in(window)(cx, &[if discard { "enter" } else { "escape" }]);
+        cx.update_window(window, |_, w, cx| {
+            let s = shark.read(cx);
+            assert_eq!(
+                s.file_tabs
+                    .iter()
+                    .filter(|t| t.editor.read(cx).path == "api/b.txt")
+                    .count(),
+                1
+            );
+            assert!(s.file_tabs.iter().any(|t| t.editor == target));
+            assert_eq!(target.read(cx).input.read(cx).selected_range(), 1..3);
+            assert_eq!(target.read(cx).input.read(cx).value().as_ref(), "bravo\n");
+            if discard {
+                assert_eq!(s.editor.as_ref(), Some(&target));
+                assert!(!s.file_tabs.iter().any(|t| t.editor == source));
+                assert!(
+                    !s.active_ws()
+                        .unwrap()
+                        .tab_order
+                        .contains(&TabId::File("api/a.txt".into()))
+                );
+                assert_eq!(
+                    s.active_ws().unwrap().tab_order[1],
+                    TabId::File("api/b.txt".into())
+                );
+                assert_eq!(
+                    State::load().workspaces[0].tab_order,
+                    s.active_ws().unwrap().tab_order
+                );
+            } else {
+                assert_eq!(s.editor.as_ref(), Some(&source));
+                assert!(source.read(cx).dirty);
+                assert_eq!(source.read(cx).input.read(cx).value().as_ref(), source_text);
+            }
+            assert_eq!(
+                fs::read_to_string(s.active_ws().unwrap().dir().join("api/a.txt")).unwrap(),
+                "alpha\n"
+            );
+            w.render_frame(cx);
+        })
+        .unwrap();
+        if !discard {
+            on(cx, &|s, w, cx| s.close_editor(target.clone(), w, cx));
+        }
+    }
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn review_tab_scale_and_restore_entity_lifetime(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(cx, fixture(&home), WindowOptions::default());
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).file_tabs.len() == 2
+    })
+    .await;
+    for count in [10, 100, 300] {
+        cx.update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| {
+                let ws = s.active_ws_mut().unwrap();
+                ws.chats.truncate(1);
+                ws.chats.extend((1..count).map(|i| crate::state::ChatMeta {
+                    id: format!("mixed~scale-{i}"),
+                    title: format!("Conversation {i}: a realistically sized review title"),
+                    ..Default::default()
+                }));
+                let start = Instant::now();
+                ws.normalize_tabs();
+                eprintln!("review tabs={count}: normalize={:?}", start.elapsed());
+                cx.notify();
+            });
+            w.render_frame(cx);
+            let start = Instant::now();
+            for _ in 0..3 {
+                shark.update(cx, |_, cx| cx.notify());
+                w.render_frame(cx);
+            }
+            eprintln!("review tabs={count}: mean frame={:?}", start.elapsed() / 3);
+        })
+        .unwrap();
+    }
+    let old = cx.update(|cx| {
+        shark
+            .read(cx)
+            .file_tabs
+            .iter()
+            .map(|t| t.editor.downgrade())
+            .collect::<Vec<_>>()
+    });
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_workspace_named("other", w, cx));
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).file_tabs.len() == 2
+    })
+    .await;
+    assert!(
+        old.iter().all(|editor| editor.upgrade().is_none()),
+        "restored editors leaked after workspace exit"
+    );
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn review_restore_large_file_batch_releases_buffers(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let mut state = fixture(&home);
+    let text = "A moderately sized line in a persisted file tab.\n".repeat(5_500);
+    let ws = &mut state.workspaces[0];
+    for i in 0..24 {
+        let path = format!("api/stress-{i}.txt");
+        fs::write(ws.dir().join(&path), &text).unwrap();
+        ws.open_tab(TabId::File(path));
+    }
+    let start = Instant::now();
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    cx.wait_for(window, Duration::from_secs(30), |_, cx| {
+        shark.read(cx).file_tabs.len() == 26
+    })
+    .await;
+    eprintln!(
+        "review restored 26 files / {} extra text bytes in {:?}",
+        text.len() * 24,
+        start.elapsed()
+    );
+    let old = cx.update(|cx| {
+        let s = shark.read(cx);
+        assert!(s.file_tabs.iter().all(|tab| !tab.editor.read(cx).dirty));
+        s.file_tabs
+            .iter()
+            .map(|t| t.editor.downgrade())
+            .collect::<Vec<_>>()
+    });
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_workspace_named("other", w, cx));
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).file_tabs.len() == 2
+    })
+    .await;
+    assert!(old.iter().all(|editor| editor.upgrade().is_none()));
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn review_file_tab_scale(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let mut state = fixture(&home);
+    let ws = &mut state.workspaces[0];
+    for i in 2..300 {
+        let path = format!("api/tab-{i}.txt");
+        fs::write(ws.dir().join(&path), "small text\n").unwrap();
+        ws.open_tab(TabId::File(path));
+    }
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    cx.wait_for(window, Duration::from_secs(30), |_, cx| {
+        shark.read(cx).file_tabs.len() == 300
+    })
+    .await;
+    for count in [300, 100, 10] {
+        cx.update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| {
+                s.file_tabs.truncate(count);
+                let paths: Vec<_> = s
+                    .file_tabs
+                    .iter()
+                    .map(|t| t.editor.read(cx).path.clone())
+                    .collect();
+                s.active_ws_mut()
+                    .unwrap()
+                    .tab_order
+                    .retain(|tab| match tab {
+                        TabId::File(path) => paths.contains(path),
+                        _ => true,
+                    });
+                assert_eq!(s.file_tabs.len(), count);
+                cx.notify();
+            });
+            w.render_frame(cx);
+            let start = Instant::now();
+            for _ in 0..3 {
+                shark.update(cx, |_, cx| cx.notify());
+                w.render_frame(cx);
+            }
+            eprintln!(
+                "review file tabs={count}: mean frame={:?}",
+                start.elapsed() / 3
+            );
+        })
+        .unwrap();
+    }
+}

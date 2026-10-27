@@ -700,16 +700,17 @@ impl Shark {
         &self,
         edge: Ordering,
         ws: &Workspace,
+        tabs: &VisibleTabs,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let mut hidden: Vec<usize> = (0..self.visible_tabs(ws, cx).len())
+        let mut hidden: Vec<usize> = (0..tabs.len())
             .filter(|&ix| self.tab_hidden(ix) == edge)
             .collect();
         if edge == Ordering::Less {
             hidden.reverse(); // nearest first
         }
         let unread: Vec<usize> = (hidden.iter().copied())
-            .filter(|&ix| match self.visible_tabs(ws, cx).get(ix) {
+            .filter(|&ix| match tabs.get(ix) {
                 Some(VisibleTab::Chat(ix)) => self.unread.contains(&ws.chats[ix].id),
                 _ => false,
             })
@@ -835,7 +836,6 @@ impl Shark {
                 )
             })
             .collect();
-        let tabs = self.visible_tabs(ws, cx);
         if let Some(ix) = tabs.index(VisibleTab::Diff) {
             pills.push((
                 VisibleTab::Diff,
@@ -959,8 +959,8 @@ impl Shark {
             .track_scroll(&self.tab_scroll)
             .children(pills)
             .into_any_element();
-        let left = self.tab_edge(Ordering::Less, ws, cx);
-        let right = self.tab_edge(Ordering::Greater, ws, cx);
+        let left = self.tab_edge(Ordering::Less, ws, &tabs, cx);
+        let right = self.tab_edge(Ordering::Greater, ws, &tabs, cx);
         let overflow = left.is_some() || right.is_some();
         let mut tabs = vec![];
         if overflow {

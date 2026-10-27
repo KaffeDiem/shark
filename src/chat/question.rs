@@ -6,6 +6,7 @@ use gpui_kit::component::Size;
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::questionnaire::*;
 use serde_json::json;
+use std::cell::Cell;
 
 /// Told to the agent when the user closes the card (or sends a message instead).
 pub(crate) const ANSWER_IN_CHAT: &str = "The user closed these questions to answer in the chat \
@@ -22,6 +23,8 @@ pub(super) struct Asked {
     codex: bool,
     /// Built on the first render, which has the window its inputs need.
     form: Option<Entity<QuestionnaireState>>,
+    scroll: ScrollHandle,
+    revealed: Cell<Option<(usize, usize, Pixels, Pixels)>>,
     _subs: Vec<Subscription>,
 }
 
@@ -184,6 +187,8 @@ impl Chat {
             qs,
             codex: codex::is_codex(self.agent_model.as_deref()),
             form: None,
+            scroll: ScrollHandle::new(),
+            revealed: Cell::new(None),
             _subs: vec![],
         });
         // Nothing to show: closing it answers in each agent's own terms.
@@ -252,10 +257,15 @@ impl Chat {
         let mut subs = vec![cx.subscribe_in(
             &form,
             window,
-            |this, _, ev: &QuestionnaireEvent, window, cx| {
-                if let QuestionnaireEvent::Submit(s) = ev {
-                    this.answer_asked(s, window, cx);
+            |this, _, ev: &QuestionnaireEvent, window, cx| match ev {
+                QuestionnaireEvent::Submit(s) => this.answer_asked(s, window, cx),
+                QuestionnaireEvent::CurrentItemChanged { .. } => {
+                    if let Some(asked) = &this.asked {
+                        asked.scroll.set_offset(Point::default());
+                        asked.revealed.set(None);
+                    }
                 }
+                _ => {}
             },
         )];
         // The form's own enter doesn't reach it from inside the field (the input takes it).
@@ -397,19 +407,69 @@ impl Chat {
     /// The question card, just above the composer like the side-question card.
     pub(super) fn render_asked(
         &self,
-        window: &Window,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let asked = self.asked.as_ref()?;
         let form = asked.form.as_ref()?;
-        let theme = cx.theme();
         let (focused, at) = (
             asked.focused(window, cx),
             form.read(cx).current_ix().unwrap_or(0),
         );
         let last = at + 1 == asked.qs.len();
         let q = &asked.qs[at.min(asked.qs.len() - 1)];
+        let max_height = window.viewport_size().height * 0.5;
+        let answer = form
+            .read(cx)
+            .focused_current_choice(window)
+            .and_then(|choice| choice.parse::<usize>().ok())
+            .or_else(|| {
+                form.read(cx)
+                    .is_current_input_focused(window)
+                    .then_some(q.options.len())
+            })
+            .map(|choice| (at, choice));
+        let viewport = window.viewport_size();
+        let target = answer.map(|(item, choice)| (item, choice, viewport.width, viewport.height));
+        let reveal = asked.revealed.replace(target) != target;
+        let items: Vec<_> = (asked.qs.iter().enumerate())
+            .map(|(i, q)| {
+                let name = i.to_string();
+                let choices: Vec<_> = (0..q.options.len())
+                    .map(|j| {
+                        let anchor = ScrollAnchor::for_handle(asked.scroll.clone());
+                        if reveal && answer == Some((i, j)) {
+                            anchor.scroll_to(window, cx);
+                        }
+                        div()
+                            .id(("asked-choice", j))
+                            .test_support()
+                            .anchor_scroll(Some(anchor))
+                            .child(
+                                QuestionnaireChoice::new(form, name.clone(), j.to_string())
+                                    .content_style(StyleRefinement::default().min_w_0()),
+                            )
+                    })
+                    .collect();
+                let input_anchor = ScrollAnchor::for_handle(asked.scroll.clone());
+                if reveal && answer == Some((i, q.options.len())) {
+                    input_anchor.scroll_to(window, cx);
+                }
+                QuestionnaireItem::new(form, name.clone())
+                    .child(QuestionnaireTitle::new(form, name.clone()))
+                    .child(QuestionnaireChoices::new(form, name.clone()).children(choices))
+                    .child(
+                        div()
+                            .id(("asked-input", i))
+                            .anchor_scroll(Some(input_anchor))
+                            .child(QuestionnaireInput::new(form, name.clone())),
+                    )
+                    .child(QuestionnaireError::new(form, name))
+            })
+            .collect();
+        let theme = cx.theme();
         let header = h_flex()
+            .flex_none()
             .gap_2()
             .text_xs()
             .text_color(theme.muted_foreground)
@@ -433,26 +493,16 @@ impl Chat {
                         this.focus_composer(window, cx);
                     })),
             );
-        let items = (asked.qs.iter().enumerate()).map(|(i, q)| {
-            let name = i.to_string();
-            QuestionnaireItem::new(form, name.clone())
-                .child(QuestionnaireTitle::new(form, name.clone()))
-                .child(QuestionnaireChoices::new(form, name.clone()).children(
-                    (0..q.options.len()).map(|j| {
-                        QuestionnaireChoice::new(form, name.clone(), j.to_string())
-                            .content_style(StyleRefinement::default().min_w_0())
-                    }),
-                ))
-                .child(QuestionnaireInput::new(form, name.clone()))
-                .child(QuestionnaireError::new(form, name))
-        });
         let actions = QuestionnaireActions::new(form)
+            .flex_none()
             .child(QuestionnairePrevious::new(form))
             .child(QuestionnaireSkip::new(form))
             .child(QuestionnaireNext::new(form))
             .child(QuestionnaireSubmit::new(form));
         let faint = crate::app::faint(theme);
         let hints = h_flex()
+            .flex_none()
+            .flex_wrap()
             .gap_3()
             .text_xs()
             .text_color(faint)
@@ -466,6 +516,7 @@ impl Chat {
                 .id("asked")
                 .w_full()
                 .max_w(px(712.))
+                .max_h(max_height)
                 .mx_auto()
                 .mb_2()
                 .p_3()
@@ -474,6 +525,19 @@ impl Chat {
                 .border_1()
                 .border_color(if focused { theme.primary } else { theme.border })
                 .bg(theme.muted)
+                // A key reveals the focused answer again after the user wheels away from it.
+                .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                    if ev.keystroke.modifiers.number_of_modifiers() == 0
+                        && let Some(asked) = &this.asked
+                        && asked
+                            .form
+                            .as_ref()
+                            .is_some_and(|f| !f.read(cx).is_current_input_focused(w))
+                    {
+                        asked.revealed.set(None);
+                        cx.notify();
+                    }
+                }))
                 // esc in the "something else" field goes back to the choices; on them it closes.
                 .capture_action(cx.listener(|this, _: &Escape, window, cx| {
                     if let Some(f) = this.asked_form() {
@@ -489,13 +553,23 @@ impl Chat {
                 .child(
                     Questionnaire::new(form)
                         .with_size(Size::Small)
-                        .children(items)
+                        .min_h_0()
+                        .child(
+                            v_flex()
+                                .id("asked-body")
+                                .test_support()
+                                .min_h_0()
+                                .overflow_y_scroll()
+                                .track_scroll(&asked.scroll)
+                                .children(items),
+                        )
                         .child(actions),
                 )
                 .map(|d| match focused {
                     true => d.child(hints),
                     false => d.child(
                         h_flex()
+                            .flex_none()
                             .text_xs()
                             .text_color(faint)
                             .child(hint("up", "from the message box to answer")),
@@ -575,6 +649,186 @@ mod tests {
 
     #[cfg(feature = "test-support")]
     #[gpui_kit::test]
+    fn review_wrapped_choices_keep_submit_inside_viewport(cx: &mut TestAppContext) {
+        use gpui_kit::test::{TestEventExt, TestQueryExt, TestWindowExt};
+
+        crate::state::TEST_HOME
+            .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cx.update(gpui_kit::init);
+        for (width, height) in [(420., 400.), (420., 600.), (800., 550.)] {
+            for multi in [false, true] {
+                let (window, chat) = cx
+                    .update(|cx| {
+                        gpui_kit::open_window(
+                            WindowOptions {
+                                window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                    point(px(0.), px(0.)),
+                                    size(px(width), px(height)),
+                                ))),
+                                ..Default::default()
+                            },
+                            cx,
+                            |w, cx| {
+                                cx.new(|cx| {
+                                    Chat::new(
+                                        Workspace::default(),
+                                        ChatMeta::default(),
+                                        false,
+                                        w,
+                                        cx,
+                                    )
+                                })
+                            },
+                        )
+                    })
+                    .unwrap();
+                cx.update_window(window, |_, w, cx| {
+                    chat.update(cx, |c, cx| {
+                        c.show_asked("review-wrap".into(), "review-wrap".into(), json!({"questions": [{
+                            "question": "What should the first release aim to deliver?",
+                            "multiSelect": multi,
+                            "options": [
+                                {"label": "Core editing", "description": "Definition and back/forward, completion, hover, diagnostics, references, rename, formatting, and quick fixes."},
+                                {"label": "Navigation", "description": "Workspace search, file search, symbol navigation, call hierarchy, breadcrumbs, pinned files, and recent workspace switching."},
+                                {"label": "Review", "description": "Review comments, side by side diffs, inline editing, staging changes, resolving conflicts, and sharing feedback with the agent."},
+                                {"label": "Collaboration", "description": "Shared workspaces, team settings, project templates, permissions, remote sessions, and notifications about important changes."}
+                            ]
+                        }]}), cx);
+                        cx.notify();
+                    });
+                    w.render_frame(cx);
+                    let submit = w.find_by_label("Submit").bounds();
+                    assert!(submit.top() >= px(0.) && submit.bottom() <= px(height),
+                        "Submit at {width}x{height}, multiple={multi}: {submit:?}");
+                    let body = w.find("asked-body").bounds();
+                    assert!(body.size.height > px(24.) && submit.top() >= body.bottom());
+                    // A real wheel event can reach the fourth option without moving focus.
+                    for _ in 0..30 {
+                        let last = w.find_by_label("Collaboration").bounds();
+                        if last.top() >= body.top() && last.top() + px(24.) <= body.bottom() { break; }
+                        w.scroll("asked-body", ScrollDelta::Pixels(point(px(0.), px(-24.))), cx);
+                    }
+                    let last = w.find_by_label("Collaboration").bounds();
+                    assert!(last.top() >= body.top() && last.top() + px(24.) <= body.bottom(),
+                        "wheel must reveal last choice: {last:?} in {body:?}");
+                    let form = chat.read(cx).asked_form().unwrap();
+                    form.read(cx).focus_handle().clone().focus(w, cx);
+                    w.key_down("down", false, cx);
+                    w.key_up("down", cx);
+                    assert_eq!(form.read(cx).focused_current_choice(w).map(|c| c.as_ref()), Some("0"), "arrow key focus");
+                    w.render_frame(cx);
+                }).unwrap();
+                cx.run_until_parked();
+                cx.update_window(window, |_, w, cx| {
+                    w.simulate_next_frame(cx);
+                    w.render_frame(cx);
+                    let body = w.find("asked-body").bounds();
+                    let first = w.find_by_label("Core editing").bounds();
+                    assert!(
+                        first.top() >= body.top() && first.top() + px(24.) <= body.bottom(),
+                        "arrow key must reveal first choice: {first:?} in {body:?}"
+                    );
+                    for _ in 0..3 {
+                        w.key_down("down", false, cx);
+                        w.key_up("down", cx);
+                    }
+                    if multi {
+                        w.press("4", cx);
+                    }
+                    w.render_frame(cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.update_window(window, |_, w, cx| {
+                    w.simulate_next_frame(cx);
+                    w.render_frame(cx);
+                    let body = w.find("asked-body").bounds();
+                    let last = w.find_by_label("Collaboration").bounds();
+                    assert!(
+                        last.top() >= body.top() && last.top() + px(24.) <= body.bottom(),
+                        "arrow key must reveal last choice: {last:?} in {body:?}"
+                    );
+                    if multi {
+                        w.scroll(
+                            "asked-body",
+                            ScrollDelta::Pixels(point(px(0.), px(2000.))),
+                            cx,
+                        );
+                        let scrolled = w.find_by_label("Collaboration").bounds();
+                        assert!(
+                            scrolled.top() > body.bottom(),
+                            "wheel must stay where the user scrolls"
+                        );
+                        // Toggle the same focused option off/on: focus identity does not change.
+                        for _ in 0..2 {
+                            w.press("4", cx);
+                        }
+                        w.simulate_next_frame(cx);
+                        w.render_frame(cx);
+                        let revealed = w.find_by_label("Collaboration").bounds();
+                        assert!(
+                            revealed.top() >= body.top()
+                                && revealed.top() + px(24.) <= body.bottom()
+                        );
+                    }
+                    let form = chat.read(cx).asked_form().unwrap();
+                    if multi {
+                        assert_eq!(
+                            form.read(cx).answer("0").unwrap().choices(),
+                            &[SharedString::from("3")],
+                            "numeric multi-select at {width}x{height}"
+                        );
+                    }
+                    w.resize(size(px(420.), px(400.)));
+                    w.bounds_changed(cx);
+                    w.render_frame(cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.update_window(window, |_, w, cx| {
+                    w.simulate_next_frame(cx);
+                    w.render_frame(cx);
+                    let body = w.find("asked-body").bounds();
+                    let last = w.find_by_label("Collaboration").bounds();
+                    assert!(
+                        last.top() >= body.top() && last.top() + px(24.) <= body.bottom(),
+                        "resize must retain focused choice: {last:?} in {body:?}"
+                    );
+                    let form = chat.read(cx).asked_form().unwrap();
+                    if !multi {
+                        w.click_at(("asked-choice", 3usize), point(px(70.), px(12.)), cx);
+                    }
+                    assert_eq!(
+                        form.read(cx).answer("0").unwrap().choices(),
+                        &[SharedString::from("3")],
+                        "selected response at {width}x{height}, multi={multi}"
+                    );
+                    let submit = w.find_by_label("Submit");
+                    assert!(submit.bounds().bottom() <= px(400.));
+                    w.click(
+                        SharedString::from(format!("questionnaire-{}-Submit", form.entity_id())),
+                        cx,
+                    );
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.update(|cx| {
+                    assert!(
+                        !chat.read(cx).asking(),
+                        "visible Submit must complete the question"
+                    )
+                });
+                cx.update_window(window, |_, w, _| w.remove_window())
+                    .unwrap();
+            }
+        }
+    }
+
+    #[cfg(feature = "test-support")]
+    #[gpui_kit::test]
     fn completed_answers_retry_and_replay_without_secrets(cx: &mut TestAppContext) {
         crate::state::TEST_HOME
             .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
@@ -609,7 +863,7 @@ mod tests {
         let qs = questions(&input);
         let summary = pairs(&qs, &[(vec![], Some("NEVER_STORE_THIS_SECRET".into()))]);
         chat.update(cx, |c, cx| {
-            let asked = Asked { request_id:"rpc".into(), tool_use_id:"question-1".into(), input, qs, codex:true, form:None, _subs:vec![] };
+            let asked = Asked { request_id:"rpc".into(), tool_use_id:"question-1".into(), input, qs, codex:true, form:None, scroll:ScrollHandle::new(), revealed:Cell::new(None), _subs:vec![] };
             c.answered(asked, summary, Ok(()), cx);
             assert!(c.history_save_error.is_some());
             assert_eq!(c.completed_answers.len(), 1);
@@ -661,6 +915,8 @@ mod tests {
                     qs: vec![],
                     codex: true,
                     form: None,
+                    scroll: ScrollHandle::new(),
+                    revealed: Cell::new(None),
                     _subs: vec![],
                 },
                 "Answered in the chat".into(),
