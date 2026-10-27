@@ -4541,10 +4541,7 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
     assert_eq!(left.left(), px(80.));
     let diff_button = bounds(cx, "feature-differ").unwrap();
     assert_eq!(right.center().x, diff_button.center().x);
-    assert_eq!(
-        diff_button.top(),
-        bounds(cx, "workspace-titlebar").unwrap().bottom() + px(16.)
-    );
+    assert_eq!(diff_button.top(), bounds(cx, "home-row").unwrap().top());
 
     click(cx, "feature-differ");
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Diff));

@@ -45,7 +45,7 @@ impl Shark {
                     .map(|d| self.draggable_chrome("features-header", d)),
             )
             .child(
-                v_flex().pt(px(16.)).child(
+                v_flex().pt(px(if self.rail { 8. } else { 0. })).child(
                     sidebar::rail_button(
                         div().id("feature-differ").relative().flex().items_center(),
                     )

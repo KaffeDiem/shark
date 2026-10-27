@@ -87,6 +87,7 @@ async fn sidebar_chrome_themes(cx: &mut TestAppContext) {
                         assert!(w.try_find("tools-commands").is_none());
                         assert!(w.try_find("rail-commands").is_none());
                         let home = w.find("home-row").bounds();
+                        assert_eq!(w.find("feature-differ").bounds().top(), home.top());
                         if rail {
                             assert_eq!(home.size.width, px(32.));
                             assert_eq!(left.right() + px(4.), commands.left());
