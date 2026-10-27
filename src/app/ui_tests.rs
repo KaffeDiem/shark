@@ -12,6 +12,7 @@ mod audit_tests;
 pub(crate) mod chrome_tests;
 mod file_changes_tests;
 mod menu_pixels;
+mod mixed_tab_tests;
 mod navigation_pixels;
 mod storage_tests;
 mod tab_tests;
@@ -1466,7 +1467,7 @@ async fn numbered_tab_shortcuts(cx: &mut TestAppContext) {
         shark.read(cx).active.is_some()
     })
     .await;
-    press(cx, &["cmd-shift-d", "cmd-t", "cmd-t"]);
+    press(cx, &["cmd-t", "cmd-t", "cmd-shift-d"]);
     let selected =
         |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).active_ws().unwrap().active_chat);
     assert_eq!(selected(cx), 2);
@@ -1599,7 +1600,7 @@ async fn numbered_tab_shortcuts(cx: &mut TestAppContext) {
             third
         )
     });
-    press(cx, &["cmd-shift-t", "ctrl-3"]);
+    press(cx, &["cmd-shift-t", "ctrl-4"]);
     cx.update(|cx| {
         assert_eq!(
             shark.read(cx).active_chat().unwrap().read(cx).meta.id,
@@ -1678,7 +1679,7 @@ async fn numbered_tab_shortcuts(cx: &mut TestAppContext) {
     }
     for n in 1..=9 {
         press(cx, &[&format!("ctrl-{n}")]);
-        assert_eq!(selected(cx), n - 1);
+        cx.update(|cx| assert_eq!(shark.read(cx).active_tab_index(cx), Some(n - 1)));
     }
     cx.update_window(window, |_, w, cx| {
         w.change_modifiers(
@@ -1836,7 +1837,14 @@ async fn drag_chat_tabs(cx: &mut TestAppContext) {
         ("drag-tabs", "closed-chat", ids[2].as_str()),
         ("drag-tabs", ids[0].as_str(), "closed-chat"),
     ] {
-        on(cx, &|s, _, cx| s.move_chat(workspace, from, to, cx));
+        on(cx, &|s, _, cx| {
+            s.move_tab(
+                workspace,
+                &TabId::Chat(from.into()),
+                &TabId::Chat(to.into()),
+                cx,
+            )
+        });
         order(cx, &[0, 2, 1]);
     }
 
@@ -1863,7 +1871,7 @@ async fn drag_chat_tabs(cx: &mut TestAppContext) {
     });
 }
 
-/// Every tab stays in the header as tabs are added, selected, closed and resized.
+/// Tabs shrink to a usable minimum, then scroll to reveal selection and hidden tabs.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn many_tabs_shrink(cx: &mut TestAppContext) {
@@ -1911,25 +1919,31 @@ async fn many_tabs_shrink(cx: &mut TestAppContext) {
                 let strip = w.find("chat-tabs").bounds();
                 let ws = shark.read(cx).active_ws().unwrap();
                 assert_eq!(ws.active_chat, selected);
-                let mut previous = strip.left();
+                let mut previous = None;
                 let mut widths = vec![];
                 for meta in &ws.chats {
                     let tab = w.find(SharedString::from(format!("chat-tab-{}", meta.id)));
                     let b = tab.bounds();
-                    assert!(tab.visible());
-                    assert!(b.left() >= previous);
-                    assert!(
-                        b.right() <= strip.right() + px(1.),
-                        "all tabs fit at {width}"
-                    );
-                    assert!(b.size.width > px(0.) && b.size.width < px(200.));
-                    previous = b.right();
+                    if let Some(previous) = previous {
+                        assert!(b.left() >= previous);
+                    }
+                    assert!(b.size.width >= px(100.) && b.size.width <= px(200.));
+                    if meta.id == ws.chats[selected].id {
+                        assert!(tab.visible());
+                        assert!(b.left() >= strip.left() - px(1.));
+                        assert!(
+                            b.right() <= strip.right() + px(1.),
+                            "selected tab revealed at {width}"
+                        );
+                    }
+                    previous = Some(b.right());
                     widths.push(b.size.width);
                 }
                 assert!(widths.iter().all(|w| (*w - widths[0]).abs() <= px(1.)));
                 assert!(w.find("new-chat").bounds().left() >= strip.right());
-                assert!(w.find_all("tabs-left").is_empty());
-                assert!(w.find_all("tabs-right").is_empty());
+                assert!(
+                    !w.find_all("tabs-left").is_empty() || !w.find_all("tabs-right").is_empty()
+                );
             })
             .unwrap();
         }

@@ -313,7 +313,12 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
     click_running(cx);
     on(cx, &|s, _, cx| {
         let target = s.active_ws().unwrap().chats[0].id.clone();
-        s.move_chat("tabs-focus", &ids[1], &target, cx);
+        s.move_tab(
+            "tabs-focus",
+            &TabId::Chat(ids[1].clone()),
+            &TabId::Chat(target),
+            cx,
+        );
         chat.update(cx, |c, _| c.meta.session_id = Some("recover-me".into()));
         s.active_ws_mut()
             .unwrap()

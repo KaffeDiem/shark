@@ -564,8 +564,15 @@ impl Shark {
             .child(
                 h_flex()
                     .h(px(44.))
+                    .w_full()
                     .flex_none()
-                    .window_control_area(WindowControlArea::Drag)
+                    .child(
+                        div()
+                            .id("tools-rail-left")
+                            .flex_1()
+                            .h_full()
+                            .map(|d| self.draggable_chrome("tools-rail-left", d)),
+                    )
                     .child(
                         side_toggle(
                             "show-tree",
@@ -573,6 +580,13 @@ impl Shark {
                             "Show workspace tools (cmd-alt-b)",
                         )
                         .on_click(cx.listener(|this, _, w, cx| this.toggle_tree(w, cx))),
+                    )
+                    .child(
+                        div()
+                            .id("tools-rail-right")
+                            .flex_1()
+                            .h_full()
+                            .map(|d| self.draggable_chrome("tools-rail-right", d)),
                     ),
             )
             .child(
@@ -1091,8 +1105,14 @@ impl Shark {
                     .mb(px(16.))
                     .pl(px(8.))
                     .pr(px(12.))
-                    .window_control_area(WindowControlArea::Drag)
-                    .child(side_header(theme, "Workspace tools").p_0().flex_1())
+                    .child(
+                        side_header(theme, "Workspace tools")
+                            .p_0()
+                            .flex_1()
+                            .h_full()
+                            .id("tools-header-empty")
+                            .map(|d| self.draggable_chrome("tools-header-empty", d)),
+                    )
                     .child(
                         side_toggle(
                             "hide-tree",

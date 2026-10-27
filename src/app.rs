@@ -6,11 +6,11 @@ use crate::diff_view::{Diff, DiffEvent, DiffFile, DiffFileStatus, DiffMode, Diff
 use crate::editor::{EditorEvent, FileEditor};
 use crate::files::{self, Row};
 use crate::menu::{self, Entry};
-use crate::state::{ChatMeta, Repo, Section, State, Workspace, move_item, workspaces_dir};
+use crate::state::{ChatMeta, Repo, Section, State, TabId, Workspace, move_item, workspaces_dir};
 use crate::sync::{GitSync, SyncEvent};
 use crate::*;
 use gpui_kit::assets::IconName;
-use gpui_kit::base::{ResizeHandleRenderer, ResizeHandleState};
+use gpui_kit::base::{InteractiveElementExt as _, ResizeHandleRenderer, ResizeHandleState};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::dialog::{Dialog, DialogEntrance};
@@ -30,6 +30,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -207,7 +208,7 @@ fn pill(id: impl Into<SharedString>, on: bool, theme: &Theme) -> Stateful<Div> {
         .aria_selected(on)
         .h(px(28.))
         .w(px(200.))
-        .min_w_0()
+        .min_w(px(100.))
         .flex_shrink_1()
         .relative()
         .overflow_hidden()
@@ -337,6 +338,10 @@ pub struct Shark {
     /// The sidebar | rest split, while the sidebar isn't a rail; persisted like Files.
     sidebar_resize: Entity<ResizableState>,
     sidebar_scroll: ScrollHandle,
+    tab_scroll: ScrollHandle,
+    tab_layout: Rc<std::cell::Cell<(Pixels, usize)>>,
+    restore_generation: u64,
+    chrome_pressed: Rc<std::cell::Cell<Option<&'static str>>>,
     /// Workspaces whose worktrees are being removed in the background.
     pub(crate) archiving: HashSet<String>,
     creating: HashSet<String>,
@@ -514,6 +519,10 @@ impl Shark {
             tree_resize,
             sidebar_resize,
             sidebar_scroll: ScrollHandle::new(),
+            tab_scroll: ScrollHandle::new(),
+            tab_layout: Rc::default(),
+            restore_generation: 0,
+            chrome_pressed: Rc::default(),
             archiving: HashSet::new(),
             creating: HashSet::new(),
             adding_repos: HashSet::new(),
@@ -643,11 +652,13 @@ impl Shark {
             && let Some(ws) = self.active_ws_mut().filter(|ws| ws.diff_closed)
         {
             ws.diff_closed = false;
+            ws.open_tab(TabId::Diff);
             let _ = self.state.save();
         }
         self.tab = tab;
         self.home.on = false;
         self.remember_open();
+        self.reveal_tab(cx);
         match tab {
             Tab::Chat => {
                 if let Some(chat) = self.active_chat() {
@@ -830,6 +841,47 @@ impl Shark {
         }))
     }
 
+    fn draggable_chrome(&self, id: &'static str, d: Stateful<Div>) -> impl IntoElement {
+        let pressed = self.chrome_pressed.clone();
+        d.window_control_area(WindowControlArea::Drag)
+            .on_mouse_down_out({
+                let pressed = pressed.clone();
+                move |_, _, _| {
+                    if pressed.get() == Some(id) {
+                        pressed.set(None);
+                    }
+                }
+            })
+            .on_mouse_down(MouseButton::Left, {
+                let pressed = pressed.clone();
+                move |_, _, _| pressed.set(Some(id))
+            })
+            .on_mouse_up(MouseButton::Left, {
+                let pressed = pressed.clone();
+                move |_, _, _| {
+                    if pressed.get() == Some(id) {
+                        pressed.set(None);
+                    }
+                }
+            })
+            .on_mouse_up_out(MouseButton::Left, {
+                let pressed = pressed.clone();
+                move |_, _, _| {
+                    if pressed.get() == Some(id) {
+                        pressed.set(None);
+                    }
+                }
+            })
+            .on_mouse_move(move |ev, window, _| {
+                if ev.pressed_button == Some(MouseButton::Left) && pressed.get() == Some(id) {
+                    pressed.set(None);
+                    window.start_window_move();
+                }
+            })
+            .on_double_click(|_, window, _| window.titlebar_double_click())
+            .test_support()
+    }
+
     fn render_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let tabs = if self.home_shown() {
             vec![]
@@ -854,7 +906,8 @@ impl Shark {
                     .flex_1()
                     .min_w(px(16.))
                     .h_full()
-                    .window_control_area(WindowControlArea::Drag),
+                    .id("titlebar-empty")
+                    .map(|d| self.draggable_chrome("titlebar-empty", d)),
             )
             .test_support()
     }
@@ -886,7 +939,8 @@ impl Shark {
                         div()
                             .flex_1()
                             .h_full()
-                            .window_control_area(WindowControlArea::Drag),
+                            .id("workspace-toolbar-empty")
+                            .map(|d| self.draggable_chrome("workspace-toolbar-empty", d)),
                     )
                     .when_some(self.active_sync().cloned(), |d, sync| d.child(sync)),
             )

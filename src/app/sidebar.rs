@@ -1060,14 +1060,16 @@ impl Shark {
                             .w(px(if rail { 72. } else { 80. }))
                             .h_full()
                             .flex_none()
-                            .window_control_area(WindowControlArea::Drag),
+                            .id("traffic-lights-empty")
+                            .map(|d| self.draggable_chrome("traffic-lights-empty", d)),
                     )
                     .when(!rail, |d| d.child(self.render_sidebar_toggle(cx)))
                     .child(
                         div()
                             .flex_1()
                             .h_full()
-                            .window_control_area(WindowControlArea::Drag),
+                            .id("sidebar-header-empty")
+                            .map(|d| self.draggable_chrome("sidebar-header-empty", d)),
                     ),
             )
             .child(

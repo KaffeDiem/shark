@@ -473,6 +473,7 @@ fn main() {
             bind_keys(cx);
             menubar::init(cx);
             let options = WindowOptions {
+                app_owns_titlebar_drag: true,
                 window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
                 titlebar: Some(TitlebarOptions {
                     traffic_light_position: Some(point(px(9.), px(15.))),

@@ -875,9 +875,6 @@ impl Shark {
             else {
                 return notify_err(window, cx, "The selected workspace is no longer available");
             };
-            if s.active.as_ref() != Some(&name) {
-                s.drop_editor();
-            }
             s.open_workspace_now(ix, window, cx);
             s.record_interaction(&name, cx);
         });
@@ -892,7 +889,9 @@ impl Shark {
         let Some(ws) = self.state.workspaces.get(ix).cloned() else {
             return;
         };
-        if self.active.as_ref() != Some(&ws.name) {
+        let changed = self.active.as_ref() != Some(&ws.name);
+        if changed {
+            self.drop_editor();
             // A fresh tree and diff for another workspace.
             self.editing = None;
             self.diff_fp = 0;
@@ -967,6 +966,9 @@ impl Shark {
         self.refresh_diff(cx);
         self.show(Tab::Chat, window, cx);
         self.select_chat(ws.active_chat, window, cx);
+        if changed {
+            self.restore_file_tabs(window, cx);
+        }
     }
 
     pub(super) fn add_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {

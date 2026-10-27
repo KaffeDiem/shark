@@ -613,10 +613,16 @@ impl Shark {
                     .gap_2()
                     .border_b_1()
                     .border_color(theme.border)
-                    .window_control_area(WindowControlArea::Drag)
-                    .child(Icon::new(IconName::House).with_size(px(14.)))
-                    .child(div().text_sm().child("Home"))
-                    .child(div().flex_1())
+                    .child(
+                        h_flex()
+                            .id("home-header-empty")
+                            .flex_1()
+                            .h_full()
+                            .gap_2()
+                            .child(Icon::new(IconName::House).with_size(px(14.)))
+                            .child(div().text_sm().child("Home"))
+                            .map(|d| self.draggable_chrome("home-header-empty", d)),
+                    )
                     .when(self.active.is_some(), |d| {
                         d.child(
                             Button::new("back-to-workspace")
