@@ -4750,6 +4750,8 @@ async fn review_queue(cx: &mut TestAppContext) {
     })
     .await;
     let api = home.join("shark/workspaces/rq/api");
+    // The fake open PR targets main on origin.
+    git::git(&api, &["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
     fs::write(api.join("f"), "a\nb\nc\n").unwrap();
     on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
     cx.update(|cx| assert_eq!(shark.read(cx).diff_files.len(), 1));

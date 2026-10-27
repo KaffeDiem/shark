@@ -284,6 +284,8 @@ pub struct Shark {
     diff_files: Vec<DiffFile>,
     diff_fps: Vec<u64>,
     diff_fp: u64,
+    /// Bases used by the displayed patch, including the PR target discovered by polling.
+    diff_bases: HashMap<String, String>,
     /// Bumped per refresh, so a slow older refresh can't overwrite a newer one.
     diff_gen: u64,
     /// The file last moved to (`}`/`{`, the tree); the diff can't say which one is on screen.
@@ -457,6 +459,7 @@ impl Shark {
             diff_files: vec![],
             diff_fps: vec![],
             diff_fp: 0,
+            diff_bases: HashMap::new(),
             diff_gen: 0,
             diff_file: 0,
             diff_loaded: false,

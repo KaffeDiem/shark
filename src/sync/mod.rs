@@ -51,6 +51,8 @@ pub enum SyncEvent {
         moves: Vec<(String, String, String)>,
         prompt: String,
     },
+    /// The PR target changed, or a fetch may have moved its base ref.
+    DiffBaseChanged,
     /// Create PRs succeeded.
     PrsCreated,
 }
@@ -429,7 +431,11 @@ impl GitSync {
                 cx.notify();
             }
         }
+        let bases: Vec<_> = self.repos.iter().map(repo_diff_base).collect();
         self.repos = repos_from(&self.ws, p.locals, p.prs, p.parents, &self.repos);
+        if p.fetched || !bases.into_iter().eq(self.repos.iter().map(repo_diff_base)) {
+            cx.emit(SyncEvent::DiffBaseChanged);
+        }
         let action = next_action(&self.repos, &self.reviewed);
         if self.action.as_ref() != Some(&action) {
             self.action = Some(action);
@@ -512,6 +518,14 @@ impl GitSync {
             .collect()
     }
 
+    /// The open PR target for display, or None to keep the caller's current workspace base.
+    pub fn diff_base(&self, repo: &str) -> Option<String> {
+        self.repos
+            .iter()
+            .find(|r| r.name == repo)
+            .and_then(repo_diff_base)
+    }
+
     /// `repo`'s open PR, and whether its lines are on GitHub: the PR's head is our HEAD and
     /// nothing is uncommitted.
     pub fn pr_for(&self, repo: &str) -> Option<(Pr, bool)> {
@@ -531,6 +545,36 @@ impl GitSync {
             head: head.into(),
             ..Default::default()
         });
+    }
+
+    /// Applies a fresh PR target through the polling path, including its diff refresh event.
+    #[cfg(all(test, feature = "test-support"))]
+    pub fn set_pr_base(&mut self, repo: &str, base: &str, cx: &mut Context<Self>) {
+        let prs = self
+            .repos
+            .iter()
+            .map(|r| {
+                let mut pr = r.pr.clone().unwrap_or(Ok(None));
+                if r.name == repo
+                    && let Ok(Some(p)) = &mut pr
+                {
+                    p.base = base.into();
+                }
+                pr
+            })
+            .collect();
+        self.apply(
+            Probed {
+                repos: worktrees(&self.ws),
+                locals: self.repos.iter().map(|r| r.local.clone()).collect(),
+                prs: Some(prs),
+                parents: vec![],
+                stack_prs: vec![],
+                fetched: false,
+                fetch_error: None,
+            },
+            cx,
+        );
     }
 
     /// Gives stacked `repo` a merged parent PR `number` with last commit `head` into `base`.
@@ -1124,6 +1168,17 @@ impl GitSync {
     }
 }
 
+fn repo_diff_base(repo: &Repo) -> Option<String> {
+    // Review checkouts have private refs from the target repository, which may not be origin.
+    repo.open_pr()
+        .filter(|p| {
+            !p.base.is_empty()
+                && !repo.base.starts_with("refs/shark/pull/")
+                && !repo.local.as_ref().is_ok_and(|l| l.review)
+        })
+        .map(|pr| format!("origin/{}", pr.base))
+}
+
 #[cfg(test)]
 fn open_pr(repo: &str, number: u64) -> Pr {
     Pr {
@@ -1632,6 +1687,146 @@ mod tests {
             });
         })
         .unwrap();
+    }
+
+    #[test]
+    fn diff_base_follows_only_open_prs_and_keeps_review_refs() {
+        use super::{PrState, repo_diff_base};
+        let (ws, p) = stacked_probe();
+        let mut repos = repos_from(&ws, p.locals, p.prs, p.parents, &[]);
+        let r = &mut repos[0];
+        r.base = "origin/main".into();
+        assert_eq!(repo_diff_base(r).as_deref(), Some("origin/parent"));
+        for state in [PrState::Closed, PrState::Merged] {
+            r.pr = Some(Ok(Some(Pr {
+                state,
+                ..super::open_pr("api", 2)
+            })));
+            assert_eq!(repo_diff_base(r), None);
+        }
+        let mut pr = super::open_pr("api", 2);
+        pr.base.clear();
+        r.pr = Some(Ok(Some(pr.clone())));
+        assert_eq!(repo_diff_base(r), None);
+        pr.base = "parent".into();
+        r.pr = Some(Ok(Some(pr)));
+        r.base = "refs/shark/pull/2/base".into();
+        assert_eq!(repo_diff_base(r), None);
+        r.base = "release".into();
+        assert_eq!(
+            repo_diff_base(r).as_deref(),
+            Some("origin/parent"),
+            "origin may be added after workspace creation"
+        );
+        r.base = "origin/main".into();
+        r.local.as_mut().unwrap().review = true;
+        assert_eq!(
+            repo_diff_base(r),
+            None,
+            "review identities keep their saved base"
+        );
+        r.local.as_mut().unwrap().review = false;
+        for pr in [None, Some(Ok(None)), Some(Err("offline".into()))] {
+            r.pr = pr;
+            assert_eq!(repo_diff_base(r), None);
+        }
+        let (_, p) = stacked_probe();
+        let last = repos_from(&ws, p.locals, p.prs, p.parents, &[]);
+        let (_, p) = stacked_probe();
+        let retained = repos_from(
+            &ws,
+            p.locals,
+            Some(vec![Err("offline".into())]),
+            vec![],
+            &last,
+        );
+        assert_eq!(
+            repo_diff_base(&retained[0]).as_deref(),
+            Some("origin/parent")
+        );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[gpui_kit::test]
+    fn changed_pr_target_emits_diff_refresh_without_head_change(cx: &mut gpui_kit::TestAppContext) {
+        use super::*;
+        let _lock = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cx.update(gpui_kit::init);
+        let (mut ws, _) = stacked_probe();
+        ws.repos[0].base = "origin/main".into();
+        ws.repos.push(crate::state::WsRepo {
+            name: "web".into(),
+            ..ws.repos[0].clone()
+        });
+        let (_, sync) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| GitSync::new(ws.clone(), w, cx))
+                })
+            })
+            .unwrap();
+        let events = Rc::new(Cell::new(0));
+        let count = events.clone();
+        let _sub = cx.update(|cx| {
+            cx.subscribe(&sync, move |_, event: &SyncEvent, _| {
+                if matches!(event, SyncEvent::DiffBaseChanged) {
+                    count.set(count.get() + 1);
+                }
+            })
+        });
+        cx.update(|cx| {
+            sync.update(cx, |s, cx| {
+                assert_eq!(
+                    s.diff_base("api"),
+                    None,
+                    "no PR must not override current workspace state"
+                );
+                s.set_pr("api", 2, true);
+                s.set_pr("web", 3, true);
+                s.set_pr_base("api", "parent", cx);
+                assert_eq!(s.diff_base("api").as_deref(), Some("origin/parent"));
+                assert_eq!(s.diff_base("web").as_deref(), Some("origin/main"));
+                assert_eq!(
+                    s.ws.repos[0].base, "origin/main",
+                    "workspace intent is unchanged"
+                );
+                assert_eq!(s.repos[0].local.as_ref().unwrap().head, "h");
+            })
+        });
+        assert_eq!(events.get(), 1);
+        cx.update(|cx| sync.update(cx, |s, cx| s.set_pr_base("api", "parent", cx)));
+        assert_eq!(events.get(), 1, "unchanged answers do not refresh the diff");
+        cx.update(|cx| sync.update(cx, |s, cx| s.set_pr_base("web", "release", cx)));
+        assert_eq!(events.get(), 2);
+        cx.update(|cx| sync.update(cx, |s, cx| s.set_pr_base("api", "", cx)));
+        assert_eq!(
+            events.get(),
+            3,
+            "falling back to the workspace base also refreshes"
+        );
+        cx.update(|cx| {
+            sync.update(cx, |s, cx| {
+                s.apply(
+                    Probed {
+                        repos: worktrees(&s.ws),
+                        locals: s.repos.iter().map(|r| r.local.clone()).collect(),
+                        prs: None,
+                        parents: vec![],
+                        stack_prs: vec![],
+                        fetched: true,
+                        fetch_error: Some("one remote failed".into()),
+                    },
+                    cx,
+                );
+            })
+        });
+        assert_eq!(
+            events.get(),
+            4,
+            "even a partial fetch can add or move a base ref"
+        );
     }
 
     #[test]
