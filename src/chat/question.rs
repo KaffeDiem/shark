@@ -129,11 +129,24 @@ fn pairs(qs: &[Q], answers: &[Answer]) -> String {
 
 /// A question row's summary from claude's tool result, when it holds the answers.
 pub(super) fn answered(result: &str) -> Option<&str> {
+    // A clipped result has no reliable protocol suffix; keep all retained answer text.
+    let truncated = result.rsplit_once("\n… truncated, ").is_some_and(|(_, n)| {
+        n.strip_suffix(" chars total")
+            .is_some_and(|n| n.parse::<u64>().is_ok())
+    });
     if let Some(r) = result.strip_prefix("Your questions have been answered: ") {
-        return r.split(". You can now continue").next();
+        return Some(
+            r.rsplit_once(". You can now continue")
+                .filter(|_| !truncated)
+                .map_or(r, |(answer, _)| answer),
+        );
     }
     if let Some(r) = result.strip_prefix("The user answered: ") {
-        return r.split(". Read the answers carefully").next();
+        return Some(
+            r.rsplit_once(". Read the answers carefully")
+                .filter(|_| !truncated)
+                .map_or(r, |(answer, _)| answer),
+        );
     }
     (result == ANSWER_IN_CHAT).then_some("Answered in the chat")
 }
@@ -334,18 +347,50 @@ impl Chat {
         if let Err(e) = res {
             self.push(Block::Info(format!("answering the agent failed: {e}")), cx);
         } else if asked.codex {
-            let call = Call {
-                id: asked.tool_use_id,
-                name: "AskUserQuestion".into(),
-                input: full_input(&asked.input),
-                result: Some(summary.clone().into()),
-                summary,
-                is_error: false,
-                open: false,
+            let id = asked.tool_use_id;
+            let result = if summary == "Answered in the chat" {
+                ANSWER_IN_CHAT.to_string()
+            } else {
+                format!("Your questions have been answered: {summary}. You can now continue")
             };
-            self.push(Block::Tool(call), cx);
+            let records = [
+                json!({"type":"assistant", "shark_completed_answer":true, "message":{"content":[{"type":"tool_use", "id":id, "name":"AskUserQuestion", "input":asked.input}]}}),
+                json!({"type":"user", "shark_completed_answer":true, "message":{"content":[{"type":"tool_result", "tool_use_id":id, "content":result, "is_error":false}]}}),
+            ].map(|v| agent::compact(&v.to_string()).into_owned());
+            if !self.completed_answers.contains_key(&id) {
+                for record in &records {
+                    for event in agent::parse(record) {
+                        self.apply(event, cx);
+                    }
+                }
+                self.completed_answers.insert(id, records);
+            }
+            self.retry_history(cx);
         }
         cx.emit(ChatEvent::Asking);
+        cx.notify();
+    }
+
+    pub(crate) fn retry_history(&mut self, cx: &mut Context<Self>) {
+        let path = agent::transcript_path(&self.meta.id);
+        let mut failure = None;
+        // shortcut: retries stay at EOF; add sequence metadata if replay must restore their original order.
+        self.completed_answers.retain(|id, records| {
+            match agent::append_answer(&path, id, records) {
+                Ok(()) => false,
+                Err(e) => {
+                    failure = Some(e.to_string());
+                    true
+                }
+            }
+        });
+        if failure.is_some() && self.history_save_error.is_none() {
+            self.push(
+                Block::Info("Answer sent, but could not save it to history".into()),
+                cx,
+            );
+        }
+        self.history_save_error = failure;
         cx.notify();
     }
 
@@ -466,6 +511,290 @@ mod tests {
     use super::*;
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
 
+    #[cfg(feature = "test-support")]
+    #[gpui_kit::test]
+    fn completed_answers_retry_and_replay_without_secrets(cx: &mut TestAppContext) {
+        crate::state::TEST_HOME
+            .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
+        use std::fs;
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cx.update(gpui_kit::init);
+        let id = format!("answer-retry-{}", std::process::id());
+        let path = agent::transcript_path(&id);
+        fs::create_dir_all(&path).unwrap(); // force a storage failure
+        let (_, chat) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| {
+                        Chat::new(
+                            Workspace::default(),
+                            ChatMeta {
+                                id: id.clone(),
+                                ..Default::default()
+                            },
+                            false,
+                            w,
+                            cx,
+                        )
+                    })
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        let input = json!({"questions":[{"id":"secret","question":"Token?","isSecret":true}]});
+        let qs = questions(&input);
+        let summary = pairs(&qs, &[(vec![], Some("NEVER_STORE_THIS_SECRET".into()))]);
+        chat.update(cx, |c, cx| {
+            let asked = Asked { request_id:"rpc".into(), tool_use_id:"question-1".into(), input, qs, codex:true, form:None, _subs:vec![] };
+            c.answered(asked, summary, Ok(()), cx);
+            assert!(c.history_save_error.is_some());
+            assert_eq!(c.completed_answers.len(), 1);
+            assert!(c.blocks.iter().any(|b| matches!(b, Block::Info(s) if s == "Answer sent, but could not save it to history")));
+        });
+        fs::remove_dir(&path).unwrap();
+        chat.update(cx, |c, cx| {
+            c.retry_history(cx);
+            c.retry_history(cx);
+            assert!(c.history_save_error.is_none());
+        });
+        let stored = fs::read_to_string(&path).unwrap();
+        assert!(!stored.contains("NEVER_STORE_THIS_SECRET"));
+        assert_eq!(stored.lines().count(), 2);
+        assert!(stored.lines().all(|line| {
+            serde_json::from_str::<Value>(line).unwrap()["shark_completed_answer"] == true
+        }));
+        let history = agent::read_history(&path, fs::metadata(&path).unwrap().len());
+        chat.update(cx, |c, cx| {
+            let live = c
+                .blocks
+                .iter()
+                .find_map(|b| match b {
+                    Block::Tool(t) => Some((t.input.clone(), t.result.clone(), t.summary.clone())),
+                    _ => None,
+                })
+                .unwrap();
+            c.blocks.clear();
+            for ev in history {
+                c.apply(ev, cx);
+            }
+            let Block::Tool(replayed) = &c.blocks[0] else {
+                panic!()
+            };
+            assert_eq!(
+                (
+                    replayed.input.clone(),
+                    replayed.result.clone(),
+                    replayed.summary.clone()
+                ),
+                live
+            );
+            let input = json!({"questions":[]});
+            c.answered(
+                Asked {
+                    request_id: "rpc2".into(),
+                    tool_use_id: "question-2".into(),
+                    input,
+                    qs: vec![],
+                    codex: true,
+                    form: None,
+                    _subs: vec![],
+                },
+                "Answered in the chat".into(),
+                Ok(()),
+                cx,
+            );
+        });
+        assert!(fs::read_to_string(&path).unwrap().contains(ANSWER_IN_CHAT));
+        fs::remove_file(path).unwrap();
+    }
+
+    /// Real Codex reply through the form, including a failed local save and exact replay.
+    #[cfg(feature = "test-support")]
+    #[gpui_kit::test]
+    #[ignore]
+    fn live_completed_answer_retry(cx: &mut TestAppContext) {
+        use std::{
+            fs,
+            time::{Duration, Instant},
+        };
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        unsafe {
+            std::env::remove_var("SHARK_CODEX");
+        }
+        crate::state::TEST_HOME.get_or_init(|| {
+            std::env::temp_dir().join(format!("shark-live-answer-{}", std::process::id()))
+        });
+        cx.update(gpui_kit::init);
+        let ws = Workspace {
+            name: format!("live-answer-{}", std::process::id()),
+            ..Default::default()
+        };
+        fs::create_dir_all(ws.dir()).unwrap();
+        let meta = ChatMeta {
+            id: ws.name.clone(),
+            model: Some("codex:gpt-6.1-sol".into()),
+            effort: Some("low".into()),
+            plan: true,
+            ..Default::default()
+        };
+        let path = agent::transcript_path(&meta.id);
+        fs::create_dir_all(&path).unwrap();
+        let (window, chat) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| Chat::new(ws.clone(), meta.clone(), false, w, cx))
+                })
+            })
+            .unwrap();
+        cx.run_until_parked();
+        // Separate wire records so the injected local-answer failure cannot lose live events.
+        let wire = ChatMeta {
+            id: format!("{}-wire", meta.id),
+            ..meta.clone()
+        };
+        let (mut process, rx) = agent::spawn(&ws, &wire).unwrap();
+        process.send("Use request_user_input exactly once to ask for a public synthetic test marker, offering options Red and Blue. The user will give their own text instead. Once answered, reply only with the final four digits of that marker. Never repeat the full marker or write it anywhere.").unwrap();
+        chat.update(cx, |c, _| {
+            c.agent = Some(process);
+            c.agent_model = meta.model.clone();
+        });
+        const SENTINEL: &str = "SHARK_SYNTHETIC_7391";
+        let end = Instant::now() + Duration::from_secs(180);
+        let (mut requests, mut completed, mut response) = (0, false, String::new());
+        while Instant::now() < end {
+            let ev = match rx.try_recv() {
+                Ok(ev) => ev,
+                Err(e) if e.is_closed() => panic!("live Codex channel closed before completion"),
+                Err(_) => {
+                    std::thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+            };
+            match &ev {
+                Ev::Text(text) | Ev::Plan { text, .. } => response.push_str(text),
+                Ev::Result { is_error, text, .. } => {
+                    assert!(!is_error, "{text}");
+                    completed = true;
+                }
+                Ev::Exited(error) => panic!("live Codex exited: {error}"),
+                _ => {}
+            }
+            chat.update(cx, |c, cx| c.apply(ev, cx));
+            if cx.update(|cx| chat.read(cx).asking()) {
+                requests += 1;
+                assert_eq!(requests, 1, "the service must ask exactly once");
+                cx.update_window(window, |_, w, cx| {
+                    chat.update(cx, |c, cx| {
+                        let asked = c.asked.as_ref().unwrap();
+                        assert_eq!(asked.qs.len(), 1);
+                        assert!(!asked.qs[0].secret, "this live question is public");
+                        c.build_asked(w, cx);
+                        c.asked_form().unwrap().update(cx, |form, cx| {
+                            form.set_answer(
+                                "0",
+                                QuestionnaireAnswer::new().with_freeform(SENTINEL),
+                                w,
+                                cx,
+                            )
+                            .unwrap();
+                            assert!(form.submit(w, cx));
+                        });
+                    });
+                })
+                .unwrap();
+                cx.run_until_parked();
+                chat.update(cx, |c, _| {
+                    assert!(
+                        !c.asking(),
+                        "production form submission answered the service"
+                    );
+                    assert!(c.history_save_error.is_some());
+                    assert_eq!(c.completed_answers.len(), 1);
+                });
+            }
+            if completed {
+                break;
+            }
+        }
+        chat.update(cx, |c, _| c.agent = None);
+        let stop_by = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < stop_by && !rx.is_closed() {
+            let _ = rx.try_recv();
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(rx.is_closed(), "live Codex reader must stop before cleanup");
+        assert!(completed, "live Codex did not finish within 180 seconds");
+        assert_eq!(requests, 1);
+        assert_eq!(
+            response.trim(),
+            "7391",
+            "service must use the real answer without echoing it"
+        );
+        assert!(
+            !fs::read_to_string(agent::transcript_path(&wire.id))
+                .unwrap()
+                .contains(SENTINEL)
+        );
+        fs::remove_dir(&path).unwrap();
+        chat.update(cx, |c, cx| {
+            c.retry_history(cx);
+            c.retry_history(cx);
+            assert!(c.history_save_error.is_none());
+            assert!(c.completed_answers.is_empty());
+        });
+        let stored = fs::read_to_string(&path).unwrap();
+        assert!(
+            stored.contains(SENTINEL),
+            "public answers must be preserved"
+        );
+        assert_eq!(
+            stored.lines().count(),
+            2,
+            "retry must store the answer exactly once"
+        );
+        let history = agent::read_history(&path, u64::MAX);
+        chat.update(cx, |c, cx| {
+            let live = c
+                .blocks
+                .iter()
+                .find_map(|b| match b {
+                    Block::Tool(t) if t.name == "AskUserQuestion" => {
+                        Some((t.input.clone(), t.result.clone(), t.summary.clone()))
+                    }
+                    _ => None,
+                })
+                .unwrap();
+            assert!(live.2.contains(SENTINEL));
+            c.blocks.clear();
+            for ev in history {
+                c.apply(ev, cx);
+            }
+            let Block::Tool(replayed) = &c.blocks[0] else {
+                panic!("missing replayed answer")
+            };
+            assert_eq!(
+                (
+                    replayed.input.clone(),
+                    replayed.result.clone(),
+                    replayed.summary.clone()
+                ),
+                live
+            );
+        });
+        fs::remove_file(path).unwrap();
+        fs::remove_file(agent::transcript_path(&wire.id)).unwrap();
+        let _ = fs::remove_file(
+            crate::state::support_dir()
+                .join("logs")
+                .join(format!("{}.stderr.log", wire.id)),
+        );
+        fs::remove_dir_all(ws.dir()).unwrap();
+    }
+
     #[test]
     fn answers_go_back_in_each_agents_shape() {
         let input = json!({"questions": [
@@ -523,6 +852,48 @@ mod tests {
                 "ok": {"answers": ["Accept"]},
             }})
         );
+    }
+
+    #[test]
+    fn answer_summaries_keep_protocol_words_inside_user_text() {
+        for (prefix, ending) in [
+            (
+                "Your questions have been answered: ",
+                ". You can now continue",
+            ),
+            ("The user answered: ", ". Read the answers carefully"),
+        ] {
+            let summary = format!(r#""Instructions?"="Stop{ending} after tests""#);
+            let result = format!("{prefix}{summary}{ending}");
+            assert_eq!(answered(&result), Some(summary.as_str()));
+        }
+    }
+
+    #[test]
+    fn clipped_answer_summaries_keep_protocol_words_inside_user_text() {
+        for (prefix, ending) in [
+            (
+                "Your questions have been answered: ",
+                ". You can now continue",
+            ),
+            ("The user answered: ", ". Read the answers carefully"),
+        ] {
+            let summary = format!(
+                r#""Instructions?"="Stop{ending} after {}""#,
+                "x".repeat(agent::MAX_OUTPUT)
+            );
+            let result = format!("{prefix}{summary}{ending}");
+            let record = json!({"type":"user", "message":{"content":[{"type":"tool_result", "tool_use_id":"q", "content":result}]}}).to_string();
+            let events = agent::parse(&agent::compact(&record));
+            let [Ev::ToolResult { text, .. }] = events.as_slice() else {
+                panic!()
+            };
+            assert!(text.contains("… truncated,"));
+            assert_eq!(
+                answered(text).unwrap().len(),
+                text.strip_prefix(prefix).unwrap().len()
+            );
+        }
     }
 
     /// The real CLIs, through Shark's own spawn, parse and reply: each asks and uses the answer

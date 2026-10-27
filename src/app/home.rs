@@ -502,7 +502,7 @@ impl Shark {
 
     fn set_appearance(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Appearance)) {
         f(&mut self.state.appearance);
-        self.state.save();
+        let _ = self.state.save();
         crate::settings::apply(&self.state.appearance, cx);
         cx.notify();
     }
@@ -534,7 +534,7 @@ impl Shark {
     /// The Get started card's X, and the palette's "Hide Get started".
     pub(super) fn dismiss_checklist(&mut self, cx: &mut Context<Self>) {
         self.state.home_checklist_dismissed = true;
-        self.state.save();
+        let _ = self.state.save();
         cx.notify()
     }
 
@@ -1203,7 +1203,7 @@ impl Shark {
                     close_button("dismiss-news", "Dismiss").on_click(cx.listener(
                         |this, _, _, cx| {
                             this.state.last_seen_version = env!("CARGO_PKG_VERSION").into();
-                            this.state.save();
+                            let _ = this.state.save();
                             cx.notify()
                         },
                     )),

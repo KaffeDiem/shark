@@ -407,6 +407,8 @@ pub struct Chat {
     side: Option<Side>,
     /// Questions the agent waits on, in a card above the composer.
     asked: Option<question::Asked>,
+    completed_answers: std::collections::BTreeMap<String, [String; 2]>,
+    pub(crate) history_save_error: Option<String>,
     /// The question card had the focus at the last render: when it goes, the composer gets it.
     asked_focused: bool,
     /// Plan versions and the pane that shows them, next to the transcript while `plan_open`.
@@ -753,6 +755,8 @@ impl Chat {
             steered: false,
             side: None,
             asked: None,
+            completed_answers: Default::default(),
+            history_save_error: None,
             asked_focused: false,
             reported: None,
             fast_by_config: codex::fast_by_config(),
@@ -1913,13 +1917,14 @@ impl Chat {
     fn apply(&mut self, ev: Ev, cx: &mut Context<Self>) {
         // Only a turn that ended well sends the next message; after a stop or an error the
         // queue waits for the user.
-        let ok = matches!(
-            ev,
-            Ev::Result {
-                is_error: false,
-                ..
-            }
-        );
+        let ok = !self.cut
+            && matches!(
+                ev,
+                Ev::Result {
+                    is_error: false,
+                    ..
+                }
+            );
         self.follow(cx, |this, cx| this.apply_inner(ev, cx));
         if ok {
             self.drain(cx);
@@ -2074,6 +2079,11 @@ impl Chat {
                     _ => None,
                 });
                 if let Some((bi, c)) = call {
+                    if c.name == "AskUserQuestion"
+                        && let Some(answer) = question::answered(&text)
+                    {
+                        c.summary = answer.to_string();
+                    }
                     c.result = Some(text.into());
                     c.is_error = is_error;
                     self.remeasure(bi); // an open call shows its output
@@ -3332,6 +3342,8 @@ pub(crate) mod ui_tests {
 
     /// Feeds recorded protocol lines to the chat as its process would.
     pub(crate) fn play(c: &mut Chat, lines: &[&str], cx: &mut Context<Chat>) {
+        // Injected events replace the reader, including the fake process's exit during cleanup.
+        c.reader = None;
         for l in lines {
             for ev in agent::parse(l) {
                 c.apply(ev, cx);
@@ -3686,6 +3698,7 @@ exec cat >/dev/null
         let submit = |cx: &mut TestAppContext, id: &str, plan: &str| {
             cx.update(|cx| {
                 chat.update(cx, |c, cx| {
+                    c.reader = None; // This fixture injects events instead of reading the fake process.
                     let input = serde_json::json!({"plan": plan});
                     c.apply(
                         Ev::ToolUse {
@@ -3745,6 +3758,8 @@ exec cat >/dev/null
                 assert!(matches!(c.blocks.last(), Some(Block::User(t, _)) if *t == want));
             })
         });
+        cx.update(|cx| chat.update(cx, |c, _| c.reader = None));
+        cx.run_until_parked(); // Drop the receiver before the OS thread sends the fake process's exit.
         cx.update(|cx| chat.update(cx, |c, _| c.agent = None));
         let _ = std::fs::remove_file(super::plan::tests_store_path(&ws.name));
         let _ = std::fs::remove_file(ws.dir());
@@ -3754,6 +3769,11 @@ exec cat >/dev/null
     /// message from the composer to answer in the chat instead.
     #[gpui_kit::test]
     fn answers_questions(cx: &mut TestAppContext) {
+        crate::state::TEST_HOME
+            .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         cx.update(|cx| {
             gpui_kit::init(cx);
             crate::bind_keys(cx);
@@ -4508,6 +4528,19 @@ exec cat >/dev/null
             "down past the last row returns to the composer"
         );
 
+        // Codex reports an interrupted turn with a non-error result.
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.apply(Ev::Interrupted, cx);
+                c.apply(result(false), cx);
+            })
+        });
+        assert_eq!(queue(cx), ["first", "second edited"]);
+        assert!(
+            users(cx).is_empty(),
+            "interruption must not send queued messages"
+        );
+
         // A good turn end sends the top message; an error doesn't.
         cx.update(|cx| chat.update(cx, |c, cx| c.apply(result(false), cx)));
         assert_eq!(users(cx), ["first"]);
@@ -4642,6 +4675,8 @@ exec cat >/dev/null
         });
         assert_eq!(queue(cx), ["update base", "restack"]);
 
+        cx.update(|cx| chat.update(cx, |c, _| c.reader = None));
+        cx.run_until_parked(); // Drop the receiver before the OS thread sends the fake process's exit.
         cx.update(|cx| chat.update(cx, |c, _| c.agent = None));
         let _ = std::fs::remove_file(dir);
         let _ = std::fs::remove_file(transcript);

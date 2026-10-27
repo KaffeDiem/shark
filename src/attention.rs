@@ -90,15 +90,22 @@ fn poll(cx: &mut Context<Shark>) -> Task<()> {
                 let last = (s.attn.checked.get(&name)).map(|c| c.2.clone());
                 // Backing off skips gh only: local git state keeps refreshing.
                 let gh = s.attn.paused_until.is_none_or(|t| now >= t);
-                Some((ws, last.unwrap_or_default(), gh))
+                Some((
+                    ws,
+                    last.unwrap_or_default(),
+                    gh,
+                    s.state.reviewed.get(&name).cloned().unwrap_or_default(),
+                ))
             }) else {
                 break;
             };
-            let Some((ws, last, gh)) = next else { continue };
+            let Some((ws, last, gh, reviewed)) = next else {
+                continue;
+            };
             let name = ws.name.clone();
             let (label, repos) = cx
                 .background_executor()
-                .spawn(async move { sync::check_in_background(&ws, &last, gh) })
+                .spawn(async move { sync::check_in_background(&ws, &last, gh, &reviewed) })
                 .await;
             let ok = this.update(cx, |s, cx| {
                 let now = Instant::now();

@@ -457,7 +457,7 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
     // Even a stale last-open Diff entry cannot reopen a deliberately closed tab.
     on(cx, &|s, _, _| {
         s.state.last_open = Some(("closed-diff".into(), "diff".into()));
-        s.state.save();
+        let _ = s.state.save();
     });
     let (restored_window, restored) = open(cx, WindowOptions::default());
     cx.run_until_parked();

@@ -49,6 +49,7 @@ mod review;
 mod review_send;
 mod review_share;
 mod sidebar;
+mod storage;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod ui_tests;
 mod workspace;
@@ -315,6 +316,8 @@ pub struct Shark {
     tab_layout: Rc<std::cell::Cell<(Pixels, usize)>>,
     /// Workspaces whose worktrees are being removed in the background.
     pub(crate) archiving: HashSet<String>,
+    creating: HashSet<String>,
+    adding_repos: HashSet<String>,
     show_tree: bool,
     /// Sidebar shrunk to icons by the user.
     rail: bool,
@@ -357,7 +360,7 @@ impl Shark {
         // from before the line existed has workspaces, and does.
         if state.last_seen_version.is_empty() && state.workspaces.is_empty() {
             state.last_seen_version = env!("CARGO_PKG_VERSION").into();
-            state.save();
+            let _ = state.save();
         }
         let home = home::Home::new(window, cx);
         let tree_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files…"));
@@ -402,13 +405,13 @@ impl Shark {
             cx.subscribe(&tree_resize, |s, r, _: &ResizablePanelEvent, cx| {
                 if let Some(w) = r.read(cx).sizes().get(1) {
                     s.state.tree_width = Some(w.as_f32());
-                    s.state.save();
+                    let _ = s.state.save();
                 }
             }),
             cx.subscribe(&sidebar_resize, |s, r, _: &ResizablePanelEvent, cx| {
                 if let Some(w) = r.read(cx).sizes().first() {
                     s.state.sidebar_width = Some(w.as_f32());
-                    s.state.save();
+                    let _ = s.state.save();
                 }
             }),
             cx.subscribe_in(
@@ -424,7 +427,7 @@ impl Shark {
             cx.subscribe(&diff, |s, _, ev: &DiffEvent, _| {
                 if let DiffEvent::SplitRatioChanged(r) = ev {
                     s.state.split_ratio = Some(*r);
-                    s.state.save();
+                    let _ = s.state.save();
                 }
             }),
             // Keys need a rendered target. A closing dialog gives focus back to what had it
@@ -479,6 +482,8 @@ impl Shark {
             tab_scroll: ScrollHandle::new(),
             tab_layout: Rc::default(),
             archiving: HashSet::new(),
+            creating: HashSet::new(),
+            adding_repos: HashSet::new(),
             // Closed by default (design 01); Files N in the Changes bar opens it.
             show_tree: false,
             rail: false,
@@ -602,7 +607,7 @@ impl Shark {
             && let Some(ws) = self.active_ws_mut().filter(|ws| ws.diff_closed)
         {
             ws.diff_closed = false;
-            self.state.save();
+            let _ = self.state.save();
         }
         self.tab = tab;
         self.home.on = false;
@@ -1138,6 +1143,25 @@ impl Render for Shark {
                 let main = v_flex()
                     .size_full()
                     .child(self.render_titlebar(window, cx))
+                    .when(!self.unsaved_data(cx).is_empty(), |d| {
+                        d.child(
+                            h_flex()
+                                .id("unsaved-data")
+                                .px_3()
+                                .py_2()
+                                .gap_3()
+                                .child(div().flex_1().text_sm().child(format!(
+                                    "Unsaved data: {}",
+                                    self.unsaved_data(cx).join("; ")
+                                )))
+                                .child(
+                                    Button::new("retry-save")
+                                        .label("Retry save")
+                                        .small()
+                                        .on_click(cx.listener(|s, _, _, cx| s.retry_saves(cx))),
+                                ),
+                        )
+                    })
                     .child(island);
                 let main = self.with_tree(main, window, cx).into_any_element();
                 let sidebar = self.render_sidebar(window, cx).into_any_element();

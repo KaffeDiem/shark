@@ -385,7 +385,7 @@ impl Shark {
         // Forget files that left the diff so the map doesn't grow forever.
         let live: HashSet<&str> = self.diff_files.iter().map(|f| f.path().as_str()).collect();
         ws.viewed.retain(|p, _| live.contains(p.as_str()));
-        self.state.save();
+        let _ = self.state.save();
         self.recompute_viewed();
         // The file being edited stays open, or its line input would go.
         let edited = self.editing.as_ref().map(|e| e.path.clone());
@@ -451,7 +451,7 @@ impl Shark {
     /// `s` and the Split / Unified button; the choice persists.
     pub(super) fn toggle_diff_mode(&mut self, cx: &mut Context<Self>) {
         self.state.unified = !self.state.unified;
-        self.state.save();
+        let _ = self.state.save();
         let mode = diff_mode(self.state.unified);
         self.diff.update(cx, |d, cx| d.set_mode(mode, cx));
         cx.notify();
@@ -461,7 +461,7 @@ impl Shark {
         self.confirm_discard(false, true, window, cx, |s, window, cx| {
             s.end_edit(cx);
             s.state.uncommitted_only = !s.state.uncommitted_only;
-            s.state.save();
+            let _ = s.state.save();
             s.refresh_diff(cx);
             if s.tab == Tab::Diff {
                 s.focus_diff(window, cx);

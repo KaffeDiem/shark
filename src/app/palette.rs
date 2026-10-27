@@ -618,7 +618,7 @@ pub(super) const COMMANDS: &[Row] = &[
         IconName::GitBranch,
         None,
         "setting",
-        |_, w, cx| sync::toggle_delete_remote(w, cx),
+        |s, _, cx| s.set_delete_remote(!s.state.delete_remote_branches, cx),
     ),
     Row(
         "New section",

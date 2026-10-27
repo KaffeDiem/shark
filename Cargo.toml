@@ -16,7 +16,7 @@ smallvec = "1"
 unicode-segmentation = "1"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSImage", "NSResponder", "NSWorkspace", "NSImageRep", "NSBitmapImageRep", "NSGraphicsContext", "objc2-core-graphics"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSString", "NSDictionary", "NSValue", "NSURL", "NSArray", "NSGeometry"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSString", "NSDictionary", "NSValue", "NSURL", "NSArray", "NSGeometry", "NSFileManager", "NSError"] }
 objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-core-media", "objc2-core-video", "AVPlayer", "AVPlayerItem", "AVPlayerItemOutput", "AVAsset", "AVTime", "AVAssetTrack", "AVMediaFormat", "AVVideoComposition", "objc2-core-foundation"] }
 objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVPixelBuffer", "CVBuffer", "CVImageBuffer", "CVReturn"] }
 objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMTime"] }

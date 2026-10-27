@@ -887,15 +887,30 @@ impl Shark {
             && self.state.sections[i].collapsed
         {
             self.state.sections[i].collapsed = false;
-            self.state.save();
+            let _ = self.state.save();
         }
         if !self.syncs.contains_key(&ws.name) {
-            let sync = cx.new(|cx| GitSync::new(ws.clone(), window, cx));
+            let sync = cx.new(|cx| {
+                let mut sync = GitSync::new(ws.clone(), window, cx);
+                sync.restore_settings(&self.state);
+                sync
+            });
             let name = ws.name.clone();
             self._subs.push(cx.subscribe_in(
                 &sync,
                 window,
                 move |this, _, ev: &SyncEvent, window, cx| match ev {
+                    SyncEvent::Reviewed(ids) => {
+                        this.state.reviewed.insert(name.clone(), ids.clone());
+                        let _ = this.state.save();
+                        cx.notify();
+                    }
+                    SyncEvent::MergeOrder(order) => {
+                        this.state.merge_order.insert(name.clone(), order.clone());
+                        let _ = this.state.save();
+                        cx.notify();
+                    }
+                    SyncEvent::DeleteRemote(on) => this.set_delete_remote(*on, cx),
                     SyncEvent::Archive => this.remove_workspace(&name, false, window, cx),
                     SyncEvent::PrsCreated => this.state.mark(|s| &mut s.opened_pr),
                     SyncEvent::DiffBaseChanged => {
@@ -952,7 +967,7 @@ impl Shark {
                 Err(e) => notify_err(window, cx, e),
             }
         }
-        self.state.save();
+        let _ = self.state.save();
         cx.notify();
     }
 
@@ -1064,13 +1079,15 @@ impl Shark {
                 "Can't create workspaces: state.json couldn't be read",
             );
         }
-        if self.state.workspaces.iter().any(|w| w.name == name) {
+        if self.creating.contains(&name) || self.state.workspaces.iter().any(|w| w.name == name) {
             return notify_err(window, cx, format!("workspace `{name}` already exists"));
         }
+        self.creating.insert(name.clone());
         self.state.last_repos = repos.iter().map(|(r, _)| r.name.clone()).collect();
-        self.state.save();
+        let _ = self.state.save();
         let dir = workspaces_dir().join(&name);
         window.push_notification(format!("Creating {}…", tilde(&dir)), cx);
+        let pending_name = name.clone();
         let pushes: Vec<(String, String)> = (moves.iter())
             .filter_map(|(r, ..)| {
                 Some((
@@ -1099,33 +1116,38 @@ impl Shark {
                     (ws, pushed)
                 })
                 .await;
-            this.update_in(cx, |s, window, cx| match result {
-                Ok(mut ws) => {
-                    match (&insert, pushed) {
-                        (Some(child), Some(Ok(_))) => s.set_base(child, &moves, false, window, cx),
-                        (Some(child), Some(Err(e))) => notify_err(
-                            window,
-                            cx,
-                            format!(
-                                "Created, but `{child}` stays where it was; pushing failed: {e}"
+            this.update_in(cx, |s, window, cx| {
+                s.creating.remove(&pending_name);
+                match result {
+                    Ok(mut ws) => {
+                        match (&insert, pushed) {
+                            (Some(child), Some(Ok(_))) => {
+                                s.set_base(child, &moves, false, window, cx)
+                            }
+                            (Some(child), Some(Err(e))) => notify_err(
+                                window,
+                                cx,
+                                format!(
+                                    "Created, but `{child}` stays where it was; pushing failed: {e}"
+                                ),
                             ),
-                        ),
-                        _ => {}
+                            _ => {}
+                        }
+                        ws.fill_models(&s.state.new_model(), s.state.last_effort.as_ref());
+                        let name = ws.name.clone();
+                        s.state.workspaces.push(ws);
+                        let _ = s.state.save();
+                        s.open_workspace(s.state.workspaces.len() - 1, window, cx);
+                        s.home_prompt_used(prompt.as_deref(), window, cx);
+                        if let Some(p) = prompt
+                            && s.active.as_ref() == Some(&name)
+                            && let Some(chat) = s.active_chat().cloned()
+                        {
+                            chat.update(cx, |c, cx| c.ask(&p, window, cx));
+                        }
                     }
-                    ws.fill_models(&s.state.new_model(), s.state.last_effort.as_ref());
-                    let name = ws.name.clone();
-                    s.state.workspaces.push(ws);
-                    s.state.save();
-                    s.open_workspace(s.state.workspaces.len() - 1, window, cx);
-                    s.home_prompt_used(prompt.as_deref(), window, cx);
-                    if let Some(p) = prompt
-                        && s.active.as_ref() == Some(&name)
-                        && let Some(chat) = s.active_chat().cloned()
-                    {
-                        chat.update(cx, |c, cx| c.ask(&p, window, cx));
-                    }
+                    Err(e) => notify_err(window, cx, e),
                 }
-                Err(e) => notify_err(window, cx, e),
             })
             .ok();
         })
@@ -1162,7 +1184,7 @@ impl Shark {
         let open = self.active.clone().map(|n| (n, tab.to_string()));
         if self.state.last_open != open {
             self.state.last_open = open;
-            self.state.save();
+            let _ = self.state.save();
         }
     }
 
@@ -1221,6 +1243,13 @@ impl Shark {
         let Some(ws) = self.ws(&name).cloned() else {
             return;
         };
+        if !self.adding_repos.insert(name.clone()) {
+            return notify_err(
+                window,
+                cx,
+                format!("{name}: a repository addition is already in progress"),
+            );
+        }
         window.push_notification(format!("Adding {} to {name}…", repo.name), cx);
         cx.spawn_in(window, async move |this, cx| {
             let dir = ws.dir();
@@ -1228,9 +1257,12 @@ impl Shark {
                 .background_executor()
                 .spawn(async move { git::add_to_workspace(&ws, &dir, &repo) })
                 .await;
-            this.update_in(cx, |s, window, cx| match result {
-                Ok(ws) => s.repo_added(ws, window, cx),
-                Err(e) => notify_err(window, cx, e),
+            this.update_in(cx, |s, window, cx| {
+                s.adding_repos.remove(&name);
+                match result {
+                    Ok(ws) => s.repo_added(ws, window, cx),
+                    Err(e) => notify_err(window, cx, e),
+                }
             })
             .ok();
         })
@@ -1526,7 +1558,7 @@ impl Shark {
             }
         }
         let ws = slot.clone();
-        self.state.save();
+        let _ = self.state.save();
         git::write_claude_md(&ws);
         let changed = (moves.iter())
             .map(|(r, o, n)| format!("`{r}` now targets `{n}` (was `{o}`)"))
@@ -1611,7 +1643,7 @@ impl Shark {
             slot.repos.push(r.clone());
         }
         let ws = slot.clone();
-        self.state.save();
+        let _ = self.state.save();
         if raced {
             git::write_claude_md(&ws);
         }
@@ -1711,17 +1743,54 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Git only sees the disk; unsaved editor edits would vanish with the worktree.
+        let active = self.active.as_deref() == Some(name);
+        let editors = self
+            .file_tabs
+            .iter()
+            .filter(|_| active)
+            .map(|t| t.editor.clone())
+            .collect();
+        let name = name.to_string();
+        // Keep buffers dirty until removal succeeds; another save or Git may block archiving.
+        self.confirm_editors(editors, active, false, window, cx, move |s, window, cx| {
+            s.archive_worktrees(&name, force, window, cx)
+        });
+    }
+
+    fn archive_worktrees(
+        &mut self,
+        name: &str,
+        force: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.active.as_deref() == Some(name)
-            && (self.file_tabs.iter().any(|t| {
-                let e = t.editor.read(cx);
-                e.dirty || e.saving
-            }) || self.editing.as_ref().is_some_and(|e| e.dirty || e.saving))
+            && (self.file_tabs.iter().any(|t| t.editor.read(cx).saving)
+                || self.editing.as_ref().is_some_and(|e| e.saving))
         {
-            let name = name.to_string();
-            return self.confirm_discard(true, true, window, cx, move |s, window, cx| {
-                s.remove_workspace(&name, force, window, cx)
-            });
+            return notify_err(window, cx, "Wait for file saves before archiving");
+        }
+        if self.adding_repos.contains(name) {
+            return notify_err(
+                window,
+                cx,
+                "Wait for the repository addition before archiving",
+            );
+        }
+        self.retry_saves(cx);
+        let pending_answers = self.ws(name).is_some_and(|ws| {
+            ws.chats.iter().chain(&ws.closed).any(|m| {
+                self.chats
+                    .get(&m.id)
+                    .is_some_and(|c| c.read(cx).history_save_error.is_some())
+            })
+        });
+        if pending_answers || self.review.failed_saves.contains_key(name) {
+            return notify_err(
+                window,
+                cx,
+                "Unsaved comments or answers: Retry save before archiving this workspace",
+            );
         }
         let Some(ws) = self.ws(name).cloned() else {
             return;
@@ -1785,10 +1854,12 @@ impl Shark {
                 self.attn.forget(name);
                 self.review.forget(name);
                 self.state.workspaces.retain(|w| w.name != name);
+                self.state.reviewed.remove(name);
+                self.state.merge_order.remove(name);
                 for s in &mut self.state.sections {
                     s.workspaces.retain(|w| w != name);
                 }
-                self.state.save();
+                let _ = self.state.save();
                 if self.active.as_deref() == Some(name) {
                     self.active = None;
                     self.drop_editor();
