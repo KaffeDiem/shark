@@ -6020,6 +6020,8 @@ async fn review_round3(cx: &mut TestAppContext) {
     press(cx, &["cmd-enter"]);
     assert_eq!(comments(cx), [(1, Status::Pending)]);
 
+    // The injected PR targets origin/main, which background polling must be able to resolve.
+    git::git(&api, &["update-ref", "refs/remotes/origin/main", "main"]).unwrap();
     // The sheet's Also publish follows the ticked rows' repos; ticking it opens the preview.
     on(cx, &|s, w, cx| {
         s.active_sync()

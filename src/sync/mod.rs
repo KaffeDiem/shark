@@ -158,61 +158,126 @@ fn run_job(job: &Job) -> Probed {
             wt.file_name().is_some_and(|name| name == r.name.as_str()) && r.branch == *branch
         });
         let prev_local = previous.and_then(|r| r.local.as_ref().ok());
-        let initial_base = previous
-            .and_then(repo_diff_base)
-            .unwrap_or_else(|| saved_base.clone());
-        // Errors (offline, no origin) show in the tooltip and menu, not a toast every 3 min.
+        // A preliminary probe must not rewrite the saved stack boundary against an old base.
+        let head = crate::git::git(wt, &["rev-parse", "--verify", "HEAD"]).unwrap_or_default();
         let mut fetch_err = job
             .fetch
             .then(|| cmd_bounded(wt, "git", &["fetch", "--prune", "--quiet", "origin"], 60).err())
             .flatten();
-        let mut local = probe(wt, branch, &initial_base, prev_local);
-        let head = local.as_ref().map(|l| l.head.as_str()).unwrap_or_default();
-        let pr = ask_pr.then(|| fetch_pr(wt, branch, head));
-        let review = crate::git::review_pr_url(wt, branch).is_some();
-        let previous = previous.filter(|r| r.local.as_ref().is_ok_and(|l| l.review == review));
+        let mut pr = ask_pr.then(|| fetch_pr(wt, branch, &head));
+        let review_url = crate::git::review_pr_url(wt, branch);
+        if review_url.is_some()
+            && let Some(Ok(Some(pr))) = &mut pr
+        {
+            pr.review_checkout = true;
+        }
+        let previous = previous.filter(|r| {
+            r.local
+                .as_ref()
+                .is_ok_and(|l| l.review == review_url.is_some())
+        });
         let selected = fresh_or_last(pr.as_ref(), &previous.and_then(|r| r.pr.clone()));
+        let authoritative = matches!(&pr, Some(Ok(_)));
+        let known_base = matches!(&selected, Some(Ok(_)));
         let selected = selected
             .as_ref()
             .and_then(|p| p.as_ref().ok())
             .and_then(|p| p.as_ref());
-        let base = selected
+        let review = review_url.is_some() || selected.is_some_and(|p| p.review_checkout);
+        let own_base = selected
             .filter(|p| {
                 !review
                     && (p.state == PrState::Open || saved_base.starts_with("refs/shark/pull/"))
                     && !p.base.is_empty()
             })
-            .map(|p| format!("origin/{}", p.base))
+            .map(|p| p.base.as_str());
+        let base = own_base
+            .map(|b| format!("origin/{b}"))
             .unwrap_or_else(|| saved_base.clone());
-        if job.fetch && review {
-            if let Some(Ok(Some(p))) = &pr {
-                if p.state == PrState::Open {
-                    if let Err(e) = crate::git::refresh_review_base(
+        if job.fetch {
+            let refresh = if let Some(base) = own_base {
+                let source = format!("refs/heads/{base}");
+                let target = format!("+{source}:refs/remotes/origin/{base}");
+                let head = format!("refs/heads/{branch}");
+                let remote_head = format!("+{head}:refs/remotes/origin/{branch}");
+                let fetch_head =
+                    selected.is_some_and(|p| p.state == PrState::Open) && branch != base;
+                crate::git::git(wt, &["check-ref-format", &source]).and_then(|_| {
+                    if fetch_head {
+                        crate::git::git(wt, &["check-ref-format", &head])?;
+                    }
+                    let mut args = vec!["fetch", "--quiet", "--no-tags", "origin", &target];
+                    if fetch_head {
+                        args.push(&remote_head);
+                    }
+                    cmd_bounded(wt, "git", &args, 30).map(|_| ())
+                })
+            } else if let Some(Ok(Some(p))) = &pr {
+                if p.review_checkout
+                    && p.state == PrState::Open
+                    && review_url.as_ref() == Some(&p.url)
+                {
+                    crate::git::refresh_review_base(
                         wt,
                         &crate::git::PullRequest {
                             number: p.number,
                             url: p.url.clone(),
                             base: p.base.clone(),
                         },
-                    ) {
-                        fetch_err = Some(match fetch_err {
-                            Some(previous) => format!("{previous}\n{e}"),
-                            None => e,
-                        });
-                    }
+                    )
+                } else {
+                    Ok(())
                 }
+            } else {
+                Ok(())
+            };
+            if let Err(e) = refresh {
+                fetch_err = Some(match fetch_err {
+                    Some(previous) => format!("{previous}\n{e}"),
+                    None => e,
+                });
             }
         }
-        if base != initial_base
-            || job.fetch && review
-            || local.as_ref().is_ok_and(|l| l.review != review)
-        {
-            local = probe(wt, branch, &base, local.as_ref().ok());
-        }
-        let trunk = local.as_ref().map_or("", |l| l.trunk.as_str());
-        let parent = (crate::stack::parent_of(&base, trunk)
-            .filter(|_| ask_pr && !trunk.is_empty()))
-        .map(|p| status::fetch_parent(wt, p));
+        // A pruned stack parent must still be checked so its merged/closed state can guide recovery.
+        let trunk = prev_local
+            .map(|l| l.trunk.clone())
+            .filter(|t| !t.is_empty())
+            .unwrap_or_else(|| crate::git::default_base(wt));
+        let parent = crate::stack::parent_of(&base, &trunk)
+            .filter(|_| ask_pr && !review && !trunk.is_empty())
+            .map(|p| status::fetch_parent(wt, p));
+        let known_parent = match &parent {
+            Some(Ok(parent)) => parent.as_ref(),
+            None => previous
+                .filter(|r| r.base == base)
+                .and_then(|r| r.parent.as_ref()),
+            Some(Err(_)) => None,
+        };
+        let recovering_parent =
+            known_parent.is_some_and(|p| !p.review_checkout && p.state != PrState::Open);
+        // Only a known retired parent permits the existing fallback used by restacking.
+        let target = own_base
+            .filter(|_| !recovering_parent)
+            .map(|b| format!("refs/remotes/origin/{b}^{{commit}}"));
+        let verified = target.as_ref().map_or(Ok(String::new()), |target| {
+            crate::git::git(wt, &["rev-parse", "--verify", "--quiet", target]).map_err(|_| {
+                format!("PR base `{base}` is unavailable locally; fetch its target first")
+            })
+        });
+        let local = verified.and_then(|_| {
+            probe(
+                wt,
+                branch,
+                &base,
+                prev_local,
+                authoritative && job.fetch && fetch_err.is_none() && !review,
+            )
+            .map(|mut l| {
+                l.review |= review;
+                l.restack &= known_base;
+                l
+            })
+        });
         (local, (pr, parent), fetch_err)
     });
     let mut locals = vec![];
@@ -1165,7 +1230,7 @@ impl GitSync {
         };
         let rows = |f: &dyn Fn(&Repo) -> Option<String>| -> Vec<(String, String, String)> {
             (self.repos.iter())
-                .filter(|r| !r.local.as_ref().is_ok_and(|l| l.review))
+                .filter(|r| !r.is_review())
                 .filter_map(|r| Some((r.name.clone(), f(r)?, r.name.clone())))
                 .collect()
         };
@@ -1289,7 +1354,8 @@ fn repo_diff_base(repo: &Repo) -> Option<String> {
         .filter(|p| {
             (p.state == PrState::Open || repo.base.starts_with("refs/shark/pull/"))
                 && !p.base.is_empty()
-                && repo.local.as_ref().is_ok_and(|l| !l.review)
+                && !repo.is_review()
+                && repo.local.is_ok()
         })
         .map(|pr| format!("origin/{}", pr.base))
 }
@@ -1298,6 +1364,7 @@ fn repo_diff_base(repo: &Repo) -> Option<String> {
 fn open_pr(repo: &str, number: u64) -> Pr {
     Pr {
         url: format!("https://github.com/o/{repo}/pull/{number}"),
+        review_checkout: false,
         number,
         state: PrState::Open,
         draft: false,
@@ -1320,9 +1387,10 @@ fn open_prs_in(repos: &[Repo], rs: &[String]) -> usize {
 }
 
 fn check_review_checkout(repos: &[Repo], rs: &[String]) -> Result<(), String> {
-    if let Some(r) = repos.iter().find(|r| {
-        (rs.is_empty() || rs.contains(&r.name)) && r.local.as_ref().is_ok_and(|l| l.review)
-    }) {
+    if let Some(r) = repos
+        .iter()
+        .find(|r| (rs.is_empty() || rs.contains(&r.name)) && r.is_review())
+    {
         return Err(format!(
             "{}: this is a local PR review checkout; use the original PR on GitHub to manage it",
             r.name
@@ -1350,9 +1418,7 @@ fn execute(
     let wanted = |r: &Repo| {
         a.repos.is_empty()
             || a.repos.contains(&r.name)
-            || (primary
-                && matches!(a.kind, Kind::CreatePr | Kind::CreateDraftPr)
-                && !r.local.as_ref().is_ok_and(|l| l.review))
+            || (primary && matches!(a.kind, Kind::CreatePr | Kind::CreateDraftPr) && !r.is_review())
     };
     let mut targets: Vec<&Repo> = repos.iter().filter(|r| wanted(r)).collect();
     if a.kind == Kind::Merge {
@@ -1515,7 +1581,7 @@ fn repos_from(
                 .find(|old| old.name == r.name && old.branch == ws.branch_of(r));
             let same_identity = old.filter(|old| match (&old.local, &local) {
                 (Ok(old), Ok(local)) => old.review == local.review,
-                _ => true,
+                _ => false,
             });
             let pr = fresh_or_last(pr.as_ref(), &same_identity.and_then(|r| r.pr.clone()));
             let mut repo = Repo {
@@ -1914,7 +1980,7 @@ esac
                 .iter()
                 .map(|r| {
                     let local =
-                        status::probe(&dir.join(&r.name), "feature", &r.base, None).unwrap();
+                        status::probe(&dir.join(&r.name), "feature", &r.base, None, true).unwrap();
                     let pr = root.join(format!("{}.open", r.name)).exists().then(|| Pr {
                         head: local.head.clone(),
                         ..open_pr(&r.name, 1)
@@ -2222,31 +2288,44 @@ esac
             pr: Some(Ok(Some(super::open_pr("api", 7)))),
             parent: None,
         };
-        for kind in [
-            Kind::Push,
-            Kind::Pull,
-            Kind::Merge,
-            Kind::CreatePr,
-            Kind::Ready,
-            Kind::Agent("commit and push".into()),
-        ] {
-            let action = Action {
-                kind,
-                label: String::new(),
-                repos: vec![],
-                attention: false,
-                reviews: vec![],
-            };
-            let result = super::execute(
-                &action,
-                &Default::default(),
-                std::slice::from_ref(&repo),
-                &[],
-                &crate::pr::NewPr::new("", false),
-                false,
-                false,
-            );
-            assert!(matches!(result, Err(e) if e.contains("local PR review checkout")));
+        let mut unavailable = repo.clone();
+        unavailable.local = Err("worktree unavailable".into());
+        unavailable
+            .pr
+            .as_mut()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .as_mut()
+            .unwrap()
+            .review_checkout = true;
+        for repo in [repo, unavailable] {
+            for kind in [
+                Kind::Push,
+                Kind::Pull,
+                Kind::Merge,
+                Kind::CreatePr,
+                Kind::Ready,
+                Kind::Agent("commit and push".into()),
+            ] {
+                let action = Action {
+                    kind,
+                    label: String::new(),
+                    repos: vec![],
+                    attention: false,
+                    reviews: vec![],
+                };
+                let result = super::execute(
+                    &action,
+                    &Default::default(),
+                    std::slice::from_ref(&repo),
+                    &[],
+                    &crate::pr::NewPr::new("", false),
+                    false,
+                    false,
+                );
+                assert!(matches!(result, Err(e) if e.contains("local PR review checkout")));
+            }
         }
     }
 
