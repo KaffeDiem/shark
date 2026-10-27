@@ -35,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::Arc;
 
+mod app_switcher;
 mod chats;
 mod diff;
 mod editor_pane;
@@ -336,6 +337,7 @@ pub struct Shark {
     pub(crate) attn: crate::attention::Attention,
     /// The open right-click menu, dropped when it dismisses.
     menu: Option<(Entity<menu::Menu>, Subscription)>,
+    app_switcher: Option<app_switcher::AppSwitcher>,
     /// The header's branch button as last painted: "Branch menu…" hangs its menu from it.
     branch_at: Rc<std::cell::Cell<Bounds<Pixels>>>,
     /// The latest dependency check; empty until the first one lands.
@@ -441,6 +443,9 @@ impl Shark {
             }),
             cx.observe_window_activation(window, |s, w, cx| {
                 s.attn.window_active = w.is_window_active();
+                if !s.attn.window_active {
+                    s.close_app_switcher(false, w, cx);
+                }
                 // Back from installing something: check again, but only if anything was missing,
                 // and at most once a minute (the check runs a login shell).
                 let due = s.deps_at.is_none_or(|t| t.elapsed().as_secs() >= 60);
@@ -498,6 +503,7 @@ impl Shark {
             sidebar_focus,
             attn: crate::attention::Attention::new(cx),
             menu: None,
+            app_switcher: None,
             branch_at: Default::default(),
             deps: vec![],
             deps_check: None,
@@ -1007,6 +1013,12 @@ impl Render for Shark {
                 cx.listener(|this, _: &ForceArchiveWorkspace, w, cx| this.archive(true, w, cx)),
             )
             .on_action(cx.listener(|this, _: &AddRepo, w, cx| this.add_repo(w, cx)))
+            .on_action(
+                cx.listener(|this, _: &CycleOpenApp, w, cx| this.cycle_open_app(false, w, cx)),
+            )
+            .on_action(
+                cx.listener(|this, _: &CycleOpenAppBack, w, cx| this.cycle_open_app(true, w, cx)),
+            )
             .on_action(cx.listener(|this, _: &ToggleHome, w, cx| this.toggle_home(w, cx)))
             .on_action(cx.listener(|this, _: &AddRepoToWorkspace, w, cx| {
                 this.pick_repo_for_workspace(w, cx)
@@ -1096,7 +1108,12 @@ impl Render for Shark {
                 this.with_section(w, cx, Shark::delete_section)
             }))
             // Held modifiers reveal workspace and chat number shortcuts.
-            .on_modifiers_changed(cx.listener(|_, _, _, cx| cx.notify()))
+            .on_modifiers_changed(cx.listener(|this, ev: &ModifiersChangedEvent, w, cx| {
+                if !ev.modifiers.platform {
+                    this.close_app_switcher(true, w, cx);
+                }
+                cx.notify();
+            }))
             .on_action(cx.listener(|this, _: &FocusLeft, w, cx| this.move_focus(-1, w, cx)))
             .on_action(cx.listener(|this, _: &FocusRight, w, cx| this.move_focus(1, w, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
@@ -1119,6 +1136,7 @@ impl Render for Shark {
                 crate::settings::open(&this.state, w, cx)
             }))
             .children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))
+            .children(self.render_app_switcher(window, cx))
             .child({
                 // Content sits below the titlebar, touching a rail or inset 8px beside an expanded pane.
                 let island = div()

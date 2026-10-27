@@ -817,6 +817,15 @@ pub(super) fn repo_paths(ws: &Workspace) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
+/// The palette and app switcher offer the same apps, in the same order.
+pub(super) fn available_apps(target: Option<&Workspace>) -> Vec<&'static OpenApp> {
+    let Some(ws) = target else { return vec![] };
+    apps::installed()
+        .iter()
+        .filter(|a| a.kind != Kind::Xcode || !a.targets(None, &repo_paths(ws)).is_empty())
+        .collect()
+}
+
 impl Shark {
     /// Terminals and editors open the target workspace's folder; git clients a repo and
     /// Xcode a project, asking which when there are several.
@@ -868,13 +877,7 @@ impl Shark {
         // Xcode only where there's a project; the rest open the folder or ask which repo.
         let target = self.target(window);
         let no_target = target.is_none();
-        let mut apps: Vec<_> = (apps::installed().iter())
-            .filter(|a| {
-                a.kind != Kind::Xcode
-                    || (target.as_ref())
-                        .is_some_and(|ws| !a.targets(None, &repo_paths(ws)).is_empty())
-            })
-            .collect();
+        let mut apps = available_apps(target.as_ref());
         for (ix, Row(label, icon, action, words, _)) in COMMANDS.iter().enumerate() {
             if let Some((heading, _)) = GROUPS.iter().find(|(_, first)| first == label) {
                 groups.push((Some(heading), vec![]));
