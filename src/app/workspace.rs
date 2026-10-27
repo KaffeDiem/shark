@@ -871,6 +871,7 @@ impl Shark {
             self.diff_file = 0;
             self.diff_loaded = false;
             self.diff_error = None;
+            self.uncommitted.clear();
             self.tree_rows.clear();
             self.collapsed_dirs.clear();
             self.tree_sel = 0;

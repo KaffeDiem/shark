@@ -38,6 +38,7 @@ use std::sync::Arc;
 mod chats;
 mod diff;
 mod editor_pane;
+mod file_changes;
 mod home;
 mod inline_edit;
 mod media;
@@ -290,6 +291,8 @@ pub struct Shark {
     /// False until the first refresh of the open workspace lands.
     diff_loaded: bool,
     diff_error: Option<String>,
+    /// Git status paths, independently of the diff's selected comparison base.
+    uncommitted: HashSet<String>,
     /// Paths currently viewed (fingerprint still matches), for the diff headers.
     viewed_now: Rc<HashSet<SharedString>>,
     tree_rows: Vec<Row>,
@@ -458,6 +461,7 @@ impl Shark {
             diff_file: 0,
             diff_loaded: false,
             diff_error: None,
+            uncommitted: HashSet::new(),
             viewed_now: Rc::default(),
             tree_rows: vec![],
             collapsed_dirs: HashSet::new(),

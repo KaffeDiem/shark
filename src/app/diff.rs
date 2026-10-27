@@ -21,6 +21,7 @@ pub(super) struct DiffData {
     fps: Vec<u64>,
     /// git failed for some repo; the patch is then empty, which must not read as "no changes".
     error: Option<String>,
+    uncommitted: HashSet<String>,
     hunks: HashMap<SharedString, Vec<review::Hunk>>,
     media: Vec<media::MediaFile>,
     /// The file edited in place, and its bytes as on disk when the refresh read it (none:
@@ -30,7 +31,7 @@ pub(super) struct DiffData {
 
 impl DiffData {
     pub(super) fn load(ws: &Workspace, uncommitted_only: bool) -> DiffData {
-        let (patch, error) = match git::combined_diff(ws, &ws.dir(), uncommitted_only) {
+        let (patch, mut error) = match git::combined_diff(ws, &ws.dir(), uncommitted_only) {
             Ok(p) => (p, None),
             Err(e) => (String::new(), Some(e)),
         };
@@ -38,7 +39,16 @@ impl DiffData {
         let mut hunks = HashMap::new();
         let mut media = vec![];
         let ws_dir = ws.dir();
-        let parsed: Vec<(DiffFile, u64)> = files::split_patch(&patch)
+        let mut uncommitted = HashSet::new();
+        for repo in &ws.repos {
+            match git::uncommitted_files(&ws_dir.join(&repo.name)) {
+                Ok(paths) => {
+                    uncommitted.extend(paths.into_keys().map(|p| format!("{}/{p}", repo.name)))
+                }
+                Err(e) => error = Some(format!("{}: {e}", repo.name)),
+            }
+        }
+        let mut parsed: Vec<(DiffFile, u64)> = files::split_patch(&patch)
             .into_iter()
             .filter_map(|chunk| {
                 let file = DiffFile::parse(chunk).ok()?.into_iter().next()?;
@@ -47,6 +57,12 @@ impl DiffData {
                 Some((file, files::fingerprint(chunk)))
             })
             .collect();
+        // A local edit can undo a committed change back to the base, leaving no base patch.
+        // Keep its row available for the uncommitted marker and discard action.
+        let present: HashSet<_> = parsed.iter().map(|(f, _)| f.path().to_string()).collect();
+        for path in uncommitted.difference(&present) {
+            parsed.push((DiffFile::unchanged(path.clone(), ""), 0));
+        }
         let paths: Vec<String> = parsed.iter().map(|(f, _)| f.path().to_string()).collect();
         let order = files::tree_order(&paths);
         let mut slots: Vec<Option<(DiffFile, u64)>> = parsed.into_iter().map(Some).collect();
@@ -56,6 +72,7 @@ impl DiffData {
             files,
             fps,
             error,
+            uncommitted,
             hunks,
             media,
             edited: None,
@@ -96,14 +113,24 @@ impl Shark {
     }
 
     pub(super) fn apply_diff(&mut self, mut data: DiffData, cx: &mut Context<Self>) {
-        let status_changed = !self.diff_loaded || data.error != self.diff_error;
+        let status_changed = !self.diff_loaded
+            || data.error != self.diff_error
+            || data.uncommitted != self.uncommitted;
         self.diff_loaded = true;
         self.diff_error = data.error;
+        self.uncommitted = data.uncommitted;
         if let Some((abs, bytes)) = data.edited.take() {
             self.edit_disk(&abs, bytes, cx);
         }
         // Turn ends and saves refresh often; an unchanged patch keeps scroll and expansion.
-        if data.fp == self.diff_fp && !self.diff_files.is_empty() {
+        if data.fp == self.diff_fp
+            && !self.diff_files.is_empty()
+            && self
+                .diff_files
+                .iter()
+                .map(|f| f.path())
+                .eq(data.files.iter().map(|f| f.path()))
+        {
             if status_changed {
                 cx.notify();
             }
@@ -1174,6 +1201,19 @@ impl Shark {
                     .when(is_open, |d| d.font_weight(FontWeight::MEDIUM))
                     .child(r.name.clone()),
             )
+            .when(self.uncommitted.contains(f.path().as_str()), |d| {
+                d.child(
+                    div()
+                        .id(("uncommitted", ix))
+                        .test_support()
+                        .size(px(6.))
+                        .flex_none()
+                        .rounded_full()
+                        .bg(theme.primary)
+                        .aria_label("Uncommitted changes")
+                        .tooltip(|w, cx| Tooltip::new("Uncommitted changes").build(w, cx)),
+                )
+            })
             .when(state == Viewed::Changed, |d| {
                 d.child(
                     div()
@@ -1298,6 +1338,17 @@ impl Shark {
                 )
                 .checked(self.viewed(ix) == Viewed::Yes),
             ]);
+        }
+        if self.uncommitted.contains(path) {
+            let (name, path) = (ws.name.clone(), path.to_string());
+            entries.push(Entry::Sep);
+            entries.push(menu::item(
+                IconName::Undo,
+                "Discard uncommitted changes…",
+                on_shark(cx, move |s, w, cx| {
+                    s.discard_uncommitted(&name, &path, w, cx)
+                }),
+            ));
         }
         entries.push(Entry::Sep);
         if on_disk {

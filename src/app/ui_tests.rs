@@ -8,6 +8,7 @@ use std::time::Instant;
 use std::{fs, path::PathBuf, time::Duration};
 
 pub(crate) mod chrome_tests;
+mod file_changes_tests;
 mod menu_pixels;
 mod tab_tests;
 
@@ -3345,6 +3346,8 @@ async fn file_menu_labels(cx: &mut TestAppContext) {
     let file = [
         "Comment",
         "Viewed",
+        "-",
+        "Discard uncommitted changes…",
         "-",
         "Reveal in Finder",
         "Open in Code",

@@ -210,6 +210,7 @@ impl FileEditor {
 
     /// Throws the edits away and takes the disk version.
     pub fn discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.saves += 1; // Invalidate reads started before the discard.
         self.dirty = false;
         self.disk = 0;
         self.stat = None;

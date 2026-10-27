@@ -1,4 +1,6 @@
 use crate::state::{Repo, Workspace, WsRepo};
+mod changes;
+pub use changes::{discard_file, uncommitted_files};
 use std::{
     fs,
     path::{Path, PathBuf},
