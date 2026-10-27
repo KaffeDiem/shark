@@ -63,6 +63,10 @@ async fn sidebar_chrome_themes(cx: &mut TestAppContext) {
                         let right = w.find("features-rail");
                         assert!(right.visible(), "{label}, width={width}, rail={rail}");
                         assert_eq!(right.bounds().size.width, px(72.));
+                        assert_eq!(
+                            w.find("new-chat").bounds().right(),
+                            w.find("content-island").bounds().right(),
+                        );
                         assert!(w.find("feature-differ").visible());
                         assert!(w.try_find("show-tree").is_none());
                         assert!(w.try_find("hide-tree").is_none());

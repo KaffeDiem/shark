@@ -982,17 +982,6 @@ impl Shark {
                     .into_any_element(),
             );
         }
-        tabs.push(
-            Button::new("new-chat")
-                .ghost()
-                .xsmall()
-                .icon(IconName::Plus)
-                .w(px(24.))
-                .flex_none()
-                .tooltip("New chat (cmd-t)")
-                .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx)))
-                .into_any_element(),
-        );
         tabs
     }
 

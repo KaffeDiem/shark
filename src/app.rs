@@ -920,7 +920,8 @@ impl Shark {
             .id("workspace-titlebar")
             .h(px(44.))
             .flex_none()
-            .px(px(8.))
+            .pl(px(8.))
+            .when(!self.right_rail_shown(), |d| d.pr(px(8.)))
             .gap(px(4.))
             .when(self.rail, |d| {
                 d.child(self.render_sidebar_toggle(cx))
@@ -937,6 +938,18 @@ impl Shark {
                     .id("titlebar-empty")
                     .map(|d| self.draggable_chrome("titlebar-empty", d)),
             )
+            .when(!self.home_shown() && self.active_ws().is_some(), |d| {
+                d.child(
+                    Button::new("new-chat")
+                        .ghost()
+                        .xsmall()
+                        .icon(IconName::Plus)
+                        .w(px(24.))
+                        .flex_none()
+                        .tooltip("New chat (cmd-t)")
+                        .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
+                )
+            })
             .test_support()
     }
 
