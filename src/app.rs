@@ -925,34 +925,40 @@ impl Shark {
             .flex_none()
             .pl(px(8.))
             .when(!self.right_rail_shown(), |d| d.pr(px(8.)))
-            .gap(px(4.))
-            .when(self.rail, |d| {
-                d.child(self.render_sidebar_toggle(cx))
-                    .child(self.render_commands(cx))
-                    .child(self.render_new_workspace(cx))
-            })
-            .children(tabs)
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap(px(4.))
+                    .when(self.rail, |d| {
+                        d.child(self.render_sidebar_toggle(cx))
+                            .child(self.render_commands(cx))
+                            .child(self.render_new_workspace(cx))
+                    })
+                    .children(tabs)
+                    .when(!self.home_shown() && self.active_ws().is_some(), |d| {
+                        d.child(
+                            Button::new("new-chat")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Plus)
+                                .w(px(24.))
+                                .flex_none()
+                                .tooltip("New chat (cmd-t)")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.new_chat(window, cx)),
+                                ),
+                        )
+                    }),
+            )
             // Native dragging belongs only to unused space, so tabs keep their own drags.
             .child(
                 div()
                     .flex_1()
-                    .min_w(px(16.))
+                    .min_w_0()
                     .h_full()
                     .id("titlebar-empty")
                     .map(|d| self.draggable_chrome("titlebar-empty", d)),
             )
-            .when(!self.home_shown() && self.active_ws().is_some(), |d| {
-                d.child(
-                    Button::new("new-chat")
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::Plus)
-                        .w(px(24.))
-                        .flex_none()
-                        .tooltip("New chat (cmd-t)")
-                        .on_click(cx.listener(|this, _, window, cx| this.new_chat(window, cx))),
-                )
-            })
             .test_support()
     }
 
