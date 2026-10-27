@@ -49,6 +49,7 @@ mod media;
 pub(crate) mod menus;
 mod palette;
 mod picker;
+mod reorder;
 mod review;
 mod review_send;
 mod review_share;
@@ -341,6 +342,7 @@ pub struct Shark {
     sidebar_resize: Entity<ResizableState>,
     sidebar_scroll: ScrollHandle,
     tab_scroll: ScrollHandle,
+    reorder: Rc<RefCell<reorder::Reorder>>,
     tab_layout: Rc<std::cell::Cell<(Pixels, usize)>>,
     restore_generation: u64,
     chrome_pressed: Rc<std::cell::Cell<Option<&'static str>>>,
@@ -523,6 +525,7 @@ impl Shark {
             sidebar_resize,
             sidebar_scroll: ScrollHandle::new(),
             tab_scroll: ScrollHandle::new(),
+            reorder: Rc::default(),
             tab_layout: Rc::default(),
             restore_generation: 0,
             chrome_pressed: Rc::default(),
@@ -1114,6 +1117,7 @@ impl Shark {
 
 impl Render for Shark {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.prune_reorder(cx);
         // Toasts clear the toolbar, Features rail, and visible Files controls.
         let mut side = if self.right_rail_shown() {
             px(72.)
@@ -1143,6 +1147,7 @@ impl Render for Shark {
         }
         let theme = cx.theme();
         h_flex()
+            .map(|d| self.reorder_events(d, cx))
             // `Vim` turns on the Vim-style list keys (see `bind_keys`).
             .key_context(if self.state.vim { "Shark Vim" } else { "Shark" })
             .size_full()

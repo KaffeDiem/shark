@@ -201,7 +201,7 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
   - Inputs and buttons use gpui-kit's `ring`.
 - **Hover:** a background step (`list_hover` / `side_hover` / `secondary_hover`) or, for tabs, text color. Never the only way to discover something.
 - **Disabled:** `muted_foreground` text and the component's `.disabled(true)`; no hover; not focusable.
-- **Motion:** none beyond `Spinner` and gpui-kit's built-ins. No custom animations or entrance effects (the palette uses `DialogEntrance::None`).
+- **Motion:** use `Spinner` and gpui-kit's built-ins. During reordering, constrain tabs to horizontal movement inside their strip and sidebar rows to vertical movement inside their pane; animate neighboring items live with gpui-kit's motion support and respect reduced motion. No entrance effects (the palette uses `DialogEntrance::None`).
 - **Selection:** text selection is translucent indigo (`selection.background`); keep it translucent so selected text stays readable.
 
 ## Components to reuse

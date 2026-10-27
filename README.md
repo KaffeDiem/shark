@@ -27,7 +27,7 @@ The diff shows the original and the working copy side by side, across every repo
 ## Full-width file tabs
 Open a file from the Diff artifact's tree or `cmd-p` to edit it across the central area. Chat and Diff stay one tab away, and Command-click keeps additional files open. A small dot in the file tree marks uncommitted changes; right-click a file and choose **Discard uncommitted changes…** to restore its last commit after confirmation. New files are deleted when discarded.
 
-Drag chat, Diff, and file tabs into any order. Each workspace remembers its order and reopens file tabs in the background when you return or restart. Unsaved edits still require saving or discarding before you leave; restored files use their contents on disk. Files that cannot be reopened are reported together and retried on the next visit. Drag empty header space to move the window; tab drags only reorder tabs.
+Drag chat, Diff, and file tabs into any order. Tabs stay inside the strip and move horizontally; workspace and section rows stay inside the sidebar and move vertically. Neighboring items animate into place while you drag. Dropping inside saves the order; releasing outside cancels. Each workspace remembers its order and reopens file tabs in the background when you return or restart. Unsaved edits still require saving or discarding before you leave; restored files use their contents on disk. Files that cannot be reopened are reported together and retried on the next visit. Drag empty header space to move the window; tab drags only reorder tabs.
 
 <img src="docs/images/file-editor.png" width="800" alt="A full-width file editor with Chat and Diff tabs and the fixed Features rail">
 

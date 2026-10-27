@@ -23,19 +23,6 @@ impl VisibleTabs {
     }
 }
 
-#[derive(Clone)]
-struct DraggedTab {
-    workspace: String,
-    id: TabId,
-    label: SharedString,
-}
-
-impl Render for DraggedTab {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        sidebar::drag_chip(self.label.clone(), cx)
-    }
-}
-
 /// The accent dot on a tab: a finished turn you haven't looked at yet.
 pub(super) fn dot(inset: f32, theme: &Theme) -> Div {
     (div().absolute().top(px(inset)).right(px(inset)))
@@ -235,33 +222,21 @@ impl Shark {
         pill: Stateful<Div>,
         id: TabId,
         label: SharedString,
-        cx: &Context<Self>,
+        _: &Context<Self>,
     ) -> Stateful<Div> {
-        let workspace = self.active.clone().unwrap();
-        let (accent, foreground) = (cx.theme().accent, cx.theme().accent_foreground);
-        // A press must keep content focus until a click actually selects the tab.
-        pill.on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default())
-            .on_drag(
-                DraggedTab {
-                    workspace: workspace.clone(),
-                    id: id.clone(),
-                    label,
-                },
-                |d, _, _, cx| cx.new(|_| d.clone()),
-            )
-            .drag_over::<DraggedTab>({
-                let (workspace, id) = (workspace.clone(), id.clone());
-                move |style, drag, _, _| {
-                    if drag.workspace == workspace && drag.id != id {
-                        style.bg(accent).text_color(foreground)
-                    } else {
-                        style
-                    }
-                }
-            })
-            .on_drop(cx.listener(move |this, drag: &DraggedTab, _, cx| {
-                this.move_tab(&drag.workspace, &drag.id, &id, cx)
-            }))
+        self.reorder_source(
+            pill.on_mouse_down(MouseButton::Left, |_, window, _| window.prevent_default()),
+            reorder::Item::Tab(self.active.clone().unwrap(), id),
+            label,
+        )
+    }
+
+    pub(super) fn visible_tab_ids(&self, ws: &Workspace, cx: &App) -> Vec<TabId> {
+        self.visible_tabs(ws, cx)
+            .0
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect()
     }
 
     pub(super) fn reveal_tab(&self, cx: &App) {
@@ -930,9 +905,12 @@ impl Shark {
         let pills: Vec<_> = tabs
             .0
             .iter()
-            .filter_map(|(_, tab)| {
+            .filter_map(|(id, tab)| {
                 let ix = pills.iter().position(|(t, _)| t == tab)?;
-                Some(pills.remove(ix).1)
+                Some(self.reorder_item(
+                    pills.remove(ix).1,
+                    reorder::Item::Tab(ws.name.clone(), id.clone()),
+                ))
             })
             .collect();
         let (layout, scroll) = (self.tab_layout.clone(), self.tab_scroll.clone());

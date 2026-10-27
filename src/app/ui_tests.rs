@@ -10,6 +10,7 @@ use std::{fs, path::PathBuf, time::Duration};
 mod app_switcher_tests;
 mod audit_tests;
 pub(crate) mod chrome_tests;
+mod drag_tests;
 mod file_changes_tests;
 mod menu_pixels;
 mod mixed_tab_tests;
