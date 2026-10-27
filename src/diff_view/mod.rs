@@ -107,7 +107,7 @@ mod actions {
 }
 
 /// gpui-component's `init` plus [`init`], what upstream's tests got from `crate::init`.
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 fn test_init(cx: &mut App) {
     gpui_kit::component::init(cx);
     init(cx);
@@ -2147,17 +2147,17 @@ fn has_line_ending_change(
 
 #[cfg(test)]
 mod copy_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 mod header_tests;
 #[cfg(test)]
 mod newline_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 mod review_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 mod scroll_tests;
 #[cfg(test)]
 mod selection_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 mod split_tests;
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 mod tests;

@@ -2,6 +2,51 @@
 use super::*;
 use std::cmp::Ordering;
 
+/// The visible strip owns its ordering: chats, optional Diff, then files.
+struct VisibleTabs {
+    chats: usize,
+    diff: bool,
+    files: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum VisibleTab {
+    Chat(usize),
+    Diff,
+    File(usize),
+}
+
+impl VisibleTabs {
+    fn file_start(&self) -> usize {
+        self.chats + usize::from(self.diff)
+    }
+
+    fn len(&self) -> usize {
+        self.file_start() + self.files
+    }
+
+    fn get(&self, ix: usize) -> Option<VisibleTab> {
+        if ix < self.chats {
+            Some(VisibleTab::Chat(ix))
+        } else if self.diff && ix == self.chats {
+            Some(VisibleTab::Diff)
+        } else if ix < self.len() {
+            Some(VisibleTab::File(ix - self.file_start()))
+        } else {
+            None
+        }
+    }
+
+    fn index(&self, tab: VisibleTab) -> Option<usize> {
+        match tab {
+            VisibleTab::Chat(ix) if ix < self.chats => Some(ix),
+            VisibleTab::Diff if self.diff => Some(self.chats),
+            VisibleTab::File(ix) if ix < self.files => Some(self.file_start() + ix),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Clone)]
 struct DraggedChat {
     workspace: String,
@@ -24,20 +69,26 @@ pub(super) fn dot(inset: f32, theme: &Theme) -> Div {
 }
 
 impl Shark {
+    fn visible_tabs(&self, ws: &Workspace) -> VisibleTabs {
+        VisibleTabs {
+            chats: ws.chats.len(),
+            diff: !ws.diff_closed,
+            files: self.file_tabs.len(),
+        }
+    }
+
     fn active_tab_index(&self) -> Option<usize> {
         let ws = self.active_ws()?;
-        Some(match self.tab {
-            Tab::Chat => ws.active_chat,
-            Tab::Diff => ws.chats.len(),
-            Tab::File => {
-                ws.chats.len()
-                    + usize::from(!ws.diff_closed)
-                    + self
-                        .file_tabs
-                        .iter()
-                        .position(|t| Some(&t.editor) == self.editor.as_ref())?
-            }
-        })
+        let tab = match self.tab {
+            Tab::Chat => VisibleTab::Chat(ws.active_chat),
+            Tab::Diff => VisibleTab::Diff,
+            Tab::File => VisibleTab::File(
+                self.file_tabs
+                    .iter()
+                    .position(|t| Some(&t.editor) == self.editor.as_ref())?,
+            ),
+        };
+        self.visible_tabs(ws).index(tab)
     }
 
     pub(super) fn reveal_tab(&self) {
@@ -214,26 +265,20 @@ impl Shark {
             return self.cycle_chat(d, window, cx);
         }
         let Some(ws) = self.active_ws() else { return };
-        let chats = ws.chats.len();
         let Some(active) = self.active_tab_index() else {
             return;
         };
-        let next = (active as isize + d)
-            .rem_euclid((chats + usize::from(!ws.diff_closed) + self.file_tabs.len()) as isize)
-            as usize;
+        let next = (active as isize + d).rem_euclid(self.visible_tabs(ws).len() as isize) as usize;
         self.select_tab(next, window, cx);
     }
 
     pub(super) fn select_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ws) = self.active_ws() else { return };
-        let chats = ws.chats.len();
-        let diff = usize::from(!ws.diff_closed);
-        if ix < chats {
-            self.select_chat(ix, window, cx);
-        } else if ix == chats && diff == 1 {
-            self.show(Tab::Diff, window, cx);
-        } else {
-            self.select_file(ix - chats - diff, window, cx);
+        match self.visible_tabs(ws).get(ix) {
+            Some(VisibleTab::Chat(ix)) => self.select_chat(ix, window, cx),
+            Some(VisibleTab::Diff) => self.show(Tab::Diff, window, cx),
+            Some(VisibleTab::File(ix)) => self.select_file(ix, window, cx),
+            None => {}
         }
     }
 
@@ -619,10 +664,9 @@ impl Shark {
         ws: &Workspace,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
-        let mut hidden: Vec<usize> =
-            (0..ws.chats.len() + usize::from(!ws.diff_closed) + self.file_tabs.len())
-                .filter(|&ix| self.tab_hidden(ix) == edge)
-                .collect();
+        let mut hidden: Vec<usize> = (0..self.visible_tabs(ws).len())
+            .filter(|&ix| self.tab_hidden(ix) == edge)
+            .collect();
         if edge == Ordering::Less {
             hidden.reverse(); // nearest first
         }
@@ -775,15 +819,16 @@ impl Shark {
                     .into_any_element()
             })
             .collect();
-        if !ws.diff_closed {
+        let tabs = self.visible_tabs(ws);
+        if let Some(ix) = tabs.index(VisibleTab::Diff) {
             pills.push(
                 pill("diff-tab", self.tab == Tab::Diff, theme)
                     .aria_label("Diff")
                     .pl_2p5()
                     .pr_1()
                     .on_click(cx.listener(|this, _, w, cx| this.show(Tab::Diff, w, cx)))
-                    .child(if ctrl_held && ws.chats.len() < 9 {
-                        kbd(&format!("ctrl-{}", ws.chats.len() + 1)).into_any_element()
+                    .child(if ctrl_held && ix < 9 {
+                        kbd(&format!("ctrl-{}", ix + 1)).into_any_element()
                     } else {
                         Icon::new(IconName::GitCompare)
                             .with_size(px(14.))
@@ -808,7 +853,7 @@ impl Shark {
                     .into_any_element(),
             );
         }
-        let file_start = ws.chats.len() + usize::from(!ws.diff_closed);
+        let file_start = tabs.file_start();
         pills.extend(self.file_tabs.iter().enumerate().map(|(ix, file)| {
             let e = file.editor.read(cx);
             let path = e.path.clone();
@@ -991,6 +1036,37 @@ impl Shark {
                 self.awake = None;
             }
             _ => {}
+        }
+    }
+}
+
+#[cfg(test)]
+mod tab_order_tests {
+    use super::{VisibleTab, VisibleTabs};
+
+    #[test]
+    fn visible_tab_indices_follow_the_strip() {
+        use VisibleTab::{Chat, Diff, File};
+        for (chats, diff, files, expected) in [
+            (0, false, 0, vec![]),
+            (1, true, 0, vec![Chat(0), Diff]),
+            (1, false, 0, vec![Chat(0)]),
+            (2, true, 2, vec![Chat(0), Chat(1), Diff, File(0), File(1)]),
+            (2, false, 2, vec![Chat(0), Chat(1), File(0), File(1)]),
+        ] {
+            let tabs = VisibleTabs { chats, diff, files };
+            assert_eq!(tabs.len(), expected.len());
+            for (ix, tab) in expected.into_iter().enumerate() {
+                assert_eq!(tabs.get(ix), Some(tab));
+                assert_eq!(tabs.index(tab), Some(ix));
+            }
+            assert_eq!(tabs.get(tabs.len()), None);
+            assert_eq!(tabs.get(usize::MAX), None);
+            assert_eq!(tabs.index(Chat(chats)), None);
+            assert_eq!(tabs.index(File(files)), None);
+            if !diff {
+                assert_eq!(tabs.index(Diff), None);
+            }
         }
     }
 }

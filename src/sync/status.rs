@@ -239,14 +239,21 @@ fn base_counts(wt: &Path, base: &str, mut l: Local) -> Result<Local, String> {
     let tries = std::iter::once(base.to_string())
         .chain(parent)
         .chain([l.trunk.clone()]);
+    let mut error = format!("no base available for `{base}`");
     for b in tries.filter(|b| !b.is_empty()) {
         let range = format!("HEAD...{b}");
-        if let Ok(c) = git(wt, &["rev-list", "--left-right", "--count", &range]) {
-            l.base = counts(&c);
-            break;
+        match git(wt, &["rev-list", "--left-right", "--count", &range]) {
+            Ok(c) => {
+                l.base = counts(&c);
+                return Ok(l);
+            }
+            Err(e) => error = e,
         }
     }
-    Ok(l)
+    match l.head.as_str() {
+        "(initial)" => Ok(l),
+        _ => Err(format!("Can't compare HEAD with base `{base}`: {error}")),
+    }
 }
 
 const PR_FIELDS: &str = "url,number,state,isDraft,mergeStateStatus,reviewDecision,statusCheckRollup,headRefOid,baseRefName,isCrossRepository,updatedAt,reviews,author";
@@ -812,8 +819,9 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
         .or_else(|| {
             // GitHub's Update branch merges the parent in; a stack rebases instead.
             let behind = current(&|p| p.merge_state == "BEHIND");
-            let (stacked, rs): (Vec<String>, Vec<String>) = (behind.into_iter())
-                .partition(|n| among(repos, std::slice::from_ref(n)).any(|r| r.stacked().is_some()));
+            let (stacked, rs): (Vec<String>, Vec<String>) = (behind.into_iter()).partition(|n| {
+                among(repos, std::slice::from_ref(n)).any(|r| r.stacked().is_some())
+            });
             let verb = among(repos, &stacked)
                 .next()
                 .map(|r| format!("Rebase onto {}", short(&r.base)));
@@ -948,10 +956,20 @@ pub fn step_args(kind: &Kind, r: &Repo) -> Result<Option<Vec<String>>, String> {
             let Some(p) = r.open_pr() else {
                 return Ok(None);
             };
-            if let Some(parent) = r.parent_is(PrState::Open) {
+            for (state, reason) in [
+                (PrState::Open, "must merge first"),
+                (PrState::Merged, "has merged; restack onto its base first"),
+                (PrState::Closed, "is closed; choose a new base first"),
+            ] {
+                if let Some(parent) = r.parent_is(state) {
+                    return Err(format!("stacked on #{}, which {reason}", parent.number));
+                }
+            }
+            if p.base != short(&r.base) {
                 return Err(format!(
-                    "stacked on #{}, which must merge first",
-                    parent.number
+                    "PR targets `{}`, but this workspace targets `{}`; retarget the PR before merging",
+                    p.base,
+                    short(&r.base)
                 ));
             }
             let l = local()?;
@@ -1608,6 +1626,22 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         assert_eq!(args(Kind::Merge, clean(1), None), Ok(None));
     }
 
+    #[test]
+    fn merge_refuses_a_pr_whose_base_has_not_been_retargeted() {
+        let own = Pr {
+            base: "old-parent".into(),
+            ..pr("CLEAN", Checks::Passing)
+        };
+        let mut r = repo("api", clean(1), Some(own));
+        let error = step_args(&Kind::Merge, &r).unwrap_err();
+        assert!(
+            error.contains("old-parent") && error.contains("main"),
+            "{error}"
+        );
+        r.base = "origin/old-parent".into();
+        assert!(step_args(&Kind::Merge, &r).unwrap().is_some());
+    }
+
     /// The real thing: a linked worktree from `create_workspace` against a bare origin.
     /// `ios` stacked on `logic` (trunk `origin/main`), clean with one commit of its own.
     fn stacked(own: Option<Pr>, parent: Option<Pr>, l: impl FnOnce(&mut Local)) -> Repo {
@@ -1769,8 +1803,15 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
             (a.label.as_str(), &a.kind),
             ("Waiting on parent PR #5", &Kind::OpenPr)
         );
-        let e = step_args(&Kind::Merge, &ios).unwrap_err();
-        assert!(e.contains("stacked on #5"), "{e}");
+        for (state, reason) in [
+            (PrState::Open, "must merge first"),
+            (PrState::Merged, "restack onto its base first"),
+            (PrState::Closed, "choose a new base first"),
+        ] {
+            let r = stacked(own.clone(), Some(parent(state)), |_| {});
+            let e = step_args(&Kind::Merge, &r).unwrap_err();
+            assert!(e.contains("stacked on #5") && e.contains(reason), "{e}");
+        }
         let api = repo("api", clean(1), own.clone());
         let a = next(&[api, ios]);
         assert_eq!(
@@ -1936,6 +1977,18 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
             git(&src, &["config", &key]).is_err(),
             "nothing left to track"
         );
+        // No comparison ref remains: do not let archive mistake unknown counts for no work.
+        git(&src, &["update-ref", "-d", "refs/remotes/origin/main"]).unwrap();
+        let error = probe(&wt, "ui", "origin/logic", None).unwrap_err();
+        assert!(error.contains("Can't compare HEAD"), "{error}");
+
+        // A genuinely unborn branch still has no commits of its own.
+        let empty = root.join("empty");
+        fs::create_dir_all(&empty).unwrap();
+        git(&empty, &["init", "-q", "-b", "main"]).unwrap();
+        let unborn = probe(&empty, "main", "origin/main", None).unwrap();
+        assert_eq!(unborn.head, "(initial)");
+        assert_eq!(unborn.base, (0, 0));
         let _ = fs::remove_dir_all(&root);
     }
 

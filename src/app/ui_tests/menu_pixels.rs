@@ -44,32 +44,7 @@ fn entries(case: &str) -> Vec<Entry> {
             action(IconName::Github, "Merge PRs…"),
             action(IconName::GitBranch, "Delete remote branches after merge").checked(true),
         ],
-        "models" => {
-            let mut rows = vec![];
-            for (i, m) in crate::chat::MODELS.iter().enumerate() {
-                let codex = crate::codex::is_codex(Some(m));
-                if codex && !rows.iter().any(|row| matches!(row, Entry::Sep)) {
-                    rows.push(Entry::Sep);
-                }
-                let keys = format!("⌃⌘{}", i + 1);
-                rows.push(
-                    menu::item(None, crate::chat::model_label(m), |_, _| {})
-                        .hint(if codex {
-                            format!("Codex  {keys}")
-                        } else {
-                            keys
-                        })
-                        .checked(*m == crate::chat::MODELS[0]),
-                );
-            }
-            rows.push(Entry::Sep);
-            rows.extend(["low", "medium", "high", "max"].map(|level| {
-                menu::item(None, crate::chat::effort_label(level), |_, _| {})
-                    .checked(level == "high")
-                    .hint(if level == "max" { "slower" } else { "" })
-            }));
-            rows
-        }
+        "models" => crate::chat::model_entries(&ChatMeta::default(), |_, _| {}, |_, _| {}).0,
         _ => vec![
             menu::sub(
                 IconName::FolderOpen,
@@ -196,6 +171,6 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 .unwrap();
         }
     }
-    println!("production menu previews: 12 rendered (both themes)");
+    println!("menu previews: 12 rendered (both themes; shared production model entries)");
     crate::chat::completion_pixels::render_pixels(cx);
 }

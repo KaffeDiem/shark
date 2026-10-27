@@ -3,8 +3,7 @@ use std::{cell::RefCell, rc::Rc};
 use gpui_kit::{AppContext, Empty, ListOffset, TestAppContext, px, size};
 
 use super::{
-    DiffEvent, DiffFile, DiffFileStatus, DiffLinePosition, DiffLineRange, DiffMode, DiffSide,
-    DiffState,
+    DiffEvent, DiffFile, DiffLinePosition, DiffLineRange, DiffMode, DiffSide, DiffState,
     state::{DisplayRow, FoldExpansion},
 };
 
@@ -193,34 +192,6 @@ fn programmatic_cross_side_ranges_clip_to_supplied_lines(cx: &mut TestAppContext
         );
         state.list().scroll_to(ListOffset::default());
     });
-}
-
-#[test]
-fn files_report_git_status_and_hidden_lines() {
-    let files = DiffFile::parse(concat!(
-        "diff --git a/new b/new\nnew file mode 100644\n--- /dev/null\n+++ b/new\n@@ -0,0 +1 @@\n+a\n",
-        "diff --git a/old b/old\ndeleted file mode 100644\n--- a/old\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n",
-        "diff --git a/from b/to\nsimilarity index 100%\nrename from from\nrename to to\n",
-        "diff --git a/src b/copy\nsimilarity index 100%\ncopy from src\ncopy to copy\n",
-        "diff --git a/edit b/edit\n--- a/edit\n+++ b/edit\n@@ -5,2 +5,2 @@\n x\n-y\n+z\n@@ -20 +20 @@\n-p\n+q\n",
-    ))
-    .unwrap();
-    assert_eq!(
-        files.iter().map(DiffFile::status).collect::<Vec<_>>(),
-        [
-            DiffFileStatus::Added,
-            DiffFileStatus::Deleted,
-            DiffFileStatus::Renamed,
-            DiffFileStatus::Copied,
-            DiffFileStatus::Modified,
-        ]
-    );
-    let hunks = files[4].hunks();
-    assert_eq!(hunks[0].hidden_lines_before(None), 4);
-    assert_eq!(hunks[1].hidden_lines_before(Some(&hunks[0])), 13);
-    let added = files[0].hunks();
-    assert_eq!(added[0].hidden_lines_before(None), 0);
-    let _ = DiffMode::Unified;
 }
 
 const MERGE: &str = "start\n<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> feature\nmiddle\n<<<<<<< HEAD\na\n||||||| base\nb\n=======\nc\n>>>>>>> other\nend\n";

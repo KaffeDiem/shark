@@ -7148,7 +7148,10 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
     .await;
     cx.update(|cx| {
         let s = shark.read(cx);
-        assert_eq!(menus::branch_label(s, s.ws("ui").unwrap(), cx), "logic ← ui");
+        assert_eq!(
+            menus::branch_label(s, s.ws("ui").unwrap(), cx),
+            "logic ← ui"
+        );
     });
 
     // New workspace on top, from the branch menu, once ui is pushed.
@@ -7178,8 +7181,10 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
     .await;
 
     // A stack row opens its workspace; "Branch menu…" opens the menu from the keyboard.
-    cx.update_window(window, |_, w, cx| w.dispatch_action(Box::new(crate::BranchMenu), cx))
-        .unwrap();
+    cx.update_window(window, |_, w, cx| {
+        w.dispatch_action(Box::new(crate::BranchMenu), cx)
+    })
+    .unwrap();
     cx.run_until_parked();
     cx.update(|cx| assert!(shark.read(cx).menu.is_some()));
     press(cx, &["u", "enter"]);
@@ -7373,7 +7378,10 @@ async fn branch_from_refusals_and_mixed_repos(cx: &mut TestAppContext) {
     // web on main beside the stacked api: the header names the parent.
     cx.update(|cx| {
         let s = shark.read(cx);
-        assert_eq!(menus::branch_label(s, s.ws("mixed").unwrap(), cx), "logic ← mixed");
+        assert_eq!(
+            menus::branch_label(s, s.ws("mixed").unwrap(), cx),
+            "logic ← mixed"
+        );
     });
     fs::remove_dir_all(&home).ok();
 }

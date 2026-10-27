@@ -227,12 +227,21 @@ mod tests {
     fn chain_skips_the_trunk_and_trusts_workspace_bases() {
         let prs = [pr(1, "feature", "main")];
         let local = [ws("main", "main", "origin/main")];
-        assert_eq!(names(&chain("main", "origin/main", &local, &prs)), (vec!["main"], 0));
+        assert_eq!(
+            names(&chain("main", "origin/main", &local, &prs)),
+            (vec!["main"], 0)
+        );
         // b was retargeted from a to main; its PR hasn't caught up yet.
         let local = [ws("a", "a", "origin/main"), ws("b", "b", "origin/main")];
         let prs = [pr(1, "a", "main"), pr(2, "b", "a")];
-        assert_eq!(names(&chain("a", "origin/main", &local, &prs)), (vec!["a"], 0));
-        assert_eq!(names(&chain("b", "origin/main", &local, &prs)), (vec!["b"], 0));
+        assert_eq!(
+            names(&chain("a", "origin/main", &local, &prs)),
+            (vec!["a"], 0)
+        );
+        assert_eq!(
+            names(&chain("b", "origin/main", &local, &prs)),
+            (vec!["b"], 0)
+        );
     }
 
     #[test]

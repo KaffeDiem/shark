@@ -236,7 +236,11 @@ fn side_toggle(id: &'static str, icon: IconName, tip: &'static str) -> Button {
 fn tab_label(label: SharedString, on: bool, theme: &Theme) -> Div {
     crate::overflow_fade::label(
         label.replace(['\n', '\r'], " ").into(),
-        if on { theme.secondary } else { theme.background },
+        if on {
+            theme.secondary
+        } else {
+            theme.background
+        },
         Some(("titlebar-tab", theme.secondary_hover)),
     )
 }
@@ -533,7 +537,13 @@ impl Shark {
         };
         let entries = menus::branch_entries(self, ws, cx);
         let b = self.branch_at.get();
-        let m = menu::open_at(entries, point(b.right(), b.bottom() + px(4.)), Anchor::TopRight, window, cx);
+        let m = menu::open_at(
+            entries,
+            point(b.right(), b.bottom() + px(4.)),
+            Anchor::TopRight,
+            window,
+            cx,
+        );
         let sub = cx.subscribe(&m, |this, _, _: &DismissEvent, cx| {
             this.menu = None;
             cx.notify();

@@ -481,6 +481,54 @@ pub(crate) fn effort_label(level: &str) -> String {
     }
 }
 
+/// Shared menu contents: production actions and preview fixtures use the same model/effort rules.
+pub(crate) fn model_entries(
+    meta: &ChatMeta,
+    choose_model: impl Fn(&'static str, &mut App) + Clone + 'static,
+    choose_effort: impl Fn(&'static str, &mut App) + Clone + 'static,
+) -> (Vec<crate::menu::Entry>, usize) {
+    let current = meta.model.as_deref().unwrap_or(MODELS[0]);
+    // Claude's models, then Codex's: switching between the two starts a new conversation.
+    let mut entries = vec![];
+    for (i, &m) in MODELS.iter().enumerate() {
+        let is_codex = codex::is_codex(Some(m));
+        if is_codex && !entries.iter().any(|e| matches!(e, crate::menu::Entry::Sep)) {
+            entries.push(crate::menu::Entry::Sep);
+        }
+        let choose = choose_model.clone();
+        let item = crate::menu::item(None, model_label(m), move |_, cx| {
+            choose(m, cx);
+        });
+        // The backend where the name doesn't say it, and the ctrl-cmd-N pick.
+        let keys = format!("⌃⌘{}", i + 1);
+        let hint = if is_codex {
+            format!("Codex  {keys}")
+        } else {
+            keys
+        };
+        entries.push(item.hint(hint).checked(m == current));
+    }
+    entries.push(crate::menu::Entry::Sep);
+    let effort = effort_of(meta);
+    let mut sel = 0;
+    for &l in efforts(current) {
+        if l == effort {
+            sel = entries.len();
+        }
+        let choose = choose_effort.clone();
+        let item = crate::menu::item(None, effort_label(l), move |_, cx| {
+            choose(l, cx);
+        });
+        let hint = if matches!(l, "max" | "ultra") {
+            "slower"
+        } else {
+            ""
+        };
+        entries.push(item.hint(hint).checked(l == effort));
+    }
+    (entries, sel)
+}
+
 /// A model id as people read it: "opus" → "Opus", "codex:gpt-6.1-sol" → "GPT-6.1 Sol".
 pub(crate) fn model_label(id: &str) -> String {
     let cap = |w: &str| {
@@ -836,46 +884,17 @@ impl Chat {
     /// checked; type a letter to jump (again to cycle). The highlight starts on the current
     /// level, the pick changed most. A pick takes effect on the next send.
     pub fn open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let current = self.model().to_string();
-        let this = cx.entity().downgrade();
-        // Claude's models, then Codex's: switching between the two starts a new conversation.
-        let mut entries = vec![];
-        for (i, &m) in MODELS.iter().enumerate() {
-            let is_codex = codex::is_codex(Some(m));
-            if is_codex && !entries.iter().any(|e| matches!(e, crate::menu::Entry::Sep)) {
-                entries.push(crate::menu::Entry::Sep);
-            }
-            let this = this.clone();
-            let item = crate::menu::item(None, model_label(m), move |_, cx| {
-                this.update(cx, |c, cx| c.set_model(m, cx)).ok();
-            });
-            // The backend where the name doesn't say it, and the ctrl-cmd-N pick.
-            let keys = format!("⌃⌘{}", i + 1);
-            let hint = if is_codex {
-                format!("Codex  {keys}")
-            } else {
-                keys
-            };
-            entries.push(item.hint(hint).checked(m == current));
-        }
-        entries.push(crate::menu::Entry::Sep);
-        let effort = self.effort();
-        let mut sel = 0;
-        for &l in self.efforts() {
-            if l == effort {
-                sel = entries.len();
-            }
-            let this = this.clone();
-            let item = crate::menu::item(None, effort_label(l), move |_, cx| {
-                this.update(cx, |c, cx| c.set_effort(l, cx)).ok();
-            });
-            let hint = if matches!(l, "max" | "ultra") {
-                "slower"
-            } else {
-                ""
-            };
-            entries.push(item.hint(hint).checked(l == effort));
-        }
+        let model_chat = cx.entity().downgrade();
+        let effort_chat = model_chat.clone();
+        let (entries, sel) = model_entries(
+            &self.meta,
+            move |m, cx| {
+                model_chat.update(cx, |c, cx| c.set_model(m, cx)).ok();
+            },
+            move |l, cx| {
+                effort_chat.update(cx, |c, cx| c.set_effort(l, cx)).ok();
+            },
+        );
         let b = self.model_at.get();
         let at = point(b.left(), b.top() - px(4.));
         let m = crate::menu::open_at(entries, at, Anchor::BottomLeft, window, cx);
@@ -3204,6 +3223,44 @@ impl Render for Chat {
 mod tests {
     use super::*;
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+
+    #[test]
+    fn model_menu_uses_supported_efforts_and_selects_the_effective_level() {
+        use crate::menu::Entry;
+        for (model, saved, selected, ultra) in [
+            ("sonnet", "xhigh", "Extra high", false),
+            ("sonnet", "ultra", "Max", false),
+            ("codex:gpt-6.1-sol", "ultra", "Ultra", true),
+        ] {
+            let meta = ChatMeta {
+                model: Some(model.into()),
+                effort: Some(saved.into()),
+                ..Default::default()
+            };
+            let (entries, sel) = model_entries(&meta, |_, _| {}, |_, _| {});
+            assert!(
+                matches!(&entries[sel], Entry::Item { label, checked: true, .. } if label == selected)
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .filter(|e| matches!(e, Entry::Item { checked: true, .. }))
+                    .count(),
+                2
+            );
+            assert!(
+                entries
+                    .iter()
+                    .any(|e| matches!(e, Entry::Item { label, .. } if label == "Extra high"))
+            );
+            assert_eq!(
+                entries
+                    .iter()
+                    .any(|e| matches!(e, Entry::Item { label, .. } if label == "Ultra")),
+                ultra
+            );
+        }
+    }
 
     /// A review prompt in a replayed transcript comes back as its card; report lines stay
     /// out of the shown reply.
