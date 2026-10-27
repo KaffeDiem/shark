@@ -283,7 +283,7 @@ impl Shark {
         }
     }
 
-    /// cmd-t: a new tab right of the current one, on the last picked model and thinking level
+    /// cmd-t: a new tab after all chats, on the last picked model and thinking level
     /// and the current chat's speed.
     pub(super) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let fast = self.active_chat().and_then(|c| c.read(cx).meta.fast);
@@ -295,8 +295,8 @@ impl Shark {
             ..self.state.new_chat(id)
         };
         let ws = self.active_ws_mut().unwrap();
-        let at = ws.active_chat + 1;
-        ws.chats.insert(at, meta);
+        let at = ws.chats.len();
+        ws.chats.push(meta);
         let _ = self.state.save();
         self.select_chat(at, window, cx);
     }
@@ -452,7 +452,7 @@ impl Shark {
         });
     }
 
-    /// cmd-shift-t: brings back the most recently closed chat, or a picked one.
+    /// cmd-shift-t: appends the most recently closed chat, or a picked one, after all chats.
     pub(super) fn reopen_chat(
         &mut self,
         pick: Option<usize>,
@@ -466,8 +466,8 @@ impl Shark {
             return notify_err(window, cx, "No closed chats in this workspace");
         };
         let meta = ws.closed.remove(ix);
-        let at = ws.active_chat + 1;
-        ws.chats.insert(at, meta);
+        let at = ws.chats.len();
+        ws.chats.push(meta);
         let _ = self.state.save();
         self.select_chat(at, window, cx);
         if let Some(name) = self.active.clone() {

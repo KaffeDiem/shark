@@ -1,6 +1,90 @@
 use super::*;
 use gpui_kit::test::TestEventExt;
 
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn new_and_reopened_chats_append(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| {
+        s.create_workspace(
+            "append-chats".into(),
+            git::on_branch(&repos, "append-chats"),
+            vec![],
+            None,
+            w,
+            cx,
+        );
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    press(cx, &["cmd-t", "cmd-t"]);
+    on(cx, &|s, _, _| {
+        s.active_ws_mut().unwrap().closed = ["picked", "retained", "latest"]
+            .map(|id| s.state.new_chat(id.into()))
+            .to_vec();
+    });
+    for (key, restored) in [
+        (Some("cmd-t"), None),
+        (Some("cmd-t"), None),
+        (Some("cmd-shift-t"), Some("latest")),
+        (None, Some("picked")),
+    ] {
+        press(cx, &["ctrl-1"]);
+        let before = cx.update(|cx| shark.read(cx).active_ws().unwrap().chats.clone());
+        if let Some(key) = key {
+            press(cx, &[key]);
+        } else {
+            on(cx, &|s, w, cx| s.reopen_chat(Some(0), w, cx));
+        }
+        cx.update_window(window, |_, w, cx| {
+            let s = shark.read(cx);
+            let ws = s.active_ws().unwrap();
+            assert_eq!(ws.chats.len(), before.len() + 1);
+            assert_eq!(&ws.chats[..before.len()], before.as_slice());
+            assert_eq!(ws.active_chat, before.len());
+            if let Some(id) = restored {
+                assert_eq!(ws.chats.last().unwrap().id, id);
+                assert!(!ws.closed.iter().any(|chat| chat.id == id));
+            }
+            assert_eq!(s.tab, Tab::Chat);
+            assert!(
+                s.active_chat()
+                    .unwrap()
+                    .read(cx)
+                    .composer
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(w)
+            );
+            let saved = State::load();
+            assert_eq!(saved.workspaces[0].chats, ws.chats);
+            assert_eq!(saved.workspaces[0].active_chat, ws.active_chat);
+        })
+        .unwrap();
+    }
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        let closed = &s.active_ws().unwrap().closed;
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].id, "retained");
+    });
+    fs::remove_dir_all(&home).ok();
+}
+
 /// File focus and chat identity survive every way of selecting or closing a chat.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]

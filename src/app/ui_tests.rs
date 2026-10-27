@@ -1856,7 +1856,7 @@ async fn drag_chat_tabs(cx: &mut TestAppContext) {
         let ws = shark.read(cx).active_ws().unwrap();
         assert_eq!(
             ws.chats.iter().map(|c| &c.id).collect::<Vec<_>>(),
-            ids.iter().collect::<Vec<_>>()
+            vec![&ids[0], &ids[2], &ids[1]]
         );
         assert_eq!(ws.chats[ws.active_chat].id, ids[1]);
     });
