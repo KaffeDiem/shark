@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 use std::{fs, path::PathBuf, time::Duration};
 
+mod app_switcher_tests;
 mod audit_tests;
 pub(crate) mod chrome_tests;
 mod file_changes_tests;
@@ -3167,6 +3168,11 @@ async fn open_in_apps(cx: &mut TestAppContext) {
         WindowOptions::default(),
     );
     let on = on_app(window, shark.clone());
+    press_in(window)(cx, &["cmd-o"]);
+    on(cx, &|s, w, cx| {
+        assert!(s.app_switcher.is_none(), "no workspace, no switcher");
+        assert!(!w.has_active_dialog(cx), "Cmd+O no longer opens Add Repo");
+    });
     for (name, picked) in [("web-only", &repos[1..]), ("both", &repos[..])] {
         on(cx, &|s, w, cx| {
             s.create_workspace(
@@ -3298,6 +3304,181 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     );
     press(cx, &["escape"]);
     run(cx, "open in fork");
+    assert_eq!(
+        last(),
+        Some(("Fork".into(), home.join("shark/workspaces/web-only/web")))
+    );
+
+    // Cmd+O captures the sidebar target even while another workspace is open.
+    use gpui_kit::test::TestEventExt;
+    on(cx, &|s, w, cx| {
+        let ix = s
+            .state
+            .workspaces
+            .iter()
+            .position(|ws| ws.name == "both")
+            .unwrap();
+        s.sel = SideRow::Ws(ix);
+        s.sidebar_focus.focus(w, cx);
+    });
+    let modifiers = |cx: &mut TestAppContext, platform: bool| {
+        cx.update_window(window, |_, w, cx| {
+            w.change_modifiers(
+                Modifiers {
+                    platform,
+                    ..Default::default()
+                },
+                cx,
+            );
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    let selected = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let switcher = shark.read(cx).app_switcher.as_ref().unwrap();
+            switcher.selected
+        })
+    };
+    let before = OPENED.lock().unwrap().len();
+    modifiers(cx, true);
+    press(cx, &["cmd-o"]);
+    cx.update(|cx| {
+        let switcher = shark.read(cx).app_switcher.as_ref().unwrap();
+        assert_eq!(
+            switcher
+                .apps
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Terminal", "Code", "Fork", "Xcode"]
+        );
+    });
+    assert_eq!(selected(cx), 0);
+    for (key, expected) in [
+        ("cmd-o", 1),
+        ("cmd-shift-o", 0),
+        ("cmd-shift-o", 3),
+        ("cmd-o", 0),
+    ] {
+        press(cx, &[key]);
+        assert_eq!(selected(cx), expected, "{key} cycles and wraps");
+        assert_eq!(
+            OPENED.lock().unwrap().len(),
+            before,
+            "holding Command never opens an app"
+        );
+    }
+    modifiers(cx, false);
+    assert_eq!(last(), Some(("Terminal".into(), ws_dir.clone())));
+    assert_eq!(
+        OPENED.lock().unwrap().len(),
+        before + 1,
+        "release opens once"
+    );
+    on(cx, &|s, w, _| {
+        assert!(s.app_switcher.is_none());
+        assert!(s.sidebar_focus.is_focused(w));
+        assert_eq!(s.active.as_deref(), Some("web-only"));
+    });
+
+    // Mouse and Enter confirmation open once, including the later Command release.
+    let before = OPENED.lock().unwrap().len();
+    modifiers(cx, true);
+    press(cx, &["cmd-o"]);
+    cx.update_window(window, |_, w, cx| w.click("app-switcher-app-1", cx))
+        .unwrap();
+    modifiers(cx, false);
+    assert_eq!(last(), Some(("Code".into(), ws_dir.clone())));
+    assert_eq!(OPENED.lock().unwrap().len(), before + 1);
+    modifiers(cx, true);
+    press(cx, &["cmd-o", "cmd-enter"]);
+    modifiers(cx, false);
+    assert_eq!(last(), Some(("Terminal".into(), ws_dir.clone())));
+    assert_eq!(OPENED.lock().unwrap().len(), before + 2);
+
+    // Escape while Command is still held cancels; its later release does nothing.
+    let before = OPENED.lock().unwrap().len();
+    modifiers(cx, true);
+    press(cx, &["cmd-o", "cmd-n"]);
+    on(cx, &|s, w, cx| {
+        assert!(s.app_switcher.is_some(), "unrelated commands stay blocked");
+        assert!(
+            !w.has_active_dialog(cx),
+            "Cmd+N cannot open a workspace dialog"
+        );
+    });
+    press(cx, &["cmd-escape"]);
+    modifiers(cx, false);
+    on(cx, &|s, w, _| {
+        assert!(s.app_switcher.is_none());
+        assert!(s.sidebar_focus.is_focused(w));
+    });
+    assert_eq!(OPENED.lock().unwrap().len(), before);
+
+    // An outside click also cancels without activating what is underneath.
+    modifiers(cx, true);
+    press(cx, &["cmd-o"]);
+    cx.update_window(window, |_, w, cx| {
+        w.pointer_down(point(px(1.), px(1.)), MouseButton::Left, cx);
+        w.pointer_up(point(px(1.), px(1.)), MouseButton::Left, cx);
+    })
+    .unwrap();
+    modifiers(cx, false);
+    cx.update(|cx| assert!(shark.read(cx).app_switcher.is_none()));
+    assert_eq!(OPENED.lock().unwrap().len(), before);
+
+    // Moving focus away cancels without launching when Command is released.
+    modifiers(cx, true);
+    press(cx, &["cmd-o"]);
+    on(cx, &|s, w, cx| s.sidebar_focus.focus(w, cx));
+    modifiers(cx, false);
+    on(cx, &|s, w, _| {
+        assert!(s.app_switcher.is_none());
+        assert!(s.sidebar_focus.is_focused(w));
+    });
+    assert_eq!(OPENED.lock().unwrap().len(), before);
+
+    // Confirming Fork keeps the existing repo picker and its focus.
+    modifiers(cx, true);
+    press(cx, &["cmd-o", "cmd-o", "cmd-o"]);
+    assert_eq!(selected(cx), 2);
+    modifiers(cx, false);
+    assert_eq!(OPENED.lock().unwrap().len(), before, "Fork asks first");
+    cx.update_window(window, |_, w, cx| {
+        assert!(w.has_active_dialog(cx));
+        w.input("web", cx);
+    })
+    .unwrap();
+    press(cx, &["enter"]);
+    assert_eq!(last(), Some(("Fork".into(), ws_dir.join("web"))));
+
+    // Reverse opening starts at the last eligible app; no project means no Xcode.
+    on(cx, &|s, w, cx| {
+        let ix = s
+            .state
+            .workspaces
+            .iter()
+            .position(|ws| ws.name == "web-only")
+            .unwrap();
+        s.sel = SideRow::Ws(ix);
+        s.sidebar_focus.focus(w, cx);
+    });
+    modifiers(cx, true);
+    press(cx, &["cmd-shift-o"]);
+    cx.update(|cx| {
+        let switcher = shark.read(cx).app_switcher.as_ref().unwrap();
+        assert_eq!(
+            switcher
+                .apps
+                .iter()
+                .map(|a| a.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Terminal", "Code", "Fork"]
+        );
+        assert_eq!(switcher.selected, 2);
+    });
+    modifiers(cx, false);
     assert_eq!(
         last(),
         Some(("Fork".into(), home.join("shark/workspaces/web-only/web")))

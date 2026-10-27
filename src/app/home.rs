@@ -841,7 +841,7 @@ impl Shark {
             )
             .children(items.iter().enumerate().map(|(i, (label, done))| {
                 let (btn, keys, go): (_, _, Go) = match i {
-                    1 => ("Add repo", "cmd-o", Shark::add_repo),
+                    1 => ("Add repo", "cmd-k", Shark::add_repo),
                     2 => ("New workspace", "cmd-n", new_ws),
                     3 => ("Use plan mode", "shift-tab", Shark::try_plan_mode),
                     _ => ("Create PRs", "cmd-k", Shark::toggle_palette),
@@ -856,6 +856,14 @@ impl Shark {
                                 true => "Checking…",
                                 false => "See the fixes at the top",
                             })
+                            .into_any_element(),
+                    ),
+                    (1, _) => Some(
+                        Button::new(("home-do", i))
+                            .ghost()
+                            .xsmall()
+                            .label(btn)
+                            .on_click(cx.listener(|s, _, w, cx| s.add_repo(w, cx)))
                             .into_any_element(),
                     ),
                     _ => Some(
@@ -923,12 +931,9 @@ impl Shark {
         if rows.is_empty() {
             let no_repos = self.state.repos.is_empty();
             let add = Button::new("home-add-repo").label("Add repo");
-            let add = key_button(
-                add.when(no_repos, |b| b.primary()),
-                "cmd-o",
-                Shark::add_repo,
-                cx,
-            );
+            let add = add
+                .when(no_repos, |b| b.primary())
+                .on_click(cx.listener(|s, _, w, cx| s.add_repo(w, cx)));
             let new = Button::new("home-new-ws").label("New workspace");
             let new = key_button(new.when(!no_repos, |b| b.primary()), "cmd-n", new_ws, cx);
             return list

@@ -334,6 +334,189 @@ pub(crate) fn render_pixels() {
     println!("tab fade pixels: 12 passed (real offscreen renderer)");
     render_menu_pixels(&mut cx);
     super::menu_pixels::render_pixels(&mut cx);
+    render_app_switcher_pixels(&mut cx);
+}
+
+/// Render the real Shark overlay, including scrolling the last app into a narrow window.
+fn render_app_switcher_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let terminal = objc2_app_kit::NSWorkspace::sharedWorkspace()
+        .URLForApplicationWithBundleIdentifier(&objc2_foundation::NSString::from_str(
+            "com.apple.Terminal",
+        ))
+        .and_then(|url| url.path())
+        .expect("Terminal ships with macOS");
+    let png = crate::apps::icon_png(PathBuf::from(terminal.to_string()).as_path())
+        .expect("production Terminal icon extraction");
+    let dimensions = imagesize::blob_size(&png).expect("native icon PNG");
+    assert!(
+        dimensions.width >= 128 && dimensions.height >= 128,
+        "large switcher icons need a large source image"
+    );
+    let icon = Arc::new(Image::from_bytes(ImageFormat::Png, png));
+    let many: &'static [crate::apps::OpenApp] = Box::leak(
+        (0..12)
+            .map(|ix| crate::apps::OpenApp {
+                name: format!("Terminal {}", ix + 1),
+                path: PathBuf::from(terminal.to_string()),
+                kind: crate::apps::Kind::Terminal,
+                icon: Some(icon.clone()),
+            })
+            .collect::<Vec<_>>()
+            .into_boxed_slice(),
+    );
+    for (mode, mode_name) in [
+        (crate::state::Mode::Dark, "dark"),
+        (crate::state::Mode::Light, "light"),
+    ] {
+        for width in [1000., 320.] {
+            let mut state = State::default();
+            state.appearance.mode = mode;
+            state.save().unwrap();
+            let (window, shark) = cx
+                .update(|cx| {
+                    gpui_kit::open_window(
+                        WindowOptions {
+                            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                point(px(0.), px(0.)),
+                                size(px(width), px(560.)),
+                            ))),
+                            focus: false,
+                            show: false,
+                            ..Default::default()
+                        },
+                        cx,
+                        |w, cx| cx.new(|cx| Shark::new(w, cx)),
+                    )
+                })
+                .unwrap();
+            cx.update_window(window, |_, w, cx| {
+                shark.update(cx, |s, cx| {
+                    s.state.workspaces = vec![Workspace {
+                        name: "switcher-preview".into(),
+                        branch: "switcher-preview".into(),
+                        ..Default::default()
+                    }];
+                    s.sel = SideRow::Ws(0);
+                    s.sidebar_focus.focus(w, cx);
+                    s.cycle_open_app(true, w, cx);
+                });
+                w.render_frame(cx);
+                let panel = w.find("app-switcher").bounds();
+                let switcher = shark.read(cx).app_switcher.as_ref().unwrap();
+                let selected = w.find(format!("app-switcher-app-{}", switcher.selected));
+                let tile = selected.bounds();
+                assert!(selected.visible(), "{mode_name}, width={width}");
+                assert!(
+                    tile.left() >= panel.left() + px(20.)
+                        && tile.right() <= panel.right() - px(20.),
+                    "selected app must scroll fully into view: {mode_name}, width={width}, {tile:?}, {panel:?}"
+                );
+                assert!(
+                    panel.left() >= px(16.) && panel.right() <= px(width - 16.)
+                        && panel.top() >= px(16.) && panel.bottom() <= px(544.),
+                    "switcher must fit the viewport: {mode_name}, width={width}, {panel:?}"
+                );
+                assert!(
+                    (panel.left() + panel.right() - px(width)).abs() <= px(1.)
+                        && (panel.top() + panel.bottom() - px(560.)).abs() <= px(1.),
+                    "switcher must be centered: {mode_name}, width={width}, {panel:?}"
+                );
+                if width == 320. {
+                    assert!(
+                        w.find("app-switcher-app-0").bounds().left() < panel.left() + px(20.),
+                        "narrow preview must exercise horizontal overflow"
+                    );
+                }
+            })
+            .unwrap();
+            let screenshot = cx
+                .capture_screenshot(window)
+                .expect("real switcher renderer");
+            if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
+                let dir = PathBuf::from(dir);
+                fs::create_dir_all(&dir).unwrap();
+                screenshot
+                    .save(dir.join(format!("app-switcher-{mode_name}-{}.png", width as usize)))
+                    .unwrap();
+            }
+            // Exercise the image branch and scroll beyond the seven tiles that fit the width cap.
+            cx.update_window(window, |_, w, cx| {
+                shark.update(cx, |s, cx| {
+                    let switcher = s.app_switcher.as_mut().unwrap();
+                    switcher.apps = many.iter().collect();
+                    switcher.selected = 0;
+                    s.cycle_open_app(true, w, cx);
+                });
+                w.render_frame(cx);
+                assert_switcher_selection_visible(w, cx, &shark);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            for resized_width in [320., 1000.] {
+                cx.update_window(window, |_, w, cx| {
+                    w.resize(size(px(resized_width), px(560.)));
+                    w.bounds_changed(cx);
+                    assert_eq!(w.viewport_size().width, px(resized_width));
+                    w.render_frame(cx);
+                })
+                .unwrap();
+                // The house scroll pattern settles a changed viewport on the next frame.
+                cx.update_window(window, |_, w, cx| {
+                    w.render_frame(cx);
+                    assert_switcher_selection_visible(w, cx, &shark);
+                    for backwards in [false, true, true, false] {
+                        shark.update(cx, |s, cx| s.cycle_open_app(backwards, w, cx));
+                        w.render_frame(cx);
+                        assert_switcher_selection_visible(w, cx, &shark);
+                    }
+                })
+                .unwrap();
+                let screenshot = cx
+                    .capture_screenshot(window)
+                    .expect("native app icon renderer");
+                if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
+                    screenshot
+                        .save(PathBuf::from(dir).join(format!(
+                            "app-switcher-native-{mode_name}-{}-{}.png",
+                            width as usize, resized_width as usize,
+                        )))
+                        .unwrap();
+                }
+            }
+            // A single app must still show its icon and wrap the longer keyboard hint inside the panel.
+            cx.update_window(window, |_, w, cx| {
+                shark.update(cx, |s, _| {
+                    let switcher = s.app_switcher.as_mut().unwrap();
+                    switcher.apps = vec![&many[0]];
+                    switcher.selected = 0;
+                });
+                w.render_frame(cx);
+                assert_switcher_selection_visible(w, cx, &shark);
+                let panel = w.find("app-switcher").bounds();
+                assert!(panel.top() >= px(16.) && panel.bottom() <= px(544.));
+            })
+            .unwrap();
+            cx.update_window(window, |_, w, _| w.remove_window())
+                .unwrap();
+        }
+    }
+    fs::remove_dir_all(&home).ok();
+    println!(
+        "app switcher previews: both themes, one/many apps, native icons, cycling and resize passed"
+    );
+}
+
+fn assert_switcher_selection_visible(w: &Window, cx: &App, shark: &Entity<Shark>) {
+    let panel = w.find("app-switcher").bounds();
+    let selected = shark.read(cx).app_switcher.as_ref().unwrap().selected;
+    let tile = w.find(format!("app-switcher-app-{selected}")).bounds();
+    assert!(
+        tile.left() >= panel.left() + px(20.) && tile.right() <= panel.right() - px(20.),
+        "selected app {selected} must remain visible: {tile:?}, panel {panel:?}"
+    );
+    assert!(panel.left() >= px(16.) && panel.right() <= w.viewport_size().width - px(16.));
 }
 
 fn render_menu_pixels(cx: &mut gpui_kit::HeadlessAppContext) {

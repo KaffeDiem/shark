@@ -255,14 +255,14 @@ fn handlers(uti: &str, role: LSRolesMask) -> Vec<String> {
     ids.iter().map(|s| s.to_string()).collect()
 }
 
-/// The app's icon at 32pt, at the screen's scale, as a PNG; AppKit reads both `.icns` and asset catalogs.
-fn icon_png(app: &Path) -> Option<Vec<u8>> {
+/// The app's icon at switcher size, as a PNG; AppKit reads both `.icns` and asset catalogs.
+pub(crate) fn icon_png(app: &Path) -> Option<Vec<u8>> {
     use objc2::AllocAnyThread as _;
     use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep};
     use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize};
     let img =
         NSWorkspace::sharedWorkspace().iconForFile(&NSString::from_str(&app.to_string_lossy()));
-    let mut rect = NSRect::new(NSPoint::new(0., 0.), NSSize::new(32., 32.));
+    let mut rect = NSRect::new(NSPoint::new(0., 0.), NSSize::new(128., 128.));
     let cg = unsafe { img.CGImageForProposedRect_context_hints(&mut rect, None, None) }?;
     let rep = NSBitmapImageRep::initWithCGImage(NSBitmapImageRep::alloc(), &cg);
     let png = unsafe {
