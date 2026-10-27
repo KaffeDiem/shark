@@ -223,6 +223,7 @@ impl Shark {
                 let ours = s.shares(&ws_name, &ids);
                 match res {
                     Ok(url) => {
+                        s.record_interaction(&ws_name, cx);
                         // Into the workspace they came from, even if another one is open now.
                         s.review.edit(&ws_name, |l| {
                             for c in l.iter_mut().filter(|c| ids.contains(&c.id)) {

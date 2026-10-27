@@ -803,6 +803,7 @@ mod tests {
                 &c.foreground,
                 &c.muted_foreground,
                 &c.sidebar,
+                &c.sidebar_foreground,
                 &c.primary,
                 &c.link,
             ] {

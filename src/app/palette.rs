@@ -102,6 +102,13 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| s.new_workspace(s.state.last_repos.clone(), None, w, cx),
     ),
     Row(
+        "Open workspace…",
+        IconName::Search,
+        Some(&OpenWorkspacePicker),
+        "switch recent repository",
+        |s, w, cx| s.open_workspace_picker(w, cx),
+    ),
+    Row(
         "Open next workspace needing attention",
         IconName::CircleAlert,
         Some(&NextAttention),
@@ -684,10 +691,10 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, _, cx| s.toggle_sidebar(cx),
     ),
     Row(
-        "Toggle file tree",
+        "Show or hide diff files",
         IconName::ListTree,
         Some(&ToggleFileTree),
-        "files",
+        "files tree differ",
         |s, w, cx| s.toggle_tree(w, cx),
     ),
     Row(
@@ -894,6 +901,8 @@ impl Shark {
             }
             if (if codex { CLAUDE_ONLY } else { CODEX_ONLY }).contains(label)
                 || (no_target && NEED_WORKSPACE.contains(label))
+                || (*label == "Show or hide diff files"
+                    && (self.tab != Tab::Diff || self.home_shown()))
             {
                 continue;
             }

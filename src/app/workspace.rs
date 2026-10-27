@@ -842,13 +842,41 @@ impl Shark {
         let Some(name) = self.state.workspaces.get(ix).map(|w| w.name.clone()) else {
             return;
         };
-        if self.active.as_ref() == Some(&name) || (self.editor.is_none() && self.editing.is_none())
-        {
-            return self.open_workspace_now(ix, window, cx);
+        self.open_workspace_named(&name, window, cx);
+    }
+
+    pub(super) fn open_workspace_named(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.archiving.contains(name) || self.ws(name).is_none() {
+            return notify_err(window, cx, "The selected workspace is no longer available");
         }
-        self.confirm_discard(true, true, window, cx, move |s, window, cx| {
-            s.drop_editor();
-            s.open_workspace_now(ix, window, cx)
+        if self.active.as_deref() == Some(name) {
+            if self.home.on {
+                self.toggle_home(window, cx);
+            }
+            self.record_interaction(name, cx);
+            return;
+        }
+        let name = name.to_string();
+        // Resolve identity before dropping *or marking clean* any buffer: the destination may
+        // disappear while the discard dialog is open.
+        let editors = self.file_tabs.iter().map(|t| t.editor.clone()).collect();
+        self.confirm_editors(editors, true, false, window, cx, move |s, window, cx| {
+            let Some(ix) = s
+                .state
+                .workspaces
+                .iter()
+                .position(|w| w.name == name)
+                .filter(|_| !s.archiving.contains(&name))
+            else {
+                return notify_err(window, cx, "The selected workspace is no longer available");
+            };
+            s.open_workspace_now(ix, window, cx);
+            s.record_interaction(&name, cx);
         });
     }
 
@@ -861,7 +889,9 @@ impl Shark {
         let Some(ws) = self.state.workspaces.get(ix).cloned() else {
             return;
         };
-        if self.active.as_ref() != Some(&ws.name) {
+        let changed = self.active.as_ref() != Some(&ws.name);
+        if changed {
+            self.drop_editor();
             // A fresh tree and diff for another workspace.
             self.editing = None;
             self.diff_fp = 0;
@@ -900,6 +930,7 @@ impl Shark {
                 &sync,
                 window,
                 move |this, _, ev: &SyncEvent, window, cx| match ev {
+                    SyncEvent::Interacted => this.record_interaction(&name, cx),
                     SyncEvent::Reviewed(ids) => {
                         this.state.reviewed.insert(name.clone(), ids.clone());
                         let _ = this.state.save();
@@ -953,6 +984,9 @@ impl Shark {
         self.refresh_diff(cx);
         self.show(Tab::Chat, window, cx);
         self.select_chat(ws.active_chat, window, cx);
+        if changed {
+            self.restore_file_tabs(window, cx);
+        }
     }
 
     pub(super) fn add_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1576,6 +1610,7 @@ impl Shark {
             }
         }
         let ws = slot.clone();
+        self.record_interaction(&ws.name, cx);
         let _ = self.state.save();
         git::write_claude_md(&ws);
         let changed = (moves.iter())
@@ -1661,6 +1696,7 @@ impl Shark {
             slot.repos.push(r.clone());
         }
         let ws = slot.clone();
+        self.record_interaction(&ws.name, cx);
         let _ = self.state.save();
         if raced {
             git::write_claude_md(&ws);

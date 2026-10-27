@@ -32,6 +32,7 @@ impl Shark {
     }
 
     pub(super) fn retry_saves(&mut self, cx: &mut Context<Self>) {
+        self.flush_interaction();
         if self.state.save_error.borrow().is_some() {
             let _ = self.state.save();
         }

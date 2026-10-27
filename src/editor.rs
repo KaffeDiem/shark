@@ -58,6 +58,17 @@ impl FileEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        Self::with_content(path, abs, vim_on, None, window, cx)
+    }
+
+    pub(crate) fn with_content(
+        path: String,
+        abs: PathBuf,
+        vim_on: bool,
+        content: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let lang = language(&path);
         let input = cx.new(|cx| EditorState::new(window, cx).language(lang));
         let mut subs = vec![
@@ -106,6 +117,13 @@ impl FileEditor {
             _subs: subs,
             _poll,
         };
+        if let Some(text) = content {
+            editor.disk = fingerprint(text.as_bytes());
+            editor
+                .input
+                .update(cx, |i, cx| i.set_value(text, window, cx));
+            editor.loaded = true;
+        }
         editor.sync_readonly(cx);
         editor.reload(window, cx);
         editor

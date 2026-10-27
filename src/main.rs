@@ -40,7 +40,7 @@ actions!(
         ForceArchiveWorkspace,
         AddRepo,
         CycleOpenApp,
-        CycleOpenAppBack,
+        OpenWorkspacePicker,
         AddRepoToWorkspace,
         StopAgent,
         FocusLeft,
@@ -222,7 +222,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-p", TogglePalette, None),
         KeyBinding::new("cmd-n", NewWorkspace, None),
         KeyBinding::new("cmd-o", CycleOpenApp, None),
-        KeyBinding::new("cmd-shift-o", CycleOpenAppBack, None),
+        KeyBinding::new("cmd-shift-o", OpenWorkspacePicker, None),
         KeyBinding::new("cmd-0", ToggleHome, None),
         // Home: esc goes back to the workspace (or stops an Ask Shark answer); tab switches
         // the prompt between new workspace and Ask Shark; i/a jump from the list to it.
@@ -273,6 +273,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("pagedown", PageDown, Some(ARROWS)),
         KeyBinding::new("pageup", PageUp, Some(ARROWS)),
         KeyBinding::new("enter", Confirm, Some(LIST)),
+        KeyBinding::new("enter", Confirm, Some("Features")),
         KeyBinding::new("o", Confirm, Some("Transcript")),
         KeyBinding::new("y", CopySelected, Some("Transcript || PlanPane")),
         KeyBinding::new("i", FocusComposer, Some("Transcript")),
@@ -473,6 +474,7 @@ fn main() {
             bind_keys(cx);
             menubar::init(cx);
             let options = WindowOptions {
+                app_owns_titlebar_drag: true,
                 window_bounds: Some(WindowBounds::centered(size(px(1280.), px(820.)), cx)),
                 titlebar: Some(TitlebarOptions {
                     traffic_light_position: Some(point(px(9.), px(15.))),

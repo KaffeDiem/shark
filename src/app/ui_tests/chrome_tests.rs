@@ -1,7 +1,7 @@
 use super::*;
 use gpui_kit::test::TestEventExt;
 
-/// Both themes keep compact Home chrome and align pane toggles at either window width.
+/// Both themes keep compact Home chrome and a fixed Features rail at either width.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn sidebar_chrome_themes(cx: &mut TestAppContext) {
@@ -30,6 +30,7 @@ async fn sidebar_chrome_themes(cx: &mut TestAppContext) {
                 },
             );
             let on = on_app(window, shark.clone());
+            let press = press_in(window);
             let name = format!("chrome-{label}-{}", width as usize);
             on(cx, &|s, w, cx| {
                 s.create_workspace(
@@ -48,6 +49,7 @@ async fn sidebar_chrome_themes(cx: &mut TestAppContext) {
             for rail in [false, true] {
                 for tree in [false, true] {
                     on(cx, &|s, w, cx| {
+                        s.show(Tab::Diff, w, cx);
                         if s.rail != rail {
                             s.toggle_sidebar(cx);
                         }
@@ -58,19 +60,58 @@ async fn sidebar_chrome_themes(cx: &mut TestAppContext) {
                     cx.update_window(window, |_, w, cx| {
                         w.render_frame(cx);
                         let left = w.find("toggle-sidebar").bounds();
-                        let right_id = if tree { "hide-tree" } else { "show-tree" };
-                        let right = w.find(right_id);
+                        let right = w.find("features-rail");
                         assert!(right.visible(), "{label}, width={width}, rail={rail}");
-                        assert_eq!(right.bounds().top(), left.top());
-                        assert_eq!(right.bounds().size.height, left.size.height);
+                        assert_eq!(right.bounds().size.width, px(72.));
+                        assert_eq!(
+                            w.find("new-chat").bounds().left(),
+                            w.find("chat-tabs").bounds().right() + px(4.),
+                        );
+                        assert!(
+                            w.find("new-chat").bounds().right()
+                                <= w.find("content-island").bounds().right()
+                        );
+                        assert!(w.find("feature-differ").visible());
+                        assert!(w.try_find("show-tree").is_none());
+                        assert!(w.try_find("hide-tree").is_none());
+                        assert!(w.try_find("tools-diff").is_none());
+                        assert_eq!(w.try_find("file-tree").is_some(), tree);
+                        if tree {
+                            let files = w.find("file-tree").bounds();
+                            let island = w.find("content-island").bounds();
+                            assert!(files.left() >= island.left());
+                            assert!(files.right() <= island.right());
+                            assert!(files.top() >= island.top());
+                            assert!(files.bottom() <= island.bottom());
+                        }
                         assert_eq!(left.top(), px(8.));
+                        let commands = w.find("commands");
+                        assert!(commands.visible());
+                        let commands = commands.bounds();
+                        let create = w.find("new-workspace").bounds();
+                        assert_eq!(commands.right() + px(4.), create.left());
+                        assert_eq!(commands.top(), create.top());
+                        assert_eq!(commands.size, create.size);
+                        assert!(w.try_find("tools-commands").is_none());
+                        assert!(w.try_find("rail-commands").is_none());
                         let home = w.find("home-row").bounds();
+                        assert_eq!(w.find("feature-differ").bounds().top(), home.top());
                         if rail {
                             assert_eq!(home.size.width, px(32.));
+                            assert_eq!(left.right() + px(4.), commands.left());
                         } else {
                             assert!(home.size.width < px(140.), "Home fits its contents");
-                            assert!(home.right() < w.find("new-workspace").bounds().left());
+                            assert!(home.right() < commands.left());
                         }
+                        w.click("commands", cx);
+                        assert!(w.has_active_dialog(cx), "Commands opens the palette");
+                        w.close_dialog(cx);
+                    })
+                    .unwrap();
+                    press(cx, &["cmd-k"]);
+                    cx.update_window(window, |_, w, cx| {
+                        assert!(w.has_active_dialog(cx), "Cmd+K still opens the palette");
+                        w.close_dialog(cx);
                     })
                     .unwrap();
                 }
@@ -335,6 +376,11 @@ pub(crate) fn render_pixels() {
     render_menu_pixels(&mut cx);
     super::menu_pixels::render_pixels(&mut cx);
     render_app_switcher_pixels(&mut cx);
+    super::workspace_picker_tests::render_pixels(&mut cx);
+    super::navigation_pixels::render_pixels(&mut cx);
+    super::drag_tests::render_pixels(&mut cx);
+    super::tree_pixels::render_pixels(&mut cx);
+    super::tree_pixels::render_artifact_pixels(&mut cx);
 }
 
 /// Render the real Shark overlay, including scrolling the last app into a narrow window.

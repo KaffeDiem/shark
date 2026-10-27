@@ -1,6 +1,90 @@
 use super::*;
 use gpui_kit::test::TestEventExt;
 
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn new_and_reopened_chats_append(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| {
+        s.create_workspace(
+            "append-chats".into(),
+            git::on_branch(&repos, "append-chats"),
+            vec![],
+            None,
+            w,
+            cx,
+        );
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    press(cx, &["cmd-t", "cmd-t"]);
+    on(cx, &|s, _, _| {
+        s.active_ws_mut().unwrap().closed = ["picked", "retained", "latest"]
+            .map(|id| s.state.new_chat(id.into()))
+            .to_vec();
+    });
+    for (key, restored) in [
+        (Some("cmd-t"), None),
+        (Some("cmd-t"), None),
+        (Some("cmd-shift-t"), Some("latest")),
+        (None, Some("picked")),
+    ] {
+        press(cx, &["ctrl-1"]);
+        let before = cx.update(|cx| shark.read(cx).active_ws().unwrap().chats.clone());
+        if let Some(key) = key {
+            press(cx, &[key]);
+        } else {
+            on(cx, &|s, w, cx| s.reopen_chat(Some(0), w, cx));
+        }
+        cx.update_window(window, |_, w, cx| {
+            let s = shark.read(cx);
+            let ws = s.active_ws().unwrap();
+            assert_eq!(ws.chats.len(), before.len() + 1);
+            assert_eq!(&ws.chats[..before.len()], before.as_slice());
+            assert_eq!(ws.active_chat, before.len());
+            if let Some(id) = restored {
+                assert_eq!(ws.chats.last().unwrap().id, id);
+                assert!(!ws.closed.iter().any(|chat| chat.id == id));
+            }
+            assert_eq!(s.tab, Tab::Chat);
+            assert!(
+                s.active_chat()
+                    .unwrap()
+                    .read(cx)
+                    .composer
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(w)
+            );
+            let saved = State::load();
+            assert_eq!(saved.workspaces[0].chats, ws.chats);
+            assert_eq!(saved.workspaces[0].active_chat, ws.active_chat);
+        })
+        .unwrap();
+    }
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        let closed = &s.active_ws().unwrap().closed;
+        assert_eq!(closed.len(), 1);
+        assert_eq!(closed[0].id, "retained");
+    });
+    fs::remove_dir_all(&home).ok();
+}
+
 /// File focus and chat identity survive every way of selecting or closing a chat.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -35,6 +119,7 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
     fs::write(home.join("shark/workspaces/tabs-focus/api/a.txt"), "text\n").unwrap();
     on(cx, &|s, w, cx| {
         s.new_chat(w, cx);
+        s.show(Tab::Diff, w, cx);
         s.open_path("api/a.txt".into(), w, cx);
     });
     let editor = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
@@ -69,7 +154,6 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
                 w.resize(size(px(width), px(700.)));
                 s.show_tree = false;
                 s.select_file(0, w, cx);
-                s.tab_scroll.scroll_to_item(0);
             });
             cx.update_window(window, |_, w, _| w.activate_window())
                 .unwrap();
@@ -88,7 +172,7 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
                     );
                     assert!(!shark.read(cx).panes(cx).contains(&Pane::Chat));
                     assert_eq!(w.is_window_active(), active);
-                    // Scroll each tab into view before hovering; only its close control appears.
+                    // Hover each tab; only its close control appears.
                     for (ix, (tab, close)) in [
                         (format!("chat-tab-{}", ids[0]), "close-chat"),
                         (format!("chat-tab-{}", ids[1]), "close-chat"),
@@ -98,12 +182,19 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
                     .into_iter()
                     .enumerate()
                     {
-                        shark.read(cx).tab_scroll.scroll_to_item(ix);
                         w.render_frame(cx);
                         w.pointer_move(point(px(0.), px(690.)), None, cx);
                         let before = w.within(SharedString::from(tab.clone())).find(close);
                         assert!(!before.visible(), "hidden: {tab}, active={active}");
                         let bounds = w.find(SharedString::from(tab.clone())).bounds();
+                        let label = w
+                            .within(SharedString::from(tab.clone()))
+                            .find("tab-label")
+                            .bounds();
+                        assert!(
+                            label.right() > before.bounds().left(),
+                            "hidden close button leaves its space available to the label: {tab}"
+                        );
                         w.pointer_move(bounds.center(), None, cx);
                         let after = w.within(SharedString::from(tab.clone())).find(close);
                         assert!(after.visible(), "hovered: {tab}, active={active}");
@@ -157,7 +248,8 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
     on(cx, &|s, w, cx| s.toggle_tree(w, cx));
     press(cx, &["escape"]);
     cx.update_window(window, |_, w, cx| {
-        assert!(shark.read(cx).tree_focus.is_focused(w))
+        assert!(shark.read(cx).sidebar_focus.is_focused(w));
+        assert!(!shark.read(cx).tree_shown());
     })
     .unwrap();
     // Chat selection, creation, cycling and reopening always reveal and focus the composer.
@@ -186,7 +278,6 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
     // Close an earlier background chat by clicking × without selecting it or moving focus.
     on(cx, &|s, w, cx| {
         s.select_chat(s.active_ws().unwrap().chats.len() - 1, w, cx);
-        s.tab_scroll.scroll_to_item(0);
     });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
@@ -202,7 +293,6 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
     // A running chat's confirmation remains tied to its ID even when reordered.
     on(cx, &|s, w, cx| {
         s.select_file(0, w, cx);
-        s.tab_scroll.scroll_to_item(0);
     });
     let running_tab = SharedString::from(format!("chat-tab-{}", ids[1]));
     let click_running = |cx: &mut TestAppContext| {
@@ -222,9 +312,14 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.update(|cx| assert!(shark.read(cx).chats.contains_key(&ids[1])));
     click_running(cx);
-    on(cx, &|s, w, cx| {
+    on(cx, &|s, _, cx| {
         let target = s.active_ws().unwrap().chats[0].id.clone();
-        s.move_chat("tabs-focus", &ids[1], &target, w, cx);
+        s.move_tab(
+            "tabs-focus",
+            &TabId::Chat(ids[1].clone()),
+            &TabId::Chat(target),
+            cx,
+        );
         chat.update(cx, |c, _| c.meta.session_id = Some("recover-me".into()));
         s.active_ws_mut()
             .unwrap()
@@ -309,6 +404,15 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
         "text\n",
     )
     .unwrap();
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(shark.read(cx).active_ws().unwrap().diff_closed);
+        assert!(w.find_all("diff-tab").is_empty());
+    })
+    .unwrap();
+    press(cx, &["ctrl-tab", "ctrl-2"]);
+    cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Chat));
+    press(cx, &["cmd-shift-d"]);
     on(cx, &|s, w, cx| s.open_path("api/a.txt".into(), w, cx));
     let editor = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
@@ -355,14 +459,29 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
         w.change_modifiers(Modifiers::default(), cx)
     })
     .unwrap();
-    // Both forms of Workspace tools explicitly reopen and save Diff.
-    for expanded in [false, true] {
-        on(cx, &|s, _, _| s.show_tree = expanded);
-        cx.update_window(window, |_, w, cx| {
-            w.click(if expanded { "tools-diff" } else { "rail-diff" }, cx)
-        })
-        .unwrap();
-        cx.run_until_parked();
+    // Differ reopens the same artifact with either internal tree preference.
+    for tree in [false, true] {
+        on(cx, &|s, _, _| s.show_tree = tree);
+        // Open, click again, then refocus the existing tab from Chat.
+        for from_chat in [false, false, true] {
+            if from_chat {
+                on(cx, &|s, w, cx| s.select_chat(0, w, cx));
+            }
+            cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                w.click("feature-differ", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                let s = shark.read(cx);
+                assert_eq!(s.tab, Tab::Diff);
+                assert_eq!(w.find_all("diff-tab").len(), 1);
+                assert!(s.diff.read(cx).focus_handle(cx).is_focused(w));
+            })
+            .unwrap();
+        }
         assert!(!State::load().workspaces[0].diff_closed);
         press(cx, &["cmd-w"]);
         cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Chat));
@@ -444,6 +563,7 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
     })
     .await;
     on(cx, &|s, w, cx| {
+        s.show(Tab::Diff, w, cx);
         assert!(!s.active_ws().unwrap().diff_closed);
         let ix = s
             .state

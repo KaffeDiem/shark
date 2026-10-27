@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
 };
@@ -132,8 +132,11 @@ pub struct Repo {
     pub path: PathBuf,
 }
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Workspace {
+    /// Last explicit user interaction, in Unix milliseconds; background work never updates it.
+    #[serde(default)]
+    pub last_interacted_at: Option<u64>,
     pub name: String,
     pub branch: String,
     pub repos: Vec<WsRepo>,
@@ -150,12 +153,49 @@ pub struct Workspace {
     pub closed: Vec<ChatMeta>,
     #[serde(default)]
     pub active_chat: usize,
-    /// Hidden until an explicit Diff action reopens it.
-    #[serde(default)]
+    /// Closed by default, until an explicit Diff action opens it.
+    #[serde(default = "diff_closed_by_default")]
     pub diff_closed: bool,
     /// Diff path -> fingerprint of its patch when marked viewed; a new patch makes it unviewed.
     #[serde(default)]
     pub viewed: HashMap<String, u64>,
+    /// The tab strip, left to right. File entries are also the files reopened with the
+    /// workspace; `normalize_tabs` keeps chats and Diff in step with `chats` and `diff_closed`.
+    #[serde(default)]
+    pub tab_order: Vec<TabId>,
+}
+
+/// A tab's identity in the strip, stable across reordering.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Hash, Debug)]
+#[serde(rename_all = "lowercase")]
+pub enum TabId {
+    Chat(String),
+    Diff,
+    /// `repo/rel/path`, as in the diff.
+    File(String),
+}
+
+fn diff_closed_by_default() -> bool {
+    true
+}
+
+impl Default for Workspace {
+    fn default() -> Self {
+        Self {
+            last_interacted_at: None,
+            name: String::new(),
+            branch: String::new(),
+            repos: Vec::new(),
+            session_id: None,
+            model: None,
+            chats: Vec::new(),
+            closed: Vec::new(),
+            active_chat: 0,
+            diff_closed: diff_closed_by_default(),
+            viewed: HashMap::new(),
+            tab_order: Vec::new(),
+        }
+    }
 }
 
 /// One conversation: its own claude process, session and transcript.
@@ -245,6 +285,81 @@ impl Workspace {
             });
         }
         self.active_chat = self.active_chat.min(self.chats.len() - 1);
+        self.normalize_tabs();
+    }
+
+    /// Drops duplicate and stale chat/Diff entries, then appends the open chats and shown Diff
+    /// the strip lacks: a workspace saved before `tab_order` gets its chats, then Diff. Open
+    /// chats follow the strip's order, so chat-only cycling matches it.
+    pub fn normalize_tabs(&mut self) {
+        let mut seen = HashSet::new();
+        let (chats, diff) = (&self.chats, !self.diff_closed);
+        self.tab_order.retain(|t| {
+            let live = match t {
+                TabId::Chat(id) => chats.iter().any(|c| &c.id == id),
+                TabId::Diff => diff,
+                TabId::File(_) => true,
+            };
+            live && seen.insert(t.clone())
+        });
+        let missing: Vec<TabId> = (self.chats.iter())
+            .map(|c| TabId::Chat(c.id.clone()))
+            .chain(diff.then_some(TabId::Diff))
+            .filter(|t| !seen.contains(t))
+            .collect();
+        self.tab_order.extend(missing);
+        let active = self.chats.get(self.active_chat).map(|c| c.id.clone());
+        let order = &self.tab_order;
+        self.chats.sort_by_key(|c| {
+            (order.iter()).position(|t| matches!(t, TabId::Chat(id) if *id == c.id))
+        });
+        if let Some(ix) = active.and_then(|a| self.chats.iter().position(|c| c.id == a)) {
+            self.active_chat = ix;
+        }
+    }
+
+    /// Appends `tab`, moving it to the end when it is already listed.
+    pub fn open_tab(&mut self, tab: TabId) {
+        self.tab_order.retain(|t| *t != tab);
+        self.tab_order.push(tab);
+    }
+
+    pub fn close_tab(&mut self, tab: &TabId) {
+        self.tab_order.retain(|t| t != tab);
+    }
+
+    /// `new` takes `old`'s slot (a replaced file), or the end when `old` isn't listed.
+    pub fn replace_tab(&mut self, old: &TabId, new: TabId) {
+        if old == &new {
+            return;
+        }
+        self.tab_order.retain(|t| *t != new);
+        match self.tab_order.iter().position(|t| t == old) {
+            Some(ix) => self.tab_order[ix] = new,
+            None => self.tab_order.push(new),
+        }
+    }
+
+    /// Moves tab `from` into `to`'s slot; false when they are the same or either is missing.
+    pub fn move_tab(&mut self, from: &TabId, to: &TabId) -> bool {
+        let pos = |t: &TabId| self.tab_order.iter().position(|x| x == t);
+        let (Some(from), Some(to)) = (pos(from), pos(to)) else {
+            return false;
+        };
+        if from == to {
+            return false;
+        }
+        move_item(&mut self.tab_order, from, to);
+        self.normalize_tabs();
+        true
+    }
+
+    /// The saved file tabs, left to right.
+    pub fn file_tabs(&self) -> impl Iterator<Item = &String> {
+        self.tab_order.iter().filter_map(|t| match t {
+            TabId::File(path) => Some(path),
+            _ => None,
+        })
     }
 
     /// Chats without a model (an old one on the CLI default, a new workspace's first) get
@@ -493,6 +608,79 @@ mod tests {
         assert_eq!(back.branch_of(&back.repos[0]), "kd/x");
     }
 
+    /// Old workspaces get their chats then a shown Diff; the saved strip mixes kinds, round
+    /// trips per workspace, and drops duplicates and stale entries without inventing files.
+    #[test]
+    fn tab_order_migrates_normalizes_and_moves() {
+        use TabId::{Chat, Diff, File};
+        let chat = |id: &str| Chat(id.into());
+        let file = |p: &str| File(p.into());
+        let old = r#"{"name":"w","branch":"b","repos":[],"diff_closed":false,
+            "chats":[{"id":"w"},{"id":"w~2"}],"active_chat":1}"#;
+        let mut ws: Workspace = serde_json::from_str(old).unwrap();
+        ws.migrate();
+        assert_eq!(ws.tab_order, [chat("w"), chat("w~2"), Diff]);
+
+        ws.open_tab(file("api/a.rs"));
+        ws.open_tab(file("api/b.rs"));
+        let unchanged = ws.tab_order.clone();
+        ws.replace_tab(&file("api/a.rs"), file("api/a.rs"));
+        assert_eq!(ws.tab_order, unchanged);
+        ws.replace_tab(&file("api/a.rs"), file("api/c.rs"));
+        assert_eq!(
+            ws.tab_order,
+            [
+                chat("w"),
+                chat("w~2"),
+                Diff,
+                file("api/c.rs"),
+                file("api/b.rs")
+            ]
+        );
+        // A file into the first chat's slot, then a chat past Diff: chats follow, the same
+        // chat stays selected.
+        assert!(ws.move_tab(&file("api/b.rs"), &chat("w")));
+        assert!(ws.move_tab(&chat("w~2"), &Diff));
+        assert!(!ws.move_tab(&Diff, &Diff));
+        assert!(!ws.move_tab(&chat("gone"), &Diff));
+        let order = [
+            file("api/b.rs"),
+            chat("w"),
+            Diff,
+            chat("w~2"),
+            file("api/c.rs"),
+        ];
+        assert_eq!(ws.tab_order, order);
+        assert_eq!(ws.chats[ws.active_chat].id, "w~2");
+        ws.close_tab(&file("api/c.rs"));
+        ws.open_tab(file("api/b.rs"));
+        assert_eq!(ws.file_tabs().collect::<Vec<_>>(), ["api/b.rs"]);
+
+        let mut other = Workspace {
+            name: "x".into(),
+            ..Default::default()
+        };
+        other.migrate();
+        let st = State {
+            workspaces: vec![ws.clone(), other],
+            ..Default::default()
+        };
+        let back: State = serde_json::from_str(&serde_json::to_string(&st).unwrap()).unwrap();
+        assert_eq!(back.workspaces[0].tab_order, ws.tab_order);
+        assert_eq!(back.workspaces[1].tab_order, [chat("x")]);
+
+        // Hand-edited or stale: duplicates, a closed chat, a hidden Diff, a missing chat.
+        ws.tab_order = vec![chat("w~2"), chat("closed"), Diff, file("f"), chat("w~2")];
+        ws.diff_closed = true;
+        ws.normalize_tabs();
+        assert_eq!(ws.tab_order, [chat("w~2"), file("f"), chat("w")]);
+        assert_eq!(
+            ws.chats.iter().map(|c| &c.id[..]).collect::<Vec<_>>(),
+            ["w~2", "w"]
+        );
+        assert_eq!(ws.chats[ws.active_chat].id, "w~2");
+    }
+
     #[test]
     fn corrupt_state_is_kept() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -664,15 +852,18 @@ mod tests {
     fn diff_closure_defaults_and_round_trips() {
         let legacy = r#"{"name":"legacy","branch":"main","repos":[]}"#;
         let mut ws: Workspace = serde_json::from_str(legacy).unwrap();
-        assert!(!ws.diff_closed);
-        assert!(!Workspace::default().diff_closed);
-        ws.diff_closed = true;
-        let saved = serde_json::to_string(&ws).unwrap();
-        assert!(
-            serde_json::from_str::<Workspace>(&saved)
-                .unwrap()
-                .diff_closed
-        );
+        assert!(ws.diff_closed);
+        assert!(Workspace::default().diff_closed);
+        for closed in [false, true] {
+            ws.diff_closed = closed;
+            let saved = serde_json::to_string(&ws).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Workspace>(&saved)
+                    .unwrap()
+                    .diff_closed,
+                closed
+            );
+        }
     }
 
     #[test]

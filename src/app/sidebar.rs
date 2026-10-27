@@ -131,26 +131,6 @@ pub(super) struct Naming {
     _sub: Subscription,
 }
 
-/// A workspace row being dragged: onto a header to move it in, onto a row to take its slot.
-#[derive(Clone)]
-struct DraggedWs(SharedString);
-
-/// A section header being dragged onto another to take its place.
-#[derive(Clone)]
-struct DraggedSection(usize, SharedString);
-
-impl Render for DraggedWs {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        drag_chip(self.0.clone(), cx)
-    }
-}
-
-impl Render for DraggedSection {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        drag_chip(self.1.clone(), cx)
-    }
-}
-
 pub(super) fn drag_chip(label: SharedString, cx: &App) -> Div {
     let theme = cx.theme();
     div()
@@ -304,7 +284,7 @@ impl Shark {
         }
     }
 
-    fn move_to_section(&mut self, ws: &str, to: Option<usize>, cx: &mut Context<Self>) {
+    pub(super) fn move_to_section(&mut self, ws: &str, to: Option<usize>, cx: &mut Context<Self>) {
         if self.section_of(ws) == to {
             return;
         }
@@ -315,11 +295,12 @@ impl Shark {
             s.workspaces.push(ws.to_string());
         }
         let _ = self.state.save();
+        self.record_interaction(ws, cx);
         self.fix_sel();
         cx.notify();
     }
 
-    fn drop_ws(&mut self, ws: &str, target: &str, cx: &mut Context<Self>) {
+    pub(super) fn drop_ws(&mut self, ws: &str, target: &str, cx: &mut Context<Self>) {
         // The workspace under the cursor, so the reorder that shifts indices can put it back.
         let cursor = match self.sel {
             SideRow::Ws(ix) => self.state.workspaces.get(ix).map(|w| w.name.clone()),
@@ -336,7 +317,7 @@ impl Shark {
         cx.notify();
     }
 
-    fn drop_section(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+    pub(super) fn drop_section(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
         let n = self.state.sections.len();
         if from == to || from >= n || to >= n {
             return;
@@ -564,16 +545,24 @@ impl Shark {
         let rail = self.rail;
         // 16px icons; the rail is 32px icon buttons, 16 apart.
         let isz = px(16.);
-        let header = |t: &'static str| side_header(theme, t).when(rail, |d| d.hidden());
+        let header = |t: &'static str| {
+            side_header(theme, t)
+                .text_color(theme.sidebar_foreground)
+                .when(rail, |d| d.hidden())
+        };
         let hint = |t: &'static str| {
             div()
                 .when(rail, |d| d.hidden())
                 .px_4()
                 .text_xs()
-                .text_color(faint(theme))
+                .text_color(theme.sidebar_foreground)
                 .child(t)
         };
-        let row = || side_row(theme).when(rail, rail_button);
+        let row = || {
+            side_row(theme)
+                .text_color(theme.sidebar_foreground)
+                .when(rail, rail_button)
+        };
         let m = window.modifiers();
         let cmd_held = m.platform && m.number_of_modifiers() == 1;
         let repos = self.state.repos.iter().enumerate().map(|(ix, r)| {
@@ -581,6 +570,7 @@ impl Shark {
             let tip: SharedString = name.clone().into();
             row()
                 .id(("repo", ix))
+                .test_support()
                 .hover(|d| d.bg(side_hover(theme)))
                 .child(Icon::new(IconName::FolderGit2).with_size(isz))
                 .when(!rail, |d| d.child(div().truncate().child(r.name.clone())))
@@ -654,27 +644,29 @@ impl Shark {
                 )
         });
         let order = self.ws_order(false);
-        let (primary, accent) = (theme.primary, theme.sidebar_accent);
-        // Dropping a workspace on a header or on a row of a section moves it there.
-        let drop_on = |to: Option<usize>| {
-            cx.listener(move |this: &mut Shark, d: &DraggedWs, _, cx| {
-                this.move_to_section(&d.0, to, cx)
-            })
-        };
+        let accent = theme.sidebar_accent;
         let ws_row = |ix: usize, w: &Workspace, section: Option<usize>| {
             let running = self.running_chats(&w.name, cx);
             let busy = running > 0;
             let selected = self.sel == SideRow::Ws(ix);
-            let active = self.active.as_ref() == Some(&w.name);
+            let active = !self.home_shown() && self.active.as_ref() == Some(&w.name);
+            let bright = active || (selected && focused);
+            let foreground = if bright {
+                theme.foreground
+            } else {
+                theme.sidebar_foreground
+            };
             let attn = self.attention_of(&w.name, cx);
             let nth = order.iter().position(|&o| o == ix).filter(|&n| n < 9);
             let ws = w.clone();
             row()
                 .id(ix)
+                .test_support()
                 // The rail shows only the icon, so rows keep the one-line height there.
                 .when(!rail, |d| d.h(px(44.)))
                 .when(section.is_some() && !rail, |d| d.ml(px(24.)))
                 .map(|d| cursor_row(d, active, selected, focused, theme))
+                .text_color(foreground)
                 // The cursor moves on press, not release: a held or dragged row is the one ringed.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -695,13 +687,12 @@ impl Shark {
                         this.show_menu(e.position, entries, w, cx);
                     }),
                 )
-                .on_drag(DraggedWs(w.name.clone().into()), |d, _, _, cx| {
-                    cx.new(|_| d.clone())
-                })
-                .drag_over::<DraggedWs>(move |d, _, _, _| d.border_color(primary))
-                .on_drop({
-                    let target = w.name.clone();
-                    cx.listener(move |this, d: &DraggedWs, _, cx| this.drop_ws(&d.0, &target, cx))
+                .map(|d| {
+                    self.reorder_source(
+                        d,
+                        reorder::Item::Workspace(w.name.clone()),
+                        w.name.clone().into(),
+                    )
                 })
                 .child(match (busy, nth) {
                     (_, Some(n)) if cmd_held => kbd(&format!("cmd-{}", n + 1)).into_any_element(),
@@ -714,7 +705,7 @@ impl Shark {
                         let (icon, color) = match &attn {
                             Attn::Needs(_) => (IconName::CircleAlert, theme.warning_foreground),
                             Attn::Unread => (IconName::CircleCheck, theme.success_foreground),
-                            Attn::None => (IconName::CircleDashed, theme.muted_foreground),
+                            Attn::None => (IconName::CircleDashed, foreground),
                         };
                         Icon::new(icon)
                             .with_size(isz)
@@ -737,7 +728,11 @@ impl Shark {
                                 div()
                                     .truncate()
                                     .text_xs()
-                                    .text_color(theme.muted_foreground)
+                                    .text_color(if bright {
+                                        theme.muted_foreground
+                                    } else {
+                                        theme.sidebar_foreground
+                                    })
                                     .child({
                                         let repos = (w.repos.iter())
                                             .map(|r| r.name.as_str())
@@ -783,73 +778,69 @@ impl Shark {
                 })
                 .into_any_element()
         };
-        let section_row =
-            |i: usize, sec: &Section| {
-                let selected = self.sel == SideRow::Section(i);
-                let tip: SharedString = sec.name.clone().into();
-                // A folded section still shows that a workspace inside needs you.
-                let needs = sec.collapsed
-                    && sec
-                        .workspaces
-                        .iter()
-                        .any(|n| matches!(self.attention_of(n, cx), Attn::Needs(_)));
-                row()
-                    .id(("section", i))
-                    .map(|d| cursor_row(d, false, selected, focused, theme))
-                    .drag_over::<DraggedWs>(move |d, _, _, _| d.bg(accent).border_color(primary))
-                    .on_drop(drop_on(Some(i)))
-                    .on_drag(DraggedSection(i, sec.name.clone().into()), |d, _, _, cx| {
-                        cx.new(|_| d.clone())
-                    })
-                    .drag_over::<DraggedSection>(move |d, _, _, _| d.border_color(primary))
-                    .on_drop(cx.listener(move |this, d: &DraggedSection, _, cx| {
-                        this.drop_section(d.0, i, cx)
-                    }))
-                    .on_click(cx.listener(move |this, _, _, cx| {
+        let section_row = |i: usize, sec: &Section| {
+            let selected = self.sel == SideRow::Section(i);
+            let tip: SharedString = sec.name.clone().into();
+            // A folded section still shows that a workspace inside needs you.
+            let needs = sec.collapsed
+                && sec
+                    .workspaces
+                    .iter()
+                    .any(|n| matches!(self.attention_of(n, cx), Attn::Needs(_)));
+            row()
+                .id(("section", i))
+                .test_support()
+                .map(|d| cursor_row(d, false, selected, focused, theme))
+                .when(selected && focused, |d| d.text_color(theme.foreground))
+                .map(|d| self.reorder_source(d, reorder::Item::Section(i), sec.name.clone().into()))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.sel = SideRow::Section(i);
+                    this.toggle_section(i, cx)
+                }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |this, e: &MouseDownEvent, w, cx| {
                         this.sel = SideRow::Section(i);
-                        this.toggle_section(i, cx)
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, e: &MouseDownEvent, w, cx| {
-                            this.sel = SideRow::Section(i);
-                            let entries = section_menu(this, i, cx);
-                            this.show_menu(e.position, entries, w, cx);
-                        }),
+                        let entries = section_menu(this, i, cx);
+                        this.show_menu(e.position, entries, w, cx);
+                    }),
+                )
+                .child(
+                    Icon::new(section_icon(&sec.icon))
+                        .with_size(isz)
+                        .when(needs, |i| i.text_color(theme.warning_foreground)),
+                )
+                .when(!rail, |d| {
+                    d.child(
+                        div()
+                            .min_w_0()
+                            .truncate()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(sec.name.clone()),
                     )
                     .child(
-                        Icon::new(section_icon(&sec.icon))
-                            .with_size(isz)
-                            .when(needs, |i| i.text_color(theme.warning_foreground)),
-                    )
-                    .when(!rail, |d| {
-                        d.child(
-                            div()
-                                .min_w_0()
-                                .truncate()
-                                .font_weight(FontWeight::MEDIUM)
-                                .child(sec.name.clone()),
-                        )
-                        .child(
-                            Icon::new(match sec.collapsed {
-                                true => IconName::ChevronRight,
-                                false => IconName::ChevronDown,
-                            })
-                            .with_size(px(12.)),
-                        )
-                        .child(div().flex_1())
-                        .when(sec.collapsed, |d| {
-                            d.child(div().text_xs().child(sec.workspaces.len().to_string()))
+                        Icon::new(match sec.collapsed {
+                            true => IconName::ChevronRight,
+                            false => IconName::ChevronDown,
                         })
+                        .with_size(px(12.)),
+                    )
+                    .child(div().flex_1())
+                    .when(sec.collapsed, |d| {
+                        d.child(div().text_xs().child(sec.workspaces.len().to_string()))
                     })
-                    .when(rail, |d| {
-                        d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
-                    })
-                    .into_any_element()
-            };
+                })
+                .when(rail, |d| {
+                    d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+                })
+                .into_any_element()
+        };
         let name_row = |input: &Entity<InputState>, icon: IconName| {
             row()
+                .id("section-name")
+                .test_support()
                 .key_context("SectionName")
+                .text_color(theme.foreground)
                 .border_1()
                 .border_color(theme.primary)
                 .bg(side_on(theme))
@@ -878,7 +869,9 @@ impl Shark {
                         Some(n) if n.rename == Some(i) => {
                             items.push(name_row(&n.input, section_icon(&sec.icon)))
                         }
-                        _ => items.push(section_row(i, sec)),
+                        _ => items.push(
+                            self.reorder_item(section_row(i, sec), reorder::Item::Section(i)),
+                        ),
                     }
                 }
                 SideRow::Ws(ix) => {
@@ -888,7 +881,10 @@ impl Shark {
                         // A new section's field goes below the existing sections.
                         items.extend(new_row.take());
                     }
-                    items.push(ws_row(ix, w, section));
+                    items.push(self.reorder_item(
+                        ws_row(ix, w, section),
+                        reorder::Item::Workspace(w.name.clone()),
+                    ));
                 }
             }
         }
@@ -921,11 +917,10 @@ impl Shark {
         };
         let ws_header = h_flex()
             .id("ws-header")
+            .test_support()
             .group("ws-header")
             .justify_between()
             .items_end()
-            .drag_over::<DraggedWs>(move |d, _, _, _| d.bg(accent))
-            .on_drop(drop_on(None))
             .child(header("Workspaces"))
             .when(!rail, |d| {
                 d.child(
@@ -936,6 +931,7 @@ impl Shark {
                         .child(
                             Button::new("new-section")
                                 .ghost()
+                                .text_color(theme.sidebar_foreground)
                                 .xsmall()
                                 .icon(IconName::FolderPlus)
                                 .tooltip("New section")
@@ -962,6 +958,7 @@ impl Shark {
                         .child(
                             Button::new("add-repo")
                                 .ghost()
+                                .text_color(theme.sidebar_foreground)
                                 .xsmall()
                                 .icon(IconName::Plus)
                                 .tooltip("Add repo, or drop folders here")
@@ -1031,14 +1028,16 @@ impl Shark {
                             .w(px(if rail { 72. } else { 80. }))
                             .h_full()
                             .flex_none()
-                            .window_control_area(WindowControlArea::Drag),
+                            .id("traffic-lights-empty")
+                            .map(|d| self.draggable_chrome("traffic-lights-empty", d)),
                     )
                     .when(!rail, |d| d.child(self.render_sidebar_toggle(cx)))
                     .child(
                         div()
                             .flex_1()
                             .h_full()
-                            .window_control_area(WindowControlArea::Drag),
+                            .id("sidebar-header-empty")
+                            .map(|d| self.draggable_chrome("sidebar-header-empty", d)),
                     ),
             )
             .child(
@@ -1053,9 +1052,12 @@ impl Shark {
                     )
                     .when(!rail, |d| {
                         d.child(
-                            div()
+                            h_flex()
+                                .flex_none()
+                                .gap(px(4.))
                                 .mr(px(8.))
                                 .mb_0p5()
+                                .child(self.render_commands(cx))
                                 .child(self.render_new_workspace(cx)),
                         )
                     }),
@@ -1068,7 +1070,9 @@ impl Shark {
                     .min_h_0()
                     .overflow_y_scroll()
                     .track_scroll(&self.sidebar_scroll)
-                    .child(ws_header)
+                    .child(
+                        self.reorder_item(ws_header.into_any_element(), reorder::Item::Ungrouped),
+                    )
                     .children(items)
                     .when(
                         self.state.workspaces.is_empty() && self.state.sections.is_empty(),

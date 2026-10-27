@@ -203,7 +203,8 @@ impl Shark {
     }
 
     fn leave_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.active.is_some() {
+        if let Some(name) = self.active.clone() {
+            self.record_interaction(&name, cx);
             let tab = self.tab;
             self.show(tab, window, cx); // clears `home.on`
         }
@@ -565,6 +566,7 @@ impl Shark {
         let modifiers = window.modifiers();
         let cmd_held = modifiers.platform && modifiers.number_of_modifiers() == 1;
         side_row(theme)
+            .text_color(theme.sidebar_foreground)
             .id("home-row")
             .when(rail, super::sidebar::rail_button)
             .map(|d| cursor_row(d, self.home_shown(), false, false, theme))
@@ -576,7 +578,7 @@ impl Shark {
                     kbd("cmd-0")
                         .appearance(false)
                         .text_xs()
-                        .text_color(theme.muted_foreground),
+                        .text_color(theme.sidebar_foreground),
                 )
             })
             .when(rail, |d| {
@@ -611,10 +613,16 @@ impl Shark {
                     .gap_2()
                     .border_b_1()
                     .border_color(theme.border)
-                    .window_control_area(WindowControlArea::Drag)
-                    .child(Icon::new(IconName::House).with_size(px(14.)))
-                    .child(div().text_sm().child("Home"))
-                    .child(div().flex_1())
+                    .child(
+                        h_flex()
+                            .id("home-header-empty")
+                            .flex_1()
+                            .h_full()
+                            .gap_2()
+                            .child(Icon::new(IconName::House).with_size(px(14.)))
+                            .child(div().text_sm().child("Home"))
+                            .map(|d| self.draggable_chrome("home-header-empty", d)),
+                    )
                     .when(self.active.is_some(), |d| {
                         d.child(
                             Button::new("back-to-workspace")

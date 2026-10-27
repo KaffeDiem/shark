@@ -6,11 +6,11 @@ use crate::diff_view::{Diff, DiffEvent, DiffFile, DiffFileStatus, DiffMode, Diff
 use crate::editor::{EditorEvent, FileEditor};
 use crate::files::{self, Row};
 use crate::menu::{self, Entry};
-use crate::state::{ChatMeta, Repo, Section, State, Workspace, move_item, workspaces_dir};
+use crate::state::{ChatMeta, Repo, Section, State, TabId, Workspace, move_item, workspaces_dir};
 use crate::sync::{GitSync, SyncEvent};
 use crate::*;
 use gpui_kit::assets::IconName;
-use gpui_kit::base::{ResizeHandleRenderer, ResizeHandleState};
+use gpui_kit::base::{InteractiveElementExt as _, ResizeHandleRenderer, ResizeHandleState};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::dialog::{Dialog, DialogEntrance};
@@ -30,6 +30,7 @@ use gpui_kit::component::{
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::cell::RefCell;
+use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -39,13 +40,16 @@ mod app_switcher;
 mod chats;
 mod diff;
 mod editor_pane;
+mod features;
 mod file_changes;
 mod home;
 mod inline_edit;
+mod interaction;
 mod media;
 pub(crate) mod menus;
 mod palette;
 mod picker;
+mod reorder;
 mod review;
 mod review_send;
 mod review_share;
@@ -54,6 +58,7 @@ mod storage;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod ui_tests;
 mod workspace;
+mod workspace_picker;
 
 use diff::Viewed;
 use menus::{copy, on_shark, open_in_entries, tilde, ws_menu};
@@ -205,8 +210,10 @@ fn pill(id: impl Into<SharedString>, on: bool, theme: &Theme) -> Stateful<Div> {
         .aria_selected(on)
         .h(px(28.))
         .w(px(200.))
-        .max_w_full()
-        .flex_none()
+        .min_w(px(100.))
+        .flex_shrink_1()
+        .relative()
+        .overflow_hidden()
         .group("titlebar-tab")
         .gap_1p5()
         .rounded(theme.radius)
@@ -214,7 +221,7 @@ fn pill(id: impl Into<SharedString>, on: bool, theme: &Theme) -> Stateful<Div> {
         .text_color(if on {
             theme.foreground
         } else {
-            theme.muted_foreground
+            theme.sidebar_foreground
         })
         .bg(if on {
             theme.secondary
@@ -222,6 +229,27 @@ fn pill(id: impl Into<SharedString>, on: bool, theme: &Theme) -> Stateful<Div> {
             theme.background
         })
         .hover(|d| d.bg(theme.secondary_hover).text_color(theme.foreground))
+}
+
+/// Leave the left side selectable even when a tab is narrower than its close button.
+fn tab_close(button: Button, theme: &Theme) -> Div {
+    h_flex()
+        .absolute()
+        .top(px(2.))
+        .left(px(28.))
+        .right(px(2.))
+        .h(px(24.))
+        .justify_end()
+        .overflow_hidden()
+        .invisible()
+        .group_hover("titlebar-tab", |s| s.visible())
+        .child(
+            div()
+                .flex_none()
+                .bg(theme.secondary_hover)
+                .rounded(theme.radius)
+                .child(button),
+        )
 }
 
 /// An icon control in the window chrome.
@@ -266,6 +294,7 @@ enum Pane {
     Diff,
     Editor,
     Tree,
+    Features,
     Home,
 }
 
@@ -307,14 +336,16 @@ pub struct Shark {
     /// The Files panel's "Filter files…" box, and its text the tree filters by.
     tree_filter: Entity<InputState>,
     tree_query: String,
-    /// The island | Files split, kept across tabs; its width also persists in `State`.
+    /// The Diff artifact's internal Files split; its width persists in `State`.
     tree_resize: Entity<ResizableState>,
     /// The sidebar | rest split, while the sidebar isn't a rail; persisted like Files.
     sidebar_resize: Entity<ResizableState>,
     sidebar_scroll: ScrollHandle,
-    /// The workspace tabs scroll sideways once they outgrow the header.
     tab_scroll: ScrollHandle,
+    reorder: Rc<RefCell<reorder::Reorder>>,
     tab_layout: Rc<std::cell::Cell<(Pixels, usize)>>,
+    restore_generation: u64,
+    chrome_pressed: Rc<std::cell::Cell<Option<&'static str>>>,
     /// Workspaces whose worktrees are being removed in the background.
     pub(crate) archiving: HashSet<String>,
     creating: HashSet<String>,
@@ -334,10 +365,13 @@ pub struct Shark {
     media_width: Rc<std::cell::Cell<Pixels>>,
     pub(crate) syncs: HashMap<String, Entity<GitSync>>,
     sidebar_focus: FocusHandle,
+    features_focus: FocusHandle,
     pub(crate) attn: crate::attention::Attention,
     /// The open right-click menu, dropped when it dismisses.
     menu: Option<(Entity<menu::Menu>, Subscription)>,
     app_switcher: Option<app_switcher::AppSwitcher>,
+    content_focus: FocusHandle,
+    interaction_save: Option<Task<()>>,
     /// The header's branch button as last painted: "Branch menu…" hangs its menu from it.
     branch_at: Rc<std::cell::Cell<Bounds<Pixels>>>,
     /// The latest dependency check; empty until the first one lands.
@@ -402,7 +436,13 @@ impl Shark {
         window.on_window_should_close(cx, move |w, cx| {
             (this.update(cx, |s, cx| s.close_window(w, cx))).unwrap_or(true)
         });
+        let activity_owner = cx.entity().downgrade();
         let _subs = vec![
+            cx.intercept_keystrokes(move |ev, w, cx| {
+                activity_owner
+                    .update(cx, |s, cx| s.interaction_key(&ev.keystroke, w, cx))
+                    .ok();
+            }),
             // A drag of the Files or sidebar edge: remember the width for the next launch.
             cx.subscribe(&tree_resize, |s, r, _: &ResizablePanelEvent, cx| {
                 if let Some(w) = r.read(cx).sizes().get(1) {
@@ -485,12 +525,15 @@ impl Shark {
             sidebar_resize,
             sidebar_scroll: ScrollHandle::new(),
             tab_scroll: ScrollHandle::new(),
+            reorder: Rc::default(),
             tab_layout: Rc::default(),
+            restore_generation: 0,
+            chrome_pressed: Rc::default(),
             archiving: HashSet::new(),
             creating: HashSet::new(),
             adding_repos: HashSet::new(),
-            // Closed by default (design 01); Files N in the Changes bar opens it.
-            show_tree: false,
+            // Files starts open inside Diff; its toolbar can hide it for more review space.
+            show_tree: true,
             rail: false,
             editor: None,
             file_tabs: vec![],
@@ -501,9 +544,12 @@ impl Shark {
             media_width: Rc::default(),
             syncs: HashMap::new(),
             sidebar_focus,
+            features_focus: cx.focus_handle(),
             attn: crate::attention::Attention::new(cx),
             menu: None,
             app_switcher: None,
+            content_focus: cx.focus_handle(),
+            interaction_save: None,
             branch_at: Default::default(),
             deps: vec![],
             deps_check: None,
@@ -613,12 +659,13 @@ impl Shark {
             && let Some(ws) = self.active_ws_mut().filter(|ws| ws.diff_closed)
         {
             ws.diff_closed = false;
+            ws.open_tab(TabId::Diff);
             let _ = self.state.save();
         }
         self.tab = tab;
         self.home.on = false;
         self.remember_open();
-        self.reveal_tab();
+        self.reveal_tab(cx);
         match tab {
             Tab::Chat => {
                 if let Some(chat) = self.active_chat() {
@@ -647,10 +694,19 @@ impl Shark {
     }
 
     fn toggle_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab != Tab::Diff || self.home_shown() {
+            return;
+        }
         self.show_tree = !self.show_tree;
-        if !self.show_tree && self.tree_focus.is_focused(window) {
-            let tab = self.tab;
-            self.show(tab, window, cx);
+        if !self.show_tree
+            && (self.tree_focus.is_focused(window)
+                || self
+                    .tree_filter
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window))
+        {
+            self.focus_diff(window, cx);
         }
         cx.notify();
     }
@@ -674,6 +730,9 @@ impl Shark {
         if self.tree_shown() {
             v.push(Pane::Tree);
         }
+        if self.right_rail_shown() {
+            v.push(Pane::Features);
+        }
         v
     }
 
@@ -681,8 +740,18 @@ impl Shark {
         if self.sidebar_focus.is_focused(window) {
             return Some(Pane::Sidebar);
         }
-        if self.tree_focus.is_focused(window) {
+        if self.tree_shown()
+            && (self.tree_focus.is_focused(window)
+                || self
+                    .tree_filter
+                    .read(cx)
+                    .focus_handle(cx)
+                    .is_focused(window))
+        {
             return Some(Pane::Tree);
+        }
+        if self.right_rail_shown() && self.features_focus.is_focused(window) {
+            return Some(Pane::Features);
         }
         if self.home_shown() {
             return self.home.has_focus(window, cx).then_some(Pane::Home);
@@ -714,7 +783,9 @@ impl Shark {
     fn focus_pane(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
         match pane {
             Pane::Sidebar => self.sidebar_focus.focus(window, cx),
-            Pane::Tree => self.tree_focus.focus(window, cx),
+            Pane::Tree if self.tree_shown() => self.tree_focus.focus(window, cx),
+            Pane::Tree => return,
+            Pane::Features => self.features_focus.focus(window, cx),
             Pane::Home => self.home.focus.focus(window, cx),
             Pane::Diff => self.diff.read(cx).focus_handle(cx).focus(window, cx),
             Pane::Chat => {
@@ -779,7 +850,14 @@ impl Shark {
             },
             "Toggle sidebar (cmd-b)",
         )
+        .text_color(cx.theme().sidebar_foreground)
         .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
+    }
+
+    fn render_commands(&self, cx: &Context<Self>) -> Button {
+        side_toggle("commands", IconName::Command, "Commands (cmd-k)")
+            .text_color(cx.theme().sidebar_foreground)
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_palette(window, cx)))
     }
 
     fn render_new_workspace(&self, cx: &Context<Self>) -> Button {
@@ -788,9 +866,51 @@ impl Shark {
             IconName::SquarePen,
             "New workspace (cmd-n)",
         )
+        .text_color(cx.theme().sidebar_foreground)
         .on_click(cx.listener(|this, _, window, cx| {
             this.new_workspace(this.state.last_repos.clone(), None, window, cx)
         }))
+    }
+
+    fn draggable_chrome(&self, id: &'static str, d: Stateful<Div>) -> impl IntoElement {
+        let pressed = self.chrome_pressed.clone();
+        d.window_control_area(WindowControlArea::Drag)
+            .on_mouse_down_out({
+                let pressed = pressed.clone();
+                move |_, _, _| {
+                    if pressed.get() == Some(id) {
+                        pressed.set(None);
+                    }
+                }
+            })
+            .on_mouse_down(MouseButton::Left, {
+                let pressed = pressed.clone();
+                move |_, _, _| pressed.set(Some(id))
+            })
+            .on_mouse_up(MouseButton::Left, {
+                let pressed = pressed.clone();
+                move |_, _, _| {
+                    if pressed.get() == Some(id) {
+                        pressed.set(None);
+                    }
+                }
+            })
+            .on_mouse_up_out(MouseButton::Left, {
+                let pressed = pressed.clone();
+                move |_, _, _| {
+                    if pressed.get() == Some(id) {
+                        pressed.set(None);
+                    }
+                }
+            })
+            .on_mouse_move(move |ev, window, _| {
+                if ev.pressed_button == Some(MouseButton::Left) && pressed.get() == Some(id) {
+                    pressed.set(None);
+                    window.start_window_move();
+                }
+            })
+            .on_double_click(|_, window, _| window.titlebar_double_click())
+            .test_support()
     }
 
     fn render_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -803,28 +923,49 @@ impl Shark {
             .id("workspace-titlebar")
             .h(px(44.))
             .flex_none()
-            .px(px(8.))
-            .gap(px(4.))
-            .when(self.rail, |d| {
-                d.child(self.render_sidebar_toggle(cx))
-                    .child(self.render_new_workspace(cx))
-            })
-            .children(tabs)
+            .pl(px(8.))
+            .when(!self.right_rail_shown(), |d| d.pr(px(8.)))
+            .child(
+                h_flex()
+                    .min_w_0()
+                    .gap(px(4.))
+                    .when(self.rail, |d| {
+                        d.child(self.render_sidebar_toggle(cx))
+                            .child(self.render_commands(cx))
+                            .child(self.render_new_workspace(cx))
+                    })
+                    .children(tabs)
+                    .when(!self.home_shown() && self.active_ws().is_some(), |d| {
+                        d.child(
+                            Button::new("new-chat")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Plus)
+                                .w(px(24.))
+                                .flex_none()
+                                .tooltip("New chat (cmd-t)")
+                                .on_click(
+                                    cx.listener(|this, _, window, cx| this.new_chat(window, cx)),
+                                ),
+                        )
+                    }),
+            )
             // Native dragging belongs only to unused space, so tabs keep their own drags.
             .child(
                 div()
                     .flex_1()
-                    .min_w(px(16.))
+                    .min_w_0()
                     .h_full()
-                    .window_control_area(WindowControlArea::Drag),
+                    .id("titlebar-empty")
+                    .map(|d| self.draggable_chrome("titlebar-empty", d)),
             )
             .test_support()
     }
 
     fn render_main(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let Some(chat) = self.active_chat().cloned().filter(|_| !self.home_shown()) else {
+        if self.home_shown() {
             return self.render_home(window, cx);
-        };
+        }
         let theme = cx.theme();
         v_flex()
             .flex_1()
@@ -848,17 +989,22 @@ impl Shark {
                         div()
                             .flex_1()
                             .h_full()
-                            .window_control_area(WindowControlArea::Drag),
+                            .id("workspace-toolbar-empty")
+                            .map(|d| self.draggable_chrome("workspace-toolbar-empty", d)),
                     )
                     .when_some(self.active_sync().cloned(), |d, sync| d.child(sync)),
             )
             .child(match self.tab {
                 // Cached: the sidebar spinner redraws this view every frame, the chat only on change.
-                Tab::Chat => div()
-                    .flex_1()
-                    .min_h_0()
-                    .child(chat.cached(StyleRefinement::default().size_full()))
-                    .into_any_element(),
+                Tab::Chat => {
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .children(self.active_chat().map(|chat| {
+                            chat.clone().cached(StyleRefinement::default().size_full())
+                        }))
+                        .into_any_element()
+                }
                 Tab::File => h_flex()
                     .flex_1()
                     .min_h_0()
@@ -867,7 +1013,7 @@ impl Shark {
                 Tab::Diff => h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_diff(window, cx))
+                    .child(self.with_tree(self.render_diff(window, cx), window, cx))
                     .into_any_element(),
             })
             .into_any_element()
@@ -977,13 +1123,22 @@ impl Shark {
 
 impl Render for Shark {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Toasts clear the titlebar and toolbar, and sit left of the right pane's controls.
-        let side = match () {
-            _ if self.tree_shown() => (self.tree_resize.read(cx).sizes().get(1).copied())
-                .unwrap_or(px(self.state.tree_width.unwrap_or(244.))),
-            _ if self.right_rail_shown() => px(72.),
-            _ => px(0.),
+        self.prune_reorder(cx);
+        // Toasts clear the toolbar, Features rail, and visible Files controls.
+        let mut side = if self.right_rail_shown() {
+            px(72.)
+        } else {
+            px(0.)
         };
+        if self.tree_shown() {
+            side += self
+                .tree_resize
+                .read(cx)
+                .sizes()
+                .get(1)
+                .copied()
+                .unwrap_or(px(self.state.tree_width.unwrap_or(244.)));
+        }
         if cx.theme().notification.margins.right != side + px(16.)
             || cx.theme().notification.margins.top != px(104.)
         {
@@ -998,6 +1153,7 @@ impl Render for Shark {
         }
         let theme = cx.theme();
         h_flex()
+            .map(|d| self.reorder_events(d, cx))
             // `Vim` turns on the Vim-style list keys (see `bind_keys`).
             .key_context(if self.state.vim { "Shark Vim" } else { "Shark" })
             .size_full()
@@ -1017,7 +1173,9 @@ impl Render for Shark {
                 cx.listener(|this, _: &CycleOpenApp, w, cx| this.cycle_open_app(false, w, cx)),
             )
             .on_action(
-                cx.listener(|this, _: &CycleOpenAppBack, w, cx| this.cycle_open_app(true, w, cx)),
+                cx.listener(|this, _: &OpenWorkspacePicker, w, cx| {
+                    this.open_workspace_picker(w, cx)
+                }),
             )
             .on_action(cx.listener(|this, _: &ToggleHome, w, cx| this.toggle_home(w, cx)))
             .on_action(cx.listener(|this, _: &AddRepoToWorkspace, w, cx| {
@@ -1157,7 +1315,9 @@ impl Render for Shark {
                             .test_support(),
                     );
                 let main = v_flex()
-                    .size_full()
+                    .h_full()
+                    .flex_1()
+                    .min_w_0()
                     .child(self.render_titlebar(window, cx))
                     .when(!self.unsaved_data(cx).is_empty(), |d| {
                         d.child(
@@ -1179,7 +1339,15 @@ impl Render for Shark {
                         )
                     })
                     .child(island);
-                let main = self.with_tree(main, window, cx).into_any_element();
+                let main = h_flex()
+                    .size_full()
+                    .min_w_0()
+                    .child(main)
+                    .when(self.right_rail_shown(), |d| {
+                        d.child(self.render_features(window, cx))
+                    })
+                    .into_any_element();
+                let main = self.interaction_content(main, cx);
                 let sidebar = self.render_sidebar(window, cx).into_any_element();
                 match self.rail {
                     true => h_flex().size_full().child(sidebar).child(main),

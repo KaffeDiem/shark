@@ -78,6 +78,7 @@ impl Shark {
         {
             return notify_err(window, cx, format!("{path} has unsaved edits in the diff"));
         }
+        let workspace = ws.name.clone();
         let abs = ws.dir().join(&path);
         if std::fs::metadata(&abs).is_ok_and(|m| m.len() > crate::editor::MAX_BYTES) {
             return notify_err(
@@ -94,61 +95,167 @@ impl Shark {
             window,
             cx,
             move |s, window, cx| {
-                let vim = s.state.vim;
-                let editor = cx.new(|cx| FileEditor::new(path, abs, vim, window, cx));
-                let subs = vec![
-                    cx.subscribe_in(
-                        &editor,
-                        window,
-                        |s, editor, ev: &EditorEvent, window, cx| match ev {
-                            EditorEvent::Saved => s.refresh_diff(cx),
-                            EditorEvent::Close => s.close_editor(editor.clone(), window, cx),
-                            EditorEvent::Leave if s.editor.as_ref() == Some(editor) => {
-                                let pane = if s.tree_shown() {
-                                    Pane::Tree
-                                } else {
-                                    Pane::Sidebar
-                                };
-                                s.focus_pane(pane, window, cx)
-                            }
-                            EditorEvent::Leave => {}
-                        },
-                    ),
-                    cx.observe(&editor, |s, editor, cx| {
-                        let Some(tab) = s.file_tabs.iter_mut().find(|t| t.editor == editor) else {
-                            return;
-                        };
-                        let e = editor.read(cx);
-                        let header = (
-                            e.dirty,
-                            e.conflict,
-                            e.vim.status(),
-                            e.vim.pending().to_string(),
-                        );
-                        if header != tab.header {
-                            tab.header = header;
-                            cx.notify();
-                        }
-                    }),
-                ];
-                let tab = FileTab {
-                    editor: editor.clone(),
-                    header: Default::default(),
-                    _subs: subs,
+                if s.active.as_ref() != Some(&workspace) {
+                    return;
+                }
+                // Restoration may have opened the target while the discard dialog was up.
+                let tab = match s
+                    .file_tabs
+                    .iter()
+                    .position(|t| t.editor.read(cx).path == path)
+                {
+                    Some(ix) => s.file_tabs.remove(ix),
+                    None => s.make_file_tab(path.clone(), abs, None, window, cx),
                 };
+                let editor = tab.editor.clone();
                 if let Some(ix) = s
                     .file_tabs
                     .iter()
                     .position(|t| Some(&t.editor) == replacing.as_ref())
                 {
+                    let old = TabId::File(s.file_tabs[ix].editor.read(cx).path.clone());
+                    s.active_ws_mut()
+                        .unwrap()
+                        .replace_tab(&old, TabId::File(path));
                     s.file_tabs[ix] = tab;
                 } else {
+                    s.active_ws_mut().unwrap().open_tab(TabId::File(path));
                     s.file_tabs.push(tab);
                 }
+                s.sort_file_tabs(cx);
+                let _ = s.state.save();
                 s.editor = Some(editor);
                 s.show(Tab::File, window, cx);
+                if let Some(name) = s.active.clone() {
+                    s.record_interaction(&name, cx);
+                }
             },
         );
+    }
+
+    fn make_file_tab(
+        &mut self,
+        path: String,
+        abs: PathBuf,
+        content: Option<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> FileTab {
+        let vim = self.state.vim;
+        let editor = cx.new(|cx| match content {
+            Some(text) => FileEditor::with_content(path, abs, vim, Some(text), window, cx),
+            None => FileEditor::new(path, abs, vim, window, cx),
+        });
+        let subs = vec![
+            cx.subscribe_in(
+                &editor,
+                window,
+                |s, editor, ev: &EditorEvent, window, cx| match ev {
+                    EditorEvent::Saved => s.refresh_diff(cx),
+                    EditorEvent::Close => s.close_editor(editor.clone(), window, cx),
+                    EditorEvent::Leave if s.editor.as_ref() == Some(editor) => {
+                        let pane = if s.tree_shown() {
+                            Pane::Tree
+                        } else {
+                            Pane::Sidebar
+                        };
+                        s.focus_pane(pane, window, cx)
+                    }
+                    EditorEvent::Leave => {}
+                },
+            ),
+            cx.observe(&editor, |s, editor, cx| {
+                let Some(tab) = s.file_tabs.iter_mut().find(|t| t.editor == editor) else {
+                    return;
+                };
+                let e = editor.read(cx);
+                let header = (
+                    e.dirty,
+                    e.conflict,
+                    e.vim.status(),
+                    e.vim.pending().to_string(),
+                );
+                if header != tab.header {
+                    tab.header = header;
+                    cx.notify();
+                }
+            }),
+        ];
+        FileTab {
+            editor,
+            header: Default::default(),
+            _subs: subs,
+        }
+    }
+
+    pub(super) fn sort_file_tabs(&mut self, cx: &App) {
+        let Some(ws) = self.active_ws() else { return };
+        let order: Vec<_> = ws.file_tabs().cloned().collect();
+        self.file_tabs
+            .sort_by_key(|t| order.iter().position(|p| *p == t.editor.read(cx).path));
+    }
+
+    /// Restore disk contents in the background without selecting or focusing a file.
+    pub(super) fn restore_file_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self
+            .active_ws()
+            .filter(|ws| ws.file_tabs().next().is_some())
+            .cloned()
+        else {
+            return;
+        };
+        let generation = self.restore_generation;
+        cx.spawn_in(window, async move |this, cx| {
+            let name = ws.name.clone();
+            let restored = cx
+                .background_executor()
+                .spawn(async move {
+                    ws.file_tabs()
+                        .map(|path| (path.clone(), restore_file(&ws, path)))
+                        .collect::<Vec<_>>()
+                })
+                .await;
+            this.update_in(cx, |s, window, cx| {
+                if s.restore_generation != generation || s.active.as_ref() != Some(&name) {
+                    return;
+                }
+                let mut failures = vec![];
+                for (path, result) in restored {
+                    // It may have been opened, replaced or closed while the read was running.
+                    if !s
+                        .active_ws()
+                        .unwrap()
+                        .tab_order
+                        .contains(&TabId::File(path.clone()))
+                        || s.file_tabs.iter().any(|t| t.editor.read(cx).path == path)
+                    {
+                        continue;
+                    }
+                    match result {
+                        Ok((abs, text)) => {
+                            let tab = s.make_file_tab(path, abs, Some(text), window, cx);
+                            s.file_tabs.push(tab);
+                        }
+                        Err(e) => failures.push(format!("{path}: {e}")),
+                    }
+                }
+                s.sort_file_tabs(cx);
+                s.reveal_tab(cx);
+                if !failures.is_empty() {
+                    notify_err(
+                        window,
+                        cx,
+                        format!(
+                            "Could not reopen files (will retry next visit): {}",
+                            failures.join("; ")
+                        ),
+                    );
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     pub(super) fn select_file(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -165,6 +272,9 @@ impl Shark {
         }
         self.editor = Some(tab.editor.clone());
         self.show(Tab::File, window, cx);
+        if let Some(name) = self.active.clone() {
+            self.record_interaction(&name, cx);
+        }
     }
 
     pub(super) fn close_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -190,9 +300,12 @@ impl Shark {
                 let Some(ix) = s.file_tabs.iter().position(|t| t.editor == editor) else {
                     return;
                 };
+                let path = editor.read(cx).path.clone();
+                s.active_ws_mut().unwrap().close_tab(&TabId::File(path));
+                let _ = s.state.save();
                 s.file_tabs.remove(ix);
                 if s.file_tabs.is_empty() {
-                    s.drop_editor();
+                    s.editor = None;
                     if s.tab == Tab::File {
                         s.show(s.file_fallback(), window, cx);
                     }
@@ -216,6 +329,7 @@ impl Shark {
     }
 
     pub(super) fn drop_editor(&mut self) {
+        self.restore_generation += 1;
         self.editor = None;
         self.file_tabs.clear();
     }
@@ -527,4 +641,47 @@ impl Shark {
             .child(div().flex_1().min_h_0().child(editor))
             .into_any_element()
     }
+}
+
+/// Saved paths are untrusted; only regular UTF-8 text within a workspace repo is editable.
+fn restore_file(ws: &Workspace, path: &str) -> Result<(PathBuf, String), String> {
+    use std::io::Read;
+    use std::path::Component;
+    let parts: Vec<_> = Path::new(path).components().collect();
+    if parts.len() < 2
+        || parts.iter().any(|p| !matches!(p, Component::Normal(_)))
+        || path.split('/').any(|p| matches!(p, "" | "." | ".."))
+    {
+        return Err("invalid repository-relative path".into());
+    }
+    let repo = parts[0].as_os_str();
+    if !ws
+        .repos
+        .iter()
+        .any(|r| std::ffi::OsStr::new(&r.name) == repo)
+    {
+        return Err("repository is not in this workspace".into());
+    }
+    let read = || -> Result<_, std::io::Error> {
+        let root = ws.dir().join(repo).canonicalize()?;
+        let abs = ws.dir().join(path).canonicalize()?;
+        if !abs.starts_with(root) {
+            return Err(std::io::Error::other("path leaves its repository"));
+        }
+        let meta = std::fs::metadata(&abs)?;
+        if !meta.is_file() || meta.len() > crate::editor::MAX_BYTES {
+            return Err(std::io::Error::other("not an editable file or too large"));
+        }
+        let file = std::fs::File::open(&abs)?;
+        let mut bytes = vec![];
+        file.take(crate::editor::MAX_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > crate::editor::MAX_BYTES || bytes.contains(&0) {
+            return Err(std::io::Error::other("binary or too large"));
+        }
+        let text = String::from_utf8(bytes).map_err(std::io::Error::other)?;
+        // Keep the opened path so polling and save checks still notice symlink changes.
+        Ok((ws.dir().join(path), text))
+    };
+    read().map_err(|e| e.to_string())
 }

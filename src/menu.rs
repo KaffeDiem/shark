@@ -822,6 +822,7 @@ impl Render for Menu {
             .w(window.viewport_size().width)
             .h(window.viewport_size().height)
             .track_focus(&self.focus)
+            .key_context("SharkMenu")
             .on_key_down(cx.listener(Self::key))
             .on_any_mouse_down(cx.listener(|this, _, w, cx| {
                 cx.stop_propagation();
