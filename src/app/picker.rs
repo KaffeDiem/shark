@@ -10,7 +10,6 @@ pub(super) struct FilePicker {
     hits: Vec<usize>,
     query: String,
     shark: WeakEntity<Shark>,
-    new_tab: bool,
     _load: Task<()>,
 }
 
@@ -18,7 +17,6 @@ impl FilePicker {
     fn new(
         repos: Vec<(String, PathBuf)>,
         shark: WeakEntity<Shark>,
-        new_tab: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -43,7 +41,6 @@ impl FilePicker {
             hits: vec![],
             query: String::new(),
             shark,
-            new_tab,
             _load,
         }
     }
@@ -96,18 +93,15 @@ impl Render for FilePicker {
             })
             .on_confirm(move |ix, window, cx| {
                 // Closing the dialog releases the picker, so read the selection first.
-                let Some((path, shark, new_tab)) = pick.upgrade().and_then(|p| {
-                    Some((
-                        p.read(cx).path(ix.row)?,
-                        p.read(cx).shark.clone(),
-                        p.read(cx).new_tab,
-                    ))
-                }) else {
+                let Some((path, shark)) = pick
+                    .upgrade()
+                    .and_then(|p| Some((p.read(cx).path(ix.row)?, p.read(cx).shark.clone())))
+                else {
                     return;
                 };
                 window.close_dialog(cx);
                 shark
-                    .update(cx, |s, cx| s.open_any_path(path, new_tab, window, cx))
+                    .update(cx, |s, cx| s.open_any_path(path, window, cx))
                     .ok();
             })
     }
@@ -115,12 +109,7 @@ impl Render for FilePicker {
 
 impl Shark {
     /// cmd-p: the picker over every tracked and untracked file of the open workspace.
-    pub(super) fn open_any_file(
-        &mut self,
-        new_tab: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn open_any_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ws) = self.active_ws() else {
             return notify_err(window, cx, "Open a workspace first");
         };
@@ -128,20 +117,14 @@ impl Shark {
             .map(|r| (r.name.clone(), ws.dir().join(&r.name)))
             .collect();
         let shark = cx.entity().downgrade();
-        let picker = cx.new(|cx| FilePicker::new(repos, shark, new_tab, window, cx));
+        let picker = cx.new(|cx| FilePicker::new(repos, shark, window, cx));
         let state = picker.read(cx).state.clone();
         window.open_dialog(cx, move |d, _, cx| menu_dialog(d, cx).child(picker.clone()));
         state.update(cx, |p, cx| p.focus(window, cx));
     }
 
     /// Opens a picked path; text files only, since the editor would show a binary one empty.
-    fn open_any_path(
-        &mut self,
-        path: String,
-        new_tab: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    fn open_any_path(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ws) = self.active_ws() else { return };
         let abs = ws.dir().join(&path);
         let text = std::fs::metadata(&abs).is_ok_and(|m| m.len() <= crate::editor::MAX_BYTES)
@@ -155,10 +138,6 @@ impl Shark {
                 ),
             );
         }
-        if new_tab {
-            self.open_path_tab(path, window, cx);
-        } else {
-            self.open_path(path, window, cx);
-        }
+        self.open_path(path, window, cx);
     }
 }

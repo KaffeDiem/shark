@@ -93,7 +93,6 @@ actions!(
         MoveQueuedDown,
         FocusQueue,
         NewChat,
-        NewTab,
         CloseChat,
         CloseTab,
         ReopenChat,
@@ -215,8 +214,7 @@ fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-k", TogglePalette, None),
         KeyBinding::new("cmd-shift-p", TogglePalette, None),
-        KeyBinding::new("ctrl-n", NewWorkspace, None),
-        KeyBinding::new("cmd-n", NewTab, None),
+        KeyBinding::new("cmd-n", NewWorkspace, None),
         KeyBinding::new("cmd-o", AddRepo, None),
         KeyBinding::new("cmd-0", ToggleHome, None),
         // Home: esc goes back to the workspace (or stops an Ask Shark answer); tab switches

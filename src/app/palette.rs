@@ -169,13 +169,6 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| s.show(Tab::Chat, w, cx),
     ),
     Row(
-        "New tab…",
-        IconName::Plus,
-        Some(&NewTab),
-        "chat diff file",
-        |s, w, cx| s.new_tab(w, cx),
-    ),
-    Row(
         "New chat",
         IconName::Plus,
         Some(&NewChat),
@@ -379,7 +372,7 @@ pub(super) const COMMANDS: &[Row] = &[
         IconName::FileSearch,
         Some(&OpenAnyFile),
         "find go to",
-        |s, w, cx| s.open_any_file(false, w, cx),
+        |s, w, cx| s.open_any_file(w, cx),
     ),
     Row(
         "Show diff",
@@ -711,7 +704,7 @@ fn shortcut(action: &dyn Action, window: &Window) -> Option<Keystroke> {
 }
 
 /// Each command with a shortcut from where `window` is focused, as (label, keystroke) like
-/// ("New workspace…", "ctrl-n"): the live keymap for Home and Ask Shark.
+/// ("New workspace…", "cmd-n"): the live keymap for Home and Ask Shark.
 pub(crate) fn keymap_summary(window: &Window) -> Vec<(String, String)> {
     (COMMANDS.iter())
         .filter_map(|Row(label, _, action, ..)| {
@@ -815,7 +808,7 @@ impl Shark {
 
     pub(super) fn toggle_palette(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.state.mark(|s| &mut s.palette_used);
-        // Sidebar order with folded sections opened; cmd-1…9 counts the shown rows only.
+        // Sidebar order with folded sections opened; cmd-n counts the shown rows only.
         let order = self.ws_order(true);
         let shown = self.ws_order(false);
         let codex = self.active_chat().is_some_and(|c| c.read(cx).codex());

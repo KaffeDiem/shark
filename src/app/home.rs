@@ -542,7 +542,7 @@ impl Shark {
     pub(super) fn try_plan_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.home_rows(cx);
         let Some(r) = self.home_at(&rows).or((!rows.is_empty()).then_some(0)) else {
-            return notify_err(window, cx, "Create a workspace first (ctrl-n)");
+            return notify_err(window, cx, "Create a workspace first (cmd-n)");
         };
         let ix = rows[r].ix;
         // Leaving the open workspace asks about unsaved edits first; plan mode comes after.
@@ -842,7 +842,7 @@ impl Shark {
             .children(items.iter().enumerate().map(|(i, (label, done))| {
                 let (btn, keys, go): (_, _, Go) = match i {
                     1 => ("Add repo", "cmd-o", Shark::add_repo),
-                    2 => ("New workspace", "ctrl-n", new_ws),
+                    2 => ("New workspace", "cmd-n", new_ws),
                     3 => ("Use plan mode", "shift-tab", Shark::try_plan_mode),
                     _ => ("Create PRs", "cmd-k", Shark::toggle_palette),
                 };
@@ -930,7 +930,7 @@ impl Shark {
                 cx,
             );
             let new = Button::new("home-new-ws").label("New workspace");
-            let new = key_button(new.when(!no_repos, |b| b.primary()), "ctrl-n", new_ws, cx);
+            let new = key_button(new.when(!no_repos, |b| b.primary()), "cmd-n", new_ws, cx);
             return list
                 .py_8()
                 .items_center()

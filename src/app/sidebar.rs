@@ -1075,7 +1075,7 @@ impl Shark {
                         |d| {
                             d.child(hint(match self.state.repos.is_empty() {
                                 true => "Add a repo first",
-                                false => "ctrl-n to create",
+                                false => "cmd-n to create",
                             }))
                         },
                     )

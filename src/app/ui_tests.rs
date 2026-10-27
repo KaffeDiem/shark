@@ -388,7 +388,7 @@ async fn pull_request_picker(cx: &mut TestAppContext) {
         })
         .unwrap()
     };
-    press(cx, &["ctrl-n", "tab", "cmd-p"]);
+    press(cx, &["cmd-n", "tab", "cmd-p"]);
     cx.wait_for(window, Duration::from_secs(10), |w, _| {
         w.try_find("source-status").is_none() && w.try_find(("source-pr", 0usize)).is_some()
     })
@@ -454,7 +454,7 @@ async fn pull_request_picker(cx: &mut TestAppContext) {
         )
     });
     // An explicit name creates another review branch without resetting the first one.
-    press(cx, &["ctrl-n"]);
+    press(cx, &["cmd-n"]);
     input(cx, "second-review");
     press(cx, &["tab", "cmd-p"]);
     input(cx, "7");
@@ -538,7 +538,7 @@ async fn branch_picker(cx: &mut TestAppContext) {
     let count = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.workspaces.len());
 
     // The row label says new or existing as the name is typed.
-    press(cx, &["ctrl-n"]);
+    press(cx, &["cmd-n"]);
     assert_eq!(gets(cx, 0).as_deref(), Some("new"));
     input(cx, "shared");
     assert_eq!(
@@ -567,7 +567,7 @@ async fn branch_picker(cx: &mut TestAppContext) {
     );
 
     // Picking, then the first row puts the new branch back. Clicking the label lists too.
-    press(cx, &["ctrl-n"]);
+    press(cx, &["cmd-n"]);
     input(cx, "y1");
     press(cx, &["tab"]);
     branches_of(cx, "web", "shared");
@@ -605,7 +605,7 @@ async fn branch_picker(cx: &mut TestAppContext) {
     assert_eq!(on("y1", "web"), "y1");
 
     // Without a name, every ticked repo needs a branch: one is not enough.
-    press(cx, &["ctrl-n", "tab"]);
+    press(cx, &["cmd-n", "tab"]);
     branches_of(cx, "api", "kd/a");
     press(cx, &["enter"]);
     press(cx, &["cmd-enter"]);
@@ -665,7 +665,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         cx.update_window(window, |_, w, cx| w.dispatch_action(a.boxed_clone(), cx))
             .unwrap()
     };
-    press(cx, &["ctrl-n"]);
+    press(cx, &["cmd-n"]);
     cx.update_window(window, |_, w, cx| w.input("ui x", cx))
         .unwrap();
     press(cx, &["enter"]);
@@ -1032,7 +1032,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
 
     // Repo picker: tab to the filter, enter ticks the match, space unticks the
     // highlighted (top) row, cmd-enter creates from the picker.
-    press(cx, &["ctrl-n"]);
+    press(cx, &["cmd-n"]);
     cx.run_until_parked();
     cx.update_window(window, |_, w, cx| w.input("kb", cx))
         .unwrap();
@@ -1135,7 +1135,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     )
     .unwrap();
     git::git(&api, &["push", "-q", "origin", "main:remote-only"]).unwrap();
-    press(cx, &["ctrl-n"]);
+    press(cx, &["cmd-n"]);
     cx.run_until_parked();
     cx.update_window(window, |_, w, cx| w.input("new-x", cx))
         .unwrap();
@@ -2065,18 +2065,17 @@ async fn titlebar_controls(cx: &mut TestAppContext) {
                     "chat-tab-{}",
                     ws.chats[ws.active_chat].id
                 )));
-                let new_chat = w.find("new-tab");
+                let new_chat = w.find("new-chat");
                 assert_eq!(tab.bounds().top(), px(8.));
                 assert_eq!(tab.bounds().size.height, px(28.));
-                assert!(new_chat.visible(), "overflow leaves new-tab visible");
+                assert!(new_chat.visible(), "overflow leaves new-chat visible");
                 assert!(new_chat.bounds().left() >= tab.bounds().right());
                 assert!(new_chat.bounds().right() <= px(width - 72.));
                 if rail {
                     assert!(tab.bounds().left() >= w.find("new-workspace").bounds().right());
                 }
                 assert_eq!(s.tab_hidden(ws.active_chat), std::cmp::Ordering::Equal);
-                w.click("new-tab", cx);
-                w.press("enter", cx);
+                w.click("new-chat", cx);
             })
             .unwrap();
             cx.run_until_parked();
@@ -2115,7 +2114,7 @@ async fn titlebar_controls(cx: &mut TestAppContext) {
             assert!(file.visible(), "the file tab survives chat overflow");
             assert_eq!(file.bounds().top(), px(8.));
             assert_eq!(file.bounds().size.height, px(28.));
-            assert!(file.bounds().right() <= w.find("new-tab").bounds().left());
+            assert!(file.bounds().right() <= w.find("new-chat").bounds().left());
             assert_eq!(
                 file.bounds().size.width,
                 w.find("diff-tab").bounds().size.width
@@ -2157,7 +2156,7 @@ async fn titlebar_controls(cx: &mut TestAppContext) {
             cx.update_window(window, |_, w, cx| {
                 w.render_frame(cx);
                 let titlebar = w.find("workspace-titlebar").bounds();
-                for id in [file_tab.clone(), SharedString::from("new-tab")] {
+                for id in [file_tab.clone(), SharedString::from("new-chat")] {
                     let control = w.find(id.clone());
                     assert!(control.visible(), "visible {id} with Workspace tools open");
                     assert!(
@@ -2555,178 +2554,6 @@ async fn command_click_file_tabs(cx: &mut TestAppContext) {
             Tab::Diff,
             "a tab switch must not bypass the inline-edit guard"
         )
-    });
-    fs::remove_dir_all(&home).ok();
-}
-
-/// Cmd-n chooses a tab without replacing dirty files; Ctrl-n creates a workspace from any pane.
-#[gpui_kit::test]
-#[allow(clippy::await_holding_lock)]
-async fn new_tab_shortcuts(cx: &mut TestAppContext) {
-    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    let home = test_home();
-    let repos = repos(&home, &["api"]);
-    let (window, shark) = boot(
-        cx,
-        State {
-            repos: repos.clone(),
-            ..Default::default()
-        },
-        WindowOptions::default(),
-    );
-    let on = on_app(window, shark.clone());
-    let press = press_in(window);
-    let input = |cx: &mut TestAppContext, text: &str| {
-        cx.update_window(window, |_, w, cx| w.input(text, cx))
-            .unwrap();
-        cx.run_until_parked();
-    };
-    press(cx, &["cmd-n"]);
-    cx.update_window(window, |_, w, cx| {
-        assert!(!w.has_active_dialog(cx), "tabs require a workspace");
-        assert!(shark.read(cx).active.is_none());
-    })
-    .unwrap();
-    press(cx, &["ctrl-n"]);
-    cx.update_window(window, |_, w, cx| {
-        assert!(
-            w.has_active_dialog(cx),
-            "Ctrl-n opens New workspace on Home"
-        );
-        w.close_dialog(cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    on(cx, &|s, w, cx| {
-        s.create_workspace(
-            "new-tabs".into(),
-            git::on_branch(&repos, "new-tabs"),
-            vec![],
-            None,
-            w,
-            cx,
-        )
-    });
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).active.is_some()
-    })
-    .await;
-    let dir = home.join("shark/workspaces/new-tabs/api");
-    fs::write(dir.join("a.txt"), "first file\n").unwrap();
-    fs::write(dir.join("b.txt"), "second file\n").unwrap();
-
-    press(cx, &["cmd-n", "escape"]);
-    cx.update(|cx| assert_eq!(shark.read(cx).active_ws().unwrap().chats.len(), 1));
-    press(cx, &["cmd-n", "enter"]);
-    cx.update_window(window, |_, w, cx| {
-        let s = shark.read(cx);
-        assert_eq!(s.active_ws().unwrap().chats.len(), 2);
-        assert_eq!(s.tab, Tab::Chat);
-        assert!(
-            s.active_chat()
-                .unwrap()
-                .read(cx)
-                .composer
-                .read(cx)
-                .focus_handle(cx)
-                .is_focused(w)
-        );
-    })
-    .unwrap();
-    press(cx, &["ctrl-n"]);
-    cx.update_window(window, |_, w, cx| {
-        assert!(w.has_active_dialog(cx), "Ctrl-n works from composer input");
-        w.close_dialog(cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-
-    // Selecting Diff from Home returns to the workspace without creating a chat.
-    press(cx, &["cmd-0", "cmd-n"]);
-    input(cx, "Diff");
-    press(cx, &["enter"]);
-    cx.update_window(window, |_, w, cx| {
-        let s = shark.read(cx);
-        assert_eq!(s.tab, Tab::Diff);
-        assert!(!s.home_shown());
-        assert_eq!(s.active_ws().unwrap().chats.len(), 2);
-        assert!(s.diff.read(cx).focus_handle(cx).is_focused(w));
-    })
-    .unwrap();
-
-    on(cx, &|s, w, cx| {
-        s.set_vim(false, cx);
-        s.open_path("api/a.txt".into(), w, cx);
-    });
-    let first = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        first.read(cx).input.read(cx).value().as_ref() == "first file\n"
-    })
-    .await;
-    input(cx, "unsaved ");
-    let draft = cx.update(|cx| first.read(cx).input.read(cx).value());
-    cx.update(|cx| assert!(first.read(cx).dirty));
-    press(cx, &["ctrl-n"]);
-    cx.update_window(window, |_, w, cx| {
-        assert!(w.has_active_dialog(cx), "Ctrl-n works from editor input");
-        w.close_dialog(cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-
-    for _ in 0..2 {
-        press(cx, &["cmd-n"]);
-        input(cx, "Open file");
-        press(cx, &["enter"]);
-        cx.wait_for(window, Duration::from_secs(10), |w, _| {
-            w.try_find(IndexPath::new(0)).is_some()
-        })
-        .await;
-        input(cx, "b.txt");
-        press(cx, &["enter"]);
-        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-            shark
-                .read(cx)
-                .editor
-                .as_ref()
-                .is_some_and(|e| e.read(cx).path == "api/b.txt")
-        })
-        .await;
-        cx.update_window(window, |_, w, cx| {
-            assert!(
-                !w.has_active_dialog(cx),
-                "new files never request discarding another tab"
-            );
-            let s = shark.read(cx);
-            assert_eq!(s.file_tabs.len(), 2, "existing paths are reused");
-            assert!(first.read(cx).dirty);
-            assert_eq!(first.read(cx).input.read(cx).value(), draft);
-            assert!(s.editor.as_ref().unwrap().read(cx).is_focused(w, cx));
-        })
-        .unwrap();
-    }
-    // Cancelling either chooser leaves the active file and its neighbours intact.
-    press(cx, &["cmd-n", "escape"]);
-    press(cx, &["cmd-n", "down", "down", "enter"]);
-    press(cx, &["escape"]);
-    cx.update(|cx| {
-        assert_eq!(shark.read(cx).file_tabs.len(), 2);
-        assert_eq!(
-            shark.read(cx).editor.as_ref().unwrap().read(cx).path,
-            "api/b.txt"
-        );
-    });
-    press(cx, &["cmd-n", "enter"]);
-    cx.update(|cx| {
-        let s = shark.read(cx);
-        assert_eq!(
-            s.tab,
-            Tab::Chat,
-            "New chat selects its tab from a file view"
-        );
-        assert_eq!(s.active_ws().unwrap().chats.len(), 3);
-        assert_eq!(s.file_tabs.len(), 2);
-        assert!(first.read(cx).dirty);
     });
     fs::remove_dir_all(&home).ok();
 }
@@ -3907,7 +3734,7 @@ async fn home_ask_shark(cx: &mut TestAppContext) {
         "{args}"
     );
     assert!(
-        args.contains("ctrl-n: New workspace…"),
+        args.contains("cmd-n: New workspace…"),
         "the live keymap: {args}"
     );
     let on = on_app(window, shark.clone());

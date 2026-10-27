@@ -80,7 +80,6 @@ pub fn menus() -> Vec<Menu> {
             "File",
             vec![
                 MenuItem::action("New Workspace", NewWorkspace),
-                MenuItem::action("New Tab…", NewTab),
                 MenuItem::action("New Chat", NewChat),
                 MenuItem::action("Open File…", OpenAnyFile),
                 MenuItem::action("Edit Working Copy", EditWorkingCopy),

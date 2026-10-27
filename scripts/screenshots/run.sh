@@ -48,7 +48,7 @@ key 'keystroke "4"' "command down" # eng-127, a changed image
 key 'keystroke "d"' "command down, shift down"
 sleep 2
 shot diff-images.png
-key 'keystroke "n"' "control down"
+key 'keystroke "n"' "command down"
 key 'keystroke "eng-131-sign-in-with-apple"'
 shot multi-repo.png
 key 'key code 53'
