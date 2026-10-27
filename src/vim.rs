@@ -1465,6 +1465,7 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "wall-clock benchmark; run explicitly on a quiet machine"]
     fn perf() {
         use std::time::Instant;
         let mut s = String::new();
