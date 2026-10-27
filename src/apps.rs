@@ -256,7 +256,7 @@ fn handlers(uti: &str, role: LSRolesMask) -> Vec<String> {
 }
 
 /// The app's icon at switcher size, as a PNG; AppKit reads both `.icns` and asset catalogs.
-fn icon_png(app: &Path) -> Option<Vec<u8>> {
+pub(crate) fn icon_png(app: &Path) -> Option<Vec<u8>> {
     use objc2::AllocAnyThread as _;
     use objc2_app_kit::{NSBitmapImageFileType, NSBitmapImageRep};
     use objc2_foundation::{NSDictionary, NSPoint, NSRect, NSSize};

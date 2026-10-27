@@ -1109,9 +1109,7 @@ impl Render for Shark {
             }))
             // Held modifiers reveal workspace and chat number shortcuts.
             .on_modifiers_changed(cx.listener(|this, ev: &ModifiersChangedEvent, w, cx| {
-                if !ev.modifiers.platform {
-                    this.close_app_switcher(true, w, cx);
-                }
+                this.app_switcher_modifiers(ev.modifiers.platform, w, cx);
                 cx.notify();
             }))
             .on_action(cx.listener(|this, _: &FocusLeft, w, cx| this.move_focus(-1, w, cx)))

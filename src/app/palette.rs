@@ -838,9 +838,19 @@ impl Shark {
         let Some(ws) = self.target(window) else {
             return notify_err(window, cx, "Open a workspace first");
         };
+        self.open_in_workspace(app, &ws, window, cx);
+    }
+
+    pub(super) fn open_in_workspace(
+        &mut self,
+        app: &'static OpenApp,
+        ws: &Workspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let targets = match app.kind {
             Kind::Terminal | Kind::Folder => vec![(String::new(), ws.dir())],
-            Kind::Git | Kind::Xcode => app.targets(None, &repo_paths(&ws)),
+            Kind::Git | Kind::Xcode => app.targets(None, &repo_paths(ws)),
         };
         let (icon, ask, none) = match app.kind {
             Kind::Xcode => (

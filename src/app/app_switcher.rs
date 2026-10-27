@@ -5,8 +5,10 @@ use crate::apps::OpenApp;
 pub(super) struct AppSwitcher {
     pub(super) apps: Vec<&'static OpenApp>,
     pub(super) selected: usize,
+    workspace: String,
     focus: FocusHandle,
     previous_focus: Option<FocusHandle>,
+    command_held: bool,
     scroll: ScrollHandle,
     width: Rc<std::cell::Cell<Pixels>>,
     _keys: Subscription,
@@ -25,11 +27,10 @@ impl Shark {
             s.selected = (s.selected + if backwards { n - 1 } else { 1 }) % n;
             s.scroll.scroll_to_item(s.selected);
         } else {
-            let target = self.target(window);
-            if target.is_none() {
+            let Some(target) = self.target(window) else {
                 return notify_err(window, cx, "Open a workspace first");
-            }
-            let apps = palette::available_apps(target.as_ref());
+            };
+            let apps = palette::available_apps(Some(&target));
             if apps.is_empty() {
                 return notify_err(
                     window,
@@ -43,6 +44,10 @@ impl Shark {
             let this = cx.entity().downgrade();
             // Key bindings dispatch before raw key events; intercept while this overlay owns focus.
             let keys = cx.intercept_keystrokes(move |ev, w, cx| {
+                // GPUI turns a bare Command release into a keystroke before dispatching modifiers.
+                if ev.keystroke.key == "platform" {
+                    return;
+                }
                 this.update(cx, |s, cx| {
                     if s.app_switcher
                         .as_ref()
@@ -67,8 +72,10 @@ impl Shark {
             self.app_switcher = Some(AppSwitcher {
                 apps,
                 selected,
+                workspace: target.name,
                 focus,
                 previous_focus,
+                command_held: window.modifiers().platform,
                 scroll,
                 width: Rc::default(),
                 _keys: keys,
@@ -89,6 +96,22 @@ impl Shark {
         }
     }
 
+    pub(super) fn app_switcher_modifiers(
+        &mut self,
+        command_held: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(s) = &mut self.app_switcher else {
+            return;
+        };
+        let released = s.command_held && !command_held;
+        s.command_held = command_held;
+        if released {
+            self.close_app_switcher(true, window, cx);
+        }
+    }
+
     pub(super) fn close_app_switcher(
         &mut self,
         open: bool,
@@ -103,14 +126,17 @@ impl Shark {
             cx.notify();
             return;
         }
-        // Restore the sidebar/Home cursor's target before using the shared launch path.
+        // Restore focus before the launch path can open a repo/project picker.
         if let Some(focus) = s.previous_focus {
             focus.focus(window, cx);
         } else {
             self.focus_fallback(window, cx);
         }
         if open {
-            self.open_in(s.apps[s.selected], window, cx);
+            match self.ws(&s.workspace).cloned() {
+                Some(ws) => self.open_in_workspace(s.apps[s.selected], &ws, window, cx),
+                None => notify_err(window, cx, "The selected workspace is no longer available"),
+            }
         }
         cx.notify();
     }
@@ -125,6 +151,11 @@ impl Shark {
         let width = px((s.apps.len() as f32 * 96. + 40.).min(760.))
             .min((window.viewport_size().width - px(32.)).max(px(0.)));
         let (layout, scroll, selected) = (s.width.clone(), s.scroll.clone(), s.selected);
+        let hint = if s.command_held {
+            "Release ⌘ to open · ⇧O reverse · Esc cancel"
+        } else {
+            "Enter to open · ⌘O cycle · Esc cancel"
+        };
         let panel = menu::chrome(theme)
             .id("app-switcher")
             .role(Role::Dialog)
@@ -149,6 +180,7 @@ impl Shark {
                     .id("app-switcher-apps")
                     .role(Role::ListBox)
                     .aria_label("Applications")
+                    .aria_description(hint)
                     .track_focus(&s.focus)
                     .w_full()
                     .overflow_x_scroll()
@@ -200,7 +232,7 @@ impl Shark {
                     .text_center()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child("Release ⌘ to open · ⇧O reverse · Esc cancel"),
+                    .child(hint),
             )
             .test_support();
         Some(

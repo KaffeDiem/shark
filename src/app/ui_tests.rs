@@ -7,6 +7,7 @@ use std::sync::Mutex;
 use std::time::Instant;
 use std::{fs, path::PathBuf, time::Duration};
 
+mod app_switcher_tests;
 mod audit_tests;
 pub(crate) mod chrome_tests;
 mod file_changes_tests;
