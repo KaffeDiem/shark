@@ -1,5 +1,7 @@
 //! One agent conversation (a chat tab): transcript blocks, composer, and the claude process.
 mod completion;
+#[cfg(all(test, feature = "test-support"))]
+pub(crate) mod completion_pixels;
 mod question;
 mod side;
 

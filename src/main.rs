@@ -16,6 +16,7 @@ mod files;
 mod git;
 mod menu;
 mod menubar;
+mod overflow_fade;
 mod plan;
 mod pr;
 mod prompts;

@@ -8,6 +8,7 @@ use std::time::Instant;
 use std::{fs, path::PathBuf, time::Duration};
 
 pub(crate) mod chrome_tests;
+mod menu_pixels;
 
 /// UI tests share the process-wide `TEST_HOME` and `state.json`, so they take turns. Chat
 /// tests that make workspace dirs take it too: `test_home` wipes them.

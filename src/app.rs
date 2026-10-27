@@ -230,62 +230,13 @@ fn side_toggle(id: &'static str, icon: IconName, tip: &'static str) -> Button {
         .tooltip(tip)
 }
 
-/// Fade only overflowing text; the overlay follows the tab surface, including hover.
+/// The overflow overlay follows the tab surface, including hover.
 fn tab_label(label: SharedString, on: bool, theme: &Theme) -> Div {
-    let label: SharedString = label.replace(['\n', '\r'], " ").into();
-    let measure = label.clone();
-    div()
-        .relative()
-        .flex_1()
-        .min_w_0()
-        .overflow_hidden()
-        .whitespace_nowrap()
-        .child(label)
-        .child(
-            div()
-                .absolute()
-                .size_full()
-                .top_0()
-                .left_0()
-                .text_color(if on {
-                    theme.secondary
-                } else {
-                    theme.background
-                })
-                .group_hover("titlebar-tab", |d| d.text_color(theme.secondary_hover))
-                .child(
-                    canvas(
-                        move |bounds, window, _| {
-                            let style = window.text_style();
-                            let line = window.text_system().shape_line(
-                                measure.clone(),
-                                style.font_size.to_pixels(window.rem_size()),
-                                &[style.to_run(measure.len())],
-                                None,
-                            );
-                            line.width > bounds.size.width
-                        },
-                        |bounds, overflow, window, _| {
-                            if overflow {
-                                let color = window.text_style().color;
-                                let width = px(24.).min(bounds.size.width);
-                                window.paint_quad(fill(
-                                    Bounds::new(
-                                        point(bounds.right() - width, bounds.top()),
-                                        size(width, bounds.size.height),
-                                    ),
-                                    linear_gradient(
-                                        90.,
-                                        linear_color_stop(color.opacity(0.), 0.),
-                                        linear_color_stop(color, 1.),
-                                    ),
-                                ));
-                            }
-                        },
-                    )
-                    .size_full(),
-                ),
-        )
+    crate::overflow_fade::label(
+        label.replace(['\n', '\r'], " ").into(),
+        if on { theme.secondary } else { theme.background },
+        Some(("titlebar-tab", theme.secondary_hover)),
+    )
 }
 
 #[derive(PartialEq, Clone, Copy, Debug)]
