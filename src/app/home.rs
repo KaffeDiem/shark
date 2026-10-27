@@ -565,6 +565,7 @@ impl Shark {
         let modifiers = window.modifiers();
         let cmd_held = modifiers.platform && modifiers.number_of_modifiers() == 1;
         side_row(theme)
+            .text_color(theme.sidebar_foreground)
             .id("home-row")
             .when(rail, super::sidebar::rail_button)
             .map(|d| cursor_row(d, self.home_shown(), false, false, theme))
@@ -576,7 +577,7 @@ impl Shark {
                     kbd("cmd-0")
                         .appearance(false)
                         .text_xs()
-                        .text_color(theme.muted_foreground),
+                        .text_color(theme.sidebar_foreground),
                 )
             })
             .when(rail, |d| {

@@ -6,11 +6,12 @@ Palettes marked "codigrate" are from github.com/codigrate/figma-color-palettes (
 each codigrate theme ships one appearance, so the other mode is a sibling theme or derived here.
 """
 import json
+import math
 import pathlib
 import sys
 
 sys.path.insert(0, str(pathlib.Path(__file__).parent))
-from contrast import apca  # noqa: E402
+from contrast import apca, wcag  # noqa: E402
 
 KEYS = "sidebar background border foreground muted_fg secondary muted primary link danger success warning".split()
 # name: (dark palette, light palette, sources)
@@ -52,14 +53,25 @@ def mix(a, b, t):
     return hexa([x + (y - x) * t for x, y in zip(rgb(a), rgb(b))])
 
 
-def lift(fg, bgs, floor, dark):
+def lift(fg, bgs, floor, dark, contrast=apca):
     """Moves `fg` toward white (dark) or black (light) until it reaches `floor` on every bg."""
     target = "#f4f4f5" if dark else "#000000"  # no pure white on near-black
     for i in range(101):
         c = mix(fg, target, i / 100)
-        if min(apca(c, b) for b in bgs) >= floor:
+        if min(contrast(c, b) for b in bgs) >= floor:
             return c
     return target
+
+
+def navigation_surfaces(sidebar, fg, accent, dark):
+    surfaces = [sidebar, accent]
+    # Round toward lower contrast so fractional GPU blends also meet the floor.
+    rounding = math.ceil if dark else math.floor
+    for t in ((0.07, 0.11) if dark else (0.03, 0.05)):
+        surfaces.append(hexa([
+            rounding(x + (y - x) * t) for x, y in zip(rgb(sidebar), rgb(fg))
+        ]))
+    return surfaces
 
 
 def build(name, mode, pal):
@@ -117,7 +129,10 @@ def build(name, mode, pal):
         "list.even.background": p["background"],
         "list.head.background": p["background"],
         "sidebar.background": p["sidebar"],
-        "sidebar.foreground": fg,
+        "sidebar.foreground": lift(
+            mix(mfg, p["sidebar"], 0.3),
+            navigation_surfaces(p["sidebar"], fg, sidebar_accent, dark), 4.5, dark, wcag,
+        ),
         "sidebar.border": p["sidebar"],
         "sidebar.accent.background": sidebar_accent,
         "sidebar.accent.foreground": fg,
@@ -176,3 +191,14 @@ if __name__ == "__main__":
         }
         (out / f"{name.lower()}.json").write_text(json.dumps(doc, indent=2) + "\n")
         print("wrote", f"{name.lower()}.json")
+
+    for path in sorted(out.glob("*.json")):
+        for theme in json.loads(path.read_text())["themes"]:
+            c = theme["colors"]
+            dark = theme["mode"] == "dark"
+            surfaces = navigation_surfaces(
+                c["sidebar.background"], c["foreground"], c["sidebar.accent.background"], dark,
+            )
+            lowest = min(wcag(c["sidebar.foreground"], bg) for bg in surfaces)
+            assert lowest >= 4.5, f"{theme['name']}: navigation contrast {lowest:.2f}:1 < 4.5:1"
+            print(f"{theme['name']}: navigation minimum {lowest:.2f}:1")

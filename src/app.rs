@@ -779,6 +779,7 @@ impl Shark {
             },
             "Toggle sidebar (cmd-b)",
         )
+        .text_color(cx.theme().sidebar_foreground)
         .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
     }
 
@@ -788,6 +789,7 @@ impl Shark {
             IconName::SquarePen,
             "New workspace (cmd-n)",
         )
+        .text_color(cx.theme().sidebar_foreground)
         .on_click(cx.listener(|this, _, window, cx| {
             this.new_workspace(this.state.last_repos.clone(), None, window, cx)
         }))

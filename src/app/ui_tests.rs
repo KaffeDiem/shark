@@ -12,6 +12,7 @@ mod audit_tests;
 pub(crate) mod chrome_tests;
 mod file_changes_tests;
 mod menu_pixels;
+mod navigation_pixels;
 mod storage_tests;
 mod tab_tests;
 

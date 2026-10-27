@@ -564,16 +564,24 @@ impl Shark {
         let rail = self.rail;
         // 16px icons; the rail is 32px icon buttons, 16 apart.
         let isz = px(16.);
-        let header = |t: &'static str| side_header(theme, t).when(rail, |d| d.hidden());
+        let header = |t: &'static str| {
+            side_header(theme, t)
+                .text_color(theme.sidebar_foreground)
+                .when(rail, |d| d.hidden())
+        };
         let hint = |t: &'static str| {
             div()
                 .when(rail, |d| d.hidden())
                 .px_4()
                 .text_xs()
-                .text_color(faint(theme))
+                .text_color(theme.sidebar_foreground)
                 .child(t)
         };
-        let row = || side_row(theme).when(rail, rail_button);
+        let row = || {
+            side_row(theme)
+                .text_color(theme.sidebar_foreground)
+                .when(rail, rail_button)
+        };
         let m = window.modifiers();
         let cmd_held = m.platform && m.number_of_modifiers() == 1;
         let repos = self.state.repos.iter().enumerate().map(|(ix, r)| {
@@ -581,6 +589,7 @@ impl Shark {
             let tip: SharedString = name.clone().into();
             row()
                 .id(("repo", ix))
+                .test_support()
                 .hover(|d| d.bg(side_hover(theme)))
                 .child(Icon::new(IconName::FolderGit2).with_size(isz))
                 .when(!rail, |d| d.child(div().truncate().child(r.name.clone())))
@@ -665,16 +674,24 @@ impl Shark {
             let running = self.running_chats(&w.name, cx);
             let busy = running > 0;
             let selected = self.sel == SideRow::Ws(ix);
-            let active = self.active.as_ref() == Some(&w.name);
+            let active = !self.home_shown() && self.active.as_ref() == Some(&w.name);
+            let bright = active || (selected && focused);
+            let foreground = if bright {
+                theme.foreground
+            } else {
+                theme.sidebar_foreground
+            };
             let attn = self.attention_of(&w.name, cx);
             let nth = order.iter().position(|&o| o == ix).filter(|&n| n < 9);
             let ws = w.clone();
             row()
                 .id(ix)
+                .test_support()
                 // The rail shows only the icon, so rows keep the one-line height there.
                 .when(!rail, |d| d.h(px(44.)))
                 .when(section.is_some() && !rail, |d| d.ml(px(24.)))
                 .map(|d| cursor_row(d, active, selected, focused, theme))
+                .text_color(foreground)
                 // The cursor moves on press, not release: a held or dragged row is the one ringed.
                 .on_mouse_down(
                     MouseButton::Left,
@@ -714,7 +731,7 @@ impl Shark {
                         let (icon, color) = match &attn {
                             Attn::Needs(_) => (IconName::CircleAlert, theme.warning_foreground),
                             Attn::Unread => (IconName::CircleCheck, theme.success_foreground),
-                            Attn::None => (IconName::CircleDashed, theme.muted_foreground),
+                            Attn::None => (IconName::CircleDashed, foreground),
                         };
                         Icon::new(icon)
                             .with_size(isz)
@@ -737,7 +754,11 @@ impl Shark {
                                 div()
                                     .truncate()
                                     .text_xs()
-                                    .text_color(theme.muted_foreground)
+                                    .text_color(if bright {
+                                        theme.muted_foreground
+                                    } else {
+                                        theme.sidebar_foreground
+                                    })
                                     .child({
                                         let repos = (w.repos.iter())
                                             .map(|r| r.name.as_str())
@@ -795,7 +816,9 @@ impl Shark {
                         .any(|n| matches!(self.attention_of(n, cx), Attn::Needs(_)));
                 row()
                     .id(("section", i))
+                    .test_support()
                     .map(|d| cursor_row(d, false, selected, focused, theme))
+                    .when(selected && focused, |d| d.text_color(theme.foreground))
                     .drag_over::<DraggedWs>(move |d, _, _, _| d.bg(accent).border_color(primary))
                     .on_drop(drop_on(Some(i)))
                     .on_drag(DraggedSection(i, sec.name.clone().into()), |d, _, _, cx| {
@@ -849,7 +872,10 @@ impl Shark {
             };
         let name_row = |input: &Entity<InputState>, icon: IconName| {
             row()
+                .id("section-name")
+                .test_support()
                 .key_context("SectionName")
+                .text_color(theme.foreground)
                 .border_1()
                 .border_color(theme.primary)
                 .bg(side_on(theme))
@@ -936,6 +962,7 @@ impl Shark {
                         .child(
                             Button::new("new-section")
                                 .ghost()
+                                .text_color(theme.sidebar_foreground)
                                 .xsmall()
                                 .icon(IconName::FolderPlus)
                                 .tooltip("New section")
@@ -962,6 +989,7 @@ impl Shark {
                         .child(
                             Button::new("add-repo")
                                 .ghost()
+                                .text_color(theme.sidebar_foreground)
                                 .xsmall()
                                 .icon(IconName::Plus)
                                 .tooltip("Add repo, or drop folders here")

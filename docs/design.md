@@ -22,6 +22,7 @@ Read this before adding or changing UI. Shark's look is modeled on Linear: a cal
 | `background` | `#121213` | `#f9f9fa` | The content island |
 | `border` | `#232426` | `#dedede` | Island edge, header divider, cards. Use sparingly |
 | `foreground` | `#e8e9eb` | `#2f2f31` | Body text, titles, active tab label |
+| `sidebar_foreground` | `#8f8f91` | `#656567` | Inactive left-navigation labels, metadata, headers and ordinary icons, expanded or rail |
 | `muted_foreground` | `#c8c8cb` | `#535355` | Secondary text people read: section headers, tool summaries, metadata, repo names |
 | `faint(theme)` | `#7f7f81` | `#959597` | `muted_foreground` 60% over `background`. Hints (empty-state hints) and idle/decorative icons only. Never information |
 | `side_hover(theme)` | `#19191a` | `#e9e9ea` | `foreground` 7% (dark) / 3% (light) over `sidebar`. Row hover in both side panes |
@@ -39,7 +40,7 @@ Read this before adding or changing UI. Shark's look is modeled on Linear: a cal
 | `link` | `#a8b1ff` | `#4061da` | Links in markdown |
 
 ### Contrast rules
-Measure APCA (Lc) against **every surface the text can sit on**, including hover and selected rows (`background`, `sidebar`, `secondary`, `muted`, `list_active`, `list_hover`, `sidebar_accent`, `side_hover`, `side_on`):
+Except for dimmed left navigation, measure APCA (Lc) against **every surface the text can sit on**, including hover and selected rows (`background`, `sidebar`, `secondary`, `muted`, `list_active`, `list_hover`, `sidebar_accent`, `side_hover`, `side_on`):
 
 | Text | Minimum | Current lowest |
 |---|---|---|
@@ -47,6 +48,10 @@ Measure APCA (Lc) against **every surface the text can sit on**, including hover
 | Any other readable text: labels, metadata, `muted_foreground`, text in selected/hover rows | Lc 70 | 71.0 dark, 71.4 light |
 | Status text and links | Lc 60 | 61.0 dark, 60.1 light |
 | Hints (`faint`), never essential | Lc 30 | 33.0 dark, 38.5 light |
+
+Left navigation uses `sidebar_foreground` at **WCAG 2 contrast ≥ 4.5:1** on normal, hover, selected and drop-target backgrounds. Generated themes blend `muted_foreground` 30% toward `sidebar`, then raise contrast to that floor. `python3 docs/themes.py` validates every theme, including Linear. This exception does not change the APCA rules elsewhere, including the right pane.
+
+The displayed destination (Home or workspace) and keyboard-focused cursor rows use `foreground` for labels and ordinary icons; active/focused workspace metadata keeps `muted_foreground`. The cursor retains its focus ring, hover keeps its background, and inline naming fields use full foreground. Warning/unread icons and running spinners keep their status colors. Apply foreground colors locally, never whole-row opacity or shared side-row defaults.
 
 Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pure white on near-black, and no font weight below 400.
 
