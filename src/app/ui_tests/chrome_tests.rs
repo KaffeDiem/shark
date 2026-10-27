@@ -1,7 +1,7 @@
 use super::*;
 use gpui_kit::test::TestEventExt;
 
-/// Both themes keep compact Home chrome and align pane toggles at either window width.
+/// Both themes keep compact Home chrome and a fixed Features rail at either width.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn sidebar_chrome_themes(cx: &mut TestAppContext) {
@@ -49,6 +49,7 @@ async fn sidebar_chrome_themes(cx: &mut TestAppContext) {
             for rail in [false, true] {
                 for tree in [false, true] {
                     on(cx, &|s, w, cx| {
+                        s.show(Tab::Diff, w, cx);
                         if s.rail != rail {
                             s.toggle_sidebar(cx);
                         }
@@ -59,11 +60,22 @@ async fn sidebar_chrome_themes(cx: &mut TestAppContext) {
                     cx.update_window(window, |_, w, cx| {
                         w.render_frame(cx);
                         let left = w.find("toggle-sidebar").bounds();
-                        let right_id = if tree { "hide-tree" } else { "show-tree" };
-                        let right = w.find(right_id);
+                        let right = w.find("features-rail");
                         assert!(right.visible(), "{label}, width={width}, rail={rail}");
-                        assert_eq!(right.bounds().top(), left.top());
-                        assert_eq!(right.bounds().size.height, left.size.height);
+                        assert_eq!(right.bounds().size.width, px(72.));
+                        assert!(w.find("feature-differ").visible());
+                        assert!(w.try_find("show-tree").is_none());
+                        assert!(w.try_find("hide-tree").is_none());
+                        assert!(w.try_find("tools-diff").is_none());
+                        assert_eq!(w.try_find("file-tree").is_some(), tree);
+                        if tree {
+                            let files = w.find("file-tree").bounds();
+                            let island = w.find("content-island").bounds();
+                            assert!(files.left() >= island.left());
+                            assert!(files.right() <= island.right());
+                            assert!(files.top() >= island.top());
+                            assert!(files.bottom() <= island.bottom());
+                        }
                         assert_eq!(left.top(), px(8.));
                         let commands = w.find("commands");
                         assert!(commands.visible());
@@ -358,6 +370,7 @@ pub(crate) fn render_pixels() {
     super::workspace_picker_tests::render_pixels(&mut cx);
     super::navigation_pixels::render_pixels(&mut cx);
     super::tree_pixels::render_pixels(&mut cx);
+    super::tree_pixels::render_artifact_pixels(&mut cx);
 }
 
 /// Render the real Shark overlay, including scrolling the last app into a narrow window.

@@ -41,6 +41,9 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         chats: vec![ChatMeta { id: name.into(), ..Default::default() }],
                         ..Default::default()
                     }).to_vec();
+                for ws in &mut s.state.workspaces {
+                    ws.normalize_tabs();
+                }
                 s.state.repos = vec![Repo { name: "api".into(), path: home.join("api") }];
                 s.state.sections = vec![Section {
                     name: "Projects".into(), icon: "folder".into(), collapsed: false,

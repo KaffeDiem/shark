@@ -272,10 +272,9 @@ impl Shark {
         let n = s.rows.len();
         let sheet = v_flex()
             .id("review-sheet")
-            .absolute()
-            .right(px(16.))
-            .bottom(px(48.))
+            .test_support()
             .w(px(500.))
+            .max_w_full()
             .rounded(theme.radius_lg)
             .border_1()
             .border_color(theme.border)
@@ -445,10 +444,14 @@ impl Shark {
             );
         // The diff dims behind it; a click there closes it.
         Some(
-            div()
+            h_flex()
                 .id("review-sheet-backdrop")
                 .absolute()
                 .inset_0()
+                .px_4()
+                .pb(px(48.))
+                .items_end()
+                .justify_end()
                 .bg(theme.overlay)
                 .occlude() // clicks and scrolls stop here, not in the diff
                 .on_mouse_down(

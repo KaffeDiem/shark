@@ -8,13 +8,124 @@ impl Render for TreePreview {
     fn render(&mut self, w: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
-            .bg(cx.theme().sidebar)
+            .bg(cx.theme().background)
             .font_features(inter_features())
             .child(
                 self.0
                     .update(cx, |s, cx| s.render_tree(w, cx).into_any_element()),
             )
     }
+}
+
+/// Full production layout, including Diff content, without constructing an AI chat.
+pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    for (mode, label) in [
+        (crate::state::Mode::Dark, "dark"),
+        (crate::state::Mode::Light, "light"),
+    ] {
+        for width in [800., 1440.] {
+            let mut state = State::default();
+            state.appearance.mode = mode;
+            state.save().unwrap();
+            let (window, shark) = cx.update(|cx| {
+                gpui_kit::open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                            point(px(0.), px(0.)), size(px(width), px(720.)),
+                        ))),
+                        focus: false,
+                        show: false,
+                        ..Default::default()
+                    },
+                    cx,
+                    |w, cx| cx.new(|cx| Shark::new(w, cx)),
+                )
+            }).unwrap();
+            cx.update_window(window, |_, w, cx| {
+                shark.update(cx, |s, cx| {
+                    let mut ws = Workspace {
+                        name: "Features and artifacts".into(),
+                        branch: "ui-improv".into(),
+                        repos: vec![crate::state::WsRepo {
+                            name: "shark".into(), src: home.join("shark"),
+                            base: "main".into(), branch: None,
+                        }],
+                        chats: vec![ChatMeta { id: "layout-chat".into(), ..Default::default() }],
+                        diff_closed: false,
+                        ..Default::default()
+                    };
+                    ws.normalize_tabs();
+                    s.active = Some(ws.name.clone());
+                    s.state.workspaces = vec![ws];
+                    s.home.on = false;
+                    s.tab = Tab::Diff;
+                    s.sel = SideRow::Ws(0);
+                    s.show_tree = true;
+                    s.diff_files = DiffFile::parse(concat!(
+                        "diff --git a/shark/src/main.rs b/shark/src/main.rs\n",
+                        "--- a/shark/src/main.rs\n+++ b/shark/src/main.rs\n",
+                        "@@ -1,3 +1,3 @@\n fn main() {\n",
+                        "-    println!(\"Hello\");\n+    println!(\"Shark\");\n }\n",
+                        "diff --git a/shark/README.md b/shark/README.md\n",
+                        "--- a/shark/README.md\n+++ b/shark/README.md\n",
+                        "@@ -1 +1 @@\n-Workspace tools\n+Features open artifact tabs.\n",
+                    )).unwrap();
+                    s.diff_fps = vec![1; s.diff_files.len()];
+                    s.diff_loaded = true;
+                    s.diff.update(cx, |d, cx| d.set_files(s.diff_files.clone(), cx));
+                    s.rebuild_tree();
+                    s.diff.read(cx).focus_handle(cx).focus(w, cx);
+                    assert!(s.chats.is_empty() && s.active_chat().is_none());
+                    cx.notify();
+                });
+                w.pointer_move(point(px(width - 1.), px(719.)), None, cx);
+                w.render_frame(cx);
+            }).unwrap();
+            cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                let rail = w.find("features-rail").bounds();
+                let island = w.find("content-island").bounds();
+                let files = w.find("file-tree").bounds();
+                assert_eq!(rail.size.width, px(72.));
+                assert_eq!(rail.right(), px(width));
+                assert!(w.find("feature-differ").visible());
+                assert!(w.find("diff-tab").visible());
+                assert!(w.find("file-tree").visible());
+                assert!(files.left() >= island.left() && files.right() <= island.right());
+                assert!(files.top() >= island.top() && files.bottom() <= island.bottom());
+                assert!(files.left() - island.left() > px(100.), "room for diff content");
+                assert!(island.right() <= rail.left());
+                assert!(w.try_find("show-tree").is_none());
+                assert!(w.try_find("hide-tree").is_none());
+                assert!(shark.read(cx).active_chat().is_none());
+            }).unwrap();
+            let screenshot = cx.capture_screenshot(window).expect("full Diff artifact renderer");
+            if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
+                let dir = PathBuf::from(dir);
+                fs::create_dir_all(&dir).unwrap();
+                screenshot.save(dir.join(format!("artifact-{label}-{}.png", width as usize))).unwrap();
+            }
+            // Review is an artifact overlay, so a narrow diff column cannot clip it.
+            cx.update_window(window, |_, w, cx| {
+                shark.update(cx, |s, cx| {
+                    let comment = serde_json::from_str(r#"{"id":1,"path":"shark/src/main.rs","start":[false,2],"end":[false,2],"text":"Use the app name","status":"Pending"}"#).unwrap();
+                    s.edit_comments(cx, |comments| comments.push(comment));
+                    s.open_sheet(w, cx);
+                });
+                w.render_frame(cx);
+                let island = w.find("content-island").bounds();
+                let sheet = w.find("review-sheet").bounds();
+                let send = w.find("sheet-send").bounds();
+                assert!(sheet.left() >= island.left() && sheet.right() <= island.right());
+                assert!(send.left() >= sheet.left() && send.right() <= sheet.right());
+            }).unwrap();
+            cx.update_window(window, |_, w, _| w.remove_window()).unwrap();
+        }
+    }
+    fs::remove_dir_all(&home).ok();
+    println!("Diff artifact: dark/light at 800/1440px, fixed Features rail and internal tree passed");
 }
 
 pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
@@ -175,11 +286,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             }
                         }
                         if row.file.is_none() {
-                            let color = if focused {
-                                theme.foreground
-                            } else {
-                                theme.sidebar_foreground
-                            };
+                            let color = theme.foreground;
                             checks.push(("folder label", label, color));
                             checks.push((
                                 "folder chevron",
@@ -203,7 +310,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 checks.push((
                                     "compact prefix",
                                     Bounds::new(label.origin, size(px(24.), label.size.height)),
-                                    theme.sidebar_foreground,
+                                    theme.foreground,
                                 ));
                                 checks.push((
                                     "filename",

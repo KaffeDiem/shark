@@ -40,6 +40,7 @@ mod app_switcher;
 mod chats;
 mod diff;
 mod editor_pane;
+mod features;
 mod file_changes;
 mod home;
 mod inline_edit;
@@ -292,6 +293,7 @@ enum Pane {
     Diff,
     Editor,
     Tree,
+    Features,
     Home,
 }
 
@@ -333,7 +335,7 @@ pub struct Shark {
     /// The Files panel's "Filter files…" box, and its text the tree filters by.
     tree_filter: Entity<InputState>,
     tree_query: String,
-    /// The island | Files split, kept across tabs; its width also persists in `State`.
+    /// The Diff artifact's internal Files split; its width persists in `State`.
     tree_resize: Entity<ResizableState>,
     /// The sidebar | rest split, while the sidebar isn't a rail; persisted like Files.
     sidebar_resize: Entity<ResizableState>,
@@ -361,6 +363,7 @@ pub struct Shark {
     media_width: Rc<std::cell::Cell<Pixels>>,
     pub(crate) syncs: HashMap<String, Entity<GitSync>>,
     sidebar_focus: FocusHandle,
+    features_focus: FocusHandle,
     pub(crate) attn: crate::attention::Attention,
     /// The open right-click menu, dropped when it dismisses.
     menu: Option<(Entity<menu::Menu>, Subscription)>,
@@ -526,8 +529,8 @@ impl Shark {
             archiving: HashSet::new(),
             creating: HashSet::new(),
             adding_repos: HashSet::new(),
-            // Closed by default (design 01); Files N in the Changes bar opens it.
-            show_tree: false,
+            // Files starts open inside Diff; its toolbar can hide it for more review space.
+            show_tree: true,
             rail: false,
             editor: None,
             file_tabs: vec![],
@@ -538,6 +541,7 @@ impl Shark {
             media_width: Rc::default(),
             syncs: HashMap::new(),
             sidebar_focus,
+            features_focus: cx.focus_handle(),
             attn: crate::attention::Attention::new(cx),
             menu: None,
             app_switcher: None,
@@ -687,10 +691,15 @@ impl Shark {
     }
 
     fn toggle_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab != Tab::Diff || self.home_shown() {
+            return;
+        }
         self.show_tree = !self.show_tree;
-        if !self.show_tree && self.tree_focus.is_focused(window) {
-            let tab = self.tab;
-            self.show(tab, window, cx);
+        if !self.show_tree
+            && (self.tree_focus.is_focused(window)
+                || self.tree_filter.read(cx).focus_handle(cx).is_focused(window))
+        {
+            self.focus_diff(window, cx);
         }
         cx.notify();
     }
@@ -714,6 +723,9 @@ impl Shark {
         if self.tree_shown() {
             v.push(Pane::Tree);
         }
+        if self.right_rail_shown() {
+            v.push(Pane::Features);
+        }
         v
     }
 
@@ -721,8 +733,14 @@ impl Shark {
         if self.sidebar_focus.is_focused(window) {
             return Some(Pane::Sidebar);
         }
-        if self.tree_focus.is_focused(window) {
+        if self.tree_shown()
+            && (self.tree_focus.is_focused(window)
+                || self.tree_filter.read(cx).focus_handle(cx).is_focused(window))
+        {
             return Some(Pane::Tree);
+        }
+        if self.right_rail_shown() && self.features_focus.is_focused(window) {
+            return Some(Pane::Features);
         }
         if self.home_shown() {
             return self.home.has_focus(window, cx).then_some(Pane::Home);
@@ -754,7 +772,9 @@ impl Shark {
     fn focus_pane(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
         match pane {
             Pane::Sidebar => self.sidebar_focus.focus(window, cx),
-            Pane::Tree => self.tree_focus.focus(window, cx),
+            Pane::Tree if self.tree_shown() => self.tree_focus.focus(window, cx),
+            Pane::Tree => return,
+            Pane::Features => self.features_focus.focus(window, cx),
             Pane::Home => self.home.focus.focus(window, cx),
             Pane::Diff => self.diff.read(cx).focus_handle(cx).focus(window, cx),
             Pane::Chat => {
@@ -913,9 +933,9 @@ impl Shark {
     }
 
     fn render_main(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
-        let Some(chat) = self.active_chat().cloned().filter(|_| !self.home_shown()) else {
+        if self.home_shown() {
             return self.render_home(window, cx);
-        };
+        }
         let theme = cx.theme();
         v_flex()
             .flex_1()
@@ -949,7 +969,9 @@ impl Shark {
                 Tab::Chat => div()
                     .flex_1()
                     .min_h_0()
-                    .child(chat.cached(StyleRefinement::default().size_full()))
+                    .children(self.active_chat().map(|chat| {
+                        chat.clone().cached(StyleRefinement::default().size_full())
+                    }))
                     .into_any_element(),
                 Tab::File => h_flex()
                     .flex_1()
@@ -959,7 +981,7 @@ impl Shark {
                 Tab::Diff => h_flex()
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_diff(window, cx))
+                    .child(self.with_tree(self.render_diff(window, cx), window, cx))
                     .into_any_element(),
             })
             .into_any_element()
@@ -1069,13 +1091,21 @@ impl Shark {
 
 impl Render for Shark {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        // Toasts clear the titlebar and toolbar, and sit left of the right pane's controls.
-        let side = match () {
-            _ if self.tree_shown() => (self.tree_resize.read(cx).sizes().get(1).copied())
-                .unwrap_or(px(self.state.tree_width.unwrap_or(244.))),
-            _ if self.right_rail_shown() => px(72.),
-            _ => px(0.),
+        // Toasts clear the toolbar, Features rail, and visible Files controls.
+        let mut side = if self.right_rail_shown() {
+            px(72.)
+        } else {
+            px(0.)
         };
+        if self.tree_shown() {
+            side += self
+                .tree_resize
+                .read(cx)
+                .sizes()
+                .get(1)
+                .copied()
+                .unwrap_or(px(self.state.tree_width.unwrap_or(244.)));
+        }
         if cx.theme().notification.margins.right != side + px(16.)
             || cx.theme().notification.margins.top != px(104.)
         {
@@ -1251,7 +1281,9 @@ impl Render for Shark {
                             .test_support(),
                     );
                 let main = v_flex()
-                    .size_full()
+                    .h_full()
+                    .flex_1()
+                    .min_w_0()
                     .child(self.render_titlebar(window, cx))
                     .when(!self.unsaved_data(cx).is_empty(), |d| {
                         d.child(
@@ -1273,7 +1305,14 @@ impl Render for Shark {
                         )
                     })
                     .child(island);
-                let main = self.with_tree(main, window, cx).into_any_element();
+                let main = h_flex()
+                    .size_full()
+                    .min_w_0()
+                    .child(main)
+                    .when(self.right_rail_shown(), |d| {
+                        d.child(self.render_features(window, cx))
+                    })
+                    .into_any_element();
                 let main = self.interaction_content(main, cx);
                 let sidebar = self.render_sidebar(window, cx).into_any_element();
                 match self.rail {

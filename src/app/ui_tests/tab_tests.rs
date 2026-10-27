@@ -248,7 +248,8 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
     on(cx, &|s, w, cx| s.toggle_tree(w, cx));
     press(cx, &["escape"]);
     cx.update_window(window, |_, w, cx| {
-        assert!(shark.read(cx).tree_focus.is_focused(w))
+        assert!(shark.read(cx).sidebar_focus.is_focused(w));
+        assert!(!shark.read(cx).tree_shown());
     })
     .unwrap();
     // Chat selection, creation, cycling and reopening always reveal and focus the composer.
@@ -458,9 +459,9 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
         w.change_modifiers(Modifiers::default(), cx)
     })
     .unwrap();
-    // Both forms of Workspace tools explicitly reopen and save Diff.
-    for expanded in [false, true] {
-        on(cx, &|s, _, _| s.show_tree = expanded);
+    // Differ reopens the same artifact with either internal tree preference.
+    for tree in [false, true] {
+        on(cx, &|s, _, _| s.show_tree = tree);
         // Open, click again, then refocus the existing tab from Chat.
         for from_chat in [false, false, true] {
             if from_chat {
@@ -468,7 +469,7 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
             }
             cx.update_window(window, |_, w, cx| {
                 w.render_frame(cx);
-                w.click(if expanded { "tools-diff" } else { "rail-diff" }, cx);
+                w.click("feature-differ", cx);
             })
             .unwrap();
             cx.run_until_parked();

@@ -273,6 +273,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("pagedown", PageDown, Some(ARROWS)),
         KeyBinding::new("pageup", PageUp, Some(ARROWS)),
         KeyBinding::new("enter", Confirm, Some(LIST)),
+        KeyBinding::new("enter", Confirm, Some("Features")),
         KeyBinding::new("o", Confirm, Some("Transcript")),
         KeyBinding::new("y", CopySelected, Some("Transcript || PlanPane")),
         KeyBinding::new("i", FocusComposer, Some("Transcript")),

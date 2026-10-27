@@ -37,8 +37,7 @@ end tell" >/dev/null
 }
 shot() { screencapture -o -x -l "$(win)" "$D/$1" && sips -Z 1600 "$D/$1" --out "$out/$1" >/dev/null; }
 
-key 'keystroke "d"' "command down, shift down" # diff
-key 'keystroke "b"' "command down, option down" # Workspace tools
+key 'keystroke "d"' "command down, shift down" # Diff artifact; its file tree is shown by default
 sleep 2 # git status and the diff
 shot hero.png
 key 'keystroke "p"' "command down"
@@ -50,7 +49,6 @@ key 'keystroke "k"' "command down"
 shot palette.png
 key 'key code 53'
 key 'key code 53'
-key 'keystroke "b"' "command down, option down"
 key 'keystroke "2"' "command down" # eng-118, its plan opens
 key 'keystroke "b"' "command down" # leave room for the plan actions
 shot plan-versions.png

@@ -465,8 +465,6 @@ impl Shark {
             s.refresh_diff(cx);
             if s.tab == Tab::Diff {
                 s.focus_diff(window, cx);
-            } else {
-                s.tree_focus.focus(window, cx);
             }
             cx.notify();
         });
@@ -489,16 +487,12 @@ impl Shark {
             .collect()
     }
 
-    /// The right side: Workspace tools expanded, else the rail. Beside every tab, not Home.
+    /// Files belongs only to the active Diff artifact.
     pub(super) fn tree_shown(&self) -> bool {
-        self.show_tree && self.active.is_some() && !self.home_shown()
+        self.show_tree && self.tab == Tab::Diff && self.active.is_some() && !self.home_shown()
     }
 
-    pub(super) fn right_rail_shown(&self) -> bool {
-        !self.show_tree && self.active.is_some() && !self.home_shown()
-    }
-
-    /// `main` with the resizable Files panel on its right, or the rail; the width persists.
+    /// The Diff artifact's internal split; the outer Features rail never resizes.
     pub(super) fn with_tree(
         &self,
         main: impl IntoElement,
@@ -507,105 +501,27 @@ impl Shark {
     ) -> impl IntoElement {
         let shown = self.tree_shown();
         let width = px(self.state.tree_width.unwrap_or(244.));
-        h_flex()
+        v_flex()
+            .relative()
             .flex_1()
             .min_w_0()
             .h_full()
+            .child(self.render_changes_bar(cx))
             .child(
-                div().flex_1().min_w_0().h_full().child(
-                    h_resizable("files-panel")
-                        .with_state(&self.tree_resize)
-                        .with_handle_appearance(super::quiet_edge())
-                        .child(resizable_panel().min_w_0().child(main))
-                        .child(
-                            resizable_panel()
-                                .visible(shown)
-                                .size(width)
-                                .size_range(px(200.)..px(560.))
-                                .fixed()
-                                .when(shown, |p| p.child(self.render_tree(window, cx))),
-                        ),
-                ),
-            )
-            .when(self.right_rail_shown(), |d| {
-                d.child(self.render_right_rail(cx))
-            })
-    }
-
-    /// The collapsed right side, the left rail's mirror: expand, then Diff.
-    fn render_right_rail(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let (n, viewed) = (self.diff_files.len(), self.viewed_now.len());
-        // What the Changes tab used to say, for the tooltip.
-        let tip: SharedString = match n {
-            _ if self.diff_error.is_some() => "Diff (cmd-shift-d) · could not load".into(),
-            _ if !self.diff_loaded => "Diff (cmd-shift-d)".into(),
-            0 => "Diff (cmd-shift-d) · no changes".into(),
-            n => format!("Diff (cmd-shift-d) · {viewed}/{n} viewed").into(),
-        };
-        let item = |id: &'static str, icon: IconName, on: bool| {
-            super::sidebar::rail_button(div().id(id).relative().flex().items_center())
-                .text_color(theme.muted_foreground)
-                .map(|d| cursor_row(d, on, false, false, theme))
-                .child(Icon::new(icon).with_size(px(16.)))
-        };
-        // A dot while files wait for review; amber when git failed.
-        let badge = match () {
-            _ if self.diff_error.is_some() => Some(theme.warning_foreground),
-            _ if self.diff_loaded && viewed < n => Some(theme.primary),
-            _ => None,
-        };
-        v_flex()
-            .id("right-rail")
-            .w(px(72.))
-            .h_full()
-            .flex_none()
-            .items_center()
-            .child(
-                h_flex()
-                    .h(px(44.))
-                    .w_full()
-                    .flex_none()
+                h_resizable("files-panel")
+                    .with_state(&self.tree_resize)
+                    .with_handle_appearance(super::quiet_edge())
+                    .child(resizable_panel().min_w_0().child(main))
                     .child(
-                        div()
-                            .id("tools-rail-left")
-                            .flex_1()
-                            .h_full()
-                            .map(|d| self.draggable_chrome("tools-rail-left", d)),
-                    )
-                    .child(
-                        side_toggle(
-                            "show-tree",
-                            IconName::PanelRightOpen,
-                            "Show workspace tools (cmd-alt-b)",
-                        )
-                        .on_click(cx.listener(|this, _, w, cx| this.toggle_tree(w, cx))),
-                    )
-                    .child(
-                        div()
-                            .id("tools-rail-right")
-                            .flex_1()
-                            .h_full()
-                            .map(|d| self.draggable_chrome("tools-rail-right", d)),
+                        resizable_panel()
+                            .visible(shown)
+                            .size(width)
+                            .size_range(px(200.)..px(560.))
+                            .fixed()
+                            .when(shown, |p| p.child(self.render_tree(window, cx))),
                     ),
             )
-            .child(
-                v_flex().pt(px(16.)).child(
-                    item("rail-diff", IconName::FileDiff, self.tab == Tab::Diff)
-                        .when_some(badge, |d, c| d.child(super::chats::dot(6., theme).bg(c)))
-                        .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
-                        .on_click(cx.listener(|this, _, w, cx| this.show(Tab::Diff, w, cx)))
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(|this, e: &MouseDownEvent, w, cx| {
-                                let entries = this.changes_menu(cx);
-                                this.show_menu(e.position, entries, w, cx);
-                            }),
-                        )
-                        .test_support(),
-                ),
-            )
-            .test_support()
+            .children(self.render_sheet(window, cx))
     }
 
     /// Puts the tree cursor on file `ix`'s row, when it has one (not inside a folded folder).
@@ -662,26 +578,18 @@ impl Shark {
         cx.notify();
     }
 
-    /// Enter / click on a tree row: toggle a folder, show a file (in the diff, or the editor
-    /// when one is open).
-    fn tree_confirm(&mut self, row: usize, window: &mut Window, cx: &mut Context<Self>) {
+    /// Enter / click on a tree row: toggle a folder or show its file in Diff.
+    fn tree_confirm(&mut self, row: usize, _window: &mut Window, cx: &mut Context<Self>) {
         self.tree_select(row, cx);
-        match self.tree_rows.get(row).and_then(|r| r.file) {
-            None => self.set_dir_open(None, cx),
-            Some(ix) if self.tab == Tab::File => self.open_file(ix, window, cx),
-            // Beside the chat, a file shows in the diff.
-            Some(_) if self.tab == Tab::Chat => {
-                self.show(Tab::Diff, window, cx);
-                self.tree_select(row, cx);
-            }
-            Some(_) => {}
+        if self.tree_rows.get(row).is_some_and(|r| r.file.is_none()) {
+            self.set_dir_open(None, cx);
         }
     }
 
     /// The file a row action applies to: the tree cursor in the tree, the open file in the file
     /// view, else the file last moved to in the diff.
     pub(super) fn cursor_file(&self, window: &Window, cx: &App) -> Option<usize> {
-        if self.tree_focus.is_focused(window) {
+        if self.tree_shown() && self.tree_focus.is_focused(window) {
             return self.tree_rows.get(self.tree_sel)?.file;
         }
         if self.tab == Tab::File
@@ -742,7 +650,7 @@ impl Shark {
         )
     }
 
-    pub(super) fn render_diff(&self, window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(super) fn render_diff(&self, _window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let viewed = self.viewed_now.clone();
         let shark = cx.entity().downgrade();
         let placeholder = self.diff_placeholder(cx);
@@ -854,14 +762,13 @@ impl Shark {
             .flex_1()
             .min_w_0()
             .h_full()
-            .child(self.render_changes_bar(cx))
+            .overflow_hidden()
             .child(pane)
             .children(self.render_orphans(cx))
             // One bottom bar: in edit mode it says what editing is doing.
             .when(!empty, |d| {
                 d.child(self.render_review_bar(status.map(Into::into), cx))
             })
-            .children(self.render_sheet(window, cx))
             .into_any_element()
     }
 
@@ -902,9 +809,11 @@ impl Shark {
         let (base, adds, dels) = self.changes_stats();
         let n = self.diff_files.len();
         h_flex()
-            .h(px(48.))
+            .min_h(px(48.))
+            .flex_wrap()
             .flex_none()
             .px(px(16.))
+            .py_2()
             .gap(px(12.))
             .border_b_1()
             .border_color(theme.border)
@@ -971,7 +880,7 @@ impl Shark {
                     .outline()
                     .selected(self.show_tree)
                     .label(format!("Files {n}"))
-                    .tooltip("Workspace tools (cmd-alt-b)")
+                    .tooltip("Show or hide diff files (cmd-alt-b)")
                     .on_click(cx.listener(|this, _, w, cx| this.toggle_tree(w, cx))),
             )
     }
@@ -1011,35 +920,9 @@ impl Shark {
         let (muted, fg, hint) = (theme.muted_foreground, theme.foreground, faint(theme));
         let focused = self.tree_focus.is_focused(window);
         let n = self.diff_files.len();
-        // The pane's 8px inset stands in for the row margin, so labels sit 16px in.
-        let nav = |id: &'static str, icon: IconName, label: &'static str, on: bool| {
-            side_row(theme)
-                .id(id)
-                .test_support()
-                .mx_0()
-                .map(|d| cursor_row(d, on, false, false, theme))
-                .child(Icon::new(icon).with_size(px(16.)).text_color(muted))
-                .child(div().flex_1().child(label))
-        };
-        let tools = v_flex().flex_none().child(
-            nav(
-                "tools-diff",
-                IconName::FileDiff,
-                "Diff",
-                self.tab == Tab::Diff,
-            )
-            .child(div().text_xs().text_color(muted).child(n.to_string()))
-            .on_click(cx.listener(|this, _, w, cx| this.show(Tab::Diff, w, cx)))
-            .on_mouse_down(
-                MouseButton::Right,
-                cx.listener(|this, e: &MouseDownEvent, w, cx| {
-                    let entries = this.changes_menu(cx);
-                    this.show_menu(e.position, entries, w, cx);
-                }),
-            ),
-        );
         let tree = v_flex()
             .id("file-tree")
+            .test_support()
             .key_context("FileTree")
             .track_focus(&self.tree_focus)
             .flex_1()
@@ -1092,37 +975,12 @@ impl Shark {
                 .flex_1(),
             );
         // The filter sits outside `FileTree`, whose letter keys would eat its typing.
-        // Header, nav and Files 16 apart; 8 in from the sides.
         v_flex()
             .size_full()
             .px(px(8.))
+            .border_l_1()
+            .border_color(theme.border)
             .text_color(fg)
-            // The hide button sits where the rail's show button was.
-            .child(
-                h_flex()
-                    .h(px(44.))
-                    .flex_none()
-                    .mb(px(16.))
-                    .pl(px(8.))
-                    .pr(px(12.))
-                    .child(
-                        side_header(theme, "Workspace tools")
-                            .p_0()
-                            .flex_1()
-                            .h_full()
-                            .id("tools-header-empty")
-                            .map(|d| self.draggable_chrome("tools-header-empty", d)),
-                    )
-                    .child(
-                        side_toggle(
-                            "hide-tree",
-                            IconName::PanelRightClose,
-                            "Hide workspace tools (cmd-alt-b)",
-                        )
-                        .on_click(cx.listener(|this, _, w, cx| this.toggle_tree(w, cx))),
-                    ),
-            )
-            .child(tools)
             .child(
                 h_flex()
                     .flex_none()
@@ -1183,11 +1041,7 @@ impl Shark {
         let depth = r.depth;
         let next_depth = self.tree_rows.get(ix + 1).map_or(0, |r| r.depth);
         let guide = theme.border;
-        let folder_color = if selected && focused {
-            theme.foreground
-        } else {
-            theme.sidebar_foreground
-        };
+        let folder_color = theme.foreground;
         // `uniform_list` rows: no margin, so the 30px height is the pitch.
         let row = side_row(theme)
             .id(("tree-row", ix))
@@ -1197,7 +1051,7 @@ impl Shark {
             .mb_0()
             .pr_2()
             .pl(px(7. + 12. * r.depth as f32))
-            .map(|d| cursor_row(d, selected, selected, focused, theme))
+            .map(|d| list_cursor_row(d, selected, focused, theme))
             .on_click(cx.listener(move |this, e: &ClickEvent, w, cx| {
                 this.tree_focus.focus(w, cx);
                 match (
@@ -1312,7 +1166,7 @@ impl Shark {
                                 (
                                     0..slash + 1,
                                     HighlightStyle {
-                                        color: Some(theme.sidebar_foreground),
+                                        color: Some(theme.foreground),
                                         ..Default::default()
                                     },
                                 )
