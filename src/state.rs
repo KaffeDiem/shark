@@ -132,7 +132,7 @@ pub struct Repo {
     pub path: PathBuf,
 }
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Workspace {
     /// Last explicit user interaction, in Unix milliseconds; background work never updates it.
     #[serde(default)]
@@ -153,12 +153,34 @@ pub struct Workspace {
     pub closed: Vec<ChatMeta>,
     #[serde(default)]
     pub active_chat: usize,
-    /// Hidden until an explicit Diff action reopens it.
-    #[serde(default)]
+    /// Closed by default, until an explicit Diff action opens it.
+    #[serde(default = "diff_closed_by_default")]
     pub diff_closed: bool,
     /// Diff path -> fingerprint of its patch when marked viewed; a new patch makes it unviewed.
     #[serde(default)]
     pub viewed: HashMap<String, u64>,
+}
+
+fn diff_closed_by_default() -> bool {
+    true
+}
+
+impl Default for Workspace {
+    fn default() -> Self {
+        Self {
+            last_interacted_at: None,
+            name: String::new(),
+            branch: String::new(),
+            repos: Vec::new(),
+            session_id: None,
+            model: None,
+            chats: Vec::new(),
+            closed: Vec::new(),
+            active_chat: 0,
+            diff_closed: diff_closed_by_default(),
+            viewed: HashMap::new(),
+        }
+    }
 }
 
 /// One conversation: its own claude process, session and transcript.
@@ -667,15 +689,18 @@ mod tests {
     fn diff_closure_defaults_and_round_trips() {
         let legacy = r#"{"name":"legacy","branch":"main","repos":[]}"#;
         let mut ws: Workspace = serde_json::from_str(legacy).unwrap();
-        assert!(!ws.diff_closed);
-        assert!(!Workspace::default().diff_closed);
-        ws.diff_closed = true;
-        let saved = serde_json::to_string(&ws).unwrap();
-        assert!(
-            serde_json::from_str::<Workspace>(&saved)
-                .unwrap()
-                .diff_closed
-        );
+        assert!(ws.diff_closed);
+        assert!(Workspace::default().diff_closed);
+        for closed in [false, true] {
+            ws.diff_closed = closed;
+            let saved = serde_json::to_string(&ws).unwrap();
+            assert_eq!(
+                serde_json::from_str::<Workspace>(&saved)
+                    .unwrap()
+                    .diff_closed,
+                closed
+            );
+        }
     }
 
     #[test]

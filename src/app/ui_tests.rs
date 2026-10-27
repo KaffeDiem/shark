@@ -1465,7 +1465,7 @@ async fn numbered_tab_shortcuts(cx: &mut TestAppContext) {
         shark.read(cx).active.is_some()
     })
     .await;
-    press(cx, &["cmd-t", "cmd-t"]);
+    press(cx, &["cmd-shift-d", "cmd-t", "cmd-t"]);
     let selected =
         |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).active_ws().unwrap().active_chat);
     assert_eq!(selected(cx), 2);
@@ -2102,6 +2102,7 @@ async fn titlebar_controls(cx: &mut TestAppContext) {
             "text\n",
         )
         .unwrap();
+        on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
         on(cx, &|s, w, cx| s.open_path(path.clone(), w, cx));
         let file_tab = SharedString::from(format!("file-tab-{path}"));
         let chat_tab = cx.update(|cx| {

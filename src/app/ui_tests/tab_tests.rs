@@ -119,6 +119,7 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
     fs::write(home.join("shark/workspaces/tabs-focus/api/a.txt"), "text\n").unwrap();
     on(cx, &|s, w, cx| {
         s.new_chat(w, cx);
+        s.show(Tab::Diff, w, cx);
         s.open_path("api/a.txt".into(), w, cx);
     });
     let editor = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
@@ -393,6 +394,15 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
         "text\n",
     )
     .unwrap();
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(shark.read(cx).active_ws().unwrap().diff_closed);
+        assert!(w.find_all("diff-tab").is_empty());
+    })
+    .unwrap();
+    press(cx, &["ctrl-tab", "ctrl-2"]);
+    cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Chat));
+    press(cx, &["cmd-shift-d"]);
     on(cx, &|s, w, cx| s.open_path("api/a.txt".into(), w, cx));
     let editor = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
@@ -442,11 +452,26 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
     // Both forms of Workspace tools explicitly reopen and save Diff.
     for expanded in [false, true] {
         on(cx, &|s, _, _| s.show_tree = expanded);
-        cx.update_window(window, |_, w, cx| {
-            w.click(if expanded { "tools-diff" } else { "rail-diff" }, cx)
-        })
-        .unwrap();
-        cx.run_until_parked();
+        // Open, click again, then refocus the existing tab from Chat.
+        for from_chat in [false, false, true] {
+            if from_chat {
+                on(cx, &|s, w, cx| s.select_chat(0, w, cx));
+            }
+            cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                w.click(if expanded { "tools-diff" } else { "rail-diff" }, cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                let s = shark.read(cx);
+                assert_eq!(s.tab, Tab::Diff);
+                assert_eq!(w.find_all("diff-tab").len(), 1);
+                assert!(s.diff.read(cx).focus_handle(cx).is_focused(w));
+            })
+            .unwrap();
+        }
         assert!(!State::load().workspaces[0].diff_closed);
         press(cx, &["cmd-w"]);
         cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Chat));
@@ -528,6 +553,7 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
     })
     .await;
     on(cx, &|s, w, cx| {
+        s.show(Tab::Diff, w, cx);
         assert!(!s.active_ws().unwrap().diff_closed);
         let ix = s
             .state
