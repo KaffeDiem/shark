@@ -443,7 +443,8 @@ fn rust(project: &Project) -> Result<Launch> {
                         {
                             let mut command = Command::new("rustup");
                             command.env("RUSTUP_AUTO_INSTALL", "0");
-                            // Generous, and TERM rather than KILL, so an install is not cut off mid-write.
+                            // A generous limit: interrupting an install can leave the toolchain
+                            // half-written. On expiry rustup gets TERM, not a process-group KILL.
                             crate::git::wait_bounded(command, root, "rustup", &["component", "add", "--toolchain", toolchain, "rust-analyzer", "rust-src"], 900, false)
                                 .map_err(anyhow::Error::msg)
                                 .with_context(|| format!("Add rust-analyzer and rust-src for the existing toolchain: rustup component add --toolchain {toolchain} rust-analyzer rust-src"))?;

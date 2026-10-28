@@ -49,18 +49,19 @@ jobs:
       - name: Build pinned gopls
         run: scripts/build-gopls.sh
 
-      - name: Verify shipped language tools
-        run: |
-          rustup component add rust-analyzer rust-src
-          python3 scripts/check-language-tools.py --self-test
-          python3 scripts/check-language-tools.py
-
-      # Artifacts drop file modes; the tarball keeps gopls executable.
+      # Artifacts drop file modes; the tarball keeps gopls executable. Uploaded before the
+      # third-party servers below run, so they cannot swap the gopls that gets signed and shipped.
       - uses: actions/upload-artifact@v4
         with:
           name: gopls
           path: target/language-tools/gopls-*-darwin-arm64.tar.gz*
           if-no-files-found: error
+
+      - name: Verify shipped language tools
+        run: |
+          rustup component add rust-analyzer rust-src
+          python3 scripts/check-language-tools.py --self-test
+          python3 scripts/check-language-tools.py
 
   build:
     needs: [check, tools]
