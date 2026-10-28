@@ -3,6 +3,8 @@
 VERSION := $(shell sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 APP := target/release/Shark.app
 DMG := target/release/Shark-$(VERSION).dmg
+GOPLS_VERSION := $(shell sed -n 's/^const GOPLS_VERSION: &str = "\(.*\)";$$/\1/p' src/lsp/tools.rs)
+GOPLS := $(APP)/Contents/Resources/language-tools/gopls/$(GOPLS_VERSION)
 # Ad-hoc by default; pass SIGN="Developer ID Application: ..." to sign for distribution.
 SIGN ?= -
 TIMESTAMP = $(if $(filter -,$(SIGN)),--timestamp=none,--timestamp)
@@ -37,11 +39,11 @@ release:
 	plutil -insert NSHighResolutionCapable -bool YES $(APP)/Contents/Info.plist
 	plutil -insert NSHumanReadableCopyright -string "© Kasper Munch Jensen. GPL-3.0." $(APP)/Contents/Info.plist
 	cp LICENSE $(APP)/Contents/Resources/LICENSE
-	@test -f target/language-tools/gopls/0.24.0/gopls || (echo "Run scripts/build-gopls.sh before make release"; exit 1)
-	mkdir -p $(APP)/Contents/Resources/language-tools
-	cp -R target/language-tools/gopls $(APP)/Contents/Resources/language-tools/
-	codesign --force --options runtime $(TIMESTAMP) --sign "$(SIGN)" $(APP)/Contents/Resources/language-tools/gopls/0.24.0/gopls
-	shasum -a 256 $(APP)/Contents/Resources/language-tools/gopls/0.24.0/gopls | awk '{print $$1}' > $(APP)/Contents/Resources/language-tools/gopls/0.24.0/gopls.sha256
+	@test -n "$(GOPLS_VERSION)" && test -f target/language-tools/gopls/$(GOPLS_VERSION)/gopls || (echo "Run scripts/build-gopls.sh before make release"; exit 1)
+	mkdir -p $(GOPLS)
+	cp -R target/language-tools/gopls/$(GOPLS_VERSION)/ $(GOPLS)/
+	codesign --force --options runtime $(TIMESTAMP) --sign "$(SIGN)" $(GOPLS)/gopls
+	shasum -a 256 $(GOPLS)/gopls | awk '{print $$1}' > $(GOPLS)/gopls.sha256
 	cp assets/fonts/*-LICENSE.txt $(APP)/Contents/Resources/
 	codesign --force --options runtime $(TIMESTAMP) --sign "$(SIGN)" $(APP)
 	cp -R $(APP) target/release/dmg/

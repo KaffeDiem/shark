@@ -24,19 +24,60 @@ jobs:
           labels=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" --jq '.[].labels[].name')
           echo "release=$(grep -qx release <<<"$labels" && echo true || echo false)" >> "$GITHUB_OUTPUT"
 
-  build:
+  # Runs third-party language servers, so its token cannot write to the repository.
+  tools:
     needs: check
+    if: needs.check.outputs.release == 'true'
+    runs-on: macos-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - id: pins
+        run: echo "go=$(sed -n 's/^GO_VERSION=//p' scripts/build-gopls.sh)" >> "$GITHUB_OUTPUT"
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ steps.pins.outputs.go }}
+          cache: false
+
+      - run: rustup toolchain install
+
+      - name: Build pinned gopls
+        run: scripts/build-gopls.sh
+
+      - name: Verify shipped language tools
+        run: |
+          rustup component add rust-analyzer rust-src
+          python3 scripts/check-language-tools.py --self-test
+          python3 scripts/check-language-tools.py
+
+      # Artifacts drop file modes; the tarball keeps gopls executable.
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gopls
+          path: target/language-tools/gopls-*-darwin-arm64.tar.gz*
+          if-no-files-found: error
+
+  build:
+    needs: [check, tools]
+    # tools is skipped for non-release pushes; a failed gate still blocks the build.
+    if: ${{ !cancelled() && !failure() }}
     runs-on: macos-latest
     permissions:
       contents: write
     concurrency: ${{ needs.check.outputs.release == 'true' && 'release' || format('build-{0}', github.run_id) }}
     env:
-      GH_TOKEN: ${{ github.token }}
       RELEASE: ${{ needs.check.outputs.release }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          # Pushes use the deploy key; no token is left in .git/config for build scripts.
+          persist-credentials: false
 
       - name: Pick version
         if: env.RELEASE == 'true'
@@ -53,22 +94,22 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
 
-      - uses: actions/setup-go@v5
+      - uses: actions/download-artifact@v4
         if: env.RELEASE == 'true'
         with:
-          go-version: '1.27.3'
-          cache: false
+          name: gopls
+          path: target/language-tools
 
-      - name: Build pinned gopls
-        if: env.RELEASE == 'true'
-        run: scripts/build-gopls.sh
-
-      - name: Verify shipped language tools
+      - name: Unpack verified gopls
         if: env.RELEASE == 'true'
         run: |
-          rustup component add rust-analyzer rust-src
-          python3 scripts/check-language-tools.py --self-test
-          python3 scripts/check-language-tools.py
+          cd target/language-tools
+          archive=$(ls gopls-*-darwin-arm64.tar.gz)
+          shasum -a 256 -c "$archive.sha256"
+          version=${archive#gopls-}
+          version=${version%-darwin-arm64.tar.gz}
+          mkdir -p "gopls/$version"
+          tar -xzf "$archive" -C "gopls/$version"
 
       - if: env.RELEASE != 'true'
         run: cargo build --release
@@ -79,6 +120,7 @@ jobs:
       - name: Publish release
         if: env.RELEASE == 'true'
         env:
+          GH_TOKEN: ${{ github.token }}
           RELEASE_DEPLOY_KEY: ${{ secrets.RELEASE_DEPLOY_KEY }}
         run: |
           # The repository deploy key can bypass PR review, but not force-push or deletion rules.
@@ -97,11 +139,11 @@ jobs:
           git commit -am "Release $VERSION"
           # The tag points at exactly the code that was built, however far master has moved.
           git tag "v$VERSION"
-          git push origin "v$VERSION"
-          gh release create "v$VERSION" "target/release/Shark-$VERSION.dmg" target/language-tools/gopls-0.24.0-darwin-arm64.tar.gz target/language-tools/gopls-0.24.0-darwin-arm64.tar.gz.sha256 --title "Shark $VERSION" --generate-notes --verify-tag
+          git push "git@github.com:$GITHUB_REPOSITORY.git" "v$VERSION"
+          gh release create "v$VERSION" "target/release/Shark-$VERSION.dmg" target/language-tools/gopls-*-darwin-arm64.tar.gz target/language-tools/gopls-*-darwin-arm64.tar.gz.sha256 --title "Shark $VERSION" --generate-notes --verify-tag
           # Then carry the version commit onto master; retry if more merges land meanwhile.
           for _ in 1 2 3 4 5; do
-            git pull --rebase origin master && git push "git@github.com:$GITHUB_REPOSITORY.git" HEAD:master && exit 0
+            git pull --rebase "git@github.com:$GITHUB_REPOSITORY.git" master && git push "git@github.com:$GITHUB_REPOSITORY.git" HEAD:master && exit 0
             sleep 5
           done
           exit 1
