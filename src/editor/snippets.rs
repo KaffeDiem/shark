@@ -330,6 +330,37 @@ impl Session {
     }
 }
 
+/// Applies import edits computed against `before` to `now` when they all precede the accepted
+/// span at `start` and that prefix is unchanged; otherwise their positions are unknown.
+pub(super) fn completion_imports(
+    before: &str,
+    now: &str,
+    start: usize,
+    edits: &[lsp_types::TextEdit],
+    encoding: crate::lsp::document::Encoding,
+) -> Option<String> {
+    let lines = crate::lsp::document::Lines::new(before);
+    let mut ranges = (edits.iter())
+        .map(|e| {
+            let from = lines.offset(e.range.start, encoding).ok()?;
+            Some((from, lines.offset(e.range.end, encoding).ok()?, &e.new_text))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    ranges.sort_by_key(|&(from, ..)| from);
+    let end = ranges.iter().map(|&(_, to, _)| to).max()?;
+    if end > start
+        || ranges.windows(2).any(|w| w[0].1 > w[1].0)
+        || before.get(..end)? != now.get(..end)?
+    {
+        return None;
+    }
+    let mut text = now.to_string();
+    for (from, to, new) in ranges.into_iter().rev() {
+        text.replace_range(from..to, new);
+    }
+    Some(text)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -548,35 +579,4 @@ mod tests {
             ]
         );
     }
-}
-
-/// Applies import edits computed against `before` to `now` when they all precede the accepted
-/// span at `start` and that prefix is unchanged; otherwise their positions are unknown.
-pub(super) fn completion_imports(
-    before: &str,
-    now: &str,
-    start: usize,
-    edits: &[lsp_types::TextEdit],
-    encoding: crate::lsp::document::Encoding,
-) -> Option<String> {
-    let lines = crate::lsp::document::Lines::new(before);
-    let mut ranges = (edits.iter())
-        .map(|e| {
-            let from = lines.offset(e.range.start, encoding).ok()?;
-            Some((from, lines.offset(e.range.end, encoding).ok()?, &e.new_text))
-        })
-        .collect::<Option<Vec<_>>>()?;
-    ranges.sort_by_key(|&(from, ..)| from);
-    let end = ranges.iter().map(|&(_, to, _)| to).max()?;
-    if end > start
-        || ranges.windows(2).any(|w| w[0].1 > w[1].0)
-        || before.get(..end)? != now.get(..end)?
-    {
-        return None;
-    }
-    let mut text = now.to_string();
-    for (from, to, new) in ranges.into_iter().rev() {
-        text.replace_range(from..to, new);
-    }
-    Some(text)
 }
