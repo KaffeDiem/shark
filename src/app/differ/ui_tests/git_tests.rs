@@ -176,7 +176,7 @@ async fn git_feature_tab_launch_close_reorder_and_workspace_restore(cx: &mut Tes
             w.click("feature-git", cx);
             w.render_frame(cx);
             let s = shark.read(cx);
-            assert_eq!(s.tab, Tab::Git);
+            assert_eq!(s.tab, Tab::Feature(Feature::Git));
             assert_eq!(s.active_git_feature(), Some(&feature));
             assert_eq!(w.find_all("git-tab").len(), 1);
             assert!(!s.active_ws().unwrap().git_closed);
@@ -196,13 +196,13 @@ async fn git_feature_tab_launch_close_reorder_and_workspace_restore(cx: &mut Tes
     press(cx, &["ctrl-2"]);
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Chat));
     press(cx, &["ctrl-shift-tab"]);
-    cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Git));
+    cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Feature(Feature::Git)));
     press(cx, &["cmd-w"]);
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Chat));
     assert!(State::load().workspaces[0].git_closed);
     press(cx, &["cmd-shift-g"]);
     cx.update(|cx| {
-        assert_eq!(shark.read(cx).tab, Tab::Git);
+        assert_eq!(shark.read(cx).tab, Tab::Feature(Feature::Git));
         assert_eq!(shark.read(cx).active_git_feature(), Some(&feature));
     });
     on(cx, &|s, w, cx| s.open_workspace_named("git-other", w, cx));
@@ -239,7 +239,7 @@ async fn git_feature_description_and_comments_cross_the_cli_boundary(cx: &mut Te
     press_in(window)(cx, &["cmd-shift-g"]);
     let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        feature.read(cx).details.as_ref().is_some()
+        feature.read(cx).inspect().details.as_ref().is_some()
     })
     .await;
     cx.update_window(window, |_, w, cx| {
@@ -258,6 +258,7 @@ async fn git_feature_description_and_comments_cross_the_cli_boundary(cx: &mut Te
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         feature
             .read(cx)
+            .inspect()
             .details
             .as_ref()
             .is_some_and(|d| d.body.starts_with("## Updated"))
@@ -308,6 +309,7 @@ async fn git_feature_description_and_comments_cross_the_cli_boundary(cx: &mut Te
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         feature
             .read(cx)
+            .inspect()
             .details
             .as_ref()
             .is_some_and(|d| d.comments.len() == 2)
@@ -328,6 +330,7 @@ async fn git_feature_description_and_comments_cross_the_cli_boundary(cx: &mut Te
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         feature
             .read(cx)
+            .inspect()
             .details
             .as_ref()
             .is_some_and(|d| d.threads[0].comments.len() == 2)
@@ -344,6 +347,7 @@ async fn git_feature_description_and_comments_cross_the_cli_boundary(cx: &mut Te
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         feature
             .read(cx)
+            .inspect()
             .details
             .as_ref()
             .is_some_and(|d| d.threads[0].resolved)
@@ -358,6 +362,7 @@ async fn git_feature_description_and_comments_cross_the_cli_boundary(cx: &mut Te
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         feature
             .read(cx)
+            .inspect()
             .details
             .as_ref()
             .is_some_and(|d| !d.threads[0].resolved)
@@ -390,7 +395,7 @@ async fn git_feature_description_conflict_and_workspace_changes_keep_drafts(
     press(cx, &["cmd-shift-g"]);
     let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        feature.read(cx).details.as_ref().is_some()
+        feature.read(cx).inspect().details.as_ref().is_some()
     })
     .await;
     cx.update_window(window, |_, w, cx| {
@@ -422,7 +427,7 @@ async fn git_feature_description_conflict_and_workspace_changes_keep_drafts(
     press(cx, &["cmd-shift-g"]);
     let other = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        other.read(cx).details.as_ref().is_some()
+        other.read(cx).inspect().details.as_ref().is_some()
     })
     .await;
     cx.update(|cx| assert!(other.read(cx).draft_text(cx).is_none()));
@@ -445,11 +450,11 @@ async fn git_feature_description_conflict_and_workspace_changes_keep_drafts(
     cx.update(|cx| feature.update(cx, |f, cx| f.retry_save(cx)));
     on_app(window, shark.clone())(cx, &|s, w, cx| {
         s.git_features.remove("git-review");
-        s.show(Tab::Git, w, cx);
+        s.show(Tab::Feature(Feature::Git), w, cx);
     });
     let restored = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        restored.read(cx).details.is_some()
+        restored.read(cx).inspect().details.is_some()
     })
     .await;
     cx.update_window(window, |_, w, cx| {
@@ -559,7 +564,14 @@ async fn git_feature_large_review_virtualizes_and_releases(cx: &mut TestAppConte
     cx.update_window(window, |_, w, cx| {
         assert!(feature.read(cx).markdown_text_len("description", cx) < 4096);
         assert_eq!(
-            feature.read(cx).details.as_ref().unwrap().body.len(),
+            feature
+                .read(cx)
+                .inspect()
+                .details
+                .as_ref()
+                .unwrap()
+                .body
+                .len(),
             65_000
         );
         check_full_text_view(w, cx, &feature, "git-long-description");
@@ -587,7 +599,13 @@ async fn git_feature_large_review_virtualizes_and_releases(cx: &mut TestAppConte
     cx.update_window(window, |_, w, cx| {
         assert!(feature.read(cx).markdown_text_len("C_1", cx) < 4096);
         assert_eq!(
-            feature.read(cx).details.as_ref().unwrap().comments[0]
+            feature
+                .read(cx)
+                .inspect()
+                .details
+                .as_ref()
+                .unwrap()
+                .comments[0]
                 .body
                 .len(),
             65_000
@@ -629,14 +647,14 @@ async fn git_feature_loading_empty_and_retry_states(cx: &mut TestAppContext) {
             w.press("cmd-shift-g", cx);
             let feature = shark.read(cx).active_git_feature().unwrap().clone();
             w.render_frame(cx);
-            assert!(feature.read(cx).loading);
+            assert!(feature.read(cx).inspect().loading);
             assert!(w.find("git-loading").visible());
             assert!(w.try_find("git-empty-pr").is_none());
             feature
         })
         .unwrap();
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !feature.read(cx).loading && feature.read(cx).error.is_some()
+        !feature.read(cx).inspect().loading && feature.read(cx).inspect().error.is_some()
     })
     .await;
     fs::remove_file(dir.join("git-fail")).unwrap();
@@ -650,21 +668,21 @@ async fn git_feature_loading_empty_and_retry_states(cx: &mut TestAppContext) {
         );
         w.click("git-state-retry", cx);
         w.render_frame(cx);
-        assert!(feature.read(cx).loading);
+        assert!(feature.read(cx).inspect().loading);
         assert!(w.find("git-loading").visible());
     })
     .unwrap();
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        feature.read(cx).details.is_some() && !feature.read(cx).loading
+        feature.read(cx).inspect().details.is_some() && !feature.read(cx).inspect().loading
     })
     .await;
-    let details = cx.update(|cx| feature.read(cx).details.as_ref().unwrap().clone());
+    let details = cx.update(|cx| feature.read(cx).inspect().details.as_ref().unwrap().clone());
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         assert!(w.find("git-overview").visible());
         assert!(w.try_find("git-load-error").is_none());
         feature.update(cx, |f, cx| {
-            f.details = None;
+            f.inject_load_state(false, true, None, cx);
             cx.notify();
         });
         w.render_frame(cx);
@@ -758,7 +776,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     s.active = Some(ws.name.clone());
                     s.state.workspaces = vec![ws];
                     s.home.on = false;
-                    s.tab = Tab::Git;
+                    s.tab = Tab::Feature(Feature::Git);
                     s.sel = SideRow::Ws(0);
                     let feature = s.ensure_git_feature(w, cx).unwrap();
                     feature.update(cx, |f, cx| f.inject_details(details.clone(), cx));
@@ -921,14 +939,9 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         }
                         f.inject_details(sample, cx);
                         f.scroll_row(0, cx);
-                        f.error = None;
-                        if matches!(state, "loading" | "no-pr" | "error") {
-                            f.details = None;
-                        }
-                        f.loading = matches!(state, "loading" | "refreshing");
-                        if matches!(state, "error" | "stale") {
-                            f.error = Some("GitHub could not load this pull request because the request timed out. Check your connection and GitHub authentication, then retry. Your saved drafts are still available in this workspace.".into());
-                        }
+                        f.inject_load_state(matches!(state, "loading" | "refreshing"),
+                            matches!(state, "loading" | "no-pr" | "error"),
+                            matches!(state, "error" | "stale").then(|| "GitHub could not load this pull request because the request timed out. Check your connection and GitHub authentication, then retry. Your saved drafts are still available in this workspace.".into()), cx);
                         if state == "no-repositories" {
                             let mut workspace = fixture.workspaces[0].clone();
                             workspace.repos.clear();
@@ -996,6 +1009,8 @@ async fn git_feature_thread_context_opens_diff_and_preserves_missing_context(
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark
             .read(cx)
+            .differ
+            .read(cx)
             .diff_files
             .iter()
             .any(|f| f.path() == "api/login.rs")
@@ -1003,17 +1018,29 @@ async fn git_feature_thread_context_opens_diff_and_preserves_missing_context(
     .await;
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
-            s.diff
+            s.differ
+                .read(cx)
+                .diff
+                .clone()
                 .update(cx, |d, cx| d.set_file_collapsed("api/login.rs", true, cx));
             s.open_git_file("api/login.rs", w, cx);
-            assert_eq!(s.tab, Tab::Diff);
-            assert_eq!(s.diff_files[s.diff_file].path(), "api/login.rs");
-            assert!(!s.diff.read(cx).is_file_collapsed("api/login.rs"));
-            s.show(Tab::Git, w, cx);
+            assert_eq!(s.tab, Tab::Feature(Feature::Diff));
+            assert_eq!(
+                s.differ.read(cx).diff_files[s.differ.read(cx).diff_file].path(),
+                "api/login.rs"
+            );
+            assert!(
+                !s.differ
+                    .read(cx)
+                    .diff
+                    .read(cx)
+                    .is_file_collapsed("api/login.rs")
+            );
+            s.show(Tab::Feature(Feature::Git), w, cx);
             s.open_git_file("api/deleted.rs", w, cx);
             assert_eq!(
                 s.tab,
-                Tab::Git,
+                Tab::Feature(Feature::Git),
                 "missing review context must not open an unrelated diff"
             );
         });
@@ -1023,29 +1050,33 @@ async fn git_feature_thread_context_opens_diff_and_preserves_missing_context(
         s.edit_working_copy(Some("api/other.rs".into()), w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).editing.is_some()
+        shark.read(cx).differ.read(cx).editing.is_some()
     })
     .await;
     on_app(window, shark.clone())(cx, &|s, w, cx| {
-        s.editing.as_mut().unwrap().dirty = true;
-        s.show(Tab::Git, w, cx);
+        s.differ
+            .update(cx, |d, _| d.editing.as_mut().unwrap().dirty = true);
+        s.show(Tab::Feature(Feature::Git), w, cx);
         s.open_git_file("api/login.rs", w, cx);
     });
     cx.update_window(window, |_, w, cx| {
         assert!(w.has_active_dialog(cx));
         w.press("escape", cx);
         let s = shark.read(cx);
-        assert_eq!(s.tab, Tab::Git);
-        assert!(s.editing.as_ref().unwrap().dirty);
+        assert_eq!(s.tab, Tab::Feature(Feature::Git));
+        assert!(s.differ.read(cx).editing.as_ref().unwrap().dirty);
     })
     .unwrap();
     on_app(window, shark.clone())(cx, &|s, w, cx| s.open_git_file("api/login.rs", w, cx));
     press_in(window)(cx, &["enter"]);
     cx.update(|cx| {
         let s = shark.read(cx);
-        assert_eq!(s.tab, Tab::Diff);
-        assert!(s.editing.is_none());
-        assert_eq!(s.diff_files[s.diff_file].path(), "api/login.rs");
+        assert_eq!(s.tab, Tab::Feature(Feature::Diff));
+        assert!(s.differ.read(cx).editing.is_none());
+        assert_eq!(
+            s.differ.read(cx).diff_files[s.differ.read(cx).diff_file].path(),
+            "api/login.rs"
+        );
     });
 }
 
@@ -1083,7 +1114,7 @@ async fn git_feature_repository_drafts_and_offline_refresh_are_isolated(cx: &mut
     press_in(window)(cx, &["cmd-shift-g"]);
     let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        feature.read(cx).details.is_some()
+        feature.read(cx).inspect().details.is_some()
     })
     .await;
     cx.update_window(window, |_, w, cx| {
@@ -1103,6 +1134,7 @@ async fn git_feature_repository_drafts_and_offline_refresh_are_isolated(cx: &mut
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         feature
             .read(cx)
+            .inspect()
             .details
             .as_ref()
             .is_some_and(|d| d.target.number == 9)
@@ -1120,6 +1152,7 @@ async fn git_feature_repository_drafts_and_offline_refresh_are_isolated(cx: &mut
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         feature
             .read(cx)
+            .inspect()
             .details
             .as_ref()
             .is_some_and(|d| d.target.number == 7)
@@ -1150,13 +1183,13 @@ async fn git_feature_repository_drafts_and_offline_refresh_are_isolated(cx: &mut
     })
     .unwrap();
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !feature.read(cx).loading
+        !feature.read(cx).inspect().loading
     })
     .await;
     cx.update(|cx| {
         let f = feature.read(cx);
-        assert!(f.error.as_ref().unwrap().contains("503"));
-        assert_eq!(f.details.as_ref().unwrap().target.number, 7);
+        assert!(f.inspect().error.as_ref().unwrap().contains("503"));
+        assert_eq!(f.inspect().details.as_ref().unwrap().target.number, 7);
         assert_eq!(f.draft_text(cx).as_deref(), Some("API draft"));
     });
     cx.update_window(window, |_, w, cx| {
@@ -1177,24 +1210,24 @@ async fn git_feature_repository_drafts_and_offline_refresh_are_isolated(cx: &mut
             for index in [1, 0, 1, 0] {
                 f.select_repo(index, w, cx);
             }
-            assert!(f.loading);
-            assert_eq!(f.selected, 0);
+            assert!(f.inspect().loading);
+            assert_eq!(f.inspect().selected, 0);
         })
     })
     .unwrap();
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !feature.read(cx).loading
+        !feature.read(cx).inspect().loading
     })
     .await;
     cx.update(|cx| {
         let f = feature.read(cx);
-        assert_eq!(f.selected, 0);
+        assert_eq!(f.inspect().selected, 0);
         assert_eq!(
-            f.details.as_ref().unwrap().target.number,
+            f.inspect().details.as_ref().unwrap().target.number,
             7,
             "delayed stale result cannot replace latest selected PR"
         );
-        assert!(f.error.is_none());
+        assert!(f.inspect().error.is_none());
     });
     assert!(
         !home.join("git-overlap").exists(),
@@ -1216,7 +1249,7 @@ async fn git_feature_corrupt_drafts_are_protected_and_reported(cx: &mut TestAppC
     press_in(window)(cx, &["cmd-shift-g"]);
     let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        feature.read(cx).details.is_some()
+        feature.read(cx).inspect().details.is_some()
     })
     .await;
     cx.update_window(window, |_, w, cx| {
@@ -1224,7 +1257,7 @@ async fn git_feature_corrupt_drafts_are_protected_and_reported(cx: &mut TestAppC
         w.render_frame(cx);
         w.input("new draft must not destroy the old file", cx);
         feature.update(cx, |f, cx| f.retry_save(cx));
-        assert!(feature.read(cx).save_error.is_some());
+        assert!(feature.read(cx).inspect().save_error.is_some());
         assert!(!shark.read(cx).unsaved_data(cx).is_empty());
     })
     .unwrap();
@@ -1245,7 +1278,7 @@ async fn git_feature_stale_description_requires_reviewed_replacement(cx: &mut Te
     press_in(window)(cx, &["cmd-shift-g"]);
     let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        feature.read(cx).details.is_some()
+        feature.read(cx).inspect().details.is_some()
     })
     .await;
     cx.update_window(window, |_, w, cx| {
@@ -1276,7 +1309,7 @@ async fn git_feature_stale_description_requires_reviewed_replacement(cx: &mut Te
     })
     .unwrap();
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !feature.read(cx).loading
+        !feature.read(cx).inspect().loading
     })
     .await;
     cx.update_window(window, |_, w, cx| {
@@ -1300,6 +1333,7 @@ async fn git_feature_stale_description_requires_reviewed_replacement(cx: &mut Te
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         feature
             .read(cx)
+            .inspect()
             .details
             .as_ref()
             .is_some_and(|d| d.body == "My reviewed replacement")
@@ -1323,10 +1357,10 @@ async fn git_feature_first_open_during_archive_cannot_load_or_post(cx: &mut Test
     let (window, shark) = boot(cx, state, WindowOptions::default());
     on_app(window, shark.clone())(cx, &|s, w, cx| {
         s.archiving.insert("git-review".into());
-        s.show(Tab::Git, w, cx);
+        s.show(Tab::Feature(Feature::Git), w, cx);
         let feature = s.active_git_feature().unwrap().clone();
-        assert!(feature.read(cx).archiving);
-        assert!(!feature.read(cx).loading);
+        assert!(feature.read(cx).inspect().archiving);
+        assert!(!feature.read(cx).inspect().loading);
         feature.update(cx, |f, cx| {
             f.start_comment(w, cx);
             f.submit(w, cx);
@@ -1340,7 +1374,7 @@ async fn git_feature_first_open_during_archive_cannot_load_or_post(cx: &mut Test
         assert!(w.find("git-unloaded").visible());
         w.click("git-state-retry", cx);
         assert!(
-            !feature.read(cx).loading,
+            !feature.read(cx).inspect().loading,
             "archiving keeps the load action disabled"
         );
     })
@@ -1351,7 +1385,7 @@ async fn git_feature_first_open_during_archive_cannot_load_or_post(cx: &mut Test
 async fn settle_markdown(
     cx: &mut TestAppContext,
     window: AnyWindowHandle,
-    feature: &Entity<super::super::git_feature::GitFeature>,
+    feature: &Entity<crate::app::git_feature::GitFeature>,
     key: &str,
 ) -> (Duration, Duration) {
     let mut worst = Duration::ZERO;
@@ -1383,10 +1417,17 @@ async fn settle_markdown(
 fn check_full_text_view(
     w: &mut Window,
     cx: &mut App,
-    feature: &Entity<super::super::git_feature::GitFeature>,
+    feature: &Entity<crate::app::git_feature::GitFeature>,
     button: &'static str,
 ) {
-    let source = feature.read(cx).details.as_ref().unwrap().body.clone();
+    let source = feature
+        .read(cx)
+        .inspect()
+        .details
+        .as_ref()
+        .unwrap()
+        .body
+        .clone();
     let offset = feature.read(cx).scroll_offset().item_ix;
     let started = Instant::now();
     w.click(button, cx);
@@ -1416,5 +1457,93 @@ fn check_full_text_view(
         feature.read(cx).scroll_offset().item_ix,
         offset,
         "returning from full text preserves the conversation position"
+    );
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn feature_rail_keys_clamp_and_focus_walks_feature_columns(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(cx, fixture(&home), WindowOptions::default());
+    let press = press_in(window);
+    press(cx, &["cmd-shift-d", "cmd-alt-right"]);
+    cx.update_window(window, |_, w, cx| {
+        assert_eq!(
+            shark.read(cx).focused_pane(w, cx),
+            Some(Pane::Feature(Feature::Diff, FeatureFocus::Files))
+        );
+    })
+    .unwrap();
+    press(cx, &["cmd-alt-right", "up", "up"]);
+    cx.update_window(window, |_, w, cx| {
+        assert_eq!(shark.read(cx).focused_pane(w, cx), Some(Pane::Features));
+        assert_eq!(shark.read(cx).feature_sel, 0);
+    })
+    .unwrap();
+    press(cx, &["down", "down", "enter"]);
+    cx.update_window(window, |_, w, cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.tab, Tab::Feature(Feature::Git));
+        assert_eq!(s.feature_sel, 1);
+        assert_eq!(
+            s.focused_pane(w, cx),
+            Some(Pane::Feature(Feature::Git, FeatureFocus::Main))
+        );
+    })
+    .unwrap();
+    press(cx, &["cmd-alt-right", "cmd-alt-right", "up", "enter"]);
+    cx.update_window(window, |_, w, cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.tab, Tab::Feature(Feature::Diff));
+        assert_eq!(
+            s.focused_pane(w, cx),
+            Some(Pane::Feature(Feature::Diff, FeatureFocus::Main))
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn inactive_git_write_blocks_close_and_archive(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let state = fixture(&home);
+    let (_gh, dir) = fake_github(&home, &state, 1);
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    press_in(window)(cx, &["cmd-shift-g"]);
+    let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        feature.read(cx).inspect().details.is_some()
+    })
+    .await;
+    fs::write(dir.join("git-delay"), "0.15").unwrap();
+    cx.update_window(window, |_, w, cx| {
+        feature.update(cx, |g, cx| g.start_comment(w, cx));
+        w.render_frame(cx);
+        w.input("Pending write survives switching workspaces", cx);
+        feature.update(cx, |g, cx| g.submit(w, cx));
+        assert!(feature.read(cx).busy());
+        shark.update(cx, |s, cx| {
+            s.open_workspace_now(1, w, cx);
+            assert!(!s.storage_guard(true, w, cx));
+            assert!(!s.close_window(w, cx));
+            s.remove_workspace("git-review", false, w, cx);
+            assert!(!s.archiving.contains("git-review"));
+            assert!(s.ws("git-review").is_some());
+        });
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        !feature.read(cx).busy()
+    })
+    .await;
+    assert_eq!(
+        fs::read_to_string(dir.join("git-writes.jsonl"))
+            .unwrap()
+            .lines()
+            .count(),
+        1
     );
 }

@@ -10,10 +10,10 @@ impl Render for TreePreview {
             .size_full()
             .bg(cx.theme().background)
             .font_features(inter_features())
-            .child(
-                self.0
-                    .update(cx, |s, cx| s.render_tree(w, cx).into_any_element()),
-            )
+            .child(self.0.update(cx, |s, cx| {
+                s.differ
+                    .update(cx, |d, cx| d.render_tree(w, cx).into_any_element())
+            }))
     }
 }
 
@@ -79,10 +79,12 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     s.active = Some(ws.name.clone());
                     s.state.workspaces = vec![ws];
                     s.home.on = false;
-                    s.tab = Tab::Diff;
+                    s.tab = Tab::Feature(Feature::Diff);
                     s.sel = SideRow::Ws(0);
-                    s.show_tree = true;
-                    s.diff_files = DiffFile::parse(concat!(
+                    s.configure_differ(cx);
+                    s.differ.update(cx, |d, cx| {
+                    d.show_tree = true;
+                    d.diff_files = DiffFile::parse(concat!(
                         "diff --git a/shark/src/main.rs b/shark/src/main.rs\n",
                         "--- a/shark/src/main.rs\n+++ b/shark/src/main.rs\n",
                         "@@ -1,3 +1,3 @@\n fn main() {\n",
@@ -92,12 +94,13 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         "@@ -1 +1 @@\n-Workspace tools\n+Features open artifact tabs.\n",
                     ))
                     .unwrap();
-                    s.diff_fps = vec![1; s.diff_files.len()];
-                    s.diff_loaded = true;
-                    s.diff
-                        .update(cx, |d, cx| d.set_files(s.diff_files.clone(), cx));
-                    s.rebuild_tree();
-                    s.diff.read(cx).focus_handle(cx).focus(w, cx);
+                    d.diff_fps = vec![1; d.diff_files.len()];
+                    d.diff_loaded = true;
+                    let files = d.diff_files.clone();
+                    d.diff.update(cx, |state, cx| state.set_files(files, cx));
+                    d.rebuild_tree();
+                    d.diff.read(cx).focus_handle(cx).focus(w, cx);
+                    });
                     assert!(s.chats.is_empty() && s.active_chat().is_none());
                     cx.notify();
                 });
@@ -110,7 +113,11 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         shark.update(cx, |s, cx| {
                             s.state.uncommitted_only = uncommitted;
                             s.state.unified = uncommitted;
-                            s.diff.update(cx, |d, cx| {
+                            s.differ.update(cx, |d, _| {
+                                d.preferences.uncommitted_only = uncommitted;
+                                d.preferences.unified = uncommitted;
+                            });
+                            s.differ.read(cx).diff.clone().update(cx, |d, cx| {
                                 d.set_mode(
                                     if uncommitted {
                                         DiffMode::Unified
@@ -191,7 +198,10 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             );
                         }
                         assert!(w.try_find("files-change-scope").is_none());
-                        assert_eq!(shark.read(cx).tree_resize.read(cx).sizes()[1], px(200.));
+                        assert_eq!(
+                            shark.read(cx).differ.read(cx).tree_resize.read(cx).sizes()[1],
+                            px(200.)
+                        );
                         assert!(shark.read(cx).active_chat().is_none());
                     })
                     .unwrap();
@@ -229,8 +239,8 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 cx.update_window(window, |_, w, cx| {
                 shark.update(cx, |s, cx| {
                     let comment = serde_json::from_str(r#"{"id":1,"path":"shark/src/main.rs","start":[false,2],"end":[false,2],"text":"Use the app name","status":"Pending"}"#).unwrap();
-                    s.edit_comments(cx, |comments| comments.push(comment));
-                    s.open_sheet(w, cx);
+                    s.differ.update(cx, |d, cx| d.edit_comments(cx, |comments| comments.push(comment)));
+                    s.differ.update(cx, |d, cx| d.open_sheet(w, cx));
                 });
                 w.render_frame(cx);
                 let island = w.find("content-island").bounds();
@@ -306,12 +316,14 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         "api/src/main.rs", "api/README.md", "web/index.ts", "ROOT.md",
                     ].map(String::from).to_vec();
                     paths.extend((0..40).map(|i| format!("zz/long/f{i:02}.rs")));
-                    s.diff_files = paths.iter().map(|p| {
+                    s.differ.update(cx, |d, _| {
+                    d.diff_files = paths.iter().map(|p| {
                         DiffFile::parse(&format!("diff --git a/{p} b/{p}\n--- a/{p}\n+++ b/{p}\n@@ -1 +1 @@\n-old\n+new\n"))
                             .unwrap().remove(0)
                     }).collect();
-                    s.diff_fps = vec![1; paths.len()];
-                    s.uncommitted.insert(paths[0].clone());
+                    d.diff_fps = vec![1; paths.len()];
+                    d.uncommitted.insert(paths[0].clone());
+                    });
                     if matches!(case, "viewed" | "changed") {
                         s.state.workspaces[0].viewed.insert(paths[0].clone(), if case == "viewed" { 1 } else { 2 });
                     }
@@ -321,26 +333,29 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         fs::write(&abs, "new\n").unwrap();
                         s.editor = Some(cx.new(|cx| FileEditor::new(paths[0].clone(), abs, false, w, cx)));
                     }
-                    s.rebuild_tree();
-                    s.tree_sel = if case == "compact-focus" {
-                        s.tree_rows.iter().position(|r| r.path == paths[0]).unwrap()
+                    s.differ.update(cx, |d, _cx| d.rebuild_tree());
+                    s.configure_differ(cx);
+                    s.differ.update(cx, |d, _| {
+                    d.tree_sel = if case == "compact-focus" {
+                        d.tree_rows.iter().position(|r| r.path == paths[0]).unwrap()
                     } else { 1 };
+                    });
                     if matches!(case, "focus" | "compact-focus") {
-                        s.tree_focus.focus(w, cx);
+                        s.differ.read(cx).tree_focus.clone().focus(w, cx);
                     } else {
                         s.home.focus.focus(w, cx);
                     }
                     if case == "collapsed" {
-                        s.set_dir_open(Some(false), cx);
+                        s.differ.update(cx, |d, cx| d.set_dir_open(Some(false), cx));
                     } else if case == "filtered" {
-                        s.collapsed_dirs.insert("api/src".into());
-                        s.filter_tree(".rs".into(), cx);
+                        s.differ.update(cx, |d, _| d.collapsed_dirs.insert("api/src".into()));
+                        s.differ.update(cx, |d, cx| d.filter_tree(".rs".into(), cx));
                     }
                     if matches!(case, "scroll" | "end") {
-                        let target = if case == "end" { s.tree_rows.len() - 1 } else {
-                            s.tree_rows.iter().position(|r| r.path.ends_with("f15.rs")).unwrap()
+                        let target = if case == "end" { s.differ.read(cx).tree_rows.len() - 1 } else {
+                            s.differ.read(cx).tree_rows.iter().position(|r| r.path.ends_with("f15.rs")).unwrap()
                         };
-                        s.tree_scroll.scroll_to_item(target, ScrollStrategy::Top);
+                        s.differ.read(cx).tree_scroll.scroll_to_item(target, ScrollStrategy::Top);
                     }
                     cx.notify();
                 });
@@ -355,11 +370,18 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 .update_window(window, |_, w, cx| {
                     let s = shark.read(cx);
                     let theme = cx.theme();
-                    let viewport = s.tree_scroll.0.borrow().base_handle.bounds();
+                    let viewport = s
+                        .differ
+                        .read(cx)
+                        .tree_scroll
+                        .0
+                        .borrow()
+                        .base_handle
+                        .bounds();
                     let mut checks = vec![];
                     let mut samples = vec![];
                     let mut visible = 0;
-                    for (ix, row) in s.tree_rows.iter().enumerate() {
+                    for (ix, row) in s.differ.read(cx).tree_rows.iter().enumerate() {
                         let Some(snapshot) = w.try_find(("tree-row", ix)) else {
                             continue;
                         };
@@ -372,7 +394,8 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         }
                         visible += 1;
                         assert_eq!(b.size.height, px(30.));
-                        let focused = ix == s.tree_sel && s.tree_focus.is_focused(w);
+                        let focused = ix == s.differ.read(cx).tree_sel
+                            && s.differ.read(cx).tree_focus.is_focused(w);
                         let label = w.find(("tree-label", ix)).bounds();
                         assert!(
                             label.right() < b.right() - px(20.),
@@ -382,13 +405,18 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         // of the renderer's next-row calculation. Also sample both row boundaries.
                         for depth in 0..=row.depth {
                             let ancestor = (0..ix).rev().find(|&a| {
-                                s.tree_rows[a].depth == depth
-                                    && s.tree_rows[a].file.is_none()
-                                    && row.path.starts_with(&format!("{}/", s.tree_rows[a].path))
+                                s.differ.read(cx).tree_rows[a].depth == depth
+                                    && s.differ.read(cx).tree_rows[a].file.is_none()
+                                    && row.path.starts_with(&format!(
+                                        "{}/",
+                                        s.differ.read(cx).tree_rows[a].path
+                                    ))
                             });
                             let last = ancestor.map(|a| {
-                                let prefix = format!("{}/", s.tree_rows[a].path);
-                                s.tree_rows
+                                let prefix = format!("{}/", s.differ.read(cx).tree_rows[a].path);
+                                s.differ
+                                    .read(cx)
+                                    .tree_rows
                                     .iter()
                                     .rposition(|r| r.path.starts_with(&prefix))
                                     .unwrap()
@@ -423,7 +451,9 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             ));
                         } else if case != "narrow" {
                             let file = row.file.unwrap();
-                            let color = if s.viewed(file) == super::super::diff::Viewed::Yes {
+                            let color = if s.differ.read(cx).viewed(file)
+                                == super::super::diff::Viewed::Yes
+                            {
                                 theme.muted_foreground
                             } else {
                                 theme.foreground
@@ -531,16 +561,35 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             if case == "normal" {
                 cx.update_window(window, |_, w, cx| {
                     w.click_at(("tree-row", 1usize), point(px(16.), px(10.)), cx);
-                    assert!(shark.read(cx).collapsed_dirs.contains("api/src"));
-                    assert!(shark.read(cx).tree_focus.is_focused(w));
+                    assert!(
+                        shark
+                            .read(cx)
+                            .differ
+                            .read(cx)
+                            .collapsed_dirs
+                            .contains("api/src")
+                    );
+                    assert!(shark.read(cx).differ.read(cx).tree_focus.is_focused(w));
                     w.press("right", cx);
-                    assert!(!shark.read(cx).collapsed_dirs.contains("api/src"));
+                    assert!(
+                        !shark
+                            .read(cx)
+                            .differ
+                            .read(cx)
+                            .collapsed_dirs
+                            .contains("api/src")
+                    );
                     w.click(("dir-viewed", 1usize), cx);
                     assert!(
-                        !shark.read(cx).collapsed_dirs.contains("api/src"),
+                        !shark
+                            .read(cx)
+                            .differ
+                            .read(cx)
+                            .collapsed_dirs
+                            .contains("api/src"),
                         "checkbox must not fold the row"
                     );
-                    assert_eq!(shark.read(cx).viewed_now.len(), 4);
+                    assert_eq!(shark.read(cx).differ.read(cx).viewed_now.len(), 4);
                 })
                 .unwrap();
             }

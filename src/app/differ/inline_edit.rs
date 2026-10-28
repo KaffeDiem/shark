@@ -5,15 +5,15 @@ use crate::diff_view::{DiffLinePosition, DiffSide};
 
 /// A working copy as lines, and the line the caret is on.
 #[derive(Clone, Debug, PartialEq)]
-pub(super) struct Buffer {
-    pub(super) lines: Vec<String>,
-    pub(super) line: usize,
+pub(in crate::app) struct Buffer {
+    pub(in crate::app) lines: Vec<String>,
+    pub(in crate::app) line: usize,
     /// The text ends with a newline.
     eol: bool,
 }
 
 impl Buffer {
-    pub(super) fn new(text: &str) -> Self {
+    pub(in crate::app) fn new(text: &str) -> Self {
         let eol = text.ends_with('\n');
         let body = text.strip_suffix('\n').unwrap_or(text);
         Buffer {
@@ -23,7 +23,7 @@ impl Buffer {
         }
     }
 
-    pub(super) fn text(&self) -> String {
+    pub(in crate::app) fn text(&self) -> String {
         let mut text = self.lines.join("\n");
         if self.eol {
             text.push('\n');
@@ -33,7 +33,7 @@ impl Buffer {
 
     /// The file's indent: a tab if a line starts with one, else its shortest run of two or
     /// more leading spaces, else four spaces.
-    pub(super) fn indent(&self) -> String {
+    pub(in crate::app) fn indent(&self) -> String {
         // Blank lines' whitespace says nothing about the indent.
         let lines = || self.lines.iter().filter(|l| !l.trim().is_empty());
         if lines().any(|l| l.starts_with('\t')) {
@@ -47,7 +47,7 @@ impl Buffer {
     }
 
     /// Backspace at column 0: joins the line to the one above. Returns the caret's column.
-    pub(super) fn join_up(&mut self) -> Option<usize> {
+    pub(in crate::app) fn join_up(&mut self) -> Option<usize> {
         if self.line == 0 {
             return None;
         }
@@ -60,7 +60,7 @@ impl Buffer {
 
     /// Replaces bytes `range` of the caret's line with `text`, which may hold several lines;
     /// the caret ends after it. Returns the caret's column.
-    pub(super) fn insert(&mut self, range: std::ops::Range<usize>, text: &str) -> usize {
+    pub(in crate::app) fn insert(&mut self, range: std::ops::Range<usize>, text: &str) -> usize {
         let text = text.replace("\r\n", "\n").replace('\r', "\n");
         let cur = &self.lines[self.line];
         // The input's range can outlive a reload of the line; keep it inside.
@@ -82,7 +82,7 @@ impl Buffer {
 
 /// `text` against `base` as a git patch of `path`, with every line as context (the diff
 /// folds it), so any line can be edited, even with no changes left.
-pub(super) fn patch(path: &str, base: &str, text: &str, added: bool) -> String {
+pub(in crate::app) fn patch(path: &str, base: &str, text: &str, added: bool) -> String {
     let old = match added {
         true => "/dev/null".to_string(),
         false => format!("a/{path}"),
@@ -120,7 +120,7 @@ fn parse(patch: &str) -> Option<DiffFile> {
 }
 
 /// The first line (0-based) of `text` that differs from `base`, or 0.
-pub(super) fn first_change(base: &str, text: &str) -> usize {
+pub(in crate::app) fn first_change(base: &str, text: &str) -> usize {
     similar::TextDiff::from_lines(base, text)
         .ops()
         .iter()
@@ -129,36 +129,36 @@ pub(super) fn first_change(base: &str, text: &str) -> usize {
 }
 
 /// One file of the diff open for editing in place.
-pub(super) struct InlineEdit {
-    pub(super) path: SharedString,
-    pub(super) abs: PathBuf,
+pub(in crate::app) struct InlineEdit {
+    pub(in crate::app) path: SharedString,
+    pub(in crate::app) abs: PathBuf,
     /// The original side; every edit is compared against it.
     base: String,
     base_blob: Option<String>,
     added: bool,
-    pub(super) buf: Buffer,
+    pub(in crate::app) buf: Buffer,
     /// The buffer against `base`, as shown in the diff.
-    pub(super) file: DiffFile,
+    pub(in crate::app) file: DiffFile,
     /// The file and hunks as git has them, shown again when editing ends.
-    pub(super) orig: (DiffFile, Vec<review::Hunk>),
-    pub(super) patch: String,
+    pub(in crate::app) orig: (DiffFile, Vec<review::Hunk>),
+    pub(in crate::app) patch: String,
     /// Fingerprint of the file as last read or written, to notice other writers.
     disk: u64,
-    pub(super) dirty: bool,
+    pub(in crate::app) dirty: bool,
     /// Saved, and not edited since.
-    pub(super) saved: bool,
+    pub(in crate::app) saved: bool,
     /// A save is being written.
-    pub(super) saving: bool,
+    pub(in crate::app) saving: bool,
     /// Something else wrote the file under unsaved edits.
-    pub(super) stale: bool,
+    pub(in crate::app) stale: bool,
     window: AnyWindowHandle,
-    pub(super) input: Entity<InputState>,
+    pub(in crate::app) input: Entity<InputState>,
     _subs: Vec<Subscription>,
 }
 
 impl InlineEdit {
     /// Refresh the original side without changing the unsaved working copy.
-    pub(super) fn rebase(&mut self, ws: &Workspace, file: &DiffFile) -> Result<(), String> {
+    pub(in crate::app) fn rebase(&mut self, ws: &Workspace, file: &DiffFile) -> Result<(), String> {
         if let Some(sha) = original_blob(file)
             && self.base_blob.as_deref() == Some(sha)
         {
@@ -179,7 +179,7 @@ impl InlineEdit {
         }
     }
 
-    pub(super) fn focused(&self, window: &Window, cx: &App) -> bool {
+    pub(in crate::app) fn focused(&self, window: &Window, cx: &App) -> bool {
         self.input.read(cx).focus_handle(cx).is_focused(window)
     }
 
@@ -188,7 +188,7 @@ impl InlineEdit {
         (self.dirty, self.saved) = (true, false);
     }
 
-    pub(super) fn caret(&self) -> DiffLinePosition {
+    pub(in crate::app) fn caret(&self) -> DiffLinePosition {
         DiffLinePosition::new(self.path.clone(), DiffSide::Modified, self.buf.line + 1)
     }
 }
@@ -252,9 +252,9 @@ fn load(ws: &Workspace, file: &DiffFile) -> Result<(String, String, bool), Strin
     Ok((base, text, added))
 }
 
-impl Shark {
+impl Differ {
     /// The diff footer's line while a file is edited in place, for the hint or review bar.
-    pub(super) fn edit_status(&self) -> Option<&'static str> {
+    pub(in crate::app) fn edit_status(&self) -> Option<&'static str> {
         let e = self.editing.as_ref()?;
         Some(match e.saved && !e.dirty {
             _ if e.stale => {
@@ -268,7 +268,7 @@ impl Shark {
     }
 
     /// The working-copy column heading of `path`.
-    pub(super) fn working_heading(&self, path: &str) -> &'static str {
+    pub(in crate::app) fn working_heading(&self, path: &str) -> &'static str {
         match self.editing.as_ref().filter(|e| e.path == path) {
             Some(e) if e.stale => "Working copy · changed on disk",
             Some(e) if e.dirty => "Working copy · unsaved",
@@ -279,37 +279,37 @@ impl Shark {
 
     /// Edit the working copy of `path`, or of the selected line's file, or of the file the
     /// cursor is on.
-    pub(super) fn edit_working_copy(
+    pub(in crate::app) fn edit_working_copy(
         &mut self,
         path: Option<SharedString>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let selected = (self.diff.read(cx).selected_lines()).filter(|_| self.tab == Tab::Diff);
-        let path = path.or(selected.map(|r| r.path().clone())).or_else(|| {
-            let ix = self.cursor_file(window, cx)?;
-            Some(self.diff_files[ix].path().clone())
-        });
-        let (Some(path), Some(ws)) = (path, self.active_ws()) else {
+        let path = self.edit_target(path, window, cx);
+        if let (Some(path), Some(workspace)) = (path, self.workspace_name()) {
+            cx.emit(DifferEvent::EditWorkingCopy {
+                workspace: workspace.into(),
+                path,
+            });
+        }
+    }
+
+    /// Called only after the host checks both editors and confirms the captured edit.
+    pub(in crate::app) fn begin_edit(
+        &mut self,
+        path: SharedString,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ws) = self.active_ws() else {
             return;
         };
         if self.editing.as_ref().is_some_and(|e| e.path == path) {
-            return self.show(Tab::Diff, window, cx);
+            return self.focus_edit(window, cx);
         }
         let Some(file) = self.diff_files.iter().find(|f| *f.path() == path) else {
             return;
         };
-        if self
-            .file_tabs
-            .iter()
-            .any(|t| t.editor.read(cx).path == path && t.editor.read(cx).dirty)
-        {
-            return notify_err(
-                window,
-                cx,
-                format!("{path} has unsaved edits in the editor"),
-            );
-        }
         let (base, text, added) = match load(ws, file) {
             Ok(loaded) => loaded,
             Err(e) => return notify_err(window, cx, e),
@@ -330,7 +330,8 @@ impl Shark {
         let Some(file) = parse(&patch) else {
             return notify_err(window, cx, format!("{path} can't be compared"));
         };
-        self.confirm_discard(false, true, window, cx, move |s, window, cx| {
+        {
+            let s = self;
             let input = cx.new(|cx| InputState::new(window, cx));
             let shark = cx.entity().downgrade();
             let subs = vec![
@@ -369,16 +370,13 @@ impl Shark {
                 input,
                 _subs: subs,
             });
-            if s.tab != Tab::Diff {
-                s.show(Tab::Diff, window, cx);
-            }
             s.show_edit_at(None, window, cx);
             // The caret's row to the top: revealing it at the bottom would go by the hinted
             // heights of rows never drawn and could miss, and an undrawn input loses focus.
             if let Some(caret) = s.editing.as_ref().map(InlineEdit::caret) {
                 s.diff.update(cx, |d, cx| d.scroll_to_line(caret, cx));
             }
-        });
+        }
     }
 
     /// Puts the caret's line in the input, the caret at `col` (else the end), and shows the
@@ -409,7 +407,12 @@ impl Shark {
     /// File `abs` as a refresh read it from disk, if it is still the one edited. Written by
     /// someone else: a clean buffer takes the new text, unsaved edits are marked stale (saving
     /// then asks); deleted, it is marked stale.
-    pub(super) fn edit_disk(&mut self, abs: &Path, bytes: Option<Vec<u8>>, cx: &mut Context<Self>) {
+    pub(in crate::app) fn edit_disk(
+        &mut self,
+        abs: &Path,
+        bytes: Option<Vec<u8>>,
+        cx: &mut Context<Self>,
+    ) {
         let Some(e) = (self.editing.as_mut()).filter(|e| !e.saving && e.abs == abs) else {
             return;
         };
@@ -445,7 +448,7 @@ impl Shark {
     }
 
     /// Focuses the line input, its row brought into view first: an undrawn input loses focus.
-    pub(super) fn focus_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::app) fn focus_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(e) = &self.editing {
             let caret = e.caret();
             self.diff.update(cx, |d, cx| d.show_line(caret, cx));
@@ -537,7 +540,12 @@ impl Shark {
     }
 
     /// A paste with line breaks inserts lines; one without is left to the input.
-    pub(super) fn paste_lines(&mut self, text: &str, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::app) fn paste_lines(
+        &mut self,
+        text: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(e) = &mut self.editing else { return };
         let range = e.input.read(cx).selected_range();
         let col = e.buf.insert(range, text);
@@ -546,18 +554,13 @@ impl Shark {
     }
 
     /// Back to reviewing; asks first when there are unsaved edits.
-    pub(super) fn leave_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.confirm_discard(false, true, window, cx, |s, window, cx| {
-            s.end_edit(cx);
-            s.refresh_diff(cx);
-            s.focus_diff(window, cx);
-            cx.notify();
-        });
+    pub(in crate::app) fn leave_edit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_discard(AfterDiscard::LeaveEdit, window, cx);
     }
 
     /// Ends in-place editing: the file shows as git has it again, without any discarded
     /// buffer, and its header (the base's blob) is there to edit it again.
-    pub(super) fn end_edit(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::app) fn end_edit(&mut self, cx: &mut Context<Self>) {
         let Some(e) = self.editing.take() else { return };
         // The next refresh shows git's view of the file, whatever was written while editing.
         self.diff_fp = 0;
@@ -569,29 +572,19 @@ impl Shark {
         self.diff.update(cx, |d, cx| d.replace_file(file, cx));
     }
 
-    /// ⌘S / File › Save follows the active artifact.
-    pub(super) fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.tab == Tab::Git {
-            if let Some(git) = self.active_git_feature().cloned() {
-                git.update(cx, |g, cx| g.submit(window, cx));
-            }
-            return;
-        }
-        if self.tab == Tab::Diff && self.editing.is_some() {
-            return self.save_edit(false, window, cx);
-        }
-        if let Some(e) = self.editor.clone() {
-            e.update(cx, |e, cx| e.save(false, window, cx))
-        }
-    }
-
     /// Writes the buffer, unless the file changed on disk since it was read (then asks).
-    pub(super) fn save_edit(&mut self, force: bool, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::app) fn save_edit(
+        &mut self,
+        force: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         // A second ⌘S while the first writes would find the file changed.
         let Some(e) = self.editing.as_mut().filter(|e| !e.saving) else {
             return;
         };
         e.saving = true;
+        let identity = (e.abs.clone(), e.input.entity_id());
         let (abs, expected, text, path) = (e.abs.clone(), e.disk, e.buf.text(), e.path.clone());
         cx.spawn_in(window, async move |this, cx| {
             let saved = text.clone();
@@ -599,7 +592,14 @@ impl Shark {
                 .spawn(async move { crate::editor::write_checked(&abs, expected, &text, force) })
                 .await;
             this.update_in(cx, |s, window, cx| {
-                if let Some(e) = s.editing.as_mut().filter(|e| e.path == path) {
+                if !s
+                    .editing
+                    .as_ref()
+                    .is_some_and(|e| (e.abs.clone(), e.input.entity_id()) == identity)
+                {
+                    return;
+                }
+                if let Some(e) = s.editing.as_mut() {
                     e.saving = false;
                 }
                 match result {
@@ -616,7 +616,14 @@ impl Shark {
                         format!("{path} changed on disk"),
                         "Someone else wrote the file since you started editing.",
                         "Overwrite",
-                        |s, window, cx| s.save_edit(true, window, cx),
+                        move |s, window, cx| {
+                            if s.editing
+                                .as_ref()
+                                .is_some_and(|e| (e.abs.clone(), e.input.entity_id()) == identity)
+                            {
+                                s.save_edit(true, window, cx);
+                            }
+                        },
                         window,
                         cx,
                     ),
@@ -630,7 +637,7 @@ impl Shark {
     }
 
     /// A click on a working-copy line of the edited file puts the caret there.
-    pub(super) fn edit_click(
+    pub(in crate::app) fn edit_click(
         &mut self,
         pos: &DiffLinePosition,
         window: &mut Window,
@@ -650,7 +657,7 @@ impl Shark {
     }
 
     /// The line input for the caret's line of the edited file, as the diff's working cell.
-    pub(super) fn with_inline_edit(&self, diff: Diff, cx: &Context<Self>) -> Diff {
+    pub(in crate::app) fn with_inline_edit(&self, diff: Diff, cx: &Context<Self>) -> Diff {
         let Some(e) = &self.editing else {
             return diff;
         };
@@ -700,16 +707,16 @@ impl Shark {
 
 /// A file header's [Edit working copy], or [Review] [Save ⌘S] while it is edited; `editing`
 /// is whether it has unsaved edits, if it is the edited file.
-pub(super) fn edit_buttons(
+pub(in crate::app) fn edit_buttons(
     file: &DiffFile,
     editing: Option<bool>,
-    shark: WeakEntity<Shark>,
+    shark: WeakEntity<Differ>,
 ) -> AnyElement {
     if file.status() == DiffFileStatus::Deleted || file.is_binary() {
         return div().into_any_element();
     }
     let path = file.path().clone();
-    let on = |f: fn(&mut Shark, SharedString, &mut Window, &mut Context<Shark>)| {
+    let on = |f: fn(&mut Differ, SharedString, &mut Window, &mut Context<Differ>)| {
         let (shark, path) = (shark.clone(), path.clone());
         move |_: &ClickEvent, window: &mut Window, cx: &mut App| {
             shark

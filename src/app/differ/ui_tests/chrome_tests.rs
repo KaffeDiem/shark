@@ -49,11 +49,11 @@ async fn sidebar_chrome_themes(cx: &mut TestAppContext) {
             for rail in [false, true] {
                 for tree in [false, true] {
                     on(cx, &|s, w, cx| {
-                        s.show(Tab::Diff, w, cx);
+                        s.show(Tab::Feature(Feature::Diff), w, cx);
                         if s.rail != rail {
                             s.toggle_sidebar(cx);
                         }
-                        if s.show_tree != tree {
+                        if s.differ.read(cx).show_tree != tree {
                             s.toggle_tree(w, cx);
                         }
                     });

@@ -22,6 +22,9 @@ and archive.
   successful data. Network mutations are never retried automatically: a lost
   response can mean the write succeeded.
 
+See [Right-pane features](right-pane-features.md) for shared host routing and the
+feature-author pattern.
+
 ## Data and lifecycle
 
 `src/pr/git_feature.rs` owns the GitHub boundary. It uses the existing authenticated

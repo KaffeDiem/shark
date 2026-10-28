@@ -33,7 +33,7 @@ const BOX: f32 = 280.;
 const KEEP: usize = 32;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
-pub(super) enum Kind {
+pub(in crate::app) enum Kind {
     Image,
     Video,
 }
@@ -45,7 +45,7 @@ fn ext(path: &str) -> String {
         .unwrap_or_default()
 }
 
-pub(super) fn kind(path: &str) -> Option<Kind> {
+pub(in crate::app) fn kind(path: &str) -> Option<Kind> {
     match ext(path).as_str() {
         "png" | "jpg" | "jpeg" | "gif" | "webp" | "bmp" | "ico" | "svg" | "tif" | "tiff"
         | "heic" | "heif" | "avif" | "psd" => Some(Kind::Image),
@@ -69,8 +69,8 @@ fn playable(ext: &str) -> bool {
 
 /// One side of a changed media file.
 #[derive(Clone, PartialEq, Debug)]
-pub(super) struct Side {
-    pub(super) sha: String,
+pub(in crate::app) struct Side {
+    pub(in crate::app) sha: String,
     /// The worktree, for `git cat-file`.
     repo: PathBuf,
     /// The working-tree file (the new side); `None` reads the blob from git (the old side).
@@ -78,16 +78,16 @@ pub(super) struct Side {
 }
 
 #[derive(Clone, PartialEq, Debug)]
-pub(super) struct MediaFile {
-    pub(super) path: SharedString,
-    pub(super) kind: Kind,
-    pub(super) old: Option<Side>,
-    pub(super) new: Option<Side>,
+pub(in crate::app) struct MediaFile {
+    pub(in crate::app) path: SharedString,
+    pub(in crate::app) kind: Kind,
+    pub(in crate::app) old: Option<Side>,
+    pub(in crate::app) new: Option<Side>,
 }
 
 impl MediaFile {
     /// From one file's patch, whose paths are `<repo>/<path>` under `ws_dir`.
-    pub(super) fn parse(path: &str, chunk: &str, ws_dir: &Path) -> Option<MediaFile> {
+    pub(in crate::app) fn parse(path: &str, chunk: &str, ws_dir: &Path) -> Option<MediaFile> {
         let kind = kind(path)?;
         let (old, new) = chunk
             .lines()
@@ -115,7 +115,7 @@ impl MediaFile {
 
 /// A side ready to show.
 #[derive(Clone, Debug)]
-pub(super) struct Preview {
+pub(in crate::app) struct Preview {
     /// The full-size copy, for playing and opening.
     source: PathBuf,
     /// What is drawn: the source itself, a downscaled PNG or a video's poster frame.
@@ -126,7 +126,7 @@ pub(super) struct Preview {
     rotated: bool,
 }
 
-pub(super) fn cache_dir() -> PathBuf {
+pub(in crate::app) fn cache_dir() -> PathBuf {
     crate::state::home().join("Library/Caches/shark/media")
 }
 
@@ -158,7 +158,7 @@ fn run(cmd: &mut Command) -> Result<std::process::Output, String> {
 }
 
 /// Copies the side's bytes into the cache and makes its preview. Blocking: background only.
-pub(super) fn prepare(side: &Side, path: &str, kind: Kind) -> Result<Preview, String> {
+pub(in crate::app) fn prepare(side: &Side, path: &str, kind: Kind) -> Result<Preview, String> {
     let dir = cache_dir();
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let ext = ext(path);
@@ -327,7 +327,7 @@ fn poster(video: &Path, out_dir: &Path) -> Result<PathBuf, String> {
 }
 
 /// Deletes cached copies not used for two weeks. Each load touches what it uses.
-pub(super) fn prune_cache() {
+pub(in crate::app) fn prune_cache() {
     let Ok(entries) = fs::read_dir(cache_dir()) else {
         return;
     };
@@ -348,10 +348,10 @@ fn touch(path: &Path) {
 
 /// An image cache that keeps the `KEEP` most recently drawn images and frees the rest,
 /// including their GPU textures. gpui's own caches keep everything forever.
-pub(super) struct Lru(VecDeque<(u64, ImageCacheItem)>);
+pub(in crate::app) struct Lru(VecDeque<(u64, ImageCacheItem)>);
 
 impl Lru {
-    pub(super) fn new(cx: &mut App) -> Entity<Lru> {
+    pub(in crate::app) fn new(cx: &mut App) -> Entity<Lru> {
         cx.new(|_| Lru(VecDeque::new()))
     }
 }
@@ -503,8 +503,8 @@ impl Drop for Player {
 }
 
 /// The before/after row of one media file.
-pub(super) struct MediaView {
-    pub(super) file: MediaFile,
+pub(in crate::app) struct MediaView {
+    pub(in crate::app) file: MediaFile,
     slots: [Option<Slot>; 2],
     started: bool,
     cache: Entity<Lru>,
@@ -517,7 +517,7 @@ pub(super) struct MediaView {
 }
 
 impl MediaView {
-    pub(super) fn new(
+    pub(in crate::app) fn new(
         file: MediaFile,
         cache: Entity<Lru>,
         width: Rc<std::cell::Cell<Pixels>>,
@@ -575,7 +575,7 @@ impl MediaView {
     }
 
     /// Play/pause: the new side, or the old one when the file was deleted.
-    pub(super) fn toggle_default(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::app) fn toggle_default(&mut self, cx: &mut Context<Self>) {
         let side = if self.file.new.is_some() { 1 } else { 0 };
         self.toggle(side, cx);
     }
@@ -598,7 +598,7 @@ impl MediaView {
         cx.notify();
     }
 
-    pub(super) fn stop(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::app) fn stop(&mut self, cx: &mut Context<Self>) {
         if self.player.take().is_some() {
             cx.notify();
         }
@@ -791,7 +791,7 @@ fn open(path: &Path) {
 }
 
 /// A video started; the others stop, so one decoder runs at a time.
-pub(super) struct Playing;
+pub(in crate::app) struct Playing;
 impl EventEmitter<Playing> for MediaView {}
 
 impl Render for MediaView {
@@ -823,17 +823,17 @@ impl Render for MediaView {
 
 #[cfg(test)]
 impl MediaView {
-    pub(super) fn started(&self) -> bool {
+    pub(in crate::app) fn started(&self) -> bool {
         self.started
     }
 
     /// Every side the file has is loaded (or failed).
-    pub(super) fn ready(&self) -> bool {
+    pub(in crate::app) fn ready(&self) -> bool {
         let has = [self.file.old.is_some(), self.file.new.is_some()];
         (0..2).all(|i| !has[i] || matches!(self.slots[i], Some(Slot::Ready(_) | Slot::Failed(_))))
     }
 
-    pub(super) fn failed(&self, side: usize) -> Option<String> {
+    pub(in crate::app) fn failed(&self, side: usize) -> Option<String> {
         match &self.slots[side] {
             Some(Slot::Failed(e)) => Some(e.clone()),
             _ => None,
@@ -842,7 +842,10 @@ impl MediaView {
 
     /// A loaded side: what is drawn, and the source's size.
     #[allow(clippy::type_complexity)]
-    pub(super) fn shown(&self, side: usize) -> Option<(Option<PathBuf>, Option<(usize, usize)>)> {
+    pub(in crate::app) fn shown(
+        &self,
+        side: usize,
+    ) -> Option<(Option<PathBuf>, Option<(usize, usize)>)> {
         match &self.slots[side] {
             Some(Slot::Failed(e)) => panic!("{}: {e}", self.file.path),
             _ => self.preview(side).map(|p| (p.image.clone(), p.size)),

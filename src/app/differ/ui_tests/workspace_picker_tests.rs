@@ -51,7 +51,7 @@ async fn workspace_picker_navigation_and_focus(cx: &mut TestAppContext) {
     .unwrap();
     press(cx, &["enter"]);
     cx.update(|cx| assert_eq!(shark.read(cx).active.as_deref(), Some("current")));
-    on(cx, &|s, _, _| s.rail = true);
+    on(cx, &|s, _, _cx| s.rail = true);
     press(cx, &["cmd-shift-o", "enter"]);
     cx.update(|cx| {
         let s = shark.read(cx);
@@ -72,7 +72,7 @@ async fn workspace_picker_navigation_and_focus(cx: &mut TestAppContext) {
         assert_eq!(w.focused(cx), Some(focus.clone()));
     })
     .unwrap();
-    on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+    on(cx, &|s, w, cx| s.show(Tab::Feature(Feature::Diff), w, cx));
     press(cx, &["cmd-shift-o"]);
     cx.update_window(window, |_, w, cx| w.input("pay", cx))
         .unwrap();
@@ -82,7 +82,7 @@ async fn workspace_picker_navigation_and_focus(cx: &mut TestAppContext) {
         assert_eq!(shark.read(cx).active.as_deref(), Some("recent"));
         assert_eq!(
             shark.read(cx).tab,
-            Tab::Diff,
+            Tab::Feature(Feature::Diff),
             "current selection preserves view"
         );
     });
@@ -174,7 +174,7 @@ async fn workspace_picker_discard_revalidates_destination(cx: &mut TestAppContex
         press_in(window)(cx, &["cmd-shift-o", "enter"]);
         cx.update_window(window, |_, w, cx| assert!(w.has_active_dialog(cx)))
             .unwrap();
-        on(cx, &|s, _, _| match scenario {
+        on(cx, &|s, _, _cx| match scenario {
             "archiving" => {
                 s.archiving.insert("recent".into());
             }
@@ -200,7 +200,7 @@ async fn workspace_picker_discard_revalidates_destination(cx: &mut TestAppContex
                 assert_eq!(ws.last_interacted_at, Some(20));
             }
         });
-        on(cx, &|s, _, _| s.archiving.clear());
+        on(cx, &|s, _, _cx| s.archiving.clear());
     }
     assert_eq!(fs::read_to_string(path).unwrap(), "original");
 }
@@ -357,7 +357,7 @@ async fn workspace_interaction_mouse_scroll_and_dialog_success(cx: &mut TestAppC
     });
     cx.update_window(window, |_, w, cx| w.click("content-island", cx))
         .unwrap();
-    on(cx, &|s, _, _| {
+    on(cx, &|s, _, _cx| {
         assert!(
             s.state.workspaces[0].last_interacted_at.unwrap() > 1,
             "click inside content"
@@ -372,7 +372,7 @@ async fn workspace_interaction_mouse_scroll_and_dialog_success(cx: &mut TestAppC
         )
     })
     .unwrap();
-    on(cx, &|s, _, _| {
+    on(cx, &|s, _, _cx| {
         assert!(
             s.state.workspaces[0].last_interacted_at.unwrap() > 1,
             "scroll inside content"
@@ -398,7 +398,7 @@ async fn workspace_interaction_mouse_scroll_and_dialog_success(cx: &mut TestAppC
         w.activate_window();
         s.refresh_attention(cx);
     });
-    on(cx, &|s, _, _| {
+    on(cx, &|s, _, _cx| {
         assert_eq!(s.state.workspaces[0].last_interacted_at, Some(1))
     });
     // A model menu selection succeeds through ChatEvent::Picked; mere menu browsing does not.
@@ -408,7 +408,7 @@ async fn workspace_interaction_mouse_scroll_and_dialog_success(cx: &mut TestAppC
         assert_eq!(s.state.workspaces[0].last_interacted_at, Some(1));
         s.set_model(0, w, cx);
     });
-    on(cx, &|s, _, _| {
+    on(cx, &|s, _, _cx| {
         assert!(s.state.workspaces[0].last_interacted_at.unwrap() > 1)
     });
 }
@@ -467,7 +467,7 @@ async fn workspace_interaction_coalesces_and_restores(cx: &mut TestAppContext) {
     assert_eq!(State::load().workspaces[1].last_interacted_at, Some(20));
     cx.executor().advance_clock(Duration::from_millis(500));
     cx.run_until_parked();
-    on(cx, &|s, _, _| {
+    on(cx, &|s, _, _cx| {
         assert!(
             s.interaction_save.is_none(),
             "continuous input doesn't defer the first save"

@@ -7,8 +7,7 @@ struct VisibleTabs(Vec<(TabId, VisibleTab)>);
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum VisibleTab {
     Chat(usize),
-    Diff,
-    Git,
+    Feature(Feature),
     File(usize),
 }
 
@@ -42,8 +41,8 @@ impl Shark {
                         TabId::Chat(id) => {
                             VisibleTab::Chat(ws.chats.iter().position(|c| &c.id == id)?)
                         }
-                        TabId::Diff if !ws.diff_closed => VisibleTab::Diff,
-                        TabId::Git if !ws.git_closed => VisibleTab::Git,
+                        TabId::Diff if !ws.diff_closed => VisibleTab::Feature(Feature::Diff),
+                        TabId::Git if !ws.git_closed => VisibleTab::Feature(Feature::Git),
                         TabId::File(path) => VisibleTab::File(
                             self.file_tabs
                                 .iter()
@@ -61,8 +60,7 @@ impl Shark {
         let ws = self.active_ws()?;
         let tab = match self.tab {
             Tab::Chat => VisibleTab::Chat(ws.active_chat),
-            Tab::Diff => VisibleTab::Diff,
-            Tab::Git => VisibleTab::Git,
+            Tab::Feature(feature) => VisibleTab::Feature(feature),
             Tab::File => VisibleTab::File(
                 self.file_tabs
                     .iter()
@@ -104,48 +102,64 @@ impl Shark {
         self._subs.push(cx.subscribe_in(
             &chat,
             window,
-            move |this, chat, ev: &ChatEvent, window, cx| match ev {
-                ChatEvent::Meta => this.save_meta(chat, cx),
-                ChatEvent::GitReviewsSent(_) => {} // GitSync records these.
-                ChatEvent::Picked => {
-                    this.record_interaction(&name, cx);
-                    // The level the chat runs at, so an old chat with none doesn't clear it.
-                    let m = &chat.read(cx).meta;
-                    let pick = (m.model.clone(), Some(crate::chat::effort_of(m).to_string()));
-                    let st = &mut this.state;
-                    if (&st.last_model, &st.last_effort) != (&pick.0, &pick.1) {
-                        (st.last_model, st.last_effort) = pick;
-                        let _ = st.save();
+            move |this, chat, ev: &ChatEvent, window, cx| {
+                match ev {
+                    ChatEvent::Meta => this.save_meta(chat, cx),
+                    ChatEvent::GitReviewsSent(_) => {} // GitSync records these.
+                    ChatEvent::Picked => {
+                        this.record_interaction(&name, cx);
+                        // The level the chat runs at, so an old chat with none doesn't clear it.
+                        let m = &chat.read(cx).meta;
+                        let pick = (m.model.clone(), Some(crate::chat::effort_of(m).to_string()));
+                        let st = &mut this.state;
+                        if (&st.last_model, &st.last_effort) != (&pick.0, &pick.1) {
+                            (st.last_model, st.last_effort) = pick;
+                            let _ = st.save();
+                        }
                     }
-                }
-                ChatEvent::TurnDone => {
-                    if this.active.as_ref() == Some(&name) {
-                        this.refresh_diff(cx);
+                    ChatEvent::TurnDone => {
+                        if this.active.as_ref() == Some(&name) {
+                            this.refresh_diff(cx);
+                        }
+                        if this.active_chat() != Some(chat) {
+                            this.unread.insert(id.clone());
+                        }
+                        this.refresh_home(Some(&name), cx);
+                        this.turn_done(&name, cx);
+                        if let Some(ws) = this.ws(&name) {
+                            let dir = ws.dir();
+                            let c = chat.read(cx);
+                            let (turn, reply, held) =
+                                (c.last_turn, c.last_reply.clone(), c.unread_review_ids(true));
+                            this.differ.update(cx, |d, cx| {
+                                d.review_turn_done(&name, &dir, &id, turn, &reply, &held, cx)
+                            });
+                        }
+                        cx.notify();
                     }
-                    if this.active_chat() != Some(chat) {
-                        this.unread.insert(id.clone());
+                    // A question off screen marks its tab; the workspace needs you until it's answered.
+                    ChatEvent::Asking => {
+                        if this.active_chat() != Some(chat) && chat.read(cx).asking() {
+                            this.unread.insert(id.clone());
+                        }
+                        this.refresh_home(Some(&name), cx);
+                        this.refresh_attention(cx);
                     }
-                    this.refresh_home(Some(&name), cx);
-                    this.turn_done(&name, cx);
-                    this.review_turn_done(&name, chat, cx);
-                    cx.notify();
-                }
-                // A question off screen marks its tab; the workspace needs you until it's answered.
-                ChatEvent::Asking => {
-                    if this.active_chat() != Some(chat) && chat.read(cx).asking() {
-                        this.unread.insert(id.clone());
+                    ChatEvent::ShowChanges | ChatEvent::ShowComment(_) => {
+                        if this.active.as_ref() == Some(&name) {
+                            this.show(Tab::Feature(Feature::Diff), window, cx);
+                            if let ChatEvent::ShowComment(id) = ev {
+                                this.differ
+                                    .update(cx, |d, cx| d.jump_to_comment(*id, window, cx));
+                            }
+                        }
                     }
-                    this.refresh_home(Some(&name), cx);
-                    this.refresh_attention(cx);
-                }
-                ChatEvent::ShowChanges => this.show(Tab::Diff, window, cx),
-                ChatEvent::ShowComment(id) => {
-                    this.show(Tab::Diff, window, cx);
-                    this.jump_to_comment(*id, window, cx);
-                }
-                ChatEvent::ReviewRemoved(ids) => this.review_delivered(&name, &id, ids, None, cx),
-                ChatEvent::ReviewSent { ids, turn } => {
-                    this.review_delivered(&name, &id, ids, Some(*turn), cx)
+                    ChatEvent::ReviewRemoved(ids) => this
+                        .differ
+                        .update(cx, |d, cx| d.review_delivered(&name, &id, ids, None, cx)),
+                    ChatEvent::ReviewSent { ids, turn } => this.differ.update(cx, |d, cx| {
+                        d.review_delivered(&name, &id, ids, Some(*turn), cx)
+                    }),
                 }
             },
         ));
@@ -220,7 +234,7 @@ impl Shark {
         cx.notify();
     }
 
-    fn tab_drag(
+    pub(super) fn tab_drag(
         &self,
         pill: Stateful<Div>,
         id: TabId,
@@ -274,8 +288,7 @@ impl Shark {
         let Some(ws) = self.active_ws() else { return };
         match self.visible_tabs(ws, cx).get(ix) {
             Some(VisibleTab::Chat(ix)) => self.select_chat(ix, window, cx),
-            Some(VisibleTab::Diff) => self.show(Tab::Diff, window, cx),
-            Some(VisibleTab::Git) => self.show(Tab::Git, window, cx),
+            Some(VisibleTab::Feature(feature)) => self.show(Tab::Feature(feature), window, cx),
             Some(VisibleTab::File(ix)) => self.select_file(ix, window, cx),
             None => {}
         }
@@ -306,8 +319,7 @@ impl Shark {
         }
         match self.tab {
             Tab::File => self.close_file(window, cx),
-            Tab::Diff => self.close_diff(window, cx),
-            Tab::Git => self.close_git(window, cx),
+            Tab::Feature(feature) => self.close_feature(feature, window, cx),
             Tab::Chat => self.close_chat(window, cx),
         }
     }
@@ -412,9 +424,8 @@ impl Shark {
         // Its queue goes with it, and claude with what it hadn't read: those are pending again.
         let unread =
             (self.chats.get(&meta.id)).map_or(vec![], |c| c.read(cx).unread_review_ids(false));
-        self.review.edit(&name, |l| {
-            review::unqueue(l, Some(&meta.id), &unread);
-        });
+        self.differ
+            .update(cx, |d, cx| d.unqueue_review(&name, &meta.id, &unread, cx));
         if let Some(chat) = self.chats.remove(&meta.id)
             && let Some(sync) = self.syncs.get(&name)
         {
@@ -442,12 +453,12 @@ impl Shark {
             if s.active.as_ref() != Some(&name) {
                 return;
             }
-            s.end_edit(cx);
+            s.differ.update(cx, |d, cx| d.end_edit(cx));
             let ws = s.active_ws_mut().unwrap();
             ws.diff_closed = true;
             ws.close_tab(&TabId::Diff);
             let _ = s.state.save();
-            if s.tab == Tab::Diff {
+            if s.tab == Tab::Feature(Feature::Diff) {
                 let ix = s.active_ws().unwrap().active_chat;
                 s.select_chat(ix, w, cx);
             }
@@ -816,75 +827,13 @@ impl Shark {
                 )
             })
             .collect();
-        if let Some(ix) = tabs.index(VisibleTab::Diff) {
-            pills.push((
-                VisibleTab::Diff,
-                pill("diff-tab", self.tab == Tab::Diff, theme)
-                    .map(|d| self.tab_drag(d, TabId::Diff, "Diff".into(), cx))
-                    .aria_label("Diff")
-                    .pl_2p5()
-                    .pr_1()
-                    .on_click(cx.listener(|this, _, w, cx| this.show(Tab::Diff, w, cx)))
-                    .child(if ctrl_held && ix < 9 {
-                        kbd(&format!("ctrl-{}", ix + 1)).into_any_element()
-                    } else {
-                        Icon::new(IconName::GitCompare)
-                            .with_size(px(14.))
-                            .into_any_element()
-                    })
-                    .child(
-                        tab_label("Diff".into(), self.tab == Tab::Diff, theme)
-                            .id("tab-label")
-                            .test_support(),
-                    )
-                    .child(tab_close(
-                        crate::settings::close_button("close-diff", "Close Diff (cmd-w)").on_click(
-                            cx.listener(|this, _, w, cx| {
-                                cx.stop_propagation();
-                                this.close_diff(w, cx);
-                            }),
-                        ),
-                        theme,
-                    ))
-                    .tooltip(|w, cx| Tooltip::new("Diff (cmd-shift-d)").build(w, cx))
-                    .test_support()
-                    .into_any_element(),
-            ));
-        }
-        if let Some(ix) = tabs.index(VisibleTab::Git) {
-            pills.push((
-                VisibleTab::Git,
-                pill("git-tab", self.tab == Tab::Git, theme)
-                    .map(|d| self.tab_drag(d, TabId::Git, "Git".into(), cx))
-                    .aria_label("Git")
-                    .pl_2p5()
-                    .pr_1()
-                    .on_click(cx.listener(|this, _, w, cx| this.show(Tab::Git, w, cx)))
-                    .child(if ctrl_held && ix < 9 {
-                        kbd(&format!("ctrl-{}", ix + 1)).into_any_element()
-                    } else {
-                        Icon::new(IconName::GitPullRequest)
-                            .with_size(px(14.))
-                            .into_any_element()
-                    })
-                    .child(
-                        tab_label("Git".into(), self.tab == Tab::Git, theme)
-                            .id("tab-label")
-                            .test_support(),
-                    )
-                    .child(tab_close(
-                        crate::settings::close_button("close-git", "Close Git (cmd-w)").on_click(
-                            cx.listener(|this, _, w, cx| {
-                                cx.stop_propagation();
-                                this.close_git(w, cx);
-                            }),
-                        ),
-                        theme,
-                    ))
-                    .tooltip(|w, cx| Tooltip::new("Git (cmd-shift-g)").build(w, cx))
-                    .test_support()
-                    .into_any_element(),
-            ));
+        for feature in Feature::ALL {
+            if let Some(ix) = tabs.index(VisibleTab::Feature(feature)) {
+                pills.push((
+                    VisibleTab::Feature(feature),
+                    self.render_feature_tab(feature, ix, ctrl_held, cx),
+                ));
+            }
         }
         pills.extend(self.file_tabs.iter().enumerate().map(|(ix, file)| {
             let e = file.editor.read(cx);

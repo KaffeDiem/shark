@@ -18,7 +18,7 @@ impl Shark {
         if let Some(e) = self.state.save_error.borrow().as_ref() {
             errors.push(format!("Workspace state and settings: {e}"));
         }
-        for (ws, e) in &self.review.failed_saves {
+        for (ws, e) in self.differ.read(cx).storage_errors() {
             errors.push(format!("Comments in {ws}: {e}"));
         }
         for chat in self.chats.values() {
@@ -28,7 +28,7 @@ impl Shark {
             }
         }
         for (ws, git) in &self.git_features {
-            if let Some(e) = &git.read(cx).save_error {
+            if let Some(e) = git.read(cx).storage_error() {
                 errors.push(format!("Git drafts in {ws}: {e}"));
             }
         }
@@ -41,7 +41,7 @@ impl Shark {
         if self.state.save_error.borrow().is_some() {
             let _ = self.state.save();
         }
-        self.review.retry_saves();
+        self.differ.update(cx, |d, _| d.retry_saves());
         for chat in self.chats.values() {
             chat.update(cx, |c, cx| c.retry_history(cx));
         }

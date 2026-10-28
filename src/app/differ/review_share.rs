@@ -6,12 +6,12 @@ use super::*;
 use crate::sync::Pr;
 use gpui_kit::component::radio::{Radio, RadioGroup};
 
-pub(super) struct Share {
-    pub(super) id: u64,
+pub(in crate::app) struct Share {
+    pub(in crate::app) id: u64,
     /// A PR review instead of a reviewer note.
-    pub(super) review: bool,
-    pub(super) posting: bool,
-    pub(super) error: Option<String>,
+    pub(in crate::app) review: bool,
+    pub(in crate::app) posting: bool,
+    pub(in crate::app) error: Option<String>,
     /// The dialog's focus: while it holds it, the dialog is the top one.
     dialog: Option<FocusHandle>,
 }
@@ -30,7 +30,7 @@ fn dedent(s: &str) -> String {
 
 /// What GitHub receives for `comments`: path, side and range, the code as commented, the
 /// text. No inline anchor: the lines may not be pushed.
-pub(super) fn github_body(comments: &[Comment], note: &str) -> String {
+pub(in crate::app) fn github_body(comments: &[Comment], note: &str) -> String {
     let mut out = String::new();
     for c in comments {
         out += &format!("**{}** · {} · {}\n\n", c.path, c.side(), c.lines());
@@ -56,15 +56,20 @@ fn inline_body(c: &Comment) -> String {
     }
 }
 
-impl Shark {
+impl Differ {
     /// The open PR of `c`'s repo, and whether the lines are on GitHub (head pushed, clean).
-    pub(super) fn pr_of(&self, c: &Comment, cx: &App) -> Option<(Pr, bool)> {
+    pub(in crate::app) fn pr_of(&self, c: &Comment, _cx: &App) -> Option<(Pr, bool)> {
         let repo = c.repo();
-        self.active_sync()?.read(cx).pr_for(repo)
+        self.prs.get(repo).cloned()
     }
 
     /// "Share to GitHub…" on a thread: the dialog (07) over the window.
-    pub(super) fn open_share(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::app) fn open_share(
+        &mut self,
+        id: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(c) = self.comment(id) else { return };
         if self.pr_of(c, cx).is_none() {
             let repo = c.repo().to_string();
@@ -90,7 +95,7 @@ impl Shark {
 
     /// Closes the dialog, if it is open. Under another dialog it stays, showing it posted:
     /// closing would close that one.
-    pub(super) fn close_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::app) fn close_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let on_top = |s: &Share| (s.dialog.as_ref()).is_none_or(|f| f.contains_focused(window, cx));
         if self.review.share.as_ref().is_some_and(on_top) {
             self.review.share = None;
@@ -100,7 +105,7 @@ impl Shark {
     }
 
     /// Posts the dialog's thread; on success the thread keeps the URL.
-    pub(super) fn post_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::app) fn post_share(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(s) = &self.review.share else { return };
         if s.posting {
             return;
@@ -118,7 +123,7 @@ impl Shark {
     /// Posts `comments` (with `note`) to their repos' PRs in the background, one post per
     /// repo: a review, else a reviewer note. Each gets its URL; a failure, or a repo without
     /// a PR, says so and leaves its comments as they were. Ones already posted are skipped.
-    pub(super) fn publish(
+    pub(in crate::app) fn publish(
         &mut self,
         comments: &[Comment],
         note: &str,
@@ -138,7 +143,7 @@ impl Shark {
 
     /// The dialog is about one of `ids`, in workspace `ws`: it shows their post.
     fn shares(&self, ws: &str, ids: &[u64]) -> bool {
-        self.active.as_deref() == Some(ws)
+        self.workspace_name() == Some(ws)
             && (self.review.share.as_ref()).is_some_and(|sh| ids.contains(&sh.id))
     }
 
@@ -223,7 +228,7 @@ impl Shark {
                 let ours = s.shares(&ws_name, &ids);
                 match res {
                     Ok(url) => {
-                        s.record_interaction(&ws_name, cx);
+                        cx.emit(DifferEvent::Interacted(ws_name.clone()));
                         // Into the workspace they came from, even if another one is open now.
                         s.review.edit(&ws_name, |l| {
                             for c in l.iter_mut().filter(|c| ids.contains(&c.id)) {

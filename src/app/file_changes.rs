@@ -21,8 +21,9 @@ impl Shark {
             let e = t.editor.read(cx);
             e.path == path && e.saving
         }) || self
-            .editing
-            .as_ref()
+            .differ
+            .read(cx)
+            .edit_snapshot()
             .is_some_and(|e| e.path == path && e.saving)
         {
             return Err(format!("Saving {path}; wait before discarding"));
@@ -61,11 +62,11 @@ impl Shark {
                     s.refresh_diff(cx);
                     return notify_err(window, cx, e);
                 }
-                if s.editing.as_ref().is_some_and(|e| e.path == path) {
-                    s.end_edit(cx);
-                    if s.tab == Tab::Diff {
-                        s.diff.read(cx).focus_handle(cx).focus(window, cx);
-                    }
+                let ended_edit = s
+                    .differ
+                    .update(cx, |d, cx| d.file_discarded(&name, &path, cx));
+                if ended_edit && s.tab == Tab::Feature(Feature::Diff) {
+                    s.focus_feature(Feature::Diff, FeatureFocus::Main, window, cx);
                 }
                 let editors: Vec<_> = s
                     .file_tabs
@@ -81,7 +82,6 @@ impl Shark {
                         s.close_editor(editor, window, cx);
                     }
                 }
-                s.uncommitted.remove(&path);
                 s.refresh_diff(cx);
                 cx.notify();
             },

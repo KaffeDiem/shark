@@ -892,25 +892,6 @@ impl Shark {
         let changed = self.active.as_ref() != Some(&ws.name);
         if changed {
             self.drop_editor();
-            // A fresh tree and diff for another workspace.
-            self.editing = None;
-            self.diff_fp = 0;
-            self.diff_bases.clear();
-            self.diff_files.clear();
-            self.diff_fps.clear();
-            self.viewed_now = Rc::default();
-            self.diff_file = 0;
-            self.diff_loaded = false;
-            self.diff_error = None;
-            self.uncommitted.clear();
-            self.tree_rows.clear();
-            self.collapsed_dirs.clear();
-            self.tree_sel = 0;
-            self.lose_view();
-            // They act on the open workspace's comments: not another one's.
-            self.review.composer = None;
-            self.review.sheet = None;
-            self.close_share(window, cx);
         }
         self.sel = SideRow::Ws(ix);
         if let Some(i) = self.section_of(&ws.name)
@@ -972,6 +953,12 @@ impl Shark {
                     }
                 },
             ));
+            self._subs.push(cx.observe(&sync, |s, sync, cx| {
+                if s.active_sync() == Some(&sync) {
+                    s.configure_differ(cx);
+                    s.differ.update(cx, |_, cx| cx.notify());
+                }
+            }));
             self.syncs.insert(ws.name.clone(), sync);
         }
         for (name, sync) in &self.syncs {
@@ -980,6 +967,7 @@ impl Shark {
         }
         self.attn.opened(&ws.name);
         self.active = Some(ws.name);
+        self.reset_differ_workspace(window, cx);
         self.refresh_attention(cx);
         self.refresh_diff(cx);
         self.show(Tab::Chat, window, cx);
@@ -1219,10 +1207,10 @@ impl Shark {
         self.open_workspace_now(ix, window, cx);
         match tab.as_str() {
             "diff" if self.active_ws().is_some_and(|ws| !ws.diff_closed) => {
-                self.show(Tab::Diff, window, cx)
+                self.show(Tab::Feature(Feature::Diff), window, cx)
             }
             "git" if self.active_ws().is_some_and(|ws| !ws.git_closed) => {
-                self.show(Tab::Git, window, cx)
+                self.show(Tab::Feature(Feature::Git), window, cx)
             }
             "home" => self.enter_home(window, cx),
             _ => {}
@@ -1233,8 +1221,8 @@ impl Shark {
     pub(super) fn remember_open(&mut self) {
         let tab = match self.tab {
             _ if self.home.on => "home",
-            Tab::Diff => "diff",
-            Tab::Git => "git",
+            Tab::Feature(Feature::Diff) => "diff",
+            Tab::Feature(Feature::Git) => "git",
             Tab::Chat | Tab::File => "chat",
         };
         let open = self.active.clone().map(|n| (n, tab.to_string()));
@@ -1834,13 +1822,17 @@ impl Shark {
                 );
             }
             git.update(cx, |g, cx| g.retry_save(cx));
-            if git.read(cx).save_error.is_some() {
+            if git.read(cx).storage_error().is_some() {
                 return notify_err(window, cx, "Save Git drafts before archiving (Retry save)");
             }
         }
         if self.active.as_deref() == Some(name)
             && (self.file_tabs.iter().any(|t| t.editor.read(cx).saving)
-                || self.editing.as_ref().is_some_and(|e| e.saving))
+                || self
+                    .differ
+                    .read(cx)
+                    .edit_snapshot()
+                    .is_some_and(|e| e.saving))
         {
             return notify_err(window, cx, "Wait for file saves before archiving");
         }
@@ -1859,7 +1851,14 @@ impl Shark {
                     .is_some_and(|c| c.read(cx).history_save_error.is_some())
             })
         });
-        if pending_answers || self.review.failed_saves.contains_key(name) {
+        if pending_answers
+            || self
+                .differ
+                .read(cx)
+                .storage_errors()
+                .iter()
+                .any(|(ws, _)| ws == name)
+        {
             return notify_err(
                 window,
                 cx,
@@ -1878,7 +1877,7 @@ impl Shark {
         }
         if let Some(git) = self.git_features.get(name) {
             git.update(cx, |g, cx| {
-                g.archiving = true;
+                g.set_archiving(true, cx);
                 cx.notify();
             });
         }
@@ -1920,7 +1919,7 @@ impl Shark {
     ) {
         if let Some(git) = self.git_features.get(name) {
             git.update(cx, |g, cx| {
-                g.archiving = false;
+                g.set_archiving(false, cx);
                 cx.notify();
             });
         }
@@ -1939,7 +1938,7 @@ impl Shark {
                 self.syncs.remove(name);
                 self.git_features.remove(name);
                 self.attn.forget(name);
-                self.review.forget(name);
+                self.differ.update(cx, |d, _| d.forget_workspace(name));
                 self.state.workspaces.retain(|w| w.name != name);
                 self.state.reviewed.remove(name);
                 self.state.merge_order.remove(name);
@@ -1950,7 +1949,7 @@ impl Shark {
                 if self.active.as_deref() == Some(name) {
                     self.active = None;
                     self.drop_editor();
-                    self.editing = None;
+                    self.reset_differ_workspace(window, cx);
                     self.tab = Tab::Chat;
                     self.sidebar_focus.focus(window, cx);
                 }

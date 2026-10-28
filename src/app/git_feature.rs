@@ -60,13 +60,13 @@ impl EventEmitter<GitFeatureEvent> for GitFeature {}
 
 pub(super) struct GitFeature {
     workspace: Workspace,
-    pub(super) selected: usize,
-    pub(super) details: Option<api::Details>,
-    pub(super) loading: bool,
-    pub(super) loaded: bool,
-    pub(super) error: Option<String>,
-    pub(super) save_error: Option<String>,
-    pub(super) archiving: bool,
+    selected: usize,
+    details: Option<api::Details>,
+    loading: bool,
+    loaded: bool,
+    error: Option<String>,
+    save_error: Option<String>,
+    archiving: bool,
     posting: bool,
     generation: u64,
     refreshed: Option<Instant>,
@@ -169,6 +169,43 @@ impl GitFeature {
 
     pub(super) fn has_focus(&self, window: &Window, cx: &App) -> bool {
         self.focus.contains_focused(window, cx)
+    }
+
+    pub(super) fn storage_error(&self) -> Option<&str> {
+        self.save_error.as_deref()
+    }
+
+    pub(super) fn set_archiving(&mut self, archiving: bool, cx: &mut Context<Self>) {
+        self.archiving = archiving;
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(super) fn inspect(&self) -> TestState<'_> {
+        TestState {
+            selected: self.selected,
+            details: &self.details,
+            loading: self.loading,
+            error: &self.error,
+            save_error: &self.save_error,
+            archiving: self.archiving,
+        }
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_load_state(
+        &mut self,
+        loading: bool,
+        clear: bool,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if clear {
+            self.details = None;
+        }
+        self.loading = loading;
+        self.error = error;
+        cx.notify();
     }
 
     pub(super) fn busy(&self) -> bool {
@@ -1704,4 +1741,14 @@ mod tests {
         assert_eq!(first.replies["thread-b"], "second");
         assert_eq!(loaded["https://github.com/o/r/pull/2"].note, "other PR");
     }
+}
+
+#[cfg(test)]
+pub(super) struct TestState<'a> {
+    pub selected: usize,
+    pub details: &'a Option<api::Details>,
+    pub loading: bool,
+    pub error: &'a Option<String>,
+    pub save_error: &'a Option<String>,
+    pub archiving: bool,
 }

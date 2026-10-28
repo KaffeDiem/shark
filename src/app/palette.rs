@@ -386,43 +386,35 @@ pub(super) const COMMANDS: &[Row] = &[
         IconName::FileDiff,
         Some(&ShowDiff),
         "changes review tab",
-        |s, w, cx| s.show(Tab::Diff, w, cx),
+        |s, w, cx| s.show(Tab::Feature(Feature::Diff), w, cx),
     ),
     Row(
         "Show Git",
         IconName::GitPullRequest,
         Some(&ShowGit),
         "pull request description comments review resolve tab",
-        |s, w, cx| s.show(Tab::Git, w, cx),
+        |s, w, cx| s.show(Tab::Feature(Feature::Git), w, cx),
     ),
     Row(
         "Open file in editor",
         IconName::FilePen,
         Some(&OpenFile),
         "",
-        |s, w, cx| {
-            if let Some(ix) = s.cursor_file(w, cx) {
-                s.open_file(ix, w, cx)
-            }
-        },
+        |s, w, cx| s.open_cursor_file(w, cx),
     ),
     Row(
         "Toggle file viewed",
         IconName::Eye,
         Some(&ToggleViewed),
         "mark unviewed",
-        |s, w, cx| {
-            if let Some(ix) = s.cursor_file(w, cx) {
-                s.toggle_viewed(ix, cx)
-            }
-        },
+        |s, w, cx| s.toggle_cursor_viewed(w, cx),
     ),
     Row(
         "Comment on diff line",
         IconName::MessageSquarePlus,
         Some(&AddComment),
         "review",
-        |s, w, cx| s.comment_dialog(w, cx),
+        |s, w, cx| s.with_differ(w, cx, Differ::comment_dialog),
     ),
     Row(
         "Send review…",
@@ -430,8 +422,8 @@ pub(super) const COMMANDS: &[Row] = &[
         Some(&SendComments),
         "review diff comments agent",
         |s, w, cx| {
-            s.show(Tab::Diff, w, cx);
-            s.open_sheet(w, cx)
+            s.show(Tab::Feature(Feature::Diff), w, cx);
+            s.with_differ(w, cx, Differ::open_sheet)
         },
     ),
     Row(
@@ -439,14 +431,14 @@ pub(super) const COMMANDS: &[Row] = &[
         IconName::Check,
         Some(&ResolveAddressed),
         "review comments threads",
-        |s, _, cx| s.resolve_addressed(cx),
+        |s, _, cx| s.differ.update(cx, |d, cx| d.resolve_addressed(cx)),
     ),
     Row(
         "Re-queue outdated",
         IconName::RotateCcw,
         Some(&RequeueOutdated),
         "review comments threads pending",
-        |s, _, cx| s.requeue_outdated(cx),
+        |s, _, cx| s.differ.update(cx, |d, cx| d.requeue_outdated(cx)),
     ),
     Row(
         "Save file",
@@ -474,7 +466,7 @@ pub(super) const COMMANDS: &[Row] = &[
         IconName::Play,
         Some(&PlayMedia),
         "media movie diff",
-        |s, w, cx| s.play_media(w, cx),
+        |s, w, cx| s.with_differ(w, cx, |d, w, cx| d.play_media(w, cx)),
     ),
     Row(
         "Run next git step",
@@ -910,7 +902,7 @@ impl Shark {
             if (if codex { CLAUDE_ONLY } else { CODEX_ONLY }).contains(label)
                 || (no_target && NEED_WORKSPACE.contains(label))
                 || (*label == "Show or hide diff files"
-                    && (self.tab != Tab::Diff || self.home_shown()))
+                    && (self.tab != Tab::Feature(Feature::Diff) || self.home_shown()))
             {
                 continue;
             }

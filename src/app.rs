@@ -38,30 +38,28 @@ use std::sync::Arc;
 
 mod app_switcher;
 mod chats;
-mod diff;
+mod differ;
+mod differ_host;
 mod editor_pane;
 mod features;
 mod file_changes;
 mod git_feature;
 mod home;
-mod inline_edit;
 mod interaction;
-mod media;
 pub(crate) mod menus;
 mod palette;
 mod picker;
 mod reorder;
-mod review;
-mod review_send;
-mod review_share;
 mod sidebar;
 mod storage;
 #[cfg(all(test, feature = "test-support"))]
-pub(crate) mod ui_tests;
+pub(crate) use differ::ui_tests;
 mod workspace;
 mod workspace_picker;
 
-use diff::Viewed;
+use differ::Differ;
+use differ::diff::Viewed;
+use features::{Feature, FeatureFocus};
 use menus::{copy, on_shark, open_in_entries, tilde, ws_menu};
 use palette::menu_dialog;
 pub(crate) use palette::open_menu;
@@ -280,8 +278,7 @@ fn tab_label(label: SharedString, on: bool, theme: &Theme) -> Div {
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum Tab {
     Chat,
-    Diff,
-    Git,
+    Feature(Feature),
     /// The full-width file editor; only while `editor` is set.
     File,
 }
@@ -293,10 +290,8 @@ enum Pane {
     Chat,
     /// The chat's plan pane, right of its transcript.
     Plan,
-    Diff,
-    Git,
+    Feature(Feature, FeatureFocus),
     Editor,
-    Tree,
     Features,
     Home,
 }
@@ -313,34 +308,7 @@ pub struct Shark {
     /// Chats whose turn ended while another chat was shown.
     unread: HashSet<String>,
     tab: Tab,
-    diff: Entity<DiffState>,
-    /// Changed files in tree order, with each patch's fingerprint.
-    diff_files: Vec<DiffFile>,
-    diff_fps: Vec<u64>,
-    diff_fp: u64,
-    /// Bases used by the displayed patch, including the PR target discovered by polling.
-    diff_bases: HashMap<String, String>,
-    /// Bumped per refresh, so a slow older refresh can't overwrite a newer one.
-    diff_gen: u64,
-    /// The file last moved to (`}`/`{`, the tree); the diff can't say which one is on screen.
-    diff_file: usize,
-    /// False until the first refresh of the open workspace lands.
-    diff_loaded: bool,
-    diff_error: Option<String>,
-    /// Git status paths, independently of the diff's selected comparison base.
-    uncommitted: HashSet<String>,
-    /// Paths currently viewed (fingerprint still matches), for the diff headers.
-    viewed_now: Rc<HashSet<SharedString>>,
-    tree_rows: Vec<Row>,
-    collapsed_dirs: HashSet<String>,
-    tree_sel: usize,
-    tree_focus: FocusHandle,
-    tree_scroll: UniformListScrollHandle,
-    /// The Files panel's "Filter files…" box, and its text the tree filters by.
-    tree_filter: Entity<InputState>,
-    tree_query: String,
-    /// The Diff artifact's internal Files split; its width persists in `State`.
-    tree_resize: Entity<ResizableState>,
+    differ: Entity<Differ>,
     /// The sidebar | rest split, while the sidebar isn't a rail; persisted like Files.
     sidebar_resize: Entity<ResizableState>,
     sidebar_scroll: ScrollHandle,
@@ -353,19 +321,10 @@ pub struct Shark {
     pub(crate) archiving: HashSet<String>,
     creating: HashSet<String>,
     adding_repos: HashSet<String>,
-    show_tree: bool,
     /// Sidebar shrunk to icons by the user.
     rail: bool,
     editor: Option<Entity<FileEditor>>,
     file_tabs: Vec<editor_pane::FileTab>,
-    /// The diff file whose working copy is edited in place.
-    editing: Option<inline_edit::InlineEdit>,
-    review: review::Review,
-    /// The before/after row of each image or video in the diff, by path.
-    media: Vec<(SharedString, Entity<media::MediaView>)>,
-    media_cache: Entity<media::Lru>,
-    /// The diff pane's width: media rows fit it, not the diff's longest line.
-    media_width: Rc<std::cell::Cell<Pixels>>,
     pub(crate) syncs: HashMap<String, Entity<GitSync>>,
     sidebar_focus: FocusHandle,
     features_focus: FocusHandle,
@@ -404,15 +363,7 @@ impl Shark {
             let _ = state.save();
         }
         let home = home::Home::new(window, cx);
-        let tree_filter = cx.new(|cx| InputState::new(window, cx).placeholder("Filter files…"));
-        let (ratio, mode) = (state.split_ratio, diff::diff_mode(state.unified));
-        let diff = cx.new(|cx| {
-            let mut d = DiffState::new(vec![], cx).with_mode(mode);
-            if let Some(ratio) = ratio {
-                d.set_split_ratio(ratio, cx);
-            }
-            d
-        });
+        let differ = cx.new(|cx| Differ::new(differ::Preferences::from(&state), window, cx));
         cx.defer_in(window, move |s, window, cx| {
             s.restore_last_open(window, cx);
             s.check_deps(cx);
@@ -431,10 +382,6 @@ impl Shark {
                 window.push_notification(n.autohide(false), cx);
             }
         });
-        cx.background_executor()
-            .spawn(async { media::prune_cache() })
-            .detach();
-        let tree_resize = cx.new(|_| ResizableState::default());
         let sidebar_resize = cx.new(|_| ResizableState::default());
         // The close button asks before unsaved edits go, as Quit does.
         let this = cx.entity().downgrade();
@@ -442,38 +389,15 @@ impl Shark {
             (this.update(cx, |s, cx| s.close_window(w, cx))).unwrap_or(true)
         });
         let activity_owner = cx.entity().downgrade();
-        let _subs = vec![
+        let mut _subs = vec![
             cx.intercept_keystrokes(move |ev, w, cx| {
                 activity_owner
                     .update(cx, |s, cx| s.interaction_key(&ev.keystroke, w, cx))
                     .ok();
             }),
-            // A drag of the Files or sidebar edge: remember the width for the next launch.
-            cx.subscribe(&tree_resize, |s, r, _: &ResizablePanelEvent, cx| {
-                if let Some(w) = r.read(cx).sizes().get(1) {
-                    s.state.tree_width = Some(w.as_f32());
-                    let _ = s.state.save();
-                }
-            }),
             cx.subscribe(&sidebar_resize, |s, r, _: &ResizablePanelEvent, cx| {
                 if let Some(w) = r.read(cx).sizes().first() {
                     s.state.sidebar_width = Some(w.as_f32());
-                    let _ = s.state.save();
-                }
-            }),
-            cx.subscribe_in(
-                &tree_filter,
-                window,
-                |s, input, ev: &InputEvent, w, cx| match ev {
-                    InputEvent::Change => s.filter_tree(input.read(cx).value().to_string(), cx),
-                    InputEvent::PressEnter { .. } => s.filter_jump(w, cx),
-                    _ => {}
-                },
-            ),
-            // One ratio for every file and workspace, restored on launch.
-            cx.subscribe(&diff, |s, _, ev: &DiffEvent, _| {
-                if let DiffEvent::SplitRatioChanged(r) = ev {
-                    s.state.split_ratio = Some(*r);
                     let _ = s.state.save();
                 }
             }),
@@ -499,6 +423,10 @@ impl Shark {
                 }
             }),
         ];
+        _subs.push(cx.observe(&differ, |_, _, cx| cx.notify()));
+        _subs.push(cx.subscribe_in(&differ, window, |s, _, event, w, cx| {
+            s.differ_event(event, w, cx)
+        }));
         Shark {
             state,
             sel: SideRow::Ws(0),
@@ -508,25 +436,7 @@ impl Shark {
             awake: None,
             unread: HashSet::new(),
             tab: Tab::Chat,
-            diff,
-            diff_files: vec![],
-            diff_fps: vec![],
-            diff_fp: 0,
-            diff_bases: HashMap::new(),
-            diff_gen: 0,
-            diff_file: 0,
-            diff_loaded: false,
-            diff_error: None,
-            uncommitted: HashSet::new(),
-            viewed_now: Rc::default(),
-            tree_rows: vec![],
-            collapsed_dirs: HashSet::new(),
-            tree_sel: 0,
-            tree_focus: cx.focus_handle(),
-            tree_scroll: UniformListScrollHandle::new(),
-            tree_filter,
-            tree_query: String::new(),
-            tree_resize,
+            differ,
             sidebar_resize,
             sidebar_scroll: ScrollHandle::new(),
             tab_scroll: ScrollHandle::new(),
@@ -537,16 +447,9 @@ impl Shark {
             archiving: HashSet::new(),
             creating: HashSet::new(),
             adding_repos: HashSet::new(),
-            // Files starts open inside Diff; its toolbar can hide it for more review space.
-            show_tree: true,
             rail: false,
             editor: None,
             file_tabs: vec![],
-            editing: None,
-            review: Default::default(),
-            media: vec![],
-            media_cache: media::Lru::new(cx),
-            media_width: Rc::default(),
             syncs: HashMap::new(),
             sidebar_focus,
             features_focus: cx.focus_handle(),
@@ -662,30 +565,27 @@ impl Shark {
     }
 
     fn show(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
-        if tab == Tab::Diff
-            && let Some(ws) = self.active_ws_mut().filter(|ws| ws.diff_closed)
-        {
-            ws.diff_closed = false;
-            ws.open_tab(TabId::Diff);
-            let _ = self.state.save();
-        }
-        if tab == Tab::Git {
+        if let Tab::Feature(feature) = tab {
             if self.active_ws().is_none() {
                 return notify_err(window, cx, "Open a workspace first");
             }
-            if let Some(ws) = self.active_ws_mut().filter(|ws| ws.git_closed) {
-                ws.git_closed = false;
-                ws.open_tab(TabId::Git);
+            let ws = self.active_ws_mut().unwrap();
+            let closed = match feature {
+                Feature::Diff => &mut ws.diff_closed,
+                Feature::Git => &mut ws.git_closed,
+            };
+            if *closed {
+                *closed = false;
+                ws.open_tab(feature.tab_id());
                 let _ = self.state.save();
             }
-            self.feature_sel = 1;
-        } else if tab == Tab::Diff {
-            self.feature_sel = 0;
+            self.feature_sel = Feature::ALL.iter().position(|f| *f == feature).unwrap();
         }
         self.tab = tab;
         self.home.on = false;
         self.remember_open();
         self.reveal_tab(cx);
+        self.configure_differ(cx);
         match tab {
             Tab::Chat => {
                 if let Some(chat) = self.active_chat() {
@@ -693,18 +593,7 @@ impl Shark {
                     focus.focus(window, cx);
                 }
             }
-            Tab::Diff => {
-                self.refresh_diff(cx);
-                match self.editing {
-                    Some(_) => self.focus_edit(window, cx),
-                    None => self.diff.read(cx).focus_handle(cx).focus(window, cx),
-                }
-            }
-            Tab::Git => {
-                if let Some(git) = self.ensure_git_feature(window, cx) {
-                    git.update(cx, |g, cx| g.focus(window, cx));
-                }
-            }
+            Tab::Feature(feature) => self.activate_feature(feature, window, cx),
             Tab::File => match &self.editor {
                 Some(e) => crate::editor::focus(e, window, cx),
                 None => return self.show(self.file_fallback(), window, cx),
@@ -715,24 +604,6 @@ impl Shark {
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
         self.rail = !self.rail;
-        cx.notify();
-    }
-
-    fn toggle_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.tab != Tab::Diff || self.home_shown() {
-            return;
-        }
-        self.show_tree = !self.show_tree;
-        if !self.show_tree
-            && (self.tree_focus.is_focused(window)
-                || self
-                    .tree_filter
-                    .read(cx)
-                    .focus_handle(cx)
-                    .is_focused(window))
-        {
-            self.focus_diff(window, cx);
-        }
         cx.notify();
     }
 
@@ -749,12 +620,12 @@ impl Shark {
                     v.push(Pane::Plan);
                 }
             }
-            Tab::Diff => v.push(Pane::Diff),
-            Tab::Git => v.push(Pane::Git),
+            Tab::Feature(feature) => v.extend(
+                self.feature_focus_targets(feature, cx)
+                    .into_iter()
+                    .map(|target| Pane::Feature(feature, target)),
+            ),
             Tab::File => v.push(Pane::Editor),
-        }
-        if self.tree_shown() {
-            v.push(Pane::Tree);
         }
         if self.right_rail_shown() {
             v.push(Pane::Features);
@@ -766,28 +637,16 @@ impl Shark {
         if self.sidebar_focus.is_focused(window) {
             return Some(Pane::Sidebar);
         }
-        if self.tree_shown()
-            && (self.tree_focus.is_focused(window)
-                || self
-                    .tree_filter
-                    .read(cx)
-                    .focus_handle(cx)
-                    .is_focused(window))
-        {
-            return Some(Pane::Tree);
-        }
         if self.right_rail_shown() && self.features_focus.is_focused(window) {
             return Some(Pane::Features);
         }
         if self.home_shown() {
             return self.home.has_focus(window, cx).then_some(Pane::Home);
         }
-        if self.tab == Tab::Git
-            && self
-                .active_git_feature()
-                .is_some_and(|g| g.read(cx).has_focus(window, cx))
-        {
-            return Some(Pane::Git);
+        if let Tab::Feature(feature) = self.tab {
+            return self
+                .focused_feature(feature, window, cx)
+                .map(|target| Pane::Feature(feature, target));
         }
         if self
             .editor
@@ -806,26 +665,15 @@ impl Shark {
                 return Some(Pane::Chat);
             }
         }
-        self.diff
-            .read(cx)
-            .focus_handle(cx)
-            .is_focused(window)
-            .then_some(Pane::Diff)
+        None
     }
 
     fn focus_pane(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
         match pane {
             Pane::Sidebar => self.sidebar_focus.focus(window, cx),
-            Pane::Tree if self.tree_shown() => self.tree_focus.focus(window, cx),
-            Pane::Tree => return,
             Pane::Features => self.features_focus.focus(window, cx),
             Pane::Home => self.home.focus.focus(window, cx),
-            Pane::Diff => self.diff.read(cx).focus_handle(cx).focus(window, cx),
-            Pane::Git => {
-                if let Some(git) = self.active_git_feature().cloned() {
-                    git.update(cx, |g, cx| g.focus(window, cx));
-                }
-            }
+            Pane::Feature(feature, target) => self.focus_feature(feature, target, window, cx),
             Pane::Chat => {
                 if let Some(chat) = self.active_chat() {
                     chat.read(cx).focus.clone().focus(window, cx);
@@ -1004,6 +852,8 @@ impl Shark {
         if self.home_shown() {
             return self.render_home(window, cx);
         }
+        let controls = self.render_feature_controls(cx);
+        let has_controls = controls.is_some();
         let theme = cx.theme();
         v_flex()
             .flex_1()
@@ -1032,15 +882,13 @@ impl Shark {
                             .id("workspace-toolbar-empty")
                             .map(|d| self.draggable_chrome("workspace-toolbar-empty", d)),
                     )
-                    .when(self.tab == Tab::Diff, |d| {
-                        d.child(self.render_diff_controls(cx))
-                    })
+                    .children(controls)
                     .when_some(self.active_sync().cloned(), |d, sync| {
                         d.child(
                             div()
                                 .min_w_0()
                                 .flex_shrink_0()
-                                .when(self.tab == Tab::Diff, |d| d.max_w(relative(0.4)))
+                                .when(has_controls, |d| d.max_w(relative(0.4)))
                                 .child(sync),
                         )
                     }),
@@ -1056,23 +904,11 @@ impl Shark {
                         }))
                         .into_any_element()
                 }
-                Tab::Git => div()
-                    .flex_1()
-                    .min_h_0()
-                    .children(
-                        self.active_git_feature()
-                            .map(|git| git.clone().cached(StyleRefinement::default().size_full())),
-                    )
-                    .into_any_element(),
+                Tab::Feature(feature) => self.render_feature(feature, cx),
                 Tab::File => h_flex()
                     .flex_1()
                     .min_h_0()
                     .child(self.render_editor(cx))
-                    .into_any_element(),
-                Tab::Diff => h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.with_tree(self.render_diff(window, cx), window, cx))
                     .into_any_element(),
             })
             .into_any_element()
@@ -1192,14 +1028,8 @@ impl Render for Shark {
         } else {
             px(0.)
         };
-        if self.tree_shown() {
-            side += self
-                .tree_resize
-                .read(cx)
-                .sizes()
-                .get(1)
-                .copied()
-                .unwrap_or(px(self.state.tree_width.unwrap_or(244.)));
+        if self.tree_shown(cx) {
+            side += self.differ.read(cx).files_width(cx);
         }
         if cx.theme().notification.margins.right != side + px(16.)
             || cx.theme().notification.margins.top != px(104.)
@@ -1207,11 +1037,6 @@ impl Render for Shark {
             let margins = &mut Theme::global_mut(cx).notification.margins;
             margins.right = side + px(16.);
             margins.top = px(104.);
-        }
-        if let Some(msg) = self.review.warning.take() {
-            cx.defer_in(window, move |_, w, cx| {
-                w.push_notification(Notification::warning(msg).autohide(false), cx)
-            });
         }
         let theme = cx.theme();
         h_flex()
@@ -1256,8 +1081,14 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &PrevTab, w, cx| this.cycle_tab(-1, w, cx)))
             .on_action(cx.listener(|this, a: &OpenTab, w, cx| this.select_tab(a.0, w, cx)))
             .on_action(cx.listener(|this, _: &OpenSide, w, cx| this.open_side(w, cx)))
-            .on_action(cx.listener(|this, _: &ShowDiff, w, cx| this.show(Tab::Diff, w, cx)))
-            .on_action(cx.listener(|this, _: &ShowGit, w, cx| this.show(Tab::Git, w, cx)))
+            .on_action(cx.listener(|this, _: &ShowDiff, w, cx| {
+                this.show(Tab::Feature(Feature::Diff), w, cx)
+            }))
+            .on_action(
+                cx.listener(|this, _: &ShowGit, w, cx| {
+                    this.show(Tab::Feature(Feature::Git), w, cx)
+                }),
+            )
             .on_action(cx.listener(|this, _: &CreatePrs, w, cx| this.create_prs(w, cx)))
             .on_action(
                 cx.listener(|this, _: &OpenPrs, w, cx| this.with_sync(w, cx, GitSync::open_prs)),
@@ -1345,11 +1176,7 @@ impl Render for Shark {
                 cx.listener(|this, _: &EditWorkingCopy, w, cx| this.edit_working_copy(None, w, cx)),
             )
             // `o` in the diff and the tree.
-            .on_action(cx.listener(|this, _: &OpenFile, w, cx| {
-                if let Some(ix) = this.cursor_file(w, cx) {
-                    this.open_file(ix, w, cx)
-                }
-            }))
+            .on_action(cx.listener(|this, _: &OpenFile, w, cx| this.open_cursor_file(w, cx)))
             .on_action(cx.listener(|this, _: &OpenAnyFile, w, cx| this.open_any_file(w, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, w, cx| {
                 crate::settings::open(&this.state, w, cx)

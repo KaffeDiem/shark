@@ -72,6 +72,7 @@ enum Block {
 
 /// Diff comments sent as one message (src/app/review.rs), shown as a card instead of the
 /// prompt text.
+#[derive(Clone)]
 pub struct ReviewCard {
     pub prompt: String,
     pub items: Vec<ReviewItem>,
@@ -190,6 +191,7 @@ fn card_of(prompt: &str) -> Option<ReviewCard> {
 }
 
 /// One comment of a review card: its id, "app.rs · Working copy · lines 631–632", its text.
+#[derive(Clone)]
 pub struct ReviewItem {
     pub id: u64,
     pub place: String,

@@ -6,20 +6,30 @@ use crate::chat::{ReviewCard, ReviewItem, plural};
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::input::{Enter, Escape};
 
-pub(super) struct Sheet {
-    /// The pending threads when it opened, ticked or not.
-    pub(super) rows: Vec<(u64, bool)>,
-    sel: usize,
-    pub(super) note: Entity<InputState>,
-    /// Also post the ticked comments to the PR as a Comment review.
-    pub(super) publish: bool,
-    pub(super) preview: bool,
-    pub(super) focus: FocusHandle,
+#[derive(Clone)]
+pub(in crate::app) struct ReviewRequest {
+    pub workspace: String,
+    pub chat: String,
+    pub card: ReviewCard,
+    comments: Vec<Comment>,
+    note: String,
+    publish: bool,
 }
 
-impl Shark {
+pub(in crate::app) struct Sheet {
+    /// The pending threads when it opened, ticked or not.
+    pub(in crate::app) rows: Vec<(u64, bool)>,
+    sel: usize,
+    pub(in crate::app) note: Entity<InputState>,
+    /// Also post the ticked comments to the PR as a Comment review.
+    pub(in crate::app) publish: bool,
+    pub(in crate::app) preview: bool,
+    pub(in crate::app) focus: FocusHandle,
+}
+
+impl Differ {
     /// `shift-c`, the bar's Send review…: the sheet over the pending threads.
-    pub(super) fn open_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::app) fn open_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows: Vec<(u64, bool)> = (self.ws_comments().iter())
             .filter(|c| c.status == Status::Pending)
             .map(|c| (c.id, true))
@@ -44,14 +54,14 @@ impl Shark {
         cx.notify();
     }
 
-    pub(super) fn close_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::app) fn close_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.review.sheet = None;
         self.focus_diff(window, cx);
         cx.notify();
     }
 
     /// `space`: tick or untick the row under the cursor.
-    pub(super) fn sheet_toggle(&mut self, cx: &mut Context<Self>) {
+    pub(in crate::app) fn sheet_toggle(&mut self, cx: &mut Context<Self>) {
         if let Some(s) = &mut self.review.sheet
             && let Some(r) = s.rows.get_mut(s.sel)
         {
@@ -60,7 +70,7 @@ impl Shark {
         }
     }
 
-    pub(super) fn sheet_move(&mut self, d: isize, cx: &mut Context<Self>) {
+    pub(in crate::app) fn sheet_move(&mut self, d: isize, cx: &mut Context<Self>) {
         if let Some(s) = &mut self.review.sheet {
             s.sel = s.sel.saturating_add_signed(d).min(s.rows.len() - 1);
             cx.notify();
@@ -68,7 +78,7 @@ impl Shark {
     }
 
     /// `enter`: the row's thread in the diff.
-    pub(super) fn sheet_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::app) fn sheet_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let id = (self.review.sheet.as_ref())
             .and_then(|s| s.rows.get(s.sel))
             .map(|r| r.0);
@@ -79,7 +89,7 @@ impl Shark {
     }
 
     /// `cmd-enter`: sends the ticked rows.
-    pub(super) fn sheet_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(in crate::app) fn sheet_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(s) = &self.review.sheet else { return };
         let ids: Vec<u64> = s.rows.iter().filter(|r| r.1).map(|r| r.0).collect();
         let note = s.note.read(cx).value().to_string();
@@ -90,7 +100,7 @@ impl Shark {
 
     /// Pending comments `ids` as one message in the open chat (queued while it works); they
     /// become Sent there. With `publish`, also a Comment review on the PR.
-    pub(super) fn send_review(
+    pub(in crate::app) fn send_review(
         &mut self,
         ids: &[u64],
         note: &str,
@@ -98,10 +108,14 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(chat) = self.active_chat().cloned() else {
+        let Some(ws) = self.active_ws() else {
             return notify_err(window, cx, "Open a workspace first");
         };
-        if let Some(ws) = self.active.clone() {
+        let Some(chat_id) = ws.chats.get(ws.active_chat).map(|c| c.id.clone()) else {
+            return;
+        };
+        let workspace = ws.name.clone();
+        if let Some(ws) = self.workspace_name().map(str::to_string) {
             self.reanchor_comments(&ws); // the lines as the agent will read them
         }
         let comments: Vec<Comment> = (self.ws_comments().iter())
@@ -133,11 +147,38 @@ impl Shark {
                 format!("{n} file{} · +{a} −{d}", plural(n))
             },
         };
-        let chat_id = chat.read(cx).meta.id.clone();
-        // Refused (archiving, spawn failed): the chat says why; the comments stay pending.
-        if !chat.update(cx, |c, cx| c.send_review(card, cx)) {
-            return notify_err(window, cx, "Review not sent; the chat says why");
-        }
+        cx.emit(DifferEvent::SendReview(ReviewRequest {
+            workspace,
+            chat: chat_id,
+            card,
+            comments,
+            note: note.into(),
+            publish,
+        }));
+    }
+
+    pub(in crate::app) fn review_request_valid(&self, request: &ReviewRequest) -> bool {
+        self.workspace_name() == Some(request.workspace.as_str())
+            && request
+                .comments
+                .iter()
+                .all(|c| self.comment(c.id) == Some(c) && !self.unsaved_edit(c))
+    }
+
+    /// The host calls this synchronously after Chat accepts, before queued Chat events run.
+    pub(in crate::app) fn review_accepted(
+        &mut self,
+        request: &ReviewRequest,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let ReviewRequest {
+            comments,
+            chat: chat_id,
+            note,
+            publish,
+            ..
+        } = request;
         // Queued until the chat's ReviewSent (right after this, or when its turn ends).
         let ids: Vec<u64> = comments.iter().map(|c| c.id).collect();
         self.edit_comments(cx, |l| {
@@ -150,14 +191,14 @@ impl Shark {
         let s = plural(n);
         window.push_notification(format!("Sent {n} comment{s} to the agent"), cx);
         self.close_sheet(window, cx);
-        if publish {
-            self.publish(&comments, note, true, window, cx);
+        if *publish {
+            self.publish(comments, note, true, window, cx);
         }
     }
 
     /// The repo and PR number of each repo of the ticked rows with an open PR: where Also
     /// publish posts.
-    pub(super) fn sheet_prs(&self, cx: &App) -> Vec<(String, u64)> {
+    pub(in crate::app) fn sheet_prs(&self, cx: &App) -> Vec<(String, u64)> {
         let Some(s) = &self.review.sheet else {
             return vec![];
         };
@@ -174,7 +215,7 @@ impl Shark {
     }
 
     /// Ticks Also publish; the preview opens, so what GitHub gets is seen first.
-    pub(super) fn sheet_publish(&mut self, on: bool, cx: &mut Context<Self>) {
+    pub(in crate::app) fn sheet_publish(&mut self, on: bool, cx: &mut Context<Self>) {
         if let Some(s) = &mut self.review.sheet {
             s.publish = on;
             s.preview |= on;
@@ -183,7 +224,7 @@ impl Shark {
     }
 
     /// The sheet, over the bottom right of the diff.
-    pub(super) fn render_sheet(
+    pub(in crate::app) fn render_sheet(
         &self,
         window: &Window,
         cx: &mut Context<Self>,
