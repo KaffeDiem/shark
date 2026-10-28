@@ -241,6 +241,7 @@ pub(crate) fn render_pixels() {
         gpui_kit::init(cx);
         crate::install_fonts(cx);
     });
+    crate::chat::ui_tests::render_activity_pixels(&mut cx);
     let (window, tabs) = cx
         .update(|cx| {
             gpui_kit::open_window(

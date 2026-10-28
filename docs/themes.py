@@ -163,6 +163,11 @@ def build(name, mode, pal):
         "danger.foreground": status["danger"],
         "info.background": pr,
         "info.foreground": status["link"],
+        "chart.1": status["link"],
+        "chart.2": status["success"],
+        "chart.3": status["warning"],
+        "chart.4": status["danger"],
+        "chart.5": lift(mix(p["link"], p["danger"], 0.5), surfaces, 60, dark),
     }
     # Same blend as `faint()` in src/app.rs.
     faint = mix(mfg, p["background"], 0.4)
@@ -208,3 +213,6 @@ if __name__ == "__main__":
                                  ("warning.foreground", 60), ("danger.foreground", 60), ("link", 60)]:
                 lowest = min(apca(c[token], c[bg]) for bg in ("popover.background", "accent.background"))
                 assert lowest >= floor, f"{theme['name']}: {token} menu contrast {lowest:.2f} < {floor}"
+            for i in range(1, 6):
+                lowest = min(apca(c[f"chart.{i}"], c[bg]) for bg in ("background", "popover.background"))
+                assert lowest >= 60, f"{theme['name']}: chart.{i} contrast {lowest:.2f} < 60"

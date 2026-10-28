@@ -52,6 +52,7 @@ Read this before adding or changing UI. Shark's look is modeled on Linear: a cal
 | `danger_foreground`, `success_foreground`, `warning_foreground` | `#ff9c9c`, `#5fd39a`, `#f2c94c` | `#c42b2b`, `#1f7a50`, `#8a6800` | Status **text and icons** |
 | `danger`, `success`, `warning` | | | Fills only (danger button). Too low-contrast for text |
 | `link` | `#a9b2ff` | `#4061da` | Links in markdown |
+| `chart_1` … `chart_5` | Theme palette | Theme palette | Background task identity: blue, green, yellow, red, purple; Lc ≥60 on the transcript and hover card |
 
 ### Contrast rules
 Except for dimmed navigation and file-tree paths, measure APCA (Lc) against **every surface the text can sit on**, including hover and selected rows (`background`, `sidebar`, `secondary`, `muted`, `list_active`, `list_hover`, `sidebar_accent`, `side_hover`, `side_on`, `popover`, `accent`):
@@ -171,6 +172,7 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 |---|---|
 | Agent idle | `CircleDashed`, `muted_foreground` |
 | Agent running | `Spinner` (sidebar: `.icon(IconName::LoaderCircle).color(theme.primary)`); header dot in `primary` |
+| Background tasks | One 12px Lucide animal per task (shell: `SquareTerminal`) in a theme hue, hopping in turn every 400ms; static under reduced motion. Show at most six, then `+k`; hover lists every task with its matching icon and hue |
 | Workspace finished off screen (unread) | Sidebar `CircleCheck` in `success_foreground` until opened |
 | Home: chat ended on a plan or a question | Same as needs you, labelled "Plan to approve" / "Question to answer"; outranks unread |
 | Stacked branch | Header `Layers` + position `2/3`; branch menu rows with the PR's number and state |
@@ -194,6 +196,7 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 | PR picker: open / draft / merged / closed | `GitPullRequest` in `success_foreground` / `GitPullRequestDraft` muted / `GitMerge` muted / `GitPullRequestClosed` in `danger_foreground`; terminal state outranks draft, and state remains in text and accessibility labels |
 
   Only the agent-running state uses a spinner or `primary`. Other pending states (checks running, syncing) use a static icon.
+  Background agents count as agent running.
 - **Badges** are a status icon (14px in rows, 12px in the header), optionally followed by a `text_xs` label. Don't use `Tag` or `Badge` fills in chrome.
 
 ## Interaction states

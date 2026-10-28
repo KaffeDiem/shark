@@ -807,6 +807,11 @@ mod tests {
                 &c.sidebar_foreground,
                 &c.primary,
                 &c.link,
+                &c.chart_1,
+                &c.chart_2,
+                &c.chart_3,
+                &c.chart_4,
+                &c.chart_5,
             ] {
                 assert!(key.is_some(), "{} is missing a core color", t.name);
             }

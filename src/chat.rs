@@ -28,15 +28,62 @@ use gpui_kit::component::shimmer::ShimmerText;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, Icon, Selectable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme, Icon, Selectable as _, ThemeColor, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde_json::Value;
 use side::Side;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
+
+const CRITTERS: [IconName; 10] = [
+    IconName::Cat,
+    IconName::Bird,
+    IconName::Rabbit,
+    IconName::Squirrel,
+    IconName::Turtle,
+    IconName::Snail,
+    IconName::Ghost,
+    IconName::Fish,
+    IconName::Dog,
+    IconName::Rat,
+];
+const PARADE_LIMIT: usize = 6;
+const HOP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
+
+fn assign_critters(critters: &mut HashMap<String, usize>, tasks: &[agent::Task]) {
+    critters.retain(|id, _| tasks.iter().any(|t| &t.id == id));
+    for task in tasks {
+        if !critters.contains_key(&task.id) {
+            let ix = (0..CRITTERS.len())
+                .find(|ix| !critters.values().any(|used| used == ix))
+                .unwrap_or(critters.len() % CRITTERS.len());
+            critters.insert(task.id.clone(), ix);
+        }
+    }
+}
+
+fn critter_icon(task: &agent::Task, ix: usize) -> IconName {
+    if task.kind == "local_bash" {
+        IconName::SquareTerminal
+    } else {
+        CRITTERS[ix]
+    }
+}
+
+fn critter_color(ix: usize, theme: &ThemeColor) -> Hsla {
+    [
+        theme.chart_1,
+        theme.chart_2,
+        theme.chart_3,
+        theme.chart_4,
+        theme.chart_5,
+    ][ix % 5]
+}
 
 struct Call {
     id: String,
@@ -220,6 +267,22 @@ pub(crate) fn copy_button(
 pub(crate) fn markdown(md: &Entity<TextViewState>, group: &'static str) -> TextView {
     TextView::new(md)
         .selectable(true)
+        .on_link_click(|url, event, _, cx| {
+            if !event.standard_click() && !event.is_middle_click() {
+                return;
+            }
+            if Path::new(url.as_str()).is_absolute() {
+                use objc2_foundation::{NSString, NSURL};
+                // Bare file paths need a file URL; Foundation escapes spaces and Unicode.
+                if let Some(file_url) =
+                    NSURL::fileURLWithPath(&NSString::from_str(url)).absoluteString()
+                {
+                    cx.open_url(&file_url.to_string());
+                }
+            } else {
+                cx.open_url(url);
+            }
+        })
         .style(TextViewStyle::default().code_block(StyleRefinement::default().pt(px(28.))))
         .code_block_actions(move |block, _, cx| {
             h_flex()
@@ -336,9 +399,11 @@ pub struct Chat {
     rows: Vec<Row>,
     sel: usize,
     pub busy: bool,
-    /// Background tasks (subagents, shells) still running, by description; the turn can end
-    /// before they do.
-    pub background: Vec<String>,
+    /// Background tasks (subagents, shells) still running; the turn can end before they do.
+    pub background: Vec<agent::Task>,
+    critters: HashMap<String, usize>,
+    hop: usize,
+    hopping: Option<Task<()>>,
     /// When the running turn started.
     pub started: Option<Instant>,
     /// Set while a git step runs in these worktrees; sends wait for it.
@@ -714,6 +779,9 @@ impl Chat {
             sel: 0,
             busy: false,
             background: vec![],
+            critters: HashMap::new(),
+            hop: 0,
+            hopping: None,
             started: None,
             hold: false,
             archiving: false,
@@ -797,6 +865,9 @@ impl Chat {
         let kept = (
             self.busy,
             std::mem::take(&mut self.background),
+            std::mem::take(&mut self.critters),
+            self.hop,
+            self.hopping.take(),
             self.started,
             self.cut,
             self.meta.session_id.clone(),
@@ -817,6 +888,9 @@ impl Chat {
         (
             self.busy,
             self.background,
+            self.critters,
+            self.hop,
+            self.hopping,
             self.started,
             self.cut,
             self.meta.session_id,
@@ -845,6 +919,33 @@ impl Chat {
     /// Whether anything is still going on: a turn, or tasks it left running in the background.
     pub fn working(&self) -> bool {
         self.busy || !self.background.is_empty()
+    }
+
+    fn set_background(&mut self, tasks: Vec<agent::Task>, cx: &mut Context<Self>) {
+        assign_critters(&mut self.critters, &tasks);
+        self.background = tasks;
+        if self.background.is_empty() || cx.reduce_motion() || self.replaying {
+            self.hopping = None;
+            self.hop = 0;
+        } else if self.hopping.is_none() {
+            self.hopping = Some(cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor().timer(HOP_INTERVAL).await;
+                    let keep_hopping = this.update(cx, |c, cx| {
+                        if c.background.is_empty() || cx.reduce_motion() {
+                            c.hopping = None;
+                            return false;
+                        }
+                        c.hop = c.hop.wrapping_add(1);
+                        cx.notify();
+                        true
+                    });
+                    if !matches!(keep_hopping, Ok(true)) {
+                        break;
+                    }
+                }
+            }));
+        }
     }
 
     pub fn queued(&self) -> usize {
@@ -1578,7 +1679,7 @@ impl Chat {
             || (!self.codex() && self.agent_effort != self.effort());
         if self.agent.is_some() && stale && !self.busy && !self.steered {
             self.agent = None; // drop stops it; the respawn resumes the same session on the new model/level
-            self.background.clear(); // its reader is replaced below, so its Exited never arrives
+            self.set_background(vec![], cx); // its reader is replaced below, so its Exited never arrives
         }
         if self.agent.is_none() {
             match agent::spawn(&self.ws, &self.meta) {
@@ -1812,7 +1913,7 @@ impl Chat {
     fn drop_process(&mut self, cx: &mut Context<Self>) {
         self.agent = None; // drop stops it
         self.drop_asked(cx);
-        self.background.clear();
+        self.set_background(vec![], cx);
         self.stopping = None;
         self.cut = false;
         self.steered = false;
@@ -1973,7 +2074,7 @@ impl Chat {
                 self.busy = true;
                 self.steered = false;
             }
-            Ev::Background(tasks) => self.background = tasks,
+            Ev::Background(tasks) => self.set_background(tasks, cx),
             Ev::Interrupted => self.cut = true,
             // claude's echo: the oldest message it hadn't read is now part of the turn.
             // `ends_with`: a workspace `note` may have been put before the text on the wire.
@@ -2206,7 +2307,12 @@ impl Chat {
     /// without remeasuring or moving the transcript.
     fn render_activity(&self, cx: &App) -> impl IntoElement {
         let theme = cx.theme();
-        let line = div().id("activity").w_full().h(px(24.)).px_4();
+        let line = div()
+            .id("activity")
+            .test_support()
+            .w_full()
+            .h(px(24.))
+            .px_4();
         if !self.working() {
             return line;
         }
@@ -2222,18 +2328,45 @@ impl Chat {
             self.model().to_string(),
         );
         let (queued, steered, tasks) = (self.queued(), self.steered, self.background.clone());
+        let critters = self.critters.clone();
+        let visible = tasks.len().min(PARADE_LIMIT);
         line.child(
             div().w_full().max_w(px(680.)).mx_auto().child(
                 HoverCard::new("activity-card")
                     .anchor(Anchor::BottomLeft)
                     .trigger(
-                        div()
+                        h_flex()
+                            .gap_1()
+                            .h(px(24.))
                             .text_xs()
                             .text_color(theme.muted_foreground)
+                            .children(tasks.iter().take(PARADE_LIMIT).enumerate().map(|(i, t)| {
+                                let ix = critters[&t.id];
+                                // Fixed slots contain the hop without changing the footer's layout.
+                                div()
+                                    .id(("background-critter", i))
+                                    .test_support()
+                                    .size(px(12.))
+                                    .flex_shrink_0()
+                                    .child(
+                                        Icon::new(critter_icon(t, ix))
+                                            .with_size(px(12.))
+                                            .text_color(critter_color(ix, theme))
+                                            .when(
+                                                !cx.reduce_motion() && i == self.hop % visible,
+                                                |d| d.mt(px(-2.)),
+                                            ),
+                                    )
+                            }))
+                            .when(tasks.len() > PARADE_LIMIT, |d| {
+                                d.child(format!("+{}", tasks.len() - PARADE_LIMIT))
+                            })
                             // The shimmer redraws the chat every frame, as a tool's spinner
                             // does; only during a turn, not for tasks left running after it.
                             .map(|d| match busy {
-                                true => d.child(ShimmerText::new(text).id("activity-text")),
+                                true => d
+                                    .child(Spinner::new().with_size(px(12.)))
+                                    .child(ShimmerText::new(text).id("activity-text")),
                                 false => d.child(text),
                             }),
                     )
@@ -2263,10 +2396,15 @@ impl Chat {
                                         .child(format!("{} in background", tasks.len())),
                                 )
                                 .children(tasks.iter().map(|t| {
+                                    let ix = critters[&t.id];
                                     h_flex()
                                         .gap_1p5()
-                                        .child(Icon::new(IconName::Bot).with_size(px(12.)))
-                                        .child(t.clone())
+                                        .child(
+                                            Icon::new(critter_icon(t, ix))
+                                                .with_size(px(12.))
+                                                .text_color(critter_color(ix, theme)),
+                                        )
+                                        .child(t.description.clone())
                                 }))
                             })
                     }),
@@ -3237,6 +3375,55 @@ mod tests {
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
 
     #[test]
+    fn critters_stay_with_tasks_and_reuse_freed_icons() {
+        let task = |id: &str| agent::Task {
+            id: id.into(),
+            kind: "local_agent".into(),
+            description: "Same description".into(),
+        };
+        let mut critters = HashMap::new();
+        assign_critters(&mut critters, &[task("a"), task("b"), task("c")]);
+        assert_eq!((critters["a"], critters["b"], critters["c"]), (0, 1, 2));
+        assert_ne!(critter_icon(&task("a"), 0), critter_icon(&task("b"), 1));
+
+        // Reordering and finishing a neighbor never change a survivor's icon.
+        assign_critters(&mut critters, &[task("c"), task("a")]);
+        assert_eq!((critters["a"], critters["c"]), (0, 2));
+        assert!(!critters.contains_key("b"));
+        assign_critters(&mut critters, &[task("c"), task("d"), task("a")]);
+        assert_eq!(critters["d"], 1);
+
+        let shell = agent::Task {
+            kind: "local_bash".into(),
+            ..task("shell")
+        };
+        assert_eq!(critter_icon(&shell, 2), IconName::SquareTerminal);
+        assign_critters(&mut critters, &[]);
+        assert!(critters.is_empty());
+    }
+
+    #[test]
+    fn critters_wrap_when_the_catalog_is_full() {
+        let tasks: Vec<_> = (0..CRITTERS.len() * 2 + 1)
+            .map(|i| agent::Task {
+                id: i.to_string(),
+                kind: "local_agent".into(),
+                description: String::new(),
+            })
+            .collect();
+        let mut critters = HashMap::new();
+        assign_critters(&mut critters, &tasks);
+        for (i, t) in tasks.iter().enumerate() {
+            assert_eq!(critters[&t.id], i % CRITTERS.len());
+        }
+        let kept = critters.clone();
+        assign_critters(&mut critters, &tasks[1..]);
+        for t in &tasks[1..] {
+            assert_eq!(critters[&t.id], kept[&t.id]);
+        }
+    }
+
+    #[test]
     fn model_menu_uses_supported_efforts_and_selects_the_effective_level() {
         use crate::menu::Entry;
         for (model, saved, selected, ultra) in [
@@ -3355,6 +3542,281 @@ pub(crate) mod ui_tests {
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
     use gpui_kit::InputEvent as _;
     use gpui_kit::test::TestWindowExt as _;
+
+    #[gpui_kit::test]
+    fn markdown_links_open_local_previews_and_web_urls(cx: &mut TestAppContext) {
+        struct Links(Entity<TextViewState>);
+        impl Render for Links {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                markdown(&self.0, "links")
+            }
+        }
+        cx.update(gpui_kit::init);
+        for (target, expected) in [
+            (
+                "/tmp/shark-better-bg-render/activity-dark-hover.png",
+                "file:///tmp/shark-better-bg-render/activity-dark-hover.png",
+            ),
+            (
+                "/tmp/shark-better-bg-render/activity-light-hover.png",
+                "file:///tmp/shark-better-bg-render/activity-light-hover.png",
+            ),
+            (
+                "/tmp/preview blå #1.png",
+                "file:///tmp/preview%20bla%CC%8A%20%231.png",
+            ),
+            (
+                "https://example.com/preview.png",
+                "https://example.com/preview.png",
+            ),
+            (
+                "file:///tmp/preview%20one.png",
+                "file:///tmp/preview%20one.png",
+            ),
+        ] {
+            let (_, view) = cx.add_window_view(|_, cx| {
+                Links(cx.new(|cx| TextViewState::markdown(&format!("[Preview](<{target}>)"), cx)))
+            });
+            let view: &mut VisualTestContext = view;
+            let before = view.opened_url();
+            view.simulate_mouse_down(
+                point(px(10.), px(10.)),
+                MouseButton::Right,
+                Modifiers::default(),
+            );
+            view.simulate_mouse_up(
+                point(px(10.), px(10.)),
+                MouseButton::Right,
+                Modifiers::default(),
+            );
+            assert_eq!(
+                view.opened_url(),
+                before,
+                "right-click must not open {target}"
+            );
+            view.simulate_click(point(px(10.), px(10.)), Modifiers::default());
+            assert_eq!(view.opened_url().as_deref(), Some(expected), "{target}");
+        }
+    }
+
+    /// Real-renderer smoke check, also exporting the parade for visual inspection.
+    pub(crate) fn render_activity_pixels(cx: &mut HeadlessAppContext) {
+        use gpui_kit::test::TestEventExt as _;
+        crate::state::TEST_HOME.get_or_init(|| {
+            std::env::temp_dir().join(format!("shark-render-{}", std::process::id()))
+        });
+        struct ActivityPixels(Entity<Chat>);
+        impl Render for ActivityPixels {
+            fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                div()
+                    .size_full()
+                    .bg(cx.theme().background)
+                    .flex()
+                    .items_end()
+                    .child(self.0.read(cx).render_activity(cx))
+            }
+        }
+        let (window, view) = cx
+            .update(|cx| {
+                gpui_kit::open_window(
+                    WindowOptions {
+                        window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                            point(px(0.), px(0.)),
+                            size(px(460.), px(200.)),
+                        ))),
+                        focus: false,
+                        show: false,
+                        ..Default::default()
+                    },
+                    cx,
+                    |w, cx| {
+                        cx.new(|cx| {
+                            let chat = cx.new(|cx| {
+                                Chat::new(
+                                    Workspace::default(),
+                                    ChatMeta {
+                                        id: "activity-pixels".into(),
+                                        ..Default::default()
+                                    },
+                                    false,
+                                    w,
+                                    cx,
+                                )
+                            });
+                            cx.observe(&chat, |_, _, cx| cx.notify()).detach();
+                            ActivityPixels(chat)
+                        })
+                    },
+                )
+            })
+            .unwrap();
+        let chat = cx.update(|cx| view.read(cx).0.clone());
+        for (mode, label) in [
+            (crate::state::Mode::Dark, "dark"),
+            (crate::state::Mode::Light, "light"),
+        ] {
+            cx.update(|cx| {
+                crate::settings::apply(
+                    &crate::state::Appearance {
+                        mode,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+                cx.set_reduce_motion(false);
+                chat.update(cx, |c, cx| {
+                    c.set_background(vec![], cx);
+                    c.set_background(
+                        (0..4)
+                            .map(|i| agent::Task {
+                                id: format!("agent-{i}"),
+                                kind: "local_agent".into(),
+                                description: format!("Background agent {}", i + 1),
+                            })
+                            .collect(),
+                        cx,
+                    );
+                });
+            });
+            cx.run_until_parked();
+            let mut first = None;
+            for state in ["first", "next", "hover", "static"] {
+                if state == "next" {
+                    cx.advance_clock(HOP_INTERVAL);
+                }
+                if state == "static" {
+                    cx.update(|cx| cx.set_reduce_motion(true));
+                }
+                cx.update_window(window, |_, w, cx| {
+                    w.render_frame(cx);
+                    if state == "hover" {
+                        w.hover(("background-critter", 0usize), cx);
+                    }
+                    if state == "static" {
+                        w.pointer_move(point(px(450.), px(0.)), None, cx);
+                    }
+                })
+                .unwrap();
+                if state == "hover" {
+                    cx.advance_clock(std::time::Duration::from_secs(1));
+                }
+                let shot = cx
+                    .capture_screenshot(window)
+                    .expect("real activity renderer");
+                if state == "next" {
+                    assert_ne!(
+                        first.as_ref().unwrap(),
+                        &shot,
+                        "the hop changes rendered pixels"
+                    );
+                }
+                if state == "first" {
+                    first = Some(shot.clone());
+                }
+                if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
+                    let dir = PathBuf::from(dir);
+                    std::fs::create_dir_all(&dir).unwrap();
+                    shot.save(dir.join(format!("activity-{label}-{state}.png")))
+                        .unwrap();
+                }
+            }
+            cx.update(|cx| chat.update(cx, |c, cx| c.set_background(vec![], cx)));
+        }
+        cx.update(|cx| cx.set_reduce_motion(false));
+        println!("activity pixels: dark/light hops, hover cards and reduced motion passed");
+    }
+
+    #[gpui_kit::test]
+    fn background_hops_stop_and_history_preserves_live_tasks(cx: &mut TestAppContext) {
+        let chat = open_chat("background-hop", cx);
+        let tasks = || {
+            (0..4)
+                .map(|i| agent::Task {
+                    id: format!("live-{i}"),
+                    kind: "local_agent".into(),
+                    description: format!("Background agent {i}"),
+                })
+                .collect()
+        };
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.apply(Ev::Background(tasks()), cx);
+                assert!(!c.busy && c.working());
+                assert!(c.hopping.is_some());
+                assert_eq!(c.list.item_count(), c.rows.len() + 1);
+            })
+        });
+        let window = cx.windows()[0];
+        let bounds = |cx: &mut TestAppContext| {
+            cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                assert_eq!(w.find("activity").bounds().size.height, px(24.));
+                (0usize..4)
+                    .map(|i| {
+                        let slot = w.find(("background-critter", i)).bounds();
+                        assert_eq!(slot.size, size(px(12.), px(12.)));
+                        slot
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap()
+        };
+        let before = bounds(cx);
+        cx.run_until_parked();
+        cx.executor().advance_clock(HOP_INTERVAL);
+        cx.run_until_parked();
+        assert_eq!(
+            bounds(cx),
+            before,
+            "hopping never moves the slots or transcript"
+        );
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                assert_eq!(c.hop, 1);
+                let critters = c.critters.clone();
+                c.load_history(vec![Ev::Background(vec![]), Ev::Exited(String::new())], cx);
+                assert_eq!(c.background, tasks());
+                assert_eq!(c.critters, critters);
+                assert_eq!(c.hop, 1);
+                assert!(c.hopping.is_some());
+                c.apply(Ev::Background(vec![]), cx);
+                assert!(!c.working());
+                assert!(c.hopping.is_none() && c.critters.is_empty());
+                assert_eq!(c.list.item_count(), c.rows.len() + 1);
+            })
+        });
+        cx.executor().advance_clock(HOP_INTERVAL * 3);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(chat.read(cx).hop, 0, "no ticks after the tasks finish");
+            cx.set_reduce_motion(true);
+            chat.update(cx, |c, cx| {
+                c.apply(Ev::Background(tasks()), cx);
+                assert!(c.hopping.is_none(), "reduced motion never starts the timer");
+            });
+        });
+        cx.executor().advance_clock(HOP_INTERVAL);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert_eq!(chat.read(cx).hop, 0);
+            cx.set_reduce_motion(false);
+            chat.update(cx, |c, cx| c.apply(Ev::Background(tasks()), cx));
+        });
+        cx.run_until_parked();
+        cx.update(|cx| cx.set_reduce_motion(true));
+        cx.executor().advance_clock(HOP_INTERVAL);
+        cx.run_until_parked();
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                assert!(
+                    c.hopping.is_none(),
+                    "a changed motion preference stops the timer"
+                );
+                c.apply(Ev::Exited(String::new()), cx);
+                assert!(!c.working() && c.critters.is_empty());
+            })
+        });
+    }
 
     /// A claude stand-in that swallows stdin. Side questions and Ask Shark (both
     /// `--no-session-persistence`) get a canned answer, and their args are written next to it.

@@ -75,7 +75,12 @@
         "danger.background": "#eb5757",
         "danger.foreground": "#ff9c9c",
         "info.background": "#5e6ad2",
-        "info.foreground": "#8a96ff"
+        "info.foreground": "#8a96ff",
+        "chart.1": "#a9b2ff",
+        "chart.2": "#5fd39a",
+        "chart.3": "#f2c94c",
+        "chart.4": "#ff9c9c",
+        "chart.5": "#d4a7ce"
       }
     },
     {
@@ -150,7 +155,12 @@
         "danger.background": "#d93f3f",
         "danger.foreground": "#c42b2b",
         "info.background": "#5e6ad2",
-        "info.foreground": "#4061da"
+        "info.foreground": "#4061da",
+        "chart.1": "#4061da",
+        "chart.2": "#1f7a50",
+        "chart.3": "#8a6800",
+        "chart.4": "#c42b2b",
+        "chart.5": "#824682"
       }
     }
   ]
