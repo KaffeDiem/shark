@@ -20,6 +20,13 @@ use std::{
 // ponytail: bypass because headless -p denies anything needing approval; add a host permission prompt in M2
 const PERMISSION_MODE: &str = "bypassPermissions";
 
+#[derive(Clone, Debug, PartialEq)]
+pub struct Task {
+    pub id: String,
+    pub kind: String,
+    pub description: String,
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Ev {
     /// The session as the CLI reports it at the start of each turn.
@@ -48,8 +55,8 @@ pub enum Ev {
         cost: f64,
         secs: u64,
     },
-    /// Backgrounded tasks (subagents, shells) still running after the turn's result, by description.
-    Background(Vec<String>),
+    /// Backgrounded tasks (subagents, shells) still running after the turn's result.
+    Background(Vec<Task>),
     /// The turn was cut short by an `interrupt` control request; its result follows.
     Interrupted,
     /// claude asks whether a tool may run (`--permission-prompt-tool stdio`) and waits for
@@ -617,9 +624,13 @@ fn parse_record(v: Value) -> Vec<Ev> {
         }],
         "system" if v["subtype"] == "background_tasks_changed" => vec![Ev::Background(
             blocks_of(&v["tasks"])
-                .map(|t| match t["description"].as_str() {
-                    Some(d) => d.to_string(),
-                    None => format!("{} {}", s(&t["task_type"]), s(&t["task_id"])),
+                .map(|t| Task {
+                    id: s(&t["task_id"]),
+                    kind: s(&t["task_type"]),
+                    description: match t["description"].as_str() {
+                        Some(d) => d.to_string(),
+                        None => format!("{} {}", s(&t["task_type"]), s(&t["task_id"])),
+                    },
                 })
                 .collect(),
         )],
@@ -869,7 +880,18 @@ not json"#;
                     permission_mode: "bypassPermissions".into(),
                     mcp: vec!["mobbin".into(), "paper".into()],
                 },
-                Ev::Background(vec!["local_agent a1".into(), "Run test suite".into()]),
+                Ev::Background(vec![
+                    Task {
+                        id: "a1".into(),
+                        kind: "local_agent".into(),
+                        description: "local_agent a1".into(),
+                    },
+                    Task {
+                        id: "b2".into(),
+                        kind: "local_bash".into(),
+                        description: "Run test suite".into(),
+                    },
+                ]),
                 Ev::Background(vec![]),
                 Ev::User("read a.txt".into()),
                 Ev::ToolUse {
