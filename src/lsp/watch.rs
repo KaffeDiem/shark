@@ -345,18 +345,29 @@ fn snapshot(
     stop: &AtomicBool,
 ) -> Result<Vec<Arc<Tree>>> {
     let tree = shared_walk(root, fresh, stop)?;
+    let real_root = std::fs::canonicalize(root)?;
     let bases: HashSet<_> = registrations
         .values()
         .flat_map(|(_, patterns)| patterns.iter().map(|p| p.base.as_path()))
         .filter(|base| !tree.dirs.contains(*base))
+        // A base reached through a symlink would lead the walk out of the worktree.
+        .filter(|base| {
+            base.strip_prefix(root).is_ok_and(|relative| {
+                std::fs::canonicalize(base).is_ok_and(|real| real == real_root.join(relative))
+            })
+        })
         .collect();
     let mut trees = vec![tree];
-    // A base that does not exist yet, such as a build script's OUT_DIR, has nothing to watch.
-    trees.extend(
-        bases
-            .into_iter()
-            .filter_map(|base| walk(base, stop).ok().map(Arc::new)),
-    );
+    for base in bases {
+        // The server asked for this base explicitly, so its ignore files do not apply.
+        match walk(base, false, stop) {
+            Ok(tree) => trees.push(Arc::new(tree)),
+            // A base that does not exist (yet), such as a build script's OUT_DIR, has nothing to watch.
+            Err(_) if !base.is_dir() => {}
+            // Dropping it silently would report every file under it as deleted.
+            Err(error) => return Err(error),
+        }
+    }
     Ok(trees)
 }
 
@@ -370,18 +381,19 @@ fn shared_walk(root: &Path, fresh: bool, stop: &AtomicBool) -> Result<Arc<Tree>>
         return Ok(tree.clone());
     }
     let started = Instant::now();
-    let tree = Arc::new(walk(root, stop)?);
+    let tree = Arc::new(walk(root, true, stop)?);
     recent.push((root.to_path_buf(), started, tree.clone()));
     Ok(tree)
 }
 
-fn walk(base: &Path, stop: &AtomicBool) -> Result<Tree> {
+fn walk(base: &Path, ignores: bool, stop: &AtomicBool) -> Result<Tree> {
     // Only the base must be readable; descendants can vanish or deny access during normal use.
     std::fs::read_dir(base)?;
     let mut tree = Tree::default();
     // Git-ignored build and dependency trees would dominate the walk. Symlinks are not followed,
     // and repository internals do not belong to the language workspace.
     let entries = ignore::WalkBuilder::new(base)
+        .standard_filters(ignores)
         .hidden(false)
         .filter_entry(|entry| entry.file_name() != ".git")
         .build();
@@ -492,7 +504,7 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("file.rs"), "hello").unwrap();
         std::os::unix::fs::symlink("/", root.join("outside")).unwrap();
-        let files = walk(&root, &AtomicBool::new(false)).unwrap().files;
+        let files = walk(&root, true, &AtomicBool::new(false)).unwrap().files;
         assert_eq!(files.len(), 1);
         assert!(files.contains_key(&root.join("file.rs")));
         std::fs::remove_dir_all(root).unwrap();
@@ -503,22 +515,37 @@ mod tests {
         use std::os::unix::fs::PermissionsExt as _;
         let root = std::env::temp_dir().join(format!("shark-watch-walk-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
-        for dir in [".git", "src", "target/debug", "target/out", "locked"] {
+        let _ = std::fs::remove_dir_all(root.with_extension("outside"));
+        for dir in [
+            ".git",
+            "src",
+            "target/debug",
+            "target/out",
+            "locked",
+            ".venv/lib",
+        ] {
             std::fs::create_dir_all(root.join(dir)).unwrap();
         }
         std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        // uv and `python -m venv` mark the whole environment ignored from inside it.
+        std::fs::write(root.join(".venv/.gitignore"), "*\n").unwrap();
         for file in [
             "src/lib.rs",
             "target/debug/dep.rs",
             "target/out/gen.rs",
             "locked/a.rs",
+            ".venv/lib/site.py",
         ] {
             std::fs::write(root.join(file), "").unwrap();
         }
+        let outside = root.with_extension("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.rs"), "").unwrap();
+        std::os::unix::fs::symlink(&outside, root.join("linked")).unwrap();
         let locked = root.join("locked");
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
         let stop = AtomicBool::new(false);
-        let files = walk(&root, &stop).unwrap().files;
+        let files = walk(&root, true, &stop).unwrap().files;
         assert!(files.contains_key(&root.join("src/lib.rs")));
         assert!(
             files
@@ -527,9 +554,19 @@ mod tests {
         );
         let out = url::Url::from_directory_path(root.join("target/out")).unwrap();
         let registration = json!({"globPattern":{"baseUri":out.as_str(),"pattern":"**/*.rs"}});
+        let venv = url::Url::from_directory_path(root.join(".venv/lib")).unwrap();
+        let venv = json!({"globPattern":{"baseUri":venv.as_str(),"pattern":"*.py"}});
+        let linked = url::Url::from_directory_path(root.join("linked")).unwrap();
+        let linked = json!({"globPattern":{"baseUri":linked.as_str(),"pattern":"*.rs"}});
         let registrations = Registrations::from([(
             "out".to_string(),
-            (0, vec![pattern(&root, &registration).unwrap().unwrap()]),
+            (
+                0,
+                [registration, venv, linked]
+                    .iter()
+                    .map(|watcher| pattern(&root, watcher).unwrap().unwrap())
+                    .collect(),
+            ),
         )]);
         let files: Vec<_> = snapshot(&root, &registrations, true, &stop)
             .unwrap()
@@ -537,7 +574,9 @@ mod tests {
             .flat_map(|tree| tree.files.keys().cloned().collect::<Vec<_>>())
             .collect();
         assert!(files.contains(&root.join("target/out/gen.rs")));
+        assert!(files.contains(&root.join(".venv/lib/site.py")));
         assert!(!files.contains(&root.join("target/debug/dep.rs")));
+        assert!(!files.iter().any(|path| path.ends_with("secret.rs")));
         // A primary server and its companion reuse one recent walk of their worktree.
         let shared = shared_walk(&root, false, &stop).unwrap();
         assert!(Arc::ptr_eq(
@@ -550,7 +589,8 @@ mod tests {
         ));
         std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
-        assert!(walk(&root, &stop).is_err());
+        std::fs::remove_dir_all(&outside).unwrap();
+        assert!(walk(&root, true, &stop).is_err());
     }
 }
 
