@@ -43,9 +43,13 @@ worktrees cannot share a server, even when their project names match.
 
 * **Rust:** use the effective rustup toolchain with automatic compiler installation
   disabled. Add `rust-analyzer` and `rust-src` only to that already installed
-  toolchain. Non-rustup toolchains must supply their own analyzer and matching
-  sources. Shark never upgrades the compiler.
-* **Python:** Pyrefly supplies intelligence and Ruff supplies formatting/fixes.
+  toolchain, one `rustup component add` at a time. Linked/custom toolchains use
+  the analyzer they ship. Without rustup, the sysroot's analyzer or one on PATH
+  (Homebrew's `rust-analyzer` formula) is used. rustup older than 1.28 is refused
+  because it installs toolchains implicitly. Shark never upgrades the compiler.
+* **Python:** Pyrefly supplies intelligence and Ruff supplies formatting/fixes. If
+  Ruff cannot be installed or started, the checker still runs and the status
+  tooltip names the failure.
   `pyrightconfig.json` or `[tool.pyright]` selects managed Pyright instead of
   converting the project. The nearest explicit checker configuration wins. A local
   `.venv`, `venv`, or activated virtual environment supplies the interpreter.
@@ -53,15 +57,18 @@ worktrees cannot share a server, even when their project names match.
   selection. Classic SDKs use the pinned wrapper with the exact project's
   `lib/tsserver.js`; native SDKs run their own `bin/tsc --lsp --stdio`. A declared
   but missing SDK produces a repair message rather than changing compiler
-  semantics. Unconfigured projects use the pinned native artifact. Managed
+  semantics. Yarn Plug'n'Play projects use the `.yarn/sdks/typescript` editor SDK
+  (`yarn dlx @yarnpkg/sdks base`). Unconfigured projects use the pinned native artifact. Managed
   Node/npm supplies the wrapper and automatic type acquisition runtime.
 * **Swift:** resolve SourceKit-LSP through the selected Xcode/Swift `xcrun`
   toolchain. A nearer SwiftPM package remains a package even when an Xcode project
   sits above it. Preserve existing custom `buildServer.json`. For new Xcode
   setups, a unique workspace or project selects SweetPad's standalone BSP;
   ambiguous containers use a persisted application-support selection. Only
-  Shark-owned BSP configuration is regenerated after root or tool changes.
-* **Go:** find `go.work` before individual modules, respecting `GOWORK=off`.
+  Shark-owned BSP configuration is regenerated after root or tool changes. A newly
+  generated `buildServer.json` is added to the repository's local `info/exclude`.
+* **Go:** find `go.work` before individual modules, respecting `GOWORK` (`off` or a
+  file path) and `GOTOOLCHAIN` from the environment or `go env -w`.
   Toolchain lookup honors project files but disables compiler downloads. Use the
   gopls binary built and bundled by Shark's release workflow.
 
@@ -98,8 +105,12 @@ The npm artifact SHA-256 values were calculated from the exact published tarball
 GitHub asset hashes and Node's hash were checked against published metadata.
 Rust and SourceKit-LSP deliberately follow the selected compiler toolchain.
 The gopls build script checks its exact Go version, builds with `-trimpath`,
-executes a protocol smoke test, and emits an archive and checksum. App packaging
-signs the bundled binary and recomputes its checksum after signing.
+executes a protocol smoke test, and emits an archive and checksum. The published
+release asset is that unsigned build; app packaging signs the bundled copy and
+recomputes its checksum after signing. The gopls pin is `GOPLS_VERSION` in
+`src/lsp/tools.rs`; the Go pin is `GO_VERSION` in `scripts/build-gopls.sh`. The
+release workflow builds and checks third-party tools in a job whose token cannot
+write to the repository.
 
 ## Actual artifact execution, 2026-10-28
 

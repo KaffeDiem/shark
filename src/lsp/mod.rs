@@ -1,6 +1,7 @@
 //! Shared, lazy language sessions. Editors own sessions; the workspace holds only weak references.
 pub mod client;
 pub mod document;
+mod install;
 pub mod providers;
 pub mod tools;
 pub mod watch;
@@ -36,6 +37,8 @@ pub struct Session {
     pub watcher: Option<watch::Watcher>,
     companion_watcher: Option<watch::Watcher>,
     pub choices: Vec<std::path::PathBuf>,
+    /// Only an Xcode build, not the server, can finish this project's index.
+    awaiting_build: bool,
     /// Work in progress by token, oldest first.
     progress: Vec<(String, Work)>,
     task: Task<()>,
@@ -58,6 +61,7 @@ impl Session {
             watcher: None,
             companion_watcher: None,
             choices: vec![],
+            awaiting_build: false,
             progress: vec![],
             task: Task::ready(()),
             companion_task: Task::ready(()),
@@ -76,6 +80,7 @@ impl Session {
             watcher: None,
             companion_watcher: None,
             choices: vec![],
+            awaiting_build: false,
             progress: vec![],
             task: Task::ready(()),
             companion_task: Task::ready(()),
@@ -96,36 +101,28 @@ impl Session {
         self.status = "Starting".into();
         self.detail = None;
         self.choices.clear();
+        self.awaiting_build = false;
         self.progress.clear();
         let project = self.project.clone();
         self.task = cx.spawn_in(window, async move |this, cx| {
             let prepared = cx.background_executor().spawn(async move {
                 let launch = tools::prepare(&project)?;
-                let mut command = std::process::Command::new(&launch.program);
-                command.args(&launch.args).envs(launch.env);
-                let client = client::Client::start(command, &launch.root, launch.settings)?;
-                let companion = launch.companion.map(|launch| {
-                    let tools::Launch { program, args, env, root, settings, initialization_options, .. } = *launch;
-                    let mut command = std::process::Command::new(program);
-                    command.args(args).envs(env);
-                    client::Client::start(command, &root, settings).map(|client| (client, initialization_options))
-                }).transpose()?;
-                Ok::<_, anyhow::Error>((client, launch.initialization_options, launch.detail, companion))
+                let client = start(&launch)?;
+                let companion = launch.companion.as_deref().map(|c| start(c).map(|client| (client, c.initialization_options.clone())));
+                Ok::<_, anyhow::Error>((client, launch, companion))
             }).await;
             let result = match prepared {
-                Ok((client, options, detail, companion)) => {
+                Ok((client, launch, companion)) => {
                     async {
-                        client.initialize_with_options(options).await?;
-                        let companion = if let Some((client, options)) = companion {
-                            client.initialize_with_options(options).await?;
-                            Some(client)
-                        } else { None };
-                        Ok((client, detail, companion))
+                        client.initialize_with_options(launch.initialization_options).await?;
+                        let (companion, note) = initialize_companion(companion).await;
+                        let detail = [launch.detail, note].into_iter().flatten().reduce(|a, b| format!("{a}\n{b}"));
+                        Ok((client, detail, launch.awaiting_build, companion))
                     }.await
                 }
                 Err(error) => Err(error),
             };
-            let (client, detail, companion) = match result {
+            let (client, detail, awaiting_build, companion) = match result {
                 Ok(ready) => ready,
                 Err(error) => {
                     let _ = this.update(cx, |s, cx| {
@@ -139,7 +136,8 @@ impl Session {
             };
             let events = client.events();
             if this.update(cx, |s, cx| {
-                s.status = if detail.is_some() { "Preparing index" } else { "Ready" }.into();
+                s.awaiting_build = awaiting_build;
+                s.status = progress_status("Starting", awaiting_build).into();
                 s.detail = detail;
                 for (client, is_companion) in [(Some(&client), false), (companion.as_ref(), true)] {
                     let Some(client) = client else { continue };
@@ -148,8 +146,8 @@ impl Session {
                             let errors = watcher.errors();
                             s.watch_tasks.push(cx.spawn(async move |this, cx| {
                                 while let Ok(error) = errors.recv().await {
+                                    // The server keeps working without change notifications.
                                     if this.update(cx, |s, cx| {
-                                        s.status = "Setup needed".into();
                                         s.detail = Some(error);
                                         cx.notify();
                                     }).is_err() { break; }
@@ -157,7 +155,7 @@ impl Session {
                             }));
                             if is_companion { s.companion_watcher = Some(watcher); } else { s.watcher = Some(watcher); }
                         }
-                        Err(error) => { s.status = "Setup needed".into(); s.detail = Some(format!("File watching: {error}")); }
+                        Err(error) => s.detail = Some(format!("File watching: {error}")),
                     }
                 }
                 s.client = Some(client);
@@ -168,30 +166,14 @@ impl Session {
                             if this.update(cx, |s, cx| match event {
                                 client::Event::Notification { method, params } => cx.emit(SessionEvent::Notification { method, params, companion: true }),
                                 client::Event::Stopped(error) => {
-                                    s.status = "Setup needed".into();
-                                    s.detail = Some(format!("Ruff: {error}"));
+                                    s.detail = Some(tools::companion_note(&anyhow::anyhow!(error)));
                                     s.companion = None;
                                     s.companion_watcher = None;
                                     s.generation += 1;
                                     cx.notify();
                                 }
-                                client::Event::RegisterCapability { params, reply } => {
-                                    match s.companion_watcher.as_ref().ok_or_else(|| anyhow::anyhow!("Ruff file watcher is unavailable")).and_then(|watcher| watcher.register(&params)) {
-                                        Ok(ready) => cx.spawn(async move |_, _| {
-                                            match ready.recv().await {
-                                                Ok(Ok(())) => reply.respond(Value::Null),
-                                                Ok(Err(error)) => reply.reject(error),
-                                                Err(_) => reply.reject("Ruff file watcher stopped"),
-                                            }
-                                        }).detach(),
-                                        Err(error) => reply.reject(error.to_string()),
-                                    }
-                                }
-                                client::Event::UnregisterCapability { params, reply } => {
-                                    match s.companion_watcher.as_ref().ok_or_else(|| anyhow::anyhow!("Ruff file watcher is unavailable")).and_then(|watcher| watcher.unregister(&params)) {
-                                        Ok(()) => reply.respond(Value::Null),
-                                        Err(error) => reply.reject(error.to_string()),
-                                    }
+                                event @ (client::Event::RegisterCapability { .. } | client::Event::UnregisterCapability { .. }) => {
+                                    watch_request(s.companion_watcher.as_ref(), event, cx)
                                 }
                                 client::Event::ApplyEdit { reply, .. } => reply.respond(serde_json::json!({"applied":false,"failureReason":"Use Ruff quick fixes from the editor"})),
                                 _ => {}
@@ -208,7 +190,7 @@ impl Session {
                         client::Event::Notification { method, params } => {
                             if method == "$/progress" {
                                 track_progress(&mut s.progress, &params);
-                                s.status = progress_status(&s.status, !s.progress.is_empty() || s.detail.is_some()).into();
+                                s.status = progress_status(&s.status, !s.progress.is_empty() || s.awaiting_build).into();
                                 cx.notify();
                             }
                             cx.emit(SessionEvent::Notification { method, params, companion: false });
@@ -225,12 +207,68 @@ impl Session {
                             s.generation += 1;
                             cx.notify();
                         }
+                        event @ (client::Event::RegisterCapability { .. } | client::Event::UnregisterCapability { .. }) => {
+                            watch_request(s.watcher.as_ref(), event, cx)
+                        }
                         event => cx.emit(SessionEvent::Request(RefCell::new(Some(event)))),
                     }
                 }).is_err() { break; }
             }
         });
         cx.notify();
+    }
+}
+
+/// Answers a server's file-watcher (un)registration from that server's own watcher.
+fn watch_request(
+    watcher: Option<&watch::Watcher>,
+    event: client::Event,
+    cx: &mut Context<Session>,
+) {
+    let watcher = watcher.ok_or_else(|| anyhow::anyhow!("File watcher unavailable"));
+    match event {
+        client::Event::RegisterCapability { params, reply } => {
+            match watcher.and_then(|w| w.register(&params)) {
+                Ok(ready) => cx
+                    .spawn(async move |_, _| match ready.recv().await {
+                        Ok(Ok(())) => reply.respond(Value::Null),
+                        Ok(Err(error)) => reply.reject(error),
+                        Err(_) => reply.reject("File watcher stopped before registration"),
+                    })
+                    .detach(),
+                Err(error) => reply.reject(error.to_string()),
+            }
+        }
+        client::Event::UnregisterCapability { params, reply } => {
+            match watcher.and_then(|w| w.unregister(&params)) {
+                Ok(()) => reply.respond(Value::Null),
+                Err(error) => reply.reject(error.to_string()),
+            }
+        }
+        _ => {}
+    }
+}
+
+fn start(launch: &tools::Launch) -> anyhow::Result<client::Client> {
+    let mut command = std::process::Command::new(&launch.program);
+    command.args(&launch.args).envs(launch.env.iter().cloned());
+    client::Client::start(command, &launch.root, launch.settings.clone())
+}
+
+/// The companion only formats and fixes: its failure is a note, never a setup error.
+async fn initialize_companion(
+    companion: Option<anyhow::Result<(client::Client, Value)>>,
+) -> (Option<client::Client>, Option<String>) {
+    let result = async {
+        let Some((client, options)) = companion.transpose()? else {
+            return Ok(None);
+        };
+        client.initialize_with_options(options).await?;
+        Ok(Some(client))
+    };
+    match result.await {
+        Ok(client) => (client, None),
+        Err(error) => (None, Some(tools::companion_note(&error))),
     }
 }
 
@@ -296,7 +334,7 @@ fn progress_status(current: &str, indexing: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::{Work, progress_status, track_progress};
+    use super::{Work, initialize_companion, progress_status, start, tools, track_progress};
     use serde_json::json;
 
     #[test]
@@ -341,5 +379,30 @@ mod tests {
         assert_eq!(progress_status("Setup needed", false), "Setup needed");
         assert_eq!(progress_status("Ready", true), "Preparing index");
         assert_eq!(progress_status("Preparing index", false), "Ready");
+    }
+
+    #[test]
+    fn companion_that_cannot_start_leaves_a_note_instead_of_failing_setup() {
+        let launch = tools::Launch {
+            program: "/nonexistent/ruff".into(),
+            args: vec!["server".into()],
+            env: vec![],
+            root: std::env::temp_dir(),
+            initialization_options: json!(null),
+            settings: json!({}),
+            detail: None,
+            awaiting_build: false,
+            companion: None,
+        };
+        let companion = Some(start(&launch).map(|client| (client, json!(null))));
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        let std::task::Poll::Ready((client, note)) =
+            std::pin::pin!(initialize_companion(companion)).poll(&mut cx)
+        else {
+            panic!("a failed start needs no server round trip");
+        };
+        assert!(client.is_none());
+        let note = note.unwrap();
+        assert!(note.starts_with("Ruff unavailable: "), "{note}");
     }
 }

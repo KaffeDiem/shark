@@ -1,13 +1,15 @@
 //! Project semantics are selected once, before installing anything; crashes never switch backends.
-#[path = "install.rs"]
-mod install;
+use super::install::{self, managed, path, run};
 use anyhow::{Context, Result, bail, ensure};
-use install::{managed, path, run};
 use serde_json::{Value, json};
 use std::{
     fs,
     path::{Path, PathBuf},
     process::Command,
+    sync::{
+        Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
 };
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -53,6 +55,8 @@ pub struct Launch {
     pub initialization_options: Value,
     pub settings: Value,
     pub detail: Option<String>,
+    /// The index stays incomplete until the user builds the project (Xcode).
+    pub awaiting_build: bool,
     pub companion: Option<Box<Launch>>,
 }
 
@@ -111,6 +115,14 @@ pub fn discover(file: &Path, worktree: &Path) -> Result<Option<Project>> {
         .ancestors()
         .take_while(|p| p.starts_with(&worktree))
         .collect();
+    let gowork = (backend == Backend::Go).then(|| go_env("GOWORK")).flatten();
+    // An explicit go.work file names the workspace wherever it sits; "off" disables workspaces.
+    let explicit_go_work = gowork
+        .as_deref()
+        .filter(|w| *w != "off")
+        .and_then(|w| Path::new(w).canonicalize().ok())
+        .filter(|w| w.is_file() && w.starts_with(&worktree))
+        .and_then(|w| w.parent().map(Path::to_path_buf));
     let mut root = match backend {
         Backend::Rust => dirs
             .iter()
@@ -147,14 +159,14 @@ pub fn discover(file: &Path, worktree: &Path) -> Result<Option<Project>> {
                     || !xcode_containers(d).is_empty()
             })
             .copied(),
-        Backend::Go => dirs
-            .iter()
-            .find(|d| {
-                std::env::var("GOWORK").ok().as_deref() != Some("off")
-                    && d.join("go.work").is_file()
+        Backend::Go => explicit_go_work
+            .as_deref()
+            .or_else(|| {
+                dirs.iter()
+                    .find(|d| gowork.as_deref() != Some("off") && d.join("go.work").is_file())
+                    .copied()
             })
-            .or_else(|| dirs.iter().find(|d| d.join("go.mod").is_file()))
-            .copied(),
+            .or_else(|| dirs.iter().find(|d| d.join("go.mod").is_file()).copied()),
         Backend::Pyright => unreachable!(),
     }
     .unwrap_or(&worktree)
@@ -179,6 +191,7 @@ pub fn discover(file: &Path, worktree: &Path) -> Result<Option<Project>> {
         }
     }
     let rust_toolchain = if backend == Backend::Rust {
+        check_rustup()?;
         rustup(file.parent().unwrap(), &["show", "active-toolchain"], 10)
             .ok()
             .and_then(|s| s.split_whitespace().next().map(str::to_string))
@@ -212,7 +225,7 @@ pub fn discover(file: &Path, worktree: &Path) -> Result<Option<Project>> {
             .or_else(|| {
                 ["VIRTUAL_ENV", "CONDA_PREFIX"]
                     .iter()
-                    .filter_map(|key| std::env::var_os(key))
+                    .filter_map(std::env::var_os)
                     .map(PathBuf::from)
                     .map(|p| p.join("bin/python"))
                     .find(|p| p.is_file())
@@ -239,6 +252,17 @@ pub fn discover(file: &Path, worktree: &Path) -> Result<Option<Project>> {
             std::env::var(key).unwrap_or_default()
         ));
     }
+    if backend == Backend::Go {
+        toolchain.push_str(&format!(
+            "go env GOTOOLCHAIN={:?} GOWORK={gowork:?}\n",
+            go_env("GOTOOLCHAIN")
+        ));
+        if let Some(file) = gowork.as_deref()
+            && let Ok(text) = fs::read_to_string(file)
+        {
+            toolchain.push_str(&format!("{file}:{text}\n"));
+        }
+    }
     // Toolchain files can sit above a nested package but never above this worktree.
     for dir in &dirs {
         for name in [
@@ -253,10 +277,11 @@ pub fn discover(file: &Path, worktree: &Path) -> Result<Option<Project>> {
             "sweetpad.toml",
             "buildServer.json",
             "node_modules/typescript/package.json",
+            ".yarn/sdks/typescript/package.json",
         ] {
             // A go.work chooses the toolchain for all its modules; member go.mod files do not split that session.
             if backend == Backend::Go
-                && root.join("go.work").is_file()
+                && (explicit_go_work.is_some() || root.join("go.work").is_file())
                 && name == "go.mod"
                 && *dir != root
             {
@@ -270,13 +295,10 @@ pub fn discover(file: &Path, worktree: &Path) -> Result<Option<Project>> {
     toolchain.push_str(&format!(
         "rust_toolchain={rust_toolchain:?}\ninterpreter={interpreter:?}"
     ));
-    match backend {
-        Backend::Swift => {
-            if let Ok(selected) = run(&root, "/usr/bin/xcrun", &["--find", "sourcekit-lsp"], 10) {
-                toolchain.push_str(&selected);
-            }
-        }
-        _ => {}
+    if backend == Backend::Swift
+        && let Ok(selected) = run(&root, "/usr/bin/xcrun", &["--find", "sourcekit-lsp"], 10)
+    {
+        toolchain.push_str(&selected);
     }
     Ok(Some(Project {
         root,
@@ -324,6 +346,7 @@ fn launch(project: &Project, program: PathBuf, args: &[&str]) -> Launch {
         initialization_options: Value::Null,
         settings: json!({}),
         detail: None,
+        awaiting_build: false,
         companion: None,
     }
 }
@@ -346,29 +369,96 @@ fn rustup(root: &Path, args: &[&str], seconds: u64) -> Result<String> {
         .map_err(anyhow::Error::msg)
 }
 
+/// rustup before 1.28 installs a missing active toolchain on any query and has no
+/// RUSTUP_AUTO_INSTALL, so opening a file could start a compiler download.
+fn check_rustup() -> Result<()> {
+    static CURRENT: AtomicBool = AtomicBool::new(false);
+    if CURRENT.load(Ordering::Relaxed) {
+        return Ok(());
+    }
+    let mut command = Command::new("rustup");
+    command.env_remove("RUSTUP_TOOLCHAIN");
+    // Outside any project no override toolchain is selected, so even old rustup installs nothing.
+    let Ok(version) =
+        crate::git::wait_bounded(command, Path::new("/"), "rustup", &["--version"], 10, true)
+    else {
+        // Without rustup, the selected rustc must supply its own analyzer.
+        return Ok(());
+    };
+    ensure!(
+        rustup_is_current(&version),
+        "Update rustup to 1.28 or newer (rustup self update); older versions install toolchains implicitly"
+    );
+    CURRENT.store(true, Ordering::Relaxed);
+    Ok(())
+}
+
+fn rustup_is_current(version: &str) -> bool {
+    let mut parts = version.split_whitespace().nth(1).unwrap_or("").split('.');
+    let mut next = || parts.next().and_then(|p| p.parse::<u32>().ok());
+    // An unparseable version is a newer format, not an old rustup.
+    matches!((next(), next()), (Some(major), Some(minor)) if (major, minor) >= (1, 28))
+        || !version.starts_with("rustup ")
+}
+
+fn rust_src_detail(sysroot: &Path) -> Option<String> {
+    (!sysroot.join("lib/rustlib/src/rust/library").is_dir())
+        .then(|| "Install matching Rust standard-library sources for complete navigation".into())
+}
+
 fn rust(project: &Project) -> Result<Launch> {
     let root = &project.root;
     if let Some(toolchain) = project.rust_toolchain.as_deref() {
         // `which`, unlike invoking the rustup proxy, never silently installs a compiler.
         rustup(root, &["which", "--toolchain", toolchain, "rustc"], 10)
             .context("Install the Rust toolchain required by rust-toolchain.toml")?;
-        let installed = rustup(
-            root,
-            &["component", "list", "--installed", "--toolchain", toolchain],
-            15,
-        )?;
-        if !installed.lines().any(|s| s.starts_with("rust-analyzer"))
-            || !installed.lines().any(|s| s.starts_with("rust-src"))
-        {
-            rustup(root, &["component", "add", "--toolchain", toolchain, "rust-analyzer", "rust-src"], 180)
-                .with_context(|| format!("Add rust-analyzer and rust-src for the existing toolchain: rustup component add --toolchain {toolchain} rust-analyzer rust-src"))?;
-        }
-        let analyzer = rustup(
-            root,
-            &["which", "--toolchain", toolchain, "rust-analyzer"],
-            10,
-        )?;
-        let mut result = launch(project, analyzer.into(), &[]);
+        let which = || {
+            rustup(
+                root,
+                &["which", "--toolchain", toolchain, "rust-analyzer"],
+                10,
+            )
+        };
+        let sysroot = |analyzer: &str| {
+            PathBuf::from(analyzer)
+                .ancestors()
+                .nth(2)
+                .map(Path::to_path_buf)
+                .unwrap_or_default()
+        };
+        let analyzer = match which() {
+            Ok(analyzer) if rust_src_detail(&sysroot(&analyzer)).is_none() => analyzer,
+            found => {
+                // rustup is not safe for concurrent changes to one toolchain (rust-lang/rustup#988).
+                static RUSTUP: Mutex<()> = Mutex::new(());
+                let _lock = RUSTUP.lock().unwrap_or_else(|e| e.into_inner());
+                match rustup(
+                    root,
+                    &["component", "list", "--installed", "--toolchain", toolchain],
+                    15,
+                ) {
+                    Ok(installed) => {
+                        if !installed.lines().any(|s| s.starts_with("rust-analyzer"))
+                            || !installed.lines().any(|s| s.starts_with("rust-src"))
+                        {
+                            let mut command = Command::new("rustup");
+                            command.env("RUSTUP_AUTO_INSTALL", "0");
+                            // Generous, and TERM rather than KILL, so an install is not cut off mid-write.
+                            crate::git::wait_bounded(command, root, "rustup", &["component", "add", "--toolchain", toolchain, "rust-analyzer", "rust-src"], 900, false)
+                                .map_err(anyhow::Error::msg)
+                                .with_context(|| format!("Add rust-analyzer and rust-src for the existing toolchain: rustup component add --toolchain {toolchain} rust-analyzer rust-src"))?;
+                        }
+                        which()?
+                    }
+                    // Linked/custom toolchains have no components but can ship their own analyzer.
+                    Err(error) => found.map_err(|_| error).with_context(|| {
+                        format!("Toolchain {toolchain} does not support rustup components; add rust-analyzer to it or select a rustup-distributed toolchain")
+                    })?,
+                }
+            }
+        };
+        let mut result = launch(project, analyzer.clone().into(), &[]);
+        result.detail = rust_src_detail(&sysroot(&analyzer));
         result
             .env
             .push(("RUSTUP_TOOLCHAIN".into(), toolchain.into()));
@@ -381,20 +471,23 @@ fn rust(project: &Project) -> Result<Launch> {
         crate::git::wait_bounded(command, root, "rustc", &["--print", "sysroot"], 15, true)
             .map_err(anyhow::Error::msg)
             .context("Install the project's required Rust toolchain; Shark will not upgrade it")?;
-    let analyzer = Path::new(&sysroot).join("bin/rust-analyzer");
-    ensure!(
-        analyzer.is_file(),
-        "Install rust-analyzer for the selected Rust toolchain at {}",
-        sysroot
-    );
+    let sysroot = Path::new(&sysroot);
+    // Homebrew's rust formula ships no analyzer; its rust-analyzer formula installs on PATH.
+    let analyzer = Some(sysroot.join("bin/rust-analyzer"))
+        .into_iter()
+        .chain(
+            std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default())
+                .map(|dir| dir.join("rust-analyzer")),
+        )
+        .find(|p| p.is_file())
+        .with_context(|| {
+            format!(
+                "Install rust-analyzer (brew install rust-analyzer) or use rustup; the Rust toolchain at {} has none",
+                sysroot.display()
+            )
+        })?;
     let mut result = launch(project, analyzer, &[]);
-    if !Path::new(&sysroot)
-        .join("lib/rustlib/src/rust/library")
-        .is_dir()
-    {
-        result.detail =
-            Some("Install matching Rust standard-library sources for complete navigation".into());
-    }
+    result.detail = rust_src_detail(sysroot);
     Ok(result)
 }
 
@@ -419,8 +512,17 @@ fn python(project: &Project) -> Result<Launch> {
     };
     result.settings = json!({"python": {"pythonPath": interpreter}});
     result.initialization_options = json!({"pythonPath": interpreter});
-    result.companion = Some(Box::new(launch(project, managed("ruff")?, &["server"])));
+    // Ruff only formats and fixes; without it the checker still supplies intelligence.
+    match managed("ruff") {
+        Ok(ruff) => result.companion = Some(Box::new(launch(project, ruff, &["server"]))),
+        Err(error) => result.detail = Some(companion_note(&error)),
+    }
     Ok(result)
+}
+
+/// Shown when the Ruff companion cannot start; the primary server keeps running.
+pub fn companion_note(error: &anyhow::Error) -> String {
+    format!("Ruff unavailable: {error:#}; formatting and lint fixes are disabled")
 }
 
 fn typescript(project: &Project) -> Result<Launch> {
@@ -429,9 +531,15 @@ fn typescript(project: &Project) -> Result<Launch> {
         .ancestors()
         .take_while(|d| d.starts_with(&project.worktree))
         .collect();
+    // Yarn Plug'n'Play has no node_modules; its editor SDK wraps the zipped package.
     if let Some(package) = dirs
         .iter()
-        .map(|d| d.join("node_modules/typescript/package.json"))
+        .flat_map(|d| {
+            [
+                d.join("node_modules/typescript/package.json"),
+                d.join(".yarn/sdks/typescript/package.json"),
+            ]
+        })
         .find(|p| p.is_file())
     {
         let value: Value = serde_json::from_slice(&fs::read(&package)?)?;
@@ -470,7 +578,7 @@ fn typescript(project: &Project) -> Result<Launch> {
         node_path(&mut result, &node);
         return Ok(result);
     }
-    for dir in dirs {
+    for dir in &dirs {
         let package = dir.join("package.json");
         if !package.is_file() {
             continue;
@@ -480,6 +588,11 @@ fn typescript(project: &Project) -> Result<Launch> {
             .iter()
             .any(|k| value[*k].get("typescript").is_some())
         {
+            if dirs.iter().any(|d| d.join(".pnp.cjs").is_file()) {
+                bail!(
+                    "Run `yarn dlx @yarnpkg/sdks base` to expose this Yarn Plug'n'Play project's TypeScript SDK to editors, then Retry"
+                );
+            }
             bail!(
                 "Install this project's dependencies to restore its declared TypeScript SDK, then Retry"
             );
@@ -547,14 +660,15 @@ fn swift(project: &Project) -> Result<Launch> {
     } else {
         None
     };
-    let owned = previous
+    let current: Option<Value> = previous
+        .as_deref()
+        .map(serde_json::from_slice)
+        .transpose()
+        .context("Fix invalid buildServer.json; Shark preserves your custom BSP configuration")?;
+    let owned = current
         .as_ref()
-        .and_then(|b| serde_json::from_slice::<Value>(b).ok())
         .is_some_and(|v| v["_shark"]["owner"] == "shark" && v["_shark"]["version"] == 1);
-    if previous.is_some() && !owned {
-        let config: Value = serde_json::from_slice(previous.as_ref().unwrap()).context(
-            "Fix invalid buildServer.json; Shark preserves your custom BSP configuration",
-        )?;
+    if let Some(config) = current.as_ref().filter(|_| !owned) {
         ensure!(
             ["name", "version", "bspVersion"]
                 .iter()
@@ -569,6 +683,7 @@ fn swift(project: &Project) -> Result<Launch> {
             "Using existing buildServer.json; build the project to prepare its navigation index"
                 .into(),
         );
+        result.awaiting_build = true;
         return Ok(result);
     }
     let mut containers = xcode_containers(&project.root);
@@ -584,14 +699,10 @@ fn swift(project: &Project) -> Result<Launch> {
             .and_then(|bytes| serde_json::from_slice::<PathBuf>(&bytes).ok())
             .map(|p| project.root.join(p))
             .or_else(|| {
-                previous
+                current
                     .as_ref()
-                    .and_then(|b| serde_json::from_slice::<Value>(b).ok())
-                    .and_then(|v| {
-                        v["_shark"]["container"]
-                            .as_str()
-                            .map(|p| project.root.join(p))
-                    })
+                    .and_then(|v| v["_shark"]["container"].as_str())
+                    .map(|p| project.root.join(p))
             });
         match selected.filter(|p| containers.contains(p)) {
             Some(selected) => containers = vec![selected],
@@ -605,9 +716,6 @@ fn swift(project: &Project) -> Result<Launch> {
     }
     let sweetpad = managed("sweetpad")?;
     let expected = json!({"owner":"shark", "version":1, "root": project.root, "tool": sweetpad, "container": containers[0].file_name()});
-    let current: Option<Value> = previous
-        .as_ref()
-        .and_then(|b| serde_json::from_slice(b).ok());
     if current.as_ref().and_then(|v| v.get("_shark")) != Some(&expected) {
         let staged = project
             .root
@@ -653,6 +761,8 @@ fn swift(project: &Project) -> Result<Launch> {
                 fs::write(&staged, text)?;
                 // Linking activates the complete file atomically and cannot replace a concurrent writer.
                 fs::hard_link(&staged, &bsp)?;
+                // Best effort: outside a git repository there is nothing to keep clean.
+                let _ = exclude_from_git(&project.root, "buildServer.json");
             }
             Ok(())
         })();
@@ -661,12 +771,65 @@ fn swift(project: &Project) -> Result<Launch> {
     }
     result.detail =
         Some("Preparing index: build this Xcode project for project-wide navigation".into());
+    result.awaiting_build = true;
     Ok(result)
+}
+
+/// Keeps a generated file with machine-specific paths out of `git status`. info/exclude is
+/// local to the clone, shared by its worktrees, and never committed.
+fn exclude_from_git(root: &Path, name: &str) -> Result<()> {
+    let output = run(
+        root,
+        "git",
+        &["rev-parse", "--git-path", "info/exclude", "--show-prefix"],
+        10,
+    )?;
+    let mut lines = output.lines();
+    let exclude = root.join(lines.next().context("git printed no exclude path")?);
+    let pattern = format!("/{}{name}", lines.next().unwrap_or_default());
+    let text = fs::read_to_string(&exclude).unwrap_or_default();
+    if !text.lines().any(|line| line == pattern) {
+        fs::create_dir_all(exclude.parent().context("Invalid exclude path")?)?;
+        let separator = if text.is_empty() || text.ends_with('\n') {
+            ""
+        } else {
+            "\n"
+        };
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&exclude)?;
+        std::io::Write::write_all(&mut file, format!("{separator}{pattern}\n").as_bytes())?;
+    }
+    Ok(())
+}
+
+/// The single gopls pin: the Makefile and scripts read it from this line.
+const GOPLS_VERSION: &str = "0.24.0";
+
+/// A Go setting as the go command resolves it: process environment, then the `go env -w`
+/// file. $GOROOT/go.env only supplies defaults that match leaving the value unset.
+fn go_env(key: &str) -> Option<String> {
+    if let Some(value) = std::env::var(key).ok().filter(|v| !v.is_empty()) {
+        return Some(value);
+    }
+    let file = match std::env::var_os("GOENV") {
+        Some(file) if file == "off" => return None,
+        Some(file) if !file.is_empty() => PathBuf::from(file),
+        // os.UserConfigDir on macOS.
+        _ => PathBuf::from(std::env::var_os("HOME")?).join("Library/Application Support/go/env"),
+    };
+    fs::read_to_string(file)
+        .ok()?
+        .lines()
+        .find_map(|line| line.strip_prefix(key)?.strip_prefix('='))
+        .filter(|v| !v.is_empty())
+        .map(String::from)
 }
 
 fn go(project: &Project) -> Result<Launch> {
     // Go's `path` mode honors go.mod/go.work toolchain selection without downloading compilers.
-    let selected = std::env::var("GOTOOLCHAIN").unwrap_or_else(|_| "auto".into());
+    let selected = go_env("GOTOOLCHAIN").unwrap_or_else(|| "auto".into());
     let selected = match selected.as_str() {
         "auto" => "path".into(),
         "local" | "path" => selected,
@@ -684,15 +847,17 @@ fn go(project: &Project) -> Result<Launch> {
         .parent()
         .and_then(Path::parent)
         .context("Cannot locate Shark resources")?
-        .join("Resources/language-tools/gopls/0.24.0");
+        .join("Resources/language-tools/gopls")
+        .join(GOPLS_VERSION);
     if cfg!(debug_assertions) && !resources.join("gopls").is_file() {
-        resources =
-            Path::new(env!("CARGO_MANIFEST_DIR")).join("target/language-tools/gopls/0.24.0");
+        resources = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("target/language-tools/gopls")
+            .join(GOPLS_VERSION);
     }
     let binary = resources.join("gopls");
     ensure!(
         binary.is_file(),
-        "This Shark build has no bundled gopls 0.24.0; install a release containing language tools (developers: run scripts/build-gopls.sh before make release)"
+        "This Shark build has no bundled gopls {GOPLS_VERSION}; install a release containing language tools (developers: run scripts/build-gopls.sh before make release)"
     );
     let expected = fs::read_to_string(resources.join("gopls.sha256"))?;
     install::verify(&binary, expected.trim())?;
@@ -715,6 +880,206 @@ mod tests {
         }
         root
     }
+    /// Runs `f` with environment overrides, restoring them afterwards. Callers hold UI_LOCK.
+    fn with_env<T>(vars: &[(&str, Option<String>)], f: impl FnOnce() -> T) -> T {
+        let saved: Vec<_> = vars
+            .iter()
+            .map(|(k, _)| (*k, std::env::var_os(k)))
+            .collect();
+        let set = |k: &str, v: Option<std::ffi::OsString>| match v {
+            // SAFETY: tests that mutate the environment are serialized by UI_LOCK.
+            Some(v) => unsafe { std::env::set_var(k, v) },
+            None => unsafe { std::env::remove_var(k) },
+        };
+        for (k, v) in vars {
+            set(k, v.clone().map(Into::into));
+        }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(f));
+        for (k, v) in saved {
+            set(k, v);
+        }
+        result.unwrap_or_else(|e| std::panic::resume_unwind(e))
+    }
+
+    fn script(dir: &Path, name: &str, body: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let file = dir.join(name);
+        fs::create_dir_all(dir).unwrap();
+        fs::write(&file, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[test]
+    fn rust_analyzer_is_found_for_linked_and_non_rustup_toolchains() {
+        #[cfg(feature = "test-support")]
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = fixture("rust-tools", &[("Cargo.toml", "[package]\nname='a'")]);
+        let sysroot = root.join("stage1");
+        script(&sysroot.join("bin"), "rust-analyzer", "exit 0");
+        let bin = root.join("bin");
+        // A linked toolchain: rustup finds its tools but rejects component operations.
+        script(
+            &bin,
+            "rustup",
+            &format!(
+                "case \"$1 $4\" in\n'which rustc'|'which rust-analyzer') echo {}/bin/$4 ;;\n*) echo \"error: invalid toolchain name: 'stage1'\" >&2; exit 1 ;;\nesac",
+                sysroot.display()
+            ),
+        );
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let mut project = Project {
+            root: root.clone(),
+            worktree: root.clone(),
+            language_id: "rust",
+            backend: Backend::Rust,
+            toolchain: String::new(),
+            rust_toolchain: Some("stage1".into()),
+            interpreter: None,
+        };
+        let linked = with_env(&[("PATH", Some(path.clone()))], || prepare(&project)).unwrap();
+        assert_eq!(linked.program, sysroot.join("bin/rust-analyzer"));
+        // An informational note is not indexing work.
+        assert!(linked.detail.is_some() && !linked.awaiting_build);
+        // Homebrew: rustc's sysroot has no analyzer; the separate formula is on PATH.
+        let brew = root.join("brew");
+        let cellar = root.join("cellar");
+        fs::create_dir_all(&cellar).unwrap();
+        script(
+            &brew.join("bin"),
+            "rustc",
+            &format!("echo {}", cellar.display()),
+        );
+        script(&brew.join("bin"), "rust-analyzer", "exit 0");
+        project.rust_toolchain = None;
+        let path = format!(
+            "{}:{}",
+            brew.join("bin").display(),
+            std::env::var("PATH").unwrap()
+        );
+        let homebrew = with_env(&[("PATH", Some(path))], || prepare(&project)).unwrap();
+        assert_eq!(homebrew.program, brew.join("bin/rust-analyzer"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rustup_older_than_1_28_is_rejected() {
+        assert!(!rustup_is_current("rustup 1.27.1 (54dd3d00f 2024-04-24)"));
+        assert!(rustup_is_current("rustup 1.28.0 (6ebc3db2b 2025-03-02)"));
+        assert!(rustup_is_current("rustup 1.29.2 (28d1352db 2025-03-05)"));
+        assert!(rustup_is_current("rustup 2.0.0"));
+    }
+
+    #[test]
+    fn go_settings_from_go_env_file_and_explicit_gowork_are_honored() {
+        #[cfg(feature = "test-support")]
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = fixture(
+            "goenv",
+            &[
+                ("env", "GOPROXY=off\nGOTOOLCHAIN=local\n"),
+                ("go.work", "go 1.26\nuse ./b"),
+                ("b/go.mod", "module b"),
+                ("b/main.go", ""),
+                ("tools/dev.work", "go 1.26\nuse ../b"),
+            ],
+        );
+        let env = |gowork: &Path| {
+            [
+                ("GOENV", Some(root.join("env").display().to_string())),
+                ("GOTOOLCHAIN", None),
+                ("GOWORK", Some(gowork.display().to_string())),
+            ]
+        };
+        let (toolchain, discovered) = with_env(&env(&root.join("tools/dev.work")), || {
+            (
+                go_env("GOTOOLCHAIN"),
+                discover(&root.join("b/main.go"), &root),
+            )
+        });
+        assert_eq!(toolchain.as_deref(), Some("local"));
+        assert_eq!(
+            discovered.unwrap().unwrap().root,
+            root.join("tools").canonicalize().unwrap()
+        );
+        let off = with_env(&env(Path::new("off")), || {
+            discover(&root.join("b/main.go"), &root)
+        });
+        assert_eq!(
+            off.unwrap().unwrap().root,
+            root.join("b").canonicalize().unwrap()
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn generated_build_server_config_is_excluded_from_every_worktree() {
+        let root = fixture("exclude", &[("app/README", "")]);
+        let git = |dir: &Path, args: &[&str]| {
+            run(dir, "git", args, 10).unwrap();
+        };
+        git(&root, &["init", "-q"]);
+        git(
+            &root,
+            &[
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@t",
+                "commit",
+                "-q",
+                "--allow-empty",
+                "-m",
+                "i",
+            ],
+        );
+        git(&root, &["worktree", "add", "-q", "--detach", "linked"]);
+        let linked = root.join("linked/app");
+        fs::create_dir_all(&linked).unwrap();
+        exclude_from_git(&linked, "buildServer.json").unwrap();
+        exclude_from_git(&linked, "buildServer.json").unwrap();
+        let exclude = fs::read_to_string(root.join(".git/info/exclude")).unwrap();
+        assert_eq!(
+            exclude.matches("/app/buildServer.json").count(),
+            1,
+            "{exclude}"
+        );
+        fs::write(linked.join("buildServer.json"), "{}").unwrap();
+        assert_eq!(
+            run(
+                &linked,
+                "git",
+                &["status", "--porcelain", "--untracked-files=all"],
+                10
+            )
+            .unwrap(),
+            ""
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn yarn_pnp_without_editor_sdk_explains_how_to_expose_typescript() {
+        let root = fixture(
+            "pnp",
+            &[
+                (
+                    "package.json",
+                    r#"{"devDependencies":{"typescript":"^5.9.0"}}"#,
+                ),
+                (".pnp.cjs", ""),
+                ("src/a.ts", ""),
+            ],
+        );
+        let project = discover(&root.join("src/a.ts"), &root).unwrap().unwrap();
+        let error = prepare(&project).unwrap_err().to_string();
+        assert!(error.contains("yarn dlx @yarnpkg/sdks base"), "{error}");
+        fs::remove_dir_all(root).unwrap();
+    }
+
     #[test]
     fn nested_projects_and_go_work_are_bounded_by_worktree() {
         #[cfg(feature = "test-support")]
