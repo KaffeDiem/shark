@@ -89,8 +89,9 @@ async fn language_replacements_preserve_selection_scroll_and_one_vim_undo(cx: &m
                 input.set_scroll_offset(point(px(-4.), px(-16.)), cx);
             });
             let scroll = e.input.read(cx).scroll_offset();
-            e.replace_language_text("😀 FIRST\nSECOND\nTHIRD\n".into(), w, cx);
-            assert_eq!(e.input.read(cx).selected_range(), 5..10);
+            // An added line above moves the selection with its code.
+            e.replace_language_text("# a\n😀 FIRST\nSECOND\nTHIRD\n".into(), w, cx);
+            assert_eq!(e.input.read(cx).selected_value().as_ref(), "FIRST");
             assert_eq!(e.input.read(cx).scroll_offset(), scroll);
             assert!(e.dirty);
             assert_eq!(e.vim.mode, vim::Mode::Normal);
@@ -122,7 +123,7 @@ async fn language_replacements_preserve_selection_scroll_and_one_vim_undo(cx: &m
     cx.update(|cx| {
         assert_eq!(
             editor.read(cx).input.read(cx).value().as_ref(),
-            "😀 FIRST\nSECOND\nTHIRD\n"
+            "# a\n😀 FIRST\nSECOND\nTHIRD\n"
         )
     });
     let _ = fs::remove_dir_all(dir);
