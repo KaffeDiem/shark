@@ -62,7 +62,7 @@ impl Out {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Vim {
     pub mode: Mode,
     /// Count typed before the operator (or before a plain motion).
@@ -120,7 +120,8 @@ impl Vim {
         matches!(self.mode, Mode::Visual | Mode::VisualLine)
     }
 
-    fn reset(&mut self) {
+    /// Drops a pending count, operator or command line.
+    pub(crate) fn reset(&mut self) {
         self.count = None;
         self.op_count = None;
         self.op = None;

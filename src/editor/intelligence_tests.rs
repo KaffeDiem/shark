@@ -672,6 +672,33 @@ async fn snippet_completion_inside_an_active_field_starts_its_own_tabstops(
     let _ = fs::remove_dir_all(dir);
 }
 
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn vim_moves_but_never_edits_in_external_sources(cx: &mut TestAppContext) {
+    let _turn = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let text = "first\nsecond\n";
+    let (dir, _, window, editor) = open_editor("external-vim", text, cx).await;
+    cx.update_window(window, |_, w, cx| {
+        focus(&editor, w, cx);
+        editor.update(cx, |e, cx| e.set_external(true, cx));
+        for key in ["j", "x", "d", "d", "i", "o", "u", "l"] {
+            w.press(key, cx);
+        }
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let e = editor.read(cx);
+        assert_eq!(e.input.read(cx).value().as_ref(), text);
+        assert_eq!(e.vim.mode, vim::Mode::Normal);
+        assert_eq!(e.vim.pending(), "");
+        assert_eq!(e.input.read(cx).cursor(), "first\ns".len());
+    });
+    let _ = fs::remove_dir_all(dir);
+}
+
 #[test]
 fn outline_nests_both_symbol_shapes_and_follows_the_cursor() {
     use super::intelligence::{outline, symbol_path};

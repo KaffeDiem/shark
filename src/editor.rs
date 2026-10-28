@@ -367,11 +367,10 @@ impl FileEditor {
 
     /// Runs one key through Vim; returns whether it was consumed.
     fn vim_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        if self.external {
-            return false;
-        }
         let before = self.vim.mode;
-        let Some((edited, cmd)) = apply_vim_key(&mut self.vim, &self.input, key, window, cx) else {
+        let Some((edited, cmd)) =
+            apply_vim_key_to(&mut self.vim, &self.input, key, self.external, window, cx)
+        else {
             return false;
         };
         self.dirty |= edited;
@@ -444,6 +443,18 @@ pub(crate) fn apply_vim_key<M: InputModeKind>(
     window: &mut Window,
     cx: &mut App,
 ) -> Option<(bool, Option<vim::Cmd>)> {
+    apply_vim_key_to(vim, input, key, false, window, cx)
+}
+
+/// `readonly` keeps motions, search and yank, and swallows keys that would edit or insert.
+fn apply_vim_key_to<M: InputModeKind>(
+    vim: &mut Vim,
+    input: &Entity<InputBaseState<M>>,
+    key: &str,
+    readonly: bool,
+    window: &mut Window,
+    cx: &mut App,
+) -> Option<(bool, Option<vim::Cmd>)> {
     let (text, cursor) = {
         let i = input.read(cx);
         (i.text().clone(), i.cursor())
@@ -452,9 +463,21 @@ pub(crate) fn apply_vim_key<M: InputModeKind>(
     let clip = matches!(key, "p" | "P")
         .then(|| cx.read_from_clipboard().and_then(|c| c.text()))
         .flatten();
+    let before = readonly.then(|| vim.clone());
     let out = vim.key(key, &text, cursor, clip.as_deref());
     if !out.handled {
         return None;
+    }
+    use crate::vim::Cmd::{Indent, Outdent, Redo, Undo};
+    if let Some(before) = before
+        && (out.edit.is_some()
+            || vim.mode == crate::vim::Mode::Insert
+            || matches!(out.cmd, Some(Undo | Redo | Indent | Outdent)))
+    {
+        // As Vim does for an unmodifiable buffer: no change, and the operator is cancelled.
+        *vim = before;
+        vim.reset();
+        return Some((false, None));
     }
     let edited = out.edit.is_some();
     input.update(cx, |i, cx| {
