@@ -655,17 +655,27 @@ async fn snippet_completion_inside_an_active_field_starts_its_own_tabstops(
         cx.run_until_parked();
     };
     let range = |a: u32, b: u32| Range::new(Position::new(0, a), Position::new(0, b));
-    accept(range(0, 1), "foo(${1:arg})$0", cx).await;
+    accept(range(0, 1), "foo(${1:arg}, ${2:y})$0", cx).await;
     cx.update(|cx| {
         assert_eq!(
             editor.read(cx).input.read(cx).selected_value().as_ref(),
             "arg"
         )
     });
-    accept(range(4, 7), "bar(${1:x})", cx).await;
+    // A plain completion in a field keeps the outer session.
+    accept(range(4, 7), "value", cx).await;
+    cx.update_window(window, |_, w, cx| w.press("tab", cx))
+        .unwrap();
+    cx.run_until_parked();
     cx.update(|cx| {
         let input = editor.read(cx).input.read(cx);
-        assert_eq!(input.value().as_ref(), "foo(bar(x))");
+        assert_eq!(input.value().as_ref(), "foo(value, y)");
+        assert_eq!(input.selected_value().as_ref(), "y");
+    });
+    accept(range(11, 12), "bar(${1:x})", cx).await;
+    cx.update(|cx| {
+        let input = editor.read(cx).input.read(cx);
+        assert_eq!(input.value().as_ref(), "foo(value, bar(x))");
         assert_eq!(input.selected_value().as_ref(), "x");
     });
     client.terminate();

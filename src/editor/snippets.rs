@@ -18,7 +18,7 @@ struct Session {
 
 impl FileEditor {
     pub(super) fn snippet_changed(&mut self, cx: &mut Context<Self>) {
-        // A completion accepted inside an active field replaces the outer session.
+        // A snippet completion accepted inside an active field replaces the outer session.
         if self.snippet_accepted(cx) {
             return;
         }
@@ -67,7 +67,16 @@ impl FileEditor {
             return false;
         };
         self.snippets.accepted = Some((completion.version, completion.fingerprint));
-        self.snippets.active = None;
+        // A plain completion typed into a field is an edit of that field; a snippet replaces it.
+        if !(completion.tabstops.is_empty()
+            && self
+                .snippets
+                .active
+                .as_mut()
+                .is_some_and(|s| s.changed(&text)))
+        {
+            self.snippets.active = None;
+        }
         if completion.tabstops.iter().any(|s| {
             s.start > s.end
                 || s.end > text.len()
