@@ -9,6 +9,9 @@ Shark is built on [GPUI](https://www.gpui.rs), Zed's GPU-rendered UI framework, 
 
 <img src="docs/images/palette.png" width="800" alt="The cmd-k command palette">
 
+## Account usage
+The navigation footer lists Claude and Codex by name, each with a progress ring and the share left of its lowest known allowance (“68% left”); the collapsed rail shows the ring above the name. Rings are grey, amber at 20% or below, red at 5% or below. A tick on each ring and panel bar marks the even pace: what would be left if the window were used evenly, so halfway through a weekly window it sits at 50%. A ring that reaches past its tick is ahead of the limit. Click either ring, or use **Show usage** in `cmd-k`, for all allowances and reset times in your local timezone. Shark checks at startup and every five minutes while its window is active, including when the detail panel is closed. Returning to Shark refreshes overdue data; opening details and Refresh also fetch immediately. Queries use your signed-in CLIs without sending a prompt; results stay in memory. Outdated results are muted, and a neutral Usage button remains when neither provider has allowances. Claude’s experimental usage contract may become unavailable after a CLI update.
+
 ## Version-controlled plans
 In plan mode (`shift-tab`) the agent, Claude or Codex, reads and plans but edits nothing. Each plan it proposes is saved as a new version. The plan pane shows what changed since the previous version: added words in green, removed words struck through in red, changed code blocks as diffs. Reply in the chat to revise the plan, step through versions with `h`/`l`, and press `a` to approve and build.
 
@@ -155,6 +158,7 @@ cargo run                                  # needs Xcode (Metal); Rust is pinned
 cargo test                                 # git/worktree, stream-json parser, PR linking
 cargo test --features test-support         # + headless keyboard/mouse UI tests
 cargo test --features test-support --test rendering # real GPU pixels: dark/light tab fades
+cargo test --features test-support live_usage -- --ignored --test-threads=1 # live allowances + panel; no inference
 cargo test live_claude -- --ignored        # real claude CLI round trip (costs a few cents)
 cargo test live_codex -- --ignored         # the same through codex app-server
 ```

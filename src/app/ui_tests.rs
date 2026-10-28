@@ -22,6 +22,7 @@ mod navigation_pixels;
 mod storage_tests;
 mod tab_tests;
 mod tree_pixels;
+mod usage_tests;
 mod workspace_picker_tests;
 mod workspace_review_tests;
 

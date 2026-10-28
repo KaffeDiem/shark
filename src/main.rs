@@ -26,6 +26,7 @@ mod stack;
 mod state;
 mod sync;
 mod ui;
+mod usage;
 mod vim;
 
 use gpui_kit::component::TitleBar;
@@ -48,6 +49,7 @@ actions!(
         FocusLeft,
         FocusRight,
         ShowChat,
+        ShowUsage,
         ShowDiff,
         ShowGit,
         CreatePrs,

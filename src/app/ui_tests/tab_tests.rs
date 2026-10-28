@@ -182,6 +182,9 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
                     .into_iter()
                     .enumerate()
                     {
+                        // Bring each tab into view before checking its hover controls.
+                        shark.read(cx).tab_scroll.scroll_to_item(ix);
+                        w.refresh();
                         w.render_frame(cx);
                         w.pointer_move(point(px(0.), px(690.)), None, cx);
                         let before = w.within(SharedString::from(tab.clone())).find(close);

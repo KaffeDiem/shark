@@ -46,6 +46,7 @@ impl Shark {
                 .any(|context| context.contains("SharkMenu"))
             && self.menu.is_none()
             && self.app_switcher.is_none()
+            && self.usage_panel.is_none()
             && let Some(name) = self.active.clone()
         {
             self.record_interaction(&name, cx);
