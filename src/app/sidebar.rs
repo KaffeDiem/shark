@@ -632,7 +632,7 @@ impl Shark {
                                 );
                             }
                         }
-                        entries.extend(open_in_entries(None, &[(name.clone(), path.clone())]));
+                        entries.extend(open_in_entries(None, &[(name.clone(), path.clone())], cx));
                         entries.push(
                             menu::item(IconName::Copy, "Copy path", move |w, cx| {
                                 copy(p3.display().to_string(), w, cx)

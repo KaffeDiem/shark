@@ -1306,7 +1306,16 @@ impl Differ {
                 }
                 let a = abs.clone();
                 let label = format!("Open in {}", app.name);
-                let item = menu::item(crate::ui::app_icon(app), label, move |_, _| app.open(&a));
+                let item = menu::item(
+                    crate::ui::app_icon(app),
+                    label,
+                    on_differ(self.workspace_name(), cx, move |_, _, cx| {
+                        cx.emit(DifferEvent::OpenApp {
+                            app,
+                            path: a.clone(),
+                        });
+                    }),
+                );
                 entries.push(item.image(app.icon.clone()));
             }
         }

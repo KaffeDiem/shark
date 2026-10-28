@@ -30,7 +30,14 @@ impl Shark {
             let Some(target) = self.target(window) else {
                 return notify_err(window, cx, "Open a workspace first");
             };
-            let apps = palette::available_apps(Some(&target));
+            let mut apps = palette::available_apps(Some(&target));
+            apps.sort_by_key(|app| {
+                self.state
+                    .recent_apps
+                    .iter()
+                    .position(|p| p == &app.path)
+                    .unwrap_or(usize::MAX)
+            });
             if apps.is_empty() {
                 return notify_err(
                     window,

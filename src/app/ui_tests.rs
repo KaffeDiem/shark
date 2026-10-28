@@ -3339,6 +3339,14 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     );
     run(cx, "open in fork");
     assert_eq!(last().unwrap().0, "Xcode", "Fork asks first");
+    let history = cx.update(|cx| shark.read(cx).state.recent_apps.clone());
+    press(cx, &["escape"]);
+    assert_eq!(
+        cx.update(|cx| shark.read(cx).state.recent_apps.clone()),
+        history,
+        "cancelling the repo picker does not change recency"
+    );
+    run(cx, "open in fork");
     cx.update_window(window, |_, w, cx| w.input("web", cx))
         .unwrap();
     press(cx, &["enter"]);
@@ -3375,6 +3383,18 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     // Cmd+O captures the sidebar target even while another workspace is open.
     use gpui_kit::test::TestEventExt;
     on(cx, &|s, w, cx| {
+        let apps = crate::apps::installed();
+        assert_eq!(
+            s.state.recent_apps,
+            [
+                apps[2].path.clone(),
+                apps[3].path.clone(),
+                apps[0].path.clone()
+            ],
+            "palette launches share history across workspaces"
+        );
+        // Exercise cold-start cycling separately from the palette history above.
+        s.state.recent_apps.clear();
         let ix = s
             .state
             .workspaces
@@ -3457,7 +3477,7 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     modifiers(cx, true);
     press(cx, &["cmd-o", "cmd-enter"]);
     modifiers(cx, false);
-    assert_eq!(last(), Some(("Terminal".into(), ws_dir.clone())));
+    assert_eq!(last(), Some(("Code".into(), ws_dir.clone())));
     assert_eq!(OPENED.lock().unwrap().len(), before + 2);
 
     // Escape while Command is still held cancels; its later release does nothing.
@@ -3537,14 +3557,14 @@ async fn open_in_apps(cx: &mut TestAppContext) {
                 .iter()
                 .map(|a| a.name.as_str())
                 .collect::<Vec<_>>(),
-            ["Terminal", "Code", "Fork"]
+            ["Fork", "Code", "Terminal"]
         );
         assert_eq!(switcher.selected, 2);
     });
     modifiers(cx, false);
     assert_eq!(
         last(),
-        Some(("Fork".into(), home.join("shark/workspaces/web-only/web")))
+        Some(("Terminal".into(), home.join("shark/workspaces/web-only")))
     );
     fs::remove_dir_all(&home).ok();
 }
@@ -3607,6 +3627,29 @@ async fn file_menu_labels(cx: &mut TestAppContext) {
     let menu = shark.update(cx, |s, cx| labels(s.editor_menu(cx)));
     assert_eq!(menu[0], "Edit working copy", "already open");
     assert_eq!(menu[1..], [&file[..], &["-", "Close file"]].concat()[..]);
+    let action = shark.update(cx, |s, cx| {
+        s.editor_menu(cx)
+            .into_iter()
+            .find_map(|entry| match entry {
+                Entry::Item {
+                    label, on_click, ..
+                } if label == "Open in Code" => Some(on_click),
+                _ => None,
+            })
+            .unwrap()
+    });
+    cx.update_window(window, |_, w, cx| action(w, cx)).unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(
+            shark.read(cx).state.recent_apps,
+            [crate::apps::installed()[1].path.clone()]
+        )
+    });
+    assert_eq!(
+        crate::apps::OPENED.lock().unwrap().last().cloned(),
+        Some(("Code".into(), home.join("shark/workspaces/fm/api/a.md")))
+    );
     fs::remove_dir_all(&home).ok();
 }
 

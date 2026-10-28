@@ -81,6 +81,10 @@ pub(crate) struct WorkspaceSnapshot {
 
 #[derive(Clone)]
 pub(crate) enum DifferEvent {
+    OpenApp {
+        app: &'static crate::apps::OpenApp,
+        path: PathBuf,
+    },
     Activate(String),
     DiscardEdit {
         edit: EditSnapshot,

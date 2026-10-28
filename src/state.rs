@@ -24,6 +24,9 @@ pub struct State {
     /// Repo names picked for the last new workspace; the next dialog starts with them.
     #[serde(default)]
     pub last_repos: Vec<String>,
+    /// Applications opened through Shark, most recent first, shared by all workspaces.
+    #[serde(default)]
+    pub recent_apps: Vec<PathBuf>,
     /// The workspace and tab (`chat`/`diff`/`git`, or `home` while Home was shown over it) open at
     /// quit; restored on launch.
     #[serde(default)]
@@ -596,6 +599,21 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_apps_default_and_round_trip() {
+        let mut state: State = serde_json::from_str(r#"{"repos":[],"workspaces":[]}"#).unwrap();
+        assert!(state.recent_apps.is_empty());
+        state.recent_apps = vec![
+            "/Applications/Code.app".into(),
+            "/Applications/Terminal.app".into(),
+        ];
+        let saved = serde_json::to_string(&state).unwrap();
+        assert_eq!(
+            serde_json::from_str::<State>(&saved).unwrap().recent_apps,
+            state.recent_apps
+        );
+    }
 
     /// A repo saved before per-repo branches is on the workspace branch, and one on the
     /// workspace branch doesn't save the field.

@@ -124,6 +124,7 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         match event {
+            DifferEvent::OpenApp { app, path } => self.launch_app(app, path),
             DifferEvent::Activate(workspace) if self.active.as_ref() == Some(workspace) => {
                 self.show(Tab::Feature(Feature::Diff), window, cx)
             }

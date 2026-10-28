@@ -824,7 +824,7 @@ pub(super) fn repo_paths(ws: &Workspace) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
-/// The palette and app switcher offer the same apps, in the same order.
+/// The palette and app switcher offer the same eligible apps.
 pub(super) fn available_apps(target: Option<&Workspace>) -> Vec<&'static OpenApp> {
     let Some(ws) = target else { return vec![] };
     apps::installed()
@@ -834,6 +834,15 @@ pub(super) fn available_apps(target: Option<&Workspace>) -> Vec<&'static OpenApp
 }
 
 impl Shark {
+    pub(super) fn launch_app(&mut self, app: &'static OpenApp, path: &Path) {
+        app.open(path);
+        if self.state.recent_apps.first() != Some(&app.path) {
+            self.state.recent_apps.retain(|p| p != &app.path);
+            self.state.recent_apps.insert(0, app.path.clone());
+            let _ = self.state.save();
+        }
+    }
+
     /// Terminals and editors open the target workspace's folder; git clients a repo and
     /// Xcode a project, asking which when there are several.
     pub(super) fn open_in(
@@ -869,14 +878,14 @@ impl Shark {
         };
         match &targets[..] {
             [] => notify_err(window, cx, format!("{none} in {}", ws.name)),
-            [(_, path)] => app.open(path),
+            [(_, path)] => self.launch_app(app, path),
             _ => {
                 let items = (targets.iter())
                     .map(|(name, _)| CommandItem::new().label(name.clone()).icon(icon))
                     .collect();
                 let pick =
-                    move |_: &mut Shark, row: usize, _: &mut Window, _: &mut Context<Shark>| {
-                        app.open(&targets[row].1)
+                    move |s: &mut Shark, row: usize, _: &mut Window, _: &mut Context<Shark>| {
+                        s.launch_app(app, &targets[row].1)
                     };
                 open_menu(cx.entity().downgrade(), ask, items, 0, pick, window, cx)
             }
