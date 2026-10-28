@@ -192,16 +192,14 @@ fn bind_keys(cx: &mut App) {
     // Vim-style keys sit under `Vim`, which the root view carries while Vim mode is on
     // (Settings › General). The arrows, letters that name an action and cmd shortcuts work
     // either way. VimNormal: the editor in Vim's Normal mode.
-    const NAV: &str =
-        "Sidebar || Home || Transcript || DiffPane || FileTree || Queue || PlanPane || VimNormal";
+    const NAV: &str = "Sidebar || Home || Transcript || DiffPane || FileTree || Queue || PlanPane || GitFeature || VimNormal";
     const LIST: &str = "Sidebar || Home || Transcript || FileTree || Queue";
     // The diff's letter keys; not while typing in the review composer, which sits in the diff.
     const DIFF: &str = "DiffPane && !Input";
     // The diff's line cursor (src/app/review.rs) moves like a list. With Vim its arrows
     // scroll natively and j/k move the cursor; without, the arrows move it.
-    const MOVE: &str =
-        "Sidebar || Home || Transcript || FileTree || Queue || DiffPane || PlanPane || Features";
-    const ARROWS: &str = "Sidebar || Home || Transcript || FileTree || Queue || PlanPane || Features || (Diff && !Vim)";
+    const MOVE: &str = "Sidebar || Home || Transcript || FileTree || Queue || DiffPane || PlanPane || GitFeature || Features";
+    const ARROWS: &str = "Sidebar || Home || Transcript || FileTree || Queue || PlanPane || Features || (GitFeature && !Input) || (Diff && !Vim)";
     // `!Input` sits outside `Vim > (…)`: inside it, `!` sees only the contexts down to the
     // match, not a focused Input below. The editor's Normal mode is an Input that types nothing.
     let vim = |keys: &str, action: Box<dyn Action>, context: &str| {

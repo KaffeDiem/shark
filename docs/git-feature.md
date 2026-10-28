@@ -3,6 +3,9 @@
 Git follows the Diff artifact lifecycle: it starts closed, opens once per workspace,
 participates in the saved tab order, and supports closing, reordering, shortcuts,
 pane navigation, the command palette, and the View menu. `cmd-shift-g` opens it.
+Arrow keys, Page Up/Down and Home/End scroll the conversation; Vim mode also supports
+j/k, Ctrl-D/U, gg and G outside text inputs. Saving from Home never posts a hidden
+Git draft.
 The existing workspace Git controls still own push, PR creation, readiness, merge,
 and archive.
 
@@ -37,7 +40,10 @@ exact PR URL and thread ID, stored under the existing application support direct
 in `git-drafts/<workspace>.json`, and written with the existing private atomic file
 writer. Description drafts retain their original remote baseline across restarts.
 Read errors protect the original draft file. Storage failures participate in the
-app's unsaved-data banner and quit/archive guards.
+app's unsaved-data banner and quit/archive guards. One background save worker per
+workspace serializes snapshots, including discards; typing never waits on its disk
+I/O. Changes made during a write become its next snapshot. Retry uses the same
+worker, and quit/archive wait for pending local saves as well as remote writes.
 
 Reads and GitHub writes run outside the UI thread. Conversation rows use the house
 variable-height virtual list; Markdown is created when a row is rendered and

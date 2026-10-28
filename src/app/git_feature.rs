@@ -6,10 +6,9 @@ use gpui_kit::component::text::TextViewState;
 use gpui_kit::component::{Disableable as _, Selectable as _};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct DescriptionDraft {
     original_title: String,
     original_body: String,
@@ -17,7 +16,7 @@ struct DescriptionDraft {
     body: String,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct Draft {
     description: Option<DescriptionDraft>,
     note: String,
@@ -76,7 +75,11 @@ pub(super) struct GitFeature {
     drafts: HashMap<String, Draft>,
     store_blocked: bool,
     save_generation: u64,
-    save_revision: Arc<Mutex<u64>>,
+    saved_generation: u64,
+    #[cfg(test)]
+    save_delay: Duration,
+    #[cfg(test)]
+    save_started: u64,
     save_task: Option<Task<()>>,
     rows: Vec<Row>,
     markdown: HashMap<String, Entity<TextViewState>>,
@@ -123,7 +126,11 @@ impl GitFeature {
             drafts,
             store_blocked,
             save_generation: 0,
-            save_revision: Arc::new(Mutex::new(0)),
+            saved_generation: 0,
+            #[cfg(test)]
+            save_delay: Duration::ZERO,
+            #[cfg(test)]
+            save_started: 0,
             save_task: None,
             rows: Vec::new(),
             markdown: HashMap::new(),
@@ -378,6 +385,7 @@ impl GitFeature {
         };
         let target = d.target.url();
         let draft = self.drafts.entry(target.clone()).or_default();
+        let before = draft.clone();
         let (title, body) = match &kind {
             Editing::Description => {
                 let edit = draft.description.get_or_insert_with(|| DescriptionDraft {
@@ -394,6 +402,7 @@ impl GitFeature {
                 draft.replies.get(id).cloned().unwrap_or_default(),
             ),
         };
+        let draft_changed = *draft != before;
         let title = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value(title)
@@ -423,6 +432,10 @@ impl GitFeature {
             body,
             _subscriptions: vec![title_sub, body_sub],
         });
+        if draft_changed {
+            self.save_generation += 1;
+            self.schedule_save(cx);
+        }
         cx.notify();
     }
 
@@ -431,6 +444,7 @@ impl GitFeature {
             return;
         };
         let draft = self.drafts.entry(c.target.clone()).or_default();
+        let before = draft.clone();
         let body = c.body.read(cx).value().to_string();
         match &c.kind {
             Editing::Description => {
@@ -444,57 +458,78 @@ impl GitFeature {
                 draft.replies.insert(id.clone(), body);
             }
         }
-        self.save_generation += 1;
-        self.schedule_save(cx);
-        cx.notify();
+        if *draft != before {
+            self.save_generation += 1;
+            self.schedule_save(cx);
+            cx.notify();
+        }
     }
 
     fn schedule_save(&mut self, cx: &mut Context<Self>) {
-        if self.store_blocked {
+        if self.store_blocked
+            || self.save_task.is_some()
+            || (self.saved_generation == self.save_generation && self.save_error.is_none())
+        {
             return;
         }
-        let generation = self.save_generation;
-        *self.save_revision.lock().unwrap_or_else(|e| e.into_inner()) = generation;
-        let revision = self.save_revision.clone();
-        let path = store_path(&self.workspace.name);
-        let bytes = serde_json::to_vec(&self.drafts).expect("Git drafts serialize");
+        // One worker owns write ordering; input only updates the next snapshot.
         self.save_task = Some(cx.spawn(async move |this, cx| {
-            cx.background_executor()
-                .timer(Duration::from_millis(300))
-                .await;
-            let result = cx
-                .background_executor()
-                .spawn(async move {
-                    let current = revision.lock().unwrap_or_else(|e| e.into_inner());
-                    if *current == generation {
-                        crate::state::write(&path, &bytes)
-                    } else {
-                        Ok(())
+            loop {
+                cx.background_executor()
+                    .timer(Duration::from_millis(300))
+                    .await;
+                let Ok((generation, path, bytes)) = this.update(cx, |s, _| {
+                    #[cfg(test)]
+                    {
+                        s.save_started = s.save_generation;
                     }
-                })
-                .await;
-            this.update(cx, |s, cx| {
-                if s.save_generation == generation {
-                    s.save_error = result.err().map(|e| e.to_string());
+                    (
+                        s.save_generation,
+                        store_path(&s.workspace.name),
+                        serde_json::to_vec(&s.drafts).expect("Git drafts serialize"),
+                    )
+                }) else {
+                    return;
+                };
+                #[cfg(test)]
+                {
+                    let delay = this
+                        .update(cx, |s, _| std::mem::take(&mut s.save_delay))
+                        .unwrap_or_default();
+                    cx.background_executor().timer(delay).await;
                 }
-                cx.notify();
-            })
-            .ok();
+                let result = cx
+                    .background_executor()
+                    .spawn(async move { crate::state::write(&path, &bytes) })
+                    .await;
+                let more = this
+                    .update(cx, |s, cx| {
+                        if result.is_ok() {
+                            s.saved_generation = generation;
+                        }
+                        let more = s.save_generation != generation;
+                        if !more {
+                            s.save_error = result.err().map(|e| e.to_string());
+                            s.save_task = None;
+                        }
+                        cx.notify();
+                        more
+                    })
+                    .unwrap_or(false);
+                if !more {
+                    break;
+                }
+            }
         }));
+    }
+
+    pub(super) fn saving_drafts(&self) -> bool {
+        self.save_task.is_some()
     }
 
     pub(super) fn retry_save(&mut self, cx: &mut Context<Self>) {
         self.capture_draft(cx);
-        self.save_task = None;
-        if !self.store_blocked {
-            let mut revision = self.save_revision.lock().unwrap_or_else(|e| e.into_inner());
-            *revision = self.save_generation;
-            self.save_error = serde_json::to_vec(&self.drafts)
-                .map_err(std::io::Error::other)
-                .and_then(|bytes| crate::state::write(&store_path(&self.workspace.name), &bytes))
-                .err()
-                .map(|e| e.to_string());
-        }
+        self.schedule_save(cx);
         cx.notify();
     }
 
@@ -602,6 +637,8 @@ impl GitFeature {
                 {
                     draft.original_title = title.clone();
                     draft.original_body = body.clone();
+                    s.save_generation += 1;
+                    s.schedule_save(cx);
                 }
                 s.submit(w, cx);
             },
@@ -1233,6 +1270,21 @@ impl GitFeature {
         .into_any_element()
     }
 
+    fn scroll(&self, lines: f32, cx: &mut Context<Self>) {
+        self.list.scroll_by(px(lines * 21.));
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(super) fn delay_next_save(&mut self, delay: Duration) {
+        self.save_delay = delay;
+    }
+
+    #[cfg(test)]
+    pub(super) fn save_started(&self) -> u64 {
+        self.save_started
+    }
+
     #[cfg(test)]
     pub(super) fn inject_details(&mut self, details: api::Details, cx: &mut Context<Self>) {
         self.generation += 1;
@@ -1628,6 +1680,18 @@ impl Render for GitFeature {
             .id("git-feature")
             .key_context("GitFeature")
             .on_action(cx.listener(|s, _: &SaveFile, w, cx| s.submit(w, cx)))
+            .on_action(cx.listener(|s, _: &SelectNext, _, cx| s.scroll(2., cx)))
+            .on_action(cx.listener(|s, _: &SelectPrev, _, cx| s.scroll(-2., cx)))
+            .on_action(cx.listener(|s, _: &PageDown, _, cx| s.scroll(15., cx)))
+            .on_action(cx.listener(|s, _: &PageUp, _, cx| s.scroll(-15., cx)))
+            .on_action(cx.listener(|s, _: &SelectFirst, _, cx| {
+                s.list.scroll_to(ListOffset::default());
+                cx.notify();
+            }))
+            .on_action(cx.listener(|s, _: &SelectLast, _, cx| {
+                s.list.scroll_to_end();
+                cx.notify();
+            }))
             .on_action(cx.listener(|s, _: &CancelEdit, w, cx| {
                 if !s.posting {
                     if s.full_text.take().is_none() {

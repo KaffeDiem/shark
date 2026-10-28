@@ -375,6 +375,9 @@ impl Shark {
     pub(super) fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.tab {
             Tab::Feature(Feature::Git) => {
+                if self.home_shown() {
+                    return;
+                }
                 if let Some(git) = self.active_git_feature().cloned() {
                     git.update(cx, |g, cx| g.submit(window, cx));
                 }

@@ -68,6 +68,14 @@ impl Shark {
         }
         self.retry_saves(cx);
         if self.unsaved_data(cx).is_empty() {
+            if self
+                .git_features
+                .values()
+                .any(|g| g.read(cx).saving_drafts())
+            {
+                window.push_notification("Wait for Git drafts to finish saving before closing", cx);
+                return false;
+            }
             return true;
         }
         let owner = cx.entity().downgrade();

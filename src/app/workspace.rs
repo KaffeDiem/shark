@@ -1822,6 +1822,13 @@ impl Shark {
                 );
             }
             git.update(cx, |g, cx| g.retry_save(cx));
+            if git.read(cx).saving_drafts() {
+                return notify_err(
+                    window,
+                    cx,
+                    "Wait for Git drafts to finish saving before archiving",
+                );
+            }
             if git.read(cx).storage_error().is_some() {
                 return notify_err(window, cx, "Save Git drafts before archiving (Retry save)");
             }
