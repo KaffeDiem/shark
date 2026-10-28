@@ -93,9 +93,9 @@ fn failed_saves_retry_latest_comments_and_guard_close(cx: &mut TestAppContext) {
     on(cx, &|s, w, cx| {
         // Load before injecting the failure: an unreadable original store remains protected.
         s.differ.update(cx, |d, _| {
-        d.review.comments.insert("retry".into(), vec![]);
-        d.review.edit("retry", |cs| cs.push(serde_json::from_str(r#"{"id":7,"path":"api/a","start":[false,1],"end":[false,1],"text":"first","github":"https://example.test/already-posted"}"#).unwrap()));
-        d.review.edit("retry", |cs| cs[0].text = "latest".into());
+        d.review_mut().comments.insert("retry".into(), vec![]);
+        d.review_mut().edit("retry", |cs| cs.push(serde_json::from_str(r#"{"id":7,"path":"api/a","start":[false,1],"end":[false,1],"text":"first","github":"https://example.test/already-posted"}"#).unwrap()));
+        d.review_mut().edit("retry", |cs| cs[0].text = "latest".into());
         });
         s.state.vim = true;
         assert!(s.state.save().is_err());
@@ -182,7 +182,7 @@ async fn both_editors_keep_hard_link_buffers_and_quit_guards_recheck_saves(
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         let s = shark.read(cx);
-        s.differ.read(cx).diff_files.len() == 4
+        s.differ.read(cx).diff_files().len() == 4
             && s.editor
                 .as_ref()
                 .is_some_and(|e| e.read(cx).input.read(cx).value() == "original\n")
@@ -206,7 +206,7 @@ async fn both_editors_keep_hard_link_buffers_and_quit_guards_recheck_saves(
         assert_eq!(e.input.read(cx).value(), "full buffer");
         s.edit_working_copy(Some("api/inline".into()), w, cx);
         s.differ.update(cx, |d, cx| {
-            let e = d.editing.as_mut().unwrap();
+            let e = d.editing_mut().as_mut().unwrap();
             e.buf.lines[0] = "inline buffer".into();
             e.dirty = true;
             d.save_edit(true, w, cx);
@@ -217,7 +217,7 @@ async fn both_editors_keep_hard_link_buffers_and_quit_guards_recheck_saves(
             .read(cx)
             .differ
             .read(cx)
-            .editing
+            .editing()
             .as_ref()
             .unwrap()
             .saving
@@ -225,7 +225,7 @@ async fn both_editors_keep_hard_link_buffers_and_quit_guards_recheck_saves(
     .await;
     on(cx, &|host, _w, cx| {
         host.differ.update(cx, |s, _cx| {
-            let e = s.editing.as_ref().unwrap();
+            let e = s.editing().as_ref().unwrap();
             assert!(e.dirty);
             assert_eq!(e.buf.text(), "inline buffer\n");
         })
@@ -252,7 +252,7 @@ async fn both_editors_keep_hard_link_buffers_and_quit_guards_recheck_saves(
                 w.has_active_dialog(cx),
                 "editor confirmation follows Quit without saving"
             );
-            assert!(s.editing.as_ref().unwrap().dirty);
+            assert!(s.editing().as_ref().unwrap().dirty);
             w.close_dialog(cx);
         })
     });
@@ -298,7 +298,7 @@ async fn both_editors_keep_hard_link_buffers_and_quit_guards_recheck_saves(
         on(cx, &|s, _, cx| {
             assert_eq!(s.unsaved_data(cx).len(), 1);
             assert!(s.editor.as_ref().unwrap().read(cx).dirty);
-            assert!(s.differ.read(cx).editing.as_ref().unwrap().dirty);
+            assert!(s.differ.read(cx).editing().as_ref().unwrap().dirty);
         });
         fs::remove_dir(&state).unwrap();
         on(cx, &|s, _, cx| s.retry_saves(cx));

@@ -5,7 +5,7 @@ use gpui_kit::component::Selectable as _;
 
 /// A changed file against the fingerprint stored when it was marked viewed.
 #[derive(PartialEq, Clone, Copy, Debug)]
-pub(in crate::app) enum Viewed {
+pub(crate) enum Viewed {
     No,
     Yes,
     /// Marked viewed, then the agent or the editor changed it.
@@ -13,12 +13,12 @@ pub(in crate::app) enum Viewed {
 }
 
 /// One parsed diff refresh, built off the main thread.
-pub(in crate::app) struct DiffData {
+pub(crate) struct DiffData {
     /// Fingerprint of the whole patch; equal means nothing to redo.
     fp: u64,
     bases: HashMap<String, String>,
     /// In tree order.
-    pub(in crate::app) files: Vec<DiffFile>,
+    pub(crate) files: Vec<DiffFile>,
     fps: Vec<u64>,
     /// git failed for some repo; the patch is then empty, which must not read as "no changes".
     error: Option<String>,
@@ -31,7 +31,7 @@ pub(in crate::app) struct DiffData {
 }
 
 impl DiffData {
-    pub(in crate::app) fn load(ws: &Workspace, uncommitted_only: bool) -> DiffData {
+    pub(crate) fn load(ws: &Workspace, uncommitted_only: bool) -> DiffData {
         let (patch, mut error) = match git::combined_diff(ws, &ws.dir(), uncommitted_only) {
             Ok(p) => (p, None),
             Err(e) => (String::new(), Some(e)),
@@ -87,7 +87,7 @@ impl DiffData {
 }
 
 impl Differ {
-    pub(in crate::app) fn refresh_diff(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn refresh_diff(&mut self, cx: &mut Context<Self>) {
         let Some(ws) = self.active_ws().cloned() else {
             return;
         };
@@ -113,7 +113,7 @@ impl Differ {
         .detach();
     }
 
-    pub(super) fn complete_refresh(
+    pub(crate) fn complete_refresh(
         &mut self,
         name: &str,
         generation: u64,
@@ -125,7 +125,7 @@ impl Differ {
         }
     }
 
-    pub(in crate::app) fn apply_diff(&mut self, mut data: DiffData, cx: &mut Context<Self>) {
+    pub(crate) fn apply_diff(&mut self, mut data: DiffData, cx: &mut Context<Self>) {
         if let Some((abs, bytes)) = data.edited.take() {
             self.edit_disk(&abs, bytes, cx);
         }
@@ -308,7 +308,7 @@ impl Differ {
     }
 
     /// `p`: play or pause the video of the file last moved to.
-    pub(in crate::app) fn play_media(&mut self, window: &Window, cx: &mut Context<Self>) {
+    pub(crate) fn play_media(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(path) =
             (self.cursor_file(window, cx)).map(|ix| self.diff_files[ix].path().clone())
         else {
@@ -323,7 +323,7 @@ impl Differ {
         }
     }
 
-    pub(in crate::app) fn viewed(&self, ix: usize) -> Viewed {
+    pub(crate) fn viewed(&self, ix: usize) -> Viewed {
         let (Some(ws), Some(f)) = (self.active_ws(), self.diff_files.get(ix)) else {
             return Viewed::No;
         };
@@ -342,7 +342,7 @@ impl Differ {
         self.viewed_now = Rc::new(set);
     }
 
-    pub(in crate::app) fn toggle_viewed(&mut self, ix: usize, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_viewed(&mut self, ix: usize, cx: &mut Context<Self>) {
         if ix < self.diff_files.len() {
             self.set_viewed(&[ix], self.viewed(ix) != Viewed::Yes, cx);
         }
@@ -362,7 +362,7 @@ impl Differ {
     }
 
     /// A folder's box: ticks every file inside, or unticks them all when all are viewed.
-    pub(in crate::app) fn toggle_viewed_dir(&mut self, dir: &str, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_viewed_dir(&mut self, dir: &str, cx: &mut Context<Self>) {
         let files = self.dir_files(dir);
         let on = !files.iter().all(|&ix| self.viewed(ix) == Viewed::Yes);
         self.set_viewed(&files, on, cx);
@@ -404,13 +404,13 @@ impl Differ {
         cx.notify();
     }
 
-    pub(in crate::app) fn toggle_viewed_path(&mut self, path: &str, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_viewed_path(&mut self, path: &str, cx: &mut Context<Self>) {
         if let Some(ix) = self.diff_files.iter().position(|f| f.path() == path) {
             self.toggle_viewed(ix, cx);
         }
     }
 
-    pub(in crate::app) fn rebuild_tree(&mut self) {
+    pub(crate) fn rebuild_tree(&mut self) {
         let keep: Vec<usize> = (0..self.diff_files.len())
             .filter(|&ix| self.tree_match(ix))
             .collect();
@@ -432,7 +432,7 @@ impl Differ {
     }
 
     /// Typing in "Filter files…": the cursor goes to the first match.
-    pub(in crate::app) fn filter_tree(&mut self, query: String, cx: &mut Context<Self>) {
+    pub(crate) fn filter_tree(&mut self, query: String, cx: &mut Context<Self>) {
         self.tree_query = query.trim().to_lowercase();
         self.rebuild_tree();
         if let Some(row) = self.tree_rows.iter().position(|r| r.file.is_some()) {
@@ -442,7 +442,7 @@ impl Differ {
     }
 
     /// Enter in the filter: show the match under the cursor.
-    pub(in crate::app) fn filter_jump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn filter_jump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if (self.tree_rows.get(self.tree_sel)).is_some_and(|r| r.file.is_some()) {
             self.tree_confirm(self.tree_sel, window, cx);
             self.focus_diff(window, cx);
@@ -450,7 +450,7 @@ impl Differ {
     }
 
     /// `s` and the Split / Unified button; the choice persists.
-    pub(in crate::app) fn toggle_diff_mode(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_diff_mode(&mut self, cx: &mut Context<Self>) {
         self.preferences.unified = !self.preferences.unified;
         cx.emit(DifferEvent::Preference(Preference::Unified(
             self.preferences.unified,
@@ -460,11 +460,7 @@ impl Differ {
         cx.notify();
     }
 
-    pub(in crate::app) fn toggle_uncommitted(
-        &mut self,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn toggle_uncommitted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.request_discard(AfterDiscard::ToggleUncommitted, window, cx);
     }
 
@@ -486,12 +482,12 @@ impl Differ {
     }
 
     /// Files belongs only to the active Diff artifact.
-    pub(in crate::app) fn tree_shown(&self) -> bool {
+    pub(crate) fn tree_shown(&self) -> bool {
         self.show_tree && self.workspace.is_some()
     }
 
     /// The Diff artifact's internal split; the outer Features rail never resizes.
-    pub(in crate::app) fn with_tree(
+    pub(crate) fn with_tree(
         &self,
         main: impl IntoElement,
         window: &Window,
@@ -522,13 +518,13 @@ impl Differ {
     }
 
     /// Puts the tree cursor on file `ix`'s row, when it has one (not inside a folded folder).
-    pub(in crate::app) fn follow_tree(&mut self, ix: usize) -> Option<usize> {
+    pub(crate) fn follow_tree(&mut self, ix: usize) -> Option<usize> {
         let row = self.tree_rows.iter().position(|r| r.file == Some(ix))?;
         self.tree_sel = row;
         Some(row)
     }
 
-    pub(in crate::app) fn tree_select(&mut self, row: usize, cx: &mut Context<Self>) {
+    pub(crate) fn tree_select(&mut self, row: usize, cx: &mut Context<Self>) {
         let Some(r) = self.tree_rows.get(row) else {
             return;
         };
@@ -546,7 +542,7 @@ impl Differ {
         cx.notify();
     }
 
-    pub(in crate::app) fn set_dir_open(&mut self, open: Option<bool>, cx: &mut Context<Self>) {
+    pub(crate) fn set_dir_open(&mut self, open: Option<bool>, cx: &mut Context<Self>) {
         let Some(r) = self.tree_rows.get(self.tree_sel) else {
             return;
         };
@@ -585,7 +581,7 @@ impl Differ {
 
     /// The file a row action applies to: the tree cursor in the tree, the open file in the file
     /// view, else the file last moved to in the diff.
-    pub(in crate::app) fn cursor_file(&self, window: &Window, _cx: &App) -> Option<usize> {
+    pub(crate) fn cursor_file(&self, window: &Window, _cx: &App) -> Option<usize> {
         if self.tree_shown() && self.tree_focus.is_focused(window) {
             return self.tree_rows.get(self.tree_sel)?.file;
         }
@@ -595,7 +591,7 @@ impl Differ {
     }
 
     /// Loading, git failed, or nothing changed; `None` when there is a diff to show.
-    pub(in crate::app) fn diff_placeholder(&self, cx: &App) -> Option<AnyElement> {
+    pub(crate) fn diff_placeholder(&self, cx: &App) -> Option<AnyElement> {
         let theme = cx.theme();
         let big = |name, color| Icon::new(name).with_size(px(32.)).text_color(color);
         let (icon, title, detail) = match &self.diff_error {
@@ -641,11 +637,7 @@ impl Differ {
         )
     }
 
-    pub(in crate::app) fn render_diff(
-        &self,
-        _window: &Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    pub(crate) fn render_diff(&self, _window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let viewed = self.viewed_now.clone();
         let shark = cx.entity().downgrade();
         let placeholder = self.diff_placeholder(cx);
@@ -767,7 +759,7 @@ impl Differ {
             .into_any_element()
     }
 
-    pub(in crate::app) fn diff_base(&self, repo: &str) -> &str {
+    pub(crate) fn diff_base(&self, repo: &str) -> &str {
         self.diff_bases
             .get(repo)
             .map(String::as_str)
@@ -782,7 +774,7 @@ impl Differ {
     }
 
     /// The bases the diff compares against, and its total added and deleted lines.
-    pub(in crate::app) fn changes_stats(&self) -> (String, usize, usize) {
+    pub(crate) fn changes_stats(&self) -> (String, usize, usize) {
         let mut bases: Vec<&str> = (self.active_ws().into_iter())
             .flat_map(|ws| ws.repos.iter().map(|r| self.diff_base(&r.name)))
             .collect();
@@ -799,7 +791,7 @@ impl Differ {
     }
 
     /// Compact controls embedded in the branch/sync header.
-    pub(in crate::app) fn render_diff_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_diff_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (base, adds, dels) = self.changes_stats();
         let n = self.diff_files.len();
         h_flex()
@@ -905,11 +897,7 @@ impl Differ {
             })
     }
 
-    pub(in crate::app) fn render_tree(
-        &self,
-        window: &Window,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    pub(crate) fn render_tree(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (muted, fg, hint) = (theme.muted_foreground, theme.foreground, faint(theme));
         let focused = self.tree_focus.is_focused(window);
@@ -1234,7 +1222,7 @@ impl Differ {
 
     /// Right-click menu of file `path` (`repo/…`): the tree's file rows, the editor header
     /// and the File tab. By path, since the open file need not be in the diff.
-    pub(in crate::app) fn file_menu(&self, path: &str, cx: &Context<Self>) -> Vec<Entry> {
+    pub(crate) fn file_menu(&self, path: &str, cx: &Context<Self>) -> Vec<Entry> {
         let Some(ws) = self.active_ws() else {
             return vec![];
         };
@@ -1318,9 +1306,7 @@ impl Differ {
                 }
                 let a = abs.clone();
                 let label = format!("Open in {}", app.name);
-                let item = menu::item(crate::app::menus::app_icon(app), label, move |_, _| {
-                    app.open(&a)
-                });
+                let item = menu::item(crate::ui::app_icon(app), label, move |_, _| app.open(&a));
                 entries.push(item.image(app.icon.clone()));
             }
         }
@@ -1388,7 +1374,7 @@ impl Differ {
     }
 
     /// Right-click menu of the Diff button and its header controls.
-    pub(in crate::app) fn changes_menu(&self, cx: &Context<Self>) -> Vec<Entry> {
+    pub(crate) fn changes_menu(&self, cx: &Context<Self>) -> Vec<Entry> {
         let mut entries = vec![
             menu::item(
                 IconName::FileDiff,
@@ -1451,7 +1437,7 @@ impl Differ {
 }
 
 /// The diff's mode for the persisted `unified` choice.
-pub(in crate::app) fn diff_mode(unified: bool) -> DiffMode {
+pub(crate) fn diff_mode(unified: bool) -> DiffMode {
     match unified {
         true => DiffMode::Unified,
         false => DiffMode::Split,

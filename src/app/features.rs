@@ -1,18 +1,6 @@
 //! Workspace feature launchers. Each feature opens its content in an artifact tab.
 use super::*;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum Feature {
-    Diff,
-    Git,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) enum FeatureFocus {
-    Main,
-    Files,
-}
-
 #[derive(Clone, Copy)]
 struct Metadata {
     title: &'static str,

@@ -153,7 +153,7 @@ impl Chat {
     pub(super) fn render_menu(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         let m = self.menu.as_ref()?;
         let theme = cx.theme();
-        let faint = crate::app::faint(theme);
+        let faint = crate::ui::faint(theme);
         let multi = self.ws.repos.len() > 1;
         let rows: Vec<AnyElement> = (0..m.matches.len())
             .filter_map(|ix| {

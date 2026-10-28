@@ -1,7 +1,7 @@
 //! The cmd-k palette and the cmd-k style menus built on it.
-use super::menus::app_icon;
 use super::*;
 use crate::apps::{self, Kind, OpenApp};
+use crate::ui::app_icon;
 
 /// The cmd-k bar look: a bare 640px dialog near the top, on the menus' `popover` surface with
 /// their 4px inset, holding a borderless `Command`.

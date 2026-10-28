@@ -122,11 +122,11 @@ async fn blocked_archive_retains_dirty_buffers(cx: &mut TestAppContext) {
     fs::create_dir_all(&comments).unwrap();
     on(cx, &|host, _w, cx| {
         host.differ.update(cx, |s, _cx| {
-        s.review.comments.insert("archive-save".into(), vec![]);
-        s.review.edit("archive-save", |comments| {
+        s.review_mut().comments.insert("archive-save".into(), vec![]);
+        s.review_mut().edit("archive-save", |comments| {
             comments.push(serde_json::from_str(r#"{"id":1,"path":"api/file","start":[false,1],"end":[false,1],"text":"keep me"}"#).unwrap());
         });
-        assert!(s.review.failed_saves.contains_key("archive-save"));
+        assert!(s.review().failed_saves.contains_key("archive-save"));
     })
     });
     press_in(window)(cx, &["enter"]);

@@ -35,7 +35,7 @@ feature-author pattern.
 PR identity, and follows pagination for conversations, reviews, threads and nested
 replies. GraphQL error envelopes are failures even when HTTP succeeds.
 
-`src/app/git_feature.rs` owns a cached view per workspace. Drafts are keyed by the
+`src/features/git/mod.rs` owns a cached view per workspace. Drafts are keyed by the
 exact PR URL and thread ID, stored under the existing application support directory
 in `git-drafts/<workspace>.json`, and written with the existing private atomic file
 writer. Description drafts retain their original remote baseline across restarts.

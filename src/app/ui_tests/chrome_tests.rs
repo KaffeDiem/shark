@@ -53,7 +53,7 @@ async fn sidebar_chrome_themes(cx: &mut TestAppContext) {
                         if s.rail != rail {
                             s.toggle_sidebar(cx);
                         }
-                        if s.differ.read(cx).show_tree != tree {
+                        if s.differ.read(cx).show_tree() != tree {
                             s.toggle_tree(w, cx);
                         }
                     });

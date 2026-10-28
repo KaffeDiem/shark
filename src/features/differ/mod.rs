@@ -1,20 +1,53 @@
 //! Differ owns its presentation, edits, reviews and asynchronous work. The host supplies
 //! workspace snapshots and handles only requests that cross feature boundaries.
-use super::*;
-pub(super) mod diff;
+use super::FeatureFocus;
+use crate::checkbox::Checkbox;
+use crate::diff_view::{Diff, DiffEvent, DiffFile, DiffFileStatus, DiffMode, DiffState};
+use crate::files::{self, Row};
+use crate::menu::{self, Entry};
+use crate::state::{State, Workspace};
+use crate::ui::{
+    confirm, copy, faint, inter_features, kbd, list_cursor_row, notify_err, quiet_edge,
+    side_header, side_row,
+};
+use crate::{
+    AddComment, CancelEdit, CollapseDir, Confirm, DeleteThread, EditThread, EditWorkingCopy,
+    ExpandDir, NextFile, NextHunk, NextThread, OpenFile, PageDown, PageUp, PlayMedia, PrevFile,
+    PrevHunk, PrevThread, RefreshDiff, ReopenThread, RequeueOutdated, ResolveAddressed,
+    ResolveThread, SaveFile, SelectFirst, SelectLast, SelectNext, SelectPrev, SendComments,
+    SubmitForm, SuggestChange, ToggleDiffMode, ToggleRow, ToggleViewed, ViewChange, git,
+};
+use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
+use gpui_kit::component::dialog::{Dialog, DialogEntrance};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::notification::Notification;
+use gpui_kit::component::resizable::{
+    ResizablePanelEvent, ResizableState, h_resizable, resizable_panel,
+};
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::tooltip::Tooltip;
+use gpui_kit::component::{ActiveTheme, Icon, Sizable as _, Theme, WindowExt, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::Arc;
+mod diff;
 mod inline_edit;
 mod media;
 mod review;
 mod review_send;
 mod review_share;
-use diff::Viewed;
 #[cfg(all(test, feature = "test-support"))]
-pub(crate) mod ui_tests;
+pub(crate) mod test_support;
+pub(crate) use diff::Viewed;
 
 #[derive(Clone)]
-pub(super) struct Preferences {
-    unified: bool,
-    uncommitted_only: bool,
+pub(crate) struct Preferences {
+    pub(crate) unified: bool,
+    pub(crate) uncommitted_only: bool,
     tree_width: Option<f32>,
     split_ratio: Option<f32>,
     vim: bool,
@@ -32,7 +65,7 @@ impl From<&State> for Preferences {
 }
 
 #[derive(Clone)]
-pub(super) enum Preference {
+pub(crate) enum Preference {
     Unified(bool),
     UncommittedOnly(bool),
     TreeWidth(f32),
@@ -41,13 +74,13 @@ pub(super) enum Preference {
 
 /// Effective comparison bases and PR context are captured by the host from GitSync.
 #[derive(Clone)]
-pub(super) struct WorkspaceSnapshot {
+pub(crate) struct WorkspaceSnapshot {
     pub workspace: Workspace,
     pub prs: HashMap<String, (crate::sync::Pr, bool)>,
 }
 
 #[derive(Clone)]
-pub(super) enum DifferEvent {
+pub(crate) enum DifferEvent {
     Activate(String),
     DiscardEdit {
         edit: EditSnapshot,
@@ -82,7 +115,7 @@ pub(super) enum DifferEvent {
 impl EventEmitter<DifferEvent> for Differ {}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(super) struct EditSnapshot {
+pub(crate) struct EditSnapshot {
     pub workspace: String,
     pub path: SharedString,
     pub abs: PathBuf,
@@ -92,7 +125,7 @@ pub(super) struct EditSnapshot {
     pub saving: bool,
 }
 
-pub(super) struct Differ {
+pub(crate) struct Differ {
     workspace: Option<Workspace>,
     preferences: Preferences,
     prs: HashMap<String, (crate::sync::Pr, bool)>,
@@ -136,7 +169,7 @@ pub(super) struct Differ {
 }
 
 impl Differ {
-    pub(super) fn new(
+    pub(crate) fn new(
         preferences: Preferences,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -215,11 +248,11 @@ impl Differ {
     fn active_ws(&self) -> Option<&Workspace> {
         self.workspace.as_ref()
     }
-    fn workspace_name(&self) -> Option<&str> {
+    pub(crate) fn workspace_name(&self) -> Option<&str> {
         self.workspace.as_ref().map(|ws| ws.name.as_str())
     }
 
-    pub(super) fn set_workspace(
+    pub(crate) fn set_workspace(
         &mut self,
         snapshot: Option<WorkspaceSnapshot>,
         window: &mut Window,
@@ -253,7 +286,7 @@ impl Differ {
         cx.notify();
     }
 
-    pub(super) fn update_workspace(&mut self, mut snapshot: Option<WorkspaceSnapshot>) {
+    pub(crate) fn update_workspace(&mut self, mut snapshot: Option<WorkspaceSnapshot>) {
         // Viewed marks originate here; a host snapshot can arrive before their persistence event.
         if let (Some(current), Some(next)) = (&self.workspace, &mut snapshot)
             && current.name == next.workspace.name
@@ -264,12 +297,12 @@ impl Differ {
         self.workspace = snapshot.map(|s| s.workspace);
     }
 
-    pub(super) fn configure(&mut self, vim: bool, editor_path: Option<String>) {
+    pub(crate) fn configure(&mut self, vim: bool, editor_path: Option<String>) {
         self.preferences.vim = vim;
         self.editor_path = editor_path;
     }
 
-    pub(super) fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_diff(cx);
         if self.editing.is_some() {
             self.focus_edit(window, cx);
@@ -278,7 +311,7 @@ impl Differ {
         }
     }
 
-    pub(super) fn edit_snapshot(&self) -> Option<EditSnapshot> {
+    pub(crate) fn edit_snapshot(&self) -> Option<EditSnapshot> {
         let e = self.editing.as_ref()?;
         Some(EditSnapshot {
             workspace: self.workspace_name()?.into(),
@@ -291,7 +324,7 @@ impl Differ {
         })
     }
 
-    pub(super) fn clear_dirty(&mut self, expected: &EditSnapshot) -> bool {
+    pub(crate) fn clear_dirty(&mut self, expected: &EditSnapshot) -> bool {
         if self.edit_snapshot().as_ref() != Some(expected) {
             return false;
         }
@@ -301,7 +334,7 @@ impl Differ {
         true
     }
 
-    pub(super) fn focus_targets(&self) -> Vec<FeatureFocus> {
+    pub(crate) fn focus_targets(&self) -> Vec<FeatureFocus> {
         let mut targets = vec![FeatureFocus::Main];
         if self.tree_shown() {
             targets.push(FeatureFocus::Files);
@@ -309,7 +342,7 @@ impl Differ {
         targets
     }
 
-    pub(super) fn focused(&self, window: &Window, cx: &App) -> Option<FeatureFocus> {
+    pub(crate) fn focused(&self, window: &Window, cx: &App) -> Option<FeatureFocus> {
         if self.tree_shown()
             && (self.tree_focus.is_focused(window)
                 || self
@@ -332,7 +365,7 @@ impl Differ {
         }
     }
 
-    pub(super) fn focus(
+    pub(crate) fn focus(
         &mut self,
         target: FeatureFocus,
         window: &mut Window,
@@ -345,7 +378,7 @@ impl Differ {
         }
     }
 
-    pub(super) fn files_width(&self, cx: &App) -> Pixels {
+    pub(crate) fn files_width(&self, cx: &App) -> Pixels {
         if !self.tree_shown() {
             return px(0.);
         }
@@ -357,7 +390,7 @@ impl Differ {
             .unwrap_or(px(self.preferences.tree_width.unwrap_or(244.)))
     }
 
-    pub(super) fn toggle_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_tree = !self.show_tree;
         if !self.show_tree
             && (self.tree_focus.is_focused(window)
@@ -438,13 +471,13 @@ impl Render for Differ {
 }
 
 #[derive(Clone)]
-pub(super) enum AfterDiscard {
+pub(crate) enum AfterDiscard {
     LeaveEdit,
     ToggleUncommitted,
     OpenPath(String),
 }
 
-pub(super) struct Status {
+pub(crate) struct Status {
     pub files: usize,
     pub viewed: usize,
     pub loaded: bool,
@@ -452,7 +485,7 @@ pub(super) struct Status {
 }
 
 impl Differ {
-    pub(super) fn status(&self) -> Status {
+    pub(crate) fn status(&self) -> Status {
         Status {
             files: self.diff_files.len(),
             viewed: self.viewed_now.len(),
@@ -461,7 +494,7 @@ impl Differ {
         }
     }
 
-    pub(super) fn edit_target(
+    pub(crate) fn edit_target(
         &self,
         path: Option<SharedString>,
         window: &Window,
@@ -476,12 +509,12 @@ impl Differ {
         .or_else(|| self.cursor_path(window, cx))
     }
 
-    pub(super) fn cursor_path(&self, window: &Window, cx: &App) -> Option<SharedString> {
+    pub(crate) fn cursor_path(&self, window: &Window, cx: &App) -> Option<SharedString> {
         self.cursor_file(window, cx)
             .map(|ix| self.diff_files[ix].path().clone())
     }
 
-    pub(super) fn viewed_path(&self, path: &str) -> Option<Viewed> {
+    pub(crate) fn viewed_path(&self, path: &str) -> Option<Viewed> {
         self.diff_files
             .iter()
             .position(|f| f.path() == path)
@@ -494,7 +527,7 @@ impl Differ {
         }
     }
 
-    pub(super) fn open_cursor_file(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_cursor_file(&self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.cursor_file(window, cx) {
             self.open_file(ix, window, cx);
         }
@@ -517,7 +550,7 @@ impl Differ {
         }
     }
 
-    fn open_file(&self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_file(&self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         self.open_file_in_tab(ix, false, window, cx);
     }
     fn open_file_tab(&self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
@@ -541,7 +574,7 @@ impl Differ {
         );
     }
 
-    pub(super) fn open_path(
+    pub(crate) fn open_path(
         &mut self,
         path: &str,
         window: &mut Window,
@@ -583,7 +616,7 @@ impl Differ {
         }
     }
 
-    pub(super) fn after_discard(
+    pub(crate) fn after_discard(
         &mut self,
         action: AfterDiscard,
         window: &mut Window,
@@ -612,7 +645,7 @@ impl Differ {
         cx.notify();
     }
 
-    pub(super) fn file_discarded(
+    pub(crate) fn file_discarded(
         &mut self,
         workspace: &str,
         path: &str,
@@ -629,20 +662,20 @@ impl Differ {
         ended_edit
     }
 
-    pub(super) fn storage_errors(&self) -> Vec<(String, String)> {
+    pub(crate) fn storage_errors(&self) -> Vec<(String, String)> {
         self.review
             .failed_saves
             .iter()
             .map(|(ws, e)| (ws.clone(), e.clone()))
             .collect()
     }
-    pub(super) fn retry_saves(&mut self) {
+    pub(crate) fn retry_saves(&mut self) {
         self.review.retry_saves();
     }
-    pub(super) fn forget_workspace(&mut self, name: &str) {
+    pub(crate) fn forget_workspace(&mut self, name: &str) {
         self.review.forget(name);
     }
-    pub(super) fn unqueue_review(
+    pub(crate) fn unqueue_review(
         &mut self,
         name: &str,
         chat: &str,

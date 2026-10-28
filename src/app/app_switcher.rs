@@ -208,7 +208,7 @@ impl Shark {
                             .hover(|d| d.bg(side_hover(theme)))
                             .child(match &app.icon {
                                 Some(icon) => img(icon.clone()).size(px(72.)).into_any_element(),
-                                None => Icon::new(menus::app_icon(app))
+                                None => Icon::new(crate::ui::app_icon(app))
                                     .with_size(px(64.))
                                     .into_any_element(),
                             })

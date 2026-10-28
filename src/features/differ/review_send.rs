@@ -7,7 +7,7 @@ use gpui_kit::component::Disableable as _;
 use gpui_kit::component::input::{Enter, Escape};
 
 #[derive(Clone)]
-pub(in crate::app) struct ReviewRequest {
+pub(crate) struct ReviewRequest {
     pub workspace: String,
     pub chat: String,
     pub card: ReviewCard,
@@ -16,20 +16,20 @@ pub(in crate::app) struct ReviewRequest {
     publish: bool,
 }
 
-pub(in crate::app) struct Sheet {
+pub(crate) struct Sheet {
     /// The pending threads when it opened, ticked or not.
-    pub(in crate::app) rows: Vec<(u64, bool)>,
+    pub(crate) rows: Vec<(u64, bool)>,
     sel: usize,
-    pub(in crate::app) note: Entity<InputState>,
+    pub(crate) note: Entity<InputState>,
     /// Also post the ticked comments to the PR as a Comment review.
-    pub(in crate::app) publish: bool,
-    pub(in crate::app) preview: bool,
-    pub(in crate::app) focus: FocusHandle,
+    pub(crate) publish: bool,
+    pub(crate) preview: bool,
+    pub(crate) focus: FocusHandle,
 }
 
 impl Differ {
     /// `shift-c`, the bar's Send review…: the sheet over the pending threads.
-    pub(in crate::app) fn open_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn open_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows: Vec<(u64, bool)> = (self.ws_comments().iter())
             .filter(|c| c.status == Status::Pending)
             .map(|c| (c.id, true))
@@ -54,14 +54,14 @@ impl Differ {
         cx.notify();
     }
 
-    pub(in crate::app) fn close_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn close_sheet(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.review.sheet = None;
         self.focus_diff(window, cx);
         cx.notify();
     }
 
     /// `space`: tick or untick the row under the cursor.
-    pub(in crate::app) fn sheet_toggle(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn sheet_toggle(&mut self, cx: &mut Context<Self>) {
         if let Some(s) = &mut self.review.sheet
             && let Some(r) = s.rows.get_mut(s.sel)
         {
@@ -70,7 +70,7 @@ impl Differ {
         }
     }
 
-    pub(in crate::app) fn sheet_move(&mut self, d: isize, cx: &mut Context<Self>) {
+    pub(crate) fn sheet_move(&mut self, d: isize, cx: &mut Context<Self>) {
         if let Some(s) = &mut self.review.sheet {
             s.sel = s.sel.saturating_add_signed(d).min(s.rows.len() - 1);
             cx.notify();
@@ -78,7 +78,7 @@ impl Differ {
     }
 
     /// `enter`: the row's thread in the diff.
-    pub(in crate::app) fn sheet_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn sheet_open(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let id = (self.review.sheet.as_ref())
             .and_then(|s| s.rows.get(s.sel))
             .map(|r| r.0);
@@ -89,7 +89,7 @@ impl Differ {
     }
 
     /// `cmd-enter`: sends the ticked rows.
-    pub(in crate::app) fn sheet_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn sheet_send(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(s) = &self.review.sheet else { return };
         let ids: Vec<u64> = s.rows.iter().filter(|r| r.1).map(|r| r.0).collect();
         let note = s.note.read(cx).value().to_string();
@@ -100,7 +100,7 @@ impl Differ {
 
     /// Pending comments `ids` as one message in the open chat (queued while it works); they
     /// become Sent there. With `publish`, also a Comment review on the PR.
-    pub(in crate::app) fn send_review(
+    pub(crate) fn send_review(
         &mut self,
         ids: &[u64],
         note: &str,
@@ -157,7 +157,7 @@ impl Differ {
         }));
     }
 
-    pub(in crate::app) fn review_request_valid(&self, request: &ReviewRequest) -> bool {
+    pub(crate) fn review_request_valid(&self, request: &ReviewRequest) -> bool {
         self.workspace_name() == Some(request.workspace.as_str())
             && request
                 .comments
@@ -166,7 +166,7 @@ impl Differ {
     }
 
     /// The host calls this synchronously after Chat accepts, before queued Chat events run.
-    pub(in crate::app) fn review_accepted(
+    pub(crate) fn review_accepted(
         &mut self,
         request: &ReviewRequest,
         window: &mut Window,
@@ -198,7 +198,7 @@ impl Differ {
 
     /// The repo and PR number of each repo of the ticked rows with an open PR: where Also
     /// publish posts.
-    pub(in crate::app) fn sheet_prs(&self, cx: &App) -> Vec<(String, u64)> {
+    pub(crate) fn sheet_prs(&self, cx: &App) -> Vec<(String, u64)> {
         let Some(s) = &self.review.sheet else {
             return vec![];
         };
@@ -215,7 +215,7 @@ impl Differ {
     }
 
     /// Ticks Also publish; the preview opens, so what GitHub gets is seen first.
-    pub(in crate::app) fn sheet_publish(&mut self, on: bool, cx: &mut Context<Self>) {
+    pub(crate) fn sheet_publish(&mut self, on: bool, cx: &mut Context<Self>) {
         if let Some(s) = &mut self.review.sheet {
             s.publish = on;
             s.preview |= on;
@@ -224,7 +224,7 @@ impl Differ {
     }
 
     /// The sheet, over the bottom right of the diff.
-    pub(in crate::app) fn render_sheet(
+    pub(crate) fn render_sheet(
         &self,
         window: &Window,
         cx: &mut Context<Self>,

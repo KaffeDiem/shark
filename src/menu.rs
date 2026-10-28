@@ -460,7 +460,7 @@ impl Menu {
                                     .into_any_element(),
                                 (None, Some(i)) => Icon::new(i)
                                     .with_size(px(16.))
-                                    .text_color(crate::app::faint(theme))
+                                    .text_color(crate::ui::faint(theme))
                                     .into_any_element(),
                                 (None, None) => div().size(px(16.)).into_any_element(),
                             }),

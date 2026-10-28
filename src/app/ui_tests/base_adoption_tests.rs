@@ -35,7 +35,10 @@ fn adopted_pr_base_persists_through_app_subscription(cx: &mut TestAppContext) {
     });
     let (sync, generation) = cx.update(|cx| {
         let s = shark.read(cx);
-        (s.syncs["adopted-base"].clone(), s.differ.read(cx).diff_gen)
+        (
+            s.syncs["adopted-base"].clone(),
+            s.differ.read(cx).diff_gen(),
+        )
     });
     sync.update(cx, |_, cx| {
         cx.emit(crate::sync::SyncEvent::PrBaseAdopted(vec![(
@@ -49,7 +52,7 @@ fn adopted_pr_base_persists_through_app_subscription(cx: &mut TestAppContext) {
         let s = shark.read(cx);
         assert_eq!(s.ws("adopted-base").unwrap().repos[0].base, new);
         assert!(
-            s.differ.read(cx).diff_gen > generation,
+            s.differ.read(cx).diff_gen() > generation,
             "adoption requests a diff refresh"
         );
     });

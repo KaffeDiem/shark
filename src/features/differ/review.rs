@@ -15,10 +15,10 @@ use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 
 /// One hunk's patch lines: kind (`b' '`, `b'-'`, `b'+'`), old and new one-based line numbers.
-pub(in crate::app) type Hunk = Vec<(u8, usize, usize)>;
+pub(crate) type Hunk = Vec<(u8, usize, usize)>;
 
 /// Hunks of one file's patch chunk, so the cursor knows the rows the diff draws.
-pub(in crate::app) fn parse_hunks(chunk: &str) -> Vec<Hunk> {
+pub(crate) fn parse_hunks(chunk: &str) -> Vec<Hunk> {
     let mut hunks: Vec<Hunk> = vec![];
     let (mut old, mut new, mut inside) = (0, 0, false);
     for line in chunk.lines() {
@@ -218,7 +218,7 @@ fn next_change(rows: &[Row], cur: usize, forward: bool) -> Option<usize> {
 
 /// Where a thread stands. Files from before statuses load as `Pending`.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
-pub(in crate::app) enum Status {
+pub(crate) enum Status {
     /// Waiting for the next send (⇧C).
     #[default]
     Pending,
@@ -236,31 +236,31 @@ pub(in crate::app) enum Status {
 
 /// A comment on lines of the diff: pending until sent, then followed to an answer.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
-pub(in crate::app) struct Comment {
+pub(crate) struct Comment {
     #[serde(default)]
-    pub(in crate::app) id: u64,
-    pub(in crate::app) path: String,
+    pub(crate) id: u64,
+    pub(crate) path: String,
     /// `(on the old side, one-based line)` of the first and last commented line.
     start: (bool, usize),
     end: (bool, usize),
-    pub(in crate::app) text: String,
+    pub(crate) text: String,
     /// The commented lines when it was written; kept when they change or go.
     #[serde(default)]
-    pub(in crate::app) snapshot: String,
+    pub(crate) snapshot: String,
     /// Code proposed to replace them.
     #[serde(default)]
-    pub(in crate::app) suggestion: Option<String>,
+    pub(crate) suggestion: Option<String>,
     /// What the lines were compared at: the base commit for the old side, else "working tree".
     #[serde(default)]
-    pub(in crate::app) rev: String,
+    pub(crate) rev: String,
     #[serde(default)]
-    pub(in crate::app) status: Status,
+    pub(crate) status: Status,
     /// The chat it was sent to.
     #[serde(default)]
-    pub(in crate::app) chat: Option<String>,
+    pub(crate) chat: Option<String>,
     /// Posted to GitHub: the comment's (or review's) URL.
     #[serde(default)]
-    pub(in crate::app) github: Option<String>,
+    pub(crate) github: Option<String>,
     /// The file text its working-copy lines were last read in.
     #[serde(skip)]
     seen: Seen,
@@ -288,7 +288,7 @@ impl Comment {
     }
 
     /// `api/a.rs:12`, `api/a.rs:12-14`, `api/a.rs:7 (old)`; across sides `7 (old)-9 (new)`.
-    pub(in crate::app) fn place(&self) -> String {
+    pub(crate) fn place(&self) -> String {
         let n = |(old, line): (bool, usize)| match old {
             true => format!("{line} (old)"),
             false => line.to_string(),
@@ -306,19 +306,19 @@ impl Comment {
     }
 
     /// The repo its path starts with.
-    pub(in crate::app) fn repo(&self) -> &str {
+    pub(crate) fn repo(&self) -> &str {
         self.path.split('/').next().unwrap_or_default()
     }
 
     /// `631–632`, `12`.
-    pub(in crate::app) fn lines(&self) -> String {
+    pub(crate) fn lines(&self) -> String {
         match self.start.1 == self.end.1 {
             true => self.end.1.to_string(),
             false => format!("{}–{}", self.start.1, self.end.1),
         }
     }
 
-    pub(in crate::app) fn side(&self) -> &'static str {
+    pub(crate) fn side(&self) -> &'static str {
         if self.end.0 {
             "original"
         } else {
@@ -327,7 +327,7 @@ impl Comment {
     }
 
     /// `app.rs · Working copy · lines 631–632`, as the chat card and GitHub preview say it.
-    pub(in crate::app) fn card_place(&self) -> String {
+    pub(crate) fn card_place(&self) -> String {
         let name = self.path.rsplit('/').next().unwrap_or(&self.path);
         let side = if self.end.0 {
             "Original"
@@ -339,7 +339,7 @@ impl Comment {
     }
 
     /// Its lines in the PR, for an inline review comment; `None` across both sides.
-    pub(in crate::app) fn gh_anchor(&self) -> Option<crate::pr::Anchor> {
+    pub(crate) fn gh_anchor(&self) -> Option<crate::pr::Anchor> {
         let (_, rel) = self.path.split_once('/')?;
         (self.start.0 == self.end.0).then(|| crate::pr::Anchor {
             path: rel.to_string(),
@@ -380,7 +380,7 @@ fn side(old: bool) -> DiffSide {
 
 /// `s` as a code block (`info` after the opening fence), its fence longer than any backtick
 /// run in it.
-pub(in crate::app) fn fenced(s: &str, info: &str) -> String {
+pub(crate) fn fenced(s: &str, info: &str) -> String {
     let mut f = "```".to_string();
     while s.contains(&f) {
         f.push('`');
@@ -390,7 +390,7 @@ pub(in crate::app) fn fenced(s: &str, info: &str) -> String {
 
 /// The comments as one prompt, in file order, with the overall `note`. Each carries its id,
 /// revision and the lines as they were, and the agent is asked to report back per id.
-pub(in crate::app) fn prompt(comments: &[Comment], note: &str) -> String {
+pub(crate) fn prompt(comments: &[Comment], note: &str) -> String {
     let mut out = String::from(
         "Review comments on the diff. Paths are workspace-relative; \"(old)\" is a line number \
          in the base version (a removed line). Each comment quotes the lines as they were when \
@@ -425,7 +425,7 @@ pub(in crate::app) fn prompt(comments: &[Comment], note: &str) -> String {
 
 /// A sent comment after turn `turn` ended: reported → Addressed; its lines no longer read like
 /// the snapshot (`now`, `None` when unknown) → Outdated; else as it was.
-pub(in crate::app) fn judge(
+pub(crate) fn judge(
     status: &Status,
     turn: usize,
     report: Option<&str>,
@@ -539,7 +539,7 @@ fn give_ids(c: &mut [Comment], last: &mut u64) -> bool {
 /// Comments that never reached an agent are pending again; true if any was. With `chat`
 /// (closed): its queue and the reviews it hadn't read (`unread`). Without (loading, after a
 /// restart): every queue, and reviews sent to a chat that is gone.
-pub(in crate::app) fn unqueue(l: &mut [Comment], chat: Option<&str>, unread: &[u64]) -> bool {
+pub(crate) fn unqueue(l: &mut [Comment], chat: Option<&str>, unread: &[u64]) -> bool {
     let mut any = false;
     for c in l.iter_mut() {
         let to = c.chat.as_deref();
@@ -569,40 +569,40 @@ enum Store {
     List(Vec<Comment>),
 }
 
-pub(in crate::app) fn comments_path(ws: &str) -> PathBuf {
+pub(crate) fn comments_path(ws: &str) -> PathBuf {
     support_dir().join("comments").join(format!("{ws}.json"))
 }
 
 /// The inline composer (A·01): under the commented lines, on their side.
-pub(in crate::app) struct Composer {
+pub(crate) struct Composer {
     /// The comment being edited; id 0 for a new one on its lines.
-    pub(in crate::app) draft: Comment,
-    pub(in crate::app) input: Entity<TextareaState>,
+    pub(crate) draft: Comment,
+    pub(crate) input: Entity<TextareaState>,
     /// Suggest change (cmd-shift-s): the lines, to edit into the proposed code.
-    pub(in crate::app) suggest: Option<Entity<TextareaState>>,
+    pub(crate) suggest: Option<Entity<TextareaState>>,
     /// Its height as last laid out; when it grows, the diff scrolls it into view.
     height: Rc<Cell<Pixels>>,
 }
 
 #[derive(Default)]
-pub(in crate::app) struct Review {
+pub(crate) struct Review {
     /// Top row and cursor of the keyboard view; `None` once the mouse scrolled.
     view: Option<(Spot, Spot)>,
-    pub(in crate::app) hunks: HashMap<SharedString, Vec<Hunk>>,
+    pub(crate) hunks: HashMap<SharedString, Vec<Hunk>>,
     /// The diff pane as last painted.
     viewport: Rc<Cell<Bounds<Pixels>>>,
     /// Comments per workspace, loaded from disk on first use.
-    pub(in crate::app) comments: HashMap<String, Vec<Comment>>,
+    pub(crate) comments: HashMap<String, Vec<Comment>>,
     /// The last comment id given out per workspace.
     last_id: HashMap<String, u64>,
     /// Workspaces whose comments file couldn't be read or moved aside: never saved over.
     unsaved: Vec<String>,
-    pub(in crate::app) failed_saves: HashMap<String, String>,
+    pub(crate) failed_saves: HashMap<String, String>,
     /// Why, for the window to show once.
-    pub(in crate::app) warning: Option<String>,
-    pub(in crate::app) composer: Option<Composer>,
-    pub(in crate::app) sheet: Option<review_send::Sheet>,
-    pub(in crate::app) share: Option<review_share::Share>,
+    pub(crate) warning: Option<String>,
+    pub(crate) composer: Option<Composer>,
+    pub(crate) sheet: Option<review_send::Sheet>,
+    pub(crate) share: Option<review_share::Share>,
     /// The thread last jumped to, and the lines selected for it: while they stay selected it
     /// is the thread there, though another one starts on the same line.
     jumped: Option<(u64, DiffLineRange)>,
@@ -610,13 +610,13 @@ pub(in crate::app) struct Review {
 
 impl Review {
     /// `}`/`{` and the tree moved the diff to a file header.
-    pub(in crate::app) fn at_file(&mut self, path: &str) {
+    pub(crate) fn at_file(&mut self, path: &str) {
         let s = Spot::File(path.to_string().into());
         self.view = Some((s.clone(), s));
     }
 
     /// Writes the file whole (a temp file renamed over it), so a crash can't leave half.
-    pub(in crate::app) fn save_comments(&mut self, ws: &str) {
+    pub(crate) fn save_comments(&mut self, ws: &str) {
         let path = comments_path(ws);
         let result = if self.unsaved.iter().any(|w| w == ws) {
             Err(std::io::Error::other(
@@ -640,7 +640,7 @@ impl Review {
         }
     }
 
-    pub(in crate::app) fn retry_saves(&mut self) {
+    pub(crate) fn retry_saves(&mut self) {
         for ws in self.failed_saves.keys().cloned().collect::<Vec<_>>() {
             self.save_comments(&ws);
         }
@@ -649,7 +649,7 @@ impl Review {
     /// Loads once; comments saved before ids get their own, ones queued in a chat that is
     /// gone now are pending. A file that doesn't parse is kept aside as `.json.<n>.bak`; one
     /// that can't be read (or moved) is left alone and not saved over.
-    pub(in crate::app) fn load_comments(&mut self, ws: &str) {
+    pub(crate) fn load_comments(&mut self, ws: &str) {
         if self.comments.contains_key(ws) {
             return;
         }
@@ -699,7 +699,7 @@ impl Review {
     }
 
     /// A removed workspace's comments, so a later one of the same name starts with none.
-    pub(in crate::app) fn forget(&mut self, ws: &str) {
+    pub(crate) fn forget(&mut self, ws: &str) {
         self.comments.remove(ws);
         self.last_id.remove(ws);
         self.unsaved.retain(|w| w != ws);
@@ -708,7 +708,7 @@ impl Review {
     }
 
     /// Edits workspace `ws`'s comments and saves them if that changed them.
-    pub(in crate::app) fn edit(&mut self, ws: &str, f: impl FnOnce(&mut Vec<Comment>)) {
+    pub(crate) fn edit(&mut self, ws: &str, f: impl FnOnce(&mut Vec<Comment>)) {
         self.load_comments(ws);
         let l = self.comments.get_mut(ws).unwrap();
         let before = l.clone();
@@ -808,7 +808,7 @@ impl Differ {
     }
 
     /// `j/k` (`n` = ±1), `ctrl-d/u` (± half a screen), `gg`/`G` (`to` = first/last row).
-    pub(in crate::app) fn diff_move(
+    pub(crate) fn diff_move(
         &mut self,
         n: isize,
         to: Option<bool>,
@@ -852,7 +852,7 @@ impl Differ {
     }
 
     /// `]c` / `[c`: the cursor goes to the next change; natively without a keyboard view.
-    pub(in crate::app) fn diff_change(
+    pub(crate) fn diff_change(
         &mut self,
         forward: bool,
         window: &mut Window,
@@ -874,7 +874,7 @@ impl Differ {
     }
 
     /// After `set_files` reset the diff, put the keyboard view back; false when there is none.
-    pub(in crate::app) fn restore_view(&mut self, cx: &mut Context<Self>) -> bool {
+    pub(crate) fn restore_view(&mut self, cx: &mut Context<Self>) -> bool {
         let Some((top, cur)) = self.review.view.clone() else {
             return false;
         };
@@ -885,12 +885,12 @@ impl Differ {
     }
 
     /// The mouse scrolled: the view model no longer matches the screen.
-    pub(in crate::app) fn lose_view(&mut self) {
+    pub(crate) fn lose_view(&mut self) {
         self.review.view = None;
     }
 
     /// Tracks the pane's height for paging; goes in the diff pane.
-    pub(in crate::app) fn viewport_probe(&self) -> impl IntoElement {
+    pub(crate) fn viewport_probe(&self) -> impl IntoElement {
         let (vp, width) = (self.review.viewport.clone(), self.media_width.clone());
         canvas(
             move |b, _, _| {
@@ -903,19 +903,19 @@ impl Differ {
         .size_full()
     }
 
-    pub(in crate::app) fn ws_comments(&self) -> &[Comment] {
+    pub(crate) fn ws_comments(&self) -> &[Comment] {
         self.workspace_name()
             .and_then(|ws| self.review.comments.get(ws))
             .map_or(&[], |c| &c[..])
     }
 
     /// The open workspace's comment `id`.
-    pub(in crate::app) fn comment(&self, id: u64) -> Option<&Comment> {
+    pub(crate) fn comment(&self, id: u64) -> Option<&Comment> {
         self.ws_comments().iter().find(|c| c.id == id)
     }
 
     /// Edits the open workspace's comments and saves them.
-    pub(in crate::app) fn edit_comments(
+    pub(crate) fn edit_comments(
         &mut self,
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut Vec<Comment>),
@@ -929,7 +929,7 @@ impl Differ {
     /// Threads (not resolved) and the composer as diff annotations under their last line, and
     /// the before/after row of each image or video under its header (not while folded). File
     /// headers get `review_chips` through `card_header_suffix`.
-    pub(in crate::app) fn with_comments(&self, diff: Diff, cx: &mut Context<Self>) -> Diff {
+    pub(crate) fn with_comments(&self, diff: Diff, cx: &mut Context<Self>) -> Diff {
         let editing = self.review.composer.as_ref().map(|c| c.draft.id);
         let state = self.diff.read(cx);
         // Indexed as in `self.media`, which `render_annotation` reads.
@@ -983,13 +983,13 @@ impl Differ {
     }
 
     /// Whether the diff shows the thread's line (in a hunk, on its side).
-    pub(in crate::app) fn on_its_line(&self, c: &Comment) -> bool {
+    pub(crate) fn on_its_line(&self, c: &Comment) -> bool {
         self.hunk_of(c, c.end.1).is_some()
     }
 
     /// Whether one hunk of the diff shows all the thread's lines, as GitHub wants an inline
     /// comment's.
-    pub(in crate::app) fn in_one_hunk(&self, c: &Comment) -> bool {
+    pub(crate) fn in_one_hunk(&self, c: &Comment) -> bool {
         let h = self.hunk_of(c, c.end.1);
         h.is_some() && self.hunk_of(c, c.start.1) == h
     }
@@ -1008,7 +1008,7 @@ impl Differ {
 
     /// Moves workspace `ws`'s working-copy threads to where their lines are on disk now, so
     /// lines added above one don't leave it beside other code.
-    pub(in crate::app) fn reanchor_comments(&mut self, ws: &str) {
+    pub(crate) fn reanchor_comments(&mut self, ws: &str) {
         let Some(dir) = self
             .workspace
             .as_ref()
@@ -1028,7 +1028,7 @@ impl Differ {
     /// Threads whose file left the diff, below it, so none goes missing. Pending ones get
     /// Edit and Delete there, as no line cursor reaches them; edited, the composer shows in
     /// the card's place.
-    pub(in crate::app) fn render_orphans(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+    pub(crate) fn render_orphans(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         // No diff (yet, or git failed): every thread would look orphaned.
         if !self.diff_loaded || self.diff_error.is_some() {
             return None;
@@ -1136,7 +1136,7 @@ impl Differ {
 
     /// `c`: the composer on the selected lines (the cursor line). A pending thread there is
     /// edited instead.
-    pub(in crate::app) fn comment_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn comment_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.workspace.is_none() {
             return notify_err(window, cx, "Open a workspace first");
         }
@@ -1156,7 +1156,7 @@ impl Differ {
     }
 
     /// `c` is on working-copy lines with unsaved edits in place: not what the agent reads.
-    pub(in crate::app) fn unsaved_edit(&self, c: &Comment) -> bool {
+    pub(crate) fn unsaved_edit(&self, c: &Comment) -> bool {
         (!c.start.0 || !c.end.0)
             && (self.editing.as_ref()).is_some_and(|e| e.dirty && *e.path == c.path)
     }
@@ -1258,7 +1258,7 @@ impl Differ {
     }
 
     /// cmd-shift-s: the Suggest change box, prefilled with the lines; again closes it.
-    pub(in crate::app) fn toggle_suggest(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_suggest(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(comp) = &mut self.review.composer else {
             return;
         };
@@ -1274,7 +1274,7 @@ impl Differ {
 
     /// cmd-enter: adds the draft to the review (Pending), or saves the edited thread. Empty
     /// text removes it.
-    pub(in crate::app) fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(comp) = self.review.composer.take() else {
             return;
         };
@@ -1314,18 +1314,18 @@ impl Differ {
     }
 
     /// Esc: drops the draft (an edited thread stays as it was).
-    pub(in crate::app) fn cancel_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn cancel_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.review.composer = None;
         self.focus_diff(window, cx);
         cx.notify();
     }
 
-    pub(in crate::app) fn focus_diff(&self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn focus_diff(&self, window: &mut Window, cx: &mut Context<Self>) {
         self.diff.read(cx).focus_handle(cx).focus(window, cx);
     }
 
     /// The shown thread under the line cursor (or the selection's last line).
-    pub(in crate::app) fn thread_at(&self, cx: &App) -> Option<u64> {
+    pub(crate) fn thread_at(&self, cx: &App) -> Option<u64> {
         let r = self.diff.read(cx).selected_lines()?;
         let at = DiffLinePosition::new(r.path().clone(), r.end_side(), r.end());
         let here: Vec<u64> = (self.ws_comments().iter())
@@ -1354,7 +1354,7 @@ impl Differ {
     }
 
     /// Runs a thread action (`e`, `x`, `d`) on the thread at the cursor.
-    pub(in crate::app) fn at_cursor(
+    pub(crate) fn at_cursor(
         &mut self,
         f: fn(&mut Self, u64, &mut Window, &mut Context<Self>),
         window: &mut Window,
@@ -1365,34 +1365,19 @@ impl Differ {
         }
     }
 
-    pub(in crate::app) fn edit_thread(
-        &mut self,
-        id: u64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn edit_thread(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         if self.unqueued(id, window, cx).is_some() {
             self.edit_comment(id, window, cx);
         }
     }
 
-    pub(in crate::app) fn delete_thread(
-        &mut self,
-        id: u64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn delete_thread(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         if self.unqueued(id, window, cx).is_some() {
             self.edit_comments(cx, |l| l.retain(|c| c.id != id));
         }
     }
 
-    pub(in crate::app) fn set_status(
-        &mut self,
-        ids: &[u64],
-        status: Status,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn set_status(&mut self, ids: &[u64], status: Status, cx: &mut Context<Self>) {
         self.edit_comments(cx, |l| {
             for c in l.iter_mut().filter(|c| ids.contains(&c.id)) {
                 c.status = status.clone();
@@ -1402,7 +1387,7 @@ impl Differ {
 
     /// `r`: resolve the sent thread at the cursor (a pending one has no way back from hidden);
     /// with none, `r` refreshes the diff as before.
-    pub(in crate::app) fn resolve_thread(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn resolve_thread(&mut self, cx: &mut Context<Self>) {
         let sent = |s: &Status| {
             matches!(
                 s,
@@ -1416,7 +1401,7 @@ impl Differ {
     }
 
     /// `R`: back to pending, to send again.
-    pub(in crate::app) fn reopen_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn reopen_thread(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(id) = (self.thread_at(cx)).filter(|&id| self.unqueued(id, window, cx).is_some())
         {
             self.set_status(&[id], Status::Pending, cx);
@@ -1431,7 +1416,7 @@ impl Differ {
     }
 
     /// Outdated threads pending again, quoting their lines as they are now.
-    pub(in crate::app) fn requeue_outdated(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn requeue_outdated(&mut self, cx: &mut Context<Self>) {
         let mut now: HashMap<u64, Comment> = (self.ws_comments().iter())
             .filter(|c| c.status == Status::Outdated)
             .map(|c| (c.id, self.anchor_text(c)))
@@ -1448,13 +1433,13 @@ impl Differ {
         });
     }
 
-    pub(in crate::app) fn resolve_addressed(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn resolve_addressed(&mut self, cx: &mut Context<Self>) {
         let ids = self.with_status(|s| matches!(s, Status::Addressed { .. }));
         self.set_status(&ids, Status::Resolved, cx);
     }
 
     /// The review bar's Discard: every pending comment, once confirmed.
-    pub(in crate::app) fn discard_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn discard_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let n = self.with_status(|s| *s == Status::Pending).len();
         confirm(
             format!(
@@ -1476,19 +1461,14 @@ impl Differ {
     }
 
     /// The thread's file in the editor, to see what the agent made of it.
-    pub(in crate::app) fn view_change(
-        &mut self,
-        id: u64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn view_change(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(ix) = self.change_ix(id) {
             self.open_file(ix, window, cx);
         }
     }
 
     /// A thread card's right-click menu. Shortcuts stay in the card's key hints.
-    pub(in crate::app) fn thread_menu(&self, id: u64, cx: &Context<Self>) -> Vec<Entry> {
+    pub(crate) fn thread_menu(&self, id: u64, cx: &Context<Self>) -> Vec<Entry> {
         let Some(c) = self.comment(id).cloned() else {
             return vec![];
         };
@@ -1551,12 +1531,7 @@ impl Differ {
     }
 
     /// Puts the line cursor on comment `id`.
-    pub(in crate::app) fn jump_to_comment(
-        &mut self,
-        id: u64,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn jump_to_comment(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(c) = self.comment(id).cloned() else {
             return;
         };
@@ -1570,7 +1545,7 @@ impl Differ {
     }
 
     /// `]c` / `[c`: the next (previous) thread, wrapping; with none, the next change.
-    pub(in crate::app) fn thread_jump(
+    pub(crate) fn thread_jump(
         &mut self,
         forward: bool,
         window: &mut Window,
@@ -1606,7 +1581,7 @@ impl Differ {
     }
 
     /// "Show chat ↗": the chat the thread went to (else the open one).
-    pub(in crate::app) fn show_thread_chat(
+    pub(crate) fn show_thread_chat(
         &mut self,
         id: u64,
         _window: &mut Window,
@@ -1623,7 +1598,7 @@ impl Differ {
 
     /// A chat turn ended: its reply's reports and the code decide what became of the comments
     /// it was sent. Read from disk, so it doesn't wait for the diff refresh.
-    pub(in crate::app) fn review_turn_done(
+    pub(crate) fn review_turn_done(
         &mut self,
         ws: &str,
         dir: &Path,
@@ -1651,7 +1626,7 @@ impl Differ {
     /// Chat `chat` sent comments `ids` (`Some(turn)`: read in that turn), or they never
     /// went out (`None`: removed from its queue, or never read before its process ended) and
     /// are pending again. Only comments still waiting in that chat change: an id may be gone.
-    pub(in crate::app) fn review_delivered(
+    pub(crate) fn review_delivered(
         &mut self,
         ws: &str,
         chat: &str,
@@ -2065,11 +2040,7 @@ impl Differ {
 
     /// A file header's review chip and Comment button: "● N pending", "Addressed", "Outdated";
     /// "Commenting" while the composer is in the file, else "Comment" / "N comments".
-    pub(in crate::app) fn review_chips(
-        &self,
-        path: &SharedString,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    pub(crate) fn review_chips(&self, path: &SharedString, cx: &mut Context<Self>) -> AnyElement {
         let theme = cx.theme();
         let threads: Vec<&Comment> = (self.ws_comments().iter())
             .filter(|c| c.shown() && c.path == path.as_str())
@@ -2121,12 +2092,7 @@ impl Differ {
     }
 
     /// The header's Comment: the selection when it is in `path`, else its first changed line.
-    pub(in crate::app) fn comment_in(
-        &mut self,
-        path: &str,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
+    pub(crate) fn comment_in(&mut self, path: &str, window: &mut Window, cx: &mut Context<Self>) {
         let here = self.picked_lines(cx).filter(|r| r.path() == path);
         let range = here.or_else(|| {
             let first = (self.review.hunks.get(path))
@@ -2151,7 +2117,7 @@ impl Differ {
     /// The sticky review bar at the bottom of the diff (A·01/02/04). `status`, when set,
     /// replaces its left text (in-place editing says what it is doing there). Without
     /// threads it is the key hint line.
-    pub(in crate::app) fn render_review_bar(
+    pub(crate) fn render_review_bar(
         &self,
         status: Option<SharedString>,
         cx: &mut Context<Self>,
@@ -2258,7 +2224,7 @@ impl Differ {
 
 /// "a reviewer note to shark #128" from a GitHub URL (`…/shark/pull/128#issuecomment-1`);
 /// anything else on the PR was a review.
-pub(in crate::app) fn posted_as(url: &str) -> String {
+pub(crate) fn posted_as(url: &str) -> String {
     let mut parts = url.split('/').rev();
     let tail = parts.next().unwrap_or_default();
     let (n, frag) = tail.split_once('#').unwrap_or((tail, ""));

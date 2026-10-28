@@ -152,7 +152,7 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
                     cx,
                 );
                 w.resize(size(px(width), px(700.)));
-                s.differ.update(cx, |d, _| d.show_tree = false);
+                s.differ.update(cx, |d, _| *d.show_tree_mut() = false);
                 s.select_file(0, w, cx);
             });
             cx.update_window(window, |_, w, _| w.activate_window())
@@ -462,7 +462,7 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
     // Differ reopens the same artifact with either internal tree preference.
     for tree in [false, true] {
         on(cx, &|s, _, cx| {
-            s.differ.update(cx, |d, _| d.show_tree = tree)
+            s.differ.update(cx, |d, _| *d.show_tree_mut() = tree)
         });
         // Open, click again, then refocus the existing tab from Chat.
         for from_chat in [false, false, true] {
@@ -483,7 +483,7 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
                 assert!(
                     s.differ
                         .read(cx)
-                        .diff
+                        .diff()
                         .read(cx)
                         .focus_handle(cx)
                         .is_focused(w)
@@ -511,26 +511,26 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
     cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Feature(Feature::Diff)));
     // Inline edits cannot be lost through × or Cmd-W; cancel preserves both edit and tab.
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !shark.read(cx).differ.read(cx).diff_files.is_empty()
+        !shark.read(cx).differ.read(cx).diff_files().is_empty()
     })
     .await;
     on(cx, &|s, w, cx| {
         s.edit_working_copy(Some("api/a.txt".into()), w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).editing.is_some()
+        shark.read(cx).differ.read(cx).editing().is_some()
     })
     .await;
     on(cx, &|s, _, cx| {
         s.differ
-            .update(cx, |d, _| d.editing.as_mut().unwrap().dirty = true)
+            .update(cx, |d, _| d.editing_mut().as_mut().unwrap().dirty = true)
     });
     press(cx, &["cmd-w"]);
     press(cx, &["escape"]);
     cx.update(|cx| {
         let s = shark.read(cx);
         assert_eq!(s.tab, Tab::Feature(Feature::Diff));
-        assert!(s.differ.read(cx).editing.as_ref().unwrap().dirty);
+        assert!(s.differ.read(cx).editing().as_ref().unwrap().dirty);
         assert!(!s.active_ws().unwrap().diff_closed);
     });
     // Background inline-edit discard restores Chat's existing focus.
@@ -546,7 +546,7 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
     cx.update_window(window, |_, w, cx| {
         let s = shark.read(cx);
         assert_eq!(s.tab, Tab::Chat);
-        assert!(s.differ.read(cx).editing.is_none());
+        assert!(s.differ.read(cx).editing().is_none());
         assert!(s.active_ws().unwrap().diff_closed);
         assert!(
             s.active_chat()

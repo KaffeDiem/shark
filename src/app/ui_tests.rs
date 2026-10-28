@@ -1,9 +1,11 @@
 //! Headless UI tests: the app on the real keymap, against real repos.
+use super::palette::COMMANDS;
 use super::*;
-use super::{diff::DiffData, palette::COMMANDS};
+use crate::diff_view::{DiffFile, DiffMode};
+use crate::features::differ::test_support::{diff::DiffData, inline_edit, review};
 use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::{fs, path::PathBuf, time::Duration};
 
@@ -891,7 +893,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     };
     run(cx, &ShowDiff);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_files.len() == 1
+        shark.read(cx).differ.read(cx).diff_files().len() == 1
     })
     .await;
     cx.update(|cx| {
@@ -899,7 +901,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .tree_rows
+            .tree_rows()
             .iter()
             .map(|r| r.name.clone())
             .collect();
@@ -908,7 +910,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     press(cx, &["cmd-alt-right"]);
     cx.update_window(window, |_, w, cx| {
         assert!(
-            shark.read(cx).differ.read(cx).tree_focus.is_focused(w),
+            shark.read(cx).differ.read(cx).tree_focus().is_focused(w),
             "cmd-alt-right from the diff -> tree"
         )
     })
@@ -1233,9 +1235,9 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let s = shark.read(cx);
         assert!(
-            s.differ.read(cx).diff_loaded
-                && s.differ.read(cx).diff_error.is_none()
-                && s.differ.read(cx).diff_files.is_empty()
+            s.differ.read(cx).diff_loaded()
+                && s.differ.read(cx).diff_error().is_none()
+                && s.differ.read(cx).diff_files().is_empty()
         );
         assert!(
             s.differ.read(cx).diff_placeholder(cx).is_some(),
@@ -1248,7 +1250,7 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
         fs::write(api.join(f), "x\n").unwrap();
     }
     on(cx, &|s, _, cx| s.refresh_diff(cx));
-    cx.update(|cx| assert_eq!(shark.read(cx).differ.read(cx).diff_files.len(), 3));
+    cx.update(|cx| assert_eq!(shark.read(cx).differ.read(cx).diff_files().len(), 3));
     let press = |cx: &mut TestAppContext, k: &str| {
         cx.update_window(window, |_, w, cx| w.press(k, cx)).unwrap();
     };
@@ -1258,7 +1260,7 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
                 .read(cx)
                 .differ
                 .read(cx)
-                .diff
+                .diff()
                 .read(cx)
                 .selected_lines()
                 .map(|r| r.path().to_string())
@@ -1272,12 +1274,12 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
     let at = |cx: &mut TestAppContext| {
         cx.update(|cx| {
             let s = shark.read(cx);
-            let row = s.differ.read(cx).tree_rows[s.differ.read(cx).tree_sel].file;
+            let row = s.differ.read(cx).tree_rows()[s.differ.read(cx).tree_sel()].file;
             (
-                s.differ.read(cx).diff_files[s.differ.read(cx).diff_file]
+                s.differ.read(cx).diff_files()[s.differ.read(cx).diff_file()]
                     .path()
                     .to_string(),
-                row == Some(s.differ.read(cx).diff_file),
+                row == Some(s.differ.read(cx).diff_file()),
             )
         })
     };
@@ -1329,7 +1331,7 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
         assert!(
             s.differ
                 .read(cx)
-                .diff_error
+                .diff_error()
                 .as_deref()
                 .is_some_and(|e| e.starts_with("api: "))
         );
@@ -1363,7 +1365,7 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
         let s = shark.read(cx);
         assert!(s.archiving.is_empty());
         assert!(
-            !s.differ.read(cx).review.comments.contains_key("st"),
+            !s.differ.read(cx).review().comments.contains_key("st"),
             "its comments go too"
         );
     });
@@ -2377,7 +2379,7 @@ async fn file_tabs_preserve_buffers(cx: &mut TestAppContext) {
     });
     cx.update(|cx| {
         assert!(
-            shark.read(cx).differ.read(cx).editing.is_none(),
+            shark.read(cx).differ.read(cx).editing().is_none(),
             "inline editing refuses hidden unsaved buffers"
         )
     });
@@ -2442,12 +2444,12 @@ async fn command_click_file_tabs(cx: &mut TestAppContext) {
     fs::write(dir.join("a.txt"), "a\n").unwrap();
     fs::write(dir.join("b.txt"), "b\n").unwrap();
     on(cx, &|s, w, cx| {
-        s.differ.update(cx, |d, _| d.show_tree = true);
+        s.differ.update(cx, |d, _| *d.show_tree_mut() = true);
         s.show(Tab::Feature(Feature::Diff), w, cx);
         s.refresh_diff(cx);
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_files.len() == 2
+        shark.read(cx).differ.read(cx).diff_files().len() == 2
     })
     .await;
     let click_file = |cx: &mut TestAppContext, path: &str, command: bool| {
@@ -2457,7 +2459,7 @@ async fn command_click_file_tabs(cx: &mut TestAppContext) {
                 .read(cx)
                 .differ
                 .read(cx)
-                .tree_rows
+                .tree_rows()
                 .iter()
                 .position(|r| r.path.as_str() == path)
                 .unwrap()
@@ -2489,7 +2491,7 @@ async fn command_click_file_tabs(cx: &mut TestAppContext) {
                 shark.read(cx).file_tabs.is_empty(),
                 "Command-clicking a folder only folds it"
             );
-            assert_eq!(shark.read(cx).differ.read(cx).tree_rows.len(), rows);
+            assert_eq!(shark.read(cx).differ.read(cx).tree_rows().len(), rows);
         })
         .unwrap();
         cx.run_until_parked();
@@ -2625,12 +2627,12 @@ async fn command_click_file_tabs(cx: &mut TestAppContext) {
         s.edit_working_copy(Some("api/a.txt".into()), w, cx);
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).editing.is_some()
+        shark.read(cx).differ.read(cx).editing().is_some()
     })
     .await;
     on(cx, &|s, w, cx| {
         s.differ
-            .update(cx, |d, _| d.editing.as_mut().unwrap().dirty = true);
+            .update(cx, |d, _| d.editing_mut().as_mut().unwrap().dirty = true);
         s.show(Tab::Feature(Feature::Diff), w, cx);
     });
     press(cx, &["ctrl-3"]);
@@ -2816,18 +2818,18 @@ async fn media_in_diff(cx: &mut TestAppContext) {
     on(cx, &|s, _, cx| s.refresh_diff(cx));
     let n = if ffmpeg { 10 } else { 9 };
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_files.len() == n
+        shark.read(cx).differ.read(cx).diff_files().len() == n
     })
     .await;
     let view = |cx: &mut TestAppContext, path: &str| {
         cx.update(|cx| {
             let s = shark.read(cx);
             assert_eq!(
-                s.differ.read(cx).media.len(),
+                s.differ.read(cx).media().len(),
                 n - 1,
                 "every file but notes.txt"
             );
-            (s.differ.read(cx).media.iter().find(|(p, _)| p == path))
+            (s.differ.read(cx).media().iter().find(|(p, _)| p == path))
                 .unwrap_or_else(|| panic!("no media row for {path}"))
                 .1
                 .clone()
@@ -2865,7 +2867,7 @@ async fn media_in_diff(cx: &mut TestAppContext) {
         }
         on(cx, &|host, _w, cx| {
             host.differ.update(cx, |s, cx| {
-                s.diff.update(cx, |d, cx| d.scroll_to_file(path, cx))
+                s.diff().update(cx, |d, cx| d.scroll_to_file(path, cx))
             })
         });
         cx.wait_for(window, Duration::from_secs(20), |_, cx| {
@@ -2942,7 +2944,7 @@ fn view_started(shark: &Entity<Shark>, path: &str, cx: &App) -> bool {
     let s = shark.read(cx);
     s.differ
         .read(cx)
-        .media
+        .media()
         .iter()
         .any(|(p, v)| p == path && v.read(cx).started())
 }
@@ -2951,7 +2953,7 @@ fn view_ready(shark: &Entity<Shark>, path: &str, cx: &App) -> bool {
     let s = shark.read(cx);
     s.differ
         .read(cx)
-        .media
+        .media()
         .iter()
         .any(|(p, v)| p == path && v.read(cx).ready())
 }
@@ -3060,7 +3062,7 @@ async fn perf_large_change(cx: &mut TestAppContext) {
 
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
-            s.differ.update(cx, |d, _| d.show_tree = true);
+            s.differ.update(cx, |d, _| *d.show_tree_mut() = true);
             s.focus_pane(Pane::Feature(Feature::Diff, FeatureFocus::Files), w, cx)
         })
     })
@@ -3068,7 +3070,7 @@ async fn perf_large_change(cx: &mut TestAppContext) {
     frame(cx);
     let n = 200;
     // The tree cursor starts on the first file's row, not on its folders.
-    let start = cx.update(|cx| shark.read(cx).differ.read(cx).tree_sel);
+    let start = cx.update(|cx| shark.read(cx).differ.read(cx).tree_sel());
     let t = Instant::now();
     for _ in 0..n {
         press(cx, "j");
@@ -3076,7 +3078,7 @@ async fn perf_large_change(cx: &mut TestAppContext) {
     }
     let tree_key = ms(t) / n as f64;
     report.push(format!("tree j + frame: {tree_key:.2} ms/key"));
-    cx.update(|cx| assert_eq!(shark.read(cx).differ.read(cx).tree_sel, start + n));
+    cx.update(|cx| assert_eq!(shark.read(cx).differ.read(cx).tree_sel(), start + n));
     let t = Instant::now();
     for _ in 0..20 {
         press(cx, "v");
@@ -3092,7 +3094,7 @@ async fn perf_large_change(cx: &mut TestAppContext) {
     press(cx, "v");
     frame(cx);
     report.push(format!("toggle folder viewed + frame: {:.0} ms", ms(t)));
-    cx.update(|cx| assert_eq!(shark.read(cx).differ.read(cx).viewed_now.len(), 2001));
+    cx.update(|cx| assert_eq!(shark.read(cx).differ.read(cx).viewed_now().len(), 2001));
     let t = Instant::now();
     press(cx, "shift-g");
     press(cx, "k");
@@ -3103,12 +3105,12 @@ async fn perf_large_change(cx: &mut TestAppContext) {
     report.push(format!("collapse + expand folder: {:.1} ms", ms(t)));
 
     // big.rs sorts after the folders: the last row.
-    let last = cx.update(|cx| shark.read(cx).differ.read(cx).tree_rows.len() - 1);
+    let last = cx.update(|cx| shark.read(cx).differ.read(cx).tree_rows().len() - 1);
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
             s.differ.update(cx, |d, cx| d.tree_select(last, cx));
             s.differ.update(cx, |d, cx| {
-                d.open_file(d.tree_rows[last].file.unwrap(), w, cx)
+                d.open_file(d.tree_rows()[last].file.unwrap(), w, cx)
             })
         })
     })
@@ -4307,14 +4309,14 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
         assert_eq!(s.differ.read(cx).changes_stats(), (base.clone(), 6, 0));
         assert_eq!(
             (
-                s.differ.read(cx).viewed_now.len(),
-                s.differ.read(cx).diff_files.len()
+                s.differ.read(cx).viewed_now().len(),
+                s.differ.read(cx).diff_files().len()
             ),
             (0, 3)
         );
         assert!(s.tree_shown(cx), "Files opens inside the Diff artifact");
         assert_eq!(
-            s.differ.read(cx).diff.read(cx).mode(),
+            s.differ.read(cx).diff().read(cx).mode(),
             DiffMode::Split,
             "split by default"
         );
@@ -4352,12 +4354,12 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
     cx.update_window(window, |_, w, cx| w.right_click("uncommitted-only", cx))
         .unwrap();
     cx.run_until_parked();
-    cx.update(|cx| assert!(shark.read(cx).differ.read(cx).menu.is_some()));
+    cx.update(|cx| assert!(shark.read(cx).differ.read(cx).menu().is_some()));
     cx.update_window(window, |_, w, cx| w.render_frame(cx))
         .unwrap();
     press(cx, &["escape"]);
     cx.update(|cx| {
-        assert!(shark.read(cx).differ.read(cx).menu.is_none());
+        assert!(shark.read(cx).differ.read(cx).menu().is_none());
         assert!(!shark.read(cx).state.uncommitted_only);
     });
     // `s` flips Split / Unified from the diff, and the choice persists.
@@ -4367,7 +4369,7 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
     press(cx, &["s"]);
     cx.update(|cx| {
         assert_eq!(
-            shark.read(cx).differ.read(cx).diff.read(cx).mode(),
+            shark.read(cx).differ.read(cx).diff().read(cx).mode(),
             DiffMode::Unified
         )
     });
@@ -4381,7 +4383,7 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .tree_filter
+            .tree_filter()
             .read(cx)
             .focus_handle(cx)
     });
@@ -4394,13 +4396,13 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
         let files: Vec<usize> = s
             .differ
             .read(cx)
-            .tree_rows
+            .tree_rows()
             .iter()
             .filter_map(|r| r.file)
             .collect();
         assert_eq!(files.len(), 1, "only chat.rs matches");
         assert_eq!(
-            s.differ.read(cx).diff_files[files[0]].path().as_str(),
+            s.differ.read(cx).diff_files()[files[0]].path().as_str(),
             "api/src/chat.rs"
         );
         files[0]
@@ -4409,14 +4411,14 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
     cx.update_window(window, |_, w, cx| {
         let s = shark.read(cx);
         assert_eq!(
-            s.differ.read(cx).diff_file,
+            s.differ.read(cx).diff_file(),
             chat_ix,
             "Enter jumps to the match"
         );
         assert!(
             s.differ
                 .read(cx)
-                .diff
+                .diff()
                 .read(cx)
                 .focus_handle(cx)
                 .is_focused(w)
@@ -4428,10 +4430,10 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
     on(cx, &|s, _, cx| {
         s.differ.update(cx, |d, cx| d.toggle_viewed(chat_ix, cx))
     });
-    cx.update(|cx| assert_eq!(shark.read(cx).differ.read(cx).viewed_now.len(), 1));
+    cx.update(|cx| assert_eq!(shark.read(cx).differ.read(cx).viewed_now().len(), 1));
 
     // The Files edge: a dragged width persists and survives Chat ↔ Changes.
-    let resize = cx.update(|cx| shark.read(cx).differ.read(cx).tree_resize.clone());
+    let resize = cx.update(|cx| shark.read(cx).differ.read(cx).tree_resize().clone());
     on(cx, &|_, w, cx| {
         resize.update(cx, |r, cx| r.resize_panel(1, px(333.), w, cx))
     });
@@ -4441,9 +4443,16 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
     on(cx, &|s, w, cx| s.show(Tab::Feature(Feature::Diff), w, cx));
     cx.update(|cx| {
         let s = shark.read(cx);
-        assert_eq!(s.differ.read(cx).diff_file, chat_ix, "file selection kept");
-        assert_eq!(s.differ.read(cx).tree_query, "chat", "filter kept");
-        assert_eq!(s.differ.read(cx).tree_resize.read(cx).sizes()[1], px(333.));
+        assert_eq!(
+            s.differ.read(cx).diff_file(),
+            chat_ix,
+            "file selection kept"
+        );
+        assert_eq!(s.differ.read(cx).tree_query(), "chat", "filter kept");
+        assert_eq!(
+            s.differ.read(cx).tree_resize().read(cx).sizes()[1],
+            px(333.)
+        );
     });
 
     // Committed branch changes disappear in the HEAD comparison; local changes remain.
@@ -4474,7 +4483,14 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
             w.render_frame(cx);
             assert_eq!(
                 w.find("uncommitted-only").checked(),
-                Some(shark.read(cx).differ.read(cx).preferences.uncommitted_only)
+                Some(
+                    shark
+                        .read(cx)
+                        .differ
+                        .read(cx)
+                        .preferences()
+                        .uncommitted_only
+                )
             );
         })
         .unwrap();
@@ -4488,7 +4504,7 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
         let paths: Vec<_> = s
             .differ
             .read(cx)
-            .diff_files
+            .diff_files()
             .iter()
             .map(|f| f.path().as_str())
             .collect();
@@ -4516,10 +4532,10 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
                 1,
                 1,
             );
-            s.diff
+            s.diff()
                 .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
             s.comment_dialog(w, cx);
-            let draft = &s.review.composer.as_ref().unwrap().draft;
+            let draft = &s.review().composer.as_ref().unwrap().draft;
             assert_eq!(draft.snapshot, "x");
             s.cancel_composer(w, cx);
         })
@@ -4529,19 +4545,19 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
     on(cx, &|s, w, cx| {
         s.edit_working_copy(Some("api/a.md".into()), w, cx);
         s.differ
-            .update(cx, |d, _| d.editing.as_mut().unwrap().dirty = true);
+            .update(cx, |d, _| d.editing_mut().as_mut().unwrap().dirty = true);
     });
     click_scope(cx);
     cx.update_window(window, |_, w, cx| {
         assert!(w.has_active_dialog(cx));
         let s = shark.read(cx);
-        assert!(s.state.uncommitted_only && s.differ.read(cx).editing.is_some());
+        assert!(s.state.uncommitted_only && s.differ.read(cx).editing().is_some());
     })
     .unwrap();
     press(cx, &["escape"]);
     on(cx, &|host, _w, cx| {
         host.differ.update(cx, |s, cx| {
-            s.editing.as_mut().unwrap().dirty = false;
+            s.editing_mut().as_mut().unwrap().dirty = false;
             s.end_edit(cx);
         })
     });
@@ -4549,7 +4565,7 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
     // A staged-only change is included too; committing everything leaves the toggle usable.
     fs::write(api.join("a.md"), "staged\n").unwrap();
     on(cx, &|s, _, cx| s.refresh_diff(cx));
-    cx.update(|cx| assert_eq!(shark.read(cx).differ.read(cx).diff_files.len(), 3));
+    cx.update(|cx| assert_eq!(shark.read(cx).differ.read(cx).diff_files().len(), 3));
     git::git(&api, &["add", "."]).unwrap();
     git::git(
         &api,
@@ -4565,13 +4581,13 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
     )
     .unwrap();
     on(cx, &|s, _, cx| s.refresh_diff(cx));
-    cx.update(|cx| assert!(shark.read(cx).differ.read(cx).diff_files.is_empty()));
+    cx.update(|cx| assert!(shark.read(cx).differ.read(cx).diff_files().is_empty()));
     click_scope(cx);
     cx.update(|cx| {
         let s = shark.read(cx);
         assert!(!s.state.uncommitted_only);
         assert_eq!(
-            s.differ.read(cx).diff_files.len(),
+            s.differ.read(cx).diff_files().len(),
             3,
             "branch changes restored from an empty view"
         );
@@ -4589,14 +4605,14 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
             assert!(
                 s.differ
                     .read(cx)
-                    .diff
+                    .diff()
                     .read(cx)
                     .focus_handle(cx)
                     .is_focused(w)
             );
             assert_eq!(s.state.uncommitted_only, uncommitted_only);
             assert_eq!(
-                s.differ.read(cx).diff_files.len(),
+                s.differ.read(cx).diff_files().len(),
                 if uncommitted_only { 0 } else { 3 }
             );
         })
@@ -4617,10 +4633,13 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let s = shark2.read(cx);
         assert!(s.tree_shown(cx));
-        assert_eq!(s.differ.read(cx).tree_resize.read(cx).sizes()[1], px(333.));
-        assert_eq!(s.differ.read(cx).diff.read(cx).mode(), DiffMode::Split);
+        assert_eq!(
+            s.differ.read(cx).tree_resize().read(cx).sizes()[1],
+            px(333.)
+        );
+        assert_eq!(s.differ.read(cx).diff().read(cx).mode(), DiffMode::Split);
         assert!(s.state.uncommitted_only);
-        assert!(s.differ.read(cx).diff_files.is_empty());
+        assert!(s.differ.read(cx).diff_files().is_empty());
     });
     cx.update_window(window2, |_, w, _| w.remove_window())
         .unwrap();
@@ -4667,7 +4686,7 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
     fs::write(home.join("shark/workspaces/rails/api/a.md"), "x\n").unwrap();
     on(cx, &|s, _, cx| s.refresh_diff(cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_files.len() == 1
+        shark.read(cx).differ.read(cx).diff_files().len() == 1
     })
     .await;
     let chat_tab = cx.update(|cx| {
@@ -4740,7 +4759,7 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
     cx.update(|cx| {
         assert_eq!(shark.read(cx).tab, Tab::Chat);
         assert!(
-            shark.read(cx).differ.read(cx).show_tree,
+            shark.read(cx).differ.read(cx).show_tree(),
             "hidden artifact preference is unchanged"
         );
         assert!(!shark.read(cx).tree_shown(cx));
@@ -4752,7 +4771,7 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
     // Hiding a focused filter returns focus to Diff.
     on(cx, &|host, w, cx| {
         host.differ.update(cx, |s, cx| {
-            s.tree_filter.read(cx).focus_handle(cx).focus(w, cx)
+            s.tree_filter().read(cx).focus_handle(cx).focus(w, cx)
         })
     });
     press(cx, &["cmd-alt-b"]);
@@ -4762,7 +4781,7 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
         assert!(
             s.differ
                 .read(cx)
-                .diff
+                .diff()
                 .read(cx)
                 .focus_handle(cx)
                 .is_focused(w)
@@ -4772,7 +4791,7 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
     assert_eq!(bounds(cx, "features-rail"), Some(right));
     press(cx, &["cmd-alt-b", "cmd-alt-right"]);
     cx.update_window(window, |_, w, cx| {
-        assert!(shark.read(cx).differ.read(cx).tree_focus.is_focused(w));
+        assert!(shark.read(cx).differ.read(cx).tree_focus().is_focused(w));
     })
     .unwrap();
     press(cx, &["cmd-alt-right"]);
@@ -4901,7 +4920,7 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
         s.show(Tab::Feature(Feature::Diff), w, cx);
         s.differ
             .read(cx)
-            .diff
+            .diff()
             .clone()
             .update(cx, |d, cx| d.set_mode(DiffMode::Split, cx));
     });
@@ -4909,7 +4928,7 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
     // A finished divider drag is saved, and a new window starts with it.
     on(cx, &|host, _w, cx| {
         host.differ.update(cx, |s, cx| {
-            s.diff.update(cx, |d, cx| {
+            s.diff().update(cx, |d, cx| {
                 d.set_split_ratio(0.4, cx);
                 cx.emit(DiffEvent::SplitRatioChanged(0.4));
             })
@@ -4919,7 +4938,7 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
     let (_, again) = open(cx, WindowOptions::default());
     cx.update(|cx| {
         assert_eq!(
-            again.read(cx).differ.read(cx).diff.read(cx).split_ratio(),
+            again.read(cx).differ.read(cx).diff().read(cx).split_ratio(),
             0.4
         )
     });
@@ -4928,7 +4947,7 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
     on(cx, &|host, _w, cx| {
         host.differ.update(cx, |s, cx| {
             let line = DiffLineRange::new("api/f.txt", DiffSide::Modified, 250, 250);
-            s.diff
+            s.diff()
                 .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
         })
     });
@@ -4952,16 +4971,17 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
     assert_eq!(hints(cx), 1);
     on(cx, &|host, _w, cx| {
         host.differ.update(cx, |s, cx| {
-            s.diff.update(cx, |d, cx| d.set_mode(DiffMode::Unified, cx))
+            s.diff()
+                .update(cx, |d, cx| d.set_mode(DiffMode::Unified, cx))
         })
     });
     assert_eq!(hints(cx), 0);
     on(cx, &|host, w, cx| {
         host.differ.update(cx, |s, cx| {
             s.cancel_composer(w, cx);
-            s.diff.update(cx, |d, cx| d.set_mode(DiffMode::Split, cx));
+            s.diff().update(cx, |d, cx| d.set_mode(DiffMode::Split, cx));
             let line = DiffLineRange::new("api/f.txt", DiffSide::Modified, 250, 250);
-            s.diff
+            s.diff()
                 .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
         })
     });
@@ -4974,7 +4994,7 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
                 .read(cx)
                 .differ
                 .read(cx)
-                .diff
+                .diff()
                 .read(cx)
                 .scroll_top()
                 .item_ix
@@ -4987,7 +5007,7 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
     );
     let buf = |cx: &mut TestAppContext| {
         cx.update(|cx| {
-            let e = shark.read(cx).differ.read(cx).editing.as_ref().unwrap();
+            let e = shark.read(cx).differ.read(cx).editing().as_ref().unwrap();
             (e.buf.lines.clone(), e.buf.line)
         })
     };
@@ -5001,10 +5021,10 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
     assert_eq!((lines_now[250].as_str(), at), ("line 251X", 250));
     cx.update_window(window, |_, w, cx| {
         let s = shark.read(cx);
-        let e = s.differ.read(cx).editing.as_ref().unwrap();
+        let e = s.differ.read(cx).editing().as_ref().unwrap();
         assert!(e.focused(w, cx), "the line input keeps focus");
         assert!(e.patch.contains("+line 251X\n"), "{}", e.patch);
-        assert_eq!(s.differ.read(cx).diff.read(cx).files()[0].additions(), 31);
+        assert_eq!(s.differ.read(cx).diff().read(cx).files()[0].additions(), 31);
         assert_eq!(
             s.differ.read(cx).working_heading("api/f.txt"),
             "Working copy · unsaved"
@@ -5051,9 +5071,9 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
     on(cx, &|s, w, cx| s.show(Tab::Feature(Feature::Diff), w, cx));
     cx.update(|cx| {
         let s = shark.read(cx);
-        let e = s.differ.read(cx).editing.as_ref().unwrap();
+        let e = s.differ.read(cx).editing().as_ref().unwrap();
         assert!(e.dirty && e.buf.lines[250] == "p250");
-        assert!(s.differ.read(cx).diff.read(cx).files()[0].additions() >= 31);
+        assert!(s.differ.read(cx).diff().read(cx).files()[0].additions() >= 31);
     });
 
     // cmd-s writes the buffer and the comparison stays.
@@ -5066,7 +5086,7 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .editing
+            .editing()
             .as_ref()
             .is_some_and(|e| e.saved)
     })
@@ -5076,7 +5096,7 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .editing
+            .editing()
             .as_ref()
             .unwrap()
             .buf
@@ -5099,13 +5119,13 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
     });
     // Escape goes back to reviewing without asking.
     press(cx, &["escape"]);
-    cx.update(|cx| assert!(shark.read(cx).differ.read(cx).editing.is_none()));
+    cx.update(|cx| assert!(shark.read(cx).differ.read(cx).editing().is_none()));
 
     // Back in: the base is the commit's blob, not empty (git's file shows again, with its
     // index header).
     let counts = |cx: &mut TestAppContext| {
         cx.update(|cx| {
-            let f = &shark.read(cx).differ.read(cx).diff.read(cx).files()[0];
+            let f = &shark.read(cx).differ.read(cx).diff().read(cx).files()[0];
             (f.additions(), f.deletions())
         })
     };
@@ -5126,7 +5146,7 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
     });
     draw(cx);
     cx.update_window(window, |_, w, cx| {
-        let e = shark.read(cx).differ.read(cx).editing.as_ref().unwrap();
+        let e = shark.read(cx).differ.read(cx).editing().as_ref().unwrap();
         assert!(
             e.buf.line == 4 && e.focused(w, cx),
             "line 5's input is drawn"
@@ -5138,7 +5158,7 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
     fs::write(home.join("shark/workspaces/ed/api/g.txt"), "g\n").unwrap();
     on(cx, &|s, _, cx| s.refresh_diff(cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_files.len() == 2
+        shark.read(cx).differ.read(cx).diff_files().len() == 2
     })
     .await;
     // A new file reloads the diff; the caret's line comes back into view.
@@ -5164,7 +5184,7 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
     press(cx, &["enter"]);
     draw(cx);
     cx.update(|cx| {
-        let e = shark.read(cx).differ.read(cx).editing.as_ref().unwrap();
+        let e = shark.read(cx).differ.read(cx).editing().as_ref().unwrap();
         assert_eq!(e.path.as_str(), "api/g.txt");
     });
     assert_eq!(counts(cx), git);
@@ -5213,7 +5233,7 @@ async fn review_queue(cx: &mut TestAppContext) {
     git::git(&api, &["update-ref", "refs/remotes/origin/main", "HEAD"]).unwrap();
     fs::write(api.join("f"), "a\nb\nc\n").unwrap();
     on(cx, &|s, w, cx| s.show(Tab::Feature(Feature::Diff), w, cx));
-    cx.update(|cx| assert_eq!(shark.read(cx).differ.read(cx).diff_files.len(), 1));
+    cx.update(|cx| assert_eq!(shark.read(cx).differ.read(cx).diff_files().len(), 1));
     let press = press_in(window);
     let comments = |cx: &mut TestAppContext| {
         cx.update(|cx| {
@@ -5230,14 +5250,14 @@ async fn review_queue(cx: &mut TestAppContext) {
     // c on line 1: the composer; its letters don't reach the diff's keys. cmd-shift-s opens
     // Suggest change on the lines; cmd-enter adds a pending thread with the snapshot.
     press(cx, &["down", "c"]);
-    cx.update(|cx| assert!(shark.read(cx).differ.read(cx).review.composer.is_some()));
+    cx.update(|cx| assert!(shark.read(cx).differ.read(cx).review().composer.is_some()));
     typing(cx, "rename vars");
     press(cx, &["cmd-shift-s"]);
     typing(cx, "!");
     press(cx, &["cmd-enter"]);
     cx.update(|cx| {
         let s = shark.read(cx);
-        assert!(s.differ.read(cx).review.composer.is_none());
+        assert!(s.differ.read(cx).review().composer.is_none());
         let c = &s.differ.read(cx).ws_comments()[0];
         assert_eq!((c.id, c.text.as_str()), (1, "rename vars"));
         assert_eq!(
@@ -5253,7 +5273,7 @@ async fn review_queue(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .review
+            .review()
             .composer
             .as_ref()
             .unwrap();
@@ -5285,7 +5305,7 @@ async fn review_queue(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .review
+            .review()
             .sheet
             .as_ref()
             .unwrap();
@@ -5361,13 +5381,13 @@ async fn review_queue(cx: &mut TestAppContext) {
     on(cx, &|host, _w, cx| {
         host.differ.update(cx, |s, cx| {
             let two = DiffLineRange::new("api/f", DiffSide::Modified, 2, 2);
-            s.diff
+            s.diff()
                 .update(cx, |d, cx| d.set_selected_lines(Some(two), cx));
         })
     });
     press(cx, &["r"]);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_files.len() == 2
+        shark.read(cx).differ.read(cx).diff_files().len() == 2
     })
     .await;
     fs::remove_file(api.join("h")).unwrap();
@@ -5387,7 +5407,7 @@ async fn review_queue(cx: &mut TestAppContext) {
         s.differ.update(cx, |d, cx| d.jump_to_comment(1, w, cx))
     });
     press(cx, &["e", "x"]);
-    cx.update(|cx| assert!(shark.read(cx).differ.read(cx).review.composer.is_none()));
+    cx.update(|cx| assert!(shark.read(cx).differ.read(cx).review().composer.is_none()));
     assert_eq!(comments(cx)[0].2, Status::Queued);
     cx.update_window(window, |_, w, cx| {
         chat.update(cx, |c, cx| c.remove_queued(0, w, cx))
@@ -5526,7 +5546,7 @@ async fn review_queue(cx: &mut TestAppContext) {
         s.differ.update(cx, |d, cx| d.post_share(w, cx));
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).review.share.is_none()
+        shark.read(cx).differ.read(cx).review().share.is_none()
     })
     .await;
     assert_eq!(
@@ -5545,7 +5565,7 @@ async fn review_queue(cx: &mut TestAppContext) {
         assert!(
             s.differ
                 .read(cx)
-                .review
+                .review()
                 .failed_saves
                 .contains_key(s.active.as_deref().unwrap())
         );
@@ -5560,7 +5580,7 @@ async fn review_queue(cx: &mut TestAppContext) {
     fs::remove_dir(&store).unwrap();
     on(cx, &|s, _, cx| {
         s.retry_saves(cx);
-        assert!(s.differ.read(cx).review.failed_saves.is_empty());
+        assert!(s.differ.read(cx).review().failed_saves.is_empty());
     });
     assert!(
         fs::read_to_string(&store)
@@ -5574,7 +5594,7 @@ async fn review_queue(cx: &mut TestAppContext) {
         host.differ.update(cx, |s, cx| {
             s.edit_comments(cx, |l| l[0].github = None);
             s.open_sheet(w, cx);
-            s.review.sheet.as_mut().unwrap().publish = true;
+            s.review_mut().sheet.as_mut().unwrap().publish = true;
             s.sheet_send(w, cx);
         })
     });
@@ -5607,12 +5627,13 @@ async fn review_queue(cx: &mut TestAppContext) {
             .update(cx, |g, _| g.set_pr("api", 7, true));
         s.configure_differ(cx);
         s.differ.update(cx, |d, cx| d.open_share(2, w, cx));
-        s.differ
-            .update(cx, |d, _| d.review.share.as_mut().unwrap().review = true);
+        s.differ.update(cx, |d, _| {
+            d.review_mut().share.as_mut().unwrap().review = true
+        });
         s.differ.update(cx, |d, cx| d.post_share(w, cx));
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).review.share.is_none()
+        shark.read(cx).differ.read(cx).review().share.is_none()
     })
     .await;
     let argv = fs::read_to_string(&log).unwrap();
@@ -5635,7 +5656,7 @@ async fn review_queue(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .review
+            .review()
             .share
             .as_ref()
             .is_some_and(|s| !s.posting)
@@ -5646,7 +5667,7 @@ async fn review_queue(cx: &mut TestAppContext) {
         let err = s
             .differ
             .read(cx)
-            .review
+            .review()
             .share
             .as_ref()
             .unwrap()
@@ -5681,12 +5702,12 @@ async fn review_queue(cx: &mut TestAppContext) {
     });
     let github_in = |cx: &mut TestAppContext, id: u64| {
         cx.update(|cx| {
-            let l = &shark.read(cx).differ.read(cx).review.comments[&ws];
+            let l = &shark.read(cx).differ.read(cx).review().comments[&ws];
             l.iter().find(|c| c.id == id).unwrap().github.clone()
         })
     };
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).review.comments[&ws][0]
+        shark.read(cx).differ.read(cx).review().comments[&ws][0]
             .github
             .is_some()
     })
@@ -5705,7 +5726,7 @@ async fn review_queue(cx: &mut TestAppContext) {
                 .read(cx)
                 .differ
                 .read(cx)
-                .review
+                .review()
                 .comments
                 .contains_key("elsewhere")
         )
@@ -5728,9 +5749,9 @@ async fn review_queue(cx: &mut TestAppContext) {
     });
     on(cx, &|host, w, cx| {
         host.differ.update(cx, |s, cx| {
-            s.editing.as_mut().unwrap().buf.lines[1] = "edited".into();
+            s.editing_mut().as_mut().unwrap().buf.lines[1] = "edited".into();
             let two = DiffLineRange::new("api/f", DiffSide::Modified, 2, 2);
-            s.diff
+            s.diff()
                 .update(cx, |d, cx| d.set_selected_lines(Some(two), cx));
             s.comment_dialog(w, cx);
         })
@@ -5740,7 +5761,7 @@ async fn review_queue(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .review
+            .review()
             .composer
             .as_ref()
             .unwrap();
@@ -5749,7 +5770,7 @@ async fn review_queue(cx: &mut TestAppContext) {
     on(cx, &|host, w, cx| {
         host.differ.update(cx, |s, cx| {
             s.cancel_composer(w, cx);
-            s.editing = None;
+            *s.editing_mut() = None;
         })
     });
 
@@ -5758,7 +5779,8 @@ async fn review_queue(cx: &mut TestAppContext) {
     let dir = crate::state::support_dir().join("comments");
     fs::write(dir.join("bad.json"), "{oops").unwrap();
     on(cx, &|s, _, cx| {
-        s.differ.update(cx, |d, _| d.review.load_comments("bad"))
+        s.differ
+            .update(cx, |d, _| d.review_mut().load_comments("bad"))
     });
     assert!(dir.join("bad.json.1.bak").exists() && !dir.join("bad.json").exists());
     fs::write(
@@ -5767,10 +5789,11 @@ async fn review_queue(cx: &mut TestAppContext) {
     )
     .unwrap();
     on(cx, &|s, _, cx| {
-        s.differ.update(cx, |d, _| d.review.load_comments("old"))
+        s.differ
+            .update(cx, |d, _| d.review_mut().load_comments("old"))
     });
     cx.update(|cx| {
-        let c = &shark.read(cx).differ.read(cx).review.comments["old"][0];
+        let c = &shark.read(cx).differ.read(cx).review().comments["old"][0];
         assert_eq!((&c.status, &c.chat), (&Status::Pending, &None));
     });
 
@@ -5780,7 +5803,7 @@ async fn review_queue(cx: &mut TestAppContext) {
     on(cx, &|s, _, cx| s.refresh_diff(cx));
     on(cx, &|host, _w, cx| {
         host.differ.update(cx, |s, cx| {
-            assert_eq!(s.diff_files.len(), 1);
+            assert_eq!(s.diff_files().len(), 1);
             assert!(s.render_orphans(cx).is_some());
         })
     });
@@ -5790,13 +5813,14 @@ async fn review_queue(cx: &mut TestAppContext) {
         let one = DiffLineRange::new("api/g", DiffSide::Modified, 1, 1);
         s.differ
             .read(cx)
-            .diff
+            .diff()
             .clone()
             .update(cx, |d, cx| d.set_selected_lines(Some(one), cx));
         s.differ.update(cx, |d, cx| d.comment_dialog(w, cx));
         s.differ.update(cx, |d, cx| d.open_sheet(w, cx));
         assert!(
-            s.differ.read(cx).review.composer.is_some() && s.differ.read(cx).review.sheet.is_some()
+            s.differ.read(cx).review().composer.is_some()
+                && s.differ.read(cx).review().sheet.is_some()
         );
         s.create_workspace(
             "rq2".into(),
@@ -5814,7 +5838,8 @@ async fn review_queue(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let s = shark.read(cx);
         assert!(
-            s.differ.read(cx).review.composer.is_none() && s.differ.read(cx).review.sheet.is_none()
+            s.differ.read(cx).review().composer.is_none()
+                && s.differ.read(cx).review().sheet.is_none()
         );
     });
     fs::remove_dir_all(&home).ok();
@@ -5858,7 +5883,7 @@ async fn card_header_pinned(cx: &mut TestAppContext) {
         s.refresh_diff(cx);
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !shark.read(cx).differ.read(cx).diff_files.is_empty()
+        !shark.read(cx).differ.read(cx).diff_files().is_empty()
     })
     .await;
     let check = |cx: &mut TestAppContext| {
@@ -5951,11 +5976,11 @@ async fn narrow_column_comments(cx: &mut TestAppContext) {
     fs::write(home.join("shark/workspaces/nc/api/f"), "a\nb\nc\nd\n").unwrap();
     on(cx, &|s, w, cx| {
         s.show(Tab::Feature(Feature::Diff), w, cx);
-        s.differ.update(cx, |d, _| d.show_tree = false); // Keep the original narrow-column geometry at an 80% split.
+        s.differ.update(cx, |d, _| *d.show_tree_mut() = false); // Keep the original narrow-column geometry at an 80% split.
         s.refresh_diff(cx);
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_files.len() == 1
+        shark.read(cx).differ.read(cx).diff_files().len() == 1
     })
     .await;
     let posted: review::Comment = serde_json::from_str(
@@ -5966,10 +5991,10 @@ async fn narrow_column_comments(cx: &mut TestAppContext) {
     .unwrap();
     on(cx, &|host, w, cx| {
         host.differ.update(cx, |s, cx| {
-            s.diff.update(cx, |d, cx| d.set_split_ratio(0.8, cx));
+            s.diff().update(cx, |d, cx| d.set_split_ratio(0.8, cx));
             s.edit_comments(cx, |l| l.push(posted.clone()));
             let three = DiffLineRange::new("api/f", DiffSide::Modified, 3, 3);
-            s.diff
+            s.diff()
                 .update(cx, |d, cx| d.set_selected_lines(Some(three), cx));
             s.comment_dialog(w, cx);
         })
@@ -6048,7 +6073,7 @@ async fn thread_menu_labels(cx: &mut TestAppContext) {
         s.refresh_diff(cx);
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_files.len() == 1
+        shark.read(cx).differ.read(cx).diff_files().len() == 1
     })
     .await;
     let thread = |id: u64, status: &str| -> review::Comment {
@@ -6178,13 +6203,13 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
         s.show(Tab::Feature(Feature::Diff), w, cx);
         s.differ
             .read(cx)
-            .diff
+            .diff()
             .clone()
             .update(cx, |d, cx| d.set_mode(DiffMode::Split, cx));
         s.refresh_diff(cx);
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_files.len() == 1
+        shark.read(cx).differ.read(cx).diff_files().len() == 1
     })
     .await;
     // Diff includes its file tree by default.
@@ -6200,7 +6225,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
         let line = DiffLineRange::new("api/f.txt", DiffSide::Modified, 250, 250);
         s.differ
             .read(cx)
-            .diff
+            .diff()
             .clone()
             .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
         s.edit_working_copy(Some("api/f.txt".into()), w, cx)
@@ -6208,7 +6233,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
     draw(cx);
     let value = |cx: &mut TestAppContext| {
         cx.update(|cx| {
-            let e = shark.read(cx).differ.read(cx).editing.as_ref().unwrap();
+            let e = shark.read(cx).differ.read(cx).editing().as_ref().unwrap();
             (
                 e.buf.lines[e.buf.line].clone(),
                 e.input.read(cx).value().to_string(),
@@ -6222,7 +6247,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
                 .read(cx)
                 .differ
                 .read(cx)
-                .editing
+                .editing()
                 .as_ref()
                 .unwrap()
                 .focused(w, cx)
@@ -6232,7 +6257,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
     assert!(focused(cx));
     // The input sits where the line's code would, one row tall; the header has no Comment.
     cx.update_window(window, |_, w, cx| {
-        let e = shark.read(cx).differ.read(cx).editing.as_ref().unwrap();
+        let e = shark.read(cx).differ.read(cx).editing().as_ref().unwrap();
         let input = w.find(("input", e.input.entity_id())).bounds();
         let row = w.find_all(("line", 249usize))[0].bounds();
         let code = (w.find_all("source").iter())
@@ -6253,11 +6278,11 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
         let s = shark.read(cx);
         assert_eq!(s.state.unified, unified);
         assert!(
-            s.differ.read(cx).review.composer.is_none()
+            s.differ.read(cx).review().composer.is_none()
                 && s.editor.is_none()
-                && s.differ.read(cx).review.sheet.is_none()
+                && s.differ.read(cx).review().sheet.is_none()
         );
-        assert!(s.differ.read(cx).viewed_now.is_empty() && s.differ.read(cx).editing.is_some());
+        assert!(s.differ.read(cx).viewed_now().is_empty() && s.differ.read(cx).editing().is_some());
     });
     cx.update_window(window, |_, w, cx| w.input("sr", cx))
         .unwrap();
@@ -6275,7 +6300,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
                 .read(cx)
                 .differ
                 .read(cx)
-                .editing
+                .editing()
                 .as_ref()
                 .unwrap()
                 .input
@@ -6291,7 +6316,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
     // A click on the line being edited leaves its caret and selection to the input.
     on(cx, &|host, _w, cx| {
         host.differ.update(cx, |s, cx| {
-            let e = s.editing.as_ref().unwrap();
+            let e = s.editing().as_ref().unwrap();
             e.input.update(cx, |i, cx| i.set_selected_range(2..4, cx));
         })
     });
@@ -6305,7 +6330,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
         })
     });
     cx.update(|cx| {
-        let e = shark.read(cx).differ.read(cx).editing.as_ref().unwrap();
+        let e = shark.read(cx).differ.read(cx).editing().as_ref().unwrap();
         assert_eq!(e.input.read(cx).selected_range(), 2..4);
     });
 
@@ -6335,7 +6360,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .editing
+            .editing()
             .as_ref()
             .is_some_and(|e| e.saved)
     })
@@ -6347,7 +6372,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .editing
+            .editing()
             .as_ref()
             .unwrap()
             .buf
@@ -6366,7 +6391,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .editing
+            .editing()
             .as_ref()
             .is_some_and(|e| e.buf.text() == theirs)
     })
@@ -6385,7 +6410,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .editing
+            .editing()
             .as_ref()
             .is_some_and(|e| e.stale)
     })
@@ -6396,7 +6421,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
             s.differ.read(cx).working_heading("api/f.txt"),
             "Working copy · changed on disk"
         );
-        assert!(s.differ.read(cx).editing.as_ref().unwrap().dirty);
+        assert!(s.differ.read(cx).editing().as_ref().unwrap().dirty);
     });
     on(cx, &|s, w, cx| {
         s.differ.update(cx, |d, cx| d.save_edit(false, w, cx))
@@ -6428,7 +6453,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .editing
+            .editing()
             .as_ref()
             .is_some_and(|e| e.saved && !e.stale)
     })
@@ -6438,7 +6463,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .editing
+            .editing()
             .as_ref()
             .unwrap()
             .buf
@@ -6460,16 +6485,16 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
         s.refresh_diff(cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_files.len() == 2
+        shark.read(cx).differ.read(cx).diff_files().len() == 2
     })
     .await;
     draw(cx);
     assert!(focused(cx), "the refresh kept the input's focus");
     // …and it is drawn, so typing reaches it.
     cx.update_window(window, |_, w, cx| {
-        let e = shark.read(cx).differ.read(cx).editing.as_ref().unwrap();
+        let e = shark.read(cx).differ.read(cx).editing().as_ref().unwrap();
         let input = w.find_all(("input", e.input.entity_id()));
-        let top = shark.read(cx).differ.read(cx).diff.read(cx).scroll_top();
+        let top = shark.read(cx).differ.read(cx).diff().read(cx).scroll_top();
         assert!(input.iter().any(|i| i.visible()), "{input:?} at {top:?}");
     })
     .unwrap();
@@ -6485,9 +6510,9 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
             .update(cx, |d, cx| d.filter_tree("g.txt".into(), cx));
         s.differ.update(cx, |d, cx| d.toggle_viewed_dir("api", cx));
         // Folding a folder the filter shows open would only change hidden state.
-        s.differ.update(cx, |d, _| d.tree_sel = 0);
+        s.differ.update(cx, |d, _| *d.tree_sel_mut() = 0);
         s.differ.update(cx, |d, cx| d.set_dir_open(Some(false), cx));
-        assert!(s.differ.read(cx).collapsed_dirs.is_empty());
+        assert!(s.differ.read(cx).collapsed_dirs().is_empty());
         s.differ
             .update(cx, |d, cx| d.filter_tree(String::new(), cx));
     });
@@ -6496,7 +6521,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
         assert_eq!(
             s.differ
                 .read(cx)
-                .viewed_now
+                .viewed_now()
                 .iter()
                 .map(|p| p.as_str())
                 .collect::<Vec<_>>(),
@@ -6508,7 +6533,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
     on(cx, &|host, w, cx| {
         host.differ.update(cx, |s, cx| {
             let line = DiffLineRange::new("api/f.txt", DiffSide::Original, 249, 249);
-            s.diff
+            s.diff()
                 .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
             s.comment_dialog(w, cx)
         })
@@ -6524,7 +6549,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .review
+            .review()
             .composer
             .as_ref()
             .unwrap();
@@ -6533,7 +6558,8 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
     // The edited file's header: [Review] [Save ⌘S], no Comment.
     on(cx, &|host, _w, cx| {
         host.differ.update(cx, |s, cx| {
-            s.diff.update(cx, |d, cx| d.scroll_to_file("api/f.txt", cx))
+            s.diff()
+                .update(cx, |d, cx| d.scroll_to_file("api/f.txt", cx))
         })
     });
     draw(cx);
@@ -6546,16 +6572,16 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
     fs::write(&file, lines(&|i| format!("line {i}\n")) + "tail\n").unwrap();
     on(cx, &|host, w, cx| {
         host.differ.update(cx, |s, cx| {
-            s.editing.as_mut().unwrap().dirty = false;
+            s.editing_mut().as_mut().unwrap().dirty = false;
             s.leave_edit(w, cx)
         })
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         let s = shark.read(cx);
-        s.differ.read(cx).editing.is_none()
+        s.differ.read(cx).editing().is_none()
             && s.differ
                 .read(cx)
-                .diff_files
+                .diff_files()
                 .iter()
                 .any(|f| f.additions() == 1 && f.deletions() == 0)
     })
@@ -6608,7 +6634,7 @@ async fn review_round3(cx: &mut TestAppContext) {
         s.refresh_diff(cx);
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_files.len() == 1
+        shark.read(cx).differ.read(cx).diff_files().len() == 1
     })
     .await;
     let draw = |cx: &mut TestAppContext| {
@@ -6626,7 +6652,7 @@ async fn review_round3(cx: &mut TestAppContext) {
         })
     };
     on(cx, &|s, _, cx| {
-        s.differ.update(cx, |d, _| d.review.at_file("api/f"))
+        s.differ.update(cx, |d, _| d.review_mut().at_file("api/f"))
     });
     draw(cx);
 
@@ -6682,7 +6708,7 @@ async fn review_round3(cx: &mut TestAppContext) {
                 .read(cx)
                 .differ
                 .read(cx)
-                .diff
+                .diff()
                 .read(cx)
                 .text_selection_lines(cx)
         })
@@ -6696,7 +6722,7 @@ async fn review_round3(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .review
+            .review()
             .composer
             .as_ref()
             .unwrap();
@@ -6715,7 +6741,7 @@ async fn review_round3(cx: &mut TestAppContext) {
                 70,
                 79,
             );
-            s.diff
+            s.diff()
                 .update(cx, |d, cx| d.set_selected_lines(Some(ten), cx));
             s.comment_dialog(w, cx);
         })
@@ -6757,7 +6783,7 @@ async fn review_round3(cx: &mut TestAppContext) {
         assert!(s.differ.read(cx).sheet_prs(cx).is_empty(), "web has no PR");
         s.differ.update(cx, |d, cx| d.sheet_toggle(cx));
         s.differ.update(cx, |d, cx| d.sheet_publish(true, cx));
-        assert!(s.differ.read(cx).review.sheet.as_ref().unwrap().preview);
+        assert!(s.differ.read(cx).review().sheet.as_ref().unwrap().preview);
         s.differ.update(cx, |d, cx| d.close_sheet(w, cx));
         s.differ.update(cx, |d, cx| {
             d.edit_comments(cx, |l| l.retain(|c| c.id != 50))
@@ -6860,7 +6886,7 @@ async fn review_round3(cx: &mut TestAppContext) {
     drop(gh_env);
     cx.update(|cx| {
         assert!(
-            shark.read(cx).differ.read(cx).review.share.is_some(),
+            shark.read(cx).differ.read(cx).review().share.is_some(),
             "not closed under Other"
         )
     });
@@ -6871,7 +6897,9 @@ async fn review_round3(cx: &mut TestAppContext) {
         })
     });
     cx.update_window(window, |_, w, cx| {
-        assert!(shark.read(cx).differ.read(cx).review.share.is_none() && !w.has_active_dialog(cx));
+        assert!(
+            shark.read(cx).differ.read(cx).review().share.is_none() && !w.has_active_dialog(cx)
+        );
     })
     .unwrap();
     fs::remove_dir_all(&home).ok();
@@ -6932,7 +6960,7 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     fs::write(&file, "fn a() {\n    c();\n}\n").unwrap();
     let wait_files = async |cx: &mut TestAppContext, n: usize| {
         cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-            shark.read(cx).differ.read(cx).diff_files.len() == n
+            shark.read(cx).differ.read(cx).diff_files().len() == n
         })
         .await
     };
@@ -6951,7 +6979,7 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     const VIM: [&str; 6] = ["j", "k", "h", "l", "g", "shift-g"];
 
     // The Files filter.
-    let filter = cx.update(|cx| shark.read(cx).differ.read(cx).tree_filter.clone());
+    let filter = cx.update(|cx| shark.read(cx).differ.read(cx).tree_filter().clone());
     on(cx, &|_, w, cx| {
         filter.read(cx).focus_handle(cx).focus(w, cx)
     });
@@ -6969,7 +6997,7 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
         let line = DiffLineRange::new("api/f.txt", DiffSide::Modified, 2, 2);
         s.differ
             .read(cx)
-            .diff
+            .diff()
             .clone()
             .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
         s.edit_working_copy(Some("api/f.txt".into()), w, cx)
@@ -6977,7 +7005,7 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     draw(cx);
     let line = |cx: &mut TestAppContext| {
         cx.update(|cx| {
-            let e = shark.read(cx).differ.read(cx).editing.as_ref().unwrap();
+            let e = shark.read(cx).differ.read(cx).editing().as_ref().unwrap();
             (
                 e.buf.lines[e.buf.line].clone(),
                 e.input.read(cx).value().to_string(),
@@ -6996,13 +7024,13 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     // Enter over a selection replaces it, then splits.
     on(cx, &|host, _w, cx| {
         host.differ.update(cx, |s, cx| {
-            let input = s.editing.as_ref().unwrap().input.clone();
+            let input = s.editing().as_ref().unwrap().input.clone();
             input.update(cx, |i, cx| i.set_selected_range(6..8, cx));
         })
     });
     press(cx, &["enter"]);
     cx.update(|cx| {
-        let e = shark.read(cx).differ.read(cx).editing.as_ref().unwrap();
+        let e = shark.read(cx).differ.read(cx).editing().as_ref().unwrap();
         assert_eq!(e.buf.lines[1..3], ["    c(", "jkhlgG"]);
     });
 
@@ -7010,7 +7038,7 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     on(cx, &|host, w, cx| {
         host.differ.update(cx, |s, cx| {
             let line = DiffLineRange::new("api/f.txt", DiffSide::Original, 1, 1);
-            s.diff
+            s.diff()
                 .update(cx, |d, cx| d.set_selected_lines(Some(line), cx));
             s.comment_dialog(w, cx)
         })
@@ -7022,7 +7050,7 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .review
+            .review()
             .composer
             .as_ref()
             .unwrap();
@@ -7032,19 +7060,19 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     press(cx, &["escape"]);
     cx.update(|cx| {
         let s = shark.read(cx);
-        assert!(s.differ.read(cx).review.composer.is_none());
-        assert!(s.differ.read(cx).editing.is_some(), "still editing");
+        assert!(s.differ.read(cx).review().composer.is_none());
+        assert!(s.differ.read(cx).editing().is_some(), "still editing");
     });
 
     // Esc with the focus on the diff, not the input: back to reviewing.
     on(cx, &|host, w, cx| {
         host.differ.update(cx, |s, cx| {
-            s.editing.as_mut().unwrap().dirty = false;
+            s.editing_mut().as_mut().unwrap().dirty = false;
             s.focus_diff(w, cx)
         })
     });
     press(cx, &["escape"]);
-    cx.update(|cx| assert!(shark.read(cx).differ.read(cx).editing.is_none()));
+    cx.update(|cx| assert!(shark.read(cx).differ.read(cx).editing().is_none()));
 
     // Unsaved edits, Esc in the line, Discard: the diff has the focus again, for j/k.
     on(cx, &|s, w, cx| {
@@ -7063,11 +7091,11 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     draw(cx);
     cx.update_window(window, |_, w, cx| {
         let s = shark.read(cx);
-        assert!(s.differ.read(cx).editing.is_none(), "discarded");
+        assert!(s.differ.read(cx).editing().is_none(), "discarded");
         assert!(
             s.differ
                 .read(cx)
-                .diff
+                .diff()
                 .read(cx)
                 .focus_handle(cx)
                 .is_focused(w),
@@ -7082,18 +7110,18 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     });
     on(cx, &|host, w, cx| {
         host.differ.update(cx, |s, cx| {
-            s.editing.as_mut().unwrap().saving = true;
+            s.editing_mut().as_mut().unwrap().saving = true;
             s.leave_edit(w, cx);
-            s.editing.as_mut().unwrap().saving = false;
+            s.editing_mut().as_mut().unwrap().saving = false;
         })
     });
-    cx.update(|cx| assert!(shark.read(cx).differ.read(cx).editing.is_some()));
+    cx.update(|cx| assert!(shark.read(cx).differ.read(cx).editing().is_some()));
 
     // The file leaves the diff: a clean edit ends…
     git::git(&dir, &["checkout", "--", "f.txt"]).unwrap();
     on(cx, &|s, _, cx| s.refresh_diff(cx));
     wait_files(cx, 0).await;
-    cx.update(|cx| assert!(shark.read(cx).differ.read(cx).editing.is_none()));
+    cx.update(|cx| assert!(shark.read(cx).differ.read(cx).editing().is_none()));
     // …a dirty one keeps its file.
     fs::write(&file, "fn a() {\n    c();\n}\n").unwrap();
     on(cx, &|s, _, cx| s.refresh_diff(cx));
@@ -7115,12 +7143,12 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     }
     cx.update(|cx| {
         let s = shark.read(cx);
-        let e = s.differ.read(cx).editing.as_ref().unwrap();
+        let e = s.differ.read(cx).editing().as_ref().unwrap();
         assert!(e.dirty);
         assert!(
             s.differ
                 .read(cx)
-                .diff_files
+                .diff_files()
                 .iter()
                 .any(|f| f.path() == "api/f.txt")
         );
@@ -7131,7 +7159,7 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     // An emptied file: its one empty line is there to edit.
     on(cx, &|host, _w, cx| {
         host.differ.update(cx, |s, cx| {
-            s.editing.as_mut().unwrap().dirty = false;
+            s.editing_mut().as_mut().unwrap().dirty = false;
             s.end_edit(cx)
         })
     });
@@ -7140,16 +7168,16 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
         let f = s
             .differ
             .read(cx)
-            .diff_files
+            .diff_files()
             .iter()
             .find(|f| f.path() == "api/f.txt");
         assert_eq!(f.map(|f| f.additions()), Some(1));
-        assert_eq!(s.differ.read(cx).diff_fp, 0, "the next refresh rebuilds");
+        assert_eq!(s.differ.read(cx).diff_fp(), 0, "the next refresh rebuilds");
     });
     fs::write(dir.join("h.txt"), "").unwrap();
     on(cx, &|s, _, cx| s.refresh_diff(cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        (shark.read(cx).differ.read(cx).diff_files.iter()).any(|f| f.path() == "api/h.txt")
+        (shark.read(cx).differ.read(cx).diff_files().iter()).any(|f| f.path() == "api/h.txt")
     })
     .await;
     on(cx, &|s, w, cx| {
@@ -7158,11 +7186,11 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let s = shark.read(cx);
         assert_eq!(
-            s.differ.read(cx).editing.as_ref().unwrap().path.as_str(),
+            s.differ.read(cx).editing().as_ref().unwrap().path.as_str(),
             "api/h.txt"
         );
         assert!(
-            s.differ.read(cx).review.hunks["api/h.txt"]
+            s.differ.read(cx).review().hunks["api/h.txt"]
                 .iter()
                 .flatten()
                 .any(|r| r.0 == b'+' && r.2 == 1)
@@ -7177,14 +7205,15 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     on(cx, &|s, _, cx| s.refresh_diff(cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         let s = shark.read(cx);
-        (s.differ.read(cx).diff_files.iter()).any(|f| f.path() == "api/h.txt" && f.additions() == 0)
+        (s.differ.read(cx).diff_files().iter())
+            .any(|f| f.path() == "api/h.txt" && f.additions() == 0)
     })
     .await;
     on(cx, &|s, w, cx| {
         s.edit_working_copy(Some("api/h.txt".into()), w, cx)
     });
     cx.update(|cx| {
-        let e = shark.read(cx).differ.read(cx).editing.as_ref().unwrap();
+        let e = shark.read(cx).differ.read(cx).editing().as_ref().unwrap();
         assert_eq!(e.path.as_str(), "api/h.txt");
         assert_eq!((e.file.additions(), e.file.deletions()), (0, 0));
     });
@@ -7250,7 +7279,7 @@ async fn inline_edit_round4(cx: &mut TestAppContext) {
         s.refresh_diff(cx);
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_files.len() == 2
+        shark.read(cx).differ.read(cx).diff_files().len() == 2
     })
     .await;
     let draw = |cx: &mut TestAppContext| {
@@ -7267,7 +7296,7 @@ async fn inline_edit_round4(cx: &mut TestAppContext) {
     };
     let text = |cx: &mut TestAppContext| {
         cx.update(|cx| {
-            let e = shark.read(cx).differ.read(cx).editing.as_ref().unwrap();
+            let e = shark.read(cx).differ.read(cx).editing().as_ref().unwrap();
             (e.path.to_string(), e.buf.text())
         })
     };
@@ -7287,7 +7316,7 @@ async fn inline_edit_round4(cx: &mut TestAppContext) {
                 .read(cx)
                 .differ
                 .read(cx)
-                .editing
+                .editing()
                 .as_ref()
                 .unwrap()
                 .focused(w, cx)
@@ -7331,7 +7360,7 @@ async fn inline_edit_round4(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let s = shark.read(cx);
         assert_eq!(s.active.as_deref(), Some("ed"));
-        assert!(s.ws("ed").is_some() && s.differ.read(cx).editing.as_ref().unwrap().dirty);
+        assert!(s.ws("ed").is_some() && s.differ.read(cx).editing().as_ref().unwrap().dirty);
     });
 
     // Back from Chat the line input has the focus; with the focus on the diff, `i` and ⌘S
@@ -7344,11 +7373,11 @@ async fn inline_edit_round4(cx: &mut TestAppContext) {
     on(cx, &|host, w, cx| {
         host.differ.update(cx, |s, cx| {
             use crate::diff_view::{DiffLineRange, DiffSide};
-            s.diff_file = (s.diff_files.iter())
+            *s.diff_file_mut() = (s.diff_files().iter())
                 .position(|f| f.path() == "api/f.txt")
                 .unwrap();
             let line = DiffLineRange::new("api/g.txt", DiffSide::Modified, 1, 1);
-            s.diff.update(cx, |d, cx| {
+            s.diff().update(cx, |d, cx| {
                 d.set_selected_lines(Some(line), cx);
                 d.scroll_to_file("api/f.txt", cx)
             });
@@ -7368,7 +7397,7 @@ async fn inline_edit_round4(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .editing
+            .editing()
             .as_ref()
             .is_some_and(|e| e.saved)
     })
@@ -7377,11 +7406,11 @@ async fn inline_edit_round4(cx: &mut TestAppContext) {
 
     // Viewed: the edited file's card stays open through a refresh.
     on(cx, &|s, _, cx| {
-        let ix = (s.differ.read(cx).diff_files.iter())
+        let ix = (s.differ.read(cx).diff_files().iter())
             .position(|f| f.path() == "api/g.txt")
             .unwrap();
         s.differ.update(cx, |d, cx| d.toggle_viewed(ix, cx));
-        s.differ.update(cx, |d, _| d.diff_fp = 0);
+        s.differ.update(cx, |d, _| *d.diff_fp_mut() = 0);
         s.refresh_diff(cx);
     });
     draw(cx);
@@ -7390,14 +7419,14 @@ async fn inline_edit_round4(cx: &mut TestAppContext) {
         assert!(
             s.differ
                 .read(cx)
-                .viewed_now
+                .viewed_now()
                 .iter()
                 .any(|p| p == "api/g.txt")
         );
         assert!(
             !s.differ
                 .read(cx)
-                .diff
+                .diff()
                 .read(cx)
                 .is_file_collapsed("api/g.txt")
         );
@@ -7406,7 +7435,7 @@ async fn inline_edit_round4(cx: &mut TestAppContext) {
     // Saved back to the base: still editing.
     on(cx, &|host, w, cx| {
         host.differ.update(cx, |s, cx| {
-            let e = s.editing.as_mut().unwrap();
+            let e = s.editing_mut().as_mut().unwrap();
             e.buf = inline_edit::Buffer::new("g\n");
             e.dirty = true;
             s.save_edit(false, w, cx)
@@ -7416,7 +7445,7 @@ async fn inline_edit_round4(cx: &mut TestAppContext) {
         let s = shark.read(cx);
         s.differ
             .read(cx)
-            .editing
+            .editing()
             .as_ref()
             .is_some_and(|e| e.saved && !e.dirty)
     })
@@ -7436,7 +7465,7 @@ async fn inline_edit_round4(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .editing
+            .editing()
             .as_ref()
             .is_some_and(|e| e.stale)
     })
@@ -7449,7 +7478,7 @@ async fn inline_edit_round4(cx: &mut TestAppContext) {
             .read(cx)
             .differ
             .read(cx)
-            .editing
+            .editing()
             .as_ref()
             .is_some_and(|e| !e.stale)
     })
@@ -7466,17 +7495,17 @@ async fn inline_edit_round4(cx: &mut TestAppContext) {
     std::os::unix::fs::symlink("g.txt", dir.join("link.txt")).unwrap();
     on(cx, &|s, _, cx| s.refresh_diff(cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        (shark.read(cx).differ.read(cx).diff_files.iter()).any(|f| f.path() == "api/link.txt")
+        (shark.read(cx).differ.read(cx).diff_files().iter()).any(|f| f.path() == "api/link.txt")
     })
     .await;
     on(cx, &edit("api/link.txt"));
-    cx.update(|cx| assert!(shark.read(cx).differ.read(cx).editing.is_none()));
+    cx.update(|cx| assert!(shark.read(cx).differ.read(cx).editing().is_none()));
 
     // Unsaved, the close button's Discard closes the window.
     fs::write(dir.join("f.txt"), "f4\n").unwrap();
     on(cx, &|s, _, cx| s.refresh_diff(cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        (shark.read(cx).differ.read(cx).diff_files.iter())
+        (shark.read(cx).differ.read(cx).diff_files().iter())
             .any(|f| f.path() == "api/f.txt" && f.additions() == 1)
     })
     .await;
@@ -7549,7 +7578,7 @@ async fn review_thread_jumps_overlapping(cx: &mut TestAppContext) {
     fs::write(api.join("f"), "1\n2\n3\n4\n5\n6\n").unwrap();
     on(cx, &|s, w, cx| s.show(Tab::Feature(Feature::Diff), w, cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_files.len() == 1
+        shark.read(cx).differ.read(cx).diff_files().len() == 1
     })
     .await;
     // c1 on 1-4, c2 on 3-4, c3 on 6.
@@ -7621,7 +7650,7 @@ async fn review_followups(cx: &mut TestAppContext) {
     fs::write(api.join("f"), "a\nb\nc\n").unwrap();
     on(cx, &|s, w, cx| s.show(Tab::Feature(Feature::Diff), w, cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_files.len() == 1
+        shark.read(cx).differ.read(cx).diff_files().len() == 1
     })
     .await;
     let ws = cx.update(|cx| shark.read(cx).active.clone().unwrap());
@@ -7729,12 +7758,13 @@ async fn review_followups(cx: &mut TestAppContext) {
             .update(cx, |g, _| g.set_pr("api", 7, true));
         s.configure_differ(cx);
         s.differ.update(cx, |d, cx| d.open_share(1, w, cx));
-        s.differ
-            .update(cx, |d, _| d.review.share.as_mut().unwrap().review = true);
+        s.differ.update(cx, |d, _| {
+            d.review_mut().share.as_mut().unwrap().review = true
+        });
         s.differ.update(cx, |d, cx| d.post_share(w, cx));
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        (shark.read(cx).differ.read(cx).review.share.as_ref()).is_some_and(|s| s.error.is_some())
+        (shark.read(cx).differ.read(cx).review().share.as_ref()).is_some_and(|s| s.error.is_some())
     })
     .await;
     fs::remove_file(&fail).unwrap();
@@ -7742,7 +7772,7 @@ async fn review_followups(cx: &mut TestAppContext) {
         s.differ.update(cx, |d, cx| d.post_share(w, cx))
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).review.share.is_none()
+        shark.read(cx).differ.read(cx).review().share.is_none()
     })
     .await;
     assert!((comment(cx).github).is_some_and(|u| u.ends_with("#pullrequestreview-5")));
@@ -7776,7 +7806,8 @@ async fn review_followups(cx: &mut TestAppContext) {
         on(cx, &|host, w, cx| {
             host.differ.update(cx, |s, cx| {
                 let r = DiffLineRange::new("api/f", DiffSide::Modified, line, line);
-                s.diff.update(cx, |d, cx| d.set_selected_lines(Some(r), cx));
+                s.diff()
+                    .update(cx, |d, cx| d.set_selected_lines(Some(r), cx));
                 s.comment_dialog(w, cx);
             })
         })
@@ -7795,7 +7826,14 @@ async fn review_followups(cx: &mut TestAppContext) {
                 .any(|c| c.text == "kept")
         );
         assert_eq!(
-            s.differ.read(cx).review.composer.as_ref().unwrap().draft.id,
+            s.differ
+                .read(cx)
+                .review()
+                .composer
+                .as_ref()
+                .unwrap()
+                .draft
+                .id,
             0
         );
     });
@@ -7812,9 +7850,9 @@ async fn review_followups(cx: &mut TestAppContext) {
             let gone = gone.clone();
             s.edit_comments(cx, |l| l.push(gone));
             assert!(s.render_orphans(cx).is_some());
-            s.diff_error = Some("git failed".into());
+            *s.diff_error_mut() = Some("git failed".into());
             assert!(s.render_orphans(cx).is_none());
-            s.diff_error = None;
+            *s.diff_error_mut() = None;
         })
     });
     fs::remove_dir_all(&home).ok();

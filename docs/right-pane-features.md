@@ -5,14 +5,21 @@ confirmation dialogs. A feature owns its GPUI entity, private implementation sta
 rendering, controls, focus targets and local actions. It receives explicit context
 and sends typed requests for work outside that boundary.
 
+Feature implementations live in `src/features/differ/` and `src/features/git/`.
+`src/app/features.rs` owns the rail, tabs, activation and focus dispatch;
+`src/app/differ_host.rs` handles Differ's workspace integration. Shared styling,
+dialogs and clipboard helpers live in `src/ui.rs`. Features import their
+dependencies explicitly and do not depend on the `app` module.
+
 ## Adding a feature
 
-1. Add its concrete variant and metadata to `Feature` in `src/app/features.rs`, and
-   place it in `Feature::ALL`. The rail, clamped keyboard navigation and feature tab
-   pills use that ordered list. Keep accessibility labels, test IDs and shortcuts
+1. Add its concrete variant to `Feature` in `src/features/mod.rs`, then add metadata
+   and an entry in `Feature::ALL` in `src/app/features.rs`. The rail, clamped
+   keyboard navigation and feature tab pills use that ordered list. Keep accessibility labels, test IDs and shortcuts
    in the metadata; do not duplicate launcher or pill rendering.
-2. Give the component its own entity and modules. Add concrete activation, content,
-   controls, focus, Save and close dispatch in the host's feature methods. Expose
+2. Give the component its own entity and modules under `src/features/`. Add concrete
+   activation, content, controls, focus, Save and close dispatch in the host's
+   feature methods. Expose
    operations and small status snapshots, rather than implementation fields.
 3. Define its lifetime and persistence mapping explicitly. Runtime `Tab::Feature`
    and `Pane::Feature` do not change the existing serialized `TabId` variants,
@@ -24,8 +31,8 @@ and sends typed requests for work outside that boundary.
 
 ## Differ and Git lifetimes
 
-`src/app/differ.rs` owns one long-lived Differ entity. Its child modules own diff
-loading and refresh generations, tree/filter/layout, inline editing, review UI,
+`src/features/differ/mod.rs` owns one long-lived Differ entity. Its child modules
+own diff loading and refresh generations, tree/filter/layout, inline editing, review UI,
 comments, publication results, media and subscriptions. Switching workspaces resets
 presentation and invalidates refreshes; comments and pending publication results
 remain keyed by their originating workspace. Closing the tab keeps the entity,
@@ -63,8 +70,9 @@ workspace even if its tab is hidden or another workspace is active.
 
 ## Validation
 
-The private-state UI fixtures live under `src/app/differ/ui_tests`; `app::ui_tests`
-reexports them for the native rendering harness. Boundary tests cover stale refreshes,
+App integration fixtures live under `src/app/ui_tests`; the native rendering
+harness uses the same module. Differ exposes private-state access only through
+its test-only `test_support` module. Boundary tests cover stale refreshes,
 same-path workspace switches, stale discard/overwrite dialogs and stale menus.
 Existing review tests cover refused sends, immediate and deferred delivery,
 offscreen publication and draft corruption. Git and mixed-tab tests cover rail

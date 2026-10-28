@@ -1023,7 +1023,7 @@ async fn git_feature_thread_context_opens_diff_and_preserves_missing_context(
             .read(cx)
             .differ
             .read(cx)
-            .diff_files
+            .diff_files()
             .iter()
             .any(|f| f.path() == "api/login.rs")
     })
@@ -1032,19 +1032,19 @@ async fn git_feature_thread_context_opens_diff_and_preserves_missing_context(
         shark.update(cx, |s, cx| {
             s.differ
                 .read(cx)
-                .diff
+                .diff()
                 .clone()
                 .update(cx, |d, cx| d.set_file_collapsed("api/login.rs", true, cx));
             s.open_git_file("api/login.rs", w, cx);
             assert_eq!(s.tab, Tab::Feature(Feature::Diff));
             assert_eq!(
-                s.differ.read(cx).diff_files[s.differ.read(cx).diff_file].path(),
+                s.differ.read(cx).diff_files()[s.differ.read(cx).diff_file()].path(),
                 "api/login.rs"
             );
             assert!(
                 !s.differ
                     .read(cx)
-                    .diff
+                    .diff()
                     .read(cx)
                     .is_file_collapsed("api/login.rs")
             );
@@ -1062,12 +1062,12 @@ async fn git_feature_thread_context_opens_diff_and_preserves_missing_context(
         s.edit_working_copy(Some("api/other.rs".into()), w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).editing.is_some()
+        shark.read(cx).differ.read(cx).editing().is_some()
     })
     .await;
     on_app(window, shark.clone())(cx, &|s, w, cx| {
         s.differ
-            .update(cx, |d, _| d.editing.as_mut().unwrap().dirty = true);
+            .update(cx, |d, _| d.editing_mut().as_mut().unwrap().dirty = true);
         s.show(Tab::Feature(Feature::Git), w, cx);
         s.open_git_file("api/login.rs", w, cx);
     });
@@ -1076,7 +1076,7 @@ async fn git_feature_thread_context_opens_diff_and_preserves_missing_context(
         w.press("escape", cx);
         let s = shark.read(cx);
         assert_eq!(s.tab, Tab::Feature(Feature::Git));
-        assert!(s.differ.read(cx).editing.as_ref().unwrap().dirty);
+        assert!(s.differ.read(cx).editing().as_ref().unwrap().dirty);
     })
     .unwrap();
     on_app(window, shark.clone())(cx, &|s, w, cx| s.open_git_file("api/login.rs", w, cx));
@@ -1084,9 +1084,9 @@ async fn git_feature_thread_context_opens_diff_and_preserves_missing_context(
     cx.update(|cx| {
         let s = shark.read(cx);
         assert_eq!(s.tab, Tab::Feature(Feature::Diff));
-        assert!(s.differ.read(cx).editing.is_none());
+        assert!(s.differ.read(cx).editing().is_none());
         assert_eq!(
-            s.differ.read(cx).diff_files[s.differ.read(cx).diff_file].path(),
+            s.differ.read(cx).diff_files()[s.differ.read(cx).diff_file()].path(),
             "api/login.rs"
         );
     });
@@ -1397,7 +1397,7 @@ async fn git_feature_first_open_during_archive_cannot_load_or_post(cx: &mut Test
 async fn settle_markdown(
     cx: &mut TestAppContext,
     window: AnyWindowHandle,
-    feature: &Entity<crate::app::git_feature::GitFeature>,
+    feature: &Entity<crate::features::git::GitFeature>,
     key: &str,
 ) -> (Duration, Duration) {
     let mut worst = Duration::ZERO;
@@ -1429,7 +1429,7 @@ async fn settle_markdown(
 fn check_full_text_view(
     w: &mut Window,
     cx: &mut App,
-    feature: &Entity<crate::app::git_feature::GitFeature>,
+    feature: &Entity<crate::features::git::GitFeature>,
     button: &'static str,
 ) {
     let source = feature

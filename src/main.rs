@@ -11,6 +11,7 @@ mod complete;
 mod deps;
 mod diff_view;
 mod editor;
+mod features;
 mod file_icon;
 mod files;
 mod git;
@@ -24,6 +25,7 @@ mod settings;
 mod stack;
 mod state;
 mod sync;
+mod ui;
 mod vim;
 
 use gpui_kit::component::TitleBar;
@@ -153,7 +155,7 @@ actions!(
     ]
 );
 
-// The review queue (src/app/review.rs): threads at the diff cursor, the composer, the sheet.
+// The review queue (src/features/differ/review.rs): threads at the diff cursor, the composer, the sheet.
 actions!(
     shark,
     [
@@ -196,7 +198,7 @@ fn bind_keys(cx: &mut App) {
     const LIST: &str = "Sidebar || Home || Transcript || FileTree || Queue";
     // The diff's letter keys; not while typing in the review composer, which sits in the diff.
     const DIFF: &str = "DiffPane && !Input";
-    // The diff's line cursor (src/app/review.rs) moves like a list. With Vim its arrows
+    // The diff's line cursor (src/features/differ/review.rs) moves like a list. With Vim its arrows
     // scroll natively and j/k move the cursor; without, the arrows move it.
     const MOVE: &str = "Sidebar || Home || Transcript || FileTree || Queue || DiffPane || PlanPane || GitFeature || Features";
     const ARROWS: &str = "Sidebar || Home || Transcript || FileTree || Queue || PlanPane || Features || (GitFeature && !Input) || (Diff && !Vim)";

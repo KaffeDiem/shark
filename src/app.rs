@@ -2,16 +2,14 @@
 use crate::attention::Attn;
 use crate::chat::{Chat, ChatEvent, MODELS};
 use crate::checkbox::Checkbox;
-use crate::diff_view::{Diff, DiffEvent, DiffFile, DiffFileStatus, DiffMode, DiffState};
 use crate::editor::{EditorEvent, FileEditor};
-use crate::files::{self, Row};
 use crate::menu::{self, Entry};
 use crate::state::{ChatMeta, Repo, Section, State, TabId, Workspace, move_item, workspaces_dir};
 use crate::sync::{GitSync, SyncEvent};
 use crate::*;
 use gpui_kit::assets::IconName;
-use gpui_kit::base::{InteractiveElementExt as _, ResizeHandleRenderer, ResizeHandleState};
-use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
+use gpui_kit::base::InteractiveElementExt as _;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
 use gpui_kit::component::dialog::{Dialog, DialogEntrance};
 use gpui_kit::component::hover_card::HoverCard;
@@ -20,7 +18,7 @@ use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::link::Link;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{
-    ResizablePanelEvent, ResizableState, h_resizable, resizable_panel, resize_handle_appearance,
+    ResizablePanelEvent, ResizableState, h_resizable, resizable_panel,
 };
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::tooltip::Tooltip;
@@ -34,16 +32,13 @@ use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::Arc;
 
 mod app_switcher;
 mod chats;
-mod differ;
 mod differ_host;
 mod editor_pane;
 mod features;
 mod file_changes;
-mod git_feature;
 mod home;
 mod interaction;
 pub(crate) mod menus;
@@ -53,227 +48,18 @@ mod reorder;
 mod sidebar;
 mod storage;
 #[cfg(all(test, feature = "test-support"))]
-pub(crate) use differ::ui_tests;
+pub(crate) mod ui_tests;
 mod workspace;
 mod workspace_picker;
 
+use crate::features::{Feature, FeatureFocus, differ, git as git_feature};
+use crate::ui::*;
 use differ::Differ;
-use differ::diff::Viewed;
-use features::{Feature, FeatureFocus};
-use menus::{copy, on_shark, open_in_entries, tilde, ws_menu};
+use differ::Viewed;
+use menus::{on_shark, open_in_entries, tilde, ws_menu};
 use palette::menu_dialog;
 pub(crate) use palette::open_menu;
 use sidebar::{Naming, SideRow, move_submenu};
-
-/// Inter disambiguation (ss02 + cv05/cv08/zero): serifed I, tailed l, slashed 0 for paths and hashes.
-/// Dialogs render outside this view's tree, so they apply it again.
-pub(crate) fn inter_features() -> FontFeatures {
-    FontFeatures(Arc::new(
-        ["ss02", "cv05", "cv08", "zero"]
-            .map(|f| (f.to_string(), 1))
-            .to_vec(),
-    ))
-}
-
-/// Hint text below the muted level; gpui-kit has no token for it. Never use it for content.
-/// `docs/themes.py` checks the same blend against the contrast floor.
-pub(crate) fn faint(theme: &Theme) -> Hsla {
-    theme.muted_foreground.blend(theme.background.opacity(0.4))
-}
-
-pub(crate) fn notify_err(window: &mut Window, cx: &mut App, e: impl Into<SharedString>) {
-    window.push_notification(Notification::error(e), cx);
-}
-
-fn kbd(keys: &str) -> Kbd {
-    Kbd::new(Keystroke::parse(keys).unwrap())
-}
-
-/// A Danger-button alert; `ok` runs on the entity once confirmed.
-pub(crate) fn confirm<T: 'static>(
-    title: String,
-    description: &'static str,
-    ok_text: &'static str,
-    ok: impl Fn(&mut T, &mut Window, &mut Context<T>) + 'static,
-    window: &mut Window,
-    cx: &mut Context<T>,
-) {
-    let (target, ok) = (cx.entity().downgrade(), Rc::new(ok));
-    window.open_alert_dialog(cx, move |d, _, _| {
-        let (target, ok) = (target.clone(), ok.clone());
-        d.font_features(inter_features())
-            .entrance(DialogEntrance::None)
-            .title(title.clone())
-            .description(description)
-            .ok_text(ok_text)
-            .ok_variant(ButtonVariant::Danger)
-            .show_cancel(true)
-            .on_ok(move |_, window, cx| {
-                // Restore focus before the action can close or replace its original pane.
-                window.close_dialog(cx);
-                target.update(cx, |s, cx| ok(s, window, cx)).ok();
-                false
-            })
-    });
-}
-
-/// A side-pane row's hover, and the pill for its open or cursor row: `foreground` over the
-/// `sidebar` color. Light mode takes less, so muted and status text keep their floors on the pill;
-/// `docs/themes.py` checks the same blends.
-pub(crate) fn side_hover(theme: &Theme) -> Hsla {
-    theme
-        .foreground
-        .alpha(if theme.is_dark() { 0.07 } else { 0.03 })
-}
-
-pub(crate) fn side_on(theme: &Theme) -> Hsla {
-    theme
-        .foreground
-        .alpha(if theme.is_dark() { 0.11 } else { 0.05 })
-}
-
-/// A row in either side pane: 30px plus 2 below (a 32px pitch), its content 16px in from the
-/// pane edge. `cursor_row` (or the caller) adds the hover.
-fn side_row(theme: &Theme) -> Div {
-    h_flex()
-        .h(px(30.))
-        .flex_none()
-        .mx_2()
-        .mb_0p5()
-        .border_1()
-        .border_color(theme.transparent)
-        .px(px(7.))
-        .gap_2()
-        .rounded(theme.radius)
-        .text_sm()
-        .text_color(theme.muted_foreground)
-}
-
-/// A side pane's group header: "Workspaces", "Repos", "Files".
-fn side_header(theme: &Theme, label: &'static str) -> Div {
-    div()
-        .px_4()
-        .pt_4()
-        .pb_1()
-        .text_xs()
-        .font_weight(FontWeight::MEDIUM)
-        .text_color(theme.muted_foreground)
-        .child(label)
-}
-
-/// A side-pane row's state: the open item (`on`) gets the grey pill and `foreground`; the
-/// cursor gets the pill plus a `primary` ring, only while its pane has focus. Other rows hover.
-fn cursor_row<E: Styled + InteractiveElement>(
-    e: E,
-    on: bool,
-    cursor: bool,
-    focused: bool,
-    theme: &Theme,
-) -> E {
-    let (pill, hover) = (side_on(theme), side_hover(theme));
-    let e = if on {
-        e.text_color(theme.foreground)
-    } else {
-        e
-    };
-    match (on, cursor && focused) {
-        (_, true) => e.bg(pill).border_color(theme.primary),
-        (true, false) => e.bg(pill),
-        (false, false) => e.hover(move |d| d.bg(hover)),
-    }
-}
-
-/// `cursor_row` inside the island (the Home list): `list_hover`, and while the list has focus
-/// `list_active` plus a `primary` ring, since the tint alone is too subtle to find the cursor.
-fn list_cursor_row<E: Styled + InteractiveElement>(
-    e: E,
-    selected: bool,
-    focused: bool,
-    theme: &Theme,
-) -> E {
-    let e = (e.border_1())
-        .border_color(theme.transparent)
-        .hover(|d| d.bg(theme.list_hover));
-    match (selected, focused) {
-        (true, true) => e.bg(theme.list_active).border_color(theme.primary),
-        (true, false) => e.bg(theme.list_hover),
-        (false, _) => e,
-    }
-}
-
-/// A titlebar tab, raised above the window chrome.
-fn pill(id: impl Into<SharedString>, on: bool, theme: &Theme) -> Stateful<Div> {
-    h_flex()
-        .id(id.into())
-        .role(Role::Tab)
-        .aria_selected(on)
-        .h(px(28.))
-        .w(px(200.))
-        .min_w(px(100.))
-        .flex_shrink_1()
-        .relative()
-        .overflow_hidden()
-        .group("titlebar-tab")
-        .gap_1p5()
-        .rounded(theme.radius)
-        .text_sm()
-        .text_color(if on {
-            theme.foreground
-        } else {
-            theme.sidebar_foreground
-        })
-        .bg(if on {
-            theme.secondary
-        } else {
-            theme.background
-        })
-        .hover(|d| d.bg(theme.secondary_hover).text_color(theme.foreground))
-}
-
-/// Leave the left side selectable even when a tab is narrower than its close button.
-fn tab_close(button: Button, theme: &Theme) -> Div {
-    h_flex()
-        .absolute()
-        .top(px(2.))
-        .left(px(28.))
-        .right(px(2.))
-        .h(px(24.))
-        .justify_end()
-        .overflow_hidden()
-        .invisible()
-        .group_hover("titlebar-tab", |s| s.visible())
-        .child(
-            div()
-                .flex_none()
-                .bg(theme.secondary_hover)
-                .rounded(theme.radius)
-                .child(button),
-        )
-}
-
-/// An icon control in the window chrome.
-fn side_toggle(id: &'static str, icon: IconName, tip: &'static str) -> Button {
-    Button::new(id)
-        .ghost()
-        .icon(icon)
-        .w(px(32.))
-        .h(px(28.))
-        .accessibility_label(tip)
-        .tooltip(tip)
-}
-
-/// The overflow overlay follows the tab surface, including hover.
-fn tab_label(label: SharedString, on: bool, theme: &Theme) -> Div {
-    crate::overflow_fade::label(
-        label.replace(['\n', '\r'], " ").into(),
-        if on {
-            theme.secondary
-        } else {
-            theme.background
-        },
-        Some(("titlebar-tab", theme.secondary_hover)),
-    )
-}
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum Tab {
@@ -1258,14 +1044,4 @@ impl Render for Shark {
                 }
             })
     }
-}
-
-/// A side pane's drag edge: no hairline at rest, since the island's border already marks it;
-/// the usual line and pill while hovered or dragged.
-pub(super) fn quiet_edge() -> ResizeHandleRenderer {
-    let usual = resize_handle_appearance();
-    Rc::new(move |h, w, cx| match h.state() {
-        ResizeHandleState::Idle => Some(div().into_any_element()),
-        _ => usual(h, w, cx),
-    })
 }

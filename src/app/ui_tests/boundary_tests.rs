@@ -39,23 +39,26 @@ async fn stale_refresh_cannot_replace_newer_results_or_another_workspace(cx: &mu
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
             let differ = s.differ.clone();
-            let old = differ.read(cx).diff_gen;
+            let old = differ.read(cx).diff_gen();
             differ.update(cx, |d, cx| {
-                d.diff_gen += 1;
-                d.diff_loaded = false;
+                *d.diff_gen_mut() += 1;
+                *d.diff_loaded_mut() = false;
                 d.complete_refresh(&a.name, old, DiffData::load(&a, false), cx);
-                assert!(!d.diff_loaded, "older generation must not install a result");
-                d.complete_refresh(&a.name, d.diff_gen, DiffData::load(&a, false), cx);
-                assert!(d.diff_loaded);
+                assert!(
+                    !d.diff_loaded(),
+                    "older generation must not install a result"
+                );
+                d.complete_refresh(&a.name, d.diff_gen(), DiffData::load(&a, false), cx);
+                assert!(d.diff_loaded());
             });
             s.open_workspace_now(1, w, cx);
             assert_eq!(s.differ, differ, "Differ is retained across workspaces");
             differ.update(cx, |d, cx| {
                 // Even matching generation cannot admit another workspace's identical relative path.
-                d.complete_refresh(&a.name, d.diff_gen, DiffData::load(&a, false), cx);
-                assert!(!d.diff_loaded);
-                d.complete_refresh(&b.name, d.diff_gen, DiffData::load(&b, false), cx);
-                assert!(d.diff_loaded);
+                d.complete_refresh(&a.name, d.diff_gen(), DiffData::load(&a, false), cx);
+                assert!(!d.diff_loaded());
+                d.complete_refresh(&b.name, d.diff_gen(), DiffData::load(&b, false), cx);
+                assert!(d.diff_loaded());
                 assert_eq!(d.workspace_name(), Some(b.name.as_str()));
             });
         })
@@ -72,7 +75,7 @@ async fn discard_dialog_cannot_clear_a_replacement_buffer_with_the_same_path(
     let home = test_home();
     let (window, shark) = boot(cx, fixture(&home), WindowOptions::default());
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_loaded
+        shark.read(cx).differ.read(cx).diff_loaded()
     })
     .await;
     on_app(window, shark.clone())(cx, &|s, w, cx| {
@@ -84,7 +87,7 @@ async fn discard_dialog_cannot_clear_a_replacement_buffer_with_the_same_path(
         // Simulate a workspace replacement while the old confirmation is still open.
         s.open_workspace_now(1, w, cx);
         s.differ.update(cx, |d, cx| {
-            let ws = d.workspace.clone().unwrap();
+            let ws = d.workspace().clone().unwrap();
             d.apply_diff(DiffData::load(&ws, false), cx);
             d.begin_edit("api/shared.rs".into(), w, cx);
             d.paste_lines("unsaved B", w, cx);
@@ -99,7 +102,7 @@ async fn discard_dialog_cannot_clear_a_replacement_buffer_with_the_same_path(
         assert!(
             s.differ
                 .read(cx)
-                .editing
+                .editing()
                 .as_ref()
                 .unwrap()
                 .buf
@@ -123,7 +126,7 @@ async fn overwrite_dialog_cannot_save_another_workspace_same_relative_path(
     );
     let (window, shark) = boot(cx, state, WindowOptions::default());
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_loaded
+        shark.read(cx).differ.read(cx).diff_loaded()
     })
     .await;
     on_app(window, shark.clone())(cx, &|s, w, cx| {
@@ -140,7 +143,7 @@ async fn overwrite_dialog_cannot_save_another_workspace_same_relative_path(
     on_app(window, shark.clone())(cx, &|s, w, cx| {
         s.open_workspace_now(1, w, cx);
         s.differ.update(cx, |d, cx| {
-            let ws = d.workspace.clone().unwrap();
+            let ws = d.workspace().clone().unwrap();
             d.apply_diff(DiffData::load(&ws, false), cx);
             d.begin_edit("api/shared.rs".into(), w, cx);
             d.paste_lines("unsaved B", w, cx);
@@ -169,7 +172,7 @@ async fn stale_file_menu_cannot_act_on_another_workspace(cx: &mut TestAppContext
     let home = test_home();
     let (window, shark) = boot(cx, fixture(&home), WindowOptions::default());
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_loaded
+        shark.read(cx).differ.read(cx).diff_loaded()
     })
     .await;
     let action = shark.update(cx, |s, cx| {
@@ -185,14 +188,14 @@ async fn stale_file_menu_cannot_act_on_another_workspace(cx: &mut TestAppContext
     });
     on_app(window, shark.clone())(cx, &|s, w, cx| s.open_workspace_now(1, w, cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_loaded
+        shark.read(cx).differ.read(cx).diff_loaded()
     })
     .await;
     cx.update_window(window, |_, w, cx| action(w, cx)).unwrap();
     cx.update(|cx| {
         let s = shark.read(cx);
         assert!(s.active_ws().unwrap().viewed.is_empty());
-        assert!(s.differ.read(cx).viewed_now.is_empty());
+        assert!(s.differ.read(cx).viewed_now().is_empty());
     });
 }
 
@@ -205,7 +208,7 @@ async fn discard_revalidates_editors_that_changed_while_the_dialog_was_open(
     let home = test_home();
     let (window, shark) = boot(cx, fixture(&home), WindowOptions::default());
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_loaded
+        shark.read(cx).differ.read(cx).diff_loaded()
     })
     .await;
     on_app(window, shark.clone())(cx, &|s, w, cx| {
@@ -235,7 +238,7 @@ async fn deleted_diff_file_can_select_an_existing_editor(cx: &mut TestAppContext
     let home = test_home();
     let (window, shark) = boot(cx, fixture(&home), WindowOptions::default());
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).diff_loaded
+        shark.read(cx).differ.read(cx).diff_loaded()
     })
     .await;
     let deleted = || {
@@ -243,7 +246,7 @@ async fn deleted_diff_file_can_select_an_existing_editor(cx: &mut TestAppContext
     };
     on_app(window, shark.clone())(cx, &|s, w, cx| {
         s.differ.update(cx, |d, cx| {
-            d.diff_files = deleted();
+            *d.diff_files_mut() = deleted();
             d.open_file(0, w, cx);
         });
     });
@@ -252,7 +255,7 @@ async fn deleted_diff_file_can_select_an_existing_editor(cx: &mut TestAppContext
         s.open_path("api/shared.rs".into(), w, cx);
         s.show(Tab::Feature(Feature::Diff), w, cx);
         s.differ.update(cx, |d, cx| {
-            d.diff_files = deleted();
+            *d.diff_files_mut() = deleted();
             d.open_file(0, w, cx);
         });
     });

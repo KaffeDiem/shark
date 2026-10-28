@@ -1,12 +1,24 @@
 //! The Git artifact: GitHub conversations, with drafts pinned to their exact PR.
-use super::*;
 use crate::pr::git_feature as api;
+use crate::state::Workspace;
+use crate::ui::confirm;
+use crate::{
+    CancelEdit, PageDown, PageUp, SaveFile, SelectFirst, SelectLast, SelectNext, SelectPrev,
+};
+use gpui_kit::assets::IconName;
+use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::input::{Editor, EditorState, Textarea, TextareaState};
+use gpui_kit::component::input::{Input, InputEvent, InputState};
+use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::TextViewState;
+use gpui_kit::component::{ActiveTheme, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::component::{Disableable as _, Selectable as _};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
+use std::{collections::HashMap, path::PathBuf};
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 struct DescriptionDraft {
@@ -51,13 +63,13 @@ enum Row {
 }
 
 #[derive(Clone)]
-pub(super) enum GitFeatureEvent {
+pub(crate) enum GitFeatureEvent {
     OpenFile { repo: String, path: String },
 }
 
 impl EventEmitter<GitFeatureEvent> for GitFeature {}
 
-pub(super) struct GitFeature {
+pub(crate) struct GitFeature {
     workspace: Workspace,
     selected: usize,
     details: Option<api::Details>,
@@ -89,7 +101,7 @@ pub(super) struct GitFeature {
 }
 
 impl GitFeature {
-    pub(super) fn new(workspace: Workspace, _: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(workspace: Workspace, _: &mut Window, cx: &mut Context<Self>) -> Self {
         let (drafts, save_error, store_blocked) = match std::fs::read(store_path(&workspace.name)) {
             Ok(bytes) => match serde_json::from_slice(&bytes) {
                 Ok(drafts) => (drafts, None, false),
@@ -140,7 +152,7 @@ impl GitFeature {
         }
     }
 
-    pub(super) fn set_workspace(
+    pub(crate) fn set_workspace(
         &mut self,
         workspace: Workspace,
         window: &mut Window,
@@ -163,7 +175,7 @@ impl GitFeature {
         }
     }
 
-    pub(super) fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.focus.focus(window, cx);
         if !self.loaded
             || self
@@ -174,21 +186,21 @@ impl GitFeature {
         }
     }
 
-    pub(super) fn has_focus(&self, window: &Window, cx: &App) -> bool {
+    pub(crate) fn has_focus(&self, window: &Window, cx: &App) -> bool {
         self.focus.contains_focused(window, cx)
     }
 
-    pub(super) fn storage_error(&self) -> Option<&str> {
+    pub(crate) fn storage_error(&self) -> Option<&str> {
         self.save_error.as_deref()
     }
 
-    pub(super) fn set_archiving(&mut self, archiving: bool, cx: &mut Context<Self>) {
+    pub(crate) fn set_archiving(&mut self, archiving: bool, cx: &mut Context<Self>) {
         self.archiving = archiving;
         cx.notify();
     }
 
     #[cfg(test)]
-    pub(super) fn inspect(&self) -> TestState<'_> {
+    pub(crate) fn inspect(&self) -> TestState<'_> {
         TestState {
             selected: self.selected,
             details: &self.details,
@@ -200,7 +212,7 @@ impl GitFeature {
     }
 
     #[cfg(test)]
-    pub(super) fn inject_load_state(
+    pub(crate) fn inject_load_state(
         &mut self,
         loading: bool,
         clear: bool,
@@ -215,7 +227,7 @@ impl GitFeature {
         cx.notify();
     }
 
-    pub(super) fn busy(&self) -> bool {
+    pub(crate) fn busy(&self) -> bool {
         self.posting
     }
 
@@ -231,7 +243,7 @@ impl GitFeature {
         cx.notify();
     }
 
-    pub(super) fn select_repo(
+    pub(crate) fn select_repo(
         &mut self,
         index: usize,
         window: &mut Window,
@@ -245,7 +257,7 @@ impl GitFeature {
         self.refresh(window, cx);
     }
 
-    pub(super) fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.loading || self.posting || self.archiving {
             return;
         }
@@ -347,19 +359,19 @@ impl GitFeature {
         }
     }
 
-    pub(super) fn start_description(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn start_description(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.details.as_ref().is_some_and(|d| d.can_update) {
             self.start_editor(Editing::Description, window, cx);
         }
     }
 
-    pub(super) fn start_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn start_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.details.as_ref().is_some_and(|d| d.can_comment) {
             self.start_editor(Editing::Comment, window, cx);
         }
     }
 
-    pub(super) fn start_reply(
+    pub(crate) fn start_reply(
         &mut self,
         thread: &str,
         window: &mut Window,
@@ -523,11 +535,11 @@ impl GitFeature {
         }));
     }
 
-    pub(super) fn saving_drafts(&self) -> bool {
+    pub(crate) fn saving_drafts(&self) -> bool {
         self.save_task.is_some()
     }
 
-    pub(super) fn retry_save(&mut self, cx: &mut Context<Self>) {
+    pub(crate) fn retry_save(&mut self, cx: &mut Context<Self>) {
         self.capture_draft(cx);
         self.schedule_save(cx);
         cx.notify();
@@ -647,7 +659,7 @@ impl GitFeature {
         );
     }
 
-    pub(super) fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.full_text.is_some() {
             return;
         }
@@ -730,7 +742,7 @@ impl GitFeature {
         .detach();
     }
 
-    pub(super) fn resolve(
+    pub(crate) fn resolve(
         &mut self,
         id: &str,
         resolved: bool,
@@ -1276,17 +1288,17 @@ impl GitFeature {
     }
 
     #[cfg(test)]
-    pub(super) fn delay_next_save(&mut self, delay: Duration) {
+    pub(crate) fn delay_next_save(&mut self, delay: Duration) {
         self.save_delay = delay;
     }
 
     #[cfg(test)]
-    pub(super) fn save_started(&self) -> u64 {
+    pub(crate) fn save_started(&self) -> u64 {
         self.save_started
     }
 
     #[cfg(test)]
-    pub(super) fn inject_details(&mut self, details: api::Details, cx: &mut Context<Self>) {
+    pub(crate) fn inject_details(&mut self, details: api::Details, cx: &mut Context<Self>) {
         self.generation += 1;
         self.loading = false;
         self.loaded = true;
@@ -1297,7 +1309,7 @@ impl GitFeature {
     }
 
     #[cfg(test)]
-    pub(super) fn full_text_len(&self, cx: &App) -> usize {
+    pub(crate) fn full_text_len(&self, cx: &App) -> usize {
         self.full_text
             .as_ref()
             .map(|input| input.read(cx).value().len())
@@ -1305,12 +1317,12 @@ impl GitFeature {
     }
 
     #[cfg(test)]
-    pub(super) fn scroll_offset(&self) -> ListOffset {
+    pub(crate) fn scroll_offset(&self) -> ListOffset {
         self.list.logical_scroll_top()
     }
 
     #[cfg(test)]
-    pub(super) fn markdown_text_len(&self, key: &str, cx: &App) -> usize {
+    pub(crate) fn markdown_text_len(&self, key: &str, cx: &App) -> usize {
         self.markdown
             .get(key)
             .map(|m| m.read(cx).rendered_text().as_str().len())
@@ -1318,7 +1330,7 @@ impl GitFeature {
     }
 
     #[cfg(test)]
-    pub(super) fn scroll_row(&mut self, index: usize, cx: &mut Context<Self>) {
+    pub(crate) fn scroll_row(&mut self, index: usize, cx: &mut Context<Self>) {
         self.list.scroll_to(ListOffset {
             item_ix: index,
             offset_in_item: px(0.),
@@ -1327,7 +1339,7 @@ impl GitFeature {
     }
 
     #[cfg(test)]
-    pub(super) fn draft_text(&self, cx: &App) -> Option<String> {
+    pub(crate) fn draft_text(&self, cx: &App) -> Option<String> {
         self.composer
             .as_ref()
             .map(|c| c.body.read(cx).value().to_string())
@@ -1808,7 +1820,7 @@ mod tests {
 }
 
 #[cfg(test)]
-pub(super) struct TestState<'a> {
+pub(crate) struct TestState<'a> {
     pub selected: usize,
     pub details: &'a Option<api::Details>,
     pub loading: bool,
