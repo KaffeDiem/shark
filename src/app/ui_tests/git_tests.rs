@@ -613,6 +613,93 @@ async fn git_feature_large_review_virtualizes_and_releases(cx: &mut TestAppConte
     );
 }
 
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_feature_loading_empty_and_retry_states(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let state = fixture(&home);
+    let mut empty_workspace = state.workspaces[0].clone();
+    empty_workspace.repos.clear();
+    let (_gh, dir) = fake_github(&home, &state, 1);
+    fs::write(dir.join("git-fail"), "offline").unwrap();
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    let feature = cx
+        .update_window(window, |_, w, cx| {
+            w.press("cmd-shift-g", cx);
+            let feature = shark.read(cx).active_git_feature().unwrap().clone();
+            w.render_frame(cx);
+            assert!(feature.read(cx).loading);
+            assert!(w.find("git-loading").visible());
+            assert!(w.try_find("git-empty-pr").is_none());
+            feature
+        })
+        .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        !feature.read(cx).loading && feature.read(cx).error.is_some()
+    })
+    .await;
+    fs::remove_file(dir.join("git-fail")).unwrap();
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.find("git-load-error").visible());
+        assert_eq!(
+            w.find_all("git-error").len(),
+            1,
+            "one readable error, not duplicate banners"
+        );
+        w.click("git-state-retry", cx);
+        w.render_frame(cx);
+        assert!(feature.read(cx).loading);
+        assert!(w.find("git-loading").visible());
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        feature.read(cx).details.is_some() && !feature.read(cx).loading
+    })
+    .await;
+    let details = cx.update(|cx| feature.read(cx).details.as_ref().unwrap().clone());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.find("git-overview").visible());
+        assert!(w.try_find("git-load-error").is_none());
+        feature.update(cx, |f, cx| {
+            f.details = None;
+            cx.notify();
+        });
+        w.render_frame(cx);
+        assert!(w.find("git-empty-pr").visible());
+        assert!(w.find("git-state-retry").visible());
+        let mut empty = details.clone();
+        empty.body = " \n ".into();
+        empty.comments.clear();
+        empty.reviews.clear();
+        empty.threads.clear();
+        feature.update(cx, |f, cx| f.inject_details(empty.clone(), cx));
+        w.render_frame(cx);
+        assert!(w.find("git-empty-description").visible());
+        assert!(w.find("git-empty-activity").visible());
+        empty.threads = details.threads.clone();
+        for thread in &mut empty.threads {
+            thread.resolved = true;
+        }
+        feature.update(cx, |f, cx| f.inject_details(empty, cx));
+        w.render_frame(cx);
+        assert!(w.find("git-resolved-threads").visible());
+        assert!(w.try_find("git-empty-activity").is_none());
+        w.click("git-resolved-show", cx);
+        w.render_frame(cx);
+        assert!(w.try_find("git-resolved-threads").is_none());
+        assert!(w.find(("git-thread-path", 0usize)).visible());
+        feature.update(cx, |f, cx| f.set_workspace(empty_workspace, w, cx));
+        w.render_frame(cx);
+        assert!(w.find("git-empty-repositories").visible());
+        assert!(w.try_find("git-state-retry").is_none());
+    })
+    .unwrap();
+    assert!(!dir.join("git-writes.jsonl").exists());
+}
+
 /// Real Metal rendering of the complete Git artifact, including a draft composer.
 pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -621,7 +708,17 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     let (_gh, dir) = fake_github(&home, &fixture, 2);
     let target =
         crate::pr::git_feature::Target::from_url("https://github.com/acme/api/pull/7").unwrap();
-    let details = crate::pr::git_feature::load(&dir, &target).unwrap();
+    let mut details = crate::pr::git_feature::load(&dir, &target).unwrap();
+    details.title =
+        "Keep sign-in sessions reliable when reconnecting after a network interruption".into();
+    details.reviews.push(crate::pr::git_feature::Review {
+        comment: crate::pr::git_feature::Comment {
+            id: "review-1".into(),
+            body: "The reconnect flow reads well. Please keep the retry policy close to the session code.\n\n- Preserve the existing session\n- Back off after a failed reconnect".into(),
+            ..details.comments[0].clone()
+        },
+        state: "CHANGES_REQUESTED".into(),
+    });
     for width in [800., 1440.] {
         for (mode, label) in [
             (crate::state::Mode::Dark, "dark"),
@@ -695,7 +792,19 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 && element.bounds().right() <= feature.right()
                         );
                     }
+                    let overview = w.find("git-overview").bounds();
+                    assert!(overview.size.width <= px(680.));
+                    assert!((overview.center().x - feature.center().x).abs() <= px(1.));
+                    let title = w.find("git-pr-title").bounds();
+                    assert!(
+                        title.size.height > px(30.),
+                        "long title must wrap, not truncate"
+                    );
+                    assert!(title.right() <= overview.right());
                     if editing {
+                        let composer = w.find("git-composer").bounds();
+                        assert_eq!(composer.left(), overview.left());
+                        assert_eq!(composer.size.width, overview.size.width);
                         for id in [
                             "git-editor-title",
                             "git-editor-body",
@@ -727,6 +836,33 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             cx.update_window(window, |_, w, cx| {
                 w.click("git-editor-cancel", cx);
                 let feature = shark.read(cx).active_git_feature().unwrap().clone();
+                feature.update(cx, |f, cx| f.scroll_row(3, cx));
+                w.render_frame(cx);
+                assert!(
+                    w.try_find("git-pr-title")
+                        .is_none_or(|title| !title.visible()),
+                    "overview scrolls with the conversation"
+                );
+                assert!(
+                    w.find("git-comment-new").visible(),
+                    "comment action remains available while reading"
+                );
+            })
+            .unwrap();
+            let activity = cx
+                .capture_screenshot(window)
+                .expect("Git activity Metal render");
+            if let Some(output) = std::env::var_os("SHARK_RENDER_DIR") {
+                activity
+                    .save(
+                        PathBuf::from(output)
+                            .join(format!("git-activity-{label}-{}.png", width as usize)),
+                    )
+                    .unwrap();
+            }
+            cx.update_window(window, |_, w, cx| {
+                let feature = shark.read(cx).active_git_feature().unwrap().clone();
+                feature.update(cx, |f, cx| f.scroll_row(0, cx));
                 let mut long = details.clone();
                 long.body = "Full Markdown source remains selectable and searchable. ".repeat(1300);
                 long.body.truncate(65_000);
@@ -757,12 +893,87 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     )
                     .unwrap();
             }
+            for (state, expected) in [
+                ("loading", "git-loading"),
+                ("no-pr", "git-empty-pr"),
+                ("error", "git-load-error"),
+                ("refreshing", "git-overview"),
+                ("stale", "git-error"),
+                ("empty", "git-empty-activity"),
+                ("resolved", "git-resolved-threads"),
+                ("no-repositories", "git-empty-repositories"),
+            ] {
+                cx.update_window(window, |_, w, cx| {
+                    let feature = shark.read(cx).active_git_feature().unwrap().clone();
+                    feature.update(cx, |f, cx| {
+                        let mut sample = details.clone();
+                        if matches!(state, "empty" | "resolved") {
+                            sample.body.clear();
+                            sample.comments.clear();
+                            sample.reviews.clear();
+                            if state == "empty" {
+                                sample.threads.clear();
+                            } else {
+                                for thread in &mut sample.threads {
+                                    thread.resolved = true;
+                                }
+                            }
+                        }
+                        f.inject_details(sample, cx);
+                        f.scroll_row(0, cx);
+                        f.error = None;
+                        if matches!(state, "loading" | "no-pr" | "error") {
+                            f.details = None;
+                        }
+                        f.loading = matches!(state, "loading" | "refreshing");
+                        if matches!(state, "error" | "stale") {
+                            f.error = Some("GitHub could not load this pull request because the request timed out. Check your connection and GitHub authentication, then retry. Your saved drafts are still available in this workspace.".into());
+                        }
+                        if state == "no-repositories" {
+                            let mut workspace = fixture.workspaces[0].clone();
+                            workspace.repos.clear();
+                            f.set_workspace(workspace, w, cx);
+                        }
+                        cx.notify();
+                    });
+                    w.render_frame(cx);
+                    let panel = w.find("git-feature").bounds();
+                    let content = w.find(expected);
+                    assert!(content.visible(), "{label}/{width}/{state}: missing {expected}");
+                    let bounds = content.bounds();
+                    assert!(bounds.left() >= panel.left() && bounds.right() <= panel.right(), "{state}: content escapes the pane horizontally");
+                    assert!(bounds.bottom() <= panel.bottom(), "{state}: state content is clipped");
+                    if matches!(state, "no-pr" | "error") {
+                        let retry = w.find("git-state-retry");
+                        assert!(retry.visible());
+                        assert!(retry.bounds().bottom() <= panel.bottom());
+                    }
+                    if matches!(state, "refreshing" | "stale") {
+                        assert!(w.find("git-overview").visible());
+                        assert!(w.try_find("git-loading").is_none());
+                    }
+                    if state == "empty" {
+                        assert!(w.find("git-empty-description").visible());
+                    }
+                }).unwrap();
+                let screenshot = cx
+                    .capture_screenshot(window)
+                    .expect("Git state Metal render");
+                if let Some(output) = std::env::var_os("SHARK_RENDER_DIR") {
+                    screenshot
+                        .save(
+                            PathBuf::from(output)
+                                .join(format!("git-state-{state}-{label}-{}.png", width as usize)),
+                        )
+                        .unwrap();
+                }
+            }
             cx.update_window(window, |_, w, _| w.remove_window())
                 .unwrap();
         }
     }
     println!(
-        "Git artifact: real Metal, dark/light, 800/1440px, description composer and full Markdown viewer passed"
+        "Git artifact: real Metal, dark/light, 800/1440px, composer, full Markdown and loading/empty/error states passed"
     );
 }
 
@@ -927,6 +1138,15 @@ async fn git_feature_repository_drafts_and_offline_refresh_are_isolated(cx: &mut
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.click("git-refresh", cx);
+        w.render_frame(cx);
+        assert!(
+            w.find("git-overview").visible(),
+            "refresh retains the reading view"
+        );
+        assert!(
+            w.try_find("git-loading").is_none(),
+            "cached refresh does not replace content with a loading panel"
+        );
     })
     .unwrap();
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
@@ -939,6 +1159,13 @@ async fn git_feature_repository_drafts_and_offline_refresh_are_isolated(cx: &mut
         assert_eq!(f.details.as_ref().unwrap().target.number, 7);
         assert_eq!(f.draft_text(cx).as_deref(), Some("API draft"));
     });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.find("git-error").visible());
+        assert!(w.find("git-overview").visible());
+        assert!(w.try_find("git-load-error").is_none());
+    })
+    .unwrap();
     assert!(!dir.join("git-writes.jsonl").exists());
     assert!(!web.join("git-writes.jsonl").exists());
     fs::remove_file(dir.join("git-fail")).unwrap();
@@ -1107,6 +1334,17 @@ async fn git_feature_first_open_during_archive_cannot_load_or_post(cx: &mut Test
             assert!(f.draft_text(cx).is_none());
         });
     });
+    cx.update_window(window, |_, w, cx| {
+        let feature = shark.read(cx).active_git_feature().unwrap().clone();
+        w.render_frame(cx);
+        assert!(w.find("git-unloaded").visible());
+        w.click("git-state-retry", cx);
+        assert!(
+            !feature.read(cx).loading,
+            "archiving keeps the load action disabled"
+        );
+    })
+    .unwrap();
     assert!(!dir.join("git-writes.jsonl").exists());
 }
 

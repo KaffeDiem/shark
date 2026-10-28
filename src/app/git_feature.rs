@@ -42,6 +42,8 @@ struct Composer {
 #[derive(Clone)]
 enum Row {
     Description,
+    EmptyActivity,
+    ResolvedThreads,
     Heading(&'static str),
     Comment(usize),
     Review(usize),
@@ -272,8 +274,14 @@ impl GitFeature {
                 self.rows.push(Row::Heading("Reviews"));
             }
             self.rows.extend((0..d.reviews.len()).map(Row::Review));
+            if d.comments.is_empty() && d.reviews.is_empty() && d.threads.is_empty() {
+                self.rows.push(Row::EmptyActivity);
+            }
             if !d.threads.is_empty() {
                 self.rows.push(Row::Heading("Review threads"));
+                if !self.show_resolved && d.threads.iter().all(|t| t.resolved) {
+                    self.rows.push(Row::ResolvedThreads);
+                }
             }
             for (i, t) in d
                 .threads
@@ -747,7 +755,160 @@ impl GitFeature {
             .into_any_element()
     }
 
-    fn render_row(&mut self, index: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+    fn overview(&self, cx: &mut Context<Self>) -> AnyElement {
+        let d = self.details.as_ref().unwrap();
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let disabled = self.posting || self.archiving;
+        let url = d.url.clone();
+        let draft = self.drafts.get(&d.target.url());
+        let resume_description = draft
+            .and_then(|draft| draft.description.as_ref())
+            .is_some_and(|draft| !draft.title.is_empty() || !draft.body.is_empty());
+        v_flex()
+            .id("git-overview")
+            .test_support()
+            .gap_3()
+            .pt_4()
+            .pb_6()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(format!("Pull request #{}", d.target.number))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("git-open-pr")
+                            .label("Open in GitHub")
+                            .icon(IconName::ExternalLink)
+                            .ghost()
+                            .xsmall()
+                            .on_click(move |_, _, cx| cx.open_url(&url)),
+                    ),
+            )
+            .child(
+                div()
+                    .id("git-pr-title")
+                    .test_support()
+                    .text_size(px(24.))
+                    .line_height(relative(1.25))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(d.title.clone()),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .text_sm()
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .px_2()
+                            .py_0p5()
+                            .rounded(theme.radius)
+                            .bg(theme.secondary)
+                            .text_color(match d.state.as_str() {
+                                "OPEN" if !d.draft => theme.success_foreground,
+                                "MERGED" => theme.primary,
+                                _ => muted,
+                            })
+                            .child(
+                                Icon::new(match d.state.as_str() {
+                                    "MERGED" => IconName::GitMerge,
+                                    "CLOSED" => IconName::GitPullRequestClosed,
+                                    _ if d.draft => IconName::GitPullRequestDraft,
+                                    _ => IconName::GitPullRequest,
+                                })
+                                .with_size(px(14.)),
+                            )
+                            .child(state_label(&d.state).to_string()),
+                    )
+                    .when(d.draft, |r| r.child(div().text_color(muted).child("Draft")))
+                    .child(div().text_color(muted).child(format!("by @{}", d.author))),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .text_xs()
+                    .text_color(muted)
+                    .child(
+                        Icon::new(IconName::GitBranch)
+                            .with_size(px(14.))
+                            .flex_none(),
+                    )
+                    .child(
+                        div()
+                            .min_w_0()
+                            .font_family(theme.mono_font_family.clone())
+                            .child(format!("{} ← {}", d.base, d.head)),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .when(d.can_update, |r| {
+                        r.child(
+                            Button::new("git-description-edit")
+                                .icon(IconName::Pencil)
+                                .label(if resume_description {
+                                    "Resume description"
+                                } else {
+                                    "Edit description"
+                                })
+                                .small()
+                                .ghost()
+                                .disabled(disabled)
+                                .on_click(cx.listener(|s, _, w, cx| s.start_description(w, cx))),
+                        )
+                    })
+                    .when(d.threads.iter().any(|t| t.resolved), |r| {
+                        r.child(
+                            Button::new("git-show-resolved")
+                                .label(if self.show_resolved {
+                                    "Hide resolved"
+                                } else {
+                                    "Show resolved"
+                                })
+                                .small()
+                                .ghost()
+                                .on_click(cx.listener(|s, _, _, cx| {
+                                    s.show_resolved = !s.show_resolved;
+                                    s.rebuild_rows();
+                                    cx.notify();
+                                })),
+                        )
+                    }),
+            )
+            .into_any_element()
+    }
+
+    fn render_row(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .w_full()
+            .px_4()
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(680.))
+                    .mx_auto()
+                    .child(self.render_row_content(index, window, cx)),
+            )
+            .into_any_element()
+    }
+
+    fn render_row_content(
+        &mut self,
+        index: usize,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let Some(row) = self.rows.get(index).cloned() else {
             return div().into_any_element();
         };
@@ -760,29 +921,90 @@ impl GitFeature {
             .id(("git-row", index))
             .test_support()
             .group("git-row")
-            .px_4()
-            .py_2()
+            .w_full()
+            .min_w_0()
+            .py_3()
             .gap_2()
-            .text_sm()
+            .text_size(px(14.))
             .line_height(relative(1.5));
         let comment = match row {
             Row::Description => {
-                let body = if details.body.is_empty() {
-                    "No description."
-                } else {
-                    &details.body
-                }
-                .to_string();
+                let body = details.body.clone();
+                let empty = body.trim().is_empty();
                 return base
-                    .child(self.body_view("description".into(), body, cx))
+                    .child(self.overview(cx))
+                    .child(div().text_xs().text_color(muted).child("Description"))
+                    .child(if empty {
+                        div()
+                            .id("git-empty-description")
+                            .test_support()
+                            .text_color(muted)
+                            .child("No description added yet.")
+                            .into_any_element()
+                    } else {
+                        self.body_view("description".into(), body, cx)
+                    })
+                    .into_any_element();
+            }
+            Row::EmptyActivity | Row::ResolvedThreads => {
+                let resolved = matches!(row, Row::ResolvedThreads);
+                return base
+                    .id(if resolved {
+                        "git-resolved-threads"
+                    } else {
+                        "git-empty-activity"
+                    })
+                    .test_support()
+                    .py_6()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(
+                                Icon::new(if resolved {
+                                    IconName::CircleCheck
+                                } else {
+                                    IconName::MessageSquare
+                                })
+                                .with_size(px(16.))
+                                .text_color(muted),
+                            )
+                            .child(if resolved {
+                                "All review threads resolved"
+                            } else {
+                                "No activity yet"
+                            }),
+                    )
+                    .child(div().text_sm().text_color(muted).child(if resolved {
+                        "Show resolved threads to revisit earlier discussions."
+                    } else if details.can_comment {
+                        "Start the conversation with Add comment."
+                    } else {
+                        "Comments and reviews will appear here."
+                    }))
+                    .when(resolved, |d| {
+                        d.child(
+                            h_flex().child(
+                                Button::new("git-resolved-show")
+                                    .label("Show resolved")
+                                    .small()
+                                    .ghost()
+                                    .on_click(cx.listener(|s, _, _, cx| {
+                                        s.show_resolved = true;
+                                        s.rebuild_rows();
+                                        cx.notify();
+                                    })),
+                            ),
+                        )
+                    })
                     .into_any_element();
             }
             Row::Heading(label) => {
                 return base
-                    .pt_4()
-                    .border_b_1()
-                    .border_color(border)
-                    .font_weight(FontWeight::SEMIBOLD)
+                    .pt_6()
+                    .pb_2()
+                    .text_xs()
+                    .text_color(muted)
+                    .font_weight(FontWeight::MEDIUM)
                     .child(label)
                     .into_any_element();
             }
@@ -814,7 +1036,12 @@ impl GitFeature {
                     }
                 );
                 return base
-                    .pt_4()
+                    .mt_3()
+                    .px_3()
+                    .bg(cx.theme().secondary)
+                    .rounded_t(cx.theme().radius_lg)
+                    .border_1()
+                    .border_color(border)
                     .child(
                         h_flex()
                             .gap_2()
@@ -822,7 +1049,10 @@ impl GitFeature {
                             .child(
                                 Button::new(("git-thread-path", i))
                                     .tooltip(format!("Show file in workspace: {place}"))
-                                    .label(place)
+                                    .accessibility_label(place.clone())
+                                    .icon(IconName::FileCode)
+                                    .child(div().flex_1().min_w_0().truncate().child(place))
+                                    .px_0()
                                     .flex_1()
                                     .min_w_0()
                                     .ghost()
@@ -841,6 +1071,8 @@ impl GitFeature {
                                         t.id
                                     )))
                                     .label(if resume { "Resume reply" } else { "Reply" })
+                                    .icon(IconName::Reply)
+                                    .ghost()
                                     .small()
                                     .disabled(self.posting || self.archiving)
                                     .on_click(
@@ -861,6 +1093,12 @@ impl GitFeature {
                                             t.id
                                         )))
                                         .label(if resolved { "Reopen" } else { "Resolve" })
+                                        .icon(if resolved {
+                                            IconName::RotateCcw
+                                        } else {
+                                            IconName::Check
+                                        })
+                                        .ghost()
                                         .small()
                                         .disabled(self.posting || self.loading || self.archiving)
                                         .on_click(
@@ -878,23 +1116,76 @@ impl GitFeature {
         let (c, state) = comment;
         let body_view = self.body_view(c.id.clone(), c.body.clone(), cx);
         let url = c.url.clone();
-        base.child(
+        base.when(matches!(row, Row::Reply(..)), |d| {
+            d.px_3()
+                .border_l_1()
+                .border_r_1()
+                .border_b_1()
+                .border_color(border)
+                .bg(cx.theme().secondary)
+                .when(matches!(row, Row::Reply(i, j) if j + 1 == self.details.as_ref().unwrap().threads[i].comments.len()), |d| {
+                    d.rounded_b(cx.theme().radius_lg)
+                })
+        })
+        .when(matches!(row, Row::Review(..)), |d| {
+            d.p_3()
+                .mt_2()
+                .rounded(cx.theme().radius_lg)
+                .border_1()
+                .border_color(border)
+                .bg(cx.theme().secondary)
+        })
+        .child(
             h_flex()
                 .gap_2()
-                .flex_wrap()
+                .items_start()
                 .text_xs()
                 .text_color(muted)
-                .child(if c.author.is_empty() {
-                    "Deleted user".to_string()
-                } else {
-                    format!("@{}", c.author)
+                .child(
+                    h_flex().flex_1().min_w_0().gap_2().flex_wrap()
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(cx.theme().foreground)
+                        .child(if c.author.is_empty() {
+                            "Deleted user".to_string()
+                        } else {
+                            format!("@{}", c.author)
+                        }),
+                )
+                .when_some(state, |d, state| {
+                    d.child(
+                        h_flex()
+                            .gap_1()
+                            .px_2()
+                            .rounded(cx.theme().radius)
+                            .bg(cx.theme().muted)
+                            .text_color(match state.as_str() {
+                                "APPROVED" => cx.theme().success_foreground,
+                                "CHANGES_REQUESTED" => cx.theme().warning_foreground,
+                                _ => muted,
+                            })
+                            .child(
+                                Icon::new(match state.as_str() {
+                                    "APPROVED" => IconName::CircleCheck,
+                                    "CHANGES_REQUESTED" => IconName::CircleAlert,
+                                    "PENDING" => IconName::Clock,
+                                    "DISMISSED" => IconName::CircleMinus,
+                                    _ => IconName::MessageSquare,
+                                })
+                                .with_size(px(12.)),
+                            )
+                            .child(state_label(&state).to_string()),
+                    )
                 })
-                .when_some(state, |d, state| d.child(state_label(&state).to_string()))
-                .child(c.created_at)
+                .child(c.created_at.replace('T', " · ").replace('Z', " UTC"))
+                )
                 .when(!url.is_empty(), |d| {
                     d.child(
                         Button::new(("git-comment-link", index))
                             .label("GitHub")
+                            .icon(IconName::ExternalLink)
                             .ghost()
                             .xsmall()
                             .on_click(move |_, _, cx| cx.open_url(&url)),
@@ -993,7 +1284,9 @@ impl Render for GitFeature {
         let theme = cx.theme();
         let (border, muted) = (theme.border, theme.muted_foreground);
         let disabled = self.posting || self.archiving;
+        let repo = self.workspace.repos.get(self.selected);
         let toolbar = h_flex()
+            .flex_none()
             .gap_2()
             .px_4()
             .py_2()
@@ -1010,118 +1303,80 @@ impl Render for GitFeature {
                     .on_click(cx.listener(move |s, _, w, cx| s.select_repo(i, w, cx)))
             }))
             .child(div().flex_1())
+            .when_some(self.details.as_ref(), |r, d| {
+                let resume_comment = self
+                    .drafts
+                    .get(&d.target.url())
+                    .is_some_and(|draft| !draft.note.is_empty());
+                r.when(d.can_comment, |r| {
+                    r.child(
+                        Button::new("git-comment-new")
+                            .icon(IconName::MessageSquare)
+                            .label(if resume_comment {
+                                "Resume comment"
+                            } else {
+                                "Add comment"
+                            })
+                            .small()
+                            .ghost()
+                            .disabled(disabled)
+                            .on_click(cx.listener(|s, _, w, cx| s.start_comment(w, cx))),
+                    )
+                })
+            })
             .child(
                 Button::new("git-refresh")
+                    .icon(IconName::RefreshCw)
+                    .loading(self.loading)
                     .label(if self.loading {
                         "Refreshing…"
                     } else {
                         "Refresh"
                     })
                     .small()
-                    .disabled(disabled || self.loading)
+                    .ghost()
+                    .disabled(disabled || self.loading || repo.is_none())
                     .on_click(cx.listener(|s, _, w, cx| s.refresh(w, cx))),
             );
-        let overview = self.details.as_ref().map(|d| {
-            let url = d.url.clone();
-            let draft = self.drafts.get(&d.target.url());
-            let resume_description = draft
-                .and_then(|draft| draft.description.as_ref())
-                .is_some_and(|draft| !draft.title.is_empty() || !draft.body.is_empty());
-            let resume_comment = draft.is_some_and(|draft| !draft.note.is_empty());
-            let title = format!("#{} {}", d.target.number, d.title);
-            let full_title = title.clone();
-            v_flex()
-                .px_4()
-                .py_3()
-                .gap_2()
-                .border_b_1()
-                .border_color(border)
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .items_start()
-                        .child(
-                            div()
-                                .id("git-pr-title")
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .tooltip(move |w, cx| Tooltip::new(full_title.clone()).build(w, cx))
-                                .text_lg()
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .child(title),
-                        )
-                        .child(
-                            Button::new("git-open-pr")
-                                .label("Open in GitHub")
-                                .small()
-                                .on_click(move |_, _, cx| cx.open_url(&url)),
-                        ),
-                )
-                .child(div().text_xs().text_color(muted).child(format!(
-                    "{}{} · @{} · {} ← {}",
-                    state_label(&d.state),
-                    if d.draft { " · Draft" } else { "" },
-                    d.author,
-                    d.base,
-                    d.head
-                )))
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .flex_wrap()
-                        .when(d.can_update, |r| {
-                            r.child(
-                                Button::new("git-description-edit")
-                                    .label(if resume_description {
-                                        "Resume description"
-                                    } else {
-                                        "Edit description"
-                                    })
-                                    .small()
-                                    .disabled(disabled)
-                                    .on_click(
-                                        cx.listener(|s, _, w, cx| s.start_description(w, cx)),
-                                    ),
-                            )
-                        })
-                        .when(d.can_comment, |r| {
-                            r.child(
-                                Button::new("git-comment-new")
-                                    .label(if resume_comment {
-                                        "Resume comment"
-                                    } else {
-                                        "Add comment"
-                                    })
-                                    .small()
-                                    .disabled(disabled)
-                                    .on_click(cx.listener(|s, _, w, cx| s.start_comment(w, cx))),
-                            )
-                        })
-                        .when(d.threads.iter().any(|t| t.resolved), |r| {
-                            r.child(
-                                Button::new("git-show-resolved")
-                                    .label(if self.show_resolved {
-                                        "Hide resolved"
-                                    } else {
-                                        "Show resolved"
-                                    })
-                                    .small()
-                                    .on_click(cx.listener(|s, _, _, cx| {
-                                        s.show_resolved = !s.show_resolved;
-                                        s.rebuild_rows();
-                                        cx.notify();
-                                    })),
-                            )
-                        }),
-                )
-        });
-        let empty = if self.loading {
-            "Loading pull request…"
+        let (state_id, state_title, state_detail, state_icon) = if repo.is_none() {
+            (
+                "git-empty-repositories",
+                "No repositories in this workspace",
+                "Add a repository to the workspace to view its pull request.",
+                IconName::FolderGit2,
+            )
+        } else if self.loading {
+            (
+                "git-loading",
+                "Loading pull request…",
+                "Fetching the description and review activity from GitHub.",
+                IconName::GitPullRequest,
+            )
         } else if self.error.is_some() {
-            "Pull request unavailable. Refresh to retry."
+            (
+                "git-load-error",
+                "Could not load the pull request",
+                "Check the connection and GitHub access, then try again.",
+                IconName::TriangleAlert,
+            )
+        } else if !self.loaded {
+            (
+                "git-unloaded",
+                "Pull request not loaded",
+                if self.archiving {
+                    "This workspace is being archived."
+                } else {
+                    "Load this branch’s pull request to read its description and review activity."
+                },
+                IconName::GitPullRequest,
+            )
         } else {
-            "No pull request for this repository’s branch. Create a PR using the workspace controls."
+            (
+                "git-empty-pr",
+                "No pull request yet",
+                "Use Create PRs in the command menu (⌘K), then refresh to see the conversation here.",
+                IconName::GitPullRequest,
+            )
         };
         let content = if let Some(input) = &self.full_text {
             v_flex()
@@ -1141,6 +1396,7 @@ impl Render for GitFeature {
                         )
                         .child(
                             Button::new("git-full-close")
+                                .icon(IconName::ArrowLeft)
                                 .label("Back to conversation")
                                 .small()
                                 .on_click(cx.listener(|s, _, w, cx| {
@@ -1165,13 +1421,84 @@ impl Render for GitFeature {
                 cx.processor(|s, i, w, cx| s.render_row(i, w, cx)),
             )
             .size_full()
+            .py_2()
             .into_any_element()
         } else {
-            div()
-                .p_4()
-                .text_sm()
-                .text_color(muted)
-                .child(empty)
+            v_flex()
+                .id(state_id)
+                .test_support()
+                .aria_label(state_title)
+                .size_full()
+                .min_h_0()
+                .overflow_y_scroll()
+                .px_4()
+                .py_8()
+                .child(
+                    v_flex()
+                        .w_full()
+                        .max_w(px(440.))
+                        .mx_auto()
+                        .items_center()
+                        .gap_3()
+                        .text_center()
+                        .text_size(px(14.))
+                        .line_height(relative(1.5))
+                        .child(if self.loading && repo.is_some() {
+                            Spinner::new()
+                                .with_size(px(28.))
+                                .color(muted)
+                                .into_any_element()
+                        } else {
+                            Icon::new(state_icon)
+                                .with_size(px(28.))
+                                .text_color(if self.error.is_some() {
+                                    theme.warning_foreground
+                                } else {
+                                    muted
+                                })
+                                .into_any_element()
+                        })
+                        .child(
+                            div()
+                                .text_lg()
+                                .font_weight(FontWeight::MEDIUM)
+                                .child(state_title),
+                        )
+                        .child(div().text_color(muted).child(state_detail))
+                        .when_some(self.error.as_ref().filter(|_| repo.is_some()), |d, e| {
+                            d.child(
+                                div()
+                                    .id("git-error")
+                                    .test_support()
+                                    .w_full()
+                                    .max_h(px(120.))
+                                    .overflow_y_scroll()
+                                    .p_3()
+                                    .rounded(theme.radius)
+                                    .bg(theme.secondary)
+                                    .text_sm()
+                                    .text_left()
+                                    .text_color(muted)
+                                    .child(e.clone()),
+                            )
+                        })
+                        .when(!self.loading && repo.is_some(), |d| {
+                            d.child(
+                                Button::new("git-state-retry")
+                                    .icon(IconName::RefreshCw)
+                                    .label(if self.error.is_some() {
+                                        "Try again"
+                                    } else if !self.loaded {
+                                        "Load pull request"
+                                    } else {
+                                        "Refresh"
+                                    })
+                                    .small()
+                                    .disabled(disabled)
+                                    .on_click(cx.listener(|s, _, w, cx| s.refresh(w, cx))),
+                            )
+                        }),
+                )
                 .into_any_element()
         };
         let composer = self.composer.as_ref().filter(|_| self.full_text.is_none()).map(|c| {
@@ -1183,11 +1510,15 @@ impl Render for GitFeature {
             v_flex()
                 .id("git-composer")
                 .test_support()
-                .px_4()
-                .py_3()
+                .w_full()
+                .max_w(px(680.))
+                .mx_auto()
+                .p_3()
                 .gap_2()
-                .border_t_1()
+                .border_1()
                 .border_color(border)
+                .rounded(theme.radius_lg)
+                .bg(theme.secondary)
                 .child(
                     div()
                         .text_sm()
@@ -1217,8 +1548,11 @@ impl Render for GitFeature {
                 .child(
                     h_flex()
                         .gap_2()
+                        .flex_wrap()
                         .child(
                             Button::new("git-editor-save")
+                                .icon(if c.kind == Editing::Description { IconName::Check } else { IconName::Send })
+                                .loading(self.posting)
                                 .label(if self.posting {
                                     "Saving…"
                                 } else if c.kind == Editing::Description {
@@ -1273,34 +1607,60 @@ impl Render for GitFeature {
             .child(toolbar)
             .when_some(self.save_error.clone(), |d, e| {
                 d.child(
-                    div()
+                    h_flex()
                         .px_4()
                         .py_2()
+                        .gap_2()
+                        .items_start()
                         .text_sm()
-                        .child(format!("Draft not saved: {e}")),
+                        .child(
+                            Icon::new(IconName::TriangleAlert)
+                                .with_size(px(16.))
+                                .text_color(theme.warning_foreground)
+                                .flex_none(),
+                        )
+                        .child(div().min_w_0().child(format!("Draft not saved: {e}"))),
                 )
             })
-            .when_some(self.error.clone(), |d, e| {
-                d.child(
-                    div()
-                        .id("git-error")
-                        .test_support()
-                        .px_4()
-                        .py_2()
-                        .text_sm()
-                        .child(format!(
-                            "{e}{}",
-                            if self.details.is_some() {
-                                " · Showing previously loaded data."
-                            } else {
-                                ""
-                            }
-                        )),
-                )
-            })
-            .when_some(overview, |d, overview| d.child(overview))
+            .when_some(
+                self.error.clone().filter(|_| self.details.is_some()),
+                |d, e| {
+                    d.child(
+                        h_flex()
+                            .id("git-error")
+                            .test_support()
+                            .px_4()
+                            .py_2()
+                            .gap_2()
+                            .items_start()
+                            .text_sm()
+                            .child(
+                                Icon::new(IconName::TriangleAlert)
+                                    .with_size(px(16.))
+                                    .text_color(theme.warning_foreground)
+                                    .flex_none(),
+                            )
+                            .child(
+                                v_flex()
+                                    .min_w_0()
+                                    .gap_1()
+                                    .child("Showing previously loaded data")
+                                    .child(
+                                        div()
+                                            .id("git-error-detail")
+                                            .max_h(px(120.))
+                                            .overflow_y_scroll()
+                                            .text_color(muted)
+                                            .child(e),
+                                    ),
+                            ),
+                    )
+                },
+            )
             .child(div().flex_1().min_h_0().child(content))
-            .when_some(composer, |d, c| d.child(c))
+            .when_some(composer, |d, c| {
+                d.child(div().flex_none().w_full().px_4().py_3().child(c))
+            })
             .test_support()
     }
 }
