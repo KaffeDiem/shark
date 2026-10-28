@@ -1,10 +1,10 @@
-# Language intelligence integration and release gates
+# Language intelligence
 
-This change retains GPUI and its 4 MiB editor limit. Language servers are shared by
+The editor uses GPUI with a 4 MiB document limit. Language servers are shared by
 project, backend, worktree, and toolchain identity. Tool setup and pipe I/O run away
 from the UI thread. Project dependencies and compiler SDKs remain prerequisites.
-This document records the implementation and evidence; it is not a claim that the
-polished release or performance gates are complete.
+This guide covers usage, tool selection, validation, and known limitations.
+Packaged-app release checks are listed below.
 
 ## Using it
 
@@ -129,10 +129,7 @@ recomputes its checksum after signing. The gopls pin is `GOPLS_VERSION` in
 release workflow builds and checks third-party tools in a job whose token cannot
 write to the repository.
 
-## Actual artifact execution, 2026-10-28
-
-Hardware: Apple M4 Max, Mac16,6, 36 GiB memory, macOS 27.0.1 (26A434).
-These are functional smoke runs, **not latency or memory benchmarks**.
+## Validation
 
 `scripts/lsp-smoke.py` creates a temporary project and executes initialize → open
 → unsaved edit → completion/definition → diagnostics → close → shutdown. It
@@ -140,34 +137,10 @@ checks that the on-disk source remains unchanged. Ruff instead exercises its
 supported formatting and diagnostics capabilities. Requests and process waits
 are bounded; failures kill and reap the process group.
 
-| Actual artifact | Result |
-|---|---|
-| Pyrefly 1.4.0 macOS arm64 | Pass |
-| Ruff 0.17.3 macOS arm64 | Pass: formatting and diagnostics |
-| Pyright 1.1.414 with managed Node 22.23.4 | Pass |
-| Wrapper 6.0.2 with project SDK TypeScript 6.0.3 and managed Node 22.23.4 | Pass |
-| rust-analyzer 1.93.1 (01f6ddf7) and 1.98.1 (48a229ce), each with matching installed Rust and rust-src | Pass |
-| Selected Xcode SourceKit-LSP, Swift 6.4, SwiftPM fixture | Pass |
-| Locally built gopls 0.24.0 with Go 1.27.3 | Pass |
-| SweetPad CLI 0.1.15, minimal real Xcode project | Pass: generate BSP, initialize, build targets, shutdown |
-| Native TypeScript 7.0.2 macOS arm64 | Pass, including strict zero-exit shutdown |
-
-Native TypeScript 7.0.2 rejects a `shutdown` request containing `params: null`;
-omitting `params` is accepted. Shark's `lsp-server` serialization already omits
-null params. Keeping stdin open after sending `exit` exposed a shutdown failure
-(`context canceled`, and a watcher panic in one run). The client writer now closes
-stdin after writing and flushing the final `exit` frame; the smoke harness does
-the same. The pending notification → shutdown response → exit → EOF order has a
-fake-server regression. Forty repeated native TypeScript runs passed: 30 with
-Shark's client capabilities and 10 with the smoke harness capabilities. The
-zero-exit assertion, bounded shutdown, pinned artifact, and compiler selection
-remain unchanged; no checker fallback is performed.
-
 `scripts/check-language-tools.py` downloads and checks the exact manifest
-artifacts, exercises them with their managed runtime, and also checks the selected
-Rust/Swift toolchain servers and SweetPad BSP. All nine artifact cases passed after
-the transport fix. The release workflow runs this gate before signing or
-publishing, retaining the strict zero-exit assertion.
+artifacts with their managed runtime, plus the selected Rust/Swift toolchain
+servers and SweetPad BSP. The release workflow runs this gate before signing or
+publishing, including a strict zero-exit shutdown assertion.
 
 Examples:
 
@@ -184,29 +157,16 @@ For a classic TypeScript SDK, set `SHARK_LSP_SMOKE_INIT` to a JSON object with
 `tsserver.path` pointing to that SDK's `lib/tsserver.js`, and run the wrapper with
 the managed Node binary.
 
-## Follow-up QA
+The dated [performance baseline](linter-performance.md) documents the benchmark
+workloads, commands, and measurement limits. It does not establish packaged-app
+input-to-display latency or busy-indexer performance.
 
-The [linter QA report](linter-qa.md) records the independent user-flow and
-correctness reviews, regression results, and native app follow-up. Native checks
-verified empty-cache Python tool setup, quick-fix dismissal retaining editor
-focus, rename across two files, and Save/Reload after a concurrent disk change.
-QA also repaired the outline shortcut and advertised hierarchical-symbol support
-already implemented by the outline parser.
-The [performance report](linter-performance.md) records headless editor CPU-frame
-timings and actual Python server readiness, warm requests, and process-tree RSS,
-with their measurement limits. These scoped measurements do not establish
-packaged-app input-to-display latency or busy-indexer performance.
+## Packaged-app release checks
 
-## Gates still required before a polished release
-
-See the [QA report](linter-qa.md) for the final full-suite and focused regression
-results. The workflow checks include multiple results, alias/tab reuse, history
-selection and scroll, external-source read-only behavior, completion/import/snippet undo,
-Vim undo/redo, atomic multi-file edits, dirty diff conflicts, and concurrent changes.
-Formatting and whitespace checks also pass. No changes were published.
+Standalone artifact smokes and headless regressions do not replace these checks:
 
 1. Verify all supported language backends through the final packaged app. The
-   nine standalone artifact smokes and the scoped native app checks do not prove
+   standalone artifact smokes and scoped native app checks do not prove
    every GPUI end-to-end language workflow.
 2. Exercise an empty-cache Finder launch, interrupted downloads during extraction
    and activation, moved worktrees with custom and Shark-owned BSP, ambiguous
@@ -227,10 +187,7 @@ Debugging, extension hosting, terminal integration, global cross-file undo, and 
 general-purpose package manager remain out of scope. Ty remains an optional
 benchmark candidate rather than another automatic backend.
 
-## Implementation limits of the integration proof
-
-The current implementation establishes the first integration milestone. It does
-not establish that the polished five-language release passes every gate above.
+## Known limitations
 
 - **Completion resolution and memory:** GPUI 0.8.0 exposes its completion menu,
   but not an accepted-item callback covering both keyboard and mouse acceptance.
@@ -246,8 +203,7 @@ not establish that the polished five-language release passes every gate above.
   four-MiB document limit does not bound aggregate completion-menu memory.
   Measure this workload and eager-resolution latency on named hardware before
   release. The next editor milestone should add an upstream GPUI accepted-item
-  hook, then resolve and stage only the selected item's edits; no dependency fork
-  or replacement editor is included in this proof.
+  hook, then resolve and stage only the selected item's edits.
 - **Snippets:** numbered tabstops, placeholder defaults, choices, and mirrored
   fields use GPUI selections, including multiple cursors for mirrors. Snippet
   variables and regular-expression transforms are unsupported; items requiring

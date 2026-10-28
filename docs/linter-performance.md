@@ -1,5 +1,11 @@
 # Language-intelligence performance measurements — 2026-10-28
 
+Historical baseline recorded in commit
+[`0944bdc`](https://github.com/KaffeDiem/shark/commit/0944bdcd7b0a3575fef396ee5ca4b781b2705f00).
+The exact measured working-tree revision was not recorded. These results predate
+later branch changes and are not measurements of the current revision. Record the
+commit and any uncommitted changes alongside future benchmark results.
+
 Hardware: Apple M4 Max, Mac16,6, 36 GiB memory, macOS 27.0.1 (26A434).
 Final samples were collected after the full regression suite and compiler builds
 finished. A separate native QA Shark instance remained idle. These are scoped
@@ -78,9 +84,10 @@ Preliminary runs while other QA activity was still running ranged from 0.711 to
 6.581 seconds to first definition. Those samples are excluded from the idle-host
 table and demonstrate the sensitivity to process startup delays and contention.
 
-Reproduce after the artifact checker has populated its verified cache:
+Populate the verified artifact cache, then run the benchmark and its offline checks:
 
 ```sh
+python3 scripts/check-language-tools.py
 python3 scripts/lsp-performance.py
 python3 scripts/test-lsp-performance.py
 ```
@@ -92,23 +99,3 @@ This script neither installs tools nor changes project configuration outside its
 temporary fixture. It prints one JSON record per run and always shuts down or
 kills/reaps its own server processes on failure. Other languages and packaged-app
 whole-process-tree comparisons remain separate checks.
-
-## Native QA app idle memory snapshot
-
-A separate isolated debug `.app` was observed idle after its two small Python
-files reached Ready with real Pyrefly and Ruff. A single `ps` snapshot recorded:
-
-| Process | RSS |
-|---|---:|
-| Shark Linter QA app | 146,912 KiB |
-| Pyrefly child | 25,872 KiB |
-| Ruff child | 20,384 KiB |
-| **Process-tree total** | **193,168 KiB = 188.64 MiB** |
-
-Evidence: `idle-memory.json` in the native QA run directory identified by
-`/tmp/shark-linter-native-location`. The snapshot contains the three PIDs,
-parent-child relationships, RSS values, and executable paths. This is a single
-idle observation for a different, much smaller workload than the 501-file server
-benchmark. It is **not** a disabled/idle/indexing comparison, a peak, a leak test,
-or a release-build memory budget. RSS also does not deduplicate shared pages or
-include GPU allocation accounting.
