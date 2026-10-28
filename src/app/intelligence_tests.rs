@@ -1560,6 +1560,12 @@ fn formatting_options_follow_the_buffer_indentation() {
         options("func f() {\n\tx()\n}\n"),
         serde_json::json!({"tabSize":4,"insertSpaces":false})
     );
+    // A generator method starts with `*` but is code, not a comment body.
+    assert_eq!(
+        options("class C {\n\t*values() {}\n}\n"),
+        serde_json::json!({"tabSize":4,"insertSpaces":false})
+    );
+    assert_eq!(options("class C {\n  *values() {}\n}\n"), spaces(2));
 }
 
 // Back skips a file deleted since; quick repeated presses walk one entry each.

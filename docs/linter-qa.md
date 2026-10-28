@@ -1,7 +1,7 @@
 # Linter user-flow and implementation QA — 2026-10-28
 
-Scope: the shared language-intelligence feature introduced by `e8c159b` and
-`56ed643`, plus the current editor/jump-bar changes. Existing uncommitted work was
+Scope: the shared language-intelligence feature introduced on the `linter`
+branch (`origin/master..linter`), plus the editor/jump-bar changes. Existing uncommitted work was
 preserved. Two independent three-agent teams reviewed user stories and then code
 correctness, lifecycle, safety, reuse, and maintainability. Findings were checked
 against callers and the installed GPUI implementation before fixes.

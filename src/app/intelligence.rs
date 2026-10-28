@@ -498,37 +498,6 @@ impl Shark {
                     _ => reply.respond(json!({"success":false})),
                 }
             }
-            client::Event::RegisterCapability { params, reply } => {
-                match session
-                    .read(cx)
-                    .watcher
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("File watcher unavailable"))
-                    .and_then(|w| w.register(&params))
-                {
-                    Ok(ready) => {
-                        cx.spawn(async move |_, _| match ready.recv().await {
-                            Ok(Ok(())) => reply.respond(Value::Null),
-                            Ok(Err(error)) => reply.reject(error),
-                            Err(_) => reply.reject("File watcher stopped before registration"),
-                        })
-                        .detach();
-                    }
-                    Err(error) => reply.reject(error.to_string()),
-                }
-            }
-            client::Event::UnregisterCapability { params, reply } => {
-                match session
-                    .read(cx)
-                    .watcher
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("File watcher unavailable"))
-                    .and_then(|w| w.unregister(&params))
-                {
-                    Ok(()) => reply.respond(Value::Null),
-                    Err(error) => reply.reject(error.to_string()),
-                }
-            }
             _ => {}
         }
     }
@@ -1188,8 +1157,17 @@ fn uri_path(uri: &Uri) -> anyhow::Result<PathBuf> {
 pub(super) fn formatting_options(text: &str) -> Value {
     let (mut tabs, mut spaces, mut previous) = (0, 0, 0);
     let mut steps = [0usize; 9];
-    // Block-comment continuations (" * doc", " */") sit one space in; they are not a step.
-    for line in (text.lines()).filter(|l| !l.trim().is_empty() && !l.trim().starts_with('*')) {
+    let mut in_comment = false;
+    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+        // Block-comment bodies (" * doc", " */") sit one space in; they are not a step.
+        let trimmed = line.trim();
+        if in_comment {
+            in_comment = !trimmed.contains("*/");
+            continue;
+        }
+        if let Some(open) = trimmed.find("/*") {
+            in_comment = !trimmed[open + 2..].contains("*/");
+        }
         if line.starts_with('\t') {
             tabs += 1;
             continue;
