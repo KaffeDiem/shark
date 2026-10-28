@@ -110,11 +110,12 @@ SHARK_GIT_FEATURE_LIVE_PR=https://github.com/KaffeDiem/shark/pull/60 \
   cargo test --features test-support pr::git_feature::tests::live_read_only_pull_request -- --ignored --nocapture
 ```
 
-The full regression run passed 380 tests with 15 opt-in tests ignored. After the
-long-text performance fix, the final focused Git run passed 19 tests with the
-opt-in live test ignored (the live read had already passed separately). The native
-Metal harness passed in both themes and at both widths. `cargo build` and formatting
-checks passed. Strict Clippy exposed four existing lint categories in unrelated
+The latest full regression run passed 405 tests with 15 opt-in tests ignored,
+using the normal parallel test runner. The native Metal harness passed in both
+themes and at both widths, including local draft recovery. `cargo build` and
+formatting checks passed. See [QA and verification](git-feature-qa.md) for the
+test-isolation fixes and detailed evidence. A prior strict Clippy run exposed
+four existing lint categories in unrelated
 code (`type_complexity`, `needless_borrow`, `non_octal_unix_permissions`, and
 `unnecessary_unwrap`); checking with only those categories allowed passes. The
 existing `block` dependency also emits a future-Rust compatibility warning.

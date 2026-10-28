@@ -7,6 +7,38 @@ agents worked alongside the coordinating agent. The original QA changed only
 tests and this report. The follow-up fixes below also change production code.
 No live PR was mutated.
 
+## Latest test verification
+
+The documented `cargo test --features test-support` command now passes with its
+normal parallel runner: **405 passed, 0 failed, 15 opt-in tests ignored** (263.32
+seconds). Native Metal rendering, `cargo build`, `cargo fmt --check`, and
+`git diff --check` also pass. The initial serial rerun passed 404 tests before
+the new isolation regression was added.
+
+Investigation found that GitSync's bare `gh` calls bypassed `SHARK_GH`, so mocked
+workspace tests could wait on real network requests. The shared bounded runner
+now honors the existing override for bare `gh`, while preserving explicit
+executables, error prefixes, and timeout behavior. A regression verifies those
+properties. The PR fixtures now distinguish branch-specific queries, and their
+environment guard restores the previous override.
+
+Stack-test cleanup now detaches the chat reader before process teardown, reusing
+the existing event-injection helper to prevent a real process thread from waking
+the deterministic scheduler during cleanup. No timeout was increased and no test
+was newly ignored.
+
+The formerly failing stack and API tests passed in the complete run. After the
+full run, the two PR fixtures were refined to return their actual parent PR for
+`--head logic`; both affected tests passed again (4.65 and 1.38 seconds). The
+earlier Python mock timeout did not recur, so no speculative Python/timeout fix
+was added.
+
+Logs: `/tmp/shark-verify-final-tests.log`, `/tmp/shark-verify-render.log`,
+`/tmp/shark-verify-build.log`, and `/tmp/shark-verify-stack-*.log`.
+The earlier failures below are retained as historical investigation evidence,
+not the current test status. The ignored opt-in tests still require separate live
+services or other explicit setup.
+
 ## Follow-up fixes
 
 All four confirmed findings are fixed in the working tree:

@@ -192,7 +192,7 @@ pub fn link_body(body: &str, prs: &[(String, String)], own: &str) -> String {
 }
 
 /// gh, or `SHARK_GH` (tests point it at a fake, as `SHARK_CLAUDE` for claude).
-fn gh() -> String {
+pub(crate) fn gh() -> String {
     std::env::var("SHARK_GH").unwrap_or_else(|_| "gh".into())
 }
 

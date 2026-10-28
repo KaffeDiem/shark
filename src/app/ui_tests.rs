@@ -7524,21 +7524,53 @@ async fn inline_edit_round4(cx: &mut TestAppContext) {
 }
 
 /// `SHARK_GH` pointed at a fake gh while it lives, so a failing test doesn't leave it set.
-struct GhGuard;
+struct GhGuard(Option<std::ffi::OsString>);
 
 impl GhGuard {
     fn set(path: &std::path::Path) -> Self {
+        let previous = std::env::var_os("SHARK_GH");
         // SAFETY: tests that read SHARK_GH hold UI_LOCK.
         unsafe { std::env::set_var("SHARK_GH", path) };
-        GhGuard
+        GhGuard(previous)
     }
 }
 
 impl Drop for GhGuard {
     fn drop(&mut self) {
         // SAFETY: as in `set`; the lock is still held.
-        unsafe { std::env::remove_var("SHARK_GH") };
+        unsafe {
+            match &self.0 {
+                Some(previous) => std::env::set_var("SHARK_GH", previous),
+                None => std::env::remove_var("SHARK_GH"),
+            }
+        }
     }
+}
+
+#[test]
+fn bounded_gh_honors_override_and_preserves_explicit_programs() {
+    use std::os::unix::fs::PermissionsExt;
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    fs::create_dir_all(&home).unwrap();
+    let fake = home.join("gh");
+    fs::write(
+        &fake,
+        "#!/bin/sh\nif [ \"$1\" = fail ]; then echo denied >&2; exit 1; fi\necho override\n",
+    )
+    .unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let _gh = GhGuard::set(&fake);
+    assert_eq!(git::cmd_bounded(&home, "gh", &[], 5).unwrap(), "override");
+    assert_eq!(
+        git::cmd_bounded(&home, "gh", &["fail"], 5).unwrap_err(),
+        "gh fail: denied"
+    );
+    assert_eq!(
+        git::cmd_bounded(&home, "/bin/sh", &["-c", "echo explicit"], 5).unwrap(),
+        "explicit"
+    );
+    fs::remove_dir_all(&home).ok();
 }
 
 /// `]c` steps through threads that start on lines another one covers, instead of going back
@@ -8031,7 +8063,14 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
     let data = home.join("open.json");
     fs::write(&data, open.to_string()).unwrap();
     let fake = home.join("gh");
-    fs::write(&fake, format!("#!/bin/sh\ncat '{}'\n", data.display())).unwrap();
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in *\" --head logic \"*) ;; *\" --head \"*) echo '[]'; exit;; esac\ncat '{}'\n",
+            data.display()
+        ),
+    )
+    .unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
     let _gh = GhGuard::set(&fake);
     let (window, shark) = boot(
@@ -8211,6 +8250,9 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
         prompt.contains(&format!("api: onto `origin/logic`, after `{ui_head}`")),
         "{prompt}"
     );
+    // Detach the local reader before teardown lets the process thread send its exit event.
+    cx.update(|cx| chat.update(cx, |c, cx| crate::chat::ui_tests::play(c, &[], cx)));
+    cx.run_until_parked();
     fs::remove_dir_all(&home).ok();
 }
 
@@ -8269,7 +8311,14 @@ async fn branch_from_refusals_and_mixed_repos(cx: &mut TestAppContext) {
     )
     .unwrap();
     let fake = home.join("gh");
-    fs::write(&fake, format!("#!/bin/sh\ncat '{}'\n", data.display())).unwrap();
+    fs::write(
+        &fake,
+        format!(
+            "#!/bin/sh\ncase \" $* \" in *\" --head logic \"*) ;; *\" --head \"*) echo '[]'; exit;; esac\ncat '{}'\n",
+            data.display()
+        ),
+    )
+    .unwrap();
     fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
     let _gh = GhGuard::set(&fake);
     let (window, shark) = boot(
