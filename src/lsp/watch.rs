@@ -8,12 +8,14 @@ use std::{
     path::{Component, Path, PathBuf},
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc,
     },
     thread,
-    time::{Duration, SystemTime},
+    time::{Duration, Instant, SystemTime},
 };
+
+const POLL: Duration = Duration::from_millis(750);
 
 #[derive(Clone)]
 struct Pattern {
@@ -34,6 +36,14 @@ impl Pattern {
 
 type Stamp = (u64, Option<SystemTime>);
 type Snapshot = HashMap<PathBuf, Stamp>;
+/// Registrations by server id; the key changes whenever the id is registered again.
+type Registrations = HashMap<String, (u64, Vec<Pattern>)>;
+
+#[derive(Default)]
+struct Tree {
+    files: Snapshot,
+    dirs: HashSet<PathBuf>,
+}
 
 struct PendingRegistration {
     ids: Vec<String>,
@@ -42,7 +52,7 @@ struct PendingRegistration {
 
 pub struct Watcher {
     root: PathBuf,
-    registrations: Arc<Mutex<HashMap<String, Vec<Pattern>>>>,
+    registrations: Arc<Mutex<Registrations>>,
     pending: Arc<Mutex<Vec<PendingRegistration>>>,
     stop: Arc<AtomicBool>,
     wake: mpsc::Sender<()>,
@@ -54,7 +64,7 @@ impl Watcher {
     pub fn new(root: &Path, client: Client) -> Result<Self> {
         validate_absolute(root)?;
         let root = root.to_path_buf();
-        let registrations = Arc::new(Mutex::new(HashMap::<String, Vec<Pattern>>::new()));
+        let registrations = Arc::new(Mutex::new(Registrations::new()));
         let pending = Arc::new(Mutex::new(Vec::<PendingRegistration>::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let (wake, wait) = mpsc::channel();
@@ -64,24 +74,27 @@ impl Watcher {
         let worker_stop = stop.clone();
         let worker_pending = pending.clone();
         thread::spawn(move || {
-            let mut previous: HashMap<String, Snapshot> = HashMap::new();
-            loop {
-                if worker_stop.load(Ordering::Relaxed) {
-                    break;
-                }
+            let mut previous: HashMap<u64, Snapshot> = HashMap::new();
+            while !worker_stop.load(Ordering::Relaxed) {
                 let registrations = worker_registrations.lock().unwrap().clone();
-                previous.retain(|id, _| registrations.contains_key(id));
+                previous.retain(|key, _| registrations.values().any(|(k, _)| k == key));
                 if !registrations.is_empty() {
-                    match snapshot(&worker_root, &worker_stop) {
-                        Ok(files) => {
+                    // A new baseline must postdate its registration, so it cannot reuse a shared walk.
+                    let fresh = registrations
+                        .values()
+                        .any(|(key, _)| !previous.contains_key(key));
+                    match snapshot(&worker_root, &registrations, fresh, &worker_stop) {
+                        _ if worker_stop.load(Ordering::Relaxed) => break,
+                        Ok(trees) => {
                             let mut changes = HashMap::<PathBuf, u32>::new();
-                            for (id, patterns) in &registrations {
-                                let current: Snapshot = files
+                            for (key, patterns) in registrations.values() {
+                                let current: Snapshot = trees
                                     .iter()
+                                    .flat_map(|tree| &tree.files)
                                     .filter(|(path, _)| patterns.iter().any(|p| p.matches(path)))
                                     .map(|(path, stamp)| (path.clone(), *stamp))
                                     .collect();
-                                if let Some(old) = previous.insert(id.clone(), current.clone()) {
+                                if let Some(old) = previous.insert(*key, current.clone()) {
                                     for (path, kind) in diff(&old, &current) {
                                         let bit = match kind {
                                             1 => 1,
@@ -99,14 +112,20 @@ impl Watcher {
                             }
                             // The server may assume watching is active after registration succeeds.
                             // Acknowledge only once every pattern in the batch has its baseline.
+                            let current = worker_registrations.lock().unwrap();
                             worker_pending.lock().unwrap().retain(|pending| {
-                                if pending.ids.iter().all(|id| previous.contains_key(id)) {
+                                if pending.ids.iter().all(|id| {
+                                    current
+                                        .get(id)
+                                        .is_some_and(|(key, _)| previous.contains_key(key))
+                                }) {
                                     let _ = pending.ready.try_send(Ok(()));
                                     false
                                 } else {
                                     true
                                 }
                             });
+                            drop(current);
                             if !changes.is_empty() {
                                 let changes: Vec<_> = changes
                                     .into_iter()
@@ -141,7 +160,7 @@ impl Watcher {
                     }
                 }
                 // Wake promptly when the last editor closes or registrations change.
-                let _ = wait.recv_timeout(Duration::from_millis(750));
+                let _ = wait.recv_timeout(POLL);
             }
         });
         Ok(Self {
@@ -183,7 +202,7 @@ impl Watcher {
                 .ok_or_else(|| anyhow!("Missing file watchers"))?;
             let patterns = watchers
                 .iter()
-                .map(|watcher| pattern(&self.root, watcher))
+                .filter_map(|watcher| pattern(&self.root, watcher).transpose())
                 .collect::<Result<Vec<_>>>()?;
             if parsed.insert(id.to_string(), patterns).is_some() {
                 bail!("Duplicate registration id: {id}");
@@ -194,12 +213,15 @@ impl Watcher {
             let _ = ready.try_send(Ok(()));
             return Ok(receiver);
         }
+        static NEXT: AtomicU64 = AtomicU64::new(0);
         let mut current = self.registrations.lock().unwrap();
-        if parsed.keys().any(|id| current.contains_key(id)) {
-            bail!("File watcher registration already exists");
-        }
         let ids = parsed.keys().cloned().collect();
-        current.extend(parsed);
+        // rust-analyzer re-registers its fixed id to replace its watchers, without unregistering.
+        current.extend(
+            parsed
+                .into_iter()
+                .map(|(id, patterns)| (id, (NEXT.fetch_add(1, Ordering::Relaxed), patterns))),
+        );
         let (ready, receiver) = async_channel::bounded(1);
         self.pending
             .lock()
@@ -266,7 +288,8 @@ fn validate_absolute(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn pattern(root: &Path, watcher: &Value) -> Result<Pattern> {
+/// `None` for a base outside the worktree, which this watcher does not serve.
+fn pattern(root: &Path, watcher: &Value) -> Result<Option<Pattern>> {
     let kind = watcher
         .get("kind")
         .map(|value| value.as_u64().ok_or_else(|| anyhow!("Invalid watch kind")))
@@ -288,7 +311,7 @@ fn pattern(root: &Path, watcher: &Value) -> Result<Pattern> {
             .map_err(|_| anyhow!("Watcher base URI must be a local file"))?;
         validate_absolute(&base)?;
         if !base.starts_with(root) {
-            bail!("File watcher base leaves the current project");
+            return Ok(None);
         }
         (
             base,
@@ -306,75 +329,90 @@ fn pattern(root: &Path, watcher: &Value) -> Result<Pattern> {
         .backslash_escape(true)
         .build()?
         .compile_matcher();
-    Ok(Pattern {
+    Ok(Some(Pattern {
         base,
         glob,
         absolute,
         kind,
-    })
+    }))
 }
 
-fn read_directory(root: &Path, dir: &Path) -> std::io::Result<Option<std::fs::ReadDir>> {
-    match std::fs::read_dir(dir) {
-        Ok(entries) => Ok(Some(entries)),
-        // A descendant can disappear between discovery and traversal during normal edits.
-        Err(error) if dir != root && error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-        Err(error) => Err(error),
+/// The shared worktree walk, plus each registered base that walk skipped as ignored.
+fn snapshot(
+    root: &Path,
+    registrations: &Registrations,
+    fresh: bool,
+    stop: &AtomicBool,
+) -> Result<Vec<Arc<Tree>>> {
+    let tree = shared_walk(root, fresh, stop)?;
+    let bases: HashSet<_> = registrations
+        .values()
+        .flat_map(|(_, patterns)| patterns.iter().map(|p| p.base.as_path()))
+        .filter(|base| !tree.dirs.contains(*base))
+        .collect();
+    let mut trees = vec![tree];
+    // A base that does not exist yet, such as a build script's OUT_DIR, has nothing to watch.
+    trees.extend(
+        bases
+            .into_iter()
+            .filter_map(|base| walk(base, stop).ok().map(Arc::new)),
+    );
+    Ok(trees)
+}
+
+/// Watchers of one worktree (a server and its companion, or several sessions) share a walk per poll.
+fn shared_walk(root: &Path, fresh: bool, stop: &AtomicBool) -> Result<Arc<Tree>> {
+    // ponytail: one lock serializes walks of different worktrees; lock per root if that shows up.
+    static RECENT: Mutex<Vec<(PathBuf, Instant, Arc<Tree>)>> = Mutex::new(Vec::new());
+    let mut recent = RECENT.lock().unwrap_or_else(|poison| poison.into_inner());
+    recent.retain(|(path, started, _)| !(fresh && path == root) && started.elapsed() < POLL);
+    if let Some((_, _, tree)) = recent.iter().find(|(path, ..)| path == root) {
+        return Ok(tree.clone());
     }
+    let started = Instant::now();
+    let tree = Arc::new(walk(root, stop)?);
+    recent.push((root.to_path_buf(), started, tree.clone()));
+    Ok(tree)
 }
 
-fn snapshot(root: &Path, stop: &AtomicBool) -> Result<Snapshot> {
-    let mut files = HashMap::new();
-    let mut dirs = vec![root.to_path_buf()];
-    let mut visited = 0usize;
-    while let Some(dir) = dirs.pop() {
+fn walk(base: &Path, stop: &AtomicBool) -> Result<Tree> {
+    // Only the base must be readable; descendants can vanish or deny access during normal use.
+    std::fs::read_dir(base)?;
+    let mut tree = Tree::default();
+    // Git-ignored build and dependency trees would dominate the walk. Symlinks are not followed,
+    // and repository internals do not belong to the language workspace.
+    let entries = ignore::WalkBuilder::new(base)
+        .hidden(false)
+        .filter_entry(|entry| entry.file_name() != ".git")
+        .build();
+    for (visited, entry) in entries.enumerate() {
         if stop.load(Ordering::Relaxed) {
-            return Ok(files);
+            bail!("File watching stopped");
         }
-        let Some(entries) = read_directory(root, &dir)? else {
-            continue;
-        };
-        for entry in entries {
-            if stop.load(Ordering::Relaxed) {
-                return Ok(files);
+        // shortcut: polling is capped at 200k entries; use native events if large-worktree measurements require it.
+        if visited > 200_000 {
+            bail!(
+                "Language file watching exceeded 200,000 entries in {}",
+                base.display()
+            );
+        }
+        let Ok(entry) = entry else { continue };
+        match entry.file_type() {
+            Some(kind) if kind.is_dir() => {
+                tree.dirs.insert(entry.into_path());
             }
-            let entry = match entry {
-                Ok(entry) => entry,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-            // Repository internals do not belong to the language workspace.
-            if entry.file_name() == ".git" {
-                continue;
-            }
-            visited += 1;
-            // shortcut: polling is capped at 200k entries; use native events if large-worktree measurements require it.
-            if visited > 200_000 {
-                bail!(
-                    "Language file watching exceeded 200,000 entries in {}",
-                    root.display()
-                );
-            }
-            let kind = match entry.file_type() {
-                Ok(kind) => kind,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-            // Never follow symlinks into a different worktree or dependency tree.
-            if kind.is_dir() {
-                dirs.push(entry.path());
-            } else if kind.is_file() {
-                match entry.metadata() {
-                    Ok(metadata) => {
-                        files.insert(entry.path(), (metadata.len(), metadata.modified().ok()));
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(error) => return Err(error.into()),
+            Some(kind) if kind.is_file() => {
+                if let Ok(metadata) = entry.metadata() {
+                    tree.files.insert(
+                        entry.into_path(),
+                        (metadata.len(), metadata.modified().ok()),
+                    );
                 }
             }
+            _ => {}
         }
     }
-    Ok(files)
+    Ok(tree)
 }
 
 fn diff(before: &Snapshot, after: &Snapshot) -> Vec<(PathBuf, u32)> {
@@ -402,7 +440,9 @@ mod tests {
     #[test]
     fn globs_respect_relative_roots_kinds_and_worktree_boundaries() {
         let root = Path::new("/work/project");
-        let p = pattern(root, &json!({"globPattern":"**/*.{rs,toml}","kind":3})).unwrap();
+        let p = pattern(root, &json!({"globPattern":"**/*.{rs,toml}","kind":3}))
+            .unwrap()
+            .unwrap();
         assert!(p.matches(Path::new("/work/project/src/lib.rs")));
         assert!(p.matches(Path::new("/work/project/Cargo.toml")));
         assert!(!p.matches(Path::new("/work/other/src/lib.rs")));
@@ -411,6 +451,7 @@ mod tests {
             root,
             &json!({"globPattern":{"baseUri":"file:///work/project/src","pattern":"*.rs"}}),
         )
+        .unwrap()
         .unwrap();
         assert!(p.matches(Path::new("/work/project/src/lib.rs")));
         assert!(!p.matches(Path::new("/work/project/src/nested/lib.rs")));
@@ -419,7 +460,8 @@ mod tests {
                 root,
                 &json!({"globPattern":{"baseUri":"file:///work/other","pattern":"**"}})
             )
-            .is_err()
+            .unwrap()
+            .is_none()
         );
         assert!(pattern(root, &json!({"globPattern":"../*"})).is_err());
         assert!(pattern(root, &json!({"globPattern":"**","kind":8})).is_err());
@@ -450,30 +492,65 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::write(root.join("file.rs"), "hello").unwrap();
         std::os::unix::fs::symlink("/", root.join("outside")).unwrap();
-        let files = snapshot(&root, &AtomicBool::new(false)).unwrap();
+        let files = walk(&root, &AtomicBool::new(false)).unwrap().files;
         assert_eq!(files.len(), 1);
         assert!(files.contains_key(&root.join("file.rs")));
         std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn polling_tolerates_removed_descendants_but_preserves_root_and_other_errors() {
-        let root = std::env::temp_dir().join(format!("shark-watch-removed-{}", std::process::id()));
-        let child = root.join("src");
-        std::fs::create_dir_all(&child).unwrap();
-        let file = child.join("lib.rs");
-        std::fs::write(&file, "fn main() {}").unwrap();
-        let before = snapshot(&root, &AtomicBool::new(false)).unwrap();
-        std::fs::remove_dir_all(&child).unwrap();
-        // This is the traversal of a directory that was queued before its deletion.
-        assert!(read_directory(&root, &child).unwrap().is_none());
-        let after = snapshot(&root, &AtomicBool::new(false)).unwrap();
-        assert_eq!(diff(&before, &after), vec![(file, 3)]);
-        let regular_file = root.join("file");
-        std::fs::write(&regular_file, "").unwrap();
-        assert!(read_directory(&root, &regular_file).is_err());
+    fn polling_skips_ignored_trees_unless_registered_and_only_fails_on_the_root() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let root = std::env::temp_dir().join(format!("shark-watch-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        for dir in [".git", "src", "target/debug", "target/out", "locked"] {
+            std::fs::create_dir_all(root.join(dir)).unwrap();
+        }
+        std::fs::write(root.join(".gitignore"), "target/\n").unwrap();
+        for file in [
+            "src/lib.rs",
+            "target/debug/dep.rs",
+            "target/out/gen.rs",
+            "locked/a.rs",
+        ] {
+            std::fs::write(root.join(file), "").unwrap();
+        }
+        let locked = root.join("locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let stop = AtomicBool::new(false);
+        let files = walk(&root, &stop).unwrap().files;
+        assert!(files.contains_key(&root.join("src/lib.rs")));
+        assert!(
+            files
+                .keys()
+                .all(|path| !path.starts_with(root.join("target")))
+        );
+        let out = url::Url::from_directory_path(root.join("target/out")).unwrap();
+        let registration = json!({"globPattern":{"baseUri":out.as_str(),"pattern":"**/*.rs"}});
+        let registrations = Registrations::from([(
+            "out".to_string(),
+            (0, vec![pattern(&root, &registration).unwrap().unwrap()]),
+        )]);
+        let files: Vec<_> = snapshot(&root, &registrations, true, &stop)
+            .unwrap()
+            .iter()
+            .flat_map(|tree| tree.files.keys().cloned().collect::<Vec<_>>())
+            .collect();
+        assert!(files.contains(&root.join("target/out/gen.rs")));
+        assert!(!files.contains(&root.join("target/debug/dep.rs")));
+        // A primary server and its companion reuse one recent walk of their worktree.
+        let shared = shared_walk(&root, false, &stop).unwrap();
+        assert!(Arc::ptr_eq(
+            &shared,
+            &shared_walk(&root, false, &stop).unwrap()
+        ));
+        assert!(!Arc::ptr_eq(
+            &shared,
+            &shared_walk(&root, true, &stop).unwrap()
+        ));
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
         std::fs::remove_dir_all(&root).unwrap();
-        assert!(snapshot(&root, &AtomicBool::new(false)).is_err());
+        assert!(walk(&root, &stop).is_err());
     }
 }
 
@@ -502,15 +579,23 @@ mod registration_tests {
         watcher
             .register(&json!({"registrations":[registration("one")]}))
             .unwrap();
+        let first = watcher.registrations.lock().unwrap()["one"].0;
+        // Registering an existing id again replaces its watchers; bases outside the worktree are skipped.
+        let outside = json!({"id":"two","method":"workspace/didChangeWatchedFiles","registerOptions":{"watchers":[{"globPattern":{"baseUri":"file:///elsewhere","pattern":"**"}},{"globPattern":"**/*.rs"}]}});
+        watcher
+            .register(&json!({"registrations":[outside,registration("one")]}))
+            .unwrap();
+        assert_eq!(watcher.registrations.lock().unwrap()["two"].1.len(), 1);
+        assert_ne!(watcher.registrations.lock().unwrap()["one"].0, first);
         assert!(
             watcher
-                .register(&json!({"registrations":[registration("two"),registration("one")]}))
+                .register(&json!({"registrations":[{"id":"bad","method":"workspace/didChangeWatchedFiles","registerOptions":{"watchers":[{"globPattern":"**","kind":8}]}}]}))
                 .is_err()
         );
-        assert_eq!(watcher.registrations.lock().unwrap().len(), 1);
+        assert_eq!(watcher.registrations.lock().unwrap().len(), 2);
         assert!(watcher.unregister(&json!({"unregisterations":[{"id":"one","method":"workspace/didChangeWatchedFiles"},{"id":"missing","method":"workspace/didChangeWatchedFiles"}]})).is_err());
-        assert_eq!(watcher.registrations.lock().unwrap().len(), 1);
-        watcher.unregister(&json!({"unregisterations":[{"id":"one","method":"workspace/didChangeWatchedFiles"}]})).unwrap();
+        assert_eq!(watcher.registrations.lock().unwrap().len(), 2);
+        watcher.unregister(&json!({"unregisterations":[{"id":"one","method":"workspace/didChangeWatchedFiles"},{"id":"two","method":"workspace/didChangeWatchedFiles"}]})).unwrap();
         assert!(watcher.registrations.lock().unwrap().is_empty());
         drop(watcher);
         std::fs::remove_dir_all(root).unwrap();
