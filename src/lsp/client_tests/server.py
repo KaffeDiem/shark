@@ -36,8 +36,6 @@ with open(log_path, "a") as log:
         method = message.get("method")
         params = message.get("params", {})
         if method == "initialize":
-            if (params.get("initializationOptions") or {}).get("testProgress"):
-                send(dict(method="$/progress", params=dict(token="index", value=dict(kind="begin", title="Index"))))
             respond(message, dict(capabilities=dict(positionEncoding="utf-16", textDocumentSync=dict(openClose=True, change=1, save=dict(includeText=True)), completionProvider=dict(resolveProvider=True))))
         elif method == "workspace/didChangeConfiguration":
             send(dict(id="config", method="workspace/configuration", params=dict(items=[dict(section="python.analysis"), {}])))
@@ -61,8 +59,8 @@ with open(log_path, "a") as log:
         elif method == "test/applyEdit":
             send(dict(id="apply", method="workspace/applyEdit", params=dict(edit=dict(changes={}))))
             respond(message, None)
-        elif method == "test/endProgress":
-            send(dict(method="$/progress", params=dict(token="index", value=dict(kind="end"))))
+        elif method == "test/ask":
+            send(dict(id="ask", method="window/showMessageRequest", params=dict(type=1, message="Index failed", actions=[dict(title="Retry")])))
             respond(message, None)
         elif method == "test/wait":
             waiting.append(message)
@@ -73,7 +71,10 @@ with open(log_path, "a") as log:
             exit_needs_eof = True
             respond(message, None)
         elif method == "test/crash":
+            sys.stderr.write("early noise\n" + "." * 4096 + "\npanicked: index corrupt\n")
             sys.exit(2)
+        elif method == "test/sleep":
+            time.sleep(params)
         elif method == "shutdown":
             if not ignore_shutdown:
                 respond(message, None)

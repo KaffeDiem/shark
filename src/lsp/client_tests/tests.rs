@@ -84,7 +84,6 @@ fn lifecycle_orders_unsaved_text_requests_configuration_and_diagnostics() {
     let peer = Peer::new();
     block_on(peer.client.initialize()).unwrap();
     assert_eq!(peer.client.encoding(), PositionEncodingKind::UTF16);
-    assert_eq!(peer.client.status(), Status::Ready);
     let initialize = peer.wait_for(|v| v["method"] == "initialize");
     // Pyrefly returns no outline unless the client advertises hierarchy support.
     assert_eq!(
@@ -196,16 +195,104 @@ fn server_edits_require_host_acknowledgement() {
 }
 
 #[test]
-fn crash_resolves_pending_requests_and_marks_setup_needed() {
+fn message_requests_are_forwarded_and_dismissed() {
     let peer = Peer::new();
     block_on(peer.client.initialize()).unwrap();
+    let events = peer.client.events();
+    block_on(peer.client.request("test/ask", Value::Null)).unwrap();
+    // The peer asks before it answers test/ask, and the coordinator handles both in order.
+    let params = std::iter::from_fn(|| events.try_recv().ok())
+        .find_map(|event| match event {
+            Event::Notification { method, params } if method == "window/showMessageRequest" => {
+                Some(params)
+            }
+            _ => None,
+        })
+        .expect("message request was not forwarded");
+    assert_eq!(params["message"], "Index failed");
+    // No action chosen, rather than an error the server may treat as a broken client.
+    let response = peer.wait_for(|v| v["id"] == "ask");
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(response["result"].is_null());
+}
+
+#[test]
+fn crash_resolves_pending_requests_and_reports_the_stderr_tail() {
+    let peer = Peer::new();
+    block_on(peer.client.initialize()).unwrap();
+    let events = peer.client.events();
     let error = block_on(peer.client.request("test/crash", Value::Null)).unwrap_err();
-    assert!(!error.to_string().is_empty());
-    let deadline = Instant::now() + Duration::from_secs(3);
-    while !matches!(peer.client.status(), Status::SetupNeeded(_)) && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
+    assert!(
+        error.to_string().contains("panicked: index corrupt"),
+        "{error}"
+    );
+    let stopped = loop {
+        if let Event::Stopped(reason) = block_on(events.recv()).unwrap() {
+            break reason;
+        }
+    };
+    assert!(stopped.contains("panicked: index corrupt"), "{stopped}");
+    assert!(!stopped.contains("early noise"), "{stopped}");
+}
+
+#[test]
+fn a_busy_server_is_not_killed_while_its_input_backs_up() {
+    let peer = Peer::new();
+    block_on(peer.client.initialize()).unwrap();
+    peer.client.notify("test/sleep", json!(1)).unwrap();
+    // Far more than the pipe buffer, queued while the server is not reading.
+    let text = "x".repeat(64 * 1024);
+    for _ in 0..64 {
+        peer.client
+            .notify("test/large", json!({ "text": text }))
+            .unwrap();
     }
-    assert!(matches!(peer.client.status(), Status::SetupNeeded(_)));
+    assert_eq!(
+        block_on(peer.client.request("test/echo", json!("after"))).unwrap(),
+        "after"
+    );
+}
+
+#[test]
+fn a_server_that_stops_reading_its_input_is_stopped() {
+    let peer = Peer::new();
+    block_on(peer.client.initialize()).unwrap();
+    let events = peer.client.events();
+    peer.client.notify("test/sleep", json!(60)).unwrap();
+    let text = "x".repeat(64 * 1024);
+    for _ in 0..64 {
+        peer.client
+            .notify("test/large", json!({ "text": text }))
+            .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let stopped = loop {
+        match events.try_recv() {
+            Ok(Event::Stopped(reason)) => break reason,
+            Ok(_) => {}
+            Err(_) => {
+                assert!(Instant::now() < deadline, "a stalled server was kept");
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    assert!(stopped.contains("stopped reading its input"), "{stopped}");
+}
+
+#[test]
+fn oversized_or_malformed_frames_are_rejected_before_allocation() {
+    let read = |bytes: &[u8]| read_message(&mut std::io::Cursor::new(bytes.to_vec()));
+    let error = read(b"Content-Length: 99999999999999\r\n\r\n").unwrap_err();
+    assert!(error.to_string().contains("exceeds the limit"));
+    assert!(read(b"Content-Length: 2\n\n{}").is_err());
+    assert!(read(b"").unwrap().is_none());
+    let body = br#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#;
+    let mut frame = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+    frame.extend_from_slice(body);
+    assert!(matches!(
+        read(&frame).unwrap(),
+        Some(Message::Notification(n)) if n.method == "initialized"
+    ));
 }
 
 #[test]
@@ -285,19 +372,6 @@ fn completion_resolve_retains_item_identity_and_supplies_auto_import_edits() {
         resolved["additionalTextEdits"][0]["newText"],
         "from math import sqrt\n"
     );
-}
-
-#[test]
-fn initialization_does_not_hide_an_index_already_in_progress() {
-    let peer = Peer::new();
-    block_on(
-        peer.client
-            .initialize_with_options(json!({"testProgress":true})),
-    )
-    .unwrap();
-    assert_eq!(peer.client.status(), Status::PreparingIndex);
-    block_on(peer.client.request("test/endProgress", Value::Null)).unwrap();
-    assert_eq!(peer.client.status(), Status::Ready);
 }
 
 #[test]

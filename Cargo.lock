@@ -6455,6 +6455,7 @@ dependencies = [
  "async-channel",
  "globset",
  "gpui-kit",
+ "ignore",
  "imagesize 0.14.0",
  "lsp-server",
  "lsp-types",
