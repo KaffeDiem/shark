@@ -6,6 +6,7 @@ import json
 import os
 import pathlib
 import posixpath
+import re
 import shutil
 import subprocess
 import sys
@@ -99,6 +100,11 @@ def install(artifact):
     return executable
 
 
+def gopls_version():
+    """The single gopls pin, shared with the app and scripts/build-gopls.sh."""
+    return re.search(r'^const GOPLS_VERSION: &str = "(.*)";$', (ROOT / "src/lsp/tools.rs").read_text(), re.M).group(1)
+
+
 def check():
     manifest = json.loads((ROOT / "src/lsp/tool-manifest.json").read_text())
     programs = {artifact["name"]: install(artifact) for artifact in manifest}
@@ -112,7 +118,7 @@ def check():
         ("Pyright", "python", [node, str(programs["pyright"]), "--stdio"], {}),
         ("Classic TypeScript", "typescript", [node, str(programs["typescript-language-server"]), "--stdio"], {"SHARK_LSP_SMOKE_INIT": json.dumps({"tsserver": {"path": str(classic)}})}),
         ("Native TypeScript", "typescript", [str(programs["typescript"]), "--lsp", "--stdio"], {}),
-        ("gopls", "go", [str(ROOT / "target/language-tools/gopls/0.24.0/gopls")], {"GOTOOLCHAIN": "path"}),
+        ("gopls", "go", [str(ROOT / "target/language-tools/gopls" / gopls_version() / "gopls")], {"GOTOOLCHAIN": "path"}),
     ]
     failures = []
     for name, language, command, extra in cases:

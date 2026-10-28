@@ -7,12 +7,14 @@ import json
 import math
 import os
 import pathlib
-import queue
-import signal
 import subprocess
+import sys
 import tempfile
 import threading
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import jsonrpc_peer  # noqa: E402
 
 ROOT = pathlib.Path(__file__).resolve().parents[1]
 MANIFEST = json.loads((ROOT / "src/lsp/tool-manifest.json").read_text())
@@ -27,49 +29,11 @@ def artifact(name):
     return str(path)
 
 
-class Peer:
+class Peer(jsonrpc_peer.Peer):
     def __init__(self, command, root):
-        self.stderr = tempfile.TemporaryFile()
-        self.process = subprocess.Popen(
-            command,
-            cwd=root,
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=self.stderr,
-            start_new_session=True,
-        )
-        self.messages = queue.Queue()
+        super().__init__(command, root)
         self.ident = 0
         self.progress = {}
-
-        def read():
-            try:
-                while True:
-                    headers = {}
-                    while True:
-                        line = self.process.stdout.readline()
-                        if not line:
-                            raise EOFError("server exited")
-                        if line in (b"\r\n", b"\n"):
-                            break
-                        key, value = line.decode().split(":", 1)
-                        headers[key.lower()] = value.strip()
-                    self.messages.put(
-                        json.loads(
-                            self.process.stdout.read(int(headers["content-length"]))
-                        )
-                    )
-            except Exception as error:
-                self.messages.put(error)
-
-        threading.Thread(target=read, daemon=True).start()
-
-    def write(self, value):
-        data = json.dumps(dict(jsonrpc="2.0", **value)).encode()
-        self.process.stdin.write(
-            ("Content-Length: %d\r\n\r\n" % len(data)).encode() + data
-        )
-        self.process.stdin.flush()
 
     def notify(self, method, params):
         self.write(dict(method=method, params=params))
@@ -90,12 +54,7 @@ class Peer:
             if isinstance(value, Exception):
                 raise value
             if "method" in value and "id" in value:
-                result = (
-                    [None] * len(value.get("params", {}).get("items", []))
-                    if value["method"] == "workspace/configuration"
-                    else None
-                )
-                self.write(dict(id=value["id"], result=result))
+                self.answer(value)
             elif value.get("method") == "$/progress":
                 p = value["params"]
                 token = str(p["token"])
@@ -117,10 +76,7 @@ class Peer:
                     self.write(dict(method="exit"))
                     self.process.wait(timeout=10)
                 finally:
-                    if self.process.poll() is None:
-                        with contextlib.suppress(ProcessLookupError):
-                            os.killpg(self.process.pid, signal.SIGKILL)
-                    self.process.wait()
+                    self.kill()
             assert self.process.returncode == 0, self.process.returncode
         finally:
             self.stderr.close()
