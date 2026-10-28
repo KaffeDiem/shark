@@ -98,6 +98,7 @@ pub(crate) struct GitFeature {
     markdown_order: VecDeque<String>,
     list: ListState,
     show_resolved: bool,
+    show_drafts: bool,
 }
 
 impl GitFeature {
@@ -149,6 +150,7 @@ impl GitFeature {
             markdown_order: VecDeque::new(),
             list: ListState::new(0, ListAlignment::Top, px(400.)),
             show_resolved: false,
+            show_drafts: false,
         }
     }
 
@@ -360,13 +362,21 @@ impl GitFeature {
     }
 
     pub(crate) fn start_description(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.details.as_ref().is_some_and(|d| d.can_update) {
+        if self
+            .details
+            .as_ref()
+            .is_some_and(|d| d.can_update || self.has_draft(&d.target.url(), &Editing::Description))
+        {
             self.start_editor(Editing::Description, window, cx);
         }
     }
 
     pub(crate) fn start_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.details.as_ref().is_some_and(|d| d.can_comment) {
+        if self
+            .details
+            .as_ref()
+            .is_some_and(|d| d.can_comment || self.has_draft(&d.target.url(), &Editing::Comment))
+        {
             self.start_editor(Editing::Comment, window, cx);
         }
     }
@@ -377,35 +387,93 @@ impl GitFeature {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self
-            .details
-            .as_ref()
-            .is_some_and(|d| d.threads.iter().any(|t| t.id == thread && t.can_reply))
-        {
+        if self.details.as_ref().is_some_and(|d| {
+            d.threads.iter().any(|t| t.id == thread && t.can_reply)
+                || self.has_draft(&d.target.url(), &Editing::Reply(thread.to_string()))
+        }) {
             self.start_editor(Editing::Reply(thread.to_string()), window, cx);
         }
     }
 
+    fn has_draft(&self, target: &str, kind: &Editing) -> bool {
+        self.drafts.get(target).is_some_and(|draft| match kind {
+            Editing::Description => draft.description.is_some(),
+            Editing::Comment => !draft.note.is_empty(),
+            Editing::Reply(id) => draft.replies.get(id).is_some_and(|body| !body.is_empty()),
+        })
+    }
+
+    fn local_drafts(&self) -> Vec<(String, Editing)> {
+        let mut targets: Vec<_> = self.drafts.keys().collect();
+        targets.sort();
+        let mut entries = Vec::new();
+        for target in targets {
+            let draft = &self.drafts[target];
+            let mut kinds = vec![Editing::Description, Editing::Comment];
+            let mut replies: Vec<_> = draft.replies.keys().cloned().collect();
+            replies.sort();
+            kinds.extend(replies.into_iter().map(Editing::Reply));
+            entries.extend(
+                kinds
+                    .into_iter()
+                    .filter(|kind| self.has_draft(target, kind))
+                    .map(|kind| (target.clone(), kind)),
+            );
+        }
+        entries
+    }
+
+    fn can_submit(&self) -> bool {
+        let (Some(c), Some(d)) = (&self.composer, &self.details) else {
+            return false;
+        };
+        c.target == d.target.url()
+            && match &c.kind {
+                Editing::Description => d.can_update,
+                Editing::Comment => d.can_comment,
+                Editing::Reply(id) => d.threads.iter().any(|t| t.id == *id && t.can_reply),
+            }
+    }
+
     fn start_editor(&mut self, kind: Editing, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(d) = &self.details else {
+            return;
+        };
+        let target = d.target.url();
+        self.show_drafts = false;
+        self.open_draft(target, kind, window, cx);
+    }
+
+    fn open_draft(
+        &mut self,
+        target: String,
+        kind: Editing,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         if self.posting || self.archiving {
             return;
         }
         self.full_text = None;
         self.capture_draft(cx);
-        let Some(d) = &self.details else {
+        let details = self.details.as_ref().filter(|d| d.target.url() == target);
+        if !self.has_draft(&target, &kind) && details.is_none() {
             return;
-        };
-        let target = d.target.url();
+        }
         let draft = self.drafts.entry(target.clone()).or_default();
         let before = draft.clone();
         let (title, body) = match &kind {
             Editing::Description => {
-                let edit = draft.description.get_or_insert_with(|| DescriptionDraft {
-                    original_title: d.title.clone(),
-                    original_body: d.body.clone(),
-                    title: d.title.clone(),
-                    body: d.body.clone(),
-                });
+                if draft.description.is_none() {
+                    let Some(d) = details else { return };
+                    draft.description = Some(DescriptionDraft {
+                        original_title: d.title.clone(),
+                        original_body: d.body.clone(),
+                        title: d.title.clone(),
+                        body: d.body.clone(),
+                    });
+                }
+                let edit = draft.description.as_ref().unwrap();
                 (edit.title.clone(), edit.body.clone())
             }
             Editing::Comment => (String::new(), draft.note.clone()),
@@ -610,7 +678,12 @@ impl GitFeature {
     }
 
     fn replace_description(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.posting || self.loading || self.archiving || !self.description_changed() {
+        if self.posting
+            || self.loading
+            || self.archiving
+            || !self.can_submit()
+            || !self.description_changed()
+        {
             return;
         }
         let d = self.details.as_ref().unwrap();
@@ -660,7 +733,7 @@ impl GitFeature {
     }
 
     pub(crate) fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.full_text.is_some() {
+        if self.full_text.is_some() || !self.can_submit() {
             return;
         }
         if self.posting || self.loading || self.archiving {
@@ -934,7 +1007,7 @@ impl GitFeature {
                 h_flex()
                     .gap_2()
                     .flex_wrap()
-                    .when(d.can_update, |r| {
+                    .when(d.can_update || resume_description, |r| {
                         r.child(
                             Button::new("git-description-edit")
                                 .icon(IconName::Pencil)
@@ -1150,7 +1223,7 @@ impl GitFeature {
                                         })
                                     })),
                             )
-                            .when(t.can_reply, |d| {
+                            .when(t.can_reply || resume, |d| {
                                 d.child(
                                     Button::new(SharedString::from(format!(
                                         "git-thread-reply-{}",
@@ -1386,6 +1459,7 @@ impl Render for GitFeature {
         let (border, muted) = (theme.border, theme.muted_foreground);
         let disabled = self.posting || self.archiving;
         let repo = self.workspace.repos.get(self.selected);
+        let drafts = self.local_drafts();
         let toolbar = h_flex()
             .flex_none()
             .gap_2()
@@ -1404,12 +1478,31 @@ impl Render for GitFeature {
                     .on_click(cx.listener(move |s, _, w, cx| s.select_repo(i, w, cx)))
             }))
             .child(div().flex_1())
+            .when(!drafts.is_empty() || self.show_drafts, |r| {
+                r.child(
+                    Button::new("git-local-drafts")
+                        .label(if self.show_drafts {
+                            "Conversation".to_string()
+                        } else {
+                            format!("Local drafts ({})", drafts.len())
+                        })
+                        .small()
+                        .ghost()
+                        .disabled(disabled)
+                        .on_click(cx.listener(|s, _, w, cx| {
+                            s.show_drafts = !s.show_drafts;
+                            s.full_text = None;
+                            s.focus.focus(w, cx);
+                            cx.notify();
+                        })),
+                )
+            })
             .when_some(self.details.as_ref(), |r, d| {
                 let resume_comment = self
                     .drafts
                     .get(&d.target.url())
                     .is_some_and(|draft| !draft.note.is_empty());
-                r.when(d.can_comment, |r| {
+                r.when(d.can_comment || resume_comment, |r| {
                     r.child(
                         Button::new("git-comment-new")
                             .icon(IconName::MessageSquare)
@@ -1479,7 +1572,62 @@ impl Render for GitFeature {
                 IconName::GitPullRequest,
             )
         };
-        let content = if let Some(input) = &self.full_text {
+        let content = if self.show_drafts {
+            v_flex()
+                .id("git-local-drafts-list")
+                .test_support()
+                .size_full()
+                .overflow_y_scroll()
+                .p_4()
+                .gap_3()
+                .child(
+                    div()
+                        .text_sm()
+                        .child("Saved on this computer. Open a draft to edit, copy or discard it."),
+                )
+                .when(drafts.is_empty(), |d| d.child("No local drafts"))
+                .children(drafts.into_iter().enumerate().map(|(i, (target, kind))| {
+                    let label = match &kind {
+                        Editing::Description => "Resume description".to_string(),
+                        Editing::Comment => "Resume comment".to_string(),
+                        Editing::Reply(_) => "Resume reply".to_string(),
+                    };
+                    let context = match &kind {
+                        Editing::Reply(id) => self
+                            .details
+                            .as_ref()
+                            .filter(|d| d.target.url() == target)
+                            .and_then(|d| d.threads.iter().find(|t| t.id == *id))
+                            .map(|t| t.path.clone())
+                            .or_else(|| {
+                                self.drafts
+                                    .get(&target)?
+                                    .replies
+                                    .get(id)
+                                    .map(|body| body.chars().take(100).collect::<String>())
+                            }),
+                        _ => None,
+                    };
+                    v_flex()
+                        .gap_1()
+                        .child(div().text_xs().text_color(muted).child(target.clone()))
+                        .when_some(context, |d, context| {
+                            d.child(div().text_sm().child(context))
+                        })
+                        .child(
+                            h_flex().child(
+                                Button::new(("git-local-draft", i))
+                                    .label(label)
+                                    .small()
+                                    .disabled(disabled)
+                                    .on_click(cx.listener(move |s, _, w, cx| {
+                                        s.open_draft(target.clone(), kind.clone(), w, cx)
+                                    })),
+                            ),
+                        )
+                }))
+                .into_any_element()
+        } else if let Some(input) = &self.full_text {
             v_flex()
                 .size_full()
                 .min_h_0()
@@ -1626,6 +1774,8 @@ impl Render for GitFeature {
                         .font_weight(FontWeight::SEMIBOLD)
                         .child(title),
                 )
+                .child(div().text_xs().text_color(muted).child(c.target.clone()))
+                .when(!self.can_submit(), |d| d.child(div().text_sm().child("Saved locally. Load this PR with permission to post before sending to GitHub.")))
                 .when(self.description_changed(), |d| d.child(
                     v_flex().gap_2().text_sm()
                         .child("GitHub’s description changed. Compare the latest version above with your draft.")
@@ -1663,7 +1813,7 @@ impl Render for GitFeature {
                                 })
                                 .primary()
                                 .small()
-                                .disabled(disabled || self.loading)
+                                .disabled(disabled || self.loading || !self.can_submit())
                                 .on_click(cx.listener(|s, _, w, cx| s.submit(w, cx))),
                         )
                         .child(

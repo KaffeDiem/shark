@@ -281,7 +281,13 @@ fn comment_from(value: &Value) -> Result<Comment, String> {
 
 fn details_from(target: &Target, value: &Value) -> Result<Details, String> {
     let url = string(value, "url")?;
-    if Target::from_url(url)? != *target || value["number"].as_u64() != Some(target.number) {
+    let returned = Target::from_url(url)?;
+    if returned.host != target.host
+        || !returned.owner.eq_ignore_ascii_case(&target.owner)
+        || !returned.repo.eq_ignore_ascii_case(&target.repo)
+        || returned.number != target.number
+        || value["number"].as_u64() != Some(target.number)
+    {
         return Err("GitHub returned a different pull request; refresh before continuing".into());
     }
     Ok(Details {

@@ -892,6 +892,39 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             }
             cx.update_window(window, |_, w, cx| {
                 let feature = shark.read(cx).active_git_feature().unwrap().clone();
+                feature.update(cx, |f, cx| f.start_reply("T_0", w, cx));
+                w.render_frame(cx);
+                w.input("Preserve the existing session after reconnecting.", cx);
+                w.press("escape", cx);
+                w.render_frame(cx);
+                w.click("git-local-drafts", cx);
+                w.render_frame(cx);
+                let panel = w.find("git-feature").bounds();
+                assert!(w.find("git-local-drafts-list").visible());
+                for i in 0..2usize {
+                    let draft = w.find(("git-local-draft", i));
+                    assert!(draft.visible());
+                    assert!(
+                        draft.bounds().left() >= panel.left()
+                            && draft.bounds().right() <= panel.right()
+                    );
+                }
+            })
+            .unwrap();
+            let screenshot = cx
+                .capture_screenshot(window)
+                .expect("local Git drafts Metal render");
+            if let Some(output) = std::env::var_os("SHARK_RENDER_DIR") {
+                screenshot
+                    .save(
+                        PathBuf::from(output)
+                            .join(format!("git-local-drafts-{label}-{}.png", width as usize)),
+                    )
+                    .unwrap();
+            }
+            cx.update_window(window, |_, w, cx| {
+                w.click("git-local-drafts", cx);
+                let feature = shark.read(cx).active_git_feature().unwrap().clone();
                 feature.update(cx, |f, cx| f.scroll_row(0, cx));
                 let mut long = details.clone();
                 long.body = "Full Markdown source remains selectable and searchable. ".repeat(1300);
@@ -1771,4 +1804,244 @@ async fn git_feature_failed_draft_save_retries_without_losing_text(cx: &mut Test
             .unwrap()
             .contains("Recover this draft")
     );
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn qa_git_post_restores_conversation_keyboard_navigation(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let state = fixture(&home);
+    let (_gh, _) = fake_github(&home, &state, 100);
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    press_in(window)(cx, &["cmd-shift-g"]);
+    let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        feature.read(cx).inspect().details.is_some()
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| {
+        feature.update(cx, |g, cx| g.start_comment(w, cx));
+        w.render_frame(cx);
+        w.input("Continue reading after posting", cx);
+        w.press("cmd-s", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        feature
+            .read(cx)
+            .inspect()
+            .details
+            .as_ref()
+            .is_some_and(|d| d.comments.len() == 2)
+            && !feature.read(cx).inspect().loading
+    })
+    .await;
+    press_in(window)(cx, &["end"]);
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(
+            feature.read(cx).scroll_offset().item_ix > 90,
+            "after posting removes the focused composer, End must still navigate the conversation"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn qa_git_saved_draft_accessible_after_permissions_revoked(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let state = fixture(&home);
+    let (_gh, dir) = fake_github(&home, &state, 1);
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    press_in(window)(cx, &["cmd-shift-g"]);
+    let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        feature.read(cx).inspect().details.is_some()
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| {
+        feature.update(cx, |g, cx| g.start_comment(w, cx));
+        w.render_frame(cx);
+        w.input("Recover my saved local comment", cx);
+        w.press("escape", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        !feature.read(cx).saving_drafts()
+    })
+    .await;
+    assert!(
+        fs::read_to_string(crate::state::support_dir().join("git-drafts/git-review.json"))
+            .unwrap()
+            .contains("Recover my saved local comment")
+    );
+    cx.update_window(window, |_, w, cx| {
+        feature.update(cx, |g, cx| g.start_description(w, cx));
+        w.render_frame(cx);
+        w.press("cmd-a", cx);
+        w.input("Local description after permission loss", cx);
+        w.press("escape", cx);
+        feature.update(cx, |g, cx| g.start_reply("T_0", w, cx));
+        w.render_frame(cx);
+        w.input("Local reply after permission loss", cx);
+        w.press("escape", cx);
+    })
+    .unwrap();
+    let mut locked = pr_fixture(1);
+    locked["locked"] = json!(true);
+    locked["viewerCanUpdate"] = json!(false);
+    locked["reviewThreads"]["nodes"][0]["viewerCanReply"] = json!(false);
+    fs::write(dir.join("git-pr.json"), locked.to_string()).unwrap();
+    cx.update_window(window, |_, w, cx| {
+        feature.update(cx, |g, cx| g.refresh(w, cx));
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        !feature.read(cx).inspect().loading
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        feature.update(cx, |g, cx| g.start_comment(w, cx));
+        assert_eq!(
+            feature.read(cx).draft_text(cx).as_deref(),
+            Some("Recover my saved local comment"),
+            "remote permissions must not prevent reading or copying a saved local draft"
+        );
+        w.render_frame(cx);
+        w.press("cmd-s", cx);
+        assert!(!feature.read(cx).busy());
+        feature.update(cx, |g, cx| g.start_description(w, cx));
+        assert_eq!(
+            feature.read(cx).draft_text(cx).as_deref(),
+            Some("Local description after permission loss")
+        );
+        w.render_frame(cx);
+        w.press("cmd-s", cx);
+        assert!(!feature.read(cx).busy());
+        feature.update(cx, |g, cx| g.start_reply("T_0", w, cx));
+        assert_eq!(
+            feature.read(cx).draft_text(cx).as_deref(),
+            Some("Local reply after permission loss")
+        );
+        w.render_frame(cx);
+        w.press("cmd-s", cx);
+        assert!(!feature.read(cx).busy());
+    })
+    .unwrap();
+    assert!(!dir.join("git-writes.jsonl").exists());
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_feature_local_drafts_recover_offline_and_keep_remote_targets(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let state = fixture(&home);
+    let (_gh, dir) = fake_github(&home, &state, 0);
+    let target = "https://github.com/acme/api/pull/7";
+    let other = "https://github.com/acme/api/pull/8";
+    let path = crate::state::support_dir().join("git-drafts/git-review.json");
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(&path, json!({
+        target: {
+            "description": {"original_title":"Original title", "original_body":"Original body", "title":"Local title", "body":"Local description"},
+            "note":"Local comment", "replies":{"deleted-thread":"Local reply"}
+        },
+        other: {"description":null, "note":"Other PR comment", "replies":{}}
+    }).to_string()).unwrap();
+    fs::write(dir.join("git-fail"), "offline").unwrap();
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    press_in(window)(cx, &["cmd-shift-g"]);
+    let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        feature.read(cx).inspect().error.is_some() && !feature.read(cx).inspect().loading
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("git-local-drafts", cx);
+    })
+    .unwrap();
+    for (index, text) in [
+        "Local description",
+        "Local comment",
+        "Local reply",
+        "Other PR comment",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.click(("git-local-draft", index), cx);
+            w.render_frame(cx);
+            assert_eq!(feature.read(cx).draft_text(cx).as_deref(), Some(text));
+            w.press("cmd-a", cx);
+            w.press("cmd-c", cx);
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|c| c.text()).as_deref(),
+                Some(text)
+            );
+            w.press("cmd-s", cx);
+            assert!(!feature.read(cx).busy(), "offline drafts cannot post");
+            w.press("escape", cx);
+        })
+        .unwrap();
+    }
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click(("git-local-draft", 1usize), cx);
+        w.render_frame(cx);
+        w.press("cmd-a", cx);
+        w.input("Edited offline", cx);
+        w.press("escape", cx);
+        w.render_frame(cx);
+        w.click(("git-local-draft", 2usize), cx);
+        w.render_frame(cx);
+        w.click("git-editor-discard", cx);
+        w.press("enter", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        !feature.read(cx).saving_drafts()
+    })
+    .await;
+    let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+    assert_eq!(saved[target]["note"], "Edited offline");
+    assert_eq!(
+        saved[target]["description"]["original_body"],
+        "Original body"
+    );
+    assert!(saved[target]["replies"].as_object().unwrap().is_empty());
+    assert_eq!(saved[other]["note"], "Other PR comment");
+
+    fs::remove_file(dir.join("git-fail")).unwrap();
+    cx.update_window(window, |_, w, cx| {
+        feature.update(cx, |g, cx| g.refresh(w, cx))
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        feature.read(cx).inspect().details.is_some() && !feature.read(cx).inspect().loading
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click(("git-local-draft", 2usize), cx);
+        w.render_frame(cx);
+        w.press("cmd-s", cx);
+        assert!(
+            !feature.read(cx).busy(),
+            "another PR's draft cannot post to the loaded PR"
+        );
+        assert_eq!(
+            feature.read(cx).draft_text(cx).as_deref(),
+            Some("Other PR comment")
+        );
+    })
+    .unwrap();
+    assert!(!dir.join("git-writes.jsonl").exists());
 }

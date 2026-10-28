@@ -1,5 +1,147 @@
 use super::*;
 
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn qa_file_menu_comment_focuses_the_comment_input(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(cx, fixture(&home), WindowOptions::default());
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).differ.read(cx).diff_loaded()
+    })
+    .await;
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.open_path("api/shared.rs".into(), w, cx);
+    });
+    let action = shark.update(cx, |s, cx| {
+        s.file_menu("api/shared.rs", cx)
+            .into_iter()
+            .find_map(|entry| match entry {
+                Entry::Item {
+                    label, on_click, ..
+                } if label == "Comment" => Some(on_click),
+                _ => None,
+            })
+            .unwrap()
+    });
+    cx.update_window(window, |_, w, cx| action(w, cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.tab, Tab::Feature(Feature::Diff));
+        let composer = s.differ.read(cx).review().composer.as_ref().unwrap();
+        assert!(
+            composer
+                .input
+                .read(cx)
+                .focus_handle(cx)
+                .contains_focused(w, cx),
+            "Comment menu should leave focus in the new composer"
+        );
+    })
+    .unwrap();
+    cx.update_window(window, |_, w, cx| {
+        w.input("Review this change", cx);
+        let composer = shark
+            .read(cx)
+            .differ
+            .read(cx)
+            .review()
+            .composer
+            .as_ref()
+            .unwrap();
+        assert_eq!(composer.input.read(cx).value(), "Review this change");
+    })
+    .unwrap();
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.differ.update(cx, |d, cx| {
+            d.begin_edit("api/shared.rs".into(), w, cx);
+            assert!(d.review().composer.is_some());
+            d.activate(w, cx);
+            assert!(d.editing().as_ref().unwrap().focused(w, cx));
+            d.comment_in("api/shared.rs", w, cx);
+            d.activate(w, cx);
+            let composer = d.review().composer.as_ref().unwrap();
+            assert!(
+                composer
+                    .input
+                    .read(cx)
+                    .focus_handle(cx)
+                    .contains_focused(w, cx)
+            );
+        });
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn qa_discard_pending_does_not_delete_another_workspaces_comments(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(cx, fixture(&home), WindowOptions::default());
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).differ.read(cx).diff_loaded()
+    })
+    .await;
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.differ.update(cx, |d, cx| {
+            for workspace in ["boundary-a", "boundary-b"] {
+                d.review_mut().edit(workspace, |comments| {
+                    comments.push(
+                        serde_json::from_value(serde_json::json!({
+                            "id": 1, "path": "api/shared.rs", "start": [false, 1],
+                            "end": [false, 1], "text": workspace
+                        }))
+                        .unwrap(),
+                    );
+                });
+            }
+            d.discard_pending(w, cx);
+        });
+        assert!(w.has_active_dialog(cx));
+        s.open_workspace_now(1, w, cx);
+    });
+    press_in(window)(cx, &["enter"]);
+    cx.update(|cx| {
+        let d = shark.read(cx).differ.read(cx);
+        assert_eq!(d.workspace_name(), Some("boundary-b"));
+        assert_eq!(
+            d.ws_comments().len(),
+            1,
+            "A's confirmation must preserve B's comments"
+        );
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn qa_viewed_marks_survive_a_host_snapshot_before_event_delivery(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(cx, fixture(&home), WindowOptions::default());
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).differ.read(cx).diff_loaded()
+    })
+    .await;
+    on_app(window, shark.clone())(cx, &|s, _, cx| {
+        s.differ
+            .update(cx, |d, cx| d.toggle_viewed_path("api/shared.rs", cx));
+        assert!(s.active_ws().unwrap().viewed.is_empty());
+        s.configure_differ(cx);
+        assert!(s.differ.read(cx).viewed_now().contains("api/shared.rs"));
+    });
+    cx.update(|cx| {
+        assert!(
+            shark
+                .read(cx)
+                .active_ws()
+                .unwrap()
+                .viewed
+                .contains_key("api/shared.rs")
+        );
+    });
+}
+
 fn fixture(home: &Path) -> State {
     let repos = repos(home, &["api"]);
     let mut state = State {

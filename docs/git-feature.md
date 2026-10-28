@@ -55,6 +55,13 @@ and editable drafts. Rapid repository switches coalesce into one pending read. N
 its drafts. Refresh keeps the list position within the same PR. Quitting or
 archiving waits for a pending remote write.
 
+Local drafts opens saved descriptions, comments and replies even after an offline
+restart, permission loss, or removal of the original review thread. Drafts can be
+read, copied, edited or discarded without GitHub access. Posting requires the
+matching PR and an available, permitted destination; the API rechecks identity
+and permissions before writing. GitHub URL capitalization differences are accepted
+without changing existing draft keys.
+
 ## API limitations
 
 GitHub's `updatePullRequest` mutation has no compare-and-swap argument. A fresh read

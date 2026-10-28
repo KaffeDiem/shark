@@ -2238,7 +2238,6 @@ pub(crate) fn posted_as(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
 
     const PATCH: &str = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,4 +1,4 @@ fn x\n a\n-b\n-c\n+B\n d\n\\ No newline at end of file\n@@ -10 +10,2 @@\n x\n+y\n";
 
@@ -2251,7 +2250,7 @@ mod tests {
             .collect()
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn rows_follow_the_diff_layout() {
         let hunks = parse_hunks(PATCH);
         assert_eq!(hunks.len(), 2);
@@ -2297,7 +2296,7 @@ mod tests {
         assert_eq!(fit(&unified, 5, 1, 10.), 0, "scrolloff above");
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn prompt_lists_places_ids_and_suggestions() {
         let c = |id, start, end, text: &str| Comment {
             id,
@@ -2339,7 +2338,7 @@ mod tests {
     }
 
     /// An old-side comment without a base reads nothing, not the index (`git show :path`).
-    #[test]
+    #[::core::prelude::v1::test]
     fn old_lines_without_a_base() {
         let dir = std::env::temp_dir().join(format!("shark-rev-{}", std::process::id()));
         let repo = dir.join("api");
@@ -2360,7 +2359,7 @@ mod tests {
     /// A working-copy thread follows its lines through edits above it. Its own line edited,
     /// it stays, so it reads Outdated, though the same text is further down; never read, it
     /// only goes to a snapshot found once.
-    #[test]
+    #[::core::prelude::v1::test]
     fn reanchors_through_the_diff() {
         let file = |ten: &str, top: &str| {
             let mut l: Vec<String> = (1..=20).map(|i| format!("l{i}")).collect();
@@ -2399,7 +2398,7 @@ mod tests {
         assert_eq!((d.start, d.end), ((false, 3), (false, 4)));
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn reports_and_judging() {
         // The prompt's own instruction line, quoted back, is no report.
         let reply = "Done.\n\n[c1] addressed: Ratio stored once.\n- `[c12] Addressed: renamed`\n[c3] skipped: no\n[cx] addressed: bad\n[c<id>] addressed: <what you changed, in one line>\n";
@@ -2439,7 +2438,7 @@ mod tests {
     }
 
     /// comments/<ws>.json from before ids and statuses still loads; each gets its own id.
-    #[test]
+    #[::core::prelude::v1::test]
     fn old_comment_files_load() {
         let old = r#"[{"path":"api/a","start":[false,1],"end":[false,2],"text":"one"},
                       {"path":"api/b","start":[true,3],"end":[true,3],"text":"two"}]"#;

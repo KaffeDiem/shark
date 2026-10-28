@@ -853,9 +853,8 @@ impl MediaView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::prelude::v1::test;
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn parses_index_line() {
         let chunk = "diff --git a/web/a.png b/web/a.png\n\
                      index 667fa07ce3c6cf443edfed540420eb8968684eea..0000000000000000000000000000000000000000 100644\n\

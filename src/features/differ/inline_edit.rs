@@ -749,9 +749,8 @@ pub(crate) fn edit_buttons(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn buffer_splits_joins_and_pastes() {
         let mut b = Buffer::new("one\ntwo\n");
         assert_eq!(b.lines, ["one", "two"]);
@@ -777,7 +776,7 @@ mod tests {
         assert_eq!(Buffer::new("a\n").indent(), "    ");
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn indent_skips_blank_lines_and_insert_splits_lone_cr() {
         assert_eq!(Buffer::new("a\n  \n\t\n    b\n").indent(), "    ");
         let mut b = Buffer::new("x\n");
@@ -788,7 +787,7 @@ mod tests {
         assert_eq!(b.text(), "x1\n2\n3!\n");
     }
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn patch_compares_buffer_with_base() {
         let base = "a\nb\nc\n";
         let mut b = Buffer::new(base);

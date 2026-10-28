@@ -58,6 +58,12 @@ fn metadata_fails_closed_on_wrong_identity_and_missing_permissions() {
     for (key, val) in [
         ("number", json!(3)),
         ("url", json!("https://github.com/other/repo/pull/12")),
+        ("url", json!("https://github.com/owner/other/pull/12")),
+        (
+            "url",
+            json!("https://github.example.org/owner/repo/pull/12"),
+        ),
+        ("url", json!("https://github.com/owner/repo/pull/13")),
         ("viewerCanUpdate", Value::Null),
         ("locked", Value::Null),
     ] {
@@ -69,6 +75,18 @@ fn metadata_fails_closed_on_wrong_identity_and_missing_permissions() {
     locked["locked"] = json!(true);
     locked["viewerCanUpdate"] = json!(false);
     assert!(!details_from(&target(), &locked).unwrap().can_comment);
+}
+
+#[test]
+fn metadata_accepts_canonical_repository_casing() {
+    let requested = Target::from_url("https://github.com/OWNER/REPO/pull/12").unwrap();
+    let details = details_from(&requested, &pr()).unwrap();
+    assert_eq!(details.url, target().url());
+    assert_eq!(details.target, requested);
+    assert_eq!(
+        details.target.url(),
+        "https://github.com/OWNER/REPO/pull/12"
+    );
 }
 
 #[test]
@@ -398,5 +416,73 @@ print(json.dumps({'data':{'repository':{'pullRequest':json.loads((p/'pr.json').r
         );
         assert!(start.elapsed() < Duration::from_secs(10));
         eprintln!("Loaded 2,000 review threads in {:?}", start.elapsed());
+    }
+
+    #[test]
+    fn pagination_rejects_missing_cursor_and_skips_deleted_nodes() {
+        let f = Fixture::new();
+        let mut data = pr();
+        data["comments"] = connection(vec![Value::Null, note("C_1"), note("C_1")]);
+        f.write("pr.json", &data);
+        assert_eq!(load(&f.root, &target()).unwrap().comments.len(), 1);
+        for cursor in [Value::Null, json!("")] {
+            data["comments"]["pageInfo"] = json!({"hasNextPage":true,"endCursor":cursor});
+            f.write("pr.json", &data);
+            assert!(
+                load(&f.root, &target())
+                    .unwrap_err()
+                    .contains("cursor is missing")
+            );
+        }
+        assert_eq!(
+            f.calls().len(),
+            3,
+            "invalid cursors must not launch another request"
+        );
+    }
+
+    #[test]
+    fn refreshed_pr_node_identity_blocks_every_pr_mutation() {
+        let f = Fixture::new();
+        let details = load(&f.root, &target()).unwrap();
+        let mut changed = pr();
+        changed["id"] = json!("PR_REPLACEMENT");
+        f.write("pr.json", &changed);
+        assert!(
+            save_description(&f.root, &details, "New title", "body")
+                .unwrap_err()
+                .contains("identity changed")
+        );
+        assert!(
+            comment(&f.root, &details, "comment")
+                .unwrap_err()
+                .contains("identity changed")
+        );
+        assert_eq!(f.mutations(), 0);
+    }
+
+    #[test]
+    fn reopening_threads_rechecks_its_own_permission() {
+        let f = Fixture::new();
+        let details = load(&f.root, &target()).unwrap();
+        let mut current = thread("T_1");
+        current["isResolved"] = json!(true);
+        current["viewerCanUnresolve"] = json!(false);
+        f.write("thread.json", &current);
+        assert!(resolve(&f.root, &details, "T_1", false).is_err());
+        assert_eq!(f.mutations(), 0);
+        current["viewerCanResolve"] = json!(false);
+        current["viewerCanUnresolve"] = json!(true);
+        f.write("thread.json", &current);
+        resolve(&f.root, &details, "T_1", false).unwrap();
+        assert_eq!(f.mutations(), 1);
+        assert!(
+            f.calls()
+                .last()
+                .unwrap()
+                .iter()
+                .any(|arg| arg.starts_with("query=mutation")
+                    && arg.contains("unresolveReviewThread"))
+        );
     }
 }

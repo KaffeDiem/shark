@@ -385,9 +385,8 @@ impl Differ {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
 
-    #[test]
+    #[::core::prelude::v1::test]
     fn github_body_has_place_code_and_text() {
         let c: Comment = serde_json::from_str(
             r#"{"path":"shark/src/app.rs","start":[false,631],"end":[false,632],"text":"Keep it aligned.","snapshot":".size(px(400.))"}"#,

@@ -304,6 +304,14 @@ impl Differ {
 
     pub(crate) fn activate(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.refresh_diff(cx);
+        // Deferred activation must preserve the comment input just focused by a menu action.
+        if let Some(composer) = &self.review.composer
+            && std::iter::once(&composer.input)
+                .chain(composer.suggest.iter())
+                .any(|input| input.read(cx).focus_handle(cx).contains_focused(window, cx))
+        {
+            return;
+        }
         if self.editing.is_some() {
             self.focus_edit(window, cx);
         } else {
