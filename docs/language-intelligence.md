@@ -13,22 +13,39 @@ The editor starts its language session and reports Starting, Preparing index,
 Ready, or Setup needed. While the server starts or reports `$/progress`, the header
 shows a spinner with the newest work and its percentage ("Indexing 42%"; the server's
 message is in the tooltip) and a progress bar under the header, indeterminate until a
-percentage arrives. Retry/restart uses the same selected backend.
+percentage arrives. Setup needed shows the problem with a Retry button; Retry
+rediscovers the project. Error and warning `window/showMessage` notices from a server
+appear as notifications.
+
+A project's files share one server. The server outlives the replacement of its only
+tab (tree clicks, same-tab definitions, Back) and stops when the last file using it
+closes. Switching workspaces parks the outgoing workspace's servers for five minutes;
+returning within that window resumes them warm.
 
 The header is a jump bar: back/forward buttons, the file path, then the symbols around
 the cursor. Click a folder to list its files and folders, or a symbol to open the file's outline as an indented tree with that
 symbol selected. Command-click follows a definition in the current tab, replacing a
-clean file (back restores it); Command-Shift-click opens a new tab. A file with unsaved
-edits is never replaced. The mouse's back/forward buttons walk the same history.
+clean file (back restores it); Command-Shift-click opens a new tab. Picking a file from
+a folder works the same way. A file with unsaved edits is never replaced. The mouse's
+back/forward buttons walk the same history; quick repeated presses step one entry each,
+and an entry whose file was deleted is skipped.
+
+Definitions outside the workspace, and inside installed dependencies (`node_modules`,
+`site-packages`), open read-only with the server that found them, so hover and
+definitions keep working there. Back returns the replaced file to its tab position.
+
+Format document sends the buffer's own indentation (tabs, or its most common indent
+step) as the formatting options; servers such as tsserver reindent to them.
 
 | Action | Key |
 |---|---|
 | Format document | Option-Shift-F |
-| Rename symbol | F2 |
+| Go to definition | F12 (Vim: `g d`) |
+| Rename symbol | F2 (starts with the symbol selected) |
 | Find references | Shift-F12 |
 | Document symbols (outline tree) | Command-Shift-O (Vim: `g s`) |
 | Signature help | Command-Shift-Space |
-| Navigate back / forward | Control-minus / Control-Shift-minus (Vim: `ctrl-o` / `ctrl-i`) |
+| Navigate back / forward | Control-minus / Control-underscore, that is Control-Shift-minus (Vim: `ctrl-o` / `ctrl-i`) |
 
 Completion, hover, definitions, code actions, and diagnostic overlays use GPUI's
 existing editor interfaces. Language edits remain unsaved until the normal checked
