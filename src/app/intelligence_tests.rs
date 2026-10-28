@@ -1486,6 +1486,41 @@ async fn language_keys_send_rename_definition_and_buffer_formatting(cx: &mut Tes
     .await;
 }
 
+// Closing a tab keeps a server whose project still has a file that has not attached yet (a
+// restored tab still discovering), and stops it once its last file closes.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn closing_a_tab_keeps_servers_of_files_still_discovering(cx: &mut TestAppContext) {
+    let _guard = ui_tests::UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, window, shark) = fixture(cx).await;
+    std::fs::create_dir_all(root.join("pending")).unwrap();
+    std::fs::write(root.join("pending/p.txt"), "papa\n").unwrap();
+    let (session, _) = fake_session(&root.join("pending"));
+    let weak = cx
+        .update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| {
+                let session = cx.new(|_| session);
+                s.register_session(session.clone(), w, cx);
+                session.downgrade()
+            })
+        })
+        .unwrap();
+    let p = open_tab(cx, window, &shark, "api/pending/p.txt").await;
+    cx.update(|cx| p.update(cx, |e, _| e.intelligence = None));
+    let close = |cx: &mut TestAppContext, editor: Entity<FileEditor>| {
+        cx.update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| s.close_editor(editor, w, cx))
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    let a = cx.update(|cx| shark.read(cx).file_tabs[0].editor.clone());
+    close(cx, a);
+    assert!(weak.upgrade().is_some(), "p.txt may still attach to it");
+    close(cx, p);
+    assert!(weak.upgrade().is_none());
+}
+
 // A saved tab or a definition pointing at a FIFO is refused instead of blocking the read
 // (restore reads every saved tab in one task, so one FIFO would hold them all back).
 #[test]
@@ -1514,6 +1549,10 @@ fn formatting_options_follow_the_buffer_indentation() {
     // JSDoc's one-space continuation lines do not set the step.
     assert_eq!(
         options("/**\n * doc\n */\nf {\n  a\n  b {\n    c\n  }\n}\n"),
+        spaces(2)
+    );
+    assert_eq!(
+        options("/**\n * doc\n */\nfunction f() {\n  return 1;\n}\n"),
         spaces(2)
     );
     assert_eq!(options("def f():\n    return 1\n"), spaces(4));

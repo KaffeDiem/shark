@@ -389,7 +389,14 @@ impl Shark {
         let tabs = &self.file_tabs;
         self.language_sessions.retain(|_, (session, _)| {
             tabs.iter().any(|t| {
-                (t.editor.read(cx).intelligence.as_ref()).is_some_and(|l| l.session == *session)
+                let e = t.editor.read(cx);
+                match &e.intelligence {
+                    Some(l) => l.session == *session,
+                    // A file still discovering (say, just restored) may be about to join it.
+                    None => e
+                        .absolute_path()
+                        .starts_with(&session.read(cx).project.worktree),
+                }
             })
         });
     }
@@ -483,7 +490,7 @@ impl Shark {
                             None,
                             focus,
                             !focus,
-                            Some((reply, focus)),
+                            Some((reply, focus, session.downgrade())),
                             window,
                             cx,
                         );
@@ -713,8 +720,8 @@ impl Shark {
 
     /// Opens `path` at `range` or `visit`: in its open tab if it has one, else in place of
     /// the current file (unless `new_tab`, or the current file has unsaved edits). A server's
-    /// `window/showDocument` passes its reply, answered once the file shows, and whether to
-    /// take focus.
+    /// `window/showDocument` passes its reply, answered once the file shows, whether to take
+    /// focus, and its session, which an external file it opens attaches to.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn open_source(
         &mut self,
@@ -723,7 +730,7 @@ impl Shark {
         visit: Option<(Visit, bool)>,
         history: bool,
         new_tab: bool,
-        reply: Option<(client::Reply, bool)>,
+        reply: Option<(client::Reply, bool, WeakEntity<Session>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -737,9 +744,10 @@ impl Shark {
         let origin = self.editor.clone();
         let origin_tab = self.tab;
         // Dependency sources have no project of their own; they use the server that found them.
-        let session = match &visit {
-            Some((v, _)) => v.session.clone(),
-            None => origin
+        let session = match (&visit, &reply) {
+            (Some((v, _)), _) => v.session.clone(),
+            (None, Some((_, _, session))) => Some(session.clone()),
+            (None, None) => origin
                 .as_ref()
                 .and_then(|e| (e.read(cx).intelligence.as_ref()).map(|l| l.session.downgrade())),
         };
@@ -928,7 +936,7 @@ impl Shark {
                     s.navigation.back.push(old);
                     s.navigation.forward.clear();
                 }
-                let focus = reply.as_ref().is_none_or(|(_, focus)| *focus);
+                let focus = reply.as_ref().is_none_or(|(_, focus, _)| *focus);
                 if focus {
                     s.editor = Some(editor.clone());
                     s.show(Tab::File, window, cx);
@@ -946,7 +954,7 @@ impl Shark {
                         }
                     })
                 });
-                if let Some((reply, _)) = reply {
+                if let Some((reply, ..)) = reply {
                     reply.respond(json!({"success":true}));
                 }
                 let _ = s.state.save();
@@ -1180,7 +1188,8 @@ fn uri_path(uri: &Uri) -> anyhow::Result<PathBuf> {
 pub(super) fn formatting_options(text: &str) -> Value {
     let (mut tabs, mut spaces, mut previous) = (0, 0, 0);
     let mut steps = [0usize; 9];
-    for line in text.lines().filter(|l| !l.trim().is_empty()) {
+    // Block-comment continuations (" * doc", " */") sit one space in; they are not a step.
+    for line in (text.lines()).filter(|l| !l.trim().is_empty() && !l.trim().starts_with('*')) {
         if line.starts_with('\t') {
             tabs += 1;
             continue;
