@@ -3,13 +3,13 @@
 import json
 import os
 import pathlib
-import queue
-import signal
 import subprocess
 import sys
 import tempfile
-import threading
 import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from jsonrpc_peer import Peer  # noqa: E402
 
 PROJECT = '''// !$*UTF8*$!
 { archiveVersion = 1; classes = {}; objectVersion = 56;
@@ -40,70 +40,37 @@ def exercise(program):
         subprocess.run([program, "--non-interactive", "bsp", "init", "--project", str(project)], cwd=root, check=True, timeout=30)
         config = json.loads((root / "buildServer.json").read_text())
         assert all(key in config for key in ["name", "version", "bspVersion", "languages", "argv"])
-        with tempfile.TemporaryFile() as stderr:
-            child = subprocess.Popen(config["argv"], cwd=root, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=stderr, start_new_session=True)
-            lifecycle_deadline = time.monotonic() + 120
-            messages = queue.Queue()
+        peer = Peer(config["argv"], root)
+        child, send = peer.process, peer.send
+        lifecycle_deadline = time.monotonic() + 120
 
-            def read():
-                try:
-                    while True:
-                        length = None
-                        while True:
-                            header = child.stdout.readline()
-                            if not header:
-                                raise EOFError("BSP server exited")
-                            if header in (b"\r\n", b"\n"):
-                                break
-                            if header.lower().startswith(b"content-length:"):
-                                length = int(header.split(b":", 1)[1])
-                        messages.put(json.loads(child.stdout.read(length)))
-                except Exception as error:
-                    messages.put(error)
+        def response(ident):
+            deadline = min(time.monotonic() + 60, lifecycle_deadline)
+            while time.monotonic() < deadline:
+                message = peer.receive(deadline)
+                if message.get("id") == ident:
+                    assert "error" not in message, message
+                    return message["result"]
+            raise TimeoutError("BSP response timed out")
 
-            threading.Thread(target=read, daemon=True).start()
-
-            def send(method, params=None, ident=None):
-                message = {"jsonrpc": "2.0", "method": method}
-                if params is not None:
-                    message["params"] = params
-                if ident is not None:
-                    message["id"] = ident
-                raw = json.dumps(message).encode()
-                child.stdin.write(("Content-Length: %d\r\n\r\n" % len(raw)).encode() + raw)
-                child.stdin.flush()
-
-            def response(ident):
-                deadline = min(time.monotonic() + 60, lifecycle_deadline)
-                while time.monotonic() < deadline:
-                    message = messages.get(timeout=max(0.01, deadline - time.monotonic()))
-                    if isinstance(message, Exception):
-                        raise message
-                    if message.get("id") == ident:
-                        assert "error" not in message, message
-                        return message["result"]
-                raise TimeoutError("BSP response timed out")
-
-            try:
-                send("build/initialize", {"displayName": "Shark release gate", "version": "1", "bspVersion": "2.2.0", "rootUri": root.as_uri(), "capabilities": {"languageIds": ["swift"]}}, 1)
-                assert response(1)["capabilities"] is not None
-                send("build/initialized", {})
-                send("workspace/buildTargets", {}, 2)
-                assert response(2)["targets"], "BSP returned no targets for the Xcode fixture"
-                send("build/shutdown", None, 3)
-                response(3)
-                send("build/exit")
-                child.wait(timeout=10)
-                assert child.returncode == 0, child.returncode
-                print("SweetPad BSP: generate/initialize/buildTargets/shutdown passed")
-            except Exception:
-                stderr.seek(0)
-                sys.stderr.write(stderr.read().decode(errors="replace")[-8000:])
-                raise
-            finally:
-                if child.poll() is None:
-                    os.killpg(child.pid, signal.SIGKILL)
-                    child.wait()
+        try:
+            send("build/initialize", {"displayName": "Shark release gate", "version": "1", "bspVersion": "2.2.0", "rootUri": root.as_uri(), "capabilities": {"languageIds": ["swift"]}}, 1)
+            assert response(1)["capabilities"] is not None
+            send("build/initialized", {})
+            send("workspace/buildTargets", {}, 2)
+            assert response(2)["targets"], "BSP returned no targets for the Xcode fixture"
+            send("build/shutdown", None, 3)
+            response(3)
+            send("build/exit")
+            child.wait(timeout=10)
+            assert child.returncode == 0, child.returncode
+            print("SweetPad BSP: generate/initialize/buildTargets/shutdown passed")
+        except Exception:
+            sys.stderr.write(peer.stderr_tail())
+            raise
+        finally:
+            peer.kill()
+            peer.stderr.close()
 
 
 if __name__ == "__main__":
