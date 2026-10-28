@@ -1,12 +1,14 @@
 //! Account usage belongs to the window, independent of the selected workspace.
 use super::*;
 use crate::usage::{Failure, Provider, Snapshot, Status};
+use gpui_kit::component::progress::ProgressCircle;
 use std::time::Duration;
+
+const POLL_INTERVAL: Duration = Duration::from_secs(300);
 
 pub(super) struct Panel {
     focus: FocusHandle,
     previous_focus: Option<FocusHandle>,
-    pub(super) poll: Option<Task<()>>,
     _keys: Subscription,
 }
 
@@ -45,11 +47,9 @@ impl Shark {
         self.usage_panel = Some(Panel {
             focus,
             previous_focus,
-            poll: None,
             _keys: keys,
         });
         self.refresh_usage(cx);
-        self.usage_polling(window, cx);
         cx.notify();
     }
 
@@ -95,52 +95,83 @@ impl Shark {
     }
 
     pub(super) fn usage_polling(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(panel) = &mut self.usage_panel else {
-            return;
-        };
+        let now = cx.background_executor().now();
+        if self.usage_due.is_none()
+            || (window.is_window_active() && self.usage_due.is_some_and(|due| due <= now))
+        {
+            self.refresh_usage(cx);
+            self.usage_due = Some(now + POLL_INTERVAL);
+        }
         if !window.is_window_active() {
-            panel.poll = None;
-        } else if panel.poll.is_none() {
-            panel.poll = Some(cx.spawn_in(window, async move |this, cx| {
-                loop {
-                    cx.background_executor()
-                        .timer(Duration::from_secs(60))
-                        .await;
-                    let keep = this
-                        .update_in(cx, |s, w, cx| {
-                            if s.usage_panel.is_none() || !w.is_window_active() {
-                                return false;
-                            }
-                            s.refresh_usage(cx);
-                            true
-                        })
-                        .unwrap_or(false);
-                    if !keep {
-                        break;
-                    }
-                }
+            self.usage_poll = None;
+        } else if self.usage_poll.is_none() {
+            let delay = self.usage_due.unwrap().saturating_duration_since(now);
+            self.usage_poll = Some(cx.spawn_in(window, async move |this, cx| {
+                cx.background_executor().timer(delay).await;
+                this.update_in(cx, |s, w, cx| {
+                    s.usage_poll = None;
+                    s.usage_polling(w, cx);
+                })
+                .ok();
             }));
         }
     }
 
-    pub(super) fn render_usage_button(&self, cx: &Context<Self>) -> impl IntoElement {
+    pub(super) fn render_usage_footer(&self, cx: &Context<Self>) -> impl IntoElement {
         let at = self.usage_at.clone();
+        let providers: Vec<_> = Provider::ALL
+            .into_iter()
+            .filter(|p| !self.usage[p.index()].allowances.is_empty())
+            .collect();
+        let fallback = providers.is_empty();
         div()
+            .id("usage-footer")
             .relative()
             .flex_none()
-            .mx(px(8.))
+            .p_2()
             .child(
-                Button::new("show-usage")
-                    .ghost()
-                    .xsmall()
-                    .label("Usage")
-                    .accessibility_label("Show usage")
-                    .on_click(cx.listener(|s, _, w, cx| {
-                        if s.usage_panel.is_some() {
-                            s.close_usage(w, cx);
-                        } else {
-                            s.show_usage(w, cx);
-                        }
+                h_flex()
+                    .gap_2()
+                    .when(self.rail, |d| d.flex_col().items_center())
+                    .when(fallback, |d| {
+                        d.child(
+                            Button::new("show-usage")
+                                .ghost()
+                                .small()
+                                .icon(IconName::ChartBar)
+                                .when(!self.rail, |b| b.label("Usage"))
+                                .accessibility_label("Show usage")
+                                .tooltip("Show account usage")
+                                .on_click(cx.listener(|s, _, w, cx| s.show_usage(w, cx))),
+                        )
+                    })
+                    .children(providers.into_iter().map(|provider| {
+                        let snapshot = &self.usage[provider.index()];
+                        let remaining = snapshot.limiting().and_then(|row| row.remaining);
+                        let color = ring_color(remaining, snapshot.outdated, cx.theme());
+                        let description = ring_description(provider, snapshot);
+                        Button::new(format!("usage-trigger-{}", provider.name()))
+                            .ghost()
+                            .size(px(32.))
+                            .p_0()
+                            .accessibility_label(description.clone())
+                            .tooltip(description.clone())
+                            .child(
+                                ProgressCircle::new(format!("usage-ring-{}", provider.name()))
+                                    .size(px(24.))
+                                    .value(remaining.unwrap_or(0.) as f32)
+                                    .color(color)
+                                    .accessibility_label(description)
+                                    .child(
+                                        Icon::new(match provider {
+                                            Provider::Claude => IconName::Sparkles,
+                                            Provider::Codex => IconName::SquareTerminal,
+                                        })
+                                        .with_size(px(12.))
+                                        .text_color(color),
+                                    ),
+                            )
+                            .on_click(cx.listener(|s, _, w, cx| s.show_usage(w, cx)))
                     })),
             )
             .child(
@@ -157,12 +188,18 @@ impl Shark {
                 .left_0()
                 .size_full(),
             )
+            .test_support()
     }
 
     pub(super) fn render_usage(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
         let panel = self.usage_panel.as_ref()?;
         let viewport = window.viewport_size();
-        let right = (viewport.width - self.usage_at.get().right()).max(px(8.));
+        let footer = self.usage_at.get();
+        let left = footer
+            .left()
+            .max(px(8.))
+            .min((viewport.width - px(328.)).max(px(8.)));
+        let bottom = (viewport.height - footer.top() + px(4.)).max(px(8.));
         let content = menu::chrome(cx.theme())
             .id("usage-panel")
             .role(Role::Dialog)
@@ -170,7 +207,7 @@ impl Shark {
             .aria_description("Subscription allowances. Enter to refresh. Escape to close.")
             .track_focus(&panel.focus)
             .w(px(320.).min(viewport.width - px(16.)))
-            .max_h(viewport.height - px(60.))
+            .max_h((viewport.height - bottom - px(8.)).max(px(0.)))
             .overflow_y_scroll()
             .p_4()
             .gap_4()
@@ -202,10 +239,9 @@ impl Shark {
                         .w(viewport.width)
                         .h(viewport.height)
                         .flex()
-                        .justify_end()
-                        .items_start()
-                        .pt(px(48.))
-                        .pr(right)
+                        .items_end()
+                        .pl(left)
+                        .pb(bottom)
                         .on_any_mouse_down(cx.listener(|s, _, w, cx| {
                             cx.stop_propagation();
                             s.close_usage(w, cx);
@@ -315,4 +351,103 @@ fn section(provider: Provider, snapshot: &Snapshot, cx: &App) -> impl IntoElemen
             }))
         })
         .test_support()
+}
+
+fn ring_color(remaining: Option<f64>, outdated: bool, theme: &Theme) -> Hsla {
+    match remaining {
+        _ if outdated => theme.muted_foreground,
+        Some(n) if n <= 5. => theme.danger_foreground,
+        Some(n) if n <= 20. => theme.warning_foreground,
+        Some(_) => theme.primary,
+        None => theme.muted_foreground,
+    }
+}
+
+fn ring_description(provider: Provider, snapshot: &Snapshot) -> String {
+    let mut text = match snapshot.limiting() {
+        Some(row) => format!(
+            "{} · {} · {}% remaining · {}",
+            provider.name(),
+            row.label,
+            row.remaining.unwrap(),
+            row.resets_at.map_or_else(
+                || "Reset time unknown".into(),
+                |at| format!("Resets {}", crate::usage::local_time(at))
+            )
+        ),
+        None => format!("{} · Remaining unknown", provider.name()),
+    };
+    if snapshot
+        .allowances
+        .iter()
+        .any(|row| row.remaining.is_none())
+    {
+        text.push_str(" · Some allowances unknown");
+    }
+    if snapshot.outdated {
+        text.push_str(" · Outdated");
+    }
+    if snapshot.status == Status::Loading {
+        text.push_str(" · Checking…");
+    }
+    if let Some(at) = snapshot.checked_at {
+        text.push_str(&format!(" · Last checked {}", crate::usage::local_time(at)));
+    }
+    text
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Failure, Provider, Snapshot, Theme, ring_color, ring_description};
+    use gpui_kit::rgb;
+
+    #[test]
+    fn usage_ring_thresholds_and_unknown_stale_labels() {
+        let mut theme = Theme::default();
+        theme.primary = rgb(0x123456).into();
+        theme.warning_foreground = rgb(0x654321).into();
+        theme.danger_foreground = rgb(0xff0000).into();
+        theme.muted_foreground = rgb(0x888888).into();
+        for (remaining, expected) in [
+            (Some(21.), theme.primary),
+            (Some(20.), theme.warning_foreground),
+            (Some(5.1), theme.warning_foreground),
+            (Some(5.), theme.danger_foreground),
+            (Some(0.), theme.danger_foreground),
+            (None, theme.muted_foreground),
+        ] {
+            assert_eq!(ring_color(remaining, false, &theme), expected);
+            assert_eq!(ring_color(remaining, true, &theme), theme.muted_foreground);
+        }
+        let mut snapshot = Snapshot::default();
+        snapshot.finish(Ok(vec![
+            crate::usage::Allowance {
+                label: "Weekly".into(),
+                remaining: Some(0.),
+                resets_at: Some(0.),
+            },
+            crate::usage::Allowance {
+                label: "Model".into(),
+                remaining: None,
+                resets_at: None,
+            },
+        ]));
+        snapshot.finish(Err(Failure::Temporary));
+        snapshot.begin();
+        let text = ring_description(Provider::Claude, &snapshot);
+        for part in [
+            "Claude",
+            "Weekly",
+            "0% remaining",
+            "Resets",
+            "Some allowances unknown",
+            "Outdated",
+            "Checking",
+            "Last checked",
+        ] {
+            assert!(text.contains(part), "{text} should contain {part}");
+        }
+        snapshot.allowances.remove(0);
+        assert!(ring_description(Provider::Claude, &snapshot).contains("Remaining unknown"));
+    }
 }

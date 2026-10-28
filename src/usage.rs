@@ -78,6 +78,14 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
+    /// The tightest known allowance; unknown windows cannot imply available capacity.
+    pub fn limiting(&self) -> Option<&Allowance> {
+        self.allowances
+            .iter()
+            .filter(|row| row.remaining.is_some())
+            .min_by(|a, b| a.remaining.unwrap().total_cmp(&b.remaining.unwrap()))
+    }
+
     /// One in-flight query per provider, shared by opening, refresh and polling.
     pub fn begin(&mut self) -> bool {
         if self.status == Status::Loading {
@@ -150,6 +158,12 @@ fn claude(value: &Value) -> Result<Vec<Allowance>, Failure> {
         return Err(Failure::Unsupported);
     }
     let limits = &value["rate_limits"];
+    // Live CLI can report support but temporarily return no usage data.
+    if value["rate_limits_available"] == true
+        && (limits.is_null() || limits.as_object().is_some_and(|v| v.is_empty()))
+    {
+        return Err(Failure::Temporary);
+    }
     let mut rows = vec![];
     let mut add = |label: String, value: &Value, percent: &str| {
         if value.is_object() && !rows.iter().any(|r: &Allowance| r.label == label) {

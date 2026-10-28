@@ -128,6 +128,8 @@ pub struct Shark {
     #[cfg(test)]
     usage_live: bool,
     usage_at: Rc<std::cell::Cell<Bounds<Pixels>>>,
+    usage_poll: Option<Task<()>>,
+    usage_due: Option<std::time::Instant>,
     content_focus: FocusHandle,
     interaction_save: Option<Task<()>>,
     /// The header's branch button as last painted: "Branch menu…" hangs its menu from it.
@@ -161,6 +163,7 @@ impl Shark {
         cx.defer_in(window, move |s, window, cx| {
             s.restore_last_open(window, cx);
             s.check_deps(cx);
+            s.usage_polling(window, cx);
             let msg = match (backup, read_only) {
                 (Some(bak), _) => Some(format!(
                     "Couldn't read state.json; moved it to {}",
@@ -260,6 +263,8 @@ impl Shark {
             #[cfg(test)]
             usage_live: false,
             usage_at: Default::default(),
+            usage_poll: None,
+            usage_due: None,
             content_focus: cx.focus_handle(),
             interaction_save: None,
             branch_at: Default::default(),
@@ -647,7 +652,6 @@ impl Shark {
                     .id("titlebar-empty")
                     .map(|d| self.draggable_chrome("titlebar-empty", d)),
             )
-            .child(self.render_usage_button(cx))
             .test_support()
     }
 

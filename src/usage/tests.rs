@@ -3,8 +3,15 @@ use super::*;
 #[test]
 #[ignore = "read-only installed CLIs, no inference"]
 fn live_usage() {
+    let mut failures = vec![];
     for provider in Provider::ALL {
-        let rows = query(provider).expect(provider.name());
+        let rows = match query(provider) {
+            Ok(rows) => rows,
+            Err(error) => {
+                failures.push(format!("{}: {error:?}", provider.name()));
+                continue;
+            }
+        };
         assert!(!rows.is_empty());
         assert!(
             rows.iter()
@@ -28,6 +35,7 @@ fn live_usage() {
             );
         }
     }
+    assert!(failures.is_empty(), "{}", failures.join(", "));
 }
 
 // Sanitized usage-only responses: Claude 2.1.309 and Codex 0.164.0, 2026-10-28.
@@ -125,6 +133,20 @@ fn missing_values_are_unknown_and_changed_contract_is_unavailable() {
 }
 
 #[test]
+fn supported_but_empty_claude_usage_is_temporary() {
+    for limits in [Value::Null, json!({})] {
+        assert_eq!(
+            claude(&json!({"rate_limits_available":true,"rate_limits":limits})),
+            Err(Failure::Temporary)
+        );
+    }
+    assert_eq!(
+        claude(&json!({"rate_limits_available":true,"rate_limits":{"new_contract":true}})),
+        Err(Failure::Unsupported)
+    );
+}
+
+#[test]
 fn foundation_parses_offsets_fractional_and_whole_seconds() {
     let z = timestamp(&json!("2026-10-28T10:50:00Z")).unwrap();
     assert_eq!(timestamp(&json!("2026-10-28T11:50:00+01:00")), Some(z));
@@ -157,6 +179,38 @@ fn snapshot_coalesces_and_keeps_only_temporary_failure_results() {
     assert!(s.allowances.is_empty());
     assert!(s.fetched_at.is_none());
     assert!(!s.outdated);
+}
+
+#[test]
+fn limiting_allowance_uses_tightest_known_remaining_even_after_reset() {
+    let mut s = Snapshot::default();
+    assert!(s.limiting().is_none());
+    s.finish(Ok(vec![
+        Allowance {
+            label: "5 hours".into(),
+            remaining: Some(80.),
+            resets_at: None,
+        },
+        Allowance {
+            label: "Weekly".into(),
+            remaining: Some(0.),
+            resets_at: Some(0.),
+        },
+        Allowance {
+            label: "Model".into(),
+            remaining: None,
+            resets_at: None,
+        },
+    ]));
+    assert_eq!(s.limiting().unwrap().label, "Weekly");
+    assert_eq!(s.limiting().unwrap().remaining, Some(0.));
+    s.allowances.remove(1);
+    assert_eq!(s.limiting().unwrap().remaining, Some(80.));
+    s.allowances.remove(0);
+    assert!(
+        s.limiting().is_none(),
+        "unknown never implies a full allowance"
+    );
 }
 
 struct Fake {

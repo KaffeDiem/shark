@@ -182,7 +182,7 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
                     .into_iter()
                     .enumerate()
                     {
-                        // Usage reserves title-bar space; narrow strips may need to scroll.
+                        // Bring each tab into view before checking its hover controls.
                         shark.read(cx).tab_scroll.scroll_to_item(ix);
                         w.refresh();
                         w.render_frame(cx);

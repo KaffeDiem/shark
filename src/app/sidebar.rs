@@ -1104,6 +1104,7 @@ impl Shark {
                             .on_mouse_down(MouseButton::Right, new_section_menu(true)),
                     ),
             )
+            .child(self.render_usage_footer(cx))
             .test_support()
     }
 }
