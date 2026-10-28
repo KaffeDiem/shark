@@ -267,6 +267,22 @@ pub(crate) fn copy_button(
 pub(crate) fn markdown(md: &Entity<TextViewState>, group: &'static str) -> TextView {
     TextView::new(md)
         .selectable(true)
+        .on_link_click(|url, event, _, cx| {
+            if !event.standard_click() && !event.is_middle_click() {
+                return;
+            }
+            if Path::new(url.as_str()).is_absolute() {
+                use objc2_foundation::{NSString, NSURL};
+                // Bare file paths need a file URL; Foundation escapes spaces and Unicode.
+                if let Some(file_url) =
+                    NSURL::fileURLWithPath(&NSString::from_str(url)).absoluteString()
+                {
+                    cx.open_url(&file_url.to_string());
+                }
+            } else {
+                cx.open_url(url);
+            }
+        })
         .style(TextViewStyle::default().code_block(StyleRefinement::default().pt(px(28.))))
         .code_block_actions(move |block, _, cx| {
             h_flex()
@@ -2348,7 +2364,9 @@ impl Chat {
                             // The shimmer redraws the chat every frame, as a tool's spinner
                             // does; only during a turn, not for tasks left running after it.
                             .map(|d| match busy {
-                                true => d.child(ShimmerText::new(text).id("activity-text")),
+                                true => d
+                                    .child(Spinner::new().with_size(px(12.)))
+                                    .child(ShimmerText::new(text).id("activity-text")),
                                 false => d.child(text),
                             }),
                     )
@@ -3524,6 +3542,62 @@ pub(crate) mod ui_tests {
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
     use gpui_kit::InputEvent as _;
     use gpui_kit::test::TestWindowExt as _;
+
+    #[gpui_kit::test]
+    fn markdown_links_open_local_previews_and_web_urls(cx: &mut TestAppContext) {
+        struct Links(Entity<TextViewState>);
+        impl Render for Links {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                markdown(&self.0, "links")
+            }
+        }
+        cx.update(gpui_kit::init);
+        for (target, expected) in [
+            (
+                "/tmp/shark-better-bg-render/activity-dark-hover.png",
+                "file:///tmp/shark-better-bg-render/activity-dark-hover.png",
+            ),
+            (
+                "/tmp/shark-better-bg-render/activity-light-hover.png",
+                "file:///tmp/shark-better-bg-render/activity-light-hover.png",
+            ),
+            (
+                "/tmp/preview blå #1.png",
+                "file:///tmp/preview%20bla%CC%8A%20%231.png",
+            ),
+            (
+                "https://example.com/preview.png",
+                "https://example.com/preview.png",
+            ),
+            (
+                "file:///tmp/preview%20one.png",
+                "file:///tmp/preview%20one.png",
+            ),
+        ] {
+            let (_, view) = cx.add_window_view(|_, cx| {
+                Links(cx.new(|cx| TextViewState::markdown(&format!("[Preview](<{target}>)"), cx)))
+            });
+            let view: &mut VisualTestContext = view;
+            let before = view.opened_url();
+            view.simulate_mouse_down(
+                point(px(10.), px(10.)),
+                MouseButton::Right,
+                Modifiers::default(),
+            );
+            view.simulate_mouse_up(
+                point(px(10.), px(10.)),
+                MouseButton::Right,
+                Modifiers::default(),
+            );
+            assert_eq!(
+                view.opened_url(),
+                before,
+                "right-click must not open {target}"
+            );
+            view.simulate_click(point(px(10.), px(10.)), Modifiers::default());
+            assert_eq!(view.opened_url().as_deref(), Some(expected), "{target}");
+        }
+    }
 
     /// Real-renderer smoke check, also exporting the parade for visual inspection.
     pub(crate) fn render_activity_pixels(cx: &mut HeadlessAppContext) {
