@@ -2,9 +2,10 @@
 //! and the git button's agent prompts. Every change applies and saves at once; there is no Save
 //! button.
 use crate::SwitchField;
-use crate::app::{Shark, faint, inter_features};
+use crate::app::Shark;
 use crate::prompts::{self, PROMPTS};
 use crate::state::{Appearance, Mode, State};
+use crate::ui::{faint, inter_features};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::DialogEntrance;

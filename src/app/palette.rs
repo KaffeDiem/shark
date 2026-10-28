@@ -1,7 +1,7 @@
 //! The cmd-k palette and the cmd-k style menus built on it.
-use super::menus::app_icon;
 use super::*;
 use crate::apps::{self, Kind, OpenApp};
+use crate::ui::app_icon;
 
 /// The cmd-k bar look: a bare 640px dialog near the top, on the menus' `popover` surface with
 /// their 4px inset, holding a borderless `Command`.
@@ -386,36 +386,35 @@ pub(super) const COMMANDS: &[Row] = &[
         IconName::FileDiff,
         Some(&ShowDiff),
         "changes review tab",
-        |s, w, cx| s.show(Tab::Diff, w, cx),
+        |s, w, cx| s.show(Tab::Feature(Feature::Diff), w, cx),
+    ),
+    Row(
+        "Show Git",
+        IconName::GitPullRequest,
+        Some(&ShowGit),
+        "pull request description comments review resolve tab",
+        |s, w, cx| s.show(Tab::Feature(Feature::Git), w, cx),
     ),
     Row(
         "Open file in editor",
         IconName::FilePen,
         Some(&OpenFile),
         "",
-        |s, w, cx| {
-            if let Some(ix) = s.cursor_file(w, cx) {
-                s.open_file(ix, w, cx)
-            }
-        },
+        |s, w, cx| s.open_cursor_file(w, cx),
     ),
     Row(
         "Toggle file viewed",
         IconName::Eye,
         Some(&ToggleViewed),
         "mark unviewed",
-        |s, w, cx| {
-            if let Some(ix) = s.cursor_file(w, cx) {
-                s.toggle_viewed(ix, cx)
-            }
-        },
+        |s, w, cx| s.toggle_cursor_viewed(w, cx),
     ),
     Row(
         "Comment on diff line",
         IconName::MessageSquarePlus,
         Some(&AddComment),
         "review",
-        |s, w, cx| s.comment_dialog(w, cx),
+        |s, w, cx| s.with_differ(w, cx, Differ::comment_dialog),
     ),
     Row(
         "Send review…",
@@ -423,8 +422,8 @@ pub(super) const COMMANDS: &[Row] = &[
         Some(&SendComments),
         "review diff comments agent",
         |s, w, cx| {
-            s.show(Tab::Diff, w, cx);
-            s.open_sheet(w, cx)
+            s.show(Tab::Feature(Feature::Diff), w, cx);
+            s.with_differ(w, cx, Differ::open_sheet)
         },
     ),
     Row(
@@ -432,14 +431,14 @@ pub(super) const COMMANDS: &[Row] = &[
         IconName::Check,
         Some(&ResolveAddressed),
         "review comments threads",
-        |s, _, cx| s.resolve_addressed(cx),
+        |s, _, cx| s.differ.update(cx, |d, cx| d.resolve_addressed(cx)),
     ),
     Row(
         "Re-queue outdated",
         IconName::RotateCcw,
         Some(&RequeueOutdated),
         "review comments threads pending",
-        |s, _, cx| s.requeue_outdated(cx),
+        |s, _, cx| s.differ.update(cx, |d, cx| d.requeue_outdated(cx)),
     ),
     Row(
         "Save file",
@@ -467,7 +466,7 @@ pub(super) const COMMANDS: &[Row] = &[
         IconName::Play,
         Some(&PlayMedia),
         "media movie diff",
-        |s, w, cx| s.play_media(w, cx),
+        |s, w, cx| s.with_differ(w, cx, |d, w, cx| d.play_media(w, cx)),
     ),
     Row(
         "Run next git step",
@@ -722,6 +721,7 @@ pub(super) const COMMANDS: &[Row] = &[
 
 /// Rows that act on a workspace; left out while there's none to act on.
 const NEED_WORKSPACE: &[&str] = &[
+    "Show Git",
     "Add repo to workspace…",
     "Archive workspace",
     "Force archive workspace…",
@@ -824,7 +824,7 @@ pub(super) fn repo_paths(ws: &Workspace) -> Vec<(String, PathBuf)> {
         .collect()
 }
 
-/// The palette and app switcher offer the same apps, in the same order.
+/// The palette and app switcher offer the same eligible apps.
 pub(super) fn available_apps(target: Option<&Workspace>) -> Vec<&'static OpenApp> {
     let Some(ws) = target else { return vec![] };
     apps::installed()
@@ -834,6 +834,15 @@ pub(super) fn available_apps(target: Option<&Workspace>) -> Vec<&'static OpenApp
 }
 
 impl Shark {
+    pub(super) fn launch_app(&mut self, app: &'static OpenApp, path: &Path) {
+        app.open(path);
+        if self.state.recent_apps.first() != Some(&app.path) {
+            self.state.recent_apps.retain(|p| p != &app.path);
+            self.state.recent_apps.insert(0, app.path.clone());
+            let _ = self.state.save();
+        }
+    }
+
     /// Terminals and editors open the target workspace's folder; git clients a repo and
     /// Xcode a project, asking which when there are several.
     pub(super) fn open_in(
@@ -869,14 +878,14 @@ impl Shark {
         };
         match &targets[..] {
             [] => notify_err(window, cx, format!("{none} in {}", ws.name)),
-            [(_, path)] => app.open(path),
+            [(_, path)] => self.launch_app(app, path),
             _ => {
                 let items = (targets.iter())
                     .map(|(name, _)| CommandItem::new().label(name.clone()).icon(icon))
                     .collect();
                 let pick =
-                    move |_: &mut Shark, row: usize, _: &mut Window, _: &mut Context<Shark>| {
-                        app.open(&targets[row].1)
+                    move |s: &mut Shark, row: usize, _: &mut Window, _: &mut Context<Shark>| {
+                        s.launch_app(app, &targets[row].1)
                     };
                 open_menu(cx.entity().downgrade(), ask, items, 0, pick, window, cx)
             }
@@ -902,7 +911,7 @@ impl Shark {
             if (if codex { CLAUDE_ONLY } else { CODEX_ONLY }).contains(label)
                 || (no_target && NEED_WORKSPACE.contains(label))
                 || (*label == "Show or hide diff files"
-                    && (self.tab != Tab::Diff || self.home_shown()))
+                    && (self.tab != Tab::Feature(Feature::Diff) || self.home_shown()))
             {
                 continue;
             }

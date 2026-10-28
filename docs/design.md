@@ -37,8 +37,8 @@ Read this before adding or changing UI. Shark's look is modeled on Linear: a cal
 | `border` | `#232426` | `#dedede` | Island edge, header divider, cards. Use sparingly |
 | `foreground` | `#e8e9eb` | `#2f2f31` | Body text, titles, active tab label |
 | `sidebar_foreground` | `#8f8f91` | `#656567` | Inactive left-navigation labels, metadata, headers and ordinary icons, expanded or rail |
-| `muted_foreground` | `#c8c8cb` | `#535355` | Secondary text people read: section headers, tool summaries, metadata, repo names |
-| `faint(theme)` | `#7f7f81` | `#959597` | `muted_foreground` 60% over `background`. Hints (empty-state hints) and idle/decorative icons only. Never information |
+| `muted_foreground` | `#c9c9cc` | `#535355` | Secondary text people read: section headers, tool summaries, metadata, repo names |
+| `faint(theme)` | `#808082` | `#959597` | `muted_foreground` 60% over `background`. Hints (empty-state hints) and idle/decorative icons only. Never information |
 | `side_hover(theme)` | `#19191a` | `#e9e9ea` | `foreground` 7% (dark) / 3% (light) over `sidebar`. Row hover in the navigation and Features rail |
 | `side_on(theme)` | `#222223` | `#e5e5e6` | `foreground` 11% / 5% over `sidebar`. The grey pill: the open item, and the cursor while its pane has focus. Light takes less so `muted_foreground` and status text keep their floors |
 | `secondary` | `#1a1a1b` | `#ffffff` | Raised cards: user messages, composer, active tab pill |
@@ -49,18 +49,18 @@ Read this before adding or changing UI. Shark's look is modeled on Linear: a cal
 | `list_hover` | `#1e1e20` | `#efeff0` | Row hover, and selected row of an unfocused list, **inside the island** |
 | `sidebar_accent` | `#18181a` | `#e7e7e8` | Drop targets in the sidebar. Rows use `side_hover` / `side_on` (light `list_hover` equals the sidebar color) |
 | `accent` | `#28292b` | `#efeff0` | gpui-kit's neutral menu-item hover. **Not** the brand color |
-| `danger_foreground`, `success_foreground`, `warning_foreground` | `#ff9b9b`, `#5fd39a`, `#f2c94c` | `#c42b2b`, `#1f7a50`, `#8a6800` | Status **text and icons** |
+| `danger_foreground`, `success_foreground`, `warning_foreground` | `#ff9c9c`, `#5fd39a`, `#f2c94c` | `#c42b2b`, `#1f7a50`, `#8a6800` | Status **text and icons** |
 | `danger`, `success`, `warning` | | | Fills only (danger button). Too low-contrast for text |
-| `link` | `#a8b1ff` | `#4061da` | Links in markdown |
+| `link` | `#a9b2ff` | `#4061da` | Links in markdown |
 
 ### Contrast rules
-Except for dimmed navigation and file-tree paths, measure APCA (Lc) against **every surface the text can sit on**, including hover and selected rows (`background`, `sidebar`, `secondary`, `muted`, `list_active`, `list_hover`, `sidebar_accent`, `side_hover`, `side_on`):
+Except for dimmed navigation and file-tree paths, measure APCA (Lc) against **every surface the text can sit on**, including hover and selected rows (`background`, `sidebar`, `secondary`, `muted`, `list_active`, `list_hover`, `sidebar_accent`, `side_hover`, `side_on`, `popover`, `accent`):
 
 | Text | Minimum | Current lowest |
 |---|---|---|
 | Prose and titles on `background` / cards | Lc 90 | 92.2 dark, 96.2 light |
-| Any other readable text: labels, metadata, `muted_foreground`, text in selected/hover rows | Lc 70 | 71.0 dark, 71.4 light |
-| Status text and links | Lc 60 | 61.0 dark, 60.1 light |
+| Any other readable text: labels, metadata, `muted_foreground`, text in selected/hover rows | Lc 70 | 70.4 dark, 71.4 light |
+| Status text and links | Lc 60 | 60.0 dark, 60.1 light |
 | Hints (`faint`), never essential | Lc 30 | 33.0 dark, 38.5 light |
 
 Left navigation labels, chevrons and path prefixes use `sidebar_foreground` at **WCAG 2 contrast ≥ 4.5:1** on normal, hover, selected and drop-target backgrounds. Generated themes blend `muted_foreground` 30% toward `sidebar`, then raise contrast to that floor. Navigation rows share these surfaces, so `python3 docs/themes.py` validates every theme, including Linear. The Diff file tree uses `foreground` for folder labels, chevrons and path prefixes on the island background, with `list_hover` and `list_active` row states. This exception does not change the APCA rules for filenames or other text elsewhere.
@@ -275,5 +275,6 @@ Sources: Linear's app code and design posts ("How we redesigned the Linear UI", 
 - Reuse `CommandState`, custom variable-height `CommandItem` rows, and the 640px `menu_dialog` surface, constrained to the viewport. Focus search immediately; arrows navigate, Enter/click opens, one Escape dismisses and restores focus. Footer: `↑↓ Navigate · ↵ Open · Esc Close`.
 - Include every live workspace, including folded sections. Score workspace and each repository name separately with the completion matcher, treating spaces, hyphens, underscores, slashes and dots as word separators, taking the best score, then recorded interaction recency, then sidebar order. With no query, select the most recent other workspace (most recent from Home). Query changes select the best match; background status updates preserve order and selected identity.
 - Each row shows the workspace name, Current when applicable, last user interaction with its exact time in a tooltip, and one compact line per repo. Show explicit Draft/Open/Merged/Closed/No PR/Not checked/Status unavailable labels from `overview_repos`; failing checks never hide Draft. Full names and statuses have accessible labels and overflow tooltips. Empty states distinguish no workspaces from no matches.
+- A fixed 16px status icon precedes the name, shared with the sidebar: the primary `LoaderCircle` spinner while an agent runs, otherwise warning `CircleAlert` for needs-you, success `CircleCheck` for unread, or muted `CircleDashed` for idle. Details align below the name with an 8px gap after the icon. A compact `text_xs` line shows the running-chat count, needs-you action, or Unread; retain a needs-you action alongside the count when another chat runs. Idle has no extra line. Only running agents animate; Git checks keep static icons. Status updates preserve the query, result order, and selected workspace.
 - `Workspace.last_interacted_at` stores optional Unix milliseconds. Successful explicit navigation and keyboard/click/scroll activity in visible workspace content count; Home, picker browsing, startup restore, activation, agent output and polling do not. Successful workspace dialog actions count. Coalesce recency saves once per second and flush through the close/quit storage guard. Unknown timestamps sort last and display No recorded interaction.
 - Confirm destinations by name and resolve them again after unsaved-edit confirmation, before changing any buffers. Removed or archiving destinations preserve the current edits. Opening the current workspace preserves its view; canceled confirmation never records destination recency.

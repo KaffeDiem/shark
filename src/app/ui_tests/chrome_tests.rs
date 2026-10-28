@@ -49,11 +49,11 @@ async fn sidebar_chrome_themes(cx: &mut TestAppContext) {
             for rail in [false, true] {
                 for tree in [false, true] {
                     on(cx, &|s, w, cx| {
-                        s.show(Tab::Diff, w, cx);
+                        s.show(Tab::Feature(Feature::Diff), w, cx);
                         if s.rail != rail {
                             s.toggle_sidebar(cx);
                         }
-                        if s.show_tree != tree {
+                        if s.differ.read(cx).show_tree() != tree {
                             s.toggle_tree(w, cx);
                         }
                     });
@@ -381,6 +381,7 @@ pub(crate) fn render_pixels() {
     super::drag_tests::render_pixels(&mut cx);
     super::tree_pixels::render_pixels(&mut cx);
     super::tree_pixels::render_artifact_pixels(&mut cx);
+    super::git_tests::render_pixels(&mut cx);
 }
 
 /// Render the real Shark overlay, including scrolling the last app into a narrow window.

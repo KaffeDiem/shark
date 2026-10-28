@@ -3,6 +3,8 @@ use crate::git::{cmd_bounded, dirty, git};
 use crate::state::Workspace;
 use std::path::Path;
 
+pub mod git_feature;
+
 const MARKER: &str = "<!-- shark:related -->";
 
 /// How new PRs are opened. The composer's first line is the title and the rest the body;
@@ -190,7 +192,7 @@ pub fn link_body(body: &str, prs: &[(String, String)], own: &str) -> String {
 }
 
 /// gh, or `SHARK_GH` (tests point it at a fake, as `SHARK_CLAUDE` for claude).
-fn gh() -> String {
+pub(crate) fn gh() -> String {
     std::env::var("SHARK_GH").unwrap_or_else(|_| "gh".into())
 }
 

@@ -11,6 +11,7 @@ mod complete;
 mod deps;
 mod diff_view;
 mod editor;
+mod features;
 mod file_icon;
 mod files;
 mod git;
@@ -24,6 +25,7 @@ mod settings;
 mod stack;
 mod state;
 mod sync;
+mod ui;
 mod vim;
 
 use gpui_kit::component::TitleBar;
@@ -47,6 +49,7 @@ actions!(
         FocusRight,
         ShowChat,
         ShowDiff,
+        ShowGit,
         CreatePrs,
         OpenPrs,
         CreateDraftPrs,
@@ -152,7 +155,7 @@ actions!(
     ]
 );
 
-// The review queue (src/app/review.rs): threads at the diff cursor, the composer, the sheet.
+// The review queue (src/features/differ/review.rs): threads at the diff cursor, the composer, the sheet.
 actions!(
     shark,
     [
@@ -191,16 +194,14 @@ fn bind_keys(cx: &mut App) {
     // Vim-style keys sit under `Vim`, which the root view carries while Vim mode is on
     // (Settings › General). The arrows, letters that name an action and cmd shortcuts work
     // either way. VimNormal: the editor in Vim's Normal mode.
-    const NAV: &str =
-        "Sidebar || Home || Transcript || DiffPane || FileTree || Queue || PlanPane || VimNormal";
+    const NAV: &str = "Sidebar || Home || Transcript || DiffPane || FileTree || Queue || PlanPane || GitFeature || VimNormal";
     const LIST: &str = "Sidebar || Home || Transcript || FileTree || Queue";
     // The diff's letter keys; not while typing in the review composer, which sits in the diff.
     const DIFF: &str = "DiffPane && !Input";
-    // The diff's line cursor (src/app/review.rs) moves like a list. With Vim its arrows
+    // The diff's line cursor (src/features/differ/review.rs) moves like a list. With Vim its arrows
     // scroll natively and j/k move the cursor; without, the arrows move it.
-    const MOVE: &str = "Sidebar || Home || Transcript || FileTree || Queue || DiffPane || PlanPane";
-    const ARROWS: &str =
-        "Sidebar || Home || Transcript || FileTree || Queue || PlanPane || (Diff && !Vim)";
+    const MOVE: &str = "Sidebar || Home || Transcript || FileTree || Queue || DiffPane || PlanPane || GitFeature || Features";
+    const ARROWS: &str = "Sidebar || Home || Transcript || FileTree || Queue || PlanPane || Features || (GitFeature && !Input) || (Diff && !Vim)";
     // `!Input` sits outside `Vim > (…)`: inside it, `!` sees only the contexts down to the
     // match, not a focused Input below. The editor's Normal mode is an Input that types nothing.
     let vim = |keys: &str, action: Box<dyn Action>, context: &str| {
@@ -242,6 +243,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-b", ToggleSidebar, None),
         KeyBinding::new("cmd-alt-b", ToggleFileTree, None),
         KeyBinding::new("cmd-shift-d", ShowDiff, None),
+        KeyBinding::new("cmd-shift-g", ShowGit, None),
         KeyBinding::new("ctrl-cmd-v", ToggleVim, None),
         // In the diff: the file last moved to with `}`/`{` or the tree.
         KeyBinding::new("v", ToggleViewed, Some("FileTree || (DiffPane && !Input)")),
@@ -329,6 +331,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", CancelEdit, Some(DIFF)),
         // Also when the line input lost focus (its row scrolled away).
         KeyBinding::new("cmd-s", SaveFile, Some("DiffPane")),
+        KeyBinding::new("cmd-s", SaveFile, Some("GitFeature")),
+        KeyBinding::new("escape", CancelEdit, Some("GitFeature")),
         KeyBinding::new("c", AddComment, Some(DIFF)),
         // Plan mode; in the composer shift-tab is caught before the input outdents.
         KeyBinding::new(

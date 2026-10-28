@@ -8,43 +8,6 @@ pub(super) struct FileTab {
 }
 
 impl Shark {
-    pub(super) fn open_file(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_file_in_tab(ix, false, window, cx);
-    }
-
-    pub(super) fn open_file_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_file_in_tab(ix, true, window, cx);
-    }
-
-    fn open_file_in_tab(
-        &mut self,
-        ix: usize,
-        new_tab: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(f) = self.diff_files.get(ix) else {
-            return;
-        };
-        let path = f.path().to_string();
-        let open = self
-            .file_tabs
-            .iter()
-            .any(|t| t.editor.read(cx).path == path);
-        if !open && (f.status() == DiffFileStatus::Deleted || f.is_binary()) {
-            return notify_err(
-                window,
-                cx,
-                format!("{path} is deleted or binary; it shows in the diff only"),
-            );
-        }
-        if new_tab {
-            self.open_path_tab(path, window, cx);
-        } else {
-            self.open_path(path, window, cx);
-        }
-    }
-
     /// Opens `repo/rel/path`, replacing the selected file after confirming unsaved edits.
     pub(super) fn open_path(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
         self.open_path_in_tab(path, false, window, cx);
@@ -74,7 +37,8 @@ impl Shark {
         {
             return self.select_file(ix, window, cx);
         }
-        if (self.editing.as_ref()).is_some_and(|e| e.path.as_str() == path && (e.dirty || e.saving))
+        if (self.differ.read(cx).edit_snapshot())
+            .is_some_and(|e| e.path.as_str() == path && (e.dirty || e.saving))
         {
             return notify_err(window, cx, format!("{path} has unsaved edits in the diff"));
         }
@@ -97,6 +61,13 @@ impl Shark {
             move |s, window, cx| {
                 if s.active.as_ref() != Some(&workspace) {
                     return;
+                }
+                if s.differ
+                    .read(cx)
+                    .edit_snapshot()
+                    .is_some_and(|e| e.path.as_str() == path && (e.dirty || e.saving))
+                {
+                    return notify_err(window, cx, format!("{path} has unsaved edits in the diff"));
                 }
                 // Restoration may have opened the target while the discard dialog was up.
                 let tab = match s
@@ -154,8 +125,8 @@ impl Shark {
                     EditorEvent::Saved => s.refresh_diff(cx),
                     EditorEvent::Close => s.close_editor(editor.clone(), window, cx),
                     EditorEvent::Leave if s.editor.as_ref() == Some(editor) => {
-                        let pane = if s.tree_shown() {
-                            Pane::Tree
+                        let pane = if s.tree_shown(cx) {
+                            Pane::Feature(Feature::Diff, FeatureFocus::Files)
                         } else {
                             Pane::Sidebar
                         };
@@ -264,8 +235,9 @@ impl Shark {
         };
         let path = tab.editor.read(cx).path.clone();
         if self
-            .editing
-            .as_ref()
+            .differ
+            .read(cx)
+            .edit_snapshot()
             .is_some_and(|e| e.path.as_str() == path && (e.dirty || e.saving))
         {
             return notify_err(window, cx, format!("{path} has unsaved edits in the diff"));
@@ -324,7 +296,7 @@ impl Shark {
         if self.active_ws().is_some_and(|ws| ws.diff_closed) {
             Tab::Chat
         } else {
-            Tab::Diff
+            Tab::Feature(Feature::Diff)
         }
     }
 
@@ -404,16 +376,37 @@ impl Shark {
         if let Some(editor) = editors.iter().find(|e| e.read(cx).saving) {
             return window.push_notification(format!("Saving {}…", editor.read(cx).path), cx);
         }
-        if let Some(e) = self.editing.as_ref().filter(|e| edit && e.saving) {
+        if let Some(e) = self
+            .differ
+            .read(cx)
+            .edit_snapshot()
+            .filter(|e| edit && e.saving)
+        {
             return window.push_notification(format!("Saving {}…", e.path), cx);
         }
-        let inline = (self.editing.as_ref())
+        let inline = (self.differ.read(cx).edit_snapshot())
             .filter(|e| edit && e.dirty)
             .map(|e| e.path.to_string());
         let paths: Vec<String> = open.chain(inline).collect();
         if paths.is_empty() {
             return then(self, window, cx);
         }
+        let workspace = self.active.clone();
+        let inline = self.differ.read(cx).edit_snapshot();
+        let buffers: Vec<_> = self
+            .file_tabs
+            .iter()
+            .map(|tab| {
+                let editor = &tab.editor;
+                let e = editor.read(cx);
+                (
+                    editor.clone(),
+                    e.path.clone(),
+                    e.dirty,
+                    e.input.read(cx).value().to_string(),
+                )
+            })
+            .collect();
         let then = RefCell::new(Some(then));
         confirm(
             format!("Discard changes to {}?", paths.join(" and ")),
@@ -421,13 +414,35 @@ impl Shark {
             "Discard",
             move |s, window, cx| {
                 if let Some(f) = then.borrow_mut().take() {
+                    if s.active != workspace
+                        || s.file_tabs.iter().any(|t| {
+                            let e = t.editor.read(cx);
+                            !buffers.iter().any(|(editor, _, _, _)| editor == &t.editor)
+                                && (e.dirty || e.saving)
+                        })
+                        || s.differ.read(cx).edit_snapshot() != inline
+                        || buffers.iter().any(|(editor, path, dirty, text)| {
+                            let e = editor.read(cx);
+                            !s.file_tabs.iter().any(|t| t.editor == *editor)
+                                || e.path != *path
+                                || e.dirty != *dirty
+                                || e.saving
+                                || e.input.read(cx).value().as_ref() != text
+                        })
+                    {
+                        return notify_err(
+                            window,
+                            cx,
+                            "The workspace or edits changed; try the action again",
+                        );
+                    }
                     // Closing may still be canceled by the final storage check.
                     if clear_dirty {
                         for e in &editors {
                             e.update(cx, |e, _| e.dirty = false);
                         }
-                        if let Some(e) = s.editing.as_mut().filter(|_| edit) {
-                            e.dirty = false;
+                        if edit && let Some(expected) = &inline {
+                            s.differ.update(cx, |d, _| d.clear_dirty(expected));
                         }
                     }
                     f(s, window, cx)
@@ -448,6 +463,7 @@ impl Shark {
     pub(crate) fn set_vim(&mut self, on: bool, cx: &mut Context<Self>) {
         self.state.vim = on;
         let _ = self.state.save();
+        self.configure_differ(cx);
         for tab in &self.file_tabs {
             tab.editor.update(cx, |e, cx| e.set_vim(on, cx));
         }
@@ -458,7 +474,7 @@ impl Shark {
     }
 
     /// Right-click menu of the open file: the file's entries, then Close file.
-    pub(super) fn editor_menu(&self, cx: &Context<Self>) -> Vec<Entry> {
+    pub(super) fn editor_menu(&self, cx: &mut Context<Self>) -> Vec<Entry> {
         let Some(e) = &self.editor else {
             return vec![];
         };
@@ -481,8 +497,7 @@ impl Shark {
         let theme = cx.theme();
         let e = editor.read(cx);
         let path = e.path.clone();
-        let ix = self.diff_files.iter().position(|f| *f.path() == path);
-        let viewed = ix.map(|ix| self.viewed(ix));
+        let viewed = self.differ.read(cx).viewed_path(&path);
         let (dir, name) = match path.rsplit_once('/') {
             Some((d, n)) => (format!("{d}/"), n.to_string()),
             None => (String::new(), path.clone()),
@@ -583,14 +598,15 @@ impl Shark {
                         )
                     })
                     .when_some(viewed, |d, v| {
-                        let ix = ix.unwrap_or_default();
+                        let path = path.clone();
                         d.child(
                             Checkbox::new("editor-viewed")
                                 .label("Viewed")
                                 .small()
                                 .checked(v == Viewed::Yes)
                                 .on_click(cx.listener(move |this, _: &bool, _, cx| {
-                                    this.toggle_viewed(ix, cx)
+                                    this.differ
+                                        .update(cx, |d, cx| d.toggle_viewed_path(&path, cx))
                                 })),
                         )
                     })

@@ -633,7 +633,7 @@ impl Render for PlanPane {
         let focused = self.focus.is_focused(window);
         let n = self.versions.len();
         let latest = self.shown + 1 == n;
-        let (muted, faint) = (theme.muted_foreground, crate::app::faint(theme));
+        let (muted, faint) = (theme.muted_foreground, crate::ui::faint(theme));
         let pill = |i: usize, theme: &gpui_kit::component::Theme| {
             let active = i == self.shown;
             h_flex()

@@ -1,6 +1,6 @@
 //! Right-click menus and the path helpers they share.
 use super::*;
-use crate::apps::{self, Kind, OpenApp};
+use crate::apps::{self, Kind};
 
 /// `/Users/me/x` → `~/x`: paths in menus are read, so keep them short.
 pub(super) fn tilde(path: &Path) -> String {
@@ -18,6 +18,7 @@ pub(super) fn tilde(path: &Path) -> String {
 pub(super) fn open_in_entries(
     folder: Option<&(String, PathBuf)>,
     repos: &[(String, PathBuf)],
+    cx: &Context<Shark>,
 ) -> Vec<Entry> {
     let mut entries = vec![];
     for app in apps::installed() {
@@ -29,7 +30,11 @@ pub(super) fn open_in_entries(
         let image = app.icon.clone();
         if targets.len() == 1 {
             let (hint, path) = targets.remove(0);
-            let item = menu::item(app_icon(app), label, move |_, _| app.open(&path));
+            let item = menu::item(
+                app_icon(app),
+                label,
+                on_shark(cx, move |s, _, _| s.launch_app(app, &path)),
+            );
             entries.push(item.hint(hint).image(image));
             continue;
         }
@@ -45,26 +50,16 @@ pub(super) fn open_in_entries(
             } else {
                 String::new()
             };
-            menu::item(icon, name, move |_, _| app.open(&path)).hint(hint)
+            menu::item(
+                icon,
+                name,
+                on_shark(cx, move |s, _, _| s.launch_app(app, &path)),
+            )
+            .hint(hint)
         });
         entries.push(menu::sub(app_icon(app), label, rows.collect()).image(image));
     }
     entries
-}
-
-/// Shown when AppKit has no icon for the app.
-pub(super) fn app_icon(app: &OpenApp) -> IconName {
-    match app.kind {
-        Kind::Terminal => IconName::SquareTerminal,
-        Kind::Folder => IconName::AppWindow,
-        Kind::Git => IconName::GitBranch,
-        Kind::Xcode => IconName::FileCode,
-    }
-}
-
-pub(super) fn copy(text: String, window: &mut Window, cx: &mut App) {
-    window.push_notification(format!("Copied {text}"), cx);
-    cx.write_to_clipboard(ClipboardItem::new_string(text));
 }
 
 /// "Workspace folder", its path muted on the right, plus one row per repo.
@@ -142,7 +137,7 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
             |p, _, cx| cx.reveal_path(p),
         ),
     ]);
-    entries.extend(open_in_entries(Some(&paths[0]), &paths[1..]));
+    entries.extend(open_in_entries(Some(&paths[0]), &paths[1..], cx));
     entries.extend([path_submenu(
         IconName::Copy,
         "Copy path",

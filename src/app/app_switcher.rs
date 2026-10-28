@@ -30,7 +30,14 @@ impl Shark {
             let Some(target) = self.target(window) else {
                 return notify_err(window, cx, "Open a workspace first");
             };
-            let apps = palette::available_apps(Some(&target));
+            let mut apps = palette::available_apps(Some(&target));
+            apps.sort_by_key(|app| {
+                self.state
+                    .recent_apps
+                    .iter()
+                    .position(|p| p == &app.path)
+                    .unwrap_or(usize::MAX)
+            });
             if apps.is_empty() {
                 return notify_err(
                     window,
@@ -208,7 +215,7 @@ impl Shark {
                             .hover(|d| d.bg(side_hover(theme)))
                             .child(match &app.icon {
                                 Some(icon) => img(icon.clone()).size(px(72.)).into_any_element(),
-                                None => Icon::new(menus::app_icon(app))
+                                None => Icon::new(crate::ui::app_icon(app))
                                     .with_size(px(64.))
                                     .into_any_element(),
                             })

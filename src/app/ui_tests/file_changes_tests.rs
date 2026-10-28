@@ -64,20 +64,24 @@ async fn uncommitted_dots_and_file_discard(cx: &mut TestAppContext) {
     fs::write(api.join("new.txt"), "new\n").unwrap();
     fs::write(dir.join("web/file.txt"), "web edits\n").unwrap();
     on(cx, &|s, w, cx| {
-        s.show_tree = true;
-        s.show(Tab::Diff, w, cx);
+        s.differ.update(cx, |d, _| *d.show_tree_mut() = true);
+        s.show(Tab::Feature(Feature::Diff), w, cx);
     });
     let refresh = |cx: &mut TestAppContext| on(cx, &|s, _, cx| s.refresh_diff(cx));
-    let has_discard = |s: &Shark, p: &str, cx: &Context<Shark>| {
+    let has_discard = |s: &Shark, p: &str, cx: &mut Context<Shark>| {
         s.file_menu(p, cx).iter().any(
             |e| matches!(e, Entry::Item { label, .. } if label == "Discard uncommitted changes…"),
         )
     };
     shark.update(cx, |s, cx| {
-        assert_eq!(s.uncommitted.len(), 4);
-        assert!(s.uncommitted.contains("api/back.txt"));
+        assert_eq!(s.differ.read(cx).uncommitted().len(), 4);
+        assert!(s.differ.read(cx).uncommitted().contains("api/back.txt"));
         assert!(
-            s.diff_files.iter().any(|f| f.path() == "api/back.txt"),
+            s.differ
+                .read(cx)
+                .diff_files()
+                .iter()
+                .any(|f| f.path() == "api/back.txt"),
             "local edits equal to base still get a row"
         );
         assert!(has_discard(s, "api/file.txt", cx));
@@ -88,14 +92,16 @@ async fn uncommitted_dots_and_file_discard(cx: &mut TestAppContext) {
         w.simulate_next_frame(cx);
         let s = shark.read(cx);
         for (ix, row) in s
-            .tree_rows
+            .differ
+            .read(cx)
+            .tree_rows()
             .iter()
             .enumerate()
             .filter(|(_, r)| r.file.is_some())
         {
             assert_eq!(
                 w.find_all(("uncommitted", ix)).len(),
-                usize::from(s.uncommitted.contains(&row.path)),
+                usize::from(s.differ.read(cx).uncommitted().contains(&row.path)),
                 "{}",
                 row.path
             );
@@ -107,7 +113,9 @@ async fn uncommitted_dots_and_file_discard(cx: &mut TestAppContext) {
     cx.update_window(window, |_, w, cx| {
         let ix = shark
             .read(cx)
-            .tree_rows
+            .differ
+            .read(cx)
+            .tree_rows()
             .iter()
             .position(|r| r.path == "api/file.txt")
             .unwrap();
@@ -179,22 +187,50 @@ async fn uncommitted_dots_and_file_discard(cx: &mut TestAppContext) {
         fs::read_to_string(dir.join("web/file.txt")).unwrap(),
         "web edits\n"
     );
-    cx.update(|cx| assert!(!shark.read(cx).uncommitted.contains("api/file.txt")));
+    cx.update(|cx| {
+        assert!(
+            !shark
+                .read(cx)
+                .differ
+                .read(cx)
+                .uncommitted()
+                .contains("api/file.txt")
+        )
+    });
 
-    on(cx, &|s, w, cx| s.toggle_uncommitted(w, cx));
+    on(cx, &|s, w, cx| {
+        s.differ.update(cx, |d, cx| d.toggle_uncommitted(w, cx))
+    });
     cx.update(|cx| {
         let s = shark.read(cx);
         assert!(s.state.uncommitted_only);
-        assert!(s.uncommitted.contains("api/back.txt"));
-        assert!(!s.diff_files.iter().any(|f| f.path() == "api/committed.txt"));
+        assert!(s.differ.read(cx).uncommitted().contains("api/back.txt"));
+        assert!(
+            !s.differ
+                .read(cx)
+                .diff_files()
+                .iter()
+                .any(|f| f.path() == "api/committed.txt")
+        );
     });
-    on(cx, &|s, w, cx| s.toggle_uncommitted(w, cx));
+    on(cx, &|s, w, cx| {
+        s.differ.update(cx, |d, cx| d.toggle_uncommitted(w, cx))
+    });
 
     // Committing without changing the base patch must still remove the dot.
     fs::write(api.join("file.txt"), "another feature\n").unwrap();
     refresh(cx);
-    cx.update(|cx| assert!(shark.read(cx).uncommitted.contains("api/file.txt")));
-    let fingerprint = cx.update(|cx| shark.read(cx).diff_fp);
+    cx.update(|cx| {
+        assert!(
+            shark
+                .read(cx)
+                .differ
+                .read(cx)
+                .uncommitted()
+                .contains("api/file.txt")
+        )
+    });
+    let fingerprint = cx.update(|cx| shark.read(cx).differ.read(cx).diff_fp());
     git::git(&api, &["add", "file.txt"]).unwrap();
     git::git(
         &api,
@@ -213,10 +249,11 @@ async fn uncommitted_dots_and_file_discard(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let s = shark.read(cx);
         assert_eq!(
-            s.diff_fp, fingerprint,
+            s.differ.read(cx).diff_fp(),
+            fingerprint,
             "committing does not change the base patch"
         );
-        assert!(!s.uncommitted.contains("api/file.txt"));
+        assert!(!s.differ.read(cx).uncommitted().contains("api/file.txt"));
     });
 
     // New files disappear, including their open tab, after confirmation.
@@ -284,7 +321,7 @@ async fn stacked_pr_target_refreshes_diff_and_review_base(cx: &mut TestAppContex
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| s.open_workspace(0, w, cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).diff_loaded
+        shark.read(cx).differ.read(cx).diff_loaded()
     })
     .await;
     let sync = cx.update(|cx| shark.read(cx).syncs["pr-diff"].clone());
@@ -293,7 +330,9 @@ async fn stacked_pr_target_refreshes_diff_and_review_base(cx: &mut TestAppContex
         assert!(
             shark
                 .read(cx)
-                .diff_files
+                .differ
+                .read(cx)
+                .diff_files()
                 .iter()
                 .any(|f| f.path() == "api/parent.txt")
         )
@@ -303,20 +342,26 @@ async fn stacked_pr_target_refreshes_diff_and_review_base(cx: &mut TestAppContex
         g.set_pr_base("api", "parent", cx);
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).diff_base("api") == "origin/parent"
+        shark.read(cx).differ.read(cx).diff_base("api") == "origin/parent"
     })
     .await;
     cx.update(|cx| {
         let s = shark.read(cx);
-        assert!(s.diff_error.is_none(), "{:?}", s.diff_error);
+        assert!(
+            s.differ.read(cx).diff_error().is_none(),
+            "{:?}",
+            s.differ.read(cx).diff_error()
+        );
         assert_eq!(
-            s.diff_files
+            s.differ
+                .read(cx)
+                .diff_files()
                 .iter()
                 .map(|f| f.path().as_str())
                 .collect::<Vec<_>>(),
             ["api/shared.txt"]
         );
-        assert_eq!(s.changes_stats().0, "origin/parent");
+        assert_eq!(s.differ.read(cx).changes_stats().0, "origin/parent");
         assert_eq!(
             s.active_ws().unwrap().repos[0].base,
             "origin/main",
@@ -324,37 +369,52 @@ async fn stacked_pr_target_refreshes_diff_and_review_base(cx: &mut TestAppContex
         );
     });
     // Re-quoting an old-side comment uses the displayed parent, not the configured trunk.
-    on(cx, &|s, _, cx| {
-        let c: review::Comment = serde_json::from_value(serde_json::json!({
-            "id": 1, "path": "api/shared.txt", "start": [true, 1], "end": [true, 1],
-            "text": "review", "status": "Outdated"
-        }))
-        .unwrap();
-        s.edit_comments(cx, |comments| comments.push(c));
-        s.requeue_outdated(cx);
-        let c = &s.ws_comments()[0];
-        assert_eq!(c.snapshot, "parent");
-        assert_eq!(serde_json::to_value(c).unwrap()["rev"], parent);
+    on(cx, &|host, _w, cx| {
+        host.differ.update(cx, |s, cx| {
+            let c: review::Comment = serde_json::from_value(serde_json::json!({
+                "id": 1, "path": "api/shared.txt", "start": [true, 1], "end": [true, 1],
+                "text": "review", "status": "Outdated"
+            }))
+            .unwrap();
+            s.edit_comments(cx, |comments| comments.push(c));
+            s.requeue_outdated(cx);
+            let c = &s.ws_comments()[0];
+            assert_eq!(c.snapshot, "parent");
+            assert_eq!(serde_json::to_value(c).unwrap()["rev"], parent);
+        })
     });
     // Retargeting while editing updates the original while preserving the unsaved buffer.
     on(cx, &|s, w, cx| {
         s.edit_working_copy(Some("api/shared.txt".into()), w, cx);
-        s.paste_lines("unsaved", w, cx);
+        s.differ.update(cx, |d, cx| d.paste_lines("unsaved", w, cx));
     });
-    let buffer = cx.update(|cx| shark.read(cx).editing.as_ref().unwrap().buf.text());
+    let buffer = cx.update(|cx| {
+        shark
+            .read(cx)
+            .differ
+            .read(cx)
+            .editing()
+            .as_ref()
+            .unwrap()
+            .buf
+            .text()
+    });
     sync.update(cx, |g, cx| g.set_pr_base("api", "main", cx));
     cx.run_until_parked();
     // Also apply a comparison that started before editing began.
     on(cx, &|s, _, cx| {
         let ws = s.active_ws().unwrap().clone();
-        s.apply_diff(DiffData::load(&ws, false), cx);
-        assert_eq!(s.diff_base("api"), "origin/main");
-        let e = s.editing.as_ref().unwrap();
+        s.differ
+            .update(cx, |d, cx| d.apply_diff(DiffData::load(&ws, false), cx));
+        assert_eq!(s.differ.read(cx).diff_base("api"), "origin/main");
+        let e = s.differ.read(cx).editing().as_ref().unwrap();
         assert_eq!(e.buf.text(), buffer);
         assert!(e.dirty && e.patch.contains("-trunk"));
-        s.edit_comments(cx, |comments| comments[0].status = review::Status::Outdated);
-        s.requeue_outdated(cx);
-        assert_eq!(s.ws_comments()[0].snapshot, "trunk");
+        s.differ.update(cx, |d, cx| {
+            d.edit_comments(cx, |comments| comments[0].status = review::Status::Outdated)
+        });
+        s.differ.update(cx, |d, cx| d.requeue_outdated(cx));
+        assert_eq!(s.differ.read(cx).ws_comments()[0].snapshot, "trunk");
     });
     // A fetch can move the same target ref, including a rewritten parent.
     let trunk = g(&wt, &["rev-parse", "origin/main"]);
@@ -369,40 +429,52 @@ async fn stacked_pr_target_refreshes_diff_and_review_base(cx: &mut TestAppContex
         cx.wait_for(window, Duration::from_secs(10), |_, cx| {
             shark
                 .read(cx)
-                .editing
+                .differ
+                .read(cx)
+                .editing()
                 .as_ref()
                 .is_some_and(|e| e.patch.contains(&format!("-{original}")))
         })
         .await;
-        on(cx, &|s, _, cx| {
-            assert_eq!(s.diff_base("api"), "origin/main");
-            assert_eq!(s.editing.as_ref().unwrap().buf.text(), buffer);
-            s.edit_comments(cx, |comments| comments[0].status = review::Status::Outdated);
-            s.requeue_outdated(cx);
-            assert_eq!(s.ws_comments()[0].snapshot, original);
+        on(cx, &|host, _w, cx| {
+            host.differ.update(cx, |s, cx| {
+                assert_eq!(s.diff_base("api"), "origin/main");
+                assert_eq!(s.editing().as_ref().unwrap().buf.text(), buffer);
+                s.edit_comments(cx, |comments| comments[0].status = review::Status::Outdated);
+                s.requeue_outdated(cx);
+                assert_eq!(s.ws_comments()[0].snapshot, original);
+            })
         });
     }
-    on(cx, &|s, w, cx| s.save_edit(false, w, cx));
+    on(cx, &|s, w, cx| {
+        s.differ.update(cx, |d, cx| d.save_edit(false, w, cx))
+    });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark
             .read(cx)
-            .editing
+            .differ
+            .read(cx)
+            .editing()
             .as_ref()
             .is_some_and(|e| !e.dirty && !e.saving)
     })
     .await;
-    on(cx, &|s, w, cx| s.leave_edit(w, cx));
+    on(cx, &|s, w, cx| {
+        s.differ.update(cx, |d, cx| d.leave_edit(w, cx))
+    });
     assert_eq!(fs::read_to_string(wt.join("shared.txt")).unwrap(), buffer);
     // Saving and leaving keeps the new target, even though HEAD never moved.
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).diff_base("api") == "origin/main"
+        shark.read(cx).differ.read(cx).diff_base("api") == "origin/main"
     })
     .await;
     cx.update(|cx| {
         assert!(
             shark
                 .read(cx)
-                .diff_files
+                .differ
+                .read(cx)
+                .diff_files()
                 .iter()
                 .any(|f| f.path() == "api/parent.txt")
         )

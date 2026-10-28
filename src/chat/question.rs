@@ -499,7 +499,7 @@ impl Chat {
             .child(QuestionnaireSkip::new(form))
             .child(QuestionnaireNext::new(form))
             .child(QuestionnaireSubmit::new(form));
-        let faint = crate::app::faint(theme);
+        let faint = crate::ui::faint(theme);
         let hints = h_flex()
             .flex_none()
             .flex_wrap()

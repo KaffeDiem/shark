@@ -9,12 +9,13 @@ pub(crate) use status::parse_prs;
 pub use status::{Kind, Pr, PrState, Repo, ago, github_url, short};
 
 use crate::app::menus::{each_or_all, pr_entry};
-use crate::app::{inter_features, notify_err, open_menu};
+use crate::app::open_menu;
 use crate::chat::Chat;
 use crate::git::{cmd_bounded, par_map};
 use crate::menu::{self, Entry};
 use crate::pr;
 use crate::state::Workspace;
+use crate::ui::{inter_features, notify_err};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::async_util::{Receiver, Sender, unbounded};
 use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariant, ButtonVariants as _};

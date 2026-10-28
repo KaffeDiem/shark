@@ -30,6 +30,8 @@ fn fixture(home: &Path) -> State {
         ws.diff_closed = false;
         ws.open_tab(TabId::Diff);
         ws.open_tab(TabId::File("api/b.txt".into()));
+        ws.git_closed = false;
+        ws.open_tab(TabId::Git);
         state.workspaces.push(ws);
     }
     state.last_open = Some(("mixed".into(), "chat".into()));
@@ -40,6 +42,7 @@ fn element(id: &TabId) -> SharedString {
     match id {
         TabId::Chat(id) => format!("chat-tab-{id}"),
         TabId::Diff => "diff-tab".into(),
+        TabId::Git => "git-tab".into(),
         TabId::File(path) => format!("file-tab-{path}"),
     }
     .into()
@@ -95,9 +98,14 @@ async fn mixed_drag_preserves_buffers_and_navigation(cx: &mut TestAppContext) {
         TabId::Chat("mixed".into()),
         TabId::Diff,
         TabId::File("api/a.txt".into()),
+        TabId::Git,
     ];
     // Every kind is both source and target, using actual pointer drags.
-    for (from, to) in [(0, 1), (1, 0), (0, 2), (2, 0), (1, 2), (2, 1)] {
+    for (from, to) in (0..ids.len()).flat_map(|from| {
+        (0..ids.len())
+            .filter(move |&to| to != from)
+            .map(move |to| (from, to))
+    }) {
         let mut expected = cx.update(|cx| shark.read(cx).active_ws().unwrap().tab_order.clone());
         let a = expected.iter().position(|t| t == &ids[from]).unwrap();
         let b = expected.iter().position(|t| t == &ids[to]).unwrap();

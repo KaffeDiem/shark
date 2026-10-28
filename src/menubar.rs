@@ -120,6 +120,7 @@ pub fn menus() -> Vec<Menu> {
                 sep(),
                 MenuItem::action("Show Chat", ShowChat),
                 MenuItem::action("Show Diff", ShowDiff),
+                MenuItem::action("Show Git", ShowGit),
                 MenuItem::action("Toggle Plan", TogglePlan),
                 sep(),
                 MenuItem::action("Toggle Vim Mode", ToggleVim),

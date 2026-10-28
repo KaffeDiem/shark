@@ -51,7 +51,7 @@ async fn workspace_picker_navigation_and_focus(cx: &mut TestAppContext) {
     .unwrap();
     press(cx, &["enter"]);
     cx.update(|cx| assert_eq!(shark.read(cx).active.as_deref(), Some("current")));
-    on(cx, &|s, _, _| s.rail = true);
+    on(cx, &|s, _, _cx| s.rail = true);
     press(cx, &["cmd-shift-o", "enter"]);
     cx.update(|cx| {
         let s = shark.read(cx);
@@ -72,7 +72,7 @@ async fn workspace_picker_navigation_and_focus(cx: &mut TestAppContext) {
         assert_eq!(w.focused(cx), Some(focus.clone()));
     })
     .unwrap();
-    on(cx, &|s, w, cx| s.show(Tab::Diff, w, cx));
+    on(cx, &|s, w, cx| s.show(Tab::Feature(Feature::Diff), w, cx));
     press(cx, &["cmd-shift-o"]);
     cx.update_window(window, |_, w, cx| w.input("pay", cx))
         .unwrap();
@@ -82,7 +82,7 @@ async fn workspace_picker_navigation_and_focus(cx: &mut TestAppContext) {
         assert_eq!(shark.read(cx).active.as_deref(), Some("recent"));
         assert_eq!(
             shark.read(cx).tab,
-            Tab::Diff,
+            Tab::Feature(Feature::Diff),
             "current selection preserves view"
         );
     });
@@ -144,6 +144,90 @@ async fn workspace_picker_keeps_identity_during_updates(cx: &mut TestAppContext)
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
+async fn workspace_picker_live_activity_preserves_query(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = fixture(cx);
+    cx.update(|cx| cx.set_reduce_motion(true));
+    let chats = cx
+        .update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| {
+                s.state.workspaces[1].chats = ["first", "second"]
+                    .map(|id| ChatMeta {
+                        id: id.into(),
+                        ..Default::default()
+                    })
+                    .to_vec();
+                s.state.workspaces[1].normalize_tabs();
+                let ws = s.state.workspaces[1].clone();
+                ws.chats
+                    .iter()
+                    .map(|meta| s.ensure_chat(&ws, meta, w, cx))
+                    .collect::<Vec<_>>()
+            })
+        })
+        .unwrap();
+    press_in(window)(cx, &["cmd-shift-o"]);
+    cx.update_window(window, |_, w, cx| w.input("recent", cx))
+        .unwrap();
+    cx.run_until_parked();
+    for (running, unread, asks, expected) in [
+        (0, false, false, "Idle"),
+        (1, false, false, "1 chat running"),
+        (2, false, false, "2 chats running"),
+        (0, true, false, "Unread"),
+        (0, true, true, "Question to answer"),
+        (1, true, true, "1 chat running · Question to answer"),
+    ] {
+        cx.update(|cx| {
+            for (ix, chat) in chats.iter().enumerate() {
+                chat.update(cx, |c, cx| {
+                    c.busy = ix < running;
+                    if asks && ix == 1 && !c.asking() {
+                        crate::chat::ui_tests::play(c, &[r#"{"type":"control_request","request_id":"picker-question","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"picker-tool","input":{"questions":[{"header":"Color","question":"Which color?","options":[{"label":"Blue","description":"Blue"},{"label":"Red","description":"Red"}]}]}}}"#], cx);
+                    }
+                    cx.notify();
+                });
+            }
+            if unread {
+                shark.update(cx, |s, cx| {
+                    s.unread.insert("first".into());
+                    cx.notify();
+                });
+            }
+        });
+        cx.run_until_parked();
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            let row = w.find("workspace-result-recent");
+            assert!(
+                row.label().is_some_and(|label| label.contains(expected)),
+                "{expected}: {:?}",
+                row.label()
+            );
+            assert!(
+                w.try_find("workspace-result-current").is_none(),
+                "query survives status updates"
+            );
+            assert_eq!(
+                w.within("workspace-result-recent")
+                    .try_find("workspace-activity")
+                    .is_some(),
+                expected != "Idle"
+            );
+            assert!(
+                w.within("workspace-result-recent")
+                    .find("workspace-indicator")
+                    .visible()
+            );
+        })
+        .unwrap();
+    }
+    press_in(window)(cx, &["enter"]);
+    cx.update(|cx| assert_eq!(shark.read(cx).active.as_deref(), Some("recent")));
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
 async fn workspace_picker_discard_revalidates_destination(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (window, shark) = fixture(cx);
@@ -174,7 +258,7 @@ async fn workspace_picker_discard_revalidates_destination(cx: &mut TestAppContex
         press_in(window)(cx, &["cmd-shift-o", "enter"]);
         cx.update_window(window, |_, w, cx| assert!(w.has_active_dialog(cx)))
             .unwrap();
-        on(cx, &|s, _, _| match scenario {
+        on(cx, &|s, _, _cx| match scenario {
             "archiving" => {
                 s.archiving.insert("recent".into());
             }
@@ -200,7 +284,7 @@ async fn workspace_picker_discard_revalidates_destination(cx: &mut TestAppContex
                 assert_eq!(ws.last_interacted_at, Some(20));
             }
         });
-        on(cx, &|s, _, _| s.archiving.clear());
+        on(cx, &|s, _, _cx| s.archiving.clear());
     }
     assert_eq!(fs::read_to_string(path).unwrap(), "original");
 }
@@ -274,7 +358,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     )
                 })
                 .unwrap();
-            cx.update_window(window, |_, w, cx| {
+            let indicators = cx.update_window(window, |_, w, cx| {
                 shark.update(cx, |s, cx| {
                     s.rail = width < 400.;
                     s.state.workspaces = ["checkout-redesign", "fix-auth-with-a-very-long-workspace-name", "many-repositories", "unknown"].into_iter().enumerate().map(|(i, name)| Workspace {
@@ -294,6 +378,26 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         }).collect();
                         s.attn.set_checked(&ws.name, repos);
                     }
+                    for ix in 0..3 {
+                        s.state.workspaces[ix].chats = (0..if ix == 0 { 2 } else { 1 }).map(|n| ChatMeta {
+                            id: format!("picker-{ix}-{n}"), ..Default::default()
+                        }).collect();
+                        s.state.workspaces[ix].normalize_tabs();
+                        let ws = s.state.workspaces[ix].clone();
+                        for meta in &ws.chats {
+                            let chat = s.ensure_chat(&ws, meta, w, cx);
+                            chat.update(cx, |c, cx| {
+                                if ix == 0 {
+                                    c.busy = true;
+                                } else if ix == 1 {
+                                    crate::chat::ui_tests::play(c, &[r#"{"type":"control_request","request_id":"picker-pixels","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"picker-pixels-tool","input":{"questions":[{"header":"Color","question":"Which color?","options":[{"label":"Blue","description":"Blue"},{"label":"Red","description":"Red"}]}]}}}"#], cx);
+                                }
+                            });
+                            if ix == 2 {
+                                s.unread.insert(meta.id.clone());
+                            }
+                        }
+                    }
                     s.active = Some("fix-auth-with-a-very-long-workspace-name".into());
                     s.home.on = false;
                     s.open_workspace_picker(w, cx);
@@ -304,10 +408,39 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 let bounds = first.bounds();
                 assert!(bounds.left() >= px(16.) && bounds.right() <= px(width - 16.), "{label}, {width}: {bounds:?}");
                 assert!(bounds.top() > px(0.) && bounds.bottom() < px(560.));
+                [
+                    ("checkout-redesign", cx.theme().primary),
+                    ("fix-auth-with-a-very-long-workspace-name", cx.theme().warning_foreground),
+                    ("many-repositories", cx.theme().success_foreground),
+                ].map(|(name, color)| {
+                    let bounds = w.within(format!("workspace-result-{name}")).find("workspace-indicator").bounds();
+                    assert_eq!(bounds.size, size(px(16.), px(16.)));
+                    (name, bounds, color)
+                })
             }).unwrap();
             let image = cx
                 .capture_screenshot(window)
                 .expect("workspace picker Metal rendering");
+            let scale = image.width() as f32 / width;
+            for (name, bounds, color) in indicators {
+                let rgb = color.to_rgb();
+                let expected = [rgb.r, rgb.g, rgb.b].map(|c| (c * 255.).round() as u8);
+                let mut matches = 0;
+                for y in (bounds.top().as_f32() * scale).ceil() as u32
+                    ..(bounds.bottom().as_f32() * scale).floor() as u32
+                {
+                    for x in (bounds.left().as_f32() * scale).ceil() as u32
+                        ..(bounds.right().as_f32() * scale).floor() as u32
+                    {
+                        let pixel = image.get_pixel(x, y);
+                        matches += usize::from((0..3).all(|c| pixel[c].abs_diff(expected[c]) <= 4));
+                    }
+                }
+                assert!(
+                    matches > 2,
+                    "{label}, {width}, {name}: indicator must render {expected:?}"
+                );
+            }
             if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
                 let dir = PathBuf::from(dir);
                 fs::create_dir_all(&dir).unwrap();
@@ -340,7 +473,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         }
     }
     println!(
-        "workspace picker pixels: both themes, narrow/wide, mixed PR states, long names and tall-row scrolling passed"
+        "workspace picker pixels: both themes, narrow/wide, running/needs-you/unread icons, mixed PR states, long names and tall-row scrolling passed"
     );
 }
 
@@ -357,7 +490,7 @@ async fn workspace_interaction_mouse_scroll_and_dialog_success(cx: &mut TestAppC
     });
     cx.update_window(window, |_, w, cx| w.click("content-island", cx))
         .unwrap();
-    on(cx, &|s, _, _| {
+    on(cx, &|s, _, _cx| {
         assert!(
             s.state.workspaces[0].last_interacted_at.unwrap() > 1,
             "click inside content"
@@ -372,7 +505,7 @@ async fn workspace_interaction_mouse_scroll_and_dialog_success(cx: &mut TestAppC
         )
     })
     .unwrap();
-    on(cx, &|s, _, _| {
+    on(cx, &|s, _, _cx| {
         assert!(
             s.state.workspaces[0].last_interacted_at.unwrap() > 1,
             "scroll inside content"
@@ -398,7 +531,7 @@ async fn workspace_interaction_mouse_scroll_and_dialog_success(cx: &mut TestAppC
         w.activate_window();
         s.refresh_attention(cx);
     });
-    on(cx, &|s, _, _| {
+    on(cx, &|s, _, _cx| {
         assert_eq!(s.state.workspaces[0].last_interacted_at, Some(1))
     });
     // A model menu selection succeeds through ChatEvent::Picked; mere menu browsing does not.
@@ -408,7 +541,7 @@ async fn workspace_interaction_mouse_scroll_and_dialog_success(cx: &mut TestAppC
         assert_eq!(s.state.workspaces[0].last_interacted_at, Some(1));
         s.set_model(0, w, cx);
     });
-    on(cx, &|s, _, _| {
+    on(cx, &|s, _, _cx| {
         assert!(s.state.workspaces[0].last_interacted_at.unwrap() > 1)
     });
 }
@@ -467,7 +600,7 @@ async fn workspace_interaction_coalesces_and_restores(cx: &mut TestAppContext) {
     assert_eq!(State::load().workspaces[1].last_interacted_at, Some(20));
     cx.executor().advance_clock(Duration::from_millis(500));
     cx.run_until_parked();
-    on(cx, &|s, _, _| {
+    on(cx, &|s, _, _cx| {
         assert!(
             s.interaction_save.is_none(),
             "continuous input doesn't defer the first save"

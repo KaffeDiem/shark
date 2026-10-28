@@ -5,7 +5,7 @@ use gpui_kit::component::Selectable as _;
 
 /// A changed file against the fingerprint stored when it was marked viewed.
 #[derive(PartialEq, Clone, Copy, Debug)]
-pub(super) enum Viewed {
+pub(crate) enum Viewed {
     No,
     Yes,
     /// Marked viewed, then the agent or the editor changed it.
@@ -13,12 +13,12 @@ pub(super) enum Viewed {
 }
 
 /// One parsed diff refresh, built off the main thread.
-pub(super) struct DiffData {
+pub(crate) struct DiffData {
     /// Fingerprint of the whole patch; equal means nothing to redo.
     fp: u64,
     bases: HashMap<String, String>,
     /// In tree order.
-    pub(super) files: Vec<DiffFile>,
+    pub(crate) files: Vec<DiffFile>,
     fps: Vec<u64>,
     /// git failed for some repo; the patch is then empty, which must not read as "no changes".
     error: Option<String>,
@@ -31,7 +31,7 @@ pub(super) struct DiffData {
 }
 
 impl DiffData {
-    pub(super) fn load(ws: &Workspace, uncommitted_only: bool) -> DiffData {
+    pub(crate) fn load(ws: &Workspace, uncommitted_only: bool) -> DiffData {
         let (patch, mut error) = match git::combined_diff(ws, &ws.dir(), uncommitted_only) {
             Ok(p) => (p, None),
             Err(e) => (String::new(), Some(e)),
@@ -86,21 +86,14 @@ impl DiffData {
     }
 }
 
-impl Shark {
-    pub(super) fn refresh_diff(&mut self, cx: &mut Context<Self>) {
-        let Some(mut ws) = self.active_ws().cloned() else {
+impl Differ {
+    pub(crate) fn refresh_diff(&mut self, cx: &mut Context<Self>) {
+        let Some(ws) = self.active_ws().cloned() else {
             return;
         };
-        if let Some(sync) = self.syncs.get(&ws.name) {
-            for r in &mut ws.repos {
-                if let Some(base) = sync.read(cx).diff_base(&r.name) {
-                    r.base = base;
-                }
-            }
-        }
         self.diff_gen += 1;
         let generation = self.diff_gen;
-        let uncommitted_only = self.state.uncommitted_only;
+        let uncommitted_only = self.preferences.uncommitted_only;
         let edited = self.editing.as_ref().map(|e| e.abs.clone());
         cx.spawn(async move |this, cx| {
             let name = ws.name.clone();
@@ -114,18 +107,25 @@ impl Shark {
                     }
                 })
                 .await;
-            this.update(cx, |s, cx| {
-                if s.active.as_ref() != Some(&name) || s.diff_gen != generation {
-                    return; // superseded: another workspace, or a newer refresh
-                }
-                s.apply_diff(data, cx);
-            })
-            .ok();
+            this.update(cx, |s, cx| s.complete_refresh(&name, generation, data, cx))
+                .ok();
         })
         .detach();
     }
 
-    pub(super) fn apply_diff(&mut self, mut data: DiffData, cx: &mut Context<Self>) {
+    pub(crate) fn complete_refresh(
+        &mut self,
+        name: &str,
+        generation: u64,
+        data: DiffData,
+        cx: &mut Context<Self>,
+    ) {
+        if self.workspace_name() == Some(name) && self.diff_gen == generation {
+            self.apply_diff(data, cx);
+        }
+    }
+
+    pub(crate) fn apply_diff(&mut self, mut data: DiffData, cx: &mut Context<Self>) {
         if let Some((abs, bytes)) = data.edited.take() {
             self.edit_disk(&abs, bytes, cx);
         }
@@ -217,7 +217,7 @@ impl Shark {
         let old_fps = std::mem::take(&mut self.diff_fps);
         self.review.hunks = data.hunks;
         self.set_media(data.media, cx);
-        if let Some(ws) = self.active.clone() {
+        if let Some(ws) = self.workspace_name().map(str::to_string) {
             self.reanchor_comments(&ws);
         }
         let was_viewed = self.viewed_now.clone();
@@ -308,7 +308,7 @@ impl Shark {
     }
 
     /// `p`: play or pause the video of the file last moved to.
-    pub(super) fn play_media(&mut self, window: &Window, cx: &mut Context<Self>) {
+    pub(crate) fn play_media(&mut self, window: &Window, cx: &mut Context<Self>) {
         let Some(path) =
             (self.cursor_file(window, cx)).map(|ix| self.diff_files[ix].path().clone())
         else {
@@ -323,7 +323,7 @@ impl Shark {
         }
     }
 
-    pub(super) fn viewed(&self, ix: usize) -> Viewed {
+    pub(crate) fn viewed(&self, ix: usize) -> Viewed {
         let (Some(ws), Some(f)) = (self.active_ws(), self.diff_files.get(ix)) else {
             return Viewed::No;
         };
@@ -342,7 +342,7 @@ impl Shark {
         self.viewed_now = Rc::new(set);
     }
 
-    pub(super) fn toggle_viewed(&mut self, ix: usize, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_viewed(&mut self, ix: usize, cx: &mut Context<Self>) {
         if ix < self.diff_files.len() {
             self.set_viewed(&[ix], self.viewed(ix) != Viewed::Yes, cx);
         }
@@ -362,17 +362,17 @@ impl Shark {
     }
 
     /// A folder's box: ticks every file inside, or unticks them all when all are viewed.
-    pub(super) fn toggle_viewed_dir(&mut self, dir: &str, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_viewed_dir(&mut self, dir: &str, cx: &mut Context<Self>) {
         let files = self.dir_files(dir);
         let on = !files.iter().all(|&ix| self.viewed(ix) == Viewed::Yes);
         self.set_viewed(&files, on, cx);
     }
 
     fn set_viewed(&mut self, files: &[usize], on: bool, cx: &mut Context<Self>) {
-        let Some(name) = self.active.clone() else {
+        let Some(name) = self.workspace_name().map(str::to_string) else {
             return;
         };
-        let Some(ws) = self.state.workspaces.iter_mut().find(|w| w.name == name) else {
+        let Some(ws) = self.workspace.as_mut().filter(|w| w.name == name) else {
             return;
         };
         for &ix in files {
@@ -385,7 +385,10 @@ impl Shark {
         // Forget files that left the diff so the map doesn't grow forever.
         let live: HashSet<&str> = self.diff_files.iter().map(|f| f.path().as_str()).collect();
         ws.viewed.retain(|p, _| live.contains(p.as_str()));
-        let _ = self.state.save();
+        cx.emit(DifferEvent::Viewed {
+            workspace: name,
+            viewed: ws.viewed.clone(),
+        });
         self.recompute_viewed();
         // The file being edited stays open, or its line input would go.
         let edited = self.editing.as_ref().map(|e| e.path.clone());
@@ -401,13 +404,13 @@ impl Shark {
         cx.notify();
     }
 
-    fn toggle_viewed_path(&mut self, path: &str, cx: &mut Context<Self>) {
+    pub(crate) fn toggle_viewed_path(&mut self, path: &str, cx: &mut Context<Self>) {
         if let Some(ix) = self.diff_files.iter().position(|f| f.path() == path) {
             self.toggle_viewed(ix, cx);
         }
     }
 
-    pub(super) fn rebuild_tree(&mut self) {
+    pub(crate) fn rebuild_tree(&mut self) {
         let keep: Vec<usize> = (0..self.diff_files.len())
             .filter(|&ix| self.tree_match(ix))
             .collect();
@@ -429,7 +432,7 @@ impl Shark {
     }
 
     /// Typing in "Filter files…": the cursor goes to the first match.
-    pub(super) fn filter_tree(&mut self, query: String, cx: &mut Context<Self>) {
+    pub(crate) fn filter_tree(&mut self, query: String, cx: &mut Context<Self>) {
         self.tree_query = query.trim().to_lowercase();
         self.rebuild_tree();
         if let Some(row) = self.tree_rows.iter().position(|r| r.file.is_some()) {
@@ -439,35 +442,26 @@ impl Shark {
     }
 
     /// Enter in the filter: show the match under the cursor.
-    pub(super) fn filter_jump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn filter_jump(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if (self.tree_rows.get(self.tree_sel)).is_some_and(|r| r.file.is_some()) {
             self.tree_confirm(self.tree_sel, window, cx);
-            if self.tab == Tab::Diff {
-                self.focus_diff(window, cx);
-            }
+            self.focus_diff(window, cx);
         }
     }
 
     /// `s` and the Split / Unified button; the choice persists.
-    pub(super) fn toggle_diff_mode(&mut self, cx: &mut Context<Self>) {
-        self.state.unified = !self.state.unified;
-        let _ = self.state.save();
-        let mode = diff_mode(self.state.unified);
+    pub(crate) fn toggle_diff_mode(&mut self, cx: &mut Context<Self>) {
+        self.preferences.unified = !self.preferences.unified;
+        cx.emit(DifferEvent::Preference(Preference::Unified(
+            self.preferences.unified,
+        )));
+        let mode = diff_mode(self.preferences.unified);
         self.diff.update(cx, |d, cx| d.set_mode(mode, cx));
         cx.notify();
     }
 
-    pub(super) fn toggle_uncommitted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.confirm_discard(false, true, window, cx, |s, window, cx| {
-            s.end_edit(cx);
-            s.state.uncommitted_only = !s.state.uncommitted_only;
-            let _ = s.state.save();
-            s.refresh_diff(cx);
-            if s.tab == Tab::Diff {
-                s.focus_diff(window, cx);
-            }
-            cx.notify();
-        });
+    pub(crate) fn toggle_uncommitted(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.request_discard(AfterDiscard::ToggleUncommitted, window, cx);
     }
 
     /// Trailing controls of a file card's header, after its "+a −d": the review chip and
@@ -488,19 +482,19 @@ impl Shark {
     }
 
     /// Files belongs only to the active Diff artifact.
-    pub(super) fn tree_shown(&self) -> bool {
-        self.show_tree && self.tab == Tab::Diff && self.active.is_some() && !self.home_shown()
+    pub(crate) fn tree_shown(&self) -> bool {
+        self.show_tree && self.workspace.is_some()
     }
 
     /// The Diff artifact's internal split; the outer Features rail never resizes.
-    pub(super) fn with_tree(
+    pub(crate) fn with_tree(
         &self,
         main: impl IntoElement,
         window: &Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let shown = self.tree_shown();
-        let width = px(self.state.tree_width.unwrap_or(244.));
+        let width = px(self.preferences.tree_width.unwrap_or(244.));
         v_flex()
             .relative()
             .flex_1()
@@ -524,13 +518,13 @@ impl Shark {
     }
 
     /// Puts the tree cursor on file `ix`'s row, when it has one (not inside a folded folder).
-    pub(super) fn follow_tree(&mut self, ix: usize) -> Option<usize> {
+    pub(crate) fn follow_tree(&mut self, ix: usize) -> Option<usize> {
         let row = self.tree_rows.iter().position(|r| r.file == Some(ix))?;
         self.tree_sel = row;
         Some(row)
     }
 
-    pub(super) fn tree_select(&mut self, row: usize, cx: &mut Context<Self>) {
+    pub(crate) fn tree_select(&mut self, row: usize, cx: &mut Context<Self>) {
         let Some(r) = self.tree_rows.get(row) else {
             return;
         };
@@ -539,7 +533,7 @@ impl Shark {
             .scroll_to_item(row, ScrollStrategy::Nearest);
         if let Some(ix) = r.file {
             self.diff_file = ix;
-            if self.tab == Tab::Diff {
+            {
                 let path = self.diff_files[ix].path().to_string();
                 self.review.at_file(&path);
                 self.diff.update(cx, |d, cx| d.scroll_to_file(&path, cx));
@@ -548,7 +542,7 @@ impl Shark {
         cx.notify();
     }
 
-    pub(super) fn set_dir_open(&mut self, open: Option<bool>, cx: &mut Context<Self>) {
+    pub(crate) fn set_dir_open(&mut self, open: Option<bool>, cx: &mut Context<Self>) {
         let Some(r) = self.tree_rows.get(self.tree_sel) else {
             return;
         };
@@ -587,15 +581,9 @@ impl Shark {
 
     /// The file a row action applies to: the tree cursor in the tree, the open file in the file
     /// view, else the file last moved to in the diff.
-    pub(super) fn cursor_file(&self, window: &Window, cx: &App) -> Option<usize> {
+    pub(crate) fn cursor_file(&self, window: &Window, _cx: &App) -> Option<usize> {
         if self.tree_shown() && self.tree_focus.is_focused(window) {
             return self.tree_rows.get(self.tree_sel)?.file;
-        }
-        if self.tab == Tab::File
-            && let Some(e) = &self.editor
-        {
-            let path = &e.read(cx).path;
-            return self.diff_files.iter().position(|f| f.path() == path);
         }
         // The diff can't say which file is on screen; use the last one moved to, which the
         // tree cursor follows.
@@ -603,7 +591,7 @@ impl Shark {
     }
 
     /// Loading, git failed, or nothing changed; `None` when there is a diff to show.
-    pub(super) fn diff_placeholder(&self, cx: &App) -> Option<AnyElement> {
+    pub(crate) fn diff_placeholder(&self, cx: &App) -> Option<AnyElement> {
         let theme = cx.theme();
         let big = |name, color| Icon::new(name).with_size(px(32.)).text_color(color);
         let (icon, title, detail) = match &self.diff_error {
@@ -622,7 +610,7 @@ impl Shark {
             ),
             None if self.diff_files.is_empty() => (
                 big(IconName::FileDiff, faint(theme)).into_any_element(),
-                if self.state.uncommitted_only {
+                if self.preferences.uncommitted_only {
                     "No uncommitted changes"
                 } else {
                     "No changes"
@@ -649,7 +637,7 @@ impl Shark {
         )
     }
 
-    pub(super) fn render_diff(&self, _window: &Window, cx: &mut Context<Self>) -> AnyElement {
+    pub(crate) fn render_diff(&self, _window: &Window, cx: &mut Context<Self>) -> AnyElement {
         let viewed = self.viewed_now.clone();
         let shark = cx.entity().downgrade();
         let placeholder = self.diff_placeholder(cx);
@@ -771,7 +759,7 @@ impl Shark {
             .into_any_element()
     }
 
-    pub(super) fn diff_base(&self, repo: &str) -> &str {
+    pub(crate) fn diff_base(&self, repo: &str) -> &str {
         self.diff_bases
             .get(repo)
             .map(String::as_str)
@@ -786,7 +774,7 @@ impl Shark {
     }
 
     /// The bases the diff compares against, and its total added and deleted lines.
-    pub(super) fn changes_stats(&self) -> (String, usize, usize) {
+    pub(crate) fn changes_stats(&self) -> (String, usize, usize) {
         let mut bases: Vec<&str> = (self.active_ws().into_iter())
             .flat_map(|ws| ws.repos.iter().map(|r| self.diff_base(&r.name)))
             .collect();
@@ -794,7 +782,7 @@ impl Shark {
         bases.dedup();
         let (adds, dels) = (self.diff_files.iter())
             .fold((0, 0), |(a, d), f| (a + f.additions(), d + f.deletions()));
-        let base = if self.state.uncommitted_only {
+        let base = if self.preferences.uncommitted_only {
             "HEAD".into()
         } else {
             bases.join(", ")
@@ -803,7 +791,7 @@ impl Shark {
     }
 
     /// Compact controls embedded in the branch/sync header.
-    pub(super) fn render_diff_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_diff_controls(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let (base, adds, dels) = self.changes_stats();
         let n = self.diff_files.len();
         h_flex()
@@ -823,15 +811,15 @@ impl Shark {
                     .px(px(10.))
                     .rounded(px(6.))
                     .outline()
-                    .selected(self.state.uncommitted_only)
-                    .toggled(self.state.uncommitted_only)
+                    .selected(self.preferences.uncommitted_only)
+                    .toggled(self.preferences.uncommitted_only)
                     .accessibility_label("Uncommitted changes only")
-                    .label(if self.state.uncommitted_only {
+                    .label(if self.preferences.uncommitted_only {
                         "Uncommitted"
                     } else {
                         "All changes"
                     })
-                    .tooltip(if self.state.uncommitted_only {
+                    .tooltip(if self.preferences.uncommitted_only {
                         "HEAD → working tree: staged, unstaged, and untracked changes. Click for all changes: workspace base → working tree.".to_string()
                     } else {
                         format!("Workspace base ({base}) → working tree: committed and uncommitted changes. Click for uncommitted changes: HEAD → working tree.")
@@ -844,14 +832,14 @@ impl Shark {
                     .size(px(28.))
                     .px_0()
                     .rounded(px(6.))
-                    .icon(if self.state.unified {
+                    .icon(if self.preferences.unified {
                         IconName::Rows2
                     } else {
                         IconName::Columns2
                     })
-                    .toggled(self.state.unified)
+                    .toggled(self.preferences.unified)
                     .accessibility_label("Unified diff")
-                    .tooltip(if self.state.unified {
+                    .tooltip(if self.preferences.unified {
                         "Unified view · Click for Split (s)"
                     } else {
                         "Split view · Click for Unified (s)"
@@ -889,7 +877,7 @@ impl Shark {
             .side_headings(move |file, _, cx| {
                 let repo = file.path().split('/').next().unwrap_or_default();
                 (shark.read_with(cx, |s, _| {
-                    let base = if s.state.uncommitted_only {
+                    let base = if s.preferences.uncommitted_only {
                         "HEAD"
                     } else {
                         s.diff_base(repo)
@@ -909,7 +897,7 @@ impl Shark {
             })
     }
 
-    pub(super) fn render_tree(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
+    pub(crate) fn render_tree(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (muted, fg, hint) = (theme.muted_foreground, theme.foreground, faint(theme));
         let focused = self.tree_focus.is_focused(window);
@@ -1011,7 +999,7 @@ impl Shark {
         let theme = cx.theme();
         let r = &self.tree_rows[ix];
         let selected = ix == self.tree_sel;
-        let open_file = self.editor.as_ref().map(|e| e.read(cx).path.clone());
+        let open_file = self.editor_path.clone();
         let depth = r.depth;
         let next_depth = self.tree_rows.get(ix + 1).map_or(0, |r| r.depth);
         let guide = theme.border;
@@ -1234,7 +1222,7 @@ impl Shark {
 
     /// Right-click menu of file `path` (`repo/…`): the tree's file rows, the editor header
     /// and the File tab. By path, since the open file need not be in the diff.
-    pub(super) fn file_menu(&self, path: &str, cx: &Context<Self>) -> Vec<Entry> {
+    pub(crate) fn file_menu(&self, path: &str, cx: &Context<Self>) -> Vec<Entry> {
         let Some(ws) = self.active_ws() else {
             return vec![];
         };
@@ -1245,7 +1233,7 @@ impl Shark {
             let f = &self.diff_files[ix];
             f.status() != DiffFileStatus::Deleted && !f.is_binary()
         });
-        let open = (self.editor.as_ref()).is_some_and(|e| e.read(cx).path == path);
+        let open = self.editor_path.as_deref() == Some(path);
         let p = path.to_string();
         let mut entries = vec![];
         if on_disk && !open {
@@ -1253,7 +1241,9 @@ impl Shark {
             entries.push(menu::item(
                 IconName::FileCode,
                 "Open in editor",
-                on_shark(cx, move |s, w, cx| s.open_path(p.clone(), w, cx)),
+                on_differ(self.workspace_name(), cx, move |s, _w, cx| {
+                    s.request_editor(p.clone(), false, false, cx)
+                }),
             ));
         }
         if let Some(ix) = ix {
@@ -1262,8 +1252,8 @@ impl Shark {
                 entries.push(menu::item(
                     IconName::Pencil,
                     "Edit working copy",
-                    on_shark(cx, move |s, w, cx| {
-                        s.show(Tab::Diff, w, cx);
+                    on_differ(self.workspace_name(), cx, move |s, w, cx| {
+                        s.request_activation(cx);
                         s.edit_working_copy(Some(p.clone().into()), w, cx)
                     }),
                 ));
@@ -1273,15 +1263,17 @@ impl Shark {
                 menu::item(
                     IconName::MessageSquare,
                     "Comment",
-                    on_shark(cx, move |s, w, cx| {
-                        s.show(Tab::Diff, w, cx);
+                    on_differ(self.workspace_name(), cx, move |s, w, cx| {
+                        s.request_activation(cx);
                         s.comment_in(&p1, w, cx)
                     }),
                 ),
                 menu::item(
                     IconName::Check,
                     "Viewed",
-                    on_shark(cx, move |s, _, cx| s.toggle_viewed_path(&p2, cx)),
+                    on_differ(self.workspace_name(), cx, move |s, _, cx| {
+                        s.toggle_viewed_path(&p2, cx)
+                    }),
                 )
                 .checked(self.viewed(ix) == Viewed::Yes),
             ]);
@@ -1292,8 +1284,11 @@ impl Shark {
             entries.push(menu::item(
                 IconName::Undo,
                 "Discard uncommitted changes…",
-                on_shark(cx, move |s, w, cx| {
-                    s.discard_uncommitted(&name, &path, w, cx)
+                on_differ(self.workspace_name(), cx, move |_s, _w, cx| {
+                    cx.emit(DifferEvent::DiscardFile {
+                        workspace: name.clone(),
+                        path: path.clone(),
+                    })
                 }),
             ));
         }
@@ -1311,7 +1306,16 @@ impl Shark {
                 }
                 let a = abs.clone();
                 let label = format!("Open in {}", app.name);
-                let item = menu::item(super::menus::app_icon(app), label, move |_, _| app.open(&a));
+                let item = menu::item(
+                    crate::ui::app_icon(app),
+                    label,
+                    on_differ(self.workspace_name(), cx, move |_, _, cx| {
+                        cx.emit(DifferEvent::OpenApp {
+                            app,
+                            path: a.clone(),
+                        });
+                    }),
+                );
                 entries.push(item.image(app.icon.clone()));
             }
         }
@@ -1344,7 +1348,9 @@ impl Shark {
             menu::item(
                 IconName::Check,
                 "All viewed",
-                on_shark(cx, move |s, _, cx| s.toggle_viewed_dir(&d, cx)),
+                on_differ(self.workspace_name(), cx, move |s, _, cx| {
+                    s.toggle_viewed_dir(&d, cx)
+                }),
             )
             .checked(all),
         ];
@@ -1358,7 +1364,9 @@ impl Shark {
                     IconName::ChevronDown
                 },
                 if open { "Collapse" } else { "Expand" },
-                on_shark(cx, move |s, _, cx| s.set_dir_open(Some(!open), cx)),
+                on_differ(self.workspace_name(), cx, move |s, _, cx| {
+                    s.set_dir_open(Some(!open), cx)
+                }),
             ));
         }
         let a = abs.clone();
@@ -1375,29 +1383,31 @@ impl Shark {
     }
 
     /// Right-click menu of the Diff button and its header controls.
-    pub(super) fn changes_menu(&self, cx: &Context<Self>) -> Vec<Entry> {
+    pub(crate) fn changes_menu(&self, cx: &Context<Self>) -> Vec<Entry> {
         let mut entries = vec![
             menu::item(
                 IconName::FileDiff,
                 "Uncommitted only",
-                on_shark(cx, |s, w, cx| s.toggle_uncommitted(w, cx)),
+                on_differ(self.workspace_name(), cx, |s, w, cx| {
+                    s.toggle_uncommitted(w, cx)
+                }),
             )
-            .checked(self.state.uncommitted_only),
+            .checked(self.preferences.uncommitted_only),
             menu::item(
                 IconName::Columns2,
                 "Unified",
-                on_shark(cx, |s, _, cx| s.toggle_diff_mode(cx)),
+                on_differ(self.workspace_name(), cx, |s, _, cx| s.toggle_diff_mode(cx)),
             )
-            .checked(self.state.unified),
+            .checked(self.preferences.unified),
             menu::item(
                 IconName::RefreshCw,
                 "Refresh",
-                on_shark(cx, |s, _, cx| s.refresh_diff(cx)),
+                on_differ(self.workspace_name(), cx, |s, _, cx| s.refresh_diff(cx)),
             ),
             menu::item(
                 IconName::PanelRight,
                 "Show files",
-                on_shark(cx, |s, w, cx| s.toggle_tree(w, cx)),
+                on_differ(self.workspace_name(), cx, |s, w, cx| s.toggle_tree(w, cx)),
             )
             .checked(self.show_tree),
         ];
@@ -1407,7 +1417,7 @@ impl Shark {
                 menu::item(
                     IconName::Send,
                     "Send review…",
-                    on_shark(cx, |s, w, cx| s.open_sheet(w, cx)),
+                    on_differ(self.workspace_name(), cx, |s, w, cx| s.open_sheet(w, cx)),
                 ),
             ]);
         }
@@ -1436,7 +1446,7 @@ impl Shark {
 }
 
 /// The diff's mode for the persisted `unified` choice.
-pub(super) fn diff_mode(unified: bool) -> DiffMode {
+pub(crate) fn diff_mode(unified: bool) -> DiffMode {
     match unified {
         true => DiffMode::Unified,
         false => DiffMode::Split,

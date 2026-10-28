@@ -131,7 +131,7 @@ async fn workspace_review_large_catalog_and_release(cx: &mut TestAppContext) {
     let (window, shark) = boot(cx, State::default(), WindowOptions::default());
     cx.run_until_parked();
     for count in [100, 500, 2000] {
-        on_app(window, shark.clone())(cx, &|s, _, _| {
+        on_app(window, shark.clone())(cx, &|s, _, _cx| {
             s.state.workspaces = (0..count)
                 .map(|i| Workspace {
                     name: format!("workspace-{i:04}"),

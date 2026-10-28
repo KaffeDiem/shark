@@ -28,6 +28,90 @@ fn modifiers(cx: &mut TestAppContext, window: AnyWindowHandle, modifiers: Modifi
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
+async fn app_switcher_recents(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = fixture(cx);
+    let apps = crate::apps::installed();
+    let press = press_in(window);
+    let history =
+        |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.recent_apps.clone());
+
+    // Keyboard confirmation records once; a cancelled selection records nothing.
+    press(cx, &["cmd-o", "right", "enter"]);
+    assert_eq!(history(cx), [apps[1].path.clone()]);
+    press(cx, &["cmd-o", "right", "escape"]);
+    assert_eq!(history(cx), [apps[1].path.clone()]);
+
+    // Both direct repo entries and workspace submenus use the same launch path.
+    for folder in [false, true] {
+        let action = shark.update(cx, |_, cx| {
+            let dir = ("Workspace folder".into(), PathBuf::from("/workspace"));
+            let entries = open_in_entries(
+                folder.then_some(&dir),
+                &[("repo".into(), PathBuf::from("/repo"))],
+                cx,
+            );
+            let entry = entries
+                .into_iter()
+                .find(|entry| match entry {
+                    Entry::Item { label, .. } | Entry::Sub { label, .. } => {
+                        label == "Open in Terminal"
+                    }
+                    _ => false,
+                })
+                .unwrap();
+            let entry = match entry {
+                Entry::Sub { mut entries, .. } => entries.remove(0),
+                entry => entry,
+            };
+            let Entry::Item { on_click, .. } = entry else {
+                panic!("expected launch action")
+            };
+            on_click
+        });
+        cx.update_window(window, |_, w, cx| action(w, cx)).unwrap();
+    }
+    assert_eq!(history(cx), [apps[0].path.clone(), apps[1].path.clone()]);
+
+    // Another workspace sees the same order; moving an app to the front deduplicates it.
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.sel = SideRow::Ws(0);
+        s.sidebar_focus.focus(w, cx);
+    });
+    press(cx, &["cmd-o", "right", "enter"]);
+    let expected = vec![apps[1].path.clone(), apps[0].path.clone()];
+    assert_eq!(history(cx), expected);
+    assert_eq!(State::load().recent_apps, expected);
+
+    // Restart with unavailable history entries: filter first, keeping unused apps in order.
+    let mut saved = State::load();
+    saved
+        .recent_apps
+        .insert(0, "/Applications/Removed.app".into());
+    saved.recent_apps.insert(0, apps[3].path.clone());
+    let (reopened, restored) = boot(cx, saved, WindowOptions::default());
+    on_app(reopened, restored.clone())(cx, &|s, w, cx| {
+        s.sel = SideRow::Ws(0);
+        s.sidebar_focus.focus(w, cx);
+    });
+    press_in(reopened)(cx, &["cmd-o"]);
+    cx.update(|cx| {
+        let switcher = restored.read(cx).app_switcher.as_ref().unwrap();
+        assert_eq!(switcher.selected, 0);
+        assert_eq!(
+            switcher
+                .apps
+                .iter()
+                .map(|app| app.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Code", "Terminal", "Fork"]
+        );
+    });
+    press_in(reopened)(cx, &["escape"]);
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
 async fn app_switcher_menu_modifiers(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (window, shark) = fixture(cx);

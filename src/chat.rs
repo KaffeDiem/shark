@@ -70,8 +70,9 @@ enum Block {
     Review(Rc<ReviewCard>, bool),
 }
 
-/// Diff comments sent as one message (src/app/review.rs), shown as a card instead of the
+/// Diff comments sent as one message (src/features/differ/review.rs), shown as a card instead of the
 /// prompt text.
+#[derive(Clone)]
 pub struct ReviewCard {
     pub prompt: String,
     pub items: Vec<ReviewItem>,
@@ -123,7 +124,7 @@ pub fn parse_reports(reply: &str) -> Vec<(u64, String)> {
 }
 
 /// The reply as shown: without its `[c<id>] addressed:` lines, which only feed the diff's
-/// threads (src/app/review.rs).
+/// threads (src/features/differ/review.rs).
 fn hide_reports(reply: &str) -> String {
     (report_lines(reply).filter(|(_, r)| r.is_none()))
         .map(|(l, _)| l)
@@ -190,6 +191,7 @@ fn card_of(prompt: &str) -> Option<ReviewCard> {
 }
 
 /// One comment of a review card: its id, "app.rs · Working copy · lines 631–632", its text.
+#[derive(Clone)]
 pub struct ReviewItem {
     pub id: u64,
     pub place: String,
@@ -2588,7 +2590,7 @@ impl Chat {
         }
         let focused = self.qfocus.is_focused(window);
         let theme = cx.theme();
-        let faint = crate::app::faint(theme);
+        let faint = crate::ui::faint(theme);
         let action = |id: (&'static str, usize),
                       icon: IconName,
                       tip: &'static str,
@@ -2944,7 +2946,7 @@ impl Render for Chat {
                                 .justify_center()
                                 .gap_2()
                                 .text_sm()
-                                .text_color(crate::app::faint(theme))
+                                .text_color(crate::ui::faint(theme))
                                 .child("Describe a task and press enter.")
                                 .child(
                                     h_flex()

@@ -42,7 +42,11 @@ fn finish(prog: &str, args: &[&str], out: Output) -> Result<String, String> {
 /// Like `git`, for any `prog` making network calls: never prompts for credentials, and is killed
 /// after `secs` so a hung fetch or gh can't stall whoever waits on it.
 pub fn cmd_bounded(dir: &Path, prog: &str, args: &[&str], secs: u64) -> Result<String, String> {
-    let mut c = Command::new(prog);
+    let mut c = Command::new(if prog == "gh" {
+        crate::pr::gh()
+    } else {
+        prog.into()
+    });
     // GIT_TERMINAL_PROMPT doesn't reach ssh, which asks for host keys and passphrases on
     // /dev/tty itself. Only when the user hasn't picked their own ssh command.
     if prog == "git"

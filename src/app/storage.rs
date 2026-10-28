@@ -18,13 +18,18 @@ impl Shark {
         if let Some(e) = self.state.save_error.borrow().as_ref() {
             errors.push(format!("Workspace state and settings: {e}"));
         }
-        for (ws, e) in &self.review.failed_saves {
+        for (ws, e) in self.differ.read(cx).storage_errors() {
             errors.push(format!("Comments in {ws}: {e}"));
         }
         for chat in self.chats.values() {
             let chat = chat.read(cx);
             if let Some(e) = &chat.history_save_error {
                 errors.push(format!("Completed answers in {}: {e}", chat.meta.id));
+            }
+        }
+        for (ws, git) in &self.git_features {
+            if let Some(e) = git.read(cx).storage_error() {
+                errors.push(format!("Git drafts in {ws}: {e}"));
             }
         }
         errors.sort();
@@ -36,9 +41,12 @@ impl Shark {
         if self.state.save_error.borrow().is_some() {
             let _ = self.state.save();
         }
-        self.review.retry_saves();
+        self.differ.update(cx, |d, _| d.retry_saves());
         for chat in self.chats.values() {
             chat.update(cx, |c, cx| c.retry_history(cx));
+        }
+        for git in self.git_features.values() {
+            git.update(cx, |g, cx| g.retry_save(cx));
         }
         cx.notify();
     }
@@ -54,8 +62,20 @@ impl Shark {
             window.push_notification("Wait for workspace changes to finish before closing", cx);
             return false;
         }
+        if self.git_features.values().any(|g| g.read(cx).busy()) {
+            window.push_notification("Wait for the Git operation to finish before closing", cx);
+            return false;
+        }
         self.retry_saves(cx);
         if self.unsaved_data(cx).is_empty() {
+            if self
+                .git_features
+                .values()
+                .any(|g| g.read(cx).saving_drafts())
+            {
+                window.push_notification("Wait for Git drafts to finish saving before closing", cx);
+                return false;
+            }
             return true;
         }
         let owner = cx.entity().downgrade();

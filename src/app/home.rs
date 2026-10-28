@@ -232,7 +232,11 @@ impl Shark {
             (true, true) => self.home.prompt.update(cx, |p, cx| p.focus(window, cx)),
             (true, false) => self.home.focus.focus(window, cx),
             // A closed dialog gives the focus back to a line input that left with the edit.
-            _ if self.tab == Tab::Diff && self.active.is_some() => self.focus_diff(window, cx),
+            _ if self.active.is_some() && matches!(self.tab, Tab::Feature(_)) => {
+                if let Tab::Feature(feature) = self.tab {
+                    self.focus_feature(feature, FeatureFocus::Main, window, cx);
+                }
+            }
             (false, _) => self.sidebar_focus.focus(window, cx),
         }
     }
