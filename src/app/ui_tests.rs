@@ -13,6 +13,7 @@ mod base_adoption_tests;
 pub(crate) mod chrome_tests;
 mod drag_tests;
 mod file_changes_tests;
+mod git_tests;
 mod menu_pixels;
 mod mixed_tab_tests;
 mod navigation_pixels;

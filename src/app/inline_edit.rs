@@ -569,8 +569,14 @@ impl Shark {
         self.diff.update(cx, |d, cx| d.replace_file(file, cx));
     }
 
-    /// ⌘S / File › Save: the file edited in the diff while it shows, else the editor's.
+    /// ⌘S / File › Save follows the active artifact.
     pub(super) fn save(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab == Tab::Git {
+            if let Some(git) = self.active_git_feature().cloned() {
+                git.update(cx, |g, cx| g.submit(window, cx));
+            }
+            return;
+        }
         if self.tab == Tab::Diff && self.editing.is_some() {
             return self.save_edit(false, window, cx);
         }

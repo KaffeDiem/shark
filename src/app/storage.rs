@@ -27,6 +27,11 @@ impl Shark {
                 errors.push(format!("Completed answers in {}: {e}", chat.meta.id));
             }
         }
+        for (ws, git) in &self.git_features {
+            if let Some(e) = &git.read(cx).save_error {
+                errors.push(format!("Git drafts in {ws}: {e}"));
+            }
+        }
         errors.sort();
         errors
     }
@@ -40,6 +45,9 @@ impl Shark {
         for chat in self.chats.values() {
             chat.update(cx, |c, cx| c.retry_history(cx));
         }
+        for git in self.git_features.values() {
+            git.update(cx, |g, cx| g.retry_save(cx));
+        }
         cx.notify();
     }
 
@@ -52,6 +60,10 @@ impl Shark {
         if !self.creating.is_empty() || !self.adding_repos.is_empty() || !self.archiving.is_empty()
         {
             window.push_notification("Wait for workspace changes to finish before closing", cx);
+            return false;
+        }
+        if self.git_features.values().any(|g| g.read(cx).busy()) {
+            window.push_notification("Wait for the Git operation to finish before closing", cx);
             return false;
         }
         self.retry_saves(cx);

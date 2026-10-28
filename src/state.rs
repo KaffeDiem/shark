@@ -24,7 +24,7 @@ pub struct State {
     /// Repo names picked for the last new workspace; the next dialog starts with them.
     #[serde(default)]
     pub last_repos: Vec<String>,
-    /// The workspace and tab (`chat`/`diff`, or `home` while Home was shown over it) open at
+    /// The workspace and tab (`chat`/`diff`/`git`, or `home` while Home was shown over it) open at
     /// quit; restored on launch.
     #[serde(default)]
     pub last_open: Option<(String, String)>,
@@ -156,11 +156,14 @@ pub struct Workspace {
     /// Closed by default, until an explicit Diff action opens it.
     #[serde(default = "diff_closed_by_default")]
     pub diff_closed: bool,
+    /// Closed until the Git feature is explicitly opened.
+    #[serde(default = "diff_closed_by_default")]
+    pub git_closed: bool,
     /// Diff path -> fingerprint of its patch when marked viewed; a new patch makes it unviewed.
     #[serde(default)]
     pub viewed: HashMap<String, u64>,
     /// The tab strip, left to right. File entries are also the files reopened with the
-    /// workspace; `normalize_tabs` keeps chats and Diff in step with `chats` and `diff_closed`.
+    /// workspace; `normalize_tabs` keeps chat and feature tabs in step with their open/closed state.
     #[serde(default)]
     pub tab_order: Vec<TabId>,
 }
@@ -171,6 +174,7 @@ pub struct Workspace {
 pub enum TabId {
     Chat(String),
     Diff,
+    Git,
     /// `repo/rel/path`, as in the diff.
     File(String),
 }
@@ -192,6 +196,7 @@ impl Default for Workspace {
             closed: Vec::new(),
             active_chat: 0,
             diff_closed: diff_closed_by_default(),
+            git_closed: true,
             viewed: HashMap::new(),
             tab_order: Vec::new(),
         }
@@ -288,16 +293,17 @@ impl Workspace {
         self.normalize_tabs();
     }
 
-    /// Drops duplicate and stale chat/Diff entries, then appends the open chats and shown Diff
-    /// the strip lacks: a workspace saved before `tab_order` gets its chats, then Diff. Open
+    /// Drops duplicate and stale entries, then appends open chats and feature tabs
+    /// the strip lacks: a workspace saved before `tab_order` gets its chats, then features. Open
     /// chats follow the strip's order, so chat-only cycling matches it.
     pub fn normalize_tabs(&mut self) {
         let mut seen = HashSet::new();
-        let (chats, diff) = (&self.chats, !self.diff_closed);
+        let (chats, diff, git) = (&self.chats, !self.diff_closed, !self.git_closed);
         self.tab_order.retain(|t| {
             let live = match t {
                 TabId::Chat(id) => chats.iter().any(|c| &c.id == id),
                 TabId::Diff => diff,
+                TabId::Git => git,
                 TabId::File(_) => true,
             };
             live && seen.insert(t.clone())
@@ -305,6 +311,7 @@ impl Workspace {
         let missing: Vec<TabId> = (self.chats.iter())
             .map(|c| TabId::Chat(c.id.clone()))
             .chain(diff.then_some(TabId::Diff))
+            .chain(git.then_some(TabId::Git))
             .filter(|t| !seen.contains(t))
             .collect();
         self.tab_order.extend(missing);

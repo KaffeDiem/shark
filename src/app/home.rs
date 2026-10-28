@@ -233,6 +233,9 @@ impl Shark {
             (true, false) => self.home.focus.focus(window, cx),
             // A closed dialog gives the focus back to a line input that left with the edit.
             _ if self.tab == Tab::Diff && self.active.is_some() => self.focus_diff(window, cx),
+            _ if self.tab == Tab::Git && self.active.is_some() => {
+                self.focus_pane(Pane::Git, window, cx)
+            }
             (false, _) => self.sidebar_focus.focus(window, cx),
         }
     }

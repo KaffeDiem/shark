@@ -3,6 +3,8 @@ use crate::git::{cmd_bounded, dirty, git};
 use crate::state::Workspace;
 use std::path::Path;
 
+pub mod git_feature;
+
 const MARKER: &str = "<!-- shark:related -->";
 
 /// How new PRs are opened. The composer's first line is the title and the rest the body;

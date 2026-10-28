@@ -40,6 +40,7 @@ fn element(id: &TabId) -> SharedString {
     match id {
         TabId::Chat(id) => format!("chat-tab-{id}"),
         TabId::Diff => "diff-tab".into(),
+        TabId::Git => "git-tab".into(),
         TabId::File(path) => format!("file-tab-{path}"),
     }
     .into()

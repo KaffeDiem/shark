@@ -389,6 +389,13 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| s.show(Tab::Diff, w, cx),
     ),
     Row(
+        "Show Git",
+        IconName::GitPullRequest,
+        Some(&ShowGit),
+        "pull request description comments review resolve tab",
+        |s, w, cx| s.show(Tab::Git, w, cx),
+    ),
+    Row(
         "Open file in editor",
         IconName::FilePen,
         Some(&OpenFile),
@@ -722,6 +729,7 @@ pub(super) const COMMANDS: &[Row] = &[
 
 /// Rows that act on a workspace; left out while there's none to act on.
 const NEED_WORKSPACE: &[&str] = &[
+    "Show Git",
     "Add repo to workspace…",
     "Archive workspace",
     "Force archive workspace…",

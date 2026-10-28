@@ -1221,6 +1221,9 @@ impl Shark {
             "diff" if self.active_ws().is_some_and(|ws| !ws.diff_closed) => {
                 self.show(Tab::Diff, window, cx)
             }
+            "git" if self.active_ws().is_some_and(|ws| !ws.git_closed) => {
+                self.show(Tab::Git, window, cx)
+            }
             "home" => self.enter_home(window, cx),
             _ => {}
         }
@@ -1231,6 +1234,7 @@ impl Shark {
         let tab = match self.tab {
             _ if self.home.on => "home",
             Tab::Diff => "diff",
+            Tab::Git => "git",
             Tab::Chat | Tab::File => "chat",
         };
         let open = self.active.clone().map(|n| (n, tab.to_string()));
@@ -1719,6 +1723,9 @@ impl Shark {
         if let Some(sync) = self.syncs.get(&ws.name) {
             sync.update(cx, |g, cx| g.set_workspace(ws.clone(), cx));
         }
+        if let Some(git) = self.git_features.get(&ws.name) {
+            git.update(cx, |g, cx| g.set_workspace(ws.clone(), window, cx));
+        }
         if self.active.as_ref() == Some(&ws.name) {
             self.refresh_diff(cx);
         }
@@ -1818,6 +1825,19 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(git) = self.git_features.get(name) {
+            if git.read(cx).busy() {
+                return notify_err(
+                    window,
+                    cx,
+                    "Wait for the Git operation to finish before archiving",
+                );
+            }
+            git.update(cx, |g, cx| g.retry_save(cx));
+            if git.read(cx).save_error.is_some() {
+                return notify_err(window, cx, "Save Git drafts before archiving (Retry save)");
+            }
+        }
         if self.active.as_deref() == Some(name)
             && (self.file_tabs.iter().any(|t| t.editor.read(cx).saving)
                 || self.editing.as_ref().is_some_and(|e| e.saving))
@@ -1856,6 +1876,12 @@ impl Shark {
         for chat in self.started_chats(name) {
             chat.update(cx, |c, _| c.archiving = true);
         }
+        if let Some(git) = self.git_features.get(name) {
+            git.update(cx, |g, cx| {
+                g.archiving = true;
+                cx.notify();
+            });
+        }
         // Force-archive keeps every branch, as its dialog says.
         let merged = match force {
             true => vec![],
@@ -1892,6 +1918,12 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(git) = self.git_features.get(name) {
+            git.update(cx, |g, cx| {
+                g.archiving = false;
+                cx.notify();
+            });
+        }
         match result {
             Ok(deleted) => {
                 let pos = self.side_rows(false).iter().position(|r| *r == self.sel);
@@ -1905,6 +1937,7 @@ impl Shark {
                     }
                 }
                 self.syncs.remove(name);
+                self.git_features.remove(name);
                 self.attn.forget(name);
                 self.review.forget(name);
                 self.state.workspaces.retain(|w| w.name != name);

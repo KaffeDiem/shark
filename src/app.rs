@@ -42,6 +42,7 @@ mod diff;
 mod editor_pane;
 mod features;
 mod file_changes;
+mod git_feature;
 mod home;
 mod inline_edit;
 mod interaction;
@@ -280,6 +281,7 @@ fn tab_label(label: SharedString, on: bool, theme: &Theme) -> Div {
 enum Tab {
     Chat,
     Diff,
+    Git,
     /// The full-width file editor; only while `editor` is set.
     File,
 }
@@ -292,6 +294,7 @@ enum Pane {
     /// The chat's plan pane, right of its transcript.
     Plan,
     Diff,
+    Git,
     Editor,
     Tree,
     Features,
@@ -366,6 +369,8 @@ pub struct Shark {
     pub(crate) syncs: HashMap<String, Entity<GitSync>>,
     sidebar_focus: FocusHandle,
     features_focus: FocusHandle,
+    feature_sel: usize,
+    git_features: HashMap<String, Entity<git_feature::GitFeature>>,
     pub(crate) attn: crate::attention::Attention,
     /// The open right-click menu, dropped when it dismisses.
     menu: Option<(Entity<menu::Menu>, Subscription)>,
@@ -545,6 +550,8 @@ impl Shark {
             syncs: HashMap::new(),
             sidebar_focus,
             features_focus: cx.focus_handle(),
+            feature_sel: 0,
+            git_features: HashMap::new(),
             attn: crate::attention::Attention::new(cx),
             menu: None,
             app_switcher: None,
@@ -662,6 +669,19 @@ impl Shark {
             ws.open_tab(TabId::Diff);
             let _ = self.state.save();
         }
+        if tab == Tab::Git {
+            if self.active_ws().is_none() {
+                return notify_err(window, cx, "Open a workspace first");
+            }
+            if let Some(ws) = self.active_ws_mut().filter(|ws| ws.git_closed) {
+                ws.git_closed = false;
+                ws.open_tab(TabId::Git);
+                let _ = self.state.save();
+            }
+            self.feature_sel = 1;
+        } else if tab == Tab::Diff {
+            self.feature_sel = 0;
+        }
         self.tab = tab;
         self.home.on = false;
         self.remember_open();
@@ -678,6 +698,11 @@ impl Shark {
                 match self.editing {
                     Some(_) => self.focus_edit(window, cx),
                     None => self.diff.read(cx).focus_handle(cx).focus(window, cx),
+                }
+            }
+            Tab::Git => {
+                if let Some(git) = self.ensure_git_feature(window, cx) {
+                    git.update(cx, |g, cx| g.focus(window, cx));
                 }
             }
             Tab::File => match &self.editor {
@@ -725,6 +750,7 @@ impl Shark {
                 }
             }
             Tab::Diff => v.push(Pane::Diff),
+            Tab::Git => v.push(Pane::Git),
             Tab::File => v.push(Pane::Editor),
         }
         if self.tree_shown() {
@@ -755,6 +781,13 @@ impl Shark {
         }
         if self.home_shown() {
             return self.home.has_focus(window, cx).then_some(Pane::Home);
+        }
+        if self.tab == Tab::Git
+            && self
+                .active_git_feature()
+                .is_some_and(|g| g.read(cx).has_focus(window, cx))
+        {
+            return Some(Pane::Git);
         }
         if self
             .editor
@@ -788,6 +821,11 @@ impl Shark {
             Pane::Features => self.features_focus.focus(window, cx),
             Pane::Home => self.home.focus.focus(window, cx),
             Pane::Diff => self.diff.read(cx).focus_handle(cx).focus(window, cx),
+            Pane::Git => {
+                if let Some(git) = self.active_git_feature().cloned() {
+                    git.update(cx, |g, cx| g.focus(window, cx));
+                }
+            }
             Pane::Chat => {
                 if let Some(chat) = self.active_chat() {
                     chat.read(cx).focus.clone().focus(window, cx);
@@ -1018,6 +1056,14 @@ impl Shark {
                         }))
                         .into_any_element()
                 }
+                Tab::Git => div()
+                    .flex_1()
+                    .min_h_0()
+                    .children(
+                        self.active_git_feature()
+                            .map(|git| git.clone().cached(StyleRefinement::default().size_full())),
+                    )
+                    .into_any_element(),
                 Tab::File => h_flex()
                     .flex_1()
                     .min_h_0()
@@ -1211,6 +1257,7 @@ impl Render for Shark {
             .on_action(cx.listener(|this, a: &OpenTab, w, cx| this.select_tab(a.0, w, cx)))
             .on_action(cx.listener(|this, _: &OpenSide, w, cx| this.open_side(w, cx)))
             .on_action(cx.listener(|this, _: &ShowDiff, w, cx| this.show(Tab::Diff, w, cx)))
+            .on_action(cx.listener(|this, _: &ShowGit, w, cx| this.show(Tab::Git, w, cx)))
             .on_action(cx.listener(|this, _: &CreatePrs, w, cx| this.create_prs(w, cx)))
             .on_action(
                 cx.listener(|this, _: &OpenPrs, w, cx| this.with_sync(w, cx, GitSync::open_prs)),

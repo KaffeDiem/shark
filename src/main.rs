@@ -47,6 +47,7 @@ actions!(
         FocusRight,
         ShowChat,
         ShowDiff,
+        ShowGit,
         CreatePrs,
         OpenPrs,
         CreateDraftPrs,
@@ -198,9 +199,9 @@ fn bind_keys(cx: &mut App) {
     const DIFF: &str = "DiffPane && !Input";
     // The diff's line cursor (src/app/review.rs) moves like a list. With Vim its arrows
     // scroll natively and j/k move the cursor; without, the arrows move it.
-    const MOVE: &str = "Sidebar || Home || Transcript || FileTree || Queue || DiffPane || PlanPane";
-    const ARROWS: &str =
-        "Sidebar || Home || Transcript || FileTree || Queue || PlanPane || (Diff && !Vim)";
+    const MOVE: &str =
+        "Sidebar || Home || Transcript || FileTree || Queue || DiffPane || PlanPane || Features";
+    const ARROWS: &str = "Sidebar || Home || Transcript || FileTree || Queue || PlanPane || Features || (Diff && !Vim)";
     // `!Input` sits outside `Vim > (…)`: inside it, `!` sees only the contexts down to the
     // match, not a focused Input below. The editor's Normal mode is an Input that types nothing.
     let vim = |keys: &str, action: Box<dyn Action>, context: &str| {
@@ -242,6 +243,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-b", ToggleSidebar, None),
         KeyBinding::new("cmd-alt-b", ToggleFileTree, None),
         KeyBinding::new("cmd-shift-d", ShowDiff, None),
+        KeyBinding::new("cmd-shift-g", ShowGit, None),
         KeyBinding::new("ctrl-cmd-v", ToggleVim, None),
         // In the diff: the file last moved to with `}`/`{` or the tree.
         KeyBinding::new("v", ToggleViewed, Some("FileTree || (DiffPane && !Input)")),
@@ -329,6 +331,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", CancelEdit, Some(DIFF)),
         // Also when the line input lost focus (its row scrolled away).
         KeyBinding::new("cmd-s", SaveFile, Some("DiffPane")),
+        KeyBinding::new("cmd-s", SaveFile, Some("GitFeature")),
+        KeyBinding::new("escape", CancelEdit, Some("GitFeature")),
         KeyBinding::new("c", AddComment, Some(DIFF)),
         // Plan mode; in the composer shift-tab is caught before the input outdents.
         KeyBinding::new(

@@ -1,0 +1,1347 @@
+//! The Git artifact: GitHub conversations, with drafts pinned to their exact PR.
+use super::*;
+use crate::pr::git_feature as api;
+use gpui_kit::component::input::{Editor, EditorState, Textarea, TextareaState};
+use gpui_kit::component::text::TextViewState;
+use gpui_kit::component::{Disableable as _, Selectable as _};
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct DescriptionDraft {
+    original_title: String,
+    original_body: String,
+    title: String,
+    body: String,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+struct Draft {
+    description: Option<DescriptionDraft>,
+    note: String,
+    replies: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+enum Editing {
+    Description,
+    Comment,
+    Reply(String),
+}
+
+struct Composer {
+    target: String,
+    kind: Editing,
+    title: Entity<InputState>,
+    body: Entity<TextareaState>,
+    _subscriptions: Vec<Subscription>,
+}
+
+#[derive(Clone)]
+enum Row {
+    Description,
+    Heading(&'static str),
+    Comment(usize),
+    Review(usize),
+    Thread(usize),
+    Reply(usize, usize),
+}
+
+#[derive(Clone)]
+pub(super) enum GitFeatureEvent {
+    OpenFile { repo: String, path: String },
+}
+
+impl EventEmitter<GitFeatureEvent> for GitFeature {}
+
+pub(super) struct GitFeature {
+    workspace: Workspace,
+    pub(super) selected: usize,
+    pub(super) details: Option<api::Details>,
+    pub(super) loading: bool,
+    pub(super) loaded: bool,
+    pub(super) error: Option<String>,
+    pub(super) save_error: Option<String>,
+    pub(super) archiving: bool,
+    posting: bool,
+    generation: u64,
+    refreshed: Option<Instant>,
+    focus: FocusHandle,
+    composer: Option<Composer>,
+    full_text: Option<Entity<EditorState>>,
+    drafts: HashMap<String, Draft>,
+    store_blocked: bool,
+    save_generation: u64,
+    save_revision: Arc<Mutex<u64>>,
+    save_task: Option<Task<()>>,
+    rows: Vec<Row>,
+    markdown: HashMap<String, Entity<TextViewState>>,
+    markdown_order: VecDeque<String>,
+    list: ListState,
+    show_resolved: bool,
+}
+
+impl GitFeature {
+    pub(super) fn new(workspace: Workspace, _: &mut Window, cx: &mut Context<Self>) -> Self {
+        let (drafts, save_error, store_blocked) = match std::fs::read(store_path(&workspace.name)) {
+            Ok(bytes) => match serde_json::from_slice(&bytes) {
+                Ok(drafts) => (drafts, None, false),
+                Err(e) => (
+                    HashMap::new(),
+                    Some(format!(
+                        "Cannot read Git drafts: {e}. The original file is protected."
+                    )),
+                    true,
+                ),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (HashMap::new(), None, false),
+            Err(e) => (
+                HashMap::new(),
+                Some(format!("Cannot read Git drafts: {e}")),
+                true,
+            ),
+        };
+        Self {
+            workspace,
+            selected: 0,
+            details: None,
+            loading: false,
+            loaded: false,
+            error: None,
+            save_error,
+            archiving: false,
+            posting: false,
+            generation: 0,
+            refreshed: None,
+            focus: cx.focus_handle(),
+            composer: None,
+            full_text: None,
+            drafts,
+            store_blocked,
+            save_generation: 0,
+            save_revision: Arc::new(Mutex::new(0)),
+            save_task: None,
+            rows: Vec::new(),
+            markdown: HashMap::new(),
+            markdown_order: VecDeque::new(),
+            list: ListState::new(0, ListAlignment::Top, px(400.)),
+            show_resolved: false,
+        }
+    }
+
+    pub(super) fn set_workspace(
+        &mut self,
+        workspace: Workspace,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let identity = |ws: &Workspace| {
+            ws.repos
+                .iter()
+                .map(|r| (r.name.clone(), r.src.clone(), ws.branch_of(r).to_string()))
+                .collect::<Vec<_>>()
+        };
+        let changed = identity(&self.workspace) != identity(&workspace);
+        self.workspace = workspace;
+        if changed {
+            self.selected = self
+                .selected
+                .min(self.workspace.repos.len().saturating_sub(1));
+            self.clear_selection(cx);
+            self.refresh(window, cx);
+        }
+    }
+
+    pub(super) fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.focus.focus(window, cx);
+        if !self.loaded
+            || self
+                .refreshed
+                .is_some_and(|t| t.elapsed() > Duration::from_secs(60))
+        {
+            self.refresh(window, cx);
+        }
+    }
+
+    pub(super) fn has_focus(&self, window: &Window, cx: &App) -> bool {
+        self.focus.contains_focused(window, cx)
+    }
+
+    pub(super) fn busy(&self) -> bool {
+        self.posting
+    }
+
+    fn clear_selection(&mut self, cx: &mut Context<Self>) {
+        self.capture_draft(cx);
+        self.composer = None;
+        self.generation += 1;
+        self.loaded = false;
+        self.details = None;
+        self.error = None;
+        self.refreshed = None;
+        self.rebuild_rows();
+        cx.notify();
+    }
+
+    pub(super) fn select_repo(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.posting || index >= self.workspace.repos.len() || self.selected == index {
+            return;
+        }
+        self.clear_selection(cx);
+        self.selected = index;
+        self.refresh(window, cx);
+    }
+
+    pub(super) fn refresh(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.loading || self.posting || self.archiving {
+            return;
+        }
+        let Some(repo) = self.workspace.repos.get(self.selected) else {
+            return;
+        };
+        let wt = self.workspace.dir().join(&repo.name);
+        let branch = self.workspace.branch_of(repo).to_string();
+        self.generation += 1;
+        let generation = self.generation;
+        self.loading = true;
+        self.error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    api::discover(&wt, &branch)?
+                        .map(|target| api::load(&wt, &target))
+                        .transpose()
+                })
+                .await;
+            this.update_in(cx, |s, window, cx| {
+                s.loading = false;
+                if s.generation != generation {
+                    // Coalesce rapid repo switches into one read of the latest selection.
+                    if !s.loaded {
+                        s.refresh(window, cx);
+                    }
+                    cx.notify();
+                    return;
+                }
+                s.loaded = true;
+                match result {
+                    Ok(details) => {
+                        let target_changed = s.details.as_ref().map(|d| &d.target)
+                            != details.as_ref().map(|d| &d.target);
+                        if target_changed {
+                            s.rows.clear();
+                            s.capture_draft(cx);
+                            s.composer = None;
+                        }
+                        s.details = details;
+                        s.refreshed = Some(Instant::now());
+                        s.rebuild_rows();
+                    }
+                    Err(e) => s.error = Some(e),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn rebuild_rows(&mut self) {
+        let offset = self.list.logical_scroll_top();
+        let had_rows = !self.rows.is_empty();
+        self.full_text = None;
+        self.rows.clear();
+        self.markdown.clear();
+        self.markdown_order.clear();
+        if let Some(d) = &self.details {
+            self.rows.push(Row::Description);
+            if !d.comments.is_empty() {
+                self.rows.push(Row::Heading("Conversation"));
+            }
+            self.rows.extend((0..d.comments.len()).map(Row::Comment));
+            if !d.reviews.is_empty() {
+                self.rows.push(Row::Heading("Reviews"));
+            }
+            self.rows.extend((0..d.reviews.len()).map(Row::Review));
+            if !d.threads.is_empty() {
+                self.rows.push(Row::Heading("Review threads"));
+            }
+            for (i, t) in d
+                .threads
+                .iter()
+                .enumerate()
+                .filter(|(_, t)| !t.resolved || self.show_resolved)
+            {
+                self.rows.push(Row::Thread(i));
+                self.rows
+                    .extend((0..t.comments.len()).map(|j| Row::Reply(i, j)));
+            }
+        }
+        self.list.reset(self.rows.len());
+        if had_rows && !self.rows.is_empty() {
+            self.list.scroll_to(ListOffset {
+                item_ix: offset.item_ix.min(self.rows.len() - 1),
+                ..offset
+            });
+        }
+    }
+
+    pub(super) fn start_description(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.details.as_ref().is_some_and(|d| d.can_update) {
+            self.start_editor(Editing::Description, window, cx);
+        }
+    }
+
+    pub(super) fn start_comment(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.details.as_ref().is_some_and(|d| d.can_comment) {
+            self.start_editor(Editing::Comment, window, cx);
+        }
+    }
+
+    pub(super) fn start_reply(
+        &mut self,
+        thread: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self
+            .details
+            .as_ref()
+            .is_some_and(|d| d.threads.iter().any(|t| t.id == thread && t.can_reply))
+        {
+            self.start_editor(Editing::Reply(thread.to_string()), window, cx);
+        }
+    }
+
+    fn start_editor(&mut self, kind: Editing, window: &mut Window, cx: &mut Context<Self>) {
+        if self.posting || self.archiving {
+            return;
+        }
+        self.full_text = None;
+        self.capture_draft(cx);
+        let Some(d) = &self.details else {
+            return;
+        };
+        let target = d.target.url();
+        let draft = self.drafts.entry(target.clone()).or_default();
+        let (title, body) = match &kind {
+            Editing::Description => {
+                let edit = draft.description.get_or_insert_with(|| DescriptionDraft {
+                    original_title: d.title.clone(),
+                    original_body: d.body.clone(),
+                    title: d.title.clone(),
+                    body: d.body.clone(),
+                });
+                (edit.title.clone(), edit.body.clone())
+            }
+            Editing::Comment => (String::new(), draft.note.clone()),
+            Editing::Reply(id) => (
+                String::new(),
+                draft.replies.get(id).cloned().unwrap_or_default(),
+            ),
+        };
+        let title = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value(title)
+                .placeholder("PR title")
+        });
+        let body = cx.new(|cx| {
+            TextareaState::new(window, cx)
+                .auto_grow(3, 8)
+                .default_value(body)
+                .placeholder("Write Markdown…")
+        });
+        let title_sub = cx.subscribe(&title, |s, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Change) {
+                s.capture_draft(cx);
+            }
+        });
+        let body_sub = cx.subscribe(&body, |s, _, ev: &InputEvent, cx| {
+            if matches!(ev, InputEvent::Change) {
+                s.capture_draft(cx);
+            }
+        });
+        body.read(cx).focus_handle(cx).focus(window, cx);
+        self.composer = Some(Composer {
+            target,
+            kind,
+            title,
+            body,
+            _subscriptions: vec![title_sub, body_sub],
+        });
+        cx.notify();
+    }
+
+    fn capture_draft(&mut self, cx: &mut Context<Self>) {
+        let Some(c) = &self.composer else {
+            return;
+        };
+        let draft = self.drafts.entry(c.target.clone()).or_default();
+        let body = c.body.read(cx).value().to_string();
+        match &c.kind {
+            Editing::Description => {
+                if let Some(d) = &mut draft.description {
+                    d.title = c.title.read(cx).value().to_string();
+                    d.body = body;
+                }
+            }
+            Editing::Comment => draft.note = body,
+            Editing::Reply(id) => {
+                draft.replies.insert(id.clone(), body);
+            }
+        }
+        self.save_generation += 1;
+        self.schedule_save(cx);
+        cx.notify();
+    }
+
+    fn schedule_save(&mut self, cx: &mut Context<Self>) {
+        if self.store_blocked {
+            return;
+        }
+        let generation = self.save_generation;
+        *self.save_revision.lock().unwrap_or_else(|e| e.into_inner()) = generation;
+        let revision = self.save_revision.clone();
+        let path = store_path(&self.workspace.name);
+        let bytes = serde_json::to_vec(&self.drafts).expect("Git drafts serialize");
+        self.save_task = Some(cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(300))
+                .await;
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    let current = revision.lock().unwrap_or_else(|e| e.into_inner());
+                    if *current == generation {
+                        crate::state::write(&path, &bytes)
+                    } else {
+                        Ok(())
+                    }
+                })
+                .await;
+            this.update(cx, |s, cx| {
+                if s.save_generation == generation {
+                    s.save_error = result.err().map(|e| e.to_string());
+                }
+                cx.notify();
+            })
+            .ok();
+        }));
+    }
+
+    pub(super) fn retry_save(&mut self, cx: &mut Context<Self>) {
+        self.capture_draft(cx);
+        self.save_task = None;
+        if !self.store_blocked {
+            let mut revision = self.save_revision.lock().unwrap_or_else(|e| e.into_inner());
+            *revision = self.save_generation;
+            self.save_error = serde_json::to_vec(&self.drafts)
+                .map_err(std::io::Error::other)
+                .and_then(|bytes| crate::state::write(&store_path(&self.workspace.name), &bytes))
+                .err()
+                .map(|e| e.to_string());
+        }
+        cx.notify();
+    }
+
+    fn close_editor(&mut self, cx: &mut Context<Self>) {
+        self.capture_draft(cx);
+        self.composer = None;
+        cx.notify();
+    }
+
+    fn confirm_discard_editor(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(c) = &self.composer else {
+            return;
+        };
+        let (target, kind) = (c.target.clone(), c.kind.clone());
+        confirm(
+            "Discard Git draft?".into(),
+            "This removes the local draft. GitHub stays unchanged.",
+            "Discard draft",
+            move |s: &mut Self, w, cx| {
+                if s.composer
+                    .as_ref()
+                    .is_some_and(|c| c.target == target && c.kind == kind)
+                {
+                    s.discard_editor(cx);
+                    s.focus.focus(w, cx);
+                }
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn discard_editor(&mut self, cx: &mut Context<Self>) {
+        if self.posting {
+            return;
+        }
+        if let Some(c) = self.composer.take() {
+            if let Some(d) = self.drafts.get_mut(&c.target) {
+                match c.kind {
+                    Editing::Description => d.description = None,
+                    Editing::Comment => d.note.clear(),
+                    Editing::Reply(id) => {
+                        d.replies.remove(&id);
+                    }
+                }
+            }
+            self.save_generation += 1;
+            self.schedule_save(cx);
+        }
+        cx.notify();
+    }
+
+    fn description_changed(&self) -> bool {
+        let (Some(c), Some(d)) = (&self.composer, &self.details) else {
+            return false;
+        };
+        c.kind == Editing::Description
+            && c.target == d.target.url()
+            && self
+                .drafts
+                .get(&c.target)
+                .and_then(|draft| draft.description.as_ref())
+                .is_some_and(|draft| {
+                    draft.original_title != d.title || draft.original_body != d.body
+                })
+    }
+
+    fn replace_description(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.posting || self.loading || self.archiving || !self.description_changed() {
+            return;
+        }
+        let d = self.details.as_ref().unwrap();
+        let (target, title, body) = (d.target.url(), d.title.clone(), d.body.clone());
+        confirm(
+            "Replace the updated description?".into(),
+            "This replaces the latest PR title and description shown above with your draft. If GitHub changes again, saving stops.",
+            "Replace description",
+            move |s: &mut Self, w, cx| {
+                if s.posting || s.loading || s.archiving {
+                    return;
+                }
+                if !s
+                    .composer
+                    .as_ref()
+                    .is_some_and(|c| c.target == target && c.kind == Editing::Description)
+                {
+                    return;
+                }
+                if !s
+                    .details
+                    .as_ref()
+                    .is_some_and(|d| d.target.url() == target && d.title == title && d.body == body)
+                {
+                    s.error = Some(
+                        "The description changed again. Refresh and compare before replacing."
+                            .into(),
+                    );
+                    cx.notify();
+                    return;
+                }
+                if let Some(draft) = s
+                    .drafts
+                    .get_mut(&target)
+                    .and_then(|draft| draft.description.as_mut())
+                {
+                    draft.original_title = title.clone();
+                    draft.original_body = body.clone();
+                }
+                s.submit(w, cx);
+            },
+            window,
+            cx,
+        );
+    }
+
+    pub(super) fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.full_text.is_some() {
+            return;
+        }
+        if self.posting || self.loading || self.archiving {
+            return;
+        }
+        self.capture_draft(cx);
+        let (Some(c), Some(mut details)) = (&self.composer, self.details.clone()) else {
+            return;
+        };
+        if c.target != details.target.url() {
+            return;
+        }
+        let kind = c.kind.clone();
+        let title = c.title.read(cx).value().to_string();
+        let body = c.body.read(cx).value().to_string();
+        if matches!(kind, Editing::Description) {
+            if title.trim().is_empty() {
+                self.error = Some("A PR title cannot be empty".into());
+                cx.notify();
+                return;
+            }
+            if let Some(d) = self
+                .drafts
+                .get(&c.target)
+                .and_then(|d| d.description.as_ref())
+            {
+                details.title = d.original_title.clone();
+                details.body = d.original_body.clone();
+            }
+        } else if body.trim().is_empty() {
+            return;
+        }
+        let Some(repo) = self.workspace.repos.get(self.selected) else {
+            return;
+        };
+        let wt = self.workspace.dir().join(&repo.name);
+        let target = c.target.clone();
+        self.posting = true;
+        self.error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let sent_kind = kind.clone();
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    match &kind {
+                        Editing::Description => api::save_description(&wt, &details, &title, &body),
+                        Editing::Comment => api::comment(&wt, &details, &body),
+                        Editing::Reply(id) => api::reply(&wt, &details, id, &body),
+                    }
+                })
+                .await;
+            this.update_in(cx, |s, window, cx| {
+                s.posting = false;
+                match result {
+                    Ok(()) => {
+                        if let Some(d) = s.drafts.get_mut(&target) {
+                            match sent_kind {
+                                Editing::Description => d.description = None,
+                                Editing::Comment => d.note.clear(),
+                                Editing::Reply(id) => {
+                                    d.replies.remove(&id);
+                                }
+                            }
+                        }
+                        if s.composer.as_ref().is_some_and(|c| c.target == target) {
+                            s.composer = None;
+                        }
+                        s.save_generation += 1;
+                        s.schedule_save(cx);
+                        s.refresh(window, cx);
+                    }
+                    Err(e) => s.error = Some(e),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    pub(super) fn resolve(
+        &mut self,
+        id: &str,
+        resolved: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.posting || self.loading || self.archiving {
+            return;
+        }
+        let Some(d) = self.details.clone() else {
+            return;
+        };
+        let allowed = d.threads.iter().any(|t| {
+            t.id == id
+                && if resolved {
+                    t.can_resolve
+                } else {
+                    t.can_unresolve
+                }
+        });
+        if !allowed {
+            return;
+        }
+        let Some(repo) = self.workspace.repos.get(self.selected) else {
+            return;
+        };
+        let wt = self.workspace.dir().join(&repo.name);
+        let id = id.to_string();
+        self.posting = true;
+        self.error = None;
+        cx.notify();
+        cx.spawn_in(window, async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { api::resolve(&wt, &d, &id, resolved) })
+                .await;
+            this.update_in(cx, |s, window, cx| {
+                s.posting = false;
+                match result {
+                    Ok(()) => s.refresh(window, cx),
+                    Err(e) => s.error = Some(e),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    fn md(&mut self, id: String, body: &str, cx: &mut Context<Self>) -> Entity<TextViewState> {
+        if let Some(at) = self.markdown_order.iter().position(|key| key == &id) {
+            self.markdown_order.remove(at);
+        }
+        self.markdown_order.push_back(id.clone());
+        if self.markdown_order.len() > 128
+            && let Some(oldest) = self.markdown_order.pop_front()
+        {
+            self.markdown.remove(&oldest);
+        }
+        self.markdown
+            .entry(id)
+            .or_insert_with(|| cx.new(|cx| TextViewState::markdown(markdown_preview(body), cx)))
+            .clone()
+    }
+
+    fn body_view(&mut self, id: String, body: String, cx: &mut Context<Self>) -> AnyElement {
+        let md = self.md(id.clone(), &body, cx);
+        v_flex()
+            .gap_2()
+            .when(body.len() > PREVIEW_BYTES, |d| {
+                d.child(
+                    h_flex()
+                        .gap_2()
+                        .flex_wrap()
+                        .text_xs()
+                        .child("Preview of a long message")
+                        .child(
+                            Button::new(SharedString::from(format!("git-long-{id}")))
+                                .label("Read full text")
+                                .small()
+                                .on_click(cx.listener(move |s, _, w, cx| {
+                                    let input = cx.new(|cx| {
+                                        EditorState::new(w, cx)
+                                            .default_value(body.clone())
+                                            .soft_wrap(true)
+                                    });
+                                    input.update(cx, |i, cx| i.set_readonly(true, cx));
+                                    input.read(cx).focus_handle(cx).focus(w, cx);
+                                    s.full_text = Some(input);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .child(crate::chat::markdown(&md, "git-row"))
+            .into_any_element()
+    }
+
+    fn render_row(&mut self, index: usize, _: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        let Some(row) = self.rows.get(index).cloned() else {
+            return div().into_any_element();
+        };
+        let Some(details) = &self.details else {
+            return div().into_any_element();
+        };
+        let muted = cx.theme().muted_foreground;
+        let border = cx.theme().border;
+        let base = v_flex()
+            .id(("git-row", index))
+            .test_support()
+            .group("git-row")
+            .px_4()
+            .py_2()
+            .gap_2()
+            .text_sm()
+            .line_height(relative(1.5));
+        let comment = match row {
+            Row::Description => {
+                let body = if details.body.is_empty() {
+                    "No description."
+                } else {
+                    &details.body
+                }
+                .to_string();
+                return base
+                    .child(self.body_view("description".into(), body, cx))
+                    .into_any_element();
+            }
+            Row::Heading(label) => {
+                return base
+                    .pt_4()
+                    .border_b_1()
+                    .border_color(border)
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child(label)
+                    .into_any_element();
+            }
+            Row::Comment(i) => (details.comments[i].clone(), None),
+            Row::Review(i) => (
+                details.reviews[i].comment.clone(),
+                Some(details.reviews[i].state.clone()),
+            ),
+            Row::Reply(i, j) => (details.threads[i].comments[j].clone(), None),
+            Row::Thread(i) => {
+                let t = &details.threads[i];
+                let resume = self
+                    .drafts
+                    .get(&details.target.url())
+                    .and_then(|d| d.replies.get(&t.id))
+                    .is_some_and(|body| !body.is_empty());
+                let (id, resolve_id, resolved) = (t.id.clone(), t.id.clone(), t.resolved);
+                let repo = self.workspace.repos[self.selected].name.clone();
+                let path = t.path.clone();
+                let place = format!(
+                    "{}{}{}{}",
+                    t.path,
+                    t.line.map(|l| format!(":{l}")).unwrap_or_default(),
+                    if t.outdated { " · Outdated" } else { "" },
+                    if t.resolved {
+                        " · Resolved"
+                    } else {
+                        " · Unresolved"
+                    }
+                );
+                return base
+                    .pt_4()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .flex_wrap()
+                            .child(
+                                Button::new(("git-thread-path", i))
+                                    .tooltip(format!("Show file in workspace: {place}"))
+                                    .label(place)
+                                    .flex_1()
+                                    .min_w_0()
+                                    .ghost()
+                                    .small()
+                                    .on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.emit(GitFeatureEvent::OpenFile {
+                                            repo: repo.clone(),
+                                            path: path.clone(),
+                                        })
+                                    })),
+                            )
+                            .when(t.can_reply, |d| {
+                                d.child(
+                                    Button::new(SharedString::from(format!(
+                                        "git-thread-reply-{}",
+                                        t.id
+                                    )))
+                                    .label(if resume { "Resume reply" } else { "Reply" })
+                                    .small()
+                                    .disabled(self.posting || self.archiving)
+                                    .on_click(
+                                        cx.listener(move |s, _, w, cx| s.start_reply(&id, w, cx)),
+                                    ),
+                                )
+                            })
+                            .when(
+                                if resolved {
+                                    t.can_unresolve
+                                } else {
+                                    t.can_resolve
+                                },
+                                |d| {
+                                    d.child(
+                                        Button::new(SharedString::from(format!(
+                                            "git-thread-resolve-{}",
+                                            t.id
+                                        )))
+                                        .label(if resolved { "Reopen" } else { "Resolve" })
+                                        .small()
+                                        .disabled(self.posting || self.loading || self.archiving)
+                                        .on_click(
+                                            cx.listener(move |s, _, w, cx| {
+                                                s.resolve(&resolve_id, !resolved, w, cx)
+                                            }),
+                                        ),
+                                    )
+                                },
+                            ),
+                    )
+                    .into_any_element();
+            }
+        };
+        let (c, state) = comment;
+        let body_view = self.body_view(c.id.clone(), c.body.clone(), cx);
+        let url = c.url.clone();
+        base.child(
+            h_flex()
+                .gap_2()
+                .flex_wrap()
+                .text_xs()
+                .text_color(muted)
+                .child(if c.author.is_empty() {
+                    "Deleted user".to_string()
+                } else {
+                    format!("@{}", c.author)
+                })
+                .when_some(state, |d, state| d.child(state_label(&state).to_string()))
+                .child(c.created_at)
+                .when(!url.is_empty(), |d| {
+                    d.child(
+                        Button::new(("git-comment-link", index))
+                            .label("GitHub")
+                            .ghost()
+                            .xsmall()
+                            .on_click(move |_, _, cx| cx.open_url(&url)),
+                    )
+                }),
+        )
+        .child(body_view)
+        .into_any_element()
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_details(&mut self, details: api::Details, cx: &mut Context<Self>) {
+        self.generation += 1;
+        self.loading = false;
+        self.loaded = true;
+        self.refreshed = Some(Instant::now());
+        self.details = Some(details);
+        self.rebuild_rows();
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(super) fn full_text_len(&self, cx: &App) -> usize {
+        self.full_text
+            .as_ref()
+            .map(|input| input.read(cx).value().len())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(super) fn scroll_offset(&self) -> ListOffset {
+        self.list.logical_scroll_top()
+    }
+
+    #[cfg(test)]
+    pub(super) fn markdown_text_len(&self, key: &str, cx: &App) -> usize {
+        self.markdown
+            .get(key)
+            .map(|m| m.read(cx).rendered_text().as_str().len())
+            .unwrap_or(0)
+    }
+
+    #[cfg(test)]
+    pub(super) fn scroll_row(&mut self, index: usize, cx: &mut Context<Self>) {
+        self.list.scroll_to(ListOffset {
+            item_ix: index,
+            offset_in_item: px(0.),
+        });
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(super) fn draft_text(&self, cx: &App) -> Option<String> {
+        self.composer
+            .as_ref()
+            .map(|c| c.body.read(cx).value().to_string())
+    }
+}
+
+const PREVIEW_BYTES: usize = 4096;
+
+// shortcut: rich text lays out whole paragraphs; remove this preview when the renderer virtualizes them.
+fn markdown_preview(body: &str) -> &str {
+    if body.len() <= PREVIEW_BYTES {
+        return body;
+    }
+    let mut end = PREVIEW_BYTES;
+    while !body.is_char_boundary(end) {
+        end -= 1;
+    }
+    &body[..end]
+}
+
+fn state_label(state: &str) -> &str {
+    match state {
+        "OPEN" => "Open",
+        "CLOSED" => "Closed",
+        "MERGED" => "Merged",
+        "APPROVED" => "Approved",
+        "CHANGES_REQUESTED" => "Changes requested",
+        "COMMENTED" => "Commented",
+        "DISMISSED" => "Dismissed",
+        "PENDING" => "Pending",
+        _ => state,
+    }
+}
+
+fn store_path(workspace: &str) -> PathBuf {
+    crate::state::support_dir()
+        .join("git-drafts")
+        .join(format!("{workspace}.json"))
+}
+
+impl Render for GitFeature {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let (border, muted) = (theme.border, theme.muted_foreground);
+        let disabled = self.posting || self.archiving;
+        let toolbar = h_flex()
+            .gap_2()
+            .px_4()
+            .py_2()
+            .flex_wrap()
+            .border_b_1()
+            .border_color(border)
+            .children(self.workspace.repos.iter().enumerate().map(|(i, r)| {
+                Button::new(SharedString::from(format!("git-repo-{i}")))
+                    .label(r.name.clone())
+                    .small()
+                    .ghost()
+                    .selected(i == self.selected)
+                    .disabled(disabled)
+                    .on_click(cx.listener(move |s, _, w, cx| s.select_repo(i, w, cx)))
+            }))
+            .child(div().flex_1())
+            .child(
+                Button::new("git-refresh")
+                    .label(if self.loading {
+                        "Refreshing…"
+                    } else {
+                        "Refresh"
+                    })
+                    .small()
+                    .disabled(disabled || self.loading)
+                    .on_click(cx.listener(|s, _, w, cx| s.refresh(w, cx))),
+            );
+        let overview = self.details.as_ref().map(|d| {
+            let url = d.url.clone();
+            let draft = self.drafts.get(&d.target.url());
+            let resume_description = draft
+                .and_then(|draft| draft.description.as_ref())
+                .is_some_and(|draft| !draft.title.is_empty() || !draft.body.is_empty());
+            let resume_comment = draft.is_some_and(|draft| !draft.note.is_empty());
+            let title = format!("#{} {}", d.target.number, d.title);
+            let full_title = title.clone();
+            v_flex()
+                .px_4()
+                .py_3()
+                .gap_2()
+                .border_b_1()
+                .border_color(border)
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_start()
+                        .child(
+                            div()
+                                .id("git-pr-title")
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .tooltip(move |w, cx| Tooltip::new(full_title.clone()).build(w, cx))
+                                .text_lg()
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .child(title),
+                        )
+                        .child(
+                            Button::new("git-open-pr")
+                                .label("Open in GitHub")
+                                .small()
+                                .on_click(move |_, _, cx| cx.open_url(&url)),
+                        ),
+                )
+                .child(div().text_xs().text_color(muted).child(format!(
+                    "{}{} · @{} · {} ← {}",
+                    state_label(&d.state),
+                    if d.draft { " · Draft" } else { "" },
+                    d.author,
+                    d.base,
+                    d.head
+                )))
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .flex_wrap()
+                        .when(d.can_update, |r| {
+                            r.child(
+                                Button::new("git-description-edit")
+                                    .label(if resume_description {
+                                        "Resume description"
+                                    } else {
+                                        "Edit description"
+                                    })
+                                    .small()
+                                    .disabled(disabled)
+                                    .on_click(
+                                        cx.listener(|s, _, w, cx| s.start_description(w, cx)),
+                                    ),
+                            )
+                        })
+                        .when(d.can_comment, |r| {
+                            r.child(
+                                Button::new("git-comment-new")
+                                    .label(if resume_comment {
+                                        "Resume comment"
+                                    } else {
+                                        "Add comment"
+                                    })
+                                    .small()
+                                    .disabled(disabled)
+                                    .on_click(cx.listener(|s, _, w, cx| s.start_comment(w, cx))),
+                            )
+                        })
+                        .when(d.threads.iter().any(|t| t.resolved), |r| {
+                            r.child(
+                                Button::new("git-show-resolved")
+                                    .label(if self.show_resolved {
+                                        "Hide resolved"
+                                    } else {
+                                        "Show resolved"
+                                    })
+                                    .small()
+                                    .on_click(cx.listener(|s, _, _, cx| {
+                                        s.show_resolved = !s.show_resolved;
+                                        s.rebuild_rows();
+                                        cx.notify();
+                                    })),
+                            )
+                        }),
+                )
+        });
+        let empty = if self.loading {
+            "Loading pull request…"
+        } else if self.error.is_some() {
+            "Pull request unavailable. Refresh to retry."
+        } else {
+            "No pull request for this repository’s branch. Create a PR using the workspace controls."
+        };
+        let content = if let Some(input) = &self.full_text {
+            v_flex()
+                .size_full()
+                .min_h_0()
+                .child(
+                    h_flex()
+                        .px_4()
+                        .py_2()
+                        .gap_2()
+                        .flex_none()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_sm()
+                                .child("Full Markdown text · read only · ⌘F to search"),
+                        )
+                        .child(
+                            Button::new("git-full-close")
+                                .label("Back to conversation")
+                                .small()
+                                .on_click(cx.listener(|s, _, w, cx| {
+                                    s.full_text = None;
+                                    s.focus.focus(w, cx);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("git-full-text")
+                        .test_support()
+                        .flex_1()
+                        .min_h_0()
+                        .child(Editor::new(input).readonly(true).appearance(false).h_full()),
+                )
+                .into_any_element()
+        } else if self.details.is_some() {
+            list(
+                self.list.clone(),
+                cx.processor(|s, i, w, cx| s.render_row(i, w, cx)),
+            )
+            .size_full()
+            .into_any_element()
+        } else {
+            div()
+                .p_4()
+                .text_sm()
+                .text_color(muted)
+                .child(empty)
+                .into_any_element()
+        };
+        let composer = self.composer.as_ref().filter(|_| self.full_text.is_none()).map(|c| {
+            let title = match &c.kind {
+                Editing::Description => "Edit PR description",
+                Editing::Comment => "Comment on GitHub",
+                Editing::Reply(_) => "Reply to review thread",
+            };
+            v_flex()
+                .id("git-composer")
+                .test_support()
+                .px_4()
+                .py_3()
+                .gap_2()
+                .border_t_1()
+                .border_color(border)
+                .child(
+                    div()
+                        .text_sm()
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .child(title),
+                )
+                .when(self.description_changed(), |d| d.child(
+                    v_flex().gap_2().text_sm()
+                        .child("GitHub’s description changed. Compare the latest version above with your draft.")
+                        .child(Button::new("git-description-replace").label("Replace with my draft…").small()
+                            .disabled(disabled || self.loading)
+                            .on_click(cx.listener(|s,_,w,cx| s.replace_description(w,cx))))))
+                .when(c.kind == Editing::Description, |d| {
+                    d.child(
+                        div()
+                            .id("git-editor-title")
+                            .test_support()
+                            .child(Input::new(&c.title).disabled(disabled)),
+                    )
+                })
+                .child(
+                    div()
+                        .id("git-editor-body")
+                        .test_support()
+                        .child(Textarea::new(&c.body).disabled(disabled)),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("git-editor-save")
+                                .label(if self.posting {
+                                    "Saving…"
+                                } else if c.kind == Editing::Description {
+                                    "Save to GitHub"
+                                } else {
+                                    "Post to GitHub"
+                                })
+                                .primary()
+                                .small()
+                                .disabled(disabled || self.loading)
+                                .on_click(cx.listener(|s, _, w, cx| s.submit(w, cx))),
+                        )
+                        .child(
+                            Button::new("git-editor-cancel")
+                                .label("Keep draft")
+                                .small()
+                                .disabled(disabled)
+                                .on_click(cx.listener(|s, _, w, cx| {
+                                    s.close_editor(cx);
+                                    s.focus.focus(w, cx);
+                                })),
+                        )
+                        .child(
+                            Button::new("git-editor-discard")
+                                .label("Discard draft")
+                                .ghost()
+                                .small()
+                                .disabled(disabled)
+                                .on_click(
+                                    cx.listener(|s, _, w, cx| s.confirm_discard_editor(w, cx)),
+                                ),
+                        ),
+                )
+        });
+        v_flex()
+            .id("git-feature")
+            .key_context("GitFeature")
+            .on_action(cx.listener(|s, _: &SaveFile, w, cx| s.submit(w, cx)))
+            .on_action(cx.listener(|s, _: &CancelEdit, w, cx| {
+                if !s.posting {
+                    if s.full_text.take().is_none() {
+                        s.close_editor(cx);
+                    }
+                    s.focus.focus(w, cx);
+                }
+            }))
+            .track_focus(&self.focus)
+            .aria_label("Git pull request")
+            .size_full()
+            .min_h_0()
+            .min_w_0()
+            .child(toolbar)
+            .when_some(self.save_error.clone(), |d, e| {
+                d.child(
+                    div()
+                        .px_4()
+                        .py_2()
+                        .text_sm()
+                        .child(format!("Draft not saved: {e}")),
+                )
+            })
+            .when_some(self.error.clone(), |d, e| {
+                d.child(
+                    div()
+                        .id("git-error")
+                        .test_support()
+                        .px_4()
+                        .py_2()
+                        .text_sm()
+                        .child(format!(
+                            "{e}{}",
+                            if self.details.is_some() {
+                                " · Showing previously loaded data."
+                            } else {
+                                ""
+                            }
+                        )),
+                )
+            })
+            .when_some(overview, |d, overview| d.child(overview))
+            .child(div().flex_1().min_h_0().child(content))
+            .when_some(composer, |d, c| d.child(c))
+            .test_support()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[::core::prelude::v1::test]
+    fn long_markdown_preview_preserves_unicode_and_source() {
+        let body = format!("{}🙂tail", "a".repeat(PREVIEW_BYTES - 1));
+        assert_eq!(markdown_preview(&body).len(), PREVIEW_BYTES - 1);
+        assert!(body.ends_with("🙂tail"));
+        assert_eq!(markdown_preview("short"), "short");
+    }
+
+    #[::core::prelude::v1::test]
+    fn drafts_preserve_baseline_and_separate_targets_and_threads() {
+        let mut drafts = HashMap::<String, Draft>::new();
+        let d = drafts
+            .entry("https://github.com/o/r/pull/1".into())
+            .or_default();
+        d.description = Some(DescriptionDraft {
+            original_title: "old".into(),
+            original_body: "baseline".into(),
+            title: "new".into(),
+            body: "edited".into(),
+        });
+        d.replies.insert("thread-a".into(), "first".into());
+        d.replies.insert("thread-b".into(), "second".into());
+        drafts
+            .entry("https://github.com/o/r/pull/2".into())
+            .or_default()
+            .note = "other PR".into();
+        let bytes = serde_json::to_vec(&drafts).unwrap();
+        let loaded: HashMap<String, Draft> = serde_json::from_slice(&bytes).unwrap();
+        let first = &loaded["https://github.com/o/r/pull/1"];
+        assert_eq!(
+            first.description.as_ref().unwrap().original_body,
+            "baseline"
+        );
+        assert_eq!(first.replies["thread-b"], "second");
+        assert_eq!(loaded["https://github.com/o/r/pull/2"].note, "other PR");
+    }
+}

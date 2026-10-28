@@ -8,6 +8,7 @@ struct VisibleTabs(Vec<(TabId, VisibleTab)>);
 enum VisibleTab {
     Chat(usize),
     Diff,
+    Git,
     File(usize),
 }
 
@@ -42,6 +43,7 @@ impl Shark {
                             VisibleTab::Chat(ws.chats.iter().position(|c| &c.id == id)?)
                         }
                         TabId::Diff if !ws.diff_closed => VisibleTab::Diff,
+                        TabId::Git if !ws.git_closed => VisibleTab::Git,
                         TabId::File(path) => VisibleTab::File(
                             self.file_tabs
                                 .iter()
@@ -60,6 +62,7 @@ impl Shark {
         let tab = match self.tab {
             Tab::Chat => VisibleTab::Chat(ws.active_chat),
             Tab::Diff => VisibleTab::Diff,
+            Tab::Git => VisibleTab::Git,
             Tab::File => VisibleTab::File(
                 self.file_tabs
                     .iter()
@@ -272,6 +275,7 @@ impl Shark {
         match self.visible_tabs(ws, cx).get(ix) {
             Some(VisibleTab::Chat(ix)) => self.select_chat(ix, window, cx),
             Some(VisibleTab::Diff) => self.show(Tab::Diff, window, cx),
+            Some(VisibleTab::Git) => self.show(Tab::Git, window, cx),
             Some(VisibleTab::File(ix)) => self.select_file(ix, window, cx),
             None => {}
         }
@@ -303,6 +307,7 @@ impl Shark {
         match self.tab {
             Tab::File => self.close_file(window, cx),
             Tab::Diff => self.close_diff(window, cx),
+            Tab::Git => self.close_git(window, cx),
             Tab::Chat => self.close_chat(window, cx),
         }
     }
@@ -842,6 +847,41 @@ impl Shark {
                         theme,
                     ))
                     .tooltip(|w, cx| Tooltip::new("Diff (cmd-shift-d)").build(w, cx))
+                    .test_support()
+                    .into_any_element(),
+            ));
+        }
+        if let Some(ix) = tabs.index(VisibleTab::Git) {
+            pills.push((
+                VisibleTab::Git,
+                pill("git-tab", self.tab == Tab::Git, theme)
+                    .map(|d| self.tab_drag(d, TabId::Git, "Git".into(), cx))
+                    .aria_label("Git")
+                    .pl_2p5()
+                    .pr_1()
+                    .on_click(cx.listener(|this, _, w, cx| this.show(Tab::Git, w, cx)))
+                    .child(if ctrl_held && ix < 9 {
+                        kbd(&format!("ctrl-{}", ix + 1)).into_any_element()
+                    } else {
+                        Icon::new(IconName::GitPullRequest)
+                            .with_size(px(14.))
+                            .into_any_element()
+                    })
+                    .child(
+                        tab_label("Git".into(), self.tab == Tab::Git, theme)
+                            .id("tab-label")
+                            .test_support(),
+                    )
+                    .child(tab_close(
+                        crate::settings::close_button("close-git", "Close Git (cmd-w)").on_click(
+                            cx.listener(|this, _, w, cx| {
+                                cx.stop_propagation();
+                                this.close_git(w, cx);
+                            }),
+                        ),
+                        theme,
+                    ))
+                    .tooltip(|w, cx| Tooltip::new("Git (cmd-shift-g)").build(w, cx))
                     .test_support()
                     .into_any_element(),
             ));
