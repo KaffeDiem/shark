@@ -128,6 +128,18 @@ async fn language_outline_and_history_shortcuts_reach_the_focused_editor(cx: &mu
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         assert!(w.has_active_dialog(cx));
+        // The outline refreshes while the menu is open; its row still means `alpha`.
+        editor.update(cx, |e, _| {
+            e.outline.insert(
+                0,
+                crate::editor::Symbol {
+                    name: "inserted".into(),
+                    depth: 0,
+                    range: 0..1,
+                    target: 1,
+                },
+            )
+        });
         w.press("enter", cx);
     })
     .unwrap();
@@ -150,7 +162,7 @@ async fn language_outline_and_history_shortcuts_reach_the_focused_editor(cx: &mu
     cx.update_window(window, |_, w, cx| {
         assert!(editor.read(cx).is_focused(w, cx));
         w.render_frame(cx);
-        w.press("ctrl-shift--", cx);
+        w.press("ctrl-_", cx);
     })
     .unwrap();
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
@@ -854,6 +866,11 @@ async fn jump_bar_folder_lists_its_files(cx: &mut TestAppContext) {
             .map(|t| t.editor.read(cx).path.clone())
             .collect();
         assert_eq!(tabs, ["api/c.txt", "api/b.txt"]);
+        assert_eq!(
+            shark.read(cx).navigation.back.len(),
+            1,
+            "Back returns to a.txt"
+        );
     });
 }
 
@@ -933,7 +950,8 @@ async fn language_navigation_failures_preserve_history_and_late_results_preserve
         shark.read(cx).editor.as_ref().unwrap().read(cx).path == "api/c.txt"
     })
     .await;
-    std::fs::remove_file(root.join("a.txt")).unwrap();
+    // An unreadable (not deleted) file may be fixed; Back keeps trying it.
+    std::fs::write(root.join("a.txt"), "alpha\0\n").unwrap();
     let before = cx
         .update_window(window, |_, w, cx| w.notifications(cx).len())
         .unwrap();
@@ -1140,15 +1158,8 @@ async fn retry_rediscovers_shared_editors_without_losing_unsaved_text(cx: &mut T
             let mut other_project = project.clone();
             other_project.toolchain = "unrelated".into();
             let unrelated = session(other_project.clone(), cx);
-            let shared_sub = cx.subscribe(&shared, |_, _, _: &crate::lsp::SessionEvent, _| {});
-            let unrelated_sub =
-                cx.subscribe(&unrelated, |_, _, _: &crate::lsp::SessionEvent, _| {});
-            s.language_sessions
-                .insert(project.session_key(), (shared.downgrade(), shared_sub));
-            s.language_sessions.insert(
-                other_project.session_key(),
-                (unrelated.downgrade(), unrelated_sub),
-            );
+            s.register_session(shared.clone(), w, cx);
+            s.register_session(unrelated.clone(), w, cx);
             let first = s.file_tabs[0].editor.clone();
             let second = s.file_tabs[1].editor.clone();
             let third = s.make_file_tab(
@@ -1201,4 +1212,427 @@ async fn retry_rediscovers_shared_editors_without_losing_unsaved_text(cx: &mut T
         });
     })
     .unwrap();
+}
+
+/// A session over a peer that records Shark's messages and never answers: a reply would
+/// wake GPUI's test scheduler from the client's thread, which it rejects as nondeterminism.
+fn fake_session(root: &Path) -> (crate::lsp::Session, PathBuf) {
+    let log = root.join("server.jsonrpc");
+    let mut command = std::process::Command::new("/bin/sh");
+    // fd 3 keeps stdout open, so the client sees a live, silent server.
+    command
+        .args(["-c", "exec 3>&1; exec cat >> \"$0\""])
+        .arg(&log);
+    let client = crate::lsp::client::Client::start(command, root, serde_json::json!({})).unwrap();
+    let project = crate::lsp::tools::Project {
+        root: root.to_owned(),
+        worktree: root.to_owned(),
+        language_id: "python",
+        backend: crate::lsp::tools::Backend::Pyrefly,
+        toolchain: String::new(),
+        rust_toolchain: None,
+        interpreter: None,
+    };
+    (crate::lsp::Session::with_client(project, client), log)
+}
+
+fn server_messages(log: &Path) -> Vec<serde_json::Value> {
+    (std::fs::read_to_string(log)
+        .unwrap_or_default()
+        .split("Content-Length: "))
+    .filter_map(|frame| serde_json::from_str(frame.split_once("\r\n\r\n")?.1).ok())
+    .collect()
+}
+
+fn session_of(editor: &Entity<FileEditor>, cx: &App) -> Option<Entity<crate::lsp::Session>> {
+    (editor.read(cx).intelligence.as_ref()).map(|l| l.session.clone())
+}
+
+async fn open_tab(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    shark: &Entity<Shark>,
+    path: &'static str,
+) -> Entity<FileEditor> {
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| s.open_path_tab(path.into(), w, cx))
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        (shark.read(cx).editor.as_ref())
+            .is_some_and(|e| e.read(cx).path == path && e.read(cx).intelligence.is_some())
+    })
+    .await;
+    cx.update(|cx| shark.read(cx).editor.clone().unwrap())
+}
+
+// One server serves a project's files; it survives the replacement of its only tab and a
+// workspace switch, and shuts down after the parked idle window.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn language_sessions_are_shared_and_outlive_their_tabs(cx: &mut TestAppContext) {
+    let _guard = ui_tests::UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, window, shark) = fixture(cx).await;
+    for name in ["c.txt", "d.txt", "e.txt"] {
+        std::fs::write(root.join(name), "echo\n").unwrap();
+    }
+    let (session, _) = fake_session(&root);
+    let weak = cx
+        .update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| {
+                let session = cx.new(|_| session);
+                s.register_session(session.clone(), w, cx);
+                session.downgrade()
+            })
+        })
+        .unwrap();
+    // Only tabs may own the editors, or they would keep the server alive themselves.
+    let c = open_tab(cx, window, &shark, "api/c.txt").await.downgrade();
+    let d = open_tab(cx, window, &shark, "api/d.txt").await.downgrade();
+    cx.update(|cx| {
+        let session = |e: &WeakEntity<FileEditor>| session_of(&e.upgrade().unwrap(), cx);
+        assert_eq!(session(&c), weak.upgrade());
+        assert_eq!(session(&d), weak.upgrade(), "two files share one server");
+    });
+    // A server message reaches the user.
+    let before = cx
+        .update_window(window, |_, w, cx| w.notifications(cx).len())
+        .unwrap();
+    cx.update(|cx| {
+        weak.upgrade().unwrap().update(cx, |_, cx| {
+            cx.emit(crate::lsp::SessionEvent::Notification {
+                method: "window/showMessage".into(),
+                params: serde_json::json!({"type":1,"message":"rust-analyzer failed to load the workspace"}),
+                companion: false,
+            })
+        })
+    });
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        assert_eq!(w.notifications(cx).len(), before + 1)
+    })
+    .unwrap();
+    // Closing one of its files keeps the server; replacing the only other one too.
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| s.close_editor(d.upgrade().unwrap(), w, cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(weak.upgrade().is_some());
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| {
+            let range = Range::new(Position::new(0, 0), Position::new(0, 1));
+            let link = lsp_types::LocationLink {
+                origin_selection_range: None,
+                target_uri: file_uri(&root.join("e.txt")),
+                target_range: range,
+                target_selection_range: range,
+            };
+            s.open_location(link, Encoding::Utf16, true, false, w, cx)
+        })
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        (shark.read(cx).editor.as_ref())
+            .is_some_and(|e| e.read(cx).path == "api/e.txt" && e.read(cx).intelligence.is_some())
+    })
+    .await;
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert!(c.upgrade().is_none(), "c.txt was replaced");
+        assert_eq!(session_of(s.editor.as_ref().unwrap(), cx), weak.upgrade());
+    });
+    // Switching workspaces parks the server, and coming back resumes it.
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| {
+            s.drop_editor(cx);
+            assert!(s.language_sessions.is_empty());
+            s.unpark_sessions(w, cx);
+            assert!(
+                s.language_sessions
+                    .values()
+                    .any(|(e, _)| Some(e) == weak.upgrade().as_ref())
+            );
+            s.drop_editor(cx);
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(weak.upgrade().is_some(), "a parked server stays up");
+    cx.executor()
+        .advance_clock(super::editor_pane::PARKED_SESSIONS + Duration::from_secs(1));
+    cx.run_until_parked();
+    assert!(weak.upgrade().is_none(), "an idle parked server shuts down");
+}
+
+// F2 renames to the typed name; F12 asks for the definition; Option-Shift-F formats with the
+// buffer's own indentation.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn language_keys_send_rename_definition_and_buffer_formatting(cx: &mut TestAppContext) {
+    let _guard = ui_tests::UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, window, shark) = fixture(cx).await;
+    let text = "answer {\n  one\n    two\n}\n";
+    std::fs::write(root.join("c.txt"), text).unwrap();
+    let (session, log) = fake_session(&root);
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| {
+            s.set_vim(false, cx);
+            let session = cx.new(|_| session);
+            s.register_session(session, w, cx);
+        })
+    })
+    .unwrap();
+    let editor = open_tab(cx, window, &shark, "api/c.txt").await;
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        let language = editor.read(cx).intelligence.as_ref().unwrap();
+        language.snapshot.lock().unwrap().text.as_ref() == text
+    })
+    .await;
+    let focus = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, w, cx| {
+            editor.update(cx, |e, cx| {
+                e.input.update(cx, |i, cx| {
+                    i.set_selected_range(2..2, cx);
+                    i.focus(w, cx);
+                })
+            });
+            w.render_frame(cx);
+        })
+        .unwrap();
+    };
+    let sent = |method: &'static str| {
+        let log = log.clone();
+        move |_: &mut Window, _: &mut App| {
+            server_messages(&log)
+                .into_iter()
+                .any(|m| m["method"] == method)
+        }
+    };
+    focus(cx);
+    cx.update_window(window, |_, w, cx| w.press("f2", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.has_active_dialog(cx));
+        w.input("result", cx);
+        w.press("enter", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), sent("textDocument/rename"))
+        .await;
+    let rename = server_messages(&log)
+        .into_iter()
+        .find(|m| m["method"] == "textDocument/rename")
+        .unwrap();
+    assert_eq!(
+        rename["params"]["newName"], "result",
+        "the dialog starts focused, with the symbol selected for replacement"
+    );
+    focus(cx);
+    cx.update_window(window, |_, w, cx| w.press("f12", cx))
+        .unwrap();
+    cx.wait_for(
+        window,
+        Duration::from_secs(10),
+        sent("textDocument/definition"),
+    )
+    .await;
+    focus(cx);
+    cx.update_window(window, |_, w, cx| w.press("alt-shift-f", cx))
+        .unwrap();
+    cx.wait_for(
+        window,
+        Duration::from_secs(10),
+        sent("textDocument/formatting"),
+    )
+    .await;
+    let format = server_messages(&log)
+        .into_iter()
+        .find(|m| m["method"] == "textDocument/formatting")
+        .unwrap();
+    assert_eq!(
+        format["params"]["options"],
+        serde_json::json!({"tabSize":2,"insertSpaces":true})
+    );
+    // Vim's `g d` is the same request.
+    cx.update(|cx| shark.update(cx, |s, cx| s.set_vim(true, cx)));
+    focus(cx);
+    cx.update_window(window, |_, w, cx| {
+        w.press("g", cx);
+        w.press("d", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, _| {
+        (server_messages(&log).iter())
+            .filter(|m| m["method"] == "textDocument/definition")
+            .count()
+            == 2
+    })
+    .await;
+}
+
+#[test]
+fn formatting_options_follow_the_buffer_indentation() {
+    let options = |text: &str| super::intelligence::formatting_options(text);
+    let spaces = |n: usize| serde_json::json!({"tabSize":n,"insertSpaces":true});
+    assert_eq!(options(""), spaces(4));
+    assert_eq!(options("a {\n  b {\n    c\n  }\n}\n"), spaces(2));
+    // JSDoc's one-space continuation lines do not set the step.
+    assert_eq!(
+        options("/**\n * doc\n */\nf {\n  a\n  b {\n    c\n  }\n}\n"),
+        spaces(2)
+    );
+    assert_eq!(options("def f():\n    return 1\n"), spaces(4));
+    assert_eq!(
+        options("func f() {\n\tx()\n}\n"),
+        serde_json::json!({"tabSize":4,"insertSpaces":false})
+    );
+}
+
+// Back skips a file deleted since; quick repeated presses walk one entry each.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn history_skips_deleted_files_and_counts_quick_presses(cx: &mut TestAppContext) {
+    let _guard = ui_tests::UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, window, shark) = fixture(cx).await;
+    std::fs::write(root.join("c.txt"), "charlie\n").unwrap();
+    std::fs::write(root.join("d.txt"), "delta\n").unwrap();
+    let go = |cx: &mut TestAppContext, name: &str| {
+        let range = Range::new(Position::new(0, 0), Position::new(0, 1));
+        let link = lsp_types::LocationLink {
+            origin_selection_range: None,
+            target_uri: file_uri(&root.join(name)),
+            target_range: range,
+            target_selection_range: range,
+        };
+        cx.update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| {
+                s.open_location(link, Encoding::Utf16, true, false, w, cx)
+            })
+        })
+        .unwrap();
+    };
+    let at = async |cx: &mut TestAppContext, path: &'static str| {
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            (shark.read(cx).editor.as_ref()).is_some_and(|e| e.read(cx).path == path)
+        })
+        .await;
+    };
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| s.select_file(0, w, cx))
+    })
+    .unwrap();
+    // a.txt → c.txt → d.txt, each in place of the last.
+    go(cx, "c.txt");
+    at(cx, "api/c.txt").await;
+    go(cx, "d.txt");
+    at(cx, "api/d.txt").await;
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| {
+            s.navigate_history(false, w, cx);
+            s.navigate_history(false, w, cx);
+        })
+    })
+    .unwrap();
+    at(cx, "api/a.txt").await;
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert!(s.navigation.back.is_empty());
+        let forward: Vec<_> = (s.navigation.forward.iter())
+            .map(|v| v.path.file_name().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            forward,
+            ["d.txt", "c.txt"],
+            "two presses went back two files"
+        );
+    });
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| s.navigate_history(true, w, cx))
+    })
+    .unwrap();
+    at(cx, "api/c.txt").await;
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| s.navigate_history(true, w, cx))
+    })
+    .unwrap();
+    at(cx, "api/d.txt").await;
+    std::fs::remove_file(root.join("c.txt")).unwrap();
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| s.navigate_history(false, w, cx))
+    })
+    .unwrap();
+    at(cx, "api/a.txt").await;
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert!(
+            s.navigation.back.is_empty(),
+            "the deleted c.txt left history"
+        );
+        assert_eq!(s.navigation.forward.len(), 1);
+    });
+}
+
+// Dependency sources, including installed packages inside the worktree, open read-only with
+// the server that found them, and Back restores the file's tab slot.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn dependency_sources_are_read_only_share_the_session_and_keep_tab_slots(
+    cx: &mut TestAppContext,
+) {
+    let _guard = ui_tests::UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, window, shark) = fixture(cx).await;
+    let dependency = root.join("node_modules/dep/index.txt");
+    std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+    std::fs::write(&dependency, "export\n").unwrap();
+    let (session, _) = fake_session(&root);
+    let session = cx
+        .update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| {
+                s.set_vim(false, cx);
+                let session = cx.new(|_| session);
+                s.register_session(session.clone(), w, cx);
+                // a.txt is the first file tab, before the diff and b.txt.
+                let a = s.file_tabs[0].editor.clone();
+                a.update(cx, |e, cx| e.attach_language(session.clone(), w, cx));
+                s.select_file(0, w, cx);
+                session
+            })
+        })
+        .unwrap();
+    let tabs = cx.update(|cx| shark.read(cx).active_ws().unwrap().tab_order.clone());
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| {
+            let range = Range::new(Position::new(0, 0), Position::new(0, 6));
+            let link = lsp_types::LocationLink {
+                origin_selection_range: None,
+                target_uri: file_uri(&dependency),
+                target_range: range,
+                target_selection_range: range,
+            };
+            s.open_location(link, Encoding::Utf16, true, false, w, cx)
+        })
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        (shark.read(cx).editor.as_ref()).is_some_and(|e| e.read(cx).external)
+    })
+    .await;
+    cx.update(|cx| {
+        let e = shark.read(cx).editor.clone().unwrap();
+        assert_eq!(session_of(&e, cx), Some(session.clone()));
+    });
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| s.navigate_history(false, w, cx))
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        (shark.read(cx).editor.as_ref()).is_some_and(|e| e.read(cx).path == "api/a.txt")
+    })
+    .await;
+    cx.update(|cx| {
+        assert_eq!(shark.read(cx).active_ws().unwrap().tab_order, tabs);
+    });
 }

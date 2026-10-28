@@ -3,10 +3,27 @@ use super::*;
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::progress::Progress;
 
+/// How long a workspace's language servers outlive switching away from it.
+pub(super) const PARKED_SESSIONS: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
 pub(super) struct FileTab {
     pub(super) editor: Entity<FileEditor>,
-    header: (bool, bool, &'static str, String, String, Vec<String>),
+    /// An external file's place in the tab order: that of the file it replaced.
+    pub(super) slot: Option<usize>,
+    header: Header,
     _subs: Vec<Subscription>,
+}
+
+/// What a file's header shows; a change re-renders it.
+#[derive(Default, PartialEq)]
+struct Header {
+    dirty: bool,
+    conflict: bool,
+    vim: &'static str,
+    pending: String,
+    status: Option<(String, Option<String>)>,
+    activity: Option<crate::lsp::Work>,
+    crumbs: Vec<String>,
 }
 
 impl Shark {
@@ -144,25 +161,31 @@ impl Shark {
                     return;
                 };
                 let e = editor.read(cx);
-                let header = (
-                    e.dirty,
-                    e.conflict,
-                    e.vim.status(),
-                    e.vim.pending().to_string(),
-                    format!("{:?}{:?}", e.language_status(cx), e.language_activity(cx)),
-                    e.crumbs
-                        .iter()
+                let header = Header {
+                    dirty: e.dirty,
+                    conflict: e.conflict,
+                    vim: e.vim.status(),
+                    pending: e.vim.pending().to_string(),
+                    status: e.language_status(cx),
+                    activity: e.language_activity(cx),
+                    crumbs: (e.crumbs.iter())
                         .map(|&i| e.outline[i].name.clone())
                         .collect(),
-                );
+                };
                 if header != tab.header {
+                    // A hidden file shows only its unsaved dot, in the tab strip.
+                    let shown =
+                        s.editor.as_ref() == Some(&editor) || header.dirty != tab.header.dirty;
                     tab.header = header;
-                    cx.notify();
+                    if shown {
+                        cx.notify();
+                    }
                 }
             }),
         ];
         FileTab {
             editor,
+            slot: None,
             header: Default::default(),
             _subs: subs,
         }
@@ -285,6 +308,7 @@ impl Shark {
                 s.active_ws_mut().unwrap().close_tab(&TabId::File(path));
                 let _ = s.state.save();
                 s.file_tabs.remove(ix);
+                s.prune_language_sessions(cx);
                 if s.file_tabs.is_empty() {
                     s.editor = None;
                     if s.tab == Tab::File {
@@ -309,12 +333,39 @@ impl Shark {
         }
     }
 
-    pub(super) fn drop_editor(&mut self) {
+    pub(super) fn drop_editor(&mut self, cx: &mut Context<Self>) {
         self.restore_generation += 1;
         self.editor = None;
         self.file_tabs.clear();
-        self.language_sessions.clear();
         self.navigation = Default::default();
+        // ponytail: every server of a workspace switched away from stays up for a fixed idle
+        // window, so memory peaks at that many workspaces' servers; evict by count if it hurts.
+        let sessions: Vec<_> = (self.language_sessions.drain())
+            .map(|(_, (session, _))| session)
+            .collect();
+        if let Some(name) = self.active.clone()
+            && !sessions.is_empty()
+        {
+            let expiry = cx.spawn({
+                let name = name.clone();
+                async move |this, cx| {
+                    cx.background_executor().timer(PARKED_SESSIONS).await;
+                    let _ = this.update(cx, |s, _| s.parked_sessions.remove(&name));
+                }
+            });
+            self.parked_sessions.insert(name, (sessions, expiry));
+        }
+    }
+
+    /// Resumes the servers parked when the user left the active workspace.
+    pub(super) fn unpark_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let parked = self
+            .active
+            .as_ref()
+            .and_then(|n| self.parked_sessions.remove(n));
+        for session in parked.into_iter().flat_map(|(sessions, _)| sessions) {
+            self.register_session(session, window, cx);
+        }
     }
 
     /// Quit, asking first if the open file has unsaved edits.
@@ -582,7 +633,11 @@ impl Shark {
                         let path = format!("{dir}/{name}");
                         match folder {
                             true => s.folder_menu(path, w, cx),
-                            false => s.open_path(path, w, cx),
+                            // Like Command-click: a file with unsaved edits stays in its tab.
+                            false => {
+                                let path = s.active_ws().unwrap().dir().join(path);
+                                s.open_source(path, None, None, true, false, None, w, cx)
+                            }
                         }
                     },
                     window,
@@ -689,7 +744,7 @@ impl Shark {
                                     .tooltip(if vim_on {
                                         "Forward (ctrl-i)"
                                     } else {
-                                        "Forward (ctrl-shift--)"
+                                        "Forward (ctrl-_)"
                                     })
                                     .on_click(
                                         cx.listener(|s, _, w, cx| s.navigate_history(true, w, cx)),
@@ -918,11 +973,16 @@ impl Shark {
                         fix: "",
                         detail,
                     }];
+                    let retry = Button::new("language-retry")
+                        .small()
+                        .outline()
+                        .label("Retry")
+                        .on_click(cx.listener(|s, _, w, cx| s.choose_or_restart_language(w, cx)));
                     d.child(
-                        div()
-                            .px_3()
-                            .py_2()
-                            .children(crate::deps::render_setup(&deps, cx)),
+                        div().px_3().py_2().children(
+                            crate::deps::render_setup(&deps, cx)
+                                .map(|d| d.child(h_flex().pl(px(22.)).child(retry))),
+                        ),
                     )
                 },
             )
@@ -985,7 +1045,6 @@ fn list_folder(dir: &Path) -> std::io::Result<Vec<(bool, String)>> {
 
 /// Saved paths are untrusted; only regular UTF-8 text within a workspace repo is editable.
 fn restore_file(ws: &Workspace, path: &str) -> Result<(PathBuf, String), String> {
-    use std::io::Read;
     use std::path::Component;
     let parts: Vec<_> = Path::new(path).components().collect();
     if parts.len() < 2
@@ -1008,18 +1067,7 @@ fn restore_file(ws: &Workspace, path: &str) -> Result<(PathBuf, String), String>
         if !abs.starts_with(root) {
             return Err(std::io::Error::other("path leaves its repository"));
         }
-        let meta = std::fs::metadata(&abs)?;
-        if !meta.is_file() || meta.len() > crate::editor::MAX_BYTES {
-            return Err(std::io::Error::other("not an editable file or too large"));
-        }
-        let file = std::fs::File::open(&abs)?;
-        let mut bytes = vec![];
-        file.take(crate::editor::MAX_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > crate::editor::MAX_BYTES || bytes.contains(&0) {
-            return Err(std::io::Error::other("binary or too large"));
-        }
-        let text = String::from_utf8(bytes).map_err(std::io::Error::other)?;
+        let text = super::intelligence::read_source(&abs).map_err(std::io::Error::other)?;
         // Keep the opened path so polling and save checks still notice symlink changes.
         Ok((ws.dir().join(path), text))
     };
