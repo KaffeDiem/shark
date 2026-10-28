@@ -1,6 +1,31 @@
 //! The sidebar: sections, workspace and repo rows, the cursor, drag and drop.
 use super::*;
 
+pub(super) fn workspace_indicator(
+    running: usize,
+    attention: &Attn,
+    foreground: Hsla,
+    size: Pixels,
+    theme: &Theme,
+) -> AnyElement {
+    if running > 0 {
+        return Spinner::new()
+            .icon(IconName::LoaderCircle)
+            .color(theme.primary)
+            .with_size(size)
+            .into_any_element();
+    }
+    let (icon, color) = match attention {
+        Attn::Needs(_) => (IconName::CircleAlert, theme.warning_foreground),
+        Attn::Unread => (IconName::CircleCheck, theme.success_foreground),
+        Attn::None => (IconName::CircleDashed, foreground),
+    };
+    Icon::new(icon)
+        .with_size(size)
+        .text_color(color)
+        .into_any_element()
+}
+
 /// Icons a section can have, by Lucide name (what `Section::icon` stores).
 const SECTION_ICONS: &[(&str, IconName)] = &[
     ("folder", IconName::Folder),
@@ -647,7 +672,6 @@ impl Shark {
         let accent = theme.sidebar_accent;
         let ws_row = |ix: usize, w: &Workspace, section: Option<usize>| {
             let running = self.running_chats(&w.name, cx);
-            let busy = running > 0;
             let selected = self.sel == SideRow::Ws(ix);
             let active = !self.home_shown() && self.active.as_ref() == Some(&w.name);
             let bright = active || (selected && focused);
@@ -694,24 +718,9 @@ impl Shark {
                         w.name.clone().into(),
                     )
                 })
-                .child(match (busy, nth) {
-                    (_, Some(n)) if cmd_held => kbd(&format!("cmd-{}", n + 1)).into_any_element(),
-                    (true, _) => Spinner::new()
-                        .icon(IconName::LoaderCircle)
-                        .color(theme.primary)
-                        .with_size(isz)
-                        .into_any_element(),
-                    (false, _) => {
-                        let (icon, color) = match &attn {
-                            Attn::Needs(_) => (IconName::CircleAlert, theme.warning_foreground),
-                            Attn::Unread => (IconName::CircleCheck, theme.success_foreground),
-                            Attn::None => (IconName::CircleDashed, foreground),
-                        };
-                        Icon::new(icon)
-                            .with_size(isz)
-                            .text_color(color)
-                            .into_any_element()
-                    }
+                .child(match nth {
+                    Some(n) if cmd_held => kbd(&format!("cmd-{}", n + 1)).into_any_element(),
+                    _ => workspace_indicator(running, &attn, foreground, isz, theme),
                 })
                 .when(!rail, |d| {
                     d.child(

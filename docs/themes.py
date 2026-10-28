@@ -88,13 +88,15 @@ def build(name, mode, pal):
     # `side_hover()` and `side_on()` in src/app.rs: the final `foreground` over `sidebar`.
     side = [mix(p["sidebar"], fg, t) for t in ((0.07, 0.11) if dark else (0.03, 0.05))]
     assert min(apca(fg, b) for b in side) >= 70, f"{name} {mode}: foreground on side rows"
-    mfg = lift(p["muted_fg"], island + chrome + side, 70, dark)
-    status = {k: lift(p[k], island + chrome + side, 60, dark) for k in ("danger", "success", "warning", "link")}
+    popover = tint(p["secondary"], 0.04) if dark else "#ffffff"
+    accent = tint(p["secondary"], 0.08)
+    surfaces = island + chrome + side + [popover, accent]
+    mfg = lift(p["muted_fg"], surfaces, 70, dark)
+    status = {k: lift(p[k], surfaces, 60, dark) for k in ("danger", "success", "warning", "link")}
     white, ink = "#ffffff", "#101010"
     on_primary = white if apca(white, p["primary"]) >= apca(ink, p["primary"]) else ink
     pr = p["primary"]
     a = lambda c, alpha: c + alpha  # noqa: E731
-    popover = tint(p["secondary"], 0.04) if dark else "#ffffff"
     colors = {
         "background": p["background"],
         "foreground": fg,
@@ -107,7 +109,7 @@ def build(name, mode, pal):
         "window.border": p["border"],
         "muted.background": p["muted"],
         "muted.foreground": mfg,
-        "accent.background": tint(p["secondary"], 0.08),
+        "accent.background": accent,
         "accent.foreground": fg,
         "secondary.background": p["secondary"],
         "secondary.hover.background": tint(p["secondary"], 0.05),
@@ -202,3 +204,7 @@ if __name__ == "__main__":
             lowest = min(wcag(c["sidebar.foreground"], bg) for bg in surfaces)
             assert lowest >= 4.5, f"{theme['name']}: navigation contrast {lowest:.2f}:1 < 4.5:1"
             print(f"{theme['name']}: navigation minimum {lowest:.2f}:1")
+            for token, floor in [("muted.foreground", 70), ("success.foreground", 60),
+                                 ("warning.foreground", 60), ("danger.foreground", 60), ("link", 60)]:
+                lowest = min(apca(c[token], c[bg]) for bg in ("popover.background", "accent.background"))
+                assert lowest >= floor, f"{theme['name']}: {token} menu contrast {lowest:.2f} < {floor}"

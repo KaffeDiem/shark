@@ -28,10 +28,12 @@ pub(super) struct PickerWorkspace {
         (String, IconName, Option<crate::complete::PrStatus>),
     )>,
     last_interacted_at: Option<u64>,
+    running: usize,
+    attention: Attn,
 }
 
 impl PickerWorkspace {
-    fn new(ws: &Workspace, repos: Option<&[SyncRepo]>) -> Self {
+    fn new(ws: &Workspace, repos: Option<&[SyncRepo]>, running: usize, attention: Attn) -> Self {
         Self {
             name: ws.name.clone(),
             repos: ws
@@ -47,6 +49,23 @@ impl PickerWorkspace {
                 })
                 .collect(),
             last_interacted_at: ws.last_interacted_at,
+            running,
+            attention,
+        }
+    }
+
+    fn activity(&self) -> Option<String> {
+        let running = match self.running {
+            0 => None,
+            1 => Some("1 chat running".to_string()),
+            n => Some(format!("{n} chats running")),
+        };
+        match (&self.attention, running) {
+            (Attn::Needs(step), Some(running)) => Some(format!("{running} · {step}")),
+            (Attn::Needs(step), None) => Some(step.clone()),
+            (_, Some(running)) => Some(running),
+            (Attn::Unread, None) => Some("Unread".into()),
+            (Attn::None, None) => None,
         }
     }
 }
@@ -130,7 +149,14 @@ impl WorkspacePicker {
             .into_iter()
             .map(|ix| &s.state.workspaces[ix])
             .filter(|ws| !s.archiving.contains(&ws.name))
-            .map(|ws| PickerWorkspace::new(ws, s.overview_repos(&ws.name, cx)))
+            .map(|ws| {
+                PickerWorkspace::new(
+                    ws,
+                    s.overview_repos(&ws.name, cx),
+                    s.running_chats(&ws.name, cx),
+                    s.attention_of(&ws.name, cx),
+                )
+            })
             .collect()
     }
 
@@ -193,14 +219,28 @@ impl WorkspacePicker {
             .workspaces
             .iter()
             .filter_map(|ws| live.get(ws.name.as_str()))
-            .map(|ws| PickerWorkspace::new(ws, s.overview_repos(&ws.name, cx)))
+            .map(|ws| {
+                PickerWorkspace::new(
+                    ws,
+                    s.overview_repos(&ws.name, cx),
+                    s.running_chats(&ws.name, cx),
+                    s.attention_of(&ws.name, cx),
+                )
+            })
             .collect();
         let added: Vec<_> = s
             .sidebar_order()
             .into_iter()
             .map(|ix| &s.state.workspaces[ix])
             .filter(|ws| live.contains_key(ws.name.as_str()) && !known.contains(ws.name.as_str()))
-            .map(|ws| PickerWorkspace::new(ws, s.overview_repos(&ws.name, cx)))
+            .map(|ws| {
+                PickerWorkspace::new(
+                    ws,
+                    s.overview_repos(&ws.name, cx),
+                    s.running_chats(&ws.name, cx),
+                    s.attention_of(&ws.name, cx),
+                )
+            })
             .collect();
         let selected = self
             .select
@@ -256,6 +296,9 @@ impl WorkspacePicker {
             .filter_map(|name| {
                 let ws = by_name.get(name.as_str())?;
                 let rows = ws.repos.clone();
+                let running = ws.running;
+                let attention = ws.attention.clone();
+                let activity = ws.activity();
                 let (time, exact) = interaction_time(ws.last_interacted_at, now);
                 let time = if self.current.as_ref() == Some(name) {
                     format!("Current · {time}")
@@ -263,7 +306,8 @@ impl WorkspacePicker {
                     time
                 };
                 let label = format!(
-                    "{name}, {time}, {exact}, {}",
+                    "{name}, {}, {time}, {exact}, {}",
+                    activity.as_deref().unwrap_or("Idle"),
                     rows.iter()
                         .map(|(name, (status, ..))| format!("{name}: {status}"))
                         .collect::<Vec<_>>()
@@ -278,6 +322,8 @@ impl WorkspacePicker {
                         .min_w_0()
                         .py_1()
                         .gap_1()
+                        .text_sm()
+                        .text_color(cx.theme().foreground)
                         .role(gpui_kit::accesskit::Role::Group)
                         .aria_label(label.clone())
                         .tooltip({
@@ -287,8 +333,22 @@ impl WorkspacePicker {
                         .child(
                             h_flex()
                                 .w_full()
-                                .gap_3()
+                                .gap_2()
                                 .items_center()
+                                .child(
+                                    div()
+                                        .id("workspace-indicator")
+                                        .test_support()
+                                        .size(px(16.))
+                                        .flex_none()
+                                        .child(sidebar::workspace_indicator(
+                                            running,
+                                            &attention,
+                                            muted,
+                                            px(16.),
+                                            cx.theme(),
+                                        )),
+                                )
                                 .child(
                                     div()
                                         .flex_1()
@@ -311,10 +371,29 @@ impl WorkspacePicker {
                                         }),
                                 ),
                         )
+                        .when_some(activity.clone(), |d, activity| {
+                            d.child(
+                                div()
+                                    .id("workspace-activity")
+                                    .test_support()
+                                    .ml_2()
+                                    .pl(px(16.))
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(match attention {
+                                        Attn::Needs(_) => cx.theme().warning_foreground,
+                                        Attn::Unread if running == 0 => {
+                                            cx.theme().success_foreground
+                                        }
+                                        _ => muted,
+                                    })
+                                    .child(activity),
+                            )
+                        })
                         .children(rows.iter().map(|(repo, (label, icon, pr))| {
                             h_flex()
-                                .w_full()
-                                .pl_3()
+                                .ml_2()
+                                .pl(px(16.))
                                 .gap_2()
                                 .items_center()
                                 .text_xs()
@@ -456,7 +535,28 @@ mod tests {
                 ..Default::default()
             },
             None,
+            0,
+            Attn::None,
         )
+    }
+
+    #[test]
+    fn activity_shows_running_counts_and_preserves_questions() {
+        let mut ws = ws("test", "api", None);
+        assert_eq!(ws.activity(), None);
+        ws.attention = Attn::Unread;
+        assert_eq!(ws.activity().as_deref(), Some("Unread"));
+        ws.running = 1;
+        assert_eq!(ws.activity().as_deref(), Some("1 chat running"));
+        ws.running = 2;
+        assert_eq!(ws.activity().as_deref(), Some("2 chats running"));
+        ws.attention = Attn::Needs("Question to answer".into());
+        assert_eq!(
+            ws.activity().as_deref(),
+            Some("2 chats running · Question to answer")
+        );
+        ws.running = 0;
+        assert_eq!(ws.activity().as_deref(), Some("Question to answer"));
     }
 
     #[test]
