@@ -227,10 +227,15 @@ impl Client {
         thread::spawn(move || {
             let mut stdin = stdin;
             while let Ok(message) = write_rx.recv() {
+                let exiting = matches!(&message, Message::Notification(n) if n.method == "exit");
                 if let Err(error) = message.write(&mut stdin) {
                     let _ = writer_tx.send(CommandMessage::PipeClosed(format!(
                         "Language server write failed: {error}"
                     )));
+                    break;
+                }
+                // Finish the transport only after the final frame has been flushed.
+                if exiting {
                     break;
                 }
             }
@@ -321,6 +326,7 @@ impl Client {
                     "hover":{"contentFormat":["markdown","plaintext"]},
                     "signatureHelp":{"signatureInformation":{"documentationFormat":["markdown","plaintext"]}},
                     "definition":{"linkSupport":true},
+                    "documentSymbol":{"hierarchicalDocumentSymbolSupport":true},
                     "publishDiagnostics":{"versionSupport":true,"relatedInformation":true},
                     "diagnostic":{"relatedDocumentSupport":true},
                     "codeAction":{"codeActionLiteralSupport":{"codeActionKind":{"valueSet":["","quickfix","refactor","source.organizeImports","source.fixAll"]}}},
@@ -522,7 +528,7 @@ fn coordinate(
             Ok(CommandMessage::Inbound(Message::Response(response))) => {
                 if shutdown.as_ref().is_some_and(|(id, _)| *id == response.id) {
                     let _ = writer.send(Notification::new("exit".into(), Value::Null).into());
-                    // Keep the write pipe alive briefly so exit is actually delivered.
+                    // Give the writer and server a bounded grace period to finish.
                     shutdown = Some((response.id, Instant::now() + Duration::from_millis(250)));
                 } else if let Some(pending) = queue.outgoing.complete(response.id) {
                     outgoing.remove(&pending.token);

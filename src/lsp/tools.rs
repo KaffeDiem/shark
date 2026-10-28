@@ -717,6 +717,10 @@ mod tests {
     }
     #[test]
     fn nested_projects_and_go_work_are_bounded_by_worktree() {
+        #[cfg(feature = "test-support")]
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = fixture(
             "roots",
             &[
@@ -809,6 +813,10 @@ mod tests {
 
     #[test]
     fn sessions_share_language_family_but_not_worktrees_or_moved_roots() {
+        #[cfg(feature = "test-support")]
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let root = fixture(
             "sessions",
             &[
@@ -877,6 +885,30 @@ mod tests {
             package.root,
             root.join("Packages/Feature").canonicalize().unwrap()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn rediscovery_uses_new_virtual_environments_and_checker_configuration() {
+        #[cfg(feature = "test-support")]
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = fixture("rediscover", &[("src/a.py", "answer = 1\n")]);
+        let first = discover(&root.join("src/a.py"), &root).unwrap().unwrap();
+        let interpreter = root.join(".venv/bin/python");
+        fs::create_dir_all(interpreter.parent().unwrap()).unwrap();
+        fs::write(&interpreter, "test interpreter").unwrap();
+        let second = discover(&root.join("src/a.py"), &root).unwrap().unwrap();
+        assert_eq!(
+            second.interpreter,
+            Some(root.canonicalize().unwrap().join(".venv/bin/python"))
+        );
+        assert_ne!(first.session_key(), second.session_key());
+        fs::write(root.join("pyrightconfig.json"), "{}").unwrap();
+        let third = discover(&root.join("src/a.py"), &root).unwrap().unwrap();
+        assert_eq!(third.backend, Backend::Pyright);
+        assert_ne!(second.session_key(), third.session_key());
         fs::remove_dir_all(root).unwrap();
     }
 }

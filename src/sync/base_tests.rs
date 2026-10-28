@@ -346,7 +346,10 @@ fn changed_review_identity_does_not_promote_cached_pr_when_lookup_fails() {
         .unwrap_or_else(|e| e.into_inner());
     let f = Fixture::new("identity-race");
     let previous = f.repos(run_job(&f.job(false, true, &[])), &[]);
-    assert_eq!(previous[0].pr().unwrap().number, 7);
+    let pr = previous[0]
+        .pr()
+        .unwrap_or_else(|| panic!("initial review lookup failed: {:?}", previous[0].pr));
+    assert_eq!(pr.number, 7);
     assert!(previous[0].local.as_ref().unwrap().review);
 
     // Another probe adopted this branch's own PR, but its answer never reached this cache.

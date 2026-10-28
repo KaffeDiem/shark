@@ -8,6 +8,7 @@ log_path = sys.argv[1]
 documents = {}
 waiting = []
 ignore_shutdown = False
+exit_needs_eof = False
 
 
 def send(value):
@@ -68,12 +69,19 @@ with open(log_path, "a") as log:
         elif method == "test/ignoreShutdown":
             ignore_shutdown = True
             respond(message, None)
+        elif method == "test/exitNeedsEof":
+            exit_needs_eof = True
+            respond(message, None)
         elif method == "test/crash":
             sys.exit(2)
         elif method == "shutdown":
             if not ignore_shutdown:
                 respond(message, None)
         elif method == "exit":
+            if exit_needs_eof:
+                assert sys.stdin.buffer.read() == b""
+                log.write(json.dumps(dict(exit_followed_by_eof=True)) + "\n")
+                log.flush()
             break
         elif method and "id" in message:
             for pending in waiting:

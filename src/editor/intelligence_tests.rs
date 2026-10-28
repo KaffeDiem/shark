@@ -300,9 +300,13 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
     let restarted = fake_client(&dir, &restarted_log);
     peer_wait(restarted.initialize()).unwrap();
     cx.update(|cx| {
+        editor.update(cx, |e, _| {
+            e.lsp_error = Some("Old synchronization failure".into())
+        });
         session.update(cx, |s, cx| {
             s.client = Some(restarted.clone());
             s.generation += 1;
+            s.status = "Ready".into();
             cx.notify();
         })
     });
@@ -312,6 +316,11 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
             .any(|v| v["method"] == "textDocument/didOpen")
     })
     .await;
+    cx.update(|cx| {
+        let e = editor.read(cx);
+        assert!(e.lsp_error.is_none());
+        assert_eq!(e.language_status(cx).unwrap().0, "Ready");
+    });
     assert_eq!(
         peer_wait(restarted.request(
             "textDocument/completion",
@@ -350,6 +359,83 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
     );
     client.shutdown();
     restarted.shutdown();
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn diagnostics_from_both_servers_remain_searchable_in_document_order(
+    cx: &mut TestAppContext,
+) {
+    let _turn = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let text = "import os\nname = 1\nvalue = name\n";
+    let (dir, file, window, editor) = open_editor("diagnostics-order", text, cx).await;
+    let client = fake_client(&dir, &dir.join("primary.jsonl"));
+    let companion = fake_client(&dir, &dir.join("ruff.jsonl"));
+    peer_wait(client.initialize()).unwrap();
+    peer_wait(companion.initialize()).unwrap();
+    let project = Project {
+        root: dir.clone(),
+        worktree: dir.clone(),
+        language_id: "python",
+        backend: Backend::Pyrefly,
+        toolchain: String::new(),
+        rust_toolchain: None,
+        interpreter: None,
+    };
+    let session = cx.update(|cx| {
+        cx.new(|_| {
+            let mut session = Session::with_client(project, client.clone());
+            session.companion = Some(companion.clone());
+            session
+        })
+    });
+    cx.update_window(window, |_, w, cx| {
+        editor.update(cx, |e, cx| e.attach_language(session.clone(), w, cx))
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        editor
+            .read(cx)
+            .intelligence
+            .as_ref()
+            .unwrap()
+            .snapshot
+            .lock()
+            .unwrap()
+            .text
+            .as_ref()
+            == text
+    })
+    .await;
+    let uri = url::Url::from_file_path(&file).unwrap().to_string();
+    for (is_companion, lines) in [(false, vec![2, 1]), (true, vec![0])] {
+        cx.update(|cx| {
+            session.update(cx, |_, cx| {
+                let diagnostics: Vec<_> = lines.iter().map(|line| json!({
+                    "range":{"start":{"line":line,"character":0},"end":{"line":line,"character":4}},
+                    "message":format!("line {line}")
+                })).collect();
+                cx.emit(crate::lsp::SessionEvent::Notification {
+                    method: "textDocument/publishDiagnostics".into(),
+                    params: json!({"uri":uri,"diagnostics":diagnostics}),
+                    companion: is_companion,
+                });
+            });
+        });
+        cx.run_until_parked();
+    }
+    cx.update(|cx| {
+        let input = editor.read(cx).input.read(cx);
+        let set = input.diagnostics().unwrap();
+        for (offset, message) in [(1, "line 0"), (11, "line 1"), (20, "line 2")] {
+            assert_eq!(set.for_offset(offset).unwrap().message.as_ref(), message);
+        }
+    });
+    client.shutdown();
+    companion.shutdown();
     let _ = fs::remove_dir_all(dir);
 }
 
@@ -516,4 +602,94 @@ fn outline_nests_both_symbol_shapes_and_follows_the_cursor() {
     assert_eq!(symbol_path(&symbols, text.find("{}").unwrap()), vec![0, 1]);
     assert_eq!(symbol_path(&symbols, text.find("c()").unwrap()), vec![2]);
     assert_eq!(symbol_path(&symbols, text.len()), Vec::<usize>::new());
+}
+
+/// CPU-side input-to-frame cost; the test renderer does not measure display presentation.
+#[gpui_kit::test]
+#[ignore = "manual benchmark; select disabled or attached with SHARK_LSP_PERF_MODE"]
+#[allow(clippy::await_holding_lock)]
+async fn perf_language_input_to_frame(cx: &mut TestAppContext) {
+    let _turn = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let mode = std::env::var("SHARK_LSP_PERF_MODE").unwrap_or_else(|_| "disabled".into());
+    assert!(["disabled", "attached"].contains(&mode.as_str()));
+    let original = format!(
+        "# typing here\n{}",
+        "value = 12345 # sample line\n".repeat(10_000)
+    );
+    let (dir, file, window, editor) = open_editor("performance", &original, cx).await;
+    let client = (mode != "disabled").then(|| {
+        let client = fake_client(&dir, &dir.join("performance-peer.jsonl"));
+        peer_wait(client.initialize()).unwrap();
+        client
+    });
+    if let Some(client) = &client {
+        let project = Project {
+            root: dir.clone(),
+            worktree: dir.clone(),
+            language_id: "python",
+            backend: Backend::Pyrefly,
+            toolchain: String::new(),
+            rust_toolchain: None,
+            interpreter: None,
+        };
+        let session = cx.update(|cx| cx.new(|_| Session::with_client(project, client.clone())));
+        cx.update_window(window, |_, w, cx| {
+            editor.update(cx, |e, cx| e.attach_language(session, w, cx));
+        })
+        .unwrap();
+    }
+    cx.update_window(window, |_, w, cx| {
+        editor.update(cx, |e, cx| {
+            e.set_vim(false, cx);
+            e.input.update(cx, |i, cx| {
+                // Network completions are timed separately; their OS wakers are not deterministic.
+                i.lsp_mut().completion_provider = None;
+                i.set_selected_range(2..2, cx);
+                i.focus(w, cx);
+            });
+        });
+        w.render_frame(cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let mut samples = vec![];
+    for n in 0..110 {
+        let started = std::time::Instant::now();
+        cx.update_window(window, |_, w, cx| {
+            w.press("x", cx);
+            w.render_frame(cx);
+        })
+        .unwrap();
+        let elapsed = started.elapsed().as_secs_f64() * 1000.;
+        if n >= 10 {
+            samples.push(elapsed);
+        }
+        cx.run_until_parked();
+        cx.executor().advance_clock(Duration::from_millis(50));
+        cx.run_until_parked();
+    }
+    cx.update(|cx| {
+        assert_eq!(
+            editor.read(cx).input.read(cx).value().len(),
+            original.len() + 110
+        );
+        assert!(editor.read(cx).dirty);
+    });
+    assert_eq!(fs::read_to_string(&file).unwrap(), original);
+    samples.sort_by(f64::total_cmp);
+    println!(
+        "LANGUAGE_INPUT_FRAME {}",
+        json!({
+            "mode":mode, "build":if cfg!(debug_assertions) { "debug" } else { "release" },
+            "renderer":"headless CPU frame; no presentation", "lines":10001,
+            "bytes":original.len(), "samples":samples.len(), "p50_ms":samples[49],
+            "p95_ms":samples[94], "max_ms":samples[99],
+        })
+    );
+    if let Some(client) = client {
+        client.shutdown();
+    }
+    let _ = fs::remove_dir_all(dir);
 }

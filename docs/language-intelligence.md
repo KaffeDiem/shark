@@ -122,21 +122,24 @@ are bounded; failures kill and reap the process group.
 | Selected Xcode SourceKit-LSP, Swift 6.4, SwiftPM fixture | Pass |
 | Locally built gopls 0.24.0 with Go 1.27.3 | Pass |
 | SweetPad CLI 0.1.15, minimal real Xcode project | Pass: generate BSP, initialize, build targets, shutdown |
-| Native TypeScript 7.0.2 macOS arm64 | Feature requests pass; strict shutdown gate fails |
+| Native TypeScript 7.0.2 macOS arm64 | Pass, including strict zero-exit shutdown |
 
 Native TypeScript 7.0.2 rejects a `shutdown` request containing `params: null`;
 omitting `params` is accepted. Shark's `lsp-server` serialization already omits
-null params. With the accepted shutdown/exit sequence, this exact artifact still
-exited with status 1 and `context canceled`. The smoke test intentionally retains
-its zero-exit assertion. This is an observed release blocker, not an inferred
-problem from an unrelated issue report. No checker fallback is performed.
+null params. Keeping stdin open after sending `exit` exposed a shutdown failure
+(`context canceled`, and a watcher panic in one run). The client writer now closes
+stdin after writing and flushing the final `exit` frame; the smoke harness does
+the same. The pending notification → shutdown response → exit → EOF order has a
+fake-server regression. Forty repeated native TypeScript runs passed: 30 with
+Shark's client capabilities and 10 with the smoke harness capabilities. The
+zero-exit assertion, bounded shutdown, pinned artifact, and compiler selection
+remain unchanged; no checker fallback is performed.
 
 `scripts/check-language-tools.py` downloads and checks the exact manifest
 artifacts, exercises them with their managed runtime, and also checks the selected
-Rust/Swift toolchain servers and SweetPad BSP. The release workflow runs this gate
-before signing or publishing. The observed native TypeScript shutdown failure
-intentionally blocks a release; the zero-exit assertion must not be weakened to
-hide it.
+Rust/Swift toolchain servers and SweetPad BSP. All nine artifact cases passed after
+the transport fix. The release workflow runs this gate before signing or
+publishing, retaining the strict zero-exit assertion.
 
 Examples:
 
@@ -153,19 +156,30 @@ For a classic TypeScript SDK, set `SHARK_LSP_SMOKE_INIT` to a JSON object with
 `tsserver.path` pointing to that SDK's `lib/tsserver.js`, and run the wrapper with
 the managed Node binary.
 
+## Follow-up QA
+
+The [linter QA report](linter-qa.md) records the independent user-flow and
+correctness reviews, regression results, and native app follow-up. Native checks
+verified empty-cache Python tool setup, quick-fix dismissal retaining editor
+focus, rename across two files, and Save/Reload after a concurrent disk change.
+QA also repaired the outline shortcut and advertised hierarchical-symbol support
+already implemented by the outline parser.
+The [performance report](linter-performance.md) records headless editor CPU-frame
+timings and actual Python server readiness, warm requests, and process-tree RSS,
+with their measurement limits. These scoped measurements do not establish
+packaged-app input-to-display latency or busy-indexer performance.
+
 ## Gates still required before a polished release
 
-The full headless regression run passed 443 tests (15 live-service tests ignored).
-After the final integration fixes, the focused runs passed 33 LSP/protocol/setup
-tests, 13 editor tests, and 2 workspace workflow tests. These counts overlap.
-The workflow checks include multiple results, alias/tab reuse, history selection
-and scroll, external-source read-only behavior, completion/import/snippet undo,
+See the [QA report](linter-qa.md) for the final full-suite and focused regression
+results. The workflow checks include multiple results, alias/tab reuse, history
+selection and scroll, external-source read-only behavior, completion/import/snippet undo,
 Vim undo/redo, atomic multi-file edits, dirty diff conflicts, and concurrent changes.
 Formatting and whitespace checks also pass. No changes were published.
 
-1. Resolve the native TypeScript shutdown failure and rerun all pinned artifacts
-   using the final packaged app and final client capabilities. These standalone
-   artifact smokes do not prove GPUI end-to-end behavior.
+1. Verify all supported language backends through the final packaged app. The
+   nine standalone artifact smokes and the scoped native app checks do not prove
+   every GPUI end-to-end language workflow.
 2. Exercise an empty-cache Finder launch, interrupted downloads during extraction
    and activation, moved worktrees with custom and Shark-owned BSP, ambiguous
    Xcode containers, real Xcode build/index readiness, and Go multi-module
@@ -175,9 +189,11 @@ Formatting and whitespace checks also pass. No changes were published.
    multiple definitions, back/forward selection and scroll, completion snippets
    plus imports, rename/format across open and closed files, dirty diff conflicts,
    restarts, and external dependency sources. Headless tests cover a subset.
-4. Measure input-to-paint latency, cold readiness, warm completion/definition,
-   and total process-tree memory with LSP disabled, idle, and indexing on named
-   hardware. No performance or “fastest server” claim is justified by these runs.
+4. Extend the scoped [performance measurements](linter-performance.md) to
+   packaged-app input-to-paint latency, cold readiness, warm completion/definition,
+   and total process-tree memory with LSP disabled, idle, and actively indexing
+   across supported languages. No overall performance or “fastest server” claim
+   is justified by the existing runs.
 
 Debugging, extension hosting, terminal integration, global cross-file undo, and a
 general-purpose package manager remain out of scope. Ty remains an optional

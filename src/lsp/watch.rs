@@ -314,6 +314,15 @@ fn pattern(root: &Path, watcher: &Value) -> Result<Pattern> {
     })
 }
 
+fn read_directory(root: &Path, dir: &Path) -> std::io::Result<Option<std::fs::ReadDir>> {
+    match std::fs::read_dir(dir) {
+        Ok(entries) => Ok(Some(entries)),
+        // A descendant can disappear between discovery and traversal during normal edits.
+        Err(error) if dir != root && error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
 fn snapshot(root: &Path, stop: &AtomicBool) -> Result<Snapshot> {
     let mut files = HashMap::new();
     let mut dirs = vec![root.to_path_buf()];
@@ -322,11 +331,18 @@ fn snapshot(root: &Path, stop: &AtomicBool) -> Result<Snapshot> {
         if stop.load(Ordering::Relaxed) {
             return Ok(files);
         }
-        for entry in std::fs::read_dir(&dir)? {
+        let Some(entries) = read_directory(root, &dir)? else {
+            continue;
+        };
+        for entry in entries {
             if stop.load(Ordering::Relaxed) {
                 return Ok(files);
             }
-            let entry = entry?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
             // Repository internals do not belong to the language workspace.
             if entry.file_name() == ".git" {
                 continue;
@@ -339,7 +355,11 @@ fn snapshot(root: &Path, stop: &AtomicBool) -> Result<Snapshot> {
                     root.display()
                 );
             }
-            let kind = entry.file_type()?;
+            let kind = match entry.file_type() {
+                Ok(kind) => kind,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
             // Never follow symlinks into a different worktree or dependency tree.
             if kind.is_dir() {
                 dirs.push(entry.path());
@@ -434,6 +454,26 @@ mod tests {
         assert_eq!(files.len(), 1);
         assert!(files.contains_key(&root.join("file.rs")));
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn polling_tolerates_removed_descendants_but_preserves_root_and_other_errors() {
+        let root = std::env::temp_dir().join(format!("shark-watch-removed-{}", std::process::id()));
+        let child = root.join("src");
+        std::fs::create_dir_all(&child).unwrap();
+        let file = child.join("lib.rs");
+        std::fs::write(&file, "fn main() {}").unwrap();
+        let before = snapshot(&root, &AtomicBool::new(false)).unwrap();
+        std::fs::remove_dir_all(&child).unwrap();
+        // This is the traversal of a directory that was queued before its deletion.
+        assert!(read_directory(&root, &child).unwrap().is_none());
+        let after = snapshot(&root, &AtomicBool::new(false)).unwrap();
+        assert_eq!(diff(&before, &after), vec![(file, 3)]);
+        let regular_file = root.join("file");
+        std::fs::write(&regular_file, "").unwrap();
+        assert!(read_directory(&root, &regular_file).is_err());
+        std::fs::remove_dir_all(&root).unwrap();
+        assert!(snapshot(&root, &AtomicBool::new(false)).is_err());
     }
 }
 

@@ -327,6 +327,50 @@ pub fn location_link(location: Location) -> LocationLink {
     }
 }
 
+// Caret lookups include diagnostics starting at the caret; the LSP request stays empty-range.
+fn diagnostic_context(
+    text: &str,
+    set: &gpui_kit::base::input::DiagnosticSet,
+    range: std::ops::Range<usize>,
+    encoding: Encoding,
+) -> Vec<Diagnostic> {
+    set.range(range.start..range.end.max(range.start.saturating_add(1)))
+        .filter_map(|entry| {
+            let d = &entry.diagnostic;
+            let range = document::convert_range(
+                text,
+                Range::new(d.range.start, d.range.end),
+                Encoding::Utf32,
+                encoding,
+            )
+            .ok()?;
+            Some(Diagnostic {
+                range,
+                severity: Some(match d.severity {
+                    gpui_kit::base::input::DiagnosticSeverity::Error => DiagnosticSeverity::ERROR,
+                    gpui_kit::base::input::DiagnosticSeverity::Warning => {
+                        DiagnosticSeverity::WARNING
+                    }
+                    gpui_kit::base::input::DiagnosticSeverity::Info => {
+                        DiagnosticSeverity::INFORMATION
+                    }
+                    gpui_kit::base::input::DiagnosticSeverity::Hint => DiagnosticSeverity::HINT,
+                }),
+                code: d
+                    .code
+                    .as_ref()
+                    .map(|c| NumberOrString::String(c.to_string())),
+                code_description: d.code_description.clone(),
+                source: d.source.as_ref().map(ToString::to_string),
+                message: d.message.to_string(),
+                related_information: d.related_information.clone(),
+                tags: d.tags.clone(),
+                data: d.data.clone(),
+            })
+        })
+        .collect()
+}
+
 impl CodeActionProvider for Provider {
     fn id(&self) -> gpui_kit::SharedString {
         self.id.clone()
@@ -342,50 +386,10 @@ impl CodeActionProvider for Provider {
         let this = self.clone();
         let text = state.read(cx).value().to_string();
         let guard = EditGuard::capture();
-        let diagnostics: Vec<Diagnostic> = state
+        let diagnostics = state
             .read(cx)
             .diagnostics()
-            .map(|set| {
-                set.range(range.clone())
-                    .filter_map(|entry| {
-                        let d = &entry.diagnostic;
-                        let range = document::convert_range(
-                            &text,
-                            Range::new(d.range.start, d.range.end),
-                            Encoding::Utf32,
-                            this.encoding(),
-                        )
-                        .ok()?;
-                        Some(Diagnostic {
-                            range,
-                            severity: Some(match d.severity {
-                                gpui_kit::base::input::DiagnosticSeverity::Error => {
-                                    DiagnosticSeverity::ERROR
-                                }
-                                gpui_kit::base::input::DiagnosticSeverity::Warning => {
-                                    DiagnosticSeverity::WARNING
-                                }
-                                gpui_kit::base::input::DiagnosticSeverity::Info => {
-                                    DiagnosticSeverity::INFORMATION
-                                }
-                                gpui_kit::base::input::DiagnosticSeverity::Hint => {
-                                    DiagnosticSeverity::HINT
-                                }
-                            }),
-                            code: d
-                                .code
-                                .as_ref()
-                                .map(|c| NumberOrString::String(c.to_string())),
-                            code_description: d.code_description.clone(),
-                            source: d.source.as_ref().map(ToString::to_string),
-                            message: d.message.to_string(),
-                            related_information: d.related_information.clone(),
-                            tags: d.tags.clone(),
-                            data: d.data.clone(),
-                        })
-                    })
-                    .collect()
-            })
+            .map(|set| diagnostic_context(&text, set, range.clone(), this.encoding()))
             .unwrap_or_default();
         let executor = cx.background_executor().clone();
         cx.spawn(async move |_| {
@@ -524,6 +528,26 @@ pub fn prepare_completion(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn quick_fix_context_includes_the_diagnostic_at_its_first_character() {
+        use gpui_kit::base::input::{Diagnostic as EditorDiagnostic, DiagnosticSet};
+        let text = "😀 unused\nnext";
+        let mut set = DiagnosticSet::new(&Rope::from(text));
+        set.push(EditorDiagnostic::new(
+            Position::new(0, 2)..Position::new(0, 8),
+            "unused name",
+        ));
+        for selection in [5..5, 6..6, 5..11] {
+            let diagnostics = diagnostic_context(text, &set, selection, Encoding::Utf16);
+            assert_eq!(diagnostics.len(), 1);
+            assert_eq!(diagnostics[0].range.start, Position::new(0, 3));
+            assert_eq!(diagnostics[0].range.end, Position::new(0, 9));
+        }
+        assert!(diagnostic_context(text, &set, 0..0, Encoding::Utf16).is_empty());
+        assert!(diagnostic_context(text, &set, 13..13, Encoding::Utf16).is_empty());
+    }
+
     #[test]
     fn completion_combines_autoimport_and_unicode_snippet_as_one_edit() {
         let snapshot = Snapshot {

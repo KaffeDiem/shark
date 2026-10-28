@@ -188,6 +188,15 @@ impl FileEditor {
         if !self.is_focused(window, cx) {
             return false;
         }
+        let input = self.input.read(cx);
+        if ks.key == "escape"
+            && ks.modifiers.number_of_modifiers() == 0
+            && (input.completion_menu_state().open || input.code_action_menu_state().open)
+        {
+            // The platform menus bubble Escape after dismissal; consume it before it leaves the editor.
+            self.input.update(cx, |i, cx| i.dismiss_lsp_overlays(cx));
+            return true;
+        }
         if self.snippet_key(ks, cx) {
             return true;
         }
@@ -958,6 +967,94 @@ mod ui_tests {
         })
         .await;
         (dir, file, window, editor)
+    }
+
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn escape_dismisses_language_menus_before_leaving_editor(cx: &mut TestAppContext) {
+        use gpui_kit::base::input::CodeActionItem;
+        let _guard = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let (dir, _, window, editor) = open_editor("escape-overlays", "bad\n", cx).await;
+        let leaves = std::rc::Rc::new(std::cell::Cell::new(0));
+        let events = leaves.clone();
+        let _subscription = cx.update(|cx| {
+            cx.subscribe(&editor, move |_, event: &EditorEvent, _| {
+                if matches!(event, EditorEvent::Leave) {
+                    events.set(events.get() + 1);
+                }
+            })
+        });
+        for vim in [false, true] {
+            for quick_fix in [false, true] {
+                let before = leaves.get();
+                cx.update_window(window, |_, w, cx| {
+                    editor.update(cx, |e, cx| {
+                        e.set_vim(vim, cx);
+                        e.input.update(cx, |input, cx| {
+                            input.focus(w, cx);
+                            if quick_fix {
+                                input.present_code_actions(
+                                    vec![CodeActionItem {
+                                        provider_id: "test".into(),
+                                        action: lsp_types::CodeAction {
+                                            title: "Fix diagnostic".into(),
+                                            ..Default::default()
+                                        },
+                                    }],
+                                    cx,
+                                );
+                            } else {
+                                input.present_completion_items(
+                                    0,
+                                    "b",
+                                    vec![lsp_types::CompletionItem::new_simple(
+                                        "better".into(),
+                                        "Complete".into(),
+                                    )],
+                                    cx,
+                                );
+                            }
+                        });
+                    });
+                    w.render_frame(cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.update_window(window, |_, w, cx| {
+                    w.render_frame(cx);
+                    let input = editor.read(cx).input.read(cx);
+                    assert_eq!(input.code_action_menu_state().open, quick_fix);
+                    assert_eq!(input.completion_menu_state().open, !quick_fix);
+                    w.press("escape", cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                cx.update_window(window, |_, w, cx| {
+                    let e = editor.read(cx);
+                    let input = e.input.read(cx);
+                    assert!(!input.code_action_menu_state().open);
+                    assert!(!input.completion_menu_state().open);
+                    assert!(e.is_focused(w, cx));
+                    assert_eq!(
+                        leaves.get(),
+                        before,
+                        "Escape dismisses the menu without leaving"
+                    );
+                    assert_eq!(input.value().as_ref(), "bad\n");
+                    w.press("escape", cx);
+                })
+                .unwrap();
+                cx.run_until_parked();
+                assert_eq!(
+                    leaves.get(),
+                    before + 1,
+                    "a second Escape leaves the idle editor"
+                );
+            }
+        }
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[gpui_kit::test]

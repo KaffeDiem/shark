@@ -85,6 +85,12 @@ fn lifecycle_orders_unsaved_text_requests_configuration_and_diagnostics() {
     block_on(peer.client.initialize()).unwrap();
     assert_eq!(peer.client.encoding(), PositionEncodingKind::UTF16);
     assert_eq!(peer.client.status(), Status::Ready);
+    let initialize = peer.wait_for(|v| v["method"] == "initialize");
+    // Pyrefly returns no outline unless the client advertises hierarchy support.
+    assert_eq!(
+        initialize["params"]["capabilities"]["textDocument"]["documentSymbol"]["hierarchicalDocumentSymbolSupport"],
+        true
+    );
     let uri = "file:///tmp/example.py";
     peer.client
         .notify(
@@ -120,6 +126,23 @@ fn lifecycle_orders_unsaved_text_requests_configuration_and_diagnostics() {
     assert!(position("initialized") < position("textDocument/didOpen"));
     assert!(position("textDocument/didChange") < position("textDocument/completion"));
     assert!(position("textDocument/didClose") < position("shutdown"));
+}
+
+#[test]
+fn shutdown_flushes_exit_before_closing_the_write_pipe() {
+    let peer = Peer::new();
+    block_on(peer.client.initialize()).unwrap();
+    block_on(peer.client.request("test/exitNeedsEof", Value::Null)).unwrap();
+    peer.client
+        .notify("test/finalNotification", json!({"value":42}))
+        .unwrap();
+    peer.client.shutdown();
+    peer.wait_for(|v| v["exit_followed_by_eof"] == true);
+    let messages = peer.messages();
+    let at = |method| messages.iter().position(|v| v["method"] == method).unwrap();
+    assert!(at("test/finalNotification") < at("shutdown"));
+    assert!(at("shutdown") < at("exit"));
+    assert_eq!(messages.last().unwrap()["exit_followed_by_eof"], true);
 }
 
 #[test]

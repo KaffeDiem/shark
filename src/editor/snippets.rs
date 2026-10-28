@@ -246,11 +246,9 @@ impl Session {
             let old_start = stop.start;
             let old_end = stop.end;
             if stop.index != self.index
-                && active.iter().any(|a| {
-                    old_start >= a.start
-                        && old_end <= a.end
-                        && !(stop.index == 0 && old_start == a.end)
-                })
+                && active
+                    .iter()
+                    .any(|a| old_start >= a.start && old_start < a.end && old_end <= a.end)
             {
                 return false;
             }
@@ -260,7 +258,13 @@ impl Session {
                     a.end <= old_start && !(stop.index == self.index && a.start == old_start)
                 })
                 .count();
-            let before_end = active.iter().filter(|a| a.end <= old_end).count();
+            let before_end = active
+                .iter()
+                .filter(|a| {
+                    a.end < old_end
+                        || (a.end == old_end && (a.start < a.end || old_start == old_end))
+                })
+                .count();
             let Some(start) = old_start.checked_add_signed(delta * before_start as isize) else {
                 return false;
             };
@@ -359,5 +363,109 @@ mod tests {
         };
         assert!(session.changed("fn done"));
         assert!(session.stops.iter().all(|s| s.index != 2));
+    }
+
+    #[::core::prelude::v1::test]
+    fn adjacent_empty_tabstops_survive_typing_in_the_first() {
+        let mut session = Session {
+            text: "f()".into(),
+            index: 1,
+            stops: vec![
+                Stop {
+                    index: 1,
+                    start: 2,
+                    end: 2,
+                },
+                Stop {
+                    index: 2,
+                    start: 2,
+                    end: 2,
+                },
+                Stop {
+                    index: 0,
+                    start: 3,
+                    end: 3,
+                },
+            ],
+        };
+        assert!(session.changed("f(x)"));
+        assert_eq!(
+            session.stops,
+            vec![
+                Stop {
+                    index: 1,
+                    start: 2,
+                    end: 3
+                },
+                Stop {
+                    index: 2,
+                    start: 3,
+                    end: 3
+                },
+                Stop {
+                    index: 0,
+                    start: 4,
+                    end: 4
+                },
+            ]
+        );
+        assert!(session.changed("f(xy)"));
+        assert_eq!(
+            session.stops[1],
+            Stop {
+                index: 2,
+                start: 4,
+                end: 4
+            }
+        );
+        session.index = 2;
+        assert!(session.changed("f(xy😀)"));
+        assert_eq!(
+            session.stops[0],
+            Stop {
+                index: 1,
+                start: 2,
+                end: 4
+            }
+        );
+        assert_eq!(
+            session.stops[1],
+            Stop {
+                index: 2,
+                start: 4,
+                end: 8
+            }
+        );
+        assert_eq!(
+            session.stops[2],
+            Stop {
+                index: 0,
+                start: 9,
+                end: 9
+            }
+        );
+        // Shift-Tab returns to only the first field, leaving the second field intact.
+        session.index = 1;
+        assert!(session.changed("f(z😀)"));
+        assert_eq!(
+            session.stops,
+            vec![
+                Stop {
+                    index: 1,
+                    start: 2,
+                    end: 3
+                },
+                Stop {
+                    index: 2,
+                    start: 3,
+                    end: 7
+                },
+                Stop {
+                    index: 0,
+                    start: 8,
+                    end: 8
+                },
+            ]
+        );
     }
 }

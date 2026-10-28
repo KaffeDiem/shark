@@ -94,6 +94,73 @@ async fn fixture(cx: &mut TestAppContext) -> (PathBuf, AnyWindowHandle, Entity<S
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
+async fn language_outline_and_history_shortcuts_reach_the_focused_editor(cx: &mut TestAppContext) {
+    let _guard = ui_tests::UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, window, shark) = fixture(cx).await;
+    let editor = cx
+        .update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| {
+                s.select_file(0, w, cx);
+                let editor = s.editor.clone().unwrap();
+                editor.update(cx, |e, cx| {
+                    e.outline = vec![crate::editor::Symbol {
+                        name: "alpha".into(),
+                        depth: 0,
+                        range: 0..5,
+                        target: 3,
+                    }];
+                    e.input.update(cx, |i, cx| {
+                        i.set_selected_range(0..0, cx);
+                        i.focus(w, cx);
+                    });
+                });
+                editor
+            })
+        })
+        .unwrap();
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(editor.read(cx).is_focused(w, cx));
+        w.press("cmd-shift-o", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.has_active_dialog(cx));
+        w.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        assert_eq!(
+            editor.read(cx).input.read(cx).selected_range(),
+            3..3,
+            "Cmd-Shift-O must select a document symbol, not open the workspace picker"
+        );
+        assert!(editor.read(cx).is_focused(w, cx));
+        w.render_frame(cx);
+        w.press("ctrl--", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        editor.read(cx).input.read(cx).selected_range() == (0..0)
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| {
+        assert!(editor.read(cx).is_focused(w, cx));
+        w.render_frame(cx);
+        w.press("ctrl-shift--", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        editor.read(cx).input.read(cx).selected_range() == (3..3)
+    })
+    .await;
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
 async fn language_batches_are_atomic_dirty_undoable_and_preserve_tabs(cx: &mut TestAppContext) {
     let _guard = ui_tests::UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (root, window, shark) = fixture(cx).await;
@@ -836,4 +903,302 @@ async fn editor_text_size_defaults_to_research_values_and_steps(cx: &mut TestApp
         assert_eq!(crate::editor::code_font(cx), (px(14.), px(21.)));
         assert_eq!(shark.read(cx).state.editor_font_size, None);
     });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn language_navigation_failures_preserve_history_and_late_results_preserve_focus(
+    cx: &mut TestAppContext,
+) {
+    let _guard = ui_tests::UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, window, shark) = fixture(cx).await;
+    std::fs::write(root.join("c.txt"), "charlie\n").unwrap();
+    let link = || {
+        let range = Range::new(Position::new(0, 0), Position::new(0, 1));
+        lsp_types::LocationLink {
+            origin_selection_range: None,
+            target_uri: file_uri(&root.join("c.txt")),
+            target_range: range,
+            target_selection_range: range,
+        }
+    };
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| {
+            s.select_file(0, w, cx);
+            s.open_location(link(), Encoding::Utf16, true, false, w, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).editor.as_ref().unwrap().read(cx).path == "api/c.txt"
+    })
+    .await;
+    std::fs::remove_file(root.join("a.txt")).unwrap();
+    let before = cx
+        .update_window(window, |_, w, cx| w.notifications(cx).len())
+        .unwrap();
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| s.navigate_history(false, w, cx))
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |w, cx| {
+        w.notifications(cx).len() > before
+    })
+    .await;
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.editor.as_ref().unwrap().read(cx).path, "api/c.txt");
+        assert_eq!(
+            s.navigation.back.len(),
+            1,
+            "a failed Back keeps its destination"
+        );
+        assert!(s.navigation.forward.is_empty());
+    });
+    std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| s.navigate_history(false, w, cx))
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).editor.as_ref().unwrap().read(cx).path == "api/a.txt"
+    })
+    .await;
+    // Change focus before the detached source read can apply its result.
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| {
+            s.open_location(link(), Encoding::Utf16, true, false, w, cx);
+            s.select_file(1, w, cx);
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.editor.as_ref().unwrap().read(cx).path, "api/b.txt");
+        assert_eq!(s.file_tabs[0].editor.read(cx).path, "api/a.txt");
+        assert_eq!(s.file_tabs[1].editor.read(cx).path, "api/b.txt");
+        assert!(s.navigation.back.is_empty());
+        assert_eq!(s.navigation.forward.len(), 1);
+    });
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| {
+            s.open_location(link(), Encoding::Utf16, true, false, w, cx);
+            let mut latest = link();
+            latest.target_uri = file_uri(&root.join("a.txt"));
+            s.open_location(latest, Encoding::Utf16, true, false, w, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).editor.as_ref().unwrap().read(cx).path == "api/a.txt"
+    })
+    .await;
+    cx.update(|cx| {
+        assert_eq!(shark.read(cx).file_tabs.len(), 2);
+        assert!(
+            shark
+                .read(cx)
+                .file_tabs
+                .iter()
+                .all(|t| t.editor.read(cx).path != "api/c.txt"),
+            "only the newest pending navigation may replace a tab"
+        );
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn language_edits_reuse_an_editor_opened_through_a_symlink(cx: &mut TestAppContext) {
+    let _guard = ui_tests::UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, window, shark) = fixture(cx).await;
+    std::os::unix::fs::symlink(root.join("a.txt"), root.join("alias.txt")).unwrap();
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| {
+            s.select_file(0, w, cx);
+            s.open_path("api/alias.txt".into(), w, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        let e = shark.read(cx).editor.as_ref().unwrap().read(cx);
+        e.path == "api/alias.txt" && e.input.read(cx).value().as_ref() == "alpha\n"
+    })
+    .await;
+    let alias = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| {
+            s.apply_workspace_edit(
+                edits(&root, "fixed", "other"),
+                Encoding::Utf16,
+                root.clone(),
+                Some(EditGuard::capture()),
+                None,
+                w,
+                cx,
+            );
+        })
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        alias.read(cx).dirty
+    })
+    .await;
+    cx.update(|cx| {
+        assert_eq!(alias.read(cx).input.read(cx).value().as_ref(), "fixed\n");
+        assert_eq!(
+            shark.read(cx).file_tabs.len(),
+            2,
+            "the alias must not acquire a second buffer"
+        );
+        assert_eq!(
+            std::fs::read_to_string(root.join("a.txt")).unwrap(),
+            "alpha\n"
+        );
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn jump_bar_folder_results_and_selection_stay_in_their_workspace(cx: &mut TestAppContext) {
+    let _guard = ui_tests::UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, window, shark) = fixture(cx).await;
+    let workspace = cx.update(|cx| shark.read(cx).active.clone());
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| {
+            s.select_file(0, w, cx);
+            s.folder_menu("api".into(), w, cx);
+            s.active = Some("different-workspace".into());
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        assert!(
+            !w.has_active_dialog(cx),
+            "a stale folder listing must not open a menu"
+        );
+        shark.update(cx, |s, cx| {
+            s.active = workspace;
+            s.folder_menu("api".into(), w, cx);
+        });
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |w, cx| {
+        w.has_active_dialog(cx)
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| {
+        // Keep a valid workspace while selecting the old menu: without the guard it opens b.txt.
+        shark.update(cx, |s, _| {
+            let mut other = s.active_ws().unwrap().clone();
+            other.name = "different-workspace".into();
+            s.state.workspaces.push(other);
+            s.active = Some("different-workspace".into());
+        });
+        w.render_frame(cx);
+        w.press("down", cx);
+        w.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(
+            shark.read(cx).editor.as_ref().unwrap().read(cx).path,
+            "api/a.txt"
+        )
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn retry_rediscovers_shared_editors_without_losing_unsaved_text(cx: &mut TestAppContext) {
+    let _guard = ui_tests::UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, window, shark) = fixture(cx).await;
+    std::fs::write(root.join("c.txt"), "charlie\n").unwrap();
+    let project = crate::lsp::tools::Project {
+        root: root.clone(),
+        worktree: root.clone(),
+        language_id: "python",
+        backend: crate::lsp::tools::Backend::Pyrefly,
+        toolchain: "original".into(),
+        rust_toolchain: None,
+        interpreter: None,
+    };
+    let session = |project: crate::lsp::tools::Project, cx: &mut Context<Shark>| {
+        let client = crate::lsp::client::Client::start(
+            std::process::Command::new("/usr/bin/true"),
+            &root,
+            serde_json::json!({}),
+        )
+        .unwrap();
+        cx.new(|_| crate::lsp::Session::with_client(project, client))
+    };
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| {
+            let shared = session(project.clone(), cx);
+            let mut other_project = project.clone();
+            other_project.toolchain = "unrelated".into();
+            let unrelated = session(other_project.clone(), cx);
+            let shared_sub = cx.subscribe(&shared, |_, _, _: &crate::lsp::SessionEvent, _| {});
+            let unrelated_sub =
+                cx.subscribe(&unrelated, |_, _, _: &crate::lsp::SessionEvent, _| {});
+            s.language_sessions
+                .insert(project.session_key(), (shared.downgrade(), shared_sub));
+            s.language_sessions.insert(
+                other_project.session_key(),
+                (unrelated.downgrade(), unrelated_sub),
+            );
+            let first = s.file_tabs[0].editor.clone();
+            let second = s.file_tabs[1].editor.clone();
+            let third = s.make_file_tab(
+                "api/c.txt".into(),
+                root.join("c.txt"),
+                Some("charlie\n".into()),
+                w,
+                cx,
+            );
+            let third_editor = third.editor.clone();
+            s.active_ws_mut()
+                .unwrap()
+                .open_tab(TabId::File("api/c.txt".into()));
+            s.file_tabs.push(third);
+            first.update(cx, |e, cx| {
+                e.attach_language(shared.clone(), w, cx);
+                e.replace_language_text("unsaved answer\n".into(), w, cx);
+                e.input
+                    .update(cx, |input, cx| input.set_selected_range(2..7, cx));
+            });
+            second.update(cx, |e, cx| e.attach_language(shared, w, cx));
+            third_editor.update(cx, |e, cx| e.attach_language(unrelated.clone(), w, cx));
+            s.editor = Some(first.clone());
+            let tabs = s.active_ws().unwrap().tab_order.clone();
+            s.restart_language(w, cx);
+            assert!(first.read(cx).intelligence.is_none());
+            assert!(second.read(cx).intelligence.is_none());
+            assert_eq!(
+                third_editor.read(cx).intelligence.as_ref().unwrap().session,
+                unrelated
+            );
+            assert!(!s.language_sessions.contains_key(&project.session_key()));
+            assert!(
+                s.language_sessions
+                    .contains_key(&other_project.session_key())
+            );
+            assert_eq!(
+                first.read(cx).input.read(cx).value().as_ref(),
+                "unsaved answer\n"
+            );
+            assert_eq!(first.read(cx).input.read(cx).selected_range(), 2..7);
+            assert!(first.read(cx).dirty);
+            assert_eq!(s.active_ws().unwrap().tab_order, tabs);
+            assert_eq!(
+                std::fs::read_to_string(root.join("a.txt")).unwrap(),
+                "alpha\n"
+            );
+            // Test builds skip discovery/startup; the tools fixture covers the new identity.
+            third_editor.update(cx, |e, _| e.intelligence = None);
+        });
+    })
+    .unwrap();
 }

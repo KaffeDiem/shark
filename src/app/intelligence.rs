@@ -21,10 +21,12 @@ pub(super) struct Visit {
 pub(super) struct History {
     pub(super) back: Vec<Visit>,
     pub(super) forward: Vec<Visit>,
+    request: u64,
 }
 
 struct Staged {
     path: PathBuf,
+    existing_path: Option<PathBuf>,
     relative: String,
     before: String,
     after: String,
@@ -90,9 +92,42 @@ impl Shark {
             .intelligence
             .as_ref()
             .map(|l| l.session.clone());
-        match session {
-            Some(session) => session.update(cx, |s, cx| s.restart(window, cx)),
-            None => self.start_language(&editor, window, cx),
+        let editors = if let Some(session) = session {
+            self.language_sessions
+                .retain(|_, (cached, _)| cached.upgrade().is_some_and(|cached| cached != session));
+            self.file_tabs
+                .iter()
+                .filter(|tab| {
+                    tab.editor
+                        .read(cx)
+                        .intelligence
+                        .as_ref()
+                        .is_some_and(|language| language.session == session)
+                })
+                .map(|tab| tab.editor.clone())
+                .collect::<Vec<_>>()
+        } else {
+            vec![editor]
+        };
+        // Retry discovers current environments and regroups every document that shared the server.
+        for editor in editors {
+            editor.update(cx, |e, cx| {
+                e.intelligence = None;
+                e.lsp_setup = None;
+                e.lsp_request = None;
+                e.lsp_error = None;
+                e.outline.clear();
+                e.crumbs.clear();
+                e.input.update(cx, |input, cx| {
+                    *input.lsp_mut() = Default::default();
+                    if let Some(diagnostics) = input.diagnostics_mut() {
+                        diagnostics.clear();
+                    }
+                    cx.notify();
+                });
+                cx.notify();
+            });
+            self.start_language(&editor, window, cx);
         }
     }
 
@@ -297,6 +332,9 @@ impl Shark {
     ) {
         match event {
             LanguageEvent::Navigate(locations, encoding, new_tab) => {
+                if self.editor.as_ref() != Some(editor) || self.tab != Tab::File {
+                    return;
+                }
                 self.pick_locations(locations.clone(), *encoding, *new_tab, window, cx)
             }
             LanguageEvent::Apply {
@@ -433,6 +471,8 @@ impl Shark {
         if locations.len() == 1 {
             return self.open_location(locations[0].clone(), encoding, true, new_tab, window, cx);
         }
+        let workspace = self.active.clone();
+        let editor = self.editor.clone();
         let items = locations
             .iter()
             .map(|l| {
@@ -452,6 +492,9 @@ impl Shark {
             items,
             0,
             move |s, ix, w, cx| {
+                if s.active != workspace || s.editor != editor {
+                    return;
+                }
                 s.open_location(locations[ix].clone(), encoding, true, new_tab, w, cx);
             },
             window,
@@ -474,24 +517,16 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let current = self.visit(cx);
         let target = if forward {
-            self.navigation.forward.pop()
+            self.navigation.forward.last().cloned()
         } else {
-            self.navigation.back.pop()
+            self.navigation.back.last().cloned()
         };
         let Some(target) = target else { return };
-        if let Some(current) = current {
-            if forward {
-                self.navigation.back.push(current);
-            } else {
-                self.navigation.forward.push(current);
-            }
-        }
         self.open_source(
             target.path.clone(),
             None,
-            Some(target),
+            Some((target, forward)),
             false,
             false,
             window,
@@ -544,6 +579,7 @@ impl Shark {
         let Some(target) = editor.read(cx).outline.get(ix).map(|s| s.target) else {
             return;
         };
+        self.navigation.request += 1;
         if let Some(old) = self.visit(cx) {
             self.navigation.back.push(old);
             self.navigation.forward.clear();
@@ -588,7 +624,7 @@ impl Shark {
         &mut self,
         path: PathBuf,
         range: Option<(lsp_types::Range, Encoding)>,
-        visit: Option<Visit>,
+        visit: Option<(Visit, bool)>,
         history: bool,
         new_tab: bool,
         window: &mut Window,
@@ -598,12 +634,18 @@ impl Shark {
         let workspace = self.active.clone();
         let directory = ws.dir();
         let roots: Vec<_> = ws.repos.iter().map(|r| directory.join(&r.name)).collect();
-        let old = history.then(|| self.visit(cx)).flatten();
+        let old = (history || visit.is_some())
+            .then(|| self.visit(cx))
+            .flatten();
+        let origin = self.editor.clone();
+        let origin_tab = self.tab;
         let open_paths: Vec<_> = self
             .file_tabs
             .iter()
             .map(|tab| tab.editor.read(cx).absolute_path().to_owned())
             .collect();
+        self.navigation.request += 1;
+        let request = self.navigation.request;
         cx.spawn_in(window, async move |this, cx| {
             let read = cx
                 .background_executor()
@@ -630,7 +672,11 @@ impl Shark {
                 })
                 .await;
             let _ = this.update_in(cx, |s, window, cx| {
-                if s.active != workspace {
+                if s.active != workspace
+                    || s.editor != origin
+                    || s.tab != origin_tab
+                    || s.navigation.request != request
+                {
                     return;
                 }
                 let (canonical, original, text, relative, existing_path) = match read {
@@ -681,7 +727,7 @@ impl Shark {
                     },
                     None => visit
                         .as_ref()
-                        .map(|v| {
+                        .map(|(v, _)| {
                             source.floor_char_boundary(v.selection.start.min(source.len()))
                                 ..source.floor_char_boundary(v.selection.end.min(source.len()))
                         })
@@ -724,7 +770,17 @@ impl Shark {
                         editor
                     }
                 };
-                if let Some(old) = old {
+                if let Some((_, forward)) = &visit {
+                    let (from, to) = if *forward {
+                        (&mut s.navigation.forward, &mut s.navigation.back)
+                    } else {
+                        (&mut s.navigation.back, &mut s.navigation.forward)
+                    };
+                    from.pop();
+                    if let Some(old) = old {
+                        to.push(old);
+                    }
+                } else if let Some(old) = old {
                     s.navigation.back.push(old);
                     s.navigation.forward.clear();
                 }
@@ -733,7 +789,7 @@ impl Shark {
                 editor.update(cx, |e, cx| {
                     e.input.update(cx, |i, cx| {
                         i.set_selected_range(selected, cx);
-                        if let Some(visit) = visit {
+                        if let Some((visit, _)) = visit {
                             i.set_scroll_offset(visit.scroll, cx);
                         }
                         i.focus(window, cx);
@@ -854,6 +910,7 @@ impl Shark {
                             );
                             Ok(Staged {
                                 path,
+                                existing_path: existing.map(|(path, ..)| path.clone()),
                                 relative,
                                 before,
                                 after,
@@ -883,7 +940,10 @@ impl Shark {
                             edit.relative
                         );
                         let existing = s.file_tabs.iter().find(|tab| {
-                            tab.editor.read(cx).absolute_path() == edit.path
+                            edit.existing_path
+                                .as_ref()
+                                .is_some_and(|path| tab.editor.read(cx).absolute_path() == path)
+                                || tab.editor.read(cx).absolute_path() == edit.path
                                 || tab.editor.read(cx).path == edit.relative
                         });
                         if let Some(tab) = existing {
@@ -904,7 +964,7 @@ impl Shark {
                             );
                         } else {
                             anyhow::ensure!(
-                                edit.version.is_none(),
+                                edit.existing_path.is_none() && edit.version.is_none(),
                                 "A target editor closed; request the edit again"
                             );
                         }
@@ -914,7 +974,10 @@ impl Shark {
                             continue;
                         }
                         let editor = match s.file_tabs.iter().find(|tab| {
-                            tab.editor.read(cx).absolute_path() == edit.path
+                            edit.existing_path
+                                .as_ref()
+                                .is_some_and(|path| tab.editor.read(cx).absolute_path() == path)
+                                || tab.editor.read(cx).absolute_path() == edit.path
                                 || tab.editor.read(cx).path == edit.relative
                         }) {
                             Some(tab) => tab.editor.clone(),

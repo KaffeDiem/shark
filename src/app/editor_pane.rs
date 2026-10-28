@@ -535,6 +535,7 @@ impl Shark {
     /// own list, a file opens in place of the current one.
     pub(super) fn folder_menu(&mut self, dir: String, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ws) = self.active_ws() else { return };
+        let workspace = self.active.clone();
         let abs = ws.dir().join(&dir);
         // The entry the open file sits under starts highlighted.
         let current = (self.editor.as_ref())
@@ -549,7 +550,10 @@ impl Shark {
                 .background_executor()
                 .spawn(async move { list_folder(&abs) })
                 .await;
-            let _ = this.update_in(cx, |_, window, cx| {
+            let _ = this.update_in(cx, |s, window, cx| {
+                if s.active != workspace {
+                    return;
+                }
                 let entries = match entries {
                     Ok(entries) if !entries.is_empty() => entries,
                     Ok(_) => return window.push_notification(format!("{dir} is empty"), cx),
@@ -571,6 +575,9 @@ impl Shark {
                     items,
                     selected,
                     move |s, ix, w, cx| {
+                        if s.active != workspace {
+                            return;
+                        }
                         let (folder, name) = &entries[ix];
                         let path = format!("{dir}/{name}");
                         match folder {

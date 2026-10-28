@@ -145,6 +145,7 @@ def exercise(language, command):
                 send("shutdown", None, 40)
                 response(40)
                 send("exit", None)
+                process.stdin.close()
                 process.wait(timeout=10)
                 assert process.returncode == 0, process.returncode
                 assert source.read_text() == initial, "smoke test unexpectedly changed the file on disk"

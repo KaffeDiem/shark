@@ -245,6 +245,7 @@ impl FileEditor {
             )
         };
         if language.generation != generation {
+            self.lsp_error = None;
             language.alive.store(false, Ordering::Release);
             let _guard = language.snapshot.lock().unwrap();
             if let Some(old) = language.client.take() {
@@ -454,7 +455,9 @@ impl FileEditor {
         });
         language.diagnostics[usize::from(companion)] =
             params.diagnostics.into_iter().map(Into::into).collect();
-        let combined: Vec<_> = language.diagnostics.iter().flatten().cloned().collect();
+        let mut combined: Vec<_> = language.diagnostics.iter().flatten().cloned().collect();
+        // GPUI's diagnostic tree requires document order, including across servers.
+        combined.sort_by_key(|d| (d.range.start, d.range.end));
         self.input.update(cx, |i, cx| {
             if let Some(diagnostics) = i.diagnostics_mut() {
                 diagnostics.clear();

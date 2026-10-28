@@ -206,7 +206,11 @@ async fn restored_files_switch_discard_retry_and_restart(cx: &mut TestAppContext
         .unwrap();
     fs::write(dir.join("api/unreadable"), "secret").unwrap();
     use std::os::unix::fs::{PermissionsExt, symlink};
-    fs::set_permissions(dir.join("api/unreadable"), fs::Permissions::from_mode(0)).unwrap();
+    fs::set_permissions(
+        dir.join("api/unreadable"),
+        fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
     fs::write(home.join("outside.txt"), "outside").unwrap();
     symlink(home.join("outside.txt"), dir.join("api/outside")).unwrap();
     for path in bad {
