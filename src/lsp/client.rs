@@ -5,7 +5,7 @@ use lsp_types::{InitializeResult, PositionEncodingKind, ServerCapabilities};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
-    io::BufReader,
+    io::{BufRead, BufReader, Read as _},
     path::Path,
     process::{Child, Command, Stdio},
     sync::{
@@ -19,15 +19,10 @@ use std::{
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
-
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Status {
-    Starting,
-    PreparingIndex,
-    Ready,
-    SetupNeeded(String),
-    Stopped,
-}
+/// Larger frames are treated as a corrupt header instead of being allocated.
+const MAX_FRAME: usize = 64 << 20;
+/// Enough of a crashed server's stderr to say why, without retaining project output.
+const STDERR_TAIL: usize = 2048;
 
 #[derive(Debug)]
 pub enum Event {
@@ -113,16 +108,10 @@ struct Handle {
     tx: mpsc::Sender<CommandMessage>,
     events: async_channel::Receiver<Event>,
     stopped: async_channel::Receiver<()>,
-    state: Arc<Mutex<State>>,
+    capabilities: Mutex<Option<ServerCapabilities>>,
     root: Value,
     settings: Value,
     next_token: AtomicU64,
-}
-
-struct State {
-    status: Status,
-    capabilities: Option<ServerCapabilities>,
-    progress: std::collections::HashSet<String>,
 }
 
 impl Drop for Handle {
@@ -190,19 +179,15 @@ impl Client {
         let stdout = child.stdout.take().expect("piped stdout");
         let mut stderr = child.stderr.take().expect("piped stderr");
         let (tx, rx) = mpsc::channel();
-        let (write_tx, write_rx) = mpsc::sync_channel::<Message>(32);
+        // Unbounded: a server busy on its main thread is not dead, and request timeouts still apply.
+        let (write_tx, write_rx) = mpsc::channel::<Message>();
         let (events_tx, events) = async_channel::unbounded();
         let (stopped_tx, stopped) = async_channel::bounded::<()>(1);
-        let state = Arc::new(Mutex::new(State {
-            status: Status::Starting,
-            capabilities: None,
-            progress: Default::default(),
-        }));
         let reader_tx = tx.clone();
         thread::spawn(move || {
             let mut reader = BufReader::new(stdout);
             loop {
-                match Message::read(&mut reader) {
+                match read_message(&mut reader) {
                     Ok(Some(message)) => {
                         if reader_tx.send(CommandMessage::Inbound(message)).is_err() {
                             break;
@@ -240,11 +225,27 @@ impl Client {
                 }
             }
         });
-        // Draining stderr avoids deadlock without retaining unbounded or sensitive project output.
+        // Draining stderr avoids deadlock; only a bounded tail is kept for the failure reason.
+        let stderr_tail = Arc::new(Mutex::new(Vec::new()));
+        let (stderr_done_tx, stderr_done) = mpsc::channel::<()>();
+        let tail = stderr_tail.clone();
         thread::spawn(move || {
-            let _ = std::io::copy(&mut stderr, &mut std::io::sink());
+            let _done = stderr_done_tx;
+            let mut chunk = [0; 4096];
+            loop {
+                match stderr.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(read) => {
+                        let mut tail = tail.lock().unwrap();
+                        tail.extend_from_slice(&chunk[..read]);
+                        let excess = tail.len().saturating_sub(STDERR_TAIL);
+                        tail.drain(..excess);
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
         });
-        let worker_state = state.clone();
         let worker_tx = tx.clone();
         let worker_settings = settings.clone();
         let root = json!({"uri":root_url.as_str(),"name":root.file_name().unwrap_or_default().to_string_lossy()});
@@ -256,9 +257,9 @@ impl Client {
                 worker_tx,
                 write_tx,
                 events_tx,
-                worker_state,
                 worker_settings,
                 worker_root,
+                (stderr_tail, stderr_done),
             );
             drop(stopped_tx);
         });
@@ -266,7 +267,7 @@ impl Client {
             tx,
             events,
             stopped,
-            state,
+            capabilities: Mutex::new(None),
             root,
             settings,
             next_token: AtomicU64::new(1),
@@ -288,12 +289,8 @@ impl Client {
         self.0.events.clone()
     }
 
-    pub fn status(&self) -> Status {
-        self.0.state.lock().unwrap().status.clone()
-    }
-
     pub fn capabilities(&self) -> Option<ServerCapabilities> {
-        self.0.state.lock().unwrap().capabilities.clone()
+        self.0.capabilities.lock().unwrap().clone()
     }
 
     pub fn encoding(&self) -> PositionEncodingKind {
@@ -336,15 +333,8 @@ impl Client {
             "initializationOptions":options,
             "trace":"off"
         });
-        let result = self.request("initialize", params).await;
         let result: InitializeResult =
-            match result.and_then(|v| serde_json::from_value(v).map_err(Into::into)) {
-                Ok(result) => result,
-                Err(error) => {
-                    self.0.state.lock().unwrap().status = Status::SetupNeeded(error.to_string());
-                    return Err(error);
-                }
-            };
+            serde_json::from_value(self.request("initialize", params).await?)?;
         let encoding = result
             .capabilities
             .position_encoding
@@ -362,18 +352,12 @@ impl Client {
                 encoding.as_str()
             );
         }
-        self.0.state.lock().unwrap().capabilities = Some(result.capabilities.clone());
+        *self.0.capabilities.lock().unwrap() = Some(result.capabilities.clone());
         self.notify("initialized", json!({}))?;
         self.notify(
             "workspace/didChangeConfiguration",
             json!({"settings":self.0.settings}),
         )?;
-        let mut state = self.0.state.lock().unwrap();
-        state.status = if state.progress.is_empty() {
-            Status::Ready
-        } else {
-            Status::PreparingIndex
-        };
         Ok(result)
     }
 
@@ -454,41 +438,65 @@ impl Client {
     }
 }
 
-// Never block the coordinator behind a stalled child: it must still cancel and reap it.
-struct Outbox {
-    tx: mpsc::SyncSender<Message>,
-    failed: std::cell::Cell<bool>,
-}
-impl Outbox {
-    fn send(&self, message: Message) -> Result<()> {
-        self.tx.try_send(message).map_err(|_| {
-            self.failed.set(true);
-            anyhow!("Language server stopped reading its input")
-        })
+/// `Message::read`, except that a corrupt length cannot make Shark allocate it.
+fn read_message(reader: &mut impl BufRead) -> std::io::Result<Option<Message>> {
+    let invalid = |error: String| std::io::Error::new(std::io::ErrorKind::InvalidData, error);
+    let mut size = None;
+    let mut line = String::new();
+    loop {
+        line.clear();
+        if reader.by_ref().take(4096).read_line(&mut line)? == 0 {
+            return Ok(None);
+        }
+        let header = line
+            .strip_suffix("\r\n")
+            .ok_or_else(|| invalid(format!("malformed header: {line:?}")))?;
+        if header.is_empty() {
+            break;
+        }
+        let (name, value) = header
+            .split_once(": ")
+            .ok_or_else(|| invalid(format!("malformed header: {header:?}")))?;
+        if name.eq_ignore_ascii_case("Content-Length") {
+            size = Some(value.parse::<usize>().map_err(|e| invalid(e.to_string()))?);
+        }
     }
+    let size = size.ok_or_else(|| invalid("no Content-Length".into()))?;
+    if size > MAX_FRAME {
+        return Err(invalid(format!("{size}-byte message exceeds the limit")));
+    }
+    let mut body = vec![0; size];
+    reader.read_exact(&mut body)?;
+    serde_json::from_slice(&body)
+        .map(Some)
+        .map_err(|e| invalid(format!("malformed LSP payload: {e}")))
 }
 
 fn coordinate(
     mut child: Child,
     rx: mpsc::Receiver<CommandMessage>,
     tx: mpsc::Sender<CommandMessage>,
-    writer: mpsc::SyncSender<Message>,
+    writer: mpsc::Sender<Message>,
     events: async_channel::Sender<Event>,
-    state: Arc<Mutex<State>>,
     settings: Value,
     root: Value,
+    (stderr, stderr_done): (Arc<Mutex<Vec<u8>>>, mpsc::Receiver<()>),
 ) {
-    let writer = Outbox {
-        tx: writer,
-        failed: std::cell::Cell::new(false),
-    };
     let mut queue: ReqQueue<Instant, Pending> = ReqQueue::default();
     let mut outgoing: HashMap<u64, (RequestId, Instant)> = HashMap::new();
     let mut incoming: HashMap<RequestId, Instant> = HashMap::new();
     let mut shutdown: Option<(RequestId, Instant)> = None;
     let mut reason = "Language server stopped".to_string();
     loop {
-        let command = rx.recv_timeout(Duration::from_millis(25));
+        // Sleep until the next deadline. The idle cap only bounds how late an exit is noticed
+        // when another process keeps the server's stdout open.
+        let wake = outgoing
+            .values()
+            .map(|(_, deadline)| *deadline)
+            .chain(incoming.values().map(|started| *started + REQUEST_TIMEOUT))
+            .chain(shutdown.as_ref().map(|(_, deadline)| *deadline))
+            .fold(Instant::now() + Duration::from_secs(1), Instant::min);
+        let command = rx.recv_timeout(wake.saturating_duration_since(Instant::now()));
         match command {
             Ok(CommandMessage::Request {
                 token,
@@ -508,9 +516,8 @@ fn coordinate(
                     },
                 );
                 outgoing.insert(token, (request.id.clone(), deadline));
-                if writer.send(request.into()).is_err() {
-                    break;
-                }
+                // A writer that stopped has already queued PipeClosed with its reason.
+                let _ = writer.send(request.into());
             }
             Ok(CommandMessage::Request { reply, .. }) => {
                 let _ = reply.try_send(Err(anyhow!("Language server is shutting down")));
@@ -607,26 +614,6 @@ fn coordinate(
                 }
             }
             Ok(CommandMessage::Inbound(Message::Notification(notification))) => {
-                if notification.method == "$/progress" {
-                    let key = notification.params["token"].to_string();
-                    let mut state = state.lock().unwrap();
-                    match notification.params["value"]["kind"].as_str() {
-                        Some("begin") => {
-                            state.progress.insert(key);
-                        }
-                        Some("end") => {
-                            state.progress.remove(&key);
-                        }
-                        _ => {}
-                    }
-                    if state.capabilities.is_some() {
-                        state.status = if state.progress.is_empty() {
-                            Status::Ready
-                        } else {
-                            Status::PreparingIndex
-                        };
-                    }
-                }
                 let _ = events.try_send(Event::Notification {
                     method: notification.method,
                     params: notification.params,
@@ -654,10 +641,6 @@ fn coordinate(
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => break,
             _ => {}
-        }
-        if writer.failed.get() {
-            reason = "Language server stopped reading its input".into();
-            break;
         }
         let now = Instant::now();
         let expired: Vec<_> = outgoing
@@ -712,18 +695,6 @@ fn coordinate(
             _ => {}
         }
     }
-    for (_, (id, _)) in outgoing {
-        if let Some(pending) = queue.outgoing.complete(id) {
-            let _ = pending.reply.try_send(Err(anyhow!(reason.clone())));
-        }
-    }
-    state.lock().unwrap().status = if shutdown.is_some() {
-        Status::Stopped
-    } else {
-        Status::SetupNeeded(reason.clone())
-    };
-    let _ = events.try_send(Event::Stopped(reason));
-    events.close();
     // Kill the dedicated process group: children may otherwise keep the pipes and threads alive.
     unsafe extern "C" {
         fn kill(pid: i32, signal: i32) -> i32;
@@ -734,6 +705,23 @@ fn coordinate(
     }
     let _ = child.kill();
     let _ = child.wait();
+    if shutdown.is_none() {
+        // The last stderr lines usually say why the server failed.
+        let _ = stderr_done.recv_timeout(Duration::from_millis(100));
+        let tail = String::from_utf8_lossy(&stderr.lock().unwrap())
+            .trim()
+            .to_string();
+        if !tail.is_empty() {
+            reason = format!("{reason}\n{tail}");
+        }
+    }
+    for (_, (id, _)) in outgoing {
+        if let Some(pending) = queue.outgoing.complete(id) {
+            let _ = pending.reply.try_send(Err(anyhow!(reason.clone())));
+        }
+    }
+    let _ = events.try_send(Event::Stopped(reason));
+    events.close();
 }
 
 fn configuration(settings: &Value, section: Option<&str>) -> Value {
