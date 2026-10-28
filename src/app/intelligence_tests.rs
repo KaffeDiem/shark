@@ -747,3 +747,93 @@ async fn vim_keys_open_the_outline_and_walk_the_jump_list(cx: &mut TestAppContex
     })
     .await;
 }
+
+// A folder in the jump bar lists its entries, folders first, starting at the open file;
+// picking a file opens it in place of the current one.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn jump_bar_folder_lists_its_files(cx: &mut TestAppContext) {
+    let _guard = ui_tests::UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, window, shark) = fixture(cx).await;
+    std::fs::create_dir(root.join("sub")).unwrap();
+    std::fs::write(root.join("c.txt"), "charlie\n").unwrap();
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| {
+            s.set_vim(false, cx);
+            s.select_file(0, w, cx);
+            s.folder_menu("api".into(), w, cx);
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    // sub/, a.txt (selected), b.txt, c.txt
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.press("down", cx);
+        w.press("down", cx);
+        w.press("enter", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark
+            .read(cx)
+            .editor
+            .as_ref()
+            .is_some_and(|e| e.read(cx).path == "api/c.txt")
+    })
+    .await;
+    cx.update(|cx| {
+        let tabs: Vec<_> = (shark.read(cx).file_tabs.iter())
+            .map(|t| t.editor.read(cx).path.clone())
+            .collect();
+        assert_eq!(tabs, ["api/c.txt", "api/b.txt"]);
+    });
+}
+
+// Code renders at 14px on 21px rows by default; cmd-=/cmd-- resize every open file and
+// persist, within the readable range.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn editor_text_size_defaults_to_research_values_and_steps(cx: &mut TestAppContext) {
+    let _guard = ui_tests::UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, window, shark) = fixture(cx).await;
+    let editors = cx.update(|cx| {
+        (shark.read(cx).file_tabs.iter())
+            .map(|t| t.editor.clone())
+            .collect::<Vec<_>>()
+    });
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| s.select_file(0, w, cx));
+        editors[0].update(cx, |e, cx| e.input.update(cx, |i, cx| i.focus(w, cx)));
+        w.render_frame(cx);
+    })
+    .unwrap();
+    let row =
+        |cx: &mut TestAppContext| cx.update(|cx| editors[0].read(cx).input.read(cx).line_height());
+    assert_eq!(row(cx), Some(px(21.)));
+    cx.update_window(window, |_, w, cx| {
+        w.press("cmd-=", cx);
+        w.press("cmd-=", cx);
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert_eq!(crate::editor::code_font(cx), (px(16.), px(24.)));
+        assert_eq!(shark.read(cx).state.editor_font_size, Some(16.));
+    });
+    assert_eq!(row(cx), Some(px(24.)));
+    cx.update_window(window, |_, w, cx| {
+        for _ in 0..20 {
+            w.press("cmd--", cx);
+        }
+    })
+    .unwrap();
+    cx.update(|cx| assert_eq!(crate::editor::code_font(cx).0, px(10.)));
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| s.step_editor_font(0., w, cx))
+    })
+    .unwrap();
+    cx.update(|cx| {
+        assert_eq!(crate::editor::code_font(cx), (px(14.), px(21.)));
+        assert_eq!(shark.read(cx).state.editor_font_size, None);
+    });
+}

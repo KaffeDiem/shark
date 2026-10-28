@@ -484,6 +484,36 @@ impl Shark {
         cx.notify();
     }
 
+    pub(super) fn editor_font_size(&self) -> f32 {
+        (self.state.editor_font_size)
+            .unwrap_or(crate::editor::FONT_SIZE)
+            .clamp(
+                *crate::editor::FONT_SIZES.start(),
+                *crate::editor::FONT_SIZES.end(),
+            )
+    }
+
+    /// Steps the code size of the file editors and the diff by `step` px; 0 resets it.
+    pub(super) fn step_editor_font(
+        &mut self,
+        step: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let size = match step {
+            0. => crate::editor::FONT_SIZE,
+            _ => (self.editor_font_size() + step).clamp(
+                *crate::editor::FONT_SIZES.start(),
+                *crate::editor::FONT_SIZES.end(),
+            ),
+        };
+        self.state.editor_font_size = (size != crate::editor::FONT_SIZE).then_some(size);
+        let _ = self.state.save();
+        cx.set_global(crate::editor::CodeFont(size));
+        cx.refresh_windows();
+        window.push_notification(format!("Editor text {size}px"), cx);
+    }
+
     /// Right-click menu of the open file: the file's entries, then Close file.
     pub(super) fn editor_menu(&self, cx: &mut Context<Self>) -> Vec<Entry> {
         let Some(e) = &self.editor else {
@@ -499,6 +529,61 @@ impl Shark {
             ),
         ]);
         entries
+    }
+
+    /// The entries of workspace folder `dir` (`repo/rel`), folders first; a folder opens its
+    /// own list, a file opens in place of the current one.
+    pub(super) fn folder_menu(&mut self, dir: String, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.active_ws() else { return };
+        let abs = ws.dir().join(&dir);
+        // The entry the open file sits under starts highlighted.
+        let current = (self.editor.as_ref())
+            .and_then(|e| {
+                let path = e.read(cx).path.clone();
+                let rest = path.strip_prefix(&format!("{dir}/"))?.to_string();
+                Some(rest.split('/').next()?.to_string())
+            })
+            .unwrap_or_default();
+        cx.spawn_in(window, async move |this, cx| {
+            let entries = cx
+                .background_executor()
+                .spawn(async move { list_folder(&abs) })
+                .await;
+            let _ = this.update_in(cx, |_, window, cx| {
+                let entries = match entries {
+                    Ok(entries) if !entries.is_empty() => entries,
+                    Ok(_) => return window.push_notification(format!("{dir} is empty"), cx),
+                    Err(error) => return notify_err(window, cx, format!("{dir}: {error}")),
+                };
+                let items = (entries.iter())
+                    .map(|(folder, name)| {
+                        let item = CommandItem::new().label(name.clone());
+                        match folder {
+                            true => item.icon(IconName::Folder),
+                            false => item.icon(IconName::File),
+                        }
+                    })
+                    .collect();
+                let selected = (entries.iter().position(|(_, n)| *n == current)).unwrap_or(0);
+                open_menu(
+                    cx.entity().downgrade(),
+                    "Open file…",
+                    items,
+                    selected,
+                    move |s, ix, w, cx| {
+                        let (folder, name) = &entries[ix];
+                        let path = format!("{dir}/{name}");
+                        match folder {
+                            true => s.folder_menu(path, w, cx),
+                            false => s.open_path(path, w, cx),
+                        }
+                    },
+                    window,
+                    cx,
+                );
+            });
+        })
+        .detach();
     }
 
     pub(super) fn render_editor(&self, cx: &mut Context<Self>) -> AnyElement {
@@ -527,6 +612,18 @@ impl Shark {
             .map(|&i| (i, e.outline[i].name.clone()))
             .collect();
         let vim_on = e.vim_on;
+        // Each folder of a workspace file lists its entries; a dependency outside the
+        // workspace shows its path as plain text.
+        let folders: Vec<(String, String)> = match e.external {
+            true => vec![],
+            false => (path.match_indices('/'))
+                .map(|(end, _)| {
+                    let dir = &path[..end];
+                    let label = dir.rsplit('/').next().unwrap_or(dir);
+                    (label.to_string(), dir.to_string())
+                })
+                .collect(),
+        };
         // `g t` works in Vim's Normal mode, where it types nothing.
         let normal =
             e.vim_on && e.vim.mode == crate::vim::Mode::Normal && e.vim.pending().is_empty();
@@ -615,13 +712,51 @@ impl Shark {
                                     this.show_menu(e.position, entries, w, cx);
                                 }),
                             )
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .text_color(theme.muted_foreground)
-                                    .child(dir),
-                            )
+                            .when(folders.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .min_w_0()
+                                        .truncate()
+                                        .text_color(theme.muted_foreground)
+                                        .child(dir),
+                                )
+                            })
+                            .when(!folders.is_empty(), |d| {
+                                d.child(
+                                    h_flex()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .text_color(theme.muted_foreground)
+                                        .children(folders.into_iter().enumerate().map(
+                                            |(ix, (label, dir))| {
+                                                h_flex()
+                                                    .flex_none()
+                                                    .child(
+                                                        div()
+                                                            .id(("folder", ix))
+                                                            .px_0p5()
+                                                            .rounded_sm()
+                                                            .cursor_pointer()
+                                                            .hover(|d| {
+                                                                d.bg(theme.secondary)
+                                                                    .text_color(theme.foreground)
+                                                            })
+                                                            .child(label)
+                                                            .on_click(cx.listener(
+                                                                move |s, _, w, cx| {
+                                                                    s.folder_menu(
+                                                                        dir.clone(),
+                                                                        w,
+                                                                        cx,
+                                                                    )
+                                                                },
+                                                            )),
+                                                    )
+                                                    .child("/")
+                                            },
+                                        )),
+                                )
+                            })
                             .child(div().flex_none().child(name))
                             // The symbols around the cursor; each opens the outline there.
                             .children(crumbs.into_iter().map(|(ix, label)| {
@@ -826,6 +961,19 @@ impl Shark {
             .child(div().flex_1().min_h_0().child(editor))
             .into_any_element()
     }
+}
+
+/// `(is folder, name)` for each entry but `.git`, folders first, by name.
+fn list_folder(dir: &Path) -> std::io::Result<Vec<(bool, String)>> {
+    let mut entries: Vec<(bool, String)> = std::fs::read_dir(dir)?
+        .filter_map(|e| {
+            let e = e.ok()?;
+            let name = e.file_name().into_string().ok()?;
+            (name != ".git").then(|| (e.path().is_dir(), name))
+        })
+        .collect();
+    entries.sort_by_key(|(folder, name)| (!folder, name.to_lowercase()));
+    Ok(entries)
 }
 
 /// Saved paths are untrusted; only regular UTF-8 text within a workspace repo is editable.

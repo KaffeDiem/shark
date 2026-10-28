@@ -798,8 +798,8 @@ impl Differ {
     }
 
     /// A code row's height.
-    fn row_height(&self, window: &Window, cx: &App) -> Pixels {
-        window.rem_size() * (f32::from(cx.theme().mono_font_size) / 16.) * 1.6
+    fn row_height(&self, _: &Window, cx: &App) -> Pixels {
+        crate::editor::code_font(cx).1
     }
 
     fn view_cap(&self, window: &Window, cx: &App) -> f32 {

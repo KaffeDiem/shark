@@ -31,6 +31,24 @@ pub enum EditorEvent {
     Language(LanguageEvent),
 }
 
+/// Code size and line height, from readability research (docs/editor-typography.md):
+/// 14px puts JetBrains Mono's x-height at about 0.15-0.17° at desk distance, nearer the
+/// 0.2° critical print size than 12.5px; 1.5× leading is WCAG's line spacing and a practical
+/// default between tight lines, which clearly hurt, and lost density.
+pub const FONT_SIZE: f32 = 14.;
+pub const FONT_SIZES: std::ops::RangeInclusive<f32> = 10.0..=24.0;
+pub const LINE_HEIGHT: f32 = 1.5;
+
+/// The saved code size (cmd-=/cmd--), shared by the file editor and the diff.
+pub struct CodeFont(pub f32);
+impl Global for CodeFont {}
+
+/// Code text size and its whole-pixel row height, for every view that shows code.
+pub fn code_font(cx: &App) -> (Pixels, Pixels) {
+    let size = cx.try_global::<CodeFont>().map_or(FONT_SIZE, |f| f.0);
+    (px(size), px((size * LINE_HEIGHT).round()))
+}
+
 pub struct FileEditor {
     /// Diff path, `repo/rel/path`.
     pub path: String,
@@ -656,6 +674,7 @@ pub(crate) fn vim_key(ks: &Keystroke) -> Option<String> {
 
 impl Render for FileEditor {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let (size, row) = code_font(cx);
         // A key after a pending prefix that completes no binding (`ctrl-w j`) skips interceptors;
         // it arrives here once nothing is pending. Keys the interceptor handled never bubble here,
         // and the ones it declined decline again.
@@ -678,7 +697,9 @@ impl Render for FileEditor {
                 Editor::new(&self.input)
                     .readonly(self.readonly())
                     .appearance(false)
-                    .h_full(),
+                    .h_full()
+                    .text_size(size)
+                    .line_height(row),
             )
     }
 }

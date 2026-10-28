@@ -649,24 +649,26 @@ impl Differ {
         let (path, line, input) = (e.path.clone(), e.buf.line + 1, e.input.clone());
         let mono = cx.theme().mono_font_family.clone();
         let shark = cx.entity().downgrade();
-        diff.render_working_cell(move |p, l, window, cx| {
+        diff.render_working_cell(move |p, l, _, cx| {
             (*p == path && l == line).then(|| {
                 let shark = shark.clone();
                 // ponytail: the edited line is plain text, no syntax colors; a highlighted copy
                 // behind transparent input text drifts once the input scrolls a long line.
                 // The code's font and size, without the input's padding: the text stays put.
-                let size = window.rem_size() * (f32::from(cx.theme().mono_font_size) / 16.);
+                let (size, row) = crate::editor::code_font(cx);
                 div()
                     .key_context("InlineEdit")
                     .w_full()
-                    .h(size * 1.6)
+                    .h(row)
                     .child(
                         Input::new(&input)
                             .appearance(false)
                             .xsmall()
                             .p_0()
-                            .h(size * 1.6)
-                            .line_height(size * 1.6)
+                            // Input's own `h` sizes only multi-line inputs; pin the row height.
+                            .min_h(row)
+                            .max_h(row)
+                            .line_height(row)
                             .text_size(size)
                             .font_family(mono.clone())
                             .on_paste(move |item, window, cx| {

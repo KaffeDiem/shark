@@ -133,6 +133,9 @@ actions!(
         NavigationBack,
         NavigationForward,
         RestartLanguage,
+        EditorFontBigger,
+        EditorFontSmaller,
+        EditorFontReset,
     ]
 );
 
@@ -270,6 +273,9 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("ctrl--", NavigationBack, Some("FileEditor")),
         KeyBinding::new("ctrl-shift--", NavigationForward, Some("FileEditor")),
         KeyBinding::new("cmd-w", CloseFile, Some("FileEditor")),
+        KeyBinding::new("cmd-=", EditorFontBigger, Some("FileEditor || DiffPane")),
+        KeyBinding::new("cmd-+", EditorFontBigger, Some("FileEditor || DiffPane")),
+        KeyBinding::new("cmd--", EditorFontSmaller, Some("FileEditor || DiffPane")),
         KeyBinding::new("cmd-t", NewChat, None),
         KeyBinding::new("cmd-w", CloseTab, None),
         KeyBinding::new("cmd-shift-t", ReopenChat, None),

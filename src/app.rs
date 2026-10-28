@@ -153,6 +153,12 @@ impl Shark {
         let mut state = State::load();
         crate::prompts::set_overrides(&state.prompts);
         crate::settings::apply(&state.appearance, cx);
+        if let Some(size) = state.editor_font_size {
+            cx.set_global(crate::editor::CodeFont(size.clamp(
+                *crate::editor::FONT_SIZES.start(),
+                *crate::editor::FONT_SIZES.end(),
+            )));
+        }
         let sidebar_focus = cx.focus_handle();
         sidebar_focus.focus(window, cx);
         let backup = state.corrupt_backup.take();
@@ -1003,6 +1009,11 @@ impl Render for Shark {
                 cx.listener(|s, _: &NavigationForward, w, cx| s.navigate_history(true, w, cx)),
             )
             .on_action(cx.listener(|s, _: &RestartLanguage, w, cx| s.restart_language(w, cx)))
+            .on_action(cx.listener(|s, _: &EditorFontBigger, w, cx| s.step_editor_font(1., w, cx)))
+            .on_action(
+                cx.listener(|s, _: &EditorFontSmaller, w, cx| s.step_editor_font(-1., w, cx)),
+            )
+            .on_action(cx.listener(|s, _: &EditorFontReset, w, cx| s.step_editor_font(0., w, cx)))
             .on_action(
                 cx.listener(|this, _: &EditWorkingCopy, w, cx| this.edit_working_copy(None, w, cx)),
             )

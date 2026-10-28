@@ -16,7 +16,7 @@ message is in the tooltip) and a progress bar under the header, indeterminate un
 percentage arrives. Retry/restart uses the same selected backend.
 
 The header is a jump bar: back/forward buttons, the file path, then the symbols around
-the cursor. Click a symbol to open the file's outline as an indented tree with that
+the cursor. Click a folder to list its files and folders, or a symbol to open the file's outline as an indented tree with that
 symbol selected. Command-click follows a definition in the current tab, replacing a
 clean file (back restores it); Command-Shift-click opens a new tab. A file with unsaved
 edits is never replaced. The mouse's back/forward buttons walk the same history.

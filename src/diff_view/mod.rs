@@ -18,6 +18,7 @@
 //!   background), `Diff::accent_working` (2 px primary left border on that file's modified
 //!   column) and `Diff::annotation_hints` (muted text in the other column's gap beside a line
 //!   annotation).
+//! - `Diff::code_font` (text size and row height in place of the theme's mono size × 1.6).
 //! - `DiffState::replace_file` swaps one file by path and splices its rows, keeping scroll,
 //!   folds and the other files' state, and the old syntax/inline emphasis until the new one is
 //!   prepared, so colors don't flash per keystroke. `show_line` expands the fold hiding a line
@@ -275,6 +276,7 @@ pub struct Diff {
     working_cell: Option<WorkingCell>,
     accent: Option<SharedString>,
     annotation_hints: Option<[SharedString; 2]>,
+    code_font: Option<(Pixels, Pixels)>,
 }
 
 fn file_renderer<F, E>(render: F) -> FileRenderer
@@ -308,7 +310,14 @@ impl Diff {
             working_cell: None,
             accent: None,
             annotation_hints: None,
+            code_font: None,
         }
+    }
+    /// Code text size and row height. Default is the theme's mono size (scaled by rem/16) on
+    /// rows 1.6 times as tall.
+    pub fn code_font(mut self, size: Pixels, row_height: Pixels) -> Self {
+        self.code_font = Some((size, row_height));
+        self
     }
     /// Shows the original and modified line-number lanes. Default is true.
     pub fn line_number(mut self, value: bool) -> Self {
@@ -550,9 +559,11 @@ fn render_diff(
     state.set_window(window.window_handle().window_id());
     state.ensure_presentation(cx);
     let rem = window.rem_size();
-    let font_size = rem * (f32::from(cx.theme().mono_font_size) / 16.);
+    let (font_size, row_height) = props.code_font.unwrap_or_else(|| {
+        let size = rem * (f32::from(cx.theme().mono_font_size) / 16.);
+        (size, size * 1.6)
+    });
     let font_family = cx.theme().mono_font_family.clone();
-    let row_height = font_size * 1.6;
     let digits = state
         .files()
         .iter()

@@ -697,6 +697,27 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| s.toggle_tree(w, cx),
     ),
     Row(
+        "Editor text bigger",
+        IconName::Plus,
+        Some(&EditorFontBigger),
+        "font size zoom in larger",
+        |s, w, cx| s.step_editor_font(1., w, cx),
+    ),
+    Row(
+        "Editor text smaller",
+        IconName::Minus,
+        Some(&EditorFontSmaller),
+        "font size zoom out",
+        |s, w, cx| s.step_editor_font(-1., w, cx),
+    ),
+    Row(
+        "Reset editor text size",
+        IconName::RefreshCw,
+        Some(&EditorFontReset),
+        "font size zoom default",
+        |s, w, cx| s.step_editor_font(0., w, cx),
+    ),
+    Row(
         "Toggle Vim mode",
         IconName::Keyboard,
         Some(&ToggleVim),
