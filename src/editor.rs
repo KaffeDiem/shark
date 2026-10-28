@@ -121,7 +121,7 @@ impl FileEditor {
                     this.lsp_request = None;
                     this.language_changed();
                     this.dirty = true;
-                    this.snippet_changed(cx);
+                    this.snippet_changed(window, cx);
                     this.sync_language(window, cx);
                     cx.notify();
                 }

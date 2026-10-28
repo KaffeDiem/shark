@@ -187,12 +187,12 @@ impl CompletionProvider for Provider {
                 CompletionResponse::Array(items) => items,
                 CompletionResponse::List(list) => list.items,
             };
-            if this
+            let resolves = this
                 .client
                 .capabilities()
                 .and_then(|c| c.completion_provider)
-                .is_some_and(|p| p.resolve_provider == Some(true))
-            {
+                .is_some_and(|p| p.resolve_provider == Some(true));
+            if resolves {
                 // shortcut: resolve the first items before showing the menu; resolve only the accepted item once GPUI exposes an accepted-item hook.
                 let resolved = Arc::new(Mutex::new(vec![]));
                 let tasks: Vec<_> = eager_resolve(&items)
@@ -235,7 +235,17 @@ impl CompletionProvider for Provider {
                     items
                         .into_iter()
                         .filter_map(|item| {
-                            prepare_completion(&snapshot, &lines, offset, item, encoding).ok()
+                            // The editor resolves an accepted unresolved item for its imports.
+                            let original = (resolves && eager_candidate(&item))
+                                .then(|| serde_json::to_value(&item).ok())
+                                .flatten();
+                            let mut item =
+                                prepare_completion(&snapshot, &lines, offset, item, encoding)
+                                    .ok()?;
+                            if let (Some(original), Some(data)) = (original, item.data.as_mut()) {
+                                data["sharkResolve"] = original;
+                            }
+                            Some(item)
                         })
                         .collect()
                 })
@@ -467,9 +477,14 @@ impl CodeActionProvider for Provider {
 /// The first data-carrying items in menu order, which resolution may give auto-import edits.
 fn eager_resolve(items: &[CompletionItem]) -> Vec<usize> {
     (0..items.len())
-        .filter(|&i| items[i].data.is_some() && items[i].additional_text_edits.is_none())
+        .filter(|&i| eager_candidate(&items[i]))
         .take(EAGER_RESOLVE)
         .collect()
+}
+
+/// Servers may defer `additionalTextEdits` (auto-imports) to resolve for items carrying data.
+fn eager_candidate(item: &CompletionItem) -> bool {
+    item.data.is_some() && item.additional_text_edits.is_none()
 }
 
 /// Fold auto-imports and snippet defaults into GPUI's single undoable completion edit.

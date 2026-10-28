@@ -162,6 +162,9 @@ impl Watcher {
                 // Wake promptly when the last editor closes or registrations change.
                 let _ = wait.recv_timeout(POLL);
             }
+            // The last walk can hold the whole tree; nothing frees it once watching stops.
+            (RECENT.lock().unwrap_or_else(|poison| poison.into_inner()))
+                .retain(|(path, started, _)| *path != worker_root && started.elapsed() < POLL);
         });
         Ok(Self {
             root,
@@ -371,10 +374,11 @@ fn snapshot(
     Ok(trees)
 }
 
+// ponytail: one lock serializes walks of different worktrees; lock per root if that shows up.
+static RECENT: Mutex<Vec<(PathBuf, Instant, Arc<Tree>)>> = Mutex::new(Vec::new());
+
 /// Watchers of one worktree (a server and its companion, or several sessions) share a walk per poll.
 fn shared_walk(root: &Path, fresh: bool, stop: &AtomicBool) -> Result<Arc<Tree>> {
-    // ponytail: one lock serializes walks of different worktrees; lock per root if that shows up.
-    static RECENT: Mutex<Vec<(PathBuf, Instant, Arc<Tree>)>> = Mutex::new(Vec::new());
     let mut recent = RECENT.lock().unwrap_or_else(|poison| poison.into_inner());
     recent.retain(|(path, started, _)| !(fresh && path == root) && started.elapsed() < POLL);
     if let Some((_, _, tree)) = recent.iter().find(|(path, ..)| path == root) {

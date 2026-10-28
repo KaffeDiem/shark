@@ -8,6 +8,8 @@ use std::ops::Range;
 pub(super) struct Snippets {
     active: Option<Session>,
     accepted: Option<(i32, u64)>,
+    /// Resolves the last accepted item's imports; a newer acceptance or closing cancels it.
+    pub(super) resolve: Option<Task<()>>,
 }
 
 struct Session {
@@ -17,9 +19,9 @@ struct Session {
 }
 
 impl FileEditor {
-    pub(super) fn snippet_changed(&mut self, cx: &mut Context<Self>) {
+    pub(super) fn snippet_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A snippet completion accepted inside an active field replaces the outer session.
-        if self.snippet_accepted(cx) {
+        if self.snippet_accepted(window, cx) {
             return;
         }
         let Some(session) = self.snippets.active.as_mut() else {
@@ -32,23 +34,28 @@ impl FileEditor {
 
     /// Starts the tabstops of the completion this change accepted, if any. GPUI keeps the last
     /// menu's items after it closes, so this runs on every change: check metadata before text.
-    fn snippet_accepted(&mut self, cx: &mut Context<Self>) -> bool {
+    fn snippet_accepted(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let Some(language) = &self.intelligence else {
             return false;
         };
         let snapshot = language.snapshot.lock().unwrap().clone();
         let input = self.input.read(cx);
         let len = input.text().len();
-        let metadata: Vec<CompletionMeta> = input
+        let metadata: Vec<(CompletionMeta, Option<serde_json::Value>)> = input
             .completion_menu_state()
             .items
             .iter()
             .filter_map(|item| {
-                let m = item.data.as_ref()?.get("sharkCompletion")?;
-                (m["version"] == snapshot.version && m["len"] == len)
-                    .then(|| CompletionMeta::deserialize(m).ok())?
+                let data = item.data.as_ref()?;
+                let m = data.get("sharkCompletion")?;
+                (m["version"] == snapshot.version && m["len"] == len).then(|| {
+                    Some((
+                        CompletionMeta::deserialize(m).ok()?,
+                        data.get("sharkResolve").cloned(),
+                    ))
+                })?
             })
-            .filter(|m| self.snippets.accepted != Some((m.version, m.fingerprint)))
+            .filter(|(m, _)| self.snippets.accepted != Some((m.version, m.fingerprint)))
             .collect();
         if metadata.is_empty() {
             return false;
@@ -58,7 +65,7 @@ impl FileEditor {
             len.checked_sub(m.end)
                 .and_then(|n| snapshot.text.len().checked_sub(n))
         };
-        let Some(completion) = metadata.into_iter().find(|m| {
+        let Some((completion, resolve)) = metadata.into_iter().find(|(m, _)| {
             text.get(m.start..m.end)
                 .is_some_and(|span| fingerprint(span.as_bytes()) == m.fingerprint)
                 && snapshot.text.get(..m.start) == text.get(..m.start)
@@ -67,6 +74,9 @@ impl FileEditor {
             return false;
         };
         self.snippets.accepted = Some((completion.version, completion.fingerprint));
+        if let Some(item) = resolve {
+            self.resolve_accepted(item, snapshot.text.clone(), completion.start, window, cx);
+        }
         // A plain completion typed into a field is an edit of that field; a snippet replaces it.
         if !(completion.tabstops.is_empty()
             && self
@@ -111,6 +121,51 @@ impl FileEditor {
             }
         }
         true
+    }
+
+    /// GPUI has no accepted-item hook, so an item shown unresolved gets its auto-imports after
+    /// acceptance, as a second undo step.
+    fn resolve_accepted(
+        &mut self,
+        item: serde_json::Value,
+        before: std::sync::Arc<str>,
+        start: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(client) = self.intelligence.as_ref().and_then(|l| l.client.clone()) else {
+            return;
+        };
+        let encoding = client.encoding().into();
+        self.snippets.resolve = Some(cx.spawn_in(window, async move |this, cx| {
+            let Ok(response) = client.request("completionItem/resolve", item).await else {
+                return;
+            };
+            let Some(edits) = serde_json::from_value::<lsp_types::CompletionItem>(response)
+                .ok()
+                .and_then(|item| item.additional_text_edits)
+            else {
+                return;
+            };
+            let _ = this.update_in(cx, |e, window, cx| {
+                e.apply_completion_imports(&before, start, &edits, encoding, window, cx)
+            });
+        }));
+    }
+
+    pub(super) fn apply_completion_imports(
+        &mut self,
+        before: &str,
+        start: usize,
+        edits: &[lsp_types::TextEdit],
+        encoding: crate::lsp::document::Encoding,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let now = self.input.read(cx).value().to_string();
+        if let Some(text) = completion_imports(before, &now, start, edits, encoding) {
+            self.replace_language_text(text, window, cx);
+        }
     }
 
     fn select_snippet(&self, cx: &mut Context<Self>) {
@@ -278,6 +333,36 @@ impl Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[::core::prelude::v1::test]
+    fn resolved_imports_apply_only_before_the_accepted_span_with_an_unchanged_prefix() {
+        use lsp_types::{Position, Range, TextEdit};
+        let utf16 = crate::lsp::document::Encoding::Utf16;
+        let at = |line, character, text: &str| {
+            TextEdit::new(
+                Range::new(
+                    Position::new(line, character),
+                    Position::new(line, character),
+                ),
+                text.into(),
+            )
+        };
+        let before = "# 😀\nsq";
+        let import = [at(0, 0, "import m\n")];
+        assert_eq!(
+            completion_imports(before, "# 😀\nsqrt(x)", 7, &import, utf16).as_deref(),
+            Some("import m\n# 😀\nsqrt(x)")
+        );
+        // An edit after the accepted span, or a changed prefix, has no known position.
+        assert_eq!(
+            completion_imports(before, "# 😀\nsqrt", 7, &[at(1, 2, "!")], utf16),
+            None
+        );
+        assert_eq!(
+            completion_imports(before, "x# 😀\nsqrt", 7, &[at(0, 4, "!")], utf16),
+            None
+        );
+    }
+
     #[::core::prelude::v1::test]
     fn tabstops_follow_unicode_and_mirrored_edits() {
         let mut session = Session {
@@ -463,4 +548,35 @@ mod tests {
             ]
         );
     }
+}
+
+/// Applies import edits computed against `before` to `now` when they all precede the accepted
+/// span at `start` and that prefix is unchanged; otherwise their positions are unknown.
+pub(super) fn completion_imports(
+    before: &str,
+    now: &str,
+    start: usize,
+    edits: &[lsp_types::TextEdit],
+    encoding: crate::lsp::document::Encoding,
+) -> Option<String> {
+    let lines = crate::lsp::document::Lines::new(before);
+    let mut ranges = (edits.iter())
+        .map(|e| {
+            let from = lines.offset(e.range.start, encoding).ok()?;
+            Some((from, lines.offset(e.range.end, encoding).ok()?, &e.new_text))
+        })
+        .collect::<Option<Vec<_>>>()?;
+    ranges.sort_by_key(|&(from, ..)| from);
+    let end = ranges.iter().map(|&(_, to, _)| to).max()?;
+    if end > start
+        || ranges.windows(2).any(|w| w[0].1 > w[1].0)
+        || before.get(..end)? != now.get(..end)?
+    {
+        return None;
+    }
+    let mut text = now.to_string();
+    for (from, to, new) in ranges.into_iter().rev() {
+        text.replace_range(from..to, new);
+    }
+    Some(text)
 }

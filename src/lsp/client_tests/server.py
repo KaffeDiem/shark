@@ -52,6 +52,8 @@ with open(log_path, "a") as log:
             else:
                 respond(message, text)
             send(dict(method="textDocument/publishDiagnostics", params=dict(uri=params["textDocument"]["uri"], version=2, diagnostics=[])))
+        elif method == "completionItem/resolve" and params["data"].get("token") == "silent":
+            pass  # A GPUI test must not be woken from the client's thread.
         elif method == "completionItem/resolve":
             assert params["data"]["token"] == "math.sqrt"
             params["additionalTextEdits"] = [dict(range=dict(start=dict(line=0, character=0), end=dict(line=0, character=0)), newText="from math import sqrt\n")]

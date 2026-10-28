@@ -574,6 +574,120 @@ async fn completion_acceptance_applies_autoimport_snippet_mirrors_and_undo(
     let _ = fs::remove_dir_all(dir);
 }
 
+// The menu shows most items unresolved; accepting one resolves it and adds its import.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn accepting_an_unresolved_completion_adds_its_import_as_a_second_undo_step(
+    cx: &mut TestAppContext,
+) {
+    let _turn = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::lsp::{document::Encoding, providers::prepare_completion};
+    use lsp_types::{CompletionItem, CompletionTextEdit, Position, Range, TextEdit};
+    let initial = "# resolve-completion\nsq";
+    let (dir, _, window, editor) = open_editor("resolve-accept", initial, cx).await;
+    let client = fake_client(&dir, &dir.join("peer.jsonl"));
+    peer_wait(client.initialize()).unwrap();
+    let project = Project {
+        root: dir.clone(),
+        worktree: dir.clone(),
+        language_id: "python",
+        backend: Backend::Pyrefly,
+        toolchain: String::new(),
+        interpreter: None,
+        rust_toolchain: None,
+    };
+    let session = cx.update(|cx| cx.new(|_| Session::with_client(project, client.clone())));
+    cx.update_window(window, |_, w, cx| {
+        editor.update(cx, |e, cx| {
+            e.set_vim(false, cx);
+            e.attach_language(session.clone(), w, cx);
+        })
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        (editor.read(cx).intelligence.as_ref()).is_some_and(|l| {
+            l.client.is_some() && l.snapshot.lock().unwrap().text.as_ref() == initial
+        })
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| {
+        editor.update(cx, |e, cx| {
+            let snapshot = (e.intelligence.as_ref().unwrap().snapshot.lock().unwrap()).clone();
+            let item = CompletionItem {
+                label: "sqrt".into(),
+                data: Some(serde_json::json!({"token":"silent"})),
+                text_edit: Some(CompletionTextEdit::Edit(TextEdit::new(
+                    Range::new(Position::new(1, 0), Position::new(1, 2)),
+                    "sqrt".into(),
+                ))),
+                ..Default::default()
+            };
+            let original = serde_json::to_value(&item).unwrap();
+            let lines = crate::lsp::document::Lines::new(&snapshot.text);
+            let mut item =
+                prepare_completion(&snapshot, &lines, initial.len(), item, Encoding::Utf16)
+                    .unwrap();
+            // What the completion provider attaches to an item it showed unresolved.
+            item.data.as_mut().unwrap()["sharkResolve"] = original;
+            e.input.update(cx, |input, cx| {
+                input.set_selected_range(initial.len()..initial.len(), cx);
+                input.present_completion_items(initial.len() - 2, "sq", vec![item.clone()], cx);
+                input.insert_completion(&item, initial.len() - 2..initial.len(), w, cx);
+            });
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let log = dir.join("peer.jsonl");
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    while !(messages(&log).iter()).any(|m| {
+        m["method"] == "completionItem/resolve" && m["params"]["data"]["token"] == "silent"
+    }) {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the accepted item was not resolved"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // The resolve reply's import, applied as the response handler does.
+    cx.update_window(window, |_, w, cx| {
+        editor.update(cx, |e, cx| {
+            let import = TextEdit::new(
+                Range::new(Position::new(0, 0), Position::new(0, 0)),
+                "from math import sqrt\n".into(),
+            );
+            e.apply_completion_imports(
+                initial,
+                initial.len() - 2,
+                &[import],
+                Encoding::Utf16,
+                w,
+                cx,
+            )
+        })
+    })
+    .unwrap();
+    let imported = "from math import sqrt\n# resolve-completion\nsqrt";
+    cx.update(|cx| {
+        assert_eq!(editor.read(cx).input.read(cx).value().as_ref(), imported);
+        // Cancel the unanswered resolve so terminating the server cannot wake it.
+        editor.update(cx, |e, _| e.snippets.resolve = None);
+    });
+    cx.update_window(window, |_, w, cx| w.press("cmd-z", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(
+            editor.read(cx).input.read(cx).value().as_ref(),
+            "# resolve-completion\nsqrt"
+        )
+    });
+    client.terminate();
+    let _ = fs::remove_dir_all(dir);
+}
+
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn snippet_completion_inside_an_active_field_starts_its_own_tabstops(
