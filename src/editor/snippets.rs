@@ -1,6 +1,7 @@
 //! Tabstops use the editor's selections, including multiple selections for mirrored fields.
 use super::*;
-use serde::Deserialize;
+use crate::lsp::document::{CompletionMeta, Stop, tab_order as order};
+use serde::Deserialize as _;
 use std::ops::Range;
 
 #[derive(Default)]
@@ -15,77 +16,65 @@ struct Session {
     index: u32,
 }
 
-#[derive(Clone, Deserialize, Debug, PartialEq, Eq)]
-struct Stop {
-    index: u32,
-    start: usize,
-    end: usize,
-}
-
-#[derive(Deserialize)]
-struct Completion {
-    version: i32,
-    fingerprint: u64,
-    cursor: usize,
-    tabstops: Vec<Stop>,
-}
-
 impl FileEditor {
     pub(super) fn snippet_changed(&mut self, cx: &mut Context<Self>) {
-        if self.snippets.active.is_none()
-            && !self
-                .input
-                .read(cx)
-                .completion_menu_state()
-                .items
-                .iter()
-                .any(|item| {
-                    item.data
-                        .as_ref()
-                        .is_some_and(|data| data.get("sharkCompletion").is_some())
-                })
-        {
+        // A completion accepted inside an active field replaces the outer session.
+        if self.snippet_accepted(cx) {
             return;
         }
-        let text = self.input.read(cx).value().to_string();
-        if let Some(session) = self.snippets.active.as_mut() {
-            if !session.changed(&text) {
-                self.snippets.active = None;
-            }
-            return;
-        }
-        let Some(language) = &self.intelligence else {
+        let Some(session) = self.snippets.active.as_mut() else {
             return;
         };
-        let version = language.snapshot.lock().unwrap().version;
-        let metadata: Vec<Completion> = self
-            .input
-            .read(cx)
+        if !session.changed(&self.input.read(cx).value()) {
+            self.snippets.active = None;
+        }
+    }
+
+    /// Starts the tabstops of the completion this change accepted, if any. GPUI keeps the last
+    /// menu's items after it closes, so this runs on every change: check metadata before text.
+    fn snippet_accepted(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(language) = &self.intelligence else {
+            return false;
+        };
+        let snapshot = language.snapshot.lock().unwrap().clone();
+        let input = self.input.read(cx);
+        let len = input.text().len();
+        let metadata: Vec<CompletionMeta> = input
             .completion_menu_state()
             .items
             .iter()
             .filter_map(|item| {
-                serde_json::from_value(item.data.as_ref()?.get("sharkCompletion")?.clone()).ok()
+                let m = item.data.as_ref()?.get("sharkCompletion")?;
+                (m["version"] == snapshot.version && m["len"] == len)
+                    .then(|| CompletionMeta::deserialize(m).ok())?
             })
-            .filter(|m: &Completion| {
-                m.version == version && self.snippets.accepted != Some((m.version, m.fingerprint))
-            })
+            .filter(|m| self.snippets.accepted != Some((m.version, m.fingerprint)))
             .collect();
         if metadata.is_empty() {
-            return;
+            return false;
         }
-        let fp = fingerprint(text.as_bytes());
-        let Some(completion) = metadata.into_iter().find(|m| m.fingerprint == fp) else {
-            return;
+        let text = input.value();
+        let tail = |m: &CompletionMeta| {
+            len.checked_sub(m.end)
+                .and_then(|n| snapshot.text.len().checked_sub(n))
         };
-        self.snippets.accepted = Some((version, fp));
+        let Some(completion) = metadata.into_iter().find(|m| {
+            text.get(m.start..m.end)
+                .is_some_and(|span| fingerprint(span.as_bytes()) == m.fingerprint)
+                && snapshot.text.get(..m.start) == text.get(..m.start)
+                && tail(m).and_then(|t| snapshot.text.get(t..)) == text.get(m.end..)
+        }) else {
+            return false;
+        };
+        self.snippets.accepted = Some((completion.version, completion.fingerprint));
+        self.snippets.active = None;
         if completion.tabstops.iter().any(|s| {
             s.start > s.end
                 || s.end > text.len()
                 || !text.is_char_boundary(s.start)
                 || !text.is_char_boundary(s.end)
         }) {
-            return;
+            return true;
         }
         let index = completion
             .tabstops
@@ -95,7 +84,7 @@ impl FileEditor {
         match index {
             Some(index) => {
                 self.snippets.active = Some(Session {
-                    text,
+                    text: text.to_string(),
                     stops: completion.tabstops,
                     index,
                 });
@@ -112,6 +101,7 @@ impl FileEditor {
                 }
             }
         }
+        true
     }
 
     fn select_snippet(&self, cx: &mut Context<Self>) {
@@ -139,7 +129,7 @@ impl FileEditor {
         let Some(session) = self.snippets.active.as_mut() else {
             return false;
         };
-        if self.input.read(cx).value().as_ref() != session.text {
+        if *self.input.read(cx).text() != *session.text {
             self.snippets.active = None;
             return false;
         }
@@ -190,10 +180,6 @@ impl FileEditor {
         }
         true
     }
-}
-
-fn order(index: u32) -> u32 {
-    if index == 0 { u32::MAX } else { index }
 }
 
 impl Session {

@@ -112,9 +112,8 @@ impl FileEditor {
             window,
             |this: &mut Self, _, ev: &InputEvent, window, cx| {
                 if matches!(ev, InputEvent::Change) && this.loaded {
-                    crate::lsp::document::document_changed();
                     this.lsp_request = None;
-                    this.clear_language_diagnostics();
+                    this.language_changed();
                     this.dirty = true;
                     this.snippet_changed(cx);
                     this.sync_language(window, cx);
@@ -271,8 +270,7 @@ impl FileEditor {
                     (Some(_), _) if e.dirty => e.conflict = true,
                     (None, _) => e.conflict = e.loaded,
                     (Some(text), Some(fp)) => {
-                        crate::lsp::document::document_changed();
-                        e.clear_language_diagnostics();
+                        e.language_changed();
                         e.disk = fp;
                         e.conflict = false;
                         e.input.update(cx, |i, cx| {

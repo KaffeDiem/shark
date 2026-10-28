@@ -509,7 +509,9 @@ async fn completion_acceptance_applies_autoimport_snippet_mirrors_and_undo(
                 )]),
                 ..Default::default()
             };
-            let item = prepare_completion(&snapshot, initial.len(), item, Encoding::Utf16).unwrap();
+            let lines = crate::lsp::document::Lines::new(&snapshot.text);
+            let item = prepare_completion(&snapshot, &lines, initial.len(), item, Encoding::Utf16)
+                .unwrap();
             e.input.update(cx, |input, cx| {
                 input.set_selected_range(initial.len()..initial.len(), cx);
                 input.present_completion_items(initial.len() - 2, "sq", vec![item.clone()], cx);
@@ -566,6 +568,105 @@ async fn completion_acceptance_applies_autoimport_snippet_mirrors_and_undo(
             initial,
             "completion and autoimport must undo together"
         )
+    });
+    client.terminate();
+    let _ = fs::remove_dir_all(dir);
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn snippet_completion_inside_an_active_field_starts_its_own_tabstops(
+    cx: &mut TestAppContext,
+) {
+    let _turn = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    use crate::lsp::{
+        document::{Encoding, Lines},
+        providers::prepare_completion,
+    };
+    use lsp_types::{CompletionItem, CompletionTextEdit, InsertTextFormat, Position, Range};
+    let (dir, _, window, editor) = open_editor("nested-snippet", "f", cx).await;
+    let client = fake_client(&dir, &dir.join("peer.jsonl"));
+    peer_wait(client.initialize()).unwrap();
+    let project = Project {
+        root: dir.clone(),
+        worktree: dir.clone(),
+        language_id: "python",
+        backend: Backend::Pyrefly,
+        toolchain: String::new(),
+        interpreter: None,
+        rust_toolchain: None,
+    };
+    let session = cx.update(|cx| cx.new(|_| Session::with_client(project, client.clone())));
+    cx.update_window(window, |_, w, cx| {
+        editor.update(cx, |e, cx| {
+            e.set_vim(false, cx);
+            e.attach_language(session.clone(), w, cx);
+        })
+    })
+    .unwrap();
+    // Accepts `snippet` over `range` once the server has the buffer's current text.
+    let accept = async |range: Range, snippet: &str, cx: &mut TestAppContext| {
+        let text = cx.update(|cx| editor.read(cx).input.read(cx).value().to_string());
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            let e = editor.read(cx);
+            e.intelligence
+                .as_ref()
+                .unwrap()
+                .snapshot
+                .lock()
+                .unwrap()
+                .text
+                .as_ref()
+                == text
+        })
+        .await;
+        cx.update_window(window, |_, w, cx| {
+            editor.update(cx, |e, cx| {
+                let snapshot = e
+                    .intelligence
+                    .as_ref()
+                    .unwrap()
+                    .snapshot
+                    .lock()
+                    .unwrap()
+                    .clone();
+                let item = CompletionItem {
+                    label: snippet.into(),
+                    insert_text_format: Some(InsertTextFormat::SNIPPET),
+                    text_edit: Some(CompletionTextEdit::Edit(lsp_types::TextEdit::new(
+                        range,
+                        snippet.into(),
+                    ))),
+                    ..Default::default()
+                };
+                let lines = Lines::new(&snapshot.text);
+                let cursor = e.input.read(cx).cursor();
+                let item =
+                    prepare_completion(&snapshot, &lines, cursor, item, Encoding::Utf16).unwrap();
+                e.input.update(cx, |input, cx| {
+                    input.present_completion_items(cursor, "", vec![item.clone()], cx);
+                    input.insert_completion(&item, cursor..cursor, w, cx);
+                });
+            })
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    let range = |a: u32, b: u32| Range::new(Position::new(0, a), Position::new(0, b));
+    accept(range(0, 1), "foo(${1:arg})$0", cx).await;
+    cx.update(|cx| {
+        assert_eq!(
+            editor.read(cx).input.read(cx).selected_value().as_ref(),
+            "arg"
+        )
+    });
+    accept(range(4, 7), "bar(${1:x})", cx).await;
+    cx.update(|cx| {
+        let input = editor.read(cx).input.read(cx);
+        assert_eq!(input.value().as_ref(), "foo(bar(x))");
+        assert_eq!(input.selected_value().as_ref(), "x");
     });
     client.terminate();
     let _ = fs::remove_dir_all(dir);

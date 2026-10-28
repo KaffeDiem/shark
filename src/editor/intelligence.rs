@@ -2,14 +2,15 @@ use super::*;
 use crate::lsp::{
     Session, SessionEvent,
     client::Client,
-    document::{self, Encoding, Snapshot},
+    document::{self, Encoding, Lines, Snapshot},
     providers::{Provider, ProviderEvent},
 };
 use lsp_types::{LocationLink, PublishDiagnosticsParams, Uri, WorkspaceEdit};
+use serde::Deserialize as _;
 use serde_json::json;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 pub enum LanguageEvent {
@@ -36,12 +37,12 @@ pub(crate) struct Symbol {
 /// Flattens a `textDocument/documentSymbol` result (nested `DocumentSymbol`s or flat
 /// `SymbolInformation`s) and nests it by range, so both shapes give the same tree.
 pub(crate) fn outline(value: &serde_json::Value, text: &str, encoding: Encoding) -> Vec<Symbol> {
-    fn walk(value: &serde_json::Value, text: &str, encoding: Encoding, out: &mut Vec<Symbol>) {
+    fn walk(value: &serde_json::Value, lines: &Lines, encoding: Encoding, out: &mut Vec<Symbol>) {
         for symbol in value.as_array().into_iter().flatten() {
             let range = |v: &serde_json::Value| {
-                let r: lsp_types::Range = serde_json::from_value(v.clone()).ok()?;
-                let a = document::offset(text, r.start, encoding).ok()?;
-                let b = document::offset(text, r.end, encoding).ok()?;
+                let r = lsp_types::Range::deserialize(v).ok()?;
+                let a = lines.offset(r.start, encoding).ok()?;
+                let b = lines.offset(r.end, encoding).ok()?;
                 (a <= b).then_some(a..b)
             };
             let full = range(&symbol["range"]).or_else(|| range(&symbol["location"]["range"]));
@@ -55,11 +56,11 @@ pub(crate) fn outline(value: &serde_json::Value, text: &str, encoding: Encoding)
                     target,
                 });
             }
-            walk(&symbol["children"], text, encoding, out);
+            walk(&symbol["children"], lines, encoding, out);
         }
     }
     let mut out = vec![];
-    walk(value, text, encoding, &mut out);
+    walk(value, &Lines::new(text), encoding, &mut out);
     out.sort_by_key(|s| (s.range.start, std::cmp::Reverse(s.range.end)));
     let mut open: Vec<usize> = vec![];
     for s in &mut out {
@@ -88,6 +89,8 @@ pub(crate) struct Language {
     pub session: Entity<Session>,
     pub uri: Uri,
     pub snapshot: Arc<Mutex<Snapshot>>,
+    /// Counts every change to this buffer; read-only responses check it.
+    edits: Arc<AtomicU64>,
     pub client: Option<Client>,
     pub companion: Option<Client>,
     generation: u64,
@@ -120,8 +123,11 @@ impl Drop for Language {
 }
 
 impl FileEditor {
-    pub(crate) fn clear_language_diagnostics(&mut self) {
+    /// The buffer changed: language responses and diagnostics for the old text are stale.
+    pub(crate) fn language_changed(&mut self) {
+        document::document_changed();
         if let Some(language) = &mut self.intelligence {
+            language.edits.fetch_add(1, Ordering::AcqRel);
             language.diagnostics = Default::default();
         }
     }
@@ -198,6 +204,9 @@ impl FileEditor {
                         companion,
                     } = event
                         && method == "textDocument/publishDiagnostics"
+                        // Every attached editor sees every publish; parse only this document's.
+                        && let Some(language) = &e.intelligence
+                        && params["uri"].as_str() == Some(language.uri.as_str())
                         && let Ok(params) =
                             serde_json::from_value::<PublishDiagnosticsParams>(params.clone())
                     {
@@ -213,6 +222,7 @@ impl FileEditor {
                 text: Arc::from(""),
                 version: 0,
             })),
+            edits: Arc::default(),
             client: None,
             companion: None,
             generation: 0,
@@ -289,6 +299,7 @@ impl FileEditor {
                 client.clone(),
                 language.uri.clone(),
                 language.snapshot.clone(),
+                language.edits.clone(),
                 tx.clone(),
             ));
             let ruff = companion.as_ref().map(|c| {
@@ -296,6 +307,7 @@ impl FileEditor {
                     c.clone(),
                     language.uri.clone(),
                     language.snapshot.clone(),
+                    language.edits.clone(),
                     tx,
                 ))
             });
@@ -439,13 +451,14 @@ impl FileEditor {
         };
         let snapshot = language.snapshot.lock().unwrap().clone();
         if params.version.is_some_and(|v| v != snapshot.version)
-            || self.input.read(cx).value().as_ref() != snapshot.text.as_ref()
+            || *self.input.read(cx).text() != *snapshot.text
         {
             return;
         }
         let encoding = Encoding::from(client.encoding());
+        let lines = Lines::new(&snapshot.text);
         params.diagnostics.retain_mut(|d| {
-            match document::convert_range(&snapshot.text, d.range, encoding, Encoding::Utf32) {
+            match lines.convert_range(d.range, encoding, Encoding::Editor) {
                 Ok(range) => {
                     d.range = range;
                     true
