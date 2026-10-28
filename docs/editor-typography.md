@@ -1,14 +1,17 @@
 # Editor typography
 
-The file editor and the diff show code at **14px with 1.5× line height (21px rows)**,
+The file editor shows code at **14px with 1.5× line height (21px rows)**,
 adjustable from 10 to 24px with `cmd-=`/`cmd--` (Reset editor text size in `cmd-k`).
+The diff uses **13px text on the same 21px rows**, including inline editing. Its text
+scales at 13/14 of the editor size with the same zoom controls and saved setting.
+This keeps the diff between its earlier size and 14px, with more space around the text.
 Before this change:
 
 - The editor used the theme's 12.5px mono size on 19px rows (`assets/themes/*.json`,
   gpui-component's `EDITOR_LINE_HEIGHT` of 1.5).
 - The diff used about 11.7px on 18.75px rows.
 
-The constants and the shared `code_font` are in `src/editor.rs`.
+The constants, `code_font`, and `diff_font` are in `src/editor.rs`.
 
 ## Why 14px
 

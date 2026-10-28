@@ -45,10 +45,16 @@ pub const LINE_HEIGHT: f32 = 1.5;
 pub struct CodeFont(pub f32);
 impl Global for CodeFont {}
 
-/// Code text size and its whole-pixel row height, for every view that shows code.
+/// File editor text size and its whole-pixel row height.
 pub fn code_font(cx: &App) -> (Pixels, Pixels) {
     let size = cx.try_global::<CodeFont>().map_or(FONT_SIZE, |f| f.0);
     (px(size), px((size * LINE_HEIGHT).round()))
+}
+
+/// Smaller diff text on the same rows gives more breathing room at every zoom level.
+pub fn diff_font(cx: &App) -> (Pixels, Pixels) {
+    let (size, row) = code_font(cx);
+    (size * (13. / 14.), row)
 }
 
 pub struct FileEditor {

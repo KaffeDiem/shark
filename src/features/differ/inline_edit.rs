@@ -655,7 +655,7 @@ impl Differ {
                 // ponytail: the edited line is plain text, no syntax colors; a highlighted copy
                 // behind transparent input text drifts once the input scrolls a long line.
                 // The code's font and size, without the input's padding: the text stays put.
-                let (size, row) = crate::editor::code_font(cx);
+                let (size, row) = crate::editor::diff_font(cx);
                 div()
                     .key_context("InlineEdit")
                     .w_full()

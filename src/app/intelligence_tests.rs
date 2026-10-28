@@ -874,8 +874,7 @@ async fn jump_bar_folder_lists_its_files(cx: &mut TestAppContext) {
     });
 }
 
-// Code renders at 14px on 21px rows by default; cmd-=/cmd-- resize every open file and
-// persist, within the readable range.
+// The editor uses 14px and the diff 13px on 21px rows; both follow the saved zoom.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn editor_text_size_defaults_to_research_values_and_steps(cx: &mut TestAppContext) {
@@ -895,6 +894,10 @@ async fn editor_text_size_defaults_to_research_values_and_steps(cx: &mut TestApp
     let row =
         |cx: &mut TestAppContext| cx.update(|cx| editors[0].read(cx).input.read(cx).line_height());
     assert_eq!(row(cx), Some(px(21.)));
+    cx.update(|cx| {
+        assert_eq!(crate::editor::code_font(cx), (px(14.), px(21.)));
+        assert_eq!(crate::editor::diff_font(cx), (px(13.), px(21.)));
+    });
     cx.update_window(window, |_, w, cx| {
         w.press("cmd-=", cx);
         w.press("cmd-=", cx);
@@ -902,6 +905,9 @@ async fn editor_text_size_defaults_to_research_values_and_steps(cx: &mut TestApp
     .unwrap();
     cx.update(|cx| {
         assert_eq!(crate::editor::code_font(cx), (px(16.), px(24.)));
+        let (size, row) = crate::editor::diff_font(cx);
+        assert!((f32::from(size) - 14.857143).abs() < 0.0001);
+        assert_eq!(row, px(24.));
         assert_eq!(shark.read(cx).state.editor_font_size, Some(16.));
     });
     assert_eq!(row(cx), Some(px(24.)));
@@ -911,7 +917,12 @@ async fn editor_text_size_defaults_to_research_values_and_steps(cx: &mut TestApp
         }
     })
     .unwrap();
-    cx.update(|cx| assert_eq!(crate::editor::code_font(cx).0, px(10.)));
+    cx.update(|cx| {
+        assert_eq!(crate::editor::code_font(cx), (px(10.), px(15.)));
+        let (size, row) = crate::editor::diff_font(cx);
+        assert!((f32::from(size) - 9.285714).abs() < 0.0001);
+        assert_eq!(row, px(15.));
+    });
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| s.step_editor_font(0., w, cx))
     })
@@ -919,6 +930,7 @@ async fn editor_text_size_defaults_to_research_values_and_steps(cx: &mut TestApp
     cx.update(|cx| {
         assert_eq!(crate::editor::code_font(cx), (px(14.), px(21.)));
         assert_eq!(shark.read(cx).state.editor_font_size, None);
+        assert_eq!(crate::editor::diff_font(cx), (px(13.), px(21.)));
     });
 }
 

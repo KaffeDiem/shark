@@ -799,7 +799,7 @@ impl Differ {
 
     /// A code row's height.
     fn row_height(&self, _: &Window, cx: &App) -> Pixels {
-        crate::editor::code_font(cx).1
+        crate::editor::diff_font(cx).1
     }
 
     fn view_cap(&self, window: &Window, cx: &App) -> f32 {

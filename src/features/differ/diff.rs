@@ -642,7 +642,7 @@ impl Differ {
         let shark = cx.entity().downgrade();
         let placeholder = self.diff_placeholder(cx);
         let empty = placeholder.is_some();
-        let (size, row) = crate::editor::code_font(cx);
+        let (size, row) = crate::editor::diff_font(cx);
         let diff_with_annotations =
             self.with_comments(Diff::new(&self.diff).code_font(size, row), cx);
         let diff_with_annotations = (self.with_edit_parts(diff_with_annotations, cx))
