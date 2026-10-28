@@ -195,6 +195,28 @@ fn server_edits_require_host_acknowledgement() {
 }
 
 #[test]
+fn message_requests_are_forwarded_and_dismissed() {
+    let peer = Peer::new();
+    block_on(peer.client.initialize()).unwrap();
+    let events = peer.client.events();
+    block_on(peer.client.request("test/ask", Value::Null)).unwrap();
+    // The peer asks before it answers test/ask, and the coordinator handles both in order.
+    let params = std::iter::from_fn(|| events.try_recv().ok())
+        .find_map(|event| match event {
+            Event::Notification { method, params } if method == "window/showMessageRequest" => {
+                Some(params)
+            }
+            _ => None,
+        })
+        .expect("message request was not forwarded");
+    assert_eq!(params["message"], "Index failed");
+    // No action chosen, rather than an error the server may treat as a broken client.
+    let response = peer.wait_for(|v| v["id"] == "ask");
+    assert!(response.get("error").is_none(), "{response}");
+    assert!(response["result"].is_null());
+}
+
+#[test]
 fn crash_resolves_pending_requests_and_reports_the_stderr_tail() {
     let peer = Peer::new();
     block_on(peer.client.initialize()).unwrap();

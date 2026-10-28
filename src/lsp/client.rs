@@ -622,7 +622,9 @@ fn coordinate(
                             reply,
                         });
                     }
-                    "workspace/diagnostic/refresh"
+                    // Nothing offers the actions yet, so the user's answer is "dismissed" (null).
+                    "window/showMessageRequest"
+                    | "workspace/diagnostic/refresh"
                     | "workspace/semanticTokens/refresh"
                     | "workspace/inlayHint/refresh"
                     | "workspace/codeLens/refresh" => {

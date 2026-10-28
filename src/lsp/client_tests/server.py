@@ -59,6 +59,9 @@ with open(log_path, "a") as log:
         elif method == "test/applyEdit":
             send(dict(id="apply", method="workspace/applyEdit", params=dict(edit=dict(changes={}))))
             respond(message, None)
+        elif method == "test/ask":
+            send(dict(id="ask", method="window/showMessageRequest", params=dict(type=1, message="Index failed", actions=[dict(title="Retry")])))
+            respond(message, None)
         elif method == "test/wait":
             waiting.append(message)
         elif method == "test/ignoreShutdown":
