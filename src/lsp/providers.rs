@@ -1,7 +1,7 @@
 //! Adapters for GPUI's existing completion, hover, definition and quick-fix overlays.
 use super::{
     client::Client,
-    document::{self, EditGuard, Encoding, Snapshot},
+    document::{self, CompletionMeta, EditGuard, Encoding, Lines, Snapshot, Stop},
 };
 use anyhow::{Result, bail, ensure};
 use gpui_kit::base::input::{
@@ -15,9 +15,15 @@ use serde_json::json;
 use std::{
     cell::RefCell,
     rc::Rc,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Duration,
 };
+
+/// Data-carrying items resolved before the menu shows; the rest are presented unresolved.
+const EAGER_RESOLVE: usize = 16;
 
 pub enum ProviderEvent {
     /// Definitions to open; true (shift held) opens a new tab.
@@ -36,6 +42,8 @@ pub struct Provider {
     client: Client,
     uri: Uri,
     snapshot: Arc<Mutex<Snapshot>>,
+    /// Bumped by every change to this document, synchronized or not.
+    edits: Arc<AtomicU64>,
     events: async_channel::Sender<ProviderEvent>,
     definitions: Rc<RefCell<Vec<LocationLink>>>,
 }
@@ -45,6 +53,7 @@ impl Provider {
         client: Client,
         uri: Uri,
         snapshot: Arc<Mutex<Snapshot>>,
+        edits: Arc<AtomicU64>,
         events: async_channel::Sender<ProviderEvent>,
     ) -> Self {
         static NEXT_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
@@ -57,6 +66,7 @@ impl Provider {
             client,
             uri,
             snapshot,
+            edits,
             events,
             definitions: Rc::default(),
         }
@@ -83,6 +93,17 @@ impl Provider {
             *self.snapshot.lock().unwrap() == *snapshot,
             "language response is stale"
         );
+        Ok(())
+    }
+
+    fn edits(&self) -> u64 {
+        self.edits.load(Ordering::Acquire)
+    }
+
+    /// Read-only responses go stale only when this document changes, including unsynced typing.
+    fn unchanged(&self, snapshot: &Snapshot, edits: u64) -> Result<()> {
+        self.current(snapshot)?;
+        ensure!(self.edits() == edits, "language response is stale");
         Ok(())
     }
 
@@ -134,7 +155,7 @@ impl CompletionProvider for Provider {
         cx.spawn(async move |_| {
             let text = executor.spawn(async move { text.to_string() }).await;
             let snapshot = this.synchronized(&text, &executor).await?;
-            let guard = EditGuard::capture();
+            let edits = this.edits();
             if trigger.trigger_kind == CompletionTriggerKind::TRIGGER_CHARACTER {
                 let configured = this
                     .client
@@ -157,8 +178,7 @@ impl CompletionProvider for Provider {
                 .client
                 .request("textDocument/completion", params)
                 .await?;
-            this.current(&snapshot)?;
-            ensure!(guard.is_current(), "completion response is stale");
+            this.unchanged(&snapshot, edits)?;
             if response.is_null() {
                 return Ok(CompletionResponse::Array(vec![]));
             }
@@ -173,52 +193,54 @@ impl CompletionProvider for Provider {
                 .and_then(|c| c.completion_provider)
                 .is_some_and(|p| p.resolve_provider == Some(true))
             {
-                // shortcut: resolve before showing the menu; switch to lazy resolution when GPUI exposes an accepted-item hook.
-                for chunk in items.chunks_mut(8) {
-                    this.current(&snapshot)?;
-                    ensure!(guard.is_current(), "completion response is stale");
-                    let tasks: Vec<_> = chunk
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, item)| {
-                            item.data.is_some() && item.additional_text_edits.is_none()
+                // shortcut: resolve the first items before showing the menu; resolve only the accepted item once GPUI exposes an accepted-item hook.
+                let resolved = Arc::new(Mutex::new(vec![]));
+                let tasks: Vec<_> = eager_resolve(&items)
+                    .into_iter()
+                    .map(|index| {
+                        let client = this.client.clone();
+                        let item = items[index].clone();
+                        let resolved = resolved.clone();
+                        executor.spawn(async move {
+                            let item = async {
+                                let response = client
+                                    .request("completionItem/resolve", serde_json::to_value(item)?)
+                                    .await?;
+                                anyhow::Ok(serde_json::from_value::<CompletionItem>(response)?)
+                            }
+                            .await;
+                            resolved.lock().unwrap().push((index, item));
                         })
-                        .map(|(index, item)| {
-                            let client = this.client.clone();
-                            let item = item.clone();
-                            (
-                                index,
-                                executor.spawn(async move {
-                                    let response = client
-                                        .request(
-                                            "completionItem/resolve",
-                                            serde_json::to_value(item)?,
-                                        )
-                                        .await?;
-                                    serde_json::from_value::<CompletionItem>(response)
-                                        .map_err(anyhow::Error::from)
-                                }),
-                            )
-                        })
-                        .collect();
-                    for (index, task) in tasks {
-                        chunk[index] = task.await?;
+                    })
+                    .collect();
+                // Present what resolved within about 50 ms; dropping the rest cancels it.
+                for _ in 0..10 {
+                    if resolved.lock().unwrap().len() == tasks.len() {
+                        break;
+                    }
+                    executor.timer(Duration::from_millis(5)).await;
+                }
+                drop(tasks);
+                for (index, item) in resolved.lock().unwrap().drain(..) {
+                    if let Ok(item) = item {
+                        items[index] = item;
                     }
                 }
-                this.current(&snapshot)?;
+                this.unchanged(&snapshot, edits)?;
             }
             let encoding = this.encoding();
             let items = executor
                 .spawn(async move {
+                    let lines = Lines::new(&snapshot.text);
                     items
                         .into_iter()
                         .filter_map(|item| {
-                            prepare_completion(&snapshot, offset, item, encoding).ok()
+                            prepare_completion(&snapshot, &lines, offset, item, encoding).ok()
                         })
                         .collect()
                 })
                 .await;
-            ensure!(guard.is_current(), "completion response is stale");
+            ensure!(this.edits() == edits, "completion response is stale");
             Ok(CompletionResponse::Array(items))
         })
     }
@@ -250,19 +272,18 @@ impl HoverProvider for Provider {
         cx.spawn(async move |_| {
             let text = executor.spawn(async move { text.to_string() }).await;
             let snapshot = this.synchronized(&text, &executor).await?;
-            let guard = EditGuard::capture();
+            let edits = this.edits();
             let response = this
                 .client
                 .request("textDocument/hover", this.params(&text, offset)?)
                 .await?;
-            this.current(&snapshot)?;
-            ensure!(guard.is_current(), "hover response is stale");
+            this.unchanged(&snapshot, edits)?;
             let mut hover: Option<Hover> = serde_json::from_value(response)?;
             if let Some(hover) = hover.as_mut() {
                 hover.range = hover
                     .range
                     .map(|range| {
-                        document::convert_range(&text, range, this.encoding(), Encoding::Utf32)
+                        document::convert_range(&text, range, this.encoding(), Encoding::Editor)
                     })
                     .transpose()?;
             }
@@ -285,13 +306,12 @@ impl DefinitionProvider for Provider {
         cx.spawn(async move |_| {
             let text = executor.spawn(async move { text.to_string() }).await;
             let snapshot = this.synchronized(&text, &executor).await?;
-            let guard = EditGuard::capture();
+            let edits = this.edits();
             let response = this
                 .client
                 .request("textDocument/definition", this.params(&text, offset)?)
                 .await?;
-            this.current(&snapshot)?;
-            ensure!(guard.is_current(), "definition response is stale");
+            this.unchanged(&snapshot, edits)?;
             let response: Option<GotoDefinitionResponse> = serde_json::from_value(response)?;
             let links = match response {
                 None => vec![],
@@ -308,7 +328,7 @@ impl DefinitionProvider for Provider {
                     link.origin_selection_range = link
                         .origin_selection_range
                         .map(|range| {
-                            document::convert_range(&text, range, this.encoding(), Encoding::Utf32)
+                            document::convert_range(&text, range, this.encoding(), Encoding::Editor)
                         })
                         .transpose()?;
                     Ok(link)
@@ -340,7 +360,7 @@ fn diagnostic_context(
             let range = document::convert_range(
                 text,
                 Range::new(d.range.start, d.range.end),
-                Encoding::Utf32,
+                Encoding::Editor,
                 encoding,
             )
             .ok()?;
@@ -444,9 +464,18 @@ impl CodeActionProvider for Provider {
     }
 }
 
+/// The first data-carrying items in menu order, which resolution may give auto-import edits.
+fn eager_resolve(items: &[CompletionItem]) -> Vec<usize> {
+    (0..items.len())
+        .filter(|&i| items[i].data.is_some() && items[i].additional_text_edits.is_none())
+        .take(EAGER_RESOLVE)
+        .collect()
+}
+
 /// Fold auto-imports and snippet defaults into GPUI's single undoable completion edit.
 pub fn prepare_completion(
     snapshot: &Snapshot,
+    lines: &Lines,
     cursor: usize,
     mut item: CompletionItem,
     encoding: Encoding,
@@ -471,8 +500,8 @@ pub fn prepare_completion(
                 .map_or(cursor, |(i, _)| i);
             (
                 Range::new(
-                    document::position(&snapshot.text, start, encoding)?,
-                    document::position(&snapshot.text, cursor, encoding)?,
+                    lines.position(start, encoding)?,
+                    lines.position(cursor, encoding)?,
                 ),
                 item.insert_text
                     .take()
@@ -480,8 +509,13 @@ pub fn prepare_completion(
             )
         }
     };
-    let primary_start = document::offset(&snapshot.text, range.start, encoding)?;
-    let primary_end = document::offset(&snapshot.text, range.end, encoding)?;
+    let offsets = |range: Range| -> Result<(usize, usize)> {
+        let start = lines.offset(range.start, encoding)?;
+        let end = lines.offset(range.end, encoding)?;
+        ensure!(start <= end, "reversed edit range");
+        Ok((start, end))
+    };
+    let (primary_start, primary_end) = offsets(range)?;
     let mut tabstops = vec![];
     if item.insert_text_format == Some(InsertTextFormat::SNIPPET) {
         let snippet = document::snippet(&text)?;
@@ -489,37 +523,66 @@ pub fn prepare_completion(
         tabstops = snippet.tabstops;
     }
     let primary_len = text.len();
-    let mut edits = item.additional_text_edits.take().unwrap_or_default();
-    let mut first = primary_start;
-    let mut last = primary_end;
-    let mut shift: isize = 0;
-    for edit in &edits {
-        let start = document::offset(&snapshot.text, edit.range.start, encoding)?;
-        let end = document::offset(&snapshot.text, edit.range.end, encoding)?;
-        first = first.min(start);
-        last = last.max(end);
-        if end <= primary_start {
-            shift += edit.new_text.len() as isize - (end - start) as isize;
-        }
-    }
-    edits.push(TextEdit::new(range, text));
+    let mut edits = item
+        .additional_text_edits
+        .take()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|e| Ok((offsets(e.range)?, e.new_text)))
+        .collect::<Result<Vec<_>>>()?;
+    let shift: isize = edits
+        .iter()
+        .filter(|((_, end), _)| *end <= primary_start)
+        .map(|((start, end), text)| text.len() as isize - (end - start) as isize)
+        .sum();
+    edits.push(((primary_start, primary_end), text));
+    // Stable: same-position insertions keep array order, as in apply_edits.
+    edits.sort_by_key(|(range, _)| *range);
+    ensure!(
+        edits.windows(2).all(|pair| pair[0].0.1 <= pair[1].0.0),
+        "overlapping edits"
+    );
+    let first = edits[0].0.0;
     // shortcut: each candidate copies the span between imports and insertion; stage only accepted edits once GPUI exposes an acceptance hook.
-    let edited = document::apply_edits(snapshot, Some(snapshot.version), &edits, encoding)?;
-    let new_end = edited.len() - (snapshot.text.len() - last);
+    let mut folded = String::new();
+    let mut at = first;
+    for ((start, end), text) in &edits {
+        folded.push_str(&snapshot.text[at..*start]);
+        folded.push_str(text);
+        at = *end;
+    }
+    let len = snapshot.text.len() - (at - first) + folded.len();
+    ensure!(
+        len as u64 <= crate::editor::MAX_BYTES,
+        "edited file exceeds the 4 MiB editor limit"
+    );
     let primary_new_start = primary_start
         .checked_add_signed(shift)
         .ok_or_else(|| anyhow::anyhow!("invalid completion edits"))?;
-    let stops: Vec<_> = tabstops.into_iter().map(|(index,range)| json!({"index":index,"start":primary_new_start+range.start,"end":primary_new_start+range.end})).collect();
-    // The host can restore the primary caret and start tabstop navigation after acceptance.
-    item.data = Some(
-        json!({"sharkCompletion":{"version":snapshot.version,"fingerprint":crate::files::fingerprint(edited.as_bytes()),"cursor":primary_new_start+primary_len,"tabstops":stops},"serverData":item.data}),
-    );
+    // The host recognizes acceptance from the span alone, then restores the caret and tabstops.
+    let meta = CompletionMeta {
+        version: snapshot.version,
+        start: first,
+        end: first + folded.len(),
+        fingerprint: crate::files::fingerprint(folded.as_bytes()),
+        len,
+        cursor: primary_new_start + primary_len,
+        tabstops: tabstops
+            .into_iter()
+            .map(|(index, range)| Stop {
+                index,
+                start: primary_new_start + range.start,
+                end: primary_new_start + range.end,
+            })
+            .collect(),
+    };
+    item.data = Some(json!({"sharkCompletion":meta,"serverData":item.data}));
     item.text_edit = Some(CompletionTextEdit::Edit(TextEdit::new(
         Range::new(
-            document::position(&snapshot.text, first, Encoding::Utf32)?,
-            document::position(&snapshot.text, last, Encoding::Utf32)?,
+            lines.position(first, Encoding::Editor)?,
+            lines.position(at, Encoding::Editor)?,
         ),
-        edited[first..new_end].to_owned(),
+        folded,
     )));
     item.insert_text_format = Some(InsertTextFormat::PLAIN_TEXT);
     Ok(item)
@@ -567,17 +630,51 @@ mod tests {
             )]),
             ..Default::default()
         };
-        let item =
-            prepare_completion(&snapshot, snapshot.text.len(), item, Encoding::Utf16).unwrap();
+        let lines = Lines::new(&snapshot.text);
+        let item = prepare_completion(
+            &snapshot,
+            &lines,
+            snapshot.text.len(),
+            item,
+            Encoding::Utf16,
+        )
+        .unwrap();
         let CompletionTextEdit::Edit(edit) = item.text_edit.unwrap() else {
             panic!()
         };
-        let result = document::apply_edits(&snapshot, None, &[edit], Encoding::Utf32).unwrap();
+        let result = document::apply_edits(&snapshot, None, &[edit], Encoding::Editor).unwrap();
         assert_eq!(result, "import foobar\n😀\nfoobar(arg)");
+        let meta: CompletionMeta =
+            serde_json::from_value(item.data.as_ref().unwrap()["sharkCompletion"].clone()).unwrap();
         assert_eq!(
-            item.data.as_ref().unwrap()["sharkCompletion"]["fingerprint"].as_u64(),
-            Some(crate::files::fingerprint(result.as_bytes()))
+            (meta.start, meta.end, meta.len),
+            (0, result.len(), result.len())
+        );
+        assert_eq!(
+            meta.fingerprint,
+            crate::files::fingerprint(&result.as_bytes()[meta.start..meta.end])
+        );
+        assert_eq!(
+            meta.tabstops[0],
+            Stop {
+                index: 1,
+                start: 26,
+                end: 29
+            }
         );
         assert!(item.additional_text_edits.is_none());
+    }
+
+    #[test]
+    fn completion_resolves_only_the_first_data_items_before_the_menu() {
+        let item = |data: bool| CompletionItem {
+            data: data.then(|| json!({})),
+            ..Default::default()
+        };
+        let mut items: Vec<_> = (0..1000).map(|i| item(i != 1)).collect();
+        items[2].additional_text_edits = Some(vec![]);
+        let eager = eager_resolve(&items);
+        assert_eq!(eager.len(), EAGER_RESOLVE);
+        assert_eq!(&eager[..3], &[0, 3, 4]);
     }
 }

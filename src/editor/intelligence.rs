@@ -2,14 +2,15 @@ use super::*;
 use crate::lsp::{
     Session, SessionEvent,
     client::Client,
-    document::{self, Encoding, Snapshot},
+    document::{self, Encoding, Lines, Snapshot},
     providers::{Provider, ProviderEvent},
 };
 use lsp_types::{LocationLink, PublishDiagnosticsParams, Uri, WorkspaceEdit};
+use serde::Deserialize as _;
 use serde_json::json;
 use std::sync::{
     Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 
 pub enum LanguageEvent {
@@ -36,12 +37,12 @@ pub(crate) struct Symbol {
 /// Flattens a `textDocument/documentSymbol` result (nested `DocumentSymbol`s or flat
 /// `SymbolInformation`s) and nests it by range, so both shapes give the same tree.
 pub(crate) fn outline(value: &serde_json::Value, text: &str, encoding: Encoding) -> Vec<Symbol> {
-    fn walk(value: &serde_json::Value, text: &str, encoding: Encoding, out: &mut Vec<Symbol>) {
+    fn walk(value: &serde_json::Value, lines: &Lines, encoding: Encoding, out: &mut Vec<Symbol>) {
         for symbol in value.as_array().into_iter().flatten() {
             let range = |v: &serde_json::Value| {
-                let r: lsp_types::Range = serde_json::from_value(v.clone()).ok()?;
-                let a = document::offset(text, r.start, encoding).ok()?;
-                let b = document::offset(text, r.end, encoding).ok()?;
+                let r = lsp_types::Range::deserialize(v).ok()?;
+                let a = lines.offset(r.start, encoding).ok()?;
+                let b = lines.offset(r.end, encoding).ok()?;
                 (a <= b).then_some(a..b)
             };
             let full = range(&symbol["range"]).or_else(|| range(&symbol["location"]["range"]));
@@ -55,11 +56,11 @@ pub(crate) fn outline(value: &serde_json::Value, text: &str, encoding: Encoding)
                     target,
                 });
             }
-            walk(&symbol["children"], text, encoding, out);
+            walk(&symbol["children"], lines, encoding, out);
         }
     }
     let mut out = vec![];
-    walk(value, text, encoding, &mut out);
+    walk(value, &Lines::new(text), encoding, &mut out);
     out.sort_by_key(|s| (s.range.start, std::cmp::Reverse(s.range.end)));
     let mut open: Vec<usize> = vec![];
     for s in &mut out {
@@ -88,6 +89,8 @@ pub(crate) struct Language {
     pub session: Entity<Session>,
     pub uri: Uri,
     pub snapshot: Arc<Mutex<Snapshot>>,
+    /// Counts every change to this buffer; read-only responses check it.
+    edits: Arc<AtomicU64>,
     pub client: Option<Client>,
     pub companion: Option<Client>,
     generation: u64,
@@ -120,8 +123,11 @@ impl Drop for Language {
 }
 
 impl FileEditor {
-    pub(crate) fn clear_language_diagnostics(&mut self) {
+    /// The buffer changed: language responses and diagnostics for the old text are stale.
+    pub(crate) fn language_changed(&mut self) {
+        document::document_changed();
         if let Some(language) = &mut self.intelligence {
+            language.edits.fetch_add(1, Ordering::AcqRel);
             language.diagnostics = Default::default();
         }
     }
@@ -198,6 +204,9 @@ impl FileEditor {
                         companion,
                     } = event
                         && method == "textDocument/publishDiagnostics"
+                        // Every attached editor sees every publish; parse only this document's.
+                        && let Some(language) = &e.intelligence
+                        && params["uri"].as_str() == Some(language.uri.as_str())
                         && let Ok(params) =
                             serde_json::from_value::<PublishDiagnosticsParams>(params.clone())
                     {
@@ -213,6 +222,7 @@ impl FileEditor {
                 text: Arc::from(""),
                 version: 0,
             })),
+            edits: Arc::default(),
             client: None,
             companion: None,
             generation: 0,
@@ -289,6 +299,7 @@ impl FileEditor {
                 client.clone(),
                 language.uri.clone(),
                 language.snapshot.clone(),
+                language.edits.clone(),
                 tx.clone(),
             ));
             let ruff = companion.as_ref().map(|c| {
@@ -296,6 +307,7 @@ impl FileEditor {
                     c.clone(),
                     language.uri.clone(),
                     language.snapshot.clone(),
+                    language.edits.clone(),
                     tx,
                 ))
             });
@@ -439,13 +451,14 @@ impl FileEditor {
         };
         let snapshot = language.snapshot.lock().unwrap().clone();
         if params.version.is_some_and(|v| v != snapshot.version)
-            || self.input.read(cx).value().as_ref() != snapshot.text.as_ref()
+            || *self.input.read(cx).text() != *snapshot.text
         {
             return;
         }
         let encoding = Encoding::from(client.encoding());
+        let lines = Lines::new(&snapshot.text);
         params.diagnostics.retain_mut(|d| {
-            match document::convert_range(&snapshot.text, d.range, encoding, Encoding::Utf32) {
+            match lines.convert_range(d.range, encoding, Encoding::Editor) {
                 Ok(range) => {
                     d.range = range;
                     true
@@ -488,18 +501,78 @@ impl FileEditor {
     ) {
         document::document_changed();
         self.input.update(cx, |i, cx| {
-            let selection = i.selected_range();
+            let selection = map_range(&i.value(), &text, i.selected_range());
             let scroll = i.scroll_offset();
-            let start = text.floor_char_boundary(selection.start.min(text.len()));
-            let end = text.floor_char_boundary(selection.end.min(text.len()));
             i.replace_all(text, window, cx);
-            i.set_selected_range(start..end, cx);
+            i.set_selected_range(selection, cx);
             i.set_scroll_offset(scroll, cx);
         });
+        self.clamp_cursor(cx);
         self.dirty = true;
         self.sync_language(window, cx);
         cx.notify();
     }
+}
+
+/// Moves `range` in `old` onto the same text in `new`, so a language edit keeps the caret on the
+/// code it was on.
+pub(super) fn map_range(
+    old: &str,
+    new: &str,
+    range: std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    let start = map_offset(old, new, range.start, true);
+    let end = if range.is_empty() {
+        start
+    } else {
+        map_offset(old, new, range.end, true)
+    };
+    start..end
+}
+
+/// Unchanged text maps exactly; changed text maps to the same distance into its replacement.
+/// Lines first, then characters within the changed line, or a small changed block.
+fn map_offset(old: &str, new: &str, offset: usize, lines: bool) -> usize {
+    // A deadline keeps a pathological diff from stalling; a coarser diff only maps less precisely.
+    let mut config = similar::TextDiff::configure();
+    config.timeout(Duration::from_millis(30));
+    let diff = if lines {
+        config.diff_lines(old, new)
+    } else {
+        config.diff_chars(old, new)
+    };
+    let size = |slices: &[&str]| slices.iter().map(|s| s.len()).sum::<usize>();
+    let (mut o, mut n) = (0, 0);
+    for op in diff.ops() {
+        let old_lines = &diff.old_slices()[op.old_range()];
+        let new_lines = &diff.new_slices()[op.new_range()];
+        let (old_len, new_len) = (size(old_lines), size(new_lines));
+        if offset >= o + old_len {
+            (o, n) = (o + old_len, n + new_len);
+            continue;
+        }
+        if op.tag() == similar::DiffTag::Equal {
+            return n + offset - o;
+        }
+        let (mut a, mut b) = (&old[o..o + old_len], &new[n..n + new_len]);
+        if lines {
+            // A rename or re-indent keeps the line count: stay on the same line.
+            if old_lines.len() == new_lines.len() {
+                for (line, other) in old_lines.iter().zip(new_lines) {
+                    if offset < o + line.len() {
+                        (a, b) = (line, other);
+                        break;
+                    }
+                    (o, n) = (o + line.len(), n + other.len());
+                }
+            }
+            if a.len() + b.len() <= 1 << 16 {
+                return n + map_offset(a, b, offset - o, false);
+            }
+        }
+        return new.floor_char_boundary(n + (offset - o).min(b.len()));
+    }
+    new.len()
 }
 
 fn notify_save(client: &Client, uri: &Uri, text: &str) -> anyhow::Result<()> {

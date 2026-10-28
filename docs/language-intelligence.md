@@ -206,8 +206,9 @@ not establish that the polished five-language release passes every gate above.
 
 - **Completion resolution and memory:** GPUI 0.8.0 exposes its completion menu,
   but not an accepted-item callback covering both keyboard and mouse acceptance.
-  Shark therefore resolves data-carrying completion items in batches of at most
-  eight requests before presenting the menu. Additional edits, including imports,
+  Shark therefore resolves the first 16 data-carrying completion items
+  concurrently, waits at most about 50 ms, and presents the rest unresolved; an
+  unresolved item is inserted without its auto-import. Additional edits, including imports,
   are folded into the primary edit so acceptance remains one undoable operation.
   A folded edit contains the text between its first and last affected ranges;
   many import candidates near the top of a large file can therefore consume
