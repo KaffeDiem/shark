@@ -23,6 +23,12 @@ const SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 const MAX_FRAME: usize = 64 << 20;
 /// Enough of a crashed server's stderr to say why, without retaining project output.
 const STDERR_TAIL: usize = 2048;
+/// A single frame write blocked this long means the server stopped reading, not that it is busy.
+const WRITE_STALL: Duration = if cfg!(test) {
+    Duration::from_secs(3)
+} else {
+    REQUEST_TIMEOUT
+};
 
 #[derive(Debug)]
 pub enum Event {
@@ -209,11 +215,16 @@ impl Client {
             }
         });
         let writer_tx = tx.clone();
+        let writing = Arc::new(Mutex::new(None::<Instant>));
+        let writer_writing = writing.clone();
         thread::spawn(move || {
             let mut stdin = stdin;
             while let Ok(message) = write_rx.recv() {
                 let exiting = matches!(&message, Message::Notification(n) if n.method == "exit");
-                if let Err(error) = message.write(&mut stdin) {
+                *writer_writing.lock().unwrap() = Some(Instant::now());
+                let written = message.write(&mut stdin);
+                *writer_writing.lock().unwrap() = None;
+                if let Err(error) = written {
                     let _ = writer_tx.send(CommandMessage::PipeClosed(format!(
                         "Language server write failed: {error}"
                     )));
@@ -259,7 +270,11 @@ impl Client {
                 events_tx,
                 worker_settings,
                 worker_root,
-                (stderr_tail, stderr_done),
+                Pipes {
+                    stderr: stderr_tail,
+                    stderr_done,
+                    writing,
+                },
             );
             drop(stopped_tx);
         });
@@ -472,6 +487,15 @@ fn read_message(reader: &mut impl BufRead) -> std::io::Result<Option<Message>> {
         .map_err(|e| invalid(format!("malformed LSP payload: {e}")))
 }
 
+/// What the coordinator observes of the pipe threads.
+struct Pipes {
+    stderr: Arc<Mutex<Vec<u8>>>,
+    /// Disconnects at stderr EOF.
+    stderr_done: mpsc::Receiver<()>,
+    /// When the frame write in progress started.
+    writing: Arc<Mutex<Option<Instant>>>,
+}
+
 fn coordinate(
     mut child: Child,
     rx: mpsc::Receiver<CommandMessage>,
@@ -480,7 +504,11 @@ fn coordinate(
     events: async_channel::Sender<Event>,
     settings: Value,
     root: Value,
-    (stderr, stderr_done): (Arc<Mutex<Vec<u8>>>, mpsc::Receiver<()>),
+    Pipes {
+        stderr,
+        stderr_done,
+        writing,
+    }: Pipes,
 ) {
     let mut queue: ReqQueue<Instant, Pending> = ReqQueue::default();
     let mut outgoing: HashMap<u64, (RequestId, Instant)> = HashMap::new();
@@ -681,6 +709,15 @@ fn coordinate(
             .as_ref()
             .is_some_and(|(_, deadline)| now >= *deadline)
         {
+            break;
+        }
+        // The idle wakeup cap bounds how late this is noticed.
+        if writing
+            .lock()
+            .unwrap()
+            .is_some_and(|since| now.duration_since(since) >= WRITE_STALL)
+        {
+            reason = "Language server stopped reading its input".into();
             break;
         }
         match child.try_wait() {

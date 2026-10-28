@@ -232,6 +232,32 @@ fn a_busy_server_is_not_killed_while_its_input_backs_up() {
 }
 
 #[test]
+fn a_server_that_stops_reading_its_input_is_stopped() {
+    let peer = Peer::new();
+    block_on(peer.client.initialize()).unwrap();
+    let events = peer.client.events();
+    peer.client.notify("test/sleep", json!(60)).unwrap();
+    let text = "x".repeat(64 * 1024);
+    for _ in 0..64 {
+        peer.client
+            .notify("test/large", json!({ "text": text }))
+            .unwrap();
+    }
+    let deadline = Instant::now() + Duration::from_secs(20);
+    let stopped = loop {
+        match events.try_recv() {
+            Ok(Event::Stopped(reason)) => break reason,
+            Ok(_) => {}
+            Err(_) => {
+                assert!(Instant::now() < deadline, "a stalled server was kept");
+                thread::sleep(Duration::from_millis(50));
+            }
+        }
+    };
+    assert!(stopped.contains("stopped reading its input"), "{stopped}");
+}
+
+#[test]
 fn oversized_or_malformed_frames_are_rejected_before_allocation() {
     let read = |bytes: &[u8]| read_message(&mut std::io::Cursor::new(bytes.to_vec()));
     let error = read(b"Content-Length: 99999999999999\r\n\r\n").unwrap_err();
