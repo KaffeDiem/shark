@@ -314,6 +314,7 @@ impl Client {
             .unwrap_or(PositionEncodingKind::UTF16)
     }
 
+    #[cfg(test)]
     pub async fn initialize(&self) -> Result<InitializeResult> {
         self.initialize_with_options(Value::Null).await
     }
@@ -426,6 +427,7 @@ impl Client {
         let _ = self.0.tx.send(CommandMessage::Terminate);
     }
 
+    #[cfg(test)]
     pub async fn stopped(&self) {
         // Closing a channel wakes every waiter, including clones from different editors.
         let _ = self.0.stopped.recv().await;
@@ -448,6 +450,7 @@ impl Client {
     }
 
     /// Stops this shared session. Existing request futures resolve with an error.
+    #[cfg(test)]
     pub fn shutdown(&self) {
         let _ = self.0.tx.send(CommandMessage::Shutdown);
     }

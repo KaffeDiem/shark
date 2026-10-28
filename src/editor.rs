@@ -16,7 +16,9 @@ mod intelligence;
 #[cfg(all(test, feature = "test-support"))]
 mod intelligence_tests;
 mod snippets;
-pub(crate) use intelligence::{LanguageEvent, Symbol};
+pub(crate) use intelligence::LanguageEvent;
+#[cfg(test)]
+pub(crate) use intelligence::Symbol;
 
 /// Bigger files open in the diff only; the editor is built for up to ~50K lines.
 pub const MAX_BYTES: u64 = 4 << 20;
