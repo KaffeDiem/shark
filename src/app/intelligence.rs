@@ -6,15 +6,18 @@ use crate::lsp::{
     document::{self, Encoding, Snapshot},
     tools,
 };
+use gpui_kit::base::input::RopeExt as _;
 use lsp_types::{LocationLink, Uri, WorkspaceEdit};
 use serde_json::{Value, json};
 use std::sync::Arc;
 
 #[derive(Clone)]
 pub(super) struct Visit {
-    path: PathBuf,
+    pub(super) path: PathBuf,
     selection: std::ops::Range<usize>,
     scroll: Point<Pixels>,
+    /// The editor's session: an external source has none of its own to rediscover.
+    session: Option<WeakEntity<Session>>,
 }
 
 #[derive(Default)]
@@ -22,6 +25,21 @@ pub(super) struct History {
     pub(super) back: Vec<Visit>,
     pub(super) forward: Vec<Visit>,
     request: u64,
+    /// The Back/Forward still loading: its direction, the entries it steps over, its request.
+    pending: Option<(bool, usize, u64)>,
+}
+
+impl History {
+    fn steps(&self, request: u64) -> usize {
+        self.pending.filter(|p| p.2 == request).map_or(1, |p| p.1)
+    }
+}
+
+pub(super) enum LanguageAction {
+    Format,
+    Rename(String),
+    References,
+    SignatureHelp,
 }
 
 struct Staged {
@@ -94,7 +112,7 @@ impl Shark {
             .map(|l| l.session.clone());
         let editors = if let Some(session) = session {
             self.language_sessions
-                .retain(|_, (cached, _)| cached.upgrade().is_some_and(|cached| cached != session));
+                .retain(|_, (cached, _)| *cached != session);
             self.file_tabs
                 .iter()
                 .filter(|tab| {
@@ -138,8 +156,20 @@ impl Shark {
         if editor.read(cx).external {
             return;
         }
-        let input = cx.new(|cx| InputState::new(window, cx).placeholder("New symbol name"));
+        let word = {
+            let i = editor.read(cx).input.read(cx);
+            (i.text().word_range(i.cursor())).map(|r| i.text().slice(r).to_string())
+        };
+        let input = cx.new(|cx| {
+            let mut input = InputState::new(window, cx).placeholder("New symbol name");
+            if let Some(word) = word {
+                input.set_value(word, window, cx);
+                input.select_all(window, cx);
+            }
+            input
+        });
         let weak = cx.entity().downgrade();
+        let field = input.clone();
         window.open_dialog(cx, move |d, _, _| {
             let input = input.clone();
             let weak = weak.clone();
@@ -153,21 +183,22 @@ impl Shark {
                     }
                     let _ = weak.update(cx, |s, cx| {
                         if s.editor.as_ref() == Some(&editor) {
-                            s.language_action("textDocument/rename", Some(name), window, cx);
+                            s.language_action(LanguageAction::Rename(name), window, cx);
                         }
                     });
                     true
                 })
         });
+        field.update(cx, |i, cx| i.focus(window, cx));
     }
 
     pub(super) fn language_action(
         &mut self,
-        method: &'static str,
-        new_name: Option<String>,
+        action: LanguageAction,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        use LanguageAction::*;
         let Some(editor) = self.editor.clone() else {
             return;
         };
@@ -175,13 +206,9 @@ impl Shark {
         let Some(language) = &e.intelligence else {
             return notify_err(window, cx, "Language tools are not ready");
         };
-        let Some(client) = (if method == "textDocument/formatting" {
-            language
-                .companion
-                .clone()
-                .or_else(|| language.client.clone())
-        } else {
-            language.client.clone()
+        let Some(client) = (match action {
+            Format => (language.companion.clone()).or_else(|| language.client.clone()),
+            _ => language.client.clone(),
         }) else {
             return notify_err(window, cx, "Language tools are not ready");
         };
@@ -205,15 +232,15 @@ impl Shark {
                 anyhow::ensure!(snapshot.text.as_ref() == text, "Document synchronization is pending; try again");
                 let encoding = Encoding::from(client.encoding());
                 let position = document::position(&text, cursor, encoding)?;
-                let mut params = json!({"textDocument":{"uri":uri}, "position":position});
-                match method {
-                    "textDocument/formatting" => { params = json!({"textDocument":{"uri":uri},"options":{"tabSize":4,"insertSpaces":true}}); }
-                    "textDocument/references" => { params["context"] = json!({"includeDeclaration":true}); }
-                    "textDocument/rename" => { params["newName"] = json!(new_name); }
-                    _ => {}
-                }
-                if method == "textDocument/rename" && client.capabilities().and_then(|c| c.rename_provider).is_some_and(|p| matches!(p, lsp_types::OneOf::Right(o) if o.prepare_provider == Some(true))) {
-                    let prepared = client.request("textDocument/prepareRename", json!({"textDocument":{"uri":uri},"position":position})).await?;
+                let at = json!({"textDocument":{"uri":uri}, "position":position});
+                let (method, params) = match &action {
+                    Format => ("textDocument/formatting", json!({"textDocument":{"uri":uri},"options":formatting_options(&text)})),
+                    References => ("textDocument/references", json!({"textDocument":{"uri":uri}, "position":position, "context":{"includeDeclaration":true}})),
+                    Rename(name) => ("textDocument/rename", json!({"textDocument":{"uri":uri}, "position":position, "newName":name})),
+                    SignatureHelp => ("textDocument/signatureHelp", at.clone()),
+                };
+                if matches!(action, Rename(_)) && client.capabilities().and_then(|c| c.rename_provider).is_some_and(|p| matches!(p, lsp_types::OneOf::Right(o) if o.prepare_provider == Some(true))) {
+                    let prepared = client.request("textDocument/prepareRename", at).await?;
                     anyhow::ensure!(!prepared.is_null(), "This symbol cannot be renamed");
                 }
                 let result = client.request(method, params).await?;
@@ -225,30 +252,38 @@ impl Shark {
                 if s.active != workspace || s.editor.as_ref() != Some(&editor) || editor.read(cx).input.read(cx).cursor() != cursor || editor.read(cx).input.read(cx).value().as_ref() != text { return; }
                 let (result, encoding) = match response { Ok(r) => r, Err(error) => return notify_err(window, cx, error.to_string()) };
                 if result.is_null() { return window.push_notification("No result at this position", cx); }
-                match method {
-                    "textDocument/formatting" => {
+                match action {
+                    Format => {
                         match serde_json::from_value::<Vec<lsp_types::TextEdit>>(result) {
                             Ok(edits) => s.apply_workspace_edit(WorkspaceEdit { changes: Some(std::collections::HashMap::from([(uri, edits)])), ..Default::default() }, encoding, root, Some(guard), None, window, cx),
                             Err(error) => notify_err(window, cx, error.to_string()),
                         }
                     }
-                    "textDocument/rename" => match serde_json::from_value(result) {
+                    Rename(_) => match serde_json::from_value(result) {
                         Ok(edit) => s.apply_workspace_edit(edit, encoding, root, Some(guard), None, window, cx),
                         Err(error) => notify_err(window, cx, error.to_string()),
                     },
-                    "textDocument/references" => match serde_json::from_value::<Vec<lsp_types::Location>>(result) {
+                    References => match serde_json::from_value::<Vec<lsp_types::Location>>(result) {
                         Ok(locations) => s.pick_locations(locations.into_iter().map(crate::lsp::providers::location_link).collect(), encoding, false, window, cx),
                         Err(error) => notify_err(window, cx, error.to_string()),
                     },
-                    "textDocument/signatureHelp" => {
+                    SignatureHelp => {
                         let label = result["signatures"].as_array().map(|signatures| signatures.iter().filter_map(|s| s["label"].as_str()).collect::<Vec<_>>().join("\n")).unwrap_or_default();
                         if !label.is_empty() { window.push_notification(label, cx); }
                     }
-                    _ => {}
                 }
             });
         });
         request_editor.update(cx, |e, _| e.lsp_request = Some(task));
+    }
+
+    /// The keyboard Go to definition: the editor's own Command-click request at the cursor.
+    pub(super) fn go_to_definition(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.editor.clone() else {
+            return;
+        };
+        editor.update(cx, |e, cx| e.input.update(cx, |i, cx| i.focus(window, cx)));
+        window.dispatch_action(Box::new(gpui_kit::base::input::GoToDefinition), cx);
     }
 
     pub(super) fn start_language(
@@ -257,10 +292,6 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // UI fixtures attach a controllable session explicitly; never install tools during unit tests.
-        if cfg!(test) {
-            return;
-        }
         let Some(ws) = self.active_ws() else { return };
         let path = editor.read(cx).path.clone();
         let Some(repo) = path
@@ -275,10 +306,22 @@ impl Shark {
         let weak = editor.downgrade();
         let workspace = self.active.clone();
         let task = cx.spawn_in(window, async move |this, cx| {
-            let project = cx
-                .background_executor()
-                .spawn(async move { tools::discover(&file, &root) })
-                .await;
+            // Unit tests never install tools: discovery finds the fake-server session a test
+            // registered for the file's worktree.
+            let project = if cfg!(test) {
+                let Ok(project) = this.read_with(cx, |s, cx| {
+                    (s.language_sessions.values())
+                        .map(|(session, _)| session.read(cx).project.clone())
+                        .find(|p| file.starts_with(&p.worktree))
+                }) else {
+                    return;
+                };
+                Ok(project)
+            } else {
+                cx.background_executor()
+                    .spawn(async move { tools::discover(&file, &root) })
+                    .await
+            };
             let _ = this.update_in(cx, |s, window, cx| {
                 if s.active != workspace {
                     return;
@@ -286,29 +329,14 @@ impl Shark {
                 let Some(editor) = weak.upgrade() else { return };
                 match project {
                     Ok(Some(project)) => {
-                        let key = project.session_key();
-                        s.language_sessions
-                            .retain(|_, (session, _)| session.upgrade().is_some());
-                        let session =
-                            match s.language_sessions.get(&key).and_then(|(e, _)| e.upgrade()) {
-                                Some(session) => session,
-                                None => {
-                                    let session = cx.new(|cx| Session::new(project, window, cx));
-                                    let sub = cx.subscribe_in(
-                                        &session,
-                                        window,
-                                        |s, session, event: &SessionEvent, w, cx| {
-                                            if let SessionEvent::Request(request) = event
-                                                && let Some(request) = request.borrow_mut().take()
-                                            {
-                                                s.language_request(session, request, w, cx);
-                                            }
-                                        },
-                                    );
-                                    s.language_sessions.insert(key, (session.downgrade(), sub));
-                                    session
-                                }
-                            };
+                        let session = match s.language_sessions.get(&project.session_key()) {
+                            Some((session, _)) => session.clone(),
+                            None => {
+                                let session = cx.new(|cx| Session::new(project, window, cx));
+                                s.register_session(session.clone(), window, cx);
+                                session
+                            }
+                        };
                         editor.update(cx, |e, cx| e.attach_language(session, window, cx));
                     }
                     Ok(None) => {}
@@ -321,6 +349,56 @@ impl Shark {
             });
         });
         editor.update(cx, |e, _| e.lsp_setup = Some(task));
+    }
+
+    /// Keeps `session` for its project's editors, routing its server requests and messages.
+    pub(super) fn register_session(
+        &mut self,
+        session: Entity<Session>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let key = session.read(cx).project.session_key();
+        let sub = cx.subscribe_in(
+            &session,
+            window,
+            |s, session, event: &SessionEvent, w, cx| match event {
+                SessionEvent::Request(request) => {
+                    if let Some(request) = request.borrow_mut().take() {
+                        s.language_request(session, request, w, cx);
+                    }
+                }
+                SessionEvent::Notification { method, params, .. }
+                    if method == "window/showMessage" =>
+                {
+                    let message = params["message"].as_str().unwrap_or_default().to_string();
+                    match params["type"].as_u64() {
+                        Some(1) => notify_err(w, cx, message),
+                        Some(2) => w.push_notification(Notification::warning(message), cx),
+                        _ => {}
+                    }
+                }
+                SessionEvent::Notification { .. } => {}
+            },
+        );
+        self.language_sessions.insert(key, (session, sub));
+    }
+
+    /// Shuts down the servers no open file uses any more.
+    pub(super) fn prune_language_sessions(&mut self, cx: &App) {
+        let tabs = &self.file_tabs;
+        self.language_sessions.retain(|_, (session, _)| {
+            tabs.iter().any(|t| {
+                let e = t.editor.read(cx);
+                match &e.intelligence {
+                    Some(l) => l.session == *session,
+                    // A file still discovering (say, just restored) may be about to join it.
+                    None => e
+                        .absolute_path()
+                        .starts_with(&session.read(cx).project.worktree),
+                }
+            })
+        });
     }
 
     pub(super) fn language_event(
@@ -395,29 +473,27 @@ impl Shark {
             }
             client::Event::ShowDocument { params, reply } => {
                 let parsed = serde_json::from_value::<lsp_types::ShowDocumentParams>(params);
-                match parsed {
-                    Ok(p) if p.uri.scheme().is_some_and(|s| s.as_str() == "file") => {
-                        let range = p.selection.unwrap_or_default();
+                match parsed.map(|p| (uri_path(&p.uri), p)) {
+                    Ok((Ok(path), p)) => {
                         let encoding = session
                             .read(cx)
                             .client
                             .as_ref()
                             .map(|c| c.encoding().into())
                             .unwrap_or(Encoding::Utf16);
-                        self.open_location(
-                            LocationLink {
-                                origin_selection_range: None,
-                                target_uri: p.uri,
-                                target_range: range,
-                                target_selection_range: range,
-                            },
-                            encoding,
-                            true,
-                            false,
+                        let range = p.selection.map(|range| (range, encoding));
+                        // Without focus it opens in a background tab; success waits for the open.
+                        let focus = p.take_focus != Some(false);
+                        self.open_source(
+                            path,
+                            range,
+                            None,
+                            focus,
+                            !focus,
+                            Some((reply, focus, session.downgrade())),
                             window,
                             cx,
                         );
-                        reply.respond(json!({"success":true}));
                     }
                     _ => reply.respond(json!({"success":false})),
                 }
@@ -508,6 +584,7 @@ impl Shark {
             path: editor.absolute_path().to_owned(),
             selection: editor.input.read(cx).selected_range(),
             scroll: editor.input.read(cx).scroll_offset(),
+            session: (editor.intelligence.as_ref()).map(|l| l.session.downgrade()),
         })
     }
 
@@ -517,21 +594,27 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let target = if forward {
-            self.navigation.forward.last().cloned()
-        } else {
-            self.navigation.back.last().cloned()
+        let nav = &self.navigation;
+        // A press before the previous one landed steps past its target instead of repeating it.
+        let steps = match nav.pending {
+            Some((f, steps, request)) if f == forward && request == nav.request => steps + 1,
+            _ => 1,
         };
-        let Some(target) = target else { return };
+        let from = if forward { &nav.forward } else { &nav.back };
+        let Some(target) = (from.len().checked_sub(steps)).map(|ix| from[ix].clone()) else {
+            return;
+        };
         self.open_source(
             target.path.clone(),
             None,
             Some((target, forward)),
             false,
             false,
+            None,
             window,
             cx,
         );
+        self.navigation.pending = Some((forward, steps, self.navigation.request));
     }
 
     /// The outline of the open file as an indented tree; picking a symbol moves the cursor
@@ -549,6 +632,7 @@ impl Shark {
         if e.outline.is_empty() {
             let message = match e.intelligence {
                 Some(_) => "No symbols in this file",
+                None if e.external => "No language tools for this dependency source",
                 None => "Language tools are not ready",
             };
             return window.push_notification(message, cx);
@@ -556,6 +640,8 @@ impl Shark {
         let items = (e.outline.iter())
             .map(|s| CommandItem::new().label(format!("{}{}", "    ".repeat(s.depth), s.name)))
             .collect();
+        // The outline can refresh while the menu is open; a row keeps the symbol it showed.
+        let targets: Vec<usize> = e.outline.iter().map(|s| s.target).collect();
         let selected = selected.or(e.crumbs.last().copied()).unwrap_or(0);
         open_menu(
             cx.entity().downgrade(),
@@ -564,7 +650,7 @@ impl Shark {
             selected,
             move |s, ix, w, cx| {
                 if s.editor.as_ref() == Some(&editor) {
-                    s.jump_to_symbol(ix, w, cx);
+                    s.jump_to_symbol(targets[ix], w, cx);
                 }
             },
             window,
@@ -572,11 +658,8 @@ impl Shark {
         );
     }
 
-    fn jump_to_symbol(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+    fn jump_to_symbol(&mut self, target: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.editor.clone() else {
-            return;
-        };
-        let Some(target) = editor.read(cx).outline.get(ix).map(|s| s.target) else {
             return;
         };
         self.navigation.request += 1;
@@ -611,6 +694,7 @@ impl Shark {
                 None,
                 history,
                 new_tab,
+                None,
                 window,
                 cx,
             ),
@@ -618,15 +702,35 @@ impl Shark {
         }
     }
 
+    /// The open tab showing `path`: through an alias's open path, its own, or its workspace path.
+    fn find_tab(
+        &self,
+        alias: Option<&Path>,
+        path: &Path,
+        relative: Option<&str>,
+        cx: &App,
+    ) -> Option<usize> {
+        self.file_tabs.iter().position(|tab| {
+            let e = tab.editor.read(cx);
+            alias.is_some_and(|p| e.absolute_path() == p)
+                || e.absolute_path() == path
+                || relative.is_some_and(|p| e.path == p)
+        })
+    }
+
     /// Opens `path` at `range` or `visit`: in its open tab if it has one, else in place of
-    /// the current file (unless `new_tab`, or the current file has unsaved edits).
-    fn open_source(
+    /// the current file (unless `new_tab`, or the current file has unsaved edits). A server's
+    /// `window/showDocument` passes its reply, answered once the file shows, whether to take
+    /// focus, and its session, which an external file it opens attaches to.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn open_source(
         &mut self,
         path: PathBuf,
         range: Option<(lsp_types::Range, Encoding)>,
         visit: Option<(Visit, bool)>,
         history: bool,
         new_tab: bool,
+        reply: Option<(client::Reply, bool, WeakEntity<Session>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -639,6 +743,14 @@ impl Shark {
             .flatten();
         let origin = self.editor.clone();
         let origin_tab = self.tab;
+        // Dependency sources have no project of their own; they use the server that found them.
+        let session = match (&visit, &reply) {
+            (Some((v, _)), _) => v.session.clone(),
+            (None, Some((_, _, session))) => Some(session.clone()),
+            (None, None) => origin
+                .as_ref()
+                .and_then(|e| (e.read(cx).intelligence.as_ref()).map(|l| l.session.downgrade())),
+        };
         let open_paths: Vec<_> = self
             .file_tabs
             .iter()
@@ -665,6 +777,11 @@ impl Shark {
                     } else {
                         None
                     };
+                    // Installed dependencies are read-only too, like sources outside the workspace.
+                    let relative = relative.filter(|p| {
+                        !p.split('/')
+                            .any(|c| c == "node_modules" || c == "site-packages")
+                    });
                     let existing = open_paths
                         .into_iter()
                         .find(|p| p == &path || p.canonicalize().is_ok_and(|p| p == canonical));
@@ -672,26 +789,40 @@ impl Shark {
                 })
                 .await;
             let _ = this.update_in(cx, |s, window, cx| {
-                if s.active != workspace
-                    || s.editor != origin
-                    || s.tab != origin_tab
-                    || s.navigation.request != request
-                {
+                if s.navigation.request != request {
+                    return;
+                }
+                let steps = s.navigation.steps(request);
+                s.navigation.pending = None;
+                if s.active != workspace || s.editor != origin || s.tab != origin_tab {
                     return;
                 }
                 let (canonical, original, text, relative, existing_path) = match read {
                     Ok(read) => read,
-                    Err(error) => return notify_err(window, cx, error.to_string()),
+                    Err(error) => {
+                        // A deleted file leaves history: Back goes on to the entry before it.
+                        let gone = (error.downcast_ref::<std::io::Error>())
+                            .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound);
+                        if let Some((_, forward)) = visit.as_ref().filter(|_| gone) {
+                            let nav = &mut s.navigation;
+                            let from = if *forward {
+                                &mut nav.forward
+                            } else {
+                                &mut nav.back
+                            };
+                            if let Some(ix) = from.len().checked_sub(steps) {
+                                from.remove(ix);
+                                if ix > 0 {
+                                    nav.pending = Some((*forward, steps - 1, request));
+                                    return s.navigate_history(*forward, window, cx);
+                                }
+                            }
+                        }
+                        return notify_err(window, cx, error.to_string());
+                    }
                 };
-                let existing = s.file_tabs.iter().position(|tab| {
-                    existing_path
-                        .as_ref()
-                        .is_some_and(|p| tab.editor.read(cx).absolute_path() == p)
-                        || tab.editor.read(cx).absolute_path() == original
-                        || relative
-                            .as_ref()
-                            .is_some_and(|p| tab.editor.read(cx).path == *p)
-                });
+                let existing =
+                    s.find_tab(existing_path.as_deref(), &original, relative.as_deref(), cx);
                 if let Some(relative) = &relative
                     && s.differ
                         .read(cx)
@@ -711,12 +842,13 @@ impl Shark {
                             .to_string()
                     })
                     .unwrap_or(text.clone());
+                // An open file opened without a location keeps its cursor.
                 let selected = match range {
                     Some((range, encoding)) => match (
                         document::offset(&source, range.start, encoding),
                         document::offset(&source, range.end, encoding),
                     ) {
-                        (Ok(a), Ok(b)) if a <= b => a..b,
+                        (Ok(a), Ok(b)) if a <= b => Some(a..b),
                         _ => {
                             return notify_err(
                                 window,
@@ -725,13 +857,10 @@ impl Shark {
                             );
                         }
                     },
-                    None => visit
-                        .as_ref()
-                        .map(|(v, _)| {
-                            source.floor_char_boundary(v.selection.start.min(source.len()))
-                                ..source.floor_char_boundary(v.selection.end.min(source.len()))
-                        })
-                        .unwrap_or(0..0),
+                    None => visit.as_ref().map(|(v, _)| {
+                        source.floor_char_boundary(v.selection.start.min(source.len()))
+                            ..source.floor_char_boundary(v.selection.end.min(source.len()))
+                    }),
                 };
                 let editor = match existing {
                     Some(ix) => s.file_tabs[ix].editor.clone(),
@@ -743,20 +872,41 @@ impl Shark {
                             .and_then(|e| {
                                 let ix = s.file_tabs.iter().position(|t| t.editor == *e)?;
                                 let old = e.read(cx);
-                                Some((ix, TabId::File(old.path.clone()), old.external))
+                                let slot = s.file_tabs[ix].slot;
+                                Some((ix, TabId::File(old.path.clone()), old.external, slot))
                             });
-                        let tab = s.make_file_tab(path.clone(), original, Some(text), window, cx);
-                        tab.editor.update(cx, |e, cx| e.set_external(external, cx));
+                        let mut tab =
+                            s.make_file_tab(path.clone(), original, Some(text), window, cx);
+                        tab.editor.update(cx, |e, cx| {
+                            e.set_external(external, cx);
+                            if let Some(session) = session.and_then(|s| s.upgrade())
+                                && external
+                            {
+                                e.attach_language(session, window, cx);
+                            }
+                        });
                         let editor = tab.editor.clone();
                         let new = TabId::File(path);
                         let ws = s.active_ws_mut().unwrap();
                         match replace {
-                            Some((ix, old_tab, old_external)) => {
+                            Some((ix, old_tab, old_external, slot)) => {
+                                // An external file sits after the tabs; it remembers the slot
+                                // of the file it replaced, so going back restores it there.
                                 match (old_external, external) {
                                     (false, false) => ws.replace_tab(&old_tab, new),
-                                    (false, true) => ws.close_tab(&old_tab),
-                                    (true, false) => ws.open_tab(new),
-                                    (true, true) => {}
+                                    (false, true) => {
+                                        tab.slot = ws.tab_order.iter().position(|t| *t == old_tab);
+                                        ws.close_tab(&old_tab);
+                                    }
+                                    (true, false) => match slot {
+                                        Some(slot) => {
+                                            ws.tab_order.retain(|t| *t != new);
+                                            let slot = slot.min(ws.tab_order.len());
+                                            ws.tab_order.insert(slot, new);
+                                        }
+                                        None => ws.open_tab(new),
+                                    },
+                                    (true, true) => tab.slot = slot,
                                 }
                                 s.file_tabs[ix] = tab;
                             }
@@ -776,25 +926,37 @@ impl Shark {
                     } else {
                         (&mut s.navigation.back, &mut s.navigation.forward)
                     };
-                    from.pop();
+                    // The target, then the entries quick repeated presses stepped over.
+                    let passed = from.split_off(from.len().saturating_sub(steps));
                     if let Some(old) = old {
                         to.push(old);
                     }
+                    to.extend(passed.into_iter().skip(1).rev());
                 } else if let Some(old) = old {
                     s.navigation.back.push(old);
                     s.navigation.forward.clear();
                 }
-                s.editor = Some(editor.clone());
-                s.show(Tab::File, window, cx);
+                let focus = reply.as_ref().is_none_or(|(_, focus, _)| *focus);
+                if focus {
+                    s.editor = Some(editor.clone());
+                    s.show(Tab::File, window, cx);
+                }
                 editor.update(cx, |e, cx| {
                     e.input.update(cx, |i, cx| {
-                        i.set_selected_range(selected, cx);
+                        if let Some(selected) = selected {
+                            i.set_selected_range(selected, cx);
+                        }
                         if let Some((visit, _)) = visit {
                             i.set_scroll_offset(visit.scroll, cx);
                         }
-                        i.focus(window, cx);
+                        if focus {
+                            i.focus(window, cx);
+                        }
                     })
                 });
+                if let Some((reply, ..)) = reply {
+                    reply.respond(json!({"success":true}));
+                }
                 let _ = s.state.save();
                 cx.notify();
             });
@@ -816,20 +978,16 @@ impl Shark {
         let workspace = self.active.clone();
         let directory = ws.dir();
         let inline = self.differ.read(cx).edit_snapshot();
+        // Ropes clone cheaply; only the edit's own documents are compared off the UI thread.
         let open: Vec<_> = self
             .file_tabs
             .iter()
             .map(|tab| {
                 let e = tab.editor.read(cx);
-                let text = e.input.read(cx).value().to_string();
-                let version = e.intelligence.as_ref().and_then(|l| {
-                    let s = l.snapshot.lock().unwrap();
-                    (s.text.as_ref() == text).then_some(s.version)
-                });
                 (
                     e.absolute_path().to_owned(),
-                    text,
-                    version,
+                    e.input.read(cx).text().clone(),
+                    e.intelligence.as_ref().map(|l| l.snapshot.clone()),
                     e.conflict || e.saving || e.external,
                     e.disk_fingerprint(),
                 )
@@ -881,7 +1039,7 @@ impl Shark {
                                 ensure_disk_before_request(&path, guard.started)?;
                             }
                             let (before, version) = match existing {
-                                Some((_, text, version, blocked, fingerprint)) => {
+                                Some((_, text, snapshot, blocked, fingerprint)) => {
                                     anyhow::ensure!(
                                         !blocked,
                                         "Resolve the save or disk conflict in {relative} first"
@@ -890,7 +1048,12 @@ impl Shark {
                                         crate::files::fingerprint(disk.as_bytes()) == *fingerprint,
                                         "{relative} changed on disk; reload before applying edits"
                                     );
-                                    (text.clone(), *version)
+                                    let text = text.to_string();
+                                    let version = snapshot.as_ref().and_then(|s| {
+                                        let s = s.lock().unwrap();
+                                        (s.text.as_ref() == text).then_some(s.version)
+                                    });
+                                    (text, version)
                                 }
                                 None => (disk, None),
                             };
@@ -904,10 +1067,6 @@ impl Shark {
                             };
                             let after =
                                 document::apply_edits(&snapshot, expected, &edits, encoding)?;
-                            anyhow::ensure!(
-                                after.len() as u64 <= crate::editor::MAX_BYTES,
-                                "Edit exceeds the 4 MiB editor limit"
-                            );
                             Ok(Staged {
                                 path,
                                 existing_path: existing.map(|(path, ..)| path.clone()),
@@ -939,15 +1098,14 @@ impl Shark {
                             "{} has unsaved diff edits",
                             edit.relative
                         );
-                        let existing = s.file_tabs.iter().find(|tab| {
-                            edit.existing_path
-                                .as_ref()
-                                .is_some_and(|path| tab.editor.read(cx).absolute_path() == path)
-                                || tab.editor.read(cx).absolute_path() == edit.path
-                                || tab.editor.read(cx).path == edit.relative
-                        });
-                        if let Some(tab) = existing {
-                            let e = tab.editor.read(cx);
+                        let existing = s.find_tab(
+                            edit.existing_path.as_deref(),
+                            &edit.path,
+                            Some(&edit.relative),
+                            cx,
+                        );
+                        if let Some(ix) = existing {
+                            let e = s.file_tabs[ix].editor.read(cx);
                             anyhow::ensure!(
                                 !e.conflict
                                     && !e.saving
@@ -973,14 +1131,14 @@ impl Shark {
                         if edit.before == edit.after {
                             continue;
                         }
-                        let editor = match s.file_tabs.iter().find(|tab| {
-                            edit.existing_path
-                                .as_ref()
-                                .is_some_and(|path| tab.editor.read(cx).absolute_path() == path)
-                                || tab.editor.read(cx).absolute_path() == edit.path
-                                || tab.editor.read(cx).path == edit.relative
-                        }) {
-                            Some(tab) => tab.editor.clone(),
+                        let existing = s.find_tab(
+                            edit.existing_path.as_deref(),
+                            &edit.path,
+                            Some(&edit.relative),
+                            cx,
+                        );
+                        let editor = match existing {
+                            Some(ix) => s.file_tabs[ix].editor.clone(),
                             None => {
                                 let tab = s.make_file_tab(
                                     edit.relative.clone(),
@@ -1024,8 +1182,36 @@ fn uri_path(uri: &Uri) -> anyhow::Result<PathBuf> {
         .map_err(|_| anyhow::anyhow!("Only local file locations are supported"))
 }
 
-fn read_source(path: &Path) -> anyhow::Result<String> {
+/// FormattingOptions matching `text`'s own indentation: tabs when most indented lines start
+/// with one, else its most common indent step (4 when nothing is indented). Servers such as
+/// tsserver reindent the whole file to these options.
+pub(super) fn formatting_options(text: &str) -> Value {
+    let (mut tabs, mut spaces, mut previous) = (0, 0, 0);
+    let mut steps = [0usize; 9];
+    // Block-comment continuations (" * doc", " */") sit one space in; they are not a step.
+    for line in (text.lines()).filter(|l| !l.trim().is_empty() && !l.trim().starts_with('*')) {
+        if line.starts_with('\t') {
+            tabs += 1;
+            continue;
+        }
+        let indent = line.len() - line.trim_start_matches(' ').len();
+        spaces += usize::from(indent > 0);
+        if let Some(step) = indent.checked_sub(previous).filter(|s| (1..=8).contains(s)) {
+            steps[step] += 1;
+        }
+        previous = indent;
+    }
+    let tab_size = (1..=8)
+        .filter(|&s| steps[s] > 0)
+        .max_by_key(|&s| (steps[s], std::cmp::Reverse(s)))
+        .unwrap_or(4);
+    json!({"tabSize": tab_size, "insertSpaces": tabs <= spaces})
+}
+
+pub(super) fn read_source(path: &Path) -> anyhow::Result<String> {
     use std::io::Read;
+    // Before opening: opening a FIFO blocks until something writes to it.
+    anyhow::ensure!(path.metadata()?.is_file(), "Not a regular source file");
     let file = std::fs::File::open(path)?;
     anyhow::ensure!(file.metadata()?.is_file(), "Not a regular source file");
     let mut bytes = Vec::new();

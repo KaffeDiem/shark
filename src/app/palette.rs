@@ -743,7 +743,7 @@ pub(super) const COMMANDS: &[Row] = &[
         IconName::File,
         Some(&FormatDocument),
         "language format lsp",
-        |s, w, cx| s.language_action("textDocument/formatting", None, w, cx),
+        |s, w, cx| s.language_action(super::intelligence::LanguageAction::Format, w, cx),
     ),
     Row(
         "Rename symbol…",
@@ -753,11 +753,18 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| s.rename_symbol(w, cx),
     ),
     Row(
+        "Go to definition",
+        IconName::ArrowRight,
+        Some(&gpui_kit::base::input::GoToDefinition),
+        "language declaration jump lsp",
+        |s, w, cx| s.go_to_definition(w, cx),
+    ),
+    Row(
         "Find references",
         IconName::Search,
         Some(&FindReferences),
         "language usages lsp",
-        |s, w, cx| s.language_action("textDocument/references", None, w, cx),
+        |s, w, cx| s.language_action(super::intelligence::LanguageAction::References, w, cx),
     ),
     Row(
         "Go to symbol…",
@@ -771,7 +778,7 @@ pub(super) const COMMANDS: &[Row] = &[
         IconName::Info,
         Some(&SignatureHelp),
         "language parameters lsp",
-        |s, w, cx| s.language_action("textDocument/signatureHelp", None, w, cx),
+        |s, w, cx| s.language_action(super::intelligence::LanguageAction::SignatureHelp, w, cx),
     ),
     Row(
         "Go back",

@@ -115,7 +115,10 @@ pub struct Shark {
     rail: bool,
     editor: Option<Entity<FileEditor>>,
     file_tabs: Vec<editor_pane::FileTab>,
-    language_sessions: HashMap<String, (WeakEntity<crate::lsp::Session>, Subscription)>,
+    /// The workspace's language servers by project; files share and outlive tabs on them.
+    language_sessions: HashMap<String, (Entity<crate::lsp::Session>, Subscription)>,
+    /// Servers of workspaces switched away from, kept warm until their idle timer runs out.
+    parked_sessions: HashMap<String, (Vec<Entity<crate::lsp::Session>>, Task<()>)>,
     navigation: intelligence::History,
     pub(crate) syncs: HashMap<String, Entity<GitSync>>,
     sidebar_focus: FocusHandle,
@@ -260,6 +263,7 @@ impl Shark {
             editor: None,
             file_tabs: vec![],
             language_sessions: HashMap::new(),
+            parked_sessions: HashMap::new(),
             navigation: Default::default(),
             syncs: HashMap::new(),
             sidebar_focus,
@@ -994,15 +998,15 @@ impl Render for Shark {
             // On the root, not the editor, so File > Save works with focus in the tree.
             .on_action(cx.listener(|this, _: &SaveFile, w, cx| this.save(w, cx)))
             .on_action(cx.listener(|s, _: &FormatDocument, w, cx| {
-                s.language_action("textDocument/formatting", None, w, cx)
+                s.language_action(intelligence::LanguageAction::Format, w, cx)
             }))
             .on_action(cx.listener(|s, _: &RenameSymbol, w, cx| s.rename_symbol(w, cx)))
             .on_action(cx.listener(|s, _: &FindReferences, w, cx| {
-                s.language_action("textDocument/references", None, w, cx)
+                s.language_action(intelligence::LanguageAction::References, w, cx)
             }))
             .on_action(cx.listener(|s, _: &DocumentSymbols, w, cx| s.symbol_menu(None, w, cx)))
             .on_action(cx.listener(|s, _: &SignatureHelp, w, cx| {
-                s.language_action("textDocument/signatureHelp", None, w, cx)
+                s.language_action(intelligence::LanguageAction::SignatureHelp, w, cx)
             }))
             .on_action(cx.listener(|s, _: &NavigationBack, w, cx| s.navigate_history(false, w, cx)))
             .on_action(
