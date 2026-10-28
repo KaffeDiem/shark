@@ -110,6 +110,7 @@ impl Shark {
             .intelligence
             .as_ref()
             .map(|l| l.session.clone());
+        let project = session.as_ref().map(|s| s.read(cx).project.clone());
         let editors = if let Some(session) = session {
             self.language_sessions
                 .retain(|_, (cached, _)| *cached != session);
@@ -127,6 +128,10 @@ impl Shark {
         } else {
             vec![editor]
         };
+        // Dependency sources cannot be rediscovered; they rejoin a project file's new session.
+        let anchor = (editors.iter())
+            .find(|e| !e.read(cx).external)
+            .map(|e| e.downgrade());
         // Retry discovers current environments and regroups every document that shared the server.
         for editor in editors {
             editor.update(cx, |e, cx| {
@@ -145,7 +150,15 @@ impl Shark {
                 });
                 cx.notify();
             });
-            self.start_language(&editor, window, cx);
+            if !editor.read(cx).external {
+                self.start_language(&editor, window, cx);
+            } else if let Some(anchor) = &anchor {
+                editor.update(cx, |e, _| e.reattach_to = Some(anchor.clone()));
+            } else if let Some(project) = project.clone() {
+                let session = cx.new(|cx| Session::new(project, window, cx));
+                self.register_session(session.clone(), window, cx);
+                editor.update(cx, |e, cx| e.attach_language(session, window, cx));
+            }
         }
     }
 
@@ -203,6 +216,9 @@ impl Shark {
             return;
         };
         let e = editor.read(cx);
+        if e.external && matches!(action, Format) {
+            return notify_err(window, cx, "Dependency sources are read-only");
+        }
         let Some(language) = &e.intelligence else {
             return notify_err(window, cx, "Language tools are not ready");
         };
@@ -337,7 +353,18 @@ impl Shark {
                                 session
                             }
                         };
-                        editor.update(cx, |e, cx| e.attach_language(session, window, cx));
+                        // Dependency sources Retry detached from this editor follow it.
+                        let followers: Vec<_> = (s.file_tabs.iter())
+                            .map(|t| t.editor.clone())
+                            .filter(|f| f.read(cx).reattach_to.as_ref() == Some(&weak))
+                            .chain([editor.clone()])
+                            .collect();
+                        for follower in followers {
+                            follower.update(cx, |e, cx| {
+                                e.reattach_to = None;
+                                e.attach_language(session.clone(), window, cx)
+                            });
+                        }
                     }
                     Ok(None) => {}
                     Err(error) => editor.update(cx, |e, cx| {
@@ -345,10 +372,16 @@ impl Shark {
                         cx.notify();
                     }),
                 }
+                editor.update(cx, |e, _| e.discovering = false);
+                // A session kept only for this file's discovery may have no user now.
+                s.prune_language_sessions(cx);
                 cx.notify();
             });
         });
-        editor.update(cx, |e, _| e.lsp_setup = Some(task));
+        editor.update(cx, |e, _| {
+            e.lsp_setup = Some(task);
+            e.discovering = true;
+        });
     }
 
     /// Keeps `session` for its project's editors, routing its server requests and messages.
@@ -393,9 +426,11 @@ impl Shark {
                 match &e.intelligence {
                     Some(l) => l.session == *session,
                     // A file still discovering (say, just restored) may be about to join it.
-                    None => e
-                        .absolute_path()
-                        .starts_with(&session.read(cx).project.worktree),
+                    None => {
+                        e.discovering
+                            && e.absolute_path()
+                                .starts_with(&session.read(cx).project.worktree)
+                    }
                 }
             })
         });
@@ -878,6 +913,7 @@ impl Shark {
                                     (true, true) => tab.slot = slot,
                                 }
                                 s.file_tabs[ix] = tab;
+                                s.prune_language_sessions(cx);
                             }
                             None => {
                                 if !external {

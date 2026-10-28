@@ -1506,7 +1506,12 @@ async fn closing_a_tab_keeps_servers_of_files_still_discovering(cx: &mut TestApp
         })
         .unwrap();
     let p = open_tab(cx, window, &shark, "api/pending/p.txt").await;
-    cx.update(|cx| p.update(cx, |e, _| e.intelligence = None));
+    cx.update(|cx| {
+        p.update(cx, |e, _| {
+            e.intelligence = None;
+            e.discovering = true;
+        })
+    });
     let close = |cx: &mut TestAppContext, editor: Entity<FileEditor>| {
         cx.update_window(window, |_, w, cx| {
             shark.update(cx, |s, cx| s.close_editor(editor, w, cx))
@@ -1517,7 +1522,13 @@ async fn closing_a_tab_keeps_servers_of_files_still_discovering(cx: &mut TestApp
     let a = cx.update(|cx| shark.read(cx).file_tabs[0].editor.clone());
     close(cx, a);
     assert!(weak.upgrade().is_some(), "p.txt may still attach to it");
-    close(cx, p);
+    // A file whose discovery found no server (README, Cargo.toml) does not hold one.
+    cx.update(|cx| p.update(cx, |e, _| e.discovering = false));
+    cx.update_window(window, |_, _, cx| {
+        shark.update(cx, |s, cx| s.prune_language_sessions(cx))
+    })
+    .unwrap();
+    cx.run_until_parked();
     assert!(weak.upgrade().is_none());
 }
 
@@ -1715,5 +1726,72 @@ async fn dependency_sources_are_read_only_share_the_session_and_keep_tab_slots(
     .await;
     cx.update(|cx| {
         assert_eq!(shark.read(cx).active_ws().unwrap().tab_order, tabs);
+    });
+}
+
+// Format refuses a dependency source, and Retry carries it to its project file's new session.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn retry_reattaches_dependency_sources_and_format_refuses_them(cx: &mut TestAppContext) {
+    let _guard = ui_tests::UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, window, shark) = fixture(cx).await;
+    let dependency = root.join("node_modules/dep/index.txt");
+    std::fs::create_dir_all(dependency.parent().unwrap()).unwrap();
+    std::fs::write(&dependency, "export\n").unwrap();
+    let (session, log) = fake_session(&root);
+    let a = cx
+        .update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| {
+                let session = cx.new(|_| session);
+                s.register_session(session.clone(), w, cx);
+                let a = s.file_tabs[0].editor.clone();
+                a.update(cx, |e, cx| e.attach_language(session, w, cx));
+                s.select_file(0, w, cx);
+                let range = Range::new(Position::new(0, 0), Position::new(0, 6));
+                let link = lsp_types::LocationLink {
+                    origin_selection_range: None,
+                    target_uri: file_uri(&dependency),
+                    target_range: range,
+                    target_selection_range: range,
+                };
+                s.open_location(link, Encoding::Utf16, true, true, w, cx);
+                a
+            })
+        })
+        .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        (shark.read(cx).editor.as_ref()).is_some_and(|e| e.read(cx).external)
+    })
+    .await;
+    let dep = cx.update(|cx| shark.read(cx).editor.clone().unwrap());
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| {
+            s.language_action(super::intelligence::LanguageAction::Format, w, cx)
+        })
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(
+        (server_messages(&log).iter()).all(|m| m["method"] != "textDocument/formatting"),
+        "formatting a read-only source reached the server"
+    );
+    let (fresh, _) = fake_session(&root);
+    let fresh = cx
+        .update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| {
+                s.editor = Some(a.clone());
+                s.restart_language(w, cx);
+                assert!(dep.read(cx).intelligence.is_none());
+                // Test discovery finds whichever registered session covers the worktree.
+                let fresh = cx.new(|_| fresh);
+                s.register_session(fresh.clone(), w, cx);
+                fresh
+            })
+        })
+        .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        assert_eq!(session_of(&a, cx), Some(fresh.clone()));
+        assert_eq!(session_of(&dep, cx), Some(fresh.clone()));
     });
 }

@@ -75,6 +75,10 @@ pub struct FileEditor {
     pub(crate) external: bool,
     pub(crate) intelligence: Option<intelligence::Language>,
     pub(crate) lsp_setup: Option<Task<()>>,
+    /// Project discovery is running; this file may be about to join a session.
+    pub(crate) discovering: bool,
+    /// A dependency source detached by Retry, waiting for this editor's new session.
+    pub(crate) reattach_to: Option<WeakEntity<FileEditor>>,
     pub(crate) lsp_request: Option<Task<()>>,
     pub(crate) lsp_error: Option<String>,
     /// Document symbols from the language server, refreshed after each sync.
@@ -164,6 +168,8 @@ impl FileEditor {
             external: false,
             intelligence: None,
             lsp_setup: None,
+            discovering: false,
+            reattach_to: None,
             lsp_request: None,
             lsp_error: None,
             outline: vec![],

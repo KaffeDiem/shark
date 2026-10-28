@@ -108,6 +108,7 @@ impl Shark {
                         .unwrap()
                         .replace_tab(&old, TabId::File(path));
                     s.file_tabs[ix] = tab;
+                    s.prune_language_sessions(cx);
                 } else {
                     s.active_ws_mut().unwrap().open_tab(TabId::File(path));
                     s.file_tabs.push(tab);
