@@ -761,9 +761,10 @@ fn swift(project: &Project) -> Result<Launch> {
                 fs::write(&staged, text)?;
                 // Linking activates the complete file atomically and cannot replace a concurrent writer.
                 fs::hard_link(&staged, &bsp)?;
-                // Best effort: outside a git repository there is nothing to keep clean.
-                let _ = exclude_from_git(&project.root, "buildServer.json");
             }
+            // Best effort, for new and regenerated Shark-owned files alike: outside a git
+            // repository there is nothing to keep clean.
+            let _ = exclude_from_git(&project.root, "buildServer.json");
             Ok(())
         })();
         let _ = fs::remove_file(staged);
@@ -827,16 +828,21 @@ fn go_env(key: &str) -> Option<String> {
         .map(String::from)
 }
 
-fn go(project: &Project) -> Result<Launch> {
-    // Go's `path` mode honors go.mod/go.work toolchain selection without downloading compilers.
+/// The user's GOTOOLCHAIN with downloads disabled: Go's `path` mode honors go.mod/go.work
+/// toolchain selection without downloading compilers.
+fn go_toolchain() -> String {
     let selected = go_env("GOTOOLCHAIN").unwrap_or_else(|| "auto".into());
-    let selected = match selected.as_str() {
+    match selected.as_str() {
         "auto" => "path".into(),
         "local" | "path" => selected,
         value if value.ends_with("+auto") => value.replace("+auto", "+path"),
         value if value.ends_with("+path") => selected,
         _ => format!("{selected}+path"),
-    };
+    }
+}
+
+fn go(project: &Project) -> Result<Launch> {
+    let selected = go_toolchain();
     let mut command = Command::new("go");
     command.env("GOTOOLCHAIN", &selected);
     crate::git::wait_bounded(command, &project.root, "go", &["version"], 15, true)
@@ -995,12 +1001,9 @@ mod tests {
             ]
         };
         let (toolchain, discovered) = with_env(&env(&root.join("tools/dev.work")), || {
-            (
-                go_env("GOTOOLCHAIN"),
-                discover(&root.join("b/main.go"), &root),
-            )
+            (go_toolchain(), discover(&root.join("b/main.go"), &root))
         });
-        assert_eq!(toolchain.as_deref(), Some("local"));
+        assert_eq!(toolchain, "local");
         assert_eq!(
             discovered.unwrap().unwrap().root,
             root.join("tools").canonicalize().unwrap()

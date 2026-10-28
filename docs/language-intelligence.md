@@ -65,8 +65,8 @@ worktrees cannot share a server, even when their project names match.
   sits above it. Preserve existing custom `buildServer.json`. For new Xcode
   setups, a unique workspace or project selects SweetPad's standalone BSP;
   ambiguous containers use a persisted application-support selection. Only
-  Shark-owned BSP configuration is regenerated after root or tool changes. A newly
-  generated `buildServer.json` is added to the repository's local `info/exclude`.
+  Shark-owned BSP configuration is regenerated after root or tool changes. A
+  Shark-generated `buildServer.json` is added to the repository's local `info/exclude`.
 * **Go:** find `go.work` before individual modules, respecting `GOWORK` (`off` or a
   file path) and `GOTOOLCHAIN` from the environment or `go env -w`.
   Toolchain lookup honors project files but disables compiler downloads. Use the
