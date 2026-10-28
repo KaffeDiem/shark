@@ -61,13 +61,18 @@ fn verified_responses_deduplicate_and_use_reported_duration() {
         ]
     );
     assert!(rows.iter().all(|r| r.resets_at.is_some()));
+    assert_eq!(
+        rows.iter().map(|r| r.window).collect::<Vec<_>>(),
+        [Some(5. * 3600.), Some(7. * 86400.), Some(7. * 86400.)]
+    );
     let rows = codex(&fixture(Provider::Codex)["result"]).unwrap();
     assert_eq!(
         rows,
         [Allowance {
             label: "Weekly".into(),
             remaining: Some(68.),
-            resets_at: Some(1793774588.)
+            resets_at: Some(1793774588.),
+            window: Some(604800.),
         }]
     );
 }
@@ -165,6 +170,7 @@ fn snapshot_coalesces_and_keeps_only_temporary_failure_results() {
         label: "Weekly".into(),
         remaining: Some(0.),
         resets_at: Some(0.),
+        window: None,
     }]));
     assert!(s.checked_at.is_some());
     let fetched = s.fetched_at;
@@ -190,16 +196,19 @@ fn limiting_allowance_uses_tightest_known_remaining_even_after_reset() {
             label: "5 hours".into(),
             remaining: Some(80.),
             resets_at: None,
+            window: None,
         },
         Allowance {
             label: "Weekly".into(),
             remaining: Some(0.),
             resets_at: Some(0.),
+            window: None,
         },
         Allowance {
             label: "Model".into(),
             remaining: None,
             resets_at: None,
+            window: None,
         },
     ]));
     assert_eq!(s.limiting().unwrap().label, "Weekly");
@@ -408,4 +417,20 @@ fn fake_errors_missing_cli_and_timeout_cleanup() {
     );
     assert_eq!(fake.requests().len(), 1);
     fake.reaped();
+}
+
+#[test]
+fn pace_is_the_share_of_the_window_still_to_come() {
+    let row = |resets_at, window| Allowance {
+        label: "Weekly".into(),
+        remaining: Some(30.),
+        resets_at,
+        window,
+    };
+    assert_eq!(row(Some(150.), Some(100.)).pace(100.), Some(50.));
+    assert_eq!(row(Some(100.), Some(100.)).pace(150.), Some(0.));
+    assert_eq!(row(Some(500.), Some(100.)).pace(100.), Some(100.));
+    assert_eq!(row(None, Some(100.)).pace(100.), None);
+    assert_eq!(row(Some(150.), None).pace(100.), None);
+    assert_eq!(row(Some(150.), Some(0.)).pace(100.), None);
 }

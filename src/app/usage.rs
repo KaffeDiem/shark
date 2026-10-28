@@ -1,7 +1,8 @@
 //! Account usage belongs to the window, independent of the selected workspace.
 use super::*;
 use crate::usage::{Failure, Provider, Snapshot, Status};
-use gpui_kit::component::progress::ProgressCircle;
+use gpui_kit::component::plot::shape::{Arc, ArcData};
+use std::f32::consts::TAU;
 use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(300);
@@ -124,15 +125,16 @@ impl Shark {
             .filter(|p| !self.usage[p.index()].allowances.is_empty())
             .collect();
         let fallback = providers.is_empty();
+        let theme = cx.theme();
+        let hover = side_hover(theme);
         div()
             .id("usage-footer")
             .relative()
             .flex_none()
             .p_2()
             .child(
-                h_flex()
-                    .gap_2()
-                    .when(self.rail, |d| d.flex_col().items_center())
+                v_flex()
+                    .when(self.rail, |d| d.items_center().gap_1())
                     .when(fallback, |d| {
                         d.child(
                             Button::new("show-usage")
@@ -147,31 +149,46 @@ impl Shark {
                     })
                     .children(providers.into_iter().map(|provider| {
                         let snapshot = &self.usage[provider.index()];
-                        let remaining = snapshot.limiting().and_then(|row| row.remaining);
-                        let color = ring_color(remaining, snapshot.outdated, cx.theme());
+                        let limiting = snapshot.limiting();
+                        let remaining = limiting.and_then(|row| row.remaining);
+                        let pace = limiting.and_then(|row| row.pace(crate::usage::now()));
                         let description = ring_description(provider, snapshot);
-                        Button::new(format!("usage-trigger-{}", provider.name()))
-                            .ghost()
-                            .size(px(32.))
-                            .p_0()
-                            .accessibility_label(description.clone())
-                            .tooltip(description.clone())
-                            .child(
-                                ProgressCircle::new(format!("usage-ring-{}", provider.name()))
-                                    .size(px(24.))
-                                    .value(remaining.unwrap_or(0.) as f32)
-                                    .color(color)
-                                    .accessibility_label(description)
-                                    .child(
-                                        Icon::new(match provider {
-                                            Provider::Claude => IconName::Sparkles,
-                                            Provider::Codex => IconName::SquareTerminal,
-                                        })
-                                        .with_size(px(12.))
-                                        .text_color(color),
-                                    ),
-                            )
+                        let left = remaining
+                            .map_or_else(|| "Unknown".into(), |n| format!("{}% left", n.ceil()));
+                        let ring = ring(
+                            remaining.unwrap_or(0.),
+                            pace,
+                            fill_color(remaining, snapshot.outdated, theme),
+                            theme,
+                        );
+                        // Expanded: a side row (ring, name, what's left). Rail: the ring over its name.
+                        let trigger = if self.rail {
+                            v_flex()
+                                .w(px(56.))
+                                .py_1p5()
+                                .gap_1()
+                                .items_center()
+                                .rounded(theme.radius)
+                                .text_xs()
+                                .text_color(theme.sidebar_foreground)
+                                .child(ring)
+                                .child(provider.name())
+                        } else {
+                            side_row(theme)
+                                .mx_0()
+                                .text_color(theme.sidebar_foreground)
+                                .child(ring)
+                                .child(div().flex_1().child(provider.name()))
+                                .child(div().text_xs().child(left))
+                        };
+                        trigger
+                            .id(format!("usage-trigger-{}", provider.name()))
+                            .role(Role::Button)
+                            .aria_label(description.clone())
+                            .hover(move |d| d.bg(hover))
+                            .tooltip(move |w, cx| Tooltip::new(description.clone()).build(w, cx))
                             .on_click(cx.listener(|s, _, w, cx| s.show_usage(w, cx)))
+                            .test_support()
                     })),
             )
             .child(
@@ -295,10 +312,14 @@ fn section(provider: Provider, snapshot: &Snapshot, cx: &App) -> impl IntoElemen
                     }
                 },
             );
-            let reset = row.resets_at.map_or_else(
+            let pace = row.pace(crate::usage::now());
+            let mut reset = row.resets_at.map_or_else(
                 || "Reset time unknown".into(),
                 |at| format!("Resets {}", crate::usage::local_time(at)),
             );
+            if let Some(p) = pace {
+                reset.push_str(&format!(" · Even pace: {}% left", p.round()));
+            }
             v_flex()
                 .id(format!("usage-{}-{ix}", provider.name()))
                 .gap_1()
@@ -311,6 +332,7 @@ fn section(provider: Provider, snapshot: &Snapshot, cx: &App) -> impl IntoElemen
                 )
                 .child(
                     div()
+                        .relative()
                         .w_full()
                         .h(px(4.))
                         .rounded_full()
@@ -324,7 +346,20 @@ fn section(provider: Provider, snapshot: &Snapshot, cx: &App) -> impl IntoElemen
                                     .h_full()
                                     .w(relative(n as f32 / 100.))
                                     .rounded_full()
-                                    .bg(theme.primary),
+                                    .bg(fill_color(Some(n), snapshot.outdated, theme)),
+                            )
+                        })
+                        .when_some(pace, |d, p| {
+                            d.child(
+                                div()
+                                    .absolute()
+                                    .top(px(-2.))
+                                    .left(relative(p as f32 / 100.))
+                                    .ml(px(-1.))
+                                    .w(px(2.))
+                                    .h(px(8.))
+                                    .rounded_full()
+                                    .bg(theme.muted_foreground),
                             )
                         }),
                 )
@@ -353,14 +388,46 @@ fn section(provider: Provider, snapshot: &Snapshot, cx: &App) -> impl IntoElemen
         .test_support()
 }
 
-fn ring_color(remaining: Option<f64>, outdated: bool, theme: &Theme) -> Hsla {
+/// What's left: `sidebar_foreground` like the rest of the navigation, `warning` / `danger`
+/// fills when low. Never `primary`, which is reserved for focus, running agents and the
+/// primary button.
+fn fill_color(remaining: Option<f64>, outdated: bool, theme: &Theme) -> Hsla {
     match remaining {
-        _ if outdated => theme.muted_foreground,
-        Some(n) if n <= 5. => theme.danger_foreground,
-        Some(n) if n <= 20. => theme.warning_foreground,
-        Some(_) => theme.primary,
-        None => theme.muted_foreground,
+        _ if outdated => faint(theme),
+        Some(n) if n <= 5. => theme.danger,
+        Some(n) if n <= 20. => theme.warning,
+        _ => theme.sidebar_foreground,
     }
+}
+
+/// A 16px ring of what's left, clockwise from the top, on a track tinted like the fill so an
+/// empty red ring still reads as red. A tick crossing it
+/// marks what would be left at an even pace: an arc past the tick is ahead of the limit.
+fn ring(left: f64, pace: Option<f64>, fill: Hsla, theme: &Theme) -> impl IntoElement {
+    let (track, tick) = (fill.opacity(0.25), theme.muted_foreground);
+    let (left, pace) = (left as f32, pace.map(|p| p as f32));
+    canvas(
+        |_, _, _| {},
+        move |b, _, w, _| {
+            let band = Arc::new().inner_radius(4.5).outer_radius(6.5);
+            band.paint(&ArcData::new(&(), 0, 100., 0., TAU), track, &b, w);
+            if left > 0. {
+                let end = left / 100. * TAU;
+                band.paint(&ArcData::new(&(), 1, left, 0., end), fill, &b, w);
+            }
+            if let Some(p) = pace {
+                let at = p / 100. * TAU;
+                Arc::new().inner_radius(3.).outer_radius(8.).paint(
+                    &ArcData::new(&(), 2, 1., at - 0.14, at + 0.14),
+                    tick,
+                    &b,
+                    w,
+                );
+            }
+        },
+    )
+    .size(px(16.))
+    .flex_none()
 }
 
 fn ring_description(provider: Provider, snapshot: &Snapshot) -> String {
@@ -377,6 +444,12 @@ fn ring_description(provider: Provider, snapshot: &Snapshot) -> String {
         ),
         None => format!("{} · Remaining unknown", provider.name()),
     };
+    if let Some(p) = snapshot
+        .limiting()
+        .and_then(|row| row.pace(crate::usage::now()))
+    {
+        text.push_str(&format!(" · Even pace: {}% left", p.round()));
+    }
     if snapshot
         .allowances
         .iter()
@@ -398,26 +471,28 @@ fn ring_description(provider: Provider, snapshot: &Snapshot) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{Failure, Provider, Snapshot, Theme, ring_color, ring_description};
+    use super::{Failure, Provider, Snapshot, Theme, fill_color, ring_description};
     use gpui_kit::rgb;
 
     #[test]
     fn usage_ring_thresholds_and_unknown_stale_labels() {
         let mut theme = Theme::default();
-        theme.primary = rgb(0x123456).into();
-        theme.warning_foreground = rgb(0x654321).into();
-        theme.danger_foreground = rgb(0xff0000).into();
-        theme.muted_foreground = rgb(0x888888).into();
+        theme.warning = rgb(0x654321).into();
+        theme.danger = rgb(0xff0000).into();
+        theme.sidebar_foreground = rgb(0x888888).into();
         for (remaining, expected) in [
-            (Some(21.), theme.primary),
-            (Some(20.), theme.warning_foreground),
-            (Some(5.1), theme.warning_foreground),
-            (Some(5.), theme.danger_foreground),
-            (Some(0.), theme.danger_foreground),
-            (None, theme.muted_foreground),
+            (Some(21.), theme.sidebar_foreground),
+            (Some(20.), theme.warning),
+            (Some(5.1), theme.warning),
+            (Some(5.), theme.danger),
+            (Some(0.), theme.danger),
+            (None, theme.sidebar_foreground),
         ] {
-            assert_eq!(ring_color(remaining, false, &theme), expected);
-            assert_eq!(ring_color(remaining, true, &theme), theme.muted_foreground);
+            assert_eq!(fill_color(remaining, false, &theme), expected);
+            assert_eq!(
+                fill_color(remaining, true, &theme),
+                crate::ui::faint(&theme)
+            );
         }
         let mut snapshot = Snapshot::default();
         snapshot.finish(Ok(vec![
@@ -425,11 +500,13 @@ mod tests {
                 label: "Weekly".into(),
                 remaining: Some(0.),
                 resets_at: Some(0.),
+                window: None,
             },
             crate::usage::Allowance {
                 label: "Model".into(),
                 remaining: None,
                 resets_at: None,
+                window: None,
             },
         ]));
         snapshot.finish(Err(Failure::Temporary));

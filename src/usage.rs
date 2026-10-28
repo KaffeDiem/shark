@@ -38,6 +38,26 @@ pub struct Allowance {
     pub label: String,
     pub remaining: Option<f64>,
     pub resets_at: Option<f64>,
+    /// Length of the reset window in seconds.
+    pub window: Option<f64>,
+}
+
+const HOUR: f64 = 3600.;
+const WEEK: f64 = 7. * 24. * HOUR;
+
+impl Allowance {
+    /// The share that would be left `now` if the window were used evenly: 50 halfway to the reset.
+    pub fn pace(&self, now: f64) -> Option<f64> {
+        let window = self.window.filter(|w| *w > 0.)?;
+        Some(((self.resets_at? - now) / window * 100.).clamp(0., 100.))
+    }
+}
+
+pub fn now() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -96,10 +116,7 @@ impl Snapshot {
     }
 
     pub fn finish(&mut self, result: Result<Vec<Allowance>, Failure>) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs_f64();
+        let now = now();
         self.checked_at = Some(now);
         match result {
             Ok(rows) => {
@@ -165,39 +182,44 @@ fn claude(value: &Value) -> Result<Vec<Allowance>, Failure> {
         return Err(Failure::Temporary);
     }
     let mut rows = vec![];
-    let mut add = |label: String, value: &Value, percent: &str| {
+    let mut add = |label: String, value: &Value, percent: &str, window: f64| {
         if value.is_object() && !rows.iter().any(|r: &Allowance| r.label == label) {
             rows.push(Allowance {
                 label,
                 remaining: remaining(&value[percent]),
                 resets_at: timestamp(&value["resets_at"]),
+                window: Some(window),
             });
         }
     };
     // The structured list and legacy fields overlap. Prefer the structured list by identity.
     for limit in limits["limits"].as_array().into_iter().flatten() {
         let label = match limit["kind"].as_str() {
-            Some("session") => Some("5 hours"),
-            Some("weekly_all") => Some("Weekly"),
+            Some("session") => Some(("5 hours", 5. * HOUR)),
+            Some("weekly_all") => Some(("Weekly", WEEK)),
             Some("weekly_scoped") => limit["scope"]["model"]["display_name"]
                 .as_str()
-                .or_else(|| limit["scope"]["model"]["id"].as_str()),
+                .or_else(|| limit["scope"]["model"]["id"].as_str())
+                .map(|label| (label, WEEK)),
             _ => None,
         };
-        if let Some(label) = label {
-            add(label.into(), limit, "percent");
+        if let Some((label, window)) = label {
+            add(label.into(), limit, "percent", window);
         }
     }
-    for (key, label) in [("five_hour", "5 hours"), ("seven_day", "Weekly")] {
-        add(label.into(), &limits[key], "utilization");
+    for (key, label, window) in [
+        ("five_hour", "5 hours", 5. * HOUR),
+        ("seven_day", "Weekly", WEEK),
+    ] {
+        add(label.into(), &limits[key], "utilization", window);
     }
     for model in limits["model_scoped"].as_array().into_iter().flatten() {
         if let Some(label) = model["display_name"].as_str() {
-            add(label.into(), model, "utilization");
+            add(label.into(), model, "utilization", WEEK);
         }
     }
     for (key, label) in [("seven_day_opus", "Opus"), ("seven_day_sonnet", "Sonnet")] {
-        add(label.into(), &limits[key], "utilization");
+        add(label.into(), &limits[key], "utilization", WEEK);
     }
     if rows.is_empty() {
         Err(Failure::Unsupported)
@@ -242,6 +264,7 @@ fn codex(value: &Value) -> Result<Vec<Allowance>, Failure> {
                     .map_or_else(|| duration.clone(), |model| format!("{model} · {duration}")),
                 remaining: remaining(&window["usedPercent"]),
                 resets_at: window["resetsAt"].as_f64().filter(|n| n.is_finite()),
+                window: window["windowDurationMins"].as_f64().map(|m| m * 60.),
             });
         }
     }

@@ -8,16 +8,19 @@ fn sample() -> Vec<Allowance> {
             label: "5 hours".into(),
             remaining: Some(20.),
             resets_at: Some(1793184600.),
+            window: Some(5. * 3600.),
         },
         Allowance {
             label: "Weekly".into(),
             remaining: Some(0.),
             resets_at: Some(1793311200.),
+            window: Some(604800.),
         },
         Allowance {
             label: "Fable".into(),
             remaining: None,
             resets_at: None,
+            window: None,
         },
     ]
 }
@@ -148,6 +151,7 @@ async fn usage_footer_availability_and_click(cx: &mut TestAppContext) {
             label: "Weekly".into(),
             remaining: None,
             resets_at: None,
+            window: None,
         }]));
         s.usage[1].finish(Ok(sample()));
         cx.notify();
@@ -361,6 +365,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                     label: "Weekly".into(),
                                     remaining: Some(68.),
                                     resets_at: Some(1793774588.),
+                                    window: Some(604800.),
                                 }]));
                                 if available != "both" {
                                     s.usage[1].finish(Err(Failure::MissingCli));
@@ -402,11 +407,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             if available == "both" {
                                 let codex = w.find("usage-trigger-Codex").bounds();
                                 assert!(w.find("usage-Codex-0").visible());
-                                if rail {
-                                    assert!(codex.top() >= button.bottom());
-                                } else {
-                                    assert!(codex.left() >= button.right());
-                                }
+                                assert!(codex.top() >= button.bottom());
                             } else {
                                 assert!(w.try_find("usage-trigger-Codex").is_none());
                             }
