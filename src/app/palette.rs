@@ -711,6 +711,13 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| crate::settings::open(&s.state, w, cx),
     ),
     Row(
+        "Show usage",
+        IconName::ChartBar,
+        Some(&ShowUsage),
+        "account allowance limits claude codex",
+        |s, w, cx| s.show_usage(w, cx),
+    ),
+    Row(
         "About Shark",
         IconName::Info,
         None,

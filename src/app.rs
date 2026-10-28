@@ -49,6 +49,7 @@ mod sidebar;
 mod storage;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod ui_tests;
+mod usage;
 mod workspace;
 mod workspace_picker;
 
@@ -120,6 +121,13 @@ pub struct Shark {
     /// The open right-click menu, dropped when it dismisses.
     menu: Option<(Entity<menu::Menu>, Subscription)>,
     app_switcher: Option<app_switcher::AppSwitcher>,
+    usage_panel: Option<usage::Panel>,
+    usage: [crate::usage::Snapshot; 2],
+    #[cfg(test)]
+    usage_queries: [usize; 2],
+    #[cfg(test)]
+    usage_live: bool,
+    usage_at: Rc<std::cell::Cell<Bounds<Pixels>>>,
     content_focus: FocusHandle,
     interaction_save: Option<Task<()>>,
     /// The header's branch button as last painted: "Branch menu…" hangs its menu from it.
@@ -198,6 +206,7 @@ impl Shark {
             }),
             cx.observe_window_activation(window, |s, w, cx| {
                 s.attn.window_active = w.is_window_active();
+                s.usage_polling(w, cx);
                 if !s.attn.window_active {
                     s.close_app_switcher(false, w, cx);
                 }
@@ -244,6 +253,13 @@ impl Shark {
             attn: crate::attention::Attention::new(cx),
             menu: None,
             app_switcher: None,
+            usage_panel: None,
+            usage: Default::default(),
+            #[cfg(test)]
+            usage_queries: [0; 2],
+            #[cfg(test)]
+            usage_live: false,
+            usage_at: Default::default(),
             content_focus: cx.focus_handle(),
             interaction_save: None,
             branch_at: Default::default(),
@@ -631,6 +647,7 @@ impl Shark {
                     .id("titlebar-empty")
                     .map(|d| self.draggable_chrome("titlebar-empty", d)),
             )
+            .child(self.render_usage_button(cx))
             .test_support()
     }
 
@@ -856,6 +873,7 @@ impl Render for Shark {
             }))
             .on_action(cx.listener(|this, _: &StopAgent, _, cx| this.stop(cx)))
             .on_action(cx.listener(|this, _: &FocusQueue, w, cx| this.focus_queue(w, cx)))
+            .on_action(cx.listener(|this, _: &ShowUsage, w, cx| this.show_usage(w, cx)))
             .on_action(cx.listener(|this, _: &ShowChat, w, cx| this.show(Tab::Chat, w, cx)))
             .on_action(cx.listener(|this, _: &NewChat, w, cx| this.new_chat(w, cx)))
             .on_action(cx.listener(|this, _: &CloseChat, w, cx| this.close_chat(w, cx)))
@@ -969,6 +987,7 @@ impl Render for Shark {
             }))
             .children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))
             .children(self.render_app_switcher(window, cx))
+            .children(self.render_usage(window, cx))
             .child({
                 // Content sits below the titlebar, touching a rail or inset 8px beside an expanded pane.
                 let island = div()

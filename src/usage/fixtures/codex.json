@@ -1,0 +1,11 @@
+{
+  "id": "usage",
+  "result": {
+    "ordinaryUsageAllowed": true,
+    "rateLimits": {"limitId": "codex", "limitName": null, "normalModelSlug": null, "primary": {"usedPercent": 32, "windowDurationMins": 10080, "resetsAt": 1793774588}, "secondary": null, "credits": {"hasCredits": true, "unlimited": false}, "planType": "pro"},
+    "rateLimitsByLimitId": {
+      "codex": {"limitId": "codex", "limitName": null, "normalModelSlug": null, "primary": {"usedPercent": 32, "windowDurationMins": 10080, "resetsAt": 1793774588}, "secondary": null, "credits": {"hasCredits": true, "unlimited": false}, "planType": "pro"}
+    },
+    "future_field": true
+  }
+}

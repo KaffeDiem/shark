@@ -22,6 +22,7 @@ mod navigation_pixels;
 mod storage_tests;
 mod tab_tests;
 mod tree_pixels;
+mod usage_tests;
 mod workspace_picker_tests;
 mod workspace_review_tests;
 
@@ -2117,9 +2118,9 @@ async fn titlebar_controls(cx: &mut TestAppContext) {
                 assert!(new_chat.visible(), "overflow leaves new-chat visible");
                 assert!(new_chat.bounds().left() >= tab.bounds().right());
                 assert_eq!(
-                    new_chat.bounds().right(),
-                    w.find("content-island").bounds().right(),
-                    "overflow pins new-chat to the artifact edge"
+                    new_chat.bounds().right() + px(8.),
+                    w.find("show-usage").bounds().left(),
+                    "overflow leaves room for account usage after new-chat"
                 );
                 if rail {
                     assert!(tab.bounds().left() >= w.find("new-workspace").bounds().right());
