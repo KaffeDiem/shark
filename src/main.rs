@@ -393,6 +393,9 @@ fn bind_keys(cx: &mut App) {
         vim("[ c", Box::new(PrevThread), DIFF),
         vim("shift-k", Box::new(MoveQueuedUp), "Queue"),
         vim("shift-j", Box::new(MoveQueuedDown), "Queue"),
+        // The editor's jump list, as in Vim (`g s`, the outline, is a Vim command).
+        vim("ctrl-o", Box::new(NavigationBack), "VimNormal"),
+        vim("ctrl-i", Box::new(NavigationForward), "VimNormal"),
         vim("g t", Box::new(NextChat), NAV),
         vim("g shift-t", Box::new(PrevChat), NAV),
         vim("j", Box::new(SelectNext), MOVE),

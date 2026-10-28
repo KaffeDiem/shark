@@ -433,6 +433,7 @@ async fn language_navigation_reuses_aliases_restores_history_and_protects_extern
                 link(&root.join("alias.txt"), 0, 1, 3),
                 Encoding::Utf16,
                 true,
+                false,
                 w,
                 cx,
             )
@@ -479,6 +480,7 @@ async fn language_navigation_reuses_aliases_restores_history_and_protects_extern
                     link(&root.join("b.txt"), 0, 0, 2),
                 ],
                 Encoding::Utf16,
+                false,
                 w,
                 cx,
             )
@@ -510,7 +512,14 @@ async fn language_navigation_reuses_aliases_restores_history_and_protects_extern
     std::fs::write(&external, &contents).unwrap();
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
-            s.open_location(link(&external, 50, 3, 13), Encoding::Utf16, true, w, cx)
+            s.open_location(
+                link(&external, 50, 3, 13),
+                Encoding::Utf16,
+                true,
+                true,
+                w,
+                cx,
+            )
         })
     })
     .unwrap();
@@ -548,6 +557,7 @@ async fn language_navigation_reuses_aliases_restores_history_and_protects_extern
                 link(&root.join("a.txt"), 0, 0, 1),
                 Encoding::Utf16,
                 true,
+                false,
                 w,
                 cx,
             )
@@ -574,4 +584,166 @@ async fn language_navigation_reuses_aliases_restores_history_and_protects_extern
         assert_eq!(dependency.read(cx).input.read(cx).scroll_offset(), scroll);
         assert_eq!(shark.read(cx).file_tabs.len(), 3);
     });
+}
+
+// cmd-click follows a definition in the current tab; cmd-shift-click (new_tab) keeps it.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn language_navigation_replaces_a_clean_tab_unless_asked_for_a_new_one(
+    cx: &mut TestAppContext,
+) {
+    let _guard = ui_tests::UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, window, shark) = fixture(cx).await;
+    std::fs::write(root.join("c.txt"), "charlie\n").unwrap();
+    std::fs::write(root.join("d.txt"), "delta\n").unwrap();
+    let link = |name: &str| {
+        let range = Range::new(Position::new(0, 1), Position::new(0, 3));
+        lsp_types::LocationLink {
+            origin_selection_range: None,
+            target_uri: file_uri(&root.join(name)),
+            target_range: range,
+            target_selection_range: range,
+        }
+    };
+    let paths = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let s = shark.read(cx);
+            let tabs: Vec<_> = (s.file_tabs.iter())
+                .map(|t| t.editor.read(cx).path.clone())
+                .collect();
+            (tabs, s.editor.as_ref().unwrap().read(cx).path.clone())
+        })
+    };
+    let open = |cx: &mut TestAppContext, name: &str, new_tab: bool| {
+        let link = link(name);
+        cx.update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| {
+                s.open_location(link, Encoding::Utf16, true, new_tab, w, cx)
+            })
+        })
+        .unwrap();
+    };
+    let wait_for = async |cx: &mut TestAppContext, path: &'static str| {
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark
+                .read(cx)
+                .editor
+                .as_ref()
+                .is_some_and(|e| e.read(cx).path == path)
+        })
+        .await;
+    };
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| s.select_file(0, w, cx))
+    })
+    .unwrap();
+    open(cx, "c.txt", false);
+    wait_for(cx, "api/c.txt").await;
+    assert_eq!(
+        paths(cx).0,
+        ["api/c.txt", "api/b.txt"],
+        "a.txt's tab now shows c.txt"
+    );
+    open(cx, "d.txt", true);
+    wait_for(cx, "api/d.txt").await;
+    assert_eq!(paths(cx).0, ["api/c.txt", "api/b.txt", "api/d.txt"]);
+    // Back from a new tab selects the tab it came from; back again restores a.txt in place.
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| s.navigate_history(false, w, cx))
+    })
+    .unwrap();
+    wait_for(cx, "api/c.txt").await;
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| s.navigate_history(false, w, cx))
+    })
+    .unwrap();
+    wait_for(cx, "api/a.txt").await;
+    assert_eq!(paths(cx).0, ["api/a.txt", "api/b.txt", "api/d.txt"]);
+    // Unsaved edits are never replaced away.
+    cx.update(|cx| {
+        let editor = shark.read(cx).editor.clone().unwrap();
+        editor.update(cx, |e, _| e.dirty = true);
+    });
+    open(cx, "c.txt", false);
+    wait_for(cx, "api/c.txt").await;
+    assert_eq!(
+        paths(cx).0,
+        ["api/a.txt", "api/b.txt", "api/d.txt", "api/c.txt"]
+    );
+    cx.update(|cx| {
+        let tabs = &shark.read(cx).active_ws().unwrap().tab_order;
+        assert_eq!(
+            tabs.iter().filter(|t| matches!(t, TabId::File(_))).count(),
+            4,
+            "the saved tab order follows the replacement"
+        );
+    });
+}
+
+// Vim's Normal mode: `g s` opens the outline at the cursor's symbol, `ctrl-o`/`ctrl-i` walk
+// the jump list.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn vim_keys_open_the_outline_and_walk_the_jump_list(cx: &mut TestAppContext) {
+    let _guard = ui_tests::UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, window, shark) = fixture(cx).await;
+    let editor = cx.update(|cx| shark.read(cx).file_tabs[0].editor.clone());
+    let symbol = |name: &str, depth, range: std::ops::Range<usize>| crate::editor::Symbol {
+        name: name.into(),
+        depth,
+        target: range.start,
+        range,
+    };
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| {
+            s.set_vim(true, cx);
+            s.select_file(0, w, cx);
+        });
+        editor.update(cx, |e, cx| {
+            // "alpha\n": a file symbol around a nested one.
+            e.outline = vec![symbol("file", 0, 0..6), symbol("ph", 1, 2..4)];
+            e.input.update(cx, |i, cx| {
+                i.set_selected_range(0..0, cx);
+                i.focus(w, cx);
+            });
+            e.sync_crumbs(cx);
+        });
+        w.render_frame(cx);
+        w.press("g", cx);
+        w.press("s", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.press("down", cx);
+        w.press("enter", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    let cursor = |cx: &mut TestAppContext| cx.update(|cx| editor.read(cx).input.read(cx).cursor());
+    assert_eq!(
+        cursor(cx),
+        2,
+        "the outline's second row is the nested symbol"
+    );
+    cx.update(|cx| assert_eq!(editor.read(cx).crumbs, [0, 1]));
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.press("ctrl-o", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        editor.read(cx).input.read(cx).cursor() == 0
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.press("ctrl-i", cx);
+    })
+    .unwrap();
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        editor.read(cx).input.read(cx).cursor() == 2
+    })
+    .await;
 }

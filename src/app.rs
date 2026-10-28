@@ -994,9 +994,7 @@ impl Render for Shark {
             .on_action(cx.listener(|s, _: &FindReferences, w, cx| {
                 s.language_action("textDocument/references", None, w, cx)
             }))
-            .on_action(cx.listener(|s, _: &DocumentSymbols, w, cx| {
-                s.language_action("textDocument/documentSymbol", None, w, cx)
-            }))
+            .on_action(cx.listener(|s, _: &DocumentSymbols, w, cx| s.symbol_menu(None, w, cx)))
             .on_action(cx.listener(|s, _: &SignatureHelp, w, cx| {
                 s.language_action("textDocument/signatureHelp", None, w, cx)
             }))

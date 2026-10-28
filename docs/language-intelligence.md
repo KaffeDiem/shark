@@ -10,16 +10,25 @@ polished release or performance gates are complete.
 
 Open a Rust, Python, TypeScript/JavaScript, Swift, or Go source file in a workspace.
 The editor starts its language session and reports Starting, Preparing index,
-Ready, or Setup needed. Retry/restart uses the same selected backend.
+Ready, or Setup needed. While the server starts or reports `$/progress`, the header
+shows a spinner with the newest work and its percentage ("Indexing 42%"; the server's
+message is in the tooltip) and a progress bar under the header, indeterminate until a
+percentage arrives. Retry/restart uses the same selected backend.
+
+The header is a jump bar: back/forward buttons, the file path, then the symbols around
+the cursor. Click a symbol to open the file's outline as an indented tree with that
+symbol selected. Command-click follows a definition in the current tab, replacing a
+clean file (back restores it); Command-Shift-click opens a new tab. A file with unsaved
+edits is never replaced. The mouse's back/forward buttons walk the same history.
 
 | Action | Key |
 |---|---|
 | Format document | Option-Shift-F |
 | Rename symbol | F2 |
 | Find references | Shift-F12 |
-| Document symbols | Command-Shift-O |
+| Document symbols (outline tree) | Command-Shift-O (Vim: `g s`) |
 | Signature help | Command-Shift-Space |
-| Navigate back / forward | Control-minus / Control-Shift-minus |
+| Navigate back / forward | Control-minus / Control-Shift-minus (Vim: `ctrl-o` / `ctrl-i`) |
 
 Completion, hover, definitions, code actions, and diagnostic overlays use GPUI's
 existing editor interfaces. Language edits remain unsaved until the normal checked

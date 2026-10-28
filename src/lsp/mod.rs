@@ -7,7 +7,7 @@ pub mod watch;
 
 use gpui_kit::*;
 use serde_json::Value;
-use std::{cell::RefCell, collections::HashSet};
+use std::cell::RefCell;
 
 pub enum SessionEvent {
     Notification {
@@ -16,6 +16,14 @@ pub enum SessionEvent {
         companion: bool,
     },
     Request(RefCell<Option<client::Event>>),
+}
+
+/// One `$/progress` token's work, as the server last reported it.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Work {
+    pub title: String,
+    pub message: Option<String>,
+    pub percentage: Option<u32>,
 }
 
 pub struct Session {
@@ -28,7 +36,8 @@ pub struct Session {
     pub watcher: Option<watch::Watcher>,
     companion_watcher: Option<watch::Watcher>,
     pub choices: Vec<std::path::PathBuf>,
-    progress: HashSet<String>,
+    /// Work in progress by token, oldest first.
+    progress: Vec<(String, Work)>,
     task: Task<()>,
     companion_task: Task<()>,
     watch_tasks: Vec<Task<()>>,
@@ -49,7 +58,7 @@ impl Session {
             watcher: None,
             companion_watcher: None,
             choices: vec![],
-            progress: HashSet::new(),
+            progress: vec![],
             task: Task::ready(()),
             companion_task: Task::ready(()),
             watch_tasks: vec![],
@@ -67,7 +76,7 @@ impl Session {
             watcher: None,
             companion_watcher: None,
             choices: vec![],
-            progress: HashSet::new(),
+            progress: vec![],
             task: Task::ready(()),
             companion_task: Task::ready(()),
             watch_tasks: vec![],
@@ -198,12 +207,7 @@ impl Session {
                     match event {
                         client::Event::Notification { method, params } => {
                             if method == "$/progress" {
-                                let token = params["token"].to_string();
-                                match params["value"]["kind"].as_str() {
-                                    Some("begin") => { s.progress.insert(token); }
-                                    Some("end") => { s.progress.remove(&token); }
-                                    _ => {}
-                                }
+                                track_progress(&mut s.progress, &params);
                                 s.status = progress_status(&s.status, !s.progress.is_empty() || s.detail.is_some()).into();
                                 cx.notify();
                             }
@@ -230,6 +234,56 @@ impl Session {
     }
 }
 
+impl Session {
+    /// What the server is busy with, for a loading indicator: the newest reported work, or
+    /// "Starting" while the server launches. None when idle or broken.
+    pub fn activity(&self) -> Option<Work> {
+        match self.status.as_str() {
+            "Starting" => Some(Work {
+                title: "Starting".into(),
+                ..Default::default()
+            }),
+            "Setup needed" => None,
+            _ => self.progress.last().map(|(_, w)| w.clone()),
+        }
+    }
+}
+
+fn track_progress(progress: &mut Vec<(String, Work)>, params: &Value) {
+    let token = params["token"].to_string();
+    let value = &params["value"];
+    let text = |key: &str| {
+        value[key]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from)
+    };
+    let percentage = value["percentage"].as_u64().map(|p| p.min(100) as u32);
+    match value["kind"].as_str() {
+        Some("begin") => {
+            progress.retain(|(t, _)| *t != token);
+            let title = text("title").unwrap_or_else(|| "Working".into());
+            let message = text("message");
+            progress.push((
+                token,
+                Work {
+                    title,
+                    message,
+                    percentage,
+                },
+            ));
+        }
+        Some("report") => {
+            if let Some((_, work)) = progress.iter_mut().find(|(t, _)| *t == token) {
+                work.message = text("message").or(work.message.take());
+                work.percentage = percentage.or(work.percentage);
+            }
+        }
+        Some("end") => progress.retain(|(t, _)| *t != token),
+        _ => {}
+    }
+}
+
 fn progress_status(current: &str, indexing: bool) -> &'static str {
     if current == "Setup needed" {
         "Setup needed"
@@ -242,7 +296,45 @@ fn progress_status(current: &str, indexing: bool) -> &'static str {
 
 #[cfg(test)]
 mod tests {
-    use super::progress_status;
+    use super::{Work, progress_status, track_progress};
+    use serde_json::json;
+
+    #[test]
+    fn progress_tracks_the_newest_work() {
+        let mut p = vec![];
+        let send = |p: &mut Vec<_>, token: i64, value| {
+            track_progress(p, &json!({"token": token, "value": value}))
+        };
+        send(
+            &mut p,
+            1,
+            json!({"kind":"begin","title":"Indexing","percentage":0}),
+        );
+        send(
+            &mut p,
+            2,
+            json!({"kind":"begin","title":"Loading","message":"cargo"}),
+        );
+        send(
+            &mut p,
+            1,
+            json!({"kind":"report","message":"3/150 (core)","percentage":2}),
+        );
+        assert_eq!(p.len(), 2);
+        send(&mut p, 2, json!({"kind":"end"}));
+        let work = Work {
+            title: "Indexing".into(),
+            message: Some("3/150 (core)".into()),
+            percentage: Some(2),
+        };
+        assert_eq!(p.last().map(|(_, w)| w.clone()), Some(work));
+        // A report without a message keeps the last one.
+        send(&mut p, 1, json!({"kind":"report","percentage":250}));
+        assert_eq!(p[0].1.percentage, Some(100));
+        assert_eq!(p[0].1.message.as_deref(), Some("3/150 (core)"));
+        send(&mut p, 1, json!({"kind":"end"}));
+        assert!(p.is_empty());
+    }
     #[test]
     fn progress_does_not_hide_setup_failures() {
         assert_eq!(progress_status("Setup needed", true), "Setup needed");

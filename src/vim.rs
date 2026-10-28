@@ -32,6 +32,8 @@ pub enum Cmd {
     PageUp,
     Indent,
     Outdent,
+    /// `g s`: the file's symbol outline, as in Zed.
+    Outline,
 }
 
 #[derive(Default, Debug, PartialEq)]
@@ -260,8 +262,12 @@ impl Vim {
             return Out::default();
         }
         if self.g && ch != 'g' {
+            let outline = ch == 's' && self.op.is_none() && !self.visual();
             self.reset();
-            return Out::default();
+            return Out {
+                cmd: outline.then_some(Cmd::Outline),
+                ..Out::default()
+            };
         }
         let gg = self.g;
 

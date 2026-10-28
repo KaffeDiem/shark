@@ -743,7 +743,7 @@ pub(super) const COMMANDS: &[Row] = &[
         IconName::Search,
         Some(&DocumentSymbols),
         "language document symbols lsp",
-        |s, w, cx| s.language_action("textDocument/documentSymbol", None, w, cx),
+        |s, w, cx| s.symbol_menu(None, w, cx),
     ),
     Row(
         "Show signature help",

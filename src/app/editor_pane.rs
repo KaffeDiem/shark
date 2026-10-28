@@ -1,9 +1,11 @@
 //! Full-width file editor tabs.
 use super::*;
+use gpui_kit::component::Disableable as _;
+use gpui_kit::component::progress::Progress;
 
 pub(super) struct FileTab {
     pub(super) editor: Entity<FileEditor>,
-    header: (bool, bool, &'static str, String, String),
+    header: (bool, bool, &'static str, String, String, Vec<String>),
     _subs: Vec<Subscription>,
 }
 
@@ -147,9 +149,11 @@ impl Shark {
                     e.conflict,
                     e.vim.status(),
                     e.vim.pending().to_string(),
-                    e.language_status(cx)
-                        .map(|s| format!("{}{:?}", s.0, s.1))
-                        .unwrap_or_default(),
+                    format!("{:?}{:?}", e.language_status(cx), e.language_activity(cx)),
+                    e.crumbs
+                        .iter()
+                        .map(|&i| e.outline[i].name.clone())
+                        .collect(),
                 );
                 if header != tab.header {
                     tab.header = header;
@@ -518,6 +522,11 @@ impl Shark {
         });
         let (dirty, conflict) = (e.dirty, e.conflict);
         let language_status = e.language_status(cx);
+        let activity = e.language_activity(cx);
+        let crumbs: Vec<_> = (e.crumbs.iter())
+            .map(|&i| (i, e.outline[i].name.clone()))
+            .collect();
+        let vim_on = e.vim_on;
         // `g t` works in Vim's Normal mode, where it types nothing.
         let normal =
             e.vim_on && e.vim.mode == crate::vim::Mode::Normal && e.vim.pending().is_empty();
@@ -530,15 +539,59 @@ impl Shark {
                 "FileEditor"
             })
             .size_full()
+            // The mouse's back and forward buttons walk the navigation history.
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Back),
+                cx.listener(|s, _, w, cx| s.navigate_history(false, w, cx)),
+            )
+            .on_mouse_down(
+                MouseButton::Navigate(NavigationDirection::Forward),
+                cx.listener(|s, _, w, cx| s.navigate_history(true, w, cx)),
+            )
             .child(
                 h_flex()
                     .h(px(36.))
                     .flex_none()
-                    .px_3()
+                    .pl_1()
+                    .pr_3()
                     .gap_2()
                     .border_b_1()
                     .border_color(theme.border)
                     .text_sm()
+                    .child(
+                        h_flex()
+                            .flex_none()
+                            .child(
+                                Button::new("nav-back")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::ChevronLeft)
+                                    .disabled(self.navigation.back.is_empty())
+                                    .tooltip(if vim_on {
+                                        "Back (ctrl-o)"
+                                    } else {
+                                        "Back (ctrl--)"
+                                    })
+                                    .on_click(
+                                        cx.listener(|s, _, w, cx| s.navigate_history(false, w, cx)),
+                                    ),
+                            )
+                            .child(
+                                Button::new("nav-forward")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::ChevronRight)
+                                    .disabled(self.navigation.forward.is_empty())
+                                    .tooltip(if vim_on {
+                                        "Forward (ctrl-i)"
+                                    } else {
+                                        "Forward (ctrl-shift--)"
+                                    })
+                                    .on_click(
+                                        cx.listener(|s, _, w, cx| s.navigate_history(true, w, cx)),
+                                    ),
+                            ),
+                    )
                     .child(match crate::file_icon::file_icon(&name, theme.is_dark()) {
                         Some(i) => img(i)
                             .size(px(16.))
@@ -570,6 +623,37 @@ impl Shark {
                                     .child(dir),
                             )
                             .child(div().flex_none().child(name))
+                            // The symbols around the cursor; each opens the outline there.
+                            .children(crumbs.into_iter().map(|(ix, label)| {
+                                h_flex()
+                                    .flex_none()
+                                    .child(
+                                        Icon::new(IconName::ChevronRight)
+                                            .with_size(px(12.))
+                                            .mx_0p5()
+                                            .text_color(theme.muted_foreground),
+                                    )
+                                    .child(
+                                        div()
+                                            .id(("crumb", ix))
+                                            .px_1()
+                                            .rounded_sm()
+                                            .cursor_pointer()
+                                            .hover(|d| d.bg(theme.secondary))
+                                            .child(label)
+                                            .tooltip(move |w, cx| {
+                                                Tooltip::new(if vim_on {
+                                                    "Go to symbol (g s)"
+                                                } else {
+                                                    "Go to symbol (cmd-shift-o)"
+                                                })
+                                                .build(w, cx)
+                                            })
+                                            .on_click(cx.listener(move |s, _, w, cx| {
+                                                s.symbol_menu(Some(ix), w, cx)
+                                            })),
+                                    )
+                            }))
                             .when(e.external, |d| {
                                 d.child(
                                     div()
@@ -594,14 +678,35 @@ impl Shark {
                             }),
                     )
                     .when_some(language_status.clone(), |d, (status, detail)| {
+                        let busy = activity.as_ref();
+                        // "Indexing 42%"; the server's message (crate, file count) is in the tooltip.
+                        let label = busy.map_or(status, |w| match w.percentage {
+                            Some(p) => format!("{} {p}%", w.title),
+                            None => w.title.clone(),
+                        });
+                        let tooltip = (busy.and_then(|w| w.message.clone()))
+                            .or(detail)
+                            .unwrap_or_else(|| "Restart language tools".into());
                         d.child(
-                            Button::new("language-status")
-                                .small()
-                                .ghost()
-                                .label(status)
-                                .tooltip(detail.unwrap_or_else(|| "Restart language tools".into()))
-                                .on_click(
-                                    cx.listener(|s, _, w, cx| s.choose_or_restart_language(w, cx)),
+                            h_flex()
+                                .flex_none()
+                                .gap_1()
+                                .when(busy.is_some(), |d| {
+                                    d.child(
+                                        Spinner::new()
+                                            .with_size(px(12.))
+                                            .color(theme.muted_foreground),
+                                    )
+                                })
+                                .child(
+                                    Button::new("language-status")
+                                        .small()
+                                        .ghost()
+                                        .label(label)
+                                        .tooltip(tooltip)
+                                        .on_click(cx.listener(|s, _, w, cx| {
+                                            s.choose_or_restart_language(w, cx)
+                                        })),
                                 ),
                         )
                     })
@@ -644,6 +749,22 @@ impl Shark {
                             .on_click(cx.listener(|this, _, w, cx| this.close_file(w, cx))),
                     ),
             )
+            // Under the header while the server works: determinate once it reports a percentage.
+            .when_some(activity, |d, work| {
+                d.child(
+                    div().h(px(0.)).relative().child(
+                        Progress::new("language-progress")
+                            .absolute()
+                            .top(px(-1.))
+                            .left_0()
+                            .right_0()
+                            .h(px(2.))
+                            .rounded_none()
+                            .loading(work.percentage.is_none())
+                            .value(work.percentage.unwrap_or(0) as f32),
+                    ),
+                )
+            })
             .when_some(
                 language_status.and_then(|(status, detail)| {
                     (status == "Setup needed").then_some(detail).flatten()

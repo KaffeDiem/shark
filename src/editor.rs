@@ -16,7 +16,7 @@ mod intelligence;
 #[cfg(all(test, feature = "test-support"))]
 mod intelligence_tests;
 mod snippets;
-pub(crate) use intelligence::LanguageEvent;
+pub(crate) use intelligence::{LanguageEvent, Symbol};
 
 /// Bigger files open in the diff only; the editor is built for up to ~50K lines.
 pub const MAX_BYTES: u64 = 4 << 20;
@@ -57,6 +57,10 @@ pub struct FileEditor {
     pub(crate) lsp_setup: Option<Task<()>>,
     pub(crate) lsp_request: Option<Task<()>>,
     pub(crate) lsp_error: Option<String>,
+    /// Document symbols from the language server, refreshed after each sync.
+    pub(crate) outline: Vec<intelligence::Symbol>,
+    /// `outline` indices around the cursor, outermost first: the jump bar's path.
+    pub(crate) crumbs: Vec<usize>,
     snippets: snippets::Snippets,
     _subs: Vec<Subscription>,
     _poll: Task<()>,
@@ -100,6 +104,8 @@ impl FileEditor {
                 }
             },
         )];
+        // The cursor moved: the jump bar follows it.
+        subs.push(cx.observe(&input, |this: &mut Self, _, cx| this.sync_crumbs(cx)));
         // Runs before key bindings, so normal-mode keys never reach the editor or the keymap.
         let this = cx.entity().downgrade();
         subs.push(cx.intercept_keystrokes(move |ev, window, cx| {
@@ -141,6 +147,8 @@ impl FileEditor {
             lsp_setup: None,
             lsp_request: None,
             lsp_error: None,
+            outline: vec![],
+            crumbs: vec![],
             snippets: snippets::Snippets::default(),
             _subs: subs,
             _poll,
@@ -361,6 +369,7 @@ impl FileEditor {
                 return self.save(false, window, cx);
             }
             SaveQuit | Quit => return window.dispatch_action(Box::new(CloseFile), cx),
+            Outline => return window.dispatch_action(Box::new(crate::DocumentSymbols), cx),
             ForceQuit => {
                 self.dirty = false;
                 return window.dispatch_action(Box::new(CloseFile), cx);

@@ -484,3 +484,36 @@ async fn completion_acceptance_applies_autoimport_snippet_mirrors_and_undo(
     client.terminate();
     let _ = fs::remove_dir_all(dir);
 }
+
+#[test]
+fn outline_nests_both_symbol_shapes_and_follows_the_cursor() {
+    use super::intelligence::{outline, symbol_path};
+    use crate::lsp::document::Encoding;
+    let text = "struct A {\n    fn b() {}\n}\nfn c() {}\n";
+    let range = |l0: u32, c0: u32, l1: u32, c1: u32| json!({"start":{"line":l0,"character":c0},"end":{"line":l1,"character":c1}});
+    let nested = json!([
+        {"name":"A","range":range(0,0,2,1),"selectionRange":range(0,7,0,8),"children":[
+            {"name":"b","range":range(1,4,1,13),"selectionRange":range(1,7,1,8)}
+        ]},
+        {"name":"c","range":range(3,0,3,9),"selectionRange":range(3,3,3,4)}
+    ]);
+    // SymbolInformation is flat and in any order; ranges nest it the same way.
+    let flat = json!([
+        {"name":"c","location":{"uri":"file:///x","range":range(3,0,3,9)}},
+        {"name":"b","location":{"uri":"file:///x","range":range(1,4,1,13)}},
+        {"name":"A","location":{"uri":"file:///x","range":range(0,0,2,1)}}
+    ]);
+    let tree = |o: &[super::intelligence::Symbol]| {
+        o.iter()
+            .map(|s| (s.name.clone(), s.depth))
+            .collect::<Vec<_>>()
+    };
+    let symbols = outline(&nested, text, Encoding::Utf16);
+    let expected = vec![("A".into(), 0), ("b".into(), 1), ("c".into(), 0)];
+    assert_eq!(tree(&symbols), expected);
+    assert_eq!(tree(&outline(&flat, text, Encoding::Utf16)), expected);
+    assert_eq!(symbols[1].target, text.find("b()").unwrap());
+    assert_eq!(symbol_path(&symbols, text.find("{}").unwrap()), vec![0, 1]);
+    assert_eq!(symbol_path(&symbols, text.find("c()").unwrap()), vec![2]);
+    assert_eq!(symbol_path(&symbols, text.len()), Vec::<usize>::new());
+}

@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 #[derive(Clone)]
-struct Visit {
+pub(super) struct Visit {
     path: PathBuf,
     selection: std::ops::Range<usize>,
     scroll: Point<Pixels>,
@@ -19,8 +19,8 @@ struct Visit {
 
 #[derive(Default)]
 pub(super) struct History {
-    back: Vec<Visit>,
-    forward: Vec<Visit>,
+    pub(super) back: Vec<Visit>,
+    pub(super) forward: Vec<Visit>,
 }
 
 struct Staged {
@@ -202,17 +202,9 @@ impl Shark {
                         Err(error) => notify_err(window, cx, error.to_string()),
                     },
                     "textDocument/references" => match serde_json::from_value::<Vec<lsp_types::Location>>(result) {
-                        Ok(locations) => s.pick_locations(locations.into_iter().map(crate::lsp::providers::location_link).collect(), encoding, window, cx),
+                        Ok(locations) => s.pick_locations(locations.into_iter().map(crate::lsp::providers::location_link).collect(), encoding, false, window, cx),
                         Err(error) => notify_err(window, cx, error.to_string()),
                     },
-                    "textDocument/documentSymbol" => {
-                        let mut symbols = vec![];
-                        collect_symbols(&result, &uri, &mut symbols);
-                        let items = symbols.iter().map(|(label, _)| CommandItem::new().label(label.clone())).collect();
-                        open_menu(cx.entity().downgrade(), "Go to symbol…", items, 0, move |s, ix, w, cx| {
-                            if let Some((_, location)) = symbols.get(ix) { s.open_location(location.clone(), encoding, true, w, cx); }
-                        }, window, cx);
-                    }
                     "textDocument/signatureHelp" => {
                         let label = result["signatures"].as_array().map(|signatures| signatures.iter().filter_map(|s| s["label"].as_str()).collect::<Vec<_>>().join("\n")).unwrap_or_default();
                         if !label.is_empty() { window.push_notification(label, cx); }
@@ -304,8 +296,8 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         match event {
-            LanguageEvent::Navigate(locations, encoding) => {
-                self.pick_locations(locations.clone(), *encoding, window, cx)
+            LanguageEvent::Navigate(locations, encoding, new_tab) => {
+                self.pick_locations(locations.clone(), *encoding, *new_tab, window, cx)
             }
             LanguageEvent::Apply {
                 edit,
@@ -383,6 +375,7 @@ impl Shark {
                             },
                             encoding,
                             true,
+                            false,
                             window,
                             cx,
                         );
@@ -430,6 +423,7 @@ impl Shark {
         &mut self,
         locations: Vec<LocationLink>,
         encoding: Encoding,
+        new_tab: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -437,7 +431,7 @@ impl Shark {
             return window.push_notification("No locations found", cx);
         }
         if locations.len() == 1 {
-            return self.open_location(locations[0].clone(), encoding, true, window, cx);
+            return self.open_location(locations[0].clone(), encoding, true, new_tab, window, cx);
         }
         let items = locations
             .iter()
@@ -458,7 +452,7 @@ impl Shark {
             items,
             0,
             move |s, ix, w, cx| {
-                s.open_location(locations[ix].clone(), encoding, true, w, cx);
+                s.open_location(locations[ix].clone(), encoding, true, new_tab, w, cx);
             },
             window,
             cx,
@@ -494,7 +488,75 @@ impl Shark {
                 self.navigation.forward.push(current);
             }
         }
-        self.open_source(target.path.clone(), None, Some(target), false, window, cx);
+        self.open_source(
+            target.path.clone(),
+            None,
+            Some(target),
+            false,
+            false,
+            window,
+            cx,
+        );
+    }
+
+    /// The outline of the open file as an indented tree; picking a symbol moves the cursor
+    /// there. `selected` (an outline index) defaults to the innermost symbol at the cursor.
+    pub(super) fn symbol_menu(
+        &mut self,
+        selected: Option<usize>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(editor) = self.editor.clone() else {
+            return;
+        };
+        let e = editor.read(cx);
+        if e.outline.is_empty() {
+            let message = match e.intelligence {
+                Some(_) => "No symbols in this file",
+                None => "Language tools are not ready",
+            };
+            return window.push_notification(message, cx);
+        }
+        let items = (e.outline.iter())
+            .map(|s| CommandItem::new().label(format!("{}{}", "    ".repeat(s.depth), s.name)))
+            .collect();
+        let selected = selected.or(e.crumbs.last().copied()).unwrap_or(0);
+        open_menu(
+            cx.entity().downgrade(),
+            "Go to symbol…",
+            items,
+            selected,
+            move |s, ix, w, cx| {
+                if s.editor.as_ref() == Some(&editor) {
+                    s.jump_to_symbol(ix, w, cx);
+                }
+            },
+            window,
+            cx,
+        );
+    }
+
+    fn jump_to_symbol(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(editor) = self.editor.clone() else {
+            return;
+        };
+        let Some(target) = editor.read(cx).outline.get(ix).map(|s| s.target) else {
+            return;
+        };
+        if let Some(old) = self.visit(cx) {
+            self.navigation.back.push(old);
+            self.navigation.forward.clear();
+        }
+        editor.update(cx, |e, cx| {
+            e.input.update(cx, |i, cx| {
+                // The outline may trail the newest edit by a sync.
+                let at = i.value().floor_char_boundary(target.min(i.value().len()));
+                i.set_selected_range(at..at, cx);
+                i.focus(window, cx);
+            })
+        });
+        cx.notify();
     }
 
     pub(super) fn open_location(
@@ -502,6 +564,7 @@ impl Shark {
         location: LocationLink,
         encoding: Encoding,
         history: bool,
+        new_tab: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -511,6 +574,7 @@ impl Shark {
                 Some((location.target_selection_range, encoding)),
                 None,
                 history,
+                new_tab,
                 window,
                 cx,
             ),
@@ -518,12 +582,15 @@ impl Shark {
         }
     }
 
+    /// Opens `path` at `range` or `visit`: in its open tab if it has one, else in place of
+    /// the current file (unless `new_tab`, or the current file has unsaved edits).
     fn open_source(
         &mut self,
         path: PathBuf,
         range: Option<(lsp_types::Range, Encoding)>,
         visit: Option<Visit>,
         history: bool,
+        new_tab: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -625,13 +692,35 @@ impl Shark {
                     None => {
                         let external = relative.is_none();
                         let path = relative.unwrap_or_else(|| canonical.display().to_string());
+                        let replace = (s.editor.as_ref())
+                            .filter(|e| !new_tab && !e.read(cx).dirty && !e.read(cx).saving)
+                            .and_then(|e| {
+                                let ix = s.file_tabs.iter().position(|t| t.editor == *e)?;
+                                let old = e.read(cx);
+                                Some((ix, TabId::File(old.path.clone()), old.external))
+                            });
                         let tab = s.make_file_tab(path.clone(), original, Some(text), window, cx);
                         tab.editor.update(cx, |e, cx| e.set_external(external, cx));
                         let editor = tab.editor.clone();
-                        if !external {
-                            s.active_ws_mut().unwrap().open_tab(TabId::File(path));
+                        let new = TabId::File(path);
+                        let ws = s.active_ws_mut().unwrap();
+                        match replace {
+                            Some((ix, old_tab, old_external)) => {
+                                match (old_external, external) {
+                                    (false, false) => ws.replace_tab(&old_tab, new),
+                                    (false, true) => ws.close_tab(&old_tab),
+                                    (true, false) => ws.open_tab(new),
+                                    (true, true) => {}
+                                }
+                                s.file_tabs[ix] = tab;
+                            }
+                            None => {
+                                if !external {
+                                    ws.open_tab(new);
+                                }
+                                s.file_tabs.push(tab);
+                            }
                         }
-                        s.file_tabs.push(tab);
                         editor
                     }
                 };
@@ -870,35 +959,6 @@ fn uri_path(uri: &Uri) -> anyhow::Result<PathBuf> {
     url::Url::parse(uri.as_str())?
         .to_file_path()
         .map_err(|_| anyhow::anyhow!("Only local file locations are supported"))
-}
-
-fn collect_symbols(value: &Value, uri: &Uri, out: &mut Vec<(String, LocationLink)>) {
-    let Some(symbols) = value.as_array() else {
-        return;
-    };
-    for symbol in symbols {
-        let location = if let Ok(location) =
-            serde_json::from_value::<lsp_types::Location>(symbol["location"].clone())
-        {
-            Some(crate::lsp::providers::location_link(location))
-        } else {
-            serde_json::from_value::<lsp_types::Range>(symbol["selectionRange"].clone())
-                .ok()
-                .map(|range| LocationLink {
-                    origin_selection_range: None,
-                    target_uri: uri.clone(),
-                    target_range: range,
-                    target_selection_range: range,
-                })
-        };
-        if let Some(location) = location {
-            out.push((
-                symbol["name"].as_str().unwrap_or("Symbol").to_string(),
-                location,
-            ));
-        }
-        collect_symbols(&symbol["children"], uri, out);
-    }
 }
 
 fn read_source(path: &Path) -> anyhow::Result<String> {

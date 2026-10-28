@@ -20,7 +20,8 @@ use std::{
 };
 
 pub enum ProviderEvent {
-    Navigate(Vec<LocationLink>),
+    /// Definitions to open; true (shift held) opens a new tab.
+    Navigate(Vec<LocationLink>, bool),
     Apply {
         edit: WorkspaceEdit,
         snapshot: Snapshot,
@@ -95,7 +96,7 @@ impl Provider {
     pub fn show_document_handler(&self) -> ShowDocumentHandler {
         let definitions = self.definitions.clone();
         let events = self.events.clone();
-        Rc::new(move |params, _, _| {
+        Rc::new(move |params, window, _| {
             let cached = definitions.borrow();
             let links = if cached.iter().any(|l| {
                 l.target_uri == params.uri && Some(l.target_selection_range) == params.selection
@@ -110,7 +111,9 @@ impl Provider {
                     target_selection_range: range,
                 }]
             };
-            let _ = events.try_send(ProviderEvent::Navigate(links));
+            // cmd-click follows in the same tab; cmd-shift-click opens a new one.
+            let new_tab = window.modifiers().shift;
+            let _ = events.try_send(ProviderEvent::Navigate(links, new_tab));
             true
         })
     }

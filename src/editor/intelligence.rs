@@ -13,13 +13,75 @@ use std::sync::{
 };
 
 pub enum LanguageEvent {
-    Navigate(Vec<LocationLink>, Encoding),
+    /// Locations to open; true opens a new tab rather than replacing the current one.
+    Navigate(Vec<LocationLink>, Encoding, bool),
     Apply {
         edit: WorkspaceEdit,
         snapshot: Snapshot,
         encoding: Encoding,
         guard: document::EditGuard,
     },
+}
+
+/// A document symbol, flattened in document order; `depth` nests it under the symbols before it.
+/// Byte offsets into the text the server saw.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct Symbol {
+    pub name: String,
+    pub depth: usize,
+    pub range: std::ops::Range<usize>,
+    pub target: usize,
+}
+
+/// Flattens a `textDocument/documentSymbol` result (nested `DocumentSymbol`s or flat
+/// `SymbolInformation`s) and nests it by range, so both shapes give the same tree.
+pub(crate) fn outline(value: &serde_json::Value, text: &str, encoding: Encoding) -> Vec<Symbol> {
+    fn walk(value: &serde_json::Value, text: &str, encoding: Encoding, out: &mut Vec<Symbol>) {
+        for symbol in value.as_array().into_iter().flatten() {
+            let range = |v: &serde_json::Value| {
+                let r: lsp_types::Range = serde_json::from_value(v.clone()).ok()?;
+                let a = document::offset(text, r.start, encoding).ok()?;
+                let b = document::offset(text, r.end, encoding).ok()?;
+                (a <= b).then_some(a..b)
+            };
+            let full = range(&symbol["range"]).or_else(|| range(&symbol["location"]["range"]));
+            if let Some(full) = full {
+                let target = range(&symbol["selectionRange"]).map_or(full.start, |r| r.start);
+                let name = symbol["name"].as_str().unwrap_or("Symbol").to_string();
+                out.push(Symbol {
+                    name,
+                    depth: 0,
+                    range: full,
+                    target,
+                });
+            }
+            walk(&symbol["children"], text, encoding, out);
+        }
+    }
+    let mut out = vec![];
+    walk(value, text, encoding, &mut out);
+    out.sort_by_key(|s| (s.range.start, std::cmp::Reverse(s.range.end)));
+    let mut open: Vec<usize> = vec![];
+    for s in &mut out {
+        while open.last().is_some_and(|&end| s.range.start >= end) {
+            open.pop();
+        }
+        s.depth = open.len();
+        open.push(s.range.end);
+    }
+    out
+}
+
+/// Indices of the symbols around `cursor`, outermost first.
+pub(crate) fn symbol_path(outline: &[Symbol], cursor: usize) -> Vec<usize> {
+    let mut path: Vec<usize> = vec![];
+    for (ix, s) in outline.iter().enumerate() {
+        if s.range.contains(&cursor) || (s.range.end == cursor && !s.range.is_empty()) {
+            path.retain(|&p| outline[p].depth < s.depth);
+            path.push(ix);
+        }
+    }
+    path
 }
 
 pub(crate) struct Language {
@@ -72,6 +134,22 @@ impl FileEditor {
             (s.status.clone(), s.detail.clone())
         })
     }
+    /// Busy work of the language server, for the loading indicator.
+    pub(crate) fn language_activity(&self, cx: &App) -> Option<crate::lsp::Work> {
+        (self.lsp_error.is_none())
+            .then(|| self.intelligence.as_ref()?.session.read(cx).activity())
+            .flatten()
+    }
+
+    /// Recomputes the symbols around the cursor; notifies only when they change.
+    pub(crate) fn sync_crumbs(&mut self, cx: &mut Context<Self>) {
+        let crumbs = symbol_path(&self.outline, self.input.read(cx).cursor());
+        if crumbs != self.crumbs {
+            self.crumbs = crumbs;
+            cx.notify();
+        }
+    }
+
     pub(crate) fn absolute_path(&self) -> &std::path::Path {
         &self.abs
     }
@@ -190,6 +268,8 @@ impl FileEditor {
             }));
             language.alive = Arc::new(AtomicBool::new(true));
             language.diagnostics = Default::default();
+            self.outline.clear();
+            self.crumbs.clear();
             self.input.update(cx, |i, cx| {
                 *i.lsp_mut() = Default::default();
                 if let Some(diagnostics) = i.diagnostics_mut() {
@@ -235,8 +315,8 @@ impl FileEditor {
                     if this
                         .update(cx, |_, cx| {
                             cx.emit(EditorEvent::Language(match event {
-                                ProviderEvent::Navigate(links) => {
-                                    LanguageEvent::Navigate(links, encoding)
+                                ProviderEvent::Navigate(links, new_tab) => {
+                                    LanguageEvent::Navigate(links, encoding, new_tab)
                                 }
                                 ProviderEvent::Apply {
                                     edit,
@@ -306,20 +386,29 @@ impl FileEditor {
                     if let Some(ruff) = &companion { notify_save(ruff, &uri, &saved)?; }
                 }
                 let version = current.version;
+                let text = current.text.clone();
+                let symbols = Some(client.clone()).filter(|c| c.capabilities().and_then(|c| c.document_symbol_provider).is_some_and(|p| !matches!(p, lsp_types::OneOf::Left(false))));
                 let clients: Vec<_> = [(Some(client), false), (companion, true)].into_iter()
                     .filter_map(|(client, companion)| client.filter(|c| c.capabilities().is_some_and(|c| c.diagnostic_provider.is_some())).map(|c| (c, companion)))
                     .collect();
-                return Ok(Some((clients, uri, version)));
+                return Ok(Some((clients, uri, version, symbols, text)));
                 }
             }).await;
             match diagnostics {
-                Ok(Some((clients, uri, version))) => {
+                Ok(Some((clients, uri, version, symbols, text))) => {
                     for (client, companion) in clients {
                     if let Ok(report) = client.request("textDocument/diagnostic", json!({"textDocument":{"uri":uri}})).await
                         && report["kind"] == "full"
                         && let Ok(items) = serde_json::from_value(report["items"].clone()) {
                         let _ = this.update(cx, |e, cx| e.language_diagnostics(PublishDiagnosticsParams { uri: uri.clone(), diagnostics: items, version: Some(version) }, companion, cx));
                     }
+                    }
+                    // A newer edit replaces this task, so a stale outline never lands.
+                    if let Some(client) = symbols
+                        && let Ok(result) = client.request("textDocument/documentSymbol", json!({"textDocument":{"uri":uri}})).await {
+                        let encoding = Encoding::from(client.encoding());
+                        let symbols = cx.background_executor().spawn(async move { outline(&result, &text, encoding) }).await;
+                        let _ = this.update(cx, |e, cx| { e.outline = symbols; e.sync_crumbs(cx); cx.notify(); });
                     }
                 }
                 Ok(None) => {}
