@@ -672,6 +672,25 @@ async fn snippet_completion_inside_an_active_field_starts_its_own_tabstops(
     let _ = fs::remove_dir_all(dir);
 }
 
+#[test]
+fn language_edits_keep_the_selection_on_the_same_code() {
+    use super::intelligence::map_range;
+    // Rename: longer names before the caret, above it and on its line.
+    let (old, new) = ("x = 1\nprint(x, x)\n", "value = 1\nprint(value, value)\n");
+    let x = old.rfind('x').unwrap();
+    let value = new.rfind("value").unwrap();
+    assert_eq!(map_range(old, new, x..x + 1), value..value + 5);
+    // Format: an added import and re-indented lines.
+    let old = "import a\nif a:\n  run()\n";
+    let new = "import a\nimport b\nif a:\n    run()\n";
+    let run = |s: &str| s.find("run").unwrap();
+    assert_eq!(map_range(old, new, run(old)..run(old)), run(new)..run(new));
+    assert_eq!(
+        map_range(old, new, old.len()..old.len()),
+        new.len()..new.len()
+    );
+}
+
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn vim_moves_but_never_edits_in_external_sources(cx: &mut TestAppContext) {

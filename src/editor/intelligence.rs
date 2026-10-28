@@ -501,18 +501,78 @@ impl FileEditor {
     ) {
         document::document_changed();
         self.input.update(cx, |i, cx| {
-            let selection = i.selected_range();
+            let selection = map_range(&i.value(), &text, i.selected_range());
             let scroll = i.scroll_offset();
-            let start = text.floor_char_boundary(selection.start.min(text.len()));
-            let end = text.floor_char_boundary(selection.end.min(text.len()));
             i.replace_all(text, window, cx);
-            i.set_selected_range(start..end, cx);
+            i.set_selected_range(selection, cx);
             i.set_scroll_offset(scroll, cx);
         });
+        self.clamp_cursor(cx);
         self.dirty = true;
         self.sync_language(window, cx);
         cx.notify();
     }
+}
+
+/// Moves `range` in `old` onto the same text in `new`, so a language edit keeps the caret on the
+/// code it was on.
+pub(super) fn map_range(
+    old: &str,
+    new: &str,
+    range: std::ops::Range<usize>,
+) -> std::ops::Range<usize> {
+    let start = map_offset(old, new, range.start, true);
+    let end = if range.is_empty() {
+        start
+    } else {
+        map_offset(old, new, range.end, true)
+    };
+    start..end
+}
+
+/// Unchanged text maps exactly; changed text maps to the same distance into its replacement.
+/// Lines first, then characters within the changed line, or a small changed block.
+fn map_offset(old: &str, new: &str, offset: usize, lines: bool) -> usize {
+    // A deadline keeps a pathological diff from stalling; a coarser diff only maps less precisely.
+    let mut config = similar::TextDiff::configure();
+    config.timeout(Duration::from_millis(30));
+    let diff = if lines {
+        config.diff_lines(old, new)
+    } else {
+        config.diff_chars(old, new)
+    };
+    let size = |slices: &[&str]| slices.iter().map(|s| s.len()).sum::<usize>();
+    let (mut o, mut n) = (0, 0);
+    for op in diff.ops() {
+        let old_lines = &diff.old_slices()[op.old_range()];
+        let new_lines = &diff.new_slices()[op.new_range()];
+        let (old_len, new_len) = (size(old_lines), size(new_lines));
+        if offset >= o + old_len {
+            (o, n) = (o + old_len, n + new_len);
+            continue;
+        }
+        if op.tag() == similar::DiffTag::Equal {
+            return n + offset - o;
+        }
+        let (mut a, mut b) = (&old[o..o + old_len], &new[n..n + new_len]);
+        if lines {
+            // A rename or re-indent keeps the line count: stay on the same line.
+            if old_lines.len() == new_lines.len() {
+                for (line, other) in old_lines.iter().zip(new_lines) {
+                    if offset < o + line.len() {
+                        (a, b) = (line, other);
+                        break;
+                    }
+                    (o, n) = (o + line.len(), n + other.len());
+                }
+            }
+            if a.len() + b.len() <= 1 << 16 {
+                return n + map_offset(a, b, offset - o, false);
+            }
+        }
+        return new.floor_char_boundary(n + (offset - o).min(b.len()));
+    }
+    new.len()
 }
 
 fn notify_save(client: &Client, uri: &Uri, text: &str) -> anyhow::Result<()> {
