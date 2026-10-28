@@ -1165,8 +1165,9 @@ pub(super) fn formatting_options(text: &str) -> Value {
             in_comment = !trimmed.contains("*/");
             continue;
         }
-        if let Some(open) = trimmed.find("/*") {
-            in_comment = !trimmed[open + 2..].contains("*/");
+        // Only a line-leading opener: `"/*"` in a string or `// /*` must not hide the rest.
+        if let Some(body) = trimmed.strip_prefix("/*") {
+            in_comment = !body.contains("*/");
         }
         if line.starts_with('\t') {
             tabs += 1;

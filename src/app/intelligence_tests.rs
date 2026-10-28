@@ -1566,6 +1566,10 @@ fn formatting_options_follow_the_buffer_indentation() {
         serde_json::json!({"tabSize":4,"insertSpaces":false})
     );
     assert_eq!(options("class C {\n  *values() {}\n}\n"), spaces(2));
+    assert_eq!(
+        options("const open = \"/*\"; // see /* spec\nfunction f() {\n  return 1;\n}\n"),
+        spaces(2)
+    );
 }
 
 // Back skips a file deleted since; quick repeated presses walk one entry each.
