@@ -2,10 +2,11 @@
 use anyhow::{Context, Result, bail, ensure};
 use serde::Deserialize;
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Component, Path, PathBuf},
     sync::{
-        Mutex,
+        Arc, Mutex,
         atomic::{AtomicU64, Ordering},
     },
 };
@@ -45,14 +46,21 @@ pub(super) fn managed(name: &str) -> Result<PathBuf> {
         cfg!(all(target_os = "macos", target_arch = "aarch64")),
         "Managed language tools require Apple Silicon macOS"
     );
-    static INSTALL: Mutex<()> = Mutex::new(());
-    let _lock = INSTALL.lock().map_err(|_| {
-        anyhow::anyhow!("Language tool installer stopped unexpectedly; restart Shark")
-    })?;
     let artifact = manifest()?
         .into_iter()
         .find(|a| a.name == name)
         .context("Language tool is not in Shark's manifest")?;
+    // One lock per tool, so a cached tool never waits behind another tool's download.
+    static INSTALLS: Mutex<BTreeMap<String, Arc<Mutex<()>>>> = Mutex::new(BTreeMap::new());
+    let lock = INSTALLS
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .entry(artifact.name.clone())
+        .or_default()
+        .clone();
+    let _lock = lock.lock().map_err(|_| {
+        anyhow::anyhow!("Language tool installer stopped unexpectedly; restart Shark")
+    })?;
     install(
         &artifact,
         &crate::state::support_dir().join("language-tools"),
@@ -62,13 +70,7 @@ pub(super) fn managed(name: &str) -> Result<PathBuf> {
 fn install(artifact: &Artifact, cache: &Path) -> Result<PathBuf> {
     let parent = cache.join(&artifact.name);
     let destination = parent.join(&artifact.version);
-    let executable = destination.join(&artifact.executable);
-    if executable.is_file()
-        && fs::read_to_string(destination.join(".verified"))
-            .ok()
-            .as_deref()
-            == Some(&artifact.sha256)
-    {
+    if let Some(executable) = verified(artifact, &destination) {
         return Ok(executable);
     }
     // Never erase an existing installation, even when it needs repair.
@@ -79,6 +81,7 @@ fn install(artifact: &Artifact, cache: &Path) -> Result<PathBuf> {
         destination.display()
     );
     fs::create_dir_all(&parent)?;
+    remove_interrupted_stages(&parent);
     static NEXT: AtomicU64 = AtomicU64::new(0);
     let stage = parent.join(format!(
         ".stage-{}-{}-{}",
@@ -141,13 +144,60 @@ fn install(artifact: &Artifact, cache: &Path) -> Result<PathBuf> {
         );
         fs::remove_file(archive)?;
         fs::write(stage.join(".verified"), &artifact.sha256)?;
-        fs::rename(&stage, &destination)?;
-        Ok(executable)
+        activate(artifact, &stage, &destination)?;
+        Ok(destination.join(&artifact.executable))
     })();
     if result.is_err() {
         let _ = fs::remove_dir_all(&stage);
     }
     result
+}
+
+fn verified(artifact: &Artifact, destination: &Path) -> Option<PathBuf> {
+    let executable = destination.join(&artifact.executable);
+    (executable.is_file()
+        && fs::read_to_string(destination.join(".verified"))
+            .ok()
+            .as_deref()
+            == Some(&artifact.sha256))
+    .then_some(executable)
+}
+
+/// Another Shark process may have activated the same version first; reuse its install.
+fn activate(artifact: &Artifact, stage: &Path, destination: &Path) -> Result<()> {
+    if let Err(error) = fs::rename(stage, destination) {
+        ensure!(verified(artifact, destination).is_some(), error);
+        let _ = fs::remove_dir_all(stage);
+    }
+    Ok(())
+}
+
+/// Stages are named `.stage-<pid>-…`; one whose process is gone was interrupted mid-install.
+/// The caller holds this tool's lock, so this process has no live stage here either.
+fn remove_interrupted_stages(parent: &Path) {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
+    }
+    const ESRCH: i32 = 3;
+    for entry in fs::read_dir(parent).into_iter().flatten().flatten() {
+        let name = entry.file_name();
+        let Some(pid) = name.to_str().and_then(|name| {
+            name.strip_prefix(".stage-")?
+                .split('-')
+                .next()?
+                .parse()
+                .ok()
+        }) else {
+            continue;
+        };
+        // SAFETY: signal zero only checks whether the process exists.
+        let gone = pid == std::process::id() as i32
+            || (unsafe { kill(pid, 0) } != 0
+                && std::io::Error::last_os_error().raw_os_error() == Some(ESRCH));
+        if gone {
+            let _ = fs::remove_dir_all(entry.path());
+        }
+    }
 }
 
 pub(super) fn verify(file: &Path, expected: &str) -> Result<()> {
@@ -200,9 +250,17 @@ mod tests {
         fs::create_dir_all(version.join(Path::new(&a.executable).parent().unwrap())).unwrap();
         fs::write(version.join(&a.executable), "working").unwrap();
         fs::write(version.join(".verified"), &a.sha256).unwrap();
-        let interrupted = root.join(&a.name).join(".stage-interrupted");
-        fs::create_dir(&interrupted).unwrap();
-        fs::write(interrupted.join("download.tar.gz"), "partial").unwrap();
+        let mut exited = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        exited.wait().unwrap();
+        let interrupted = root
+            .join(&a.name)
+            .join(format!(".stage-{}-0-0", exited.id()));
+        // launchd always runs; a live process's stage is still in use.
+        let live = root.join(&a.name).join(".stage-1-0-0");
+        for stage in [&interrupted, &live] {
+            fs::create_dir(stage).unwrap();
+            fs::write(stage.join("download.tar.gz"), "partial").unwrap();
+        }
         a.url = "https://127.0.0.1:1/not-available".into();
         assert_eq!(install(&a, &root).unwrap(), version.join(&a.executable));
         a.version = "failed-upgrade".into();
@@ -212,10 +270,30 @@ mod tests {
             "working"
         );
         assert!(!root.join(&a.name).join(&a.version).exists());
+        assert!(!interrupted.exists());
         assert_eq!(
-            fs::read_to_string(interrupted.join("download.tar.gz")).unwrap(),
+            fs::read_to_string(live.join("download.tar.gz")).unwrap(),
             "partial"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn losing_the_activation_race_reuses_the_other_process_install() {
+        let root = std::env::temp_dir().join(format!("shark-install-race-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let a = manifest().unwrap().remove(0);
+        let (stage, destination) = (root.join(".stage"), root.join(&a.version));
+        fs::create_dir_all(destination.join(Path::new(&a.executable).parent().unwrap())).unwrap();
+        fs::write(destination.join("partial"), "").unwrap();
+        fs::create_dir_all(&stage).unwrap();
+        fs::write(stage.join("file"), "").unwrap();
+        // A non-empty destination that is not a verified install is still an error.
+        assert!(activate(&a, &stage, &destination).is_err());
+        fs::write(destination.join(&a.executable), "installed").unwrap();
+        fs::write(destination.join(".verified"), &a.sha256).unwrap();
+        activate(&a, &stage, &destination).unwrap();
+        assert!(!stage.exists());
         fs::remove_dir_all(root).unwrap();
     }
 }
