@@ -3,7 +3,7 @@ use super::*;
 
 pub(super) struct FileTab {
     pub(super) editor: Entity<FileEditor>,
-    header: (bool, bool, &'static str, String),
+    header: (bool, bool, &'static str, String, String),
     _subs: Vec<Subscription>,
 }
 
@@ -104,7 +104,7 @@ impl Shark {
         );
     }
 
-    fn make_file_tab(
+    pub(super) fn make_file_tab(
         &mut self,
         path: String,
         abs: PathBuf,
@@ -117,6 +117,7 @@ impl Shark {
             Some(text) => FileEditor::with_content(path, abs, vim, Some(text), window, cx),
             None => FileEditor::new(path, abs, vim, window, cx),
         });
+        self.start_language(&editor, window, cx);
         let subs = vec![
             cx.subscribe_in(
                 &editor,
@@ -124,6 +125,7 @@ impl Shark {
                 |s, editor, ev: &EditorEvent, window, cx| match ev {
                     EditorEvent::Saved => s.refresh_diff(cx),
                     EditorEvent::Close => s.close_editor(editor.clone(), window, cx),
+                    EditorEvent::Language(event) => s.language_event(editor, event, window, cx),
                     EditorEvent::Leave if s.editor.as_ref() == Some(editor) => {
                         let pane = if s.tree_shown(cx) {
                             Pane::Feature(Feature::Diff, FeatureFocus::Files)
@@ -145,6 +147,9 @@ impl Shark {
                     e.conflict,
                     e.vim.status(),
                     e.vim.pending().to_string(),
+                    e.language_status(cx)
+                        .map(|s| format!("{}{:?}", s.0, s.1))
+                        .unwrap_or_default(),
                 );
                 if header != tab.header {
                     tab.header = header;
@@ -304,6 +309,8 @@ impl Shark {
         self.restore_generation += 1;
         self.editor = None;
         self.file_tabs.clear();
+        self.language_sessions.clear();
+        self.navigation = Default::default();
     }
 
     /// Quit, asking first if the open file has unsaved edits.
@@ -510,6 +517,7 @@ impl Shark {
             }
         });
         let (dirty, conflict) = (e.dirty, e.conflict);
+        let language_status = e.language_status(cx);
         // `g t` works in Vim's Normal mode, where it types nothing.
         let normal =
             e.vim_on && e.vim.mode == crate::vim::Mode::Normal && e.vim.pending().is_empty();
@@ -562,6 +570,15 @@ impl Shark {
                                     .child(dir),
                             )
                             .child(div().flex_none().child(name))
+                            .when(e.external, |d| {
+                                d.child(
+                                    div()
+                                        .ml_2()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("Read only"),
+                                )
+                            })
                             .when(dirty, |d| {
                                 d.child(
                                     div()
@@ -576,6 +593,18 @@ impl Shark {
                                 )
                             }),
                     )
+                    .when_some(language_status.clone(), |d, (status, detail)| {
+                        d.child(
+                            Button::new("language-status")
+                                .small()
+                                .ghost()
+                                .label(status)
+                                .tooltip(detail.unwrap_or_else(|| "Restart language tools".into()))
+                                .on_click(
+                                    cx.listener(|s, _, w, cx| s.choose_or_restart_language(w, cx)),
+                                ),
+                        )
+                    })
                     .when_some(vim, |d, vim| {
                         d.child(
                             div()
@@ -614,6 +643,25 @@ impl Shark {
                         crate::settings::close_button("close-file", "Close file (cmd-w)")
                             .on_click(cx.listener(|this, _, w, cx| this.close_file(w, cx))),
                     ),
+            )
+            .when_some(
+                language_status.and_then(|(status, detail)| {
+                    (status == "Setup needed").then_some(detail).flatten()
+                }),
+                |d, detail| {
+                    let deps = [crate::deps::Dep {
+                        name: "Language tools",
+                        ok: false,
+                        fix: "",
+                        detail,
+                    }];
+                    d.child(
+                        div()
+                            .px_3()
+                            .py_2()
+                            .children(crate::deps::render_setup(&deps, cx)),
+                    )
+                },
             )
             .when(conflict, |d| {
                 let (e1, e2) = (editor.clone(), editor.clone());

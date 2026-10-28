@@ -15,6 +15,7 @@ mod features;
 mod file_icon;
 mod files;
 mod git;
+mod lsp;
 mod menu;
 mod menubar;
 mod overflow_fade;
@@ -124,6 +125,14 @@ actions!(
         DeleteSection,
         CancelEdit,
         ToggleHome,
+        FormatDocument,
+        RenameSymbol,
+        FindReferences,
+        DocumentSymbols,
+        SignatureHelp,
+        NavigationBack,
+        NavigationForward,
+        RestartLanguage,
     ]
 );
 
@@ -253,6 +262,13 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("left", CollapseDir, Some("FileTree || Sidebar")),
         KeyBinding::new("right", ExpandDir, Some("FileTree || Sidebar")),
         KeyBinding::new("cmd-s", SaveFile, Some("FileEditor")),
+        KeyBinding::new("alt-shift-f", FormatDocument, Some("FileEditor")),
+        KeyBinding::new("f2", RenameSymbol, Some("FileEditor")),
+        KeyBinding::new("shift-f12", FindReferences, Some("FileEditor")),
+        KeyBinding::new("cmd-shift-o", DocumentSymbols, Some("FileEditor")),
+        KeyBinding::new("cmd-shift-space", SignatureHelp, Some("FileEditor")),
+        KeyBinding::new("ctrl--", NavigationBack, Some("FileEditor")),
+        KeyBinding::new("ctrl-shift--", NavigationForward, Some("FileEditor")),
         KeyBinding::new("cmd-w", CloseFile, Some("FileEditor")),
         KeyBinding::new("cmd-t", NewChat, None),
         KeyBinding::new("cmd-w", CloseTab, None),
@@ -476,6 +492,8 @@ fn main() {
         .run(|cx| {
             set_dock_icon();
             gpui_kit::init(cx);
+            cx.on_app_quit(|_| lsp::client::Client::terminate_all())
+                .detach();
             install_fonts(cx);
             bind_keys(cx);
             menubar::init(cx);

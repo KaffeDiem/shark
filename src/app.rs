@@ -40,6 +40,9 @@ mod editor_pane;
 mod features;
 mod file_changes;
 mod home;
+mod intelligence;
+#[cfg(all(test, feature = "test-support"))]
+mod intelligence_tests;
 mod interaction;
 pub(crate) mod menus;
 mod palette;
@@ -112,6 +115,8 @@ pub struct Shark {
     rail: bool,
     editor: Option<Entity<FileEditor>>,
     file_tabs: Vec<editor_pane::FileTab>,
+    language_sessions: HashMap<String, (WeakEntity<crate::lsp::Session>, Subscription)>,
+    navigation: intelligence::History,
     pub(crate) syncs: HashMap<String, Entity<GitSync>>,
     sidebar_focus: FocusHandle,
     features_focus: FocusHandle,
@@ -248,6 +253,8 @@ impl Shark {
             rail: false,
             editor: None,
             file_tabs: vec![],
+            language_sessions: HashMap::new(),
+            navigation: Default::default(),
             syncs: HashMap::new(),
             sidebar_focus,
             features_focus: cx.focus_handle(),
@@ -980,6 +987,24 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &CloseFile, w, cx| this.close_file(w, cx)))
             // On the root, not the editor, so File > Save works with focus in the tree.
             .on_action(cx.listener(|this, _: &SaveFile, w, cx| this.save(w, cx)))
+            .on_action(cx.listener(|s, _: &FormatDocument, w, cx| {
+                s.language_action("textDocument/formatting", None, w, cx)
+            }))
+            .on_action(cx.listener(|s, _: &RenameSymbol, w, cx| s.rename_symbol(w, cx)))
+            .on_action(cx.listener(|s, _: &FindReferences, w, cx| {
+                s.language_action("textDocument/references", None, w, cx)
+            }))
+            .on_action(cx.listener(|s, _: &DocumentSymbols, w, cx| {
+                s.language_action("textDocument/documentSymbol", None, w, cx)
+            }))
+            .on_action(cx.listener(|s, _: &SignatureHelp, w, cx| {
+                s.language_action("textDocument/signatureHelp", None, w, cx)
+            }))
+            .on_action(cx.listener(|s, _: &NavigationBack, w, cx| s.navigate_history(false, w, cx)))
+            .on_action(
+                cx.listener(|s, _: &NavigationForward, w, cx| s.navigate_history(true, w, cx)),
+            )
+            .on_action(cx.listener(|s, _: &RestartLanguage, w, cx| s.restart_language(w, cx)))
             .on_action(
                 cx.listener(|this, _: &EditWorkingCopy, w, cx| this.edit_working_copy(None, w, cx)),
             )

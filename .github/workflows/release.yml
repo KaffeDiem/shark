@@ -53,6 +53,23 @@ jobs:
       - run: rustup toolchain install
       - uses: Swatinem/rust-cache@v2
 
+      - uses: actions/setup-go@v5
+        if: env.RELEASE == 'true'
+        with:
+          go-version: '1.27.3'
+          cache: false
+
+      - name: Build pinned gopls
+        if: env.RELEASE == 'true'
+        run: scripts/build-gopls.sh
+
+      - name: Verify shipped language tools
+        if: env.RELEASE == 'true'
+        run: |
+          rustup component add rust-analyzer rust-src
+          python3 scripts/check-language-tools.py --self-test
+          python3 scripts/check-language-tools.py
+
       - if: env.RELEASE != 'true'
         run: cargo build --release
 
@@ -81,7 +98,7 @@ jobs:
           # The tag points at exactly the code that was built, however far master has moved.
           git tag "v$VERSION"
           git push origin "v$VERSION"
-          gh release create "v$VERSION" "target/release/Shark-$VERSION.dmg" --title "Shark $VERSION" --generate-notes --verify-tag
+          gh release create "v$VERSION" "target/release/Shark-$VERSION.dmg" target/language-tools/gopls-0.24.0-darwin-arm64.tar.gz target/language-tools/gopls-0.24.0-darwin-arm64.tar.gz.sha256 --title "Shark $VERSION" --generate-notes --verify-tag
           # Then carry the version commit onto master; retry if more merges land meanwhile.
           for _ in 1 2 3 4 5; do
             git pull --rebase origin master && git push "git@github.com:$GITHUB_REPOSITORY.git" HEAD:master && exit 0

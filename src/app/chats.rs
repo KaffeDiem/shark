@@ -52,6 +52,12 @@ impl Shark {
                     };
                     Some((id.clone(), tab))
                 })
+                .chain(self.file_tabs.iter().enumerate().filter_map(|(ix, tab)| {
+                    let editor = tab.editor.read(cx);
+                    editor
+                        .external
+                        .then(|| (TabId::File(editor.path.clone()), VisibleTab::File(ix)))
+                }))
                 .collect(),
         )
     }

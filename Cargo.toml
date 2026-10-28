@@ -25,6 +25,13 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGImage"] }
 objc2-core-services = { version = "0.3", default-features = false, features = ["std", "LaunchServices", "LSInfo", "LSConstants"] }
 resvg = { version = "0.46", default-features = false }
+lsp-server = "=0.10.0"
+lsp-types = "=0.97.0"
+anyhow = "1"
+async-channel = "2"
+globset = "0.4"
+url = "2"
+toml = "0.9"
 
 [profile.dev.package."*"]
 opt-level = 3

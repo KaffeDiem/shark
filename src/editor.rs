@@ -12,6 +12,12 @@ use gpui_kit::component::{RopeExt as _, WindowExt as _};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
+mod intelligence;
+#[cfg(all(test, feature = "test-support"))]
+mod intelligence_tests;
+mod snippets;
+pub(crate) use intelligence::LanguageEvent;
+
 /// Bigger files open in the diff only; the editor is built for up to ~50K lines.
 pub const MAX_BYTES: u64 = 4 << 20;
 
@@ -22,6 +28,7 @@ pub enum EditorEvent {
     Leave,
     /// A completed :wq closes this editor even if another tab is now selected.
     Close,
+    Language(LanguageEvent),
 }
 
 pub struct FileEditor {
@@ -39,11 +46,18 @@ pub struct FileEditor {
     pub conflict: bool,
     pub vim: Vim,
     pub vim_on: bool,
+    vim_action: bool,
     /// A write is in flight; reloads started before it finished are stale.
     pub(crate) saving: bool,
     saves: u64,
     /// `:wq` is waiting for its write to land.
     close_after_save: bool,
+    pub(crate) external: bool,
+    pub(crate) intelligence: Option<intelligence::Language>,
+    pub(crate) lsp_setup: Option<Task<()>>,
+    pub(crate) lsp_request: Option<Task<()>>,
+    pub(crate) lsp_error: Option<String>,
+    snippets: snippets::Snippets,
     _subs: Vec<Subscription>,
     _poll: Task<()>,
 }
@@ -71,14 +85,21 @@ impl FileEditor {
     ) -> Self {
         let lang = language(&path);
         let input = cx.new(|cx| EditorState::new(window, cx).language(lang));
-        let mut subs = vec![
-            cx.subscribe(&input, |this: &mut Self, _, ev: &InputEvent, cx| {
-                if matches!(ev, InputEvent::Change) && this.loaded && !this.dirty {
+        let mut subs = vec![cx.subscribe_in(
+            &input,
+            window,
+            |this: &mut Self, _, ev: &InputEvent, window, cx| {
+                if matches!(ev, InputEvent::Change) && this.loaded {
+                    crate::lsp::document::document_changed();
+                    this.lsp_request = None;
+                    this.clear_language_diagnostics();
                     this.dirty = true;
+                    this.snippet_changed(cx);
+                    this.sync_language(window, cx);
                     cx.notify();
                 }
-            }),
-        ];
+            },
+        )];
         // Runs before key bindings, so normal-mode keys never reach the editor or the keymap.
         let this = cx.entity().downgrade();
         subs.push(cx.intercept_keystrokes(move |ev, window, cx| {
@@ -111,9 +132,16 @@ impl FileEditor {
             conflict: false,
             vim: Vim::default(),
             vim_on,
+            vim_action: false,
             saving: false,
             saves: 0,
             close_after_save: false,
+            external: false,
+            intelligence: None,
+            lsp_setup: None,
+            lsp_request: None,
+            lsp_error: None,
+            snippets: snippets::Snippets::default(),
             _subs: subs,
             _poll,
         };
@@ -133,6 +161,9 @@ impl FileEditor {
     fn intercept(&mut self, ks: &Keystroke, window: &mut Window, cx: &mut Context<Self>) -> bool {
         if !self.is_focused(window, cx) {
             return false;
+        }
+        if self.snippet_key(ks, cx) {
+            return true;
         }
         if self.idle() && ks.key == "escape" && ks.modifiers.number_of_modifiers() == 0 {
             // Let input cancellation run before the bubbled Escape leaves the editor.
@@ -159,8 +190,14 @@ impl FileEditor {
     /// Normal and visual mode must not let stray letters into the buffer.
     fn sync_readonly(&self, cx: &mut Context<Self>) {
         // Until the first read lands, typing would be lost when the file replaces the buffer.
-        let ro = !self.loaded || (self.vim_on && self.vim.mode != vim::Mode::Insert);
+        let ro = self.readonly();
         self.input.update(cx, |i, cx| i.set_readonly(ro, cx));
+    }
+
+    fn readonly(&self) -> bool {
+        self.external
+            || !self.loaded
+            || (self.vim_on && self.vim.mode != vim::Mode::Insert && !self.vim_action)
     }
 
     /// Reads the file again: replaces a clean buffer, flags a conflict on a dirty one.
@@ -199,6 +236,8 @@ impl FileEditor {
                     (Some(_), _) if e.dirty => e.conflict = true,
                     (None, _) => e.conflict = e.loaded,
                     (Some(text), Some(fp)) => {
+                        crate::lsp::document::document_changed();
+                        e.clear_language_diagnostics();
                         e.disk = fp;
                         e.conflict = false;
                         e.input.update(cx, |i, cx| {
@@ -216,6 +255,7 @@ impl FileEditor {
                             e.loaded = true;
                             e.sync_readonly(cx);
                         }
+                        e.sync_language(window, cx);
                     }
                     (Some(_), None) => {}
                 }
@@ -237,7 +277,7 @@ impl FileEditor {
 
     /// Writes the buffer unless someone else changed the file since it was read (then `force`).
     pub fn save(&mut self, force: bool, window: &mut Window, cx: &mut Context<Self>) {
-        if !self.loaded || self.saving {
+        if self.external || !self.loaded || self.saving {
             return;
         }
         self.saving = true;
@@ -259,6 +299,7 @@ impl FileEditor {
                         // Typing during the write keeps the buffer dirty.
                         e.dirty = e.input.read(cx).value() != saved;
                         e.conflict = false;
+                        e.language_saved(&saved, window, cx);
                         cx.emit(EditorEvent::Saved);
                         if close && !e.dirty {
                             cx.emit(EditorEvent::Close);
@@ -293,6 +334,9 @@ impl FileEditor {
 
     /// Runs one key through Vim; returns whether it was consumed.
     fn vim_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if self.external {
+            return false;
+        }
         let before = self.vim.mode;
         let Some((edited, cmd)) = apply_vim_key(&mut self.vim, &self.input, key, window, cx) else {
             return false;
@@ -342,11 +386,13 @@ impl FileEditor {
             Outdent => Box::new(self::Outdent),
         };
         // Undo, indent and friends edit even in normal mode.
+        self.vim_action = true;
         self.input.update(cx, |i, cx| i.set_readonly(false, cx));
         window.dispatch_action(action, cx);
         let this = cx.entity().downgrade();
         window.defer(cx, move |_, cx| {
             this.update(cx, |e, cx| {
+                e.vim_action = false;
                 e.sync_readonly(cx);
                 e.clamp_cursor(cx);
             })
@@ -619,7 +665,12 @@ impl Render for FileEditor {
                     cx.stop_propagation();
                 }
             }))
-            .child(Editor::new(&self.input).appearance(false).h_full())
+            .child(
+                Editor::new(&self.input)
+                    .readonly(self.readonly())
+                    .appearance(false)
+                    .h_full(),
+            )
     }
 }
 
@@ -880,7 +931,11 @@ mod ui_tests {
     }
 
     #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
     async fn reload_keeps_focus_and_undo_stays_clean(cx: &mut TestAppContext) {
+        let _guard = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (dir, file, window, editor) = open_editor("editor", "one\n", cx).await;
         let text = |cx: &mut TestAppContext| {
             cx.update(|cx| editor.read(cx).input.read(cx).value().to_string())
@@ -920,7 +975,11 @@ mod ui_tests {
 
     /// `ctrl-w j` completes no app chord: the `j` still moves Vim's cursor.
     #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
     async fn key_after_unbound_chord_reaches_vim(cx: &mut TestAppContext) {
+        let _guard = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let (dir, _, window, editor) = open_editor("chord", "one\ntwo\n", cx).await;
         cx.update(|cx| cx.bind_keys([KeyBinding::new("ctrl-w z", crate::OpenAnyFile, None)]));
         cx.update_window(window, |_, w, cx| {
