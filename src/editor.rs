@@ -397,6 +397,9 @@ impl FileEditor {
             }
             SaveQuit | Quit => return window.dispatch_action(Box::new(CloseFile), cx),
             Outline => return window.dispatch_action(Box::new(crate::DocumentSymbols), cx),
+            Definition => {
+                return window.dispatch_action(Box::new(gpui_kit::base::input::GoToDefinition), cx);
+            }
             ForceQuit => {
                 self.dirty = false;
                 return window.dispatch_action(Box::new(CloseFile), cx);

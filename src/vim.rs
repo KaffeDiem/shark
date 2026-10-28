@@ -34,6 +34,8 @@ pub enum Cmd {
     Outdent,
     /// `g s`: the file's symbol outline, as in Zed.
     Outline,
+    /// `g d`: go to the definition under the cursor.
+    Definition,
 }
 
 #[derive(Default, Debug, PartialEq)]
@@ -262,10 +264,14 @@ impl Vim {
             return Out::default();
         }
         if self.g && ch != 'g' {
-            let outline = ch == 's' && self.op.is_none() && !self.visual();
+            let plain = self.op.is_none() && !self.visual();
             self.reset();
             return Out {
-                cmd: outline.then_some(Cmd::Outline),
+                cmd: match ch {
+                    's' if plain => Some(Cmd::Outline),
+                    'd' if plain => Some(Cmd::Definition),
+                    _ => None,
+                },
                 ..Out::default()
             };
         }

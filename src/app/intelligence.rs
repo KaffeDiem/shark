@@ -1201,6 +1201,8 @@ pub(super) fn formatting_options(text: &str) -> Value {
 
 pub(super) fn read_source(path: &Path) -> anyhow::Result<String> {
     use std::io::Read;
+    // Before opening: opening a FIFO blocks until something writes to it.
+    anyhow::ensure!(path.metadata()?.is_file(), "Not a regular source file");
     let file = std::fs::File::open(path)?;
     anyhow::ensure!(file.metadata()?.is_file(), "Not a regular source file");
     let mut bytes = Vec::new();

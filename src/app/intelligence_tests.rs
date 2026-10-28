@@ -1312,13 +1312,26 @@ async fn language_sessions_are_shared_and_outlive_their_tabs(cx: &mut TestAppCon
         assert_eq!(w.notifications(cx).len(), before + 1)
     })
     .unwrap();
-    // Closing one of its files keeps the server; replacing the only other one too.
+    // Closing one of its files keeps the server, and stops one no file uses; replacing the
+    // only other file keeps it too.
+    std::fs::create_dir_all(root.join("node_modules")).unwrap();
+    let (unused, _) = fake_session(&root.join("node_modules"));
+    let unused = cx
+        .update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| {
+                let unused = cx.new(|_| unused);
+                s.register_session(unused.clone(), w, cx);
+                unused.downgrade()
+            })
+        })
+        .unwrap();
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| s.close_editor(d.upgrade().unwrap(), w, cx))
     })
     .unwrap();
     cx.run_until_parked();
     assert!(weak.upgrade().is_some());
+    assert!(unused.upgrade().is_none(), "no open file used it");
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
             let range = Range::new(Position::new(0, 0), Position::new(0, 1));
@@ -1471,6 +1484,25 @@ async fn language_keys_send_rename_definition_and_buffer_formatting(cx: &mut Tes
             == 2
     })
     .await;
+}
+
+// A saved tab or a definition pointing at a FIFO is refused instead of blocking the read
+// (restore reads every saved tab in one task, so one FIFO would hold them all back).
+#[test]
+fn read_source_refuses_a_fifo_without_blocking() {
+    let fifo = std::env::temp_dir().join(format!("shark-fifo-{}.rs", std::process::id()));
+    let _ = std::fs::remove_file(&fifo);
+    let made = std::process::Command::new("mkfifo").arg(&fifo).status();
+    assert!(made.unwrap().success());
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = fifo.clone();
+    std::thread::spawn(move || {
+        let _ = tx.send(super::intelligence::read_source(&path).map_err(|e| e.to_string()));
+    });
+    let result = rx.recv_timeout(Duration::from_secs(5));
+    let _ = std::fs::remove_file(&fifo);
+    let result = result.expect("read_source blocked on a FIFO");
+    assert_eq!(result.unwrap_err(), "Not a regular source file");
 }
 
 #[test]
