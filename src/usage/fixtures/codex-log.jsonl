@@ -1,0 +1,8 @@
+{"timestamp":"@A","type":"session_meta","payload":{"id":"s1","cwd":"/tmp"}}
+{"timestamp":"@A","type":"event_msg","payload":{"type":"user_message","message":"why is token_count repeated?"}}
+{"timestamp":"@A","type":"event_msg","payload":{"type":"token_count","info":null,"rate_limits":{}}}
+{"timestamp":"@A","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":10},"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":10}}}}
+{"timestamp":"@A","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":10},"last_token_usage":{"input_tokens":100,"cached_input_tokens":40,"output_tokens":10}}}}
+{"timestamp":"@B","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":300,"cached_input_tokens":90,"output_tokens":30},"last_token_usage":{"input_tokens":200,"cached_input_tokens":50,"output_tokens":20}}}}
+{"timestamp":"@C","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":310,"cached_input_tokens":110,"output_tokens":35},"last_token_usage":{"input_tokens":10,"cached_input_tokens":20,"output_tokens":5}}}}
+{"timestamp":"@C","type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage

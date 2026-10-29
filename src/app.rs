@@ -123,6 +123,9 @@ pub struct Shark {
     app_switcher: Option<app_switcher::AppSwitcher>,
     usage_panel: Option<usage::Panel>,
     usage: [crate::usage::Snapshot; 2],
+    /// Daily tokens from the agents' local logs, rescanned with each usage refresh.
+    usage_activity: [crate::usage::activity::Daily; 2],
+    activity_cache: std::sync::Arc<[std::sync::Mutex<crate::usage::activity::Cache>; 2]>,
     #[cfg(test)]
     usage_queries: [usize; 2],
     #[cfg(test)]
@@ -258,6 +261,8 @@ impl Shark {
             app_switcher: None,
             usage_panel: None,
             usage: Default::default(),
+            usage_activity: Default::default(),
+            activity_cache: Default::default(),
             #[cfg(test)]
             usage_queries: [0; 2],
             #[cfg(test)]

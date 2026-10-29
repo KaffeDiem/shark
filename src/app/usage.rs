@@ -1,6 +1,7 @@
 //! Account usage belongs to the window, independent of the selected workspace.
 use super::*;
-use crate::usage::{Failure, Provider, Snapshot, Status};
+use crate::usage::activity::{self, Daily};
+use crate::usage::{Allowance, Failure, Provider, Snapshot, Status, countdown};
 use gpui_kit::component::plot::shape::{Arc, ArcData};
 use std::f32::consts::TAU;
 use std::time::Duration;
@@ -91,6 +92,24 @@ impl Shark {
                 .ok();
             })
             .detach();
+            let cache = self.activity_cache.clone();
+            cx.spawn(async move |this, cx| {
+                let daily = cx
+                    .background_executor()
+                    .spawn(async move {
+                        let mut cache = cache[provider.index()]
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        crate::usage::activity::scan(provider, &mut cache, crate::usage::now())
+                    })
+                    .await;
+                this.update(cx, |s, cx| {
+                    s.usage_activity[provider.index()] = daily;
+                    cx.notify();
+                })
+                .ok();
+            })
+            .detach();
         }
         cx.notify();
     }
@@ -149,16 +168,17 @@ impl Shark {
                     })
                     .children(providers.into_iter().map(|provider| {
                         let snapshot = &self.usage[provider.index()];
+                        let now = crate::usage::now();
                         let limiting = snapshot.limiting();
                         let remaining = limiting.and_then(|row| row.remaining);
-                        let pace = limiting.and_then(|row| row.pace(crate::usage::now()));
+                        let pace = limiting.and_then(|row| row.pace(now));
                         let description = ring_description(provider, snapshot);
-                        let left = remaining
-                            .map_or_else(|| "Unknown".into(), |n| format!("{}% left", n.ceil()));
+                        let left = left_label(limiting, now);
                         let ring = ring(
                             remaining.unwrap_or(0.),
                             pace,
                             fill_color(remaining, snapshot.outdated, theme),
+                            theme.sidebar,
                             theme,
                         );
                         // Expanded: a side row (ring, name, what's left). Rail: the ring over its name.
@@ -179,16 +199,32 @@ impl Shark {
                                 .text_color(theme.sidebar_foreground)
                                 .child(ring)
                                 .child(div().flex_1().child(provider.name()))
-                                .child(div().text_xs().child(left))
+                                .child(
+                                    div()
+                                        .text_xs()
+                                        .when_some(
+                                            label_color(remaining, snapshot.outdated, theme),
+                                            |d, c| d.text_color(c),
+                                        )
+                                        .child(left),
+                                )
                         };
-                        trigger
-                            .id(format!("usage-trigger-{}", provider.name()))
-                            .role(Role::Button)
-                            .aria_label(description.clone())
-                            .hover(move |d| d.bg(hover))
-                            .tooltip(move |w, cx| Tooltip::new(description.clone()).build(w, cx))
-                            .on_click(cx.listener(|s, _, w, cx| s.show_usage(w, cx)))
-                            .test_support()
+                        let (snapshot, daily) = (
+                            snapshot.clone(),
+                            self.usage_activity[provider.index()].clone(),
+                        );
+                        HoverCard::new(format!("usage-card-{}", provider.name()))
+                            .anchor(Anchor::BottomLeft)
+                            .trigger(
+                                trigger
+                                    .id(format!("usage-trigger-{}", provider.name()))
+                                    .role(Role::Button)
+                                    .aria_label(description)
+                                    .hover(move |d| d.bg(hover))
+                                    .on_click(cx.listener(|s, _, w, cx| s.show_usage(w, cx)))
+                                    .test_support(),
+                            )
+                            .content(move |_, _, cx| card(provider, &snapshot, &daily, cx))
                     })),
             )
             .child(
@@ -215,7 +251,7 @@ impl Shark {
         let left = footer
             .left()
             .max(px(8.))
-            .min((viewport.width - px(328.)).max(px(8.)));
+            .min((viewport.width - px(352.)).max(px(8.)));
         let bottom = (viewport.height - footer.top() + px(4.)).max(px(8.));
         let content = menu::chrome(cx.theme())
             .id("usage-panel")
@@ -223,7 +259,7 @@ impl Shark {
             .aria_label("Account usage")
             .aria_description("Subscription allowances. Enter to refresh. Escape to close.")
             .track_focus(&panel.focus)
-            .w(px(320.).min(viewport.width - px(16.)))
+            .w(px(344.).min(viewport.width - px(16.)))
             .max_h((viewport.height - bottom - px(8.)).max(px(0.)))
             .overflow_y_scroll()
             .p_4()
@@ -243,9 +279,10 @@ impl Shark {
                             .on_click(cx.listener(|s, _, _, cx| s.refresh_usage(cx))),
                     ),
             )
-            .children(
-                Provider::ALL.map(|provider| section(provider, &self.usage[provider.index()], cx)),
-            )
+            .children(Provider::ALL.map(|provider| {
+                let i = provider.index();
+                section(provider, &self.usage[i], &self.usage_activity[i], cx)
+            }))
             .test_support();
         Some(
             deferred(
@@ -273,7 +310,8 @@ impl Shark {
     }
 }
 
-fn section(provider: Provider, snapshot: &Snapshot, cx: &App) -> impl IntoElement {
+/// The calendar is here too, so its daily values are reachable without a pointer.
+fn section(provider: Provider, snapshot: &Snapshot, daily: &Daily, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
     let status = match snapshot.status {
         Status::Idle => Some("Not checked"),
@@ -308,7 +346,7 @@ fn section(provider: Provider, snapshot: &Snapshot, cx: &App) -> impl IntoElemen
                     if n > 0. && n < 1. {
                         "<1% remaining".into()
                     } else {
-                        format!("{n:.0}% remaining")
+                        format!("{}% remaining", n.ceil())
                     }
                 },
             );
@@ -350,16 +388,18 @@ fn section(provider: Provider, snapshot: &Snapshot, cx: &App) -> impl IntoElemen
                             )
                         })
                         .when_some(pace, |d, p| {
+                            // A 1.5px line, knocked out of the bar by 1.5px of panel background.
                             d.child(
                                 div()
                                     .absolute()
-                                    .top(px(-2.))
+                                    .top(px(-3.))
                                     .left(relative(p as f32 / 100.))
-                                    .ml(px(-1.))
-                                    .w(px(2.))
-                                    .h(px(8.))
-                                    .rounded_full()
-                                    .bg(theme.muted_foreground),
+                                    .ml(px(-2.25))
+                                    .w(px(4.5))
+                                    .h(px(10.))
+                                    .border_x(px(1.5))
+                                    .border_color(theme.popover)
+                                    .bg(theme.popover_foreground),
                             )
                         }),
                 )
@@ -371,6 +411,11 @@ fn section(provider: Provider, snapshot: &Snapshot, cx: &App) -> impl IntoElemen
                 )
                 .test_support()
         }))
+        .child(
+            div()
+                .text_xs()
+                .child(heatmap(provider, daily, crate::usage::now(), theme)),
+        )
         .child(div().text_xs().text_color(theme.muted_foreground).child(
             snapshot.checked_at.map_or_else(
                 || "Last checked: never".into(),
@@ -400,34 +445,105 @@ fn fill_color(remaining: Option<f64>, outdated: bool, theme: &Theme) -> Hsla {
     }
 }
 
+/// The footer label's text: the brighter `*_foreground` at `fill_color`'s thresholds.
+fn label_color(remaining: Option<f64>, outdated: bool, theme: &Theme) -> Option<Hsla> {
+    match remaining {
+        _ if outdated => None,
+        Some(n) if n <= 5. => Some(theme.danger_foreground),
+        Some(n) if n <= 20. => Some(theme.warning_foreground),
+        _ => None,
+    }
+}
+
+/// "62% left · 5h"; when low, the reset instead: "18% left · resets 3d".
+fn left_label(row: Option<&Allowance>, now: f64) -> String {
+    let Some((row, n)) = row.and_then(|row| Some((row, row.remaining?))) else {
+        return "Unknown".into();
+    };
+    match row.resets_at {
+        Some(at) if n <= 20. => format!("{}% left · resets {}", n.ceil(), countdown(at - now)),
+        _ => format!("{}% left · {}", n.ceil(), short_window(&row.label)),
+    }
+}
+
+/// "5 hours" → "5h", "Weekly" → "week", "gpt-5 · Weekly" → "gpt-5 week", "Fable" as is.
+fn short_window(label: &str) -> String {
+    label
+        .split(" · ")
+        .map(short_part)
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn short_part(label: &str) -> String {
+    match label.split_once(' ') {
+        _ if label == "Weekly" => "week".into(),
+        Some((n, "hour" | "hours")) => format!("{n}h"),
+        Some((n, "days")) => format!("{n}d"),
+        Some((n, "minutes")) => format!("{n}m"),
+        _ if label.chars().count() > 10 => {
+            format!("{}…", label.chars().take(9).collect::<String>())
+        }
+        _ => label.into(),
+    }
+}
+
 /// A 16px ring of what's left, clockwise from the top, on a track tinted like the fill so an
-/// empty red ring still reads as red. A tick crossing it
-/// marks what would be left at an even pace: an arc past the tick is ahead of the limit.
-fn ring(left: f64, pace: Option<f64>, fill: Hsla, theme: &Theme) -> impl IntoElement {
-    let (track, tick) = (fill.opacity(0.25), theme.muted_foreground);
+/// empty red ring still reads as red. A tick crossing it, knocked out of the band in the row
+/// background `bg`, marks what would be left at an even pace: an arc past the tick is ahead
+/// of the limit.
+fn ring(left: f64, pace: Option<f64>, fill: Hsla, bg: Hsla, theme: &Theme) -> impl IntoElement {
+    let (track, tick) = (fill.opacity(0.25), theme.sidebar_foreground);
     let (left, pace) = (left as f32, pace.map(|p| p as f32));
     canvas(
         |_, _, _| {},
         move |b, _, w, _| {
-            let band = Arc::new().inner_radius(4.5).outer_radius(6.5);
+            let band = Arc::new().inner_radius(4.).outer_radius(7.5);
             band.paint(&ArcData::new(&(), 0, 100., 0., TAU), track, &b, w);
             if left > 0. {
                 let end = left / 100. * TAU;
                 band.paint(&ArcData::new(&(), 1, left, 0., end), fill, &b, w);
             }
             if let Some(p) = pace {
-                let at = p / 100. * TAU;
-                Arc::new().inner_radius(3.).outer_radius(8.).paint(
-                    &ArcData::new(&(), 2, 1., at - 0.14, at + 0.14),
-                    tick,
-                    &b,
-                    w,
-                );
+                let (sin, cos) = (p / 100. * TAU).sin_cos();
+                let at = |r: f32| b.center() + point(px(r * sin), px(-r * cos));
+                // The knockout stays within the band, so a hovered row's background can't show it.
+                for (width, from, to, color) in [(4.5, 4., 7.5, bg), (1.5, 2.5, 8., tick)] {
+                    let mut line = PathBuilder::stroke(px(width));
+                    line.move_to(at(from));
+                    line.line_to(at(to));
+                    if let Ok(path) = line.build() {
+                        w.paint_path(path, color);
+                    }
+                }
             }
         },
     )
     .size(px(16.))
     .flex_none()
+}
+
+/// One allowance: "5 hours · 62% left · resets in 2h 14m (Thu 11:00 PM) · even pace 40%".
+fn limit_line(row: &Allowance, now: f64) -> String {
+    let mut text = format!(
+        "{} · {}",
+        row.label,
+        row.remaining.map_or_else(
+            || "Remaining unknown".into(),
+            |n| format!("{}% left", n.ceil())
+        )
+    );
+    if let Some(at) = row.resets_at {
+        text.push_str(&format!(
+            " · resets in {} ({})",
+            countdown(at - now),
+            crate::usage::short_time(at)
+        ));
+    }
+    if let Some(p) = row.pace(now) {
+        text.push_str(&format!(" · even pace {}%", p.round()));
+    }
+    text
 }
 
 fn ring_description(provider: Provider, snapshot: &Snapshot) -> String {
@@ -436,7 +552,7 @@ fn ring_description(provider: Provider, snapshot: &Snapshot) -> String {
             "{} · {} · {}% remaining · {}",
             provider.name(),
             row.label,
-            row.remaining.unwrap(),
+            row.remaining.unwrap().ceil(),
             row.resets_at.map_or_else(
                 || "Reset time unknown".into(),
                 |at| format!("Resets {}", crate::usage::local_time(at))
@@ -450,6 +566,12 @@ fn ring_description(provider: Provider, snapshot: &Snapshot) -> String {
     {
         text.push_str(&format!(" · Even pace: {}% left", p.round()));
     }
+    text.push_str(&status_note(snapshot));
+    text
+}
+
+fn status_note(snapshot: &Snapshot) -> String {
+    let mut text = String::new();
     if snapshot
         .allowances
         .iter()
@@ -469,9 +591,193 @@ fn ring_description(provider: Provider, snapshot: &Snapshot) -> String {
     text
 }
 
+const CELL: f32 = 11.;
+const GAP: f32 = 3.;
+const WEEKS: i64 = 20;
+
+/// Heatmap level 0–4: 0 for no tokens, else the quartile of non-zero days (GitHub's cut).
+fn levels(tokens: &[u64]) -> impl Fn(u64) -> usize {
+    let mut busy: Vec<u64> = tokens.iter().copied().filter(|n| *n > 0).collect();
+    busy.sort_unstable();
+    // Cut below the maximum so the busiest day always reaches level 4.
+    let top = busy.len().saturating_sub(1);
+    let cut = |q: usize| busy[..top].get(top * q / 4).copied().unwrap_or(0);
+    let cuts = [cut(1), cut(2), cut(3)];
+    move |n| match n {
+        0 => 0,
+        n => 1 + cuts.iter().filter(|c| n > **c).count(),
+    }
+}
+
+fn level_color(level: usize, theme: &Theme) -> Hsla {
+    match level {
+        0 => theme.muted,
+        n => theme.foreground.opacity([0.25, 0.45, 0.7, 1.][n - 1]),
+    }
+}
+
+fn cell(level: usize, theme: &Theme) -> Div {
+    div()
+        .size(px(CELL))
+        .flex_none()
+        .rounded(px(2.))
+        .bg(level_color(level, theme))
+}
+
+/// The footer hover card: each allowance, then a GitHub-style calendar of daily tokens.
+fn card(
+    provider: Provider,
+    snapshot: &Snapshot,
+    daily: &Daily,
+    cx: &App,
+) -> impl IntoElement + use<> {
+    let theme = cx.theme();
+    let now = crate::usage::now();
+    let muted = theme.muted_foreground;
+    v_flex()
+        .id(format!("usage-card-{}", provider.name()))
+        .w(px(304.))
+        .gap_2()
+        .text_xs()
+        .child(
+            div()
+                .font_weight(FontWeight::SEMIBOLD)
+                .child(provider.name()),
+        )
+        .children(
+            snapshot
+                .allowances
+                .iter()
+                .map(|row| div().text_color(muted).child(limit_line(row, now))),
+        )
+        .children(
+            Some(status_note(snapshot).trim_start_matches(" · ").to_string())
+                .filter(|t| !t.is_empty())
+                .map(|t| div().text_color(muted).child(t)),
+        )
+        .child(heatmap(provider, daily, now, theme))
+        .test_support()
+}
+
+fn heatmap(provider: Provider, daily: &Daily, now: f64, theme: &Theme) -> AnyElement {
+    let today = activity::local_day(now);
+    // Columns run Monday to Sunday; the last one holds today.
+    let first = today - (today + 3).rem_euclid(7) - (WEEKS - 1) * 7;
+    let at = |day: i64| {
+        usize::try_from(day - daily.first_day)
+            .ok()
+            .and_then(|i| daily.tokens.get(i).copied())
+            .unwrap_or(0)
+    };
+    let shown: Vec<u64> = (first..=today).map(at).collect();
+    let total: u64 = shown.iter().sum();
+    let empty = match () {
+        _ if daily.tokens.is_empty() => Some("Reading local logs…"),
+        _ if total == 0 => Some("No local activity found"),
+        _ => None,
+    };
+    if let Some(text) = empty {
+        return div()
+            .text_color(faint(theme))
+            .child(text)
+            .into_any_element();
+    }
+    let level = levels(&shown);
+    let busiest = (first..=today).max_by_key(|d| (at(*d), -d)).unwrap();
+    let step = CELL + GAP;
+    let gutter = 28.;
+    // Each month over the column holding its 1st; the first column's only if it has room.
+    let mut months: Vec<(i64, i64)> = vec![(0, first)];
+    for day in first + 1..=today {
+        if activity::civil(day).2 == 1 {
+            months.push(((day - first) / 7, day));
+        }
+    }
+    if months.get(1).is_some_and(|(week, _)| *week < 3) {
+        months.remove(0);
+    }
+    let (long, month) = (activity::day_labels("EEEMMMd"), activity::day_labels("MMM"));
+    v_flex()
+        .gap_2()
+        .child(format!(
+            "{} tokens in {WEEKS} weeks · busiest {}",
+            crate::usage::tokens(total),
+            long(busiest)
+        ))
+        .child(
+            v_flex()
+                .id(SharedString::from(format!(
+                    "usage-heatmap-{}",
+                    provider.name()
+                )))
+                .role(Role::Group)
+                .aria_label(format!("{} tokens per day", provider.name()))
+                .gap(px(GAP))
+                .text_color(theme.muted_foreground)
+                .child(div().relative().h(px(16.)).children(months.into_iter().map(
+                    |(week, day)| {
+                        div()
+                            .absolute()
+                            .left(px(gutter + week as f32 * step))
+                            .child(month(day))
+                    },
+                )))
+                .children((0..7i64).map(|row| {
+                    h_flex()
+                        .gap(px(GAP))
+                        .h(px(CELL))
+                        .child(
+                            div()
+                                .w(px(gutter - GAP))
+                                .line_height(px(CELL))
+                                .when(row % 2 == 0 && row < 6, |d| {
+                                    d.child(["Mon", "Wed", "Fri"][row as usize / 2])
+                                }),
+                        )
+                        .children((0..WEEKS).map(|week| {
+                            let day = first + week * 7 + row;
+                            if day > today {
+                                return div().size(px(CELL)).flex_none().into_any_element();
+                            }
+                            let n = at(day);
+                            let tip = format!(
+                                "{} · {}",
+                                long(day),
+                                match n {
+                                    0 => "No activity".into(),
+                                    n => format!("{} tokens", crate::usage::tokens(n)),
+                                }
+                            );
+                            cell(level(n), theme)
+                                .id(SharedString::from(format!(
+                                    "usage-day-{}-{day}",
+                                    provider.name()
+                                )))
+                                .role(Role::Label)
+                                .aria_label(tip.clone())
+                                .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+                                .into_any_element()
+                        }))
+                })),
+        )
+        .child(
+            h_flex()
+                .justify_end()
+                .gap(px(GAP))
+                .text_color(theme.muted_foreground)
+                .child(div().mr_1().child("Less"))
+                .children((0..5).map(|n| cell(n, theme)))
+                .child(div().ml_1().child("More")),
+        )
+        .into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Failure, Provider, Snapshot, Theme, fill_color, ring_description};
+    use super::{
+        Allowance, Failure, Provider, Snapshot, Theme, fill_color, label_color, left_label, levels,
+        limit_line, ring_description,
+    };
     use gpui_kit::rgb;
 
     #[test]
@@ -526,5 +832,58 @@ mod tests {
         }
         snapshot.allowances.remove(0);
         assert!(ring_description(Provider::Claude, &snapshot).contains("Remaining unknown"));
+
+        let row = |label: &str, remaining: f64| Allowance {
+            label: label.into(),
+            remaining: Some(remaining),
+            resets_at: Some(1000. + 2. * 3600. + 14. * 60.),
+            window: Some(5. * 3600.),
+        };
+        for (label, remaining, expected) in [
+            ("5 hours", 61.2, "62% left · 5h"),
+            ("Weekly", 21., "21% left · week"),
+            (
+                "gpt-5.5-codex-max · Weekly",
+                50.,
+                "50% left · gpt-5.5-c… week",
+            ),
+            ("Fable", 30., "30% left · Fable"),
+            ("5 hours", 4., "4% left · resets 2h 14m"),
+        ] {
+            assert_eq!(left_label(Some(&row(label, remaining)), 1000.), expected);
+        }
+        let mut weekly = row("Weekly", 18.);
+        weekly.resets_at = Some(1000. + 3. * 86400. + 60.);
+        assert_eq!(left_label(Some(&weekly), 1000.), "18% left · resets 3d");
+        assert_eq!(left_label(None, 0.), "Unknown");
+        assert_eq!(label_color(Some(21.), false, &theme), None);
+        assert_eq!(
+            label_color(Some(20.), false, &theme),
+            Some(theme.warning_foreground)
+        );
+        assert_eq!(
+            label_color(Some(5.), false, &theme),
+            Some(theme.danger_foreground)
+        );
+        let line = limit_line(&row("5 hours", 61.2), 1000. + 3600.);
+        assert!(
+            line.starts_with("5 hours · 62% left · resets in 1h 14m ("),
+            "{line}"
+        );
+        assert!(line.ends_with(") · even pace 25%"), "{line}");
+        snapshot.finish(Ok(vec![row("5 hours", 61.234)]));
+        let text = ring_description(Provider::Claude, &snapshot);
+        assert!(text.contains("· 62% remaining ·"), "{text}");
+        assert_eq!(crate::usage::countdown(59.), "1m");
+        assert_eq!(crate::usage::tokens(412_345), "412k");
+        assert_eq!(crate::usage::tokens(38_200_000), "38.2M");
+        assert_eq!(crate::usage::tokens(999_999), "1.0M");
+        let level = levels(&[0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        assert_eq!(
+            [0, 1, 2, 3, 4, 5, 6, 7, 8].map(&level),
+            [0, 1, 1, 2, 2, 3, 3, 4, 4]
+        );
+        assert_eq!([0, 5, 9].map(levels(&[0, 5, 9])), [0, 1, 4]);
+        assert_eq!(levels(&[7])(7), 4);
     }
 }
