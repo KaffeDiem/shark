@@ -381,6 +381,7 @@ pub(crate) fn render_pixels() {
     super::workspace_picker_tests::render_pixels(&mut cx);
     super::navigation_pixels::render_pixels(&mut cx);
     super::drag_tests::render_pixels(&mut cx);
+    super::group_tests::render_pixels(&mut cx);
     super::tree_pixels::render_pixels(&mut cx);
     super::tree_pixels::render_artifact_pixels(&mut cx);
     super::git_tests::render_pixels(&mut cx);

@@ -51,13 +51,11 @@ impl Shark {
     }
 
     pub(super) fn tree_shown(&self, cx: &App) -> bool {
-        self.tab == Tab::Feature(Feature::Diff)
-            && !self.home_shown()
-            && self.differ.read(cx).tree_shown()
+        self.tab_visible(&TabId::Diff, cx) && self.differ.read(cx).tree_shown()
     }
 
     pub(super) fn toggle_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.tab == Tab::Feature(Feature::Diff) && !self.home_shown() {
+        if self.tab_visible(&TabId::Diff, cx) {
             self.with_differ(window, cx, Differ::toggle_tree);
         }
     }

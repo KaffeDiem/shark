@@ -10,6 +10,8 @@ pub(super) struct FilePicker {
     hits: Vec<usize>,
     query: String,
     shark: WeakEntity<Shark>,
+    /// The workspace and tab group it was opened from; the file opens there.
+    origin: (String, usize),
     _load: Task<()>,
 }
 
@@ -17,6 +19,7 @@ impl FilePicker {
     fn new(
         repos: Vec<(String, PathBuf)>,
         shark: WeakEntity<Shark>,
+        origin: (String, usize),
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
@@ -41,6 +44,7 @@ impl FilePicker {
             hits: vec![],
             query: String::new(),
             shark,
+            origin,
             _load,
         }
     }
@@ -53,6 +57,29 @@ impl FilePicker {
     fn path(&self, row: usize) -> Option<String> {
         Some(rel(self.files.get(*self.hits.get(row)?)?))
     }
+
+    /// The hit at `row` and where it opens.
+    fn target(&self, row: usize) -> Option<Picked> {
+        Some((self.path(row)?, self.origin.clone(), self.shark.clone()))
+    }
+}
+
+type Picked = (String, (String, usize), WeakEntity<Shark>);
+
+/// Closes the picker and opens the hit where the picker was opened from; `new_tab` is
+/// cmd-enter or cmd-click.
+fn open_picked(
+    (path, (workspace, g), shark): Picked,
+    new_tab: bool,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window.close_dialog(cx);
+    shark
+        .update(cx, |s, cx| {
+            s.open_any_path(path, &workspace, g, new_tab, window, cx)
+        })
+        .ok();
 }
 
 fn rel(item: &Item) -> String {
@@ -60,7 +87,8 @@ fn rel(item: &Item) -> String {
 }
 
 impl Render for FilePicker {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let command_held = window.modifiers().platform;
         let dark = cx.theme().is_dark();
         let items = (self.hits.iter()).map(|&i| {
             let label: SharedString = rel(&self.files[i]).into();
@@ -79,10 +107,32 @@ impl Render for FilePicker {
             }
         });
         let (q, pick) = (cx.entity().downgrade(), cx.entity().downgrade());
-        Command::new(&self.state)
+        let command = Command::new(&self.state)
             .items(items.collect::<Vec<_>>())
             .filterable(false)
             .placeholder("Open file…")
+            .footer(move |_, _, cx| {
+                let theme = cx.theme();
+                let (muted, faint) = (theme.muted_foreground, faint(theme));
+                h_flex()
+                    .id("file-picker-hints")
+                    .px_3()
+                    .py_2()
+                    .gap_4()
+                    .text_xs()
+                    .text_color(faint)
+                    .child(crate::chat::hint("enter", "Open"))
+                    .child(
+                        crate::chat::hint("cmd-enter", "New tab")
+                            .id("new-tab-hint")
+                            .when(command_held, |d| {
+                                d.text_color(muted).font_weight(FontWeight::MEDIUM)
+                            })
+                            .test_support(),
+                    )
+                    .child(crate::chat::hint("escape", "Cancel"))
+                    .test_support()
+            })
             .on_query(move |query, _, cx| {
                 q.update(cx, |p, cx| {
                     p.query = query.to_string();
@@ -92,18 +142,23 @@ impl Render for FilePicker {
                 .ok();
             })
             .on_confirm(move |ix, window, cx| {
+                // Enter or a click; cmd-click (the click's modifiers) appends.
+                let new_tab = window.modifiers().platform;
                 // Closing the dialog releases the picker, so read the selection first.
-                let Some((path, shark)) = pick
-                    .upgrade()
-                    .and_then(|p| Some((p.read(cx).path(ix.row)?, p.read(cx).shark.clone())))
-                else {
-                    return;
-                };
-                window.close_dialog(cx);
-                shark
-                    .update(cx, |s, cx| s.open_any_path(path, window, cx))
-                    .ok();
-            })
+                if let Some(picked) = pick.upgrade().and_then(|p| p.read(cx).target(ix.row)) {
+                    open_picked(picked, new_tab, window, cx);
+                }
+            });
+        div()
+            .key_context("FilePicker")
+            .on_modifiers_changed(cx.listener(|_, _: &ModifiersChangedEvent, _, cx| cx.notify()))
+            .on_action(cx.listener(|p, _: &OpenInNewTab, window, cx| {
+                let row = p.state.read(cx).selected_index().map(|ix| ix.row);
+                if let Some(picked) = row.and_then(|row| p.target(row)) {
+                    window.defer(cx, move |window, cx| open_picked(picked, true, window, cx));
+                }
+            }))
+            .child(command)
     }
 }
 
@@ -113,19 +168,29 @@ impl Shark {
         let Some(ws) = self.active_ws() else {
             return notify_err(window, cx, "Open a workspace first");
         };
-        let repos: Vec<_> = (ws.repos.iter())
-            .map(|r| (r.name.clone(), ws.dir().join(&r.name)))
-            .collect();
+        let repos = palette::repo_paths(ws);
+        let origin = (ws.name.clone(), ws.layout.focused);
         let shark = cx.entity().downgrade();
-        let picker = cx.new(|cx| FilePicker::new(repos, shark, window, cx));
+        let picker = cx.new(|cx| FilePicker::new(repos, shark, origin, window, cx));
         let state = picker.read(cx).state.clone();
         window.open_dialog(cx, move |d, _, cx| menu_dialog(d, cx).child(picker.clone()));
         state.update(cx, |p, cx| p.focus(window, cx));
     }
 
-    /// Opens a picked path; text files only, since the editor would show a binary one empty.
-    fn open_any_path(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws() else { return };
+    /// Opens a picked path in group `g` of `workspace`; text files only, since the editor would
+    /// show a binary one empty. An open path just gets its tab selected.
+    fn open_any_path(
+        &mut self,
+        path: String,
+        workspace: &str,
+        g: usize,
+        new_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ws) = self.active_ws().filter(|ws| ws.name == workspace) else {
+            return notify_err(window, cx, "The workspace changed; open the file again");
+        };
         let abs = ws.dir().join(&path);
         let text = std::fs::metadata(&abs).is_ok_and(|m| m.len() <= crate::editor::MAX_BYTES)
             && std::fs::read(&abs).is_ok_and(|b| std::str::from_utf8(&b).is_ok());
@@ -138,6 +203,6 @@ impl Shark {
                 ),
             );
         }
-        self.open_path(path, window, cx);
+        self.open_in_group(path, workspace, g, new_tab, window, cx);
     }
 }

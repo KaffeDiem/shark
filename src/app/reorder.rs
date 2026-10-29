@@ -6,6 +6,10 @@ use std::time::Duration;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Item {
     Tab(String, TabId),
+    /// The trailing space of a workspace's tab group: a tab dropped there goes last.
+    Append(String, usize),
+    /// The dotted target that moves a tab into a new right group.
+    Split(String),
     Workspace(String),
     Section(usize),
     Ungrouped,
@@ -15,8 +19,26 @@ pub(super) enum Item {
 pub(super) struct Reorder {
     bounds: HashMap<Item, Bounds<Pixels>>,
     offsets: HashMap<Item, Pixels>,
-    source: Option<Item>,
-    target: Option<Item>,
+    pub(super) source: Option<Item>,
+    pub(super) target: Option<Item>,
+    /// The drag has been shown: the titlebar's drop targets are up.
+    armed: bool,
+}
+
+/// Where a drag previews and may drop: the sidebar's list, or the titlebar's tab area.
+#[derive(Clone)]
+enum Area {
+    Scroll(ScrollHandle),
+    Tabs(Rc<std::cell::Cell<Bounds<Pixels>>>),
+}
+
+impl Area {
+    fn bounds(&self) -> Bounds<Pixels> {
+        match self {
+            Area::Scroll(s) => s.bounds(),
+            Area::Tabs(b) => b.get(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -25,7 +47,7 @@ pub(super) struct Drag {
     sections: Vec<String>,
     label: SharedString,
     offset: Point<Pixels>,
-    scroll: ScrollHandle,
+    scroll: Area,
     state: Rc<RefCell<Reorder>>,
 }
 
@@ -84,9 +106,15 @@ impl Render for Drag {
         let pointer = window.mouse_position();
         let bounds = self.preview_bounds(pointer);
         let correction = bounds.origin - (pointer - self.offset);
+        // Over a drop zone the chip fades, so the target under it stays visible.
+        let zone = matches!(
+            self.state.borrow().target,
+            Some(Item::Append(..) | Item::Split(_))
+        );
         // GPUI positions the preview root itself; only a child can offset it back into the pane.
         div().child(
             sidebar::drag_chip(self.label.clone(), cx)
+                .when(zone, |d| d.opacity(0.5))
                 .id("reorder-preview")
                 .test_support()
                 .relative()
@@ -104,13 +132,34 @@ impl Shark {
         let mut current = self.reorder_items(true, cx);
         current.extend(self.reorder_items(false, cx));
         current.push(Item::Ungrouped);
+        if let Some(name) = &self.active {
+            current.extend((0..2).map(|g| Item::Append(name.clone(), g)));
+            current.push(Item::Split(name.clone()));
+        }
         let mut state = self.reorder.borrow_mut();
         state.bounds.retain(|key, _| current.contains(key));
         if !cx.has_active_drag() {
             state.source = None;
             state.target = None;
+            state.armed = false;
             state.offsets.clear();
         }
+    }
+
+    /// Escape during a tab or sidebar drag: drop nothing, put everything back.
+    pub(super) fn cancel_drag(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if !cx.has_active_drag() || self.reorder.borrow().source.is_none() {
+            return false;
+        }
+        let mut state = self.reorder.borrow_mut();
+        state.source = None;
+        state.target = None;
+        state.armed = false;
+        state.offsets.clear();
+        drop(state);
+        cx.stop_active_drag(window);
+        cx.notify();
+        true
     }
     pub(super) fn reorder_source<E: StatefulInteractiveElement>(
         &self,
@@ -119,9 +168,9 @@ impl Shark {
         label: SharedString,
     ) -> E {
         let scroll = if matches!(source, Item::Tab(..)) {
-            self.tab_scroll.clone()
+            Area::Tabs(self.tabs_area.clone())
         } else {
-            self.sidebar_scroll.clone()
+            Area::Scroll(self.sidebar_scroll.clone())
         };
         let state = self.reorder.clone();
         let sections = if matches!(source, Item::Tab(..)) {
@@ -164,12 +213,13 @@ impl Shark {
         .into_any_element()
     }
 
+    /// Tabs of every group, left to right, or the sidebar's rows.
     fn reorder_items(&self, horizontal: bool, cx: &App) -> Vec<Item> {
         if horizontal {
             self.active_ws()
                 .map(|ws| {
-                    self.visible_tab_ids(ws, cx)
-                        .into_iter()
+                    (0..2)
+                        .flat_map(|g| self.visible_tab_ids(ws, g, cx))
                         .map(|id| Item::Tab(ws.name.clone(), id))
                         .collect()
                 })
@@ -189,6 +239,13 @@ impl Shark {
         let horizontal = drag.horizontal();
         let area = drag.scroll.bounds();
         let mut order = self.reorder_items(horizontal, cx);
+        // A tab reorders within its own strip; other strips and the zones only take drops.
+        let group = |id: &TabId| self.active_ws().map_or(0, |ws| ws.group_of(id));
+        if let Item::Tab(_, source) = &drag.source {
+            let g = group(source);
+            order.retain(|item| matches!(item, Item::Tab(_, id) if group(id) == g));
+        }
+        let zones = self.drop_zones(drag, cx);
         let mut state = self.reorder.borrow_mut();
         if !drag.valid(self, cx) {
             state.target = None;
@@ -197,8 +254,14 @@ impl Shark {
             cx.notify();
             return;
         }
+        if horizontal && !state.armed {
+            // The split target and drop zones appear with the drag.
+            state.armed = true;
+            cx.notify();
+        }
         let valid = |item: &&Item| match (&drag.source, *item) {
             (Item::Tab(ws, _), Item::Tab(other, _)) => ws == other,
+            (Item::Tab(..), Item::Append(..) | Item::Split(_)) => zones.contains(item),
             (Item::Workspace(_), Item::Workspace(_) | Item::Section(_) | Item::Ungrouped) => true,
             (Item::Section(_), Item::Section(_)) => true,
             _ => false,
@@ -211,7 +274,12 @@ impl Shark {
         let target = state
             .bounds
             .keys()
-            .filter(|key| order.contains(key) || **key == Item::Ungrouped)
+            .filter(|key| {
+                order.contains(key)
+                    || **key == Item::Ungrouped
+                    || zones.contains(key)
+                    || (horizontal && matches!(key, Item::Tab(..)))
+            })
             .filter(valid)
             .min_by(|a, b| {
                 let distance = |item: &Item| {
@@ -229,8 +297,10 @@ impl Shark {
                         px(0.)
                     }
                 };
-                distance(a)
-                    .partial_cmp(&distance(b))
+                // Nested zones (the split target inside the trailing space): the smaller wins.
+                let width = |item: &Item| state.bounds[item].size.width;
+                (distance(a), width(a))
+                    .partial_cmp(&(distance(b), width(b)))
                     .unwrap_or(Ordering::Equal)
             })
             .cloned();
@@ -240,6 +310,12 @@ impl Shark {
         state.target = target.clone();
         state.offsets.clear();
         let Some(target) = target else { return };
+        if horizontal && !order.contains(&target) {
+            // Another strip or a zone: it highlights, nothing slides.
+            drop(state);
+            cx.notify();
+            return;
+        }
         let before = order.clone();
         match (&drag.source, &target) {
             (Item::Section(from), Item::Section(to)) => {
@@ -364,15 +440,31 @@ impl Shark {
         let target = self.reorder.borrow_mut().target.take();
         self.reorder.borrow_mut().source = None;
         self.reorder.borrow_mut().offsets.clear();
+        let zones = self.drop_zones(drag, cx);
         if drag.valid(self, cx)
             && drag.scroll.bounds().contains(&window.mouse_position())
             && target.as_ref().is_some_and(|key| {
-                *key == Item::Ungrouped || self.reorder_items(drag.horizontal(), cx).contains(key)
+                *key == Item::Ungrouped
+                    || zones.contains(key)
+                    || self.reorder_items(drag.horizontal(), cx).contains(key)
             })
         {
+            let group = |s: &Shark, id: &TabId| s.active_ws().map_or(0, |ws| ws.group_of(id));
             match (&drag.source, target) {
-                (Item::Tab(ws, from), Some(Item::Tab(other, to))) if *ws == other => {
+                (Item::Tab(ws, from), Some(Item::Tab(other, to)))
+                    if *ws == other && group(self, from) == group(self, &to) =>
+                {
                     self.move_tab(ws, from, &to, cx)
+                }
+                (Item::Tab(ws, from), Some(Item::Tab(other, to))) if *ws == other => {
+                    let g = group(self, &to);
+                    self.move_to_group(ws, from, g, Some(&to), window, cx)
+                }
+                (Item::Tab(ws, from), Some(Item::Append(other, g))) if *ws == other => {
+                    self.move_to_group(ws, from, g, None, window, cx)
+                }
+                (Item::Tab(ws, from), Some(Item::Split(other))) if *ws == other => {
+                    self.move_to_group(ws, from, 1, None, window, cx)
                 }
                 (Item::Workspace(ws), Some(Item::Workspace(to))) => self.drop_ws(ws, &to, cx),
                 (Item::Workspace(ws), Some(Item::Section(to))) => {
@@ -384,6 +476,25 @@ impl Shark {
             }
         }
         cx.notify();
+    }
+
+    /// The zones a tab drag may drop on: each group's trailing space, and the split target
+    /// while there is one group and the tab isn't the only one.
+    fn drop_zones(&self, drag: &Drag, cx: &App) -> Vec<Item> {
+        let (Item::Tab(name, tab), Some(ws)) = (&drag.source, self.active_ws()) else {
+            return vec![];
+        };
+        if ws.name != *name {
+            return vec![];
+        }
+        let mut zones: Vec<Item> = self
+            .groups()
+            .map(|g| Item::Append(name.clone(), g))
+            .collect();
+        if !ws.split() && self.can_move_to(tab, 1, cx) {
+            zones.push(Item::Split(name.clone()));
+        }
+        zones
     }
 
     pub(super) fn reorder_events(&self, element: Div, cx: &Context<Self>) -> Div {
@@ -457,7 +568,7 @@ impl Element for Moving {
             window,
             cx,
         );
-        let offset = if matches!(self.item, Item::Tab(..)) {
+        let offset = if matches!(self.item, Item::Tab(..) | Item::Append(..) | Item::Split(_)) {
             point(offset, px(0.))
         } else {
             point(px(0.), offset)

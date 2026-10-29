@@ -157,11 +157,11 @@ async fn mixed_drag_preserves_buffers_and_navigation(cx: &mut TestAppContext) {
     cx.update(|cx| assert_eq!(editor.read(cx).input.read(cx).value().as_ref(), "alpha\n"));
     for (ix, id) in order.iter().enumerate() {
         press(cx, &[&format!("ctrl-{}", ix + 1)]);
-        cx.update(|cx| assert_eq!(shark.read(cx).active_tab_index(cx), Some(ix), "{id:?}"));
+        cx.update(|cx| assert_eq!(shark.read(cx).active_tab_index(0, cx), Some(ix), "{id:?}"));
         press(cx, &["ctrl-tab"]);
         cx.update(|cx| {
             assert_eq!(
-                shark.read(cx).active_tab_index(cx),
+                shark.read(cx).active_tab_index(0, cx),
                 Some((ix + 1) % order.len())
             )
         });
@@ -304,7 +304,9 @@ async fn restored_files_switch_discard_retry_and_restart(cx: &mut TestAppContext
     .await;
     cx.update(|cx| {
         let s = again.read(cx);
-        assert_eq!(s.tab, Tab::Chat);
+        // The selected file comes back once its delayed read lands.
+        assert_eq!(s.tab, Tab::File);
+        assert_eq!(s.editor.as_ref(), Some(&s.file_tabs[0].editor));
         assert_eq!(s.active_ws().unwrap().tab_order, saved);
         assert_eq!(
             s.file_tabs[0]

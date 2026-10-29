@@ -169,6 +169,24 @@ pub struct Workspace {
     /// workspace; `normalize_tabs` keeps chat and feature tabs in step with their open/closed state.
     #[serde(default)]
     pub tab_order: Vec<TabId>,
+    /// Side-by-side groups over `tab_order`; one group until a tab is moved right.
+    #[serde(default)]
+    pub layout: TabLayout,
+}
+
+/// Two tab groups side by side. A tab is in the right group when listed in `right`, else the
+/// left; each group's order is `tab_order`'s. `Workspace::normalize_tabs` keeps it consistent.
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
+#[serde(default)]
+pub struct TabLayout {
+    /// The right group's tabs; empty while there is one group.
+    pub right: Vec<TabId>,
+    /// Each group's selected tab, left then right.
+    pub selected: [Option<TabId>; 2],
+    /// The group last focused, 0 or 1; commands like cmd-w and ctrl-tab act on it.
+    pub focused: usize,
+    /// The left group's share of the width; `None` is half.
+    pub ratio: Option<f32>,
 }
 
 /// A tab's identity in the strip, stable across reordering.
@@ -202,6 +220,7 @@ impl Default for Workspace {
             git_closed: true,
             viewed: HashMap::new(),
             tab_order: Vec::new(),
+            layout: TabLayout::default(),
         }
     }
 }
@@ -326,32 +345,144 @@ impl Workspace {
         if let Some(ix) = active.and_then(|a| self.chats.iter().position(|c| c.id == a)) {
             self.active_chat = ix;
         }
+        self.normalize_layout();
     }
 
-    /// Appends `tab`, moving it to the end when it is already listed.
+    /// Drops right-group entries and selections that aren't open tabs; a group left empty
+    /// collapses into the other, which keeps its selection; a ratio must be a share.
+    fn normalize_layout(&mut self) {
+        let mut seen = HashSet::new();
+        let order = &self.tab_order;
+        let l = &mut self.layout;
+        l.right
+            .retain(|t| order.contains(t) && seen.insert(t.clone()));
+        if !l.right.is_empty() && l.right.len() == order.len() {
+            l.right.clear();
+            l.selected = [l.selected[1].take(), None];
+            l.focused = 0;
+        }
+        if l.right.is_empty() {
+            l.selected[1] = None;
+            l.focused = 0;
+        }
+        l.focused = l.focused.min(1);
+        let right = l.right.clone();
+        let ok = |t: &TabId, g: usize| order.contains(t) && (right.contains(t) as usize) == g;
+        for g in 0..2 {
+            if l.selected[g].as_ref().is_some_and(|t| !ok(t, g)) {
+                l.selected[g] = None;
+            }
+            // Each group of a split shows something; one group keeps the legacy rules.
+            if !right.is_empty() && l.selected[g].is_none() {
+                l.selected[g] = order.iter().find(|t| ok(t, g)).cloned();
+            }
+        }
+        l.ratio = l.ratio.filter(|r| r.is_finite() && *r > 0. && *r < 1.);
+    }
+
+    /// Two groups are shown.
+    pub fn split(&self) -> bool {
+        !self.layout.right.is_empty()
+    }
+
+    /// 0 for the left group, 1 for the right.
+    pub fn group_of(&self, tab: &TabId) -> usize {
+        self.layout.right.contains(tab) as usize
+    }
+
+    /// Group `g`'s tabs, left to right.
+    pub fn group_tabs(&self, g: usize) -> Vec<TabId> {
+        (self.tab_order.iter())
+            .filter(|t| self.group_of(t) == g)
+            .cloned()
+            .collect()
+    }
+
+    /// The left group's share of the width.
+    pub fn split_ratio(&self) -> f32 {
+        self.layout.ratio.unwrap_or(0.5).clamp(0.1, 0.9)
+    }
+
+    /// Selects `tab` in its group and focuses that group.
+    pub fn select_tab(&mut self, tab: &TabId) {
+        if self.tab_order.contains(tab) {
+            let g = self.group_of(tab);
+            self.layout.selected[g] = Some(tab.clone());
+            self.layout.focused = g;
+        }
+    }
+
+    /// `tab` is leaving its group: when it was selected there, the next tab at its position
+    /// takes over, else the one before it.
+    fn leave_group(&mut self, tab: &TabId) {
+        let g = self.group_of(tab);
+        if self.layout.selected[g].as_ref() != Some(tab) {
+            return;
+        }
+        let group = self.group_tabs(g);
+        let at = group.iter().position(|t| t == tab).unwrap_or(0);
+        self.layout.selected[g] = (group.get(at + 1))
+            .or(at.checked_sub(1).and_then(|i| group.get(i)))
+            .cloned();
+    }
+
+    /// Appends `tab` to the focused group, or moves it to the end of its own group when it is
+    /// already listed.
     pub fn open_tab(&mut self, tab: TabId) {
+        let g = match self.tab_order.contains(&tab) {
+            true => self.group_of(&tab),
+            false => self.layout.focused,
+        };
+        self.open_tab_in(tab, g);
+    }
+
+    /// Appends `tab` to group `g`; opening never creates a split.
+    pub fn open_tab_in(&mut self, tab: TabId, g: usize) {
+        let right = g == 1 && self.split();
         self.tab_order.retain(|t| *t != tab);
-        self.tab_order.push(tab);
+        self.layout.right.retain(|t| *t != tab);
+        self.tab_order.push(tab.clone());
+        if right {
+            self.layout.right.push(tab);
+        }
+        self.normalize_layout();
     }
 
+    /// Removes `tab`; its group selects the tab after it, else the one before.
     pub fn close_tab(&mut self, tab: &TabId) {
+        self.leave_group(tab);
         self.tab_order.retain(|t| t != tab);
+        self.normalize_layout();
     }
 
-    /// `new` takes `old`'s slot (a replaced file), or the end when `old` isn't listed.
+    /// `new` takes `old`'s slot and group (a replaced file), or joins the focused group when
+    /// `old` isn't listed.
     pub fn replace_tab(&mut self, old: &TabId, new: TabId) {
         if old == &new {
             return;
         }
         self.tab_order.retain(|t| *t != new);
-        match self.tab_order.iter().position(|t| t == old) {
-            Some(ix) => self.tab_order[ix] = new,
-            None => self.tab_order.push(new),
+        self.layout.right.retain(|t| *t != new);
+        let Some(ix) = self.tab_order.iter().position(|t| t == old) else {
+            return self.open_tab(new);
+        };
+        self.tab_order[ix] = new.clone();
+        let l = &mut self.layout;
+        for t in l.right.iter_mut().chain(l.selected.iter_mut().flatten()) {
+            if t == old {
+                *t = new.clone();
+            }
         }
+        self.normalize_layout();
     }
 
     /// Moves tab `from` into `to`'s slot; false when they are the same or either is missing.
+    /// From the other group it joins `to`'s, before it.
     pub fn move_tab(&mut self, from: &TabId, to: &TabId) -> bool {
+        if self.group_of(from) != self.group_of(to) {
+            return self.tab_order.contains(to)
+                && self.move_to_group(from, self.group_of(to), Some(to));
+        }
         let pos = |t: &TabId| self.tab_order.iter().position(|x| x == t);
         let (Some(from), Some(to)) = (pos(from), pos(to)) else {
             return false;
@@ -360,6 +491,45 @@ impl Workspace {
             return false;
         }
         move_item(&mut self.tab_order, from, to);
+        self.normalize_tabs();
+        true
+    }
+
+    /// Moves `tab` into group `g`, before `before` or at the group's end, then selects it and
+    /// focuses that group. With one group, `g == 1` splits at half and half, unless `tab` is the
+    /// only tab. A group left empty collapses. False when nothing changes.
+    pub fn move_to_group(&mut self, tab: &TabId, g: usize, before: Option<&TabId>) -> bool {
+        if g > 1 || !self.tab_order.contains(tab) || before == Some(tab) {
+            return false;
+        }
+        if before.is_some_and(|b| !self.tab_order.contains(b) || self.group_of(b) != g) {
+            return false;
+        }
+        let creating = g == 1 && !self.split();
+        if creating && self.tab_order.len() < 2 {
+            return false;
+        }
+        let from = self.group_of(tab);
+        if from == g && before.is_none() && self.group_tabs(g).last() == Some(tab) {
+            return false;
+        }
+        if from != g {
+            self.leave_group(tab);
+        }
+        self.tab_order.retain(|t| t != tab);
+        match before.and_then(|b| self.tab_order.iter().position(|t| t == b)) {
+            Some(ix) => self.tab_order.insert(ix, tab.clone()),
+            None => self.tab_order.push(tab.clone()),
+        }
+        self.layout.right.retain(|t| t != tab);
+        if g == 1 {
+            self.layout.right.push(tab.clone());
+        }
+        if creating {
+            self.layout.ratio = None;
+        }
+        self.layout.selected[g] = Some(tab.clone());
+        self.layout.focused = g;
         self.normalize_tabs();
         true
     }
@@ -704,6 +874,172 @@ mod tests {
             ["w~2", "w"]
         );
         assert_eq!(ws.chats[ws.active_chat].id, "w~2");
+    }
+
+    /// Legacy workspaces load as one group; a split round trips; membership stays unique;
+    /// moves, reorders and closes keep each group's selection and collapse an emptied group.
+    #[test]
+    fn tab_layout_groups() {
+        use TabId::{Chat, Diff, File};
+        let chat = |id: &str| Chat(id.into());
+        let file = |p: &str| File(p.into());
+        let legacy = r#"{"name":"w","branch":"b","repos":[],"diff_closed":false,
+            "chats":[{"id":"w"},{"id":"w~2"}],"active_chat":1}"#;
+        let mut ws: Workspace = serde_json::from_str(legacy).unwrap();
+        ws.migrate();
+        assert_eq!(ws.layout, TabLayout::default(), "legacy is one group");
+        assert!(!ws.split());
+        ws.open_tab(file("api/a.rs"));
+        ws.open_tab(file("api/b.rs"));
+
+        // The only tab can't leave; a split needs content left behind.
+        let mut lone = Workspace {
+            name: "x".into(),
+            ..Default::default()
+        };
+        lone.migrate();
+        assert!(!lone.move_to_group(&chat("x"), 1, None));
+        assert!(!lone.split());
+
+        // Moving right splits at half and half, selects and focuses the moved tab, and the
+        // left group selects the tab after it.
+        ws.layout.ratio = Some(0.3);
+        ws.select_tab(&file("api/a.rs"));
+        assert!(ws.move_to_group(&file("api/a.rs"), 1, None));
+        assert!(ws.split());
+        assert_eq!(ws.layout.ratio, None);
+        assert_eq!(ws.group_tabs(1), [file("api/a.rs")]);
+        assert_eq!(
+            ws.group_tabs(0),
+            [chat("w"), chat("w~2"), Diff, file("api/b.rs")]
+        );
+        assert_eq!(
+            ws.layout.selected,
+            [Some(file("api/b.rs")), Some(file("api/a.rs"))]
+        );
+        assert_eq!(ws.layout.focused, 1);
+
+        // Between groups, before a tab; then within a group, into a slot.
+        assert!(ws.move_tab(&chat("w"), &file("api/a.rs")));
+        assert_eq!(ws.group_tabs(1), [chat("w"), file("api/a.rs")]);
+        assert_eq!(ws.layout.selected[1], Some(chat("w")));
+        assert!(ws.move_tab(&chat("w"), &file("api/a.rs")));
+        assert_eq!(ws.group_tabs(1), [file("api/a.rs"), chat("w")]);
+        assert_eq!(
+            ws.chats[ws.active_chat].id, "w~2",
+            "the active chat keeps its id"
+        );
+        // Appending to a group, and no-ops.
+        assert!(ws.move_to_group(&Diff, 1, None));
+        assert_eq!(ws.group_tabs(1).last(), Some(&Diff));
+        assert!(!ws.move_to_group(&Diff, 1, None), "already last");
+        assert!(!ws.move_to_group(&Diff, 1, Some(&Diff)));
+        assert!(
+            !ws.move_to_group(&Diff, 0, Some(&chat("w"))),
+            "before a tab elsewhere"
+        );
+        assert!(!ws.move_to_group(&chat("gone"), 0, None));
+        assert!(!ws.move_to_group(&Diff, 2, None));
+
+        // Opening appends to the focused group; replacing keeps the group and selection.
+        ws.layout.focused = 1;
+        ws.open_tab(file("api/c.rs"));
+        assert_eq!(ws.group_of(&file("api/c.rs")), 1);
+        ws.select_tab(&file("api/c.rs"));
+        ws.replace_tab(&file("api/c.rs"), file("api/d.rs"));
+        assert_eq!(ws.group_of(&file("api/d.rs")), 1);
+        assert_eq!(ws.layout.selected[1], Some(file("api/d.rs")));
+        ws.layout.focused = 0;
+        ws.open_tab(file("api/e.rs"));
+        assert_eq!(ws.group_of(&file("api/e.rs")), 0);
+
+        // Unique membership: every open tab is in exactly one group, through a round trip.
+        let back: Workspace = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+        assert_eq!(back.layout, ws.layout);
+        assert_eq!(back.tab_order, ws.tab_order);
+        let (l, r) = (back.group_tabs(0), back.group_tabs(1));
+        assert_eq!(l.len() + r.len(), back.tab_order.len());
+        assert!(l.iter().all(|t| !r.contains(t)));
+
+        // Closing the selected tab selects the next one, else the one before.
+        ws.select_tab(&file("api/a.rs"));
+        let right = ws.group_tabs(1);
+        let at = right.iter().position(|t| *t == file("api/a.rs")).unwrap();
+        ws.close_tab(&file("api/a.rs"));
+        assert_eq!(ws.layout.selected[1].as_ref(), right.get(at + 1));
+        ws.select_tab(&file("api/d.rs"));
+        ws.close_tab(&file("api/d.rs"));
+        assert_eq!(
+            ws.layout.selected[1],
+            Some(Diff),
+            "the last tab gives way to the one before"
+        );
+
+        // Moving the right group's tabs out collapses it; the left keeps its selection.
+        ws.select_tab(&chat("w~2"));
+        for t in ws.group_tabs(1) {
+            assert!(ws.move_to_group(&t, 0, None));
+        }
+        assert!(!ws.split());
+        assert_eq!(ws.layout.focused, 0);
+        assert_eq!(ws.layout.selected[1], None);
+        // Emptying the left instead: the right becomes the only group, with its selection.
+        assert!(ws.move_to_group(&chat("w"), 1, None));
+        for t in ws.group_tabs(0) {
+            ws.select_tab(&chat("w"));
+            assert!(ws.move_to_group(&t, 1, None) || t == chat("w"));
+        }
+        assert!(!ws.split());
+        assert_eq!(ws.layout.focused, 0);
+        assert!(ws.layout.selected[0].is_some());
+        assert!(
+            ws.tab_order
+                .contains(ws.layout.selected[0].as_ref().unwrap())
+        );
+    }
+
+    /// Hand-edited or stale layouts: unknown members and selections go, a split group without
+    /// a selection gets its first tab, and an invalid divider falls back to half.
+    #[test]
+    fn tab_layout_normalizes() {
+        use TabId::{Chat, Diff, File};
+        let json = r#"{"name":"w","branch":"b","repos":[],"diff_closed":false,
+            "chats":[{"id":"w"},{"id":"w~2"}],"tab_order":[{"chat":"w"},{"chat":"w~2"},"diff",{"file":"a"}],
+            "layout":{"right":[{"chat":"w~2"},{"chat":"gone"},{"chat":"w~2"},{"file":"a"}],
+            "selected":[{"chat":"w~2"},{"file":"zzz"}],"focused":7,"ratio":-3.0}}"#;
+        let mut ws: Workspace = serde_json::from_str(json).unwrap();
+        ws.migrate();
+        assert_eq!(ws.layout.right, [Chat("w~2".into()), File("a".into())]);
+        assert_eq!(
+            ws.layout.selected,
+            [Some(Chat("w".into())), Some(Chat("w~2".into()))],
+            "a selection outside its group is replaced by the group's first tab"
+        );
+        assert_eq!(ws.layout.focused, 1);
+        assert_eq!(ws.layout.ratio, None);
+        assert_eq!(ws.split_ratio(), 0.5);
+        for bad in [f32::NAN, f32::INFINITY, 0., 1., 2.] {
+            ws.layout.ratio = Some(bad);
+            ws.normalize_tabs();
+            assert_eq!(ws.layout.ratio, None, "{bad}");
+        }
+        ws.layout.ratio = Some(0.02);
+        assert_eq!(ws.split_ratio(), 0.1, "clamped so neither group vanishes");
+        // A closed Diff leaves the left group only chats; every right tab gone collapses it.
+        ws.diff_closed = true;
+        ws.tab_order.retain(|t| *t != File("a".into()));
+        ws.normalize_tabs();
+        assert_eq!(ws.layout.right, [Chat("w~2".into())]);
+        assert!(!ws.tab_order.contains(&Diff));
+        ws.layout.right = ws.tab_order.clone();
+        ws.normalize_tabs();
+        assert!(!ws.split());
+        assert_eq!(ws.layout.selected[1], None);
+        // Unknown fields in an old file's layout don't break loading.
+        let old: Workspace =
+            serde_json::from_str(r#"{"name":"w","branch":"b","repos":[],"layout":{"extra":1}}"#)
+                .unwrap();
+        assert_eq!(old.layout, TabLayout::default());
     }
 
     #[test]

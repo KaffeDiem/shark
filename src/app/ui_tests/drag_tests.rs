@@ -110,7 +110,7 @@ async fn tab_drag_is_bounded_and_animates_before_release(cx: &mut TestAppContext
             source.top(),
             "preview locks the vertical axis"
         );
-        assert_inside(preview, shark.read(cx).tab_scroll.bounds());
+        assert_inside(preview, shark.read(cx).tabs_area.get());
         w.pointer_up(outside, MouseButton::Left, cx);
         assert_eq!(
             shark.read(cx).active_ws().unwrap().tab_order,

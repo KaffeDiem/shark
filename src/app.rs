@@ -39,6 +39,7 @@ mod differ_host;
 mod editor_pane;
 mod features;
 mod file_changes;
+mod groups;
 mod home;
 mod interaction;
 pub(crate) mod menus;
@@ -74,11 +75,12 @@ enum Tab {
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum Pane {
     Sidebar,
-    Chat,
+    /// A tab group's chat, by group.
+    Chat(usize),
     /// The chat's plan pane, right of its transcript.
-    Plan,
+    Plan(usize),
     Feature(Feature, FeatureFocus),
-    Editor,
+    Editor(usize),
     Features,
     Home,
 }
@@ -99,9 +101,20 @@ pub struct Shark {
     /// The sidebar | rest split, while the sidebar isn't a rail; persisted like Files.
     sidebar_resize: Entity<ResizableState>,
     sidebar_scroll: ScrollHandle,
-    tab_scroll: ScrollHandle,
+    /// Per tab group, left then right.
+    tab_scroll: [ScrollHandle; 2],
     reorder: Rc<RefCell<reorder::Reorder>>,
-    tab_layout: Rc<std::cell::Cell<(Pixels, usize)>>,
+    tab_layout: [Rc<std::cell::Cell<(Pixels, usize)>>; 2],
+    /// Each group's content as last laid out, so its strip lines up above it.
+    group_bounds: Rc<std::cell::Cell<[Bounds<Pixels>; 2]>>,
+    /// The titlebar's tab area as last laid out: where tab drags preview and drop.
+    tabs_area: Rc<std::cell::Cell<Bounds<Pixels>>>,
+    /// Tracked on each group's content while split; focus inside one focuses its group.
+    group_focus: [FocusHandle; 2],
+    /// The group divider per workspace, and whether its saved ratio was applied.
+    splits: HashMap<String, (Entity<ResizableState>, bool)>,
+    /// Saved file tabs of the open workspace that couldn't be read; retried on the next visit.
+    restore_failed: HashSet<String>,
     restore_generation: u64,
     chrome_pressed: Rc<std::cell::Cell<Option<&'static str>>>,
     /// Workspaces whose worktrees are being removed in the background.
@@ -180,6 +193,7 @@ impl Shark {
             }
         });
         let sidebar_resize = cx.new(|_| ResizableState::default());
+        let group_focus = [cx.focus_handle(), cx.focus_handle()];
         // The close button asks before unsaved edits go, as Quit does.
         let this = cx.entity().downgrade();
         window.on_window_should_close(cx, move |w, cx| {
@@ -221,6 +235,9 @@ impl Shark {
                 }
             }),
         ];
+        for (g, handle) in group_focus.iter().enumerate() {
+            _subs.push(cx.on_focus_in(handle, window, move |s, w, cx| s.group_focus_in(g, w, cx)));
+        }
         _subs.push(cx.observe(&differ, |_, _, cx| cx.notify()));
         _subs.push(cx.subscribe_in(&differ, window, |s, _, event, w, cx| {
             s.differ_event(event, w, cx)
@@ -237,9 +254,14 @@ impl Shark {
             differ,
             sidebar_resize,
             sidebar_scroll: ScrollHandle::new(),
-            tab_scroll: ScrollHandle::new(),
+            tab_scroll: [ScrollHandle::new(), ScrollHandle::new()],
             reorder: Rc::default(),
-            tab_layout: Rc::default(),
+            tab_layout: Default::default(),
+            group_bounds: Default::default(),
+            tabs_area: Default::default(),
+            group_focus,
+            splits: HashMap::new(),
+            restore_failed: HashSet::new(),
             restore_generation: 0,
             chrome_pressed: Rc::default(),
             archiving: HashSet::new(),
@@ -389,6 +411,7 @@ impl Shark {
             self.feature_sel = Feature::ALL.iter().position(|f| *f == feature).unwrap();
         }
         self.tab = tab;
+        self.record_selection(cx);
         self.home.on = false;
         self.remember_open();
         self.reveal_tab(cx);
@@ -420,19 +443,26 @@ impl Shark {
             v.push(Pane::Home);
             return v;
         }
-        match self.tab {
-            Tab::Chat => {
-                v.push(Pane::Chat);
-                if self.active_chat().is_some_and(|c| c.read(cx).plan_open) {
-                    v.push(Pane::Plan);
+        // Both groups' panes, in visual order.
+        for g in self.groups() {
+            match self.group_selection(g, cx) {
+                Some(TabId::Chat(_)) => {
+                    v.push(Pane::Chat(g));
+                    if self.group_chat(g, cx).is_some_and(|c| c.read(cx).plan_open) {
+                        v.push(Pane::Plan(g));
+                    }
                 }
+                Some(TabId::File(_)) => v.push(Pane::Editor(g)),
+                Some(id) => {
+                    let feature = Feature::of(&id).unwrap();
+                    v.extend(
+                        self.feature_focus_targets(feature, cx)
+                            .into_iter()
+                            .map(|target| Pane::Feature(feature, target)),
+                    )
+                }
+                None => {}
             }
-            Tab::Feature(feature) => v.extend(
-                self.feature_focus_targets(feature, cx)
-                    .into_iter()
-                    .map(|target| Pane::Feature(feature, target)),
-            ),
-            Tab::File => v.push(Pane::Editor),
         }
         if self.right_rail_shown() {
             v.push(Pane::Features);
@@ -450,29 +480,76 @@ impl Shark {
         if self.home_shown() {
             return self.home.has_focus(window, cx).then_some(Pane::Home);
         }
-        if let Tab::Feature(feature) = self.tab {
-            return self
-                .focused_feature(feature, window, cx)
-                .map(|target| Pane::Feature(feature, target));
-        }
-        if self
-            .editor
-            .as_ref()
-            .is_some_and(|e| e.read(cx).is_focused(window, cx))
-        {
-            return Some(Pane::Editor);
-        }
-        if let Some(chat) = self.active_chat() {
-            let c = chat.read(cx);
-            if c.plan_focused(window, cx) {
-                return Some(Pane::Plan);
-            }
-            if c.focus.is_focused(window) || c.composer.read(cx).focus_handle(cx).is_focused(window)
-            {
-                return Some(Pane::Chat);
+        for g in self.groups() {
+            match self.group_selection(g, cx) {
+                Some(TabId::Chat(_)) => {
+                    let Some(chat) = self.group_chat(g, cx) else {
+                        continue;
+                    };
+                    let c = chat.read(cx);
+                    if c.plan_focused(window, cx) {
+                        return Some(Pane::Plan(g));
+                    }
+                    if c.focus.is_focused(window)
+                        || c.composer.read(cx).focus_handle(cx).is_focused(window)
+                    {
+                        return Some(Pane::Chat(g));
+                    }
+                }
+                Some(TabId::File(_)) => {
+                    if (self.group_editor(g, cx)).is_some_and(|e| e.read(cx).is_focused(window, cx))
+                    {
+                        return Some(Pane::Editor(g));
+                    }
+                }
+                Some(id) => {
+                    let feature = Feature::of(&id).unwrap();
+                    if let Some(target) = self.focused_feature(feature, window, cx) {
+                        return Some(Pane::Feature(feature, target));
+                    }
+                }
+                None => {}
             }
         }
         None
+    }
+
+    /// Group `g`'s chat, when it shows one that has started.
+    fn group_chat(&self, g: usize, cx: &App) -> Option<&Entity<Chat>> {
+        match self.group_selection(g, cx)? {
+            TabId::Chat(id) => self.chats.get(&id),
+            _ => None,
+        }
+    }
+
+    /// Group `g`'s editor, when it shows a loaded file.
+    fn group_editor(&self, g: usize, cx: &App) -> Option<Entity<FileEditor>> {
+        match self.group_selection(g, cx)? {
+            TabId::File(_) if g == self.focused_group() => self.editor.clone(),
+            TabId::File(path) => self.editor_for(&path, cx),
+            _ => None,
+        }
+    }
+
+    /// Focus arrived in group `g`'s content: it becomes the focused group. A click on the
+    /// group itself rather than a control in it goes on to the content.
+    fn group_focus_in(&mut self, g: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.split_shown() {
+            return;
+        }
+        self.adopt_group(g, window, cx);
+        if !self.group_focus[g].is_focused(window) {
+            return;
+        }
+        let pane = match self.group_selection(g, cx) {
+            Some(TabId::Chat(_)) => Pane::Chat(g),
+            Some(TabId::File(_)) if self.group_editor(g, cx).is_some() => Pane::Editor(g),
+            Some(id @ (TabId::Diff | TabId::Git)) => {
+                Pane::Feature(Feature::of(&id).unwrap(), FeatureFocus::Main)
+            }
+            _ => return,
+        };
+        self.focus_pane(pane, window, cx);
     }
 
     fn focus_pane(&mut self, pane: Pane, window: &mut Window, cx: &mut Context<Self>) {
@@ -480,20 +557,28 @@ impl Shark {
             Pane::Sidebar => self.sidebar_focus.focus(window, cx),
             Pane::Features => self.features_focus.focus(window, cx),
             Pane::Home => self.home.focus.focus(window, cx),
-            Pane::Feature(feature, target) => self.focus_feature(feature, target, window, cx),
-            Pane::Chat => {
-                if let Some(chat) = self.active_chat() {
+            Pane::Feature(feature, target) => {
+                if let Some(g) = self.active_ws().map(|ws| ws.group_of(&feature.tab_id())) {
+                    self.adopt_group(g, window, cx);
+                }
+                self.focus_feature(feature, target, window, cx)
+            }
+            Pane::Chat(g) => {
+                self.adopt_group(g, window, cx);
+                if let Some(chat) = self.group_chat(g, cx) {
                     chat.read(cx).focus.clone().focus(window, cx);
                 }
             }
-            Pane::Plan => {
-                if let Some(chat) = self.active_chat() {
+            Pane::Plan(g) => {
+                self.adopt_group(g, window, cx);
+                if let Some(chat) = self.group_chat(g, cx) {
                     chat.read(cx).plan.read(cx).focus.clone().focus(window, cx);
                 }
             }
-            Pane::Editor => {
-                if let Some(e) = &self.editor {
-                    crate::editor::focus(e, window, cx);
+            Pane::Editor(g) => {
+                self.adopt_group(g, window, cx);
+                if let Some(e) = self.group_editor(g, cx) {
+                    crate::editor::focus(&e, window, cx);
                 }
             }
         }
@@ -511,7 +596,7 @@ impl Shark {
             None if delta < 0 => 0,
             None => 1.min(panes.len() - 1),
         };
-        if panes[to] != Pane::Chat || self.active.is_some() {
+        if !matches!(panes[to], Pane::Chat(_)) || self.active.is_some() {
             self.focus_pane(panes[to], window, cx);
         }
     }
@@ -607,51 +692,53 @@ impl Shark {
     }
 
     fn render_titlebar(&self, window: &Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let tabs = if self.home_shown() {
-            vec![]
-        } else {
-            self.render_tabs(window, cx)
+        let groups = match self.home_shown() || self.active_ws().is_none() {
+            true => vec![],
+            false => self.render_strips(window, cx),
         };
+        let area = self.tabs_area.clone();
         h_flex()
             .id("workspace-titlebar")
             .h(px(44.))
             .flex_none()
             .pl(px(8.))
             .when(!self.right_rail_shown(), |d| d.pr(px(8.)))
-            .child(
-                h_flex()
-                    .min_w_0()
-                    .gap(px(4.))
-                    .when(self.rail, |d| {
-                        d.child(self.render_sidebar_toggle(cx))
-                            .child(self.render_commands(cx))
-                            .child(self.render_new_workspace(cx))
-                    })
-                    .children(tabs)
-                    .when(!self.home_shown() && self.active_ws().is_some(), |d| {
-                        d.child(
-                            Button::new("new-chat")
-                                .ghost()
-                                .xsmall()
-                                .icon(IconName::Plus)
-                                .w(px(24.))
-                                .flex_none()
-                                .tooltip("New chat (cmd-t)")
-                                .on_click(
-                                    cx.listener(|this, _, window, cx| this.new_chat(window, cx)),
-                                ),
-                        )
-                    }),
-            )
-            // Native dragging belongs only to unused space, so tabs keep their own drags.
-            .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .id("titlebar-empty")
-                    .map(|d| self.draggable_chrome("titlebar-empty", d)),
-            )
+            .when(self.rail, |d| {
+                d.child(
+                    h_flex()
+                        .flex_none()
+                        .gap(px(4.))
+                        .mr(px(4.))
+                        .child(self.render_sidebar_toggle(cx))
+                        .child(self.render_commands(cx))
+                        .child(self.render_new_workspace(cx)),
+                )
+            })
+            .map(|d| match groups.is_empty() {
+                // Native dragging belongs only to unused space, so tabs keep their own drags.
+                true => d.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .id("titlebar-empty")
+                        .map(|d| self.draggable_chrome("titlebar-empty", d)),
+                ),
+                false => d.child(
+                    h_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .h_full()
+                        .relative()
+                        .children(groups)
+                        // Where tab drags preview and drop: both strips and their trailing space.
+                        .child(
+                            canvas(move |b, _, _| area.set(b), |_, _, _, _| {})
+                                .absolute()
+                                .size_full(),
+                        ),
+                ),
+            })
             .test_support()
     }
 
@@ -659,65 +746,193 @@ impl Shark {
         if self.home_shown() {
             return self.render_home(window, cx);
         }
-        let controls = self.render_feature_controls(cx);
-        let has_controls = controls.is_some();
-        let theme = cx.theme();
+        if self.split_shown() {
+            return self.render_groups(cx);
+        }
         v_flex()
             .flex_1()
             .min_w_0()
             .h_full()
-            .child(
-                h_flex()
-                    .h(px(44.))
-                    .flex_none()
-                    .px(px(16.))
-                    .gap(px(8.))
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(
-                        div()
-                            .flex_shrink_1()
-                            .min_w(px(28.))
-                            .overflow_hidden()
-                            .child(self.render_branch(cx)),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .h_full()
-                            .id("workspace-toolbar-empty")
-                            .map(|d| self.draggable_chrome("workspace-toolbar-empty", d)),
-                    )
-                    .children(controls)
-                    .when_some(self.active_sync().cloned(), |d, sync| {
-                        d.child(
-                            div()
-                                .min_w_0()
-                                .flex_shrink_0()
-                                .when(has_controls, |d| d.max_w(relative(0.4)))
-                                .child(sync),
-                        )
-                    }),
-            )
-            .child(match self.tab {
-                // Cached: the sidebar spinner redraws this view every frame, the chat only on change.
-                Tab::Chat => {
+            .child(self.render_toolbar(0, cx))
+            .child(self.render_group_content(0, cx))
+            .into_any_element()
+    }
+
+    /// A group's 44px header. The workspace's toolbar is shared: the branch heads the left
+    /// group, the git button ends the right one, and Diff's controls sit over Diff.
+    fn render_toolbar(&self, g: usize, cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        let split = self.split_shown();
+        let diff_here = match split {
+            true => self.group_selection(g, cx) == Some(TabId::Diff),
+            false => self.tab_visible(&TabId::Diff, cx),
+        };
+        let controls = diff_here
+            .then(|| self.render_feature_controls(cx))
+            .flatten();
+        let has_controls = controls.is_some();
+        let sync = (self.active_sync().cloned()).filter(|_| !split || g == 1);
+        let empty = match g {
+            0 => "workspace-toolbar-empty",
+            _ => "workspace-toolbar-empty-1",
+        };
+        let theme = cx.theme();
+        h_flex()
+            .h(px(44.))
+            .flex_none()
+            .px(px(16.))
+            .gap(px(8.))
+            .border_b_1()
+            .border_color(theme.border)
+            .when(g == 0, |d| {
+                d.child(
                     div()
-                        .flex_1()
-                        .min_h_0()
-                        .children(self.active_chat().map(|chat| {
-                            chat.clone().cached(StyleRefinement::default().size_full())
-                        }))
-                        .into_any_element()
-                }
-                Tab::Feature(feature) => self.render_feature(feature, cx),
-                Tab::File => h_flex()
+                        .flex_shrink_1()
+                        .min_w(px(28.))
+                        .overflow_hidden()
+                        .child(self.render_branch(cx)),
+                )
+            })
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .id(empty)
+                    .map(|d| self.draggable_chrome(empty, d)),
+            )
+            .children(controls)
+            .when_some(sync, |d, sync| {
+                d.child(
+                    div()
+                        .min_w_0()
+                        .flex_shrink_0()
+                        .when(has_controls, |d| d.max_w(relative(0.4)))
+                        .child(sync),
+                )
+            })
+    }
+
+    /// Group `g`'s selected content.
+    fn render_group_content(&self, g: usize, cx: &mut Context<Self>) -> AnyElement {
+        let sel = self.group_selection(g, cx);
+        let missing = |text: String, cx: &mut Context<Self>| {
+            div()
+                .flex_1()
+                .min_h_0()
+                .child(groups::placeholder(g, text, cx.theme()))
+                .into_any_element()
+        };
+        match sel {
+            // Cached: the sidebar spinner redraws this view every frame, the chat only on change.
+            Some(TabId::Chat(id)) => match self.chats.get(&id) {
+                Some(chat) => div()
                     .flex_1()
                     .min_h_0()
-                    .child(self.render_editor(cx))
+                    .child(chat.clone().cached(StyleRefinement::default().size_full()))
                     .into_any_element(),
+                None => missing("Loading chat…".into(), cx),
+            },
+            Some(TabId::File(path)) => match self.group_editor(g, cx) {
+                Some(editor) => h_flex()
+                    .flex_1()
+                    .min_h_0()
+                    .child(self.render_editor(editor, cx))
+                    .into_any_element(),
+                None if self.restore_failed.contains(&path) => missing(
+                    format!("Couldn't open {path}; it is retried on the next visit"),
+                    cx,
+                ),
+                None => missing(format!("Opening {path}…"), cx),
+            },
+            Some(id) => self.render_feature(Feature::of(&id).unwrap(), cx),
+            None if g == 0 && !self.split_shown() => div().flex_1().min_h_0().into_any_element(),
+            None => missing("Nothing to show".into(), cx),
+        }
+    }
+
+    /// Two groups side by side, each its own island with its own header, 8px apart; the
+    /// divider in the gap resizes them.
+    fn render_groups(&self, cx: &mut Context<Self>) -> AnyElement {
+        let split = (self.active.as_ref())
+            .and_then(|n| self.splits.get(n))
+            .filter(|_| self.split_shown());
+        let Some((state, _)) = split else {
+            return self.render_group_content(0, cx);
+        };
+        let state = state.clone();
+        let focused = self.focused_group();
+        let panels: Vec<AnyElement> = (0..2)
+            .map(|g| {
+                let bounds = self.group_bounds.clone();
+                let content = v_flex()
+                    .id(("tab-group", g))
+                    .flex_1()
+                    .min_h_0()
+                    .min_w_0()
+                    .relative()
+                    .track_focus(&self.group_focus[g])
+                    .aria_label(match (g, g == focused) {
+                        (0, true) => "Left group, focused",
+                        (0, false) => "Left group",
+                        (_, true) => "Right group, focused",
+                        _ => "Right group",
+                    })
+                    .child(self.render_group_content(g, cx))
+                    .child(
+                        canvas(
+                            move |b, window, cx| {
+                                let mut all = bounds.get();
+                                if all[g] != b {
+                                    all[g] = b;
+                                    bounds.set(all);
+                                    // The strips above line up with this on the next frame.
+                                    window.defer(cx, |window, _| window.refresh());
+                                }
+                            },
+                            |_, _, _, _| {},
+                        )
+                        .absolute()
+                        .size_full(),
+                    )
+                    .test_support();
+                let theme = cx.theme();
+                v_flex()
+                    .id(("group-island", g))
+                    .size_full()
+                    .min_w_0()
+                    .rounded(theme.radius_lg)
+                    .border_1()
+                    .border_color(theme.border)
+                    .bg(theme.background)
+                    .overflow_hidden()
+                    .capture_any_mouse_down(cx.listener(move |s, _, w, cx| s.adopt_group(g, w, cx)))
+                    .child(self.render_toolbar(g, cx))
+                    .child(content)
+                    .test_support()
+                    .into_any_element()
             })
+            .collect();
+        let mut panels = panels.into_iter();
+        h_flex()
+            .size_full()
+            .min_w_0()
+            .child(
+                h_resizable("tab-groups")
+                    .with_state(&state)
+                    .with_handle_appearance(quiet_edge())
+                    .child(
+                        resizable_panel()
+                            .size_range(groups::GROUP_MIN..Pixels::MAX)
+                            .pr(px(4.))
+                            .child(panels.next().unwrap()),
+                    )
+                    .child(
+                        resizable_panel()
+                            .size_range(groups::GROUP_MIN..Pixels::MAX)
+                            .pl(px(4.))
+                            .child(panels.next().unwrap()),
+                    ),
+            )
             .into_any_element()
     }
 
@@ -829,6 +1044,7 @@ impl Shark {
 impl Render for Shark {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.prune_reorder(cx);
+        self.prepare_split(window, cx);
         // Toasts clear the toolbar, Features rail, and visible Files controls.
         let mut side = if self.right_rail_shown() {
             px(72.)
@@ -888,6 +1104,15 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &NextTab, w, cx| this.cycle_tab(1, w, cx)))
             .on_action(cx.listener(|this, _: &PrevTab, w, cx| this.cycle_tab(-1, w, cx)))
             .on_action(cx.listener(|this, a: &OpenTab, w, cx| this.select_tab(a.0, w, cx)))
+            .on_action(
+                cx.listener(|this, _: &MoveTabToGroup, w, cx| this.move_tab_to_other_group(w, cx)),
+            )
+            // Escape abandons a tab drag; nothing moves.
+            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                if ev.keystroke.key == "escape" && this.cancel_drag(w, cx) {
+                    cx.stop_propagation();
+                }
+            }))
             .on_action(cx.listener(|this, _: &OpenSide, w, cx| this.open_side(w, cx)))
             .on_action(cx.listener(|this, _: &ShowDiff, w, cx| {
                 this.show(Tab::Feature(Feature::Diff), w, cx)
@@ -1005,11 +1230,14 @@ impl Render for Shark {
                         h_flex()
                             .id("content-island")
                             .size_full()
-                            .rounded(cx.theme().radius_lg)
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .bg(cx.theme().background)
-                            .overflow_hidden()
+                            // Split, each group is its own island.
+                            .when(!self.split_shown(), |d| {
+                                d.rounded(cx.theme().radius_lg)
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .bg(cx.theme().background)
+                                    .overflow_hidden()
+                            })
                             .child(self.render_main(window, cx))
                             .test_support(),
                     );

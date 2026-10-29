@@ -16,6 +16,7 @@ pub(crate) mod chrome_tests;
 mod drag_tests;
 mod file_changes_tests;
 mod git_tests;
+mod group_tests;
 mod menu_pixels;
 mod mixed_tab_tests;
 mod navigation_pixels;
@@ -1703,7 +1704,7 @@ async fn numbered_tab_shortcuts(cx: &mut TestAppContext) {
     }
     for n in 1..=9 {
         press(cx, &[&format!("ctrl-{n}")]);
-        cx.update(|cx| assert_eq!(shark.read(cx).active_tab_index(cx), Some(n - 1)));
+        cx.update(|cx| assert_eq!(shark.read(cx).active_tab_index(0, cx), Some(n - 1)));
     }
     cx.update_window(window, |_, w, cx| {
         w.change_modifiers(

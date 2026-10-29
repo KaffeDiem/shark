@@ -170,7 +170,7 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
                         (pane.size.width - island.size.width).abs() <= px(2.),
                         "editor fills central width"
                     );
-                    assert!(!shark.read(cx).panes(cx).contains(&Pane::Chat));
+                    assert!(!shark.read(cx).panes(cx).contains(&Pane::Chat(0)));
                     assert_eq!(w.is_window_active(), active);
                     // Hover each tab; only its close control appears.
                     for (ix, (tab, close)) in [
@@ -183,7 +183,7 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
                     .enumerate()
                     {
                         // Bring each tab into view before checking its hover controls.
-                        shark.read(cx).tab_scroll.scroll_to_item(ix);
+                        shark.read(cx).tab_scroll[0].scroll_to_item(ix);
                         w.refresh();
                         w.render_frame(cx);
                         w.pointer_move(point(px(0.), px(690.)), None, cx);

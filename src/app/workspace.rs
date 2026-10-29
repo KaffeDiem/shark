@@ -973,8 +973,48 @@ impl Shark {
         self.show(Tab::Chat, window, cx);
         self.select_chat(ws.active_chat, window, cx);
         if changed {
+            self.restore_layout(ws.layout, window, cx);
             self.restore_file_tabs(window, cx);
         }
+    }
+
+    /// Both groups' saved selections, files included, and the focused group. A file still
+    /// being read shows its loading state until `restore_file_tabs` lands. Without saved
+    /// selections (an older state.json) the usual chat rules stand.
+    fn restore_layout(
+        &mut self,
+        saved: crate::state::TabLayout,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if saved.selected.iter().all(Option::is_none) {
+            return;
+        }
+        let Some(ws) = self.active_ws_mut() else {
+            return;
+        };
+        ws.layout.selected = saved.selected.clone();
+        ws.layout.focused = saved.focused;
+        // Saved selections were normalized on load; what changed since is dropped again.
+        ws.normalize_tabs();
+        let focused = ws.layout.focused;
+        let sel = ws.layout.selected[focused].clone();
+        let _ = self.state.save();
+        self.prepare_other_group(window, cx);
+        match sel {
+            Some(TabId::File(path)) if self.editor_for(&path, cx).is_none() => {
+                self.editor = None;
+                self.tab = Tab::File;
+                self.remember_open();
+                match self.split_shown() {
+                    true => self.group_focus[focused].focus(window, cx),
+                    false => self.content_focus.focus(window, cx),
+                }
+            }
+            Some(id) => self.select_id(id, window, cx),
+            None => {}
+        }
+        cx.notify();
     }
 
     pub(super) fn add_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {

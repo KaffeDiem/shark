@@ -24,6 +24,14 @@ impl Feature {
         }
     }
 
+    pub(super) fn of(tab: &TabId) -> Option<Self> {
+        match tab {
+            TabId::Diff => Some(Self::Diff),
+            TabId::Git => Some(Self::Git),
+            _ => None,
+        }
+    }
+
     fn metadata(self) -> Metadata {
         match self {
             Self::Diff => Metadata {
@@ -134,7 +142,7 @@ impl Shark {
                     .map(|d| {
                         cursor_row(
                             d,
-                            self.tab == Tab::Feature(feature),
+                            self.tab_visible(&feature.tab_id(), cx),
                             self.feature_sel == ix,
                             self.features_focus.is_focused(window),
                             theme,
@@ -154,12 +162,12 @@ impl Shark {
         &self,
         feature: Feature,
         ix: usize,
+        on: bool,
         ctrl_held: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
         let meta = feature.metadata();
         let theme = cx.theme();
-        let on = self.tab == Tab::Feature(feature);
         pill(meta.tab_id, on, theme)
             .map(|d| self.tab_drag(d, feature.tab_id(), meta.title.into(), cx))
             .aria_label(meta.title)
@@ -188,6 +196,12 @@ impl Shark {
                 theme,
             ))
             .tooltip(move |w, cx| Tooltip::new(meta.tab_tip).build(w, cx))
+            .map(|d| {
+                let g = self
+                    .active_ws()
+                    .map_or(0, |ws| ws.group_of(&feature.tab_id()));
+                self.focus_mark(g, on, d, theme)
+            })
             .test_support()
             .into_any_element()
     }
@@ -261,10 +275,14 @@ impl Shark {
         let Some(ws) = self.active_ws_mut() else {
             return;
         };
+        let split = ws.split();
         ws.git_closed = true;
         ws.close_tab(&TabId::Git);
         let _ = self.state.save();
-        if self.tab == Tab::Feature(Feature::Git) {
+        let shown = self.tab == Tab::Feature(Feature::Git);
+        if split {
+            self.sync_groups(shown, window, cx);
+        } else if shown {
             let ix = self.active_ws().unwrap().active_chat;
             self.select_chat(ix, window, cx);
         }
@@ -329,13 +347,11 @@ impl Shark {
     }
 
     pub(super) fn render_feature_controls(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        match self.tab {
-            Tab::Feature(Feature::Diff) => Some(
-                self.differ
-                    .update(cx, |d, cx| d.render_diff_controls(cx).into_any_element()),
-            ),
-            _ => None,
-        }
+        // Shared by both groups: Diff's controls while either shows it.
+        self.tab_visible(&TabId::Diff, cx).then(|| {
+            self.differ
+                .update(cx, |d, cx| d.render_diff_controls(cx).into_any_element())
+        })
     }
 
     pub(super) fn render_feature(&self, feature: Feature, _cx: &App) -> AnyElement {
@@ -374,6 +390,8 @@ impl Shark {
                 self.differ
                     .update(cx, |d, cx| d.save_edit(false, window, cx));
             }
+            // Split, only the focused group's own file; one group keeps saving the last file.
+            Tab::Chat | Tab::Feature(_) if self.split_shown() => {}
             _ => {
                 if let Some(editor) = &self.editor {
                     editor.update(cx, |e, cx| e.save(false, window, cx));

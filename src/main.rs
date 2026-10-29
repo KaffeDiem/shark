@@ -124,6 +124,8 @@ actions!(
         DeleteSection,
         CancelEdit,
         ToggleHome,
+        MoveTabToGroup,
+        OpenInNewTab,
     ]
 );
 
@@ -262,6 +264,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-}", NextChat, None),
         KeyBinding::new("cmd-{", PrevChat, None),
         KeyBinding::new("ctrl-tab", NextTab, None),
+        KeyBinding::new("cmd-\\", MoveTabToGroup, None),
+        KeyBinding::new("cmd-enter", OpenInNewTab, Some("FilePicker")),
         KeyBinding::new("ctrl-shift-tab", PrevTab, None),
         KeyBinding::new("cmd-shift-enter", AskSide, Some("Composer")),
         KeyBinding::new("escape", CloseSide, Some("SideAnswer")),

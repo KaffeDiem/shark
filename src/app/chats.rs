@@ -32,10 +32,12 @@ pub(super) fn dot(inset: f32, theme: &Theme) -> Div {
 }
 
 impl Shark {
-    fn visible_tabs(&self, ws: &Workspace, cx: &App) -> VisibleTabs {
+    /// Group `g`'s strip.
+    fn visible_tabs(&self, ws: &Workspace, g: usize, cx: &App) -> VisibleTabs {
         VisibleTabs(
             ws.tab_order
                 .iter()
+                .filter(|id| ws.group_of(id) == g)
                 .filter_map(|id| {
                     let tab = match id {
                         TabId::Chat(id) => {
@@ -56,18 +58,11 @@ impl Shark {
         )
     }
 
-    pub(super) fn active_tab_index(&self, cx: &App) -> Option<usize> {
+    /// Where group `g`'s selection sits in its strip.
+    pub(super) fn active_tab_index(&self, g: usize, cx: &App) -> Option<usize> {
         let ws = self.active_ws()?;
-        let tab = match self.tab {
-            Tab::Chat => VisibleTab::Chat(ws.active_chat),
-            Tab::Feature(feature) => VisibleTab::Feature(feature),
-            Tab::File => VisibleTab::File(
-                self.file_tabs
-                    .iter()
-                    .position(|t| Some(&t.editor) == self.editor.as_ref())?,
-            ),
-        };
-        self.visible_tabs(ws, cx).index(tab)
+        let sel = self.group_selection(g, cx)?;
+        (self.visible_tabs(ws, g, cx).0.iter()).position(|(id, _)| *id == sel)
     }
 
     /// The chat entity for `meta`, started (transcript replayed) on first use.
@@ -121,7 +116,7 @@ impl Shark {
                         if this.active.as_ref() == Some(&name) {
                             this.refresh_diff(cx);
                         }
-                        if this.active_chat() != Some(chat) {
+                        if !this.chat_on_screen(chat, cx) {
                             this.unread.insert(id.clone());
                         }
                         this.refresh_home(Some(&name), cx);
@@ -139,7 +134,7 @@ impl Shark {
                     }
                     // A question off screen marks its tab; the workspace needs you until it's answered.
                     ChatEvent::Asking => {
-                        if this.active_chat() != Some(chat) && chat.read(cx).asking() {
+                        if !this.chat_on_screen(chat, cx) && chat.read(cx).asking() {
                             this.unread.insert(id.clone());
                         }
                         this.refresh_home(Some(&name), cx);
@@ -218,7 +213,9 @@ impl Shark {
         let Some(ws) = self.active_ws().filter(|ws| ws.name == workspace) else {
             return;
         };
-        let tabs = self.visible_tabs(ws, cx);
+        // Within one strip; between strips is `move_to_group`.
+        let g = ws.group_of(from);
+        let tabs = self.visible_tabs(ws, g, cx);
         if ![from, to]
             .iter()
             .all(|id| tabs.0.iter().any(|(t, _)| t == *id))
@@ -248,8 +245,9 @@ impl Shark {
         )
     }
 
-    pub(super) fn visible_tab_ids(&self, ws: &Workspace, cx: &App) -> Vec<TabId> {
-        self.visible_tabs(ws, cx)
+    /// Group `g`'s strip, as identities.
+    pub(super) fn visible_tab_ids(&self, ws: &Workspace, g: usize, cx: &App) -> Vec<TabId> {
+        self.visible_tabs(ws, g, cx)
             .0
             .into_iter()
             .map(|(id, _)| id)
@@ -257,36 +255,52 @@ impl Shark {
     }
 
     pub(super) fn reveal_tab(&self, cx: &App) {
-        if let Some(active) = self.active_tab_index(cx) {
-            self.tab_scroll.scroll_to_item(active);
+        for g in 0..2 {
+            if let Some(active) = self.active_tab_index(g, cx) {
+                self.tab_scroll[g].scroll_to_item(active);
+            }
         }
     }
 
+    /// cmd-shift-] and [: the focused group's chats; nothing when it has none.
     pub(super) fn cycle_chat(&mut self, d: isize, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(ws) = self.active_ws() {
-            let n = ws.chats.len() as isize;
-            let ix = (ws.active_chat as isize + d).rem_euclid(n) as usize;
-            self.select_chat(ix, window, cx);
+        let Some(ws) = self.active_ws() else { return };
+        let g = ws.layout.focused;
+        let chats: Vec<usize> = (ws.chats.iter().enumerate())
+            .filter(|(_, c)| ws.group_of(&TabId::Chat(c.id.clone())) == g)
+            .map(|(ix, _)| ix)
+            .collect();
+        if chats.is_empty() {
+            return;
         }
+        let n = chats.len() as isize;
+        let next = match chats.iter().position(|&ix| ix == ws.active_chat) {
+            Some(at) => (at as isize + d).rem_euclid(n),
+            None if d > 0 => 0,
+            None => n - 1,
+        };
+        self.select_chat(chats[next as usize], window, cx);
     }
 
-    /// Ctrl-tab follows the visible strip: the saved mixed tab order.
+    /// Ctrl-tab follows the focused group's strip: its part of the saved mixed tab order.
     pub(super) fn cycle_tab(&mut self, d: isize, window: &mut Window, cx: &mut Context<Self>) {
         if self.home_shown() {
             return self.cycle_chat(d, window, cx);
         }
         let Some(ws) = self.active_ws() else { return };
-        let Some(active) = self.active_tab_index(cx) else {
+        let g = ws.layout.focused;
+        let Some(active) = self.active_tab_index(g, cx) else {
             return;
         };
-        let next =
-            (active as isize + d).rem_euclid(self.visible_tabs(ws, cx).len() as isize) as usize;
+        let n = self.visible_tabs(ws, g, cx).len() as isize;
+        let next = (active as isize + d).rem_euclid(n) as usize;
         self.select_tab(next, window, cx);
     }
 
+    /// ctrl-1…9: the nth tab of the focused group.
     pub(super) fn select_tab(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ws) = self.active_ws() else { return };
-        match self.visible_tabs(ws, cx).get(ix) {
+        match self.visible_tabs(ws, ws.layout.focused, cx).get(ix) {
             Some(VisibleTab::Chat(ix)) => self.select_chat(ix, window, cx),
             Some(VisibleTab::Feature(feature)) => self.show(Tab::Feature(feature), window, cx),
             Some(VisibleTab::File(ix)) => self.select_file(ix, window, cx),
@@ -390,12 +404,18 @@ impl Shark {
         };
         let selected = ws.chats[ws.active_chat].id.clone();
         let fresh_id = ws.next_chat_id();
+        let split = ws.split();
+        let closed = TabId::Chat(id.to_string());
         let meta = ws.chats.remove(ix);
         if ws.chats.is_empty() {
+            // The fresh chat takes the last one's place, in its group.
+            ws.replace_tab(&closed, TabId::Chat(fresh_id.clone()));
             ws.chats.push(ChatMeta {
                 id: fresh_id,
                 ..fresh
             });
+        } else {
+            ws.close_tab(&closed);
         }
         ws.active_chat = ws
             .chats
@@ -431,7 +451,21 @@ impl Shark {
         {
             sync.update(cx, |g, cx| g.remove_chat(&chat, cx)); // the last ref; dropping stops claude
         }
-        if self.active.as_deref() == Some(workspace) && selected == id {
+        let active = self.active.as_deref() == Some(workspace);
+        if active && split {
+            let shown = self.tab == Tab::Chat && selected == id;
+            if shown && !self.home_shown() {
+                self.sync_groups(true, window, cx);
+            } else {
+                // Its group shows a neighbor; the focused chat may have changed.
+                let ws = self.active_ws().cloned().unwrap();
+                let chat = self.ensure_chat(&ws, &ws.chats[ws.active_chat], window, cx);
+                if let Some(sync) = self.syncs.get(workspace) {
+                    sync.update(cx, |g, cx| g.set_chat(chat, cx));
+                }
+                self.sync_groups(false, window, cx);
+            }
+        } else if active && selected == id {
             if self.tab == Tab::Chat && !self.home_shown() {
                 self.select_chat(next, window, cx);
             } else {
@@ -455,10 +489,14 @@ impl Shark {
             }
             s.differ.update(cx, |d, cx| d.end_edit(cx));
             let ws = s.active_ws_mut().unwrap();
+            let split = ws.split();
             ws.diff_closed = true;
             ws.close_tab(&TabId::Diff);
             let _ = s.state.save();
-            if s.tab == Tab::Feature(Feature::Diff) {
+            let shown = s.tab == Tab::Feature(Feature::Diff);
+            if split {
+                s.sync_groups(shown, w, cx);
+            } else if shown {
                 let ix = s.active_ws().unwrap().active_chat;
                 s.select_chat(ix, w, cx);
             }
@@ -669,13 +707,14 @@ impl Shark {
         window.push_notification(format!("Thinking: {l} (from the next message)"), cx);
     }
 
-    /// Where tab `ix` sits against the tab strip as of the last layout: `Less` hidden (partly
-    /// counts) past the left edge, `Greater` past the right, `Equal` in view.
-    pub(super) fn tab_hidden(&self, ix: usize) -> Ordering {
-        let Some(b) = self.tab_scroll.bounds_for_item(ix) else {
+    /// Where tab `ix` of group `g` sits against its strip as of the last layout: `Less` hidden
+    /// (partly counts) past the left edge, `Greater` past the right, `Equal` in view.
+    pub(super) fn tab_hidden(&self, g: usize, ix: usize) -> Ordering {
+        let scroll = &self.tab_scroll[g];
+        let Some(b) = scroll.bounds_for_item(ix) else {
             return Ordering::Equal;
         };
-        let (view, x) = (self.tab_scroll.bounds(), self.tab_scroll.offset().x);
+        let (view, x) = (scroll.bounds(), scroll.offset().x);
         if b.left() + x < view.left() - px(1.) {
             Ordering::Less
         } else if b.right() + x > view.right() + px(1.) {
@@ -685,17 +724,18 @@ impl Shark {
         }
     }
 
-    /// An arrow at an edge of the tab strip while tabs hide past it, dotted when one of them
+    /// An arrow at an edge of group `g`'s strip while tabs hide past it, dotted when one of them
     /// finished a turn unseen; clicking brings that one (else the nearest hidden tab) into view.
     fn tab_edge(
         &self,
+        g: usize,
         edge: Ordering,
         ws: &Workspace,
         tabs: &VisibleTabs,
         cx: &mut Context<Self>,
     ) -> Option<AnyElement> {
         let mut hidden: Vec<usize> = (0..tabs.len())
-            .filter(|&ix| self.tab_hidden(ix) == edge)
+            .filter(|&ix| self.tab_hidden(g, ix) == edge)
             .collect();
         if edge == Ordering::Less {
             hidden.reverse(); // nearest first
@@ -712,6 +752,10 @@ impl Shark {
             Ordering::Less => ("tabs-left", IconName::ChevronLeft),
             _ => ("tabs-right", IconName::ChevronRight),
         };
+        let id = match g {
+            0 => SharedString::from(id),
+            _ => format!("{id}-{g}").into(),
+        };
         let tip = match unread.len() {
             0 => format!("{} more", hidden.len()),
             n => format!("{} more · {n} finished", hidden.len()),
@@ -727,7 +771,7 @@ impl Shark {
                         .icon(icon)
                         .tooltip(tip)
                         .on_click(cx.listener(move |this, _, window, cx| {
-                            this.tab_scroll.scroll_to_item(to);
+                            this.tab_scroll[g].scroll_to_item(to);
                             cx.on_next_frame(window, |_, _, cx| cx.notify());
                             cx.notify();
                         })),
@@ -737,20 +781,200 @@ impl Shark {
         )
     }
 
-    /// Chats, Diff and files share equal-width tabs that shrink to fit the header.
-    pub(super) fn render_tabs(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+    /// The titlebar's tab area: one strip per group, each with its new-chat button and
+    /// trailing space, aligned with the group below. Window dragging owns the trailing space
+    /// except while a tab drags, when it takes drops; the last one offers a split.
+    pub(super) fn render_strips(&self, window: &Window, cx: &mut Context<Self>) -> Vec<AnyElement> {
+        let Some(ws) = self.active_ws() else {
+            return vec![];
+        };
+        let split = self.split_shown();
+        let groups = if split { 2 } else { 1 };
+        // While split, each strip spans its island below (content plus its 1px border), with
+        // the same gap between them.
+        let (left_width, gap) = {
+            let (area, bounds) = (self.tabs_area.get(), self.group_bounds.get());
+            let measured = split && !area.size.width.is_zero() && !bounds[1].size.width.is_zero();
+            let left = bounds[0].right() + px(1.);
+            match measured {
+                true => (
+                    Some((left - area.left()).max(px(0.))),
+                    (bounds[1].left() - px(1.) - left).max(px(0.)),
+                ),
+                false => (None, px(0.)),
+            }
+        };
+        let reorder = self.reorder.borrow();
+        let dragging =
+            cx.has_active_drag() && matches!(reorder.source, Some(reorder::Item::Tab(..)));
+        let source_group = match &reorder.source {
+            Some(reorder::Item::Tab(_, id)) => Some(ws.group_of(id)),
+            _ => None,
+        };
+        let target = reorder.target.clone();
+        drop(reorder);
+        let drop_group = match (&target, source_group) {
+            (Some(reorder::Item::Append(_, g)), _) => Some(*g),
+            (Some(reorder::Item::Tab(_, id)), Some(from)) if ws.group_of(id) != from => {
+                Some(ws.group_of(id))
+            }
+            _ => None,
+        };
+        let split_target = dragging && !split && self.visible_tab_ids(ws, 0, cx).len() > 1;
+        let theme = cx.theme();
+        let (accent, faint, radius) = (
+            theme.primary.opacity(0.06),
+            theme.primary.opacity(0.16),
+            theme.radius,
+        );
+        let name = ws.name.clone();
+        (0..groups)
+            .map(|g| {
+                let last = g + 1 == groups;
+                let empty = if last {
+                    "titlebar-empty"
+                } else {
+                    "titlebar-gap"
+                };
+                let trailing = div()
+                    .id(empty)
+                    .flex_1()
+                    .min_w_0()
+                    .h_full()
+                    .flex()
+                    .items_center()
+                    .when(dragging, |d| {
+                        // A drop zone even when the tabs overflow.
+                        d.min_w(px(32.)).when(
+                            target == Some(reorder::Item::Append(name.clone(), g)),
+                            |d| d.bg(accent).rounded(radius),
+                        )
+                    })
+                    .when(last && split_target, |d| {
+                        // Room for the target even when the tabs overflow.
+                        d.min_w(px(48.)).child(self.render_split_target(
+                            target == Some(reorder::Item::Split(name.clone())),
+                            cx,
+                        ))
+                    })
+                    .map(|d| self.draggable_chrome(empty, d));
+                let trailing = self.reorder_item(
+                    trailing.into_any_element(),
+                    reorder::Item::Append(name.clone(), g),
+                );
+                h_flex()
+                    .h_full()
+                    .min_w_0()
+                    .map(|d| match (last, left_width) {
+                        (false, Some(w)) => d.flex_none().w(w),
+                        _ => d.flex_1(),
+                    })
+                    .when(split && g == 1, |d| d.pl(gap))
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .h_full()
+                            .gap(px(4.))
+                            .rounded(radius)
+                            .when(drop_group == Some(g), |d| d.bg(faint))
+                            .children(self.render_tabs(g, window, cx))
+                            .child(
+                                Button::new(match g {
+                                    0 => SharedString::from("new-chat"),
+                                    _ => format!("new-chat-{g}").into(),
+                                })
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Plus)
+                                .w(px(24.))
+                                .flex_none()
+                                .tooltip("New chat (cmd-t)")
+                                .on_click(cx.listener(
+                                    move |this, _, window, cx| {
+                                        this.adopt_group(g, window, cx);
+                                        this.new_chat(window, cx)
+                                    },
+                                )),
+                            ),
+                    )
+                    .child(trailing)
+                    .into_any_element()
+            })
+            .collect()
+    }
+
+    /// Both groups show their selection; a bar under it marks the focused group's.
+    pub(super) fn focus_mark(
+        &self,
+        g: usize,
+        on: bool,
+        d: Stateful<Div>,
+        theme: &Theme,
+    ) -> Stateful<Div> {
+        d.when(on && self.split_shown() && g == self.focused_group(), |d| {
+            d.child(
+                div()
+                    .id("focused-group-mark")
+                    .absolute()
+                    .bottom_0()
+                    .left(px(8.))
+                    .right(px(8.))
+                    .h(px(2.))
+                    .rounded_full()
+                    .bg(theme.primary)
+                    .test_support(),
+            )
+        })
+    }
+
+    /// The dotted drop target that splits the workspace, shown while a tab drags.
+    fn render_split_target(&self, hovered: bool, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let target = h_flex()
+            .id("split-target")
+            .role(Role::Button)
+            .aria_label("Drop to open in a new right group")
+            .flex_none()
+            .ml(px(4.))
+            .w(px(36.))
+            .h(px(28.))
+            .justify_center()
+            .rounded(theme.radius)
+            .border_1()
+            .border_dashed()
+            .border_color(theme.primary.opacity(if hovered { 0.9 } else { 0.5 }))
+            .bg(theme.primary.opacity(if hovered { 0.18 } else { 0.06 }))
+            .text_color(theme.primary)
+            .child(Icon::new(IconName::Columns2).with_size(px(14.)))
+            .test_support()
+            .into_any_element();
+        let name = self.active.clone().unwrap_or_default();
+        self.reorder_item(target, reorder::Item::Split(name))
+    }
+
+    /// Group `g`'s tabs: chats, features and files in one equal-width strip that shrinks to fit.
+    pub(super) fn render_tabs(
+        &self,
+        g: usize,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> Vec<AnyElement> {
         let Some(ws) = self.active_ws() else {
             return vec![];
         };
         let theme = cx.theme();
-        let tabs = self.visible_tabs(ws, cx);
+        let tabs = self.visible_tabs(ws, g, cx);
+        let split = self.split_shown();
+        let focused = g == ws.layout.focused;
+        let sel = self.group_selection(g, cx);
         let m = window.modifiers();
-        let ctrl_held = m.control && m.number_of_modifiers() == 1;
+        // Numbers only on the group they act on.
+        let ctrl_held = m.control && m.number_of_modifiers() == 1 && focused;
         let mut pills: Vec<(VisibleTab, AnyElement)> = (ws.chats.iter().enumerate())
-            .map(|(ix, meta)| {
-                let tab_ix = tabs.index(VisibleTab::Chat(ix)).unwrap();
+            .filter_map(|(ix, meta)| {
+                let tab_ix = tabs.index(VisibleTab::Chat(ix))?;
                 let chat = self.chats.get(&meta.id).map(|c| c.read(cx));
-                let on = ix == ws.active_chat && self.tab == Tab::Chat;
+                let on = sel.as_ref() == Some(&TabId::Chat(meta.id.clone()));
                 let label: SharedString = match chat {
                     Some(c) => c.title(),
                     None if meta.title.is_empty() => "New chat".into(),
@@ -786,7 +1010,7 @@ impl Shark {
                         .when(unread, |d| d.child(dot(-2., theme)))
                         .into_any_element(),
                 };
-                (
+                Some((
                     VisibleTab::Chat(ix),
                     pill(format!("chat-tab-{}", meta.id), on, theme)
                         .aria_label(label.clone())
@@ -822,26 +1046,28 @@ impl Shark {
                                 }),
                             theme,
                         ))
+                        .map(|d| self.focus_mark(g, on, d, theme))
                         .test_support()
                         .into_any_element(),
-                )
+                ))
             })
             .collect();
         for feature in Feature::ALL {
             if let Some(ix) = tabs.index(VisibleTab::Feature(feature)) {
+                let on = sel.as_ref() == Some(&feature.tab_id());
                 pills.push((
                     VisibleTab::Feature(feature),
-                    self.render_feature_tab(feature, ix, ctrl_held, cx),
+                    self.render_feature_tab(feature, ix, on, ctrl_held, cx),
                 ));
             }
         }
-        pills.extend(self.file_tabs.iter().enumerate().map(|(ix, file)| {
+        pills.extend(self.file_tabs.iter().enumerate().filter_map(|(ix, file)| {
+            let tab_ix = tabs.index(VisibleTab::File(ix))?;
             let e = file.editor.read(cx);
             let path = e.path.clone();
             let name: SharedString = path.rsplit('/').next().unwrap_or(&path).to_string().into();
-            let on = self.tab == Tab::File && self.editor.as_ref() == Some(&file.editor);
-            let tab_ix = tabs.index(VisibleTab::File(ix)).unwrap();
-            (
+            let on = sel.as_ref() == Some(&TabId::File(path.clone()));
+            Some((
                 VisibleTab::File(ix),
                 pill(format!("file-tab-{path}"), on, theme)
                     .map(|d| self.tab_drag(d, TabId::File(path.clone()), name.clone(), cx))
@@ -887,9 +1113,10 @@ impl Shark {
                         theme,
                     ))
                     .tooltip(move |w, cx| Tooltip::new(path.clone()).build(w, cx))
+                    .map(|d| self.focus_mark(g, on, d, theme))
                     .test_support()
                     .into_any_element(),
-            )
+            ))
         }));
         let pills: Vec<_> = tabs
             .0
@@ -902,8 +1129,8 @@ impl Shark {
                 ))
             })
             .collect();
-        let (layout, scroll) = (self.tab_layout.clone(), self.tab_scroll.clone());
-        let active = self.active_tab_index(cx).unwrap_or(0);
+        let (layout, scroll) = (self.tab_layout[g].clone(), self.tab_scroll[g].clone());
+        let active = self.active_tab_index(g, cx).unwrap_or(0);
         let strip = h_flex()
             .on_children_prepainted(move |children, window, cx| {
                 let next = (scroll.bounds().size.width, children.len());
@@ -916,18 +1143,25 @@ impl Shark {
                     });
                 }
             })
-            .id("chat-tabs")
+            .id(match g {
+                0 => SharedString::from("chat-tabs"),
+                _ => format!("chat-tabs-{g}").into(),
+            })
             .role(Role::TabList)
-            .aria_label("Workspace tabs")
+            .aria_label(match (split, g) {
+                (false, _) => "Workspace tabs",
+                (true, 0) => "Left group tabs",
+                (true, _) => "Right group tabs",
+            })
             .test_support()
             .min_w_0()
             .gap_1()
             .overflow_x_scroll()
-            .track_scroll(&self.tab_scroll)
+            .track_scroll(&self.tab_scroll[g])
             .children(pills)
             .into_any_element();
-        let left = self.tab_edge(Ordering::Less, ws, &tabs, cx);
-        let right = self.tab_edge(Ordering::Greater, ws, &tabs, cx);
+        let left = self.tab_edge(g, Ordering::Less, ws, &tabs, cx);
+        let right = self.tab_edge(g, Ordering::Greater, ws, &tabs, cx);
         let overflow = left.is_some() || right.is_some();
         let mut tabs = vec![];
         if overflow {

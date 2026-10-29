@@ -232,6 +232,13 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| s.cycle_tab(-1, w, cx),
     ),
     Row(
+        "Move tab to other group",
+        IconName::Columns2,
+        Some(&MoveTabToGroup),
+        "split side by side right left pane tab",
+        |s, w, cx| s.move_tab_to_other_group(w, cx),
+    ),
+    Row(
         "Ask a side question",
         IconName::MessageCircleQuestionMark,
         Some(&OpenSide),
@@ -917,8 +924,8 @@ impl Shark {
             }
             if (if codex { CLAUDE_ONLY } else { CODEX_ONLY }).contains(label)
                 || (no_target && NEED_WORKSPACE.contains(label))
-                || (*label == "Show or hide diff files"
-                    && (self.tab != Tab::Feature(Feature::Diff) || self.home_shown()))
+                || (*label == "Show or hide diff files" && !self.tab_visible(&TabId::Diff, cx))
+                || (*label == "Move tab to other group" && !self.can_move_shown_tab(cx))
             {
                 continue;
             }

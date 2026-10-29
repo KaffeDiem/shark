@@ -8,9 +8,30 @@ pub(super) struct FileTab {
 }
 
 impl Shark {
+    pub(super) fn check_diff_edits(&self, path: &str, cx: &App) -> Result<(), String> {
+        if self
+            .differ
+            .read(cx)
+            .edit_snapshot()
+            .is_some_and(|e| e.path.as_str() == path && (e.dirty || e.saving))
+        {
+            return Err(format!("{path} has unsaved edits in the diff"));
+        }
+        Ok(())
+    }
+
     /// Opens `repo/rel/path`, replacing the selected file after confirming unsaved edits.
     pub(super) fn open_path(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.open_path_in_tab(path, false, window, cx);
+        let g = self.focused_group();
+        // Split, only the focused group's own file is replaced; one group keeps the last file.
+        let replacing = match self.active_ws().is_some_and(Workspace::split) {
+            true => match self.group_selection(g, cx) {
+                Some(TabId::File(p)) => self.editor_for(&p, cx),
+                _ => None,
+            },
+            false => self.editor.clone(),
+        };
+        self.open_file(path, replacing, g, window, cx);
     }
 
     pub(super) fn open_path_tab(
@@ -19,13 +40,43 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_path_in_tab(path, true, window, cx);
+        let g = self.focused_group();
+        self.open_file(path, None, g, window, cx);
     }
 
-    fn open_path_in_tab(
+    /// Quick open into group `g` of `workspace`, as captured when the picker opened: replaces
+    /// the group's selected file, or appends when it shows something else or `new_tab`.
+    pub(super) fn open_in_group(
         &mut self,
         path: String,
+        workspace: &str,
+        g: usize,
         new_tab: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.active.as_deref() != Some(workspace) {
+            return notify_err(window, cx, "The workspace changed; open the file again");
+        }
+        let g = if self.active_ws().is_some_and(Workspace::split) {
+            g
+        } else {
+            0
+        };
+        let replacing = match self.group_selection(g, cx) {
+            Some(TabId::File(p)) if !new_tab => self.editor_for(&p, cx),
+            _ => None,
+        };
+        self.open_file(path, replacing, g, window, cx);
+    }
+
+    /// Opens `path` in place of `replacing`'s tab, else as a new tab at the end of group `g`.
+    /// An already open path just gets its tab selected.
+    fn open_file(
+        &mut self,
+        path: String,
+        replacing: Option<Entity<FileEditor>>,
+        g: usize,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -37,13 +88,18 @@ impl Shark {
         {
             return self.select_file(ix, window, cx);
         }
-        if (self.differ.read(cx).edit_snapshot())
-            .is_some_and(|e| e.path.as_str() == path && (e.dirty || e.saving))
-        {
-            return notify_err(window, cx, format!("{path} has unsaved edits in the diff"));
+        if let Err(error) = self.check_diff_edits(&path, cx) {
+            return notify_err(window, cx, error);
         }
         let workspace = ws.name.clone();
         let abs = ws.dir().join(&path);
+        // A saved tab of the other group not loaded yet (restoring, or unavailable until now)
+        // keeps its slot and group; it loads there instead of replacing anything.
+        let id = TabId::File(path.clone());
+        let listed = move |s: &Shark| {
+            (s.active_ws()).is_some_and(|ws| ws.tab_order.contains(&id) && ws.group_of(&id) != g)
+        };
+        let replacing = replacing.filter(|_| !listed(self));
         if std::fs::metadata(&abs).is_ok_and(|m| m.len() > crate::editor::MAX_BYTES) {
             return notify_err(
                 window,
@@ -51,7 +107,6 @@ impl Shark {
                 format!("{path} is too large to edit; it shows in the diff only"),
             );
         }
-        let replacing = (!new_tab).then(|| self.editor.clone()).flatten();
         self.confirm_editors(
             replacing.iter().cloned().collect(),
             false,
@@ -62,12 +117,8 @@ impl Shark {
                 if s.active.as_ref() != Some(&workspace) {
                     return;
                 }
-                if s.differ
-                    .read(cx)
-                    .edit_snapshot()
-                    .is_some_and(|e| e.path.as_str() == path && (e.dirty || e.saving))
-                {
-                    return notify_err(window, cx, format!("{path} has unsaved edits in the diff"));
+                if let Err(error) = s.check_diff_edits(&path, cx) {
+                    return notify_err(window, cx, error);
                 }
                 // Restoration may have opened the target while the discard dialog was up.
                 let tab = match s
@@ -79,7 +130,10 @@ impl Shark {
                     None => s.make_file_tab(path.clone(), abs, None, window, cx),
                 };
                 let editor = tab.editor.clone();
-                if let Some(ix) = s
+                s.restore_failed.remove(&path);
+                if listed(s) {
+                    s.file_tabs.push(tab);
+                } else if let Some(ix) = s
                     .file_tabs
                     .iter()
                     .position(|t| Some(&t.editor) == replacing.as_ref())
@@ -90,7 +144,7 @@ impl Shark {
                         .replace_tab(&old, TabId::File(path));
                     s.file_tabs[ix] = tab;
                 } else {
-                    s.active_ws_mut().unwrap().open_tab(TabId::File(path));
+                    s.active_ws_mut().unwrap().open_tab_in(TabId::File(path), g);
                     s.file_tabs.push(tab);
                 }
                 s.sort_file_tabs(cx);
@@ -191,6 +245,7 @@ impl Shark {
                     return;
                 }
                 let mut failures = vec![];
+                s.restore_failed.clear();
                 for (path, result) in restored {
                     // It may have been opened, replaced or closed while the read was running.
                     if !s
@@ -207,10 +262,14 @@ impl Shark {
                             let tab = s.make_file_tab(path, abs, Some(text), window, cx);
                             s.file_tabs.push(tab);
                         }
-                        Err(e) => failures.push(format!("{path}: {e}")),
+                        Err(e) => {
+                            failures.push(format!("{path}: {e}"));
+                            s.restore_failed.insert(path);
+                        }
                     }
                 }
                 s.sort_file_tabs(cx);
+                s.restored_selection(window, cx);
                 s.reveal_tab(cx);
                 if !failures.is_empty() {
                     notify_err(
@@ -229,18 +288,36 @@ impl Shark {
         .detach();
     }
 
+    /// Restored files appear in the groups waiting on them. Only a focused group still showing
+    /// its loading state takes the editor, and keyboard focus only if nothing else has it now.
+    fn restored_selection(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.active_ws() else { return };
+        let g = ws.layout.focused;
+        let Some(TabId::File(path)) = ws.layout.selected[g].clone() else {
+            return;
+        };
+        if self.tab != Tab::File || self.editor.is_some() || self.home_shown() {
+            return;
+        }
+        let Some(editor) = self.editor_for(&path, cx) else {
+            return;
+        };
+        let waiting =
+            self.group_focus[g].is_focused(window) || self.content_focus.is_focused(window);
+        self.editor = Some(editor.clone());
+        self.configure_differ(cx);
+        if waiting {
+            crate::editor::focus(&editor, window, cx);
+        }
+    }
+
     pub(super) fn select_file(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let Some(tab) = self.file_tabs.get(ix) else {
             return;
         };
         let path = tab.editor.read(cx).path.clone();
-        if self
-            .differ
-            .read(cx)
-            .edit_snapshot()
-            .is_some_and(|e| e.path.as_str() == path && (e.dirty || e.saving))
-        {
-            return notify_err(window, cx, format!("{path} has unsaved edits in the diff"));
+        if let Err(error) = self.check_diff_edits(&path, cx) {
+            return notify_err(window, cx, error);
         }
         self.editor = Some(tab.editor.clone());
         self.show(Tab::File, window, cx);
@@ -251,9 +328,30 @@ impl Shark {
 
     pub(super) fn close_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(editor) = self.editor.clone() else {
-            return;
+            return self.close_unloaded_file(window, cx);
         };
         self.close_editor(editor, window, cx);
+    }
+
+    /// cmd-w on a file still opening or that couldn't be opened: its tab goes, nothing to save.
+    fn close_unloaded_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.tab != Tab::File || self.home_shown() {
+            return;
+        }
+        let Some(ws) = self.active_ws_mut() else {
+            return;
+        };
+        let Some(id @ TabId::File(_)) = ws.layout.selected[ws.layout.focused].clone() else {
+            return;
+        };
+        ws.close_tab(&id);
+        let _ = self.state.save();
+        match self.active_ws().unwrap().layout.selected[self.focused_group()].clone() {
+            Some(next) => self.select_id(next, window, cx),
+            None => self.show(self.file_fallback(), window, cx),
+        }
+        self.prepare_other_group(window, cx);
+        cx.notify();
     }
 
     pub(super) fn close_editor(
@@ -273,10 +371,18 @@ impl Shark {
                     return;
                 };
                 let path = editor.read(cx).path.clone();
-                s.active_ws_mut().unwrap().close_tab(&TabId::File(path));
+                let ws = s.active_ws_mut().unwrap();
+                let split = ws.split();
+                ws.close_tab(&TabId::File(path));
                 let _ = s.state.save();
                 s.file_tabs.remove(ix);
-                if s.file_tabs.is_empty() {
+                let shown = s.tab == Tab::File && s.editor.as_ref() == Some(&editor);
+                if split {
+                    if s.editor.as_ref() == Some(&editor) {
+                        s.editor = None;
+                    }
+                    s.sync_groups(shown, window, cx);
+                } else if s.file_tabs.is_empty() {
                     s.editor = None;
                     if s.tab == Tab::File {
                         s.show(s.file_fallback(), window, cx);
@@ -304,6 +410,7 @@ impl Shark {
         self.restore_generation += 1;
         self.editor = None;
         self.file_tabs.clear();
+        self.restore_failed.clear();
     }
 
     /// Quit, asking first if the open file has unsaved edits.
@@ -490,10 +597,11 @@ impl Shark {
         entries
     }
 
-    pub(super) fn render_editor(&self, cx: &mut Context<Self>) -> AnyElement {
-        let Some(editor) = self.editor.clone() else {
-            return div().into_any_element();
-        };
+    pub(super) fn render_editor(
+        &self,
+        editor: Entity<FileEditor>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let theme = cx.theme();
         let e = editor.read(cx);
         let path = e.path.clone();
@@ -610,10 +718,14 @@ impl Shark {
                                 })),
                         )
                     })
-                    .child(
-                        crate::settings::close_button("close-file", "Close file (cmd-w)")
-                            .on_click(cx.listener(|this, _, w, cx| this.close_file(w, cx))),
-                    ),
+                    .child({
+                        let editor = editor.clone();
+                        crate::settings::close_button("close-file", "Close file (cmd-w)").on_click(
+                            cx.listener(move |this, _, w, cx| {
+                                this.close_editor(editor.clone(), w, cx)
+                            }),
+                        )
+                    }),
             )
             .when(conflict, |d| {
                 let (e1, e2) = (editor.clone(), editor.clone());
