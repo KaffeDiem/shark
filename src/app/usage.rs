@@ -251,7 +251,7 @@ impl Shark {
         let left = footer
             .left()
             .max(px(8.))
-            .min((viewport.width - px(328.)).max(px(8.)));
+            .min((viewport.width - px(352.)).max(px(8.)));
         let bottom = (viewport.height - footer.top() + px(4.)).max(px(8.));
         let content = menu::chrome(cx.theme())
             .id("usage-panel")
@@ -259,7 +259,7 @@ impl Shark {
             .aria_label("Account usage")
             .aria_description("Subscription allowances. Enter to refresh. Escape to close.")
             .track_focus(&panel.focus)
-            .w(px(320.).min(viewport.width - px(16.)))
+            .w(px(344.).min(viewport.width - px(16.)))
             .max_h((viewport.height - bottom - px(8.)).max(px(0.)))
             .overflow_y_scroll()
             .p_4()
@@ -279,9 +279,10 @@ impl Shark {
                             .on_click(cx.listener(|s, _, _, cx| s.refresh_usage(cx))),
                     ),
             )
-            .children(
-                Provider::ALL.map(|provider| section(provider, &self.usage[provider.index()], cx)),
-            )
+            .children(Provider::ALL.map(|provider| {
+                let i = provider.index();
+                section(provider, &self.usage[i], &self.usage_activity[i], cx)
+            }))
             .test_support();
         Some(
             deferred(
@@ -309,7 +310,8 @@ impl Shark {
     }
 }
 
-fn section(provider: Provider, snapshot: &Snapshot, cx: &App) -> impl IntoElement {
+/// The calendar is here too, so its daily values are reachable without a pointer.
+fn section(provider: Provider, snapshot: &Snapshot, daily: &Daily, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
     let status = match snapshot.status {
         Status::Idle => Some("Not checked"),
@@ -409,6 +411,11 @@ fn section(provider: Provider, snapshot: &Snapshot, cx: &App) -> impl IntoElemen
                 )
                 .test_support()
         }))
+        .child(
+            div()
+                .text_xs()
+                .child(heatmap(provider, daily, crate::usage::now(), theme)),
+        )
         .child(div().text_xs().text_color(theme.muted_foreground).child(
             snapshot.checked_at.map_or_else(
                 || "Last checked: never".into(),
@@ -689,15 +696,22 @@ fn heatmap(provider: Provider, daily: &Daily, now: f64, theme: &Theme) -> AnyEle
     if months.get(1).is_some_and(|(week, _)| *week < 3) {
         months.remove(0);
     }
+    let (long, month) = (activity::day_labels("EEEMMMd"), activity::day_labels("MMM"));
     v_flex()
         .gap_2()
         .child(format!(
             "{} tokens in {WEEKS} weeks · busiest {}",
             crate::usage::tokens(total),
-            activity::day_label(busiest, "EEEMMMd")
+            long(busiest)
         ))
         .child(
             v_flex()
+                .id(SharedString::from(format!(
+                    "usage-heatmap-{}",
+                    provider.name()
+                )))
+                .role(Role::Group)
+                .aria_label(format!("{} tokens per day", provider.name()))
                 .gap(px(GAP))
                 .text_color(theme.muted_foreground)
                 .child(div().relative().h(px(16.)).children(months.into_iter().map(
@@ -705,7 +719,7 @@ fn heatmap(provider: Provider, daily: &Daily, now: f64, theme: &Theme) -> AnyEle
                         div()
                             .absolute()
                             .left(px(gutter + week as f32 * step))
-                            .child(activity::day_label(day, "MMM"))
+                            .child(month(day))
                     },
                 )))
                 .children((0..7i64).map(|row| {
@@ -726,19 +740,22 @@ fn heatmap(provider: Provider, daily: &Daily, now: f64, theme: &Theme) -> AnyEle
                                 return div().size(px(CELL)).flex_none().into_any_element();
                             }
                             let n = at(day);
-                            let tip = move || {
-                                let n = match n {
+                            let tip = format!(
+                                "{} · {}",
+                                long(day),
+                                match n {
                                     0 => "No activity".into(),
                                     n => format!("{} tokens", crate::usage::tokens(n)),
-                                };
-                                format!("{} · {n}", activity::day_label(day, "EEEMMMd"))
-                            };
+                                }
+                            );
                             cell(level(n), theme)
                                 .id(SharedString::from(format!(
                                     "usage-day-{}-{day}",
                                     provider.name()
                                 )))
-                                .tooltip(move |w, cx| Tooltip::new(tip()).build(w, cx))
+                                .role(Role::Label)
+                                .aria_label(tip.clone())
+                                .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
                                 .into_any_element()
                         }))
                 })),

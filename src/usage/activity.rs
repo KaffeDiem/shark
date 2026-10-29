@@ -18,9 +18,10 @@ pub struct Daily {
     pub tokens: Vec<u64>,
 }
 
-/// Per-file results keyed by path, reused while the file's length and mtime are unchanged.
+/// Per-file results keyed by path, reused while the file's length and mtime are unchanged and
+/// the time zone the days were bucketed in still applies.
 #[derive(Default)]
-pub struct Cache(HashMap<PathBuf, (u64, f64, Days)>);
+pub struct Cache(HashMap<PathBuf, (u64, f64, Days)>, String);
 
 /// (local day, tokens) pairs for one file.
 type Days = Vec<(i64, u64)>;
@@ -32,14 +33,16 @@ pub fn local_day(seconds: f64) -> i64 {
     ((seconds + offset as f64) / 86400.).floor() as i64
 }
 
-/// A [`local_day`] for display, from a localized template: `"EEEMMMd"` → "Tue, Oct 28".
-pub fn day_label(day: i64, template: &str) -> String {
+/// Formats [`local_day`]s for display from a localized template: `"EEEMMMd"` → "Tue, Oct 28".
+pub fn day_labels(template: &str) -> impl Fn(i64) -> String {
     let formatter = NSDateFormatter::new();
     formatter.setLocalizedDateFormatFromTemplate(&NSString::from_str(template));
     formatter.setTimeZone(Some(&NSTimeZone::timeZoneForSecondsFromGMT(0)));
-    formatter
-        .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(day as f64 * 86400.))
-        .to_string()
+    move |day| {
+        formatter
+            .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(day as f64 * 86400.))
+            .to_string()
+    }
 }
 
 /// (year, month 1-12, day 1-31) of a [`local_day`] in the Gregorian calendar, whatever the locale.
@@ -81,25 +84,23 @@ pub(super) fn scan_in(provider: Provider, root: &Path, cache: &mut Cache, now: f
     let started = std::time::Instant::now();
     let today = local_day(now);
     let first_day = today - DAYS as i64 + 1;
-    let mut files = vec![];
-    match provider {
-        Provider::Claude => walk(&root.join("projects"), &mut files),
-        // Codex files live under their start date, so only the window's directories are read.
-        Provider::Codex => {
-            for day in first_day..=today {
-                let (y, m, d) = civil(day);
-                let dir = root.join(format!("sessions/{y:04}/{m:02}/{d:02}"));
-                files.extend(
-                    fs::read_dir(dir)
-                        .into_iter()
-                        .flatten()
-                        .flatten()
-                        .map(|entry| entry.path())
-                        .filter(|path| path.extension().is_some_and(|e| e == "jsonl")),
-                );
-            }
-        }
+    // Pick up a system time zone change; days bucketed in the old zone are parsed again.
+    NSTimeZone::resetSystemTimeZone();
+    let zone = NSTimeZone::localTimeZone().name().to_string();
+    if cache.1 != zone {
+        cache.0.clear();
+        cache.1 = zone;
     }
+    // Codex files sit under their start date, but a resumed session appends to its old file,
+    // so every directory is walked and the mtime filter below skips the old ones.
+    let mut files = vec![];
+    walk(
+        &root.join(match provider {
+            Provider::Claude => "projects",
+            Provider::Codex => "sessions",
+        }),
+        &mut files,
+    );
     let mut old = std::mem::take(&mut cache.0);
     let mut hours = HashMap::new();
     let mut tokens = vec![0; DAYS];

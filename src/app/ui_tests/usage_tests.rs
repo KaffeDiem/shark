@@ -359,6 +359,16 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                         )
                                     }));
                                 }
+                                let today = crate::usage::activity::local_day(crate::usage::now());
+                                s.usage_activity[0] = crate::usage::activity::Daily {
+                                    first_day: today - 139,
+                                    tokens: (0..140u64)
+                                        .map(|i| match i * 7919 % 11 {
+                                            0..=2 => 0,
+                                            n => n * n * 40_000 + i * 9_000,
+                                        })
+                                        .collect(),
+                                };
                                 s.show_usage(w, cx);
                                 s.usage[0].finish(Ok(sample()));
                                 s.usage[1].finish(Ok(vec![Allowance {
@@ -432,16 +442,6 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         cx.update_window(window, |_, w, cx| {
                             shark.update(cx, |s, cx| {
                                 s.close_usage(w, cx);
-                                let today = crate::usage::activity::local_day(crate::usage::now());
-                                s.usage_activity[0] = crate::usage::activity::Daily {
-                                    first_day: today - 139,
-                                    tokens: (0..140u64)
-                                        .map(|i| match i * 7919 % 11 {
-                                            0..=2 => 0,
-                                            n => n * n * 40_000 + i * 9_000,
-                                        })
-                                        .collect(),
-                                };
                                 cx.notify();
                             });
                             w.render_frame(cx);

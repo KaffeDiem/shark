@@ -527,6 +527,7 @@ fn activity_scan_windows_skips_stale_files_and_reuses_cache() {
         codex_dir(today).join("rollout-a.jsonl"),
         &log(Provider::Codex, today - 1),
     );
+    // A session started before the window and resumed inside it still counts.
     write(
         codex_dir(today - 140).join("rollout-b.jsonl"),
         &log(Provider::Codex, today - 1),
@@ -539,7 +540,7 @@ fn activity_scan_windows_skips_stale_files_and_reuses_cache() {
     assert_eq!(daily.tokens.len(), activity::DAYS);
     assert_eq!(daily.tokens[138..], [284, 2000]);
     assert_eq!(daily.tokens[..138].iter().sum::<u64>(), 0);
-    assert_eq!(scan(Provider::Codex).tokens[138..], [240, 5]);
+    assert_eq!(scan(Provider::Codex).tokens[138..], [480, 10]);
 
     // Same length and mtime: the cached result stands even though the bytes changed.
     let mtime = std::fs::metadata(&session).unwrap().modified().unwrap();
