@@ -110,6 +110,8 @@ pub struct Shark {
     adding_repos: HashSet<String>,
     /// Sidebar shrunk to icons by the user.
     rail: bool,
+    /// Zen mode (cmd-.): only the shown chat; see `zen_shown`.
+    zen: bool,
     editor: Option<Entity<FileEditor>>,
     file_tabs: Vec<editor_pane::FileTab>,
     pub(crate) syncs: HashMap<String, Entity<GitSync>>,
@@ -246,6 +248,7 @@ impl Shark {
             creating: HashSet::new(),
             adding_repos: HashSet::new(),
             rail: false,
+            zen: false,
             editor: None,
             file_tabs: vec![],
             syncs: HashMap::new(),
@@ -389,6 +392,8 @@ impl Shark {
             self.feature_sel = Feature::ALL.iter().position(|f| *f == feature).unwrap();
         }
         self.tab = tab;
+        // Diff, Git or a file ends Zen; it only ever shows a chat.
+        self.zen &= tab == Tab::Chat;
         self.home.on = false;
         self.remember_open();
         self.reveal_tab(cx);
@@ -414,7 +419,31 @@ impl Shark {
         cx.notify();
     }
 
+    /// Zen hides everything but the chat, while there's one to show.
+    fn zen_shown(&self) -> bool {
+        self.zen && !self.home_shown() && self.tab == Tab::Chat && self.active_chat().is_some()
+    }
+
+    fn toggle_zen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.zen_shown() {
+            self.zen = false;
+            return cx.notify();
+        }
+        if self.active.is_none() || self.active_ws().is_some_and(|w| w.chats.is_empty()) {
+            return notify_err(window, cx, "Open a chat first");
+        }
+        self.show(Tab::Chat, window, cx);
+        self.zen = true;
+    }
+
     fn panes(&self, cx: &App) -> Vec<Pane> {
+        if self.zen_shown() {
+            let plan = self.active_chat().is_some_and(|c| c.read(cx).plan_open);
+            return [Pane::Chat]
+                .into_iter()
+                .chain(plan.then_some(Pane::Plan))
+                .collect();
+        }
         let mut v = vec![Pane::Sidebar];
         if self.home_shown() {
             v.push(Pane::Home);
@@ -824,6 +853,51 @@ impl Shark {
                     }))
             })
     }
+    /// Zen (cmd-.): the chat alone on its own background, clear of the traffic lights.
+    fn render_zen(&self, chat: Entity<Chat>, cx: &mut Context<Self>) -> Div {
+        let zen = v_flex()
+            .size_full()
+            .child(
+                div()
+                    .id("zen-titlebar")
+                    .h(px(44.))
+                    .flex_none()
+                    .map(|d| self.draggable_chrome("zen-titlebar", d)),
+            )
+            .children(self.render_unsaved(cx))
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .child(chat.cached(StyleRefinement::default().size_full())),
+            );
+        h_flex()
+            .size_full()
+            .child(self.interaction_content(zen.into_any_element(), cx))
+    }
+
+    fn render_unsaved(&self, cx: &Context<Self>) -> Option<impl IntoElement + use<>> {
+        let unsaved = self.unsaved_data(cx);
+        (!unsaved.is_empty()).then(|| {
+            h_flex()
+                .id("unsaved-data")
+                .px_3()
+                .py_2()
+                .gap_3()
+                .child(
+                    div()
+                        .flex_1()
+                        .text_sm()
+                        .child(format!("Unsaved data: {}", unsaved.join("; "))),
+                )
+                .child(
+                    Button::new("retry-save")
+                        .label("Retry save")
+                        .small()
+                        .on_click(cx.listener(|s, _, _, cx| s.retry_saves(cx))),
+                )
+        })
+    }
 }
 
 impl Render for Shark {
@@ -975,6 +1049,7 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &FocusLeft, w, cx| this.move_focus(-1, w, cx)))
             .on_action(cx.listener(|this, _: &FocusRight, w, cx| this.move_focus(1, w, cx)))
             .on_action(cx.listener(|this, _: &ToggleSidebar, _, cx| this.toggle_sidebar(cx)))
+            .on_action(cx.listener(|this, _: &ToggleZen, w, cx| this.toggle_zen(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleFileTree, w, cx| this.toggle_tree(w, cx)))
             .on_action(cx.listener(|this, _: &ToggleVim, w, cx| this.toggle_vim(w, cx)))
             .on_action(cx.listener(|this, _: &CloseFile, w, cx| this.close_file(w, cx)))
@@ -992,79 +1067,67 @@ impl Render for Shark {
             .children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))
             .children(self.render_app_switcher(window, cx))
             .children(self.render_usage(window, cx))
-            .child({
-                // Content sits below the titlebar, touching a rail or inset 8px beside an expanded pane.
-                let island = div()
-                    .size_full()
-                    .pb(px(8.))
-                    .min_h_0()
-                    .flex_1()
-                    .when(!self.rail, |d| d.pl(px(8.)))
-                    .when(!self.right_rail_shown(), |d| d.pr(px(8.)))
-                    .child(
-                        h_flex()
-                            .id("content-island")
+            .when(self.zen_shown(), |d| d.bg(cx.theme().background))
+            .child(
+                match self.zen_shown().then(|| self.active_chat().cloned()) {
+                    Some(Some(chat)) => self.render_zen(chat, cx),
+                    _ => {
+                        // Content sits below the titlebar, touching a rail or inset 8px beside an expanded pane.
+                        let island = div()
                             .size_full()
-                            .rounded(cx.theme().radius_lg)
-                            .border_1()
-                            .border_color(cx.theme().border)
-                            .bg(cx.theme().background)
-                            .overflow_hidden()
-                            .child(self.render_main(window, cx))
-                            .test_support(),
-                    );
-                let main = v_flex()
-                    .h_full()
-                    .flex_1()
-                    .min_w_0()
-                    .child(self.render_titlebar(window, cx))
-                    .when(!self.unsaved_data(cx).is_empty(), |d| {
-                        d.child(
-                            h_flex()
-                                .id("unsaved-data")
-                                .px_3()
-                                .py_2()
-                                .gap_3()
-                                .child(div().flex_1().text_sm().child(format!(
-                                    "Unsaved data: {}",
-                                    self.unsaved_data(cx).join("; ")
-                                )))
-                                .child(
-                                    Button::new("retry-save")
-                                        .label("Retry save")
-                                        .small()
-                                        .on_click(cx.listener(|s, _, _, cx| s.retry_saves(cx))),
-                                ),
-                        )
-                    })
-                    .child(island);
-                let main = h_flex()
-                    .size_full()
-                    .min_w_0()
-                    .child(main)
-                    .when(self.right_rail_shown(), |d| {
-                        d.child(self.render_features(window, cx))
-                    })
-                    .into_any_element();
-                let main = self.interaction_content(main, cx);
-                let sidebar = self.render_sidebar(window, cx).into_any_element();
-                match self.rail {
-                    true => h_flex().size_full().child(sidebar).child(main),
-                    // Dragged like Files, between 200 and 480.
-                    false => h_flex().size_full().child(
-                        h_resizable("sidebar-panel")
-                            .with_state(&self.sidebar_resize)
-                            .with_handle_appearance(quiet_edge())
+                            .pb(px(8.))
+                            .min_h_0()
+                            .flex_1()
+                            .when(!self.rail, |d| d.pl(px(8.)))
+                            .when(!self.right_rail_shown(), |d| d.pr(px(8.)))
                             .child(
-                                resizable_panel()
-                                    .size(px(self.state.sidebar_width.unwrap_or(244.)))
-                                    .size_range(px(200.)..px(480.))
-                                    .fixed()
-                                    .child(sidebar),
-                            )
-                            .child(resizable_panel().min_w_0().child(main)),
-                    ),
-                }
-            })
+                                h_flex()
+                                    .id("content-island")
+                                    .size_full()
+                                    .rounded(cx.theme().radius_lg)
+                                    .border_1()
+                                    .border_color(cx.theme().border)
+                                    .bg(cx.theme().background)
+                                    .overflow_hidden()
+                                    .child(self.render_main(window, cx))
+                                    .test_support(),
+                            );
+                        let main = v_flex()
+                            .h_full()
+                            .flex_1()
+                            .min_w_0()
+                            .child(self.render_titlebar(window, cx))
+                            .children(self.render_unsaved(cx))
+                            .child(island);
+                        let main = h_flex()
+                            .size_full()
+                            .min_w_0()
+                            .child(main)
+                            .when(self.right_rail_shown(), |d| {
+                                d.child(self.render_features(window, cx))
+                            })
+                            .into_any_element();
+                        let main = self.interaction_content(main, cx);
+                        let sidebar = self.render_sidebar(window, cx).into_any_element();
+                        match self.rail {
+                            true => h_flex().size_full().child(sidebar).child(main),
+                            // Dragged like Files, between 200 and 480.
+                            false => h_flex().size_full().child(
+                                h_resizable("sidebar-panel")
+                                    .with_state(&self.sidebar_resize)
+                                    .with_handle_appearance(quiet_edge())
+                                    .child(
+                                        resizable_panel()
+                                            .size(px(self.state.sidebar_width.unwrap_or(244.)))
+                                            .size_range(px(200.)..px(480.))
+                                            .fixed()
+                                            .child(sidebar),
+                                    )
+                                    .child(resizable_panel().min_w_0().child(main)),
+                            ),
+                        }
+                    }
+                },
+            )
     }
 }

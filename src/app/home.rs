@@ -237,6 +237,7 @@ impl Shark {
                     self.focus_feature(feature, FeatureFocus::Main, window, cx);
                 }
             }
+            _ if self.zen_shown() => self.focus_pane(Pane::Chat, window, cx),
             (false, _) => self.sidebar_focus.focus(window, cx),
         }
     }
