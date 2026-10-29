@@ -6427,7 +6427,7 @@ dependencies = [
 
 [[package]]
 name = "shark"
-version = "0.1.14"
+version = "0.1.15"
 dependencies = [
  "gpui-kit",
  "imagesize 0.14.0",
