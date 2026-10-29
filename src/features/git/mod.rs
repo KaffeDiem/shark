@@ -1929,6 +1929,16 @@ impl Render for GitFeature {
 }
 
 #[cfg(test)]
+pub(crate) struct TestState<'a> {
+    pub selected: usize,
+    pub details: &'a Option<api::Details>,
+    pub loading: bool,
+    pub error: &'a Option<String>,
+    pub save_error: &'a Option<String>,
+    pub archiving: bool,
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     #[::core::prelude::v1::test]
@@ -1967,14 +1977,4 @@ mod tests {
         assert_eq!(first.replies["thread-b"], "second");
         assert_eq!(loaded["https://github.com/o/r/pull/2"].note, "other PR");
     }
-}
-
-#[cfg(test)]
-pub(crate) struct TestState<'a> {
-    pub selected: usize,
-    pub details: &'a Option<api::Details>,
-    pub loading: bool,
-    pub error: &'a Option<String>,
-    pub save_error: &'a Option<String>,
-    pub archiving: bool,
 }

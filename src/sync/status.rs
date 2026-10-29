@@ -469,7 +469,7 @@ pub fn fetch_pr(wt: &Path, branch: &str, head: &str) -> Result<Option<Pr>, Strin
                 ],
             )?;
         } else {
-            let json = cmd_bounded(wt, "gh", &["pr", "view", &url, "--json", PR_FIELDS], 20)?;
+            let json = cmd_bounded(wt, "gh", &["pr", "view", url, "--json", PR_FIELDS], 20)?;
             let value = serde_json::from_str(&json).map_err(|e| format!("gh: {e}"))?;
             return Ok(Some(Pr {
                 review_checkout: true,

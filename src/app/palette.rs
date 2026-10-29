@@ -793,18 +793,12 @@ fn row_item(label: impl Into<SharedString>, icon: IconName, key: Option<Keystrok
         None => item,
         Some(key) => item.child(move |_, cx| {
             let muted = cx.theme().muted_foreground;
-            h_flex()
-                .flex_1()
-                .gap_2()
-                .items_center()
-                .child(Icon::new(icon).size_4().text_color(muted))
-                .child(div().flex_1().min_w_0().truncate().child(label.clone()))
-                .child(
-                    Kbd::new(key.clone())
-                        .appearance(false)
-                        .text_xs()
-                        .text_color(muted),
-                )
+            command_row(Icon::new(icon).size_4().text_color(muted), label.clone()).child(
+                Kbd::new(key.clone())
+                    .appearance(false)
+                    .text_xs()
+                    .text_color(muted),
+            )
         }),
     }
 }
@@ -820,14 +814,9 @@ fn app_item(app: &'static OpenApp) -> CommandItem {
     let label: SharedString = format!("Open in {}", app.name).into();
     match app.icon.clone() {
         None => row_item(label, app_icon(app), None),
-        Some(icon) => CommandItem::new().label(label.clone()).child(move |_, _| {
-            h_flex()
-                .flex_1()
-                .gap_2()
-                .items_center()
-                .child(img(icon.clone()).size_4().flex_none())
-                .child(div().flex_1().min_w_0().truncate().child(label.clone()))
-        }),
+        Some(icon) => CommandItem::new()
+            .label(label.clone())
+            .child(move |_, _| command_row(img(icon.clone()).size_4().flex_none(), label.clone())),
     }
 }
 

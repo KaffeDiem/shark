@@ -695,3 +695,55 @@ fn render_menu_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     }
     println!("menu fade pixels: 4 passed (real offscreen renderer)");
 }
+
+/// Home and Settings share mode controls while saving through their respective hosts.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn appearance_modes_work_from_home_and_settings(cx: &mut TestAppContext) {
+    use crate::state::Mode;
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            home_checklist_dismissed: true,
+            ..Default::default()
+        },
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(1200.), px(1400.)),
+            ))),
+            ..Default::default()
+        },
+    );
+    cx.run_until_parked();
+    for settings in [false, true] {
+        cx.update_window(window, |_, w, cx| {
+            if settings {
+                shark.update(cx, |s, cx| crate::settings::open(&s.state, w, cx));
+                w.render_frame(cx);
+                w.press("ctrl-tab", cx);
+            }
+            for (label, mode) in [
+                ("Dark", Mode::Dark),
+                ("Light", Mode::Light),
+                ("System", Mode::System),
+            ] {
+                w.render_frame(cx);
+                w.within(if settings {
+                    "settings-page"
+                } else {
+                    "home-page"
+                })
+                .click(label, cx);
+                assert_eq!(shark.read(cx).state.appearance.mode, mode);
+                assert_eq!(State::load().appearance.mode, mode);
+                if mode != Mode::System {
+                    assert_eq!(cx.theme().is_dark(), mode == Mode::Dark);
+                }
+            }
+        })
+        .unwrap();
+    }
+}

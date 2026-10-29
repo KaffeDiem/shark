@@ -455,8 +455,9 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 ),
                                 color,
                             ));
-                        } else if case != "narrow" {
-                            let file = row.file.unwrap();
+                        } else if let Some(file) = row.file
+                            && case != "narrow"
+                        {
                             let color = if s.differ.read(cx).viewed(file)
                                 == crate::features::differ::Viewed::Yes
                             {

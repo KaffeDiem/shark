@@ -3,8 +3,8 @@
 //! over the open one while `Home::on`.
 use super::*;
 use crate::agent::{self, Agent, Ev};
-use crate::settings::{card, close_button, pill};
-use crate::state::{Appearance, Mode};
+use crate::settings::{card, close_button, mode_buttons};
+use crate::state::Appearance;
 use crate::sync::PrState;
 use gpui_kit::component::text::TextViewState;
 use std::time::SystemTime;
@@ -505,7 +505,11 @@ impl Shark {
         }
     }
 
-    fn set_appearance(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Appearance)) {
+    pub(crate) fn set_appearance(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Appearance),
+    ) {
         f(&mut self.state.appearance);
         let _ = self.state.save();
         crate::settings::apply(&self.state.appearance, cx);
@@ -1163,11 +1167,6 @@ impl Shark {
     fn render_appearance(&self, cx: &mut Context<Self>) -> AnyElement {
         let mode = self.state.appearance.mode;
         let theme = cx.theme();
-        let modes = [
-            (Mode::System, "System", IconName::Monitor),
-            (Mode::Light, "Light", IconName::Sun),
-            (Mode::Dark, "Dark", IconName::Moon),
-        ];
         card(theme)
             .child(
                 h_flex()
@@ -1175,11 +1174,9 @@ impl Shark {
                     .px_3()
                     .gap_3()
                     .child(div().text_sm().child("Appearance"))
-                    .child(h_flex().gap_1().children(modes.map(|(m, label, icon)| {
-                        pill(label, Some(icon), m == mode).on_click(cx.listener(
-                            move |this, _, _, cx| this.set_appearance(cx, |a| a.mode = m),
-                        ))
-                    })))
+                    .child(mode_buttons(mode, cx, |this, mode, cx| {
+                        this.set_appearance(cx, |a| a.mode = mode)
+                    }))
                     .child(div().flex_1())
                     .child(
                         Button::new("all-settings")

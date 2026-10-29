@@ -196,11 +196,11 @@ pub(crate) fn gh() -> String {
     std::env::var("SHARK_GH").unwrap_or_else(|_| "gh".into())
 }
 
-/// Runs gh to post something; an error is gh's last word, not the command line (which carries
-/// the whole body).
-fn gh_post(wt: &Path, args: &[&str]) -> Result<String, String> {
+/// Runs gh without exposing request bodies from its command line in errors.
+fn gh_request(wt: &Path, args: &[&str], secs: u64) -> Result<String, String> {
     let gh = gh();
-    cmd_bounded(wt, &gh, args, 60).map_err(|e| gh_error(&e, &format!("{gh} {}: ", args.join(" "))))
+    cmd_bounded(wt, &gh, args, secs)
+        .map_err(|e| gh_error(&e, &format!("{gh} {}: ", args.join(" "))))
 }
 
 /// `e` without `cmd`, its last line; a timeout may still have posted.
@@ -222,7 +222,7 @@ fn gh_error(e: &str, cmd: &str) -> String {
 /// note); returns its URL.
 pub fn publish_note(wt: &Path, number: u64, body: &str) -> Result<String, String> {
     let n = number.to_string();
-    let out = gh_post(wt, &["pr", "comment", &n, "--body", body])?;
+    let out = gh_request(wt, &["pr", "comment", &n, "--body", body], 60)?;
     Ok(out.lines().last().unwrap_or_default().to_string())
 }
 
@@ -351,7 +351,7 @@ pub fn publish_review(
 ) -> Result<String, String> {
     let args = review_api_args(&number.to_string(), head, body, inline);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    gh_post(wt, &args)
+    gh_request(wt, &args, 60)
 }
 
 /// `gh api` for a review, with one inline comment when given; gh fills in `{owner}/{repo}`.

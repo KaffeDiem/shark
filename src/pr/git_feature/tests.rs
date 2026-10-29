@@ -34,6 +34,12 @@ fn target_rejects_ambiguous_or_unsafe_urls() {
         "https://github.com/a/b/pull/1/files",
         "https://github.com/a/b/pull/--help",
         "https://github.com/a/b/pull/1\n",
+        "https://github.example.org:0/a/b/pull/1",
+        "https://github.example.org:65536/a/b/pull/1",
+        "https://github.example.org:+443/a/b/pull/1",
+        "https://github.example.org:/a/b/pull/1",
+        "https://github.example.org:443:443/a/b/pull/1",
+        "https://github.com/a/b:other/pull/1",
     ] {
         assert!(Target::from_url(url).is_err(), "{url}");
     }
@@ -46,6 +52,12 @@ fn target_rejects_ambiguous_or_unsafe_urls() {
             .unwrap()
             .host,
         "github.example.org"
+    );
+    assert_eq!(
+        Target::from_url("https://GITHUB.example.org:8443/owner/repo/pull/12")
+            .unwrap()
+            .url(),
+        "https://github.example.org:8443/owner/repo/pull/12"
     );
 }
 
@@ -242,6 +254,30 @@ print(json.dumps({'data':{'repository':{'pullRequest':json.loads((p/'pr.json').r
             }
             let _ = fs::remove_dir_all(&self.root);
         }
+    }
+
+    #[test]
+    fn shared_gh_requests_redact_bodies_and_bound_timeouts() {
+        let f = Fixture::new();
+        let script = f.root.join("gh");
+        fs::write(
+            &script,
+            "#!/bin/sh\nprintf 'warning\\nHTTP 502: Bad Gateway\\n' >&2\nexit 1\n",
+        )
+        .unwrap();
+        let args = ["pr", "comment", "12", "--body", "private\nrequest body"];
+        assert_eq!(
+            crate::pr::gh_request(&f.root, &args, 30).unwrap_err(),
+            "HTTP 502: Bad Gateway"
+        );
+        fs::write(&script, "#!/bin/sh\nexec sleep 10\n").unwrap();
+        let started = Instant::now();
+        let error = crate::pr::gh_request(&f.root, &args, 1).unwrap_err();
+        assert_eq!(
+            error,
+            "timed out after 1s; it may have posted, so check the PR before retrying"
+        );
+        assert!(started.elapsed() < Duration::from_secs(5));
     }
 
     #[test]

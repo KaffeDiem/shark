@@ -95,14 +95,8 @@ impl Render for FilePicker {
             let item = CommandItem::new().label(label.clone());
             match crate::file_icon::file_icon(&self.files[i].label, dark) {
                 None => item.icon(IconName::File),
-                // As `app_item` in the palette: a custom row for an image icon.
                 Some(icon) => item.child(move |_, _| {
-                    h_flex()
-                        .flex_1()
-                        .gap_2()
-                        .items_center()
-                        .child(img(icon.clone()).size_4().flex_none())
-                        .child(div().flex_1().min_w_0().truncate().child(label.clone()))
+                    command_row(img(icon.clone()).size_4().flex_none(), label.clone())
                 }),
             }
         });

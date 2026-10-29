@@ -53,7 +53,7 @@ impl DiffData {
             .into_iter()
             .filter_map(|chunk| {
                 let file = DiffFile::parse(chunk).ok()?.into_iter().next()?;
-                hunks.insert(file.path().clone(), review::parse_hunks(chunk));
+                hunks.insert(file.path().clone(), review::hunks(&file));
                 media.extend(media::MediaFile::parse(file.path(), chunk, &ws_dir));
                 Some((file, files::fingerprint(chunk)))
             })
@@ -203,9 +203,7 @@ impl Differ {
         if let Some(e) = &mut self.editing
             && let Some(f) = data.files.iter_mut().find(|f| *f.path() == e.path)
         {
-            let hunks = data
-                .hunks
-                .insert(e.path.clone(), review::parse_hunks(&e.patch));
+            let hunks = data.hunks.insert(e.path.clone(), review::hunks(&e.file));
             e.orig = (
                 std::mem::replace(f, e.file.clone()),
                 hunks.unwrap_or_default(),

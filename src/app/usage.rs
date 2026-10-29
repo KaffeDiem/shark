@@ -476,10 +476,15 @@ mod tests {
 
     #[test]
     fn usage_ring_thresholds_and_unknown_stale_labels() {
-        let mut theme = Theme::default();
-        theme.warning = rgb(0x654321).into();
-        theme.danger = rgb(0xff0000).into();
-        theme.sidebar_foreground = rgb(0x888888).into();
+        let theme = Theme {
+            colors: gpui_kit::component::theme::ThemeColor {
+                warning: rgb(0x654321).into(),
+                danger: rgb(0xff0000).into(),
+                sidebar_foreground: rgb(0x888888).into(),
+                ..Theme::default().colors
+            },
+            ..Default::default()
+        };
         for (remaining, expected) in [
             (Some(21.), theme.sidebar_foreground),
             (Some(20.), theme.warning),

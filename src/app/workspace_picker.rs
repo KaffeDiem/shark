@@ -20,13 +20,12 @@ pub(super) struct WorkspacePicker {
     minute: u64,
 }
 
+type RepoStatus = (String, IconName, Option<crate::complete::PrStatus>);
+
 #[derive(PartialEq)]
 pub(super) struct PickerWorkspace {
     name: String,
-    repos: Vec<(
-        String,
-        (String, IconName, Option<crate::complete::PrStatus>),
-    )>,
+    repos: Vec<(String, RepoStatus)>,
     last_interacted_at: Option<u64>,
     running: usize,
     attention: Attn,
@@ -101,7 +100,7 @@ fn rank(workspaces: &[PickerWorkspace], query: &str) -> Vec<String> {
 }
 
 /// Lifecycle is separate from the next Git action: failing checks must not hide Draft.
-fn status(repo: Option<&SyncRepo>) -> (String, IconName, Option<crate::complete::PrStatus>) {
+fn status(repo: Option<&SyncRepo>) -> RepoStatus {
     use crate::complete::PrStatus;
     match repo.and_then(|r| r.pr.as_ref()) {
         None => ("Not checked".into(), IconName::Clock, None),

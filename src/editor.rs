@@ -15,6 +15,22 @@ use std::time::{Duration, SystemTime};
 /// Bigger files open in the diff only; the editor is built for up to ~50K lines.
 pub const MAX_BYTES: u64 = 4 << 20;
 
+/// Reads only regular, bounded UTF-8 text; callers keep their own path and symlink policy.
+pub(crate) fn read_text(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let meta = std::fs::metadata(path)?;
+    if !meta.is_file() || meta.len() > MAX_BYTES {
+        return Err(std::io::Error::other("not an editable file or too large"));
+    }
+    let file = std::fs::File::open(path)?;
+    let mut bytes = vec![];
+    file.take(MAX_BYTES + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_BYTES || bytes.contains(&0) {
+        return Err(std::io::Error::other("binary or too large"));
+    }
+    String::from_utf8(bytes).map_err(std::io::Error::other)
+}
+
 pub enum EditorEvent {
     /// The file on disk now matches the buffer; the diff should refresh.
     Saved,
@@ -179,7 +195,7 @@ impl FileEditor {
                     if Some(stat) == seen || m.len() > MAX_BYTES {
                         return Ok(None);
                     }
-                    std::fs::read(&abs).map(|b| Some((stat, b)))
+                    read_text(&abs).map(|text| Some((stat, text)))
                 })
                 .await;
             this.update_in(cx, |e, window, cx| {
@@ -194,7 +210,7 @@ impl FileEditor {
                     return;
                 }
                 // Deleted or no longer UTF-8: keep the buffer and let the user decide.
-                let text = text.ok().and_then(|b| String::from_utf8(b).ok());
+                let text = text.ok();
                 match (text, fp) {
                     (Some(_), _) if e.dirty => e.conflict = true,
                     (None, _) => e.conflict = e.loaded,
@@ -628,6 +644,37 @@ mod tests {
     use super::{fingerprint, write_checked, write_staged};
 
     #[test]
+    fn text_reads_reject_binary_invalid_and_oversized_files() {
+        use std::fs;
+        let dir = std::env::temp_dir().join(format!("shark-read-text-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("file");
+        for text in ["", "λ\r\ntext\n"] {
+            fs::write(&file, text).unwrap();
+            assert_eq!(super::read_text(&file).unwrap(), text);
+        }
+        for bytes in [b"text\0binary".as_slice(), &[0xff]] {
+            fs::write(&file, bytes).unwrap();
+            assert!(super::read_text(&file).is_err());
+        }
+        fs::write(&file, "x".repeat(super::MAX_BYTES as usize)).unwrap();
+        assert_eq!(
+            super::read_text(&file).unwrap().len(),
+            super::MAX_BYTES as usize
+        );
+        fs::OpenOptions::new()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_len(super::MAX_BYTES + 1)
+            .unwrap();
+        assert!(super::read_text(&file).is_err());
+        assert!(super::read_text(&dir).is_err());
+        assert!(super::read_text(&dir.join("missing")).is_err());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn confirmed_save_restores_deleted_file_without_replacing_new_entries() {
         use std::{
             fs,
@@ -909,6 +956,15 @@ mod ui_tests {
             assert!(!editor.read(cx).is_focused(w, cx))
         })
         .unwrap();
+
+        // A binary replacement preserves the text and flags the conflict.
+        fs::write(&file, "binary\0replacement").unwrap();
+        cx.executor().advance_clock(Duration::from_secs(3));
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            editor.read(cx).conflict
+        })
+        .await;
+        assert_eq!(text(cx), "two\n");
 
         // Past the size cap the buffer stops following the file.
         fs::write(&file, "x".repeat(MAX_BYTES as usize + 1)).unwrap();

@@ -294,12 +294,7 @@ impl Settings {
     }
 
     pub(crate) fn appearance(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Appearance)) {
-        if let Some(a) = self.with_state(cx, |s| {
-            f(&mut s.appearance);
-            s.appearance.clone()
-        }) {
-            apply(&a, cx);
-        }
+        self.shark.update(cx, |s, cx| s.set_appearance(cx, f)).ok();
         cx.notify();
     }
 
@@ -438,19 +433,9 @@ impl Settings {
         let light = self.theme_strip(false, &saved.light, cx);
         let dark = self.theme_strip(true, &saved.dark, cx);
         let theme = cx.theme();
-        let modes = [
-            (Mode::System, "System", IconName::Monitor),
-            (Mode::Light, "Light", IconName::Sun),
-            (Mode::Dark, "Dark", IconName::Moon),
-        ];
-        let mode_group = h_flex()
-            .gap_1()
-            .children(modes.iter().map(|(m, label, icon)| {
-                let m = *m;
-                pill(label, Some(*icon), m == mode).on_click(
-                    cx.listener(move |this, _, _, cx| this.appearance(cx, |a| a.mode = m)),
-                )
-            }));
+        let mode_group = mode_buttons(mode, cx, |this, mode, cx| {
+            this.appearance(cx, |a| a.mode = mode)
+        });
         let sample = div()
             .px_3()
             .py_2()
@@ -590,14 +575,28 @@ const PAGES: &[(IconName, (&str, &str))] = &[
     ),
 ];
 
-/// A ghost button that shows its selection, so tabs and mode are tab stops with enter/space.
-pub(crate) fn pill(label: &'static str, icon: Option<IconName>, active: bool) -> Button {
-    Button::new(label)
-        .ghost()
-        .small()
-        .label(label)
-        .when_some(icon, |b, i| b.icon(i))
-        .selected(active)
+/// The same appearance mode controls in Settings and Home; each host saves its own state.
+pub(crate) fn mode_buttons<T: 'static>(
+    mode: Mode,
+    cx: &Context<T>,
+    on_select: fn(&mut T, Mode, &mut Context<T>),
+) -> Div {
+    h_flex().gap_1().children(
+        [
+            (Mode::System, "System", IconName::Monitor),
+            (Mode::Light, "Light", IconName::Sun),
+            (Mode::Dark, "Dark", IconName::Moon),
+        ]
+        .map(|(value, label, icon)| {
+            Button::new(label)
+                .ghost()
+                .small()
+                .label(label)
+                .icon(icon)
+                .selected(value == mode)
+                .on_click(cx.listener(move |this, _, _, cx| on_select(this, value, cx)))
+        }),
+    )
 }
 
 /// The small X that closes or dismisses something.

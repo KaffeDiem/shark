@@ -773,7 +773,6 @@ impl Shark {
 
 /// Saved paths are untrusted; only regular UTF-8 text within a workspace repo is editable.
 fn restore_file(ws: &Workspace, path: &str) -> Result<(PathBuf, String), String> {
-    use std::io::Read;
     use std::path::Component;
     let parts: Vec<_> = Path::new(path).components().collect();
     if parts.len() < 2
@@ -796,18 +795,7 @@ fn restore_file(ws: &Workspace, path: &str) -> Result<(PathBuf, String), String>
         if !abs.starts_with(root) {
             return Err(std::io::Error::other("path leaves its repository"));
         }
-        let meta = std::fs::metadata(&abs)?;
-        if !meta.is_file() || meta.len() > crate::editor::MAX_BYTES {
-            return Err(std::io::Error::other("not an editable file or too large"));
-        }
-        let file = std::fs::File::open(&abs)?;
-        let mut bytes = vec![];
-        file.take(crate::editor::MAX_BYTES + 1)
-            .read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > crate::editor::MAX_BYTES || bytes.contains(&0) {
-            return Err(std::io::Error::other("binary or too large"));
-        }
-        let text = String::from_utf8(bytes).map_err(std::io::Error::other)?;
+        let text = crate::editor::read_text(&abs)?;
         // Keep the opened path so polling and save checks still notice symlink changes.
         Ok((ws.dir().join(path), text))
     };

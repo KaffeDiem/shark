@@ -243,3 +243,13 @@ pub(crate) fn app_icon(app: &crate::apps::OpenApp) -> IconName {
         crate::apps::Kind::Xcode => IconName::FileCode,
     }
 }
+
+/// The common icon and truncating label layout for custom command-palette rows.
+pub(crate) fn command_row(icon: impl IntoElement, label: SharedString) -> Div {
+    h_flex()
+        .flex_1()
+        .gap_2()
+        .items_center()
+        .child(icon)
+        .child(div().flex_1().min_w_0().truncate().child(label))
+}

@@ -217,10 +217,8 @@ fn load(ws: &Workspace, file: &DiffFile) -> Result<(String, String, bool), Strin
     if std::fs::metadata(&abs).is_ok_and(|m| m.len() > crate::editor::MAX_BYTES) {
         return Err(format!("{path} is too large to edit in the diff"));
     }
-    let text = std::fs::read(&abs)
-        .ok()
-        .and_then(|b| String::from_utf8(b).ok())
-        .ok_or(format!("{path} can't be read as text"))?;
+    let text =
+        crate::editor::read_text(&abs).map_err(|e| format!("{path} can't be read as text: {e}"))?;
     let headers = file.extended_headers();
     let added = headers.iter().any(|h| h.starts_with("new file mode"));
     let sha = original_blob(file);
@@ -471,7 +469,7 @@ impl Differ {
         let (file, caret) = (e.file.clone(), e.caret());
         self.review
             .hunks
-            .insert(e.path.clone(), review::parse_hunks(&e.patch));
+            .insert(e.path.clone(), review::hunks(&e.file));
         if let Some(f) = self.diff_files.iter_mut().find(|f| f.path() == file.path()) {
             *f = file.clone();
         }
@@ -808,7 +806,12 @@ mod tests {
         assert_eq!(first_change("same\n", "same\n"), 0);
 
         // Every line is there to edit: far from the change, and with no change at all.
-        let rows = |p: &str| review::parse_hunks(p).iter().flatten().count();
+        let rows = |p: &str| {
+            review::hunks(&DiffFile::parse(p).unwrap()[0])
+                .iter()
+                .flatten()
+                .count()
+        };
         let long: String = (1..=20).map(|i| format!("{i}\n")).collect();
         assert_eq!(
             rows(&patch("api/f", &long, &long.replace("20\n", "x\n"), false)),
@@ -822,7 +825,7 @@ mod tests {
         // An empty or emptied file keeps a working line to edit.
         for (base, added) in [("", true), ("", false), ("a\nb\n", false)] {
             let p = patch("api/f", base, "", added);
-            let hunks = review::parse_hunks(&p);
+            let hunks = review::hunks(&DiffFile::parse(&p).unwrap()[0]);
             assert!(
                 hunks.iter().flatten().any(|r| r.0 != b'-' && r.2 == 1),
                 "{p}"

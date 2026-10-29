@@ -17,44 +17,40 @@ use std::cell::Cell;
 /// One hunk's patch lines: kind (`b' '`, `b'-'`, `b'+'`), old and new one-based line numbers.
 pub(crate) type Hunk = Vec<(u8, usize, usize)>;
 
-/// Hunks of one file's patch chunk, so the cursor knows the rows the diff draws.
-pub(crate) fn parse_hunks(chunk: &str) -> Vec<Hunk> {
-    let mut hunks: Vec<Hunk> = vec![];
-    let (mut old, mut new, mut inside) = (0, 0, false);
-    for line in chunk.lines() {
-        if let Some(rest) = line.strip_prefix("@@ -") {
-            let start = |s: &str| s.split(',').next()?.parse::<usize>().ok();
-            let mut parts = rest.split(' ');
-            let o = parts.next().and_then(start);
-            let n = parts.next().and_then(|s| start(s.strip_prefix('+')?));
-            inside = o.is_some() && n.is_some();
-            (old, new) = (o.unwrap_or(0), n.unwrap_or(0));
-            if inside {
-                hunks.push(vec![]);
-            }
-            continue;
-        }
-        let Some(h) = hunks.last_mut().filter(|_| inside) else {
-            continue;
-        };
-        match line.as_bytes().first() {
-            Some(b' ') | None => {
-                h.push((b' ', old, new));
-                (old, new) = (old + 1, new + 1);
-            }
-            Some(b'-') => {
-                h.push((b'-', old, 0));
-                old += 1;
-            }
-            Some(b'+') => {
-                h.push((b'+', 0, new));
-                new += 1;
-            }
-            Some(b'\\') => {}
-            _ => inside = false,
-        }
-    }
-    hunks
+/// Review coordinates from the same parsed document the diff renders.
+pub(crate) fn hunks(file: &DiffFile) -> Vec<Hunk> {
+    let mut offset = 0;
+    file.hunks()
+        .iter()
+        .map(|hunk| {
+            let count: usize = file.pairs()[hunk.pairs()]
+                .iter()
+                .map(|pair| match pair.is_changed() {
+                    true => pair.original().is_some() as usize + pair.modified().is_some() as usize,
+                    false => 1,
+                })
+                .sum();
+            let lines = &file.patch_lines()[offset..offset + count];
+            offset += count;
+            lines
+                .iter()
+                .map(|line| {
+                    let old = line
+                        .line(DiffSide::Original)
+                        .map(|ix| file.line_number(DiffSide::Original, ix));
+                    let new = line
+                        .line(DiffSide::Modified)
+                        .map(|ix| file.line_number(DiffSide::Modified, ix));
+                    let kind = match (old, new) {
+                        (Some(_), Some(_)) => b' ',
+                        (Some(_), None) => b'-',
+                        _ => b'+',
+                    };
+                    (kind, old.unwrap_or(0), new.unwrap_or(0))
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// A row the cursor can sit on: a file header or a source line.
@@ -1600,8 +1596,7 @@ impl Differ {
     /// it was sent. Read from disk, so it doesn't wait for the diff refresh.
     pub(crate) fn review_turn_done(
         &mut self,
-        ws: &str,
-        dir: &Path,
+        ws: &Workspace,
         id: &str,
         turn: usize,
         reply: &str,
@@ -1609,7 +1604,8 @@ impl Differ {
         cx: &mut Context<Self>,
     ) {
         let reports: HashMap<u64, String> = parse_reports(reply).into_iter().collect();
-        self.review.edit(ws, |list| {
+        let dir = ws.dir();
+        self.review.edit(&ws.name, |list| {
             for c in list.iter_mut() {
                 let ours = c.chat.as_deref() == Some(id) && !held.contains(&c.id);
                 if !ours || !matches!(c.status, Status::Sent { .. }) {
@@ -2239,7 +2235,7 @@ pub(crate) fn posted_as(url: &str) -> String {
 mod tests {
     use super::*;
 
-    const PATCH: &str = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,4 +1,4 @@ fn x\n a\n-b\n-c\n+B\n d\n\\ No newline at end of file\n@@ -10 +10,2 @@\n x\n+y\n";
+    const PATCH: &str = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,4 +1,3 @@ fn x\n a\n-b\n-c\n+B\n d\n@@ -10 +10,2 @@\n x\n+y\n\\ No newline at end of file\n";
 
     fn spots(rows: &[Row]) -> Vec<String> {
         rows.iter()
@@ -2252,7 +2248,8 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn rows_follow_the_diff_layout() {
-        let hunks = parse_hunks(PATCH);
+        let file = DiffFile::parse(PATCH).unwrap().remove(0);
+        let hunks = hunks(&file);
         assert_eq!(hunks.len(), 2);
         assert_eq!(hunks[0][3], (b'+', 0, 2));
         assert_eq!(hunks[1], [(b' ', 10, 10), (b'+', 0, 11)]);
@@ -2294,6 +2291,57 @@ mod tests {
         // the point where the end shows.
         assert_eq!(fit(&unified, 0, 8, 10.), 2);
         assert_eq!(fit(&unified, 5, 1, 10.), 0, "scrolloff above");
+    }
+
+    #[::core::prelude::v1::test]
+    fn review_hunks_use_validated_source_numbers_for_empty_sides_and_crlf() {
+        for (patch, expected) in [
+            (
+                "--- /dev/null\n+++ b/f\n@@ -0,0 +1,2 @@\n+one\n+two\n",
+                vec![(b'+', 0, 1), (b'+', 0, 2)],
+            ),
+            (
+                "--- a/f\n+++ /dev/null\n@@ -3,2 +0,0 @@\n-one\n-two\n",
+                vec![(b'-', 3, 0), (b'-', 4, 0)],
+            ),
+            (
+                "--- a/f\r\n+++ b/f\r\n@@ -5,2 +8,2 @@\r\n \r\n-old\r\n+new\r\n",
+                vec![(b' ', 5, 8), (b'-', 6, 0), (b'+', 0, 9)],
+            ),
+        ] {
+            let file = DiffFile::parse(patch).unwrap().remove(0);
+            assert_eq!(hunks(&file), vec![expected]);
+        }
+        let file = DiffFile::parse("diff --git a/f b/f\nold mode 100644\nnew mode 100755\n")
+            .unwrap()
+            .remove(0);
+        assert!(hunks(&file).is_empty());
+    }
+
+    #[::core::prelude::v1::test]
+    fn review_hunk_projection_preserves_unequal_change_runs_after_empty_hunks() {
+        for deleted in 0..=4 {
+            for added in 0..=4 {
+                let mut patch = format!(
+                    "--- a/f\n+++ b/f\n@@ -0,0 +0,0 @@\n@@ -10,{} +20,{} @@\n \n",
+                    deleted + 2,
+                    added + 2
+                );
+                let mut expected = vec![(b' ', 10, 20)];
+                for i in 0..deleted {
+                    patch.push_str("-old\n");
+                    expected.push((b'-', 11 + i, 0));
+                }
+                for i in 0..added {
+                    patch.push_str("+new\n");
+                    expected.push((b'+', 0, 21 + i));
+                }
+                patch.push_str(" tail\n\\ No newline at end of file\n");
+                expected.push((b' ', 11 + deleted, 21 + added));
+                let file = DiffFile::parse(&patch).unwrap().remove(0);
+                assert_eq!(hunks(&file), vec![vec![], expected], "{patch}");
+            }
+        }
     }
 
     #[::core::prelude::v1::test]

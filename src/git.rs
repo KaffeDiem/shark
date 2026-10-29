@@ -577,36 +577,22 @@ fn pr_remote(src: &Path, pr: &PullRequest) -> Result<String, String> {
             "Pull request base is missing; refresh pull requests and select it again".into(),
         );
     }
-    let path = pr
-        .url
-        .strip_prefix("https://")
-        .ok_or("Invalid pull request URL")?;
-    let parts: Vec<_> = path.split('/').collect();
-    if parts.len() != 5
-        || parts[3] != "pull"
-        || parts[4].parse::<u64>().ok() != Some(pr.number)
-        || pr.number == 0
-        || parts[..3].iter().any(|p| {
-            p.is_empty()
-                || !p
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b".-_:".contains(&b))
-        })
-    {
+    let target = crate::pr::git_feature::Target::from_url(&pr.url)?;
+    if target.number != pr.number {
         return Err("Invalid pull request URL".into());
     }
     git(
         src,
         &["check-ref-format", &format!("refs/heads/{}", pr.base)],
     )?;
-    let repo = format!("{}/{}", parts[1], parts[2]);
-    let remote = format!("https://{}/{repo}.git", parts[0]);
+    let repo = format!("{}/{}", target.owner, target.repo);
+    let remote = format!("https://{}/{repo}.git", target.host);
     let origin = git(src, &["remote", "get-url", "origin"]).unwrap_or_default();
     let origin = origin.trim_end_matches('/').trim_end_matches(".git");
     let matching_origin = [
-        format!("https://{}/{repo}", parts[0]),
-        format!("git@{}:{repo}", parts[0]),
-        format!("ssh://git@{}/{repo}", parts[0]),
+        format!("https://{}/{repo}", target.host),
+        format!("git@{}:{repo}", target.host),
+        format!("ssh://git@{}/{repo}", target.host),
     ]
     .contains(&origin.to_string());
     Ok(if matching_origin {
@@ -1166,6 +1152,52 @@ pub fn combined_diff(ws: &Workspace, dir: &Path, uncommitted_only: bool) -> Resu
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn review_remote_shares_pr_identity_validation_and_reuses_origin() {
+        let root = std::env::temp_dir().join(format!("shark-pr-remote-{}", std::process::id()));
+        let repo = init_repo(&root, "api");
+        let mut pr = PullRequest {
+            number: 7,
+            url: "https://GITHUB.com/o/upstream/pull/7/".into(),
+            base: "release".into(),
+        };
+        assert_eq!(
+            pr_remote(&repo.path, &pr).unwrap(),
+            "https://github.com/o/upstream.git"
+        );
+        for origin in [
+            "https://github.com/o/upstream.git",
+            "git@github.com:o/upstream.git",
+            "ssh://git@github.com/o/upstream.git",
+        ] {
+            git(&repo.path, &["config", "remote.origin.url", origin]).unwrap();
+            assert_eq!(pr_remote(&repo.path, &pr).unwrap(), "origin");
+        }
+        for url in [
+            "https://github.com/o/upstream/pull/8",
+            "https://github.com/o/../pull/7",
+            "https://github.com/./upstream/pull/7",
+            "https://github.com/o/repo:other/pull/7",
+            "https://user@github.com/o/upstream/pull/7",
+            "https://github.com/o/upstream/pull/7?x=y",
+        ] {
+            pr.url = url.into();
+            assert!(pr_remote(&repo.path, &pr).is_err(), "{url}");
+        }
+        pr.url = "https://github.com/o/upstream/pull/7".into();
+        for base in ["", "../main", "bad..name"] {
+            pr.base = base.into();
+            assert!(pr_remote(&repo.path, &pr).is_err(), "{base}");
+        }
+        pr.base = "release".into();
+        pr.url = "https://github.example.org:8443/o/upstream/pull/7".into();
+        assert_eq!(
+            pr_remote(&repo.path, &pr).unwrap(),
+            "https://github.example.org:8443/o/upstream.git"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn included_secrets_require_absent_ignored_destination() {

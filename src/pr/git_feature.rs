@@ -30,7 +30,19 @@ impl Target {
                 && s.bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
         };
-        if parts.len() != 5 || parts[3] != "pull" || !parts[..3].iter().all(|s| valid(s)) {
+        let valid_host = |host: &str| match host.split_once(':') {
+            Some((host, port)) => {
+                valid(host)
+                    && port.bytes().all(|b| b.is_ascii_digit())
+                    && port.parse::<u16>().is_ok_and(|port| port > 0)
+            }
+            None => valid(host),
+        };
+        if parts.len() != 5
+            || parts[3] != "pull"
+            || !valid_host(parts[0])
+            || !parts[1..3].iter().all(|s| valid(s))
+        {
             return Err("Invalid GitHub pull request URL".into());
         }
         let number = parts[4]
@@ -142,9 +154,7 @@ impl<'a> Client<'a> {
             args.extend(["-f".into(), format!("{key}={value}")]);
         }
         let refs: Vec<_> = args.iter().map(String::as_str).collect();
-        let gh = super::gh();
-        let out = crate::git::cmd_bounded(self.wt, &gh, &refs, remaining.min(30)).map_err(|e| {
-            let error = super::gh_error(&e, &format!("{gh} {}: ", refs.join(" ")));
+        let out = super::gh_request(self.wt, &refs, remaining.min(30)).map_err(|error| {
             if mutation && error.contains("timed out") {
                 "GitHub timed out; the change may have been saved. Refresh and check before retrying.".into()
             } else { error }
@@ -223,7 +233,6 @@ pub fn discover(wt: &Path, branch: &str) -> Result<Option<Target>, String> {
     }
     let origin = crate::git::git(wt, &["config", "--get", "remote.origin.url"])?;
     let origin = crate::sync::github_url(&origin).ok_or("Origin is not a GitHub repository")?;
-    let gh = super::gh();
     let args = [
         "pr",
         "list",
@@ -238,8 +247,7 @@ pub fn discover(wt: &Path, branch: &str) -> Result<Option<Target>, String> {
         "--limit",
         "100",
     ];
-    let out = crate::git::cmd_bounded(wt, &gh, &args, 30)
-        .map_err(|e| super::gh_error(&e, &format!("{gh} {}: ", args.join(" "))))?;
+    let out = super::gh_request(wt, &args, 30)?;
     let prs: Vec<Value> =
         serde_json::from_str(&out).map_err(|e| format!("Invalid GitHub response: {e}"))?;
     let own: Vec<_> = prs

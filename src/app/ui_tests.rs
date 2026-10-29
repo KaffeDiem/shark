@@ -2632,19 +2632,30 @@ async fn command_click_file_tabs(cx: &mut TestAppContext) {
         shark.read(cx).differ.read(cx).editing().is_some()
     })
     .await;
-    on(cx, &|s, w, cx| {
-        s.differ
-            .update(cx, |d, _| d.editing_mut().as_mut().unwrap().dirty = true);
-        s.show(Tab::Feature(Feature::Diff), w, cx);
-    });
-    press(cx, &["ctrl-3"]);
-    cx.update(|cx| {
-        assert_eq!(
-            shark.read(cx).tab,
-            Tab::Feature(Feature::Diff),
-            "a tab switch must not bypass the inline-edit guard"
-        )
-    });
+    for (dirty, saving) in [(true, false), (false, true)] {
+        on(cx, &|s, w, cx| {
+            s.differ.update(cx, |d, _| {
+                let edit = d.editing_mut().as_mut().unwrap();
+                edit.dirty = dirty;
+                edit.saving = saving;
+            });
+            s.show(Tab::Feature(Feature::Diff), w, cx);
+        });
+        press(cx, &["ctrl-3"]);
+        cx.update(|cx| {
+            assert_eq!(
+                shark.read(cx).tab,
+                Tab::Feature(Feature::Diff),
+                "a tab switch must not bypass the inline-edit guard"
+            )
+        });
+        on(cx, &|s, w, cx| {
+            s.open_path("api/a.txt".into(), w, cx);
+            assert_eq!(s.tab, Tab::Feature(Feature::Diff));
+            s.open_path_tab("api/a.txt".into(), w, cx);
+            assert_eq!(s.tab, Tab::Feature(Feature::Diff));
+        });
+    }
     fs::remove_dir_all(&home).ok();
 }
 
@@ -7765,9 +7776,9 @@ async fn review_followups(cx: &mut TestAppContext) {
             c.last_reply.clone(),
             c.unread_review_ids(true),
         );
-        let dir = s.ws(&ws).unwrap().dir();
+        let workspace = s.ws(&ws).unwrap();
         s.differ.update(cx, |d, cx| {
-            d.review_turn_done(&ws, &dir, &id, turn, &reply, &held, cx)
+            d.review_turn_done(workspace, &id, turn, &reply, &held, cx)
         });
     });
     assert_eq!(comment(cx).status, Status::Sent { turn: 1 });
@@ -7781,9 +7792,9 @@ async fn review_followups(cx: &mut TestAppContext) {
             c.last_reply.clone(),
             c.unread_review_ids(true),
         );
-        let dir = s.ws(&ws).unwrap().dir();
+        let workspace = s.ws(&ws).unwrap();
         s.differ.update(cx, |d, cx| {
-            d.review_turn_done(&ws, &dir, &id, turn, &reply, &held, cx)
+            d.review_turn_done(workspace, &id, turn, &reply, &held, cx)
         });
     });
     assert_eq!(

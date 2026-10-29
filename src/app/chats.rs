@@ -122,12 +122,11 @@ impl Shark {
                         this.refresh_home(Some(&name), cx);
                         this.turn_done(&name, cx);
                         if let Some(ws) = this.ws(&name) {
-                            let dir = ws.dir();
                             let c = chat.read(cx);
                             let (turn, reply, held) =
                                 (c.last_turn, c.last_reply.clone(), c.unread_review_ids(true));
                             this.differ.update(cx, |d, cx| {
-                                d.review_turn_done(&name, &dir, &id, turn, &reply, &held, cx)
+                                d.review_turn_done(ws, &id, turn, &reply, &held, cx)
                             });
                         }
                         cx.notify();
