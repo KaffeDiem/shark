@@ -212,6 +212,7 @@ impl Shark {
 
     pub(super) fn enter_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.home.on = true;
+        self.zen = false;
         self.remember_open();
         self.refresh_home(None, cx);
         self.scan_approved(cx);
@@ -235,6 +236,11 @@ impl Shark {
             _ if self.active.is_some() && matches!(self.tab, Tab::Feature(_)) => {
                 if let Tab::Feature(feature) = self.tab {
                     self.focus_feature(feature, FeatureFocus::Main, window, cx);
+                }
+            }
+            _ if self.zen_shown() => {
+                if let Some(&pane) = self.panes(cx).first() {
+                    self.focus_pane(pane, window, cx)
                 }
             }
             (false, _) => self.sidebar_focus.focus(window, cx),
