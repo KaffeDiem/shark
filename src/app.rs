@@ -436,13 +436,12 @@ impl Shark {
         if self.home_shown() {
             return notify_err(window, cx, "Open a workspace first");
         }
+        // Out of the hidden sidebar or rail, into the content; a field already in the content
+        // (a side question) keeps the focus.
+        let kept = self.content_focus.contains_focused(window, cx)
+            && !self.features_focus.contains_focused(window, cx);
         self.zen = true;
-        // Out of the hidden sidebar or rail, into the content.
-        if matches!(
-            self.focused_pane(window, cx),
-            None | Some(Pane::Sidebar | Pane::Features)
-        ) && let Some(&pane) = self.panes(cx).first()
-        {
+        if !kept && let Some(&pane) = self.panes(cx).first() {
             self.focus_pane(pane, window, cx);
         }
         cx.notify();

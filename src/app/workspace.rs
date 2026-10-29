@@ -1955,6 +1955,7 @@ impl Shark {
                 let _ = self.state.save();
                 if self.active.as_deref() == Some(name) {
                     self.active = None;
+                    self.zen = false;
                     self.drop_editor();
                     self.reset_differ_workspace(window, cx);
                     self.tab = Tab::Chat;

@@ -682,5 +682,29 @@ async fn zen_shows_only_the_tab(cx: &mut TestAppContext) {
     zen(cx, false, Tab::Chat);
     press(cx, &["cmd-.", "cmd-."]);
     zen(cx, false, Tab::Chat);
+    // Home ends Zen; coming back doesn't restore it.
+    press(cx, &["cmd-.", "cmd-0", "cmd-0"]);
+    zen(cx, false, Tab::Chat);
+    // Naming a section needs the sidebar: Zen ends and the field has the keys.
+    press(cx, &["cmd-."]);
+    on(cx, &|s, w, cx| s.start_naming(None, None, w, cx));
+    zen(cx, false, Tab::Chat);
+    on(cx, &|s, w, cx| {
+        assert!(s.sidebar_focus.contains_focused(w, cx))
+    });
+    press(cx, &["escape"]);
+    // A side question's field keeps the keys through Zen.
+    on(cx, &|s, w, cx| {
+        let chat = s.active_chat().unwrap().clone();
+        chat.update(cx, |c, cx| c.open_side(w, cx));
+    });
+    let focused =
+        |cx: &mut TestAppContext| cx.update_window(window, |_, w, cx| w.focused(cx)).unwrap();
+    let side = focused(cx);
+    press(cx, &["cmd-."]);
+    zen(cx, true, Tab::Chat);
+    assert_eq!(focused(cx), side);
+    press(cx, &["cmd-."]);
+    assert_eq!(focused(cx), side);
     fs::remove_dir_all(&home).ok();
 }

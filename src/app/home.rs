@@ -212,6 +212,7 @@ impl Shark {
 
     pub(super) fn enter_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.home.on = true;
+        self.zen = false;
         self.remember_open();
         self.refresh_home(None, cx);
         self.scan_approved(cx);

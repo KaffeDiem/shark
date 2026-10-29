@@ -414,7 +414,9 @@ impl Shark {
                 i.select_all(window, cx);
             })
         });
+        // The field lives in the sidebar, which Zen hides.
         self.rail = false;
+        self.zen = false;
         self.naming = Some(Naming {
             rename,
             then_move,
