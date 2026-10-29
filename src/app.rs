@@ -110,7 +110,7 @@ pub struct Shark {
     adding_repos: HashSet<String>,
     /// Sidebar shrunk to icons by the user.
     rail: bool,
-    /// Zen mode (cmd-.): only the shown chat; see `zen_shown`.
+    /// Zen mode (cmd-.): only the shown tab's content; see `zen_shown`.
     zen: bool,
     editor: Option<Entity<FileEditor>>,
     file_tabs: Vec<editor_pane::FileTab>,
@@ -392,8 +392,6 @@ impl Shark {
             self.feature_sel = Feature::ALL.iter().position(|f| *f == feature).unwrap();
         }
         self.tab = tab;
-        // Diff, Git or a file ends Zen; it only ever shows a chat.
-        self.zen &= tab == Tab::Chat;
         self.home.on = false;
         self.remember_open();
         self.reveal_tab(cx);
@@ -415,13 +413,19 @@ impl Shark {
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        // In Zen the sidebar is hidden; cmd-b brings it back by leaving Zen.
+        if self.zen_shown() {
+            self.zen = false;
+            return cx.notify();
+        }
         self.rail = !self.rail;
         cx.notify();
     }
 
-    /// Zen hides everything but the chat, while there's one to show.
+    /// Zen hides the sidebar, tabs, header and Features rail around the shown chat, Diff, Git
+    /// or file; Home ends it.
     fn zen_shown(&self) -> bool {
-        self.zen && !self.home_shown() && self.tab == Tab::Chat && self.active_chat().is_some()
+        self.zen && !self.home_shown()
     }
 
     fn toggle_zen(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -429,22 +433,26 @@ impl Shark {
             self.zen = false;
             return cx.notify();
         }
-        if self.active.is_none() || self.active_ws().is_some_and(|w| w.chats.is_empty()) {
-            return notify_err(window, cx, "Open a chat first");
+        if self.home_shown() {
+            return notify_err(window, cx, "Open a workspace first");
         }
-        self.show(Tab::Chat, window, cx);
         self.zen = true;
+        // Out of the hidden sidebar or rail, into the content.
+        if matches!(
+            self.focused_pane(window, cx),
+            None | Some(Pane::Sidebar | Pane::Features)
+        ) && let Some(&pane) = self.panes(cx).first()
+        {
+            self.focus_pane(pane, window, cx);
+        }
+        cx.notify();
     }
 
     fn panes(&self, cx: &App) -> Vec<Pane> {
-        if self.zen_shown() {
-            let plan = self.active_chat().is_some_and(|c| c.read(cx).plan_open);
-            return [Pane::Chat]
-                .into_iter()
-                .chain(plan.then_some(Pane::Plan))
-                .collect();
-        }
-        let mut v = vec![Pane::Sidebar];
+        let mut v = match self.zen_shown() {
+            true => vec![],
+            false => vec![Pane::Sidebar],
+        };
         if self.home_shown() {
             v.push(Pane::Home);
             return v;
@@ -729,25 +737,29 @@ impl Shark {
                         )
                     }),
             )
-            .child(match self.tab {
-                // Cached: the sidebar spinner redraws this view every frame, the chat only on change.
-                Tab::Chat => {
-                    div()
-                        .flex_1()
-                        .min_h_0()
-                        .children(self.active_chat().map(|chat| {
-                            chat.clone().cached(StyleRefinement::default().size_full())
-                        }))
-                        .into_any_element()
-                }
-                Tab::Feature(feature) => self.render_feature(feature, cx),
-                Tab::File => h_flex()
-                    .flex_1()
-                    .min_h_0()
-                    .child(self.render_editor(cx))
-                    .into_any_element(),
-            })
+            .child(self.render_tab(cx))
             .into_any_element()
+    }
+
+    /// The shown tab's content, below the header (or Zen's bar).
+    fn render_tab(&self, cx: &mut Context<Self>) -> AnyElement {
+        match self.tab {
+            // Cached: the sidebar spinner redraws this view every frame, the chat only on change.
+            Tab::Chat => div()
+                .flex_1()
+                .min_h_0()
+                .children(
+                    self.active_chat()
+                        .map(|chat| chat.clone().cached(StyleRefinement::default().size_full())),
+                )
+                .into_any_element(),
+            Tab::Feature(feature) => self.render_feature(feature, cx),
+            Tab::File => h_flex()
+                .flex_1()
+                .min_h_0()
+                .child(self.render_editor(cx))
+                .into_any_element(),
+        }
     }
 
     /// The header's branch label, `base ← branch`, with a stack icon and the branch's place in
@@ -853,24 +865,33 @@ impl Shark {
                     }))
             })
     }
-    /// Zen (cmd-.): the chat alone on its own background, clear of the traffic lights.
-    fn render_zen(&self, chat: Entity<Chat>, cx: &mut Context<Self>) -> Div {
+    /// Zen (cmd-.): the shown tab alone on the content background. Its bar keeps the traffic
+    /// lights clear, drags the window and holds the tab's own controls (Diff's).
+    fn render_zen(&self, cx: &mut Context<Self>) -> Div {
+        let controls = self.render_feature_controls(cx);
         let zen = v_flex()
             .size_full()
             .child(
-                div()
-                    .id("zen-titlebar")
+                h_flex()
                     .h(px(44.))
                     .flex_none()
-                    .map(|d| self.draggable_chrome("zen-titlebar", d)),
+                    .pl(px(80.))
+                    .pr(px(16.))
+                    .when(controls.is_some(), |d| {
+                        d.border_b_1().border_color(cx.theme().border)
+                    })
+                    .child(
+                        div()
+                            .id("zen-titlebar")
+                            .flex_1()
+                            .min_w_0()
+                            .h_full()
+                            .map(|d| self.draggable_chrome("zen-titlebar", d)),
+                    )
+                    .children(controls),
             )
             .children(self.render_unsaved(cx))
-            .child(
-                div()
-                    .flex_1()
-                    .min_h_0()
-                    .child(chat.cached(StyleRefinement::default().size_full())),
-            );
+            .child(v_flex().flex_1().min_h_0().child(self.render_tab(cx)));
         h_flex()
             .size_full()
             .child(self.interaction_content(zen.into_any_element(), cx))
@@ -912,12 +933,13 @@ impl Render for Shark {
         if self.tree_shown(cx) {
             side += self.differ.read(cx).files_width(cx);
         }
+        let top = if self.zen_shown() { px(60.) } else { px(104.) };
         if cx.theme().notification.margins.right != side + px(16.)
-            || cx.theme().notification.margins.top != px(104.)
+            || cx.theme().notification.margins.top != top
         {
             let margins = &mut Theme::global_mut(cx).notification.margins;
             margins.right = side + px(16.);
-            margins.top = px(104.);
+            margins.top = top;
         }
         let theme = cx.theme();
         h_flex()
@@ -1068,66 +1090,64 @@ impl Render for Shark {
             .children(self.render_app_switcher(window, cx))
             .children(self.render_usage(window, cx))
             .when(self.zen_shown(), |d| d.bg(cx.theme().background))
-            .child(
-                match self.zen_shown().then(|| self.active_chat().cloned()) {
-                    Some(Some(chat)) => self.render_zen(chat, cx),
-                    _ => {
-                        // Content sits below the titlebar, touching a rail or inset 8px beside an expanded pane.
-                        let island = div()
-                            .size_full()
-                            .pb(px(8.))
-                            .min_h_0()
-                            .flex_1()
-                            .when(!self.rail, |d| d.pl(px(8.)))
-                            .when(!self.right_rail_shown(), |d| d.pr(px(8.)))
-                            .child(
-                                h_flex()
-                                    .id("content-island")
-                                    .size_full()
-                                    .rounded(cx.theme().radius_lg)
-                                    .border_1()
-                                    .border_color(cx.theme().border)
-                                    .bg(cx.theme().background)
-                                    .overflow_hidden()
-                                    .child(self.render_main(window, cx))
-                                    .test_support(),
-                            );
-                        let main = v_flex()
-                            .h_full()
-                            .flex_1()
-                            .min_w_0()
-                            .child(self.render_titlebar(window, cx))
-                            .children(self.render_unsaved(cx))
-                            .child(island);
-                        let main = h_flex()
-                            .size_full()
-                            .min_w_0()
-                            .child(main)
-                            .when(self.right_rail_shown(), |d| {
-                                d.child(self.render_features(window, cx))
-                            })
-                            .into_any_element();
-                        let main = self.interaction_content(main, cx);
-                        let sidebar = self.render_sidebar(window, cx).into_any_element();
-                        match self.rail {
-                            true => h_flex().size_full().child(sidebar).child(main),
-                            // Dragged like Files, between 200 and 480.
-                            false => h_flex().size_full().child(
-                                h_resizable("sidebar-panel")
-                                    .with_state(&self.sidebar_resize)
-                                    .with_handle_appearance(quiet_edge())
-                                    .child(
-                                        resizable_panel()
-                                            .size(px(self.state.sidebar_width.unwrap_or(244.)))
-                                            .size_range(px(200.)..px(480.))
-                                            .fixed()
-                                            .child(sidebar),
-                                    )
-                                    .child(resizable_panel().min_w_0().child(main)),
-                            ),
-                        }
+            .child(match self.zen_shown() {
+                true => self.render_zen(cx),
+                false => {
+                    // Content sits below the titlebar, touching a rail or inset 8px beside an expanded pane.
+                    let island = div()
+                        .size_full()
+                        .pb(px(8.))
+                        .min_h_0()
+                        .flex_1()
+                        .when(!self.rail, |d| d.pl(px(8.)))
+                        .when(!self.right_rail_shown(), |d| d.pr(px(8.)))
+                        .child(
+                            h_flex()
+                                .id("content-island")
+                                .size_full()
+                                .rounded(cx.theme().radius_lg)
+                                .border_1()
+                                .border_color(cx.theme().border)
+                                .bg(cx.theme().background)
+                                .overflow_hidden()
+                                .child(self.render_main(window, cx))
+                                .test_support(),
+                        );
+                    let main = v_flex()
+                        .h_full()
+                        .flex_1()
+                        .min_w_0()
+                        .child(self.render_titlebar(window, cx))
+                        .children(self.render_unsaved(cx))
+                        .child(island);
+                    let main = h_flex()
+                        .size_full()
+                        .min_w_0()
+                        .child(main)
+                        .when(self.right_rail_shown(), |d| {
+                            d.child(self.render_features(window, cx))
+                        })
+                        .into_any_element();
+                    let main = self.interaction_content(main, cx);
+                    let sidebar = self.render_sidebar(window, cx).into_any_element();
+                    match self.rail {
+                        true => h_flex().size_full().child(sidebar).child(main),
+                        // Dragged like Files, between 200 and 480.
+                        false => h_flex().size_full().child(
+                            h_resizable("sidebar-panel")
+                                .with_state(&self.sidebar_resize)
+                                .with_handle_appearance(quiet_edge())
+                                .child(
+                                    resizable_panel()
+                                        .size(px(self.state.sidebar_width.unwrap_or(244.)))
+                                        .size_range(px(200.)..px(480.))
+                                        .fixed()
+                                        .child(sidebar),
+                                )
+                                .child(resizable_panel().min_w_0().child(main)),
+                        ),
                     }
-                },
-            )
+                }
+            })
     }
 }
