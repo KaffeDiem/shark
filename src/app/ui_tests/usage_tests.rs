@@ -425,6 +425,52 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 )))
                                 .unwrap();
                         }
+                        if view != "home" || available != "both" {
+                            continue;
+                        }
+                        // The hover card over a seeded heatmap, panel closed.
+                        cx.update_window(window, |_, w, cx| {
+                            shark.update(cx, |s, cx| {
+                                s.close_usage(w, cx);
+                                let today = crate::usage::activity::local_day(crate::usage::now());
+                                s.usage_activity[0] = crate::usage::activity::Daily {
+                                    first_day: today - 139,
+                                    tokens: (0..140u64)
+                                        .map(|i| match i * 7919 % 11 {
+                                            0..=2 => 0,
+                                            n => n * n * 40_000 + i * 9_000,
+                                        })
+                                        .collect(),
+                                };
+                                cx.notify();
+                            });
+                            w.render_frame(cx);
+                            w.hover("usage-trigger-Claude", cx);
+                        })
+                        .unwrap();
+                        cx.advance_clock(Duration::from_secs(1));
+                        cx.update_window(window, |_, w, cx| {
+                            w.render_frame(cx);
+                            let card = w.find("usage-card-Claude").bounds();
+                            assert!(card.top() >= px(0.) && card.right() <= px(width));
+                            let footer = w.find("usage-footer").bounds();
+                            assert!(card.bottom() <= footer.top() + px(8.), "{card:?}");
+                        })
+                        .unwrap();
+                        let screenshot = cx.capture_screenshot(window).expect("hover card");
+                        if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
+                            screenshot
+                                .save(PathBuf::from(dir).join(format!(
+                                    "usage-hover-{label}-{}-{rail}.png",
+                                    width as usize
+                                )))
+                                .unwrap();
+                        }
+                        cx.update_window(window, |_, w, cx| {
+                            w.pointer_move(point(px(width - 10.), px(10.)), None, cx);
+                        })
+                        .unwrap();
+                        cx.advance_clock(Duration::from_secs(1));
                     }
                 }
             }
