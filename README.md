@@ -49,7 +49,7 @@ A workspace can start from another branch or an open PR instead of `main`: its P
 brew tap KaffeDiem/shark https://github.com/KaffeDiem/shark
 brew install --cask KaffeDiem/shark/shark
 ```
-Or [Download Shark 0.1.15](https://github.com/KaffeDiem/shark/releases/download/v0.1.15/Shark-0.1.15.dmg) (Apple Silicon), open it and drag Shark to Applications. The app isn't notarized: on first launch, open it, then allow it in System Settings → Privacy & Security → Open Anyway, or run `xattr -dr com.apple.quarantine /Applications/Shark.app`.
+Or [Download Shark 0.1.16](https://github.com/KaffeDiem/shark/releases/download/v0.1.16/Shark-0.1.16.dmg) (Apple Silicon), open it and drag Shark to Applications. The app isn't notarized: on first launch, open it, then allow it in System Settings → Privacy & Security → Open Anyway, or run `xattr -dr com.apple.quarantine /Applications/Shark.app`.
 
 Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH. For Codex models (GPT-6.1 Sol, GPT-6 Astra), also `codex`, logged in with `codex login` (a ChatGPT plan works). Codex chats have no side questions. They have a **Fast** toggle for Codex's faster service tier, which uses more of your plan's usage.
 
