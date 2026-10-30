@@ -956,6 +956,7 @@ impl Shark {
             self._subs.push(cx.observe(&sync, |s, sync, cx| {
                 if s.active_sync() == Some(&sync) {
                     s.configure_differ(cx);
+                    s.configure_git(cx);
                     s.differ.update(cx, |_, cx| cx.notify());
                 }
             }));
@@ -1711,8 +1712,13 @@ impl Shark {
         if let Some(sync) = self.syncs.get(&ws.name) {
             sync.update(cx, |g, cx| g.set_workspace(ws.clone(), cx));
         }
-        if let Some(git) = self.git_features.get(&ws.name) {
-            git.update(cx, |g, cx| g.set_workspace(ws.clone(), window, cx));
+        if let Some(git) = self.git_features.get(&ws.name).cloned() {
+            // The effective bases, as Git already has them, so its history isn't reset.
+            let git_ws = (self.active.as_ref() == Some(&ws.name))
+                .then(|| self.effective_workspace(cx))
+                .flatten()
+                .unwrap_or_else(|| ws.clone());
+            git.update(cx, |g, cx| g.set_workspace(git_ws, window, cx));
         }
         if self.active.as_ref() == Some(&ws.name) {
             self.refresh_diff(cx);

@@ -1,5 +1,6 @@
 use crate::state::{Repo, Workspace, WsRepo};
 mod changes;
+pub mod history;
 pub use changes::{discard_file, uncommitted_files};
 use std::{
     fs,
@@ -69,13 +70,40 @@ pub fn cmd_bounded(dir: &Path, prog: &str, args: &[&str], secs: u64) -> Result<S
 /// with it. A session, not just a group: an interactive shell in a background group of the
 /// terminal Shark was started from stops on SIGTTOU.
 pub fn wait_bounded(
-    mut c: Command,
+    c: Command,
     dir: &Path,
     prog: &str,
     args: &[&str],
     secs: u64,
     group: bool,
 ) -> Result<String, String> {
+    finish(prog, args, wait_output(c, dir, prog, args, secs, group)?)
+}
+
+/// Like `git`, but stdout stays raw bytes (blobs are binary) and a hung process is killed after
+/// `secs`.
+pub fn git_bytes(dir: &Path, args: &[&str], secs: u64) -> Result<Vec<u8>, String> {
+    let mut c = Command::new("git");
+    c.env("GIT_TERMINAL_PROMPT", "0");
+    let out = wait_output(c, dir, "git", args, secs, false)?;
+    match out.status.success() {
+        true => Ok(out.stdout),
+        false => Err(format!(
+            "git {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        )),
+    }
+}
+
+fn wait_output(
+    mut c: Command,
+    dir: &Path,
+    prog: &str,
+    args: &[&str],
+    secs: u64,
+    group: bool,
+) -> Result<Output, String> {
     if group {
         unsafe extern "C" {
             fn setsid() -> i32;
@@ -102,7 +130,7 @@ pub fn wait_bounded(
     // wait_with_output drains both pipes, so a big gh response can't fill one and deadlock.
     std::thread::spawn(move || tx.send(child.wait_with_output()));
     match rx.recv_timeout(Duration::from_secs(secs)) {
-        Ok(out) => finish(prog, args, out.map_err(|e| format!("{prog}: {e}"))?),
+        Ok(out) => out.map_err(|e| format!("{prog}: {e}")),
         Err(_) => {
             // The waiting thread reaps it. An interactive shell ignores TERM.
             match group {

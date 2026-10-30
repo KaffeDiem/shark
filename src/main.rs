@@ -15,6 +15,7 @@ mod features;
 mod file_icon;
 mod files;
 mod git;
+mod media;
 mod menu;
 mod menubar;
 mod overflow_fade;
@@ -335,6 +336,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-s", SaveFile, Some("DiffPane")),
         KeyBinding::new("cmd-s", SaveFile, Some("GitFeature")),
         KeyBinding::new("escape", CancelEdit, Some("GitFeature")),
+        KeyBinding::new("enter", Confirm, Some("GitCommits && !Input")),
         KeyBinding::new("c", AddComment, Some(DIFF)),
         // Plan mode; in the composer shift-tab is caught before the input outdents.
         KeyBinding::new(

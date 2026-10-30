@@ -1,12 +1,16 @@
-//! Images and videos in the diff: a before/after row under the file's header.
+//! Images and videos shared by Diff and Git: a before/after row, or one side alone.
 //!
-//! Both sides are named by the blob hash git prints on the patch's `index` line (git hashes
-//! working-tree files too), so every byte copy and preview is cached on disk by content and
-//! never goes stale. Previews are capped at `MAX` px: gpui keeps every decoded image at full
+//! Each side names where its bytes come from: the working tree, an exact Git blob, or a
+//! downloaded file. Blob sides are named by their hash (git hashes working-tree files too), so
+//! every byte copy and preview is cached on disk by content and never goes stale. Previews are capped at `MAX` px: gpui keeps every decoded image at full
 //! size, in memory and on the GPU, until it is dropped, and `Lru` drops the oldest ones.
 //! Videos play inline through AVFoundation, which hands decoded NV12 frames straight to gpui's
 //! `surface()`, one video at a time.
-use super::*;
+use gpui_kit::assets::IconName;
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::{ActiveTheme, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use objc2::AnyThread as _;
 use objc2::rc::Retained;
 use objc2::runtime::AnyObject;
@@ -22,8 +26,13 @@ use objc2_core_video::{
 use objc2_foundation::{MainThreadMarker, NSDictionary, NSNumber, NSString, NSURL};
 use std::collections::VecDeque;
 use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
+
+pub(crate) mod fetch;
 
 /// Longest side of a preview in px: about a full-width side on a Retina screen.
 const MAX: usize = 1200;
@@ -67,14 +76,36 @@ fn playable(ext: &str) -> bool {
     matches!(ext, "mp4" | "mov" | "m4v")
 }
 
-/// One side of a changed media file.
+/// Where one side's bytes come from.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum Source {
+    /// A working-tree file, which must still hash to `Side::sha`.
+    Working(PathBuf),
+    /// The exact blob `Side::sha`, read from the repository.
+    Blob,
+    /// A file already downloaded into the cache; `Side::sha` is its cache key.
+    Downloaded(PathBuf),
+}
+
+/// One side of a media file.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct Side {
     pub(crate) sha: String,
     /// The worktree, for `git cat-file`.
-    repo: PathBuf,
-    /// The working-tree file (the new side); `None` reads the blob from git (the old side).
-    file: Option<PathBuf>,
+    pub(crate) repo: PathBuf,
+    pub(crate) source: Source,
+}
+
+impl Side {
+    /// Cache name. A working file can hash to a blob while holding other bytes (Git LFS and
+    /// other clean filters), so working copies and raw blobs never share an entry.
+    fn key(&self) -> String {
+        match self.source {
+            Source::Working(_) => format!("w-{}", self.sha),
+            Source::Blob => format!("b-{}", self.sha),
+            Source::Downloaded(_) => self.sha.clone(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -97,18 +128,18 @@ impl MediaFile {
             .next()?
             .split_once("..")?;
         let repo = ws_dir.join(path.split('/').next()?);
-        let side = |sha: &str, file| {
+        let side = |sha: &str, source| {
             (!sha.bytes().all(|b| b == b'0')).then(|| Side {
                 sha: sha.to_string(),
                 repo: repo.clone(),
-                file,
+                source,
             })
         };
         Some(MediaFile {
             path: path.to_string().into(),
             kind,
-            old: side(old, None),
-            new: side(new, Some(ws_dir.join(path))),
+            old: side(old, Source::Blob),
+            new: side(new, Source::Working(ws_dir.join(path))),
         })
     }
 }
@@ -131,7 +162,10 @@ pub(crate) fn cache_dir() -> PathBuf {
 }
 
 /// Writes `out` through a temp file, so a crash or a concurrent load never leaves half a file.
-fn produce(out: &Path, make: impl FnOnce(&Path) -> Result<(), String>) -> Result<(), String> {
+pub(crate) fn produce(
+    out: &Path,
+    make: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
     if out.exists() {
         return Ok(());
     }
@@ -162,11 +196,12 @@ pub(crate) fn prepare(side: &Side, path: &str, kind: Kind) -> Result<Preview, St
     let dir = cache_dir();
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let ext = ext(path);
-    let source = dir.join(format!("{}.{ext}", side.sha));
-    produce(&source, |tmp| match &side.file {
+    let key = side.key();
+    let source = dir.join(format!("{key}.{ext}"));
+    produce(&source, |tmp| match &side.source {
         // The row loads after the diff ran; a file rewritten in between must not be cached
         // under the older hash. `--path` applies the same filters git diff hashed with.
-        Some(f) => {
+        Source::Working(f) => {
             fs::copy(f, tmp).map_err(|e| e.to_string())?;
             let rel = path.split_once('/').map_or(path, |(_, r)| r);
             let o = run(Command::new("git")
@@ -178,12 +213,12 @@ pub(crate) fn prepare(side: &Side, path: &str, kind: Kind) -> Result<Preview, St
                 false => Err("changed on disk since the diff; refresh (r)".into()),
             }
         }
-        None => {
-            let o = run(Command::new("git")
-                .current_dir(&side.repo)
-                .args(["cat-file", "blob", &side.sha]))?;
-            fs::write(tmp, o.stdout).map_err(|e| e.to_string())
+        // Raw bytes, bounded: a historical side never comes from the working tree.
+        Source::Blob => {
+            let bytes = crate::git::history::blob(&side.repo, &side.sha)?;
+            fs::write(tmp, bytes).map_err(|e| e.to_string())
         }
+        Source::Downloaded(f) => fs::copy(f, tmp).map(|_| ()).map_err(|e| e.to_string()),
     })?;
     let bytes = fs::metadata(&source).map_err(|e| e.to_string())?.len();
     if bytes == 0 {
@@ -214,7 +249,7 @@ pub(crate) fn prepare(side: &Side, path: &str, kind: Kind) -> Result<Preview, St
     let big = size.is_some_and(|(w, h)| w.max(h) > MAX);
     let image = match kind {
         Kind::Image if let Some(tree) = svg.filter(|_| big) => {
-            let out = dir.join(format!("{}.preview.png", side.sha));
+            let out = dir.join(format!("{key}.preview.png"));
             produce(&out, |tmp| {
                 let scale = MAX as f32 / tree.size().width().max(tree.size().height());
                 let (w, h) = (tree.size().width() * scale, tree.size().height() * scale);
@@ -228,7 +263,7 @@ pub(crate) fn prepare(side: &Side, path: &str, kind: Kind) -> Result<Preview, St
         }
         Kind::Image if native(&ext) && !big => Some(source.clone()),
         Kind::Image => {
-            let out = dir.join(format!("{}.preview.png", side.sha));
+            let out = dir.join(format!("{key}.preview.png"));
             produce(&out, |tmp| {
                 let mut sips = Command::new("sips");
                 if big {
@@ -244,10 +279,10 @@ pub(crate) fn prepare(side: &Side, path: &str, kind: Kind) -> Result<Preview, St
             Some(out)
         }
         Kind::Video if playable(&ext) => {
-            let out = dir.join(format!("{}.poster.png", side.sha));
+            let out = dir.join(format!("{key}.poster.png"));
             // Quick Look's thumbnailer decodes one frame; it hangs on broken files, so it gets
             // a deadline, and a failure is remembered so it costs that wait once, not per launch.
-            let failed = dir.join(format!("{}.poster.none", side.sha));
+            let failed = dir.join(format!("{key}.poster.none"));
             (!failed.exists())
                 .then(|| {
                     produce(&out, |tmp| {
@@ -514,6 +549,8 @@ pub(crate) struct MediaView {
     window: Option<AnyWindowHandle>,
     /// The diff pane's width, measured last frame.
     width: Rc<std::cell::Cell<Pixels>>,
+    /// Shows one side alone, under this label (a historical Before/After or a document image).
+    only: Option<(usize, SharedString)>,
 }
 
 impl MediaView {
@@ -531,7 +568,13 @@ impl MediaView {
             player: None,
             pumping: false,
             window: None,
+            only: None,
         }
+    }
+
+    pub(crate) fn only(mut self, side: usize, label: impl Into<SharedString>) -> MediaView {
+        self.only = Some((side, label.into()));
+        self
     }
 
     /// Loads both sides off the main thread, the first time the row is drawn.
@@ -540,6 +583,9 @@ impl MediaView {
         let sides = [self.file.old.clone(), self.file.new.clone()];
         for (ix, side) in sides.into_iter().enumerate() {
             let Some(side) = side else { continue };
+            if self.only.as_ref().is_some_and(|(only, _)| *only != ix) {
+                continue;
+            }
             self.slots[ix] = Some(Slot::Loading);
             let (path, kind) = (self.file.path.to_string(), self.file.kind);
             cx.spawn(async move |this, cx| {
@@ -576,7 +622,11 @@ impl MediaView {
 
     /// Play/pause: the new side, or the old one when the file was deleted.
     pub(crate) fn toggle_default(&mut self, cx: &mut Context<Self>) {
-        let side = if self.file.new.is_some() { 1 } else { 0 };
+        let side = match &self.only {
+            Some((side, _)) => *side,
+            None if self.file.new.is_some() => 1,
+            None => 0,
+        };
         self.toggle(side, cx);
     }
 
@@ -666,21 +716,23 @@ impl MediaView {
         let theme = cx.theme();
         let (muted, faint_bg) = (theme.muted_foreground, theme.muted.opacity(0.4));
         let missing = [&self.file.old, &self.file.new][side].is_none();
+        let name = match &self.only {
+            Some((_, label)) => label.to_string(),
+            None => if side == 0 { "Before" } else { "After" }.to_string(),
+        };
         let label = match (side, &self.slots[side]) {
+            _ if missing && self.only.is_some() => format!("{name} · none"),
             (0, _) if missing => "Before · none".to_string(),
             (_, _) if missing => "After · deleted".to_string(),
             (_, Some(Slot::Ready(p))) => {
-                let mut s = vec![
-                    if side == 0 { "Before" } else { "After" }.to_string(),
-                    ext(&self.file.path).to_uppercase(),
-                ];
+                let mut s = vec![name, ext(&self.file.path).to_uppercase()];
                 if let Some((w, h)) = p.size {
                     s.push(format!("{w}×{h}"));
                 }
                 s.push(human_bytes(p.bytes));
                 s.join(" · ")
             }
-            _ => if side == 0 { "Before" } else { "After" }.to_string(),
+            _ => name,
         };
         let playing = self.player.as_ref().filter(|p| p.side == side);
         let body: AnyElement = match (&self.slots[side], playing) {
@@ -816,8 +868,10 @@ impl Render for MediaView {
             })
             .gap_3()
             .items_start()
-            .child(self.tile(0, cx))
-            .child(self.tile(1, cx))
+            .map(|d| match self.only.as_ref().map(|(side, _)| *side) {
+                Some(side) => d.child(self.tile(side, cx)),
+                None => d.child(self.tile(0, cx)).child(self.tile(1, cx)),
+            })
     }
 }
 
@@ -829,7 +883,10 @@ impl MediaView {
 
     /// Every side the file has is loaded (or failed).
     pub(crate) fn ready(&self) -> bool {
-        let has = [self.file.old.is_some(), self.file.new.is_some()];
+        let mut has = [self.file.old.is_some(), self.file.new.is_some()];
+        if let Some((side, _)) = &self.only {
+            has[1 - side] = false;
+        }
         (0..2).all(|i| !has[i] || matches!(self.slots[i], Some(Slot::Ready(_) | Slot::Failed(_))))
     }
 
@@ -867,5 +924,15 @@ mod tests {
         assert!(m.new.is_none(), "all-zero hash is a missing side");
         assert!(MediaFile::parse("web/a.rs", chunk, Path::new("/ws")).is_none());
         assert_eq!(kind("x/Clip.MOV"), Some(Kind::Video));
+        let new = m.new.clone().unwrap_or(Side {
+            sha: old.sha.clone(),
+            repo: old.repo.clone(),
+            source: Source::Working("/ws/web/a.png".into()),
+        });
+        assert_ne!(
+            new.key(),
+            old.key(),
+            "working copies never reuse a blob's cache entry"
+        );
     }
 }

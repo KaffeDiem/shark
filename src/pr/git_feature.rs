@@ -92,6 +92,8 @@ pub struct Details {
     pub state: String,
     pub author: String,
     pub head: String,
+    /// The head commit when read, for resolving relative assets; empty when GitHub omits it.
+    pub head_sha: String,
     pub base: String,
     pub draft: bool,
     pub can_update: bool,
@@ -101,7 +103,7 @@ pub struct Details {
     pub threads: Vec<Thread>,
 }
 
-const INFO: &str = "id number url title body state isDraft author{login} headRefName baseRefName viewerCanUpdate locked";
+const INFO: &str = "id number url title body state isDraft author{login} headRefName headRefOid baseRefName viewerCanUpdate locked";
 const COMMENT: &str = "id body author{login} url createdAt";
 const PAGE: &str = "pageInfo{hasNextPage endCursor}";
 const THREAD: &str =
@@ -299,6 +301,11 @@ fn details_from(target: &Target, value: &Value) -> Result<Details, String> {
         state: string(value, "state")?.into(),
         author: author(value),
         head: string(value, "headRefName")?.into(),
+        head_sha: value["headRefOid"]
+            .as_str()
+            .filter(|s| s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .unwrap_or_default()
+            .into(),
         base: string(value, "baseRefName")?.into(),
         draft: boolean(value, "isDraft")?,
         can_update: boolean(value, "viewerCanUpdate")?,
