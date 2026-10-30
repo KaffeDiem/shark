@@ -32,8 +32,14 @@ pub(crate) const THEMES: &[(&str, &str)] = &[
     ("GitHub", include_str!("../assets/themes/github.json")),
     ("One", include_str!("../assets/themes/one.json")),
     ("Dracula", include_str!("../assets/themes/dracula.json")),
-    ("Catppuccin", include_str!("../assets/themes/catppuccin.json")),
-    ("Tokyo Night", include_str!("../assets/themes/tokyo-night.json")),
+    (
+        "Catppuccin",
+        include_str!("../assets/themes/catppuccin.json"),
+    ),
+    (
+        "Tokyo Night",
+        include_str!("../assets/themes/tokyo-night.json"),
+    ),
     ("Gruvbox", include_str!("../assets/themes/gruvbox.json")),
     ("Nord", include_str!("../assets/themes/nord.json")),
     ("Rosé Pine", include_str!("../assets/themes/rose-pine.json")),
