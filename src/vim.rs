@@ -32,6 +32,10 @@ pub enum Cmd {
     PageUp,
     Indent,
     Outdent,
+    /// `g s`: the file's symbol outline, as in Zed.
+    Outline,
+    /// `g d`: go to the definition under the cursor.
+    Definition,
 }
 
 #[derive(Default, Debug, PartialEq)]
@@ -60,7 +64,7 @@ impl Out {
     }
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Vim {
     pub mode: Mode,
     /// Count typed before the operator (or before a plain motion).
@@ -118,7 +122,8 @@ impl Vim {
         matches!(self.mode, Mode::Visual | Mode::VisualLine)
     }
 
-    fn reset(&mut self) {
+    /// Drops a pending count, operator or command line.
+    pub(crate) fn reset(&mut self) {
         self.count = None;
         self.op_count = None;
         self.op = None;
@@ -260,8 +265,16 @@ impl Vim {
             return Out::default();
         }
         if self.g && ch != 'g' {
+            let plain = self.op.is_none() && !self.visual();
             self.reset();
-            return Out::default();
+            return Out {
+                cmd: match ch {
+                    's' if plain => Some(Cmd::Outline),
+                    'd' if plain => Some(Cmd::Definition),
+                    _ => None,
+                },
+                ..Out::default()
+            };
         }
         let gg = self.g;
 

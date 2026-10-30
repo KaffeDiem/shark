@@ -21,6 +21,10 @@ pub struct State {
     /// Vim keys in the file editor.
     #[serde(default)]
     pub vim: bool,
+    /// The file editor's code size in logical px (cmd-=/cmd--); None is
+    /// `editor::FONT_SIZE`.
+    #[serde(default)]
+    pub editor_font_size: Option<f32>,
     /// Repo names picked for the last new workspace; the next dialog starts with them.
     #[serde(default)]
     pub last_repos: Vec<String>,
