@@ -346,6 +346,11 @@ pub fn snippet(source: &str) -> Result<Snippet> {
     out.text.clear();
     out.tabstops.clear();
     expand_snippet(source, &mut out, &mut values, 0)?;
+    // Without $0 the last Tab still leaves the snippet, at its end.
+    if !out.tabstops.is_empty() && out.tabstops.iter().all(|(index, _)| *index != 0) {
+        let end = out.text.len();
+        out.tabstops.push((0, end..end));
+    }
     out.tabstops.sort_by_key(|(index, _)| tab_order(*index));
     Ok(out)
 }
@@ -675,6 +680,7 @@ mod tests {
         assert!(snippet("$TM_FILENAME").is_err());
         assert!(snippet("${TM_FILENAME}").is_err());
         assert_eq!(snippet("$1:${1:value}").unwrap().text, "value:value");
+        assert_eq!(snippet("bar(${1:x})").unwrap().tabstops[1], (0, 6..6));
     }
     #[test]
     fn snippet_backslash_escapes_only_lsp_escapable_characters() {

@@ -672,17 +672,19 @@ async fn accepting_an_unresolved_completion_adds_its_import_as_a_second_undo_ste
     let imported = "from math import sqrt\n# resolve-completion\nsqrt";
     cx.update(|cx| {
         assert_eq!(editor.read(cx).input.read(cx).value().as_ref(), imported);
-        // Cancel the unanswered resolve so terminating the server cannot wake it.
-        editor.update(cx, |e, _| e.snippets.resolve = None);
+        assert!(editor.read(cx).snippets.resolve.is_some());
     });
     cx.update_window(window, |_, w, cx| w.press("cmd-z", cx))
         .unwrap();
     cx.run_until_parked();
     cx.update(|cx| {
+        let e = editor.read(cx);
         assert_eq!(
-            editor.read(cx).input.read(cx).value().as_ref(),
+            e.input.read(cx).value().as_ref(),
             "# resolve-completion\nsqrt"
-        )
+        );
+        // Undo cancels the unanswered resolve, so a late reply cannot re-add an import.
+        assert!(e.snippets.resolve.is_none());
     });
     client.terminate();
     let _ = fs::remove_dir_all(dir);
@@ -792,6 +794,15 @@ async fn snippet_completion_inside_an_active_field_starts_its_own_tabstops(
         let input = editor.read(cx).input.read(cx);
         assert_eq!(input.value().as_ref(), "foo(value, bar(x))");
         assert_eq!(input.selected_value().as_ref(), "x");
+    });
+    // Without $0 the last Tab leaves the snippet after its closing parenthesis.
+    cx.update_window(window, |_, w, cx| w.press("tab", cx))
+        .unwrap();
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let input = editor.read(cx).input.read(cx);
+        assert_eq!(input.value().as_ref(), "foo(value, bar(x))");
+        assert_eq!(input.selected_range(), 17..17);
     });
     client.terminate();
     let _ = fs::remove_dir_all(dir);

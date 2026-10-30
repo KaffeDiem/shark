@@ -74,7 +74,7 @@ class Peer:
         return self.stderr.read().decode(errors="replace")[-8000:]
 
     def kill(self):
-        if self.process.poll() is None:
-            with contextlib.suppress(ProcessLookupError):
-                os.killpg(self.process.pid, signal.SIGKILL)
-            self.process.wait()
+        # Signal the group even if the leader already exited: its children may not have.
+        with contextlib.suppress(ProcessLookupError):
+            os.killpg(self.process.pid, signal.SIGKILL)
+        self.process.wait()

@@ -8,7 +8,8 @@ use std::ops::Range;
 pub(super) struct Snippets {
     active: Option<Session>,
     accepted: Option<(i32, u64)>,
-    /// Resolves the last accepted item's imports; a newer acceptance or closing cancels it.
+    /// Resolves the last accepted item's imports; a newer acceptance, undo, reload or closing
+    /// cancels it.
     pub(super) resolve: Option<Task<()>>,
 }
 
@@ -137,6 +138,7 @@ impl FileEditor {
             return;
         };
         let encoding = client.encoding().into();
+        let alive = self.intelligence.as_ref().map(|l| l.alive.clone());
         self.snippets.resolve = Some(cx.spawn_in(window, async move |this, cx| {
             let Ok(response) = client.request("completionItem/resolve", item).await else {
                 return;
@@ -147,6 +149,10 @@ impl FileEditor {
             else {
                 return;
             };
+            // A detached or restarted session dropped the document this acceptance belonged to.
+            if !alive.is_some_and(|a| a.load(std::sync::atomic::Ordering::Acquire)) {
+                return;
+            }
             let _ = this.update_in(cx, |e, window, cx| {
                 e.apply_completion_imports(&before, start, &edits, encoding, window, cx)
             });
@@ -163,8 +169,28 @@ impl FileEditor {
         cx: &mut Context<Self>,
     ) {
         let now = self.input.read(cx).value().to_string();
-        if let Some(text) = completion_imports(before, &now, start, edits, encoding) {
-            self.replace_language_text(text, window, cx);
+        let Some((text, end)) = completion_imports(before, &now, start, edits, encoding) else {
+            return;
+        };
+        // Imports land before the accepted span, so the active snippet moves by their length.
+        let delta = text.len() as isize - now.len() as isize;
+        let selected = self.input.read(cx).selected_range();
+        let fields = (self.snippets.active.as_mut()).map(|s| s.shift(end, delta, &text, selected));
+        if matches!(fields, Some(None)) {
+            self.snippets.active = None;
+        }
+        self.replace_language_text(text, window, cx);
+        // The rewrite keeps only the main caret; put it back in every mirrored field.
+        if let Some(Some(fields)) = fields {
+            self.input.update(cx, |i, cx| {
+                for (n, range) in fields.into_iter().enumerate() {
+                    if n == 0 {
+                        i.set_selected_range(range, cx);
+                    } else {
+                        i.add_selection(range, cx);
+                    }
+                }
+            });
         }
     }
 
@@ -247,6 +273,40 @@ impl FileEditor {
 }
 
 impl Session {
+    /// Moves every stop by `delta` for an edit that ends at or before `at`, returning the
+    /// selections to restore: the caret's offsets within its field, in each mirror. `None` when
+    /// a stop starts before `at`, so its position is unknown.
+    fn shift(
+        &mut self,
+        at: usize,
+        delta: isize,
+        new: &str,
+        selected: Range<usize>,
+    ) -> Option<Vec<Range<usize>>> {
+        if self.stops.iter().any(|s| s.start < at) {
+            return None;
+        }
+        let field = (self.stops.iter())
+            .find(|s| s.index == self.index && s.start <= selected.start && selected.end <= s.end)
+            .map(|s| (selected.start - s.start, selected.end - s.start, s.start));
+        for stop in &mut self.stops {
+            stop.start = stop.start.checked_add_signed(delta)?;
+            stop.end = stop.end.checked_add_signed(delta)?;
+        }
+        self.text = new.into();
+        let Some((from, to, primary)) = field else {
+            return Some(vec![]);
+        };
+        let primary = primary.checked_add_signed(delta)?;
+        let mut active: Vec<_> = (self.stops.iter())
+            .filter(|s| s.index == self.index)
+            .map(|s| s.start)
+            .collect();
+        // The caret's own field first, so it stays the main selection.
+        active.sort_by_key(|&start| start != primary);
+        Some(active.into_iter().map(|s| s + from..s + to).collect())
+    }
+
     /// GPUI edits all mirrored selections together; unchanged gaps prove this is still our snippet.
     fn changed(&mut self, new: &str) -> bool {
         let mut active: Vec<_> = self
@@ -331,14 +391,15 @@ impl Session {
 }
 
 /// Applies import edits computed against `before` to `now` when they all precede the accepted
-/// span at `start` and that prefix is unchanged; otherwise their positions are unknown.
+/// span at `start` and that prefix is unchanged; otherwise their positions are unknown. Returns
+/// the text and the end of the edited prefix, after which offsets only shift.
 pub(super) fn completion_imports(
     before: &str,
     now: &str,
     start: usize,
     edits: &[lsp_types::TextEdit],
     encoding: crate::lsp::document::Encoding,
-) -> Option<String> {
+) -> Option<(String, usize)> {
     let lines = crate::lsp::document::Lines::new(before);
     let mut ranges = (edits.iter())
         .map(|e| {
@@ -358,7 +419,7 @@ pub(super) fn completion_imports(
     for (from, to, new) in ranges.into_iter().rev() {
         text.replace_range(from..to, new);
     }
-    Some(text)
+    Some((text, end))
 }
 
 #[cfg(test)]
@@ -380,8 +441,8 @@ mod tests {
         let before = "# 😀\nsq";
         let import = [at(0, 0, "import m\n")];
         assert_eq!(
-            completion_imports(before, "# 😀\nsqrt(x)", 7, &import, utf16).as_deref(),
-            Some("import m\n# 😀\nsqrt(x)")
+            completion_imports(before, "# 😀\nsqrt(x)", 7, &import, utf16),
+            Some(("import m\n# 😀\nsqrt(x)".into(), 0))
         );
         // An edit after the accepted span, or a changed prefix, has no known position.
         assert_eq!(
@@ -392,6 +453,25 @@ mod tests {
             completion_imports(before, "x# 😀\nsqrt", 7, &[at(0, 4, "!")], utf16),
             None
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn imports_before_the_snippet_shift_its_stops_and_mirrored_carets() {
+        let stop = |index, start, end| Stop { index, start, end };
+        let mut session = Session {
+            text: "f(arg, arg)".into(),
+            index: 1,
+            stops: vec![stop(1, 2, 5), stop(1, 7, 10), stop(0, 11, 11)],
+        };
+        let new = "import m\nf(arg, arg)";
+        assert_eq!(session.shift(0, 9, new, 8..8), Some(vec![17..17, 12..12]));
+        assert_eq!(
+            session.stops,
+            vec![stop(1, 11, 14), stop(1, 16, 19), stop(0, 20, 20)]
+        );
+        assert!(session.changed("import m\nf(ab, ab)"));
+        // An edit past a stop's start leaves its position unknown.
+        assert_eq!(session.shift(12, 1, "x", 0..0), None);
     }
 
     #[::core::prelude::v1::test]

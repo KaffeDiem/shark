@@ -95,7 +95,7 @@ pub(crate) struct Language {
     pub companion: Option<Client>,
     generation: u64,
     version: i32,
-    alive: Arc<AtomicBool>,
+    pub(super) alive: Arc<AtomicBool>,
     saved: Arc<Mutex<Option<String>>>,
     diagnostics: [Vec<gpui_kit::base::input::Diagnostic>; 2],
     sync: Task<()>,

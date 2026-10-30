@@ -70,13 +70,13 @@ class Peer(jsonrpc_peer.Peer):
 
     def close(self):
         try:
-            if self.process.poll() is None:
-                try:
+            try:
+                if self.process.poll() is None:
                     self.request("shutdown")
                     self.write(dict(method="exit"))
                     self.process.wait(timeout=10)
-                finally:
-                    self.kill()
+            finally:
+                self.kill()
             assert self.process.returncode == 0, self.process.returncode
         finally:
             self.stderr.close()

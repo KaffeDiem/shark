@@ -284,6 +284,7 @@ impl FileEditor {
                     (Some(_), _) if e.dirty => e.conflict = true,
                     (None, _) => e.conflict = e.loaded,
                     (Some(text), Some(fp)) => {
+                        e.snippets.resolve = None;
                         e.language_changed();
                         e.disk = fp;
                         e.conflict = false;
@@ -734,6 +735,9 @@ impl Render for FileEditor {
                     cx.propagate();
                 }
             }))
+            // Undo or redo takes back the acceptance a pending auto-import belongs to.
+            .capture_action(cx.listener(|e, _: &Undo, _, _| e.snippets.resolve = None))
+            .capture_action(cx.listener(|e, _: &Redo, _, _| e.snippets.resolve = None))
             .on_key_down(cx.listener(|e, ev: &KeyDownEvent, window, cx| {
                 let ks = &ev.keystroke;
                 if !window.has_pending_keystrokes() && e.intercept(ks, window, cx) {

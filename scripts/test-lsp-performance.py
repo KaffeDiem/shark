@@ -1,9 +1,12 @@
 """Offline checks for the manual performance harness, without starting language tools."""
 
 import importlib.util
+import os
 import pathlib
 import queue
+import tempfile
 import threading
+import time
 import unittest
 from unittest.mock import patch
 
@@ -64,6 +67,24 @@ class PerformanceHarnessTests(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, "ps unavailable"):
                 benchmark.run(1)
         self.assertEqual(len(closed), 2)
+
+    def test_kill_reaps_children_of_an_exited_server_wrapper(self):
+        with tempfile.TemporaryDirectory() as root:
+            peer = benchmark.jsonrpc_peer.Peer(
+                ["/bin/sh", "-c", "sleep 60 & echo $! > child"], root
+            )
+            peer.process.wait()
+            child = int(pathlib.Path(root, "child").read_text())
+            peer.kill()
+            peer.stderr.close()
+            deadline = time.monotonic() + 5
+            while True:
+                try:
+                    os.kill(child, 0)
+                except ProcessLookupError:
+                    break
+                self.assertLess(time.monotonic(), deadline, "child server survived")
+                time.sleep(0.05)
 
 
 if __name__ == "__main__":
