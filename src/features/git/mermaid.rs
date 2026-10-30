@@ -98,6 +98,13 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn renders_and_caches_by_theme_and_reports_errors() {
+        // UI tests clear the shared cache; the same directory they use keeps the real home clean.
+        #[cfg(feature = "test-support")]
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::state::TEST_HOME
+            .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
         let src = "flowchart TD\n  A[Start] --> B[Done]\n";
         let light = render(src, false).unwrap();
         assert!(light.png.exists());

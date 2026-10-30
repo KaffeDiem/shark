@@ -117,6 +117,24 @@ pub(crate) fn blocks(source: &str, chunk: bool) -> Vec<Block> {
             i += 1;
             continue;
         }
+        // A line past HARD (one huge paragraph, minified text) is cut at spaces or char
+        // boundaries, since a block is laid out whole.
+        if chunk && line.len() > HARD {
+            flush(&mut text, &mut out);
+            let mut rest = line;
+            while !rest.is_empty() {
+                let at = rest.floor_char_boundary(HARD);
+                let at = match rest[..at].rfind(' ') {
+                    Some(sp) if at < rest.len() => sp + 1,
+                    _ => at,
+                };
+                text.push_str(&rest[..at]);
+                flush(&mut text, &mut out);
+                rest = &rest[at..];
+            }
+            i += 1;
+            continue;
+        }
         text.push_str(line);
         if chunk && text.len() >= CHUNK {
             let next_plain = lines.get(i + 1).is_none_or(|n| !continues(n));
@@ -328,7 +346,13 @@ fn web_link(url: &str, ctx: Option<&DocContext>) -> Option<String> {
     let ctx = ctx?;
     let path = repo_path(&ctx.dir, url)?;
     let rev = ctx.rev.as_deref().unwrap_or("HEAD");
-    Some(format!("{}/blob/{rev}/{path}", ctx.web.as_deref()?))
+    // Segments are percent-encoded: `a#b.png` must not become a fragment.
+    let mut link = url::Url::parse(ctx.web.as_deref()?).ok()?;
+    (link.path_segments_mut().ok()?)
+        .pop_if_empty()
+        .extend(["blob", rev])
+        .extend(path.split('/'));
+    Some(link.into())
 }
 
 /// What a block shows, made when it first renders.
@@ -679,6 +703,10 @@ fn list_view(state: ListState, cx: &mut Context<RichDoc>) -> impl IntoElement {
 }
 
 impl RichDoc {
+    pub(crate) fn list(&self) -> Option<&ListState> {
+        self.list.as_ref()
+    }
+
     pub(crate) fn scroll_by(&self, delta: Pixels) {
         if let Some(l) = &self.list {
             l.scroll_by(delta);
@@ -777,6 +805,16 @@ mod tests {
         assert_eq!(joined.trim_end(), doc.trim_end(), "nothing is lost");
 
         let table = format!("| a | b |\n|---|---|\n{}", "| cell | cell |\n".repeat(1000));
+        let line = "wörd ".repeat(10_000) + "\n";
+        let parts = blocks(&line, true);
+        assert!(parts.len() > 5, "a newline-free paragraph is cut too");
+        assert!(
+            parts
+                .iter()
+                .all(|b| matches!(b, Block::Text(t) if t.len() <= HARD))
+        );
+        assert_eq!(blocks(&line, false).len(), 1);
+
         assert_eq!(
             blocks(&table, true).len(),
             1,
@@ -812,6 +850,10 @@ mod tests {
         assert_eq!(
             web_link("a.png", Some(&ctx)).as_deref(),
             Some("https://github.com/o/r/blob/abc/docs/a.png")
+        );
+        assert_eq!(
+            web_link("a%23b%20c.png", Some(&ctx)).as_deref(),
+            Some("https://github.com/o/r/blob/abc/docs/a%23b%20c.png")
         );
         assert_eq!(
             attr("<img alt='x y' src=a.png>", "src").as_deref(),

@@ -213,8 +213,13 @@ pub(crate) fn prepare(side: &Side, path: &str, kind: Kind) -> Result<Preview, St
                 false => Err("changed on disk since the diff; refresh (r)".into()),
             }
         }
-        // Raw bytes, bounded: a historical side never comes from the working tree.
+        // Raw bytes, bounded: a historical side never comes from the working tree. Blobs are
+        // read whole into memory, so huge ones are refused first.
         Source::Blob => {
+            let size = crate::git::history::blob_size(&side.repo, &side.sha)?;
+            if size > fetch::MAX_BYTES {
+                return Err(format!("too large to preview ({})", human_bytes(size)));
+            }
             let bytes = crate::git::history::blob(&side.repo, &side.sha)?;
             fs::write(tmp, bytes).map_err(|e| e.to_string())
         }

@@ -6,7 +6,8 @@ use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const MAX_BYTES: u64 = 200 * 1024 * 1024;
+/// Also the largest Git blob read for a preview.
+pub(super) const MAX_BYTES: u64 = 200 * 1024 * 1024;
 
 /// A downloaded resource, ready for `MediaView`.
 #[derive(Clone, Debug, PartialEq)]
@@ -102,18 +103,14 @@ pub(crate) fn fetch(url: &str) -> Result<Fetched, String> {
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let body = dir.join(format!(".{key}-{}-{seq}.download", std::process::id()));
     // Curl before 8.4.0 (macOS 11 to 13 ship older) only enforces `--max-filesize` when the
-    // response states its length, so the result is measured too.
-    let downloaded = download(url, &body, &dir).and_then(|t| {
-        match std::fs::metadata(&body).map_err(|e| e.to_string())?.len() > MAX_BYTES {
-            true => Err("too large".into()),
-            false => Ok(t),
-        }
-    });
+    // response states its length; `download` caps the file itself one byte past the limit.
+    let downloaded = download(url, &body, &dir);
+    let too_large = std::fs::metadata(&body).is_ok_and(|m| m.len() > MAX_BYTES);
     let content_type = match downloaded {
-        Ok(t) => t,
-        Err(e) => {
+        Ok(t) if !too_large => t,
+        r => {
             let _ = std::fs::remove_file(&body);
-            return Err(e);
+            return Err(r.err().filter(|_| !too_large).unwrap_or("too large".into()));
         }
     };
     let classified = (classify(&content_type).map(|(k, e)| (k, e.to_string())))
@@ -169,6 +166,8 @@ fn download(url: &str, out: &Path, dir: &Path) -> Result<String, String> {
     let mut c = Command::new("curl");
     // No credentials of the user's may reach a document-supplied host.
     c.env_remove("NETRC").env_remove("CURL_HOME");
+    // The kernel stops curl writing past the cap (SIGXFSZ), whatever the response says.
+    cap_file_size(&mut c, MAX_BYTES + 1);
     crate::git::wait_bounded(c, dir, "curl", &args, 75, false).map_err(|e| {
         match e.find("curl: (") {
             Some(at) => e[at + 6..].trim().to_string(),
@@ -176,6 +175,32 @@ fn download(url: &str, out: &Path, dir: &Path) -> Result<String, String> {
             None => e,
         }
     })
+}
+
+/// Limits every file the command writes to `bytes` (`RLIMIT_FSIZE`).
+fn cap_file_size(c: &mut Command, bytes: u64) {
+    #[repr(C)]
+    struct Rlimit {
+        cur: u64,
+        max: u64,
+    }
+    unsafe extern "C" {
+        fn setrlimit(resource: i32, rlp: *const Rlimit) -> i32;
+    }
+    const RLIMIT_FSIZE: i32 = 1;
+    let cap = Rlimit {
+        cur: bytes,
+        max: bytes,
+    };
+    // SAFETY: setrlimit is a plain syscall, safe between fork and exec.
+    unsafe {
+        std::os::unix::process::CommandExt::pre_exec(c, move || {
+            match setrlimit(RLIMIT_FSIZE, &cap) {
+                0 => Ok(()),
+                _ => Err(std::io::Error::last_os_error()),
+            }
+        })
+    };
 }
 
 #[cfg(test)]
@@ -207,6 +232,19 @@ mod tests {
                 .contains("HTTPS")
         );
         assert!(fetch("file:///etc/passwd").is_err());
+    }
+
+    #[::core::prelude::v1::test]
+    fn file_size_cap_stops_the_writer() {
+        let out = std::env::temp_dir().join(format!("shark-cap-{}", std::process::id()));
+        let mut c = Command::new("sh");
+        c.args(["-c", "head -c 5000 /dev/zero > \"$0\""]).arg(&out);
+        cap_file_size(&mut c, 1000);
+        let status = c.status().unwrap();
+        let len = std::fs::metadata(&out).unwrap().len();
+        let _ = std::fs::remove_file(&out);
+        assert!(!status.success());
+        assert_eq!(len, 1000);
     }
 
     /// A cached download is found by `{key}.{ext}`, skipping `{key}.preview.png` and friends

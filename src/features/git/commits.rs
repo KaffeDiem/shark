@@ -358,7 +358,7 @@ impl Commits {
                 }
                 s.content = Some(match result {
                     Ok(Loaded::Patch(d)) => {
-                        s.diff.update(cx, |state, cx| state.set_files([d], cx));
+                        s.diff.update(cx, |state, cx| state.set_files(d, cx));
                         Content::Diff
                     }
                     Ok(Loaded::Note(n)) => Content::Note(n),
@@ -449,10 +449,31 @@ impl Commits {
         }
     }
 
+    /// The open file's scrolling list, when it shows one: the diff, or the Markdown preview
+    /// (kept, hidden, under Source). Plain text is an editor, focused when it opens.
+    fn file_list(&self, cx: &App) -> Option<ListState> {
+        match &self.content {
+            Some(Content::Diff) => Some(self.diff.read(cx).list().clone()),
+            _ if !self.source => self.doc.as_ref().and_then(|d| d.read(cx).list().cloned()),
+            _ => None,
+        }
+    }
+
+    /// Home and End: the open file's first or last line, else the first or last row.
+    fn edge(&mut self, end: bool, cx: &mut Context<Self>) {
+        match self.file_list(cx) {
+            Some(l) if end => l.scroll_to_end(),
+            Some(l) => l.scroll_to(ListOffset::default()),
+            None if self.file.is_some() => {}
+            None => self.move_cursor(if end { isize::MAX / 2 } else { isize::MIN / 2 }, cx),
+        }
+        cx.notify();
+    }
+
     fn scroll(&mut self, lines: f32, cx: &mut Context<Self>) {
         let delta = px(lines * 21.);
-        if let Some(doc) = &self.doc {
-            doc.read(cx).scroll_by(delta);
+        if let Some(l) = self.file_list(cx) {
+            l.scroll_by(delta);
         } else if self.selected.is_some() && self.file.is_none() {
             self.files_list.scroll_by(delta);
         } else if self.file.is_none() {
@@ -738,6 +759,10 @@ impl Commits {
                         .soft_wrap(true)
                 });
                 input.update(cx, |i, cx| i.set_readonly(true, cx));
+                // It has no scroll API of its own, so keys reach it by focus.
+                if self.focus.contains_focused(window, cx) {
+                    input.read(cx).focus_handle(cx).focus(window, cx);
+                }
                 self.editor = Some(input);
             }
             if *markdown && !self.source && self.doc.is_none() {
@@ -820,8 +845,9 @@ impl Commits {
                                     .small()
                                     .ghost()
                                     .selected(!self.source)
-                                    .on_click(cx.listener(|s, _, _, cx| {
+                                    .on_click(cx.listener(|s, _, w, cx| {
                                         s.source = false;
+                                        s.focus.focus(w, cx);
                                         cx.notify();
                                     })),
                             )
@@ -920,7 +946,7 @@ impl Commits {
 }
 
 enum Loaded {
-    Patch(DiffFile),
+    Patch(Vec<DiffFile>),
     Note(String),
     Text(String),
 }
@@ -959,18 +985,28 @@ fn load(
                 side(&file.new)
             )));
         }
+        for b in [&file.old, &file.new].into_iter().flatten() {
+            let size = history::blob_size(wt, &b.id)?;
+            if size > MAX_TEXT {
+                return Ok(Loaded::Note(format!(
+                    "Too large to diff here ({}).",
+                    human_bytes(size)
+                )));
+            }
+        }
         let patch = history::patch(wt, commit, &file.path)?;
+        // A type change (file ↔ symlink) is two entries: a deletion and an addition.
         let parsed = DiffFile::parse(&patch).map_err(|e| e.to_string())?;
-        return match parsed.into_iter().next() {
-            Some(d) if d.is_binary() => Ok(Loaded::Note(format!(
+        return match parsed.is_empty() {
+            true => Ok(Loaded::Note(
+                "Git reports no textual change for this file.".into(),
+            )),
+            false if parsed.iter().all(|d| d.is_binary()) => Ok(Loaded::Note(format!(
                 "Binary file with no inline preview ({} → {}).",
                 size_of(wt, &file.old),
                 size_of(wt, &file.new),
             ))),
-            Some(d) => Ok(Loaded::Patch(d)),
-            None => Ok(Loaded::Note(
-                "Git reports no textual change for this file.".into(),
-            )),
+            false => Ok(Loaded::Patch(parsed)),
         };
     }
     let blob = match view {
@@ -1155,22 +1191,8 @@ impl Render for Commits {
             .on_action(cx.listener(|s, _: &SelectPrev, _, cx| s.move_cursor(-1, cx)))
             .on_action(cx.listener(|s, _: &PageDown, _, cx| s.scroll(15., cx)))
             .on_action(cx.listener(|s, _: &PageUp, _, cx| s.scroll(-15., cx)))
-            .on_action(cx.listener(|s, _: &SelectFirst, _, cx| {
-                if let Some(d) = &s.doc {
-                    d.read(cx).scroll_to_start();
-                } else {
-                    s.move_cursor(isize::MIN / 2, cx);
-                }
-                cx.notify();
-            }))
-            .on_action(cx.listener(|s, _: &SelectLast, _, cx| {
-                if let Some(d) = &s.doc {
-                    d.read(cx).scroll_to_end();
-                } else {
-                    s.move_cursor(isize::MAX / 2, cx);
-                }
-                cx.notify();
-            }))
+            .on_action(cx.listener(|s, _: &SelectFirst, _, cx| s.edge(false, cx)))
+            .on_action(cx.listener(|s, _: &SelectLast, _, cx| s.edge(true, cx)))
             .on_action(cx.listener(|s, _: &Confirm, _, cx| s.confirm(cx)))
             .on_action(cx.listener(|s, _: &CancelEdit, w, cx| {
                 if s.back(cx) {
@@ -1263,5 +1285,44 @@ impl Commits {
     }
     pub(crate) fn doc(&self) -> Option<&Entity<RichDoc>> {
         self.doc.as_ref()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A file replaced by a symlink is a deletion plus an addition in the patch; Diff shows both.
+    #[::core::prelude::v1::test]
+    fn type_change_diff_keeps_both_entries() {
+        let dir = std::env::temp_dir().join(format!("shark-typechange-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let git = |args: &[&str]| {
+            let o = std::process::Command::new("git")
+                .current_dir(&dir)
+                .args(["-c", "user.name=T", "-c", "user.email=t@e"])
+                .args(["-c", "commit.gpgsign=false"])
+                .args(args)
+                .output()
+                .unwrap();
+            assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+            String::from_utf8_lossy(&o.stdout).trim().to_string()
+        };
+        git(&["init", "-q"]);
+        std::fs::write(dir.join("f"), "text\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "one"]);
+        std::fs::remove_file(dir.join("f")).unwrap();
+        std::os::unix::fs::symlink("target", dir.join("f")).unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-qm", "two"]);
+        let c = history::commit(&dir, &git(&["rev-parse", "HEAD"])).unwrap();
+        let got = load(&dir, &c, &c.files[0], FileView::Diff);
+        let _ = std::fs::remove_dir_all(&dir);
+        match got {
+            Ok(Loaded::Patch(d)) => assert_eq!(d.len(), 2),
+            _ => panic!("expected a two-entry patch"),
+        }
     }
 }
