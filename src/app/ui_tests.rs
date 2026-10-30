@@ -20,6 +20,7 @@ mod git_tests;
 mod menu_pixels;
 mod mixed_tab_tests;
 mod navigation_pixels;
+mod repo_settings_tests;
 mod storage_tests;
 mod tab_tests;
 mod tree_pixels;

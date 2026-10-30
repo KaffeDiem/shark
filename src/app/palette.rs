@@ -130,6 +130,20 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, w, cx| s.pick_repo_for_workspace(w, cx),
     ),
     Row(
+        "Run or stop run scripts",
+        IconName::Play,
+        Some(&RunScripts),
+        "dev server start scripts repo",
+        |s, w, cx| s.toggle_run(w, cx),
+    ),
+    Row(
+        "Show script output",
+        IconName::ScrollText,
+        None,
+        "log run setup archive scripts",
+        |s, w, cx| s.show_script_log(w, cx),
+    ),
+    Row(
         "Archive workspace",
         IconName::Archive,
         Some(&ArchiveWorkspace),
@@ -821,6 +835,8 @@ pub(super) const COMMANDS: &[Row] = &[
 const NEED_WORKSPACE: &[&str] = &[
     "Show Git",
     "Add repo to workspace…",
+    "Run or stop run scripts",
+    "Show script output",
     "Archive workspace",
     "Force archive workspace…",
     "Reveal in Finder",

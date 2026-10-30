@@ -34,7 +34,7 @@ async fn new_and_reopened_chats_append(cx: &mut TestAppContext) {
     press(cx, &["cmd-t", "cmd-t"]);
     on(cx, &|s, _, _cx| {
         s.active_ws_mut().unwrap().closed = ["picked", "retained", "latest"]
-            .map(|id| s.state.new_chat(id.into()))
+            .map(|id| s.state.new_chat(&Workspace::default(), id.into()))
             .to_vec();
     });
     for (key, restored) in [

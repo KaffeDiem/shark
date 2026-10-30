@@ -599,15 +599,27 @@ impl Shark {
                 .id(("repo", ix))
                 .test_support()
                 .hover(|d| d.bg(side_hover(theme)))
+                // Drag to reorder: scripts run in this order across a workspace's repos.
+                .on_drag(RepoDrag(ix, name.clone().into()), |d, _, _, cx| {
+                    cx.new(|_| d.clone())
+                })
+                .drag_over::<RepoDrag>(|s, _, _, cx| s.bg(cx.theme().accent))
+                .on_drop(cx.listener(move |this, d: &RepoDrag, _, cx| {
+                    if d.0 != ix && d.0 < this.state.repos.len() {
+                        move_item(&mut this.state.repos, d.0, ix);
+                        let _ = this.state.save();
+                        cx.notify();
+                    }
+                }))
                 .child(Icon::new(IconName::FolderGit2).with_size(isz))
                 .when(!rail, |d| d.child(div().truncate().child(r.name.clone())))
                 .when(rail, |d| {
                     d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
                 })
                 .on_click({
-                    let name = name.clone();
+                    let repo = r.clone();
                     cx.listener(move |this, _, w, cx| {
-                        this.new_workspace(vec![name.clone()], None, w, cx)
+                        repo_settings::open(this, repo.clone(), w, cx)
                     })
                 })
                 .on_mouse_down(
@@ -615,7 +627,17 @@ impl Shark {
                     cx.listener(move |this, e: &MouseDownEvent, w, cx| {
                         let (p1, p3) = (path.clone(), path.clone());
                         let picked = vec![name.clone()];
+                        let repo = this.state.repos.iter().find(|r| r.name == name).cloned();
                         let mut entries = vec![
+                            menu::item(
+                                IconName::Settings,
+                                "Repository settings…",
+                                on_shark(cx, move |s, w, cx| {
+                                    if let Some(r) = repo.clone() {
+                                        repo_settings::open(s, r, w, cx)
+                                    }
+                                }),
+                            ),
                             menu::item(
                                 IconName::Plus,
                                 "New workspace…",
@@ -654,7 +676,7 @@ impl Shark {
                                 .collect();
                             if !rows.is_empty() {
                                 entries.insert(
-                                    1,
+                                    2,
                                     menu::sub(IconName::FolderPlus, "Add to workspace", rows),
                                 );
                             }
@@ -745,10 +767,13 @@ impl Shark {
                                         theme.sidebar_foreground
                                     })
                                     .child({
-                                        let repos = (w.repos.iter())
+                                        let mut repos = (w.repos.iter())
                                             .map(|r| r.name.as_str())
                                             .collect::<Vec<_>>()
                                             .join(" · ");
+                                        if self.running(&w.name) {
+                                            repos = format!("Scripts running · {repos}");
+                                        }
                                         match (&attn, running) {
                                             // The step says where, and that it's waiting on you.
                                             (Attn::Needs(step), _) => step.clone(),
@@ -1108,5 +1133,24 @@ impl Shark {
             )
             .child(self.render_usage_footer(cx))
             .test_support()
+    }
+}
+
+/// A repo row being dragged: its index and name, shown under the pointer.
+#[derive(Clone)]
+struct RepoDrag(usize, SharedString);
+
+impl Render for RepoDrag {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        div()
+            .px_2()
+            .py_1()
+            .rounded(theme.radius)
+            .bg(theme.popover)
+            .border_1()
+            .border_color(theme.border)
+            .text_sm()
+            .child(self.1.clone())
     }
 }

@@ -1174,15 +1174,19 @@ impl Shark {
                             ),
                             _ => {}
                         }
-                        ws.fill_models(&s.state.new_model(), s.state.last_effort.as_ref());
+                        let (model, effort) = s.state.defaults_for(&ws);
+                        ws.fill_models(&model, effort.as_ref());
                         let name = ws.name.clone();
-                        s.state.workspaces.push(ws);
+                        s.state.workspaces.push(ws.clone());
                         let _ = s.state.save();
                         s.open_workspace(s.state.workspaces.len() - 1, window, cx);
                         s.home_prompt_used(prompt.as_deref(), window, cx);
-                        if let Some(p) = prompt
-                            && s.active.as_ref() == Some(&name)
-                            && let Some(chat) = s.active_chat().cloned()
+                        let chat = (s.active.as_ref() == Some(&name))
+                            .then(|| s.active_chat().cloned())
+                            .flatten();
+                        let then = prompt.zip(chat);
+                        if !s.run_setup(&ws, None, then.clone(), window, cx)
+                            && let Some((p, chat)) = then
                         {
                             chat.update(cx, |c, cx| c.ask(&p, window, cx));
                         }
@@ -1722,6 +1726,7 @@ impl Shark {
             Notification::success(format!("Added {} to {}", r.name, ws.name)),
             cx,
         );
+        self.run_setup(&ws, Some(&r.name), None, window, cx);
         cx.notify();
     }
 
@@ -1851,6 +1856,9 @@ impl Shark {
                 "Wait for the repository addition before archiving",
             );
         }
+        if self.setting_up.iter().any(|n| n == name) {
+            return notify_err(window, cx, "Wait for setup scripts before archiving");
+        }
         self.retry_saves(cx);
         let pending_answers = self.ws(name).is_some_and(|ws| {
             ws.chats.iter().chain(&ws.closed).any(|m| {
@@ -1897,20 +1905,38 @@ impl Shark {
                 .get(name)
                 .map_or(vec![], |g| g.read(cx).merged_branches()),
         };
+        // Its dev servers would run on in a removed worktree: stopped (and waited for) first.
+        let run = self.runs.remove(name);
+        let jobs = crate::scripts::jobs(&self.state, &ws, crate::scripts::Phase::Archive, None);
         // `worktree remove` deletes node_modules, target and the like: seconds, off the UI thread.
         window.push_notification(format!("Archiving {name}…"), cx);
         cx.spawn_in(window, async move |this, cx| {
             let dir = ws.dir();
             let name = ws.name.clone();
-            let result = cx
+            let (scripts, result) = cx
                 .background_executor()
                 .spawn(async move {
-                    git::remove_workspace(&ws, &dir, force)
-                        .map(|()| git::delete_merged_branches(&ws, &merged))
+                    crate::scripts::Running::stop_all(run, 5);
+                    // And those cmd-r stopped just before.
+                    crate::scripts::wait_stopping(Some(&ws.name));
+                    // A failed archive script keeps the worktree, unless forced.
+                    let scripts = crate::scripts::run_all(&ws.name, &jobs).err();
+                    if scripts.is_some() && !force {
+                        return (
+                            scripts,
+                            Err("Archive script failed; workspace kept.".into()),
+                        );
+                    }
+                    let removed = git::remove_workspace(&ws, &dir, force)
+                        .map(|()| git::delete_merged_branches(&ws, &merged));
+                    (scripts, removed)
                 })
                 .await;
             this.update_in(cx, |s, window, cx| {
                 s.archiving.remove(&name);
+                if let Some(e) = scripts {
+                    super::run::script_failed(&name, e, window, cx);
+                }
                 s.archived(&name, result, window, cx)
             })
             .ok();
@@ -1949,6 +1975,7 @@ impl Shark {
                 self.attn.forget(name);
                 self.differ.update(cx, |d, _| d.forget_workspace(name));
                 self.state.workspaces.retain(|w| w.name != name);
+                let _ = std::fs::remove_file(crate::scripts::log_path(name));
                 self.state.reviewed.remove(name);
                 self.state.merge_order.remove(name);
                 for s in &mut self.state.sections {

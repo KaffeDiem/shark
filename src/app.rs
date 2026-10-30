@@ -48,6 +48,8 @@ pub(crate) mod menus;
 mod palette;
 mod picker;
 mod reorder;
+mod repo_settings;
+mod run;
 mod sidebar;
 mod storage;
 #[cfg(all(test, feature = "test-support"))]
@@ -111,6 +113,8 @@ pub struct Shark {
     pub(crate) archiving: HashSet<String>,
     creating: HashSet<String>,
     adding_repos: HashSet<String>,
+    /// Workspaces with setup scripts running, once per run (a repo added during the first).
+    setting_up: Vec<String>,
     /// Sidebar shrunk to icons by the user.
     rail: bool,
     /// Zen mode (cmd-.): only the shown tab's content; see `zen_shown`.
@@ -153,6 +157,8 @@ pub struct Shark {
     /// When the last dependency check started.
     deps_at: Option<std::time::Instant>,
     pub(crate) home: home::Home,
+    /// Running run scripts by workspace (cmd-r); dropping one stops them.
+    runs: HashMap<String, crate::scripts::Running>,
     _subs: Vec<Subscription>,
 }
 
@@ -237,6 +243,12 @@ impl Shark {
                 }
             }),
         ];
+        // Dev servers started by cmd-r don't outlive Shark.
+        _subs.push(cx.on_app_quit(|s, _| {
+            crate::scripts::Running::stop_all(s.runs.drain().map(|(_, r)| r), 2);
+            crate::scripts::wait_stopping(None);
+            async {}
+        }));
         _subs.push(cx.observe(&differ, |_, _, cx| cx.notify()));
         _subs.push(cx.subscribe_in(&differ, window, |s, _, event, w, cx| {
             s.differ_event(event, w, cx)
@@ -261,6 +273,7 @@ impl Shark {
             archiving: HashSet::new(),
             creating: HashSet::new(),
             adding_repos: HashSet::new(),
+            setting_up: vec![],
             rail: false,
             zen: false,
             editor: None,
@@ -294,6 +307,7 @@ impl Shark {
             deps_check: None,
             deps_at: None,
             home,
+            runs: HashMap::new(),
             _subs,
         }
     }
@@ -1122,6 +1136,7 @@ impl Render for Shark {
             // `o` in the diff and the tree.
             .on_action(cx.listener(|this, _: &OpenFile, w, cx| this.open_cursor_file(w, cx)))
             .on_action(cx.listener(|this, _: &OpenAnyFile, w, cx| this.open_any_file(w, cx)))
+            .on_action(cx.listener(|this, _: &RunScripts, w, cx| this.toggle_run(w, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, w, cx| {
                 crate::settings::open(&this.state, w, cx)
             }))
