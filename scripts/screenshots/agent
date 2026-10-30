@@ -1,0 +1,38 @@
+#!/usr/bin/env python3
+# Stands in for claude and codex in run.sh: answers the usage queries with fixed allowances
+# and refuses everything else, so nothing reaches the network.
+import json
+import sys
+import time
+
+now = time.time()
+iso = lambda s: time.strftime('%Y-%m-%dT%H:%M:%S+00:00', time.gmtime(now + s))
+send = lambda v: print(json.dumps(v), flush=True)
+args = sys.argv[1:]
+
+if args[:1] == ['app-server']:  # codex
+    for line in sys.stdin:
+        req = json.loads(line)
+        if req.get('id') == 'init':
+            send({'id': 'init', 'result': {}})
+        elif req.get('id') == 'usage':
+            week = {'usedPercent': 46, 'windowDurationMins': 10080, 'resetsAt': int(now + 4 * 86400)}
+            five = {'usedPercent': 12, 'windowDurationMins': 300, 'resetsAt': int(now + 3 * 3600)}
+            limits = {'limitId': 'codex', 'primary': five, 'secondary': week, 'planType': 'pro'}
+            send({'id': 'usage', 'result': {'rateLimits': limits, 'rateLimitsByLimitId': {'codex': limits}}})
+            break
+elif '--input-format' in args:  # claude
+    for line in sys.stdin:
+        if json.loads(line).get('request', {}).get('subtype') == 'get_usage':
+            five, week = iso(2 * 3600), iso(3 * 86400)
+            send({'type': 'control_response', 'response': {'subtype': 'success', 'request_id': 'usage', 'response': {
+                'subscription_type': 'max', 'rate_limits_available': True, 'rate_limits': {
+                    'five_hour': {'utilization': 38, 'resets_at': five},
+                    'seven_day': {'utilization': 54, 'resets_at': week},
+                    'limits': [
+                        {'kind': 'session', 'group': 'session', 'percent': 38, 'resets_at': five, 'scope': None},
+                        {'kind': 'weekly_all', 'group': 'weekly', 'percent': 54, 'resets_at': week, 'scope': None},
+                    ]}}}})
+            break
+else:
+    sys.exit(1)

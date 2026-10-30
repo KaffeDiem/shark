@@ -383,7 +383,7 @@ pub fn spawn_side(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Re
 }
 
 /// Shark's user docs, for answering questions about the app itself.
-pub const README: &str = include_str!("../README.md");
+pub const README: &str = concat!(include_str!("../README.md"), "\n\n", include_str!("../docs/manual.md"));
 
 /// A one-shot question about Shark, outside any workspace: no tools, no MCP, saved nowhere.
 /// `system` is appended to claude's system prompt (e.g. `README` and the keymap).
