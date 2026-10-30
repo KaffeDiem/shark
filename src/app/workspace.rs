@@ -891,7 +891,7 @@ impl Shark {
         };
         let changed = self.active.as_ref() != Some(&ws.name);
         if changed {
-            self.drop_editor();
+            self.drop_editor(cx);
         }
         self.sel = SideRow::Ws(ix);
         if let Some(i) = self.section_of(&ws.name)
@@ -973,6 +973,7 @@ impl Shark {
         self.show(Tab::Chat, window, cx);
         self.select_chat(ws.active_chat, window, cx);
         if changed {
+            self.unpark_sessions(window, cx);
             self.restore_file_tabs(window, cx);
         }
     }
@@ -1943,6 +1944,7 @@ impl Shark {
                     }
                 }
                 self.syncs.remove(name);
+                self.parked_sessions.remove(name);
                 self.git_features.remove(name);
                 self.attn.forget(name);
                 self.differ.update(cx, |d, _| d.forget_workspace(name));
@@ -1956,7 +1958,7 @@ impl Shark {
                 if self.active.as_deref() == Some(name) {
                     self.active = None;
                     self.zen = false;
-                    self.drop_editor();
+                    self.drop_editor(cx);
                     self.reset_differ_workspace(window, cx);
                     self.tab = Tab::Chat;
                     self.sidebar_focus.focus(window, cx);

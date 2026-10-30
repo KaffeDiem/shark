@@ -40,6 +40,9 @@ mod editor_pane;
 mod features;
 mod file_changes;
 mod home;
+mod intelligence;
+#[cfg(all(test, feature = "test-support"))]
+mod intelligence_tests;
 mod interaction;
 pub(crate) mod menus;
 mod palette;
@@ -114,6 +117,11 @@ pub struct Shark {
     zen: bool,
     editor: Option<Entity<FileEditor>>,
     file_tabs: Vec<editor_pane::FileTab>,
+    /// The workspace's language servers by project; files share and outlive tabs on them.
+    language_sessions: HashMap<String, (Entity<crate::lsp::Session>, Subscription)>,
+    /// Servers of workspaces switched away from, kept warm until their idle timer runs out.
+    parked_sessions: HashMap<String, (Vec<Entity<crate::lsp::Session>>, Task<()>)>,
+    navigation: intelligence::History,
     pub(crate) syncs: HashMap<String, Entity<GitSync>>,
     sidebar_focus: FocusHandle,
     features_focus: FocusHandle,
@@ -153,6 +161,9 @@ impl Shark {
         let mut state = State::load();
         crate::prompts::set_overrides(&state.prompts);
         crate::settings::apply(&state.appearance, cx);
+        if let Some(size) = state.editor_font_size {
+            cx.set_global(crate::editor::CodeFont(editor_pane::clamp_font_size(size)));
+        }
         let sidebar_focus = cx.focus_handle();
         sidebar_focus.focus(window, cx);
         let backup = state.corrupt_backup.take();
@@ -254,6 +265,9 @@ impl Shark {
             zen: false,
             editor: None,
             file_tabs: vec![],
+            language_sessions: HashMap::new(),
+            parked_sessions: HashMap::new(),
+            navigation: Default::default(),
             syncs: HashMap::new(),
             sidebar_focus,
             features_focus: cx.focus_handle(),
@@ -1081,6 +1095,27 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &CloseFile, w, cx| this.close_file(w, cx)))
             // On the root, not the editor, so File > Save works with focus in the tree.
             .on_action(cx.listener(|this, _: &SaveFile, w, cx| this.save(w, cx)))
+            .on_action(cx.listener(|s, _: &FormatDocument, w, cx| {
+                s.language_action(intelligence::LanguageAction::Format, w, cx)
+            }))
+            .on_action(cx.listener(|s, _: &RenameSymbol, w, cx| s.rename_symbol(w, cx)))
+            .on_action(cx.listener(|s, _: &FindReferences, w, cx| {
+                s.language_action(intelligence::LanguageAction::References, w, cx)
+            }))
+            .on_action(cx.listener(|s, _: &DocumentSymbols, w, cx| s.symbol_menu(None, w, cx)))
+            .on_action(cx.listener(|s, _: &SignatureHelp, w, cx| {
+                s.language_action(intelligence::LanguageAction::SignatureHelp, w, cx)
+            }))
+            .on_action(cx.listener(|s, _: &NavigationBack, w, cx| s.navigate_history(false, w, cx)))
+            .on_action(
+                cx.listener(|s, _: &NavigationForward, w, cx| s.navigate_history(true, w, cx)),
+            )
+            .on_action(cx.listener(|s, _: &RestartLanguage, w, cx| s.restart_language(w, cx)))
+            .on_action(cx.listener(|s, _: &EditorFontBigger, w, cx| s.step_editor_font(1., w, cx)))
+            .on_action(
+                cx.listener(|s, _: &EditorFontSmaller, w, cx| s.step_editor_font(-1., w, cx)),
+            )
+            .on_action(cx.listener(|s, _: &EditorFontReset, w, cx| s.step_editor_font(0., w, cx)))
             .on_action(
                 cx.listener(|this, _: &EditWorkingCopy, w, cx| this.edit_working_copy(None, w, cx)),
             )

@@ -798,13 +798,13 @@ impl Differ {
     }
 
     /// A code row's height.
-    fn row_height(&self, window: &Window, cx: &App) -> Pixels {
-        window.rem_size() * (f32::from(cx.theme().mono_font_size) / 16.) * 1.6
+    fn row_height(&self, cx: &App) -> Pixels {
+        crate::editor::diff_font(cx).1
     }
 
-    fn view_cap(&self, window: &Window, cx: &App) -> f32 {
+    fn view_cap(&self, cx: &App) -> f32 {
         let h = self.review.viewport.get().size.height;
-        (h / self.row_height(window, cx)).max(SCROLLOFF * 2. + 1.)
+        (h / self.row_height(cx)).max(SCROLLOFF * 2. + 1.)
     }
 
     /// `j/k` (`n` = ±1), `ctrl-d/u` (± half a screen), `gg`/`G` (`to` = first/last row).
@@ -815,7 +815,7 @@ impl Differ {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let cap = self.view_cap(window, cx);
+        let cap = self.view_cap(cx);
         let n = match n.abs() {
             1 => n,
             _ => n.signum() * (cap / 2.) as isize,
@@ -868,7 +868,7 @@ impl Differ {
         let Some(c) = next_change(&rows, find(&rows, &cur), forward) else {
             return;
         };
-        let t = fit(&rows, find(&rows, &top), c, self.view_cap(window, cx));
+        let t = fit(&rows, find(&rows, &top), c, self.view_cap(cx));
         self.drop_mouse_selection(window, cx);
         self.apply_view(&rows, t, c, cx);
     }
@@ -1234,7 +1234,7 @@ impl Differ {
         // Room for most of it, so it is laid out; then `render_composer` measures it. An
         // orphan's shows below the diff.
         if self.diff_files.iter().any(|f| f.path() == anchor.path()) {
-            self.reveal(&anchor, 8., window, cx);
+            self.reveal(&anchor, 8., cx);
         }
         cx.notify();
     }
@@ -1520,12 +1520,12 @@ impl Differ {
 
     /// Scrolls row `spot` into view with `below` code rows of room under it (for what is
     /// annotated there), keeping the selected lines.
-    fn reveal(&mut self, spot: &Spot, below: f32, window: &mut Window, cx: &mut Context<Self>) {
+    fn reveal(&mut self, spot: &Spot, below: f32, cx: &mut Context<Self>) {
         let sel = self.diff.read(cx).selected_lines();
         let rows = self.diff_rows(cx);
         let cur = find(&rows, spot);
         let top = (self.review.view.as_ref()).map_or(cur, |(t, _)| find(&rows, t));
-        let cap = (self.view_cap(window, cx) - below).max(SCROLLOFF * 2. + 1.);
+        let cap = (self.view_cap(cx) - below).max(SCROLLOFF * 2. + 1.);
         self.apply_view(&rows, fit(&rows, top, cur, cap), cur, cx);
         self.diff.update(cx, |d, cx| d.set_selected_lines(sel, cx));
     }
@@ -1536,7 +1536,7 @@ impl Differ {
             return;
         };
         self.drop_mouse_selection(window, cx);
-        self.reveal(&Spot::Line(c.anchor()), 0., window, cx);
+        self.reveal(&Spot::Line(c.anchor()), 0., cx);
         // `find` lands on the closest row; the thread's own line is what `e`/`x` read.
         let sel = DiffLineRange::new(c.path.clone(), side(c.end.0), c.end.1, c.end.1);
         self.diff

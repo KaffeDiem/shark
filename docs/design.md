@@ -251,7 +251,7 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
   - a `COMMANDS` row with its action and keywords;
   - a menu-bar item where it fits;
   - a direct shortcut only when it's used often; otherwise the palette is the way in;
-  - a line in the README keys table.
+  - a line in the keys table in docs/manual.md.
 - **Row actions** act on the cursor row of the focused list, otherwise on the open item (see `archive`). They get a single-key binding in the list's context plus a palette row.
 
 ## Gotchas
@@ -263,7 +263,7 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 ## Checklist for a UI change
 1. Colors come from theme tokens (or `faint`), with no hex in views. Every new text pair meets the contrast rules.
 2. Sizes, radii, type and icons come from the tables above. Status uses the status vocabulary.
-3. The command is reachable by keyboard and listed in the palette and the README.
+3. The command is reachable by keyboard and listed in the palette and the keys table in docs/manual.md.
 4. Dialogs apply `inter_features()`.
 5. `cargo test --features test-support` passes (the headless keyboard test covers focus and key contexts).
 6. Checked by eye in both modes, without changing the system appearance:
