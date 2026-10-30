@@ -8,6 +8,8 @@ use std::{
     os::unix::process::CommandExt,
     path::PathBuf,
     process::{Child, Command, Stdio},
+    sync::Mutex,
+    thread::JoinHandle,
 };
 
 #[derive(Clone, Copy)]
@@ -108,19 +110,60 @@ pub fn run_all(ws: &str, jobs: &[Job]) -> Result<(), String> {
 pub const PORTS: u16 = 10;
 const FIRST_PORT: u16 = 51000;
 
-/// The first block of `PORTS` not held by a running workspace and whose first port is free, so a
-/// server still shutting down (or started outside Shark) isn't handed out again.
-pub fn free_port(held: impl Iterator<Item = u16> + Clone) -> u16 {
-    (0..)
+/// The first block of `PORTS` not held by a running or stopping workspace and with all its ports
+/// free, so a server still shutting down (or started outside Shark) isn't handed out again.
+pub fn free_port(held: impl Iterator<Item = u16>) -> Result<u16, String> {
+    let held: Vec<u16> = held.chain(stopping().iter().map(|s| s.1)).collect();
+    (0..(u16::MAX - FIRST_PORT) / PORTS)
         .map(|i| FIRST_PORT + i * PORTS)
-        .find(|p| {
-            !held.clone().any(|h| h == *p) && std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok()
-        })
-        .unwrap()
+        .find(|p| !held.contains(p) && (*p..*p + PORTS).all(port_free))
+        .ok_or_else(|| format!("No {PORTS} free ports from {FIRST_PORT} up for SHARK_PORT"))
+}
+
+/// Nothing listens on `port` at any address a dev server binds: macOS lets a bind to one
+/// through while another (`127.0.0.1` vs `0.0.0.0`) holds it.
+fn port_free(port: u16) -> bool {
+    use std::net::{Ipv4Addr, Ipv6Addr, TcpListener};
+    let addrs: [std::net::IpAddr; 4] = [
+        Ipv4Addr::LOCALHOST.into(),
+        Ipv4Addr::UNSPECIFIED.into(),
+        Ipv6Addr::LOCALHOST.into(),
+        Ipv6Addr::UNSPECIFIED.into(),
+    ];
+    // Only "in use" counts: no IPv6 on the host isn't a taken port.
+    addrs.into_iter().all(|a| {
+        !matches!(TcpListener::bind((a, port)), Err(e) if e.kind() == std::io::ErrorKind::AddrInUse)
+    })
+}
+
+/// Runs dropped (cmd-r again) and still stopping in the background, by workspace and port: their
+/// ports stay taken, and archiving and quit wait for them.
+static STOPPING: Mutex<Vec<(String, u16, JoinHandle<()>)>> = Mutex::new(vec![]);
+
+fn stopping() -> std::sync::MutexGuard<'static, Vec<(String, u16, JoinHandle<()>)>> {
+    let mut s = STOPPING.lock().unwrap_or_else(|e| e.into_inner());
+    s.retain(|(.., h)| !h.is_finished());
+    s
+}
+
+/// Blocks until `ws`'s dropped runs (every workspace's with `None`) have stopped.
+pub fn wait_stopping(ws: Option<&str>) {
+    let mine: Vec<_> = {
+        let mut s = stopping();
+        let (mine, rest) = std::mem::take(&mut *s)
+            .into_iter()
+            .partition(|(w, ..)| ws.is_none_or(|ws| ws == w));
+        *s = rest;
+        mine
+    };
+    for (.., h) in mine {
+        let _ = h.join();
+    }
 }
 
 /// A workspace's run scripts, started in order; dropping it stops them and their children.
 pub struct Running {
+    ws: String,
     pub port: u16,
     /// Repo and process group per script; a group outlives its shell while what it started runs.
     groups: Vec<(String, Child, bool)>,
@@ -130,6 +173,7 @@ impl Running {
     pub fn start(ws: &str, jobs: &[Job], port: u16) -> Result<Self, String> {
         let mut log = open_log(ws)?;
         let mut running = Running {
+            ws: ws.into(),
             port,
             groups: vec![],
         };
@@ -196,11 +240,12 @@ fn group_alive(c: &Child) -> bool {
 }
 
 impl Drop for Running {
-    /// Stops in the background, so servers get 5s to shut down cleanly.
+    /// Stops in the background, so servers get 5s to shut down cleanly; tracked in `STOPPING`.
     fn drop(&mut self) {
         let groups = std::mem::take(&mut self.groups);
         if !groups.is_empty() {
-            std::thread::spawn(move || Self::stop(groups, 5));
+            let h = std::thread::spawn(move || Self::stop(groups, 5));
+            stopping().push((std::mem::take(&mut self.ws), self.port, h));
         }
     }
 }
@@ -295,10 +340,25 @@ mod tests {
             (vec!["api (exit status: 0)".into()], true)
         );
         assert_eq!(fs::read_to_string(dir.join("port")).unwrap(), "51010\n");
-        assert!(![51000, 51010].contains(&free_port([51000, 51010].into_iter())));
-        let p = free_port(std::iter::empty());
-        let _taken = std::net::TcpListener::bind(("127.0.0.1", p)).unwrap();
-        assert_ne!(free_port(std::iter::empty()), p, "a port in use is skipped");
+        let held = free_port([51000, 51010].into_iter()).unwrap();
+        assert!(![51000, 51010].contains(&held));
+        let p = free_port(std::iter::empty()).unwrap();
+        let taken = std::net::TcpListener::bind(("0.0.0.0", p + 3)).unwrap();
+        assert_ne!(
+            free_port(std::iter::empty()),
+            Ok(p),
+            "a block with a port in use is skipped"
+        );
+        drop(taken);
+
+        // A run stopped by dropping it keeps its ports until its servers are gone.
+        let script = "trap '' TERM; sleep 30";
+        let stopped = Running::start(&ws, &[job(&dir, script)], p).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(200));
+        drop(stopped);
+        assert_ne!(free_port(std::iter::empty()), Ok(p), "still stopping");
+        wait_stopping(Some(&ws));
+        assert_eq!(free_port(std::iter::empty()), Ok(p));
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_file(log_path(&ws));
     }

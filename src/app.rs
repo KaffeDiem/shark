@@ -113,6 +113,8 @@ pub struct Shark {
     pub(crate) archiving: HashSet<String>,
     creating: HashSet<String>,
     adding_repos: HashSet<String>,
+    /// Workspaces with setup scripts running, once per run (a repo added during the first).
+    setting_up: Vec<String>,
     /// Sidebar shrunk to icons by the user.
     rail: bool,
     /// Zen mode (cmd-.): only the shown tab's content; see `zen_shown`.
@@ -244,6 +246,7 @@ impl Shark {
         // Dev servers started by cmd-r don't outlive Shark.
         _subs.push(cx.on_app_quit(|s, _| {
             crate::scripts::Running::stop_all(s.runs.drain().map(|(_, r)| r), 2);
+            crate::scripts::wait_stopping(None);
             async {}
         }));
         _subs.push(cx.observe(&differ, |_, _, cx| cx.notify()));
@@ -270,6 +273,7 @@ impl Shark {
             archiving: HashSet::new(),
             creating: HashSet::new(),
             adding_repos: HashSet::new(),
+            setting_up: vec![],
             rail: false,
             zen: false,
             editor: None,

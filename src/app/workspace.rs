@@ -1856,6 +1856,9 @@ impl Shark {
                 "Wait for the repository addition before archiving",
             );
         }
+        if self.setting_up.iter().any(|n| n == name) {
+            return notify_err(window, cx, "Wait for setup scripts before archiving");
+        }
         self.retry_saves(cx);
         let pending_answers = self.ws(name).is_some_and(|ws| {
             ws.chats.iter().chain(&ws.closed).any(|m| {
@@ -1914,6 +1917,8 @@ impl Shark {
                 .background_executor()
                 .spawn(async move {
                     crate::scripts::Running::stop_all(run, 5);
+                    // And those cmd-r stopped just before.
+                    crate::scripts::wait_stopping(Some(&ws.name));
                     // A failed archive script keeps the worktree, unless forced.
                     let scripts = crate::scripts::run_all(&ws.name, &jobs).err();
                     if scripts.is_some() && !force {

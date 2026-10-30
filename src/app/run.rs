@@ -25,8 +25,9 @@ impl Shark {
             );
         }
         let port = scripts::free_port(self.runs.values().map(|r| r.port));
-        match Running::start(&ws.name, &jobs, port) {
+        match port.and_then(|port| Running::start(&ws.name, &jobs, port)) {
             Ok(r) => {
+                let port = r.port;
                 self.runs.insert(ws.name.clone(), r);
                 let n = jobs.len();
                 let msg = format!(
@@ -93,12 +94,17 @@ impl Shark {
         }
         let name = ws.name.clone();
         window.push_notification(format!("Running setup scripts in {name}…"), cx);
+        // Archiving waits for it: the worktree mustn't go while setup writes to it.
+        self.setting_up.push(name.clone());
         cx.spawn_in(window, async move |this, cx| {
             let ws = name.clone();
             let result = (cx.background_executor())
                 .spawn(async move { scripts::run_all(&ws, &jobs) })
                 .await;
-            this.update_in(cx, |_, window, cx| {
+            this.update_in(cx, |s, window, cx| {
+                if let Some(i) = s.setting_up.iter().position(|n| *n == name) {
+                    s.setting_up.remove(i);
+                }
                 let ok = result.is_ok();
                 match result {
                     Ok(()) => window.push_notification(

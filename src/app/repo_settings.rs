@@ -55,6 +55,8 @@ impl Render for ScriptDrag {
 pub(super) struct RepoSettingsView {
     shark: WeakEntity<Shark>,
     repo: Repo,
+    /// What "Last used" means now, so its levels (Claude's or Codex's) are the ones offered.
+    last: String,
     model: Choice,
     effort: Choice,
     /// One input per script, per `PHASES` entry; saved on every change.
@@ -62,11 +64,18 @@ pub(super) struct RepoSettingsView {
     _subs: Vec<Subscription>,
 }
 
+/// The levels `s`'s model takes; "Last used" is `last`.
+fn levels(s: &RepoSettings, last: &str) -> &'static [&'static str] {
+    efforts(s.model.as_deref().unwrap_or(last))
+}
+
 pub(super) fn open(shark: &mut Shark, repo: Repo, window: &mut Window, cx: &mut Context<Shark>) {
     let settings = shark.state.repo_settings.get(&repo.name).cloned();
     let weak = cx.entity().downgrade();
-    let view =
-        cx.new(|cx| RepoSettingsView::new(weak, repo, settings.unwrap_or_default(), window, cx));
+    let last = shark.state.new_model();
+    let view = cx.new(|cx| {
+        RepoSettingsView::new(weak, repo, last, settings.unwrap_or_default(), window, cx)
+    });
     window.open_dialog(cx, move |d, _, _| {
         d.font_features(inter_features())
             .entrance(DialogEntrance::None)
@@ -79,6 +88,7 @@ impl RepoSettingsView {
     fn new(
         shark: WeakEntity<Shark>,
         repo: Repo,
+        last: String,
         s: RepoSettings,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -96,24 +106,26 @@ impl RepoSettingsView {
                 cx,
             )
         });
-        let effort = Self::effort_choice(&s, window, cx);
+        let effort = Self::effort_choice(&s, &last, window, cx);
         let mut subs = vec![cx.subscribe_in(&model, window, |this, _, ev, window, cx| {
             let SelectEvent::Confirm(Some(v)) = ev else {
                 return;
             };
             let m = MODELS.iter().find(|m| model_label(m) == v.as_ref());
+            let last = this.last.clone();
             let s = this.update(cx, |s| {
                 s.model = m.map(|m| m.to_string());
-                let levels = efforts(s.model.as_deref().unwrap_or(MODELS[0]));
+                let levels = levels(s, &last);
                 s.effort = s.effort.take().filter(|e| levels.contains(&e.as_str()));
             });
             // Claude and Codex take different levels.
-            this.effort = Self::effort_choice(&s, window, cx);
+            this.effort = Self::effort_choice(&s, &this.last, window, cx);
             this._subs.push(this.watch_effort(window, cx));
         })];
         let mut this = RepoSettingsView {
             shark,
             repo,
+            last,
             model,
             effort,
             scripts: Default::default(),
@@ -129,8 +141,13 @@ impl RepoSettingsView {
         this
     }
 
-    fn effort_choice(s: &RepoSettings, window: &mut Window, cx: &mut Context<Self>) -> Choice {
-        let levels = efforts(s.model.as_deref().unwrap_or(MODELS[0]));
+    fn effort_choice(
+        s: &RepoSettings,
+        last: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Choice {
+        let levels = levels(s, last);
         let mut items = vec![SharedString::from("Last used")];
         items.extend(levels.iter().map(|l| effort_label(l).into()));
         let at = (s.effort.as_deref())
@@ -152,8 +169,9 @@ impl RepoSettingsView {
                 return;
             };
             let v = v.to_string();
+            let last = this.last.clone();
             this.update(cx, move |s| {
-                let levels = efforts(s.model.as_deref().unwrap_or(MODELS[0]));
+                let levels = levels(s, &last);
                 s.effort = (levels.iter().find(|l| effort_label(l) == v)).map(|l| l.to_string());
             });
         })
