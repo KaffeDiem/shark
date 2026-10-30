@@ -162,10 +162,7 @@ impl Shark {
         crate::prompts::set_overrides(&state.prompts);
         crate::settings::apply(&state.appearance, cx);
         if let Some(size) = state.editor_font_size {
-            cx.set_global(crate::editor::CodeFont(size.clamp(
-                *crate::editor::FONT_SIZES.start(),
-                *crate::editor::FONT_SIZES.end(),
-            )));
+            cx.set_global(crate::editor::CodeFont(editor_pane::clamp_font_size(size)));
         }
         let sidebar_focus = cx.focus_handle();
         sidebar_focus.focus(window, cx);

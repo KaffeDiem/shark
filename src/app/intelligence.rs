@@ -42,6 +42,53 @@ pub(super) enum LanguageAction {
     SignatureHelp,
 }
 
+/// The LSP method and parameters that carry out `action` at `position` in `uri`.
+fn language_request(
+    action: &LanguageAction,
+    uri: &Uri,
+    text: &str,
+    position: lsp_types::Position,
+) -> (&'static str, Value) {
+    let document = json!({"uri": uri});
+    match action {
+        LanguageAction::Format => (
+            "textDocument/formatting",
+            json!({"textDocument": document, "options": formatting_options(text)}),
+        ),
+        LanguageAction::References => (
+            "textDocument/references",
+            json!({
+                "textDocument": document,
+                "position": position,
+                "context": {"includeDeclaration": true},
+            }),
+        ),
+        LanguageAction::Rename(name) => (
+            "textDocument/rename",
+            json!({"textDocument": document, "position": position, "newName": name}),
+        ),
+        LanguageAction::SignatureHelp => (
+            "textDocument/signatureHelp",
+            json!({"textDocument": document, "position": position}),
+        ),
+    }
+}
+
+/// Whether the server validates a rename target with `textDocument/prepareRename` first.
+fn wants_prepare_rename(client: &client::Client) -> bool {
+    let provider = client.capabilities().and_then(|c| c.rename_provider);
+    matches!(provider, Some(lsp_types::OneOf::Right(o)) if o.prepare_provider == Some(true))
+}
+
+/// The labels of a signature-help result, one per line.
+fn signature_label(result: &Value) -> String {
+    let signatures = result["signatures"].as_array();
+    (signatures.into_iter().flatten())
+        .filter_map(|s| s["label"].as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 struct Staged {
     path: PathBuf,
     existing_path: Option<PathBuf>,
@@ -241,51 +288,97 @@ impl Shark {
             let response = async {
                 let mut snapshot = snapshots.lock().unwrap().clone();
                 for _ in 0..100 {
-                    if snapshot.text.as_ref() == text { break; }
-                    cx.background_executor().timer(std::time::Duration::from_millis(10)).await;
+                    if snapshot.text.as_ref() == text {
+                        break;
+                    }
+                    let tick = std::time::Duration::from_millis(10);
+                    cx.background_executor().timer(tick).await;
                     snapshot = snapshots.lock().unwrap().clone();
                 }
-                anyhow::ensure!(snapshot.text.as_ref() == text, "Document synchronization is pending; try again");
+                anyhow::ensure!(
+                    snapshot.text.as_ref() == text,
+                    "Document synchronization is pending; try again"
+                );
                 let encoding = Encoding::from(client.encoding());
                 let position = document::position(&text, cursor, encoding)?;
-                let at = json!({"textDocument":{"uri":uri}, "position":position});
-                let (method, params) = match &action {
-                    Format => ("textDocument/formatting", json!({"textDocument":{"uri":uri},"options":formatting_options(&text)})),
-                    References => ("textDocument/references", json!({"textDocument":{"uri":uri}, "position":position, "context":{"includeDeclaration":true}})),
-                    Rename(name) => ("textDocument/rename", json!({"textDocument":{"uri":uri}, "position":position, "newName":name})),
-                    SignatureHelp => ("textDocument/signatureHelp", at.clone()),
-                };
-                if matches!(action, Rename(_)) && client.capabilities().and_then(|c| c.rename_provider).is_some_and(|p| matches!(p, lsp_types::OneOf::Right(o) if o.prepare_provider == Some(true))) {
+                let (method, params) = language_request(&action, &uri, &text, position);
+                if matches!(action, Rename(_)) && wants_prepare_rename(&client) {
+                    let at = json!({"textDocument": {"uri": uri}, "position": position});
                     let prepared = client.request("textDocument/prepareRename", at).await?;
                     anyhow::ensure!(!prepared.is_null(), "This symbol cannot be renamed");
                 }
                 let result = client.request(method, params).await?;
-                anyhow::ensure!(*snapshots.lock().unwrap() == snapshot, "The document changed; request the result again");
+                anyhow::ensure!(
+                    *snapshots.lock().unwrap() == snapshot,
+                    "The document changed; request the result again"
+                );
                 Ok::<_, anyhow::Error>((result, encoding))
-            }.await;
+            }
+            .await;
             let _ = this.update_in(cx, |s, window, cx| {
-                let Some(editor) = editor.upgrade() else { return };
-                if s.active != workspace || s.editor.as_ref() != Some(&editor) || editor.read(cx).input.read(cx).cursor() != cursor || editor.read(cx).input.read(cx).value().as_ref() != text { return; }
-                let (result, encoding) = match response { Ok(r) => r, Err(error) => return notify_err(window, cx, error.to_string()) };
-                if result.is_null() { return window.push_notification("No result at this position", cx); }
+                let Some(editor) = editor.upgrade() else {
+                    return;
+                };
+                let input = editor.read(cx).input.read(cx);
+                let unchanged = input.cursor() == cursor && input.value().as_ref() == text;
+                if s.active != workspace || s.editor.as_ref() != Some(&editor) || !unchanged {
+                    return;
+                }
+                let (result, encoding) = match response {
+                    Ok(r) => r,
+                    Err(error) => return notify_err(window, cx, error.to_string()),
+                };
+                if result.is_null() {
+                    return window.push_notification("No result at this position", cx);
+                }
                 match action {
-                    Format => {
-                        match serde_json::from_value::<Vec<lsp_types::TextEdit>>(result) {
-                            Ok(edits) => s.apply_workspace_edit(WorkspaceEdit { changes: Some(std::collections::HashMap::from([(uri, edits)])), ..Default::default() }, encoding, root, Some(guard), None, window, cx),
+                    Format => match serde_json::from_value::<Vec<lsp_types::TextEdit>>(result) {
+                        Ok(edits) => {
+                            let changes = std::collections::HashMap::from([(uri, edits)]);
+                            let edit = WorkspaceEdit {
+                                changes: Some(changes),
+                                ..Default::default()
+                            };
+                            s.apply_workspace_edit(
+                                edit,
+                                encoding,
+                                root,
+                                Some(guard),
+                                None,
+                                window,
+                                cx,
+                            )
+                        }
+                        Err(error) => notify_err(window, cx, error.to_string()),
+                    },
+                    Rename(_) => match serde_json::from_value(result) {
+                        Ok(edit) => s.apply_workspace_edit(
+                            edit,
+                            encoding,
+                            root,
+                            Some(guard),
+                            None,
+                            window,
+                            cx,
+                        ),
+                        Err(error) => notify_err(window, cx, error.to_string()),
+                    },
+                    References => {
+                        match serde_json::from_value::<Vec<lsp_types::Location>>(result) {
+                            Ok(locations) => {
+                                let links = locations
+                                    .into_iter()
+                                    .map(crate::lsp::providers::location_link);
+                                s.pick_locations(links.collect(), encoding, false, window, cx)
+                            }
                             Err(error) => notify_err(window, cx, error.to_string()),
                         }
                     }
-                    Rename(_) => match serde_json::from_value(result) {
-                        Ok(edit) => s.apply_workspace_edit(edit, encoding, root, Some(guard), None, window, cx),
-                        Err(error) => notify_err(window, cx, error.to_string()),
-                    },
-                    References => match serde_json::from_value::<Vec<lsp_types::Location>>(result) {
-                        Ok(locations) => s.pick_locations(locations.into_iter().map(crate::lsp::providers::location_link).collect(), encoding, false, window, cx),
-                        Err(error) => notify_err(window, cx, error.to_string()),
-                    },
                     SignatureHelp => {
-                        let label = result["signatures"].as_array().map(|signatures| signatures.iter().filter_map(|s| s["label"].as_str()).collect::<Vec<_>>().join("\n")).unwrap_or_default();
-                        if !label.is_empty() { window.push_notification(label, cx); }
+                        let label = signature_label(&result);
+                        if !label.is_empty() {
+                            window.push_notification(label, cx);
+                        }
                     }
                 }
             });

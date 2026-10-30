@@ -537,12 +537,11 @@ impl Shark {
     }
 
     pub(super) fn editor_font_size(&self) -> f32 {
-        (self.state.editor_font_size)
-            .unwrap_or(crate::editor::FONT_SIZE)
-            .clamp(
-                *crate::editor::FONT_SIZES.start(),
-                *crate::editor::FONT_SIZES.end(),
-            )
+        clamp_font_size(
+            self.state
+                .editor_font_size
+                .unwrap_or(crate::editor::FONT_SIZE),
+        )
     }
 
     /// Steps the code size of the file editors and the diff by `step` px; 0 resets it.
@@ -554,10 +553,7 @@ impl Shark {
     ) {
         let size = match step {
             0. => crate::editor::FONT_SIZE,
-            _ => (self.editor_font_size() + step).clamp(
-                *crate::editor::FONT_SIZES.start(),
-                *crate::editor::FONT_SIZES.end(),
-            ),
+            _ => clamp_font_size(self.editor_font_size() + step),
         };
         self.state.editor_font_size = (size != crate::editor::FONT_SIZE).then_some(size);
         let _ = self.state.save();
@@ -1029,6 +1025,14 @@ impl Shark {
             .child(div().flex_1().min_h_0().child(editor))
             .into_any_element()
     }
+}
+
+/// A saved or stepped code size, held inside the editor's supported range.
+pub(super) fn clamp_font_size(size: f32) -> f32 {
+    size.clamp(
+        *crate::editor::FONT_SIZES.start(),
+        *crate::editor::FONT_SIZES.end(),
+    )
 }
 
 /// `(is folder, name)` for each entry but `.git`, folders first, by name.

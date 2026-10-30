@@ -1,4 +1,5 @@
 use super::*;
+use crate::lsp::test_support::{block_on, fake_server, logged};
 use crate::lsp::{
     Session,
     client::Client,
@@ -7,70 +8,10 @@ use crate::lsp::{
 use core::prelude::v1::test;
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
 use serde_json::{Value, json};
-use std::{fs, process::Command};
-
-// GPUI's deterministic scheduler rejects wakers invoked by real OS threads. Keep the
-// real peer's waits on an ordinary waker; the editor still uses the test scheduler.
-fn peer_wait<T>(future: impl std::future::Future<Output = T>) -> T {
-    struct Unpark(std::thread::Thread);
-    impl std::task::Wake for Unpark {
-        fn wake(self: std::sync::Arc<Self>) {
-            self.0.unpark();
-        }
-    }
-    let waker = std::task::Waker::from(std::sync::Arc::new(Unpark(std::thread::current())));
-    let mut context = std::task::Context::from_waker(&waker);
-    let mut future = std::pin::pin!(future);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            std::task::Poll::Ready(value) => return value,
-            std::task::Poll::Pending => std::thread::park_timeout(Duration::from_secs(1)),
-        }
-    }
-}
+use std::fs;
 
 fn fake_client(root: &std::path::Path, log: &std::path::Path) -> Client {
-    let mut command = Command::new("/usr/bin/python3");
-    command
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/lsp/client_tests/server.py"
-        ))
-        .arg(log);
-    Client::start(command, root, json!({})).unwrap()
-}
-
-fn messages(log: &std::path::Path) -> Vec<Value> {
-    fs::read_to_string(log)
-        .unwrap_or_default()
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect()
-}
-
-async fn open_editor(
-    tag: &str,
-    contents: &str,
-    cx: &mut TestAppContext,
-) -> (PathBuf, PathBuf, AnyWindowHandle, Entity<FileEditor>) {
-    let dir = std::env::temp_dir().join(format!("shark-lsp-ui-{tag}-{}", std::process::id()));
-    fs::create_dir_all(&dir).unwrap();
-    let file = dir.join("a.py");
-    fs::write(&file, contents).unwrap();
-    cx.update(gpui_kit::init);
-    let abs = file.clone();
-    let (window, editor) = cx
-        .update(|cx| {
-            gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
-                cx.new(|cx| FileEditor::new("r/a.py".into(), abs, true, w, cx))
-            })
-        })
-        .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        editor.read(cx).loaded
-    })
-    .await;
-    (dir, file, window, editor)
+    Client::start(fake_server(log), root, json!({})).unwrap()
 }
 
 #[gpui_kit::test]
@@ -80,7 +21,7 @@ async fn language_replacements_preserve_selection_scroll_and_one_vim_undo(cx: &m
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let original = "😀 first\nsecond\nthird\n";
-    let (dir, file, window, editor) = open_editor("undo", original, cx).await;
+    let (dir, file, window, editor) = ui_tests::open_editor("a.py", "undo", original, cx).await;
     cx.update_window(window, |_, w, cx| {
         focus(&editor, w, cx);
         editor.update(cx, |e, cx| {
@@ -138,10 +79,10 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let initial = "name = '🦈'\r\n";
-    let (dir, file, window, editor) = open_editor("sync", initial, cx).await;
+    let (dir, file, window, editor) = ui_tests::open_editor("a.py", "sync", initial, cx).await;
     let log = dir.join("server.jsonl");
     let client = fake_client(&dir, &log);
-    peer_wait(client.initialize()).unwrap();
+    block_on(client.initialize()).unwrap();
     let project = Project {
         root: dir.clone(),
         worktree: dir.clone(),
@@ -172,7 +113,7 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
     .await;
     let uri = url::Url::from_file_path(&file).unwrap().to_string();
     assert_eq!(
-        peer_wait(client.request(
+        block_on(client.request(
             "textDocument/completion",
             json!({"textDocument":{"uri":uri}})
         ))
@@ -243,7 +184,7 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
     })
     .await;
     assert_eq!(
-        peer_wait(client.request(
+        block_on(client.request(
             "textDocument/completion",
             json!({"textDocument":{"uri":uri}})
         ))
@@ -251,12 +192,12 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
         final_text
     );
     cx.wait_for(window, Duration::from_secs(10), |_, _| {
-        messages(&log)
+        logged(&log)
             .iter()
             .any(|v| v["method"] == "textDocument/didSave")
     })
     .await;
-    let protocol = messages(&log);
+    let protocol = logged(&log);
     let change = protocol
         .iter()
         .rposition(|v| v["method"] == "textDocument/didChange")
@@ -289,7 +230,7 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
     })
     .await;
     assert_eq!(
-        peer_wait(client.request(
+        block_on(client.request(
             "textDocument/completion",
             json!({"textDocument":{"uri":uri}})
         ))
@@ -299,7 +240,7 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
 
     let restarted_log = dir.join("restarted.jsonl");
     let restarted = fake_client(&dir, &restarted_log);
-    peer_wait(restarted.initialize()).unwrap();
+    block_on(restarted.initialize()).unwrap();
     cx.update(|cx| {
         editor.update(cx, |e, _| {
             e.lsp_error = Some("Old synchronization failure".into())
@@ -312,7 +253,7 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
         })
     });
     cx.wait_for(window, Duration::from_secs(10), |_, _| {
-        messages(&restarted_log)
+        logged(&restarted_log)
             .iter()
             .any(|v| v["method"] == "textDocument/didOpen")
     })
@@ -323,16 +264,16 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
         assert_eq!(e.language_status(cx).unwrap().0, "Ready");
     });
     assert_eq!(
-        peer_wait(restarted.request(
+        block_on(restarted.request(
             "textDocument/completion",
             json!({"textDocument":{"uri":uri}})
         ))
         .unwrap(),
         disk_text
     );
-    peer_wait(client.request("test/echo", Value::Null)).unwrap();
+    block_on(client.request("test/echo", Value::Null)).unwrap();
     assert!(
-        messages(&log)
+        logged(&log)
             .iter()
             .any(|v| v["method"] == "textDocument/didClose")
     );
@@ -347,8 +288,8 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
     .unwrap();
     cx.executor().advance_clock(Duration::from_millis(100));
     cx.run_until_parked();
-    peer_wait(restarted.request("test/echo", Value::Null)).unwrap();
-    let protocol = messages(&restarted_log);
+    block_on(restarted.request("test/echo", Value::Null)).unwrap();
+    let protocol = logged(&restarted_log);
     let closed = protocol
         .iter()
         .rposition(|v| v["method"] == "textDocument/didClose")
@@ -372,11 +313,12 @@ async fn diagnostics_from_both_servers_remain_searchable_in_document_order(
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let text = "import os\nname = 1\nvalue = name\n";
-    let (dir, file, window, editor) = open_editor("diagnostics-order", text, cx).await;
+    let (dir, file, window, editor) =
+        ui_tests::open_editor("a.py", "diagnostics-order", text, cx).await;
     let client = fake_client(&dir, &dir.join("primary.jsonl"));
     let companion = fake_client(&dir, &dir.join("ruff.jsonl"));
-    peer_wait(client.initialize()).unwrap();
-    peer_wait(companion.initialize()).unwrap();
+    block_on(client.initialize()).unwrap();
+    block_on(companion.initialize()).unwrap();
     let project = Project {
         root: dir.clone(),
         worktree: dir.clone(),
@@ -453,9 +395,10 @@ async fn completion_acceptance_applies_autoimport_snippet_mirrors_and_undo(
         CompletionItem, CompletionTextEdit, InsertTextFormat, Position, Range, TextEdit,
     };
     let initial = "# 😀\nsq";
-    let (dir, file, window, editor) = open_editor("completion", initial, cx).await;
+    let (dir, file, window, editor) =
+        ui_tests::open_editor("a.py", "completion", initial, cx).await;
     let client = fake_client(&dir, &dir.join("peer.jsonl"));
-    peer_wait(client.initialize()).unwrap();
+    block_on(client.initialize()).unwrap();
     let project = Project {
         root: dir.clone(),
         worktree: dir.clone(),
@@ -586,9 +529,10 @@ async fn accepting_an_unresolved_completion_adds_its_import_as_a_second_undo_ste
     use crate::lsp::{document::Encoding, providers::prepare_completion};
     use lsp_types::{CompletionItem, CompletionTextEdit, Position, Range, TextEdit};
     let initial = "# resolve-completion\nsq";
-    let (dir, _, window, editor) = open_editor("resolve-accept", initial, cx).await;
+    let (dir, _, window, editor) =
+        ui_tests::open_editor("a.py", "resolve-accept", initial, cx).await;
     let client = fake_client(&dir, &dir.join("peer.jsonl"));
-    peer_wait(client.initialize()).unwrap();
+    block_on(client.initialize()).unwrap();
     let project = Project {
         root: dir.clone(),
         worktree: dir.clone(),
@@ -642,7 +586,7 @@ async fn accepting_an_unresolved_completion_adds_its_import_as_a_second_undo_ste
     cx.run_until_parked();
     let log = dir.join("peer.jsonl");
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    while !(messages(&log).iter()).any(|m| {
+    while !(logged(&log).iter()).any(|m| {
         m["method"] == "completionItem/resolve" && m["params"]["data"]["token"] == "silent"
     }) {
         assert!(
@@ -703,9 +647,9 @@ async fn snippet_completion_inside_an_active_field_starts_its_own_tabstops(
         providers::prepare_completion,
     };
     use lsp_types::{CompletionItem, CompletionTextEdit, InsertTextFormat, Position, Range};
-    let (dir, _, window, editor) = open_editor("nested-snippet", "f", cx).await;
+    let (dir, _, window, editor) = ui_tests::open_editor("a.py", "nested-snippet", "f", cx).await;
     let client = fake_client(&dir, &dir.join("peer.jsonl"));
-    peer_wait(client.initialize()).unwrap();
+    block_on(client.initialize()).unwrap();
     let project = Project {
         root: dir.clone(),
         worktree: dir.clone(),
@@ -834,7 +778,7 @@ async fn vim_moves_but_never_edits_in_external_sources(cx: &mut TestAppContext) 
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let text = "first\nsecond\n";
-    let (dir, _, window, editor) = open_editor("external-vim", text, cx).await;
+    let (dir, _, window, editor) = ui_tests::open_editor("a.py", "external-vim", text, cx).await;
     cx.update_window(window, |_, w, cx| {
         focus(&editor, w, cx);
         editor.update(cx, |e, cx| e.set_external(true, cx));
@@ -887,92 +831,91 @@ fn outline_nests_both_symbol_shapes_and_follows_the_cursor() {
     assert_eq!(symbol_path(&symbols, text.len()), Vec::<usize>::new());
 }
 
-/// CPU-side input-to-frame cost; the test renderer does not measure display presentation.
 #[gpui_kit::test]
-#[ignore = "manual benchmark; select disabled or attached with SHARK_LSP_PERF_MODE"]
 #[allow(clippy::await_holding_lock)]
-async fn perf_language_input_to_frame(cx: &mut TestAppContext) {
-    let _turn = crate::app::ui_tests::UI_LOCK
+async fn escape_dismisses_language_menus_before_leaving_editor(cx: &mut TestAppContext) {
+    use gpui_kit::base::input::CodeActionItem;
+    let _guard = crate::app::ui_tests::UI_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    let mode = std::env::var("SHARK_LSP_PERF_MODE").unwrap_or_else(|_| "disabled".into());
-    assert!(["disabled", "attached"].contains(&mode.as_str()));
-    let original = format!(
-        "# typing here\n{}",
-        "value = 12345 # sample line\n".repeat(10_000)
-    );
-    let (dir, file, window, editor) = open_editor("performance", &original, cx).await;
-    let client = (mode != "disabled").then(|| {
-        let client = fake_client(&dir, &dir.join("performance-peer.jsonl"));
-        peer_wait(client.initialize()).unwrap();
-        client
+    let (dir, _, window, editor) =
+        ui_tests::open_editor("a.txt", "escape-overlays", "bad\n", cx).await;
+    let leaves = std::rc::Rc::new(std::cell::Cell::new(0));
+    let events = leaves.clone();
+    let _subscription = cx.update(|cx| {
+        cx.subscribe(&editor, move |_, event: &EditorEvent, _| {
+            if matches!(event, EditorEvent::Leave) {
+                events.set(events.get() + 1);
+            }
+        })
     });
-    if let Some(client) = &client {
-        let project = Project {
-            root: dir.clone(),
-            worktree: dir.clone(),
-            language_id: "python",
-            backend: Backend::Pyrefly,
-            toolchain: String::new(),
-            rust_toolchain: None,
-            interpreter: None,
-        };
-        let session = cx.update(|cx| cx.new(|_| Session::with_client(project, client.clone())));
-        cx.update_window(window, |_, w, cx| {
-            editor.update(cx, |e, cx| e.attach_language(session, w, cx));
-        })
-        .unwrap();
-    }
-    cx.update_window(window, |_, w, cx| {
-        editor.update(cx, |e, cx| {
-            e.set_vim(false, cx);
-            e.input.update(cx, |i, cx| {
-                // Network completions are timed separately; their OS wakers are not deterministic.
-                i.lsp_mut().completion_provider = None;
-                i.set_selected_range(2..2, cx);
-                i.focus(w, cx);
-            });
-        });
-        w.render_frame(cx);
-    })
-    .unwrap();
-    cx.run_until_parked();
-    let mut samples = vec![];
-    for n in 0..110 {
-        let started = std::time::Instant::now();
-        cx.update_window(window, |_, w, cx| {
-            w.press("x", cx);
-            w.render_frame(cx);
-        })
-        .unwrap();
-        let elapsed = started.elapsed().as_secs_f64() * 1000.;
-        if n >= 10 {
-            samples.push(elapsed);
+    for vim in [false, true] {
+        for quick_fix in [false, true] {
+            let before = leaves.get();
+            cx.update_window(window, |_, w, cx| {
+                editor.update(cx, |e, cx| {
+                    e.set_vim(vim, cx);
+                    e.input.update(cx, |input, cx| {
+                        input.focus(w, cx);
+                        if quick_fix {
+                            input.present_code_actions(
+                                vec![CodeActionItem {
+                                    provider_id: "test".into(),
+                                    action: lsp_types::CodeAction {
+                                        title: "Fix diagnostic".into(),
+                                        ..Default::default()
+                                    },
+                                }],
+                                cx,
+                            );
+                        } else {
+                            input.present_completion_items(
+                                0,
+                                "b",
+                                vec![lsp_types::CompletionItem::new_simple(
+                                    "better".into(),
+                                    "Complete".into(),
+                                )],
+                                cx,
+                            );
+                        }
+                    });
+                });
+                w.render_frame(cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                let input = editor.read(cx).input.read(cx);
+                assert_eq!(input.code_action_menu_state().open, quick_fix);
+                assert_eq!(input.completion_menu_state().open, !quick_fix);
+                w.press("escape", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            cx.update_window(window, |_, w, cx| {
+                let e = editor.read(cx);
+                let input = e.input.read(cx);
+                assert!(!input.code_action_menu_state().open);
+                assert!(!input.completion_menu_state().open);
+                assert!(e.is_focused(w, cx));
+                assert_eq!(
+                    leaves.get(),
+                    before,
+                    "Escape dismisses the menu without leaving"
+                );
+                assert_eq!(input.value().as_ref(), "bad\n");
+                w.press("escape", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            assert_eq!(
+                leaves.get(),
+                before + 1,
+                "a second Escape leaves the idle editor"
+            );
         }
-        cx.run_until_parked();
-        cx.executor().advance_clock(Duration::from_millis(50));
-        cx.run_until_parked();
-    }
-    cx.update(|cx| {
-        assert_eq!(
-            editor.read(cx).input.read(cx).value().len(),
-            original.len() + 110
-        );
-        assert!(editor.read(cx).dirty);
-    });
-    assert_eq!(fs::read_to_string(&file).unwrap(), original);
-    samples.sort_by(f64::total_cmp);
-    println!(
-        "LANGUAGE_INPUT_FRAME {}",
-        json!({
-            "mode":mode, "build":if cfg!(debug_assertions) { "debug" } else { "release" },
-            "renderer":"headless CPU frame; no presentation", "lines":10001,
-            "bytes":original.len(), "samples":samples.len(), "p50_ms":samples[49],
-            "p95_ms":samples[94], "max_ms":samples[99],
-        })
-    );
-    if let Some(client) = client {
-        client.shutdown();
     }
     let _ = fs::remove_dir_all(dir);
 }

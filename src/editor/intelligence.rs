@@ -107,18 +107,7 @@ impl Drop for Language {
     fn drop(&mut self) {
         self.alive.store(false, Ordering::Release);
         let _guard = self.snapshot.lock().unwrap();
-        if let Some(client) = &self.client {
-            let _ = client.notify(
-                "textDocument/didClose",
-                json!({"textDocument":{"uri":self.uri}}),
-            );
-        }
-        if let Some(client) = &self.companion {
-            let _ = client.notify(
-                "textDocument/didClose",
-                json!({"textDocument":{"uri":self.uri}}),
-            );
-        }
+        notify_close(&self.uri, [self.client.take(), self.companion.take()]);
     }
 }
 
@@ -258,18 +247,10 @@ impl FileEditor {
             self.lsp_error = None;
             language.alive.store(false, Ordering::Release);
             let _guard = language.snapshot.lock().unwrap();
-            if let Some(old) = language.client.take() {
-                let _ = old.notify(
-                    "textDocument/didClose",
-                    json!({"textDocument":{"uri":language.uri}}),
-                );
-            }
-            if let Some(old) = language.companion.take() {
-                let _ = old.notify(
-                    "textDocument/didClose",
-                    json!({"textDocument":{"uri":language.uri}}),
-                );
-            }
+            notify_close(
+                &language.uri,
+                [language.client.take(), language.companion.take()],
+            );
             language.sync = Task::ready(());
             language.generation = generation;
             drop(_guard);
@@ -359,73 +340,175 @@ impl FileEditor {
         let saved = language.saved.clone();
         let rope = self.input.read(cx).text().clone();
         language.sync = cx.spawn_in(window, async move |this, cx| {
-            if !opening { cx.background_executor().timer(Duration::from_millis(35)).await; }
-            let diagnostics = cx.background_executor().spawn(async move {
-                let text: Arc<str> = Arc::from(rope.to_string());
-                loop {
-                let previous = snapshot.lock().unwrap().clone();
-                if previous.version >= version { return Ok::<_, anyhow::Error>(None); }
-                let encoding = Encoding::from(client.encoding());
-                let ruff_change = companion.as_ref().map(|c| document::incremental_change(&previous.text, &text, c.encoding().into())).transpose()?.flatten();
-                let change = if previous.version == 0 { None } else {
-                    document::incremental_change(&previous.text, &text, encoding)?
-                };
-                let mut current = snapshot.lock().unwrap();
-                if !alive.load(Ordering::Acquire) { return Ok(None); }
-                if current.version != previous.version { continue; }
-                if previous.version == 0 {
-                    client.notify("textDocument/didOpen", json!({"textDocument":{"uri":uri,"languageId":language_id,"version":version,"text":text.as_ref()}}))?;
-                    if let Some(ruff) = &companion { ruff.notify("textDocument/didOpen", json!({"textDocument":{"uri":uri,"languageId":language_id,"version":version,"text":text.as_ref()}}))?; }
-                } else if previous.text != text {
-                    let kind = client.capabilities().and_then(|c| c.text_document_sync).map(|s| match s {
-                        lsp_types::TextDocumentSyncCapability::Kind(k) => k,
-                        lsp_types::TextDocumentSyncCapability::Options(o) => o.change.unwrap_or(lsp_types::TextDocumentSyncKind::NONE),
-                    }).unwrap_or(lsp_types::TextDocumentSyncKind::NONE);
-                    let change = if kind == lsp_types::TextDocumentSyncKind::INCREMENTAL {
-                        change
-                    } else if kind == lsp_types::TextDocumentSyncKind::FULL {
-                        Some(lsp_types::TextDocumentContentChangeEvent { range: None, range_length: None, text: text.to_string() })
-                    } else { None };
-                    if let Some(change) = change {
-                        client.notify("textDocument/didChange", json!({"textDocument":{"uri":uri,"version":version},"contentChanges":[change]}))?;
+            if !opening {
+                cx.background_executor()
+                    .timer(Duration::from_millis(35))
+                    .await;
+            }
+            let diagnostics = cx
+                .background_executor()
+                .spawn(async move {
+                    let text: Arc<str> = Arc::from(rope.to_string());
+                    loop {
+                        let previous = snapshot.lock().unwrap().clone();
+                        if previous.version >= version {
+                            return Ok::<_, anyhow::Error>(None);
+                        }
+                        let encoding = Encoding::from(client.encoding());
+                        let ruff_change = companion
+                            .as_ref()
+                            .map(|c| {
+                                document::incremental_change(
+                                    &previous.text,
+                                    &text,
+                                    c.encoding().into(),
+                                )
+                            })
+                            .transpose()?
+                            .flatten();
+                        let change = if previous.version == 0 {
+                            None
+                        } else {
+                            document::incremental_change(&previous.text, &text, encoding)?
+                        };
+                        let mut current = snapshot.lock().unwrap();
+                        if !alive.load(Ordering::Acquire) {
+                            return Ok(None);
+                        }
+                        if current.version != previous.version {
+                            continue;
+                        }
+                        if previous.version == 0 {
+                            let params = open_params(&uri, language_id, version, &text);
+                            client.notify("textDocument/didOpen", params.clone())?;
+                            if let Some(ruff) = &companion {
+                                ruff.notify("textDocument/didOpen", params)?;
+                            }
+                        } else if previous.text != text {
+                            let kind = client
+                                .capabilities()
+                                .and_then(|c| c.text_document_sync)
+                                .map(|s| match s {
+                                    lsp_types::TextDocumentSyncCapability::Kind(k) => k,
+                                    lsp_types::TextDocumentSyncCapability::Options(o) => {
+                                        o.change.unwrap_or(lsp_types::TextDocumentSyncKind::NONE)
+                                    }
+                                })
+                                .unwrap_or(lsp_types::TextDocumentSyncKind::NONE);
+                            let change = if kind == lsp_types::TextDocumentSyncKind::INCREMENTAL {
+                                change
+                            } else if kind == lsp_types::TextDocumentSyncKind::FULL {
+                                Some(lsp_types::TextDocumentContentChangeEvent {
+                                    range: None,
+                                    range_length: None,
+                                    text: text.to_string(),
+                                })
+                            } else {
+                                None
+                            };
+                            if let Some(change) = change {
+                                client.notify(
+                                    "textDocument/didChange",
+                                    json!({
+                                        "textDocument": {"uri": uri, "version": version},
+                                        "contentChanges": [change],
+                                    }),
+                                )?;
+                            }
+                            if let (Some(ruff), Some(change)) = (&companion, ruff_change) {
+                                ruff.notify(
+                                    "textDocument/didChange",
+                                    json!({
+                                        "textDocument": {"uri": uri, "version": version},
+                                        "contentChanges": [change],
+                                    }),
+                                )?;
+                            }
+                        }
+                        if previous.version == 0 || previous.text != text {
+                            *current = Snapshot { text, version };
+                        }
+                        if let Some(saved) = saved.lock().unwrap().take() {
+                            notify_save(&client, &uri, &saved)?;
+                            if let Some(ruff) = &companion {
+                                notify_save(ruff, &uri, &saved)?;
+                            }
+                        }
+                        let version = current.version;
+                        let text = current.text.clone();
+                        let symbols = Some(client.clone()).filter(|c| {
+                            c.capabilities()
+                                .and_then(|c| c.document_symbol_provider)
+                                .is_some_and(|p| !matches!(p, lsp_types::OneOf::Left(false)))
+                        });
+                        let clients: Vec<_> = [(Some(client), false), (companion, true)]
+                            .into_iter()
+                            .filter_map(|(client, companion)| {
+                                client
+                                    .filter(|c| {
+                                        c.capabilities()
+                                            .is_some_and(|c| c.diagnostic_provider.is_some())
+                                    })
+                                    .map(|c| (c, companion))
+                            })
+                            .collect();
+                        return Ok(Some((clients, uri, version, symbols, text)));
                     }
-                    if let (Some(ruff), Some(change)) = (&companion, ruff_change) { ruff.notify("textDocument/didChange", json!({"textDocument":{"uri":uri,"version":version},"contentChanges":[change]}))?; }
-                }
-                if previous.version == 0 || previous.text != text {
-                    *current = Snapshot { text, version };
-                }
-                if let Some(saved) = saved.lock().unwrap().take() {
-                    notify_save(&client, &uri, &saved)?;
-                    if let Some(ruff) = &companion { notify_save(ruff, &uri, &saved)?; }
-                }
-                let version = current.version;
-                let text = current.text.clone();
-                let symbols = Some(client.clone()).filter(|c| c.capabilities().and_then(|c| c.document_symbol_provider).is_some_and(|p| !matches!(p, lsp_types::OneOf::Left(false))));
-                let clients: Vec<_> = [(Some(client), false), (companion, true)].into_iter()
-                    .filter_map(|(client, companion)| client.filter(|c| c.capabilities().is_some_and(|c| c.diagnostic_provider.is_some())).map(|c| (c, companion)))
-                    .collect();
-                return Ok(Some((clients, uri, version, symbols, text)));
-                }
-            }).await;
+                })
+                .await;
             match diagnostics {
                 Ok(Some((clients, uri, version, symbols, text))) => {
                     for (client, companion) in clients {
-                    if let Ok(report) = client.request("textDocument/diagnostic", json!({"textDocument":{"uri":uri}})).await
-                        && report["kind"] == "full"
-                        && let Ok(items) = serde_json::from_value(report["items"].clone()) {
-                        let _ = this.update(cx, |e, cx| e.language_diagnostics(PublishDiagnosticsParams { uri: uri.clone(), diagnostics: items, version: Some(version) }, companion, cx));
-                    }
+                        if let Ok(report) = client
+                            .request(
+                                "textDocument/diagnostic",
+                                json!({"textDocument":{"uri":uri}}),
+                            )
+                            .await
+                            && report["kind"] == "full"
+                            && let Ok(items) = serde_json::from_value(report["items"].clone())
+                        {
+                            let _ = this.update(cx, |e, cx| {
+                                e.language_diagnostics(
+                                    PublishDiagnosticsParams {
+                                        uri: uri.clone(),
+                                        diagnostics: items,
+                                        version: Some(version),
+                                    },
+                                    companion,
+                                    cx,
+                                )
+                            });
+                        }
                     }
                     // A newer edit replaces this task, so a stale outline never lands.
                     if let Some(client) = symbols
-                        && let Ok(result) = client.request("textDocument/documentSymbol", json!({"textDocument":{"uri":uri}})).await {
+                        && let Ok(result) = client
+                            .request(
+                                "textDocument/documentSymbol",
+                                json!({"textDocument":{"uri":uri}}),
+                            )
+                            .await
+                    {
                         let encoding = Encoding::from(client.encoding());
-                        let symbols = cx.background_executor().spawn(async move { outline(&result, &text, encoding) }).await;
-                        let _ = this.update(cx, |e, cx| { e.outline = symbols; e.sync_crumbs(cx); cx.notify(); });
+                        let symbols = cx
+                            .background_executor()
+                            .spawn(async move { outline(&result, &text, encoding) })
+                            .await;
+                        let _ = this.update(cx, |e, cx| {
+                            e.outline = symbols;
+                            e.sync_crumbs(cx);
+                            cx.notify();
+                        });
                     }
                 }
                 Ok(None) => {}
-                Err(error) => { let _ = this.update(cx, |e, cx| { e.lsp_error = Some(error.to_string()); cx.notify(); }); }
+                Err(error) => {
+                    let _ = this.update(cx, |e, cx| {
+                        e.lsp_error = Some(error.to_string());
+                        cx.notify();
+                    });
+                }
             }
         });
     }
@@ -573,6 +656,22 @@ fn map_offset(old: &str, new: &str, offset: usize, lines: bool) -> usize {
         return new.floor_char_boundary(n + (offset - o).min(b.len()));
     }
     new.len()
+}
+
+fn open_params(uri: &Uri, language_id: &str, version: i32, text: &str) -> serde_json::Value {
+    json!({"textDocument": {
+        "uri": uri,
+        "languageId": language_id,
+        "version": version,
+        "text": text,
+    }})
+}
+
+/// Tells each server it no longer has the document open.
+fn notify_close(uri: &Uri, clients: [Option<Client>; 2]) {
+    for client in clients.into_iter().flatten() {
+        let _ = client.notify("textDocument/didClose", json!({"textDocument":{"uri":uri}}));
+    }
 }
 
 fn notify_save(client: &Client, uri: &Uri, text: &str) -> anyhow::Result<()> {

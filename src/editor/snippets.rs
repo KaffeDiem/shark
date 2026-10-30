@@ -425,7 +425,13 @@ pub(super) fn completion_imports(
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[::core::prelude::v1::test]
+    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+
+    fn stop(index: u32, start: usize, end: usize) -> Stop {
+        Stop { index, start, end }
+    }
+
+    #[test]
     fn resolved_imports_apply_only_before_the_accepted_span_with_an_unchanged_prefix() {
         use lsp_types::{Position, Range, TextEdit};
         let utf16 = crate::lsp::document::Encoding::Utf16;
@@ -455,9 +461,8 @@ mod tests {
         );
     }
 
-    #[::core::prelude::v1::test]
+    #[test]
     fn imports_before_the_snippet_shift_its_stops_and_mirrored_carets() {
-        let stop = |index, start, end| Stop { index, start, end };
         let mut session = Session {
             text: "f(arg, arg)".into(),
             index: 1,
@@ -474,189 +479,61 @@ mod tests {
         assert_eq!(session.shift(12, 1, "x", 0..0), None);
     }
 
-    #[::core::prelude::v1::test]
+    #[test]
     fn tabstops_follow_unicode_and_mirrored_edits() {
         let mut session = Session {
             text: "f(arg, arg, next)".into(),
             index: 1,
             stops: vec![
-                Stop {
-                    index: 1,
-                    start: 2,
-                    end: 5,
-                },
-                Stop {
-                    index: 1,
-                    start: 7,
-                    end: 10,
-                },
-                Stop {
-                    index: 2,
-                    start: 12,
-                    end: 16,
-                },
-                Stop {
-                    index: 0,
-                    start: 17,
-                    end: 17,
-                },
+                stop(1, 2, 5),
+                stop(1, 7, 10),
+                stop(2, 12, 16),
+                stop(0, 17, 17),
             ],
         };
         assert!(session.changed("f(😀, 😀, next)"));
-        assert_eq!(
-            session.stops[0],
-            Stop {
-                index: 1,
-                start: 2,
-                end: 6
-            }
-        );
-        assert_eq!(
-            session.stops[1],
-            Stop {
-                index: 1,
-                start: 8,
-                end: 12
-            }
-        );
-        assert_eq!(
-            session.stops[2],
-            Stop {
-                index: 2,
-                start: 14,
-                end: 18
-            }
-        );
+        assert_eq!(session.stops[0], stop(1, 2, 6));
+        assert_eq!(session.stops[1], stop(1, 8, 12));
+        assert_eq!(session.stops[2], stop(2, 14, 18));
         assert!(!session.changed("other text"));
     }
-    #[::core::prelude::v1::test]
+
+    #[test]
     fn replacing_outer_placeholder_removes_nested_stops() {
         let mut session = Session {
             text: "fn name(x)".into(),
             index: 1,
-            stops: vec![
-                Stop {
-                    index: 1,
-                    start: 3,
-                    end: 10,
-                },
-                Stop {
-                    index: 2,
-                    start: 8,
-                    end: 9,
-                },
-                Stop {
-                    index: 0,
-                    start: 10,
-                    end: 10,
-                },
-            ],
+            stops: vec![stop(1, 3, 10), stop(2, 8, 9), stop(0, 10, 10)],
         };
         assert!(session.changed("fn done"));
         assert!(session.stops.iter().all(|s| s.index != 2));
     }
 
-    #[::core::prelude::v1::test]
+    #[test]
     fn adjacent_empty_tabstops_survive_typing_in_the_first() {
         let mut session = Session {
             text: "f()".into(),
             index: 1,
-            stops: vec![
-                Stop {
-                    index: 1,
-                    start: 2,
-                    end: 2,
-                },
-                Stop {
-                    index: 2,
-                    start: 2,
-                    end: 2,
-                },
-                Stop {
-                    index: 0,
-                    start: 3,
-                    end: 3,
-                },
-            ],
+            stops: vec![stop(1, 2, 2), stop(2, 2, 2), stop(0, 3, 3)],
         };
         assert!(session.changed("f(x)"));
         assert_eq!(
             session.stops,
-            vec![
-                Stop {
-                    index: 1,
-                    start: 2,
-                    end: 3
-                },
-                Stop {
-                    index: 2,
-                    start: 3,
-                    end: 3
-                },
-                Stop {
-                    index: 0,
-                    start: 4,
-                    end: 4
-                },
-            ]
+            vec![stop(1, 2, 3), stop(2, 3, 3), stop(0, 4, 4),]
         );
         assert!(session.changed("f(xy)"));
-        assert_eq!(
-            session.stops[1],
-            Stop {
-                index: 2,
-                start: 4,
-                end: 4
-            }
-        );
+        assert_eq!(session.stops[1], stop(2, 4, 4));
         session.index = 2;
         assert!(session.changed("f(xy😀)"));
-        assert_eq!(
-            session.stops[0],
-            Stop {
-                index: 1,
-                start: 2,
-                end: 4
-            }
-        );
-        assert_eq!(
-            session.stops[1],
-            Stop {
-                index: 2,
-                start: 4,
-                end: 8
-            }
-        );
-        assert_eq!(
-            session.stops[2],
-            Stop {
-                index: 0,
-                start: 9,
-                end: 9
-            }
-        );
+        assert_eq!(session.stops[0], stop(1, 2, 4));
+        assert_eq!(session.stops[1], stop(2, 4, 8));
+        assert_eq!(session.stops[2], stop(0, 9, 9));
         // Shift-Tab returns to only the first field, leaving the second field intact.
         session.index = 1;
         assert!(session.changed("f(z😀)"));
         assert_eq!(
             session.stops,
-            vec![
-                Stop {
-                    index: 1,
-                    start: 2,
-                    end: 3
-                },
-                Stop {
-                    index: 2,
-                    start: 3,
-                    end: 7
-                },
-                Stop {
-                    index: 0,
-                    start: 8,
-                    end: 8
-                },
-            ]
+            vec![stop(1, 2, 3), stop(2, 3, 7), stop(0, 8, 8),]
         );
     }
 }

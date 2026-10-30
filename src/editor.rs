@@ -17,7 +17,7 @@ mod intelligence;
 mod intelligence_tests;
 mod snippets;
 pub(crate) use intelligence::LanguageEvent;
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 pub(crate) use intelligence::Symbol;
 
 /// Bigger files open in the diff only; the editor is built for up to ~50K lines.
@@ -33,10 +33,7 @@ pub enum EditorEvent {
     Language(LanguageEvent),
 }
 
-/// Code size and line height, from readability research (docs/editor-typography.md):
-/// 14px puts JetBrains Mono's x-height at about 0.15-0.17° at desk distance, nearer the
-/// 0.2° critical print size than 12.5px; 1.5× leading is WCAG's line spacing and a practical
-/// default between tight lines, which clearly hurt, and lost density.
+/// Code size and line height; rationale in docs/editor-typography.md.
 pub const FONT_SIZE: f32 = 14.;
 pub const FONT_SIZES: std::ops::RangeInclusive<f32> = 10.0..=24.0;
 pub const LINE_HEIGHT: f32 = 1.5;
@@ -985,22 +982,23 @@ mod ui_tests {
     use gpui_kit::test::{TestAppContextExt, TestWindowExt};
     use std::fs;
 
-    /// A loaded editor on `contents` in a fresh temp dir; returns the dir and the file.
-    async fn open_editor(
+    /// A loaded editor on `name` with `contents` in a fresh temp dir; returns the dir and the file.
+    pub(super) async fn open_editor(
+        name: &str,
         tag: &str,
         contents: &str,
         cx: &mut TestAppContext,
     ) -> (PathBuf, PathBuf, AnyWindowHandle, Entity<FileEditor>) {
         let dir = std::env::temp_dir().join(format!("shark-{tag}-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("a.txt");
+        let file = dir.join(name);
         fs::write(&file, contents).unwrap();
         cx.update(gpui_kit::init);
         let abs = file.clone();
         let (window, editor) = cx
             .update(|cx| {
                 gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
-                    cx.new(|cx| FileEditor::new("r/a.txt".into(), abs, true, w, cx))
+                    cx.new(|cx| FileEditor::new(format!("r/{name}"), abs, true, w, cx))
                 })
             })
             .unwrap();
@@ -1012,100 +1010,8 @@ mod ui_tests {
     }
 
     #[gpui_kit::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn escape_dismisses_language_menus_before_leaving_editor(cx: &mut TestAppContext) {
-        use gpui_kit::base::input::CodeActionItem;
-        let _guard = crate::app::ui_tests::UI_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let (dir, _, window, editor) = open_editor("escape-overlays", "bad\n", cx).await;
-        let leaves = std::rc::Rc::new(std::cell::Cell::new(0));
-        let events = leaves.clone();
-        let _subscription = cx.update(|cx| {
-            cx.subscribe(&editor, move |_, event: &EditorEvent, _| {
-                if matches!(event, EditorEvent::Leave) {
-                    events.set(events.get() + 1);
-                }
-            })
-        });
-        for vim in [false, true] {
-            for quick_fix in [false, true] {
-                let before = leaves.get();
-                cx.update_window(window, |_, w, cx| {
-                    editor.update(cx, |e, cx| {
-                        e.set_vim(vim, cx);
-                        e.input.update(cx, |input, cx| {
-                            input.focus(w, cx);
-                            if quick_fix {
-                                input.present_code_actions(
-                                    vec![CodeActionItem {
-                                        provider_id: "test".into(),
-                                        action: lsp_types::CodeAction {
-                                            title: "Fix diagnostic".into(),
-                                            ..Default::default()
-                                        },
-                                    }],
-                                    cx,
-                                );
-                            } else {
-                                input.present_completion_items(
-                                    0,
-                                    "b",
-                                    vec![lsp_types::CompletionItem::new_simple(
-                                        "better".into(),
-                                        "Complete".into(),
-                                    )],
-                                    cx,
-                                );
-                            }
-                        });
-                    });
-                    w.render_frame(cx);
-                })
-                .unwrap();
-                cx.run_until_parked();
-                cx.update_window(window, |_, w, cx| {
-                    w.render_frame(cx);
-                    let input = editor.read(cx).input.read(cx);
-                    assert_eq!(input.code_action_menu_state().open, quick_fix);
-                    assert_eq!(input.completion_menu_state().open, !quick_fix);
-                    w.press("escape", cx);
-                })
-                .unwrap();
-                cx.run_until_parked();
-                cx.update_window(window, |_, w, cx| {
-                    let e = editor.read(cx);
-                    let input = e.input.read(cx);
-                    assert!(!input.code_action_menu_state().open);
-                    assert!(!input.completion_menu_state().open);
-                    assert!(e.is_focused(w, cx));
-                    assert_eq!(
-                        leaves.get(),
-                        before,
-                        "Escape dismisses the menu without leaving"
-                    );
-                    assert_eq!(input.value().as_ref(), "bad\n");
-                    w.press("escape", cx);
-                })
-                .unwrap();
-                cx.run_until_parked();
-                assert_eq!(
-                    leaves.get(),
-                    before + 1,
-                    "a second Escape leaves the idle editor"
-                );
-            }
-        }
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[gpui_kit::test]
-    #[allow(clippy::await_holding_lock)]
     async fn reload_keeps_focus_and_undo_stays_clean(cx: &mut TestAppContext) {
-        let _guard = crate::app::ui_tests::UI_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let (dir, file, window, editor) = open_editor("editor", "one\n", cx).await;
+        let (dir, file, window, editor) = open_editor("a.txt", "editor", "one\n", cx).await;
         let text = |cx: &mut TestAppContext| {
             cx.update(|cx| editor.read(cx).input.read(cx).value().to_string())
         };
@@ -1144,12 +1050,8 @@ mod ui_tests {
 
     /// `ctrl-w j` completes no app chord: the `j` still moves Vim's cursor.
     #[gpui_kit::test]
-    #[allow(clippy::await_holding_lock)]
     async fn key_after_unbound_chord_reaches_vim(cx: &mut TestAppContext) {
-        let _guard = crate::app::ui_tests::UI_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let (dir, _, window, editor) = open_editor("chord", "one\ntwo\n", cx).await;
+        let (dir, _, window, editor) = open_editor("a.txt", "chord", "one\ntwo\n", cx).await;
         cx.update(|cx| cx.bind_keys([KeyBinding::new("ctrl-w z", crate::OpenAnyFile, None)]));
         cx.update_window(window, |_, w, cx| {
             focus(&editor, w, cx);
