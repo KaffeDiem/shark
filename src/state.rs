@@ -83,6 +83,24 @@ pub struct State {
     /// The original column's share of a Split diff, the same for every file; `None` is half.
     #[serde(default)]
     pub split_ratio: Option<f32>,
+    /// Per-repo settings by repo name (the repo settings dialog); missing names use defaults.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub repo_settings: BTreeMap<String, RepoSettings>,
+}
+
+/// A repo's defaults and scripts. Scripts are shell commands run in its worktree, in order.
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq, Debug)]
+#[serde(default)]
+pub struct RepoSettings {
+    /// Model and thinking level new chats start on in workspaces with this repo.
+    pub model: Option<String>,
+    pub effort: Option<String>,
+    /// After its worktree is created.
+    pub setup: Vec<String>,
+    /// cmd-r in a workspace with this repo; cmd-r again stops them.
+    pub run: Vec<String>,
+    /// Before its worktree is removed.
+    pub archive: Vec<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -509,6 +527,21 @@ impl State {
         state
     }
 
+    /// The model and level a new chat in `ws` starts on: the first of its repos with a default,
+    /// else the last picked.
+    pub fn defaults_for(&self, ws: &Workspace) -> (String, Option<String>) {
+        let valid = |m: &String| crate::chat::MODELS.contains(&m.as_str());
+        let s = (ws.repos.iter())
+            .filter_map(|r| self.repo_settings.get(&r.name))
+            .find(|s| s.model.as_ref().is_some_and(valid) || s.effort.is_some());
+        let model = s.and_then(|s| s.model.clone().filter(valid));
+        let effort = s.and_then(|s| s.effort.clone());
+        (
+            model.unwrap_or_else(|| self.new_model()),
+            effort.or(self.last_effort.clone()),
+        )
+    }
+
     /// The model a new chat gets: the last one picked, else the first.
     pub fn new_model(&self) -> String {
         let models = crate::chat::MODELS;
@@ -516,12 +549,13 @@ impl State {
         last.unwrap_or(models[0]).into()
     }
 
-    /// A new chat `id` on the last picked model and thinking level.
-    pub fn new_chat(&self, id: String) -> ChatMeta {
+    /// A new chat `id` in `ws` on its repos' default model, else the last picked.
+    pub fn new_chat(&self, ws: &Workspace, id: String) -> ChatMeta {
+        let (model, effort) = self.defaults_for(ws);
         ChatMeta {
             id,
-            model: Some(self.new_model()),
-            effort: self.last_effort.clone(),
+            model: Some(model),
+            effort,
             ..Default::default()
         }
     }
@@ -836,10 +870,30 @@ mod tests {
         fs::write(&path, json(r#","last_model":"haiku","last_effort":"max""#)).unwrap();
         let st = State::load_at(&path);
         assert_eq!(models(&st)[0], m("haiku", Some("max")));
-        let new = st.new_chat("x".into());
+        let new = st.new_chat(&st.workspaces[0], "x".into());
         assert_eq!(
             (new.model.as_deref(), new.effort.as_deref()),
             (Some("haiku"), Some("max"))
+        );
+        // A repo's default beats the last pick; its level falls back to the last one.
+        let mut st = st;
+        st.workspaces[0].repos = vec![WsRepo {
+            name: "api".into(),
+            src: "/api".into(),
+            base: "origin/main".into(),
+            branch: None,
+        }];
+        st.repo_settings.insert(
+            "api".into(),
+            RepoSettings {
+                model: Some("opus".into()),
+                ..Default::default()
+            },
+        );
+        let new = st.new_chat(&st.workspaces[0], "y".into());
+        assert_eq!(
+            (new.model.as_deref(), new.effort.as_deref()),
+            (Some("opus"), Some("max"))
         );
         let mut w: Workspace = serde_json::from_str(
             r#"{"name":"w","branch":"w","repos":[],"chats":[{"id":"a"},{"id":"b","session_id":"s"}]}"#,

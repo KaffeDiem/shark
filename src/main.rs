@@ -21,6 +21,7 @@ mod overflow_fade;
 mod plan;
 mod pr;
 mod prompts;
+mod scripts;
 mod settings;
 mod stack;
 mod state;
@@ -98,6 +99,7 @@ actions!(
         RefreshWorkspaceSources,
         NextAttention,
         OpenSettings,
+        RunScripts,
         EditQueued,
         DeleteQueued,
         MoveQueuedUp,
@@ -309,6 +311,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-enter", BranchFromSource, Some("NewWorkspace")),
         KeyBinding::new("cmd-r", RefreshWorkspaceSources, Some("NewWorkspace")),
         KeyBinding::new("cmd-,", OpenSettings, None),
+        // Outside the New workspace dialog, whose cmd-r refreshes its lists.
+        KeyBinding::new("cmd-r", RunScripts, None),
         KeyBinding::new("ctrl-tab", SwitchField, Some("Settings")),
         KeyBinding::new("ctrl-shift-tab", SwitchField, Some("Settings")),
         KeyBinding::new("cmd-/", PickModel, None),
