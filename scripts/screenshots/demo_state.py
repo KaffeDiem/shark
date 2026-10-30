@@ -106,3 +106,38 @@ t = [
 ]
 with open(f'{S}/transcripts/eng-118-push-notifications.jsonl', 'w') as f:
     for l in t: f.write(json.dumps(l) + '\n')
+
+# Review threads on eng-123-login's diff: one the agent addressed, one still pending.
+os.makedirs(f'{S}/comments', exist_ok=True)
+login = 'backend/internal/auth/login.go'
+comments = [
+    {'id': 1, 'path': login, 'start': [False, 26], 'end': [False, 26], 'rev': 'working tree',
+     'text': "Don't drop the error here; a failed session should be a 500.",
+     'snapshot': '\tsession, err := s.sessions.New(r.Context(), user)',
+     'status': {'Addressed': {'turn': 0, 'note': 'Returns 500 "could not create session" now.'}}, 'chat': 'eng-123-login'},
+    {'id': 2, 'path': login, 'start': [False, 17], 'end': [False, 20], 'rev': 'working tree',
+     'text': 'Send Retry-After so the app can say when to try again.',
+     'snapshot': '\tif !s.limiter.Allow(clientIP(r)) {\n\t\thttp.Error(w, "too many attempts", http.StatusTooManyRequests)\n\t\treturn\n\t}',
+     'suggestion': '\tif !s.limiter.Allow(clientIP(r)) {\n\t\tw.Header().Set("Retry-After", "60")\n\t\thttp.Error(w, "too many attempts", http.StatusTooManyRequests)\n\t\treturn\n\t}'},
+]
+json.dump({'last': 2, 'comments': comments}, open(f'{S}/comments/eng-123-login.json', 'w'))
+
+# 20 weeks of agent logs for the usage calendar: weekdays busy, weekends light.
+import math, time
+now = time.time()
+def day(i):  # tokens i days ago
+    wd = time.localtime(now - i * 86400).tm_wday
+    return 0 if wd == 6 or (i * 7) % 11 == 0 else int((40 if wd < 5 else 8) * (1 + math.sin(i)) * 1e5)
+stamp = lambda i: time.strftime('%Y-%m-%dT12:00:00Z', time.gmtime(now - i * 86400))
+os.makedirs(H + '/.claude/projects/demo', exist_ok=True)
+with open(H + '/.claude/projects/demo/demo.jsonl', 'w') as f:
+    for i in range(140):
+        if day(i):
+            f.write(json.dumps({'type': 'assistant', 'timestamp': stamp(i), 'requestId': f'r{i}', 'message': {'id': f'm{i}', 'usage': {'input_tokens': day(i), 'output_tokens': day(i) // 20}}}) + '\n')
+os.makedirs(H + '/.codex/sessions/demo', exist_ok=True)
+with open(H + '/.codex/sessions/demo/demo.jsonl', 'w') as f:
+    for i in range(0, 140, 3):
+        n = day(i) // 3
+        if n:
+            u = {'input_tokens': n, 'cached_input_tokens': 0, 'output_tokens': n // 20}
+            f.write(json.dumps({'timestamp': stamp(i), 'type': 'event_msg', 'payload': {'type': 'token_count', 'info': {'total_token_usage': u, 'last_token_usage': u}}}) + '\n')

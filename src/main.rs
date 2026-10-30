@@ -16,6 +16,7 @@ mod features;
 mod file_icon;
 mod files;
 mod git;
+mod lsp;
 mod menu;
 mod menubar;
 mod overflow_fade;
@@ -125,6 +126,17 @@ actions!(
         DeleteSection,
         CancelEdit,
         ToggleHome,
+        FormatDocument,
+        RenameSymbol,
+        FindReferences,
+        DocumentSymbols,
+        SignatureHelp,
+        NavigationBack,
+        NavigationForward,
+        RestartLanguage,
+        EditorFontBigger,
+        EditorFontSmaller,
+        EditorFontReset,
         ToggleZen,
     ]
 );
@@ -227,7 +239,7 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-shift-p", TogglePalette, None),
         KeyBinding::new("cmd-n", NewWorkspace, None),
         KeyBinding::new("cmd-o", CycleOpenApp, None),
-        KeyBinding::new("cmd-shift-o", OpenWorkspacePicker, None),
+        KeyBinding::new("cmd-shift-o", OpenWorkspacePicker, Some("!FileEditor")),
         KeyBinding::new("cmd-0", ToggleHome, None),
         // Home: esc goes back to the workspace (or stops an Ask Shark answer); tab switches
         // the prompt between new workspace and Ask Shark; i/a jump from the list to it.
@@ -256,7 +268,23 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("left", CollapseDir, Some("FileTree || Sidebar")),
         KeyBinding::new("right", ExpandDir, Some("FileTree || Sidebar")),
         KeyBinding::new("cmd-s", SaveFile, Some("FileEditor")),
+        KeyBinding::new("alt-shift-f", FormatDocument, Some("FileEditor")),
+        KeyBinding::new("f2", RenameSymbol, Some("FileEditor")),
+        KeyBinding::new(
+            "f12",
+            gpui_kit::base::input::GoToDefinition,
+            Some("FileEditor"),
+        ),
+        KeyBinding::new("shift-f12", FindReferences, Some("FileEditor")),
+        KeyBinding::new("cmd-shift-o", DocumentSymbols, Some("FileEditor")),
+        KeyBinding::new("cmd-shift-space", SignatureHelp, Some("FileEditor")),
+        KeyBinding::new("ctrl--", NavigationBack, Some("FileEditor")),
+        // macOS reports Control-Shift-minus as `ctrl-_`.
+        KeyBinding::new("ctrl-_", NavigationForward, Some("FileEditor")),
         KeyBinding::new("cmd-w", CloseFile, Some("FileEditor")),
+        KeyBinding::new("cmd-=", EditorFontBigger, Some("FileEditor || DiffPane")),
+        KeyBinding::new("cmd-+", EditorFontBigger, Some("FileEditor || DiffPane")),
+        KeyBinding::new("cmd--", EditorFontSmaller, Some("FileEditor || DiffPane")),
         KeyBinding::new("cmd-t", NewChat, None),
         KeyBinding::new("cmd-w", CloseTab, None),
         KeyBinding::new("cmd-shift-t", ReopenChat, None),
@@ -380,6 +408,9 @@ fn bind_keys(cx: &mut App) {
         vim("[ c", Box::new(PrevThread), DIFF),
         vim("shift-k", Box::new(MoveQueuedUp), "Queue"),
         vim("shift-j", Box::new(MoveQueuedDown), "Queue"),
+        // The editor's jump list, as in Vim (`g s`, the outline, is a Vim command).
+        vim("ctrl-o", Box::new(NavigationBack), "VimNormal"),
+        vim("ctrl-i", Box::new(NavigationForward), "VimNormal"),
         vim("g t", Box::new(NextChat), NAV),
         vim("g shift-t", Box::new(PrevChat), NAV),
         vim("j", Box::new(SelectNext), MOVE),
@@ -479,6 +510,8 @@ fn main() {
         .run(|cx| {
             set_dock_icon();
             gpui_kit::init(cx);
+            cx.on_app_quit(|_| lsp::client::Client::terminate_all())
+                .detach();
             install_fonts(cx);
             bind_keys(cx);
             menubar::init(cx);
