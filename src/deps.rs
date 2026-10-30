@@ -45,7 +45,42 @@ pub fn check() -> Vec<Dep> {
     let path_err = PATH_ERROR.get().map(|s| s.as_str());
     let mut deps = rows(path_err, |p| on_path(p, &path), &claude, gh_auth);
     restart_hints(&mut deps, &claude, login_path);
+    // Azure DevOps is optional: checked only once az is installed.
+    if on_path(&crate::azure::az(), &path) {
+        deps.push(azure_dep());
+    }
     deps
+}
+
+/// The azure-devops extension, then a login; the first missing one.
+fn azure_dep() -> Dep {
+    let az = crate::azure::az();
+    let run = |args: &[&str]| crate::git::cmd_bounded(Path::new("/"), &az, args, 15);
+    let (name, fix, result) =
+        match run(&["extension", "show", "--name", "azure-devops", "-o", "none"]) {
+            Err(e) => (
+                "Azure DevOps extension",
+                "az extension add --name azure-devops",
+                Err(e),
+            ),
+            Ok(_) => (
+                "Azure login",
+                "az login",
+                run(&["account", "show", "-o", "none"]),
+            ),
+        };
+    let detail = match &result {
+        Err(e) if e.contains("timed out") => e.clone(),
+        Err(_) if name == "Azure login" => "Not logged in to Azure".into(),
+        Err(_) => "Needed for Azure DevOps repos".into(),
+        Ok(_) => String::new(),
+    };
+    Dep {
+        name,
+        ok: result.is_ok(),
+        fix,
+        detail,
+    }
 }
 
 /// PATH is read once at launch, so a tool installed since then (or a fixed rc file) only

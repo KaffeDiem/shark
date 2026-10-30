@@ -1352,8 +1352,7 @@ impl Shark {
                     .spawn(async move {
                         (prs.into_iter())
                             .filter_map(|(wt, url, b)| {
-                                let args = ["pr", "edit", url.as_str(), "--base", b.as_str()];
-                                let e = git::cmd_bounded(&wt, "gh", &args, 30).err()?;
+                                let e = crate::pr::retarget(&wt, &url, &b).err()?;
                                 Some((wt, b, e))
                             })
                             .collect::<Vec<_>>()
@@ -1363,7 +1362,7 @@ impl Shark {
                     return;
                 }
                 this.update_in(cx, |s, w, cx| {
-                    // GitHub kept the old base: its next answer is followed again, unless
+                    // The host kept the old base: its next answer is followed again, unless
                     // the base changed here once more since.
                     for (wt, b, _) in &failed {
                         let repo = wt.file_name().map(|n| n.to_string_lossy().into_owned());

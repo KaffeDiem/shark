@@ -161,6 +161,8 @@ pub struct PullRequest {
     pub number: u64,
     pub url: String,
     pub base: String,
+    /// Its source branch; Azure DevOps has no `refs/pull/<n>/head` to fetch instead.
+    pub head: String,
 }
 
 /// PR selections use fresh local review branches, preserving colleagues' branches. `parents`
@@ -865,6 +867,21 @@ fn pr_remote(src: &Path, pr: &PullRequest) -> Result<String, String> {
             "Pull request base is missing; refresh pull requests and select it again".into(),
         );
     }
+    if let Some((remote, number)) = crate::azure::parse_pr_url(&pr.url) {
+        if number != pr.number {
+            return Err("Invalid pull request URL".into());
+        }
+        git(
+            src,
+            &["check-ref-format", &format!("refs/heads/{}", pr.base)],
+        )?;
+        return Ok(
+            match crate::azure::Remote::of(src) == Some(remote.clone()) {
+                true => "origin".into(),
+                false => remote.web(),
+            },
+        );
+    }
     let t = crate::pr::Target::from_url(&pr.url)
         .ok()
         .filter(|t| t.number == pr.number)
@@ -919,11 +936,18 @@ pub(crate) fn fetch_review_refs(src: &Path, pr: &PullRequest, head: bool) -> Res
         review_ref(pr.number, "base")
     )];
     if head {
-        specs.push(format!(
-            "+refs/pull/{}/head:{}",
-            pr.number,
-            review_ref(pr.number, "head")
-        ));
+        let source = match crate::azure::parse_pr_url(&pr.url) {
+            // Azure DevOps has no `refs/pull/<n>/head`; fetch its source branch.
+            Some(_) => {
+                let b = format!("refs/heads/{}", pr.head);
+                git(src, &["check-ref-format", &b]).map_err(|_| {
+                    "Pull request branch is missing; refresh pull requests".to_string()
+                })?;
+                b
+            }
+            None => format!("refs/pull/{}/head", pr.number),
+        };
+        specs.push(format!("+{source}:{}", review_ref(pr.number, "head")));
     }
     // --atomic: if the base fails to update, the head must not advance alone.
     let mut args = vec!["fetch", "--quiet", "--no-tags", "--atomic", &remote];
@@ -1551,6 +1575,7 @@ fn header(ws: &Task) -> String {
             .first()
             .map_or(ws.branch.as_str(), |r| ws.branch_of(r));
         let shared = ws.repos.iter().all(|r| ws.branch_of(r) == first);
+        let mut any_azure = false;
         let mut s = format!(
             "# Task `{}`\n\nThis directory is NOT a git repo. Each subdirectory is a git worktree{}:\n",
             ws.name,
@@ -1565,9 +1590,20 @@ fn header(ws: &Task) -> String {
                 false => format!(" on `{}`", ws.branch_of(r)),
             };
             // A PR URL names the GitHub repo, which needn't match the folder.
-            let gh = (git(&r.src, &["remote", "get-url", "origin"]).ok())
-                .and_then(|o| crate::pr::github_url(&o))
-                .map_or(String::new(), |u| format!(", GitHub {u}"));
+            let origin = git(&r.src, &["remote", "get-url", "origin"]).ok();
+            let azure = origin.as_deref().and_then(crate::azure::Remote::parse);
+            let gh = match (&azure, origin.as_deref().and_then(crate::pr::github_url)) {
+                (Some(a), _) => format!(
+                    ", Azure DevOps {}: org `{}`, project `{}`, repo `{}`",
+                    a.web(),
+                    a.org,
+                    a.project,
+                    a.repo
+                ),
+                (None, Some(u)) => format!(", GitHub {u}"),
+                (None, None) => String::new(),
+            };
+            any_azure |= azure.is_some();
             s += &format!(
                 "{}{}{on} (base `{}`{gh})\n",
                 listed(&r.name),
@@ -1576,6 +1612,10 @@ fn header(ws: &Task) -> String {
             );
         }
         s += "\nRun git per repo (e.g. `git -C <repo> status`) and commit in each repo separately. Never run git in this root directory.\n\nThis task is already an isolated worktree managed by Shark. Don't create more git worktrees (no `isolation: \"worktree\"`, `--worktree` or EnterWorktree); split parallel work by file instead.\n\n";
+        if any_azure {
+            s += crate::azure::AGENT_HINT;
+            s += "\n";
+        }
         s += CONTEXT_NOTE;
         s
     }

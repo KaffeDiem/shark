@@ -403,6 +403,7 @@ impl Shark {
                     number: pr.number,
                     url: pr.url,
                     base: pr.base_ref_name,
+                    head: String::new(),
                 },
             ))
         });
@@ -750,7 +751,7 @@ mod ui_tests {
                 });
             }
             let apply = |s: &mut Shark, number| s.apply_pasted_pr(number, repo.clone(), format!("#{number}"), git::PullRequest {
-                number, url: format!("https://github.com/o/api/pull/{number}"), base: "main".into(),
+                number, url: format!("https://github.com/o/api/pull/{number}"), base: "main".into(), head: String::new(),
             });
             match case {
                 0 => {

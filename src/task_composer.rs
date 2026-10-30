@@ -1548,6 +1548,7 @@ mod tests {
                             number: 7,
                             url: "https://github.com/o/upstream/pull/7".into(),
                             base: "release".into(),
+                            head: String::new(),
                         }),
                     }],
                     vec![],

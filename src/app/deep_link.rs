@@ -69,6 +69,7 @@ impl Shark {
                         number: v.number,
                         url: v.url,
                         base: v.base_ref_name,
+                        head: v.head_ref_name,
                     };
                     s.create_task_on(
                         branch.clone(),

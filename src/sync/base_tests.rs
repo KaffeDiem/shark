@@ -214,6 +214,7 @@ esac
             number: 7,
             url: "https://github.com/o/api/pull/7".into(),
             base: "main".into(),
+            head: String::new(),
         };
         crate::git::update_review_branch(&self.wt, "feature", &pr)
     }

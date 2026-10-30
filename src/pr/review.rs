@@ -6,6 +6,9 @@ use std::path::Path;
 /// Posts `body` to `target` as a conversation comment (a reviewer
 /// note); returns its URL.
 pub fn publish_note(wt: &Path, target: &Target, body: &str) -> Result<String, String> {
+    if let Some(remote) = target.remote() {
+        return crate::azure::publish(wt, &remote, target.number, body, None);
+    }
     let out = gh_post(wt, &["pr", "comment", &target.url(), "--body", body], 60)?;
     Ok(last_line(&out))
 }
@@ -26,6 +29,8 @@ pub fn verify_original_anchor(
     revision: &str,
     anchor: &Anchor,
 ) -> Option<(String, bool)> {
+    // ponytail: no old-side check on Azure DevOps; such comments go as path and excerpt.
+    target.remote().is_none().then_some(())?;
     let read = |endpoint: &str| -> Option<serde_json::Value> {
         serde_json::from_str(
             &cmd_bounded(
@@ -131,6 +136,9 @@ pub fn publish_review(
     body: &str,
     inline: Option<(&Anchor, &str)>,
 ) -> Result<String, String> {
+    if let Some(remote) = target.remote() {
+        return crate::azure::publish(wt, &remote, target.number, body, inline);
+    }
     let args = review_api_args(target, head, body, inline);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     gh_post(wt, &args, 60)
