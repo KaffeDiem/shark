@@ -90,12 +90,29 @@ worktrees cannot share a server, even when their project names match.
   gopls binary built and bundled by Shark's release workflow.
 
 SweetPad CLI 0.1.15's `bsp init` accepts a project or workspace; its BSP serves the
-container's targets and does not accept a scheme/destination selection. Schemes
-and destinations are build-time choices. This integration does not trigger an
-Xcode build. Xcode sessions retain Preparing index with a build repair message;
-project-wide navigation readiness has not been verified. See the
+container's targets and applies the project's `sweetpad.toml` build arguments.
+Shark adds `--configuration` with the project's Debug configuration (`Debug`, else
+the first whose name contains "debug") to the generated server command, because
+SweetPad otherwise resolves `Debug` and, in a project without it, xcodebuild
+builds the default, often Release, configuration. If the configurations cannot
+be read, setup reports it and Retry tries again.
+
+On start, SweetPad builds every target with `xcodebuild` and answers
+SourceKit-LSP's `buildTarget/prepare` only after all of them, so SourceKit-LSP's
+background indexing is turned off for these sessions: diagnostics, hover and
+definition answer within seconds instead of after those builds (measured on a
+650-file app with 30 packages: 3 s instead of 81 s on each launch). The cost is
+index freshness: SourceKit-LSP reads the index that builds write, SweetPad's
+startup builds and any Xcode build, but saving a file does not re-index it, so
+references and workspace symbols miss code added since the last build. Until a
+fresh worktree's first build produces a package's module, imports of it report
+"No such module".
+
+SweetPad 0.1.15's compiler arguments omit the module maps of Swift packages with
+C or Objective-C targets (Firebase, PostHog). A file whose module imports one
+gets no semantic diagnostics; hover, definition and completion still work. See the
 [SweetPad autocomplete documentation](https://sweetpad.hyzyla.dev/docs/cli/autocomplete/)
-and [CLI BSP implementation](https://github.com/sweetpad-dev/sweetpad/blob/cli-v0.1.15/sweetpad-cli/src/cli/commands/bsp.rs).
+and [CLI BSP implementation](https://github.com/sweetpad-dev/sweetpad/blob/cli-v0.1.15/sweetpad-core/src/bsp/mod.rs).
 
 ## Fixed artifact provenance
 

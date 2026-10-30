@@ -86,6 +86,14 @@ class PerformanceHarnessTests(unittest.TestCase):
                 self.assertLess(time.monotonic(), deadline, "child server survived")
                 time.sleep(0.05)
 
+    def test_kill_accepts_a_server_that_already_exited(self):
+        with tempfile.TemporaryDirectory() as root:
+            peer = benchmark.jsonrpc_peer.Peer(["/usr/bin/true"], root)
+            time.sleep(0.2)
+            peer.kill()
+            peer.stderr.close()
+            self.assertEqual(peer.process.returncode, 0)
+
 
 if __name__ == "__main__":
     unittest.main()

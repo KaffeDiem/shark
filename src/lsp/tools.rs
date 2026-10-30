@@ -666,9 +666,9 @@ fn swift(project: &Project) -> Result<Launch> {
         .map(serde_json::from_slice)
         .transpose()
         .context("Fix invalid buildServer.json; Shark preserves your custom BSP configuration")?;
-    let owned = current
-        .as_ref()
-        .is_some_and(|v| v["_shark"]["owner"] == "shark" && v["_shark"]["version"] == 1);
+    let owned = current.as_ref().is_some_and(|v| {
+        v["_shark"]["owner"] == "shark" && matches!(v["_shark"]["version"].as_u64(), Some(1 | 2))
+    });
     if let Some(config) = current.as_ref().filter(|_| !owned) {
         ensure!(
             ["name", "version", "bspVersion"]
@@ -716,7 +716,8 @@ fn swift(project: &Project) -> Result<Launch> {
         }
     }
     let sweetpad = managed("sweetpad")?;
-    let expected = json!({"owner":"shark", "version":1, "root": project.root, "tool": sweetpad, "container": containers[0].file_name()});
+    // Version 2 names the configuration; version 1 files are regenerated.
+    let expected = json!({"owner":"shark", "version":2, "root": project.root, "tool": sweetpad, "container": containers[0].file_name()});
     if current.as_ref().and_then(|v| v.get("_shark")) != Some(&expected) {
         let staged = project
             .root
@@ -726,14 +727,6 @@ fn swift(project: &Project) -> Result<Launch> {
             "Remove stale {} and Retry",
             staged.display()
         );
-        let flag = if containers[0]
-            .extension()
-            .is_some_and(|s| s == "xcworkspace")
-        {
-            "--workspace"
-        } else {
-            "--project"
-        };
         let generated = (|| -> Result<()> {
             run(
                 &project.root,
@@ -742,7 +735,7 @@ fn swift(project: &Project) -> Result<Launch> {
                     "--non-interactive",
                     "bsp",
                     "init",
-                    flag,
+                    container_flag(&containers[0]),
                     path(&containers[0])?,
                     "--output-file",
                     path(&staged)?,
@@ -750,6 +743,16 @@ fn swift(project: &Project) -> Result<Launch> {
                 30,
             )?;
             let mut config: Value = serde_json::from_slice(&fs::read(&staged)?)?;
+            // ponytail: read once per generated config; a renamed Debug configuration takes a
+            // deleted buildServer.json or a new config version.
+            if let Some(configuration) =
+                debug_configuration(&configurations(&sweetpad, &containers[0])?)
+            {
+                let argv = config["argv"]
+                    .as_array_mut()
+                    .context("SweetPad wrote no BSP argv")?;
+                argv.extend(["--configuration".into(), configuration.into()]);
+            }
             config["_shark"] = expected;
             let text = serde_json::to_string_pretty(&config)?;
             if let Some(previous) = &previous {
@@ -771,10 +774,44 @@ fn swift(project: &Project) -> Result<Launch> {
         let _ = fs::remove_file(staged);
         generated?;
     }
-    result.detail =
-        Some("Preparing index: build this Xcode project for project-wide navigation".into());
-    result.awaiting_build = true;
+    // SweetPad answers sourcekit-lsp's prepare only after its startup xcodebuild of every target,
+    // so background indexing would hold diagnostics for minutes on each launch. Those builds
+    // still write the index sourcekit-lsp reads.
+    result.initialization_options = json!({"backgroundIndexing": false});
     Ok(result)
+}
+
+fn container_flag(container: &Path) -> &'static str {
+    if container.extension().is_some_and(|s| s == "xcworkspace") {
+        "--workspace"
+    } else {
+        "--project"
+    }
+}
+
+/// SweetPad builds and resolves `Debug` unless told otherwise; in a project without it,
+/// xcodebuild substitutes the default (often Release) configuration, whose builds can fail and
+/// whose arguments are optimized.
+fn configurations(sweetpad: &Path, container: &Path) -> Result<Vec<String>> {
+    let args = ["--json", "--non-interactive", "project", "info"];
+    let target = [container_flag(container), path(container)?];
+    let out = run(
+        container.parent().unwrap_or(container),
+        path(sweetpad)?,
+        &[&args[..], &target].concat(),
+        30,
+    )
+    .context("Could not read the Xcode project's build configurations; Retry")?;
+    let mut info: Value = serde_json::from_str(&out)?;
+    Ok(serde_json::from_value(
+        info["data"]["configurations"].take(),
+    )?)
+}
+
+fn debug_configuration(configurations: &[String]) -> Option<&str> {
+    (configurations.iter().find(|c| *c == "Debug"))
+        .or_else(|| (configurations.iter()).find(|c| c.to_ascii_lowercase().contains("debug")))
+        .map(String::as_str)
 }
 
 /// Keeps a generated file with machine-specific paths out of `git status`. info/exclude is
@@ -1232,6 +1269,20 @@ mod tests {
         let error = prepare(&project).unwrap_err().to_string();
         assert!(error.contains("declared TypeScript SDK"), "{error}");
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn sweetpad_indexes_the_projects_debug_configuration() {
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(
+            debug_configuration(&names(&["Release", "Debug", "Beta-Debug"])),
+            Some("Debug")
+        );
+        assert_eq!(
+            debug_configuration(&names(&["Dev-Release", "Dev-Debug", "Prod-Debug"])),
+            Some("Dev-Debug")
+        );
+        assert_eq!(debug_configuration(&names(&["Release"])), None);
     }
 
     #[test]

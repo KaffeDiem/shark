@@ -75,6 +75,7 @@ class Peer:
 
     def kill(self):
         # Signal the group even if the leader already exited: its children may not have.
-        with contextlib.suppress(ProcessLookupError):
+        # macOS reports EPERM, not ESRCH, when only the unreaped leader is left.
+        with contextlib.suppress(ProcessLookupError, PermissionError):
             os.killpg(self.process.pid, signal.SIGKILL)
         self.process.wait()
