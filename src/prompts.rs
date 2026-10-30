@@ -72,7 +72,7 @@ check, and push.",
         title: "Fix checks",
         repos: "repos with failing checks, and the check names",
         default: "CI checks fail on the PRs ({repos}). For each, read the failure (`gh pr checks`, then \
-`gh run view <run-id> --log-failed` in that repo), fix the cause, commit and push. \
+`gh run view <run-id> --log-failed` in that repo; on Azure DevOps the `az` commands in the root CLAUDE.md), fix the cause, commit and push. \
 Don't disable or skip checks.",
     },
     Prompt {
@@ -80,7 +80,8 @@ Don't disable or skip checks.",
         title: "Address review",
         repos: "repos whose PR has changes requested",
         default: "Reviewers requested changes on the PRs in: {repos}. Read the review comments \
-(`gh pr view --comments` and `gh api repos/{owner}/{repo}/pulls/<n>/comments`), address each one, \
+(`gh pr view --comments` and `gh api repos/{owner}/{repo}/pulls/<n>/comments`; on Azure DevOps the PR's threads, \
+see the root CLAUDE.md), address each one, \
 commit and push, then summarize what you changed per comment.",
     },
     Prompt {
@@ -88,7 +89,8 @@ commit and push, then summarize what you changed per comment.",
         title: "Address comments",
         repos: "repos whose PR has new review comments",
         default: "Reviewers left comments on the PRs in: {repos}. Read them (`gh pr view --comments` and \
-`gh api repos/{owner}/{repo}/pulls/<n>/comments`). Address the ones that ask for a change, \
+`gh api repos/{owner}/{repo}/pulls/<n>/comments`; on Azure DevOps the PR's threads, see the root CLAUDE.md). \
+Address the ones that ask for a change, \
 commit and push, then summarize per comment what you changed or why you left it.",
     },
     Prompt {

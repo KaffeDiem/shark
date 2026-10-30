@@ -132,6 +132,12 @@ pub fn create_linked_prs(
             &["push", "-u", "origin", &format!("refs/heads/{branch}")],
             120,
         )?;
+        let base = r.base.strip_prefix("origin/").unwrap_or(&r.base);
+        if let Some(remote) = crate::azure::Remote::of(&wt) {
+            let url = crate::azure::find_or_create_pr(&wt, &remote, branch, base, new)?;
+            prs.push((r.name.clone(), url));
+            continue;
+        }
         // Only an open PR from this repo is reused; `gh pr view <branch>` would also return a
         // merged one, and new commits after a merge need a new PR.
         let open = cmd_bounded(
@@ -154,7 +160,6 @@ pub fn create_linked_prs(
         let url = match open.is_empty() {
             false => open,
             true => {
-                let base = r.base.strip_prefix("origin/").unwrap_or(&r.base);
                 let out = cmd_bounded(&wt, "gh", &new.args(branch, base), 60)?;
                 out.lines().last().unwrap_or_default().to_string()
             }
@@ -164,6 +169,12 @@ pub fn create_linked_prs(
     if prs.len() > 1 {
         for (r, url) in &prs {
             let wt = dir.join(r);
+            if crate::azure::parse_pr_url(url).is_some() {
+                let body = crate::azure::description(&wt, url)?;
+                let body = link_body(&body, &prs, url);
+                crate::azure::update(&wt, url, serde_json::json!({"description": body}))?;
+                continue;
+            }
             let body = cmd_bounded(
                 &wt,
                 "gh",
@@ -191,6 +202,14 @@ pub fn link_body(body: &str, prs: &[(String, String)], own: &str) -> String {
     out
 }
 
+/// Points the PR at `url` to merge into `base`.
+pub fn retarget(wt: &Path, url: &str, base: &str) -> Result<(), String> {
+    match crate::azure::parse_pr_url(url) {
+        Some(_) => crate::azure::retarget(wt, url, base),
+        None => cmd_bounded(wt, "gh", &["pr", "edit", url, "--base", base], 30).map(|_| ()),
+    }
+}
+
 /// gh, or `SHARK_GH` (tests point it at a fake, as `SHARK_CLAUDE` for claude).
 pub(crate) fn gh() -> String {
     std::env::var("SHARK_GH").unwrap_or_else(|_| "gh".into())
@@ -204,7 +223,7 @@ fn gh_post(wt: &Path, args: &[&str]) -> Result<String, String> {
 }
 
 /// `e` without `cmd`, its last line; a timeout may still have posted.
-fn gh_error(e: &str, cmd: &str) -> String {
+pub(crate) fn gh_error(e: &str, cmd: &str) -> String {
     let why = e.strip_prefix(cmd).unwrap_or(e);
     let why = why
         .lines()
@@ -221,6 +240,9 @@ fn gh_error(e: &str, cmd: &str) -> String {
 /// Posts `body` to PR `number` of the repo at `wt` as a conversation comment (a reviewer
 /// note); returns its URL.
 pub fn publish_note(wt: &Path, number: u64, body: &str) -> Result<String, String> {
+    if let Some(remote) = crate::azure::Remote::of(wt) {
+        return crate::azure::publish(wt, &remote, number, body, None);
+    }
     let n = number.to_string();
     let out = gh_post(wt, &["pr", "comment", &n, "--body", body])?;
     Ok(out.lines().last().unwrap_or_default().to_string())
@@ -242,6 +264,8 @@ pub fn verify_original_anchor(
     revision: &str,
     anchor: &Anchor,
 ) -> Option<(String, bool)> {
+    // ponytail: no old-side check on Azure DevOps; such comments go as path and excerpt.
+    crate::azure::Remote::of(wt).is_none().then_some(())?;
     let read = |endpoint: &str| -> Option<serde_json::Value> {
         serde_json::from_str(&cmd_bounded(wt, &gh(), &["api", endpoint], 30).ok()?).ok()
     };
@@ -349,6 +373,9 @@ pub fn publish_review(
     body: &str,
     inline: Option<(&Anchor, &str)>,
 ) -> Result<String, String> {
+    if let Some(remote) = crate::azure::Remote::of(wt) {
+        return crate::azure::publish(wt, &remote, number, body, inline);
+    }
     let args = review_api_args(&number.to_string(), head, body, inline);
     let args: Vec<&str> = args.iter().map(String::as_str).collect();
     gh_post(wt, &args)

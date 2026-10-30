@@ -6,7 +6,7 @@ mod base_tests;
 mod status;
 #[cfg(test)]
 pub(crate) use status::parse_prs;
-pub use status::{Kind, Pr, PrState, Repo, ago, github_url, short};
+pub use status::{Checks, Kind, Pr, PrState, Repo, ago, github_url, short};
 
 use crate::app::menus::{each_or_all, pr_entry};
 use crate::app::open_menu;
@@ -228,6 +228,7 @@ fn run_job(job: &Job) -> Probed {
                             number: p.number,
                             url: p.url.clone(),
                             base: p.base.clone(),
+                            head: String::new(),
                         },
                     )
                 } else {
@@ -1530,6 +1531,11 @@ fn execute(
             let Some(mut args) = planned(r)? else {
                 return Ok(None);
             };
+            let p = r.open_pr().expect("planned a merge");
+            if crate::azure::parse_pr_url(&p.url).is_some() {
+                crate::azure::merge(wt, &p.url, &p.head, delete_remote)?;
+                return Ok(Some(format!("merged #{}", p.number)));
+            }
             args.push(merge_method(wt)?.into());
             // Run from the linked worktree, gh deletes only the remote branch: it skips the
             // local one that is checked out here (archive deletes that).
@@ -1658,6 +1664,20 @@ fn gh_on_pr(
     let Some(p) = r.pr().filter(|p| p.state == state) else {
         return Ok(None);
     };
+    if crate::azure::parse_pr_url(&p.url).is_some() {
+        let body = match args {
+            ["pr", "reopen"] => serde_json::json!({"status": "active"}),
+            ["pr", "ready"] => serde_json::json!({"isDraft": false}),
+            _ => {
+                return Err(format!(
+                    "`gh {}` has no Azure DevOps equivalent",
+                    args.join(" ")
+                ));
+            }
+        };
+        crate::azure::update(wt, &p.url, body)?;
+        return Ok(Some(format!("#{} {done}", p.number)));
+    }
     cmd_bounded(wt, "gh", &[args, &[p.url.as_str()]].concat(), 60)?;
     Ok(Some(format!("#{} {done}", p.number)))
 }

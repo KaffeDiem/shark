@@ -454,6 +454,7 @@ impl NewWorkspaceForm {
                         number: pr.number,
                         url: pr.url.clone(),
                         base: pr.base_ref_name.clone(),
+                        head: pr.head_ref_name.clone(),
                     },
                 ))
             })
@@ -1624,10 +1625,7 @@ impl Shark {
                     let errs = (cx.background_executor())
                         .spawn(async move {
                             (prs.iter())
-                                .filter_map(|(wt, url, b)| {
-                                    let args = ["pr", "edit", url.as_str(), "--base", b.as_str()];
-                                    git::cmd_bounded(wt, "gh", &args, 30).err()
-                                })
+                                .filter_map(|(wt, url, b)| crate::pr::retarget(wt, url, b).err())
                                 .collect::<Vec<_>>()
                         })
                         .await;

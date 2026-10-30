@@ -370,6 +370,12 @@ const PR_ARGS: [&str; 10] = [
 
 /// Recent PRs for chat, or open PRs for checkout; successful fetches replace this repo's cache.
 pub fn fetch_repo_prs(repo: &str, src: &Path, open: bool) -> Result<Vec<Pr>, String> {
+    if let Some(remote) = crate::azure::Remote::of(src) {
+        let mut prs = crate::azure::list_prs(src, &remote, open)?;
+        prs.iter_mut().for_each(|p| p.repo = repo.to_string());
+        save_repo_prs(src, open, &prs);
+        return Ok(prs);
+    }
     let mut args = PR_ARGS;
     if open {
         args[3] = "open";

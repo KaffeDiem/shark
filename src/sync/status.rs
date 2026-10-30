@@ -409,6 +409,17 @@ pub fn fetch_parent(wt: &Path, parent: &str) -> Result<Option<Pr>, String> {
 /// `head` is the local HEAD as just probed.
 pub fn fetch_pr(wt: &Path, branch: &str, head: &str) -> Result<Option<Pr>, String> {
     let review = crate::git::review_pr_url(wt, branch);
+    if let Some(remote) = crate::azure::Remote::of(wt) {
+        // ponytail: a review checkout stays one; publishing it as its own PR is GitHub-only.
+        let pr = match &review {
+            Some(url) => Some(Pr {
+                review_checkout: true,
+                ..crate::azure::pr_at(wt, url)?
+            }),
+            None => crate::azure::fetch_pr(wt, &remote, branch)?,
+        };
+        return Ok(holding_head(wt, pr, head));
+    }
     // gh may default to a fork's upstream; branch ownership belongs to origin.
     let origin = git(wt, &["config", "--get", "remote.origin.url"])
         .ok()
@@ -477,7 +488,11 @@ pub fn fetch_pr(wt: &Path, branch: &str, head: &str) -> Result<Option<Pr>, Strin
             }));
         }
     }
-    let mut pr = own;
+    Ok(holding_head(wt, own, head))
+}
+
+/// A merged `pr` notes when it holds `head`, the local HEAD.
+fn holding_head(wt: &Path, mut pr: Option<Pr>, head: &str) -> Option<Pr> {
     if let Some(p) = pr
         .as_mut()
         .filter(|p| p.state == PrState::Merged && !head.is_empty() && p.head != head)
@@ -493,7 +508,7 @@ pub fn fetch_pr(wt: &Path, branch: &str, head: &str) -> Result<Option<Pr>, Strin
             p.contains_head = head.to_string();
         }
     }
-    Ok(pr)
+    pr
 }
 
 /// Everything known about one repo of a workspace.
@@ -582,10 +597,22 @@ impl Repo {
     pub fn branch_url(&self, branch: &str) -> Option<String> {
         let l = self.local.as_ref().ok()?;
         l.remote?;
+        if let Some(r) = crate::azure::Remote::parse(l.origin.as_deref()?) {
+            return Some(r.branch_url(branch));
+        }
         Some(format!(
             "{}/tree/{branch}",
             github_url(l.origin.as_deref()?)?
         ))
+    }
+
+    /// Where its PRs live, for messages.
+    pub fn host(&self) -> &'static str {
+        let origin = self.local.as_ref().ok().and_then(|l| l.origin.as_deref());
+        match origin.and_then(crate::azure::Remote::parse) {
+            Some(_) => "Azure DevOps",
+            None => "GitHub",
+        }
     }
 
     /// Its work is exactly what a merged PR landed.
@@ -634,7 +661,7 @@ impl Repo {
                     _ => "open",
                 }
             )),
-            Some(Err(_)) => parts.push("GitHub unavailable".into()),
+            Some(Err(_)) => parts.push(format!("{} unavailable", self.host())),
             _ => {}
         }
         if parts.is_empty() {
@@ -932,7 +959,13 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
         let failed = among(repos, &unknown).any(|r| matches!(r.pr, Some(Err(_))));
         return match failed {
             true => act(
-                label("GitHub unavailable", &unknown),
+                label(
+                    &format!(
+                        "{} unavailable",
+                        among(repos, &unknown).next().map_or("GitHub", Repo::host)
+                    ),
+                    &unknown,
+                ),
                 Kind::None,
                 unknown,
                 true,

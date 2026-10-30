@@ -44,6 +44,13 @@ A workspace can start from another branch or an open PR instead of `main`: its P
 
 <img src="docs/images/stack.png" width="800" alt="The branch menu showing a three-PR stack, its current workspace, and actions to rebase or insert a workspace">
 
+## Azure DevOps
+Repos whose `origin` is on Azure DevOps (`dev.azure.com`, `*.visualstudio.com` or `ssh.dev.azure.com`) work like GitHub ones, through the `az` CLI with its `azure-devops` extension instead of `gh`. Nothing to configure: the org, project and repo come from the remote. The git button reads each PR's status, build and status policies (as checks), reviewer votes (−5 or −10 asks for changes) and active comment threads, and can create, reopen, publish a draft, retarget and complete PRs. Completing uses squash unless the branch's merge-strategy policy rules it out, and only at the commit Shark checked. New PRs link the work items named in the branch (`feature/131035-x`). `#` completion, PR review checkouts, Share to PR from the diff, and the Git artifact's description, comments, replies and resolve all work too.
+
+The Git artifact also lists **Work items**: the PBIs linked to the PR (or named in the branch when there is no PR yet), each with its tasks, their state, who they are assigned to, and how many are done. The workspace `CLAUDE.md` tells the agent which `az` commands replace `gh` for those repos.
+
+Setup: `brew install azure-cli`, `az extension add --name azure-devops`, `az login`. Home shows what is missing once `az` is installed.
+
 ## Install
 ```sh
 brew tap KaffeDiem/shark https://github.com/KaffeDiem/shark

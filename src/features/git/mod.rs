@@ -1,4 +1,5 @@
-//! The Git artifact: GitHub conversations, with drafts pinned to their exact PR.
+//! The Git artifact: GitHub and Azure DevOps conversations, with drafts pinned to their exact
+//! PR, and on Azure DevOps the work items (PBIs and their tasks) the branch is for.
 use crate::pr::git_feature as api;
 use crate::state::Workspace;
 use crate::ui::confirm;
@@ -56,6 +57,7 @@ enum Row {
     EmptyActivity,
     ResolvedThreads,
     Heading(&'static str),
+    WorkItems,
     Comment(usize),
     Review(usize),
     Thread(usize),
@@ -73,6 +75,8 @@ pub(crate) struct GitFeature {
     workspace: Workspace,
     selected: usize,
     details: Option<api::Details>,
+    /// Azure DevOps only; a failure here doesn't hide the PR.
+    work_items: Result<Vec<crate::azure::WorkItem>, String>,
     loading: bool,
     loaded: bool,
     error: Option<String>,
@@ -125,6 +129,7 @@ impl GitFeature {
             workspace,
             selected: 0,
             details: None,
+            work_items: Ok(vec![]),
             loading: false,
             loaded: false,
             error: None,
@@ -239,6 +244,7 @@ impl GitFeature {
         self.generation += 1;
         self.loaded = false;
         self.details = None;
+        self.work_items = Ok(vec![]);
         self.error = None;
         self.refreshed = None;
         self.rebuild_rows();
@@ -277,9 +283,13 @@ impl GitFeature {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    api::discover(&wt, &branch)?
+                    let details = api::discover(&wt, &branch)?
                         .map(|target| api::load(&wt, &target))
-                        .transpose()
+                        .transpose()?;
+                    let pr = (details.as_ref())
+                        .filter(|d| d.target.remote().is_some())
+                        .map(|d| d.target.number);
+                    Ok::<_, String>((details, crate::azure::work_items(&wt, &branch, pr)))
                 })
                 .await;
             this.update_in(cx, |s, window, cx| {
@@ -294,7 +304,8 @@ impl GitFeature {
                 }
                 s.loaded = true;
                 match result {
-                    Ok(details) => {
+                    Ok((details, work_items)) => {
+                        s.work_items = work_items;
                         let target_changed = s.details.as_ref().map(|d| &d.target)
                             != details.as_ref().map(|d| &d.target);
                         if target_changed {
@@ -324,6 +335,9 @@ impl GitFeature {
         self.markdown_order.clear();
         if let Some(d) = &self.details {
             self.rows.push(Row::Description);
+            if self.work_items.as_ref().is_ok_and(|w| !w.is_empty()) || self.work_items.is_err() {
+                self.rows.push(Row::WorkItems);
+            }
             if !d.comments.is_empty() {
                 self.rows.push(Row::Heading("Conversation"));
             }
@@ -920,6 +934,7 @@ impl GitFeature {
         let muted = theme.muted_foreground;
         let disabled = self.posting || self.archiving;
         let url = d.url.clone();
+        let host = host(d);
         let draft = self.drafts.get(&d.target.url());
         let resume_description = draft
             .and_then(|draft| draft.description.as_ref())
@@ -939,7 +954,7 @@ impl GitFeature {
                     .child(div().flex_1())
                     .child(
                         Button::new("git-open-pr")
-                            .label("Open in GitHub")
+                            .label(format!("Open in {host}"))
                             .icon(IconName::ExternalLink)
                             .ghost()
                             .xsmall()
@@ -984,7 +999,11 @@ impl GitFeature {
                             .child(state_label(&d.state).to_string()),
                     )
                     .when(d.draft, |r| r.child(div().text_color(muted).child("Draft")))
-                    .child(div().text_color(muted).child(format!("by @{}", d.author))),
+                    .child(
+                        div()
+                            .text_color(muted)
+                            .child(format!("by {}", handle(d, &d.author))),
+                    ),
             )
             .child(
                 h_flex()
@@ -1167,6 +1186,12 @@ impl GitFeature {
                     .child(label)
                     .into_any_element();
             }
+            Row::WorkItems => {
+                return base
+                    .pt_4()
+                    .children(self.work_items_view(cx))
+                    .into_any_element();
+            }
             Row::Comment(i) => (details.comments[i].clone(), None),
             Row::Review(i) => (
                 details.reviews[i].comment.clone(),
@@ -1185,7 +1210,11 @@ impl GitFeature {
                 let path = t.path.clone();
                 let place = format!(
                     "{}{}{}{}",
-                    t.path,
+                    if t.path.is_empty() {
+                        "Conversation"
+                    } else {
+                        &t.path
+                    },
                     t.line.map(|l| format!(":{l}")).unwrap_or_default(),
                     if t.outdated { " · Outdated" } else { "" },
                     if t.resolved {
@@ -1217,10 +1246,12 @@ impl GitFeature {
                                     .ghost()
                                     .small()
                                     .on_click(cx.listener(move |_, _, _, cx| {
-                                        cx.emit(GitFeatureEvent::OpenFile {
-                                            repo: repo.clone(),
-                                            path: path.clone(),
-                                        })
+                                        if !path.is_empty() {
+                                            cx.emit(GitFeatureEvent::OpenFile {
+                                                repo: repo.clone(),
+                                                path: path.clone(),
+                                            })
+                                        }
                                     })),
                             )
                             .when(t.can_reply || resume, |d| {
@@ -1273,6 +1304,7 @@ impl GitFeature {
             }
         };
         let (c, state) = comment;
+        let (link, author) = (host(details), handle(details, &c.author));
         let body_view = self.body_view(c.id.clone(), c.body.clone(), cx);
         let url = c.url.clone();
         base.when(matches!(row, Row::Reply(..)), |d| {
@@ -1310,7 +1342,7 @@ impl GitFeature {
                         .child(if c.author.is_empty() {
                             "Deleted user".to_string()
                         } else {
-                            format!("@{}", c.author)
+                            author
                         }),
                 )
                 .when_some(state, |d, state| {
@@ -1343,7 +1375,7 @@ impl GitFeature {
                 .when(!url.is_empty(), |d| {
                     d.child(
                         Button::new(("git-comment-link", index))
-                            .label("GitHub")
+                            .label(link)
                             .icon(IconName::ExternalLink)
                             .ghost()
                             .xsmall()
@@ -1433,6 +1465,142 @@ fn markdown_preview(body: &str) -> &str {
     &body[..end]
 }
 
+/// Where `d` lives, for labels.
+fn host(d: &api::Details) -> &'static str {
+    match d.target.remote() {
+        Some(_) => "Azure DevOps",
+        None => "GitHub",
+    }
+}
+
+/// GitHub logins read as `@login`; Azure DevOps gives display names.
+fn handle(d: &api::Details, author: &str) -> String {
+    match d.target.remote() {
+        Some(_) => author.to_string(),
+        None => format!("@{author}"),
+    }
+}
+
+impl GitFeature {
+    /// The branch's PBIs, each with its tasks: state, who has it, and a link.
+    fn work_items_view(&self, cx: &App) -> Option<AnyElement> {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let items = match &self.work_items {
+            Ok(items) if items.is_empty() => return None,
+            Ok(items) => items,
+            Err(e) => {
+                return Some(
+                    div()
+                        .id("git-work-items-error")
+                        .test_support()
+                        .text_sm()
+                        .text_color(muted)
+                        .child(format!("Work items unavailable: {e}"))
+                        .into_any_element(),
+                );
+            }
+        };
+        let line = |w: &crate::azure::WorkItem, top: bool| {
+            let url = w.url.clone();
+            let who = match w.assigned.is_empty() {
+                true => "Unassigned".to_string(),
+                false => w.assigned.clone(),
+            };
+            h_flex()
+                .gap_2()
+                .min_w_0()
+                .text_size(px(if top { 14. } else { 13. }))
+                .child(
+                    Icon::new(match () {
+                        _ if top => IconName::ClipboardList,
+                        _ if w.done() => IconName::CircleCheck,
+                        _ => IconName::Circle,
+                    })
+                    .with_size(px(14.))
+                    .flex_none()
+                    .text_color(if !top && w.done() {
+                        theme.success_foreground
+                    } else {
+                        muted
+                    }),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(muted)
+                        .child(format!("{} {}", w.kind, w.id)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .when(top, |d| d.font_weight(FontWeight::MEDIUM))
+                        .child(w.title.clone()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .px_2()
+                        .rounded(theme.radius)
+                        .bg(theme.muted)
+                        .text_xs()
+                        .text_color(if w.done() {
+                            theme.success_foreground
+                        } else {
+                            theme.foreground
+                        })
+                        .child(w.state.clone()),
+                )
+                .child(div().flex_none().text_xs().text_color(muted).child(who))
+                .child(
+                    Button::new(SharedString::from(format!("git-work-item-{}", w.id)))
+                        .icon(IconName::ExternalLink)
+                        .tooltip("Open in Azure DevOps")
+                        .ghost()
+                        .xsmall()
+                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                )
+        };
+        Some(
+            v_flex()
+                .id("git-work-items")
+                .test_support()
+                .w_full()
+                .gap_3()
+                .text_left()
+                .child(div().text_xs().text_color(muted).child("Work items"))
+                .children(items.iter().map(|w| {
+                    let done = w.children.iter().filter(|c| c.done()).count();
+                    v_flex()
+                        .gap_1()
+                        .p_3()
+                        .rounded(theme.radius_lg)
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.secondary)
+                        .child(line(w, true))
+                        .when(!w.children.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .pl_6()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(format!("{done} of {} done", w.children.len())),
+                            )
+                        })
+                        .children(
+                            w.children
+                                .iter()
+                                .map(|c| div().pl_6().child(line(c, false))),
+                        )
+                }))
+                .into_any_element(),
+        )
+    }
+}
+
 fn state_label(state: &str) -> &str {
     match state {
         "OPEN" => "Open",
@@ -1455,6 +1623,7 @@ fn store_path(workspace: &str) -> PathBuf {
 
 impl Render for GitFeature {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let work_items = self.work_items_view(cx);
         let theme = cx.theme();
         let (border, muted) = (theme.border, theme.muted_foreground);
         let disabled = self.posting || self.archiving;
@@ -1543,14 +1712,14 @@ impl Render for GitFeature {
             (
                 "git-loading",
                 "Loading pull request…",
-                "Fetching the description and review activity from GitHub.",
+                "Fetching the description and review activity.",
                 IconName::GitPullRequest,
             )
         } else if self.error.is_some() {
             (
                 "git-load-error",
                 "Could not load the pull request",
-                "Check the connection and GitHub access, then try again.",
+                "Check the connection and your gh or az login, then try again.",
                 IconName::TriangleAlert,
             )
         } else if !self.loaded {
@@ -1748,12 +1917,15 @@ impl Render for GitFeature {
                             )
                         }),
                 )
+                .when_some(work_items, |d, w| {
+                    d.child(div().w_full().max_w(px(680.)).mx_auto().pt_8().child(w))
+                })
                 .into_any_element()
         };
         let composer = self.composer.as_ref().filter(|_| self.full_text.is_none()).map(|c| {
             let title = match &c.kind {
                 Editing::Description => "Edit PR description",
-                Editing::Comment => "Comment on GitHub",
+                Editing::Comment => "Comment on the PR",
                 Editing::Reply(_) => "Reply to review thread",
             };
             v_flex()
