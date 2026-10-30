@@ -1,4 +1,6 @@
 //! Short-lived, prompt-free account queries. No chat state or snapshots go to disk.
+pub mod activity;
+
 use objc2_foundation::{
     NSDate, NSDateFormatter, NSDateFormatterStyle, NSISO8601DateFormatOptions,
     NSISO8601DateFormatter, NSString, NSTimeZone,
@@ -147,7 +149,37 @@ pub fn local_time(seconds: f64) -> String {
         .to_string()
 }
 
-fn timestamp(value: &Value) -> Option<f64> {
+/// Weekday and time, e.g. "Thu 11:00 PM", in the user's locale.
+pub fn short_time(seconds: f64) -> String {
+    let formatter = NSDateFormatter::new();
+    formatter.setLocalizedDateFormatFromTemplate(&NSString::from_str("EEEjmm"));
+    formatter.setTimeZone(Some(&NSTimeZone::localTimeZone()));
+    formatter
+        .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(seconds))
+        .to_string()
+}
+
+/// Time until a reset: "3d", "2h 14m", "5m".
+pub fn countdown(seconds: f64) -> String {
+    let m = (seconds.max(0.) / 60.).ceil() as u64;
+    match (m / 1440, m / 60 % 24, m % 60) {
+        (0, 0, m) => format!("{m}m"),
+        (0, h, m) => format!("{h}h {m}m"),
+        (d, _, _) => format!("{d}d"),
+    }
+}
+
+/// Token counts: "950", "412k", "38.2M".
+pub fn tokens(n: u64) -> String {
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..999_500 => format!("{:.0}k", n as f64 / 1e3),
+        999_500..999_950_000 => format!("{:.1}M", n as f64 / 1e6),
+        _ => format!("{:.1}B", n as f64 / 1e9),
+    }
+}
+
+pub(crate) fn timestamp(value: &Value) -> Option<f64> {
     let formatter = NSISO8601DateFormatter::new();
     let text = NSString::from_str(value.as_str()?);
     for options in [

@@ -690,6 +690,13 @@ pub(super) const COMMANDS: &[Row] = &[
         |s, _, cx| s.toggle_sidebar(cx),
     ),
     Row(
+        "Toggle Zen mode",
+        IconName::Fullscreen,
+        Some(&ToggleZen),
+        "focus deep work distraction free hide chat only",
+        |s, w, cx| s.toggle_zen(w, cx),
+    ),
+    Row(
         "Show or hide diff files",
         IconName::ListTree,
         Some(&ToggleFileTree),

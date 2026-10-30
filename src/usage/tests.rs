@@ -434,3 +434,143 @@ fn pace_is_the_share_of_the_window_still_to_come() {
     assert_eq!(row(Some(150.), None).pace(100.), None);
     assert_eq!(row(Some(150.), Some(0.)).pace(100.), None);
 }
+
+fn midnight(day: i64) -> f64 {
+    let utc = day as f64 * 86400.;
+    let local = utc
+        - NSTimeZone::localTimeZone()
+            .secondsFromGMTForDate(&NSDate::dateWithTimeIntervalSince1970(utc)) as f64;
+    assert_eq!(
+        (activity::local_day(local - 1.), activity::local_day(local)),
+        (day - 1, day)
+    );
+    local
+}
+
+/// A log whose `@A` is noon on `day`, `@B` the last second of it and `@C` the next midnight.
+fn log(provider: Provider, day: i64) -> String {
+    let iso = |s: f64| {
+        NSISO8601DateFormatter::new()
+            .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(s))
+            .to_string()
+    };
+    let next = midnight(day + 1);
+    match provider {
+        Provider::Claude => include_str!("fixtures/claude-log.jsonl"),
+        Provider::Codex => include_str!("fixtures/codex-log.jsonl"),
+    }
+    .replace("@A", &iso(midnight(day) + 12. * HOUR))
+    .replace("@B", &iso(next - 1.))
+    .replace("@C", &iso(next))
+}
+
+#[test]
+fn activity_logs_deduplicate_skip_noise_and_split_at_local_midnight() {
+    let day = activity::local_day(now()) - 5;
+    // Claude: 2+100+30 once despite the repeat, plus 1+9 before midnight; cache reads excluded.
+    // Codex: 100-40+10 once despite the repeated total, plus 200-50+20; 10-20 saturates.
+    for (provider, expected) in [
+        (Provider::Claude, [(day, 142), (day + 1, 1000)]),
+        (Provider::Codex, [(day, 240), (day + 1, 5)]),
+    ] {
+        let mut days = activity::parse(
+            provider,
+            log(provider, day).as_bytes(),
+            &mut Default::default(),
+        );
+        days.sort();
+        assert_eq!(days, expected, "{}", provider.name());
+    }
+}
+
+#[test]
+fn civil_dates_ignore_the_locale() {
+    assert_eq!(activity::civil(20390), (2025, 10, 29));
+    assert_eq!(activity::civil(0), (1970, 1, 1));
+    assert_eq!(activity::civil(-1), (1969, 12, 31));
+    assert_eq!(activity::civil(11016), (2000, 2, 29));
+}
+
+#[test]
+fn activity_scan_windows_skips_stale_files_and_reuses_cache() {
+    let root = std::env::temp_dir().join(format!("shark-activity-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&root);
+    let (now, today) = (now(), activity::local_day(now()));
+    let write = |path: std::path::PathBuf, text: &str| {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, text).unwrap();
+        path
+    };
+    let session = write(
+        root.join("projects/p/s.jsonl"),
+        &log(Provider::Claude, today - 1),
+    );
+    // Subagent logs count; a line from before the window does not.
+    let agent = log(Provider::Claude, today - 1).replace(r#""msg_"#, r#""agent_"#)
+        + &log(Provider::Claude, today - 200).replace(r#""msg_"#, r#""old_"#);
+    write(root.join("projects/p/s/subagents/agent-1.jsonl"), &agent);
+    let stale = write(
+        root.join("projects/q/old.jsonl"),
+        &log(Provider::Claude, today - 1),
+    );
+    std::fs::File::options()
+        .write(true)
+        .open(&stale)
+        .unwrap()
+        .set_modified(UNIX_EPOCH + Duration::from_secs(86400))
+        .unwrap();
+    let codex_dir = |day| {
+        let (y, m, d) = activity::civil(day);
+        root.join(format!("sessions/{y:04}/{m:02}/{d:02}"))
+    };
+    write(
+        codex_dir(today).join("rollout-a.jsonl"),
+        &log(Provider::Codex, today - 1),
+    );
+    // A session started before the window and resumed inside it still counts.
+    write(
+        codex_dir(today - 140).join("rollout-b.jsonl"),
+        &log(Provider::Codex, today - 1),
+    );
+
+    let mut caches = [activity::Cache::default(), activity::Cache::default()];
+    let mut scan = |p: Provider| activity::scan_in(p, &root, &mut caches[p.index()], now);
+    let daily = scan(Provider::Claude);
+    assert_eq!(daily.first_day, today - 139);
+    assert_eq!(daily.tokens.len(), activity::DAYS);
+    assert_eq!(daily.tokens[138..], [284, 2000]);
+    assert_eq!(daily.tokens[..138].iter().sum::<u64>(), 0);
+    assert_eq!(scan(Provider::Codex).tokens[138..], [480, 10]);
+
+    // Same length and mtime: the cached result stands even though the bytes changed.
+    let mtime = std::fs::metadata(&session).unwrap().modified().unwrap();
+    std::fs::write(
+        &session,
+        log(Provider::Claude, today - 1).replace("1000", "3000"),
+    )
+    .unwrap();
+    let file = std::fs::File::options().write(true).open(&session).unwrap();
+    file.set_modified(mtime).unwrap();
+    assert_eq!(scan(Provider::Claude).tokens[139], 2000);
+    file.set_modified(mtime + Duration::from_secs(1)).unwrap();
+    assert_eq!(scan(Provider::Claude).tokens[139], 4000);
+    std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+#[ignore = "reads the real local logs"]
+fn live_activity() {
+    for provider in Provider::ALL {
+        let mut cache = activity::Cache::default();
+        for _ in 0..2 {
+            let started = std::time::Instant::now();
+            let daily = activity::scan(provider, &mut cache, now());
+            eprintln!(
+                "{}: {:?}, last 3 days {:?}",
+                provider.name(),
+                started.elapsed(),
+                &daily.tokens[activity::DAYS - 3..]
+            );
+        }
+    }
+}
