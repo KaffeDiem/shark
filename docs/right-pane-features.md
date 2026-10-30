@@ -38,9 +38,11 @@ presentation and invalidates refreshes; comments and pending publication results
 remain keyed by their originating workspace. Closing the tab keeps the entity,
 comments and presentation, after the existing inline-edit discard guard runs.
 
-Git remains lazy and cached per workspace. It receives the same effective comparison
-bases as Differ; GitSync changes reach it through `Shark::configure_git`. Closing its tab keeps drafts and pending
-writes. Quit and archive guards inspect retained Git entities even when another
+Git remains lazy and cached per workspace. The host gives it the same effective
+comparison bases as Differ (`Shark::effective_workspace`) through
+`GitFeature::set_workspace`; GitSync changes reach it through `Shark::configure_git`.
+Its Conversation and Commits views keep their state while the other is shown. Closing
+its tab keeps drafts and pending writes. Quit and archive guards inspect retained Git entities even when another
 workspace or feature is visible. Corrupt draft files remain protected from writes.
 
 ## Integration and safety

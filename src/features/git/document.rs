@@ -10,7 +10,6 @@ use gpui_kit::component::text::TextViewState;
 use gpui_kit::component::{ActiveTheme, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -57,8 +56,9 @@ fn closes(line: &str, ch: u8, len: usize) -> bool {
     fence(line).is_some_and(|(c, l, info)| c == ch && l >= len && info.is_empty())
 }
 
-/// Splits Markdown into blocks. Fences stay whole; an unclosed fence runs to the end.
-pub(crate) fn blocks(source: &str) -> Vec<Block> {
+/// Splits Markdown into blocks. Fences stay whole; an unclosed fence runs to the end. With
+/// `chunk`, long text is also cut into pieces.
+pub(crate) fn blocks(source: &str, chunk: bool) -> Vec<Block> {
     let lines: Vec<&str> = source.split_inclusive('\n').collect();
     // Link reference definitions apply document-wide; each block gets a copy (they render
     // nothing), so `[text][1]` still resolves after a split.
@@ -118,12 +118,14 @@ pub(crate) fn blocks(source: &str) -> Vec<Block> {
             continue;
         }
         text.push_str(line);
-        let next_plain = lines.get(i + 1).is_none_or(|n| !continues(n));
-        // Past HARD, a paragraph may end at a line break, but tables, lists, quotes and
-        // indented code stay whole.
-        let hard = text.len() >= HARD && next_plain && !continues(line);
-        if (line.trim().is_empty() && text.len() >= CHUNK && next_plain) || hard {
-            flush(&mut text, &mut out);
+        if chunk && text.len() >= CHUNK {
+            let next_plain = lines.get(i + 1).is_none_or(|n| !continues(n));
+            // Past HARD, a paragraph may end at a line break, but tables, lists, quotes and
+            // indented code stay whole.
+            let hard = text.len() >= HARD && next_plain && !continues(line);
+            if (line.trim().is_empty() && next_plain) || hard {
+                flush(&mut text, &mut out);
+            }
         }
         i += 1;
     }
@@ -151,6 +153,13 @@ fn reference(line: &str) -> bool {
             .is_some_and(|(l, d)| l.len() > 1 && !d.trim().is_empty())
 }
 
+/// An `https` URL to an image, video or GitHub attachment.
+fn embeds(url: &str) -> bool {
+    url.starts_with("https://")
+        && !url.contains(char::is_whitespace)
+        && (media::fetch::attachment(url) || media::fetch::url_kind(url).is_some())
+}
+
 /// Images on a line of their own: `![alt](url)`, `<img src="…">`, or a bare media or GitHub
 /// attachment URL. `data:` images stay inline Markdown.
 fn media_line(line: &str) -> Option<Vec<Block>> {
@@ -166,9 +175,7 @@ fn media_line(line: &str) -> Option<Vec<Block>> {
         && !r.starts_with('!')
         && let Some((text, r)) = r.split_once("](")
         && let Some(url) = r.strip_suffix(')')
-        && !url.contains(char::is_whitespace)
-        && url.starts_with("https://")
-        && (media::fetch::attachment(url) || media::fetch::url_kind(url).is_some())
+        && embeds(url)
     {
         return Some(vec![Block::Media {
             url: url.into(),
@@ -176,10 +183,7 @@ fn media_line(line: &str) -> Option<Vec<Block>> {
         }]);
     }
     let bare = rest.trim_start_matches('<').trim_end_matches('>');
-    if !bare.contains(char::is_whitespace)
-        && bare.starts_with("https://")
-        && (media::fetch::attachment(bare) || media::fetch::url_kind(bare).is_some())
-    {
+    if embeds(bare) {
         return Some(vec![Block::Media {
             url: bare.into(),
             alt: String::new(),
@@ -280,10 +284,8 @@ pub(crate) fn repo_path(dir: &str, url: &str) -> Option<String> {
     (!parts.is_empty()).then(|| parts.join("/"))
 }
 
-/// What one media block shows, plus where Open in browser goes.
-type Resolved = Result<MediaFile, String>;
-
-fn resolve(url: &str, ctx: Option<&DocContext>) -> Resolved {
+/// What one media block shows.
+fn resolve(url: &str, ctx: Option<&DocContext>) -> Result<MediaFile, String> {
     if url.contains("://") || url.starts_with("//") {
         let fetched = media::fetch::fetch(url)?;
         return Ok(MediaFile {
@@ -329,19 +331,43 @@ fn web_link(url: &str, ctx: Option<&DocContext>) -> Option<String> {
     Some(format!("{}/blob/{rev}/{path}", ctx.web.as_deref()?))
 }
 
-enum Slot<T> {
+/// What a block shows, made when it first renders.
+enum View {
+    /// A diagram being laid out or a file being fetched.
     Loading,
-    Ready(T),
+    Text(Entity<TextViewState>),
+    Diagram(Diagram),
+    /// A diagram that failed to render, with its source as a code fence.
+    Unrendered(String, Entity<TextViewState>),
+    Media(Entity<MediaView>),
+    /// A file that can't be shown.
     Failed(String),
+}
+
+struct Item {
+    block: Block,
+    /// `None` until the block first renders.
+    view: Option<View>,
+}
+
+/// The spinner box shown while a diagram renders or a file loads.
+fn loading(cx: &App) -> Div {
+    let theme = cx.theme();
+    div()
+        .h(px(120.))
+        .w_full()
+        .flex()
+        .items_center()
+        .justify_center()
+        .rounded(theme.radius)
+        .bg(theme.muted.opacity(0.4))
+        .child(Spinner::new().color(theme.muted_foreground))
 }
 
 pub(crate) struct RichDoc {
     source: String,
     ctx: Option<DocContext>,
-    blocks: Vec<Block>,
-    texts: HashMap<usize, Entity<TextViewState>>,
-    diagrams: HashMap<usize, Slot<Diagram>>,
-    media: HashMap<usize, Slot<Entity<MediaView>>>,
+    items: Vec<Item>,
     dark: Option<bool>,
     cache: Entity<Lru>,
     /// Virtualizes the blocks when the document is read in full.
@@ -359,15 +385,15 @@ impl RichDoc {
         cache: Entity<Lru>,
         full: bool,
     ) -> RichDoc {
-        let blocks = blocks(&source);
-        let list = full.then(|| ListState::new(blocks.len(), ListAlignment::Top, px(800.)));
+        let items: Vec<Item> = blocks(&source, full)
+            .into_iter()
+            .map(|block| Item { block, view: None })
+            .collect();
+        let list = full.then(|| ListState::new(items.len(), ListAlignment::Top, px(800.)));
         RichDoc {
             source,
             ctx,
-            blocks,
-            texts: HashMap::new(),
-            diagrams: HashMap::new(),
-            media: HashMap::new(),
+            items,
             dark: None,
             cache,
             list,
@@ -382,34 +408,33 @@ impl RichDoc {
 
     /// Stops any playing video, when its document leaves the screen.
     pub(crate) fn stop(&mut self, cx: &mut Context<Self>) {
-        for slot in self.media.values() {
-            if let Slot::Ready(v) = slot {
+        for item in &self.items {
+            if let Some(View::Media(v)) = &item.view {
                 v.update(cx, |v, cx| v.stop(cx));
             }
         }
     }
 
-    fn start_diagram(&mut self, ix: usize, dark: bool, cx: &mut Context<Self>) {
-        let Block::Mermaid(src) = &self.blocks[ix] else {
-            return;
-        };
-        let src = src.clone();
-        self.diagrams.insert(ix, Slot::Loading);
+    fn start_diagram(&mut self, ix: usize, src: String, dark: bool, cx: &mut Context<Self>) {
+        self.items[ix].view = Some(View::Loading);
         cx.spawn(async move |this, cx| {
             let out = cx
                 .background_executor()
-                .spawn(async move { mermaid::render(&src, dark) })
+                .spawn({
+                    let src = src.clone();
+                    async move { mermaid::render(&src, dark) }
+                })
                 .await;
             this.update(cx, |s, cx| {
                 // A theme change while rendering already started a newer one.
                 if s.dark == Some(dark) {
-                    s.diagrams.insert(
-                        ix,
-                        match out {
-                            Ok(d) => Slot::Ready(d),
-                            Err(e) => Slot::Failed(e),
-                        },
-                    );
+                    s.items[ix].view = Some(match out {
+                        Ok(d) => View::Diagram(d),
+                        Err(e) => View::Unrendered(
+                            e,
+                            cx.new(|cx| TextViewState::markdown(&format!("```\n{src}```\n"), cx)),
+                        ),
+                    });
                     cx.notify();
                 }
             })
@@ -418,19 +443,16 @@ impl RichDoc {
         .detach();
     }
 
-    fn start_media(&mut self, ix: usize, cx: &mut Context<Self>) {
-        let Block::Media { url, alt } = &self.blocks[ix] else {
-            return;
-        };
-        let (url, alt, ctx) = (url.clone(), alt.clone(), self.ctx.clone());
-        self.media.insert(ix, Slot::Loading);
+    fn start_media(&mut self, ix: usize, url: String, alt: String, cx: &mut Context<Self>) {
+        let ctx = self.ctx.clone();
+        self.items[ix].view = Some(View::Loading);
         cx.spawn(async move |this, cx| {
             let out = cx
                 .background_executor()
                 .spawn(async move { resolve(&url, ctx.as_ref()) })
                 .await;
             this.update(cx, |s, cx| {
-                let slot = match out {
+                s.items[ix].view = Some(match out {
                     Ok(file) => {
                         let label = if alt.trim().is_empty() {
                             match file.kind {
@@ -444,8 +466,8 @@ impl RichDoc {
                         let view = cx.new(|_| MediaView::new(file, cache, width).only(1, label));
                         s._subs
                             .push(cx.subscribe(&view, |s, playing, _: &Playing, cx| {
-                                for slot in s.media.values() {
-                                    if let Slot::Ready(v) = slot
+                                for item in &s.items {
+                                    if let Some(View::Media(v)) = &item.view
                                         && *v != playing
                                     {
                                         v.update(cx, |v, cx| v.stop(cx));
@@ -453,11 +475,10 @@ impl RichDoc {
                                 }
                                 cx.emit(Playing);
                             }));
-                        Slot::Ready(view)
+                        View::Media(view)
                     }
-                    Err(e) => Slot::Failed(e),
-                };
-                s.media.insert(ix, slot);
+                    Err(e) => View::Failed(e),
+                });
                 cx.notify();
             })
             .ok();
@@ -472,74 +493,55 @@ impl RichDoc {
             theme.muted.opacity(0.4),
             theme.radius,
         );
-        let el = match self.blocks[ix].clone() {
+        let el = match self.items[ix].block.clone() {
             Block::Text(text) => {
-                let state = self
-                    .texts
-                    .entry(ix)
-                    .or_insert_with(|| cx.new(|cx| TextViewState::markdown(&text, cx)))
-                    .clone();
+                let state = match &self.items[ix].view {
+                    Some(View::Text(state)) => state.clone(),
+                    _ => {
+                        let state = cx.new(|cx| TextViewState::markdown(&text, cx));
+                        self.items[ix].view = Some(View::Text(state.clone()));
+                        state
+                    }
+                };
                 crate::chat::markdown(&state, "git-row").into_any_element()
             }
-            Block::Mermaid(src) => {
-                let dark = cx.theme().is_dark();
-                if !self.diagrams.contains_key(&ix) {
-                    self.start_diagram(ix, dark, cx);
-                }
-                match &self.diagrams[&ix] {
-                    Slot::Loading => div()
-                        .h(px(120.))
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(radius)
-                        .bg(faint)
-                        .child(Spinner::new().color(muted))
-                        .into_any_element(),
-                    Slot::Ready(d) => div()
-                        .id(("git-mermaid", ix))
-                        .test_support()
-                        .relative()
-                        .w_full()
-                        .h(px(d.size.1.min(900.)))
-                        .child(
-                            img(d.png.clone())
-                                .image_cache(&self.cache)
-                                .absolute()
-                                .inset_0()
-                                .size_full()
-                                .object_fit(ObjectFit::ScaleDown),
-                        )
-                        .into_any_element(),
-                    Slot::Failed(e) => {
-                        let fallback = format!("```\n{src}```\n");
-                        let state = self
-                            .texts
-                            .entry(ix)
-                            .or_insert_with(|| cx.new(|cx| TextViewState::markdown(&fallback, cx)))
-                            .clone();
-                        v_flex()
-                            .id(("git-mermaid-error", ix))
-                            .test_support()
+            Block::Mermaid(src) => match &self.items[ix].view {
+                Some(View::Diagram(d)) => div()
+                    .id(("git-mermaid", ix))
+                    .test_support()
+                    .relative()
+                    .w_full()
+                    .h(px(d.size.1.min(900.)))
+                    .child(
+                        img(d.png.clone())
+                            .image_cache(&self.cache)
+                            .absolute()
+                            .inset_0()
+                            .size_full()
+                            .object_fit(ObjectFit::ScaleDown),
+                    )
+                    .into_any_element(),
+                Some(View::Unrendered(e, source)) => v_flex()
+                    .id(("git-mermaid-error", ix))
+                    .test_support()
+                    .gap_1()
+                    .child(
+                        h_flex()
                             .gap_1()
-                            .child(
-                                h_flex()
-                                    .gap_1()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(Icon::new(IconName::TriangleAlert).with_size(px(12.)))
-                                    .child(format!("Mermaid diagram not rendered: {e}")),
-                            )
-                            .child(crate::chat::markdown(&state, "git-row"))
-                            .into_any_element()
-                    }
+                            .text_xs()
+                            .text_color(muted)
+                            .child(Icon::new(IconName::TriangleAlert).with_size(px(12.)))
+                            .child(format!("Mermaid diagram not rendered: {e}")),
+                    )
+                    .child(crate::chat::markdown(source, "git-row"))
+                    .into_any_element(),
+                Some(_) => loading(cx).into_any_element(),
+                None => {
+                    self.start_diagram(ix, src, cx.theme().is_dark(), cx);
+                    loading(cx).into_any_element()
                 }
-            }
+            },
             Block::Media { url, alt } => {
-                if !self.media.contains_key(&ix) {
-                    self.start_media(ix, cx);
-                }
                 let link = web_link(&url, self.ctx.as_ref());
                 let caption = h_flex()
                     .gap_2()
@@ -556,19 +558,9 @@ impl RichDoc {
                                 .on_click(move |_, _, cx| cx.open_url(&link)),
                         )
                     });
-                let body = match &self.media[&ix] {
-                    Slot::Loading => div()
-                        .h(px(120.))
-                        .w_full()
-                        .flex()
-                        .items_center()
-                        .justify_center()
-                        .rounded(radius)
-                        .bg(faint)
-                        .child(Spinner::new().color(muted))
-                        .into_any_element(),
-                    Slot::Ready(view) => view.clone().into_any_element(),
-                    Slot::Failed(e) => div()
+                let body = match &self.items[ix].view {
+                    Some(View::Media(view)) => view.clone().into_any_element(),
+                    Some(View::Failed(e)) => div()
                         .id(("git-media-error", ix))
                         .test_support()
                         .w_full()
@@ -586,6 +578,11 @@ impl RichDoc {
                             }
                         ))
                         .into_any_element(),
+                    Some(_) => loading(cx).into_any_element(),
+                    None => {
+                        self.start_media(ix, url, alt, cx);
+                        loading(cx).into_any_element()
+                    }
                 };
                 v_flex()
                     .id(("git-media", ix))
@@ -600,39 +597,38 @@ impl RichDoc {
     }
 
     #[cfg(test)]
-    pub(crate) fn blocks_ref(&self) -> &[Block] {
-        &self.blocks
-    }
-
-    #[cfg(test)]
     pub(crate) fn rendered_len(&self, cx: &App) -> usize {
-        self.texts
-            .values()
+        self.items
+            .iter()
+            .filter_map(|i| match &i.view {
+                Some(View::Text(t) | View::Unrendered(_, t)) => Some(t),
+                _ => None,
+            })
             .map(|t| t.read(cx).rendered_text().as_str().len())
             .sum()
     }
 
     #[cfg(test)]
     pub(crate) fn diagram_state(&self, ix: usize) -> Option<Result<PathBuf, String>> {
-        match self.diagrams.get(&ix)? {
-            Slot::Loading => None,
-            Slot::Ready(d) => Some(Ok(d.png.clone())),
-            Slot::Failed(e) => Some(Err(e.clone())),
+        match self.items[ix].view.as_ref()? {
+            View::Diagram(d) => Some(Ok(d.png.clone())),
+            View::Unrendered(e, _) => Some(Err(e.clone())),
+            _ => None,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn media_view(&self, ix: usize) -> Option<Entity<MediaView>> {
-        match self.media.get(&ix)? {
-            Slot::Ready(v) => Some(v.clone()),
+        match self.items.get(ix)?.view.as_ref()? {
+            View::Media(v) => Some(v.clone()),
             _ => None,
         }
     }
 
     #[cfg(test)]
     pub(crate) fn media_error(&self, ix: usize) -> Option<String> {
-        match self.media.get(&ix)? {
-            Slot::Failed(e) => Some(e.clone()),
+        match self.items.get(ix)?.view.as_ref()? {
+            View::Failed(e) => Some(e.clone()),
             _ => None,
         }
     }
@@ -642,18 +638,12 @@ impl Render for RichDoc {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dark = cx.theme().is_dark();
         if self.dark != Some(dark) {
-            // Diagrams follow the theme; the cache keeps both.
+            // Only diagrams follow the theme (text is styled when drawn); the cache keeps both.
             self.dark = Some(dark);
-            self.diagrams.clear();
-            let diagrams: Vec<_> = self
-                .blocks
-                .iter()
-                .enumerate()
-                .filter(|(_, b)| matches!(b, Block::Mermaid(_)))
-                .map(|(i, _)| i)
-                .collect();
-            for i in diagrams {
-                self.texts.remove(&i);
+            for item in &mut self.items {
+                if matches!(item.block, Block::Mermaid(_)) {
+                    item.view = None;
+                }
             }
         }
         match self.list.clone() {
@@ -661,7 +651,7 @@ impl Render for RichDoc {
             None => v_flex()
                 .w_full()
                 .min_w_0()
-                .children((0..self.blocks.len()).map(|i| self.render_block(i, cx)))
+                .children((0..self.items.len()).map(|i| self.render_block(i, cx)))
                 .into_any_element(),
         }
     }
@@ -727,7 +717,7 @@ mod tests {
                    inline ![x](y.png) stays\n\
                    ```rust\n![not](media.png)\n```\n\
                    ![d](data:image/png;base64,AAAA)\n";
-        let b = blocks(src);
+        let b = blocks(src, true);
         assert_eq!(b[0], Block::Text("Intro\n\n".into()));
         assert_eq!(b[1], Block::Mermaid("flowchart TD\n A-->B\n".into()));
         assert_eq!(b[2], media("docs/a.png", "shot"));
@@ -748,21 +738,24 @@ mod tests {
 
         // Multibyte text never splits a character.
         for line in ["Hi 👋\n", "日本語で説明\n", "你好\n", "é<img\n"] {
-            assert_eq!(blocks(line), [Block::Text(line.into())]);
+            assert_eq!(blocks(line, true), [Block::Text(line.into())]);
         }
         assert_eq!(
-            blocks("[demo](https://github.com/user-attachments/assets/x)\n"),
+            blocks(
+                "[demo](https://github.com/user-attachments/assets/x)\n",
+                true
+            ),
             [media(
                 "https://github.com/user-attachments/assets/x",
                 "demo"
             )]
         );
         assert!(matches!(
-            &blocks("[docs](https://x.test/a)\n")[0],
+            &blocks("[docs](https://x.test/a)\n", true)[0],
             Block::Text(_)
         ));
 
-        let unclosed = blocks("a\n```mermaid\nflowchart TD\n");
+        let unclosed = blocks("a\n```mermaid\nflowchart TD\n", true);
         assert_eq!(
             unclosed.len(),
             1,
@@ -771,8 +764,9 @@ mod tests {
 
         let long = "word ".repeat(100) + "\n\n";
         let doc = long.repeat(50);
-        let parts = blocks(&doc);
+        let parts = blocks(&doc, true);
         assert!(parts.len() > 5, "long documents become several blocks");
+        assert_eq!(blocks(&doc, false).len(), 1, "previews are not chunked");
         let joined: String = parts
             .iter()
             .map(|b| match b {
@@ -783,12 +777,16 @@ mod tests {
         assert_eq!(joined.trim_end(), doc.trim_end(), "nothing is lost");
 
         let table = format!("| a | b |\n|---|---|\n{}", "| cell | cell |\n".repeat(1000));
-        assert_eq!(blocks(&table).len(), 1, "a long table stays one block");
+        assert_eq!(
+            blocks(&table, true).len(),
+            1,
+            "a long table stays one block"
+        );
         let refs = format!(
             "See [one][1].\n\n{}\n\n[1]: https://x.test\n",
             "word ".repeat(600)
         );
-        let parts = blocks(&refs);
+        let parts = blocks(&refs, true);
         assert!(parts.len() > 1);
         assert!(matches!(&parts[0], Block::Text(t) if t.contains("[1]: https://x.test")));
     }

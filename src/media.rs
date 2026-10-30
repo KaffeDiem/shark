@@ -83,8 +83,8 @@ pub(crate) enum Source {
     Working(PathBuf),
     /// The exact blob `Side::sha`, read from the repository.
     Blob,
-    /// A file already downloaded into the cache; `Side::sha` is its cache key.
-    Downloaded(PathBuf),
+    /// A file `fetch` put in the cache; `Side::sha` is its cache key.
+    Downloaded,
 }
 
 /// One side of a media file.
@@ -103,7 +103,7 @@ impl Side {
         match self.source {
             Source::Working(_) => format!("w-{}", self.sha),
             Source::Blob => format!("b-{}", self.sha),
-            Source::Downloaded(_) => self.sha.clone(),
+            Source::Downloaded => self.sha.clone(),
         }
     }
 }
@@ -218,7 +218,8 @@ pub(crate) fn prepare(side: &Side, path: &str, kind: Kind) -> Result<Preview, St
             let bytes = crate::git::history::blob(&side.repo, &side.sha)?;
             fs::write(tmp, bytes).map_err(|e| e.to_string())
         }
-        Source::Downloaded(f) => fs::copy(f, tmp).map(|_| ()).map_err(|e| e.to_string()),
+        // `fetch` already wrote it under this name; absent, it was pruned since.
+        Source::Downloaded => Err("the download expired; reload the document".into()),
     })?;
     let bytes = fs::metadata(&source).map_err(|e| e.to_string())?.len();
     if bytes == 0 {
@@ -830,7 +831,7 @@ fn play_badge() -> impl IntoElement {
         .child(Icon::new(IconName::Play).with_size(px(20.)))
 }
 
-fn human_bytes(n: u64) -> String {
+pub(crate) fn human_bytes(n: u64) -> String {
     match n {
         n if n < 1024 => format!("{n} B"),
         n if n < 1024 * 1024 => format!("{:.1} KB", n as f64 / 1024.),
@@ -924,11 +925,11 @@ mod tests {
         assert!(m.new.is_none(), "all-zero hash is a missing side");
         assert!(MediaFile::parse("web/a.rs", chunk, Path::new("/ws")).is_none());
         assert_eq!(kind("x/Clip.MOV"), Some(Kind::Video));
-        let new = m.new.clone().unwrap_or(Side {
+        let new = Side {
             sha: old.sha.clone(),
             repo: old.repo.clone(),
             source: Source::Working("/ws/web/a.png".into()),
-        });
+        };
         assert_ne!(
             new.key(),
             old.key(),

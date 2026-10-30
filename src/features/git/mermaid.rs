@@ -1,7 +1,7 @@
 //! Mermaid fences rendered natively: merman lays out a resvg-safe SVG, resvg rasterizes it to a
 //! PNG in the media cache, named by the source and theme, so a diagram renders once.
 use std::hash::{Hash, Hasher};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 use std::time::Duration;
 
@@ -32,17 +32,18 @@ pub(crate) fn render(source: &str, dark: bool) -> Result<Diagram, String> {
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let key = key(source, dark);
     let png = dir.join(format!("{key}.png"));
-    let size_file = dir.join(format!("{key}.size"));
-    if let Some(size) = std::fs::read_to_string(&size_file)
-        .ok()
-        .and_then(|s| {
-            let (w, h) = s.trim().split_once('x')?;
-            Some((w.parse().ok()?, h.parse().ok()?))
-        })
-        .filter(|_| png.exists())
-    {
-        return Ok(Diagram { png, size });
+    if !png.exists() {
+        rasterize(source, dark, &png)?;
     }
+    // The PNG is twice the logical size, so the cap shrinks the logical size too.
+    let size = imagesize::size(&png).map_err(|e| e.to_string())?;
+    Ok(Diagram {
+        png,
+        size: (size.width as f32 / 2., size.height as f32 / 2.),
+    })
+}
+
+fn rasterize(source: &str, dark: bool, png: &Path) -> Result<(), String> {
     let svg = svg(source, dark)?;
     let tree = resvg::usvg::Tree::from_data(svg.as_bytes(), &OPTIONS).map_err(|e| e.to_string())?;
     let (w, h) = (tree.size().width(), tree.size().height());
@@ -56,10 +57,7 @@ pub(crate) fn render(source: &str, dark: bool) -> Result<Diagram, String> {
         resvg::tiny_skia::Transform::from_scale(scale, scale),
         &mut pixmap.as_mut(),
     );
-    let size = (w * scale / 2., h * scale / 2.);
-    crate::media::produce(&png, |tmp| pixmap.save_png(tmp).map_err(|e| e.to_string()))?;
-    let _ = std::fs::write(&size_file, format!("{}x{}", size.0, size.1));
-    Ok(Diagram { png, size })
+    crate::media::produce(png, |tmp| pixmap.save_png(tmp).map_err(|e| e.to_string()))
 }
 
 /// System fonts, so labels render as text rather than vanish.

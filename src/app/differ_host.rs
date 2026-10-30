@@ -3,10 +3,9 @@ use super::*;
 use differ::{DifferEvent, WorkspaceSnapshot};
 
 impl Shark {
-    /// The active workspace with GitSync's effective comparison bases, as Diff and Git use them.
-    pub(super) fn effective_workspace(&self, cx: &App) -> Option<Workspace> {
-        let mut workspace = self.active_ws()?.clone();
-        if let Some(sync) = self.active_sync() {
+    /// `workspace` with GitSync's effective comparison bases, as Diff and Git use them.
+    pub(super) fn effective_workspace(&self, mut workspace: Workspace, cx: &App) -> Workspace {
+        if let Some(sync) = self.syncs.get(&workspace.name) {
             let sync = sync.read(cx);
             for repo in &mut workspace.repos {
                 if let Some(base) = sync.diff_base(&repo.name) {
@@ -14,11 +13,11 @@ impl Shark {
                 }
             }
         }
-        Some(workspace)
+        workspace
     }
 
     fn differ_workspace(&self, cx: &App) -> Option<WorkspaceSnapshot> {
-        let workspace = self.effective_workspace(cx)?;
+        let workspace = self.effective_workspace(self.active_ws()?.clone(), cx);
         let mut prs = HashMap::new();
         if let Some(sync) = self.active_sync() {
             let sync = sync.read(cx);
@@ -31,10 +30,11 @@ impl Shark {
         Some(WorkspaceSnapshot { workspace, prs })
     }
 
-    /// Hands a moved comparison base to the retained Git entity, which resets only its history.
-    pub(super) fn configure_git(&self, cx: &mut Context<Self>) {
-        if let (Some(ws), Some(git)) = (self.effective_workspace(cx), self.active_git_feature()) {
-            git.update(cx, |g, cx| g.set_bases(&ws, cx));
+    /// A moved comparison base reaches the retained Git entity, which resets only its history.
+    pub(super) fn configure_git(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let (Some(ws), Some(git)) = (self.active_ws(), self.active_git_feature()) {
+            let ws = self.effective_workspace(ws.clone(), cx);
+            git.update(cx, |g, cx| g.set_workspace(ws, window, cx));
         }
     }
 

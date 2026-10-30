@@ -22,7 +22,6 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
-use std::ops::Not as _;
 use std::time::{Duration, Instant};
 use std::{collections::HashMap, path::PathBuf};
 
@@ -68,6 +67,12 @@ enum Row {
     Reply(usize, usize),
 }
 
+/// A message open in the reader; `source` is its read-only Markdown source, when switched to.
+struct Reader {
+    doc: Entity<RichDoc>,
+    source: Option<Entity<EditorState>>,
+}
+
 /// What the Git pane shows; both keep their state while the other is shown.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) enum GitView {
@@ -96,9 +101,7 @@ pub(crate) struct GitFeature {
     refreshed: Option<Instant>,
     focus: FocusHandle,
     composer: Option<Composer>,
-    full_text: Option<Entity<EditorState>>,
-    /// The complete message, rich; `full_text` is its source.
-    reader: Option<Entity<RichDoc>>,
+    reader: Option<Reader>,
     drafts: HashMap<String, Draft>,
     store_blocked: bool,
     save_generation: u64,
@@ -114,7 +117,6 @@ pub(crate) struct GitFeature {
     media_cache: Entity<Lru>,
     view: GitView,
     commits: Entity<Commits>,
-    _doc_subs: Vec<Subscription>,
     list: ListState,
     show_resolved: bool,
     show_drafts: bool,
@@ -140,7 +142,8 @@ impl GitFeature {
                 true,
             ),
         };
-        let commits = cx.new(Commits::new);
+        let media_cache = Lru::new(cx);
+        let commits = cx.new(|cx| Commits::new(media_cache.clone(), cx));
         commits.update(cx, |c, cx| c.set_repo(repo_context(&workspace, 0), cx));
         Self {
             workspace,
@@ -156,7 +159,6 @@ impl GitFeature {
             refreshed: None,
             focus: cx.focus_handle(),
             composer: None,
-            full_text: None,
             reader: None,
             drafts,
             store_blocked,
@@ -170,16 +172,16 @@ impl GitFeature {
             rows: Vec::new(),
             markdown: HashMap::new(),
             markdown_order: VecDeque::new(),
-            media_cache: Lru::new(cx),
+            media_cache,
             view: GitView::Conversation,
             commits,
-            _doc_subs: vec![],
             list: ListState::new(0, ListAlignment::Top, px(400.)),
             show_resolved: false,
             show_drafts: false,
         }
     }
 
+    /// A base change (the host passes its effective bases) resets only the history.
     pub(crate) fn set_workspace(
         &mut self,
         workspace: Workspace,
@@ -200,16 +202,6 @@ impl GitFeature {
                 .min(self.workspace.repos.len().saturating_sub(1));
             self.clear_selection(cx);
             self.refresh(window, cx);
-        }
-        self.sync_commits(cx);
-    }
-
-    /// Takes the host's effective comparison bases. A base change resets only the history.
-    pub(crate) fn set_bases(&mut self, workspace: &Workspace, cx: &mut Context<Self>) {
-        for repo in &mut self.workspace.repos {
-            if let Some(r) = workspace.repos.iter().find(|r| r.name == repo.name) {
-                repo.base = r.base.clone();
-            }
         }
         self.sync_commits(cx);
     }
@@ -247,7 +239,11 @@ impl GitFeature {
 
     /// Leaving a view or message stops its videos.
     fn stop_media(&mut self, cx: &mut Context<Self>) {
-        for doc in self.markdown.values().chain(&self.reader) {
+        for doc in self
+            .markdown
+            .values()
+            .chain(self.reader.as_ref().map(|r| &r.doc))
+        {
             doc.update(cx, |d, cx| d.stop(cx));
         }
         self.commits.update(cx, |c, cx| c.stop(cx));
@@ -409,13 +405,11 @@ impl GitFeature {
     fn rebuild_rows(&mut self) {
         let offset = self.list.logical_scroll_top();
         let had_rows = !self.rows.is_empty();
-        self.full_text = None;
         self.reader = None;
         self.rows.clear();
         // Dropping a document drops its players, which pauses them.
         self.markdown.clear();
         self.markdown_order.clear();
-        self._doc_subs.clear();
         if let Some(d) = &self.details {
             self.rows.push(Row::Description);
             if !d.comments.is_empty() {
@@ -548,7 +542,6 @@ impl GitFeature {
         if self.posting || self.archiving {
             return;
         }
-        self.full_text = None;
         self.reader = None;
         self.capture_draft(cx);
         let details = self.details.as_ref().filter(|d| d.target.url() == target);
@@ -829,11 +822,7 @@ impl GitFeature {
 
     pub(crate) fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         // A composer hidden behind the reader or the Commits view never posts.
-        if self.full_text.is_some()
-            || self.reader.is_some()
-            || self.view != GitView::Conversation
-            || !self.can_submit()
-        {
+        if self.reader.is_some() || self.view != GitView::Conversation || !self.can_submit() {
             return;
         }
         if self.posting || self.loading || self.archiving {
@@ -971,7 +960,7 @@ impl GitFeature {
         let repo = self.workspace.repos.get(self.selected)?;
         Some(DocContext {
             repo: self.workspace.dir().join(&repo.name),
-            rev: (!d.head_sha.is_empty()).then(|| d.head_sha.clone()),
+            rev: d.head_sha.clone(),
             dir: String::new(),
             web: Some(format!(
                 "https://{}/{}/{}",
@@ -983,15 +972,15 @@ impl GitFeature {
     fn rich(&mut self, source: String, full: bool, cx: &mut Context<Self>) -> Entity<RichDoc> {
         let (ctx, cache) = (self.doc_context(), self.media_cache.clone());
         let doc = cx.new(|_| RichDoc::new(source, ctx, cache, full));
-        // One video plays at a time across the conversation.
-        self._doc_subs
-            .push(cx.subscribe(&doc, |s, playing, _: &Playing, cx| {
-                for doc in s.markdown.values().chain(&s.reader) {
-                    if *doc != playing {
-                        doc.update(cx, |d, cx| d.stop(cx));
-                    }
+        // One video plays at a time across the conversation. Detached: it ends with the doc.
+        cx.subscribe(&doc, |s, playing, _: &Playing, cx| {
+            for doc in s.markdown.values().chain(s.reader.as_ref().map(|r| &r.doc)) {
+                if *doc != playing {
+                    doc.update(cx, |d, cx| d.stop(cx));
                 }
-            }));
+            }
+        })
+        .detach();
         doc
     }
 
@@ -1015,18 +1004,14 @@ impl GitFeature {
 
     fn open_reader(&mut self, body: String, window: &mut Window, cx: &mut Context<Self>) {
         self.stop_media(cx);
-        self.full_text = None;
-        self.reader = Some(self.rich(body, true, cx));
+        let doc = self.rich(body, true, cx);
+        self.reader = Some(Reader { doc, source: None });
         self.focus.focus(window, cx);
         cx.notify();
     }
 
     fn show_source(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(body) = self
-            .reader
-            .as_ref()
-            .map(|r| r.read(cx).source().to_string())
-        else {
+        let Some(body) = (self.reader.as_ref()).map(|r| r.doc.read(cx).source().to_string()) else {
             return;
         };
         self.stop_media(cx);
@@ -1037,13 +1022,14 @@ impl GitFeature {
         });
         input.update(cx, |i, cx| i.set_readonly(true, cx));
         input.read(cx).focus_handle(cx).focus(window, cx);
-        self.full_text = Some(input);
+        if let Some(r) = &mut self.reader {
+            r.source = Some(input);
+        }
         cx.notify();
     }
 
     fn close_reader(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.stop_media(cx);
-        self.full_text = None;
         self.reader = None;
         self.focus.focus(window, cx);
         cx.notify();
@@ -1051,30 +1037,28 @@ impl GitFeature {
 
     fn body_view(&mut self, id: String, body: String, cx: &mut Context<Self>) -> AnyElement {
         let md = self.md(id.clone(), &body, cx);
+        // Every message opens in the reader, which also offers its Markdown source.
+        let long = body.len() > PREVIEW_BYTES;
         v_flex()
             .gap_2()
-            .map(|d| {
-                // Every message opens in the reader, which also offers its Markdown source.
-                let long = body.len() > PREVIEW_BYTES;
-                d.child(
-                    h_flex()
-                        .gap_2()
-                        .flex_wrap()
-                        .text_xs()
-                        .when(long, |d| d.child("Preview of a long message"))
-                        .child(
-                            Button::new(SharedString::from(format!("git-long-{id}")))
-                                .label(if long { "Read full text" } else { "Reader" })
-                                .map(|b| match long {
-                                    true => b.small(),
-                                    false => b.ghost().xsmall().tooltip("Read with source"),
-                                })
-                                .on_click(cx.listener(move |s, _, w, cx| {
-                                    s.open_reader(body.clone(), w, cx)
-                                })),
-                        ),
-                )
-            })
+            .child(
+                h_flex()
+                    .gap_2()
+                    .flex_wrap()
+                    .text_xs()
+                    .when(long, |d| d.child("Preview of a long message"))
+                    .child(
+                        Button::new(SharedString::from(format!("git-long-{id}")))
+                            .label(if long { "Read full text" } else { "Reader" })
+                            .map(|b| match long {
+                                true => b.small(),
+                                false => b.ghost().xsmall().tooltip("Read with source"),
+                            })
+                            .on_click(
+                                cx.listener(move |s, _, w, cx| s.open_reader(body.clone(), w, cx)),
+                            ),
+                    ),
+            )
             .child(md)
             .into_any_element()
     }
@@ -1522,7 +1506,7 @@ impl GitFeature {
 
     fn scroll(&self, lines: f32, cx: &mut Context<Self>) {
         match &self.reader {
-            Some(r) => r.read(cx).scroll_by(px(lines * 21.)),
+            Some(r) => r.doc.read(cx).scroll_by(px(lines * 21.)),
             None => self.list.scroll_by(px(lines * 21.)),
         }
         cx.notify();
@@ -1551,8 +1535,8 @@ impl GitFeature {
 
     #[cfg(test)]
     pub(crate) fn full_text_len(&self, cx: &App) -> usize {
-        self.full_text
-            .as_ref()
+        (self.reader.as_ref())
+            .and_then(|r| r.source.as_ref())
             .map(|input| input.read(cx).value().len())
             .unwrap_or(0)
     }
@@ -1577,7 +1561,7 @@ impl GitFeature {
 
     #[cfg(test)]
     pub(crate) fn reader(&self) -> Option<&Entity<RichDoc>> {
-        self.reader.as_ref()
+        self.reader.as_ref().map(|r| &r.doc)
     }
 
     #[cfg(test)]
@@ -1629,7 +1613,6 @@ fn state_label(state: &str) -> &str {
 fn repo_context(workspace: &Workspace, selected: usize) -> Option<RepoContext> {
     let repo = workspace.repos.get(selected)?;
     Some(RepoContext {
-        name: repo.name.clone(),
         wt: workspace.dir().join(&repo.name),
         base: repo.base.clone(),
     })
@@ -1673,7 +1656,7 @@ impl Render for GitFeature {
                     .icon(IconName::MessageSquare)
                     .small()
                     .ghost()
-                    .selected(commits_view.not())
+                    .selected(!commits_view)
                     .on_click(cx.listener(|s, _, w, cx| s.set_view(GitView::Conversation, w, cx))),
             )
             .child(
@@ -1686,9 +1669,8 @@ impl Render for GitFeature {
                     .on_click(cx.listener(|s, _, w, cx| s.set_view(GitView::Commits, w, cx))),
             )
             .child(div().flex_1())
-            .when(
-                (!drafts.is_empty() || self.show_drafts) && !commits_view,
-                |r| {
+            .when(!commits_view, |r| {
+                r.when(!drafts.is_empty() || self.show_drafts, |r| {
                     r.child(
                         Button::new("git-local-drafts")
                             .label(if self.show_drafts {
@@ -1701,37 +1683,34 @@ impl Render for GitFeature {
                             .disabled(disabled)
                             .on_click(cx.listener(|s, _, w, cx| {
                                 s.show_drafts = !s.show_drafts;
-                                s.full_text = None;
                                 s.reader = None;
                                 s.focus.focus(w, cx);
                                 cx.notify();
                             })),
                     )
-                },
-            )
-            .when_some(self.details.as_ref().filter(|_| !commits_view), |r, d| {
-                let resume_comment = self
-                    .drafts
-                    .get(&d.target.url())
-                    .is_some_and(|draft| !draft.note.is_empty());
-                r.when(d.can_comment || resume_comment, |r| {
-                    r.child(
-                        Button::new("git-comment-new")
-                            .icon(IconName::MessageSquare)
-                            .label(if resume_comment {
-                                "Resume comment"
-                            } else {
-                                "Add comment"
-                            })
-                            .small()
-                            .ghost()
-                            .disabled(disabled)
-                            .on_click(cx.listener(|s, _, w, cx| s.start_comment(w, cx))),
-                    )
                 })
-            })
-            .when(!commits_view, |r| {
-                r.child(
+                .when_some(self.details.as_ref(), |r, d| {
+                    let resume_comment = self
+                        .drafts
+                        .get(&d.target.url())
+                        .is_some_and(|draft| !draft.note.is_empty());
+                    r.when(d.can_comment || resume_comment, |r| {
+                        r.child(
+                            Button::new("git-comment-new")
+                                .icon(IconName::MessageSquare)
+                                .label(if resume_comment {
+                                    "Resume comment"
+                                } else {
+                                    "Add comment"
+                                })
+                                .small()
+                                .ghost()
+                                .disabled(disabled)
+                                .on_click(cx.listener(|s, _, w, cx| s.start_comment(w, cx))),
+                        )
+                    })
+                })
+                .child(
                     Button::new("git-refresh")
                         .icon(IconName::RefreshCw)
                         .loading(self.loading)
@@ -1843,8 +1822,8 @@ impl Render for GitFeature {
                         )
                 }))
                 .into_any_element()
-        } else if let Some(reader) = &self.reader {
-            let source = self.full_text.clone();
+        } else if let Some(Reader { doc, source }) = &self.reader {
+            let source = source.clone();
             v_flex()
                 .size_full()
                 .min_h_0()
@@ -1870,7 +1849,9 @@ impl Render for GitFeature {
                                 .ghost()
                                 .selected(source.is_none())
                                 .on_click(cx.listener(|s, _, w, cx| {
-                                    s.full_text = None;
+                                    if let Some(r) = &mut s.reader {
+                                        r.source = None;
+                                    }
                                     s.focus.focus(w, cx);
                                     cx.notify();
                                 })),
@@ -1912,7 +1893,7 @@ impl Render for GitFeature {
                         .test_support()
                         .flex_1()
                         .min_h_0()
-                        .child(reader.clone())
+                        .child(doc.clone())
                         .into_any_element(),
                 })
                 .into_any_element()
@@ -2005,7 +1986,7 @@ impl Render for GitFeature {
         let composer = self
             .composer
             .as_ref()
-            .filter(|_| self.full_text.is_none() && self.reader.is_none() && !commits_view)
+            .filter(|_| self.reader.is_none() && !commits_view)
             .map(|c| {
             let title = match &c.kind {
                 Editing::Description => "Edit PR description",
@@ -2104,21 +2085,21 @@ impl Render for GitFeature {
             .on_action(cx.listener(|s, _: &PageUp, _, cx| s.scroll(-15., cx)))
             .on_action(cx.listener(|s, _: &SelectFirst, _, cx| {
                 match &s.reader {
-                    Some(r) => r.read(cx).scroll_to_start(),
+                    Some(r) => r.doc.read(cx).scroll_to_start(),
                     None => s.list.scroll_to(ListOffset::default()),
                 }
                 cx.notify();
             }))
             .on_action(cx.listener(|s, _: &SelectLast, _, cx| {
                 match &s.reader {
-                    Some(r) => r.read(cx).scroll_to_end(),
+                    Some(r) => r.doc.read(cx).scroll_to_end(),
                     None => s.list.scroll_to_end(),
                 }
                 cx.notify();
             }))
             .on_action(cx.listener(|s, _: &CancelEdit, w, cx| {
                 if !s.posting {
-                    if s.full_text.is_some() || s.reader.is_some() {
+                    if s.reader.is_some() {
                         s.close_reader(w, cx);
                     } else {
                         s.close_editor(cx);

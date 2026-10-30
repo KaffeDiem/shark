@@ -6,26 +6,10 @@ async fn uncommitted_dots_and_file_discard(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
     let repos = repos(&home, &["api", "web"]);
-    let commit = |dir: &Path| {
-        git::git(dir, &["add", "."]).unwrap();
-        git::git(
-            dir,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-qm",
-                "files",
-            ],
-        )
-        .unwrap();
-    };
     for repo in &repos {
         fs::write(repo.path.join("file.txt"), "base\n").unwrap();
         fs::write(repo.path.join("back.txt"), "base\n").unwrap();
-        commit(&repo.path);
+        commit_all(&repo.path, "files");
     }
     let (window, shark) = boot(
         cx,
@@ -56,7 +40,7 @@ async fn uncommitted_dots_and_file_discard(cx: &mut TestAppContext) {
     fs::write(api.join("file.txt"), "feature\n").unwrap();
     fs::write(api.join("back.txt"), "feature\n").unwrap();
     fs::write(api.join("committed.txt"), "committed\n").unwrap();
-    commit(&api);
+    commit_all(&api, "files");
     fs::write(api.join("file.txt"), "staged\n").unwrap();
     git::git(&api, &["add", "file.txt"]).unwrap();
     fs::write(api.join("file.txt"), "unstaged\n").unwrap();
@@ -232,19 +216,7 @@ async fn uncommitted_dots_and_file_discard(cx: &mut TestAppContext) {
     });
     let fingerprint = cx.update(|cx| shark.read(cx).differ.read(cx).diff_fp());
     git::git(&api, &["add", "file.txt"]).unwrap();
-    git::git(
-        &api,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "more work",
-        ],
-    )
-    .unwrap();
+    commit_staged(&api, "more work");
     refresh(cx);
     cx.update(|cx| {
         let s = shark.read(cx);

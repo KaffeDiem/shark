@@ -3,25 +3,17 @@
 use super::git_bytes;
 use std::path::Path;
 
-/// Commits per page.
-pub const PAGE: usize = 100;
+// ponytail: one unpaged `git log`; branches beyond this show the newest N, page it if that bites.
+pub const MAX_COMMITS: usize = 1000;
 const SECS: u64 = 30;
-
-/// `base..head`, both resolved to full commit SHAs once per refresh.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Range {
-    pub base: String,
-    pub head: String,
-}
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Summary {
     pub sha: String,
-    pub short: String,
     pub author: String,
     /// Author date, ISO 8601.
     pub date: String,
-    pub parents: Vec<String>,
+    pub merge: bool,
     pub subject: String,
 }
 
@@ -53,8 +45,28 @@ pub struct FileChange {
 }
 
 impl FileChange {
-    pub fn mode_only(&self) -> bool {
-        matches!((&self.old, &self.new), (Some(o), Some(n)) if o.id == n.id && o.mode != n.mode)
+    /// The old and new modes when both sides exist and differ.
+    pub fn mode_change(&self) -> Option<(&str, &str)> {
+        match (&self.old, &self.new) {
+            (Some(o), Some(n)) if o.mode != n.mode => Some((&o.mode, &n.mode)),
+            _ => None,
+        }
+    }
+
+    /// `mode_change` when the contents are identical.
+    pub fn mode_only(&self) -> Option<(&str, &str)> {
+        let same = matches!((&self.old, &self.new), (Some(o), Some(n)) if o.id == n.id);
+        self.mode_change().filter(|_| same)
+    }
+
+    /// `submodule` or `symlink` when either side is one: neither has file contents to show.
+    pub fn special(&self) -> Option<&'static str> {
+        let sides = || [&self.old, &self.new].into_iter().flatten();
+        if sides().any(Blob::submodule) {
+            Some("submodule")
+        } else {
+            sides().any(Blob::symlink).then_some("symlink")
+        }
     }
 }
 
@@ -78,6 +90,8 @@ impl Commit {
     }
 }
 
+/// `git_bytes`, not `git`: a partial clone may fetch missing objects here, so the timeout and
+/// the no-prompt environment matter.
 fn text(wt: &Path, args: &[&str]) -> Result<String, String> {
     git_bytes(wt, args, SECS).map(|b| String::from_utf8_lossy(&b).into_owned())
 }
@@ -93,8 +107,9 @@ fn commit_sha(wt: &Path, rev: &str) -> Option<String> {
     .filter(|s| !s.is_empty())
 }
 
-/// Resolves the comparison base and local HEAD. A missing base is an error, never all history.
-pub fn resolve(wt: &Path, base: &str) -> Result<Range, String> {
+/// `base..HEAD`, newest first in topological order, merged side branches included, at most
+/// `MAX_COMMITS`. A missing base is an error, never all history.
+pub fn commits(wt: &Path, base: &str) -> Result<Vec<Summary>, String> {
     if base.trim().is_empty() {
         return Err("This repository has no comparison base".into());
     }
@@ -102,20 +117,8 @@ pub fn resolve(wt: &Path, base: &str) -> Result<Range, String> {
         format!("Comparison base {base} is not available locally. Fetch it, then refresh.")
     })?;
     let head = commit_sha(wt, "HEAD").ok_or("HEAD has no commits yet")?;
-    Ok(Range {
-        base: base_sha,
-        head,
-    })
-}
-
-/// One page of `base..head`, newest first in topological order, merged side branches included.
-/// Returns whether more pages follow.
-pub fn commits(wt: &Path, range: &Range, skip: usize) -> Result<(Vec<Summary>, bool), String> {
-    let spec = format!("{}..{}", range.base, range.head);
-    let (skip_arg, max) = (
-        format!("--skip={skip}"),
-        format!("--max-count={}", PAGE + 1),
-    );
+    let spec = format!("{base_sha}..{head}");
+    let max = format!("--max-count={MAX_COMMITS}");
     let out = text(
         wt,
         &[
@@ -123,30 +126,25 @@ pub fn commits(wt: &Path, range: &Range, skip: usize) -> Result<(Vec<Summary>, b
             "--topo-order",
             "--no-color",
             "--no-show-signature",
-            "--format=%H%x1f%h%x1f%an%x1f%aI%x1f%P%x1f%s%x1e",
-            &skip_arg,
+            "--format=%H%x1f%an%x1f%aI%x1f%P%x1f%s%x1e",
             &max,
             &spec,
             "--",
         ],
     )?;
-    let mut list: Vec<Summary> = out
+    Ok(out
         .split('\x1e')
         .filter_map(|record| {
             let f: Vec<_> = record.trim_start_matches('\n').split('\x1f').collect();
-            (f.len() == 6).then(|| Summary {
+            (f.len() == 5).then(|| Summary {
                 sha: f[0].into(),
-                short: f[1].into(),
-                author: f[2].into(),
-                date: f[3].into(),
-                parents: f[4].split_whitespace().map(Into::into).collect(),
-                subject: f[5].into(),
+                author: f[1].into(),
+                date: f[2].into(),
+                merge: f[3].split_whitespace().count() > 1,
+                subject: f[4].into(),
             })
         })
-        .collect();
-    let more = list.len() > PAGE;
-    list.truncate(PAGE);
-    Ok((list, more))
+        .collect())
 }
 
 fn sha_like(s: &str) -> bool {
@@ -176,20 +174,13 @@ pub fn commit(wt: &Path, sha: &str) -> Result<Commit, String> {
     }
     let parents: Vec<String> = f[1].split_whitespace().map(Into::into).collect();
     let compared_to = parents.first().cloned();
-    let mut args = vec![
-        "diff-tree",
-        "-r",
-        "-z",
-        "--raw",
-        "--no-renames",
-        "--no-abbrev",
-        "--no-ext-diff",
-    ];
-    match &compared_to {
-        Some(p) => args.extend([p.as_str(), sha]),
-        None => args.extend(["--root", sha]),
-    }
-    let raw = git_bytes(wt, &args, SECS)?;
+    let raw = diff_tree(
+        wt,
+        compared_to.as_deref(),
+        sha,
+        &["-r", "-z", "--raw", "--no-abbrev"],
+        &[],
+    )?;
     Ok(Commit {
         sha: f[0].trim().into(),
         parents,
@@ -202,11 +193,32 @@ pub fn commit(wt: &Path, sha: &str) -> Result<Commit, String> {
     })
 }
 
+/// `diff-tree` of a commit against `parent`, or the empty tree for a root commit.
+fn diff_tree(
+    wt: &Path,
+    parent: Option<&str>,
+    sha: &str,
+    flags: &[&str],
+    paths: &[&str],
+) -> Result<Vec<u8>, String> {
+    let mut args = vec![
+        "--literal-pathspecs",
+        "diff-tree",
+        "--no-commit-id",
+        "--no-renames",
+        "--no-ext-diff",
+    ];
+    args.extend(flags);
+    args.push(parent.unwrap_or("--root"));
+    args.extend([sha, "--"]);
+    args.extend(paths);
+    git_bytes(wt, &args, SECS)
+}
+
 /// `diff-tree -z --raw` records: `:old new oldsha newsha S\0path\0`.
 fn parse_raw(raw: &[u8]) -> Vec<FileChange> {
     let mut parts = raw.split(|b| *b == 0);
     let mut files = vec![];
-    // The single-commit `--root` form prints the commit SHA first.
     while let Some(head) = parts.next() {
         let head = String::from_utf8_lossy(head);
         let Some(meta) = head.strip_prefix(':') else {
@@ -235,36 +247,15 @@ fn parse_raw(raw: &[u8]) -> Vec<FileChange> {
 
 /// One file's unified patch for the commit, as `git diff` writes it for Diff.
 pub fn patch(wt: &Path, commit: &Commit, path: &str) -> Result<String, String> {
-    let empty;
-    let from = match &commit.compared_to {
-        Some(p) => p.as_str(),
-        None => {
-            empty = empty_tree(wt)?;
-            empty.as_str()
-        }
-    };
-    text(
+    let flags = ["-p", "--no-color", "--no-textconv", "--full-index"];
+    let out = diff_tree(
         wt,
-        &[
-            "--literal-pathspecs",
-            "diff",
-            "--no-color",
-            "--no-ext-diff",
-            "--no-textconv",
-            "--full-index",
-            "--no-renames",
-            from,
-            &commit.sha,
-            "--",
-            path,
-        ],
-    )
-}
-
-fn empty_tree(wt: &Path) -> Result<String, String> {
-    // Hashed, not hard-coded: SHA-256 repositories have a different empty tree.
-    let out = text(wt, &["hash-object", "-t", "tree", "/dev/null"])?;
-    Ok(out.trim().to_string())
+        commit.compared_to.as_deref(),
+        &commit.sha,
+        &flags,
+        &[path],
+    )?;
+    Ok(String::from_utf8_lossy(&out).into_owned())
 }
 
 /// The size of a blob, so huge files can be refused before reading them.

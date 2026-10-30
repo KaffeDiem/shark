@@ -28,15 +28,18 @@ pub(crate) fn spawn_err(dir: &Path, prog: &str, e: std::io::Error) -> String {
     }
 }
 
+fn failed(prog: &str, args: &[&str], out: &Output) -> String {
+    format!(
+        "{prog} {}: {}",
+        args.join(" "),
+        String::from_utf8_lossy(&out.stderr).trim()
+    )
+}
+
 fn finish(prog: &str, args: &[&str], out: Output) -> Result<String, String> {
-    if out.status.success() {
-        Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-    } else {
-        Err(format!(
-            "{prog} {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
+    match out.status.success() {
+        true => Ok(String::from_utf8_lossy(&out.stdout).trim().to_string()),
+        false => Err(failed(prog, args, &out)),
     }
 }
 
@@ -88,11 +91,7 @@ pub fn git_bytes(dir: &Path, args: &[&str], secs: u64) -> Result<Vec<u8>, String
     let out = wait_output(c, dir, "git", args, secs, false)?;
     match out.status.success() {
         true => Ok(out.stdout),
-        false => Err(format!(
-            "git {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        )),
+        false => Err(failed("git", args, &out)),
     }
 }
 

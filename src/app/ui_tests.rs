@@ -38,24 +38,33 @@ fn test_home() -> PathBuf {
     home
 }
 
+/// Commits what is staged as the test user (empty commits allowed); returns the new HEAD.
+fn commit_staged(dir: &std::path::Path, msg: &str) -> String {
+    let user = ["-c", "user.name=t", "-c", "user.email=t@t"];
+    let commit = ["commit", "-q", "--allow-empty", "-m", msg];
+    git::git(dir, &[&user[..], &commit[..]].concat()).unwrap();
+    git::git(dir, &["rev-parse", "HEAD"]).unwrap()
+}
+
+/// Stages everything, then [`commit_staged`].
+fn commit_all(dir: &std::path::Path, msg: &str) -> String {
+    git::git(dir, &["add", "-A"]).unwrap();
+    commit_staged(dir, msg)
+}
+
+/// Waits for `ready` (checked once per frame) for up to 10 s of test time.
+async fn until(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    ready: impl FnMut(&mut Window, &mut App) -> bool,
+) {
+    cx.wait_for(window, Duration::from_secs(10), ready).await;
+}
+
 fn init_repo(repo: &std::path::Path) {
     fs::create_dir_all(repo).unwrap();
     git::git(repo, &["init", "-q", "-b", "main"]).unwrap();
-    git::git(
-        repo,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "i",
-        ],
-    )
-    .unwrap();
+    commit_staged(repo, "i");
 }
 
 /// Repos `home/src/<name>`, each with one commit.

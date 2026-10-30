@@ -92,8 +92,8 @@ pub struct Details {
     pub state: String,
     pub author: String,
     pub head: String,
-    /// The head commit when read, for resolving relative assets; empty when GitHub omits it.
-    pub head_sha: String,
+    /// The head commit when read, for resolving relative assets; `None` when GitHub omits it.
+    pub head_sha: Option<String>,
     pub base: String,
     pub draft: bool,
     pub can_update: bool,
@@ -303,9 +303,8 @@ fn details_from(target: &Target, value: &Value) -> Result<Details, String> {
         head: string(value, "headRefName")?.into(),
         head_sha: value["headRefOid"]
             .as_str()
-            .filter(|s| s.bytes().all(|b| b.is_ascii_hexdigit()))
-            .unwrap_or_default()
-            .into(),
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(Into::into),
         base: string(value, "baseRefName")?.into(),
         draft: boolean(value, "isDraft")?,
         can_update: boolean(value, "viewerCanUpdate")?,

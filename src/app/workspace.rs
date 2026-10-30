@@ -953,13 +953,14 @@ impl Shark {
                     }
                 },
             ));
-            self._subs.push(cx.observe(&sync, |s, sync, cx| {
-                if s.active_sync() == Some(&sync) {
-                    s.configure_differ(cx);
-                    s.configure_git(cx);
-                    s.differ.update(cx, |_, cx| cx.notify());
-                }
-            }));
+            self._subs
+                .push(cx.observe_in(&sync, window, |s, sync, w, cx| {
+                    if s.active_sync() == Some(&sync) {
+                        s.configure_differ(cx);
+                        s.configure_git(w, cx);
+                        s.differ.update(cx, |_, cx| cx.notify());
+                    }
+                }));
             self.syncs.insert(ws.name.clone(), sync);
         }
         for (name, sync) in &self.syncs {
@@ -1713,11 +1714,7 @@ impl Shark {
             sync.update(cx, |g, cx| g.set_workspace(ws.clone(), cx));
         }
         if let Some(git) = self.git_features.get(&ws.name).cloned() {
-            // The effective bases, as Git already has them, so its history isn't reset.
-            let git_ws = (self.active.as_ref() == Some(&ws.name))
-                .then(|| self.effective_workspace(cx))
-                .flatten()
-                .unwrap_or_else(|| ws.clone());
+            let git_ws = self.effective_workspace(ws.clone(), cx);
             git.update(cx, |g, cx| g.set_workspace(git_ws, window, cx));
         }
         if self.active.as_ref() == Some(&ws.name) {

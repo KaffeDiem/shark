@@ -2,8 +2,8 @@
 //! objects. It never checks out, stages or edits; working files and Diff stay untouched.
 use super::document::{DocContext, RichDoc};
 use crate::diff_view::{Diff, DiffFile, DiffMode, DiffState};
-use crate::git::history::{self, Blob, Commit, FileChange, Range, Summary};
-use crate::media::{self, Lru, MediaFile, MediaView, Side, Source};
+use crate::git::history::{self, Blob, Commit, FileChange, Summary};
+use crate::media::{self, Lru, MediaFile, MediaView, Side, Source, human_bytes};
 use crate::{
     CancelEdit, Confirm, PageDown, PageUp, SelectFirst, SelectLast, SelectNext, SelectPrev,
 };
@@ -21,7 +21,6 @@ use std::rc::Rc;
 /// What the history is read from: the host's effective comparison base, as Diff uses it.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct RepoContext {
-    pub(crate) name: String,
     pub(crate) wt: PathBuf,
     pub(crate) base: String,
 }
@@ -53,9 +52,7 @@ pub(crate) struct Commits {
     repo: Option<RepoContext>,
     web: Option<String>,
     generation: u64,
-    range: Option<Range>,
     summaries: Vec<Summary>,
-    more: bool,
     loading: bool,
     loaded: bool,
     error: Option<String>,
@@ -69,8 +66,6 @@ pub(crate) struct Commits {
     source: bool,
     content: Option<Content>,
     content_generation: u64,
-    /// Older was pressed on the last loaded commit; open the next once its page arrives.
-    pending_older: Option<String>,
     editor: Option<Entity<EditorState>>,
     doc: Option<Entity<RichDoc>>,
     diff: Entity<DiffState>,
@@ -100,31 +95,19 @@ fn status_label(f: &FileChange) -> &'static str {
         'A' => "Added",
         'D' => "Deleted",
         'T' => "Type changed",
-        _ if f.mode_only() => "Mode changed",
+        _ if f.mode_only().is_some() => "Mode changed",
         _ => "Modified",
     }
 }
 
-fn kind_note(b: &Blob) -> Option<&'static str> {
-    if b.submodule() {
-        Some("submodule")
-    } else if b.symlink() {
-        Some("symlink")
-    } else {
-        None
-    }
-}
-
 impl Commits {
-    pub(crate) fn new(cx: &mut Context<Self>) -> Self {
+    pub(crate) fn new(cache: Entity<Lru>, cx: &mut Context<Self>) -> Self {
         let diff = cx.new(|cx| DiffState::new(vec![], cx).with_mode(DiffMode::Unified));
         Self {
             repo: None,
             web: None,
             generation: 0,
-            range: None,
             summaries: vec![],
-            more: false,
             loading: false,
             loaded: false,
             error: None,
@@ -138,11 +121,10 @@ impl Commits {
             source: false,
             content: None,
             content_generation: 0,
-            pending_older: None,
             editor: None,
             doc: None,
             diff,
-            cache: Lru::new(cx),
+            cache,
             list: ListState::new(0, ListAlignment::Top, px(400.)),
             files_list: ListState::new(0, ListAlignment::Top, px(400.)),
             focus: cx.focus_handle(),
@@ -161,9 +143,7 @@ impl Commits {
         self.repo = repo;
         self.generation += 1;
         self.leave_file(cx);
-        self.range = None;
         self.summaries.clear();
-        self.more = false;
         self.loading = false;
         self.loaded = false;
         self.error = None;
@@ -193,12 +173,11 @@ impl Commits {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    let range = history::resolve(&repo.wt, &repo.base)?;
-                    let (page, more) = history::commits(&repo.wt, &range, 0)?;
+                    let list = history::commits(&repo.wt, &repo.base)?;
                     let web = crate::git::git(&repo.wt, &["config", "--get", "remote.origin.url"])
                         .ok()
                         .and_then(|u| crate::sync::github_url(&u));
-                    Ok::<_, String>((range, page, more, web))
+                    Ok::<_, String>((list, web))
                 })
                 .await;
             this.update(cx, |s, cx| {
@@ -207,14 +186,12 @@ impl Commits {
                 }
                 s.loading = false;
                 match result {
-                    Ok((range, page, more, web)) => {
+                    Ok((list, web)) => {
                         s.loaded = true;
                         s.error = None;
                         s.web = web;
-                        s.range = Some(range);
-                        s.summaries = page;
-                        s.more = more;
-                        s.list.reset(s.summaries.len() + usize::from(s.more));
+                        s.summaries = list;
+                        s.list.reset(s.summaries.len());
                         s.cursor = s.cursor.min(s.summaries.len().saturating_sub(1));
                         // Selections stay while their commit is still part of the branch.
                         if let Some(sha) = &s.selected
@@ -224,50 +201,6 @@ impl Commits {
                         }
                     }
                     // Failed refreshes keep what loaded before.
-                    Err(e) => s.error = Some(e),
-                }
-                cx.notify();
-            })
-            .ok();
-        })
-        .detach();
-    }
-
-    fn load_more(&mut self, cx: &mut Context<Self>) {
-        let (Some(repo), Some(range)) = (self.repo.clone(), self.range.clone()) else {
-            return;
-        };
-        if self.loading || !self.more {
-            return;
-        }
-        let generation = self.generation;
-        let skip = self.summaries.len();
-        self.loading = true;
-        cx.notify();
-        cx.spawn(async move |this, cx| {
-            let r = range.clone();
-            let result = cx
-                .background_executor()
-                .spawn(async move { history::commits(&repo.wt, &r, skip) })
-                .await;
-            this.update(cx, |s, cx| {
-                if s.generation != generation || s.range.as_ref() != Some(&range) {
-                    return;
-                }
-                s.loading = false;
-                match result {
-                    Ok((page, more)) if s.summaries.len() == skip => {
-                        s.summaries.extend(page);
-                        s.more = more;
-                        s.list.reset(s.summaries.len() + usize::from(s.more));
-                        if let Some(sha) = s.pending_older.take()
-                            && s.selected.as_ref() == Some(&sha)
-                            && s.summaries.len() > skip
-                        {
-                            s.open_commit(skip, cx);
-                        }
-                    }
-                    Ok(_) => {}
                     Err(e) => s.error = Some(e),
                 }
                 cx.notify();
@@ -326,7 +259,7 @@ impl Commits {
         cx.notify();
     }
 
-    /// Older is further down the newest-first list; it loads the next page when needed.
+    /// Older is further down the newest-first list.
     fn step(&mut self, older: bool, cx: &mut Context<Self>) {
         let Some(at) = self
             .selected
@@ -337,12 +270,8 @@ impl Commits {
         };
         match older {
             true if at + 1 < self.summaries.len() => self.open_commit(at + 1, cx),
-            true => {
-                self.pending_older = self.selected.clone();
-                self.load_more(cx);
-            }
             false if at > 0 => self.open_commit(at - 1, cx),
-            false => {}
+            _ => {}
         }
     }
 
@@ -386,12 +315,9 @@ impl Commits {
         self.content = Some(Content::Loading);
         let generation = self.content_generation;
         cx.notify();
-        let media = media::kind(&file.path).filter(|_| {
-            ![&file.old, &file.new]
-                .iter()
-                .any(|b| b.as_ref().is_some_and(|b| b.symlink() || b.submodule()))
-        });
-        if let Some(kind) = media.filter(|_| !file.mode_only()) {
+        let media = media::kind(&file.path)
+            .filter(|_| file.special().is_none() && file.mode_only().is_none());
+        if let Some(kind) = media {
             let side = |b: &Option<Blob>| {
                 b.as_ref().map(|b| Side {
                     sha: b.id.clone(),
@@ -539,22 +465,7 @@ impl Commits {
         let theme = cx.theme();
         let muted = theme.muted_foreground;
         let Some(c) = self.summaries.get(ix) else {
-            return div()
-                .px_4()
-                .py_3()
-                .child(
-                    Button::new("git-commits-more")
-                        .label(if self.loading {
-                            "Loading…"
-                        } else {
-                            "Load older commits"
-                        })
-                        .loading(self.loading)
-                        .small()
-                        .ghost()
-                        .on_click(cx.listener(|s, _, _, cx| s.load_more(cx))),
-                )
-                .into_any_element();
+            return div().into_any_element();
         };
         let selected = ix == self.cursor;
         v_flex()
@@ -576,7 +487,7 @@ impl Commits {
                 h_flex()
                     .gap_2()
                     .min_w_0()
-                    .when(c.parents.len() > 1, |d| {
+                    .when(c.merge, |d| {
                         d.child(
                             Icon::new(IconName::GitMerge)
                                 .with_size(px(14.))
@@ -605,7 +516,7 @@ impl Commits {
                     .child(
                         div()
                             .font_family(theme.mono_font_family.clone())
-                            .child(c.short.clone()),
+                            .child(short(&c.sha).to_string()),
                     )
                     .child(div().min_w_0().truncate().child(c.author.clone()))
                     .child(when(&c.date)),
@@ -649,7 +560,7 @@ impl Commits {
                     .label("Older")
                     .small()
                     .ghost()
-                    .disabled(at.is_none_or(|a| a + 1 >= self.summaries.len() && !self.more))
+                    .disabled(at.is_none_or(|a| a + 1 >= self.summaries.len()))
                     .on_click(cx.listener(|s, _, _, cx| s.step(true, cx))),
             );
         let body = match (&self.commit, &self.commit_error) {
@@ -765,22 +676,10 @@ impl Commits {
                 .into_any_element();
         };
         let mut notes = vec![status_label(f).to_string()];
-        if let (Some(o), Some(n)) = (&f.old, &f.new)
-            && o.mode != n.mode
-        {
-            notes.push(format!("{} → {}", o.mode, n.mode));
+        if let Some((o, n)) = f.mode_change() {
+            notes.push(format!("{o} → {n}"));
         }
-        notes.extend(
-            [&f.old, &f.new]
-                .into_iter()
-                .flatten()
-                .filter_map(kind_note)
-                .map(String::from)
-                .take(1),
-        );
-        if media::kind(&f.path).is_some() {
-            notes.push("media".into());
-        }
+        notes.extend(f.special().map(String::from));
         let color = match f.status {
             'A' => theme.success_foreground,
             'D' => theme.danger,
@@ -1026,12 +925,13 @@ enum Loaded {
     Text(String),
 }
 
-fn human(n: u64) -> String {
-    match n {
-        n if n < 1024 => format!("{n} B"),
-        n if n < 1024 * 1024 => format!("{:.1} KB", n as f64 / 1024.),
-        n => format!("{:.1} MB", n as f64 / (1024. * 1024.)),
-    }
+/// A blob's size for a note: empty when unreadable, `none` for a missing side.
+fn size_of(wt: &std::path::Path, b: &Option<Blob>) -> String {
+    b.as_ref().map_or("none".into(), |b| {
+        history::blob_size(wt, &b.id)
+            .map(human_bytes)
+            .unwrap_or_default()
+    })
 }
 
 /// Reads one view of a file from Git objects. Blocking: background only.
@@ -1042,18 +942,12 @@ fn load(
     view: FileView,
 ) -> Result<Loaded, String> {
     if view == FileView::Diff {
-        if file.mode_only() {
-            let (o, n) = (file.old.as_ref().unwrap(), file.new.as_ref().unwrap());
+        if let Some((o, n)) = file.mode_only() {
             return Ok(Loaded::Note(format!(
-                "File mode changed from {} to {}; the contents are unchanged.",
-                o.mode, n.mode
+                "File mode changed from {o} to {n}; the contents are unchanged."
             )));
         }
-        if [&file.old, &file.new]
-            .into_iter()
-            .flatten()
-            .any(Blob::submodule)
-        {
+        if file.special() == Some("submodule") {
             let side = |b: &Option<Blob>| {
                 b.as_ref()
                     .map_or("none".into(), |b| short(&b.id).to_string())
@@ -1070,16 +964,8 @@ fn load(
         return match parsed.into_iter().next() {
             Some(d) if d.is_binary() => Ok(Loaded::Note(format!(
                 "Binary file with no inline preview ({} → {}).",
-                file.old
-                    .as_ref()
-                    .map_or("none".into(), |b| history::blob_size(wt, &b.id)
-                        .map(human)
-                        .unwrap_or_default()),
-                file.new
-                    .as_ref()
-                    .map_or("none".into(), |b| history::blob_size(wt, &b.id)
-                        .map(human)
-                        .unwrap_or_default()),
+                size_of(wt, &file.old),
+                size_of(wt, &file.new),
             ))),
             Some(d) => Ok(Loaded::Patch(d)),
             None => Ok(Loaded::Note(
@@ -1111,7 +997,7 @@ fn load(
     if size > MAX_TEXT {
         return Ok(Loaded::Note(format!(
             "Too large to show here ({}).",
-            human(size)
+            human_bytes(size)
         )));
     }
     let bytes = history::blob(wt, &blob.id)?;
@@ -1120,7 +1006,7 @@ fn load(
         Ok(text) if !binary => Ok(Loaded::Text(text)),
         _ => Ok(Loaded::Note(format!(
             "Binary file ({}); it has no text preview.",
-            human(size)
+            human_bytes(size)
         ))),
     }
 }
@@ -1140,6 +1026,7 @@ impl Render for Commits {
             let theme = cx.theme();
             let muted = theme.muted_foreground;
             let count = self.summaries.len();
+            let capped = count == history::MAX_COMMITS;
             v_flex()
                 .size_full()
                 .child(
@@ -1153,8 +1040,8 @@ impl Render for Commits {
                         .border_color(theme.border)
                         .child(div().flex_1().min_w_0().truncate().child(format!(
                             "{count}{} commit{} on this branch since {}",
-                            if self.more { "+" } else { "" },
-                            if count == 1 && !self.more { "" } else { "s" },
+                            if capped { "+" } else { "" },
+                            if count == 1 { "" } else { "s" },
                             self.repo.as_ref().map(|r| r.base.as_str()).unwrap_or("base"),
                         )))
                         .child(

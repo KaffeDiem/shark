@@ -1,12 +1,12 @@
 //! Document-supplied images and videos, downloaded with the system `curl`. HTTPS only, also
 //! for redirects; no credentials, cookies or `.curlrc`; bounded in time and size; written
 //! atomically into the media cache under a key derived from the URL.
-use super::{Kind, Side, Source, cache_dir, kind, produce};
+use super::{Kind, Side, Source, cache_dir, ext, kind};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const MAX_BYTES: &str = "209715200";
+const MAX_BYTES: u64 = 200 * 1024 * 1024;
 
 /// A downloaded resource, ready for `MediaView`.
 #[derive(Clone, Debug, PartialEq)]
@@ -28,10 +28,13 @@ pub(crate) fn attachment(url: &str) -> bool {
         || (rest.starts_with("github.com/") && rest.split('/').nth(3) == Some("assets"))
 }
 
+fn url_path(url: &str) -> &str {
+    url.split(['?', '#']).next().unwrap_or(url)
+}
+
 /// The extension of an image or video URL's path, if it names one.
 pub(crate) fn url_kind(url: &str) -> Option<Kind> {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    kind(path)
+    kind(url_path(url))
 }
 
 /// What a response's `Content-Type` makes of the bytes.
@@ -62,12 +65,6 @@ fn key(url: &str) -> String {
     format!("dl-{:016x}", h.finish())
 }
 
-fn curl() -> PathBuf {
-    std::env::var_os("SHARK_CURL")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| "curl".into())
-}
-
 /// Downloads `url` once; later calls reuse the cached file. Blocking: background only.
 pub(crate) fn fetch(url: &str) -> Result<Fetched, String> {
     if !url.starts_with("https://") {
@@ -76,32 +73,42 @@ pub(crate) fn fetch(url: &str) -> Result<Fetched, String> {
     let dir = cache_dir();
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let key = key(url);
-    let meta = dir.join(format!("{key}.type"));
-    let fetched = |ext: &str, kind| {
-        let name = format!("attachment.{ext}");
-        let file = dir.join(format!("{key}.{ext}"));
-        Fetched {
-            kind,
-            name,
-            side: Side {
-                sha: key.clone(),
-                repo: PathBuf::new(),
-                source: Source::Downloaded(file),
-            },
-        }
+    let fetched = |ext: &str, kind| Fetched {
+        kind,
+        name: format!("attachment.{ext}"),
+        side: Side {
+            sha: key.clone(),
+            repo: PathBuf::new(),
+            source: Source::Downloaded,
+        },
     };
-    if let Some(ext) = std::fs::read_to_string(&meta).ok()
-        && let Some(k) = kind(&format!("x.{}", ext.trim()))
-        && dir.join(format!("{key}.{}", ext.trim())).exists()
-    {
-        return Ok(fetched(ext.trim(), k));
+    // The cache holds `{key}.{ext}` next to `{key}.preview.png` and the like; a bare extension
+    // is the download. `load` touches it, so it ages out with its previews.
+    // ponytail: scans the whole cache dir per fetch (background thread); probe known extensions
+    // if the cache grows large enough to matter.
+    let prefix = format!("{key}.");
+    let cached = (std::fs::read_dir(&dir).ok().into_iter().flatten().flatten()).find_map(|e| {
+        let name = e.file_name().to_string_lossy().into_owned();
+        let ext = name.strip_prefix(&prefix)?;
+        let k = kind(&name).filter(|_| !ext.contains('.'))?;
+        Some((k, ext.to_string()))
+    });
+    if let Some((k, ext)) = cached {
+        return Ok(fetched(&ext, k));
     }
     // Private until classified: a concurrent fetch of the same URL downloads its own copy,
     // and both publish identical bytes with an atomic rename.
     static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let seq = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let body = dir.join(format!(".{key}-{}-{seq}.download", std::process::id()));
-    let downloaded = download(url, &body, &dir);
+    // Curl before 8.4.0 (macOS 11 to 13 ship older) only enforces `--max-filesize` when the
+    // response states its length, so the result is measured too.
+    let downloaded = download(url, &body, &dir).and_then(|t| {
+        match std::fs::metadata(&body).map_err(|e| e.to_string())?.len() > MAX_BYTES {
+            true => Err("too large".into()),
+            false => Ok(t),
+        }
+    });
     let content_type = match downloaded {
         Ok(t) => t,
         Err(e) => {
@@ -109,9 +116,8 @@ pub(crate) fn fetch(url: &str) -> Result<Fetched, String> {
             return Err(e);
         }
     };
-    let classified = classify(&content_type)
-        .or_else(|| url_kind(url).map(|k| (k, ext_of(url))))
-        .filter(|(_, ext)| !ext.is_empty());
+    let classified = (classify(&content_type).map(|(k, e)| (k, e.to_string())))
+        .or_else(|| url_kind(url).map(|k| (k, ext(url_path(url)))));
     let Some((kind, ext)) = classified else {
         let _ = std::fs::remove_file(&body);
         return Err(match content_type.is_empty() {
@@ -119,35 +125,17 @@ pub(crate) fn fetch(url: &str) -> Result<Fetched, String> {
             false => format!("not an image or video ({content_type}); it may need sign-in"),
         });
     };
-    let file = dir.join(format!("{key}.{ext}"));
-    if let Err(e) = std::fs::rename(&body, &file) {
+    if let Err(e) = std::fs::rename(&body, dir.join(format!("{key}.{ext}"))) {
         let _ = std::fs::remove_file(&body);
         return Err(e.to_string());
     }
-    let _ = produce(&meta, |tmp| {
-        std::fs::write(tmp, ext).map_err(|e| e.to_string())
-    });
-    Ok(fetched(ext, kind))
-}
-
-fn ext_of(url: &str) -> &'static str {
-    let path = url.split(['?', '#']).next().unwrap_or(url);
-    let ext = Path::new(path)
-        .extension()
-        .map(|e| e.to_string_lossy().to_lowercase())
-        .unwrap_or_default();
-    [
-        "png", "jpg", "jpeg", "gif", "webp", "bmp", "ico", "svg", "tif", "tiff", "heic", "heif",
-        "avif", "psd", "mp4", "mov", "m4v", "webm", "mkv", "avi",
-    ]
-    .into_iter()
-    .find(|e| *e == ext)
-    .unwrap_or("")
+    Ok(fetched(&ext, kind))
 }
 
 /// Runs curl into `out`; returns the final response's content type.
 fn download(url: &str, out: &Path, dir: &Path) -> Result<String, String> {
     let out = out.to_string_lossy();
+    let max = MAX_BYTES.to_string();
     let args = [
         // Must come first: ignores ~/.curlrc, which could add credentials or headers.
         "-q",
@@ -166,7 +154,7 @@ fn download(url: &str, out: &Path, dir: &Path) -> Result<String, String> {
         "--max-time",
         "60",
         "--max-filesize",
-        MAX_BYTES,
+        &max,
         "--user-agent",
         "Shark",
         "--header",
@@ -178,7 +166,7 @@ fn download(url: &str, out: &Path, dir: &Path) -> Result<String, String> {
         "--",
         url,
     ];
-    let mut c = Command::new(curl());
+    let mut c = Command::new("curl");
     // No credentials of the user's may reach a document-supplied host.
     c.env_remove("NETRC").env_remove("CURL_HOME");
     crate::git::wait_bounded(c, dir, "curl", &args, 75, false).map_err(|e| {
@@ -212,12 +200,42 @@ mod tests {
             url_kind("https://x.test/a/clip.MP4?raw=1"),
             Some(Kind::Video)
         );
-        assert_eq!(ext_of("https://x.test/a.JPG#f"), "jpg");
+        assert_eq!(ext(url_path("https://x.test/a.JPG#f")), "jpg");
         assert!(
             fetch("http://example.com/a.png")
                 .unwrap_err()
                 .contains("HTTPS")
         );
         assert!(fetch("file:///etc/passwd").is_err());
+    }
+
+    /// A cached download is found by `{key}.{ext}`, skipping `{key}.preview.png` and friends
+    /// (which also have image extensions). Seeds the cache so no request is made.
+    #[::core::prelude::v1::test]
+    fn cache_lookup_skips_derived_files() {
+        #[cfg(feature = "test-support")]
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        // The same directory the UI tests use, so nothing lands in the real home.
+        crate::state::TEST_HOME
+            .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
+        let url = "https://x.test/cache-lookup/a.png";
+        let (dir, key) = (cache_dir(), key(url));
+        std::fs::create_dir_all(&dir).unwrap();
+        let names = [".preview.png", ".poster.png", ".webm"].map(|e| format!("{key}{e}"));
+        for n in &names {
+            std::fs::write(dir.join(n), b"x").unwrap();
+        }
+        let got = fetch(url);
+        for n in &names {
+            let _ = std::fs::remove_file(dir.join(n));
+        }
+        let got = got.unwrap();
+        assert_eq!(
+            (got.kind, got.name.as_str()),
+            (Kind::Video, "attachment.webm")
+        );
+        assert_eq!(got.side.sha, key);
     }
 }
