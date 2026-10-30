@@ -4,12 +4,7 @@ The file editor shows code at **14px with 1.5× line height (21px rows)**,
 adjustable from 10 to 24px with `cmd-=`/`cmd--` (Reset editor text size in `cmd-k`).
 The diff uses **13px text on the same 21px rows**, including inline editing. Its text
 scales at 13/14 of the editor size with the same zoom controls and saved setting.
-This keeps the diff between its earlier size and 14px, with more space around the text.
-Before this change:
-
-- The editor used the theme's 12.5px mono size on 19px rows (`assets/themes/*.json`,
-  gpui-component's `EDITOR_LINE_HEIGHT` of 1.5).
-- The diff used about 11.7px on 18.75px rows.
+The smaller diff text leaves more space around each line.
 
 The constants, `code_font`, and `diff_font` are in `src/editor.rs`.
 
@@ -24,18 +19,12 @@ angle, and it rises with age.
 | Reading speed is at its maximum for x-heights from about 0.2° to 2°. Below the critical print size (0.15–0.3° by individual) it drops sharply. | Legge & Bigelow 2011, *J Vision* 11(5):8, https://doi.org/10.1167/11.5.8 |
 | The critical print size rises from about 0.10° (age 23) to 0.135° (age 68) and 0.18° (age 81). | Calabrèse et al. 2016, *IOVS*, n=645, https://doi.org/10.1167/iovs.16-19580 |
 | On screen, fixations get shorter as text grows up to about 22pt, and comprehension is worse at 10–12pt than at 18pt. These "pt" were on a 17-inch 1024×768 (about 75 ppi) screen, so each is about 1.45–2.2 Mac logical px: even their 10pt condition is about 14.5–22 Mac px. The direction carries over; the numbers do not. | Rello, Pielot & Marcos, CHI 2016, n=104, https://doi.org/10.1145/2858036.2858204 |
-| Older adults read 14pt faster than 12pt and prefer it (cited via Rello 2016's summary, not checked against the primary paper). | Bernard, Liao & Mills, CHI EA 2001, https://doi.org/10.1145/634067.634173 |
 | Glance legibility thresholds rise about 80% from age 20 to 65; larger type reduces them. | Dobres et al. 2016, *Ergonomics*, https://doi.org/10.1080/00140139.2015.1137637 |
 | Apple's default macOS text size is 13pt. JetBrains Mono recommends 13. VS Code and Xcode ship 12; Zed ships 15. | Apple HIG Typography; JetBrains Mono site; editor source defaults |
 
 JetBrains Mono's x-height is 0.55 em. At 60 cm on a Mac (109–129 logical ppi), the
-x-height works out to:
-
-- 12.5px: about 0.13–0.15°
-- 14px: about 0.15–0.17°
-
-So 14px moves toward the 0.2° consensus without giving up much density. 16px, two `cmd-=`
-presses away, gives about 0.165–0.196°. Reaching 0.2° takes about 16.5px on a 109-ppi
+x-height at 14px is about 0.15–0.17°. That is close to the 0.2° consensus without giving
+up much density. 16px, two `cmd-=` presses away, gives about 0.165–0.196°. Reaching 0.2° takes about 16.5px on a 109-ppi
 external display and about 19px on a 129-ppi laptop.
 
 ## Why 1.5× line height

@@ -4,7 +4,6 @@ The editor uses GPUI with a 4 MiB document limit. Language servers are shared by
 project, backend, worktree, and toolchain identity. Tool setup and pipe I/O run away
 from the UI thread. Project dependencies and compiler SDKs remain prerequisites.
 This guide covers usage, tool selection, validation, and known limitations.
-Packaged-app release checks are listed below.
 
 ## Using it
 
@@ -100,10 +99,9 @@ be read, setup reports it and Retry tries again.
 On start, SweetPad builds every target with `xcodebuild` and answers
 SourceKit-LSP's `buildTarget/prepare` only after all of them, so SourceKit-LSP's
 background indexing is turned off for these sessions: diagnostics, hover and
-definition answer within seconds instead of after those builds (measured on a
-650-file app with 30 packages: 3 s instead of 81 s on each launch). The cost is
-index freshness: SourceKit-LSP reads the index that builds write, SweetPad's
-startup builds and any Xcode build, but saving a file does not re-index it, so
+definition answer without waiting for those builds. The cost is index freshness:
+SourceKit-LSP reads the index that builds write, SweetPad's startup builds and any
+Xcode build, but saving a file does not re-index it, so
 references and workspace symbols miss code added since the last build. Until a
 fresh worktree's first build produces a package's module, imports of it report
 "No such module".
@@ -135,8 +133,6 @@ configuration migration commands run.
 | SweetPad CLI | 0.1.15 | [Published release and asset digest](https://github.com/sweetpad-dev/sweetpad/releases/tag/cli-v0.1.15) |
 | gopls | 0.24.0, built by Go 1.27.3 | [Pinned module](https://github.com/golang/tools/tree/gopls/v0.24.0/gopls) |
 
-The npm artifact SHA-256 values were calculated from the exact published tarballs;
-GitHub asset hashes and Node's hash were checked against published metadata.
 Rust and SourceKit-LSP deliberately follow the selected compiler toolchain.
 The gopls build script checks its exact Go version, builds with `-trimpath`,
 executes a protocol smoke test, and emits an archive and checksum. The published
@@ -174,35 +170,9 @@ For a classic TypeScript SDK, set `SHARK_LSP_SMOKE_INIT` to a JSON object with
 `tsserver.path` pointing to that SDK's `lib/tsserver.js`, and run the wrapper with
 the managed Node binary.
 
-The dated [performance baseline](linter-performance.md) documents the benchmark
-workloads, commands, and measurement limits. It does not establish packaged-app
-input-to-display latency or busy-indexer performance.
-
-## Packaged-app release checks
-
-Standalone artifact smokes and headless regressions do not replace these checks:
-
-1. Verify all supported language backends through the final packaged app. The
-   standalone artifact smokes and scoped native app checks do not prove
-   every GPUI end-to-end language workflow.
-2. Exercise an empty-cache Finder launch, interrupted downloads during extraction
-   and activation, moved worktrees with custom and Shark-owned BSP, ambiguous
-   Xcode containers, real Xcode build/index readiness, and Go multi-module
-   projects. Unit fixtures cover selection/cache invariants but do not replace
-   these end-to-end runs.
-3. Exercise the interactive editor workflows with Vim and concurrent agent writes:
-   multiple definitions, back/forward selection and scroll, completion snippets
-   plus imports, rename/format across open and closed files, dirty diff conflicts,
-   restarts, and external dependency sources. Headless tests cover a subset.
-4. Extend the scoped [performance measurements](linter-performance.md) to
-   packaged-app input-to-paint latency, cold readiness, warm completion/definition,
-   and total process-tree memory with LSP disabled, idle, and actively indexing
-   across supported languages. No overall performance or “fastest server” claim
-   is justified by the existing runs.
-
 Debugging, extension hosting, terminal integration, global cross-file undo, and a
-general-purpose package manager remain out of scope. Ty remains an optional
-benchmark candidate rather than another automatic backend.
+general-purpose package manager are out of scope. Packaged-app input-to-display
+latency and performance under a busy indexer are not measured.
 
 ## Known limitations
 
@@ -218,9 +188,6 @@ benchmark candidate rather than another automatic backend.
   many import candidates near the top of a large file can therefore consume
   memory proportional to candidate count multiplied by that text span. The
   four-MiB document limit does not bound aggregate completion-menu memory.
-  Measure this workload and eager-resolution latency on named hardware before
-  release. The next editor milestone should add an upstream GPUI accepted-item
-  hook, then resolve and stage only the selected item's edits.
 - **Snippets:** numbered tabstops, placeholder defaults, choices, and mirrored
   fields use GPUI selections, including multiple cursors for mirrors. Snippet
   variables and regular-expression transforms are unsupported; items requiring
