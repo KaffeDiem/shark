@@ -609,7 +609,7 @@ pub(crate) fn close_button(id: &'static str, tooltip: &'static str) -> Button {
         .tooltip(tooltip)
 }
 
-fn section(theme: &Theme, label: &'static str) -> impl IntoElement {
+pub(crate) fn section(theme: &Theme, label: &'static str) -> impl IntoElement {
     div()
         .text_xs()
         .text_color(theme.muted_foreground)
@@ -674,7 +674,7 @@ fn caption(theme: &Theme, label: &'static str, desc: &'static str) -> Div {
 }
 
 /// Label and description on the left, the control on the right (Linear's settings rows).
-fn row(
+pub(crate) fn row(
     theme: &Theme,
     sep: bool,
     label: &'static str,

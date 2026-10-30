@@ -116,6 +116,7 @@ pub fn menus() -> Vec<Menu> {
                 MenuItem::action("Command Palette", TogglePalette),
                 sep(),
                 MenuItem::action("Toggle Sidebar", ToggleSidebar),
+                MenuItem::action("Toggle Zen Mode", ToggleZen),
                 MenuItem::action("Show or Hide Diff Files", ToggleFileTree),
                 sep(),
                 MenuItem::action("Show Chat", ShowChat),

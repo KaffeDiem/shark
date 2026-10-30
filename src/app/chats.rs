@@ -52,6 +52,12 @@ impl Shark {
                     };
                     Some((id.clone(), tab))
                 })
+                .chain(self.file_tabs.iter().enumerate().filter_map(|(ix, tab)| {
+                    let editor = tab.editor.read(cx);
+                    editor
+                        .external
+                        .then(|| (TabId::File(editor.path.clone()), VisibleTab::File(ix)))
+                }))
                 .collect(),
         )
     }
@@ -303,7 +309,7 @@ impl Shark {
         };
         let meta = ChatMeta {
             fast,
-            ..self.state.new_chat(id)
+            ..self.state.new_chat(self.active_ws().unwrap(), id)
         };
         let ws = self.active_ws_mut().unwrap();
         let at = ws.chats.len();
@@ -376,7 +382,10 @@ impl Shark {
                 );
             }
         }
-        let fresh = self.state.new_chat(String::new());
+        let Some(ws) = self.ws(workspace) else {
+            return;
+        };
+        let fresh = self.state.new_chat(ws, String::new());
         let Some(ws) = self
             .state
             .workspaces

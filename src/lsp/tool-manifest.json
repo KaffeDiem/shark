@@ -1,0 +1,9 @@
+[
+  {"name":"node","version":"22.23.4","url":"https://nodejs.org/dist/v22.23.4/node-v22.23.4-darwin-arm64.tar.gz","sha256":"c9e1dbc748b33ed2d14f42445191ecaf14c56259c7a9a26d0042c49ec2b66428","executable":"node-v22.23.4-darwin-arm64/bin/node"},
+  {"name":"pyrefly","version":"1.4.0","url":"https://github.com/facebook/pyrefly/releases/download/1.4.0/pyrefly-macos-arm64.tar.gz","sha256":"590b1a638e68e9573fe2c79386d8cfb69eddc575c54b798d2375b054a5c66c90","executable":"pyrefly"},
+  {"name":"ruff","version":"0.17.3","url":"https://github.com/astral-sh/ruff/releases/download/0.17.3/ruff-aarch64-apple-darwin.tar.gz","sha256":"118f7121aa838785672bf612487f755a89108bb5f44e0f3df96c5967a72614f9","executable":"ruff-aarch64-apple-darwin/ruff"},
+  {"name":"typescript","version":"7.0.2","url":"https://registry.npmjs.org/@typescript/typescript-darwin-arm64/-/typescript-darwin-arm64-7.0.2.tgz","sha256":"902e2fe1cf0799198ef902c6b8c310a450fef629a6baba41d45641ef75c04ebd","executable":"package/lib/tsc"},
+  {"name":"typescript-language-server","version":"6.0.2","url":"https://registry.npmjs.org/typescript-language-server/-/typescript-language-server-6.0.2.tgz","sha256":"d225b223a8a4764ecbd94bdba85d2ef185eaa7b9842a1a31c38c2bbe7f2fe9b9","executable":"package/lib/cli.mjs"},
+  {"name":"pyright","version":"1.1.414","url":"https://registry.npmjs.org/pyright/-/pyright-1.1.414.tgz","sha256":"bf5f473f6167c0d14175492c3263d783b4489a6956e1c06c18e15228e3a3fa42","executable":"package/langserver.index.js"},
+  {"name":"sweetpad","version":"0.1.15","url":"https://github.com/sweetpad-dev/sweetpad/releases/download/cli-v0.1.15/sweetpad-cli-0.1.15-macos-universal.tar.gz","sha256":"79f5da2df7de0a381f675b11f539c1bab056a27b89e3260b6691b48e52c63a41","executable":"sweetpad"}
+]

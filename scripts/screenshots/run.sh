@@ -18,7 +18,7 @@ printf '%s\n' 'export PATH="${SHARK_GH%/*}:$PATH"' > "$D/home/.zshrc"
 cargo build --manifest-path "$root/Cargo.toml"
 win() { swift "$here/winid.swift" $pid | cut -d' ' -f1; }
 launch() {
-    SHELL=/bin/zsh ZDOTDIR=$D/home HOME=$D/home GIT_CONFIG_GLOBAL=/dev/null SHARK_GH="$here/gh" SHARK_CLAUDE=/usr/bin/false \
+    SHELL=/bin/zsh ZDOTDIR=$D/home HOME=$D/home GIT_CONFIG_GLOBAL=/dev/null SHARK_GH="$here/gh" SHARK_CLAUDE="$here/agent" SHARK_CODEX="$here/agent" \
         "$root/target/debug/shark" >>"$D/app.log" 2>&1 &
     pid=$!
     while [ -z "$(win)" ]; do sleep 1; done
@@ -40,6 +40,20 @@ shot() { screencapture -o -x -l "$(win)" "$D/$1" && sips -Z 1600 "$D/$1" --out "
 key 'keystroke "d"' "command down, shift down" # Diff artifact; its file tree is shown by default
 sleep 2 # git status and the diff
 shot hero.png
+key 'keystroke "C"' "shift down" # Send review with setup's two threads
+shot review.png
+key 'key code 53'
+key 'keystroke "k"' "command down"
+key 'keystroke "Git menu"'
+key 'key code 36'
+shot git-menu.png
+key 'key code 53'
+key 'keystroke "k"' "command down"
+key 'keystroke "Show usage"'
+key 'key code 36'
+sleep 2 # the allowances from ./agent
+shot usage.png
+key 'key code 53'
 key 'keystroke "p"' "command down"
 key 'keystroke "backend/internal/auth/login.go"'
 key 'key code 36'

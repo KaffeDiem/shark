@@ -14,11 +14,13 @@ mod audit_tests;
 mod base_adoption_tests;
 pub(crate) mod chrome_tests;
 mod drag_tests;
+mod editor_pane_tests;
 mod file_changes_tests;
 mod git_tests;
 mod menu_pixels;
 mod mixed_tab_tests;
 mod navigation_pixels;
+mod repo_settings_tests;
 mod storage_tests;
 mod tab_tests;
 mod tree_pixels;
@@ -30,7 +32,7 @@ mod workspace_review_tests;
 /// tests that make workspace dirs take it too: `test_home` wipes them.
 pub(crate) static UI_LOCK: Mutex<()> = Mutex::new(());
 
-fn test_home() -> PathBuf {
+pub(super) fn test_home() -> PathBuf {
     let home = crate::state::TEST_HOME
         .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())))
         .clone();
@@ -61,7 +63,7 @@ async fn until(
     cx.wait_for(window, Duration::from_secs(10), ready).await;
 }
 
-fn init_repo(repo: &std::path::Path) {
+pub(super) fn init_repo(repo: &std::path::Path) {
     fs::create_dir_all(repo).unwrap();
     git::git(repo, &["init", "-q", "-b", "main"]).unwrap();
     commit_staged(repo, "i");
@@ -82,7 +84,7 @@ fn repos(home: &std::path::Path, names: &[&str]) -> Vec<Repo> {
 }
 
 /// Saves `state`, then starts the app on the real keymap.
-fn boot(
+pub(super) fn boot(
     cx: &mut TestAppContext,
     state: State,
     options: WindowOptions,

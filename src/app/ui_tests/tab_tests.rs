@@ -34,7 +34,7 @@ async fn new_and_reopened_chats_append(cx: &mut TestAppContext) {
     press(cx, &["cmd-t", "cmd-t"]);
     on(cx, &|s, _, _cx| {
         s.active_ws_mut().unwrap().closed = ["picked", "retained", "latest"]
-            .map(|id| s.state.new_chat(id.into()))
+            .map(|id| s.state.new_chat(&Workspace::default(), id.into()))
             .to_vec();
     });
     for (key, restored) in [
@@ -605,5 +605,106 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
         assert!(w.find_all("diff-tab").is_empty());
     })
     .unwrap();
+    fs::remove_dir_all(&home).ok();
+}
+
+/// cmd-. (Zen) hides the sidebar, tabs, header and Features rail around whatever tab is
+/// shown; the keys keep switching tabs and can't focus what's hidden. Diff keeps its controls.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn zen_shows_only_the_tab(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| {
+        s.create_workspace(
+            "zen".into(),
+            git::on_branch(&repos, "zen"),
+            vec![],
+            None,
+            w,
+            cx,
+        );
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    fs::write(home.join("shark/workspaces/zen/api/note.txt"), "hi\n").unwrap();
+    let zen = |cx: &mut TestAppContext, on: bool, tab: Tab| {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            for id in [
+                "sidebar",
+                "features-rail",
+                "workspace-titlebar",
+                "content-island",
+            ] {
+                assert_eq!(w.try_find(id).is_none(), on, "{id}, zen={on}, {tab:?}");
+            }
+            assert_eq!(w.try_find("zen-titlebar").is_some(), on);
+            let s = shark.read(cx);
+            assert_eq!((s.zen_shown(), s.tab), (on, tab));
+            let pane = s.focused_pane(w, cx);
+            assert!(
+                !matches!(pane, Some(Pane::Sidebar | Pane::Features)),
+                "{pane:?}"
+            );
+        })
+        .unwrap();
+    };
+    press(cx, &["cmd-alt-left", "cmd-."]);
+    zen(cx, true, Tab::Chat);
+    press(cx, &["cmd-alt-left"]);
+    zen(cx, true, Tab::Chat);
+    press(cx, &["cmd-shift-d"]);
+    zen(cx, true, Tab::Feature(Feature::Diff));
+    cx.update_window(window, |_, w, _| {
+        assert!(w.try_find("uncommitted-only").is_some())
+    })
+    .unwrap();
+    on(cx, &|s, w, cx| s.open_path("api/note.txt".into(), w, cx));
+    zen(cx, true, Tab::File);
+    press(cx, &["cmd-alt-left", "ctrl-1"]);
+    zen(cx, true, Tab::Chat);
+    // cmd-b asks for the sidebar: Zen ends.
+    press(cx, &["cmd-b"]);
+    zen(cx, false, Tab::Chat);
+    press(cx, &["cmd-.", "cmd-."]);
+    zen(cx, false, Tab::Chat);
+    // Home ends Zen; coming back doesn't restore it.
+    press(cx, &["cmd-.", "cmd-0", "cmd-0"]);
+    zen(cx, false, Tab::Chat);
+    // Naming a section needs the sidebar: Zen ends and the field has the keys.
+    press(cx, &["cmd-."]);
+    on(cx, &|s, w, cx| s.start_naming(None, None, w, cx));
+    zen(cx, false, Tab::Chat);
+    on(cx, &|s, w, cx| {
+        assert!(s.sidebar_focus.contains_focused(w, cx))
+    });
+    press(cx, &["escape"]);
+    // A side question's field keeps the keys through Zen.
+    on(cx, &|s, w, cx| {
+        let chat = s.active_chat().unwrap().clone();
+        chat.update(cx, |c, cx| c.open_side(w, cx));
+    });
+    let focused =
+        |cx: &mut TestAppContext| cx.update_window(window, |_, w, cx| w.focused(cx)).unwrap();
+    let side = focused(cx);
+    press(cx, &["cmd-."]);
+    zen(cx, true, Tab::Chat);
+    assert_eq!(focused(cx), side);
+    press(cx, &["cmd-."]);
+    assert_eq!(focused(cx), side);
     fs::remove_dir_all(&home).ok();
 }

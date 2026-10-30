@@ -54,7 +54,7 @@ impl Feature {
 
 impl Shark {
     pub(super) fn right_rail_shown(&self) -> bool {
-        self.active.is_some() && !self.home_shown()
+        self.active.is_some() && !self.home_shown() && !self.zen_shown()
     }
 
     pub(super) fn render_features(

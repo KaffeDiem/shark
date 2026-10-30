@@ -255,7 +255,12 @@ async fn workspace_picker_discard_revalidates_destination(cx: &mut TestAppContex
         .unwrap();
     cx.run_until_parked();
     for scenario in ["cancel", "archiving", "removed"] {
-        press_in(window)(cx, &["cmd-shift-o", "enter"]);
+        // Cmd-Shift-O belongs to the outline while editing; the File menu still opens workspaces.
+        cx.update_window(window, |_, w, cx| {
+            w.dispatch_action(Box::new(OpenWorkspacePicker), cx)
+        })
+        .unwrap();
+        press_in(window)(cx, &["enter"]);
         cx.update_window(window, |_, w, cx| assert!(w.has_active_dialog(cx)))
             .unwrap();
         on(cx, &|s, _, _cx| match scenario {
