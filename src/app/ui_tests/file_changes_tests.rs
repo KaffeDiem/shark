@@ -8,19 +8,7 @@ async fn uncommitted_dots_and_file_discard(cx: &mut TestAppContext) {
     let repos = repos(&home, &["api", "web"]);
     let commit = |dir: &Path| {
         git::git(dir, &["add", "."]).unwrap();
-        git::git(
-            dir,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-qm",
-                "files",
-            ],
-        )
-        .unwrap();
+        git::commit(dir, &["-qm", "files"]);
     };
     for repo in &repos {
         fs::write(repo.path.join("file.txt"), "base\n").unwrap();
@@ -232,19 +220,7 @@ async fn uncommitted_dots_and_file_discard(cx: &mut TestAppContext) {
     });
     let fingerprint = cx.update(|cx| shark.read(cx).differ.read(cx).diff_fp());
     git::git(&api, &["add", "file.txt"]).unwrap();
-    git::git(
-        &api,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "more work",
-        ],
-    )
-    .unwrap();
+    git::commit(&api, &["-qm", "more work"]);
     refresh(cx);
     cx.update(|cx| {
         let s = shark.read(cx);

@@ -6,8 +6,8 @@ fn recreated_workspace_can_save_comments_after_unreadable_store(_: &mut TestAppC
     test_home();
     let path = review::comments_path("recreated");
     fs::create_dir_all(&path).unwrap();
-    let mut review = review::Review::default();
-    review.load_comments("recreated");
+    let mut review = review::CommentStore::default();
+    review.load("recreated");
     assert!(review.warning.is_some());
     fs::remove_dir(&path).unwrap();
     review.forget("recreated");
@@ -56,7 +56,7 @@ async fn creation_reservations_and_unsaved_metadata(cx: &mut TestAppContext) {
     on(cx, &|s, w, cx| {
         assert_eq!(s.state.workspaces.len(), 1);
         assert!(s.state.workspaces[0].dir().join("api").exists());
-        assert_eq!(s.unsaved_data(cx).len(), 1);
+        assert_eq!(s.unsaved_data(None, cx).len(), 1);
         s.add_repo_to_workspace("owned".into(), repos[1].clone(), w, cx);
         s.add_repo_to_workspace("owned".into(), repos[2].clone(), w, cx);
         assert_eq!(s.adding_repos.len(), 1);
@@ -76,7 +76,7 @@ async fn creation_reservations_and_unsaved_metadata(cx: &mut TestAppContext) {
     fs::remove_dir(&state).unwrap();
     on(cx, &|s, _, cx| s.retry_saves(cx));
     assert_eq!(State::load().workspaces[0].repos.len(), 3);
-    on(cx, &|s, _, cx| assert!(s.unsaved_data(cx).is_empty()));
+    on(cx, &|s, _, cx| assert!(s.unsaved_data(None, cx).is_empty()));
 }
 
 #[gpui_kit::test]
@@ -93,13 +93,13 @@ fn failed_saves_retry_latest_comments_and_guard_close(cx: &mut TestAppContext) {
     on(cx, &|s, w, cx| {
         // Load before injecting the failure: an unreadable original store remains protected.
         s.differ.update(cx, |d, _| {
-        d.review_mut().comments.insert("retry".into(), vec![]);
-        d.review_mut().edit("retry", |cs| cs.push(serde_json::from_str(r#"{"id":7,"path":"api/a","start":[false,1],"end":[false,1],"text":"first","github":"https://example.test/already-posted"}"#).unwrap()));
-        d.review_mut().edit("retry", |cs| cs[0].text = "latest".into());
+        d.review_mut().store.comments.insert("retry".into(), vec![]);
+        d.review_mut().store.edit("retry", |cs| cs.push(serde_json::from_str(r#"{"id":7,"path":"api/a","start":[false,1],"end":[false,1],"text":"first","github":"https://example.test/already-posted"}"#).unwrap()));
+        d.review_mut().store.edit("retry", |cs| cs[0].text = "latest".into());
         });
         s.state.vim = true;
         assert!(s.state.save().is_err());
-        assert_eq!(s.unsaved_data(cx).len(), 2);
+        assert_eq!(s.unsaved_data(None, cx).len(), 2);
         assert!(!s.close_window(w, cx));
     });
     cx.update_window(window, |_, w, cx| {
@@ -109,7 +109,7 @@ fn failed_saves_retry_latest_comments_and_guard_close(cx: &mut TestAppContext) {
     .unwrap();
     on(cx, &|s, w, cx| {
         assert!(!w.has_active_dialog(cx));
-        assert_eq!(s.unsaved_data(cx).len(), 2);
+        assert_eq!(s.unsaved_data(None, cx).len(), 2);
         s.quit(w, cx);
     });
     cx.update_window(window, |_, w, cx| {
@@ -120,7 +120,7 @@ fn failed_saves_retry_latest_comments_and_guard_close(cx: &mut TestAppContext) {
     .unwrap();
     on(cx, &|s, w, cx| {
         assert!(w.has_active_dialog(cx));
-        assert_eq!(s.unsaved_data(cx).len(), 2);
+        assert_eq!(s.unsaved_data(None, cx).len(), 2);
         w.close_dialog(cx);
     });
     fs::remove_dir(&state).unwrap();
@@ -130,7 +130,7 @@ fn failed_saves_retry_latest_comments_and_guard_close(cx: &mut TestAppContext) {
         w.click("retry-save", cx);
     })
     .unwrap();
-    on(cx, &|s, _, cx| assert!(s.unsaved_data(cx).is_empty()));
+    on(cx, &|s, _, cx| assert!(s.unsaved_data(None, cx).is_empty()));
     assert!(State::load().vim);
     let saved: serde_json::Value = serde_json::from_slice(&fs::read(comments).unwrap()).unwrap();
     assert_eq!(saved["comments"][0]["text"], "latest");
@@ -260,7 +260,7 @@ async fn both_editors_keep_hard_link_buffers_and_quit_guards_recheck_saves(
     on(cx, &|s, w, cx| {
         s.quit(w, cx);
         assert!(
-            s.unsaved_data(cx).is_empty(),
+            s.unsaved_data(None, cx).is_empty(),
             "Quit retries state before checking editor buffers"
         );
         assert!(w.has_active_dialog(cx));
@@ -275,7 +275,7 @@ async fn both_editors_keep_hard_link_buffers_and_quit_guards_recheck_saves(
             } else {
                 assert!(!s.close_window(w, cx));
             }
-            assert!(s.unsaved_data(cx).is_empty());
+            assert!(s.unsaved_data(None, cx).is_empty());
             assert!(w.has_active_dialog(cx));
         });
         // A background update fails to save while the editor-discard dialog is open.
@@ -296,7 +296,7 @@ async fn both_editors_keep_hard_link_buffers_and_quit_guards_recheck_saves(
         })
         .unwrap();
         on(cx, &|s, _, cx| {
-            assert_eq!(s.unsaved_data(cx).len(), 1);
+            assert_eq!(s.unsaved_data(None, cx).len(), 1);
             assert!(s.editor.as_ref().unwrap().read(cx).dirty);
             assert!(s.differ.read(cx).editing().as_ref().unwrap().dirty);
         });

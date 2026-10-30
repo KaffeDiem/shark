@@ -1,5 +1,6 @@
 //! Editing a file's working copy in place in the diff, a line at a time; every edit compares
 //! the buffer against the base again, so the diff shows unsaved edits.
+use super::diff::DiffData;
 use super::*;
 use crate::diff_view::{DiffLinePosition, DiffSide};
 
@@ -232,15 +233,9 @@ fn load(ws: &Workspace, file: &DiffFile) -> Result<(String, String, bool), Strin
             let repo = ws.dir().join(path.split('/').next().unwrap_or(""));
             // ponytail: one blocking `git cat-file` on entering edit mode; move it off the UI
             // thread if big repos make it lag.
-            let out = std::process::Command::new("git")
-                .current_dir(&repo)
-                .args(["cat-file", "blob", sha])
-                .output()
-                .map_err(|e| e.to_string())?;
-            if !out.status.success() {
-                return Err(format!("{path}: git cat-file failed"));
-            }
-            String::from_utf8(out.stdout).map_err(|_| format!("{path}: the base isn't text"))?
+            let out = crate::git::git_bytes(&repo, &["cat-file", "blob", sha])
+                .map_err(|_| format!("{path}: git cat-file failed"))?;
+            String::from_utf8(out).map_err(|_| format!("{path}: the base isn't text"))?
         }
     };
     // ponytail: CRLF files stay read-only here; keep each line's ending if they need editing.
@@ -253,6 +248,73 @@ fn load(ws: &Workspace, file: &DiffFile) -> Result<(String, String, bool), Strin
 }
 
 impl Differ {
+    /// Rebases the edit on a refresh's base; the error that stops the refresh from applying, if
+    /// any. The buffer stays intact when a PR is retargeted or its base ref moves.
+    pub(crate) fn reconcile_edit(&mut self, data: &DiffData) -> Option<String> {
+        let (ws, e) = (self.active_ws().cloned()?, self.editing.as_mut()?);
+        if let Some(error) = &data.error {
+            return Some(error.clone());
+        }
+        if data.fp == self.diff_fp {
+            return None;
+        }
+        let file = (data.files.iter())
+            .find(|f| *f.path() == e.path)
+            .cloned()
+            .or_else(|| (e.dirty || e.saved).then(|| DiffFile::unchanged(e.path.clone(), "")));
+        file.and_then(|f| e.rebase(&ws, &f).err())
+    }
+
+    /// Puts the edited file's buffer into a refresh's files: kept when it left the diff with
+    /// unsaved or saved edits (editing ends if clean), and shown in place of git's otherwise.
+    pub(crate) fn splice_edit(&mut self, data: &mut DiffData, cx: &mut Context<Self>) {
+        // The edited file left the diff (say `git checkout -- f`): clean, editing ends; unsaved
+        // edits keep it in the diff.
+        if let Some(e) = &self.editing
+            && !data.files.iter().any(|f| *f.path() == e.path)
+        {
+            // Saved back to the base by this edit: still editing.
+            match e.dirty || e.saved {
+                // git's last view of it, so `orig` stays git's and not the buffer.
+                // In tree order, so the same files stay in place.
+                true => {
+                    let paths: Vec<String> = (data.files.iter().map(|f| f.path().to_string()))
+                        .chain([e.path.to_string()])
+                        .collect();
+                    let order = files::tree_order(&paths);
+                    let at = order
+                        .iter()
+                        .position(|&i| i == paths.len() - 1)
+                        .unwrap_or(0);
+                    data.files.insert(at, e.orig.0.clone());
+                    data.hunks.insert(e.path.clone(), e.orig.1.clone());
+                    data.fps.insert(at, 0);
+                }
+                false => self.end_edit(cx),
+            }
+        }
+        // The file edited in place shows its buffer, saved or not; git's comes back after.
+        if let Some(e) = &mut self.editing
+            && let Some(f) = data.files.iter_mut().find(|f| *f.path() == e.path)
+        {
+            let hunks = data
+                .hunks
+                .insert(e.path.clone(), review::parse_hunks(&e.patch));
+            e.orig = (
+                std::mem::replace(f, e.file.clone()),
+                hunks.unwrap_or_default(),
+            );
+        }
+    }
+
+    /// Shows `file` in the diff and the file list, keeping the scroll.
+    fn put_file(&mut self, file: DiffFile, cx: &mut Context<Self>) {
+        if let Some(f) = self.diff_files.iter_mut().find(|f| f.path() == file.path()) {
+            *f = file.clone();
+        }
+        self.diff.update(cx, |d, cx| d.replace_file(file, cx));
+    }
+
     /// The diff footer's line while a file is edited in place, for the hint or review bar.
     pub(crate) fn edit_status(&self) -> Option<&'static str> {
         let e = self.editing.as_ref()?;
@@ -472,13 +534,8 @@ impl Differ {
         self.review
             .hunks
             .insert(e.path.clone(), review::parse_hunks(&e.patch));
-        if let Some(f) = self.diff_files.iter_mut().find(|f| f.path() == file.path()) {
-            *f = file.clone();
-        }
-        self.diff.update(cx, |d, cx| {
-            d.replace_file(file, cx);
-            d.show_line(caret, cx);
-        });
+        self.put_file(file, cx);
+        self.diff.update(cx, |d, cx| d.show_line(caret, cx));
         cx.notify();
     }
 
@@ -556,10 +613,7 @@ impl Differ {
         self.diff_fp = 0;
         let (file, hunks) = e.orig;
         self.review.hunks.insert(e.path.clone(), hunks);
-        if let Some(f) = self.diff_files.iter_mut().find(|f| *f.path() == e.path) {
-            *f = file.clone();
-        }
-        self.diff.update(cx, |d, cx| d.replace_file(file, cx));
+        self.put_file(file, cx);
     }
 
     /// Writes the buffer, unless the file changed on disk since it was read (then asks).
@@ -574,7 +628,7 @@ impl Differ {
         cx.spawn_in(window, async move |this, cx| {
             let saved = text.clone();
             let result = (cx.background_executor())
-                .spawn(async move { crate::editor::write_checked(&abs, expected, &text, force) })
+                .spawn(async move { crate::files::write_checked(&abs, expected, &text, force) })
                 .await;
             this.update_in(cx, |s, window, cx| {
                 if !s

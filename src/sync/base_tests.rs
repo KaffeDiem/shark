@@ -34,20 +34,7 @@ impl Fixture {
         git(&root, &["init", "-q", "--bare", &remote.to_string_lossy()]).unwrap();
         git(&wt, &["init", "-q", "-b", "main"]).unwrap();
         let commit = |message| {
-            git(
-                &wt,
-                &[
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@t",
-                    "commit",
-                    "--allow-empty",
-                    "-qm",
-                    message,
-                ],
-            )
-            .unwrap();
+            crate::git::commit(&wt, &["--allow-empty", "-qm", message]);
             git(&wt, &["rev-parse", "HEAD"]).unwrap()
         };
         let main = commit("main");
@@ -191,20 +178,7 @@ fn own_pr_replaces_review_identity_and_follows_retargets() {
     let f = Fixture::new("adopt");
     f.write("own.json", json!([f.pr(8, "release", "OPEN")]));
     // Work can continue locally after publishing the branch's own PR.
-    git(
-        &f.wt,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "--allow-empty",
-            "-qm",
-            "unpublished work",
-        ],
-    )
-    .unwrap();
+    crate::git::commit(&f.wt, &["--allow-empty", "-qm", "unpublished work"]);
     let local_head = git(&f.wt, &["rev-parse", "HEAD"]).unwrap();
     assert_ne!(local_head, f.head);
     let mut repos = f.repos(run_job(&f.job(false, true, &[])), &[]);

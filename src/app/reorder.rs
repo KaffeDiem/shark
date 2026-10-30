@@ -29,6 +29,14 @@ pub(super) struct Drag {
     state: Rc<RefCell<Reorder>>,
 }
 
+/// `b`'s extent along the drag axis: its left and right, or top and bottom.
+fn axis(b: &Bounds<Pixels>, horizontal: bool) -> (Pixels, Pixels) {
+    match horizontal {
+        true => (b.left(), b.right()),
+        false => (b.top(), b.bottom()),
+    }
+}
+
 impl Drag {
     fn horizontal(&self) -> bool {
         matches!(self.source, Item::Tab(..))
@@ -203,11 +211,8 @@ impl Shark {
             (Item::Section(_), Item::Section(_)) => true,
             _ => false,
         };
-        let coordinate = if horizontal {
-            pointer.x.clamp(area.left(), area.right())
-        } else {
-            pointer.y.clamp(area.top(), area.bottom())
-        };
+        let (low, high) = axis(&area, horizontal);
+        let coordinate = if horizontal { pointer.x } else { pointer.y }.clamp(low, high);
         let target = state
             .bounds
             .keys()
@@ -215,12 +220,7 @@ impl Shark {
             .filter(valid)
             .min_by(|a, b| {
                 let distance = |item: &Item| {
-                    let b = state.bounds[item];
-                    let (start, end) = if horizontal {
-                        (b.left(), b.right())
-                    } else {
-                        (b.top(), b.bottom())
-                    };
+                    let (start, end) = axis(&state.bounds[item], horizontal);
                     if coordinate < start {
                         start - coordinate
                     } else if coordinate > end {
@@ -278,17 +278,8 @@ impl Shark {
                 };
                 match &target {
                     Item::Workspace(to) => preview.drop_ws(source, to),
-                    Item::Section(i) if self.section_of(source) != Some(*i) => {
-                        for section in &mut preview.sections {
-                            section.workspaces.retain(|name| name != source);
-                        }
-                        preview.sections[*i].workspaces.push(source.clone());
-                    }
-                    Item::Ungrouped => {
-                        for section in &mut preview.sections {
-                            section.workspaces.retain(|name| name != source);
-                        }
-                    }
+                    Item::Section(i) => preview.move_to_section(source, Some(*i)),
+                    Item::Ungrouped => preview.move_to_section(source, None),
                     _ => {}
                 }
                 order.clear();
@@ -323,31 +314,17 @@ impl Shark {
         let Some(first) = before.first().and_then(|key| state.bounds.get(key)) else {
             return;
         };
-        let mut next = if horizontal {
-            first.left()
-        } else {
-            first.top()
-        };
+        let mut next = axis(first, horizontal).0;
         for item in order {
             if let Some(bounds) = state.bounds.get(&item).copied() {
-                let original = if horizontal {
-                    bounds.left()
-                } else {
-                    bounds.top()
-                };
+                let original = axis(&bounds, horizontal).0;
                 state.offsets.insert(item.clone(), next - original);
                 let pitch = before
                     .iter()
                     .position(|key| key == &item)
                     .and_then(|i| before.get(i + 1))
                     .and_then(|key| state.bounds.get(key))
-                    .map(|following| {
-                        if horizontal {
-                            following.left() - bounds.left()
-                        } else {
-                            following.top() - bounds.top()
-                        }
-                    })
+                    .map(|following| axis(following, horizontal).0 - original)
                     .unwrap_or(if horizontal {
                         bounds.size.width + px(4.)
                     } else {

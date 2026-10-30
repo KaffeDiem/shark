@@ -31,6 +31,13 @@ impl Shark {
         }
     }
 
+    /// Records an interaction with the open workspace, if any.
+    pub(super) fn record_active_interaction(&mut self, cx: &mut Context<Self>) {
+        if let Some(name) = self.active.clone() {
+            self.record_interaction(&name, cx);
+        }
+    }
+
     pub(super) fn flush_interaction(&mut self) {
         if self.interaction_save.take().is_some() {
             let _ = self.state.save();
@@ -47,9 +54,8 @@ impl Shark {
             && self.menu.is_none()
             && self.app_switcher.is_none()
             && self.usage_panel.is_none()
-            && let Some(name) = self.active.clone()
         {
-            self.record_interaction(&name, cx);
+            self.record_active_interaction(cx);
         }
     }
 

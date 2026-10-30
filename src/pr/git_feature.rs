@@ -142,9 +142,7 @@ impl<'a> Client<'a> {
             args.extend(["-f".into(), format!("{key}={value}")]);
         }
         let refs: Vec<_> = args.iter().map(String::as_str).collect();
-        let gh = super::gh();
-        let out = crate::git::cmd_bounded(self.wt, &gh, &refs, remaining.min(30)).map_err(|e| {
-            let error = super::gh_error(&e, &format!("{gh} {}: ", refs.join(" ")));
+        let out = super::gh_post(self.wt, &refs, remaining.min(30)).map_err(|error| {
             if mutation && error.contains("timed out") {
                 "GitHub timed out; the change may have been saved. Refresh and check before retrying.".into()
             } else { error }
@@ -221,32 +219,9 @@ pub fn discover(wt: &Path, branch: &str) -> Result<Option<Target>, String> {
     if let Some(url) = crate::git::review_pr_url(wt, branch) {
         return Target::from_url(&url).map(Some);
     }
-    let origin = crate::git::git(wt, &["config", "--get", "remote.origin.url"])?;
-    let origin = crate::sync::github_url(&origin).ok_or("Origin is not a GitHub repository")?;
-    let gh = super::gh();
-    let args = [
-        "pr",
-        "list",
-        "--repo",
-        &origin,
-        "--head",
-        branch,
-        "--state",
-        "all",
-        "--json",
-        "url,state,isCrossRepository,updatedAt",
-        "--limit",
-        "100",
-    ];
-    let out = crate::git::cmd_bounded(wt, &gh, &args, 30)
-        .map_err(|e| super::gh_error(&e, &format!("{gh} {}: ", args.join(" "))))?;
-    let prs: Vec<Value> =
-        serde_json::from_str(&out).map_err(|e| format!("Invalid GitHub response: {e}"))?;
-    let own: Vec<_> = prs
-        .iter()
-        .filter(|p| p["isCrossRepository"].as_bool() == Some(false))
-        .collect();
-    crate::sync::pick_pr(&own)
+    crate::sync::origin_repo(wt).ok_or("Origin is not a GitHub repository")?;
+    let prs = crate::sync::branch_prs(wt, branch, "url,state,isCrossRepository,updatedAt", 30)?;
+    crate::sync::pick_pr(&prs.iter().collect::<Vec<_>>())
         .map(|p| Target::from_url(string(p, "url")?))
         .transpose()
 }
@@ -358,23 +333,21 @@ fn pages(
     Ok(out)
 }
 
+/// Every comment of the node `id`, following pagination from its `first` page.
+fn comments(client: &Client, id: &str, kind: &str, first: &Value) -> Result<Vec<Comment>, String> {
+    pages(client, id, kind, "comments", COMMENT, first.clone())?
+        .iter()
+        .map(comment_from)
+        .collect()
+}
+
 pub fn load(wt: &Path, target: &Target) -> Result<Details, String> {
     let client = Client::new(wt, target);
     let review_fields = format!("{COMMENT} state");
     let thread_fields = format!("{THREAD} comments(first:100){{nodes{{{COMMENT}}}{PAGE}}}");
     let value = client.pr(&format!("{INFO} comments(first:100){{nodes{{{COMMENT}}}{PAGE}}} reviews(first:100){{nodes{{{review_fields}}}{PAGE}}} reviewThreads(first:100){{nodes{{{thread_fields}}}{PAGE}}}"))?;
     let mut details = details_from(target, &value)?;
-    details.comments = pages(
-        &client,
-        &details.id,
-        "PullRequest",
-        "comments",
-        COMMENT,
-        value["comments"].clone(),
-    )?
-    .iter()
-    .map(comment_from)
-    .collect::<Result<_, _>>()?;
+    details.comments = comments(&client, &details.id, "PullRequest", &value["comments"])?;
     details.reviews = pages(
         &client,
         &details.id,
@@ -400,17 +373,7 @@ pub fn load(wt: &Path, target: &Target) -> Result<Details, String> {
         value["reviewThreads"].clone(),
     )? {
         let id = string(&value, "id")?.to_string();
-        let comments = pages(
-            &client,
-            &id,
-            "PullRequestReviewThread",
-            "comments",
-            COMMENT,
-            value["comments"].clone(),
-        )?
-        .iter()
-        .map(comment_from)
-        .collect::<Result<_, _>>()?;
+        let comments = comments(&client, &id, "PullRequestReviewThread", &value["comments"])?;
         details.threads.push(Thread {
             id,
             path: string(&value, "path")?.into(),
@@ -434,18 +397,21 @@ fn fresh(client: &Client, previous: &Details) -> Result<Details, String> {
     Ok(details)
 }
 
-fn mutate(client: &Client, query: &str, vars: &[(&str, &str)], field: &str) -> Result<(), String> {
+/// Runs a mutation and requires GitHub to echo a non-empty id at the JSON pointer `id_path`.
+fn mutate(
+    client: &Client,
+    query: &str,
+    vars: &[(&str, &str)],
+    id_path: &str,
+) -> Result<(), String> {
     let data = client
         .query(query, vars, true)
         .map_err(|e| format!("{e} Refresh and check before retrying."))?;
-    let result = &data[field];
-    let id = match field {
-        "updatePullRequest" => &result["pullRequest"]["id"],
-        "addComment" => &result["commentEdge"]["node"]["id"],
-        "addPullRequestReviewThreadReply" => &result["comment"]["id"],
-        _ => &result["thread"]["id"],
-    };
-    if id.as_str().is_none_or(str::is_empty) {
+    if data
+        .pointer(id_path)
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
         return Err("GitHub did not confirm the change. Refresh and check before retrying.".into());
     }
     Ok(())
@@ -473,7 +439,7 @@ pub fn save_description(
         &client,
         "mutation($id:ID!,$title:String!,$body:String!){updatePullRequest(input:{pullRequestId:$id,title:$title,body:$body}){pullRequest{id}}}",
         &[("id", &current.id), ("title", title), ("body", body)],
-        "updatePullRequest",
+        "/updatePullRequest/pullRequest/id",
     )
 }
 
@@ -490,7 +456,7 @@ pub fn comment(wt: &Path, previous: &Details, body: &str) -> Result<(), String> 
         &client,
         "mutation($id:ID!,$body:String!){addComment(input:{subjectId:$id,body:$body}){commentEdge{node{id}}}}",
         &[("id", &current.id), ("body", body)],
-        "addComment",
+        "/addComment/commentEdge/node/id",
     )
 }
 
@@ -523,7 +489,7 @@ pub fn reply(wt: &Path, previous: &Details, thread_id: &str, body: &str) -> Resu
         &client,
         "mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id,body:$body}){comment{id}}}",
         &[("id", thread_id), ("body", body)],
-        "addPullRequestReviewThreadReply",
+        "/addPullRequestReviewThreadReply/comment/id",
     )
 }
 
@@ -550,7 +516,7 @@ pub fn resolve(
         &client,
         &format!("mutation($id:ID!){{{field}(input:{{threadId:$id}}){{thread{{id isResolved}}}}}}"),
         &[("id", thread_id)],
-        field,
+        &format!("/{field}/thread/id"),
     )
 }
 

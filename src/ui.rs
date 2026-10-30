@@ -1,12 +1,16 @@
 //! Shared UI styling and dialogs used by the host and workspace features.
+use crate::state::Mode;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{ResizeHandleRenderer, ResizeHandleState};
+use crate::{PageDown, PageUp, SelectFirst, SelectLast, SelectNext, SelectPrev};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
-use gpui_kit::component::dialog::DialogEntrance;
+use gpui_kit::component::command::CommandItem;
+use gpui_kit::component::dialog::{Dialog, DialogEntrance};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::resize_handle_appearance;
-use gpui_kit::component::{Theme, WindowExt, h_flex};
+use gpui_kit::component::{Selectable as _, Sizable as _, Theme, WindowExt, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::{rc::Rc, sync::Arc};
 
@@ -18,6 +22,13 @@ pub(crate) fn inter_features() -> FontFeatures {
             .map(|f| (f.to_string(), 1))
             .to_vec(),
     ))
+}
+
+/// Every `open_dialog` starts here: dialogs render outside the view's tree (see `inter_features`),
+/// and none of them animates in.
+pub(crate) fn dialog(d: Dialog) -> Dialog {
+    d.font_features(inter_features())
+        .entrance(DialogEntrance::None)
 }
 
 /// Hint text below the muted level; gpui-kit has no token for it. Never use it for content.
@@ -32,6 +43,19 @@ pub(crate) fn notify_err(window: &mut Window, cx: &mut App, e: impl Into<SharedS
 
 pub(crate) fn kbd(keys: &str) -> Kbd {
     Kbd::new(Keystroke::parse(keys).unwrap())
+}
+
+/// Keys (space-separated) and what they do, for a hint row.
+pub(crate) fn hint(keys: &str, label: &'static str) -> Div {
+    h_flex()
+        .gap_1()
+        .children(keys.split(' ').map(kbd))
+        .child(label)
+}
+
+/// The "s" of `n` things.
+pub(crate) fn plural(n: usize) -> &'static str {
+    if n == 1 { "" } else { "s" }
 }
 
 /// A Danger-button alert; `ok` runs on the entity once confirmed.
@@ -230,7 +254,18 @@ pub(crate) fn quiet_edge() -> ResizeHandleRenderer {
     })
 }
 pub(crate) fn copy(text: String, window: &mut Window, cx: &mut App) {
-    window.push_notification(format!("Copied {text}"), cx);
+    let msg = format!("Copied {text}");
+    copy_with(text, msg, window, cx);
+}
+
+/// Puts `text` on the clipboard and toasts `msg`.
+pub(crate) fn copy_with(
+    text: String,
+    msg: impl Into<SharedString>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    window.push_notification(msg.into(), cx);
     cx.write_to_clipboard(ClipboardItem::new_string(text));
 }
 
@@ -241,5 +276,156 @@ pub(crate) fn app_icon(app: &crate::apps::OpenApp) -> IconName {
         crate::apps::Kind::Folder => IconName::AppWindow,
         crate::apps::Kind::Git => IconName::GitBranch,
         crate::apps::Kind::Xcode => IconName::FileCode,
+    }
+}
+
+/// A ghost button that shows its selection, so tabs and mode are tab stops with enter/space.
+pub(crate) fn option_pill(label: &'static str, icon: Option<IconName>, active: bool) -> Button {
+    Button::new(label)
+        .ghost()
+        .small()
+        .label(label)
+        .when_some(icon, |b, i| b.icon(i))
+        .selected(active)
+}
+
+/// The System, Light and Dark pills, each with its mode; the caller adds `on_click`.
+pub(crate) fn mode_pills(current: Mode) -> impl Iterator<Item = (Mode, Button)> {
+    [
+        (Mode::System, "System", IconName::Monitor),
+        (Mode::Light, "Light", IconName::Sun),
+        (Mode::Dark, "Dark", IconName::Moon),
+    ]
+    .into_iter()
+    .map(move |(m, label, icon)| (m, option_pill(label, Some(icon), m == current)))
+}
+
+/// The small X that closes or dismisses something.
+pub(crate) fn close_button(id: &'static str, tooltip: &'static str) -> Button {
+    Button::new(id)
+        .ghost()
+        .xsmall()
+        .icon(IconName::X)
+        .tooltip(tooltip)
+}
+
+pub(crate) fn section(theme: &Theme, label: &'static str) -> impl IntoElement {
+    div()
+        .text_xs()
+        .text_color(theme.muted_foreground)
+        .font_weight(FontWeight::MEDIUM)
+        .child(label)
+}
+
+pub(crate) fn card(theme: &Theme) -> Div {
+    v_flex()
+        .rounded(theme.radius_lg)
+        .border_1()
+        .border_color(theme.border)
+        .bg(theme.secondary)
+}
+
+pub(crate) fn caption(theme: &Theme, label: &'static str, desc: &'static str) -> Div {
+    v_flex().child(div().text_sm().child(label)).child(
+        div()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .child(desc),
+    )
+}
+
+/// Label and description on the left, the control on the right (Linear's settings rows).
+pub(crate) fn row(
+    theme: &Theme,
+    sep: bool,
+    label: &'static str,
+    desc: &'static str,
+    control: impl IntoElement,
+) -> impl IntoElement {
+    h_flex()
+        .min_h(px(52.))
+        .px_3()
+        .gap_3()
+        .when(sep, |r| r.border_t_1().border_color(theme.border))
+        .child(caption(theme, label, desc).flex_1())
+        .child(div().w(px(240.)).flex().justify_end().child(control))
+}
+
+/// A command-menu row with an image icon (an app's or a file's) before its label.
+pub(crate) fn image_item(label: SharedString, icon: Arc<Image>) -> CommandItem {
+    CommandItem::new().label(label.clone()).child(move |_, _| {
+        h_flex()
+            .flex_1()
+            .gap_2()
+            .items_center()
+            .child(img(icon.clone()).size_4().flex_none())
+            .child(div().flex_1().min_w_0().truncate().child(label.clone()))
+    })
+}
+
+/// A move of a list cursor, as the select and page actions ask for it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Nav {
+    Next,
+    Prev,
+    First,
+    Last,
+    PageDown,
+    PageUp,
+}
+
+impl Nav {
+    /// Where the cursor at `at` of `len` rows goes, clamped to the list; `page` rows per page.
+    pub(crate) fn to(self, at: usize, len: usize, page: usize) -> usize {
+        let to = match self {
+            Nav::Next => at + 1,
+            Nav::Prev => at.saturating_sub(1),
+            Nav::First => 0,
+            Nav::Last => usize::MAX,
+            Nav::PageDown => at + page,
+            Nav::PageUp => at.saturating_sub(page),
+        };
+        to.min(len.saturating_sub(1))
+    }
+}
+
+/// Wires the six list-navigation actions on `el` to `go`; without `pages` the page keys
+/// pass on to whatever is above.
+pub(crate) fn nav_actions<T: 'static, E: InteractiveElement>(
+    el: E,
+    pages: bool,
+    cx: &Context<T>,
+    go: fn(&mut T, Nav, &mut Context<T>),
+) -> E {
+    el.on_action(cx.listener(move |t, _: &SelectNext, _, cx| go(t, Nav::Next, cx)))
+        .on_action(cx.listener(move |t, _: &SelectPrev, _, cx| go(t, Nav::Prev, cx)))
+        .on_action(cx.listener(move |t, _: &SelectFirst, _, cx| go(t, Nav::First, cx)))
+        .on_action(cx.listener(move |t, _: &SelectLast, _, cx| go(t, Nav::Last, cx)))
+        .on_action(cx.listener(move |t, _: &PageDown, _, cx| match pages {
+            true => go(t, Nav::PageDown, cx),
+            false => cx.propagate(),
+        }))
+        .on_action(cx.listener(move |t, _: &PageUp, _, cx| match pages {
+            true => go(t, Nav::PageUp, cx),
+            false => cx.propagate(),
+        }))
+}
+
+#[cfg(test)]
+mod nav_tests {
+    use super::Nav;
+    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro
+
+    #[test]
+    fn nav_clamps_to_the_list() {
+        assert_eq!(Nav::Next.to(2, 3, 10), 2);
+        assert_eq!(Nav::Next.to(0, 3, 10), 1);
+        assert_eq!(Nav::Prev.to(0, 3, 10), 0);
+        assert_eq!(Nav::First.to(2, 3, 10), 0);
+        assert_eq!(Nav::Last.to(0, 3, 10), 2);
+        assert_eq!(Nav::PageDown.to(1, 30, 10), 11);
+        assert_eq!(Nav::PageDown.to(25, 30, 10), 29);
+        assert_eq!(Nav::PageUp.to(4, 30, 10), 0);
+        assert_eq!(Nav::Last.to(0, 0, 10), 0, "an empty list stays at 0");
     }
 }

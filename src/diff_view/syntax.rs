@@ -40,25 +40,36 @@ impl SyntaxHighlighter {
     }
 }
 
-/// The syntax for a code fence or editor language name.
-///
-/// Syntect matches a token against extensions and syntax names. Most of the
-/// names the rest of the library uses are already one of those; the few that
-/// are not are spelled here the way syntect knows them.
-fn find_syntax(language: &str) -> Option<&'static SyntaxReference> {
-    let syntaxes = &*SYNTAXES;
-    let canonical = language_name(language);
-    let alias = match canonical.as_ref() {
-        "text" => return None,
-        "csharp" => "cs",
-        "make" => "Makefile",
-        "markdown_inline" => "md",
-        "embedded_template" | "ejs" => "erb",
-        other => other,
+/// The syntect token for a path: its extension, or the file name (`Makefile`).
+/// Only the final component counts; paths may come from another platform.
+pub(crate) fn language_token(path: &str) -> SharedString {
+    let name = path.rsplit(['/', '\\']).next().unwrap_or("");
+    if name.eq_ignore_ascii_case("CMakeLists.txt") {
+        return "cmake".into();
+    }
+    match name.rsplit_once('.') {
+        Some((stem, ext)) if !stem.is_empty() => ext,
+        _ => name,
+    }
+    .to_owned()
+    .into()
+}
+
+/// The syntax for a token, or `None` when syntect only knows plain text.
+/// Syntect resolves extensions itself; the aliases are the ones it lacks.
+fn find_syntax(token: &str) -> Option<&'static SyntaxReference> {
+    let lower = token.to_ascii_lowercase();
+    let token = match lower.as_str() {
+        "mjs" | "cjs" | "jsx" => "js",
+        "jsonc" => "json",
+        "h" => "c",
+        "mdx" => "md",
+        "astro" => "html",
+        "ejs" => "erb",
+        _ => token,
     };
-    [language, canonical.as_ref(), alias]
-        .into_iter()
-        .find_map(|token| syntaxes.find_syntax_by_token(token))
+    SYNTAXES
+        .find_syntax_by_token(token)
         .filter(|syntax| syntax.name != "Plain Text")
 }
 
@@ -238,38 +249,95 @@ fn semantic_name(scope: Scope) -> Option<&'static str> {
     Some(name)
 }
 
-/// Built-in aliases for editing defaults when no exact grammar name is registered.
-/// Availability of a parser does not change what a language name means.
-pub(crate) fn language_name(name: &str) -> SharedString {
-    let name = name.to_lowercase();
-    match name.as_str() {
-        "plain" => "text".into(),
-        "plaintext" => "text".into(),
-        "jsonc" => "json".into(),
-        "sh" => "bash".into(),
-        "c++" => "cpp".into(),
-        "cs" => "csharp".into(),
-        "scss" => "css".into(),
-        "ex" => "elixir".into(),
-        "js" => "javascript".into(),
-        "kt" => "kotlin".into(),
-        "kts" => "kotlin".into(),
-        "ktm" => "kotlin".into(),
-        "makefile" => "make".into(),
-        "md" => "markdown".into(),
-        "mdx" => "markdown".into(),
-        "markdown-inline" => "markdown_inline".into(),
-        "php3" => "php".into(),
-        "php4" => "php".into(),
-        "php5" => "php".into(),
-        "phtml" => "php".into(),
-        "protobuf" => "proto".into(),
-        "py" => "python".into(),
-        "rb" => "ruby".into(),
-        "rs" => "rust".into(),
-        "ts" => "typescript".into(),
-        "yml" => "yaml".into(),
-        "pyi" => "python".into(),
-        _ => name.into(),
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tokens_come_from_the_final_path_component() {
+        for (path, token) in [
+            ("src/main.RS", "RS"),
+            ("C:\\src\\lib.hpp", "hpp"),
+            ("build/Makefile", "Makefile"),
+            ("build/cmakelists.txt", "cmake"),
+            ("directory.rs/README", "README"),
+            (".gitignore", ".gitignore"),
+        ] {
+            assert_eq!(language_token(path).as_str(), token, "{path}");
+        }
+    }
+
+    #[test]
+    fn common_paths_get_a_syntax_and_plain_text_does_not() {
+        let mut missing = Vec::new();
+        for path in [
+            "a.rs",
+            "a.ts",
+            "a.tsx",
+            "a.js",
+            "a.mjs",
+            "a.cjs",
+            "a.jsx",
+            "a.mts",
+            "a.cts",
+            "a.json",
+            "a.jsonc",
+            "a.md",
+            "a.mdx",
+            "a.py",
+            "a.pyi",
+            "a.go",
+            "a.swift",
+            "a.c",
+            "a.h",
+            "a.cpp",
+            "a.cc",
+            "a.cxx",
+            "a.hpp",
+            "a.hxx",
+            "a.java",
+            "a.kt",
+            "a.kts",
+            "a.rb",
+            "a.php",
+            "a.php3",
+            "a.phtml",
+            "a.sh",
+            "a.bash",
+            "a.yaml",
+            "a.yml",
+            "a.toml",
+            "a.css",
+            "a.scss",
+            "a.html",
+            "a.htm",
+            "a.astro",
+            "a.ex",
+            "a.exs",
+            "a.sql",
+            "a.cs",
+            "a.lua",
+            "a.proto",
+            "a.scala",
+            "a.svelte",
+            "a.zig",
+            "a.diff",
+            "a.erb",
+            "a.ejs",
+            "a.gql",
+            "a.graphql",
+            "a.cmake",
+            "Makefile",
+            "GNUmakefile",
+            "CMakeLists.txt",
+        ] {
+            if find_syntax(&language_token(path)).is_none() {
+                missing.push(path);
+            }
+        }
+        assert!(missing.is_empty(), "{missing:?}");
+        for path in ["notes", "notes.unknown", "a.txt"] {
+            assert!(find_syntax(&language_token(path)).is_none(), "{path}");
+        }
     }
 }

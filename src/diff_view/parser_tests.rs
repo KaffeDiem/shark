@@ -144,15 +144,10 @@ fn malformed_hunks_fail_without_partial_documents() {
         let error = DiffFile::parse(patch)
             .err()
             .expect("reject malformed patch");
-        assert!(error.line() > 0);
-        assert!(!error.message().is_empty());
+        let message = error.to_string();
+        assert!(message.starts_with("patch line ") && !message.starts_with("patch line 0:"));
     }
     assert!(DiffFile::parse("").unwrap().is_empty());
-}
-
-#[test]
-fn the_hunk_separator_counts_unchanged_lines() {
-    assert_eq!(t!("Diff.HiddenLines", count = 3), "↑ 3 unchanged lines");
 }
 
 #[test]

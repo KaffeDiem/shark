@@ -18,15 +18,20 @@ mod git;
 mod lsp;
 mod menu;
 mod menubar;
+mod models;
 mod overflow_fade;
 mod plan;
 mod pr;
+mod proc;
 mod prompts;
+mod prs;
 mod scripts;
 mod settings;
 mod stack;
 mod state;
 mod sync;
+mod theme;
+mod transcript;
 mod ui;
 mod usage;
 mod vim;
@@ -205,6 +210,20 @@ pub struct OpenWorkspace(pub usize);
 #[action(namespace = shark, no_json)]
 pub struct OpenTab(pub usize);
 
+/// A binding whose action isn't a plain `KeyBinding::new` one (boxed, by name).
+fn load(keys: &str, action: Box<dyn Action>, context: &str) -> KeyBinding {
+    let context = KeyBindingContextPredicate::parse(context).unwrap();
+    KeyBinding::load(
+        keys,
+        action,
+        Some(Rc::new(context)),
+        false,
+        None,
+        &DummyKeyboardMapper,
+    )
+    .unwrap()
+}
+
 fn bind_keys(cx: &mut App) {
     // First, so the bindings below take precedence, as when gpui-component bound them.
     diff_view::init(cx);
@@ -212,7 +231,7 @@ fn bind_keys(cx: &mut App) {
     // (Settings › General). The arrows, letters that name an action and cmd shortcuts work
     // either way. VimNormal: the editor in Vim's Normal mode.
     const NAV: &str = "Sidebar || Home || Transcript || DiffPane || FileTree || Queue || PlanPane || GitFeature || VimNormal";
-    const LIST: &str = "Sidebar || Home || Transcript || FileTree || Queue";
+    const TREE: &str = "FileTree || Sidebar";
     // The diff's letter keys; not while typing in the review composer, which sits in the diff.
     const DIFF: &str = "DiffPane && !Input";
     // The diff's line cursor (src/features/differ/review.rs) moves like a list. With Vim its arrows
@@ -222,18 +241,11 @@ fn bind_keys(cx: &mut App) {
     // `!Input` sits outside `Vim > (…)`: inside it, `!` sees only the contexts down to the
     // match, not a focused Input below. The editor's Normal mode is an Input that types nothing.
     let vim = |keys: &str, action: Box<dyn Action>, context: &str| {
-        let predicate = format!("(Vim > ({context})) && (!Input || VimNormal)");
-        KeyBinding::load(
+        load(
             keys,
             action,
-            Some(Rc::new(
-                KeyBindingContextPredicate::parse(&predicate).unwrap(),
-            )),
-            false,
-            None,
-            &DummyKeyboardMapper,
+            &format!("(Vim > ({context})) && (!Input || VimNormal)"),
         )
-        .unwrap()
     };
     cx.bind_keys([
         KeyBinding::new("cmd-k", TogglePalette, None),
@@ -246,8 +258,12 @@ fn bind_keys(cx: &mut App) {
         // the prompt between new workspace and Ask Shark; i/a jump from the list to it.
         KeyBinding::new("escape", CancelEdit, Some("HomeView")),
         KeyBinding::new("tab", SwitchField, Some("HomePrompt")),
-        KeyBinding::new("i", FocusComposer, Some("Home")),
-        KeyBinding::new("a", FocusComposer, Some("Home")),
+        KeyBinding::new(
+            "i",
+            FocusComposer,
+            Some("Home || Transcript || Queue || PlanPane"),
+        ),
+        KeyBinding::new("a", FocusComposer, Some("Home || Transcript || Queue")),
         // The workspace under the cursor, as in the row menu.
         KeyBinding::new("cmd-backspace", ArchiveWorkspace, Some("Home || Sidebar")),
         // Not in the editor: Vim users leave insert mode with ctrl-c.
@@ -266,9 +282,14 @@ fn bind_keys(cx: &mut App) {
         // In the diff: the file last moved to with `}`/`{` or the tree.
         KeyBinding::new("v", ToggleViewed, Some("FileTree || (DiffPane && !Input)")),
         KeyBinding::new("o", OpenFile, Some("FileTree || (DiffPane && !Input)")),
-        KeyBinding::new("left", CollapseDir, Some("FileTree || Sidebar")),
-        KeyBinding::new("right", ExpandDir, Some("FileTree || Sidebar")),
-        KeyBinding::new("cmd-s", SaveFile, Some("FileEditor")),
+        KeyBinding::new("left", CollapseDir, Some(TREE)),
+        KeyBinding::new("right", ExpandDir, Some(TREE)),
+        // Also in the diff when the line input lost focus (its row scrolled away).
+        KeyBinding::new(
+            "cmd-s",
+            SaveFile,
+            Some("FileEditor || DiffPane || GitFeature"),
+        ),
         KeyBinding::new("alt-shift-f", FormatDocument, Some("FileEditor")),
         KeyBinding::new("f2", RenameSymbol, Some("FileEditor")),
         KeyBinding::new(
@@ -308,12 +329,13 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("end", SelectLast, Some(ARROWS)),
         KeyBinding::new("pagedown", PageDown, Some(ARROWS)),
         KeyBinding::new("pageup", PageUp, Some(ARROWS)),
-        KeyBinding::new("enter", Confirm, Some(LIST)),
-        KeyBinding::new("enter", Confirm, Some("Features")),
+        KeyBinding::new(
+            "enter",
+            Confirm,
+            Some("Sidebar || Home || Transcript || FileTree || Queue || Features"),
+        ),
         KeyBinding::new("o", Confirm, Some("Transcript")),
         KeyBinding::new("y", CopySelected, Some("Transcript || PlanPane")),
-        KeyBinding::new("i", FocusComposer, Some("Transcript")),
-        KeyBinding::new("a", FocusComposer, Some("Transcript")),
         KeyBinding::new("escape", FocusTranscript, Some("Composer")),
         KeyBinding::new("e", EditQueued, Some("Queue")),
         KeyBinding::new("d", DeleteQueued, Some("Queue")),
@@ -321,8 +343,6 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("alt-up", MoveQueuedUp, Some("Queue")),
         KeyBinding::new("alt-down", MoveQueuedDown, Some("Queue")),
         KeyBinding::new("escape", FocusComposer, Some("Queue")),
-        KeyBinding::new("i", FocusComposer, Some("Queue")),
-        KeyBinding::new("a", FocusComposer, Some("Queue")),
         KeyBinding::new("cmd-j", NextAttention, None),
         KeyBinding::new("m", MoveToSection, Some("Sidebar")),
         // Inline section name in the sidebar: the Input lets escape through.
@@ -365,9 +385,6 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("i", EditWorkingCopy, Some(DIFF)),
         // Back to reviewing, also when the line input lost focus.
         KeyBinding::new("escape", CancelEdit, Some(DIFF)),
-        // Also when the line input lost focus (its row scrolled away).
-        KeyBinding::new("cmd-s", SaveFile, Some("DiffPane")),
-        KeyBinding::new("cmd-s", SaveFile, Some("GitFeature")),
         KeyBinding::new("escape", CancelEdit, Some("GitFeature")),
         KeyBinding::new("c", AddComment, Some(DIFF)),
         // Plan mode; in the composer shift-tab is caught before the input outdents.
@@ -381,7 +398,6 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("d", TogglePlanChanges, Some("PlanPane")),
         KeyBinding::new("a", ApprovePlan, Some("PlanPane")),
         KeyBinding::new("n", BuildPlanInNewChat, Some("PlanPane")),
-        KeyBinding::new("i", FocusComposer, Some("PlanPane")),
         KeyBinding::new("shift-c", SendComments, Some(DIFF)),
         // Threads at the diff cursor. `r` resolves one, else falls through to RefreshDiff.
         KeyBinding::new("e", EditThread, Some(DIFF)),
@@ -422,14 +438,14 @@ fn bind_keys(cx: &mut App) {
         vim("shift-g", Box::new(SelectLast), MOVE),
         vim("ctrl-d", Box::new(PageDown), MOVE),
         vim("ctrl-u", Box::new(PageUp), MOVE),
-        vim("h", Box::new(CollapseDir), "FileTree || Sidebar"),
-        vim("l", Box::new(ExpandDir), "FileTree || Sidebar"),
+        vim("h", Box::new(CollapseDir), TREE),
+        vim("l", Box::new(ExpandDir), TREE),
         vim("h", Box::new(PlanOlder), "PlanPane"),
         vim("l", Box::new(PlanNewer), "PlanPane"),
     ]);
     // Direct picks, numbered like the model menu: ctrl-cmd-1 is the first row.
     cx.bind_keys(
-        (0..chat::MODELS.len())
+        (0..models::MODELS.len())
             .map(|i| KeyBinding::new(&format!("ctrl-cmd-{}", i + 1), SetModel(i), None)),
     );
     cx.bind_keys(
@@ -437,7 +453,6 @@ fn bind_keys(cx: &mut App) {
     );
     cx.bind_keys((0..9).map(|i| KeyBinding::new(&format!("ctrl-{}", i + 1), OpenTab(i), None)));
     // The Diff component's scroll actions are private; bind vim keys to them by name.
-    let diff = Rc::new(KeyBindingContextPredicate::parse("(Vim > Diff) && !Input").unwrap());
     let scroll = [
         ("h", "shark_diff::ScrollLeft"),
         ("l", "shark_diff::ScrollRight"),
@@ -446,15 +461,7 @@ fn bind_keys(cx: &mut App) {
         .iter()
         .filter_map(|(k, name)| {
             let action = cx.build_action(name, None).ok()?;
-            KeyBinding::load(
-                k,
-                action,
-                Some(diff.clone()),
-                false,
-                None,
-                &DummyKeyboardMapper,
-            )
-            .ok()
+            Some(load(k, action, "(Vim > Diff) && !Input"))
         })
         .collect();
     cx.bind_keys(bindings);
@@ -471,7 +478,7 @@ const FONTS: &[&[u8]] = &[
     include_bytes!("../assets/fonts/JetBrainsMonoNL-Bold.ttf"),
 ];
 
-/// The theme itself is applied by `Shark::new` from the saved appearance (`settings::apply`).
+/// The theme itself is applied by `Shark::new` from the saved appearance (`theme::apply`).
 fn install_fonts(cx: &mut App) {
     let fonts = FONTS.iter().map(|f| Cow::Borrowed(*f)).collect();
     cx.text_system().add_fonts(fonts).expect("embedded fonts");
@@ -549,4 +556,49 @@ fn main() {
             });
             cx.activate(true);
         });
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro
+
+    /// Merged bindings (`||` contexts) still resolve in every context they cover, and the
+    /// neighbours on the same keys keep their own.
+    #[gpui_kit::test]
+    fn merged_bindings_resolve(cx: &mut TestAppContext) {
+        cx.update(bind_keys);
+        let hit = |keys: &str, context: &str, action: &dyn Action| {
+            let stack = [
+                KeyContext::parse("Shark").unwrap(),
+                KeyContext::parse(context).unwrap(),
+            ];
+            let key = [Keystroke::parse(keys).unwrap()];
+            let (found, _) =
+                cx.update(|cx| cx.key_bindings().borrow().bindings_for_input(&key, &stack));
+            found.first().is_some_and(|b| b.action().partial_eq(action))
+        };
+        for c in ["Home", "Transcript", "Queue", "PlanPane"] {
+            assert!(hit("i", c, &FocusComposer), "i in {c}");
+        }
+        for c in ["Home", "Transcript", "Queue"] {
+            assert!(hit("a", c, &FocusComposer), "a in {c}");
+        }
+        assert!(hit("a", "PlanPane", &ApprovePlan));
+        assert!(hit("i", "DiffPane", &EditWorkingCopy));
+        for c in ["FileEditor", "DiffPane", "GitFeature"] {
+            assert!(hit("cmd-s", c, &SaveFile), "cmd-s in {c}");
+        }
+        for c in [
+            "Sidebar",
+            "Home",
+            "Transcript",
+            "FileTree",
+            "Queue",
+            "Features",
+        ] {
+            assert!(hit("enter", c, &Confirm), "enter in {c}");
+        }
+        assert!(hit("left", "Sidebar", &CollapseDir) && hit("right", "FileTree", &ExpandDir));
+    }
 }

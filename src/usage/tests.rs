@@ -1,4 +1,5 @@
 use super::*;
+use objc2_foundation::{NSDate, NSTimeZone};
 
 #[test]
 #[ignore = "read-only installed CLIs, no inference"]
@@ -29,9 +30,7 @@ fn live_usage() {
                 provider.name(),
                 row.label,
                 row.remaining,
-                row.resets_at
-                    .map(local_time)
-                    .unwrap_or_else(|| "unknown".into())
+                row.resets_at.map_or("unknown".into(), |t| t.to_string())
             );
         }
     }
@@ -158,7 +157,6 @@ fn foundation_parses_offsets_fractional_and_whole_seconds() {
     assert!(
         (timestamp(&json!("2026-10-28T10:50:00.404499+00:00")).unwrap() - z - 0.404).abs() < 0.002
     );
-    assert!(!local_time(z).is_empty());
 }
 
 #[test]
@@ -485,14 +483,6 @@ fn activity_logs_deduplicate_skip_noise_and_split_at_local_midnight() {
 }
 
 #[test]
-fn civil_dates_ignore_the_locale() {
-    assert_eq!(activity::civil(20390), (2025, 10, 29));
-    assert_eq!(activity::civil(0), (1970, 1, 1));
-    assert_eq!(activity::civil(-1), (1969, 12, 31));
-    assert_eq!(activity::civil(11016), (2000, 2, 29));
-}
-
-#[test]
 fn activity_scan_windows_skips_stale_files_and_reuses_cache() {
     let root = std::env::temp_dir().join(format!("shark-activity-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
@@ -520,10 +510,7 @@ fn activity_scan_windows_skips_stale_files_and_reuses_cache() {
         .unwrap()
         .set_modified(UNIX_EPOCH + Duration::from_secs(86400))
         .unwrap();
-    let codex_dir = |day| {
-        let (y, m, d) = activity::civil(day);
-        root.join(format!("sessions/{y:04}/{m:02}/{d:02}"))
-    };
+    let codex_dir = |day| root.join(format!("sessions/{day}"));
     write(
         codex_dir(today).join("rollout-a.jsonl"),
         &log(Provider::Codex, today - 1),
@@ -603,4 +590,60 @@ fn window_label_is_singular_for_one() {
     ] {
         assert_eq!(window_label(&json!(mins)), label);
     }
+}
+
+#[test]
+fn exchange_reads_each_providers_protocol_from_pipes() {
+    let reply = |provider, lines: &[String]| {
+        let mut sent = vec![];
+        let out = std::io::Cursor::new(lines.join("\n") + "\n");
+        let result = exchange(provider, &mut sent, out);
+        let sent: Vec<Value> = String::from_utf8(sent)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        (result, sent)
+    };
+    let (rows, sent) = reply(
+        Provider::Claude,
+        &[
+            json!({"type":"control_response","response":{"request_id":"wrong","subtype":"success","response":{}}}).to_string(),
+            fixture(Provider::Claude).to_string(),
+        ],
+    );
+    assert_eq!(rows.unwrap().len(), 3);
+    assert_eq!(sent[0]["request"]["subtype"], "get_usage");
+    assert_eq!(sent.len(), 1);
+
+    // A usage answer before the handshake finishes is ignored.
+    let usage = fixture(Provider::Codex).to_string();
+    let (rows, sent) = reply(
+        Provider::Codex,
+        &[
+            usage.clone(),
+            json!({"id":"init","result":{}}).to_string(),
+            usage,
+        ],
+    );
+    assert_eq!(rows.unwrap()[0].remaining, Some(68.));
+    let methods: Vec<_> = sent.iter().map(|v| v["method"].as_str().unwrap()).collect();
+    assert_eq!(
+        methods,
+        ["initialize", "initialized", "account/rateLimits/read"]
+    );
+
+    let (rows, _) = reply(
+        Provider::Codex,
+        &[json!({"id":"init","error":{"message":"not logged in"}}).to_string()],
+    );
+    assert_eq!(rows, Err(Failure::SignIn));
+    assert_eq!(
+        exchange(Provider::Claude, Vec::new(), std::io::empty()),
+        Err(Failure::Temporary)
+    );
+    assert_eq!(
+        exchange(Provider::Claude, Vec::new(), &b"{}"[..]),
+        Err(Failure::Unsupported)
+    );
 }

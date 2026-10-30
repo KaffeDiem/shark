@@ -37,7 +37,7 @@ impl Shark {
                 let n = jobs.len();
                 let msg = format!(
                     "Started {n} script{} in order, without waiting on each other (SHARK_PORT {port}); cmd-r stops",
-                    if n == 1 { "" } else { "s" }
+                    crate::ui::plural(n)
                 );
                 window.push_notification(Notification::success(msg), cx);
                 self.watch_run(ws.name, window, cx);

@@ -4,6 +4,9 @@ use crate::state::Workspace;
 use std::path::Path;
 
 pub mod git_feature;
+mod review;
+
+pub use review::{Anchor, publish_note, publish_review, verify_original_anchor};
 
 const MARKER: &str = "<!-- shark:related -->";
 
@@ -40,29 +43,6 @@ impl NewPr {
             a.push("--draft");
         }
         a
-    }
-}
-
-/// Repo names in merge order: `saved` first (names no longer in the workspace dropped), then
-/// the rest in the order they were added.
-pub fn merge_order(ws: &Workspace, saved: &[String]) -> Vec<String> {
-    let names: Vec<String> = ws.repos.iter().map(|r| r.name.clone()).collect();
-    let mut out: Vec<String> = saved
-        .iter()
-        .filter(|n| names.contains(n))
-        .cloned()
-        .collect();
-    out.extend(names.into_iter().filter(|n| !saved.contains(n)));
-    out
-}
-
-/// Moves `name` one place earlier (`earlier`) or later in `order`; unchanged at the ends.
-pub fn move_in_order(order: &mut [String], name: &str, earlier: bool) {
-    if let Some(i) = order.iter().position(|n| n == name) {
-        let j = if earlier { i.wrapping_sub(1) } else { i + 1 };
-        if j < order.len() {
-            order.swap(i, j);
-        }
     }
 }
 
@@ -111,8 +91,8 @@ pub fn create_linked_prs(
             ));
         }
         // A stacked branch's PR merges into its parent, which must be on GitHub.
-        if git(&wt, &["rev-parse", "--verify", "--quiet", &r.base]).is_err() {
-            let b = r.base.strip_prefix("origin/").unwrap_or(&r.base);
+        if !crate::git::has_ref(&wt, &r.base) {
+            let b = crate::sync::short(&r.base);
             return Err(format!(
                 "{}: its base `{b}` isn't on GitHub; push it first (from its workspace), or Change base…",
                 r.name
@@ -161,17 +141,23 @@ pub fn create_linked_prs(
         let url = match open.is_empty() {
             false => open,
             true => {
-                let base = r.base.strip_prefix("origin/").unwrap_or(&r.base);
+                let base = crate::sync::short(&r.base);
                 let out = cmd_bounded(&wt, "gh", &repo_flag(new.args(branch, base)), 60)?;
-                out.lines().last().unwrap_or_default().to_string()
+                last_line(&out)
             }
         };
         prs.push((r.name.clone(), url));
     }
     // The PRs exist by now: a failed link is a warning, not a lost result.
+    let warning = link_prs(dir, &prs);
+    Ok((prs, warning))
+}
+
+/// Rewrites each PR's body to link the others; the warning lists the repos that failed.
+fn link_prs(dir: &Path, prs: &[(String, String)]) -> Option<String> {
     let mut failed = vec![];
     if prs.len() > 1 {
-        for (r, url) in &prs {
+        for (r, url) in prs {
             let wt = dir.join(r);
             let link = || {
                 let body = cmd_bounded(
@@ -183,7 +169,7 @@ pub fn create_linked_prs(
                 cmd_bounded(
                     &wt,
                     "gh",
-                    &["pr", "edit", url, "--body", &link_body(&body, &prs, url)],
+                    &["pr", "edit", url, "--body", &link_body(&body, prs, url)],
                     30,
                 )
             };
@@ -192,17 +178,21 @@ pub fn create_linked_prs(
             }
         }
     }
-    let warning = (!failed.is_empty()).then(|| {
+    (!failed.is_empty()).then(|| {
         format!(
             "The PRs were created, but linking them failed; rerun to retry:\n{}",
             failed.join("\n")
         )
-    });
-    Ok((prs, warning))
+    })
+}
+
+/// The last line of command output (gh prints the new PR's URL last).
+fn last_line(s: &str) -> String {
+    s.lines().last().unwrap_or_default().to_string()
 }
 
 /// `args` plus `--repo <origin>`, as polling passes it.
-fn with_repo<'a>(mut args: Vec<&'a str>, origin: Option<&'a str>) -> Vec<&'a str> {
+pub(crate) fn with_repo<'a>(mut args: Vec<&'a str>, origin: Option<&'a str>) -> Vec<&'a str> {
     args.extend(origin.into_iter().flat_map(|o| ["--repo", o]));
     args
 }
@@ -217,16 +207,14 @@ pub fn link_body(body: &str, prs: &[(String, String)], own: &str) -> String {
     out
 }
 
-/// gh, or `SHARK_GH` (tests point it at a fake, as `SHARK_CLAUDE` for claude).
-pub(crate) fn gh() -> String {
-    std::env::var("SHARK_GH").unwrap_or_else(|_| "gh".into())
-}
+pub(crate) use crate::proc::gh;
 
 /// Runs gh to post something; an error is gh's last word, not the command line (which carries
 /// the whole body).
-fn gh_post(wt: &Path, args: &[&str]) -> Result<String, String> {
+pub(crate) fn gh_post(wt: &Path, args: &[&str], secs: u64) -> Result<String, String> {
     let gh = gh();
-    cmd_bounded(wt, &gh, args, 60).map_err(|e| gh_error(&e, &format!("{gh} {}: ", args.join(" "))))
+    cmd_bounded(wt, &gh, args, secs)
+        .map_err(|e| gh_error(&e, &format!("{gh} {}: ", args.join(" "))))
 }
 
 /// `e` without `cmd`, its last line; a timeout may still have posted.
@@ -244,282 +232,9 @@ fn gh_error(e: &str, cmd: &str) -> String {
     }
 }
 
-/// Posts `body` to PR `number` of the repo at `wt` as a conversation comment (a reviewer
-/// note); returns its URL.
-pub fn publish_note(wt: &Path, number: u64, body: &str) -> Result<String, String> {
-    let n = number.to_string();
-    let out = gh_post(wt, &["pr", "comment", &n, "--body", body])?;
-    Ok(out.lines().last().unwrap_or_default().to_string())
-}
-
-/// Where an inline review comment sits in a PR: repo-relative path, last (and first) line,
-/// and the side: the base's lines (`left`) or the head's.
-pub struct Anchor {
-    pub path: String,
-    pub line: usize,
-    pub start: Option<usize>,
-    pub left: bool,
-}
-
-/// Verify against fresh GitHub data; any unavailable or changing evidence means excerpt-only.
-pub fn verify_original_anchor(
-    wt: &Path,
-    number: u64,
-    revision: &str,
-    anchor: &Anchor,
-) -> Option<(String, bool)> {
-    let read = |endpoint: &str| -> Option<serde_json::Value> {
-        serde_json::from_str(&cmd_bounded(wt, &gh(), &["api", endpoint], 30).ok()?).ok()
-    };
-    let endpoint = format!("repos/{{owner}}/{{repo}}/pulls/{number}");
-    let commits = |v: &serde_json::Value| -> Option<(String, String)> {
-        let sha = |v: &serde_json::Value| {
-            v.as_str()
-                .filter(|s| s.len() == 40 && s.bytes().all(|b| b.is_ascii_hexdigit()))
-                .map(String::from)
-        };
-        Some((sha(&v["base"]["sha"])?, sha(&v["head"]["sha"])?))
-    };
-    let first = commits(&read(&endpoint)?)?;
-    let comparison = read(&format!(
-        "repos/{{owner}}/{{repo}}/compare/{}...{}",
-        first.0, first.1
-    ));
-    let valid = comparison
-        .as_ref()
-        .is_some_and(|comparison| original_anchor_matches(comparison, revision, anchor));
-    let unchanged = read(&endpoint).and_then(|v| commits(&v)).as_ref() == Some(&first);
-    Some((first.1, valid && unchanged))
-}
-
-fn original_anchor_matches(
-    comparison: &serde_json::Value,
-    revision: &str,
-    anchor: &Anchor,
-) -> bool {
-    if revision.is_empty() || comparison["merge_base_commit"]["sha"].as_str() != Some(revision) {
-        return false;
-    }
-    let Some(file) = comparison["files"].as_array().and_then(|files| {
-        files
-            .iter()
-            .find(|f| f["filename"].as_str() == Some(&anchor.path))
-    }) else {
-        return false;
-    };
-    if !matches!(file["status"].as_str(), Some("modified" | "removed"))
-        || !file["previous_filename"].is_null()
-    {
-        return false;
-    }
-    let Some(patch) = file["patch"].as_str() else {
-        return false;
-    };
-    let valid = || -> Option<bool> {
-        let range = |s: &str| -> Option<(usize, usize)> {
-            let (start, count) = s.split_once(',').unwrap_or((s, "1"));
-            Some((start.parse().ok()?, count.parse().ok()?))
-        };
-        let mut lines = patch.lines().peekable();
-        let (mut found, mut added, mut removed) = (false, 0u64, 0u64);
-        while let Some(line) = lines.next() {
-            let mut parts = line.strip_prefix("@@ -")?.split(' ');
-            let (old, old_count) = range(parts.next()?)?;
-            let (_, new_count) = range(parts.next()?.strip_prefix('+')?)?;
-            if parts.next()? != "@@" {
-                return None;
-            }
-            let (mut olds, mut news) = (0, 0);
-            while lines.peek().is_some_and(|l| !l.starts_with("@@ ")) {
-                match lines.next()?.as_bytes().first() {
-                    Some(b' ') => {
-                        olds += 1;
-                        news += 1;
-                    }
-                    Some(b'-') => {
-                        olds += 1;
-                        removed += 1;
-                    }
-                    Some(b'+') => {
-                        news += 1;
-                        added += 1;
-                    }
-                    Some(b'\\') => {}
-                    _ => return None,
-                }
-            }
-            if (olds, news) != (old_count, new_count) {
-                return None;
-            }
-            let start = anchor.start.unwrap_or(anchor.line);
-            found |= start > 0
-                && start <= anchor.line
-                && start >= old
-                && anchor.line < old.checked_add(old_count)?;
-        }
-        // Counts also detect patches truncated at a hunk boundary.
-        Some(
-            found && file["additions"].as_u64()? == added && file["deletions"].as_u64()? == removed,
-        )
-    };
-    valid().unwrap_or(false)
-}
-
-/// Posts a Comment review (neither approves nor requests changes) to PR `number` at commit
-/// `head`: `body` alone, or with `inline` as a comment on its lines (then `body` is the
-/// review's note). Returns the review's URL.
-pub fn publish_review(
-    wt: &Path,
-    number: u64,
-    head: &str,
-    body: &str,
-    inline: Option<(&Anchor, &str)>,
-) -> Result<String, String> {
-    let args = review_api_args(&number.to_string(), head, body, inline);
-    let args: Vec<&str> = args.iter().map(String::as_str).collect();
-    gh_post(wt, &args)
-}
-
-/// `gh api` for a review, with one inline comment when given; gh fills in `{owner}/{repo}`.
-fn review_api_args(
-    n: &str,
-    head: &str,
-    body: &str,
-    inline: Option<(&Anchor, &str)>,
-) -> Vec<String> {
-    let mut v: Vec<String> = ["api", "--method", "POST"].map(String::from).into();
-    v.push(format!("repos/{{owner}}/{{repo}}/pulls/{n}/reviews"));
-    let mut field = |flag: &str, kv: String| v.extend([flag.to_string(), kv]);
-    field("-f", "event=COMMENT".into());
-    field("-f", format!("commit_id={head}"));
-    field("-f", format!("body={body}"));
-    if let Some((a, text)) = inline {
-        let side = if a.left { "LEFT" } else { "RIGHT" };
-        field("-f", format!("comments[][path]={}", a.path));
-        field("-F", format!("comments[][line]={}", a.line));
-        field("-f", format!("comments[][side]={side}"));
-        if let Some(s) = a.start {
-            field("-F", format!("comments[][start_line]={s}"));
-            field("-f", format!("comments[][start_side]={side}"));
-        }
-        field("-f", format!("comments[][body]={text}"));
-    }
-    v.extend(["-q".into(), ".html_url".into()]);
-    v
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[cfg(feature = "test-support")]
-    #[test]
-    fn original_anchor_rechecks_moving_github_commits() {
-        use serde_json::json;
-        use std::{fs, os::unix::fs::PermissionsExt};
-        let _turn = crate::app::ui_tests::UI_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let root = std::env::temp_dir().join(format!("shark-anchor-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        let script = root.join("gh");
-        fs::write(
-            &script,
-            r#"#!/bin/sh
-case "$2" in
-*/compare/*) cat comparison.json; if [ -e move ]; then cp moved.json pr.json; fi ;;
-*/pulls/*) cat pr.json ;;
-*) exit 1 ;;
-esac
-"#,
-        )
-        .unwrap();
-        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
-        let previous = std::env::var_os("SHARK_GH");
-        struct Restore(Option<std::ffi::OsString>);
-        impl Drop for Restore {
-            fn drop(&mut self) {
-                unsafe {
-                    match &self.0 {
-                        Some(v) => std::env::set_var("SHARK_GH", v),
-                        None => std::env::remove_var("SHARK_GH"),
-                    }
-                }
-            }
-        }
-        let _restore = Restore(previous);
-        unsafe {
-            std::env::set_var("SHARK_GH", &script);
-        }
-        let base = "a".repeat(40);
-        let head = "b".repeat(40);
-        fs::write(
-            root.join("pr.json"),
-            json!({"base":{"sha":base},"head":{"sha":head}}).to_string(),
-        )
-        .unwrap();
-        fs::write(
-            root.join("moved.json"),
-            json!({"base":{"sha":base},"head":{"sha":"c".repeat(40)}}).to_string(),
-        )
-        .unwrap();
-        fs::write(root.join("comparison.json"), json!({"merge_base_commit":{"sha":base},"files":[{"filename":"a.rs","status":"modified","patch":"@@ -1 +1 @@\n-old\n+new","additions":1,"deletions":1}]}).to_string()).unwrap();
-        let anchor = Anchor {
-            path: "a.rs".into(),
-            line: 1,
-            start: None,
-            left: true,
-        };
-        assert_eq!(
-            verify_original_anchor(&root, 1, &base, &anchor),
-            Some((head.clone(), true))
-        );
-        assert_eq!(
-            verify_original_anchor(&root, 1, "legacy", &anchor),
-            Some((head.clone(), false))
-        );
-        fs::write(root.join("move"), "").unwrap();
-        assert_eq!(
-            verify_original_anchor(&root, 1, &base, &anchor),
-            Some((head, false))
-        );
-        fs::remove_file(root.join("comparison.json")).unwrap();
-        assert_eq!(
-            verify_original_anchor(&root, 1, &base, &anchor),
-            Some(("c".repeat(40), false))
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn original_anchors_require_complete_matching_comparison() {
-        use serde_json::json;
-        let anchor = Anchor {
-            path: "a.rs".into(),
-            line: 3,
-            start: Some(2),
-            left: true,
-        };
-        let comparison = json!({"merge_base_commit":{"sha":"base"}, "files":[{
-            "filename":"a.rs", "status":"modified", "patch":"@@ -2,2 +2,2 @@\n context\n-old\n+new", "additions":1, "deletions":1
-        }]});
-        assert!(original_anchor_matches(&comparison, "base", &anchor));
-        for revision in ["", "HEAD", "different-base"] {
-            assert!(!original_anchor_matches(&comparison, revision, &anchor));
-        }
-        for (key, value) in [
-            ("status", json!("renamed")),
-            ("patch", json!(null)),
-            ("patch", json!("@@ -2,2 +2,2 @@\n context")),
-            ("additions", json!(2)),
-        ] {
-            let mut changed = comparison.clone();
-            changed["files"][0][key] = value;
-            assert!(!original_anchor_matches(&changed, "base", &anchor));
-        }
-        let outside = Anchor { line: 4, ..anchor };
-        assert!(!original_anchor_matches(&comparison, "base", &outside));
-    }
 
     #[test]
     fn gh_errors_are_brief() {
@@ -538,44 +253,6 @@ esac
     }
 
     #[test]
-    fn inline_review_args() {
-        let a = Anchor {
-            path: "src/app.rs".into(),
-            line: 632,
-            start: Some(631),
-            left: false,
-        };
-        let args = review_api_args(
-            "128",
-            "abc",
-            "app.rs:631-632",
-            Some((&a, "Keep it aligned.")),
-        );
-        assert_eq!(
-            args.join(" "),
-            "api --method POST repos/{owner}/{repo}/pulls/128/reviews -f event=COMMENT \
-             -f commit_id=abc -f body=app.rs:631-632 -f comments[][path]=src/app.rs \
-             -F comments[][line]=632 -f comments[][side]=RIGHT \
-             -F comments[][start_line]=631 -f comments[][start_side]=RIGHT \
-             -f comments[][body]=Keep it aligned. -q .html_url"
-        );
-        let one = Anchor {
-            start: None,
-            left: true,
-            ..a
-        };
-        let args = review_api_args("7", "h", "note", Some((&one, "x"))).join(" ");
-        assert!(
-            args.contains("-f body=note") && args.contains("side]=LEFT"),
-            "{args}"
-        );
-        assert!(!args.contains("start_line"));
-        // Without an inline comment: the review alone.
-        let args = review_api_args("7", "h", "note", None).join(" ");
-        assert!(args.ends_with("-f body=note -q .html_url"), "{args}");
-    }
-
-    #[test]
     fn link_body_is_idempotent() {
         let prs = vec![
             ("api".to_string(), "https://x/api/1".to_string()),
@@ -585,6 +262,20 @@ esac
         assert!(once.starts_with("Adds login.\n\n"));
         assert!(once.contains("- web: https://x/web/2") && !once.contains("api/1"));
         assert_eq!(link_body(&once, &prs, "https://x/api/1"), once);
+    }
+
+    #[test]
+    fn linking_reports_failed_repos_and_skips_a_single_pr() {
+        let none = std::env::temp_dir().join("shark-no-such-dir");
+        let pr = |r: &str| (r.to_string(), format!("https://x/{r}/1"));
+        assert_eq!(link_prs(&none, &[pr("api")]), None);
+        let warning = link_prs(&none, &[pr("api"), pr("web")]).expect("both fail");
+        assert!(
+            warning.contains("api:") && warning.contains("web:"),
+            "{warning}"
+        );
+        assert_eq!(last_line("Creating\nhttps://x/api/1\n"), "https://x/api/1");
+        assert_eq!(last_line(""), "");
     }
 
     #[test]
@@ -601,33 +292,6 @@ esac
             NewPr::new("Just a title", false).args("b", "main").len(),
             fill.len() + 2
         );
-    }
-
-    #[test]
-    fn merge_order_follows_saved_then_added() {
-        let ws = Workspace {
-            name: "w".into(),
-            branch: "b".into(),
-            repos: ["api", "web", "ios"]
-                .map(|n| crate::state::WsRepo {
-                    name: n.into(),
-                    src: n.into(),
-                    base: "origin/main".into(),
-                    branch: None,
-                })
-                .into(),
-            ..Default::default()
-        };
-        let o = merge_order(&ws, &["ios".into(), "gone".into()]);
-        assert_eq!(o, ["ios", "api", "web"]);
-        let moved = |name: &str, earlier: bool| {
-            let mut o = o.clone();
-            move_in_order(&mut o, name, earlier);
-            o
-        };
-        assert_eq!(moved("api", true), ["api", "ios", "web"]);
-        assert_eq!(moved("web", false), o, "already last");
-        assert_eq!(moved("ios", true), o, "already first");
     }
 
     /// Creation asks gh about origin like polling does (`--repo`), and a failed link step still

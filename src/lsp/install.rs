@@ -21,15 +21,22 @@ pub(super) struct Artifact {
 }
 
 pub(super) fn run(root: &Path, program: &str, args: &[&str], seconds: u64) -> Result<String> {
-    crate::git::wait_bounded(
-        std::process::Command::new(program),
-        root,
-        program,
-        args,
-        seconds,
-        true,
-    )
-    .map_err(anyhow::Error::msg)
+    run_env(&[], root, program, args, seconds, true)
+}
+
+/// `run` with extra environment variables; `group` puts the child in its own killable session.
+pub(super) fn run_env(
+    envs: &[(&str, &str)],
+    root: &Path,
+    program: &str,
+    args: &[&str],
+    seconds: u64,
+    group: bool,
+) -> Result<String> {
+    let mut command = std::process::Command::new(program);
+    command.envs(envs.iter().copied());
+    crate::proc::wait_bounded(command, root, program, args, seconds, group)
+        .map_err(anyhow::Error::msg)
 }
 
 pub(super) fn path(path: &Path) -> Result<&str> {
@@ -206,9 +213,6 @@ fn activate_new(artifact: &Artifact, stage: &Path, destination: &Path) -> Result
 /// Stages are named `.stage-<pid>-…`; one whose process is gone was interrupted mid-install.
 /// The caller holds this tool's lock, so this process has no live stage here either.
 fn remove_interrupted_stages(parent: &Path) {
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
-    }
     const ESRCH: i32 = 3;
     for entry in fs::read_dir(parent).into_iter().flatten().flatten() {
         let name = entry.file_name();
@@ -221,9 +225,9 @@ fn remove_interrupted_stages(parent: &Path) {
         }) else {
             continue;
         };
-        // SAFETY: signal zero only checks whether the process exists.
+        // Signal zero only checks whether the process exists; EPERM means it does.
         let gone = pid == std::process::id() as i32
-            || (unsafe { kill(pid, 0) } != 0
+            || (!crate::proc::signal(pid, 0)
                 && std::io::Error::last_os_error().raw_os_error() == Some(ESRCH));
         if gone {
             let _ = fs::remove_dir_all(entry.path());

@@ -68,13 +68,10 @@ impl Shark {
                 if ended_edit && s.tab == Tab::Feature(Feature::Diff) {
                     s.focus_feature(Feature::Diff, FeatureFocus::Main, window, cx);
                 }
-                let editors: Vec<_> = s
-                    .file_tabs
-                    .iter()
-                    .filter(|t| t.editor.read(cx).path == path)
-                    .map(|t| t.editor.clone())
-                    .collect();
-                for editor in editors {
+                let editor = s
+                    .file_tab_ix(&path, cx)
+                    .map(|ix| s.file_tabs[ix].editor.clone());
+                if let Some(editor) = editor {
                     if std::fs::symlink_metadata(ws.dir().join(&path)).is_ok() {
                         editor.update(cx, |e, cx| e.discard(window, cx));
                     } else {

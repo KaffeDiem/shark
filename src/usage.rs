@@ -1,12 +1,10 @@
 //! Short-lived, prompt-free account queries. No chat state or snapshots go to disk.
 pub mod activity;
 
-use objc2_foundation::{
-    NSDate, NSDateFormatter, NSDateFormatterStyle, NSISO8601DateFormatOptions,
-    NSISO8601DateFormatter, NSString, NSTimeZone,
-};
+use objc2_foundation::{NSISO8601DateFormatOptions, NSISO8601DateFormatter, NSString};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
+use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::mpsc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -53,6 +51,15 @@ impl Allowance {
         let window = self.window.filter(|w| *w > 0.)?;
         Some(((self.resets_at? - now) / window * 100.).clamp(0., 100.))
     }
+}
+
+/// The provider's data dir: `$CLAUDE_CONFIG_DIR` or `$CODEX_HOME`, else `~/.claude` or `~/.codex`.
+pub(crate) fn config_dir(p: Provider) -> PathBuf {
+    let (var, dir) = match p {
+        Provider::Claude => ("CLAUDE_CONFIG_DIR", ".claude"),
+        Provider::Codex => ("CODEX_HOME", ".codex"),
+    };
+    (std::env::var_os(var).map(PathBuf::from)).unwrap_or_else(|| crate::state::home().join(dir))
 }
 
 pub fn now() -> f64 {
@@ -136,46 +143,6 @@ impl Snapshot {
                 self.status = Status::Failed(error);
             }
         }
-    }
-}
-
-pub fn local_time(seconds: f64) -> String {
-    let formatter = NSDateFormatter::new();
-    formatter.setDateStyle(NSDateFormatterStyle::MediumStyle);
-    formatter.setTimeStyle(NSDateFormatterStyle::ShortStyle);
-    formatter.setTimeZone(Some(&NSTimeZone::localTimeZone()));
-    formatter
-        .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(seconds))
-        .to_string()
-}
-
-/// Weekday and time, e.g. "Thu 11:00 PM", in the user's locale.
-pub fn short_time(seconds: f64) -> String {
-    let formatter = NSDateFormatter::new();
-    formatter.setLocalizedDateFormatFromTemplate(&NSString::from_str("EEEjmm"));
-    formatter.setTimeZone(Some(&NSTimeZone::localTimeZone()));
-    formatter
-        .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(seconds))
-        .to_string()
-}
-
-/// Time until a reset: "3d", "2h 14m", "5m".
-pub fn countdown(seconds: f64) -> String {
-    let m = (seconds.max(0.) / 60.).ceil() as u64;
-    match (m / 1440, m / 60 % 24, m % 60) {
-        (0, 0, m) => format!("{m}m"),
-        (0, h, m) => format!("{h}h {m}m"),
-        (d, _, _) => format!("{d}d"),
-    }
-}
-
-/// Token counts: "950", "412k", "38.2M".
-pub fn tokens(n: u64) -> String {
-    match n {
-        0..1_000 => n.to_string(),
-        1_000..999_500 => format!("{:.0}k", n as f64 / 1e3),
-        999_500..999_950_000 => format!("{:.1}M", n as f64 / 1e6),
-        _ => format!("{:.1}B", n as f64 / 1e9),
     }
 }
 
@@ -376,26 +343,88 @@ struct QueryChild(Child);
 impl Drop for QueryChild {
     fn drop(&mut self) {
         // Descendants can hold pipes open even after the CLI exits.
-        let _ = Command::new("/bin/kill")
-            .args(["-KILL", "--", &format!("-{}", self.0.id())])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        crate::proc::signal(-(self.0.id() as i32), crate::proc::SIGKILL);
         let _ = self.0.kill();
         let _ = self.0.wait();
     }
 }
 
 pub fn query(provider: Provider) -> Result<Vec<Allowance>, Failure> {
-    let (override_name, default) = match provider {
-        Provider::Claude => ("SHARK_CLAUDE", "claude"),
-        Provider::Codex => ("SHARK_CODEX", "codex"),
+    let bin = match provider {
+        Provider::Claude => crate::proc::claude_bin(),
+        Provider::Codex => crate::proc::codex_bin(),
     };
-    query_with(
-        provider,
-        Command::new(std::env::var_os(override_name).unwrap_or(default.into())),
-        Duration::from_secs(20),
-    )
+    query_with(provider, Command::new(bin), Duration::from_secs(20))
+}
+
+/// The provider's request/response protocol over its pipes; returns on the first verdict.
+fn exchange(
+    provider: Provider,
+    mut stdin: impl Write,
+    stdout: impl Read,
+) -> Result<Vec<Allowance>, Failure> {
+    let mut send = |v: Value| writeln!(stdin, "{v}").map_err(|_| Failure::Temporary);
+    match provider {
+        Provider::Claude => send(
+            json!({"type":"control_request","request_id":"usage","request":{"subtype":"get_usage","skip_behaviors":true}}),
+        )?,
+        Provider::Codex => send(
+            json!({"id":"init","method":"initialize","params":{"clientInfo":{"name":"shark_usage","version":env!("CARGO_PKG_VERSION")}}}),
+        )?,
+    }
+    let mut initialized = false;
+    let mut reader = BufReader::new(stdout);
+    loop {
+        // Bound individual protocol messages, including malformed CLI output.
+        let mut line = String::new();
+        let n = reader
+            .by_ref()
+            .take(1024 * 1024)
+            .read_line(&mut line)
+            .map_err(|_| Failure::Temporary)?;
+        if n == 0 {
+            return Err(Failure::Temporary);
+        }
+        if !line.ends_with('\n') {
+            return Err(Failure::Unsupported);
+        }
+        let Ok(v) = serde_json::from_str::<Value>(&line) else {
+            continue;
+        };
+        match provider {
+            Provider::Claude if v["type"] == "result" && v["is_error"] == true => {
+                return Err(failure(&message(&v)));
+            }
+            Provider::Claude
+                if v["type"] == "control_response" && v["response"]["request_id"] == "usage" =>
+            {
+                return if v["response"]["subtype"] == "success" {
+                    claude(&v["response"]["response"])
+                } else {
+                    Err(failure(&message(&v["response"])))
+                };
+            }
+            Provider::Codex if !initialized && v["id"] == "init" => {
+                if !v["error"].is_null() {
+                    return Err(failure(&message(&v["error"])));
+                }
+                if !v["result"].is_object() {
+                    return Err(Failure::Unsupported);
+                }
+                send(json!({"method":"initialized"}))?;
+                send(json!({"id":"usage","method":"account/rateLimits/read"}))?;
+                initialized = true;
+            }
+            Provider::Codex if initialized && v["id"] == "usage" => {
+                return if v["error"].is_null() {
+                    codex(&v["result"])
+                } else {
+                    Err(failure(&message(&v["error"])))
+                };
+            }
+            _ => {}
+        }
+    }
 }
 
 fn query_with(
@@ -439,7 +468,7 @@ fn query_with(
                 }
             })?,
     );
-    let mut stdin = child.0.stdin.take().ok_or(Failure::Temporary)?;
+    let stdin = child.0.stdin.take().ok_or(Failure::Temporary)?;
     let stdout = child.0.stdout.take().ok_or(Failure::Temporary)?;
     let stderr = child.0.stderr.take().ok_or(Failure::Temporary)?;
     let errors = std::thread::spawn(move || {
@@ -449,72 +478,7 @@ fn query_with(
     });
     let (tx, rx) = mpsc::channel();
     let reader = std::thread::spawn(move || {
-        let result = (|| {
-            let mut send = |v: Value| writeln!(stdin, "{v}").map_err(|_| Failure::Temporary);
-            match provider {
-                Provider::Claude => send(
-                    json!({"type":"control_request","request_id":"usage","request":{"subtype":"get_usage","skip_behaviors":true}}),
-                )?,
-                Provider::Codex => send(
-                    json!({"id":"init","method":"initialize","params":{"clientInfo":{"name":"shark_usage","version":env!("CARGO_PKG_VERSION")}}}),
-                )?,
-            }
-            let mut initialized = false;
-            let mut reader = BufReader::new(stdout);
-            loop {
-                // Bound individual protocol messages, including malformed CLI output.
-                let mut line = String::new();
-                let n = reader
-                    .by_ref()
-                    .take(1024 * 1024)
-                    .read_line(&mut line)
-                    .map_err(|_| Failure::Temporary)?;
-                if n == 0 {
-                    return Err(Failure::Temporary);
-                }
-                if !line.ends_with('\n') {
-                    return Err(Failure::Unsupported);
-                }
-                let Ok(v) = serde_json::from_str::<Value>(&line) else {
-                    continue;
-                };
-                match provider {
-                    Provider::Claude if v["type"] == "result" && v["is_error"] == true => {
-                        return Err(failure(&message(&v)));
-                    }
-                    Provider::Claude
-                        if v["type"] == "control_response"
-                            && v["response"]["request_id"] == "usage" =>
-                    {
-                        return if v["response"]["subtype"] == "success" {
-                            claude(&v["response"]["response"])
-                        } else {
-                            Err(failure(&message(&v["response"])))
-                        };
-                    }
-                    Provider::Codex if !initialized && v["id"] == "init" => {
-                        if !v["error"].is_null() {
-                            return Err(failure(&message(&v["error"])));
-                        }
-                        if !v["result"].is_object() {
-                            return Err(Failure::Unsupported);
-                        }
-                        send(json!({"method":"initialized"}))?;
-                        send(json!({"id":"usage","method":"account/rateLimits/read"}))?;
-                        initialized = true;
-                    }
-                    Provider::Codex if initialized && v["id"] == "usage" => {
-                        return if v["error"].is_null() {
-                            codex(&v["result"])
-                        } else {
-                            Err(failure(&message(&v["error"])))
-                        };
-                    }
-                    _ => {}
-                }
-            }
-        })();
-        let _ = tx.send(result);
+        let _ = tx.send(exchange(provider, stdin, stdout));
     });
     let received = rx.recv_timeout(timeout);
     let timed_out = matches!(received, Err(mpsc::RecvTimeoutError::Timeout));

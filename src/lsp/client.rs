@@ -1,6 +1,7 @@
 //! Ordered JSON-RPC over stdio. No pipe I/O or process waits run on the UI thread.
 use anyhow::{Context as _, Result, anyhow, bail};
 use lsp_server::{Message, Notification, ReqQueue, RequestId, Response};
+use super::document::Encoding;
 use lsp_types::{InitializeResult, PositionEncodingKind, ServerCapabilities};
 use serde_json::{Value, json};
 use std::{
@@ -75,21 +76,28 @@ impl Reply {
 
     pub fn reject(mut self, reason: impl Into<String>) {
         if let Some(id) = self.id.take() {
-            let _ = self.tx.send(CommandMessage::Reply(Response::new_err(
-                id,
-                lsp_server::ErrorCode::RequestFailed as i32,
-                reason.into(),
-            )));
+            let _ = self
+                .tx
+                .send(CommandMessage::Reply(failed(id, reason.into())));
         }
     }
+}
+
+/// A `RequestFailed` error response.
+fn failed(id: RequestId, message: String) -> Response {
+    Response::new_err(id, lsp_server::ErrorCode::RequestFailed as i32, message)
+}
+
+/// The `$/cancelRequest` notification for an outgoing request.
+fn cancel(id: RequestId) -> Message {
+    Notification::new("$/cancelRequest".into(), json!({"id":id})).into()
 }
 
 impl Drop for Reply {
     fn drop(&mut self) {
         if let Some(id) = self.id.take() {
-            let _ = self.tx.send(CommandMessage::Reply(Response::new_err(
+            let _ = self.tx.send(CommandMessage::Reply(failed(
                 id,
-                lsp_server::ErrorCode::RequestFailed as i32,
                 "The editor cannot handle this server request".into(),
             )));
         }
@@ -307,10 +315,9 @@ impl Client {
         self.0.capabilities.lock().unwrap().clone()
     }
 
-    pub fn encoding(&self) -> PositionEncodingKind {
-        self.capabilities()
-            .and_then(|c| c.position_encoding)
-            .unwrap_or(PositionEncodingKind::UTF16)
+    pub fn encoding(&self) -> Encoding {
+        (self.capabilities().and_then(|c| c.position_encoding))
+            .map_or(Encoding::Utf16, Encoding::from)
     }
 
     #[cfg(test)]
@@ -552,8 +559,7 @@ fn coordinate(
             Ok(CommandMessage::Cancel(token)) => {
                 if let Some((id, _)) = outgoing.remove(&token) {
                     queue.outgoing.complete(id.clone());
-                    let _ = writer
-                        .send(Notification::new("$/cancelRequest".into(), json!({"id":id})).into());
+                    let _ = writer.send(cancel(id));
                 }
             }
             Ok(CommandMessage::Inbound(Message::Response(response))) => {
@@ -592,28 +598,18 @@ fn coordinate(
                     }
                     "workspace/workspaceFolders" => reply.respond(json!([root])),
                     "window/workDoneProgress/create" => reply.respond(Value::Null),
-                    "workspace/applyEdit" => {
-                        let _ = events.try_send(Event::ApplyEdit {
-                            params: request.params,
-                            reply,
-                        });
-                    }
-                    "window/showDocument" => {
-                        let _ = events.try_send(Event::ShowDocument {
-                            params: request.params,
-                            reply,
-                        });
-                    }
-                    "client/registerCapability" => {
-                        let _ = events.try_send(Event::RegisterCapability {
-                            params: request.params,
-                            reply,
-                        });
-                    }
-                    "client/unregisterCapability" => {
-                        let _ = events.try_send(Event::UnregisterCapability {
-                            params: request.params,
-                            reply,
+                    method @ ("workspace/applyEdit"
+                    | "window/showDocument"
+                    | "client/registerCapability"
+                    | "client/unregisterCapability") => {
+                        let params = request.params;
+                        let _ = events.try_send(match method {
+                            "workspace/applyEdit" => Event::ApplyEdit { params, reply },
+                            "window/showDocument" => Event::ShowDocument { params, reply },
+                            "client/registerCapability" => {
+                                Event::RegisterCapability { params, reply }
+                            }
+                            _ => Event::UnregisterCapability { params, reply },
                         });
                     }
                     // Forwarded to the editor as notifications; the server gets a null reply ("dismissed").
@@ -676,8 +672,7 @@ fn coordinate(
                         .reply
                         .try_send(Err(anyhow!("Language server request timed out")));
                 }
-                let _ = writer
-                    .send(Notification::new("$/cancelRequest".into(), json!({"id":id})).into());
+                let _ = writer.send(cancel(id));
             }
         }
         let expired: Vec<_> = incoming
@@ -687,14 +682,7 @@ fn coordinate(
             .collect();
         for id in expired {
             incoming.remove(&id);
-            let _ = writer.send(
-                Response::new_err(
-                    id,
-                    lsp_server::ErrorCode::RequestFailed as i32,
-                    "Editor request timed out".into(),
-                )
-                .into(),
-            );
+            let _ = writer.send(failed(id, "Editor request timed out".into()).into());
         }
         if shutdown
             .as_ref()
@@ -724,13 +712,7 @@ fn coordinate(
         }
     }
     // Kill the dedicated process group: children may otherwise keep the pipes and threads alive.
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
-    }
-    // SAFETY: POSIX kill takes no pointers; the child was placed in its own process group above.
-    unsafe {
-        kill(-(child.id() as i32), 9);
-    }
+    crate::proc::signal(-(child.id() as i32), crate::proc::SIGKILL);
     let _ = child.kill();
     let _ = child.wait();
     if shutdown.is_none() && !terminated {

@@ -8,7 +8,7 @@ use gpui_kit::{
 
 use super::{
     Diff, DiffEvent, DiffLinePosition, DiffMode, DiffSide, DiffState, document::fixture,
-    state::DisplayRow,
+    rows::DisplayRow,
 };
 
 fn lines(word: &str, count: usize) -> String {
@@ -40,8 +40,8 @@ fn split_ratio_is_clamped_and_silent_when_set(cx: &mut TestAppContext) {
         assert!((state.split_ratio() - 0.6).abs() < 1e-4);
         state.drag_divider(px(400.), px(400.), cx);
         assert_eq!(state.split_ratio(), 0.8);
-        state.end_divider_drag(cx);
-        state.end_divider_drag(cx);
+        state.end_gesture(cx);
+        state.end_gesture(cx);
         // Without a drag, pointer moves leave the ratio alone.
         state.drag_divider(px(0.), px(400.), cx);
         assert_eq!(state.split_ratio(), 0.8);

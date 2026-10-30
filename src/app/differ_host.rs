@@ -134,12 +134,7 @@ impl Shark {
                 new_tab,
                 existing_only,
             } if self.active.as_ref() == Some(workspace) => {
-                if *existing_only
-                    && !self
-                        .file_tabs
-                        .iter()
-                        .any(|t| t.editor.read(cx).path == *path)
-                {
+                if *existing_only && self.file_tab_ix(path, cx).is_none() {
                     return notify_err(
                         window,
                         cx,
@@ -180,13 +175,7 @@ impl Shark {
                     return notify_err(window, cx, format!("{path} is not in the current diff"));
                 }
 
-                let conflict = |s: &Shark, cx: &App| {
-                    s.file_tabs.iter().any(|t| {
-                        let e = t.editor.read(cx);
-                        e.path == path && (e.dirty || e.saving)
-                    })
-                };
-                if conflict(self, cx) {
+                if self.editor_busy(&path, cx) {
                     return notify_err(
                         window,
                         cx,
@@ -197,10 +186,7 @@ impl Shark {
                     if s.active.as_ref() != Some(&workspace) {
                         return;
                     }
-                    if s.file_tabs.iter().any(|t| {
-                        let e = t.editor.read(cx);
-                        e.path == path && (e.dirty || e.saving)
-                    }) {
+                    if s.editor_busy(&path, cx) {
                         return notify_err(
                             w,
                             cx,

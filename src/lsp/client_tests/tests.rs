@@ -12,15 +12,11 @@ fn server_pid(log: &std::path::Path) -> i32 {
 
 /// Whether the process is gone, polling briefly in case the reaping is still in flight.
 fn reaped(pid: i32) -> bool {
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
-    }
     let deadline = Instant::now() + Duration::from_secs(2);
-    // SAFETY: signal zero checks the process's existence and does not send a signal.
-    while unsafe { kill(pid, 0) } == 0 && Instant::now() < deadline {
+    while crate::proc::signal(pid, 0) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
-    unsafe { kill(pid, 0) != 0 }
+    !crate::proc::signal(pid, 0)
 }
 
 struct Peer {
@@ -69,7 +65,7 @@ impl Drop for Peer {
 fn lifecycle_orders_unsaved_text_requests_configuration_and_diagnostics() {
     let peer = Peer::new();
     block_on(peer.client.initialize()).unwrap();
-    assert_eq!(peer.client.encoding(), PositionEncodingKind::UTF16);
+    assert_eq!(peer.client.encoding(), Encoding::Utf16);
     let initialize = peer.wait_for(|v| v["method"] == "initialize");
     // Pyrefly returns no outline unless the client advertises hierarchy support.
     assert_eq!(

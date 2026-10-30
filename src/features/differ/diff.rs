@@ -1,6 +1,5 @@
 //! The Diff tab and the file tree: loading, viewed marks, tree navigation.
 use super::*;
-use crate::diff_view::DiffHunkSeparator;
 use gpui_kit::component::Selectable as _;
 
 /// A changed file against the fingerprint stored when it was marked viewed.
@@ -15,17 +14,17 @@ pub(crate) enum Viewed {
 /// One parsed diff refresh, built off the main thread.
 pub(crate) struct DiffData {
     /// Fingerprint of the whole patch; equal means nothing to redo.
-    fp: u64,
+    pub(super) fp: u64,
     bases: HashMap<String, String>,
     /// Per repo, the commit the patch is against.
     revs: HashMap<String, String>,
     /// In tree order.
     pub(crate) files: Vec<DiffFile>,
-    fps: Vec<u64>,
+    pub(super) fps: Vec<u64>,
     /// git failed for some repo; the patch is then empty, which must not read as "no changes".
-    error: Option<String>,
+    pub(super) error: Option<String>,
     uncommitted: HashSet<String>,
-    hunks: HashMap<SharedString, Vec<review::Hunk>>,
+    pub(super) hunks: HashMap<SharedString, Vec<review::Hunk>>,
     media: Vec<media::MediaFile>,
     /// The file edited in place, and its bytes as on disk when the refresh read it (none:
     /// gone or unreadable).
@@ -74,7 +73,7 @@ impl DiffData {
                 let file = parse_chunk(chunk)?;
                 hunks.insert(file.path().clone(), review::parse_hunks(chunk));
                 media.extend(media::MediaFile::parse(file.path(), chunk, &ws_dir));
-                Some((file, review::chunk_fingerprint(chunk)))
+                Some((file, review_comment::chunk_fingerprint(chunk)))
             })
             .collect();
         // A local edit can undo a committed change back to the base, leaving no base patch.
@@ -95,7 +94,7 @@ impl DiffData {
                 .collect(),
             revs: (ws.repos.iter())
                 .map(|r| {
-                    let rev = review::compare_rev(&ws_dir.join(&r.name), &r.base, uncommitted_only);
+                    let rev = git::compare_rev(&ws_dir.join(&r.name), &r.base, uncommitted_only);
                     (r.name.clone(), rev)
                 })
                 .collect(),
@@ -154,39 +153,21 @@ impl Differ {
         if let Some((abs, bytes)) = data.edited.take() {
             self.edit_disk(&abs, bytes, cx);
         }
-        // The buffer stays intact when a PR is retargeted or its base ref moves.
-        if let (Some(ws), Some(e)) = (self.active_ws().cloned(), &mut self.editing) {
-            let error = if let Some(error) = &data.error {
-                Some(error.clone())
-            } else if data.fp != self.diff_fp {
-                let file = data
-                    .files
-                    .iter()
-                    .find(|f| *f.path() == e.path)
-                    .cloned()
-                    .or_else(|| {
-                        (e.dirty || e.saved).then(|| DiffFile::unchanged(e.path.clone(), ""))
-                    });
-                file.and_then(|f| e.rebase(&ws, &f).err())
-            } else {
-                None
-            };
-            if let Some(error) = error {
-                self.diff_error = Some(error);
-                cx.notify();
-                return;
-            }
+        if let Some(error) = self.reconcile_edit(&data) {
+            self.diff_error = Some(error);
+            cx.notify();
+            return;
         }
         let status_changed = !self.diff_loaded
             || data.bases != self.diff_bases
             || data.revs != self.diff_revs
             || data.error != self.diff_error
             || data.uncommitted != self.uncommitted;
-        self.diff_bases = data.bases;
-        self.diff_revs = data.revs;
+        self.diff_bases = std::mem::take(&mut data.bases);
+        self.diff_revs = std::mem::take(&mut data.revs);
         self.diff_loaded = true;
-        self.diff_error = data.error;
-        self.uncommitted = data.uncommitted;
+        self.diff_error = data.error.take();
+        self.uncommitted = std::mem::take(&mut data.uncommitted);
         // Turn ends and saves refresh often; an unchanged patch keeps scroll and expansion.
         if data.fp == self.diff_fp
             && !self.diff_files.is_empty()
@@ -201,43 +182,7 @@ impl Differ {
             }
             return;
         }
-        // The edited file left the diff (say `git checkout -- f`): clean, editing ends; unsaved
-        // edits keep it in the diff.
-        if let Some(e) = &self.editing
-            && !data.files.iter().any(|f| *f.path() == e.path)
-        {
-            // Saved back to the base by this edit: still editing.
-            match e.dirty || e.saved {
-                // git's last view of it, so `orig` stays git's and not the buffer.
-                // In tree order, so the same files stay in place.
-                true => {
-                    let paths: Vec<String> = (data.files.iter().map(|f| f.path().to_string()))
-                        .chain([e.path.to_string()])
-                        .collect();
-                    let order = files::tree_order(&paths);
-                    let at = order
-                        .iter()
-                        .position(|&i| i == paths.len() - 1)
-                        .unwrap_or(0);
-                    data.files.insert(at, e.orig.0.clone());
-                    data.hunks.insert(e.path.clone(), e.orig.1.clone());
-                    data.fps.insert(at, 0);
-                }
-                false => self.end_edit(cx),
-            }
-        }
-        // The file edited in place shows its buffer, saved or not; git's comes back after.
-        if let Some(e) = &mut self.editing
-            && let Some(f) = data.files.iter_mut().find(|f| *f.path() == e.path)
-        {
-            let hunks = data
-                .hunks
-                .insert(e.path.clone(), review::parse_hunks(&e.patch));
-            e.orig = (
-                std::mem::replace(f, e.file.clone()),
-                hunks.unwrap_or_default(),
-            );
-        }
+        self.splice_edit(&mut data, cx);
         // With the same files, only those that changed are replaced, so the others keep their
         // folds, annotations and selection and the view stays put.
         let in_place = !self.diff_files.is_empty()
@@ -245,9 +190,7 @@ impl Differ {
         let old_fps = std::mem::take(&mut self.diff_fps);
         self.review.hunks = data.hunks;
         self.set_media(data.media, cx);
-        if let Some(ws) = self.workspace_name().map(str::to_string) {
-            self.reanchor_comments(&ws);
-        }
+        self.reanchor_comments();
         let was_viewed = self.viewed_now.clone();
         // set_files scrolls back to the top; come back to the file the user was on.
         let kept = self
@@ -389,10 +332,15 @@ impl Differ {
         (self.diff_files[ix].path().to_lowercase()).contains(&self.tree_query)
     }
 
+    /// Every file of `files` is viewed.
+    fn dir_all_viewed(&self, files: &[usize]) -> bool {
+        files.iter().all(|&ix| self.viewed(ix) == Viewed::Yes)
+    }
+
     /// A folder's box: ticks every file inside, or unticks them all when all are viewed.
     pub(crate) fn toggle_viewed_dir(&mut self, dir: &str, cx: &mut Context<Self>) {
         let files = self.dir_files(dir);
-        let on = !files.iter().all(|&ix| self.viewed(ix) == Viewed::Yes);
+        let on = !self.dir_all_viewed(&files);
         self.set_viewed(&files, on, cx);
     }
 
@@ -558,18 +506,21 @@ impl Differ {
         self.tree_scroll
             .scroll_to_item(row, ScrollStrategy::Nearest);
         if let Some(ix) = r.file {
-            self.diff_file = ix;
-            {
-                let path = self.diff_files[ix].path().to_string();
-                self.review.at_file(&path);
-                // A line cursor left in the previous file would win over this one for `c`/`i`.
-                self.diff.update(cx, |d, cx| {
-                    d.set_selected_lines(None, cx);
-                    d.scroll_to_file(&path, cx)
-                });
-            }
+            self.goto_file(ix, cx);
         }
         cx.notify();
+    }
+
+    /// Makes file `ix` the one last moved to and scrolls the diff to it.
+    pub(crate) fn goto_file(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.diff_file = ix;
+        let path = self.diff_files[ix].path().to_string();
+        self.review.at_file(&path);
+        // A line cursor left in the previous file would win over the new one for `c`/`i`.
+        self.diff.update(cx, |d, cx| {
+            d.set_selected_lines(None, cx);
+            d.scroll_to_file(&path, cx)
+        });
     }
 
     pub(crate) fn set_dir_open(&mut self, open: Option<bool>, cx: &mut Context<Self>) {
@@ -676,7 +627,6 @@ impl Differ {
         let diff_with_annotations =
             self.with_comments(Diff::new(&self.diff).code_font(size, row), cx);
         let diff_with_annotations = (self.with_edit_parts(diff_with_annotations, cx))
-            .hunk_separator(DiffHunkSeparator::LineInfo)
             .flex_1()
             .min_h_0();
         let status = self.edit_status();
@@ -1234,8 +1184,7 @@ impl Differ {
     }
 
     fn dir_viewed_box(&self, ix: usize, dir: &str, cx: &mut Context<Self>) -> impl IntoElement {
-        let files = self.dir_files(dir);
-        let all = files.iter().all(|&f| self.viewed(f) == Viewed::Yes);
+        let all = self.dir_all_viewed(&self.dir_files(dir));
         let dir = dir.to_string();
         div()
             .id(("dir-viewed-box", ix))
@@ -1326,12 +1275,7 @@ impl Differ {
         }
         entries.push(Entry::Sep);
         if on_disk {
-            let a = abs.clone();
-            entries.push(menu::item(
-                IconName::FolderOpen,
-                "Reveal in Finder",
-                move |_, cx| cx.reveal_path(&a),
-            ));
+            entries.push(reveal_entry(&abs));
             for app in crate::apps::installed() {
                 if app.kind != crate::apps::Kind::Folder {
                     continue;
@@ -1351,19 +1295,19 @@ impl Differ {
                 entries.push(item.image(app.icon.clone()));
             }
         }
-        entries.extend([
-            menu::item(IconName::Copy, "Copy path", move |w, cx| {
-                copy(abs.display().to_string(), w, cx)
-            }),
-            // Relative to the repo, as its own tools and the agent's diffs name it.
-            menu::item(IconName::Copy, "Copy relative path", move |w, cx| {
+        entries.push(copy_path_entry(&abs));
+        // Relative to the repo, as its own tools and the agent's diffs name it.
+        entries.push(menu::item(
+            IconName::Copy,
+            "Copy relative path",
+            move |w, cx| {
                 copy(
                     p.split_once('/').map_or(&*p, |(_, rel)| rel).to_string(),
                     w,
                     cx,
                 )
-            }),
-        ]);
+            },
+        ));
         entries
     }
 
@@ -1373,8 +1317,7 @@ impl Differ {
             return vec![];
         };
         let abs = ws.dir().join(dir);
-        let files = self.dir_files(dir);
-        let all = files.iter().all(|&f| self.viewed(f) == Viewed::Yes);
+        let all = self.dir_all_viewed(&self.dir_files(dir));
         let d = dir.to_string();
         let mut entries = vec![
             menu::item(
@@ -1401,16 +1344,7 @@ impl Differ {
                 }),
             ));
         }
-        let a = abs.clone();
-        entries.extend([
-            Entry::Sep,
-            menu::item(IconName::FolderOpen, "Reveal in Finder", move |_, cx| {
-                cx.reveal_path(&a)
-            }),
-            menu::item(IconName::Copy, "Copy path", move |w, cx| {
-                copy(abs.display().to_string(), w, cx)
-            }),
-        ]);
+        entries.extend([Entry::Sep, reveal_entry(&abs), copy_path_entry(&abs)]);
         entries
     }
 
@@ -1443,7 +1377,7 @@ impl Differ {
             )
             .checked(self.show_tree),
         ];
-        if (self.ws_comments().iter()).any(|c| c.status == review::Status::Pending) {
+        if (self.ws_comments().iter()).any(|c| c.status == review_comment::Status::Pending) {
             entries.extend([
                 Entry::Sep,
                 menu::item(
@@ -1461,20 +1395,29 @@ impl Differ {
             return;
         }
         let n = self.diff_files.len() as isize;
-        self.diff_file = (self.diff_file as isize + delta).rem_euclid(n) as usize;
-        let path = self.diff_files[self.diff_file].path().to_string();
-        self.review.at_file(&path);
-        // A line cursor left in the previous file would win over the new one for `i`.
-        self.diff.update(cx, |d, cx| {
-            d.set_selected_lines(None, cx);
-            d.scroll_to_file(&path, cx)
-        });
+        self.goto_file((self.diff_file as isize + delta).rem_euclid(n) as usize, cx);
         if let Some(row) = self.follow_tree(self.diff_file) {
             self.tree_scroll
                 .scroll_to_item(row, ScrollStrategy::Nearest);
         }
         cx.notify();
     }
+}
+
+/// The "Reveal in Finder" menu entry of `abs`.
+fn reveal_entry(abs: &Path) -> Entry {
+    let abs = abs.to_path_buf();
+    menu::item(IconName::FolderOpen, "Reveal in Finder", move |_, cx| {
+        cx.reveal_path(&abs)
+    })
+}
+
+/// The "Copy path" menu entry of `abs`.
+fn copy_path_entry(abs: &Path) -> Entry {
+    let abs = abs.display().to_string();
+    menu::item(IconName::Copy, "Copy path", move |w, cx| {
+        copy(abs.clone(), w, cx)
+    })
 }
 
 /// The diff's mode for the persisted `unified` choice.

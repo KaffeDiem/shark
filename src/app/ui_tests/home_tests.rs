@@ -160,7 +160,7 @@ async fn chat_commands_leave_home(cx: &mut TestAppContext) {
         .iter()
         .position(|r| r.0 == "Start a new conversation")
         .unwrap();
-    on(cx, &|s, w, cx| (COMMANDS[row].4)(s, w, cx));
+    on(cx, &|s, w, cx| COMMANDS[row].run(s, w, cx));
     assert!(!shown(cx), "new conversation shows its chat");
     fs::remove_dir_all(&home).ok();
 }
@@ -312,5 +312,68 @@ async fn cancelled_open_still_sets_up_the_new_workspace(cx: &mut TestAppContext)
         assert_eq!(s.active.as_deref(), Some("one"));
         assert_eq!(s.home.prompt.read(cx).value().as_ref(), "build it");
     });
+    fs::remove_dir_all(&home).ok();
+}
+
+/// Palette rows with no handler of their own dispatch their action, as its key would.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn palette_rows_dispatch_their_actions(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (home, window, shark) = one_workspace(cx).await;
+    let press = press_in(window);
+    let pick = |cx: &mut TestAppContext, query: &str| {
+        press(cx, &["cmd-k"]);
+        cx.update_window(window, |_, w, cx| w.input(query, cx))
+            .unwrap();
+        press(cx, &["enter"]);
+    };
+    let chats = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.workspaces[0].chats.len());
+    let before = chats(cx);
+    pick(cx, "New chat");
+    assert_eq!(chats(cx), before + 1, "New chat");
+    cx.update(|cx| cx.write_to_clipboard(ClipboardItem::new_string(String::new())));
+    pick(cx, "Copy branch name");
+    let branch = cx.update(|cx| shark.read(cx).state.workspaces[0].branch.clone());
+    assert_eq!(
+        cx.update(|cx| cx.read_from_clipboard().and_then(|c| c.text())),
+        Some(branch),
+        "Copy branch name"
+    );
+    pick(cx, "Toggle Zen mode");
+    cx.update(|cx| assert!(shark.read(cx).zen_shown(), "Toggle Zen mode"));
+    fs::remove_dir_all(&home).ok();
+}
+
+/// j/k and gg/G stop at the first and last sidebar row.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn sidebar_vim_keys_clamp(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            vim: true,
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.state.workspaces = ["one", "two", "three"].map(fake).to_vec();
+        s.sidebar_focus.focus(w, cx);
+    });
+    let press = press_in(window);
+    let sel = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).sel);
+    press(cx, &["shift-g"]);
+    assert_eq!(sel(cx), SideRow::Ws(2));
+    press(cx, &["j"]);
+    assert_eq!(sel(cx), SideRow::Ws(2), "j stops at the last row");
+    press(cx, &["g", "g"]);
+    assert_eq!(sel(cx), SideRow::Ws(0));
+    press(cx, &["k"]);
+    assert_eq!(sel(cx), SideRow::Ws(0), "k stops at the first row");
+    press(cx, &["j", "j"]);
+    assert_eq!(sel(cx), SideRow::Ws(2));
     fs::remove_dir_all(&home).ok();
 }

@@ -1,5 +1,5 @@
 //! File-level Git status and discarding, independent of the UI and diff comparison base.
-use super::{git, run};
+use super::{git, git_bytes};
 use std::{
     collections::BTreeMap,
     fs,
@@ -9,9 +9,8 @@ use std::{
 /// Repo-relative paths, with whether each file is untracked. Renames are separate paths,
 /// like the diff, so discarding one row never changes a second file.
 pub fn uncommitted_files(wt: &Path) -> Result<BTreeMap<String, bool>, String> {
-    let out = run(
+    let out = git_bytes(
         wt,
-        "git",
         &[
             "--no-optional-locks",
             "status",
@@ -22,10 +21,7 @@ pub fn uncommitted_files(wt: &Path) -> Result<BTreeMap<String, bool>, String> {
             "--ignore-submodules=none",
         ],
     )?;
-    if !out.status.success() {
-        return Err(String::from_utf8_lossy(&out.stderr).trim().into());
-    }
-    let text = std::str::from_utf8(&out.stdout).map_err(|e| e.to_string())?;
+    let text = std::str::from_utf8(&out).map_err(|e| e.to_string())?;
     text.split('\0')
         .filter(|s| !s.is_empty())
         .map(|record| {
@@ -102,21 +98,7 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
         fs::create_dir_all(&root).unwrap();
         git(&root, &["init", "-q", "-b", "main"]).unwrap();
-        let commit = || {
-            git(
-                &root,
-                &[
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@t",
-                    "commit",
-                    "-qm",
-                    "files",
-                ],
-            )
-            .unwrap()
-        };
+        let commit = || crate::git::commit(&root, &["-qm", "files"]);
         for path in [
             "file.txt",
             "deleted.txt",

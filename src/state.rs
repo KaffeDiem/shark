@@ -1,3 +1,4 @@
+use crate::scripts::Phase;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
@@ -107,6 +108,26 @@ pub struct RepoSettings {
     pub archive: Vec<String>,
 }
 
+impl RepoSettings {
+    /// The scripts of `p`.
+    pub fn phase(&self, p: Phase) -> &Vec<String> {
+        match p {
+            Phase::Setup => &self.setup,
+            Phase::Run => &self.run,
+            Phase::Archive => &self.archive,
+        }
+    }
+
+    /// The scripts of `p`, to edit.
+    pub fn phase_mut(&mut self, p: Phase) -> &mut Vec<String> {
+        match p {
+            Phase::Setup => &mut self.setup,
+            Phase::Run => &mut self.run,
+            Phase::Archive => &mut self.archive,
+        }
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
 pub struct Section {
     pub name: String,
@@ -128,7 +149,7 @@ pub enum Mode {
     Dark,
 }
 
-/// Theme families by name (`settings::THEMES`); fonts `None` use the theme's.
+/// Theme families by name (`theme::THEMES`); fonts `None` use the theme's.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 #[serde(default)]
 pub struct Appearance {
@@ -202,6 +223,16 @@ pub enum TabId {
     Git,
     /// `repo/rel/path`, as in the diff.
     File(String),
+}
+
+/// What `Workspace::remove_chat` took out of the lists.
+pub struct RemovedChat {
+    pub meta: ChatMeta,
+    /// It was the only chat, so a fresh one took its place.
+    pub last: bool,
+    pub untouched: bool,
+    /// Closed chats pushed out by the cap.
+    pub evicted: Vec<ChatMeta>,
 }
 
 fn diff_closed_by_default() -> bool {
@@ -304,6 +335,13 @@ impl Workspace {
         workspaces_dir().join(&self.name)
     }
 
+    /// Its repos as (name, worktree path).
+    pub fn repo_paths(&self) -> Vec<(String, PathBuf)> {
+        (self.repos.iter())
+            .map(|r| (r.name.clone(), self.dir().join(&r.name)))
+            .collect()
+    }
+
     /// The branch `r`'s worktree is on: its own, or the workspace's.
     pub fn branch_of<'a>(&'a self, r: &'a WsRepo) -> &'a str {
         r.branch.as_deref().unwrap_or(&self.branch)
@@ -328,7 +366,11 @@ impl Workspace {
     /// chats follow the strip's order, so chat-only cycling matches it.
     pub fn normalize_tabs(&mut self) {
         let mut seen = HashSet::new();
-        let (chats, diff, git) = (&self.chats, !self.diff_closed, !self.git_closed);
+        let (diff, git) = (
+            crate::features::Feature::Diff.is_open(self),
+            crate::features::Feature::Git.is_open(self),
+        );
+        let chats = &self.chats;
         self.tab_order.retain(|t| {
             let live = match t {
                 TabId::Chat(id) => chats.iter().any(|c| &c.id == id),
@@ -353,6 +395,52 @@ impl Workspace {
         if let Some(ix) = active.and_then(|a| self.chats.iter().position(|c| c.id == a)) {
             self.active_chat = ix;
         }
+    }
+
+    /// Appends `meta` as the last chat tab; returns its index.
+    pub fn push_chat(&mut self, meta: ChatMeta) -> usize {
+        self.open_tab(TabId::Chat(meta.id.clone()));
+        self.chats.push(meta);
+        self.chats.len() - 1
+    }
+
+    /// Removes chat `id`; the last one gives way to `fresh` (renamed) in its tab slot. Unless
+    /// `untouched` says it's empty, it is kept in `closed`, the newest 20.
+    pub fn remove_chat(
+        &mut self,
+        id: &str,
+        fresh: ChatMeta,
+        untouched: impl FnOnce(&ChatMeta) -> bool,
+    ) -> Option<RemovedChat> {
+        let ix = self.chats.iter().position(|c| c.id == id)?;
+        let selected = self.chats[self.active_chat].id.clone();
+        let fresh_id = self.next_chat_id();
+        let meta = self.chats.remove(ix);
+        let last = self.chats.is_empty();
+        if last {
+            // The replacement takes the closed chat's slot.
+            self.replace_tab(&TabId::Chat(id.to_string()), TabId::Chat(fresh_id.clone()));
+            self.chats.push(ChatMeta {
+                id: fresh_id,
+                ..fresh
+            });
+        }
+        self.active_chat = (self.chats.iter().position(|c| c.id == selected))
+            .unwrap_or_else(|| ix.min(self.chats.len() - 1));
+        self.normalize_tabs();
+        let untouched = untouched(&meta);
+        if !untouched {
+            self.closed.push(meta.clone());
+        }
+        // ponytail: keeps the 20 newest closed chats; a closed-chats browser can lift this
+        let drop = self.closed.len().saturating_sub(20);
+        let evicted = self.closed.drain(..drop).collect();
+        Some(RemovedChat {
+            meta,
+            last,
+            untouched,
+            evicted,
+        })
     }
 
     /// Appends `tab`, moving it to the end when it is already listed.
@@ -409,7 +497,7 @@ impl Workspace {
                     let claude = c.session_id.is_some() && crate::codex::is_codex(Some(model));
                     c.model = Some(
                         if claude {
-                            crate::chat::MODELS[0]
+                            crate::models::MODELS[0]
                         } else {
                             model
                         }
@@ -539,7 +627,7 @@ impl State {
     /// The model and level a new chat in `ws` starts on: each from the first of its repos that
     /// sets it, else the last picked.
     pub fn defaults_for(&self, ws: &Workspace) -> (String, Option<String>) {
-        let valid = |m: &String| crate::chat::MODELS.contains(&m.as_str());
+        let valid = |m: &String| crate::models::MODELS.contains(&m.as_str());
         let mut settings = (ws.repos.iter()).filter_map(|r| self.repo_settings.get(&r.name));
         let model = settings.clone().find_map(|s| s.model.clone().filter(valid));
         let effort = settings.find_map(|s| s.effort.clone());
@@ -551,7 +639,7 @@ impl State {
 
     /// The model a new chat gets: the last one picked, else the first.
     pub fn new_model(&self) -> String {
-        let models = crate::chat::MODELS;
+        let models = crate::models::MODELS;
         let last = self.last_model.as_deref().filter(|m| models.contains(m));
         last.unwrap_or(models[0]).into()
     }
@@ -608,6 +696,30 @@ impl State {
                 };
                 move_item(&mut self.workspaces, f, t);
             }
+        }
+    }
+
+    /// Forgets workspace `name` everywhere the state lists it.
+    pub fn remove_workspace(&mut self, name: &str) {
+        self.workspaces.retain(|w| w.name != name);
+        self.reviewed.remove(name);
+        self.merge_order.remove(name);
+        for s in &mut self.sections {
+            s.workspaces.retain(|w| w != name);
+        }
+    }
+
+    /// Moves workspace `ws` into section `to`, or out of all sections for `None`.
+    pub fn move_to_section(&mut self, ws: &str, to: Option<usize>) {
+        let from = (self.sections.iter()).position(|s| s.workspaces.iter().any(|w| w == ws));
+        if from == to {
+            return;
+        }
+        for s in &mut self.sections {
+            s.workspaces.retain(|w| w != ws);
+        }
+        if let Some(s) = to.and_then(|i| self.sections.get_mut(i)) {
+            s.workspaces.push(ws.to_string());
         }
     }
 
@@ -1010,5 +1122,97 @@ mod tests {
             .filter(|n| !st.sections[0].workspaces.contains(n))
             .collect();
         assert_eq!(ungrouped, ["d", "b"]);
+    }
+
+    #[test]
+    fn remove_workspace_clears_every_list() {
+        let ws = |n: &str| Workspace {
+            name: n.into(),
+            ..Default::default()
+        };
+        let mut st = State {
+            workspaces: vec![ws("a"), ws("b")],
+            sections: vec![Section {
+                name: "S".into(),
+                icon: "folder".into(),
+                collapsed: false,
+                workspaces: vec!["a".into(), "b".into()],
+            }],
+            ..Default::default()
+        };
+        st.reviewed.insert("a".into(), vec!["f".into()]);
+        st.reviewed.insert("b".into(), vec![]);
+        st.merge_order.insert("a".into(), vec!["b".into()]);
+        st.remove_workspace("a");
+        assert_eq!(st.workspaces.len(), 1);
+        assert_eq!(st.sections[0].workspaces, ["b"]);
+        assert_eq!(st.reviewed.keys().collect::<Vec<_>>(), ["b"]);
+        assert!(st.merge_order.is_empty());
+    }
+
+    fn chat(id: &str) -> ChatMeta {
+        ChatMeta {
+            id: id.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn remove_last_chat_keeps_the_slot_with_a_fresh_one() {
+        let mut ws = Workspace {
+            name: "w".into(),
+            diff_closed: false,
+            ..Default::default()
+        };
+        ws.push_chat(chat("w"));
+        ws.open_tab(TabId::Diff);
+        let r = ws.remove_chat("w", chat(""), |_| false).unwrap();
+        assert!(r.last && !r.untouched && r.evicted.is_empty());
+        assert_eq!(ws.chats.len(), 1);
+        assert_eq!(ws.chats[0].id, "w~2");
+        assert_eq!(ws.tab_order, [TabId::Chat("w~2".into()), TabId::Diff]);
+        assert_eq!(ws.closed, [chat("w")]);
+        assert!(ws.remove_chat("gone", chat(""), |_| false).is_none());
+    }
+
+    #[test]
+    fn remove_chat_skips_untouched_and_caps_closed_at_twenty() {
+        let mut ws = Workspace {
+            chats: vec![chat("a"), chat("b")],
+            active_chat: 1,
+            closed: (0..20).map(|i| chat(&format!("old{i}"))).collect(),
+            ..Default::default()
+        };
+        let r = ws.remove_chat("a", chat(""), |_| false).unwrap();
+        assert!(!r.last);
+        assert_eq!(ws.chats[ws.active_chat].id, "b");
+        assert_eq!(ws.closed.len(), 20);
+        assert_eq!(ws.closed.last().unwrap().id, "a");
+        assert_eq!(r.evicted.iter().map(|c| &c.id[..]).collect::<Vec<_>>(), ["old0"]);
+        let r = ws.remove_chat("b", chat(""), |_| true).unwrap();
+        assert!(r.last && r.untouched);
+        assert_eq!(ws.closed.len(), 20);
+        assert_eq!(ws.closed.last().unwrap().id, "a");
+    }
+
+    #[test]
+    fn move_to_section_is_idempotent_and_ungroups() {
+        let section = |n: &str, ws: &[&str]| Section {
+            name: n.into(),
+            icon: "folder".into(),
+            collapsed: false,
+            workspaces: ws.iter().map(|w| w.to_string()).collect(),
+        };
+        let mut st = State {
+            sections: vec![section("A", &["x", "y"]), section("B", &[])],
+            ..Default::default()
+        };
+        st.move_to_section("x", Some(0));
+        assert_eq!(st.sections[0].workspaces, ["x", "y"]);
+        st.move_to_section("x", Some(1));
+        assert_eq!(st.sections[0].workspaces, ["y"]);
+        assert_eq!(st.sections[1].workspaces, ["x"]);
+        st.move_to_section("x", None);
+        assert!(st.sections[1].workspaces.is_empty());
     }
 }

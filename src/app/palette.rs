@@ -6,12 +6,11 @@ use crate::ui::app_icon;
 /// The cmd-k bar look: a bare 640px dialog near the top, on the menus' `popover` surface with
 /// their 4px inset, holding a borderless `Command`.
 pub(super) fn menu_dialog(d: Dialog, cx: &App) -> Dialog {
-    d.w(px(640.))
+    crate::ui::dialog(d)
+        .w(px(640.))
         .p(px(4.))
         .bg(cx.theme().popover)
-        .font_features(inter_features())
         .margin_top(px(96.))
-        .entrance(DialogEntrance::None)
         .close_button(false)
 }
 
@@ -83,756 +82,627 @@ pub(crate) fn open_grouped<T: 'static>(
 type Cmd = fn(&mut Shark, &mut Window, &mut Context<Shark>);
 
 /// A palette row: label, icon, the action whose shortcut it shows, extra search words, and
-/// what it does. The handler runs the row; the action is only read for its key binding.
+/// what it does. Without a handler the row dispatches its action, as the key would.
 pub(super) struct Row(
     pub &'static str,
     pub IconName,
     pub Option<&'static dyn Action>,
     pub &'static str,
-    pub Cmd,
+    pub Option<Cmd>,
 );
+
+impl Row {
+    /// A row with no handler of its own: it dispatches `action`.
+    const fn key(
+        label: &'static str,
+        icon: IconName,
+        action: &'static dyn Action,
+        words: &'static str,
+    ) -> Row {
+        Row(label, icon, Some(action), words, None)
+    }
+
+    /// Runs the row's handler, else dispatches its action.
+    pub(super) fn run(&self, s: &mut Shark, window: &mut Window, cx: &mut Context<Shark>) {
+        match (self.4, self.2) {
+            (Some(f), _) => f(s, window, cx),
+            (None, Some(a)) => window.dispatch_action(a.boxed_clone(), cx),
+            _ => {}
+        }
+    }
+}
 
 /// Grouped the way people reach for them; `GROUPS` names each group by its first row.
 pub(super) const COMMANDS: &[Row] = &[
-    Row(
+    Row::key(
         "New workspace…",
         IconName::Plus,
-        Some(&NewWorkspace),
+        &NewWorkspace,
         "create branch",
-        |s, w, cx| s.new_workspace(s.state.last_repos.clone(), None, w, cx),
     ),
-    Row(
+    Row::key(
         "Open workspace…",
         IconName::Search,
-        Some(&OpenWorkspacePicker),
+        &OpenWorkspacePicker,
         "switch recent repository",
-        |s, w, cx| s.open_workspace_picker(w, cx),
     ),
-    Row(
+    Row::key(
         "Open next workspace needing attention",
         IconName::CircleAlert,
-        Some(&NextAttention),
+        &NextAttention,
         "jump waiting",
-        |s, w, cx| s.next_attention(w, cx),
     ),
-    Row(
-        "Add repo…",
-        IconName::FolderPlus,
-        Some(&AddRepo),
-        "folder git",
-        |s, w, cx| s.add_repo(w, cx),
-    ),
-    Row(
+    Row::key("Add repo…", IconName::FolderPlus, &AddRepo, "folder git"),
+    Row::key(
         "Add repo to workspace…",
         IconName::FolderPlus,
-        Some(&AddRepoToWorkspace),
+        &AddRepoToWorkspace,
         "",
-        |s, w, cx| s.pick_repo_for_workspace(w, cx),
     ),
-    Row(
+    Row::key(
         "Run or stop run scripts",
         IconName::Play,
-        Some(&RunScripts),
+        &RunScripts,
         "dev server start scripts repo",
-        |s, w, cx| s.toggle_run(w, cx),
     ),
     Row(
         "Show script output",
         IconName::ScrollText,
         None,
         "log run setup archive scripts",
-        |s, w, cx| s.show_script_log(w, cx),
+        Some(|s, w, cx| s.show_script_log(w, cx)),
     ),
-    Row(
+    Row::key(
         "Archive workspace",
         IconName::Archive,
-        Some(&ArchiveWorkspace),
+        &ArchiveWorkspace,
         "remove close",
-        |s, w, cx| s.archive(false, w, cx),
     ),
-    Row(
+    Row::key(
         "Force archive workspace…",
         IconName::ArchiveX,
-        Some(&ForceArchiveWorkspace),
+        &ForceArchiveWorkspace,
         "discard changes delete",
-        |s, w, cx| s.archive(true, w, cx),
     ),
-    Row(
+    Row::key(
         "Reveal in Finder",
         IconName::FolderOpen,
-        Some(&RevealInFinder),
+        &RevealInFinder,
         "workspace folder",
-        |s, w, cx| s.with_target(w, cx, |ws, _, cx| cx.reveal_path(&ws.dir())),
     ),
-    Row(
-        "Copy workspace path",
-        IconName::Copy,
-        Some(&CopyPath),
-        "folder",
-        |s, w, cx| {
-            s.with_target(w, cx, |ws, w, cx| {
-                copy(ws.dir().display().to_string(), w, cx)
-            })
-        },
-    ),
-    Row(
-        "Copy branch name",
-        IconName::GitBranch,
-        Some(&CopyBranch),
-        "",
-        |s, w, cx| s.with_target(w, cx, |ws, w, cx| copy(ws.branch.clone(), w, cx)),
-    ),
-    Row(
-        "Show chat",
-        IconName::MessageSquare,
-        Some(&ShowChat),
-        "tab",
-        |s, w, cx| s.show(Tab::Chat, w, cx),
-    ),
-    Row(
-        "New chat",
-        IconName::Plus,
-        Some(&NewChat),
-        "tab",
-        |s, w, cx| s.new_chat(w, cx),
-    ),
-    Row(
-        "Close chat",
-        IconName::X,
-        Some(&CloseChat),
-        "tab",
-        |s, w, cx| s.close_chat(w, cx),
-    ),
+    Row::key("Copy workspace path", IconName::Copy, &CopyPath, "folder"),
+    Row::key("Copy branch name", IconName::GitBranch, &CopyBranch, ""),
+    Row::key("Show chat", IconName::MessageSquare, &ShowChat, "tab"),
+    Row::key("New chat", IconName::Plus, &NewChat, "tab"),
+    Row::key("Close chat", IconName::X, &CloseChat, "tab"),
     Row(
         "Reopen closed chat…",
         IconName::ArchiveRestore,
         Some(&ReopenChat),
         "restore tab",
-        |s, w, cx| s.pick_closed_chat(w, cx),
+        Some(|s, w, cx| s.pick_closed_chat(w, cx)),
     ),
-    Row(
-        "Next chat",
-        IconName::ChevronRight,
-        Some(&NextChat),
-        "tab",
-        |s, w, cx| s.cycle_chat(1, w, cx),
-    ),
-    Row(
-        "Previous chat",
-        IconName::ChevronLeft,
-        Some(&PrevChat),
-        "tab",
-        |s, w, cx| s.cycle_chat(-1, w, cx),
-    ),
-    Row(
-        "Close tab",
-        IconName::X,
-        Some(&CloseTab),
-        "chat diff file",
-        |s, w, cx| s.close_tab(w, cx),
-    ),
-    Row(
+    Row::key("Next chat", IconName::ChevronRight, &NextChat, "tab"),
+    Row::key("Previous chat", IconName::ChevronLeft, &PrevChat, "tab"),
+    Row::key("Close tab", IconName::X, &CloseTab, "chat diff file"),
+    Row::key(
         "Next tab",
         IconName::ChevronRight,
-        Some(&NextTab),
+        &NextTab,
         "chat diff file",
-        |s, w, cx| s.cycle_tab(1, w, cx),
     ),
-    Row(
+    Row::key(
         "Previous tab",
         IconName::ChevronLeft,
-        Some(&PrevTab),
+        &PrevTab,
         "chat diff file",
-        |s, w, cx| s.cycle_tab(-1, w, cx),
     ),
-    Row(
+    Row::key(
         "Ask a side question",
         IconName::MessageCircleQuestionMark,
-        Some(&OpenSide),
+        &OpenSide,
         "btw aside",
-        |s, w, cx| s.open_side(w, cx),
     ),
-    Row(
+    Row::key(
         "Change model…",
         IconName::Sparkles,
-        Some(&PickModel),
+        &PickModel,
         "opus sonnet haiku",
-        |s, w, cx| s.pick_model(w, cx),
     ),
-    Row(
+    Row::key(
         "Toggle fast mode",
         IconName::Zap,
-        Some(&ToggleFastMode),
+        &ToggleFastMode,
         "codex speed priority tier",
-        |s, w, cx| s.toggle_fast(w, cx),
     ),
-    Row(
+    Row::key(
         "Raise thinking level",
         IconName::ChevronUp,
-        Some(&RaiseEffort),
+        &RaiseEffort,
         "effort reasoning more",
-        |s, w, cx| s.step_effort(1, w, cx),
     ),
-    Row(
+    Row::key(
         "Lower thinking level",
         IconName::ChevronDown,
-        Some(&LowerEffort),
+        &LowerEffort,
         "effort reasoning less",
-        |s, w, cx| s.step_effort(-1, w, cx),
     ),
     Row(
         "Thinking: Low",
         IconName::Brain,
         None,
         "effort reasoning level low",
-        |s, w, cx| s.set_effort("low", w, cx),
+        Some(|s, w, cx| s.set_effort("low", w, cx)),
     ),
     Row(
         "Thinking: Medium",
         IconName::Brain,
         None,
         "effort reasoning level medium",
-        |s, w, cx| s.set_effort("medium", w, cx),
+        Some(|s, w, cx| s.set_effort("medium", w, cx)),
     ),
     Row(
         "Thinking: High",
         IconName::Brain,
         None,
         "effort reasoning level high",
-        |s, w, cx| s.set_effort("high", w, cx),
+        Some(|s, w, cx| s.set_effort("high", w, cx)),
     ),
     Row(
         "Thinking: Extra high",
         IconName::Brain,
         None,
         "effort reasoning level xhigh",
-        |s, w, cx| s.set_effort("xhigh", w, cx),
+        Some(|s, w, cx| s.set_effort("xhigh", w, cx)),
     ),
     Row(
         "Thinking: Max",
         IconName::Brain,
         None,
         "effort reasoning level max",
-        |s, w, cx| s.set_effort("max", w, cx),
+        Some(|s, w, cx| s.set_effort("max", w, cx)),
     ),
     Row(
         "Thinking: Ultra",
         IconName::Brain,
         None,
         "effort reasoning level ultra",
-        |s, w, cx| s.set_effort("ultra", w, cx),
+        Some(|s, w, cx| s.set_effort("ultra", w, cx)),
     ),
-    Row(
+    Row::key(
         "Interrupt agent",
         IconName::Square,
-        Some(&StopAgent),
+        &StopAgent,
         "stop cancel",
-        |s, _, cx| s.stop(cx),
     ),
     Row(
         "Start a new conversation",
         IconName::MessageSquarePlus,
         None,
         "forget session thread reset claude codex",
-        |s, w, cx| match s.active_chat().cloned() {
-            Some(chat) => {
+        Some(|s, w, cx| {
+            if let Some(chat) = s.chat_or_err(w, cx) {
                 if s.home_shown() {
                     s.show(Tab::Chat, w, cx);
                 }
                 chat.update(cx, |c, cx| c.new_conversation(cx))
             }
-            None => notify_err(w, cx, "Open a workspace first"),
-        },
+        }),
     ),
-    Row(
+    Row::key(
         "Manage queued messages",
         IconName::ListOrdered,
-        Some(&FocusQueue),
+        &FocusQueue,
         "queue",
-        |s, w, cx| s.focus_queue(w, cx),
     ),
-    Row(
+    Row::key(
         "Toggle plan mode",
         IconName::ClipboardList,
-        Some(&TogglePlanMode),
+        &TogglePlanMode,
         "",
-        |s, w, cx| s.with_plan(w, cx, |c, _, cx| c.set_plan_mode(!c.meta.plan, cx)),
     ),
-    Row(
+    Row::key(
         "Toggle plan pane",
         IconName::ClipboardList,
-        Some(&TogglePlan),
+        &TogglePlan,
         "pane",
-        |s, w, cx| s.with_plan(w, cx, |c, w, cx| c.toggle_plan(w, cx)),
     ),
     Row(
         "Copy plan",
         IconName::Copy,
         Some(&CopySelected),
         "clipboard",
-        |s, w, cx| s.with_plan(w, cx, |c, w, cx| c.plan.update(cx, |p, cx| p.copy(w, cx))),
+        Some(|s, w, cx| s.with_plan(w, cx, |c, w, cx| c.plan.update(cx, |p, cx| p.copy(w, cx)))),
     ),
     Row(
         "Copy selected message",
         IconName::Copy,
         Some(&CopySelected),
         "clipboard reply tool output",
-        |s, w, cx| s.with_plan(w, cx, |c, w, cx| c.copy_selected(w, cx)),
+        Some(|s, w, cx| s.with_plan(w, cx, |c, w, cx| c.copy_selected(w, cx))),
     ),
-    Row(
-        "Approve plan and build",
-        IconName::Hammer,
-        Some(&ApprovePlan),
-        "",
-        |s, w, cx| s.with_plan(w, cx, |c, w, cx| c.approve_plan(w, cx)),
-    ),
-    Row(
+    Row::key("Approve plan and build", IconName::Hammer, &ApprovePlan, ""),
+    Row::key(
         "Build plan in a new chat",
         IconName::Hammer,
-        Some(&BuildPlanInNewChat),
+        &BuildPlanInNewChat,
         "approve",
-        |s, w, cx| s.build_plan_in_new_chat(w, cx),
     ),
-    Row(
+    Row::key(
         "Open file…",
         IconName::FileSearch,
-        Some(&OpenAnyFile),
+        &OpenAnyFile,
         "find go to",
-        |s, w, cx| s.open_any_file(w, cx),
     ),
-    Row(
+    Row::key(
         "Show diff",
         IconName::FileDiff,
-        Some(&ShowDiff),
+        &ShowDiff,
         "changes review tab",
-        |s, w, cx| s.show(Tab::Feature(Feature::Diff), w, cx),
     ),
-    Row(
+    Row::key(
         "Show Git",
         IconName::GitPullRequest,
-        Some(&ShowGit),
+        &ShowGit,
         "pull request description comments review resolve tab",
-        |s, w, cx| s.show(Tab::Feature(Feature::Git), w, cx),
     ),
     Row(
         "Open file in editor",
         IconName::FilePen,
         Some(&OpenFile),
         "",
-        |s, w, cx| s.open_cursor_file(w, cx),
+        Some(|s, w, cx| s.open_cursor_file(w, cx)),
     ),
     Row(
         "Toggle file viewed",
         IconName::Eye,
         Some(&ToggleViewed),
         "mark unviewed",
-        |s, w, cx| s.toggle_cursor_viewed(w, cx),
+        Some(|s, w, cx| s.toggle_cursor_viewed(w, cx)),
     ),
     Row(
         "Comment on diff line",
         IconName::MessageSquarePlus,
         Some(&AddComment),
         "review",
-        |s, w, cx| s.with_differ(w, cx, Differ::comment_dialog),
+        Some(|s, w, cx| s.with_differ(w, cx, Differ::comment_dialog)),
     ),
     Row(
         "Send review…",
         IconName::Send,
         Some(&SendComments),
         "review diff comments agent",
-        |s, w, cx| {
+        Some(|s, w, cx| {
             s.show(Tab::Feature(Feature::Diff), w, cx);
             s.with_differ(w, cx, Differ::open_sheet)
-        },
+        }),
     ),
     Row(
         "Resolve addressed",
         IconName::Check,
         Some(&ResolveAddressed),
         "review comments threads",
-        |s, _, cx| s.differ.update(cx, |d, cx| d.resolve_addressed(cx)),
+        Some(|s, _, cx| s.differ.update(cx, |d, cx| d.resolve_addressed(cx))),
     ),
     Row(
         "Re-queue outdated",
         IconName::RotateCcw,
         Some(&RequeueOutdated),
         "review comments threads pending",
-        |s, _, cx| s.differ.update(cx, |d, cx| d.requeue_outdated(cx)),
+        Some(|s, _, cx| s.differ.update(cx, |d, cx| d.requeue_outdated(cx))),
     ),
     Row(
         "Save file",
         IconName::Save,
         Some(&SaveFile),
         "",
-        |s, w, cx| s.save(w, cx),
+        Some(|s, w, cx| s.save(w, cx)),
     ),
     Row(
         "Edit working copy",
         IconName::Pencil,
         Some(&EditWorkingCopy),
         "diff inline edit in place",
-        |s, w, cx| s.edit_working_copy(None, w, cx),
+        Some(|s, w, cx| s.edit_working_copy(None, w, cx)),
     ),
-    Row(
-        "Close file",
-        IconName::X,
-        Some(&CloseFile),
-        "editor",
-        |s, w, cx| s.close_file(w, cx),
-    ),
+    Row::key("Close file", IconName::X, &CloseFile, "editor"),
     Row(
         "Play or pause video",
         IconName::Play,
         Some(&PlayMedia),
         "media movie diff",
-        |s, w, cx| s.with_differ(w, cx, |d, w, cx| d.play_media(w, cx)),
+        Some(|s, w, cx| s.with_differ(w, cx, |d, w, cx| d.play_media(w, cx))),
     ),
-    Row(
+    Row::key(
         "Run next git step",
         IconName::GitPullRequestArrow,
-        Some(&GitNext),
+        &GitNext,
         "git commit push",
-        |s, w, cx| s.with_sync(w, cx, GitSync::primary),
     ),
-    Row(
+    Row::key(
         "Branch menu…",
         IconName::Layers,
-        Some(&BranchMenu),
+        &BranchMenu,
         "stack base parent copy",
-        |s, w, cx| s.open_branch_menu(w, cx),
     ),
-    Row(
-        "Git menu…",
-        IconName::GitBranch,
-        Some(&GitMenu),
-        "",
-        |s, w, cx| s.with_sync(w, cx, GitSync::open_menu),
-    ),
-    Row(
-        "Fetch now",
-        IconName::RefreshCw,
-        Some(&GitFetch),
-        "git sync",
-        |s, w, cx| s.with_sync(w, cx, GitSync::fetch_now),
-    ),
+    Row::key("Git menu…", IconName::GitBranch, &GitMenu, ""),
+    Row::key("Fetch now", IconName::RefreshCw, &GitFetch, "git sync"),
     Row(
         "Commit and push",
         IconName::GitCommitHorizontal,
         None,
         "git agent queue",
-        |s, w, cx| s.with_sync(w, cx, GitSync::commit_and_push),
+        Some(|s, w, cx| s.with_sync(w, cx, GitSync::commit_and_push)),
     ),
     Row(
         "Pull",
         IconName::ArrowDown,
         None,
         "git fast-forward",
-        |s, w, cx| {
+        Some(|s, w, cx| {
             s.with_sync(w, cx, |g, w, cx| {
                 g.run_kind(sync::Kind::Pull, "Pull", w, cx)
             })
-        },
+        }),
     ),
-    Row("Push", IconName::ArrowUp, None, "git", |s, w, cx| {
-        s.with_sync(w, cx, |g, w, cx| {
-            g.run_kind(sync::Kind::Push, "Push", w, cx)
-        })
-    }),
+    Row(
+        "Push",
+        IconName::ArrowUp,
+        None,
+        "git",
+        Some(|s, w, cx| {
+            s.with_sync(w, cx, |g, w, cx| {
+                g.run_kind(sync::Kind::Push, "Push", w, cx)
+            })
+        }),
+    ),
     Row(
         "Update from base",
         IconName::GitCompareArrows,
         None,
         "git rebase merge main agent",
-        |s, w, cx| s.with_sync(w, cx, GitSync::update_from_base),
+        Some(|s, w, cx| s.with_sync(w, cx, GitSync::update_from_base)),
     ),
     Row(
         "Change base…",
         IconName::Target,
         None,
         "git rebase retarget main target onto",
-        |s, w, cx| match s.target(w) {
-            Some(ws) => s.change_base(ws.name, w, cx),
-            None => notify_err(w, cx, "Open a workspace first"),
-        },
+        Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.change_base(ws.name, w, cx))),
     ),
     Row(
         "New workspace on top…",
         IconName::Layers,
         None,
         "stack stacked branch from child pr",
-        |s, w, cx| match s.target(w) {
-            Some(ws) => s.stack_from(ws.name, false, w, cx),
-            None => notify_err(w, cx, "Open a workspace first"),
-        },
+        Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.stack_from(ws.name, false, w, cx))),
     ),
     Row(
         "Insert workspace below…",
         IconName::ListPlus,
         None,
         "stack stacked between parent in-between pr",
-        |s, w, cx| match s.target(w) {
-            Some(ws) => s.stack_from(ws.name, true, w, cx),
-            None => notify_err(w, cx, "Open a workspace first"),
-        },
+        Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.stack_from(ws.name, true, w, cx))),
     ),
     Row(
         "Rebase onto parent",
         IconName::GitCompareArrows,
         None,
         "stack restack parent agent",
-        |s, w, cx| s.with_sync(w, cx, GitSync::restack_onto_parent),
+        Some(|s, w, cx| s.with_sync(w, cx, GitSync::restack_onto_parent)),
     ),
     Row(
         "Go to stack…",
         IconName::Layers,
         None,
         "stack parent child pr navigate",
-        |s, w, cx| match s.target(w) {
-            Some(ws) => s.go_to_stack(ws.name, w, cx),
-            None => notify_err(w, cx, "Open a workspace first"),
-        },
+        Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.go_to_stack(ws.name, w, cx))),
     ),
-    Row(
+    Row::key(
         "Create or update PRs",
         IconName::GitPullRequestCreate,
-        Some(&CreatePrs),
+        &CreatePrs,
         "pull request github linked",
-        |s, w, cx| s.create_prs(w, cx),
     ),
-    Row(
+    Row::key(
         "Create draft PRs",
         IconName::GitPullRequestDraft,
-        Some(&CreateDraftPrs),
+        &CreateDraftPrs,
         "pull request github",
-        |s, w, cx| s.create_draft_prs(w, cx),
     ),
     Row(
         "Merge PRs…",
         IconName::GitMerge,
         None,
         "pull request github",
-        |s, w, cx| {
+        Some(|s, w, cx| {
             s.with_sync(w, cx, |g, w, cx| {
                 g.run_kind(sync::Kind::Merge, "Merge PRs", w, cx)
             })
-        },
+        }),
     ),
-    Row(
+    Row::key(
         "Open pull requests",
         IconName::ExternalLink,
-        Some(&OpenPrs),
+        &OpenPrs,
         "pull request github",
-        |s, w, cx| s.with_sync(w, cx, GitSync::open_prs),
     ),
-    Row(
+    Row::key(
         "Move repo earlier in merge order…",
         IconName::ArrowUp,
-        Some(&MergeEarlier),
+        &MergeEarlier,
         "",
-        |s, w, cx| s.with_sync(w, cx, |g, w, cx| g.move_in_merge_order(true, w, cx)),
     ),
-    Row(
+    Row::key(
         "Move repo later in merge order…",
         IconName::ArrowDown,
-        Some(&MergeLater),
+        &MergeLater,
         "",
-        |s, w, cx| s.with_sync(w, cx, |g, w, cx| g.move_in_merge_order(false, w, cx)),
     ),
     Row(
         "Toggle remote branch deletion after merge",
         IconName::GitBranch,
         None,
         "setting",
-        |s, _, cx| s.set_delete_remote(!s.state.delete_remote_branches, cx),
+        Some(|s, _, cx| s.set_delete_remote(!s.state.delete_remote_branches, cx)),
     ),
-    Row(
-        "New section",
-        IconName::FolderPlus,
-        Some(&NewSection),
-        "group",
-        |s, w, cx| s.start_naming(None, None, w, cx),
-    ),
-    Row(
+    Row::key("New section", IconName::FolderPlus, &NewSection, "group"),
+    Row::key(
         "Move workspace to section…",
         IconName::FolderInput,
-        Some(&MoveToSection),
+        &MoveToSection,
         "group",
-        |s, w, cx| s.pick_section(w, cx),
     ),
-    Row(
-        "Rename section",
-        IconName::Pencil,
-        Some(&RenameSection),
-        "group",
-        |s, w, cx| s.with_section(w, cx, |s, i, w, cx| s.start_naming(Some(i), None, w, cx)),
-    ),
-    Row(
+    Row::key("Rename section", IconName::Pencil, &RenameSection, "group"),
+    Row::key(
         "Change section icon…",
         IconName::Shapes,
-        Some(&SectionIcon),
+        &SectionIcon,
         "group",
-        |s, w, cx| s.with_section(w, cx, Shark::pick_icon),
     ),
     Row(
         "Toggle section folded",
         IconName::ChevronsUpDown,
         None,
         "fold group",
-        |s, w, cx| s.with_section(w, cx, |s, i, _, cx| s.toggle_section(i, cx)),
+        Some(|s, w, cx| s.with_section(w, cx, |s, i, _, cx| s.toggle_section(i, cx))),
     ),
-    Row(
+    Row::key(
         "Delete section",
         IconName::Trash,
-        Some(&DeleteSection),
+        &DeleteSection,
         "group remove workspaces stay",
-        |s, w, cx| s.with_section(w, cx, Shark::delete_section),
     ),
     Row(
         "Go to Home",
         IconName::House,
         Some(&ToggleHome),
         "start overview dashboard",
-        |s, w, cx| s.enter_home(w, cx),
+        Some(|s, w, cx| s.enter_home(w, cx)),
     ),
     Row(
         "Hide Get started",
         IconName::CircleCheck,
         None,
         "checklist onboarding dismiss home",
-        |s, _, cx| s.dismiss_checklist(cx),
+        Some(|s, _, cx| s.dismiss_checklist(cx)),
     ),
-    Row(
+    Row::key(
         "Toggle sidebar",
         IconName::PanelLeft,
-        Some(&ToggleSidebar),
+        &ToggleSidebar,
         "rail",
-        |s, _, cx| s.toggle_sidebar(cx),
     ),
-    Row(
+    Row::key(
         "Toggle Zen mode",
         IconName::Fullscreen,
-        Some(&ToggleZen),
+        &ToggleZen,
         "focus deep work distraction free hide chat only",
-        |s, w, cx| s.toggle_zen(w, cx),
     ),
-    Row(
+    Row::key(
         "Show or hide diff files",
         IconName::ListTree,
-        Some(&ToggleFileTree),
+        &ToggleFileTree,
         "files tree differ",
-        |s, w, cx| s.toggle_tree(w, cx),
     ),
-    Row(
+    Row::key(
         "Editor text bigger",
         IconName::Plus,
-        Some(&EditorFontBigger),
+        &EditorFontBigger,
         "font size zoom in larger",
-        |s, w, cx| s.step_editor_font(1., w, cx),
     ),
-    Row(
+    Row::key(
         "Editor text smaller",
         IconName::Minus,
-        Some(&EditorFontSmaller),
+        &EditorFontSmaller,
         "font size zoom out",
-        |s, w, cx| s.step_editor_font(-1., w, cx),
     ),
-    Row(
+    Row::key(
         "Reset editor text size",
         IconName::RefreshCw,
-        Some(&EditorFontReset),
+        &EditorFontReset,
         "font size zoom default",
-        |s, w, cx| s.step_editor_font(0., w, cx),
     ),
-    Row(
+    Row::key(
         "Toggle Vim mode",
         IconName::Keyboard,
-        Some(&ToggleVim),
+        &ToggleVim,
         "keys modal",
-        |s, w, cx| s.toggle_vim(w, cx),
     ),
-    Row(
+    Row::key(
         "Settings",
         IconName::Settings,
-        Some(&OpenSettings),
+        &OpenSettings,
         "preferences theme font prompts",
-        |s, w, cx| crate::settings::open(&s.state, w, cx),
     ),
-    Row(
+    Row::key(
         "Show usage",
         IconName::ChartBar,
-        Some(&ShowUsage),
+        &ShowUsage,
         "account allowance limits claude codex",
-        |s, w, cx| s.show_usage(w, cx),
     ),
-    Row(
+    Row::key(
         "Format document",
         IconName::File,
-        Some(&FormatDocument),
+        &FormatDocument,
         "language format lsp",
-        |s, w, cx| s.language_action(super::intelligence::LanguageAction::Format, w, cx),
     ),
-    Row(
+    Row::key(
         "Rename symbol…",
         IconName::File,
-        Some(&RenameSymbol),
+        &RenameSymbol,
         "language refactor lsp",
-        |s, w, cx| s.rename_symbol(w, cx),
     ),
     Row(
         "Go to definition",
         IconName::ArrowRight,
         Some(&gpui_kit::base::input::GoToDefinition),
         "language declaration jump lsp",
-        |s, w, cx| s.go_to_definition(w, cx),
+        Some(|s, w, cx| s.go_to_definition(w, cx)),
     ),
-    Row(
+    Row::key(
         "Find references",
         IconName::Search,
-        Some(&FindReferences),
+        &FindReferences,
         "language usages lsp",
-        |s, w, cx| s.language_action(super::intelligence::LanguageAction::References, w, cx),
     ),
-    Row(
+    Row::key(
         "Go to symbol…",
         IconName::Search,
-        Some(&DocumentSymbols),
+        &DocumentSymbols,
         "language document symbols lsp",
-        |s, w, cx| s.symbol_menu(None, w, cx),
     ),
-    Row(
+    Row::key(
         "Show signature help",
         IconName::Info,
-        Some(&SignatureHelp),
+        &SignatureHelp,
         "language parameters lsp",
-        |s, w, cx| s.language_action(super::intelligence::LanguageAction::SignatureHelp, w, cx),
     ),
-    Row(
+    Row::key(
         "Go back",
         IconName::ArrowLeft,
-        Some(&NavigationBack),
+        &NavigationBack,
         "language navigation previous",
-        |s, w, cx| s.navigate_history(false, w, cx),
     ),
-    Row(
+    Row::key(
         "Go forward",
         IconName::ArrowRight,
-        Some(&NavigationForward),
+        &NavigationForward,
         "language navigation next",
-        |s, w, cx| s.navigate_history(true, w, cx),
     ),
     Row(
         "Restart language tools",
         IconName::RefreshCw,
         Some(&RestartLanguage),
         "language setup retry lsp",
-        |s, w, cx| s.choose_or_restart_language(w, cx),
+        Some(|s, w, cx| s.choose_or_restart_language(w, cx)),
     ),
     Row(
         "About Shark",
         IconName::Info,
         None,
         "version",
-        |_, w, cx| crate::settings::about(w, cx),
+        Some(|_, w, cx| crate::settings::about(w, cx)),
     ),
 ];
 
@@ -925,22 +795,8 @@ fn app_item(app: &'static OpenApp) -> CommandItem {
     let label: SharedString = format!("Open in {}", app.name).into();
     match app.icon.clone() {
         None => row_item(label, app_icon(app), None),
-        Some(icon) => CommandItem::new().label(label.clone()).child(move |_, _| {
-            h_flex()
-                .flex_1()
-                .gap_2()
-                .items_center()
-                .child(img(icon.clone()).size_4().flex_none())
-                .child(div().flex_1().min_w_0().truncate().child(label.clone()))
-        }),
+        Some(icon) => image_item(label, icon),
     }
-}
-
-/// A workspace's repos as (name, path).
-pub(super) fn repo_paths(ws: &Workspace) -> Vec<(String, PathBuf)> {
-    (ws.repos.iter())
-        .map(|r| (r.name.clone(), ws.dir().join(&r.name)))
-        .collect()
 }
 
 /// The palette and app switcher offer the same eligible apps.
@@ -948,7 +804,7 @@ pub(super) fn available_apps(target: Option<&Workspace>) -> Vec<&'static OpenApp
     let Some(ws) = target else { return vec![] };
     apps::installed()
         .iter()
-        .filter(|a| a.kind != Kind::Xcode || !a.targets(None, &repo_paths(ws)).is_empty())
+        .filter(|a| a.kind != Kind::Xcode || !a.targets(None, &ws.repo_paths()).is_empty())
         .collect()
 }
 
@@ -970,10 +826,9 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.target(window) else {
-            return notify_err(window, cx, "Open a workspace first");
-        };
-        self.open_in_workspace(app, &ws, window, cx);
+        self.with_target(window, cx, |s, ws, window, cx| {
+            s.open_in_workspace(app, &ws, window, cx)
+        });
     }
 
     pub(super) fn open_in_workspace(
@@ -985,7 +840,7 @@ impl Shark {
     ) {
         let targets = match app.kind {
             Kind::Terminal | Kind::Folder => vec![(String::new(), ws.dir())],
-            Kind::Git | Kind::Xcode => app.targets(None, &repo_paths(ws)),
+            Kind::Git | Kind::Xcode => app.targets(None, &ws.repo_paths()),
         };
         let (icon, ask, none) = match app.kind {
             Kind::Xcode => (
@@ -1065,7 +920,7 @@ impl Shark {
             0,
             // Rows count the shown commands, then the workspaces.
             move |s, row, window, cx| match rows.get(row) {
-                Some(&Pick::Cmd(ix)) => (COMMANDS[ix].4)(s, window, cx),
+                Some(&Pick::Cmd(ix)) => COMMANDS[ix].run(s, window, cx),
                 Some(&Pick::App(app)) => s.open_in(app, window, cx),
                 None => s.open_workspace(order[row - rows.len()], window, cx),
             },

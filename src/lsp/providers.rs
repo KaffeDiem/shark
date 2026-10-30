@@ -3,7 +3,7 @@ use super::{
     client::Client,
     document::{self, CompletionMeta, EditGuard, Encoding, Lines, Snapshot, Stop},
 };
-use anyhow::{Result, bail, ensure};
+use anyhow::{Result, ensure};
 use gpui_kit::base::input::{
     CodeActionProvider, CompletionProvider, DefinitionProvider, EditorState, HoverProvider, Rope,
     ShowDocumentHandler,
@@ -27,7 +27,7 @@ const EAGER_RESOLVE: usize = 16;
 
 pub enum ProviderEvent {
     /// Definitions to open; true (shift held) opens a new tab.
-    Navigate(Vec<LocationLink>, bool),
+    Navigate(Vec<LocationLink>, Encoding, bool),
     Apply {
         edit: WorkspaceEdit,
         snapshot: Snapshot,
@@ -73,19 +73,11 @@ impl Provider {
     }
 
     pub fn encoding(&self) -> Encoding {
-        self.client.encoding().into()
+        self.client.encoding()
     }
 
     async fn synchronized(&self, text: &str, executor: &BackgroundExecutor) -> Result<Snapshot> {
-        for _ in 0..100 {
-            let snapshot = self.snapshot.lock().unwrap().clone();
-            if snapshot.text.as_ref() == text {
-                return Ok(snapshot);
-            }
-            // A previous flush can land first; keep waiting for this request's exact text.
-            executor.timer(Duration::from_millis(10)).await;
-        }
-        bail!("document synchronization timed out")
+        document::synchronized(&self.snapshot, text, executor).await
     }
 
     fn current(&self, snapshot: &Snapshot) -> Result<()> {
@@ -113,10 +105,44 @@ impl Provider {
         )
     }
 
+    /// Syncs the document, then requests at `offset`; `finish` adds request-specific params. Returns
+    /// the text, its snapshot, the edit count at send time and the response, if still current.
+    async fn request_at(
+        &self,
+        method: &str,
+        text: Rope,
+        offset: usize,
+        executor: &BackgroundExecutor,
+        finish: impl FnOnce(&mut serde_json::Value) -> Result<()>,
+    ) -> Result<(String, Snapshot, u64, serde_json::Value)> {
+        let text = executor.spawn(async move { text.to_string() }).await;
+        let snapshot = self.synchronized(&text, executor).await?;
+        let edits = self.edits();
+        let mut params = self.params(&text, offset)?;
+        finish(&mut params)?;
+        let response = self.client.request(method, params).await?;
+        self.unchanged(&snapshot, edits)?;
+        Ok((text, snapshot, edits, response))
+    }
+
+    fn trigger_characters(&self) -> Vec<String> {
+        self.client
+            .capabilities()
+            .and_then(|c| c.completion_provider)
+            .and_then(|p| p.trigger_characters)
+            .unwrap_or_default()
+    }
+
+    /// Server coordinates to editor coordinates.
+    fn to_editor(&self, text: &str, range: Range) -> Result<Range> {
+        document::convert_range(text, range, self.encoding(), Encoding::Editor)
+    }
+
     /// The hook receives original server coordinates; the location-aware opener converts them.
     pub fn show_document_handler(&self) -> ShowDocumentHandler {
         let definitions = self.definitions.clone();
         let events = self.events.clone();
+        let encoding = self.encoding();
         Rc::new(move |params, window, _| {
             let cached = definitions.borrow();
             let links = if cached.iter().any(|l| {
@@ -134,7 +160,7 @@ impl Provider {
             };
             // cmd-click follows in the same tab; cmd-shift-click opens a new one.
             let new_tab = window.modifiers().shift;
-            let _ = events.try_send(ProviderEvent::Navigate(links, new_tab));
+            let _ = events.try_send(ProviderEvent::Navigate(links, encoding, new_tab));
             true
         })
     }
@@ -153,32 +179,27 @@ impl CompletionProvider for Provider {
         let text = text.clone();
         let executor = cx.background_executor().clone();
         cx.spawn(async move |_| {
-            let text = executor.spawn(async move { text.to_string() }).await;
-            let snapshot = this.synchronized(&text, &executor).await?;
-            let edits = this.edits();
-            if trigger.trigger_kind == CompletionTriggerKind::TRIGGER_CHARACTER {
-                let configured = this
-                    .client
-                    .capabilities()
-                    .and_then(|c| c.completion_provider)
-                    .and_then(|p| p.trigger_characters)
-                    .unwrap_or_default();
-                if !trigger
-                    .trigger_character
-                    .as_ref()
-                    .is_some_and(|c| configured.contains(c))
-                {
-                    trigger.trigger_kind = CompletionTriggerKind::INVOKED;
-                    trigger.trigger_character = None;
-                }
-            }
-            let mut params = this.params(&text, offset)?;
-            params["context"] = serde_json::to_value(trigger)?;
-            let response = this
-                .client
-                .request("textDocument/completion", params)
+            let (_, snapshot, edits, response) = this
+                .request_at(
+                    "textDocument/completion",
+                    text,
+                    offset,
+                    &executor,
+                    |params| {
+                        if trigger.trigger_kind == CompletionTriggerKind::TRIGGER_CHARACTER
+                            && !trigger
+                                .trigger_character
+                                .as_ref()
+                                .is_some_and(|c| this.trigger_characters().contains(c))
+                        {
+                            trigger.trigger_kind = CompletionTriggerKind::INVOKED;
+                            trigger.trigger_character = None;
+                        }
+                        params["context"] = serde_json::to_value(&trigger)?;
+                        Ok(())
+                    },
+                )
                 .await?;
-            this.unchanged(&snapshot, edits)?;
             if response.is_null() {
                 return Ok(CompletionResponse::Array(vec![]));
             }
@@ -256,12 +277,7 @@ impl CompletionProvider for Provider {
     }
 
     fn is_completion_trigger(&self, _: usize, new_text: &str, _: &mut App) -> bool {
-        let configured = self
-            .client
-            .capabilities()
-            .and_then(|c| c.completion_provider)
-            .and_then(|p| p.trigger_characters)
-            .unwrap_or_default();
+        let configured = self.trigger_characters();
         !new_text.is_empty()
             && (new_text.chars().all(|c| c.is_alphanumeric() || c == '_')
                 || configured.iter().any(|c| c == new_text))
@@ -280,21 +296,14 @@ impl HoverProvider for Provider {
         let text = text.clone();
         let executor = cx.background_executor().clone();
         cx.spawn(async move |_| {
-            let text = executor.spawn(async move { text.to_string() }).await;
-            let snapshot = this.synchronized(&text, &executor).await?;
-            let edits = this.edits();
-            let response = this
-                .client
-                .request("textDocument/hover", this.params(&text, offset)?)
+            let (text, _, _, response) = this
+                .request_at("textDocument/hover", text, offset, &executor, |_| Ok(()))
                 .await?;
-            this.unchanged(&snapshot, edits)?;
             let mut hover: Option<Hover> = serde_json::from_value(response)?;
             if let Some(hover) = hover.as_mut() {
                 hover.range = hover
                     .range
-                    .map(|range| {
-                        document::convert_range(&text, range, this.encoding(), Encoding::Editor)
-                    })
+                    .map(|range| this.to_editor(&text, range))
                     .transpose()?;
             }
             Ok(hover)
@@ -314,14 +323,11 @@ impl DefinitionProvider for Provider {
         let text = text.clone();
         let executor = cx.background_executor().clone();
         cx.spawn(async move |_| {
-            let text = executor.spawn(async move { text.to_string() }).await;
-            let snapshot = this.synchronized(&text, &executor).await?;
-            let edits = this.edits();
-            let response = this
-                .client
-                .request("textDocument/definition", this.params(&text, offset)?)
+            let (text, _, _, response) = this
+                .request_at("textDocument/definition", text, offset, &executor, |_| {
+                    Ok(())
+                })
                 .await?;
-            this.unchanged(&snapshot, edits)?;
             let response: Option<GotoDefinitionResponse> = serde_json::from_value(response)?;
             let links = match response {
                 None => vec![],
@@ -337,9 +343,7 @@ impl DefinitionProvider for Provider {
                 .map(|mut link| {
                     link.origin_selection_range = link
                         .origin_selection_range
-                        .map(|range| {
-                            document::convert_range(&text, range, this.encoding(), Encoding::Editor)
-                        })
+                        .map(|range| this.to_editor(&text, range))
                         .transpose()?;
                     Ok(link)
                 })
@@ -581,13 +585,7 @@ pub fn prepare_completion(
             )
         }
     };
-    let offsets = |range: Range| -> Result<(usize, usize)> {
-        let start = lines.offset(range.start, encoding)?;
-        let end = lines.offset(range.end, encoding)?;
-        ensure!(start <= end, "reversed edit range");
-        Ok((start, end))
-    };
-    let (primary_start, primary_end) = offsets(range)?;
+    let (primary_start, primary_end) = lines.span(range, encoding)?;
     let mut tabstops = vec![];
     if item.insert_text_format == Some(InsertTextFormat::SNIPPET) {
         let snippet = document::snippet(&text)?;
@@ -600,7 +598,7 @@ pub fn prepare_completion(
         .take()
         .unwrap_or_default()
         .into_iter()
-        .map(|e| Ok((offsets(e.range)?, e.new_text)))
+        .map(|e| Ok((lines.span(e.range, encoding)?, e.new_text)))
         .collect::<Result<Vec<_>>>()?;
     let shift: isize = edits
         .iter()

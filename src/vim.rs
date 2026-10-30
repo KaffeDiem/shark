@@ -125,6 +125,24 @@ impl Vim {
         &self.keys
     }
 
+    /// Normal mode with nothing pending: the next key starts a fresh command.
+    pub fn idle(&self) -> bool {
+        self.mode == Mode::Normal && self.keys.is_empty()
+    }
+
+    /// Insert mode, where keys type text.
+    pub fn typing(&self) -> bool {
+        self.mode == Mode::Insert
+    }
+
+    /// The mode pill: "NORMAL", or "NORMAL 2d" while keys are pending.
+    pub fn label(&self) -> String {
+        match self.pending() {
+            "" => self.status().to_string(),
+            p => format!("{} {p}", self.status()),
+        }
+    }
+
     fn visual(&self) -> bool {
         matches!(self.mode, Mode::Visual | Mode::VisualLine)
     }
@@ -304,10 +322,7 @@ impl Vim {
         if let Some(op) = self.op {
             self.reset();
             if ch == op && !gg {
-                let r0 = row(t, cur);
-                let r1 = (r0 + n - 1).min(nlines(t) - 1);
-                let target = lstart(t, r1);
-                return self.apply(op, t, cur, target, Kind::Linewise);
+                return self.linewise(op, t, cur, n);
             }
             if op == 'c'
                 && matches!(ch, 'w' | 'W')
@@ -394,38 +409,22 @@ impl Vim {
             'I' if simple => insert(self, first_nonblank(t, r)),
             'A' if simple => insert(self, e),
             'o' | 'O' if simple => {
-                let ind = indent(t, r);
-                let nl = eol(t);
                 self.mode = Mode::Insert;
-                if ch == 'o' {
-                    let c = e + nl.len() + ind.len();
-                    Out {
-                        edit: Some((e..e, format!("{nl}{ind}"))),
-                        ..Out::at(c)
-                    }
-                } else {
-                    let c = s + ind.len();
-                    Out {
-                        edit: Some((s..s, format!("{ind}{nl}"))),
-                        ..Out::at(c)
-                    }
-                }
+                open_line(t, r, ch == 'O')
             }
-            'x' | 'X' | 'D' | 'C' | 's' | 'S' if simple => {
+            'S' if simple => {
+                self.reset();
+                return self.linewise('c', t, cur, n);
+            }
+            'x' | 'X' | 'D' | 'C' | 's' if simple => {
                 let (op, m) = match ch {
                     'x' => ('d', 'l'),
                     'X' => ('d', 'h'),
                     'D' => ('d', '$'),
                     'C' => ('c', '$'),
-                    's' => ('c', 'l'),
-                    _ => ('c', 'c'),
+                    _ => ('c', 'l'),
                 };
-                if m == 'c' {
-                    let r1 = (r + n - 1).min(nlines(t) - 1);
-                    self.reset();
-                    return self.apply(op, t, cur, lstart(t, r1), Kind::Linewise);
-                }
-                if m == 'l' && e == s {
+                if m == 'l' && blank(t, r) {
                     if op == 'c' {
                         self.reset();
                         return insert(self, cur);
@@ -439,34 +438,7 @@ impl Vim {
             }
             'p' | 'P' if simple => paste(t, cur, n, ch == 'p', clip),
             'J' if simple => join(t, r, n.max(2)),
-            '~' if simple => {
-                let end = right_n(t, cur, n);
-                let s: String = t
-                    .slice(cur..end)
-                    .chars()
-                    .map(|c| {
-                        if c.is_lowercase() {
-                            c.to_uppercase().next().unwrap()
-                        } else {
-                            c.to_lowercase().next().unwrap()
-                        }
-                    })
-                    .collect();
-                if cur == end {
-                    Out::default()
-                } else {
-                    let last = s.chars().next_back().map_or(0, char::len_utf8);
-                    let c = if end >= e {
-                        cur + s.len() - last
-                    } else {
-                        cur + s.len()
-                    };
-                    Out {
-                        edit: Some((cur..end, s)),
-                        ..Out::at(c)
-                    }
-                }
-            }
+            '~' if simple => toggle_case(t, cur, n),
             'u' if simple => Out::cmd(Cmd::Undo),
             '/' => Out::cmd(Cmd::Search),
             'n' => Out::cmd(Cmd::SearchNext),
@@ -570,7 +542,7 @@ impl Vim {
             '^' => (first_nonblank(t, r), Exclusive),
             '$' => {
                 self.want = Some(usize::MAX);
-                let e = lend(t, (r + n - 1).min(last));
+                let e = lend(t, span_end(t, r, n));
                 self.want_at = Some(e);
                 return Some((e, if op { Eol } else { Inclusive }));
             }
@@ -592,6 +564,12 @@ impl Vim {
             self.want = None;
         }
         Some(res)
+    }
+
+    /// `op` over `n` whole lines from the cursor's: `dd`, `cc`, `yy`, `S`.
+    fn linewise(&mut self, op: char, t: &Rope, cur: usize, n: usize) -> Out {
+        let target = lstart(t, span_end(t, row(t, cur), n));
+        self.apply(op, t, cur, target, Kind::Linewise)
     }
 
     /// Apply operator `op` over cursor..target.
@@ -702,6 +680,62 @@ impl Vim {
     }
 }
 
+/// Last line of an `n`-line span starting at row `r`, clamped to the buffer.
+fn span_end(t: &Rope, r: usize, n: usize) -> usize {
+    (r + n - 1).min(nlines(t) - 1)
+}
+
+/// Byte length of `s`'s last char (0 when empty).
+fn last_len(s: &str) -> usize {
+    s.chars().next_back().map_or(0, char::len_utf8)
+}
+
+/// `o`/`O`: a new indented line below or above row `r`, caret at its indent.
+fn open_line(t: &Rope, r: usize, above: bool) -> Out {
+    let (s, e) = (lstart(t, r), lend(t, r));
+    let ind = indent(t, r);
+    let nl = eol(t);
+    if above {
+        Out {
+            edit: Some((s..s, format!("{ind}{nl}"))),
+            ..Out::at(s + ind.len())
+        }
+    } else {
+        Out {
+            edit: Some((e..e, format!("{nl}{ind}"))),
+            ..Out::at(e + nl.len() + ind.len())
+        }
+    }
+}
+
+/// `~`: flips the case of `n` chars from the cursor; the caret moves past them, but not off the line.
+fn toggle_case(t: &Rope, cur: usize, n: usize) -> Out {
+    let end = right_n(t, cur, n);
+    if cur == end {
+        return Out::default();
+    }
+    let s: String = t
+        .slice(cur..end)
+        .chars()
+        .map(|c| {
+            if c.is_lowercase() {
+                c.to_uppercase().next().unwrap()
+            } else {
+                c.to_lowercase().next().unwrap()
+            }
+        })
+        .collect();
+    let c = if end >= lend(t, row(t, cur)) {
+        cur + s.len() - last_len(&s)
+    } else {
+        cur + s.len()
+    };
+    Out {
+        edit: Some((cur..end, s)),
+        ..Out::at(c)
+    }
+}
+
 /// Where the caret goes after `>>`/`<<`: the first non-blank of the line holding `at`.
 pub fn first_nonblank_at(t: &Rope, at: usize) -> usize {
     first_nonblank(t, row(t, at))
@@ -769,14 +803,13 @@ fn paste(t: &Rope, cur: usize, n: usize, after: bool, clip: Option<&str>) -> Out
             ..Out::at(c + ind)
         };
     }
-    let at = if after && lend(t, r) > lstart(t, r) {
+    let at = if after && !blank(t, r) {
         next(t, cur)
     } else {
         cur
     };
     let text = clip.repeat(n);
-    let last = text.chars().next_back().map_or(0, char::len_utf8);
-    let c = at + text.len() - last;
+    let c = at + text.len() - last_len(&text);
     Out {
         edit: Some((at..at, text)),
         ..Out::at(c)
@@ -793,15 +826,14 @@ fn eol(t: &Rope) -> &'static str {
 }
 
 fn join(t: &Rope, r: usize, n: usize) -> Out {
-    let last = (r + n - 1).min(nlines(t) - 1);
+    let last = span_end(t, r, n);
     if last == r {
         return Out::default();
     }
     let start = lend(t, r);
     let mut text = String::new();
-    let mut prev_empty = lend(t, r) == lstart(t, r);
-    let ends_blank =
-        |rr: usize| lend(t, rr) > lstart(t, rr) && matches!(t.byte(lend(t, rr) - 1), b' ' | b'\t');
+    let mut prev_empty = blank(t, r);
+    let ends_blank = |rr: usize| !blank(t, rr) && matches!(t.byte(lend(t, rr) - 1), b' ' | b'\t');
     let mut trailing = ends_blank(r);
     let mut sep_at = 0;
     for rr in r + 1..=last {
@@ -827,7 +859,7 @@ fn join(t: &Rope, r: usize, n: usize) -> Out {
         c = if text.is_empty() {
             prev(t, start)
         } else {
-            c - text.chars().next_back().map_or(0, char::len_utf8)
+            c - last_len(&text)
         };
     }
     Out {
@@ -892,7 +924,11 @@ fn clamp(t: &Rope, off: usize) -> usize {
         off = lend(t, r);
     }
     let (s, e) = (lstart(t, r), lend(t, r));
-    if e == s { s } else { off.clamp(s, prev(t, e)) }
+    if blank(t, r) {
+        s
+    } else {
+        off.clamp(s, prev(t, e))
+    }
 }
 
 fn first_nonblank(t: &Rope, r: usize) -> usize {
@@ -1151,6 +1187,20 @@ mod tests {
 
     fn k(src: &str, keys: &str) -> String {
         run(src, keys).text
+    }
+
+    #[test]
+    fn idle_label_and_typing_follow_mode_and_pending_keys() {
+        let v = run("|abc", "").vim;
+        assert!(v.idle() && !v.typing());
+        assert_eq!(v.label(), "NORMAL");
+        let v = run("|abc", "2d").vim;
+        assert!(!v.idle() && !v.typing());
+        assert_eq!(v.label(), "NORMAL 2d");
+        let v = run("|abc", "i").vim;
+        assert!(!v.idle() && v.typing());
+        assert_eq!(v.label(), "INSERT");
+        assert!(run("|abc", "v").vim.visual() && !run("|abc", "v").vim.idle());
     }
 
     #[test]

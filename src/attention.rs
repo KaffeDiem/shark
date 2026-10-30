@@ -24,12 +24,19 @@ pub enum Attn {
     Needs(String),
 }
 
+/// One background check's result.
+struct Checked {
+    at: Instant,
+    needs: Option<String>,
+    repos: Vec<Repo>,
+}
+
 #[derive(Default)]
 pub struct Attention {
     unread: HashSet<String>,
     /// Background checks: when, the step label if it needs the user, and each repo's state
     /// (empty until the first check landed).
-    checked: HashMap<String, (Instant, Option<String>, Vec<Repo>)>,
+    checked: HashMap<String, Checked>,
     paused_until: Option<Instant>,
     /// The workspace whose last check failed: one that isn't on GitHub shouldn't pause the rest.
     failed: Option<String>,
@@ -42,8 +49,10 @@ pub struct Attention {
 impl Attention {
     #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn set_checked(&mut self, name: &str, repos: Vec<Repo>) {
+        let at = Instant::now();
+        let needs = None;
         self.checked
-            .insert(name.into(), (Instant::now(), None, repos));
+            .insert(name.into(), Checked { at, needs, repos });
     }
 
     pub fn new(cx: &mut Context<Shark>) -> Self {
@@ -71,10 +80,48 @@ impl Attention {
         names
             .iter()
             .filter(|n| Some(n.as_str()) != active)
-            .map(|n| (self.checked.get(n).map(|c| c.0), n))
+            .map(|n| (self.checked.get(n).map(|c| c.at), n))
             .filter(|(at, _)| at.is_none_or(|t| now.duration_since(t) >= BG_EVERY))
             .min_by_key(|(at, _)| *at)
             .map(|(_, n)| n.clone())
+    }
+
+    /// Stores a background check's outcome. Two different workspaces failing gh in a row pause gh;
+    /// a failure keeps the last label; the open workspace isn't stored (its GitSync polls).
+    fn record(
+        &mut self,
+        name: &str,
+        active: Option<&str>,
+        label: Result<Option<String>, String>,
+        repos: Vec<Repo>,
+        gh: bool,
+        now: Instant,
+    ) {
+        let needs = match label {
+            Ok(l) => {
+                self.failed = None;
+                l
+            }
+            Err(_) => {
+                if gh {
+                    if self.failed.as_deref().is_some_and(|f| f != name) {
+                        self.paused_until = Some(now + BG_BACKOFF);
+                    }
+                    self.failed = Some(name.to_string());
+                }
+                self.checked.get(name).and_then(|c| c.needs.clone())
+            }
+        };
+        if active != Some(name) {
+            self.checked.insert(
+                name.to_string(),
+                Checked {
+                    at: now,
+                    needs,
+                    repos,
+                },
+            );
+        }
     }
 }
 
@@ -93,7 +140,7 @@ fn poll(cx: &mut Context<Shark>) -> Task<()> {
                 let ws = (s.state.workspaces.iter())
                     .find(|w| w.name == name)
                     .cloned()?;
-                let last = (s.attn.checked.get(&name)).map(|c| c.2.clone());
+                let last = (s.attn.checked.get(&name)).map(|c| c.repos.clone());
                 // Backing off skips gh only: local git state keeps refreshing.
                 let gh = s.attn.paused_until.is_none_or(|t| now >= t);
                 Some((
@@ -114,25 +161,9 @@ fn poll(cx: &mut Context<Shark>) -> Task<()> {
                 .spawn(async move { sync::check_in_background(&ws, &last, gh, &reviewed) })
                 .await;
             let ok = this.update(cx, |s, cx| {
-                let now = Instant::now();
-                let needs = match label {
-                    Ok(l) => {
-                        s.attn.failed = None;
-                        l
-                    }
-                    Err(_) => {
-                        if gh {
-                            if s.attn.failed.as_ref().is_some_and(|f| *f != name) {
-                                s.attn.paused_until = Some(now + BG_BACKOFF);
-                            }
-                            s.attn.failed = Some(name.clone());
-                        }
-                        s.attn.checked.get(&name).and_then(|c| c.1.clone())
-                    }
-                };
-                if s.active.as_ref() != Some(&name) {
-                    s.attn.checked.insert(name, (now, needs, repos));
-                }
+                let active = s.active.clone();
+                s.attn
+                    .record(&name, active.as_deref(), label, repos, gh, Instant::now());
                 s.refresh_attention(cx);
             });
             if ok.is_err() {
@@ -163,19 +194,19 @@ impl Shark {
 
     fn needs_you(&self, name: &str, cx: &App) -> Option<String> {
         if self.asking_chat(name, cx) {
-            return Some(crate::agent::QUESTION.into());
+            return Some(crate::transcript::QUESTION.into());
         }
         if self.busy(name, cx) {
             return None;
         }
         match self.bg_checked(name) {
-            Some((_, needs, _)) => needs.clone(),
+            Some(c) => c.needs.clone(),
             None => self.syncs.get(name)?.read(cx).needs_you(),
         }
     }
 
     /// The background check's result, for a workspace other than the open one.
-    fn bg_checked(&self, name: &str) -> Option<&(Instant, Option<String>, Vec<Repo>)> {
+    fn bg_checked(&self, name: &str) -> Option<&Checked> {
         let open = self.active.as_deref() == Some(name);
         self.attn.checked.get(name).filter(|_| !open)
     }
@@ -184,7 +215,7 @@ impl Shark {
     /// source as `needs_you`. `None` until a probe or background check landed.
     pub(crate) fn overview_repos<'a>(&'a self, name: &str, cx: &'a App) -> Option<&'a [Repo]> {
         match self.bg_checked(name) {
-            Some((_, _, repos)) if !repos.is_empty() => Some(repos),
+            Some(c) if !c.repos.is_empty() => Some(&c.repos),
             _ => self.syncs.get(name)?.read(cx).repos(),
         }
     }
@@ -196,7 +227,7 @@ impl Shark {
             self.attn.unread.insert(name.to_string());
             // The agent may have pushed or opened a PR; check again on the next tick.
             if let Some(c) = self.attn.checked.get_mut(name) {
-                c.0 = Instant::now().checked_sub(BG_EVERY).unwrap_or(c.0);
+                c.at = Instant::now().checked_sub(BG_EVERY).unwrap_or(c.at);
             }
         }
         if !shown || !self.attn.window_active {
@@ -238,7 +269,7 @@ impl Shark {
 
     /// Opens the next workspace after the open one (in sidebar order) that needs you.
     pub(crate) fn next_attention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let order = self.sidebar_order();
+        let order = self.ws_order(true);
         let n = order.len();
         let from = self
             .active
@@ -312,7 +343,15 @@ fn notify(_: &str, _: &str) {}
 
 #[cfg(test)]
 mod tests {
-    use super::{Attention, BG_EVERY, Instant};
+    use super::{Attention, BG_BACKOFF, BG_EVERY, Checked, Instant};
+
+    fn checked(at: Instant) -> Checked {
+        Checked {
+            at,
+            needs: None,
+            repos: vec![],
+        }
+    }
 
     #[test]
     fn checks_are_staggered_and_skip_the_shown_one() {
@@ -320,16 +359,52 @@ mod tests {
         let now = Instant::now() + BG_EVERY * 2;
         let mut at = Attention::default();
         assert_eq!(at.due(&names, Some("a"), now).as_deref(), Some("b"));
-        at.checked.insert("b".into(), (now, None, vec![]));
+        at.checked.insert("b".into(), checked(now));
         assert_eq!(at.due(&names, Some("a"), now).as_deref(), Some("c"));
-        at.checked
-            .insert("c".into(), (now - BG_EVERY, None, vec![]));
+        at.checked.insert("c".into(), checked(now - BG_EVERY));
         assert_eq!(
             at.due(&names, Some("a"), now).as_deref(),
             Some("c"),
             "old enough"
         );
-        at.checked.insert("c".into(), (now, None, vec![]));
+        at.checked.insert("c".into(), checked(now));
         assert_eq!(at.due(&names, Some("a"), now), None, "all fresh");
+    }
+
+    #[test]
+    fn two_workspaces_failing_in_a_row_pause_gh() {
+        let (mut at, now) = (Attention::default(), Instant::now());
+        let fail = || Err("no gh".to_string());
+        at.record("a", None, fail(), vec![], true, now);
+        at.record("a", None, fail(), vec![], true, now);
+        assert_eq!(at.paused_until, None, "the same workspace twice");
+        at.record("b", None, fail(), vec![], true, now);
+        assert_eq!(at.paused_until, Some(now + BG_BACKOFF));
+        let mut at = Attention::default();
+        at.record("a", None, fail(), vec![], false, now);
+        at.record("b", None, fail(), vec![], false, now);
+        assert_eq!(at.paused_until, None, "gh wasn't asked");
+    }
+
+    #[test]
+    fn success_stores_the_label_and_clears_the_failure() {
+        let (mut at, now) = (Attention::default(), Instant::now());
+        at.record("a", None, Err("x".into()), vec![], true, now);
+        at.record("a", None, Ok(Some("Merge".into())), vec![], true, now);
+        assert_eq!(at.failed, None);
+        assert_eq!(at.checked["a"].needs.as_deref(), Some("Merge"));
+        at.record("b", None, Err("x".into()), vec![], true, now);
+        assert_eq!(at.paused_until, None, "success reset the streak");
+        at.record("a", None, Err("x".into()), vec![], true, now);
+        assert_eq!(
+            at.checked["a"].needs.as_deref(),
+            Some("Merge"),
+            "failure keeps it"
+        );
+        at.record("open", Some("open"), Ok(None), vec![], true, now);
+        assert!(
+            !at.checked.contains_key("open"),
+            "the open one isn't stored"
+        );
     }
 }

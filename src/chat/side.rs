@@ -1,5 +1,22 @@
 //! The side-question card: a forked, tool-less claude answers above the composer.
 use super::*;
+use gpui_kit::component::Theme;
+
+/// The card above the composer that holds a side question or the agent's questions; its border
+/// shows the focus.
+pub(super) fn aside_card(theme: &Theme, focused: bool) -> Div {
+    v_flex()
+        .w_full()
+        .max_w(px(712.))
+        .mx_auto()
+        .mb_2()
+        .p_3()
+        .gap_2()
+        .rounded(theme.radius_lg)
+        .border_1()
+        .border_color(if focused { theme.primary } else { theme.border })
+        .bg(theme.muted)
+}
 
 /// A side question and its answer, in a card above the composer. Neither the question nor the
 /// answer reaches the chat or its transcript.
@@ -92,7 +109,7 @@ impl Chat {
             Ok((mut a, rx)) => match a.send(&question) {
                 Ok(()) => {
                     side.agent = Some(a);
-                    side._reader = Some(Self::read_events(rx, Self::apply_side, cx));
+                    side._reader = Some(read_events(rx, Self::apply_side, cx));
                 }
                 Err(e) => (side.done, side.error) = (true, Some(format!("send failed: {e}"))),
             },
@@ -122,9 +139,8 @@ impl Chat {
                 side.answer.update(cx, |m, cx| m.push_str(&d, cx));
             }
             Ev::Text(full) => {
+                side.answer.update(cx, |m, cx| m.set_text(&full, cx));
                 side.text = full;
-                let t = side.text.clone();
-                side.answer.update(cx, |m, cx| m.set_text(&t, cx));
             }
             Ev::Result { is_error, text, .. } => {
                 side.done = true;
@@ -151,8 +167,7 @@ impl Chat {
         if let Some(side) = &self.side
             && !side.text.is_empty()
         {
-            cx.write_to_clipboard(ClipboardItem::new_string(side.text.clone()));
-            window.push_notification("Copied the answer", cx);
+            crate::ui::copy_with(side.text.clone(), "Copied the answer", window, cx);
         }
     }
 
@@ -269,17 +284,7 @@ impl Chat {
                 .into_any_element(),
         };
         Some(
-            v_flex()
-                .w_full()
-                .max_w(px(712.))
-                .mx_auto()
-                .mb_2()
-                .p_3()
-                .gap_2()
-                .rounded(theme.radius_lg)
-                .border_1()
-                .border_color(if focused { theme.primary } else { theme.border })
-                .bg(theme.muted)
+            aside_card(theme, focused)
                 .child(header)
                 .child(body)
                 .into_any_element(),

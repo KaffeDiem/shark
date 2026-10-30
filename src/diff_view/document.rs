@@ -2,7 +2,6 @@ use std::{ops::Range, sync::Arc};
 
 use gpui_kit::SharedString;
 
-use super::conflict::DiffConflict;
 use smallvec::{SmallVec, smallvec};
 use unicode_segmentation::UnicodeSegmentation as _;
 
@@ -110,6 +109,10 @@ impl DiffLineRange {
     }
     pub(crate) fn end_position(&self) -> DiffLinePosition {
         DiffLinePosition::new(self.path.clone(), self.end_side, self.end)
+    }
+    /// `start` and `end` as `(min, max)`, for a range on one side.
+    pub(crate) fn ordered(&self) -> (usize, usize) {
+        (self.start.min(self.end), self.start.max(self.end))
     }
     /// Whether the range covers lines on one side only.
     pub(crate) fn is_single_side(&self) -> bool {
@@ -252,13 +255,26 @@ impl LinePair {
     }
 }
 
+/// The end of the run starting at `start` that satisfies `pred`, stopping at `limit`.
+pub(crate) fn run_end(start: usize, limit: usize, pred: impl Fn(usize) -> bool) -> usize {
+    (start..limit).find(|&ix| !pred(ix)).unwrap_or(limit)
+}
+
+/// The lines of a run of changed pairs in patch order: every original, then every modified.
+pub(crate) fn split_run(run: &[LinePair]) -> impl Iterator<Item = (Option<usize>, Option<usize>)> {
+    let originals = run.iter().filter_map(|pair| pair.original);
+    let modifieds = run.iter().filter_map(|pair| pair.modified);
+    originals
+        .map(|line| (Some(line), None))
+        .chain(modifieds.map(|line| (None, Some(line))))
+}
+
 /// One `@@` hunk: its pairs and the source lines it supplies on each side.
 #[derive(Clone, Debug)]
 pub(crate) struct Hunk {
     pairs: Range<usize>,
     original: Range<usize>,
     modified: Range<usize>,
-    label: SharedString,
     /// The one-based original lines the header declares.
     original_lines: Range<usize>,
 }
@@ -268,14 +284,12 @@ impl Hunk {
         pairs: Range<usize>,
         original: Range<usize>,
         modified: Range<usize>,
-        label: SharedString,
         original_lines: Range<usize>,
     ) -> Self {
         Self {
             pairs,
             original,
             modified,
-            label,
             original_lines,
         }
     }
@@ -293,10 +307,6 @@ impl Hunk {
             DiffSide::Original => self.original.clone(),
             DiffSide::Modified => self.modified.clone(),
         }
-    }
-    /// The `@@` header line.
-    pub(crate) fn label(&self) -> &SharedString {
-        &self.label
     }
 }
 
@@ -340,8 +350,6 @@ pub enum DiffFileStatus {
     Copied,
     /// A whole file shown for reference, from [`DiffFile::unchanged`].
     Unchanged,
-    /// A working file with conflict markers, from [`DiffFile::parse_conflicts`].
-    Conflicted,
 }
 
 /// One line of the patch body in patch order: an unchanged line on both
@@ -377,7 +385,6 @@ struct DocumentInner {
     /// The patch body in order; each side's lines map back into it.
     patch_lines: Vec<PatchLine>,
     patch_ixs: [Vec<usize>; 2],
-    conflicts: Vec<DiffConflict>,
 }
 
 /// One changed file parsed from a unified or Git diff.
@@ -387,7 +394,6 @@ struct DocumentInner {
 #[derive(Clone)]
 pub struct DiffFile {
     inner: Arc<DocumentInner>,
-    language: Option<SharedString>,
 }
 
 impl DiffFile {
@@ -411,8 +417,7 @@ impl DiffFile {
     ) -> Self {
         let (mut additions, mut deletions) = (0, 0);
         for pair in &pairs {
-            // Conflict lines are unresolved alternatives, not additions.
-            if pair.changed && status != DiffFileStatus::Conflicted {
+            if pair.changed {
                 additions += usize::from(pair.modified.is_some());
                 deletions += usize::from(pair.original.is_some());
             }
@@ -448,27 +453,33 @@ impl DiffFile {
                 line_number_digits: widest.max(1).ilog10() as usize + 1,
                 patch_lines,
                 patch_ixs,
-                conflicts: Vec::new(),
             }),
-            language: None,
         }
     }
 
-    /// Overrides the syntax language detected from the path, using a
-    /// highlighter language name such as `rust` or `javascript`.
-    pub fn with_language(mut self, language: impl Into<SharedString>) -> Self {
-        self.language = Some(language.into());
-        self
+    /// A file shown in full, for reference, without changes. It appears as a
+    /// single column in every display mode.
+    pub fn unchanged(path: impl Into<SharedString>, text: &str) -> Self {
+        let path = path.into();
+        let ranges = line_ranges(text);
+        let pairs = (0..ranges.len())
+            .map(|ix| LinePair::new(None, Some(ix), false))
+            .collect();
+        let lines = ranges
+            .into_iter()
+            .enumerate()
+            .map(|(ix, range)| (ix + 1, range));
+        DiffFile::new(
+            DiffFileStatus::Unchanged,
+            FileSide::new(Some(path.clone()), String::new(), []),
+            FileSide::new(Some(path), text.to_owned(), lines),
+            pairs,
+            Vec::new(),
+            Vec::new(),
+            false,
+        )
     }
-    /// The syntax language: the override, or the one detected from the path.
-    pub fn language(&self) -> SharedString {
-        self.language
-            .clone()
-            .unwrap_or_else(|| super::presentation::detected_language(self.path()))
-    }
-    pub(crate) fn language_override(&self) -> Option<&SharedString> {
-        self.language.as_ref()
-    }
+
     /// How the file changed.
     pub fn status(&self) -> DiffFileStatus {
         self.inner.status
@@ -511,25 +522,11 @@ impl DiffFile {
             || self.inner.binary
             || self.original_path().is_none()
             || self.modified_path().is_none()
-            || self.status() == DiffFileStatus::Conflicted
     }
 
     /// Whether the file has one column in every display mode.
     pub(crate) fn is_single_column(&self) -> bool {
-        matches!(
-            self.status(),
-            DiffFileStatus::Unchanged | DiffFileStatus::Conflicted
-        )
-    }
-    /// Merge conflicts in working-file order; slice indices identify resolutions.
-    pub fn conflicts(&self) -> &[DiffConflict] {
-        &self.inner.conflicts
-    }
-    pub(crate) fn with_conflicts(mut self, conflicts: Vec<DiffConflict>) -> Self {
-        Arc::get_mut(&mut self.inner)
-            .expect("a newly built file is not shared")
-            .conflicts = conflicts;
-        self
+        self.status() == DiffFileStatus::Unchanged
     }
 
     pub(crate) fn lines_count(&self, side: DiffSide) -> usize {
@@ -552,6 +549,15 @@ impl DiffFile {
     /// The one-based line number of the line at `index` on `side`.
     pub(crate) fn line_number(&self, side: DiffSide, index: usize) -> usize {
         self.lines(side)[index].line_number
+    }
+    /// The position of the line at `ix` on `side`.
+    pub(crate) fn position(&self, side: DiffSide, ix: usize) -> DiffLinePosition {
+        DiffLinePosition::new(self.path().clone(), side, self.line_number(side, ix))
+    }
+    /// The line ending of the line at `ix` on `side`; empty for an unterminated last line.
+    pub(crate) fn line_ending(&self, side: DiffSide, ix: usize) -> &str {
+        let line = &self.lines(side)[ix];
+        &self.source(side)[line.content_end..line.source.end]
     }
     pub(crate) fn line_index(&self, side: DiffSide, line: usize) -> Option<usize> {
         self.lines(side)
@@ -596,6 +602,18 @@ impl DiffFile {
     }
 }
 
+/// Splits `text` into lines and their byte ranges, keeping line endings.
+fn line_ranges(text: &str) -> Vec<Range<usize>> {
+    let mut offset = 0;
+    text.split_inclusive('\n')
+        .map(|line| {
+            let range = offset..offset + line.len();
+            offset = range.end;
+            range
+        })
+        .collect()
+}
+
 /// Orders the patch body as Git writes it: within each run of changes, every
 /// deletion precedes every addition. Runs never cross hunk boundaries.
 fn patch_order(
@@ -614,8 +632,8 @@ fn patch_order(
     for range in ranges {
         let mut ix = range.start;
         while ix < range.end {
-            if !pairs[ix].changed {
-                let pair = pairs[ix];
+            let pair = pairs[ix];
+            if !pair.changed {
                 lines.push(PatchLine {
                     original: pair.original,
                     modified: pair.modified,
@@ -623,26 +641,12 @@ fn patch_order(
                 ix += 1;
                 continue;
             }
-            let start = ix;
-            while ix < range.end && pairs[ix].changed {
-                ix += 1;
-            }
-            for pair in &pairs[start..ix] {
-                if let Some(line) = pair.original {
-                    lines.push(PatchLine {
-                        original: Some(line),
-                        modified: None,
-                    });
-                }
-            }
-            for pair in &pairs[start..ix] {
-                if let Some(line) = pair.modified {
-                    lines.push(PatchLine {
-                        original: None,
-                        modified: Some(line),
-                    });
-                }
-            }
+            let end = run_end(ix, range.end, |ix| pairs[ix].changed);
+            lines.extend(
+                split_run(&pairs[ix..end])
+                    .map(|(original, modified)| PatchLine { original, modified }),
+            );
+            ix = end;
         }
     }
     for (patch_ix, line) in lines.iter().enumerate() {
@@ -871,6 +875,49 @@ mod tests {
         let deleted = fixture::document(Some(("old", "one\n")), None);
         assert_eq!((deleted.additions(), deleted.deletions()), (0, 1));
         assert!(fixture::document(None, Some(("empty", ""))).has_changes());
+    }
+
+    #[test]
+    fn unchanged_files_show_every_line_once() {
+        let file = DiffFile::unchanged("src/lib.rs", "one\r\ntwo\nlast");
+        assert_eq!(file.status(), DiffFileStatus::Unchanged);
+        assert!(file.is_single_column());
+        assert!(!file.has_changes());
+        assert_eq!(file.lines_count(DiffSide::Modified), 3);
+        assert_eq!(file.lines_count(DiffSide::Original), 0);
+        assert_eq!(
+            file.text_for_lines(DiffSide::Modified, 1, 3),
+            "one\r\ntwo\nlast"
+        );
+        assert!(DiffFile::unchanged("empty", "").pairs().is_empty());
+    }
+
+    #[test]
+    fn runs_end_at_the_limit_and_split_originals_before_modifieds() {
+        assert_eq!(run_end(1, 5, |ix| ix < 3), 3);
+        assert_eq!(run_end(1, 5, |_| true), 5);
+        assert_eq!(run_end(2, 5, |_| false), 2);
+        let run = [
+            LinePair::new(Some(0), Some(0), true),
+            LinePair::new(None, Some(1), true),
+            LinePair::new(Some(1), None, true),
+        ];
+        assert_eq!(
+            split_run(&run).collect::<Vec<_>>(),
+            [
+                (Some(0), None),
+                (Some(1), None),
+                (None, Some(0)),
+                (None, Some(1))
+            ]
+        );
+        let doc = fixture::modified("a.txt", "x\nold\ny\n", "x\nnew\nmore\ny\n");
+        assert_eq!(doc.line_ending(DiffSide::Modified, 1), "\n");
+        assert_eq!(doc.position(DiffSide::Original, 1).line(), 2);
+        assert_eq!(
+            DiffLineRange::new("a", DiffSide::Modified, 5, 2).ordered(),
+            (2, 5)
+        );
     }
 
     #[test]

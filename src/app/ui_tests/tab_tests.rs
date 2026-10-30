@@ -144,7 +144,7 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
     for mode in [crate::state::Mode::Dark, crate::state::Mode::Light] {
         for width in [800., 1440.] {
             on(cx, &|s, w, cx| {
-                crate::settings::apply(
+                crate::theme::apply(
                     &crate::state::Appearance {
                         mode,
                         ..Default::default()

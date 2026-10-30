@@ -46,7 +46,7 @@ async fn app_switcher_recents(cx: &mut TestAppContext) {
     for folder in [false, true] {
         let action = shark.update(cx, |_, cx| {
             let dir = ("Workspace folder".into(), PathBuf::from("/workspace"));
-            let entries = open_in_entries(
+            let entries = crate::app::menus::open_in_entries(
                 folder.then_some(&dir),
                 &[("repo".into(), PathBuf::from("/repo"))],
                 cx,

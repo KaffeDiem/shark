@@ -6,19 +6,7 @@ use crate::features::differ::test_support::diff::Viewed;
 
 fn commit_all(dir: &Path) {
     git::git(dir, &["add", "."]).unwrap();
-    git::git(
-        dir,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "c",
-        ],
-    )
-    .unwrap();
+    git::commit(dir, &["-qm", "c"]);
 }
 
 /// A booted app with workspace `name` on repo `api`, whose main has `base` committed; returns
@@ -170,6 +158,29 @@ async fn old_side_thread_follows_its_compare_commit(cx: &mut TestAppContext) {
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| on_line(cx))
         .await;
+    fs::remove_dir_all(&home).ok();
+}
+
+/// A new old-side comment records the revision the diff compares against, as the last
+/// refresh found it.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn old_side_comment_records_the_diffs_revision(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (home, window, shark, api) = fixture(cx, "rr", &[("f", "a\nb\n")]).await;
+    fs::write(api.join("f"), "a\nB\n").unwrap();
+    show_diff(cx, window, &shark, 1).await;
+    // Refreshed again, then commented: the first changed line is the removed `b`.
+    show_diff(cx, window, &shark, 1).await;
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.differ.update(cx, |d, cx| d.comment_in("api/f", w, cx))
+    });
+    cx.update(|cx| {
+        let d = shark.read(cx).differ.read(cx);
+        let draft = &d.review().composer.as_ref().unwrap().draft;
+        assert!(draft.side() == "original" && !draft.rev.is_empty());
+        assert_eq!(draft.rev, d.diff_revs()["api"]);
+    });
     fs::remove_dir_all(&home).ok();
 }
 
@@ -354,7 +365,7 @@ async fn switching_workspace_keeps_the_typed_comment(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let r = shark.read(cx).differ.read(cx).review();
         assert!(r.composer.is_none());
-        let kept = r.comments.get("w1").expect("w1's comments");
+        let kept = r.store.comments.get("w1").expect("w1's comments");
         assert_eq!((kept.len(), kept[0].text.as_str()), (1, "draft"));
         assert_eq!(kept[0].status, review::Status::Pending);
     });

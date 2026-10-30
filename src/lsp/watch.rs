@@ -100,40 +100,8 @@ impl Watcher {
                     match snapshot(&worker_root, &registrations, fresh, &worker_stop) {
                         _ if worker_stop.load(Ordering::Relaxed) => break,
                         Ok(trees) => {
-                            let mut changes = HashMap::<PathBuf, u32>::new();
-                            for (key, patterns, _) in registrations.values() {
-                                let current: Snapshot = trees
-                                    .iter()
-                                    .flat_map(|tree| &tree.files)
-                                    .filter(|(path, _)| patterns.iter().any(|p| p.matches(path)))
-                                    .map(|(path, stamp)| (path.clone(), *stamp))
-                                    .collect();
-                                if let Some(mut old) = previous.insert(*key, current.clone()) {
-                                    // Files only the new patterns cover have no old stamp; they
-                                    // existed, they were not created.
-                                    for (path, stamp) in &current {
-                                        if inherited
-                                            .get(key)
-                                            .is_some_and(|ps| !ps.iter().any(|p| p.matches(path)))
-                                        {
-                                            old.entry(path.clone()).or_insert(*stamp);
-                                        }
-                                    }
-                                    for (path, kind) in diff(&old, &current) {
-                                        let bit = match kind {
-                                            1 => 1,
-                                            2 => 2,
-                                            _ => 4,
-                                        };
-                                        if patterns
-                                            .iter()
-                                            .any(|p| p.kind & bit != 0 && p.matches(&path))
-                                        {
-                                            changes.insert(path, kind);
-                                        }
-                                    }
-                                }
-                            }
+                            let changes =
+                                poll_changes(&registrations, &mut previous, &trees, &inherited);
                             // The server may assume watching is active after registration succeeds.
                             // Acknowledge only once every pattern in the batch has its baseline.
                             let current = worker_registrations.lock().unwrap();
@@ -153,7 +121,9 @@ impl Watcher {
                             if !changes.is_empty() {
                                 let changes: Vec<_> = changes
                                     .into_iter()
-                                    .filter_map(|(path, kind)| {
+                                    .filter_map(|(path, bit)| {
+                                        // Watch-kind bits 1, 2, 4 are LSP change types 1, 2, 3.
+                                        let kind = bit.trailing_zeros() + 1;
                                         url::Url::from_file_path(path)
                                             .ok()
                                             .map(|uri| json!({"uri":uri.as_str(),"type":kind}))
@@ -335,8 +305,7 @@ fn pattern(root: &Path, watcher: &Value) -> Result<Option<Pattern>> {
             .as_str()
             .or_else(|| value["baseUri"]["uri"].as_str())
             .ok_or_else(|| anyhow!("Missing relative watch base URI"))?;
-        let base = url::Url::parse(uri)?
-            .to_file_path()
+        let base = super::document::uri_path(uri)
             .map_err(|_| anyhow!("Watcher base URI must be a local file"))?;
         validate_absolute(&base)?;
         if !base.starts_with(root) {
@@ -457,6 +426,45 @@ fn walk(base: &Path, ignores: bool, stop: &AtomicBool) -> Result<Tree> {
     Ok(tree)
 }
 
+/// Records each registration's new baseline and returns the changed paths with their watch-kind
+/// bit (create 1, change 2, delete 4), for registrations whose patterns subscribe to it.
+fn poll_changes(
+    registrations: &Registrations,
+    previous: &mut HashMap<u64, Snapshot>,
+    trees: &[Arc<Tree>],
+    inherited: &HashMap<u64, &Vec<Pattern>>,
+) -> HashMap<PathBuf, u32> {
+    let mut changes = HashMap::new();
+    for (key, patterns, _) in registrations.values() {
+        let current: Snapshot = trees
+            .iter()
+            .flat_map(|tree| &tree.files)
+            .filter(|(path, _)| patterns.iter().any(|p| p.matches(path)))
+            .map(|(path, stamp)| (path.clone(), *stamp))
+            .collect();
+        if let Some(mut old) = previous.insert(*key, current.clone()) {
+            // Files only the new patterns cover have no old stamp; they existed, they were not created.
+            for (path, stamp) in &current {
+                if inherited
+                    .get(key)
+                    .is_some_and(|ps| !ps.iter().any(|p| p.matches(path)))
+                {
+                    old.entry(path.clone()).or_insert(*stamp);
+                }
+            }
+            for (path, bit) in diff(&old, &current) {
+                if patterns
+                    .iter()
+                    .any(|p| p.kind & u64::from(bit) != 0 && p.matches(&path))
+                {
+                    changes.insert(path, bit);
+                }
+            }
+        }
+    }
+    changes
+}
+
 fn diff(before: &Snapshot, after: &Snapshot) -> Vec<(PathBuf, u32)> {
     let mut changes = Vec::new();
     for (path, stamp) in after {
@@ -470,7 +478,7 @@ fn diff(before: &Snapshot, after: &Snapshot) -> Vec<(PathBuf, u32)> {
         before
             .keys()
             .filter(|path| !after.contains_key(*path))
-            .map(|path| (path.clone(), 3)),
+            .map(|path| (path.clone(), 4)),
     );
     changes
 }
@@ -526,7 +534,7 @@ mod tests {
         assert_eq!(changes.len(), 3);
         assert_eq!(changes[Path::new("created")], 1);
         assert_eq!(changes[Path::new("changed")], 2);
-        assert_eq!(changes[Path::new("deleted")], 3);
+        assert_eq!(changes[Path::new("deleted")], 4);
     }
 
     #[test]

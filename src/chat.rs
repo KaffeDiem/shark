@@ -2,13 +2,22 @@
 mod completion;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod completion_pixels;
+mod critters;
+mod links;
+mod model;
+mod planmode;
 mod question;
+mod queue;
+mod review;
 mod side;
+mod tools;
 
 use crate::agent::{self, Agent, Ev};
 use crate::complete::{self, Item};
+use crate::models::EFFORT;
 use crate::plan::{self, PlanPane};
 use crate::state::{ChatMeta, Workspace};
+use crate::ui::{hint, plural};
 use crate::vim::{self, Vim};
 use crate::*;
 use completion::Menu;
@@ -21,7 +30,6 @@ use gpui_kit::component::input::{
     Enter, Escape, IndentInline, InputContent, InputEvent, MoveDown, MoveUp, OutdentInline, Redo,
     Textarea, TextareaState, Undo,
 };
-use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::shimmer::ShimmerText;
@@ -33,68 +41,21 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
+pub(crate) use links::{copy_button, link_roots, markdown};
+#[cfg(all(test, feature = "test-support"))]
+pub(crate) use model::model_entries;
+pub(crate) use model::{effort_label, model_label};
+use planmode::{ENTER_PLAN, NEEDS_APPROVAL, PLAN_SHOWN};
+use self::queue::Queued;
+pub(crate) use review::{ReviewCard, ReviewItem, parse_reports};
+use review::{card_of, hidden_reply, hide_reports, may_report, review_title, split_notes};
 use serde_json::Value;
 use side::Side;
 use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::time::Instant;
-
-const CRITTERS: [IconName; 10] = [
-    IconName::Cat,
-    IconName::Bird,
-    IconName::Rabbit,
-    IconName::Squirrel,
-    IconName::Turtle,
-    IconName::Snail,
-    IconName::Ghost,
-    IconName::Fish,
-    IconName::Dog,
-    IconName::Rat,
-];
-const PARADE_LIMIT: usize = 6;
-const HOP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
-
-fn assign_critters(critters: &mut HashMap<String, usize>, tasks: &[agent::Task]) {
-    critters.retain(|id, _| tasks.iter().any(|t| &t.id == id));
-    for task in tasks {
-        if !critters.contains_key(&task.id) {
-            let ix = (0..CRITTERS.len())
-                .find(|ix| !critters.values().any(|used| used == ix))
-                .unwrap_or(critters.len() % CRITTERS.len());
-            critters.insert(task.id.clone(), ix);
-        }
-    }
-}
-
-fn critter_icon(task: &agent::Task, ix: usize) -> IconName {
-    if task.kind == "local_bash" {
-        IconName::SquareTerminal
-    } else {
-        CRITTERS[ix]
-    }
-}
-
-fn critter_color(ix: usize, theme: &ThemeColor) -> Hsla {
-    [
-        theme.chart_1,
-        theme.chart_2,
-        theme.chart_3,
-        theme.chart_4,
-        theme.chart_5,
-    ][ix % 5]
-}
-
-struct Call {
-    id: String,
-    name: String,
-    summary: String,
-    /// The full input, one `key: value` per line and capped, for the row's tooltip.
-    input: String,
-    result: Option<SharedString>,
-    is_error: bool,
-    open: bool,
-}
+use tools::{ASK_TOOL, Call, PLAN_TOOL, full_input, group_summary, standalone, summarize};
 
 enum Block {
     /// `true` while queued: sent mid-turn, and claude hasn't read it yet.
@@ -117,350 +78,19 @@ enum Block {
     Review(Rc<ReviewCard>, bool),
 }
 
-/// Diff comments sent as one message (src/features/differ/review.rs), shown as a card instead of the
-/// prompt text.
-#[derive(Clone)]
-pub struct ReviewCard {
-    pub prompt: String,
-    pub items: Vec<ReviewItem>,
-    /// The diff when it was sent, e.g. "3 files · +5 −3".
-    pub changes: String,
-}
-
-impl ReviewCard {
-    pub fn ids(&self) -> Vec<u64> {
-        self.items.iter().map(|i| i.id).collect()
-    }
-}
-
-/// A `[c<id>] addressed: <note>` line, as `(id, note)`.
-fn report(l: &str) -> Option<(u64, String)> {
-    let l = l.trim().trim_start_matches(['-', '*', '`', ' ']);
-    let (id, rest) = l.strip_prefix("[c")?.split_once(']')?;
-    let rest = rest.trim_start();
-    let note = rest
-        .get(..10)
-        .filter(|p| p.eq_ignore_ascii_case("addressed:"))
-        .map(|_| &rest[10..])?;
-    Some((
-        id.parse().ok()?,
-        note.trim().trim_end_matches('`').trim().to_string(),
-    ))
-}
-
-/// The reply's lines (with their ends), each with its report when it is one; lines in a code
-/// block are none.
-fn report_lines(reply: &str) -> impl Iterator<Item = (&str, Option<(u64, String)>)> {
-    let mut fence: Option<&str> = None;
-    reply.split_inclusive('\n').map(move |l| {
-        let ticks = l.trim_start();
-        let ticks = &ticks[..ticks.len() - ticks.trim_start_matches('`').len()];
-        let inside = fence.is_some();
-        match fence {
-            None if ticks.len() >= 3 => fence = Some(ticks),
-            Some(f) if ticks.starts_with(f) && l.trim().len() == ticks.len() => fence = None,
-            _ => {}
-        }
-        (l, (!inside && fence.is_none()).then(|| report(l)).flatten())
-    })
-}
-
-/// The reply's `[c<id>] addressed: <note>` lines, as `(id, note)`.
-pub fn parse_reports(reply: &str) -> Vec<(u64, String)> {
-    report_lines(reply).filter_map(|(_, r)| r).collect()
-}
-
-/// The reply as shown: without its `[c<id>] addressed:` lines, which only feed the diff's
-/// threads (src/features/differ/review.rs).
-fn hide_reports(reply: &str) -> String {
-    (report_lines(reply).filter(|(_, r)| r.is_none()))
-        .map(|(l, _)| l)
-        .collect()
-}
-
-/// A reply that is only report lines: nothing to show. Stops at the first other line, so
-/// it is cheap per frame.
-fn hidden_reply(src: &str) -> bool {
-    let mut any = false;
-    for (l, r) in report_lines(src) {
-        match r {
-            Some(_) => any = true,
-            None if l.trim().is_empty() => {}
-            None => return false,
+impl Block {
+    /// A message's text (a review's prompt) and whether it is still queued; `None` for the rest.
+    fn message(&self) -> Option<(&str, bool)> {
+        match self {
+            Block::User(t, queued) => Some((t, *queued)),
+            Block::Review(r, queued) => Some((&r.prompt, *queued)),
+            _ => None,
         }
     }
-    any
-}
-
-/// Some line of `text` starts like a report (`[c<digit>`), unlike `#[cfg(...)]`.
-fn may_report(text: &str) -> bool {
-    text.lines().any(|l| {
-        let l = l.trim_start().trim_start_matches(['-', '*', '`', ' ']);
-        l.strip_prefix("[c")
-            .is_some_and(|r| r.starts_with(|c: char| c.is_ascii_digit()))
-    })
-}
-
-/// A message as it went on the wire, split into the `[shark]` workspace notes put before it
-/// (`repos_changed`) and the text itself.
-fn split_notes(wire: &str) -> (&str, &str) {
-    match wire.split_once("\n\n") {
-        Some((notes, text)) if notes.starts_with("[shark] ") => (notes, text),
-        _ => ("", wire),
-    }
-}
-
-/// A review's prompt (review.rs `prompt`) back as its card, for a replayed transcript: each
-/// `[c<id>] <place>` and its quoted text. The diff it was sent with is unknown by then.
-fn card_of(prompt: &str) -> Option<ReviewCard> {
-    // A workspace note may come before it on the wire.
-    let prompt = &prompt[prompt.find("Review comments on the diff.")?..];
-    let (mut items, mut fence) = (Vec::<ReviewItem>::new(), None);
-    for l in prompt.lines() {
-        if let Some(f) = fence {
-            fence = (l != f).then_some(f);
-            continue;
-        }
-        if l.starts_with("```") {
-            fence = Some(l);
-        } else if let Some((id, rest)) = l.strip_prefix("[c").and_then(|l| l.split_once("] "))
-            && let Ok(id) = id.parse()
-        {
-            let place = rest.split(" · ").next().unwrap_or(rest).to_string();
-            items.push(ReviewItem {
-                id,
-                place,
-                text: String::new(),
-            });
-        } else if let (Some(t), Some(it)) = (l.strip_prefix("> "), items.last_mut()) {
-            if !it.text.is_empty() {
-                it.text.push('\n');
-            }
-            it.text.push_str(t);
-        }
-    }
-    (!items.is_empty()).then(|| ReviewCard {
-        prompt: prompt.to_string(),
-        items,
-        changes: String::new(),
-    })
-}
-
-/// One comment of a review card: its id, "app.rs · Working copy · lines 631–632", its text.
-#[derive(Clone)]
-pub struct ReviewItem {
-    pub id: u64,
-    pub place: String,
-    pub text: String,
 }
 
 /// A transcript row: a block, or one call inside an expanded tool group.
 type Row = (usize, Option<usize>);
-
-/// A copy button whose icon turns into a check for 2s. Until `group` is hovered it is
-/// invisible but laid out, so showing it never moves anything.
-pub(crate) fn copy_button(
-    id: impl Into<ElementId>,
-    text: impl Into<SharedString>,
-    group: &'static str,
-) -> Div {
-    div()
-        .flex_none()
-        .invisible()
-        .group_hover(group, |s| s.visible())
-        .child(Clipboard::new(id).value(text).tooltip("Copy"))
-}
-
-/// Where `cwd`-relative chat links may point: the workspace dir, then each repo's worktree.
-pub(crate) fn link_roots(ws: &Workspace) -> Vec<PathBuf> {
-    let dir = ws.dir();
-    let repos = ws.repos.iter().map(|r| dir.join(&r.name));
-    std::iter::once(dir.clone()).chain(repos).collect()
-}
-
-/// A file URL for `path`; Foundation escapes spaces and Unicode.
-fn file_url(path: &str) -> Option<String> {
-    use objc2_foundation::{NSString, NSURL};
-    let url = NSURL::fileURLWithPath(&NSString::from_str(path)).absoluteString();
-    url.map(|u| u.to_string())
-}
-
-/// `s` with `%XX` escapes decoded; `None` when it has none or they are not valid UTF-8.
-fn percent_decode(s: &str) -> Option<String> {
-    let (b, mut out, mut i) = (s.as_bytes(), Vec::new(), 0);
-    while i < b.len() {
-        let hex = |k: usize| b.get(k).and_then(|c| (*c as char).to_digit(16));
-        match (b[i], hex(i + 1), hex(i + 2)) {
-            (b'%', Some(h), Some(l)) => {
-                out.push((h * 16 + l) as u8);
-                i += 3;
-            }
-            (c, ..) => {
-                out.push(c);
-                i += 1;
-            }
-        }
-    }
-    String::from_utf8(out).ok().filter(|d| d != s)
-}
-
-/// What a clicked link opens. URLs pass through; paths (absolute, `~/`, or relative to one
-/// of `roots`, with any `:N[:M]` or `#L..` location dropped) become file URLs.
-fn link_target(url: &str, roots: &[PathBuf]) -> Option<String> {
-    if url.contains("://") || url.starts_with("mailto:") || url.starts_with("tel:") {
-        return Some(url.to_string());
-    }
-    let mut stripped = url;
-    if let Some((p, frag)) = url.rsplit_once('#')
-        && frag
-            .strip_prefix('L')
-            .is_some_and(|d| d.starts_with(|c: char| c.is_ascii_digit()))
-    {
-        stripped = p;
-    }
-    for _ in 0..2 {
-        match stripped.rsplit_once(':') {
-            Some((p, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => stripped = p,
-            _ => break,
-        }
-    }
-    // A filename may itself contain ':' or '#', so the unstripped form is the fallback.
-    let expand = |p: &str| match p.strip_prefix("~/") {
-        Some(rest) => crate::state::home().join(rest),
-        None => PathBuf::from(p),
-    };
-    let first = expand(stripped);
-    // Links are often percent-encoded (`a%20b.txt`); try the decoded path first.
-    for p in [
-        percent_decode(stripped).map(|d| expand(&d)),
-        Some(first.clone()),
-        Some(expand(url)),
-    ]
-    .into_iter()
-    .flatten()
-    {
-        if p.is_absolute() {
-            if p.exists() {
-                return file_url(&p.to_string_lossy());
-            }
-        } else if let Some(hit) = roots.iter().map(|r| r.join(&p)).find(|c| c.exists()) {
-            // `components` drops a leading `./`.
-            return file_url(&hit.components().collect::<PathBuf>().to_string_lossy());
-        }
-    }
-    if first.is_absolute() {
-        return file_url(&first.to_string_lossy());
-    }
-    Some(if url.starts_with("www.") {
-        format!("https://{url}")
-    } else {
-        url.to_string()
-    })
-}
-
-/// Markdown whose code blocks get the language and a copy button in their top-right corner.
-/// The blocks keep the top padding the language label had, so the corner never covers code.
-/// Relative file links resolve against `roots`.
-pub(crate) fn markdown(
-    md: &Entity<TextViewState>,
-    group: &'static str,
-    roots: Vec<PathBuf>,
-) -> TextView {
-    TextView::new(md)
-        .selectable(true)
-        .on_link_click(move |url, event, _, cx| {
-            if !event.standard_click() && !event.is_middle_click() {
-                return;
-            }
-            if let Some(target) = link_target(url, &roots) {
-                cx.open_url(&target);
-            }
-        })
-        .style(TextViewStyle::default().code_block(StyleRefinement::default().pt(px(28.))))
-        .code_block_actions(move |block, _, cx| {
-            h_flex()
-                .h(px(20.))
-                .gap_1()
-                .pl_1()
-                .text_xs()
-                .text_color(cx.theme().muted_foreground)
-                .when_some(block.lang().filter(|l| !l.is_empty()), |d, l| d.child(l))
-                .child(copy_button("copy", block.code(), group))
-        })
-}
-
-fn standalone(name: &str) -> Option<IconName> {
-    match name {
-        "Skill" => Some(IconName::BookOpen),
-        "Agent" | "Task" => Some(IconName::Bot),
-        // A submitted plan: its row opens the version in the plan pane.
-        "ExitPlanMode" => Some(IconName::ClipboardList),
-        // The agent's questions: the row shows the answers.
-        "AskUserQuestion" => Some(IconName::MessageCircleQuestionMark),
-        _ => None,
-    }
-}
-
-/// "Read 3 files, ran 2 commands" for a tool group, in first-use order.
-fn group_summary(calls: &[Call]) -> String {
-    let mut parts: Vec<(&str, &str, &str, usize)> = vec![];
-    for c in calls {
-        let (verb, one, many) = match c.name.as_str() {
-            "Read" => ("read", "file", "files"),
-            "Edit" | "MultiEdit" | "Write" | "NotebookEdit" => ("edited", "file", "files"),
-            "Bash" => ("ran", "command", "commands"),
-            "Grep" | "Glob" => ("searched", "pattern", "patterns"),
-            "WebSearch" | "WebFetch" => ("looked up", "page", "pages"),
-            _ => ("used", "tool", "tools"),
-        };
-        match parts.iter_mut().find(|p| p.0 == verb) {
-            Some(p) => p.3 += 1,
-            None => parts.push((verb, one, many, 1)),
-        }
-    }
-    let s = parts
-        .iter()
-        .map(|&(v, one, many, n)| format!("{v} {n} {}", if n == 1 { one } else { many }))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let mut c = s.chars();
-    c.next()
-        .map(|f| f.to_uppercase().chain(c).collect())
-        .unwrap_or_default()
-}
-
-/// A message typed while the agent runs. The top one goes out when a turn ends well; any can
-/// go out now to steer the running turn.
-struct Queued {
-    /// With its chips, so editing puts them back.
-    content: InputContent,
-    /// First line, capped, so a long paste isn't shaped on every frame.
-    preview: SharedString,
-    /// A review waiting for the turn to end; it goes out as its card.
-    review: Option<Rc<ReviewCard>>,
-    /// GitHub reviews are acknowledged only once this prompt is sent.
-    git_reviews: Vec<String>,
-}
-
-impl Queued {
-    fn new(content: InputContent) -> Self {
-        let first = content.text().trim().lines().next().unwrap_or_default();
-        let mut preview: String = first.chars().take(200).collect();
-        if preview.len() < content.text().trim().len() {
-            preview.push('…');
-        }
-        Queued {
-            content,
-            preview: preview.into(),
-            review: None,
-            git_reviews: vec![],
-        }
-    }
-
-    fn text(&self) -> String {
-        self.content.text().trim().to_string()
-    }
-}
 
 pub enum ChatEvent {
     /// `meta` changed (session, model or title); the app saves it.
@@ -581,173 +211,10 @@ pub struct Chat {
     _subs: Vec<Subscription>,
 }
 
-/// Replies to tools that need a person, which claude asks us about (`Ev::Permission`).
-const PLAN_SHOWN: &str = "The user now sees this plan in the app's plan panel, where they \
-    approve it or reply with changes. End your turn with one short sentence, without repeating \
-    the plan. If they ask for changes, update the plan file and call ExitPlanMode again.";
-const ENTER_PLAN: &str = "Only the user turns plan mode on in this app (shift-tab). Carry on, or \
-    suggest it in your reply.";
-const NEEDS_APPROVAL: &str = "This needs the user's approval, which this app can't ask for. Do \
-    without it, or tell the user what to run.";
-const APPROVED: &str = "I approve the plan. Plan mode is off: implement it now.";
-const BUILD_FRESH: &str = "Implement this plan. It was made and approved in another chat, so you \
-    have none of that chat's context: read the code it touches before you change it.";
-
 /// How long an interrupt may take before the process is stopped instead.
 const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 
-/// Every chat names one: claude gets `--model`, `codex:<model id>` runs `codex app-server` with
-/// that model (see `codex::is_codex`).
-pub(crate) const MODELS: &[&str] = &[
-    "fable",
-    "opus",
-    "sonnet",
-    "haiku",
-    "codex:gpt-6.1-sol",
-    "codex:gpt-6-astra",
-];
-
-/// Thinking levels, lowest first: claude's `--effort`, codex's `effort` (both models take all six,
-/// per `model/list`). Haiku takes `--effort` too.
-const CLAUDE_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
-const CODEX_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max", "ultra"];
-/// A chat's level until one is picked.
-const EFFORT: &str = "high";
-
-/// The thinking levels `model` takes, lowest first.
-pub(crate) fn efforts(model: &str) -> &'static [&'static str] {
-    match codex::is_codex(Some(model)) {
-        true => CODEX_EFFORTS,
-        false => CLAUDE_EFFORTS,
-    }
-}
-
-/// The level a chat runs at: its own (or `high`). One the model lacks is its highest if it was
-/// `ultra`, else `high`, so an unknown value never picks the costliest.
-pub(crate) fn effort_of(meta: &ChatMeta) -> &'static str {
-    let levels = efforts(meta.model.as_deref().unwrap_or(MODELS[0]));
-    let want = meta.effort.as_deref().unwrap_or(EFFORT);
-    match levels.iter().find(|l| **l == want) {
-        Some(l) => l,
-        None if want == "ultra" => levels.last().unwrap(),
-        None => levels
-            .iter()
-            .find(|l| **l == EFFORT)
-            .unwrap_or(levels.last().unwrap()),
-    }
-}
-
-/// A thinking level as people read it: "xhigh" → "Extra high".
-pub(crate) fn effort_label(level: &str) -> String {
-    match level {
-        "xhigh" => "Extra high".into(),
-        l => model_label(l),
-    }
-}
-
-/// Shared menu contents: production actions and preview fixtures use the same model/effort rules.
-pub(crate) fn model_entries(
-    meta: &ChatMeta,
-    choose_model: impl Fn(&'static str, &mut App) + Clone + 'static,
-    choose_effort: impl Fn(&'static str, &mut App) + Clone + 'static,
-) -> (Vec<crate::menu::Entry>, usize) {
-    let current = meta.model.as_deref().unwrap_or(MODELS[0]);
-    // Claude's models, then Codex's: switching between the two starts a new conversation.
-    let mut entries = vec![];
-    for (i, &m) in MODELS.iter().enumerate() {
-        let is_codex = codex::is_codex(Some(m));
-        if is_codex && !entries.iter().any(|e| matches!(e, crate::menu::Entry::Sep)) {
-            entries.push(crate::menu::Entry::Sep);
-        }
-        let choose = choose_model.clone();
-        let item = crate::menu::item(None, model_label(m), move |_, cx| {
-            choose(m, cx);
-        });
-        // The backend where the name doesn't say it, and the ctrl-cmd-N pick.
-        let keys = format!("⌃⌘{}", i + 1);
-        let hint = if is_codex {
-            format!("Codex  {keys}")
-        } else {
-            keys
-        };
-        entries.push(item.hint(hint).checked(m == current));
-    }
-    entries.push(crate::menu::Entry::Sep);
-    let effort = effort_of(meta);
-    let mut sel = 0;
-    for &l in efforts(current) {
-        if l == effort {
-            sel = entries.len();
-        }
-        let choose = choose_effort.clone();
-        let item = crate::menu::item(None, effort_label(l), move |_, cx| {
-            choose(l, cx);
-        });
-        let hint = if matches!(l, "max" | "ultra") {
-            "slower"
-        } else {
-            ""
-        };
-        entries.push(item.hint(hint).checked(l == effort));
-    }
-    (entries, sel)
-}
-
-/// A model id as people read it: "opus" → "Opus", "codex:gpt-6.1-sol" → "GPT-6.1 Sol".
-pub(crate) fn model_label(id: &str) -> String {
-    let cap = |w: &str| {
-        let mut w = w.to_string();
-        if let Some(c) = w.get_mut(..1) {
-            c.make_ascii_uppercase();
-        }
-        w
-    };
-    match id.strip_prefix("codex:") {
-        Some(m) => {
-            let mut words = m.split('-');
-            let head = match (words.next(), words.next()) {
-                (Some("gpt"), Some(v)) => format!("GPT-{v}"),
-                (a, b) => [a, b]
-                    .into_iter()
-                    .flatten()
-                    .map(cap)
-                    .collect::<Vec<_>>()
-                    .join(" "),
-            };
-            std::iter::once(head)
-                .chain(words.map(cap))
-                .collect::<Vec<_>>()
-                .join(" ")
-        }
-        None => cap(id),
-    }
-}
-
 impl EventEmitter<ChatEvent> for Chat {}
-
-fn summarize(input: &Value, root: &str) -> String {
-    let field = [
-        "skill",
-        "command",
-        "file_path",
-        "pattern",
-        "path",
-        "url",
-        "description",
-        "prompt",
-    ]
-    .iter()
-    .find_map(|k| input[k].as_str());
-    let s = field
-        .map(str::to_string)
-        .unwrap_or_else(|| input.to_string());
-    let s = s.lines().next().unwrap_or_default();
-    // Paths inside the workspace read better as repo/file.
-    let s = s
-        .strip_prefix(root)
-        .map_or(s, |r| r.trim_start_matches('/'));
-    s.chars().take(120).collect()
-}
 
 /// A tab title from a message: its first line, cut at a word near 40 characters.
 fn title_of(text: &str) -> String {
@@ -760,51 +227,29 @@ fn title_of(text: &str) -> String {
     format!("{}…", cut.trim_end())
 }
 
-/// A chat started by a review: "Review · 3 comments".
-fn review_title(r: &ReviewCard) -> String {
-    let n = r.items.len();
-    format!("Review · {n} comment{}", plural(n))
+/// Feeds a process's events to `apply` until it ends or `T` is gone.
+pub(crate) fn read_events<T: 'static>(
+    rx: gpui_kit::base::async_util::Receiver<Ev>,
+    apply: fn(&mut T, Ev, &mut Context<T>),
+    cx: &mut Context<T>,
+) -> Task<()> {
+    cx.spawn(async move |this, cx| {
+        while let Ok(ev) = rx.recv().await {
+            if this.update(cx, |t, cx| apply(t, ev, cx)).is_err() {
+                break;
+            }
+        }
+    })
 }
 
-/// The "s" of `n` things.
-pub(crate) fn plural(n: usize) -> &'static str {
-    if n == 1 { "" } else { "s" }
-}
-
-/// The first `n` chars, with "…" when cut.
-fn cap(s: &str, n: usize) -> String {
-    let mut c: String = s.chars().take(n).collect();
-    if c.len() < s.len() {
-        c.push('…');
+/// A turn's cost from claude's running `total` (updated here); a lower total is a fresh
+/// process's, shown as it is.
+fn turn_cost(total: &mut f64, cost: f64) -> f64 {
+    let turn = if cost >= *total { cost - *total } else { cost };
+    if cost > 0. {
+        *total = cost; // codex and failures report none
     }
-    c
-}
-
-fn full_input(input: &Value) -> String {
-    let s = match input.as_object() {
-        Some(o) => (o.iter())
-            .map(|(k, v)| {
-                format!(
-                    "{k}: {}",
-                    v.as_str().map_or_else(|| v.to_string(), Into::into)
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
-        None => serde_json::to_string_pretty(input).unwrap_or_default(),
-    };
-    cap(&s, 2000)
-}
-
-/// Keys (space-separated) and what they do, for a hint row.
-pub(crate) fn hint(keys: &str, label: &'static str) -> Div {
-    h_flex()
-        .gap_1()
-        .children(
-            keys.split(' ')
-                .map(|k| Kbd::new(Keystroke::parse(k).unwrap())),
-        )
-        .child(label)
+    turn
 }
 
 /// "48s", "2m 5s".
@@ -937,11 +382,11 @@ impl Chat {
         chat.list.set_follow_mode(FollowMode::Tail);
         // Read history off the UI thread, up to its current end: a process started meanwhile
         // appends to the same file, and its lines arrive live.
-        let path = agent::transcript_path(&chat.meta.id);
+        let path = crate::transcript::transcript_path(&chat.meta.id);
         let len = std::fs::metadata(&path).map_or(0, |m| m.len());
         cx.spawn(async move |this, cx| {
             let evs = (cx.background_executor())
-                .spawn(async move { agent::read_history(&path, len) })
+                .spawn(async move { crate::transcript::read_history(&path, len) })
                 .await;
             this.update(cx, |c, cx| c.load_history(evs, cx)).ok();
         })
@@ -1018,43 +463,8 @@ impl Chat {
         self.busy || !self.background.is_empty()
     }
 
-    fn set_background(&mut self, tasks: Vec<agent::Task>, cx: &mut Context<Self>) {
-        assign_critters(&mut self.critters, &tasks);
-        self.background = tasks;
-        if self.background.is_empty() || cx.reduce_motion() || self.replaying {
-            self.hopping = None;
-            self.hop = 0;
-        } else if self.hopping.is_none() {
-            self.hopping = Some(cx.spawn(async move |this, cx| {
-                loop {
-                    cx.background_executor().timer(HOP_INTERVAL).await;
-                    let keep_hopping = this.update(cx, |c, cx| {
-                        if c.background.is_empty() || cx.reduce_motion() {
-                            c.hopping = None;
-                            return false;
-                        }
-                        c.hop = c.hop.wrapping_add(1);
-                        cx.notify();
-                        true
-                    });
-                    if !matches!(keep_hopping, Ok(true)) {
-                        break;
-                    }
-                }
-            }));
-        }
-    }
-
     pub fn queued(&self) -> usize {
         self.queue.len()
-    }
-
-    pub fn model(&self) -> &str {
-        self.meta.model.as_deref().unwrap_or(MODELS[0])
-    }
-
-    pub(crate) fn codex(&self) -> bool {
-        codex::is_codex(self.meta.model.as_deref())
     }
 
     /// The tab label.
@@ -1063,216 +473,6 @@ impl Chat {
             true => "New chat".into(),
             false => self.meta.title.clone().into(),
         }
-    }
-
-    /// The thinking level this chat runs at (see `effort_of`).
-    pub fn effort(&self) -> &'static str {
-        effort_of(&self.meta)
-    }
-
-    /// The levels this chat's model takes, lowest first.
-    pub fn efforts(&self) -> &'static [&'static str] {
-        efforts(self.model())
-    }
-
-    /// The model button's label: "Opus · High".
-    pub(crate) fn model_chip(&self) -> String {
-        format!(
-            "{} · {}",
-            model_label(self.model()),
-            effort_label(self.effort())
-        )
-    }
-
-    /// cmd-/ or the model button: the models, then the thinking levels, the current ones
-    /// checked; type a letter to jump (again to cycle). The highlight starts on the current
-    /// level, the pick changed most. A pick takes effect on the next send.
-    pub fn open_model_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let model_chat = cx.entity().downgrade();
-        let effort_chat = model_chat.clone();
-        let (entries, sel) = model_entries(
-            &self.meta,
-            move |m, cx| {
-                model_chat.update(cx, |c, cx| c.set_model(m, cx)).ok();
-            },
-            move |l, cx| {
-                effort_chat.update(cx, |c, cx| c.set_effort(l, cx)).ok();
-            },
-        );
-        let b = self.model_at.get();
-        let at = point(b.left(), b.top() - px(4.));
-        let m = crate::menu::open_at(entries, at, Anchor::BottomLeft, window, cx);
-        m.update(cx, |m, _| m.select(sel));
-        let sub = cx.subscribe(&m, |c, _, _: &DismissEvent, cx| {
-            c.model_menu = None;
-            cx.notify();
-        });
-        self.model_menu = Some((m, sub));
-        cx.notify();
-    }
-
-    /// The user's pick: the process restarts on it at the next send. A thinking level the new
-    /// model lacks becomes its highest.
-    pub fn set_model(&mut self, m: &str, cx: &mut Context<Self>) {
-        let model = Some(m.to_string());
-        if self.meta.model != model {
-            let codex = codex::is_codex(model.as_deref());
-            // A session belongs to one CLI: the other can't resume it.
-            if codex != codex::is_codex(self.meta.model.as_deref())
-                && self.meta.session_id.is_some()
-            {
-                self.meta.session_id = None;
-                self.push(Block::Info(format!("{m} starts a new conversation")), cx);
-            }
-            self.meta.model = model;
-            if self.meta.effort.is_some() {
-                self.meta.effort = Some(self.effort().into());
-            }
-            cx.emit(ChatEvent::Meta);
-            cx.notify();
-        }
-        cx.emit(ChatEvent::Picked);
-    }
-
-    /// The user's pick of thinking level (one the model lacks becomes its highest). Claude
-    /// restarts on it at the next send, like a model change; codex sends it with the next
-    /// message.
-    pub fn set_effort(&mut self, level: &str, cx: &mut Context<Self>) {
-        let was = self.meta.effort.replace(level.into());
-        let level = self.effort();
-        self.meta.effort = Some(level.into());
-        if let Some(a) = &mut self.agent {
-            a.set_effort(level);
-        }
-        if was != self.meta.effort {
-            cx.emit(ChatEvent::Meta);
-            cx.notify();
-        }
-        cx.emit(ChatEvent::Picked);
-    }
-
-    /// One thinking level up (`d` > 0) or down, stopping at the ends; the level it's on now.
-    pub fn step_effort(&mut self, d: isize, cx: &mut Context<Self>) -> &'static str {
-        let levels = self.efforts();
-        let ix = levels.iter().position(|l| *l == self.effort()).unwrap_or(0);
-        let ix = ix.saturating_add_signed(d).min(levels.len() - 1);
-        self.set_effort(levels[ix], cx);
-        levels[ix]
-    }
-
-    /// Plan mode on or off. A running process switches at once, mid-turn too; a new one
-    /// switches as it starts.
-    pub fn set_plan_mode(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.meta.plan == on {
-            return;
-        }
-        self.meta.plan = on;
-        if self.busy && self.codex() {
-            self.push(
-                Block::Info("codex switches plan mode from the next message".into()),
-                cx,
-            );
-        }
-        if let Some(a) = &mut self.agent
-            && let Err(e) = a.set_plan_mode(on)
-        {
-            self.push(Block::Info(format!("switching plan mode failed: {e}")), cx);
-        }
-        // The pane says what will appear there; with nothing in it, it goes with the mode.
-        if on || self.plan.read(cx).versions.is_empty() {
-            self.plan_open = on;
-        }
-        cx.emit(ChatEvent::Meta);
-        cx.notify();
-    }
-
-    /// codex's Fast service tier: its own default until toggled here.
-    pub fn fast(&self) -> bool {
-        self.meta.fast.unwrap_or(self.fast_by_config)
-    }
-
-    /// Fast on or off for a codex chat (callers check), from its next message (a running turn
-    /// keeps its tier).
-    pub fn set_fast(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.meta.fast = Some(on);
-        if let Some(a) = &mut self.agent {
-            a.set_fast(on);
-        }
-        cx.emit(ChatEvent::Meta);
-        cx.notify();
-    }
-
-    /// Why the plan can't be approved or built now: none yet, already approved, or an older
-    /// version is on screen (approving always takes the latest).
-    pub fn plan_blocker(&self, cx: &App) -> Option<&'static str> {
-        let p = self.plan.read(cx);
-        let latest = p.versions.len().checked_sub(1);
-        if latest.is_none() {
-            Some("no plan to approve yet; the agent submits one in plan mode (shift-tab)")
-        } else if p.approved == latest {
-            Some("this plan is already approved; ask for a revision to approve a new version")
-        } else if latest != Some(p.shown) {
-            Some("an older version is shown; press l for the latest, then approve")
-        } else {
-            None
-        }
-    }
-
-    /// Says why the plan can't be approved or built, if it can't. Returns whether it refused.
-    pub fn refuse_plan(&mut self, cx: &mut Context<Self>) -> bool {
-        let why = self.plan_blocker(cx);
-        if let Some(why) = why {
-            self.push(Block::Info(why.into()), cx);
-        }
-        why.is_some()
-    }
-
-    /// Ends plan mode and tells the agent to build the latest plan. A draft rides along.
-    pub fn approve_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let why = if let Some(why) = self.plan_blocker(cx) {
-            why
-        } else if self.busy {
-            "the agent is still working; approve when the turn ends (ctrl-c stops it)"
-        } else {
-            let was = self.meta.plan;
-            self.set_plan_mode(false, cx);
-            if self.ask(APPROVED, window, cx) {
-                self.plan_approved(cx);
-                self.focus_composer(window, cx);
-            } else {
-                self.set_plan_mode(was, cx);
-            }
-            return;
-        };
-        self.push(Block::Info(why.into()), cx);
-    }
-
-    /// Marks the latest plan approved and closes the pane: there is nothing left to review.
-    pub fn plan_approved(&mut self, cx: &mut Context<Self>) {
-        self.plan.update(cx, |p, cx| p.approve(cx));
-        self.plan_open = false;
-        cx.notify();
-    }
-
-    /// The first message of a chat that builds another chat's plan: the plan and nothing else,
-    /// titled after the plan.
-    pub fn build_plan(&mut self, plan: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
-        self.meta.title = title_of(&plan::title(plan));
-        self.ask(&format!("{BUILD_FRESH}\n\n{plan}"), window, cx)
-    }
-
-    /// `TogglePlan`: shows the plan pane and focuses it, or hides it.
-    pub fn toggle_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.plan_open = !self.plan_open;
-        match self.plan_open {
-            true => self.plan.read(cx).focus.clone().focus(window, cx),
-            false => self.focus_composer(window, cx),
-        }
-        cx.notify();
-    }
-
-    pub fn plan_focused(&self, window: &Window, cx: &App) -> bool {
-        self.plan_open && self.plan.read(cx).focus.is_focused(window)
     }
 
     pub fn focus_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -1305,7 +505,7 @@ impl Chat {
         {
             return false;
         }
-        let idle = self.vim.mode == vim::Mode::Normal && self.vim.pending().is_empty();
+        let idle = self.vim.idle();
         // ctrl-c stops the agent here, and shift-tab toggles plan mode.
         let app_key = (ks.key == "c" && ks.modifiers.control)
             || ks.key == "tab"
@@ -1313,7 +513,8 @@ impl Chat {
         let Some(key) = (!app_key).then(|| editor::vim_key(ks)).flatten() else {
             return false;
         };
-        let Some((_, cmd)) = editor::apply_vim_key(&mut self.vim, &self.composer, &key, window, cx)
+        let Some((_, cmd)) =
+            editor::apply_vim_key(&mut self.vim, &self.composer, &key, false, window, cx)
         else {
             return false;
         };
@@ -1327,152 +528,6 @@ impl Chat {
         self.update_menu(cx);
         cx.notify();
         true
-    }
-
-    /// Re-lists files in the background; the old list serves until it lands.
-    fn reindex(&mut self, cx: &mut Context<Self>) {
-        if self.indexing.is_some() {
-            return;
-        }
-        let dir = self.ws.dir();
-        let repos: Vec<_> = (self.ws.repos.iter())
-            .map(|r| (r.name.clone(), dir.join(&r.name)))
-            .collect();
-        self.indexing = Some(cx.spawn(async move |this, cx| {
-            let files = cx
-                .background_executor()
-                .spawn(async move { complete::files(&repos) })
-                .await;
-            this.update(cx, |c, cx| {
-                c.indexing = None;
-                c.files = files;
-                c.update_menu(cx);
-            })
-            .ok();
-        }));
-    }
-
-    /// Asks claude for its current skills and commands in the background.
-    fn reprobe(&mut self, cx: &mut Context<Self>) {
-        if self.probing.is_some() || cfg!(test) {
-            return;
-        }
-        let (name, dir) = (self.ws.name.clone(), self.ws.dir());
-        self.probing = Some(cx.spawn(async move |this, cx| {
-            let cmds = cx
-                .background_executor()
-                .spawn(async move { complete::probe_commands(&name, &dir) })
-                .await;
-            this.update(cx, |c, cx| {
-                c.probing = None;
-                if let Some(cmds) = cmds {
-                    c.commands = cmds;
-                    c.update_menu(cx);
-                }
-            })
-            .ok();
-        }));
-    }
-
-    /// Re-lists every repo's PRs in the background, at most once a minute: every `# heading` opens
-    /// the menu. Each repo's list replaces its cached rows as it lands, so the menu shows progress
-    /// per repo, and a repo that fails keeps its cached rows.
-    fn refetch_prs(&mut self, cx: &mut Context<Self>) {
-        let fresh = (self.prs_at).is_some_and(|t| t.elapsed() < std::time::Duration::from_secs(60));
-        if self.fetching_prs.is_some() || fresh || cfg!(test) {
-            return;
-        }
-        let repos: Vec<_> = (self.ws.repos.iter())
-            .map(|r| (r.name.clone(), r.src.clone()))
-            .collect();
-        let n = repos.len();
-        (self.prs_left, self.prs_errs) = (n, vec![]);
-        let (tx, rx) = std::sync::mpsc::channel();
-        let bg = cx.background_executor().clone();
-        bg.spawn(async move {
-            crate::git::par_map(&repos, |(name, dir)| {
-                let _ = tx.send((name.clone(), complete::fetch_repo_prs(name, dir, false)));
-            });
-        })
-        .detach();
-        self.fetching_prs = Some(cx.spawn(async move |this, cx| {
-            let mut rx = rx;
-            for _ in 0..n {
-                let (got, back) = bg.spawn(async move { (rx.recv(), rx) }).await;
-                rx = back;
-                let Ok((repo, res)) = got else { break };
-                this.update(cx, |c, cx| {
-                    c.prs_left = c.prs_left.saturating_sub(1);
-                    match res {
-                        Ok(list) => {
-                            c.prs.retain(|p| p.repo != repo);
-                            c.prs.extend(list);
-                            c.pr_items = complete::pr_items(&c.prs);
-                        }
-                        Err(e) => c.prs_errs.push((repo, e)),
-                    }
-                    c.update_menu(cx);
-                })
-                .ok();
-            }
-            this.update(cx, |c, cx| {
-                c.fetching_prs = None;
-                c.prs_left = 0;
-                if c.prs_errs.is_empty() {
-                    c.prs_at = Some(Instant::now());
-                }
-                // A repo that left the workspace takes its PRs with it.
-                let repos = &c.ws.repos;
-                c.prs.retain(|p| repos.iter().any(|r| r.name == p.repo));
-                c.pr_items = complete::pr_items(&c.prs);
-                c.update_menu(cx);
-            })
-            .ok();
-        }));
-    }
-
-    /// Dropped or pasted files: copied into the workspace off the main thread, then mentioned at
-    /// the cursor in drop order. Pasted image bytes come as `(bytes, ext)`.
-    fn attach(
-        &mut self,
-        paths: Vec<PathBuf>,
-        image: Option<(Vec<u8>, &'static str)>,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let dir = self.ws.dir();
-        cx.spawn_in(window, async move |this, cx| {
-            let done = cx
-                .background_executor()
-                .spawn(async move {
-                    let mut out: Vec<_> = paths.iter().map(|p| complete::attach(&dir, p)).collect();
-                    out.extend(image.map(|(b, ext)| {
-                        complete::attach_bytes(&dir, &format!("Pasted image.{ext}"), &b)
-                    }));
-                    out
-                })
-                .await;
-            this.update_in(cx, |c, window, cx| {
-                // The user may have selected text while it copied; insert beside it, not over it.
-                c.composer.update(cx, |c, cx| {
-                    let at = c.cursor();
-                    c.set_selected_range(at..at, cx)
-                });
-                for r in done {
-                    match r {
-                        Ok(p) => {
-                            let label = Path::new(&p).file_name().unwrap_or_default();
-                            let label = label.to_string_lossy().into_owned();
-                            c.insert_mention(complete::mention(&p), label, window, cx);
-                        }
-                        Err(e) => window.push_notification(Notification::error(e), cx),
-                    }
-                }
-                c.focus_composer(window, cx);
-            })
-            .ok();
-        })
-        .detach();
     }
 
     /// cmd-v of Finder files or image data attaches them; anything else pastes as text.
@@ -1534,15 +589,7 @@ impl Chat {
         let sent = !self.hold && (!busy || now) && self.send_text(text, now, cx);
         self.steered |= sent && busy;
         if !sent && (self.busy || self.hold) {
-            let at = self.queue_slot();
-            self.queue.insert(
-                at,
-                Queued {
-                    git_reviews: std::mem::take(&mut self.editing_git_reviews),
-                    ..Queued::new(content)
-                },
-            );
-            self.qsel = at;
+            self.qsel = self.queue_draft(content);
         } else if !sent {
             return; // spawn or write failed; the error is in the transcript, keep the draft
         }
@@ -1551,9 +598,7 @@ impl Chat {
                 &mut self.editing_git_reviews,
             )));
         }
-        self.editing = None;
-        self.composer
-            .update(cx, |c, cx| c.set_value("", window, cx));
+        self.finish_draft(window, cx);
         self.reset_vim(cx);
         if sent {
             self.drain(cx); // an edit that went straight out lets the rest follow
@@ -1561,178 +606,12 @@ impl Chat {
         cx.notify();
     }
 
-    /// Sends the top queued message if the agent is free.
-    pub fn drain(&mut self, cx: &mut Context<Self>) {
-        if self.busy || self.hold || self.editing.is_some() || self.queue.is_empty() {
-            return;
-        }
-        let q = self.queue.remove(0); // editing is None here
-        match self.send_block(q.text(), false, q.review.clone(), cx) {
-            true => {
-                self.qsel = self.qsel.saturating_sub(1);
-                cx.emit(ChatEvent::GitReviewsSent(q.git_reviews));
-            }
-            false => self.queue.insert(0, q),
-        }
-        self.after_queue_change(cx);
-    }
-
-    /// Where a message goes back into the queue: the slot of the one being edited, else last.
-    fn queue_slot(&self) -> usize {
-        self.editing
-            .unwrap_or(self.queue.len())
-            .min(self.queue.len())
-    }
-
-    /// Removes a queued message, keeping the slot of the one being edited in place.
-    fn take_queued(&mut self, ix: usize) -> Queued {
-        if let Some(e) = &mut self.editing
-            && *e > ix
-        {
-            *e -= 1;
-        }
-        self.queue.remove(ix)
-    }
-
-    fn after_queue_change(&mut self, cx: &mut Context<Self>) {
-        self.qsel = self.qsel.min(self.queue.len().saturating_sub(1));
-        self.qscroll.scroll_to_item(self.qsel);
-        cx.notify();
-    }
-
-    pub fn focus_queue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.queue.is_empty() {
-            return self.focus_composer(window, cx);
-        }
-        self.qfocus.focus(window, cx);
-        self.after_queue_change(cx);
-    }
-
-    fn queue_select(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        // The composer sits below the last row, so moving past it lands there.
-        if ix >= self.queue.len() {
-            return self.focus_composer(window, cx);
-        }
-        self.qsel = ix;
-        self.after_queue_change(cx);
-    }
-
-    /// Sends the selected message into the running turn.
-    fn steer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.qsel >= self.queue.len() {
-            return;
-        }
-        if self.hold {
-            self.push(
-                Block::Info("a git step is running; it stays queued".into()),
-                cx,
-            );
-            return;
-        }
-        let editing = self.editing;
-        let q = self.take_queued(self.qsel);
-        let busy = self.busy;
-        if self.send_block(q.text(), true, q.review.clone(), cx) {
-            // Claude may hold it unread until this turn ends; don't restart the process under it.
-            self.steered |= busy;
-            cx.emit(ChatEvent::GitReviewsSent(q.git_reviews));
-        } else {
-            self.editing = editing;
-            self.queue.insert(self.qsel, q);
-        }
-        self.after_queue_change(cx);
-        if self.queue.is_empty() {
-            self.focus_composer(window, cx);
-        }
-    }
-
-    /// Remove on a queued review card.
-    pub(crate) fn remove_queued(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        self.qsel = ix;
-        self.delete_queued(window, cx);
-    }
-
     /// What went out, oldest first: messages, and reviews as their prompt.
     #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn sent_texts(&self) -> Vec<String> {
         (self.blocks.iter())
-            .filter_map(|b| match b {
-                Block::User(t, _) => Some(t.clone()),
-                Block::Review(r, _) => Some(r.prompt.clone()),
-                _ => None,
-            })
+            .filter_map(|b| b.message().map(|(t, _)| t.to_string()))
             .collect()
-    }
-
-    fn delete_queued(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.qsel >= self.queue.len() {
-            return;
-        }
-        if let Some(r) = self.take_queued(self.qsel).review {
-            cx.emit(ChatEvent::ReviewRemoved(r.ids()));
-        }
-        self.after_queue_change(cx);
-        if self.queue.is_empty() {
-            self.focus_composer(window, cx);
-        }
-    }
-
-    fn move_queued(&mut self, d: isize, cx: &mut Context<Self>) {
-        let to = self.qsel as isize + d;
-        if to < 0 || to as usize >= self.queue.len() {
-            return;
-        }
-        self.queue.swap(self.qsel, to as usize);
-        self.qsel = to as usize;
-        self.after_queue_change(cx);
-    }
-
-    /// Loads the selected message into the composer; Enter puts it back in the same slot.
-    /// A draft already there is queued first, so nothing typed is lost.
-    fn edit_queued(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if self.queue.get(self.qsel).is_none_or(|q| q.review.is_some()) {
-            return;
-        }
-        let mut ix = self.qsel;
-        let item = self.take_queued(ix);
-        let draft = self.composer.read(cx).content();
-        if !draft.text().trim().is_empty() {
-            let at = self.queue_slot();
-            self.queue.insert(
-                at,
-                Queued {
-                    git_reviews: std::mem::take(&mut self.editing_git_reviews),
-                    ..Queued::new(draft)
-                },
-            );
-            if at <= ix {
-                ix += 1;
-            }
-        }
-        self.editing = Some(ix);
-        self.editing_git_reviews = item.git_reviews;
-        let end = item.content.text().len();
-        self.composer.update(cx, |c, cx| {
-            c.set_value(item.content, window, cx);
-            c.set_selected_range(end..end, cx);
-            c.focus(window, cx);
-        });
-        self.after_queue_change(cx);
-    }
-
-    /// Appends a git prompt without changing the draft or an edit already in progress.
-    pub fn enqueue(&mut self, prompt: &str, reviews: Vec<String>, cx: &mut Context<Self>) -> bool {
-        if self.archiving {
-            return false;
-        }
-        self.queue.push(Queued {
-            git_reviews: reviews,
-            ..Queued::new(prompt.to_string().into())
-        });
-        self.qsel = self.queue.len() - 1;
-        self.drain(cx);
-        self.after_queue_change(cx);
-        true
     }
 
     /// Sends a host-written prompt together with any draft instructions.
@@ -1751,9 +630,7 @@ impl Chat {
             cx.emit(ChatEvent::GitReviewsSent(std::mem::take(
                 &mut self.editing_git_reviews,
             )));
-            self.editing = None;
-            self.composer
-                .update(cx, |c, cx| c.set_value("", window, cx));
+            self.finish_draft(window, cx);
         }
         // The agent didn't start (refusals keep `hold`/`archiving` set): a new chat's first
         // message, e.g. from New workspace, goes back to the composer instead of being lost.
@@ -1815,12 +692,12 @@ impl Chat {
                     self.agent = Some(a);
                     self.agent_model = self.meta.model.clone();
                     self.agent_effort = self.effort();
-                    self.reader = Some(Self::read_events(rx, Self::apply, cx));
+                    self.reader = Some(read_events(rx, Self::apply, cx));
                 }
                 Err(e) => {
-                    let codex = crate::codex::is_codex(self.meta.model.as_deref());
+                    let codex = self.meta.is_codex();
                     let prog = if codex { "codex" } else { "claude" };
-                    let why = crate::git::spawn_err(&self.ws.dir(), prog, e);
+                    let why = crate::proc::spawn_err(&self.ws.dir(), prog, e);
                     let msg = format!("Couldn't start the agent: {why}. See Home for setup.");
                     self.push(Block::Info(msg), cx);
                     return false;
@@ -1845,35 +722,10 @@ impl Chat {
         true
     }
 
-    /// Sends exactly a review's prompt, leaving the composer's draft alone. While a turn or
-    /// git step runs it waits at the top of the queue. `ReviewSent` says when it goes out;
-    /// false when it was refused (the transcript says why).
-    pub fn send_review(&mut self, mut card: ReviewCard, cx: &mut Context<Self>) -> bool {
-        // As the queue sends it, so claude's echo matches the card.
-        card.prompt = card.prompt.trim().to_string();
-        let card = Rc::new(card);
-        if self.busy || self.hold {
-            let q = Queued {
-                review: Some(card.clone()),
-                ..Queued::new(card.prompt.clone().into())
-            };
-            self.queue.insert(0, q);
-            // The rows below it moved down one: the cursor and the edited slot follow them.
-            self.qsel += 1;
-            if let Some(e) = &mut self.editing {
-                *e += 1;
-            }
-            self.after_queue_change(cx);
-            return true;
-        }
-        self.send_block(card.prompt.clone(), false, Some(card), cx)
-    }
-
     /// The ended turn's reply and number, for review reports: the text after the last message
     /// claude read (ones queued mid-turn and still unread don't start it).
     fn keep_reply(&mut self) {
-        let start = (self.blocks.iter())
-            .rposition(|b| matches!(b, Block::User(_, false) | Block::Review(_, false)));
+        let start = (self.blocks.iter()).rposition(|b| matches!(b.message(), Some((_, false))));
         let after = start.map_or(0, |i| i + 1);
         self.last_reply = (self.blocks[after..].iter())
             .filter_map(|b| match b {
@@ -1883,52 +735,15 @@ impl Chat {
             .collect::<Vec<_>>()
             .join("\n");
         self.last_turn = (self.blocks[..after].iter())
-            .filter(|b| matches!(b, Block::User(..) | Block::Review(..)))
+            .filter(|b| b.message().is_some())
             .count();
     }
 
     /// Messages in the transcript; the nth one starts turn n.
     pub fn turns(&self) -> usize {
         (self.blocks.iter())
-            .filter(|b| matches!(b, Block::User(..) | Block::Review(..)))
+            .filter(|b| b.message().is_some())
             .count()
-    }
-
-    /// Comments of sent reviews claude hasn't echoed yet; with `held`, only ones sent mid-turn,
-    /// which the turn that is ending never read.
-    pub fn unread_review_ids(&self, held: bool) -> Vec<u64> {
-        (self.unread.iter())
-            .filter_map(|&bi| match self.blocks.get(bi) {
-                Some(Block::Review(r, queued)) if *queued || !held => Some(r.ids()),
-                _ => None,
-            })
-            .flatten()
-            .collect()
-    }
-
-    /// Comments of reviews still waiting to be read: the tab shows "Chat · N".
-    pub fn review_count(&self) -> usize {
-        let queued = self.queue.iter().filter_map(|q| q.review.as_ref());
-        let unread = (self.unread.iter()).filter_map(|&bi| match self.blocks.get(bi) {
-            Some(Block::Review(r, _)) => Some(r),
-            _ => None,
-        });
-        queued.chain(unread).map(|r| r.items.len()).sum()
-    }
-
-    /// Feeds a process's events to `apply` until it ends or the chat is gone.
-    fn read_events(
-        rx: gpui_kit::base::async_util::Receiver<Ev>,
-        apply: fn(&mut Self, Ev, &mut Context<Self>),
-        cx: &mut Context<Self>,
-    ) -> Task<()> {
-        cx.spawn(async move |this, cx| {
-            while let Ok(ev) = rx.recv().await {
-                if this.update(cx, |c, cx| apply(c, ev, cx)).is_err() {
-                    break;
-                }
-            }
-        })
     }
 
     /// A repo joined the workspace: refresh `@` files, show it, and tell the agent next turn
@@ -2024,9 +839,9 @@ impl Chat {
             }
         }
         if n > 0 {
-            let s = if n == 1 { "" } else { "s" };
             self.blocks.push(Block::Info(format!(
-                "{n} message{s} not delivered; send again"
+                "{n} message{} not delivered; send again",
+                plural(n)
             )));
         }
     }
@@ -2131,14 +946,6 @@ impl Chat {
         self.follow(cx, |this, _| this.blocks.push(b));
     }
 
-    /// A submitted plan as the pane's newest version, shown.
-    fn show_plan(&mut self, id: String, text: String, cx: &mut Context<Self>) {
-        if !text.trim().is_empty() {
-            self.plan.update(cx, |p, cx| p.add(id, text, cx));
-            self.plan_open = true;
-        }
-    }
-
     fn apply(&mut self, ev: Ev, cx: &mut Context<Self>) {
         // Only a turn that ended well sends the next message; after a stop or an error the
         // queue waits for the user.
@@ -2159,197 +966,32 @@ impl Chat {
     /// The streaming text block a reply continues: the last block, looking past messages
     /// queued while it streams (they'd otherwise split the reply in two).
     fn live_text(&self) -> Option<usize> {
-        let bi = (self.blocks.iter())
-            .rposition(|b| !matches!(b, Block::User(_, true) | Block::Review(_, true)))?;
+        let bi = (self.blocks.iter()).rposition(|b| !matches!(b.message(), Some((_, true))))?;
         matches!(self.blocks[bi], Block::Text { done: false, .. }).then_some(bi)
     }
 
     fn apply_inner(&mut self, ev: Ev, cx: &mut Context<Self>) {
         match ev {
             Ev::Init {
-                session_id: id,
+                session_id,
                 model,
                 permission_mode,
                 mcp,
-            } => {
-                // A process of the backend the chat just switched away from: its session
-                // can't be resumed by the new one.
-                let stale = !self.replaying
-                    && codex::is_codex(self.agent_model.as_deref())
-                        != codex::is_codex(self.meta.model.as_deref());
-                if !stale && self.meta.session_id.as_ref() != Some(&id) {
-                    self.meta.session_id = Some(id);
-                    if !self.replaying {
-                        cx.emit(ChatEvent::Meta);
-                    }
-                }
-                let mut r = format!("running {model} · permissions: {permission_mode}");
-                if !mcp.is_empty() {
-                    r += &format!(" · MCP: {}", mcp.join(", "));
-                }
-                self.reported = Some(r);
-                // Each turn starts with init, including ones the CLI starts itself when a
-                // background task finishes.
-                if !self.busy {
-                    self.started = Some(Instant::now());
-                }
-                self.busy = true;
-                self.steered = false;
-            }
+            } => self.on_init(session_id, &model, &permission_mode, &mcp, cx),
             Ev::Background(tasks) => self.set_background(tasks, cx),
             Ev::Interrupted => self.cut = true,
-            // claude's echo: the oldest message it hadn't read is now part of the turn.
-            // `ends_with`: a workspace `note` may have been put before the text on the wire.
-            // Not just the oldest: one the CLI refused (a failed codex turn/start) is never echoed.
-            Ev::User(text) => {
-                let read = (self.unread.iter()).position(|&bi| match &self.blocks[bi] {
-                    Block::User(t, _) => text.ends_with(t.as_str()),
-                    Block::Review(r, _) => text.ends_with(r.prompt.as_str()),
-                    _ => false,
-                });
-                match read {
-                    Some(k) => {
-                        let bi = self.unread.remove(k).unwrap();
-                        if let Block::User(_, queued) | Block::Review(_, queued) =
-                            &mut self.blocks[bi]
-                        {
-                            *queued = false;
-                        }
-                        self.remeasure(bi);
-                        // codex reads a steer into the running turn, with no new init after.
-                        if self.unread.is_empty() {
-                            self.steered = false;
-                        }
-                    }
-                    None => {
-                        // A replayed message carries the workspace notes sent with it.
-                        let (notes, text) = split_notes(&text);
-                        self.blocks
-                            .extend(notes.lines().map(|n| Block::Info(n.into())));
-                        self.blocks.push(match card_of(text) {
-                            Some(card) => Block::Review(Rc::new(card), false),
-                            None => Block::User(text.into(), false),
-                        });
-                    }
-                }
-            }
+            Ev::User(text) => self.on_echo(text),
             Ev::Notice(text) => self.blocks.push(Block::Info(text)),
-            Ev::TextDelta(s) => match self.live_text() {
-                Some(bi) => {
-                    if let Block::Text { md, src, .. } = &mut self.blocks[bi] {
-                        // Reports come last. A line that may start one waits until it ends,
-                        // then the text is rebuilt without them: once per such line, not per
-                        // delta. Only its lines are checked, so a long reply stays linear.
-                        let from = src.rfind('\n').map_or(0, |i| i + 1);
-                        src.push_str(&s);
-                        match may_report(&src[from..]) {
-                            true if s.contains('\n') => {
-                                md.update(cx, |m, cx| m.set_text(&hide_reports(src), cx))
-                            }
-                            true => {}
-                            false => md.update(cx, |m, cx| m.push_str(&s, cx)),
-                        }
-                    }
-                    self.remeasure(bi);
-                }
-                None => {
-                    let md = cx.new(|cx| TextViewState::markdown(&hide_reports(&s), cx));
-                    self.blocks.push(Block::Text {
-                        md,
-                        src: s,
-                        done: false,
-                    });
-                }
-            },
-            Ev::Text(full) => match self.live_text() {
-                Some(bi) => {
-                    if let Block::Text { md, src, done } = &mut self.blocks[bi] {
-                        md.update(cx, |m, cx| m.set_text(&hide_reports(&full), cx));
-                        *src = full;
-                        *done = true;
-                    }
-                    self.remeasure(bi);
-                }
-                None => {
-                    let md = cx.new(|cx| TextViewState::markdown(&hide_reports(&full), cx));
-                    self.blocks.push(Block::Text {
-                        md,
-                        src: full,
-                        done: true,
-                    });
-                }
-            },
-            Ev::ToolUse { id, name, input } => {
-                let call = Call {
-                    summary: match name.as_str() {
-                        "ExitPlanMode" => plan::title(input["plan"].as_str().unwrap_or_default()),
-                        "AskUserQuestion" => question::asked_summary(&input),
-                        _ => summarize(&input, &self.ws.dir().to_string_lossy()),
-                    },
-                    input: full_input(&input),
-                    id,
-                    name,
-                    result: None,
-                    is_error: false,
-                    open: false,
-                };
-                match self.blocks.last_mut() {
-                    _ if standalone(&call.name).is_some() => self.blocks.push(Block::Tool(call)),
-                    Some(Block::Tools { calls, .. }) => calls.push(call),
-                    _ => self.blocks.push(Block::Tools {
-                        calls: vec![call],
-                        open: false,
-                    }),
-                }
-            }
-            Ev::ToolResult { id, text, is_error } => {
-                let call = (self.blocks.iter_mut().enumerate().rev()).find_map(|(bi, b)| match b {
-                    Block::Tool(c) => (c.id == id).then_some((bi, c)),
-                    Block::Tools { calls, .. } => {
-                        calls.iter_mut().find(|c| c.id == id).map(|c| (bi, c))
-                    }
-                    _ => None,
-                });
-                if let Some((bi, c)) = call {
-                    if c.name == "AskUserQuestion"
-                        && let Some(answer) = question::answered(&text)
-                    {
-                        c.summary = answer.to_string();
-                    }
-                    c.result = Some(text.into());
-                    c.is_error = is_error;
-                    self.remeasure(bi); // an open call shows its output
-                }
-            }
+            Ev::TextDelta(s) => self.on_text(s, cx),
+            Ev::Text(full) => self.on_full_text(full, cx),
+            Ev::ToolUse { id, name, input } => self.on_tool_use(id, name, input),
+            Ev::ToolResult { id, text, is_error } => self.on_tool_result(id, text, is_error),
             Ev::Permission {
                 request_id,
                 tool,
                 tool_use_id,
                 input,
-            } => {
-                // Questions wait for the user's answers in a card; the turn holds meanwhile.
-                // (Replayed history has none: a request is only ever live.)
-                if tool == "AskUserQuestion" && !self.replaying {
-                    return self.show_asked(request_id, tool_use_id, input, cx);
-                }
-                // Plan mode's approval happens in the plan pane, after the turn: the agent is
-                // told the plan was shown, and the turn ends instead of waiting on a person.
-                let reason = match tool.as_str() {
-                    "ExitPlanMode" => {
-                        let text = input["plan"].as_str().unwrap_or_default().to_string();
-                        self.show_plan(tool_use_id, text, cx);
-                        PLAN_SHOWN
-                    }
-                    "EnterPlanMode" => ENTER_PLAN,
-                    _ => NEEDS_APPROVAL,
-                };
-                if let Some(a) = &mut self.agent
-                    && let Err(e) = a.deny(&request_id, reason)
-                {
-                    self.blocks
-                        .push(Block::Info(format!("answering the agent failed: {e}")));
-                }
-            }
+            } => self.on_permission(request_id, tool, tool_use_id, input, cx),
             // codex's turn goes on to its end by itself: there is no request to answer. The
             // pane keeps its versions, so history doesn't add them again.
             Ev::Plan { id, text } => {
@@ -2370,48 +1012,7 @@ impl Chat {
                 text,
                 cost,
                 secs,
-            } => {
-                self.busy = false;
-                if !self.replaying {
-                    self.stopping = None; // a live interrupt's fallback outlives history
-                    self.drop_asked(cx);
-                }
-                let cut = std::mem::take(&mut self.cut);
-                // A pruned or deleted session: claude says so in the result and exits, and
-                // every resume would fail the same way. (Replay restores the session after.)
-                let gone = is_error && text.starts_with("No conversation found with session ID");
-                let took = duration(secs);
-                // A lower total is a fresh process's: show it as it is.
-                let turn = if cost >= self.cost_total {
-                    cost - self.cost_total
-                } else {
-                    cost
-                };
-                if cost > 0. {
-                    self.cost_total = cost; // codex and failures report none
-                }
-                let cost = turn;
-                self.blocks.push(Block::Info(if cut {
-                    format!("interrupted · {took} · ${cost:.2}")
-                } else if is_error {
-                    format!("error: {text}")
-                } else {
-                    format!("done · {took} · ${cost:.2}")
-                }));
-                if gone {
-                    self.meta.session_id = None;
-                    self.blocks.push(Block::Info(
-                        "previous session not found; starting fresh, send again".into(),
-                    ));
-                }
-                if !self.replaying {
-                    if gone {
-                        cx.emit(ChatEvent::Meta);
-                    }
-                    self.keep_reply();
-                    cx.emit(ChatEvent::TurnDone);
-                }
-            }
+            } => self.on_result(is_error, text, cost, secs, cx),
             Ev::Exited(msg) => {
                 self.drop_process(cx);
                 if self.busy {
@@ -2429,6 +1030,236 @@ impl Chat {
         }
     }
 
+    /// The CLI's init, which starts each turn: its session, and what it reported about itself.
+    fn on_init(
+        &mut self,
+        id: String,
+        model: &str,
+        permission_mode: &str,
+        mcp: &[String],
+        cx: &mut Context<Self>,
+    ) {
+        // A process of the backend the chat just switched away from: its session
+        // can't be resumed by the new one.
+        let stale =
+            !self.replaying && codex::is_codex(self.agent_model.as_deref()) != self.meta.is_codex();
+        if !stale && self.meta.session_id.as_ref() != Some(&id) {
+            self.meta.session_id = Some(id);
+            if !self.replaying {
+                cx.emit(ChatEvent::Meta);
+            }
+        }
+        let mut r = format!("running {model} · permissions: {permission_mode}");
+        if !mcp.is_empty() {
+            r += &format!(" · MCP: {}", mcp.join(", "));
+        }
+        self.reported = Some(r);
+        // Each turn starts with init, including ones the CLI starts itself when a
+        // background task finishes.
+        if !self.busy {
+            self.started = Some(Instant::now());
+        }
+        self.busy = true;
+        self.steered = false;
+    }
+
+    /// claude's echo: the oldest message it hadn't read is now part of the turn.
+    /// `ends_with`: a workspace `note` may have been put before the text on the wire.
+    /// Not just the oldest: one the CLI refused (a failed codex turn/start) is never echoed.
+    fn on_echo(&mut self, text: String) {
+        let read = (self.unread.iter())
+            .position(|&bi| (self.blocks[bi].message()).is_some_and(|(t, _)| text.ends_with(t)));
+        match read {
+            Some(k) => {
+                let bi = self.unread.remove(k).unwrap();
+                if let Block::User(_, queued) | Block::Review(_, queued) = &mut self.blocks[bi] {
+                    *queued = false;
+                }
+                self.remeasure(bi);
+                // codex reads a steer into the running turn, with no new init after.
+                if self.unread.is_empty() {
+                    self.steered = false;
+                }
+            }
+            None => {
+                // A replayed message carries the workspace notes sent with it.
+                let (notes, text) = split_notes(&text);
+                self.blocks
+                    .extend(notes.lines().map(|n| Block::Info(n.into())));
+                self.blocks.push(match card_of(text) {
+                    Some(card) => Block::Review(Rc::new(card), false),
+                    None => Block::User(text.into(), false),
+                });
+            }
+        }
+    }
+
+    fn on_text(&mut self, s: String, cx: &mut Context<Self>) {
+        match self.live_text() {
+            Some(bi) => {
+                if let Block::Text { md, src, .. } = &mut self.blocks[bi] {
+                    // Reports come last. A line that may start one waits until it ends,
+                    // then the text is rebuilt without them: once per such line, not per
+                    // delta. Only its lines are checked, so a long reply stays linear.
+                    let from = src.rfind('\n').map_or(0, |i| i + 1);
+                    src.push_str(&s);
+                    match may_report(&src[from..]) {
+                        true if s.contains('\n') => {
+                            md.update(cx, |m, cx| m.set_text(&hide_reports(src), cx))
+                        }
+                        true => {}
+                        false => md.update(cx, |m, cx| m.push_str(&s, cx)),
+                    }
+                }
+                self.remeasure(bi);
+            }
+            None => {
+                let md = cx.new(|cx| TextViewState::markdown(&hide_reports(&s), cx));
+                self.blocks.push(Block::Text {
+                    md,
+                    src: s,
+                    done: false,
+                });
+            }
+        }
+    }
+
+    fn on_full_text(&mut self, full: String, cx: &mut Context<Self>) {
+        match self.live_text() {
+            Some(bi) => {
+                if let Block::Text { md, src, done } = &mut self.blocks[bi] {
+                    md.update(cx, |m, cx| m.set_text(&hide_reports(&full), cx));
+                    *src = full;
+                    *done = true;
+                }
+                self.remeasure(bi);
+            }
+            None => {
+                let md = cx.new(|cx| TextViewState::markdown(&hide_reports(&full), cx));
+                self.blocks.push(Block::Text {
+                    md,
+                    src: full,
+                    done: true,
+                });
+            }
+        }
+    }
+
+    fn on_tool_use(&mut self, id: String, name: String, input: Value) {
+        let call = Call {
+            summary: match name.as_str() {
+                PLAN_TOOL => plan::title(input["plan"].as_str().unwrap_or_default()),
+                ASK_TOOL => question::asked_summary(&input),
+                _ => summarize(&input, &self.ws.dir().to_string_lossy()),
+            },
+            input: full_input(&input),
+            id,
+            name,
+            result: None,
+            is_error: false,
+            open: false,
+        };
+        match self.blocks.last_mut() {
+            _ if standalone(&call.name).is_some() => self.blocks.push(Block::Tool(call)),
+            Some(Block::Tools { calls, .. }) => calls.push(call),
+            _ => self.blocks.push(Block::Tools {
+                calls: vec![call],
+                open: false,
+            }),
+        }
+    }
+
+    fn on_tool_result(&mut self, id: String, text: String, is_error: bool) {
+        let call = (self.blocks.iter_mut().enumerate().rev()).find_map(|(bi, b)| match b {
+            Block::Tool(c) => (c.id == id).then_some((bi, c)),
+            Block::Tools { calls, .. } => calls.iter_mut().find(|c| c.id == id).map(|c| (bi, c)),
+            _ => None,
+        });
+        if let Some((bi, c)) = call {
+            if c.name == ASK_TOOL
+                && let Some(answer) = question::answered(&text)
+            {
+                c.summary = answer.to_string();
+            }
+            c.result = Some(text.into());
+            c.is_error = is_error;
+            self.remeasure(bi); // an open call shows its output
+        }
+    }
+
+    fn on_permission(
+        &mut self,
+        request_id: String,
+        tool: String,
+        tool_use_id: String,
+        input: Value,
+        cx: &mut Context<Self>,
+    ) {
+        // Questions wait for the user's answers in a card; the turn holds meanwhile.
+        // (Replayed history has none: a request is only ever live.)
+        if tool == ASK_TOOL && !self.replaying {
+            return self.show_asked(request_id, tool_use_id, input, cx);
+        }
+        // Plan mode's approval happens in the plan pane, after the turn: the agent is
+        // told the plan was shown, and the turn ends instead of waiting on a person.
+        let reason = match tool.as_str() {
+            PLAN_TOOL => {
+                let text = input["plan"].as_str().unwrap_or_default().to_string();
+                self.show_plan(tool_use_id, text, cx);
+                PLAN_SHOWN
+            }
+            "EnterPlanMode" => ENTER_PLAN,
+            _ => NEEDS_APPROVAL,
+        };
+        if let Some(a) = &mut self.agent
+            && let Err(e) = a.deny(&request_id, reason)
+        {
+            self.blocks
+                .push(Block::Info(format!("answering the agent failed: {e}")));
+        }
+    }
+
+    fn on_result(
+        &mut self,
+        is_error: bool,
+        text: String,
+        cost: f64,
+        secs: u64,
+        cx: &mut Context<Self>,
+    ) {
+        self.busy = false;
+        if !self.replaying {
+            self.stopping = None; // a live interrupt's fallback outlives history
+            self.drop_asked(cx);
+        }
+        let cut = std::mem::take(&mut self.cut);
+        // A pruned or deleted session: claude says so in the result and exits, and
+        // every resume would fail the same way. (Replay restores the session after.)
+        let gone = is_error && text.starts_with(agent::SESSION_GONE);
+        let took = duration(secs);
+        let cost = turn_cost(&mut self.cost_total, cost);
+        self.blocks.push(Block::Info(if cut {
+            format!("interrupted · {took} · ${cost:.2}")
+        } else if is_error {
+            format!("error: {text}")
+        } else {
+            format!("done · {took} · ${cost:.2}")
+        }));
+        if gone {
+            self.meta.session_id = None;
+            self.blocks.push(Block::Info(
+                "previous session not found; starting fresh, send again".into(),
+            ));
+        }
+        if !self.replaying {
+            if gone {
+                cx.emit(ChatEvent::Meta);
+            }
+            self.keep_reply();
+            cx.emit(ChatEvent::TurnDone);
+        }
+    }
+
     /// On the last row the list follows new output again; elsewhere it holds still.
     fn select(&mut self, ix: usize, cx: &mut Context<Self>) {
         self.sel = ix.min(self.rows.len().saturating_sub(1));
@@ -2439,116 +1270,6 @@ impl Chat {
             self.list.scroll_to_reveal_item(self.sel);
         }
         cx.notify();
-    }
-
-    /// The list's last item, under the newest message: a quiet line while a turn or background
-    /// tasks run; hovering lists the details. Fixed height, so it comes and goes
-    /// without remeasuring or moving the transcript.
-    fn render_activity(&self, cx: &App) -> impl IntoElement {
-        let theme = cx.theme();
-        let line = div()
-            .id("activity")
-            .test_support()
-            .w_full()
-            .h(px(24.))
-            .px_4();
-        if !self.working() {
-            return line;
-        }
-        let text = match (self.busy, self.background.len()) {
-            _ if self.asking() => "Waiting for your answers".into(),
-            (true, 0) => "Working".into(),
-            (true, n) => format!("Working · {n} in background"),
-            (false, n) => format!("{n} in background"),
-        };
-        let (busy, started, model) = (
-            self.busy && !self.asking(),
-            self.started,
-            self.model().to_string(),
-        );
-        let (queued, steered, tasks) = (self.queued(), self.steered, self.background.clone());
-        let critters = self.critters.clone();
-        let visible = tasks.len().min(PARADE_LIMIT);
-        line.child(
-            div().w_full().max_w(px(680.)).mx_auto().child(
-                HoverCard::new("activity-card")
-                    .anchor(Anchor::BottomLeft)
-                    .trigger(
-                        h_flex()
-                            .gap_1()
-                            .h(px(24.))
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .children(tasks.iter().take(PARADE_LIMIT).enumerate().map(|(i, t)| {
-                                let ix = critters[&t.id];
-                                // Fixed slots contain the hop without changing the footer's layout.
-                                div()
-                                    .id(("background-critter", i))
-                                    .test_support()
-                                    .size(px(12.))
-                                    .flex_shrink_0()
-                                    .child(
-                                        Icon::new(critter_icon(t, ix))
-                                            .with_size(px(12.))
-                                            .text_color(critter_color(ix, theme))
-                                            .when(
-                                                !cx.reduce_motion() && i == self.hop % visible,
-                                                |d| d.mt(px(-2.)),
-                                            ),
-                                    )
-                            }))
-                            .when(tasks.len() > PARADE_LIMIT, |d| {
-                                d.child(format!("+{}", tasks.len() - PARADE_LIMIT))
-                            })
-                            // The shimmer redraws the chat every frame, as a tool's spinner
-                            // does; only during a turn, not for tasks left running after it.
-                            .map(|d| match busy {
-                                true => d
-                                    .child(Spinner::new().with_size(px(12.)))
-                                    .child(ShimmerText::new(text).id("activity-text")),
-                                false => d.child(text),
-                            }),
-                    )
-                    .content(move |_, _, cx| {
-                        let theme = cx.theme();
-                        let line = |t: String| div().child(t);
-                        v_flex()
-                            .gap_1()
-                            .text_xs()
-                            .max_w(px(420.))
-                            .when_some(started.filter(|_| busy), |d, t| {
-                                d.child(line(format!(
-                                    "Turn running for {}",
-                                    duration(t.elapsed().as_secs())
-                                )))
-                            })
-                            .child(line(format!("Model {model}")))
-                            .when(queued > 0, |d| d.child(line(format!("{queued} queued"))))
-                            .when(steered, |d| {
-                                d.child(line("Message sent mid-turn, not read yet".into()))
-                            })
-                            .when(!tasks.is_empty(), |d| {
-                                d.child(
-                                    div()
-                                        .pt_1()
-                                        .text_color(theme.muted_foreground)
-                                        .child(format!("{} in background", tasks.len())),
-                                )
-                                .children(tasks.iter().map(|t| {
-                                    let ix = critters[&t.id];
-                                    h_flex()
-                                        .gap_1p5()
-                                        .child(
-                                            Icon::new(critter_icon(t, ix))
-                                                .with_size(px(12.))
-                                                .text_color(critter_color(ix, theme)),
-                                        )
-                                        .child(t.description.clone())
-                                }))
-                            })
-                    }),
-            ),
-        )
     }
 
     fn render_row(&self, ix: usize, window: &Window, cx: &mut Context<Self>) -> AnyElement {
@@ -2592,7 +1313,7 @@ impl Chat {
         let status = |c: &Call| match (&c.result, c.is_error) {
             (None, _) => Spinner::new().with_size(px(14.)).into_any_element(),
             // Denied on purpose: approval happens in the plan pane, answers in the chat.
-            (Some(_), true) if !matches!(c.name.as_str(), "ExitPlanMode" | "AskUserQuestion") => {
+            (Some(_), true) if !matches!(c.name.as_str(), PLAN_TOOL | ASK_TOOL) => {
                 icon(IconName::X)
                     .text_color(theme.danger_foreground)
                     .into_any_element()
@@ -2617,8 +1338,8 @@ impl Chat {
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme.foreground)
                                 .child(match c.name.as_str() {
-                                    "ExitPlanMode" => "Plan".to_string(),
-                                    "AskUserQuestion" => "Question".to_string(),
+                                    PLAN_TOOL => "Plan".to_string(),
+                                    ASK_TOOL => "Question".to_string(),
                                     _ => c.name.clone(),
                                 }),
                         )
@@ -2627,13 +1348,13 @@ impl Chat {
                                 match (c.name.as_str(), plan.number_of(&c.id)) {
                                     // The call's own input can be stale: claude fills
                                     // in the plan file when it asks, not when it calls.
-                                    ("ExitPlanMode", Some(n)) => {
+                                    (PLAN_TOOL, Some(n)) => {
                                         format!(
                                             "v{n} · {}",
                                             plan::title(&plan.versions[n - 1].text)
                                         )
                                     }
-                                    ("AskUserQuestion", _) => (c.result.as_deref())
+                                    (ASK_TOOL, _) => (c.result.as_deref())
                                         .and_then(question::answered)
                                         .unwrap_or(&c.summary)
                                         .to_string(),
@@ -2656,7 +1377,7 @@ impl Chat {
                         }),
                 )
                 .when(c.open, |d| {
-                    // Clipped, with a "truncated" note, when parsed (agent::MAX_OUTPUT).
+                    // Clipped, with a "truncated" note, when parsed (crate::transcript::MAX_OUTPUT).
                     let result = c.result.clone();
                     let text = result.clone().unwrap_or("(running)".into());
                     d.child(
@@ -2783,248 +1504,6 @@ impl Chat {
         row.child(inner).into_any_element()
     }
 
-    /// A review as sent (screen 06): its comments, each linking to the diff, then a row that
-    /// opens the diff. `footer` says where it stands.
-    fn review_card(
-        &self,
-        r: &ReviewCard,
-        key: usize,
-        footer: Option<AnyElement>,
-        cx: &Context<Self>,
-    ) -> impl IntoElement {
-        let theme = cx.theme();
-        let n = r.items.len();
-        v_flex()
-            .gap_2()
-            .text_sm()
-            .child(
-                v_flex()
-                    .gap_2()
-                    .pl_3()
-                    .py_2()
-                    .border_l_2()
-                    .border_color(theme.primary)
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.success_foreground)
-                            .child(match n {
-                                1 => "Diff comment added to context".to_string(),
-                                n => format!("{n} diff comments added to context"),
-                            }),
-                    )
-                    .children(r.items.iter().map(|it| {
-                        let id = it.id;
-                        v_flex()
-                            .gap_0p5()
-                            .child(
-                                div()
-                                    .id(("review-link", (key << 16) + id as usize))
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .cursor_pointer()
-                                    .hover(|d| d.text_color(theme.foreground))
-                                    .child(format!("{} ↗", it.place))
-                                    .on_click(cx.listener(move |_, _, _, cx| {
-                                        cx.stop_propagation();
-                                        cx.emit(ChatEvent::ShowComment(id))
-                                    })),
-                            )
-                            .child(div().text_color(theme.foreground).child(it.text.clone()))
-                    }))
-                    .when_some(footer, |d, f| {
-                        d.child(div().text_xs().text_color(theme.muted_foreground).child(f))
-                    }),
-            )
-            .child(
-                h_flex()
-                    .id(("review-changes", key))
-                    .h(px(32.))
-                    .px_3()
-                    .rounded(theme.radius)
-                    .border_1()
-                    .border_color(theme.border)
-                    .cursor_pointer()
-                    .hover(|d| d.bg(theme.list_hover))
-                    .on_click(cx.listener(|_, _, _, cx| {
-                        cx.stop_propagation();
-                        cx.emit(ChatEvent::ShowChanges)
-                    }))
-                    .child(div().flex_1().child("Review changes"))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(r.changes.clone()),
-                    ),
-            )
-    }
-
-    /// Queued messages above the input, in send order: the top row goes next.
-    fn render_queue(&self, window: &Window, cx: &mut Context<Self>) -> Option<AnyElement> {
-        if self.queue.is_empty() {
-            return None;
-        }
-        let focused = self.qfocus.is_focused(window);
-        let theme = cx.theme();
-        let faint = crate::ui::faint(theme);
-        let action = |id: (&'static str, usize),
-                      icon: IconName,
-                      tip: &'static str,
-                      f: fn(&mut Self, &mut Window, &mut Context<Self>)| {
-            let ix = id.1;
-            Button::new(id)
-                .ghost()
-                .xsmall()
-                .icon(icon)
-                .tooltip(tip)
-                .on_click(cx.listener(move |this, _, window, cx| {
-                    this.qsel = ix;
-                    f(this, window, cx);
-                    cx.stop_propagation(); // the row's own click would refocus the queue
-                }))
-        };
-        let rows: Vec<AnyElement> = (self.queue.iter().enumerate())
-            .map(|(ix, q)| {
-                let sel = focused && ix == self.qsel;
-                if let Some(r) = &q.review {
-                    let footer = h_flex()
-                        .gap_1()
-                        .child("Included with your next message ·")
-                        .child(
-                            div()
-                                .id(("q-remove", ix))
-                                .cursor_pointer()
-                                .text_color(theme.foreground)
-                                .hover(|d| d.underline())
-                                .child("Remove")
-                                .on_click(cx.listener(move |this, _, window, cx| {
-                                    this.remove_queued(ix, window, cx);
-                                    cx.stop_propagation();
-                                })),
-                        );
-                    return div()
-                        .px_2()
-                        .py_1()
-                        .rounded(theme.radius)
-                        .when(sel, |d| d.bg(theme.list_active))
-                        .child(self.review_card(r, ix, Some(footer.into_any_element()), cx))
-                        .into_any_element();
-                }
-                h_flex()
-                    .id(("queued", ix))
-                    .h(px(28.))
-                    .pl_2()
-                    .gap_2()
-                    .rounded(theme.radius)
-                    .border_l_2()
-                    .border_color(if sel {
-                        theme.primary
-                    } else {
-                        theme.transparent
-                    })
-                    .when(sel, |d| d.bg(theme.list_active))
-                    .when(!sel, |d| d.hover(|d| d.bg(theme.list_hover)))
-                    .on_click(cx.listener(move |this, _, window, cx| {
-                        this.qsel = ix;
-                        this.focus_queue(window, cx);
-                    }))
-                    .child(
-                        Icon::new(IconName::CornerDownRight)
-                            .with_size(px(14.))
-                            .text_color(theme.muted_foreground),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_color(theme.foreground)
-                            .child(q.preview.clone()),
-                    )
-                    .child(action(
-                        ("q-send", ix),
-                        IconName::ArrowUp,
-                        "Send now (enter)",
-                        Self::steer,
-                    ))
-                    .child(action(
-                        ("q-edit", ix),
-                        IconName::Pencil,
-                        "Edit (e)",
-                        Self::edit_queued,
-                    ))
-                    .child(action(
-                        ("q-del", ix),
-                        IconName::Trash,
-                        "Delete (d)",
-                        Self::delete_queued,
-                    ))
-                    .into_any_element()
-            })
-            .collect();
-        let n = self.queue.len();
-        Some(
-            v_flex()
-                .id("queue")
-                .key_context("Queue")
-                .track_focus(&self.qfocus)
-                .pb_1()
-                .mb_1()
-                .border_b_1()
-                .border_color(theme.border)
-                .text_sm()
-                .on_action(cx.listener(|this, _: &SelectNext, w, cx| {
-                    this.queue_select(this.qsel + 1, w, cx)
-                }))
-                .on_action(cx.listener(|this, _: &SelectPrev, w, cx| {
-                    this.queue_select(this.qsel.saturating_sub(1), w, cx)
-                }))
-                .on_action(cx.listener(|this, _: &SelectFirst, w, cx| this.queue_select(0, w, cx)))
-                .on_action(cx.listener(|this, _: &SelectLast, w, cx| {
-                    this.queue_select(this.queue.len().saturating_sub(1), w, cx)
-                }))
-                .on_action(cx.listener(|this, _: &Confirm, w, cx| this.steer(w, cx)))
-                .on_action(cx.listener(|this, _: &EditQueued, w, cx| this.edit_queued(w, cx)))
-                .on_action(cx.listener(|this, _: &DeleteQueued, w, cx| this.delete_queued(w, cx)))
-                .on_action(cx.listener(|this, _: &MoveQueuedUp, _, cx| this.move_queued(-1, cx)))
-                .on_action(cx.listener(|this, _: &MoveQueuedDown, _, cx| this.move_queued(1, cx)))
-                .on_action(cx.listener(|this, _: &FocusComposer, w, cx| this.focus_composer(w, cx)))
-                .child(
-                    h_flex()
-                        .h(px(24.))
-                        .px_2()
-                        .gap_3()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(match self.editing.is_some() {
-                            true => format!("{n} queued · paused while you edit"),
-                            false => format!("{n} queued · sends when the turn ends"),
-                        })
-                        .child(div().flex_1())
-                        .when(focused, |d| {
-                            d.text_color(faint)
-                                .child(hint("enter", "send now"))
-                                .child(hint("e", "edit"))
-                                .child(hint("d", "delete"))
-                                .child(hint("shift-k shift-j", "reorder"))
-                        })
-                        .when(!focused, |d| {
-                            d.text_color(faint).child(hint("up", "manage"))
-                        }),
-                )
-                .child(
-                    div()
-                        .id("queue-rows")
-                        .max_h(px(5. * 28.))
-                        .overflow_y_scroll()
-                        .track_scroll(&self.qscroll)
-                        .children(rows),
-                )
-                .into_any_element(),
-        )
-    }
-
     /// The reply a turn's closing line ("done · 48s") sits under, if it ended on one.
     fn reply_above(&self, bi: usize) -> Option<&String> {
         match self.blocks.get(bi.checked_sub(1)?) {
@@ -3041,10 +1520,9 @@ impl Chat {
         };
         let text = match (&self.blocks[bi], call) {
             (Block::Info(t), _) => Some(self.reply_above(bi).unwrap_or(t).clone()),
-            (Block::User(t, _), _) => Some(t.clone()),
-            (Block::Review(r, _), _) => Some(r.prompt.clone()),
+            (b @ (Block::User(..) | Block::Review(..)), _) => b.message().map(|(t, _)| t.into()),
             (Block::Text { src, .. }, _) => Some(src.clone()),
-            (Block::Tool(c), _) if c.name == "ExitPlanMode" => {
+            (Block::Tool(c), _) if c.name == PLAN_TOOL => {
                 let plan = self.plan.read(cx);
                 plan.number_of(&c.id)
                     .map(|n| plan.versions[n - 1].text.clone())
@@ -3056,8 +1534,7 @@ impl Chat {
             (Block::Tools { .. }, None) => None,
         };
         if let Some(text) = text {
-            cx.write_to_clipboard(ClipboardItem::new_string(text));
-            window.push_notification("Copied", cx);
+            crate::ui::copy_with(text, "Copied", window, cx);
         }
     }
 
@@ -3067,7 +1544,7 @@ impl Chat {
         };
         // A submitted plan opens in the plan pane rather than showing the tool's reply.
         if let Block::Tool(c) = &self.blocks[bi]
-            && c.name == "ExitPlanMode"
+            && c.name == PLAN_TOOL
         {
             let n = self.plan.read(cx).number_of(&c.id);
             if let Some(n) = n {
@@ -3095,6 +1572,310 @@ fn insert_mode() -> Vim {
     v
 }
 
+impl Chat {
+    /// The transcript before the first message: what to type, and the keys.
+    fn empty_state(&self, cx: &App) -> Div {
+        v_flex()
+            .absolute()
+            .inset_0()
+            .items_center()
+            .justify_center()
+            .gap_2()
+            .text_sm()
+            .text_color(crate::ui::faint(cx.theme()))
+            .child("Describe a task and press enter.")
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(hint("shift-tab", "plan mode"))
+                    // Side questions fork a claude session; codex has none.
+                    .when(!self.codex(), |d| {
+                        d.child(hint("cmd-shift-enter", "side question"))
+                    }),
+            )
+            .child(
+                h_flex()
+                    .gap_3()
+                    .child(hint("c", "comment on a diff line"))
+                    .child(hint("shift-c", "send comments")),
+            )
+    }
+
+    /// The composer card, with the side question and the agent's questions above it.
+    fn composer_bar(
+        &self,
+        asked_card: Option<AnyElement>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let theme = cx.theme();
+        let (radius, border, card, muted) = (
+            theme.radius_lg,
+            theme.border,
+            theme.secondary,
+            theme.muted_foreground,
+        );
+        // The editor's Vim pill, on `muted`: the card is already `secondary`.
+        let vim_pill = self.vim_on.then(|| {
+            div()
+                .px_2()
+                .h(px(20.))
+                .flex()
+                .items_center()
+                .rounded_full()
+                .font_family(theme.mono_font_family.clone())
+                .bg(theme.muted)
+                .child(self.vim.label())
+        });
+        div()
+            .px_4()
+            .pb_4()
+            .pt_1()
+            .children(self.render_side(window, cx))
+            .children(asked_card)
+            .child(
+                v_flex()
+                    .key_context("Composer")
+                    // A key after a prefix that completes no binding (`ctrl-w j`) skips
+                    // interceptors; catch it here, before the input types it.
+                    .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
+                        let took = this.vim_took.take() == Some(ev.keystroke.clone());
+                        if took
+                            || (!window.has_pending_keystrokes()
+                                && this.vim_intercept(&ev.keystroke, window, cx))
+                        {
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .relative()
+                    .w_full()
+                    .max_w(px(712.))
+                    .mx_auto()
+                    .p_2()
+                    .gap_1()
+                    .rounded(radius)
+                    .border_1()
+                    .border_color(border)
+                    .bg(card)
+                    .on_action(cx.listener(|this, _: &FocusTranscript, window, cx| {
+                        this.focus.focus(window, cx);
+                        cx.notify();
+                    }))
+                    .on_action(cx.listener(|this, _: &AskSide, window, cx| {
+                        this.ask_draft_aside(window, cx)
+                    }))
+                    // While the menu is open, these keys drive it instead of the input.
+                    .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
+                        if this.menu.is_some() {
+                            this.move_menu(1, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
+                        if this.menu.is_some() {
+                            this.move_menu(-1, cx);
+                            cx.stop_propagation();
+                            return;
+                        }
+                        // Up from the first line goes to the queue, like Claude Code's.
+                        let c = this.composer.read(cx);
+                        let first_line = !c.value()[..c.cursor()].contains('\n');
+                        // The agent's questions first: the way back to the card.
+                        if first_line
+                            && let Some(f) = this.asked_form()
+                            && c.focus_handle(cx).is_focused(window)
+                        {
+                            f.read(cx).focus_handle().clone().focus(window, cx);
+                            cx.stop_propagation();
+                            return;
+                        }
+                        if first_line
+                            && !this.queue.is_empty()
+                            && c.focus_handle(cx).is_focused(window)
+                        {
+                            this.qsel = this.queue.len() - 1;
+                            this.focus_queue(window, cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .capture_action(cx.listener(|this, a: &Enter, window, cx| {
+                        // With no match, Enter sends what was typed.
+                        if !a.shift && this.pick_selected(window, cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
+                        if this.pick_selected(window, cx) {
+                            cx.stop_propagation();
+                        }
+                    }))
+                    // shift-tab: plan mode, as in Claude Code, instead of outdenting.
+                    .capture_action(cx.listener(|this, _: &OutdentInline, _, cx| {
+                        this.set_plan_mode(!this.meta.plan, cx);
+                        cx.stop_propagation();
+                    }))
+                    .capture_action(cx.listener(|this, _: &Escape, _, cx| {
+                        if this.menu.is_some() {
+                            this.close_menu(cx);
+                            cx.stop_propagation();
+                        }
+                    }))
+                    .when_some(self.render_menu(cx), |d, menu| d.child(menu))
+                    .when_some(self.render_queue(window, cx), |d, q| d.child(q))
+                    .child(
+                        Textarea::new(&self.composer)
+                            .on_paste({
+                                let chat = cx.entity().downgrade();
+                                move |item, window, cx| {
+                                    chat.update(cx, |c, cx| c.paste(item, window, cx))
+                                        .unwrap_or(false)
+                                }
+                            })
+                            .appearance(false)
+                            .text_size(px(14.)),
+                    )
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .text_xs()
+                            .text_color(muted)
+                            .child(
+                                Button::new("plan-mode")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::ClipboardList)
+                                    .label("Plan")
+                                    .selected(self.meta.plan)
+                                    .tooltip(if self.meta.plan {
+                                        "Plan mode on: the agent plans and edits nothing (shift-tab)"
+                                    } else {
+                                        "Plan mode: plan first, build after you approve (shift-tab)"
+                                    })
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_plan_mode(!this.meta.plan, cx)
+                                    })),
+                            )
+                            .when(self.codex(), |d| d.child(
+                                Button::new("fast-mode")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Zap)
+                                    .label("Fast")
+                                    .selected(self.fast())
+                                    .tooltip_with_action(
+                                        "Fast: quicker replies that use more of your plan's usage",
+                                        &ToggleFastMode,
+                                        None,
+                                    )
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.set_fast(!this.fast(), cx)
+                                    })),
+                            ))
+                            .child(
+                                div().relative().min_w_0().child(
+                                Button::new("model")
+                                    .ghost()
+                                    .xsmall()
+                                    .icon(IconName::Sparkles)
+                                    .label(self.model_chip())
+                                    .dropdown_caret(true)
+                                    // Shrinks to an ellipsis before the footer overflows.
+                                    .flex_shrink(1.)
+                                    .min_w_0()
+                                    .max_w_full()
+                                    .tooltip_with_action(
+                                        match &self.reported {
+                                            Some(r) => format!("Model and thinking · {r} · ⌘⇧. / ⌘⇧, raise or lower thinking"),
+                                            None => "Model and thinking · ⌘⇧. / ⌘⇧, raise or lower thinking".into(),
+                                        },
+                                        &PickModel,
+                                        None,
+                                    )
+                                    .on_click(|_, window, cx| {
+                                        window.dispatch_action(PickModel.boxed_clone(), cx)
+                                    }),
+                                )
+                                .child({
+                                    let at = self.model_at.clone();
+                                    canvas(move |b, _, _| at.set(b), |_, _, _, _| {})
+                                        .absolute()
+                                        .top_0()
+                                        .left_0()
+                                        .size_full()
+                                }),
+                            )
+                            .children(
+                                (self.model_menu.as_ref())
+                                    .map(|(m, _)| crate::menu::layer(m.clone())),
+                            )
+                            .when_some(vim_pill, |d, p| d.child(p.flex_none()))
+                            // Idle shows no keys: enter sends. Clipped, not wrapped, when narrow.
+                            .child(
+                                h_flex()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .justify_end()
+                                    .gap_3()
+                                    .when(self.busy || self.hold, |d| {
+                                        d.child(match self.editing {
+                                            Some(_) => hint("enter", "save"),
+                                            None => hint("enter", "queue"),
+                                        })
+                                    })
+                                    .when(self.busy && !self.hold, |d| {
+                                        d.child(hint("cmd-enter", "send now"))
+                                    })
+                                    .when(self.busy, |d| d.child(hint("ctrl-c", "interrupt"))),
+                            ),
+                    ),
+            )
+    }
+
+    /// The dashed "Drop to attach" overlay for files dragged over the pane.
+    fn drop_overlay(cx: &App) -> Div {
+        let theme = cx.theme();
+        let (radius, accent, muted) = (theme.radius_lg, theme.drag_border, theme.muted_foreground);
+        let (bg, fg, drop_bg) = (
+            theme.background.opacity(0.85),
+            theme.foreground,
+            theme.drop_target,
+        );
+        v_flex()
+            .absolute()
+            .inset_2()
+            .items_center()
+            .justify_center()
+            .gap_1()
+            .rounded(radius)
+            .border_2()
+            .border_dashed()
+            .border_color(accent)
+            .bg(bg)
+            // The theme's drop tint over a faded transcript.
+            .child(div().absolute().inset_0().rounded(radius).bg(drop_bg))
+            .child(
+                Icon::new(IconName::Paperclip)
+                    .with_size(px(32.))
+                    .text_color(accent)
+                    .mb_2(),
+            )
+            .child(
+                div()
+                    .text_base()
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(fg)
+                    .child("Drop to attach"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(muted)
+                    .child("Files and images are added to your message"),
+            )
+    }
+}
+
 impl Render for Chat {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // The queue emptied (a turn ended, a git step finished) while it had focus.
@@ -3109,78 +1890,59 @@ impl Render for Chat {
         let asked_card = self.render_asked(window, cx);
         self.asked_focused =
             asked_card.is_some() && (self.asked.as_ref()).is_some_and(|a| a.focused(window, cx));
-        let theme = cx.theme();
-        let (radius, border, card, muted) = (
-            theme.radius_lg,
-            theme.border,
-            theme.secondary,
-            theme.muted_foreground,
-        );
-        // The editor's Vim pill, on `muted`: the card is already `secondary`.
-        let vim_pill = self.vim_on.then(|| {
-            let p = self.vim.pending();
-            div()
-                .px_2()
-                .h(px(20.))
-                .flex()
-                .items_center()
-                .rounded_full()
-                .font_family(theme.mono_font_family.clone())
-                .bg(theme.muted)
-                .child(match p.is_empty() {
-                    true => self.vim.status().to_string(),
-                    false => format!("{} {p}", self.vim.status()),
-                })
-        });
+        let border = cx.theme().border;
         let rows = list(
             self.list.clone(),
             cx.processor(|this, ix, window, cx| this.render_row(ix, window, cx)),
         )
         .size_full()
         .py_2();
-        let drop_bg = theme.drop_target;
-        let accent = theme.drag_border;
-        let (bg, fg) = (theme.background.opacity(0.85), theme.foreground);
         let main = v_flex()
             .id("chat-pane")
             .group("chat-pane")
             .relative()
             .size_full()
-            .on_action(cx.listener(|this, _: &FocusComposer, window, cx| {
-                this.focus_composer(window, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &FocusComposer, window, cx| this.focus_composer(window, cx)),
+            )
             // Files from Finder anywhere on the pane are copied in and mentioned in the composer.
             // Not `drag_over`/`on_drop`: gpui checks hover for those, and hover is off while the
             // last input was a key (a file drag doesn't count as the mouse), so a drag right
             // after typing showed nothing and dropped nothing.
-            .on_drag_move(cx.listener(|this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
-                let over = (e.bounds.contains(&e.event.position)).then(|| e.drag(cx).paths().to_vec());
-                if over.is_some() != this.dropping.is_some() {
-                    cx.notify();
-                }
-                this.dropping = over;
-            }))
+            .on_drag_move(
+                cx.listener(|this, e: &DragMoveEvent<ExternalPaths>, _, cx| {
+                    let over =
+                        (e.bounds.contains(&e.event.position)).then(|| e.drag(cx).paths().to_vec());
+                    if over.is_some() != this.dropping.is_some() {
+                        cx.notify();
+                    }
+                    this.dropping = over;
+                }),
+            )
             .on_file_drop_exit(cx.listener(|this, _, _, cx| {
                 this.dropping = None;
                 cx.notify();
             }))
             .child({
                 let chat = cx.entity().downgrade();
-                canvas(|_, _, _| {}, move |_, _, window, _| {
-                    let chat = chat.clone();
-                    window.on_mouse_event(move |_: &MouseUpEvent, phase, window, cx| {
-                        if phase != DispatchPhase::Bubble {
-                            return;
-                        }
-                        chat.update(cx, |this, cx| {
-                            if let Some(paths) = this.dropping.take() {
-                                this.attach(paths, None, window, cx);
-                                cx.notify();
+                canvas(
+                    |_, _, _| {},
+                    move |_, _, window, _| {
+                        let chat = chat.clone();
+                        window.on_mouse_event(move |_: &MouseUpEvent, phase, window, cx| {
+                            if phase != DispatchPhase::Bubble {
+                                return;
                             }
-                        })
-                        .ok();
-                    });
-                })
+                            chat.update(cx, |this, cx| {
+                                if let Some(paths) = this.dropping.take() {
+                                    this.attach(paths, None, window, cx);
+                                    cx.notify();
+                                }
+                            })
+                            .ok();
+                        });
+                    },
+                )
                 .absolute()
                 .size_0()
             })
@@ -3209,282 +1971,22 @@ impl Render for Chat {
                         this.select(this.sel.saturating_sub(5), cx)
                     }))
                     .on_action(cx.listener(|this, _: &Confirm, _, cx| this.toggle(cx)))
-                    .on_action(cx.listener(|this, _: &CopySelected, w, cx| this.copy_selected(w, cx)))
+                    .on_action(
+                        cx.listener(|this, _: &CopySelected, w, cx| this.copy_selected(w, cx)),
+                    )
                     .on_action(cx.listener(|this, _: &FocusComposer, window, cx| {
                         this.focus_composer(window, cx)
                     }))
                     .child(rows)
-                    .when(self.blocks.is_empty(), |d| {
-                        d.child(
-                            v_flex()
-                                .absolute()
-                                .inset_0()
-                                .items_center()
-                                .justify_center()
-                                .gap_2()
-                                .text_sm()
-                                .text_color(crate::ui::faint(theme))
-                                .child("Describe a task and press enter.")
-                                .child(
-                                    h_flex()
-                                        .gap_3()
-                                        .child(hint("shift-tab", "plan mode"))
-                                        // Side questions fork a claude session; codex has none.
-                                        .when(!self.codex(), |d| {
-                                            d.child(hint("cmd-shift-enter", "side question"))
-                                        }),
-                                )
-                                .child(
-                                    h_flex()
-                                        .gap_3()
-                                        .child(hint("c", "comment on a diff line"))
-                                        .child(hint("shift-c", "send comments")),
-                                ),
-                        )
-                    })
+                    .when(self.blocks.is_empty(), |d| d.child(self.empty_state(cx)))
                     .vertical_scrollbar(&self.list),
             )
-            .child(
-                div()
-                    .px_4()
-                    .pb_4()
-                    .pt_1()
-                    .children(self.render_side(window, cx))
-                    .children(asked_card)
-                    .child(
-                        v_flex()
-                            .key_context("Composer")
-                            // A key after a prefix that completes no binding (`ctrl-w j`) skips
-                            // interceptors; catch it here, before the input types it.
-                            .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, window, cx| {
-                                let took = this.vim_took.take() == Some(ev.keystroke.clone());
-                                if took
-                                    || (!window.has_pending_keystrokes()
-                                        && this.vim_intercept(&ev.keystroke, window, cx))
-                                {
-                                    cx.stop_propagation();
-                                }
-                            }))
-                            .relative()
-                            .w_full()
-                            .max_w(px(712.))
-                            .mx_auto()
-                            .p_2()
-                            .gap_1()
-                            .rounded(radius)
-                            .border_1()
-                            .border_color(border)
-                            .bg(card)
-                            .on_action(cx.listener(|this, _: &FocusTranscript, window, cx| {
-                                this.focus.focus(window, cx);
-                                cx.notify();
-                            }))
-                            .on_action(cx.listener(|this, _: &AskSide, window, cx| {
-                                this.ask_draft_aside(window, cx)
-                            }))
-                            // While the menu is open, these keys drive it instead of the input.
-                            .capture_action(cx.listener(|this, _: &MoveDown, _, cx| {
-                                if this.menu.is_some() {
-                                    this.move_menu(1, cx);
-                                    cx.stop_propagation();
-                                }
-                            }))
-                            .capture_action(cx.listener(|this, _: &MoveUp, window, cx| {
-                                if this.menu.is_some() {
-                                    this.move_menu(-1, cx);
-                                    cx.stop_propagation();
-                                    return;
-                                }
-                                // Up from the first line goes to the queue, like Claude Code's.
-                                let c = this.composer.read(cx);
-                                let first_line = !c.value()[..c.cursor()].contains('\n');
-                                // The agent's questions first: the way back to the card.
-                                if first_line
-                                    && let Some(f) = this.asked_form()
-                                    && c.focus_handle(cx).is_focused(window)
-                                {
-                                    f.read(cx).focus_handle().clone().focus(window, cx);
-                                    cx.stop_propagation();
-                                    return;
-                                }
-                                if first_line
-                                    && !this.queue.is_empty()
-                                    && c.focus_handle(cx).is_focused(window)
-                                {
-                                    this.qsel = this.queue.len() - 1;
-                                    this.focus_queue(window, cx);
-                                    cx.stop_propagation();
-                                }
-                            }))
-                            .capture_action(cx.listener(|this, a: &Enter, window, cx| {
-                                // With no match, Enter sends what was typed.
-                                if !a.shift && this.pick_selected(window, cx) {
-                                    cx.stop_propagation();
-                                }
-                            }))
-                            .capture_action(cx.listener(|this, _: &IndentInline, window, cx| {
-                                if this.pick_selected(window, cx) {
-                                    cx.stop_propagation();
-                                }
-                            }))
-                            // shift-tab: plan mode, as in Claude Code, instead of outdenting.
-                            .capture_action(cx.listener(|this, _: &OutdentInline, _, cx| {
-                                this.set_plan_mode(!this.meta.plan, cx);
-                                cx.stop_propagation();
-                            }))
-                            .capture_action(cx.listener(|this, _: &Escape, _, cx| {
-                                if this.menu.is_some() {
-                                    this.close_menu(cx);
-                                    cx.stop_propagation();
-                                }
-                            }))
-                            .when_some(self.render_menu(cx), |d, menu| d.child(menu))
-                            .when_some(self.render_queue(window, cx), |d, q| d.child(q))
-                            .child(
-                                Textarea::new(&self.composer)
-                                    .on_paste({
-                                        let chat = cx.entity().downgrade();
-                                        move |item, window, cx| {
-                                            chat.update(cx, |c, cx| c.paste(item, window, cx))
-                                                .unwrap_or(false)
-                                        }
-                                    })
-                                    .appearance(false)
-                                    .text_size(px(14.)),
-                            )
-                            .child(
-                                h_flex()
-                                    .gap_2()
-                                    .text_xs()
-                                    .text_color(muted)
-                                    .child(
-                                        Button::new("plan-mode")
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(IconName::ClipboardList)
-                                            .label("Plan")
-                                            .selected(self.meta.plan)
-                                            .tooltip(if self.meta.plan {
-                                                "Plan mode on: the agent plans and edits nothing (shift-tab)"
-                                            } else {
-                                                "Plan mode: plan first, build after you approve (shift-tab)"
-                                            })
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.set_plan_mode(!this.meta.plan, cx)
-                                            })),
-                                    )
-                                    .when(self.codex(), |d| d.child(
-                                        Button::new("fast-mode")
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(IconName::Zap)
-                                            .label("Fast")
-                                            .selected(self.fast())
-                                            .tooltip_with_action(
-                                                "Fast: quicker replies that use more of your plan's usage",
-                                                &ToggleFastMode,
-                                                None,
-                                            )
-                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                this.set_fast(!this.fast(), cx)
-                                            })),
-                                    ))
-                                    .child(
-                                        div().relative().min_w_0().child(
-                                        Button::new("model")
-                                            .ghost()
-                                            .xsmall()
-                                            .icon(IconName::Sparkles)
-                                            .label(self.model_chip())
-                                            .dropdown_caret(true)
-                                            // Shrinks to an ellipsis before the footer overflows.
-                                            .flex_shrink(1.)
-                                            .min_w_0()
-                                            .max_w_full()
-                                            .tooltip_with_action(
-                                                match &self.reported {
-                                                    Some(r) => format!("Model and thinking · {r} · ⌘⇧. / ⌘⇧, raise or lower thinking"),
-                                                    None => "Model and thinking · ⌘⇧. / ⌘⇧, raise or lower thinking".into(),
-                                                },
-                                                &PickModel,
-                                                None,
-                                            )
-                                            .on_click(|_, window, cx| {
-                                                window.dispatch_action(PickModel.boxed_clone(), cx)
-                                            }),
-                                        )
-                                        .child({
-                                            let at = self.model_at.clone();
-                                            canvas(move |b, _, _| at.set(b), |_, _, _, _| {})
-                                                .absolute()
-                                                .top_0()
-                                                .left_0()
-                                                .size_full()
-                                        }),
-                                    )
-                                    .children(
-                                        (self.model_menu.as_ref())
-                                            .map(|(m, _)| crate::menu::layer(m.clone())),
-                                    )
-                                    .when_some(vim_pill, |d, p| d.child(p.flex_none()))
-                                    // Idle shows no keys: enter sends. Clipped, not wrapped, when narrow.
-                                    .child(
-                                        h_flex()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .overflow_hidden()
-                                            .justify_end()
-                                            .gap_3()
-                                            .when(self.busy || self.hold, |d| {
-                                                d.child(match self.editing {
-                                                    Some(_) => hint("enter", "save"),
-                                                    None => hint("enter", "queue"),
-                                                })
-                                            })
-                                            .when(self.busy && !self.hold, |d| {
-                                                d.child(hint("cmd-enter", "send now"))
-                                            })
-                                            .when(self.busy, |d| d.child(hint("ctrl-c", "interrupt"))),
-                                    ),
-                            ),
-                    ),
-            )
+            .child(self.composer_bar(asked_card, window, cx))
             // No hitbox, so it never takes the drop or the mouse. A drag that ends elsewhere
             // leaves no active drag, so a missed exit can't leave it up.
-            .when(self.dropping.is_some() && cx.has_active_drag(), |d| d.child(
-                v_flex()
-                    .absolute()
-                    .inset_2()
-                    .items_center()
-                    .justify_center()
-                    .gap_1()
-                    .rounded(radius)
-                    .border_2()
-                    .border_dashed()
-                    .border_color(accent)
-                    .bg(bg)
-                    // The theme's drop tint over a faded transcript.
-                    .child(div().absolute().inset_0().rounded(radius).bg(drop_bg))
-                    .child(
-                        Icon::new(IconName::Paperclip)
-                            .with_size(px(32.))
-                            .text_color(accent)
-                            .mb_2(),
-                    )
-                    .child(
-                        div()
-                            .text_base()
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(fg)
-                            .child("Drop to attach"),
-                    )
-                    .child(
-                        div()
-                            .text_sm()
-                            .text_color(muted)
-                            .child("Files and images are added to your message"),
-                    ),
-            ));
+            .when(self.dropping.is_some() && cx.has_active_drag(), |d| {
+                d.child(Self::drop_overlay(cx))
+            });
         if !self.plan_open {
             return main.into_any_element();
         }
@@ -3514,261 +2016,24 @@ mod tests {
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
 
     #[test]
-    fn critters_stay_with_tasks_and_reuse_freed_icons() {
-        let task = |id: &str| agent::Task {
-            id: id.into(),
-            kind: "local_agent".into(),
-            description: "Same description".into(),
-        };
-        let mut critters = HashMap::new();
-        assign_critters(&mut critters, &[task("a"), task("b"), task("c")]);
-        assert_eq!((critters["a"], critters["b"], critters["c"]), (0, 1, 2));
-        assert_ne!(critter_icon(&task("a"), 0), critter_icon(&task("b"), 1));
-
-        // Reordering and finishing a neighbor never change a survivor's icon.
-        assign_critters(&mut critters, &[task("c"), task("a")]);
-        assert_eq!((critters["a"], critters["c"]), (0, 2));
-        assert!(!critters.contains_key("b"));
-        assign_critters(&mut critters, &[task("c"), task("d"), task("a")]);
-        assert_eq!(critters["d"], 1);
-
-        let shell = agent::Task {
-            kind: "local_bash".into(),
-            ..task("shell")
-        };
-        assert_eq!(critter_icon(&shell, 2), IconName::SquareTerminal);
-        assign_critters(&mut critters, &[]);
-        assert!(critters.is_empty());
-    }
-
-    #[test]
-    fn critters_wrap_when_the_catalog_is_full() {
-        let tasks: Vec<_> = (0..CRITTERS.len() * 2 + 1)
-            .map(|i| agent::Task {
-                id: i.to_string(),
-                kind: "local_agent".into(),
-                description: String::new(),
-            })
-            .collect();
-        let mut critters = HashMap::new();
-        assign_critters(&mut critters, &tasks);
-        for (i, t) in tasks.iter().enumerate() {
-            assert_eq!(critters[&t.id], i % CRITTERS.len());
-        }
-        let kept = critters.clone();
-        assign_critters(&mut critters, &tasks[1..]);
-        for t in &tasks[1..] {
-            assert_eq!(critters[&t.id], kept[&t.id]);
-        }
-    }
-
-    #[test]
-    fn model_menu_uses_supported_efforts_and_selects_the_effective_level() {
-        use crate::menu::Entry;
-        for (model, saved, selected, ultra) in [
-            ("sonnet", "xhigh", "Extra high", false),
-            ("sonnet", "ultra", "Max", false),
-            ("codex:gpt-6.1-sol", "ultra", "Ultra", true),
-        ] {
-            let meta = ChatMeta {
-                model: Some(model.into()),
-                effort: Some(saved.into()),
-                ..Default::default()
-            };
-            let (entries, sel) = model_entries(&meta, |_, _| {}, |_, _| {});
-            assert!(
-                matches!(&entries[sel], Entry::Item { label, checked: true, .. } if label == selected)
-            );
-            assert_eq!(
-                entries
-                    .iter()
-                    .filter(|e| matches!(e, Entry::Item { checked: true, .. }))
-                    .count(),
-                2
-            );
-            assert!(
-                entries
-                    .iter()
-                    .any(|e| matches!(e, Entry::Item { label, .. } if label == "Extra high"))
-            );
-            assert_eq!(
-                entries
-                    .iter()
-                    .any(|e| matches!(e, Entry::Item { label, .. } if label == "Ultra")),
-                ultra
-            );
-        }
-    }
-
-    /// A review prompt in a replayed transcript comes back as its card; report lines stay
-    /// out of the shown reply.
-    #[test]
-    fn review_cards_and_reports() {
-        let p = "note\n\nReview comments on the diff. Paths …:\n\n[c1] api/a.rs:12 · working tree\n````\n[c9] x\n> y\n````\n> rename\n> it\nSuggested change:\n```\nlet y;\n```\n\n[c4] api/b.rs:3-5 (old) · base 0123456789\n> keep\n\nEnd your reply with one line per comment you addressed, exactly like:\n[c<id>] addressed: <what you changed, in one line>\n";
-        let card = card_of(p).unwrap();
-        let items: Vec<_> = (card.items.iter())
-            .map(|i| (i.id, i.place.as_str(), i.text.as_str()))
-            .collect();
-        assert_eq!(
-            items,
-            [
-                (1, "api/a.rs:12", "rename\nit"),
-                (4, "api/b.rs:3-5 (old)", "keep")
-            ]
-        );
-        assert!(card.prompt.starts_with("Review comments"));
-        assert!(card_of("plain [c1] x\n> y").is_none());
-        assert_eq!(
-            hide_reports("Done.\n[c1] addressed: x\n- `[c2] addressed: y`\nBye"),
-            "Done.\nBye"
-        );
-        // One in a code block is an example, not a report.
-        let fenced = "See:\n```\n[c1] addressed: example\n```\n[c2] addressed: real";
-        assert_eq!(parse_reports(fenced), [(2, "real".to_string())]);
-        assert_eq!(
-            hide_reports(fenced),
-            "See:\n```\n[c1] addressed: example\n```\n"
-        );
-        assert!(hidden_reply("[c1] addressed: x\n"));
-        assert!(hidden_reply("\n- [c1] addressed: x\n[c2] addressed: y"));
-        assert!(!hidden_reply("Done.\n[c1] addressed: x"));
-        assert!(!hidden_reply("") && !hidden_reply("#[cfg(test)]"));
-        assert!(may_report("x\n - `[c12] addr") && may_report("[c3"));
-        assert!(!may_report("#[cfg(test)]\n[cx] y\n[c"));
-    }
-
-    #[test]
-    fn summarizes_tool_groups() {
-        let call = |name: &str, err| Call {
-            id: String::new(),
-            name: name.into(),
-            summary: String::new(),
-            input: String::new(),
-            result: Some("".into()),
-            is_error: err,
-            open: false,
-        };
-        let calls = ["Read", "Bash", "Read", "Edit", "Write", "mcp__x__y"].map(|n| call(n, false));
-        assert_eq!(
-            group_summary(&calls),
-            "Read 2 files, ran 1 command, edited 2 files, used 1 tool"
-        );
-        assert_eq!(group_summary(&[]), "");
-        let input = serde_json::json!({"file_path": "/ws/feat/api/src/a.rs"});
-        assert_eq!(summarize(&input, "/ws/feat"), "api/src/a.rs");
-        let skill = serde_json::json!({"skill": "pdf", "args": "x"});
-        assert_eq!(summarize(&skill, "/ws/feat"), "pdf");
-        let bash = serde_json::json!({"command": "a\nb", "timeout": 5});
-        assert_eq!(full_input(&bash), "command: a\nb\ntimeout: 5");
-        assert_eq!(cap("abcdef", 3), "abc…");
-    }
-
-    /// A workspace dir holding `repo/src/lib.rs`, `repo/README.md`, and `repo/a b å.txt`.
-    fn link_fixture(tag: &str) -> (PathBuf, Vec<PathBuf>) {
-        let ws = std::env::temp_dir().join(format!("shark-links-{tag}-{}", std::process::id()));
-        let repo = ws.join("repo");
-        std::fs::create_dir_all(repo.join("src")).unwrap();
-        for f in ["src/lib.rs", "README.md", "a b å.txt", "x:1.txt"] {
-            std::fs::write(repo.join(f), "").unwrap();
-        }
-        (ws.clone(), vec![ws, repo])
-    }
-
-    #[test]
-    fn link_target_resolves_relative_paths() {
-        let (ws, roots) = link_fixture("rel");
-        let at = |rel: &str| Some(format!("file://{}/{rel}", ws.display()));
-        // Prefixed by the repo name, resolved from the workspace dir.
-        assert_eq!(
-            link_target("repo/src/lib.rs", &roots),
-            at("repo/src/lib.rs")
-        );
-        // Relative to the repo worktree.
-        assert_eq!(link_target("src/lib.rs", &roots), at("repo/src/lib.rs"));
-        for url in [
-            "src/lib.rs:42",
-            "src/lib.rs:42:7",
-            "src/lib.rs#L10",
-            "src/lib.rs#L10-L20",
-            "src/lib.rs#L10C3",
-        ] {
-            assert_eq!(link_target(url, &roots), at("repo/src/lib.rs"), "{url}");
-        }
-        assert_eq!(link_target("./README.md#L10", &roots), at("repo/README.md"));
-        assert_eq!(
-            link_target("./repo/README.md", &roots),
-            at("repo/README.md")
-        );
-        // Foundation escapes spaces and Unicode.
-        assert_eq!(
-            link_target("a b å.txt", &roots),
-            at("repo/a%20b%20a%CC%8A.txt")
-        );
-        // Percent escapes decode before the lookup, with and without a location suffix.
-        for url in [
-            "a%20b%20%C3%A5.txt",
-            "./a%20b%20a%CC%8A.txt:3",
-            "a%20b å.txt#L2",
-        ] {
-            assert_eq!(
-                link_target(url, &roots),
-                at("repo/a%20b%20a%CC%8A.txt"),
-                "{url}"
-            );
-        }
-        std::fs::create_dir_all(ws.join("docs")).unwrap();
-        std::fs::write(ws.join("docs/caf\u{e9} 1.txt"), "").unwrap();
-        assert_eq!(
-            link_target("docs/caf%C3%A9%201.txt", &roots),
-            at("docs/cafe%CC%81%201.txt")
-        );
-        // A literal '%' in the name still resolves.
-        std::fs::write(ws.join("100%.txt"), "").unwrap();
-        assert_eq!(link_target("100%.txt", &roots), at("100%25.txt"));
-        // A ':' that is part of the filename still resolves.
-        assert_eq!(link_target("x:1.txt", &roots), at("repo/x:1.txt"));
-    }
-
-    #[test]
-    fn link_target_passes_through_and_falls_back() {
-        let (ws, roots) = link_fixture("pass");
-        for url in [
-            "https://example.com/a:1#L2",
-            "http://example.com",
-            "file:///tmp/a%20b.png",
-            "mailto:a@b.c",
-            "tel:+4512345678",
-            "nope/missing.rs",
-            "missing.rs:3",
-            "#section",
-        ] {
-            assert_eq!(link_target(url, &roots).as_deref(), Some(url), "{url}");
-        }
-        assert_eq!(
-            link_target("www.example.com/x", &roots).as_deref(),
-            Some("https://www.example.com/x")
-        );
-        // Without roots a relative path has nowhere to resolve.
-        assert_eq!(
-            link_target("src/lib.rs", &[]).as_deref(),
-            Some("src/lib.rs")
-        );
-        // Absolute paths become file URLs, existing or not.
-        let abs = ws.join("repo/src/lib.rs");
-        assert_eq!(
-            link_target(&format!("{}:42", abs.display()), &roots),
-            Some(format!("file://{}", abs.display()))
-        );
-        assert_eq!(
-            link_target("/tmp/shark-missing/a b.png", &roots).as_deref(),
-            Some("file:///tmp/shark-missing/a%20b.png")
-        );
+    fn turn_cost_is_the_delta_of_the_running_total() {
+        let mut total = 0.;
+        assert_eq!(turn_cost(&mut total, 0.5), 0.5);
+        assert_eq!(turn_cost(&mut total, 0.75), 0.25);
+        // A fresh process reports a lower total: shown as it is.
+        assert_eq!(turn_cost(&mut total, 0.25), 0.25);
+        // codex and failures report none: the total stays.
+        assert_eq!(turn_cost(&mut total, 0.), 0.);
+        assert_eq!(total, 0.25);
     }
 }
 
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod ui_tests {
     use super::*;
+    use crate::models::effort_of;
+    use critters::HOP_INTERVAL;
+    use planmode::{APPROVED, BUILD_FRESH};
 
     /// Feeds recorded protocol lines to the chat as its process would.
     pub(crate) fn play(c: &mut Chat, lines: &[&str], cx: &mut Context<Chat>) {
@@ -3783,72 +2048,6 @@ pub(crate) mod ui_tests {
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
     use gpui_kit::InputEvent as _;
     use gpui_kit::test::TestWindowExt as _;
-
-    #[gpui_kit::test]
-    fn markdown_links_open_local_previews_and_web_urls(cx: &mut TestAppContext) {
-        struct Links(Entity<TextViewState>, Vec<PathBuf>);
-        impl Render for Links {
-            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                markdown(&self.0, "links", self.1.clone())
-            }
-        }
-        cx.update(gpui_kit::init);
-        let ws = std::env::temp_dir().join(format!("shark-link-ui-{}", std::process::id()));
-        std::fs::create_dir_all(ws.join("api/src")).unwrap();
-        std::fs::write(ws.join("api/src/lib.rs"), "").unwrap();
-        let roots = vec![ws.clone(), ws.join("api")];
-        let lib = format!("file://{}/api/src/lib.rs", ws.display());
-        for (target, expected) in [
-            ("api/src/lib.rs", lib.as_str()),
-            ("src/lib.rs:42", lib.as_str()),
-            (
-                "/tmp/shark-better-bg-render/activity-dark-hover.png",
-                "file:///tmp/shark-better-bg-render/activity-dark-hover.png",
-            ),
-            (
-                "/tmp/shark-better-bg-render/activity-light-hover.png",
-                "file:///tmp/shark-better-bg-render/activity-light-hover.png",
-            ),
-            (
-                "/tmp/preview blå #1.png",
-                "file:///tmp/preview%20bla%CC%8A%20%231.png",
-            ),
-            (
-                "https://example.com/preview.png",
-                "https://example.com/preview.png",
-            ),
-            (
-                "file:///tmp/preview%20one.png",
-                "file:///tmp/preview%20one.png",
-            ),
-        ] {
-            let (_, view) = cx.add_window_view(|_, cx| {
-                Links(
-                    cx.new(|cx| TextViewState::markdown(&format!("[Preview](<{target}>)"), cx)),
-                    roots.clone(),
-                )
-            });
-            let view: &mut VisualTestContext = view;
-            let before = view.opened_url();
-            view.simulate_mouse_down(
-                point(px(10.), px(10.)),
-                MouseButton::Right,
-                Modifiers::default(),
-            );
-            view.simulate_mouse_up(
-                point(px(10.), px(10.)),
-                MouseButton::Right,
-                Modifiers::default(),
-            );
-            assert_eq!(
-                view.opened_url(),
-                before,
-                "right-click must not open {target}"
-            );
-            view.simulate_click(point(px(10.), px(10.)), Modifiers::default());
-            assert_eq!(view.opened_url().as_deref(), Some(expected), "{target}");
-        }
-    }
 
     /// Real-renderer smoke check, also exporting the parade for visual inspection.
     pub(crate) fn render_activity_pixels(cx: &mut HeadlessAppContext) {
@@ -3907,7 +2106,7 @@ pub(crate) mod ui_tests {
             (crate::state::Mode::Light, "light"),
         ] {
             cx.update(|cx| {
-                crate::settings::apply(
+                crate::theme::apply(
                     &crate::state::Appearance {
                         mode,
                         ..Default::default()
@@ -4148,7 +2347,10 @@ exec cat >/dev/null
         assert!(args.contains("--no-session-persistence"), "{args}");
         assert!(args.contains("--model sonnet"), "the chat's model: {args}");
         assert!(args.contains("--effort max"), "and level: {args}");
-        assert!(!agent::transcript_path(&meta.id).exists(), "no transcript");
+        assert!(
+            !crate::transcript::transcript_path(&meta.id).exists(),
+            "no transcript"
+        );
         let _ = std::fs::remove_file(ws.dir());
     }
 
@@ -4174,9 +2376,10 @@ exec cat >/dev/null
         let args = std::fs::read_to_string(fake.with_extension("args")).unwrap();
         assert!(args.contains("--model haiku"), "{args}");
         assert!(
-            args.contains("--tools  --strict-mcp-config --safe-mode --no-session-persistence"),
+            args.contains("--tools  --strict-mcp-config --no-session-persistence"),
             "{args}"
         );
+        assert!(args.contains("--safe-mode"), "{args}");
         assert!(args.contains("--append-system-prompt the docs"), "{args}");
         assert!(!args.contains("--resume"), "{args}");
     }
@@ -4487,7 +2690,7 @@ exec cat >/dev/null
                     c.apply(
                         Ev::ToolUse {
                             id: id.into(),
-                            name: "ExitPlanMode".into(),
+                            name: PLAN_TOOL.into(),
                             input: input.clone(),
                         },
                         cx,
@@ -4495,7 +2698,7 @@ exec cat >/dev/null
                     c.apply(
                         Ev::Permission {
                             request_id: "r".into(),
-                            tool: "ExitPlanMode".into(),
+                            tool: PLAN_TOOL.into(),
                             tool_use_id: id.into(),
                             input,
                         },
@@ -4574,7 +2777,7 @@ exec cat >/dev/null
         cx.update(|cx| chat.update(cx, |c, _| c.reader = None));
         cx.run_until_parked(); // Drop the receiver before the OS thread sends the fake process's exit.
         cx.update(|cx| chat.update(cx, |c, _| c.agent = None));
-        let _ = std::fs::remove_file(super::plan::tests_store_path(&ws.name));
+        let _ = std::fs::remove_file(super::plan::store_path(&ws.name));
         let _ = std::fs::remove_file(ws.dir());
     }
 
@@ -4630,7 +2833,7 @@ exec cat >/dev/null
                     c.apply(
                         Ev::Permission {
                             request_id: id.into(),
-                            tool: "AskUserQuestion".into(),
+                            tool: ASK_TOOL.into(),
                             tool_use_id: format!("call-{id}"),
                             input: serde_json::json!({"questions": [
                                 {"id": "db", "header": "DB", "question": "Which DB?", "isOther": true, "options": [{"label": "Postgres", "description": "SQL"}, {"label": "Redis", "description": "KV"}]},
@@ -4646,7 +2849,7 @@ exec cat >/dev/null
             cx.update(|cx| {
                 let c = chat.read(cx);
                 match c.blocks.last() {
-                    Some(Block::Tool(t)) if t.name == "AskUserQuestion" => Some(t.summary.clone()),
+                    Some(Block::Tool(t)) if t.name == ASK_TOOL => Some(t.summary.clone()),
                     _ => None,
                 }
             })
@@ -5026,7 +3229,7 @@ exec cat >/dev/null
                 assert_eq!(p.number_of("t1-plan"), Some(1));
                 assert!(c.plan_open && !c.busy);
                 assert!(
-                    c.blocks.iter().any(|b| matches!(b, Block::Tool(t) if t.name == "ExitPlanMode" && t.summary == "Cache")),
+                    c.blocks.iter().any(|b| matches!(b, Block::Tool(t) if t.name == PLAN_TOOL && t.summary == "Cache")),
                     "a Plan row"
                 );
                 c.plan_open = false;
@@ -5317,7 +3520,7 @@ exec cat >/dev/null
             .unwrap_or_else(|e| e.into_inner());
         std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
         std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
-        let (dir, transcript) = (ws.dir(), agent::transcript_path(&meta.id));
+        let (dir, transcript) = (ws.dir(), crate::transcript::transcript_path(&meta.id));
         let (window, chat) = cx
             .update(|cx| {
                 gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
@@ -5874,18 +4077,5 @@ exec cat >/dev/null
         keys(cx, &["escape"]);
         assert_eq!(value(cx), "jk");
         assert!(in_transcript(cx));
-    }
-}
-
-#[cfg(test)]
-mod model_label_tests {
-    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
-
-    #[test]
-    fn labels_read_like_names() {
-        let l = super::model_label;
-        assert_eq!(l("opus"), "Opus");
-        assert_eq!(l("codex:gpt-6.1-sol"), "GPT-6.1 Sol");
-        assert_eq!(l("codex:gpt-6-astra"), "GPT-6 Astra");
     }
 }

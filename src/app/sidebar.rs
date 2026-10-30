@@ -1,6 +1,32 @@
 //! The sidebar: sections, workspace and repo rows, the cursor, drag and drop.
 use super::*;
 
+/// A workspace's status icon: a spinner while an agent runs, else by what it needs from you.
+/// `idle` colours the dashed circle of a workspace that needs nothing.
+pub(super) fn indicator(
+    bucket: home::Bucket,
+    idle: Hsla,
+    size: Pixels,
+    theme: &Theme,
+) -> AnyElement {
+    let (icon, color) = match bucket {
+        home::Bucket::Running => {
+            return Spinner::new()
+                .icon(IconName::LoaderCircle)
+                .color(theme.primary)
+                .with_size(size)
+                .into_any_element();
+        }
+        home::Bucket::Needs => (IconName::CircleAlert, theme.warning_foreground),
+        home::Bucket::Unread => (IconName::CircleCheck, theme.success_foreground),
+        home::Bucket::Idle => (IconName::CircleDashed, idle),
+    };
+    Icon::new(icon)
+        .with_size(size)
+        .text_color(color)
+        .into_any_element()
+}
+
 pub(super) fn workspace_indicator(
     running: usize,
     attention: &Attn,
@@ -8,22 +34,12 @@ pub(super) fn workspace_indicator(
     size: Pixels,
     theme: &Theme,
 ) -> AnyElement {
-    if running > 0 {
-        return Spinner::new()
-            .icon(IconName::LoaderCircle)
-            .color(theme.primary)
-            .with_size(size)
-            .into_any_element();
-    }
-    let (icon, color) = match attention {
-        Attn::Needs(_) => (IconName::CircleAlert, theme.warning_foreground),
-        Attn::Unread => (IconName::CircleCheck, theme.success_foreground),
-        Attn::None => (IconName::CircleDashed, foreground),
-    };
-    Icon::new(icon)
-        .with_size(size)
-        .text_color(color)
-        .into_any_element()
+    indicator(
+        home::bucket(running, attention, None).0,
+        foreground,
+        size,
+        theme,
+    )
 }
 
 /// Icons a section can have, by Lucide name (what `Section::icon` stores).
@@ -137,6 +153,13 @@ fn section_menu(this: &Shark, i: usize, cx: &Context<Shark>) -> Vec<Entry> {
     ]
 }
 
+/// Cursor state taken by [`Shark::cursors`]: sidebar row, its workspace's name, home row.
+pub(super) struct Cursors {
+    side: Option<usize>,
+    ws: Option<String>,
+    home: Option<usize>,
+}
+
 /// A sidebar row the cursor can sit on.
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub(super) enum SideRow {
@@ -169,6 +192,16 @@ pub(super) fn drag_chip(label: SharedString, cx: &App) -> Div {
         .text_color(theme.foreground)
         .font_features(inter_features())
         .child(label)
+}
+
+/// 16px icons; the rail is 32px icon buttons, 16 apart.
+const ISZ: Pixels = px(16.);
+
+/// A row of the sidebar's lists.
+fn sidebar_row(rail: bool, theme: &Theme) -> Div {
+    side_row(theme)
+        .text_color(theme.sidebar_foreground)
+        .when(rail, rail_button)
 }
 
 /// A sidebar row in the rail: Paper's 32px icon button, centered, 16 above the next.
@@ -213,13 +246,44 @@ impl Shark {
         rows
     }
 
-    /// Every workspace in sidebar order, folded sections included (`cmd-j` walks this).
-    pub(crate) fn sidebar_order(&self) -> Vec<usize> {
-        self.ws_order(true)
+    /// Sidebar and home cursors before a workspace is removed; see [`Self::restore_cursors`].
+    pub(super) fn cursors(&self, cx: &App) -> Cursors {
+        Cursors {
+            side: self.side_rows(false).iter().position(|r| *r == self.sel),
+            // The sidebar cursor follows its workspace, not its row number.
+            ws: match self.sel {
+                SideRow::Ws(ix) => self.state.workspaces.get(ix).map(|w| w.name.clone()),
+                SideRow::Section(_) => None,
+            },
+            home: self.home_at(&self.home_rows(cx)),
+        }
+    }
+
+    /// After `name` is removed: a cursor on its row stays at the same height, on whatever moved up into it.
+    pub(super) fn restore_cursors(&mut self, name: &str, before: Cursors, cx: &App) {
+        let rows = self.side_rows(false);
+        let moved = (before.ws.as_deref().filter(|c| *c != name))
+            .and_then(|c| self.state.workspaces.iter().position(|w| w.name == c));
+        self.sel = match (self.sel, moved) {
+            (SideRow::Section(i), _) => SideRow::Section(i),
+            (_, Some(ix)) => SideRow::Ws(ix),
+            _ => before
+                .side
+                .and_then(|p| rows.get(p.min(rows.len().saturating_sub(1))))
+                .copied()
+                .unwrap_or(SideRow::Ws(0)),
+        };
+        if self.home.sel.as_deref() == Some(name) {
+            let rows = self.home_rows(cx);
+            let at = before.home.unwrap_or(0).min(rows.len().saturating_sub(1));
+            self.home.sel = rows
+                .get(at)
+                .map(|r| self.state.workspaces[r.ix].name.clone());
+        }
     }
 
     /// Workspaces in sidebar order, folded ones only with `unfold`; cmd-N opens the Nth visible.
-    pub(super) fn ws_order(&self, unfold: bool) -> Vec<usize> {
+    pub(crate) fn ws_order(&self, unfold: bool) -> Vec<usize> {
         self.side_rows(unfold)
             .into_iter()
             .filter_map(|r| match r {
@@ -241,13 +305,13 @@ impl Shark {
             .unwrap_or(SideRow::Ws(0));
     }
 
-    fn move_sel(&mut self, to: impl FnOnce(usize, usize) -> usize, cx: &mut Context<Self>) {
+    fn move_sel(&mut self, nav: Nav, cx: &mut Context<Self>) {
         let rows = self.side_rows(false);
         if rows.is_empty() {
             return;
         }
         let at = rows.iter().position(|r| *r == self.sel).unwrap_or(0);
-        let to = to(at, rows.len()).min(rows.len() - 1);
+        let to = nav.to(at, rows.len(), 0);
         self.sel = rows[to];
         // Child 0 of the scrolled list is the Workspaces header.
         self.sidebar_scroll.scroll_to_item(to + 1);
@@ -313,12 +377,7 @@ impl Shark {
         if self.section_of(ws) == to {
             return;
         }
-        for s in &mut self.state.sections {
-            s.workspaces.retain(|w| w != ws);
-        }
-        if let Some(s) = to.and_then(|i| self.state.sections.get_mut(i)) {
-            s.workspaces.push(ws.to_string());
-        }
+        self.state.move_to_section(ws, to);
         let _ = self.state.save();
         self.record_interaction(ws, cx);
         self.fix_sel();
@@ -517,49 +576,286 @@ impl Shark {
 
     /// Sections, then "No section" when it is in one, then "New section".
     pub(super) fn pick_section(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.target(window).map(|w| w.name) else {
-            return notify_err(window, cx, "Open a workspace first");
-        };
-        let current = self.section_of(&ws);
-        let n = self.state.sections.len();
-        let mut items: Vec<CommandItem> = self
-            .state
-            .sections
-            .iter()
-            .enumerate()
-            .map(|(i, s)| {
-                CommandItem::new()
-                    .label(s.name.clone())
-                    .icon(section_icon(&s.icon))
-                    .checked(current == Some(i))
-            })
-            .collect();
-        if current.is_some() {
+        self.with_target(window, cx, |s, ws, window, cx| {
+            let ws = ws.name;
+            let current = s.section_of(&ws);
+            let n = s.state.sections.len();
+            let mut items: Vec<CommandItem> = (s.state.sections)
+                .iter()
+                .enumerate()
+                .map(|(i, s)| {
+                    CommandItem::new()
+                        .label(s.name.clone())
+                        .icon(section_icon(&s.icon))
+                        .checked(current == Some(i))
+                })
+                .collect();
+            if current.is_some() {
+                items.push(
+                    CommandItem::new()
+                        .label("No section")
+                        .icon(IconName::FolderOutput),
+                );
+            }
             items.push(
                 CommandItem::new()
-                    .label("No section")
-                    .icon(IconName::FolderOutput),
+                    .label("New section")
+                    .icon(IconName::FolderPlus),
             );
-        }
-        items.push(
-            CommandItem::new()
-                .label("New section")
-                .icon(IconName::FolderPlus),
-        );
-        let last = items.len() - 1;
-        open_menu(
-            cx.entity().downgrade(),
-            "Move to section…",
-            items,
-            current.unwrap_or(0),
-            move |s, row, window, cx| match row {
-                _ if row == last => s.start_naming(None, Some(ws.clone()), window, cx),
-                _ if row < n => s.move_to_section(&ws, Some(row), cx),
-                _ => s.move_to_section(&ws, None, cx),
-            },
-            window,
-            cx,
-        );
+            let last = items.len() - 1;
+            open_menu(
+                cx.entity().downgrade(),
+                "Move to section…",
+                items,
+                current.unwrap_or(0),
+                move |s, row, window, cx| match row {
+                    _ if row == last => s.start_naming(None, Some(ws.clone()), window, cx),
+                    _ if row < n => s.move_to_section(&ws, Some(row), cx),
+                    _ => s.move_to_section(&ws, None, cx),
+                },
+                window,
+                cx,
+            );
+        })
+    }
+
+    /// A repo's row; dragging it reorders the repos, right-click opens its menu.
+    fn repo_row(&self, ix: usize, r: &Repo, cx: &Context<Self>) -> impl IntoElement {
+        let (theme, rail) = (cx.theme(), self.rail);
+        let name = r.name.clone();
+        let repo = r.clone();
+        let tip: SharedString = name.clone().into();
+        sidebar_row(rail, theme)
+            .id(("repo", ix))
+            .test_support()
+            .hover(|d| d.bg(side_hover(theme)))
+            // Drag to reorder: scripts run in this order across a workspace's repos.
+            .on_drag(RepoDrag(ix, name.clone().into()), |d, _, _, cx| {
+                cx.new(|_| d.clone())
+            })
+            .drag_over::<RepoDrag>(|s, _, _, cx| s.bg(cx.theme().accent))
+            .on_drop(cx.listener(move |this, d: &RepoDrag, _, cx| {
+                if d.0 != ix && d.0 < this.state.repos.len() {
+                    move_item(&mut this.state.repos, d.0, ix);
+                    let _ = this.state.save();
+                    cx.notify();
+                }
+            }))
+            .child(Icon::new(IconName::FolderGit2).with_size(ISZ))
+            .when(!rail, |d| d.child(div().truncate().child(r.name.clone())))
+            .when(rail, |d| {
+                d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+            })
+            .on_click({
+                let repo = r.clone();
+                cx.listener(move |this, _, w, cx| repo_settings::open(this, repo.clone(), w, cx))
+            })
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, w, cx| {
+                    let entries = menus::repo_menu(this, &repo, cx);
+                    this.show_menu(e.position, entries, w, cx);
+                }),
+            )
+    }
+
+    /// A workspace's row; `order` is the visible workspaces, whose first nine have a cmd-N.
+    fn ws_row(
+        &self,
+        ix: usize,
+        w: &Workspace,
+        section: Option<usize>,
+        order: &[usize],
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let (theme, rail) = (cx.theme(), self.rail);
+        let focused = self.sidebar_focus.is_focused(window);
+        let m = window.modifiers();
+        let cmd_held = m.platform && m.number_of_modifiers() == 1;
+        let running = self.running_chats(&w.name, cx);
+        let selected = self.sel == SideRow::Ws(ix);
+        let active = !self.home_shown() && self.active.as_ref() == Some(&w.name);
+        let bright = active || (selected && focused);
+        let foreground = if bright {
+            theme.foreground
+        } else {
+            theme.sidebar_foreground
+        };
+        let attn = self.attention_of(&w.name, cx);
+        let nth = order.iter().position(|&o| o == ix).filter(|&n| n < 9);
+        let ws = w.clone();
+        sidebar_row(rail, theme)
+            .id(ix)
+            .test_support()
+            // The rail shows only the icon, so rows keep the one-line height there.
+            .when(!rail, |d| d.h(px(44.)))
+            .when(section.is_some() && !rail, |d| d.ml(px(24.)))
+            .map(|d| cursor_row(d, active, selected, focused, theme))
+            .text_color(foreground)
+            // The cursor moves on press, not release: a held or dragged row is the one ringed.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, _, _, cx| {
+                    this.sel = SideRow::Ws(ix);
+                    cx.notify();
+                }),
+            )
+            .on_click(cx.listener(move |this, _, window, cx| this.open_workspace(ix, window, cx)))
+            // Right-click moves the cursor too, so it's clear which row the menu is for.
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, w, cx| {
+                    this.sel = SideRow::Ws(ix);
+                    let entries = ws_menu(this, &ws, cx);
+                    this.show_menu(e.position, entries, w, cx);
+                }),
+            )
+            .map(|d| {
+                self.reorder_source(
+                    d,
+                    reorder::Item::Workspace(w.name.clone()),
+                    w.name.clone().into(),
+                )
+            })
+            .child(match nth {
+                Some(n) if cmd_held => kbd(&format!("cmd-{}", n + 1)).into_any_element(),
+                _ => workspace_indicator(running, &attn, foreground, ISZ, theme),
+            })
+            .when(!rail, |d| {
+                d.child(
+                    v_flex()
+                        .flex_1()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .truncate()
+                                .when(active, |d| d.font_weight(FontWeight::MEDIUM))
+                                .child(w.name.clone()),
+                        )
+                        .child(
+                            div()
+                                .truncate()
+                                .text_xs()
+                                .text_color(if bright {
+                                    theme.muted_foreground
+                                } else {
+                                    theme.sidebar_foreground
+                                })
+                                .child({
+                                    let mut repos = (w.repos.iter())
+                                        .map(|r| r.name.as_str())
+                                        .collect::<Vec<_>>()
+                                        .join(" · ");
+                                    if self.running(&w.name) {
+                                        repos = format!("Scripts running · {repos}");
+                                    }
+                                    match (&attn, running) {
+                                        // The step says where, and that it's waiting on you.
+                                        (Attn::Needs(step), _) => step.clone(),
+                                        (_, 0 | 1) => repos,
+                                        (_, n) => format!("{n} chats running · {repos}"),
+                                    }
+                                }),
+                        ),
+                )
+            })
+            .when(rail, |d| {
+                let name: SharedString = w.name.clone().into();
+                d.tooltip(move |w, cx| Tooltip::new(name.clone()).build(w, cx))
+            })
+            // Holding cmd in the rail names every workspace beside its cmd-N key.
+            .when(rail && cmd_held, |d| {
+                d.relative().child(
+                    div().absolute().top_0().left_full().child(deferred(
+                        anchored().child(
+                            div()
+                                .ml_2()
+                                .h(px(28.))
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .whitespace_nowrap()
+                                .rounded(theme.radius)
+                                .border_1()
+                                .border_color(theme.border)
+                                .bg(theme.popover)
+                                .text_color(theme.popover_foreground)
+                                .text_sm()
+                                .shadow_md()
+                                .child(w.name.clone()),
+                        ),
+                    )),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// A section's header row.
+    fn section_row(
+        &self,
+        i: usize,
+        sec: &Section,
+        window: &Window,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let (theme, rail) = (cx.theme(), self.rail);
+        let focused = self.sidebar_focus.is_focused(window);
+        let selected = self.sel == SideRow::Section(i);
+        let tip: SharedString = sec.name.clone().into();
+        // A folded section still shows that a workspace inside needs you.
+        let needs = sec.collapsed
+            && sec
+                .workspaces
+                .iter()
+                .any(|n| matches!(self.attention_of(n, cx), Attn::Needs(_)));
+        sidebar_row(rail, theme)
+            .id(("section", i))
+            .test_support()
+            .map(|d| cursor_row(d, false, selected, focused, theme))
+            .when(selected && focused, |d| d.text_color(theme.foreground))
+            .map(|d| self.reorder_source(d, reorder::Item::Section(i), sec.name.clone().into()))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.sel = SideRow::Section(i);
+                this.toggle_section(i, cx)
+            }))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, w, cx| {
+                    this.sel = SideRow::Section(i);
+                    let entries = section_menu(this, i, cx);
+                    this.show_menu(e.position, entries, w, cx);
+                }),
+            )
+            .child(
+                Icon::new(section_icon(&sec.icon))
+                    .with_size(ISZ)
+                    .when(needs, |i| i.text_color(theme.warning_foreground)),
+            )
+            .when(!rail, |d| {
+                d.child(
+                    div()
+                        .min_w_0()
+                        .truncate()
+                        .font_weight(FontWeight::MEDIUM)
+                        .child(sec.name.clone()),
+                )
+                .child(
+                    Icon::new(match sec.collapsed {
+                        true => IconName::ChevronRight,
+                        false => IconName::ChevronDown,
+                    })
+                    .with_size(px(12.)),
+                )
+                .child(div().flex_1())
+                .when(sec.collapsed, |d| {
+                    d.child(div().text_xs().child(sec.workspaces.len().to_string()))
+                })
+            })
+            .when(rail, |d| {
+                d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+            })
+            .into_any_element()
     }
 
     pub(super) fn render_sidebar(
@@ -568,10 +864,7 @@ impl Shark {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let theme = cx.theme();
-        let focused = self.sidebar_focus.is_focused(window);
         let rail = self.rail;
-        // 16px icons; the rail is 32px icon buttons, 16 apart.
-        let isz = px(16.);
         let header = |t: &'static str| {
             side_header(theme, t)
                 .text_color(theme.sidebar_foreground)
@@ -585,294 +878,11 @@ impl Shark {
                 .text_color(theme.sidebar_foreground)
                 .child(t)
         };
-        let row = || {
-            side_row(theme)
-                .text_color(theme.sidebar_foreground)
-                .when(rail, rail_button)
-        };
-        let m = window.modifiers();
-        let cmd_held = m.platform && m.number_of_modifiers() == 1;
-        let repos = self.state.repos.iter().enumerate().map(|(ix, r)| {
-            let (name, path) = (r.name.clone(), r.path.clone());
-            let tip: SharedString = name.clone().into();
-            row()
-                .id(("repo", ix))
-                .test_support()
-                .hover(|d| d.bg(side_hover(theme)))
-                // Drag to reorder: scripts run in this order across a workspace's repos.
-                .on_drag(RepoDrag(ix, name.clone().into()), |d, _, _, cx| {
-                    cx.new(|_| d.clone())
-                })
-                .drag_over::<RepoDrag>(|s, _, _, cx| s.bg(cx.theme().accent))
-                .on_drop(cx.listener(move |this, d: &RepoDrag, _, cx| {
-                    if d.0 != ix && d.0 < this.state.repos.len() {
-                        move_item(&mut this.state.repos, d.0, ix);
-                        let _ = this.state.save();
-                        cx.notify();
-                    }
-                }))
-                .child(Icon::new(IconName::FolderGit2).with_size(isz))
-                .when(!rail, |d| d.child(div().truncate().child(r.name.clone())))
-                .when(rail, |d| {
-                    d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
-                })
-                .on_click({
-                    let repo = r.clone();
-                    cx.listener(move |this, _, w, cx| {
-                        repo_settings::open(this, repo.clone(), w, cx)
-                    })
-                })
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, e: &MouseDownEvent, w, cx| {
-                        let (p1, p3) = (path.clone(), path.clone());
-                        let picked = vec![name.clone()];
-                        let repo = this.state.repos.iter().find(|r| r.name == name).cloned();
-                        let mut entries = vec![
-                            menu::item(
-                                IconName::Settings,
-                                "Repository settings…",
-                                on_shark(cx, move |s, w, cx| {
-                                    if let Some(r) = repo.clone() {
-                                        repo_settings::open(s, r, w, cx)
-                                    }
-                                }),
-                            ),
-                            menu::item(
-                                IconName::Plus,
-                                "New workspace…",
-                                on_shark(cx, move |s, w, cx| {
-                                    s.new_workspace(picked.clone(), None, w, cx)
-                                }),
-                            ),
-                            Entry::Sep,
-                            menu::item(IconName::FolderOpen, "Reveal in Finder", move |_, cx| {
-                                cx.reveal_path(&p1)
-                            })
-                            .hint(tilde(&path)),
-                        ];
-                        // Active workspace first: the likeliest target.
-                        let mut targets: Vec<&Workspace> = (this.state.workspaces.iter())
-                            .filter(|w| !w.repos.iter().any(|r| r.name == name))
-                            .collect();
-                        targets.sort_by_key(|w| this.active.as_ref() != Some(&w.name));
-                        if let Some(repo) = this.state.repos.iter().find(|r| r.name == name) {
-                            let rows: Vec<Entry> = (targets.into_iter())
-                                .map(|w| {
-                                    let (ws, repo) = (w.name.clone(), repo.clone());
-                                    menu::item(
-                                        IconName::MessageSquare,
-                                        w.name.clone(),
-                                        on_shark(cx, move |s, win, cx| {
-                                            s.add_repo_to_workspace(
-                                                ws.clone(),
-                                                repo.clone(),
-                                                win,
-                                                cx,
-                                            )
-                                        }),
-                                    )
-                                })
-                                .collect();
-                            if !rows.is_empty() {
-                                entries.insert(
-                                    2,
-                                    menu::sub(IconName::FolderPlus, "Add to workspace", rows),
-                                );
-                            }
-                        }
-                        entries.extend(open_in_entries(None, &[(name.clone(), path.clone())], cx));
-                        entries.push(
-                            menu::item(IconName::Copy, "Copy path", move |w, cx| {
-                                copy(p3.display().to_string(), w, cx)
-                            })
-                            .hint(tilde(&path)),
-                        );
-                        this.show_menu(e.position, entries, w, cx);
-                    }),
-                )
-        });
+        let repos = (self.state.repos.iter().enumerate()).map(|(ix, r)| self.repo_row(ix, r, cx));
         let order = self.ws_order(false);
         let accent = theme.sidebar_accent;
-        let ws_row = |ix: usize, w: &Workspace, section: Option<usize>| {
-            let running = self.running_chats(&w.name, cx);
-            let selected = self.sel == SideRow::Ws(ix);
-            let active = !self.home_shown() && self.active.as_ref() == Some(&w.name);
-            let bright = active || (selected && focused);
-            let foreground = if bright {
-                theme.foreground
-            } else {
-                theme.sidebar_foreground
-            };
-            let attn = self.attention_of(&w.name, cx);
-            let nth = order.iter().position(|&o| o == ix).filter(|&n| n < 9);
-            let ws = w.clone();
-            row()
-                .id(ix)
-                .test_support()
-                // The rail shows only the icon, so rows keep the one-line height there.
-                .when(!rail, |d| d.h(px(44.)))
-                .when(section.is_some() && !rail, |d| d.ml(px(24.)))
-                .map(|d| cursor_row(d, active, selected, focused, theme))
-                .text_color(foreground)
-                // The cursor moves on press, not release: a held or dragged row is the one ringed.
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |this, _, _, cx| {
-                        this.sel = SideRow::Ws(ix);
-                        cx.notify();
-                    }),
-                )
-                .on_click(
-                    cx.listener(move |this, _, window, cx| this.open_workspace(ix, window, cx)),
-                )
-                // Right-click moves the cursor too, so it's clear which row the menu is for.
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, e: &MouseDownEvent, w, cx| {
-                        this.sel = SideRow::Ws(ix);
-                        let entries = ws_menu(this, &ws, cx);
-                        this.show_menu(e.position, entries, w, cx);
-                    }),
-                )
-                .map(|d| {
-                    self.reorder_source(
-                        d,
-                        reorder::Item::Workspace(w.name.clone()),
-                        w.name.clone().into(),
-                    )
-                })
-                .child(match nth {
-                    Some(n) if cmd_held => kbd(&format!("cmd-{}", n + 1)).into_any_element(),
-                    _ => workspace_indicator(running, &attn, foreground, isz, theme),
-                })
-                .when(!rail, |d| {
-                    d.child(
-                        v_flex()
-                            .flex_1()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .when(active, |d| d.font_weight(FontWeight::MEDIUM))
-                                    .child(w.name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(if bright {
-                                        theme.muted_foreground
-                                    } else {
-                                        theme.sidebar_foreground
-                                    })
-                                    .child({
-                                        let mut repos = (w.repos.iter())
-                                            .map(|r| r.name.as_str())
-                                            .collect::<Vec<_>>()
-                                            .join(" · ");
-                                        if self.running(&w.name) {
-                                            repos = format!("Scripts running · {repos}");
-                                        }
-                                        match (&attn, running) {
-                                            // The step says where, and that it's waiting on you.
-                                            (Attn::Needs(step), _) => step.clone(),
-                                            (_, 0 | 1) => repos,
-                                            (_, n) => format!("{n} chats running · {repos}"),
-                                        }
-                                    }),
-                            ),
-                    )
-                })
-                .when(rail, |d| {
-                    let name: SharedString = w.name.clone().into();
-                    d.tooltip(move |w, cx| Tooltip::new(name.clone()).build(w, cx))
-                })
-                // Holding cmd in the rail names every workspace beside its cmd-N key.
-                .when(rail && cmd_held, |d| {
-                    d.relative().child(
-                        div().absolute().top_0().left_full().child(deferred(
-                            anchored().child(
-                                div()
-                                    .ml_2()
-                                    .h(px(28.))
-                                    .px_2()
-                                    .flex()
-                                    .items_center()
-                                    .whitespace_nowrap()
-                                    .rounded(theme.radius)
-                                    .border_1()
-                                    .border_color(theme.border)
-                                    .bg(theme.popover)
-                                    .text_color(theme.popover_foreground)
-                                    .text_sm()
-                                    .shadow_md()
-                                    .child(w.name.clone()),
-                            ),
-                        )),
-                    )
-                })
-                .into_any_element()
-        };
-        let section_row = |i: usize, sec: &Section| {
-            let selected = self.sel == SideRow::Section(i);
-            let tip: SharedString = sec.name.clone().into();
-            // A folded section still shows that a workspace inside needs you.
-            let needs = sec.collapsed
-                && sec
-                    .workspaces
-                    .iter()
-                    .any(|n| matches!(self.attention_of(n, cx), Attn::Needs(_)));
-            row()
-                .id(("section", i))
-                .test_support()
-                .map(|d| cursor_row(d, false, selected, focused, theme))
-                .when(selected && focused, |d| d.text_color(theme.foreground))
-                .map(|d| self.reorder_source(d, reorder::Item::Section(i), sec.name.clone().into()))
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.sel = SideRow::Section(i);
-                    this.toggle_section(i, cx)
-                }))
-                .on_mouse_down(
-                    MouseButton::Right,
-                    cx.listener(move |this, e: &MouseDownEvent, w, cx| {
-                        this.sel = SideRow::Section(i);
-                        let entries = section_menu(this, i, cx);
-                        this.show_menu(e.position, entries, w, cx);
-                    }),
-                )
-                .child(
-                    Icon::new(section_icon(&sec.icon))
-                        .with_size(isz)
-                        .when(needs, |i| i.text_color(theme.warning_foreground)),
-                )
-                .when(!rail, |d| {
-                    d.child(
-                        div()
-                            .min_w_0()
-                            .truncate()
-                            .font_weight(FontWeight::MEDIUM)
-                            .child(sec.name.clone()),
-                    )
-                    .child(
-                        Icon::new(match sec.collapsed {
-                            true => IconName::ChevronRight,
-                            false => IconName::ChevronDown,
-                        })
-                        .with_size(px(12.)),
-                    )
-                    .child(div().flex_1())
-                    .when(sec.collapsed, |d| {
-                        d.child(div().text_xs().child(sec.workspaces.len().to_string()))
-                    })
-                })
-                .when(rail, |d| {
-                    d.tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
-                })
-                .into_any_element()
-        };
         let name_row = |input: &Entity<InputState>, icon: IconName| {
-            row()
+            sidebar_row(rail, theme)
                 .id("section-name")
                 .test_support()
                 .key_context("SectionName")
@@ -881,7 +891,7 @@ impl Shark {
                 .border_color(theme.primary)
                 .bg(side_on(theme))
                 .on_action(cx.listener(|this, _: &CancelEdit, w, cx| this.cancel_naming(w, cx)))
-                .child(Icon::new(icon).with_size(isz))
+                .child(Icon::new(icon).with_size(ISZ))
                 .child(
                     div()
                         .flex_1()
@@ -905,9 +915,10 @@ impl Shark {
                         Some(n) if n.rename == Some(i) => {
                             items.push(name_row(&n.input, section_icon(&sec.icon)))
                         }
-                        _ => items.push(
-                            self.reorder_item(section_row(i, sec), reorder::Item::Section(i)),
-                        ),
+                        _ => items.push(self.reorder_item(
+                            self.section_row(i, sec, window, cx),
+                            reorder::Item::Section(i),
+                        )),
                     }
                 }
                 SideRow::Ws(ix) => {
@@ -918,7 +929,7 @@ impl Shark {
                         items.extend(new_row.take());
                     }
                     items.push(self.reorder_item(
-                        ws_row(ix, w, section),
+                        self.ws_row(ix, w, section, &order, window, cx),
                         reorder::Item::Workspace(w.name.clone()),
                     ));
                 }
@@ -931,9 +942,7 @@ impl Shark {
                     menu::item(
                         IconName::Plus,
                         "New workspace…",
-                        on_shark(cx, |s, w, cx| {
-                            s.new_workspace(s.state.last_repos.clone(), None, w, cx)
-                        }),
+                        on_shark(cx, |s, w, cx| s.new_workspace_default(w, cx)),
                     ),
                     menu::item(
                         IconName::FolderPlus,
@@ -1013,10 +1022,10 @@ impl Shark {
                     this.show_menu(e.position, entries, w, cx);
                 }),
             );
-        let add_repo_row = row()
+        let add_repo_row = sidebar_row(rail, theme)
             .id("add-repo-row")
             .hover(|d| d.bg(side_hover(theme)))
-            .child(Icon::new(IconName::FolderPlus).with_size(isz))
+            .child(Icon::new(IconName::FolderPlus).with_size(ISZ))
             .when(!rail, |d| d.child(div().flex_1().child("Add repo…")))
             .when(rail, |d| {
                 d.tooltip(|w, cx| Tooltip::new("Add repo").build(w, cx))
@@ -1039,12 +1048,7 @@ impl Shark {
             })
             .h_full()
             .flex_none()
-            .on_action(cx.listener(|this, _: &SelectNext, _, cx| this.move_sel(|at, _| at + 1, cx)))
-            .on_action(cx.listener(|this, _: &SelectPrev, _, cx| {
-                this.move_sel(|at, _| at.saturating_sub(1), cx)
-            }))
-            .on_action(cx.listener(|this, _: &SelectFirst, _, cx| this.move_sel(|_, _| 0, cx)))
-            .on_action(cx.listener(|this, _: &SelectLast, _, cx| this.move_sel(|_, n| n - 1, cx)))
+            .map(|d| nav_actions(d, false, cx, Shark::move_sel))
             .on_action(cx.listener(|this, _: &Confirm, window, cx| match this.sel {
                 SideRow::Ws(ix) => this.open_workspace(ix, window, cx),
                 SideRow::Section(i) => this.toggle_section(i, cx),
