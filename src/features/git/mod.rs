@@ -910,7 +910,7 @@ impl GitFeature {
                         ),
                 )
             })
-            .child(crate::chat::markdown(&md, "git-row"))
+            .child(crate::chat::markdown(&md, "git-row", vec![]))
             .into_any_element()
     }
 

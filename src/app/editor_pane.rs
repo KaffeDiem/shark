@@ -196,7 +196,10 @@ impl Shark {
         let Some(ws) = self.active_ws() else { return };
         let order: Vec<_> = ws.file_tabs().cloned().collect();
         self.file_tabs
-            .sort_by_key(|t| order.iter().position(|p| *p == t.editor.read(cx).path));
+            // Unlisted (external) files go last, as the strip draws them.
+            .sort_by_key(|t| {
+                (order.iter().position(|p| *p == t.editor.read(cx).path)).unwrap_or(usize::MAX)
+            });
     }
 
     /// Restore disk contents in the background without selecting or focusing a file.
@@ -306,20 +309,23 @@ impl Shark {
                     return;
                 };
                 let path = editor.read(cx).path.clone();
+                let shown = s.editor.as_ref() == Some(&editor);
+                let at = s
+                    .active_tab_index(cx)
+                    .filter(|_| shown && s.tab == Tab::File);
                 s.active_ws_mut().unwrap().close_tab(&TabId::File(path));
                 let _ = s.state.save();
                 s.file_tabs.remove(ix);
                 s.prune_language_sessions(cx);
                 if s.file_tabs.is_empty() {
                     s.editor = None;
-                    if s.tab == Tab::File {
-                        s.show(s.file_fallback(), window, cx);
-                    }
-                } else if s.editor.as_ref() == Some(&editor) {
+                } else if shown {
                     s.editor = Some(s.file_tabs[ix.min(s.file_tabs.len() - 1)].editor.clone());
-                    if s.tab == Tab::File {
-                        s.show(Tab::File, window, cx);
-                    }
+                }
+                if let Some(at) = at.filter(|_| !s.home_shown()) {
+                    s.select_neighbor(at, window, cx);
+                } else if s.tab == Tab::File && s.editor.is_none() {
+                    s.show(s.file_fallback(), window, cx);
                 }
                 cx.notify();
             },

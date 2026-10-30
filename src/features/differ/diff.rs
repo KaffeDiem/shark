@@ -17,6 +17,8 @@ pub(crate) struct DiffData {
     /// Fingerprint of the whole patch; equal means nothing to redo.
     fp: u64,
     bases: HashMap<String, String>,
+    /// Per repo, the commit the patch is against.
+    revs: HashMap<String, String>,
     /// In tree order.
     pub(crate) files: Vec<DiffFile>,
     fps: Vec<u64>,
@@ -28,6 +30,23 @@ pub(crate) struct DiffData {
     /// The file edited in place, and its bytes as on disk when the refresh read it (none:
     /// gone or unreadable).
     edited: Option<(PathBuf, Option<Vec<u8>>)>,
+}
+
+/// The file of one patch chunk. One that fails to parse is shown with the reason in its
+/// place, not dropped without a word.
+fn parse_chunk(chunk: &str) -> Option<DiffFile> {
+    match DiffFile::parse(chunk) {
+        Ok(files) => files.into_iter().next(),
+        Err(e) => {
+            let header = chunk.lines().next().unwrap_or_default();
+            let path = header.strip_prefix("diff --git ").unwrap_or(header);
+            let path = path.rsplit_once(" b/").map_or(path, |(_, b)| b);
+            Some(DiffFile::unchanged(
+                path,
+                &format!("Could not parse this file's diff: {e}\n"),
+            ))
+        }
+    }
 }
 
 impl DiffData {
@@ -52,10 +71,10 @@ impl DiffData {
         let mut parsed: Vec<(DiffFile, u64)> = files::split_patch(&patch)
             .into_iter()
             .filter_map(|chunk| {
-                let file = DiffFile::parse(chunk).ok()?.into_iter().next()?;
+                let file = parse_chunk(chunk)?;
                 hunks.insert(file.path().clone(), review::parse_hunks(chunk));
                 media.extend(media::MediaFile::parse(file.path(), chunk, &ws_dir));
-                Some((file, files::fingerprint(chunk)))
+                Some((file, review::chunk_fingerprint(chunk)))
             })
             .collect();
         // A local edit can undo a committed change back to the base, leaving no base patch.
@@ -73,6 +92,12 @@ impl DiffData {
                 .repos
                 .iter()
                 .map(|r| (r.name.clone(), r.base.clone()))
+                .collect(),
+            revs: (ws.repos.iter())
+                .map(|r| {
+                    let rev = review::compare_rev(&ws_dir.join(&r.name), &r.base, uncommitted_only);
+                    (r.name.clone(), rev)
+                })
                 .collect(),
             fp,
             files,
@@ -154,9 +179,11 @@ impl Differ {
         }
         let status_changed = !self.diff_loaded
             || data.bases != self.diff_bases
+            || data.revs != self.diff_revs
             || data.error != self.diff_error
             || data.uncommitted != self.uncommitted;
         self.diff_bases = data.bases;
+        self.diff_revs = data.revs;
         self.diff_loaded = true;
         self.diff_error = data.error;
         self.uncommitted = data.uncommitted;
@@ -211,8 +238,9 @@ impl Differ {
                 hunks.unwrap_or_default(),
             );
         }
-        // While editing, the same files are replaced one by one so the view stays put.
-        let in_place = self.editing.is_some()
+        // With the same files, only those that changed are replaced, so the others keep their
+        // folds, annotations and selection and the view stays put.
+        let in_place = !self.diff_files.is_empty()
             && (self.diff_files.iter().map(|f| f.path())).eq(data.files.iter().map(|f| f.path()));
         let old_fps = std::mem::take(&mut self.diff_fps);
         self.review.hunks = data.hunks;
@@ -382,9 +410,7 @@ impl Differ {
                 false => ws.viewed.remove(&path),
             };
         }
-        // Forget files that left the diff so the map doesn't grow forever.
-        let live: HashSet<&str> = self.diff_files.iter().map(|f| f.path().as_str()).collect();
-        ws.viewed.retain(|p, _| live.contains(p.as_str()));
+        // Files outside the current diff (say in Uncommitted mode) keep their marks.
         cx.emit(DifferEvent::Viewed {
             workspace: name,
             viewed: ws.viewed.clone(),
@@ -536,7 +562,11 @@ impl Differ {
             {
                 let path = self.diff_files[ix].path().to_string();
                 self.review.at_file(&path);
-                self.diff.update(cx, |d, cx| d.scroll_to_file(&path, cx));
+                // A line cursor left in the previous file would win over this one for `c`/`i`.
+                self.diff.update(cx, |d, cx| {
+                    d.set_selected_lines(None, cx);
+                    d.scroll_to_file(&path, cx)
+                });
             }
         }
         cx.notify();
@@ -1452,5 +1482,87 @@ pub(crate) fn diff_mode(unified: bool) -> DiffMode {
     match unified {
         true => DiffMode::Unified,
         false => DiffMode::Split,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    // Not `super::*`: it would bring `gpui_kit::test` in over the `#[test]` its macro expands to.
+    use super::{DiffData, parse_chunk};
+    use crate::{
+        diff_view::DiffFile,
+        features::differ::{Differ, Preferences},
+    };
+    use gpui_kit::TestAppContext;
+    use std::collections::{HashMap, HashSet};
+
+    #[gpui_kit::test]
+    fn a_chunk_that_fails_to_parse_stays_in_the_list_with_its_reason(_: &mut TestAppContext) {
+        let chunk = "diff --git \"a/caf\\351.txt\" \"b/caf\\351.txt\"\n--- \"a/caf\\351.txt\"\n+++ \"b/caf\\351.txt\"\n@@ -1 +1 @@\n-a\n+b\n";
+        let bad =
+            "diff --git a/x.txt b/x.txt\n--- a/x.txt\n+++ b/x.txt\n@@ -1,2 +1,2 @@\n-old\né\n";
+        assert!(DiffFile::parse(bad).is_err());
+        let file = parse_chunk(bad).unwrap();
+        assert_eq!(file.path().as_str(), "x.txt");
+        assert!(
+            file.text_for_lines(crate::diff_view::DiffSide::Modified, 1, 1)
+                .contains("Could not parse")
+        );
+        // Whatever the parser makes of the quoted non-UTF-8 path, the chunk yields a file.
+        assert!(parse_chunk(chunk).is_some());
+    }
+
+    fn data(patch: &str, fps: [u64; 2]) -> DiffData {
+        let files = DiffFile::parse(patch).unwrap();
+        DiffData {
+            fp: fps[1],
+            bases: HashMap::new(),
+            revs: HashMap::new(),
+            files,
+            fps: fps.to_vec(),
+            error: None,
+            uncommitted: HashSet::new(),
+            hunks: HashMap::new(),
+            media: vec![],
+            edited: None,
+        }
+    }
+
+    #[gpui_kit::test]
+    fn a_refresh_keeps_the_view_state_of_files_that_did_not_change(cx: &mut TestAppContext) {
+        use crate::diff_view::{DiffLineRange, DiffSide};
+        cx.update(|cx| {
+            gpui_kit::component::init(cx);
+            crate::diff_view::init(cx);
+        });
+        let (differ, cx) = cx.add_window_view(|window, cx| {
+            Differ::new(
+                Preferences::from(&crate::state::State::default()),
+                window,
+                cx,
+            )
+        });
+        let patch = |b: &str| {
+            format!(
+                "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,2 +1,2 @@\n one\n-two\n+TWO\n\
+                 diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-old\n+{b}\n"
+            )
+        };
+        let select = DiffLineRange::new("a.txt", DiffSide::Modified, 2, 2);
+        differ.update(cx, |d, cx| {
+            d.apply_diff(data(&patch("one"), [1, 2]), cx);
+            d.diff
+                .update(cx, |s, cx| s.set_selected_lines(Some(select.clone()), cx));
+            // Only b.txt changed.
+            d.apply_diff(data(&patch("two"), [1, 3]), cx);
+            let (selected, text) = d.diff.read_with(cx, |s, _| {
+                (
+                    s.selected_lines(),
+                    s.files()[1].text_for_lines(DiffSide::Modified, 1, 1),
+                )
+            });
+            assert_eq!(selected, Some(select.clone()));
+            assert_eq!(text, "two\n");
+        });
     }
 }

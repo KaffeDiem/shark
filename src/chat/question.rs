@@ -41,6 +41,13 @@ pub(super) struct Q {
     secret: bool,
 }
 
+/// The user's own text for an answer: trimmed, unless it's a secret (spaces may belong to it).
+/// Blank is no answer.
+fn note_of(text: &str, secret: bool) -> Option<String> {
+    let t = if secret { text } else { text.trim() };
+    (!text.trim().is_empty()).then(|| t.to_string())
+}
+
 /// What the user answered to one question: the labels picked and any text of their own.
 type Answer = (Vec<String>, Option<String>);
 
@@ -313,8 +320,10 @@ impl Chat {
                     .filter_map(|j| asked.qs[i].options.get(j.parse::<usize>().ok()?))
                     .map(|(l, _)| l.clone())
                     .collect();
-                let note = a.freeform().map(|t| t.trim().to_string());
-                (labels, note.filter(|t| !t.is_empty()))
+                (
+                    labels,
+                    a.freeform().and_then(|t| note_of(t, asked.qs[i].secret)),
+                )
             })
             .collect();
         let (reply, summary) = (
@@ -584,6 +593,14 @@ impl Chat {
 mod tests {
     use super::*;
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+
+    #[test]
+    fn secret_answers_keep_their_spaces() {
+        assert_eq!(note_of("  pw ", true).as_deref(), Some("  pw "));
+        assert_eq!(note_of("  pw ", false).as_deref(), Some("pw"));
+        assert_eq!(note_of("   ", true), None);
+        assert_eq!(note_of("", false), None);
+    }
 
     #[cfg(feature = "test-support")]
     #[gpui_kit::test]

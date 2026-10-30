@@ -127,7 +127,13 @@ pub fn set_overrides(o: &BTreeMap<String, String>) {
 }
 
 pub fn get(id: &str) -> String {
-    if let Some(p) = OVERRIDES.read().unwrap().get(id) {
+    // A blank override (saved by an older version) would queue a message that never sends.
+    if let Some(p) = OVERRIDES
+        .read()
+        .unwrap()
+        .get(id)
+        .filter(|p| !p.trim().is_empty())
+    {
         return p.clone();
     }
     PROMPTS

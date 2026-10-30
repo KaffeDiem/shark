@@ -234,6 +234,16 @@ pub(crate) enum Status {
     Resolved,
 }
 
+impl Status {
+    /// Resolvable once sent; a pending or queued thread would vanish unsent.
+    fn resolvable(&self) -> bool {
+        matches!(
+            self,
+            Status::Sent { .. } | Status::Addressed { .. } | Status::Outdated
+        )
+    }
+}
+
 /// A comment on lines of the diff: pending until sent, then followed to an answer.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
 pub(crate) struct Comment {
@@ -522,6 +532,27 @@ fn lines_now(dir: &Path, c: &mut Comment) -> Option<String> {
         }
     };
     Some(slice(&src, c.start.1, c.end.1))
+}
+
+/// Fingerprint of one file's patch for its viewed mark: the working-tree blob the patch ends
+/// in, so switching Uncommitted (another old side) alone doesn't mark it changed. Falls back
+/// to the whole chunk when there is none (deleted, mode-only).
+pub(crate) fn chunk_fingerprint(chunk: &str) -> u64 {
+    let new = (chunk.lines().find_map(|l| l.strip_prefix("index ")))
+        .and_then(|l| l.split_whitespace().next()?.split_once(".."))
+        .map(|(_, new)| new)
+        .filter(|new| new.bytes().any(|b| b != b'0'));
+    crate::files::fingerprint(new.unwrap_or(chunk))
+}
+
+/// The commit the diff of `repo_dir` compares against: HEAD when only uncommitted changes show,
+/// else the merge-base with `base`. Empty when git fails.
+pub(crate) fn compare_rev(repo_dir: &Path, base: &str, uncommitted_only: bool) -> String {
+    let args = match uncommitted_only {
+        true => vec!["rev-parse", "HEAD"],
+        false => vec!["merge-base", base, "HEAD"],
+    };
+    crate::git::git(repo_dir, &args).unwrap_or_default()
 }
 
 /// Ids for comments saved before there were any (they load as 0), counting on from `last`;
@@ -994,8 +1025,13 @@ impl Differ {
         h.is_some() && self.hunk_of(c, c.start.1) == h
     }
 
-    /// The hunk of the diff showing line `line` of the comment's side.
+    /// The hunk of the diff showing line `line` of the comment's side. Old-side numbers count
+    /// in the commit the comment was made against, so another compare commit shows none.
     fn hunk_of(&self, c: &Comment, line: usize) -> Option<usize> {
+        let now = (c.path.split_once('/')).and_then(|(repo, _)| self.diff_revs.get(repo));
+        if c.end.0 && now.is_some_and(|r| !r.is_empty() && !c.rev.is_empty() && *r != c.rev) {
+            return None;
+        }
         (self.review.hunks.get(c.path.as_str()))?
             .iter()
             .position(|h| {
@@ -1109,16 +1145,14 @@ impl Differ {
         let rev = match c.end.0 {
             false => "working tree".to_string(),
             true => (c.path.split_once('/'))
-                .and_then(|(repo, _)| {
-                    let base = self.diff_base(repo);
+                .map(|(repo, _)| {
                     // ponytail: merge-base (and lines_now's git show) block the UI thread as
                     // the composer opens; move them to the background executor if big repos lag.
-                    let args = if self.preferences.uncommitted_only {
-                        vec!["rev-parse", "HEAD"]
-                    } else {
-                        vec!["merge-base", base, "HEAD"]
-                    };
-                    crate::git::git(&ws.dir().join(repo), &args).ok()
+                    compare_rev(
+                        &ws.dir().join(repo),
+                        self.diff_base(repo),
+                        self.preferences.uncommitted_only,
+                    )
                 })
                 .unwrap_or_default(),
         };
@@ -1197,7 +1231,7 @@ impl Differ {
 
     /// A composer open elsewhere with text in it is added (or saved), not lost, before
     /// another opens.
-    fn keep_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn keep_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let typed = |c: &Composer| !c.input.read(cx).value().trim().is_empty();
         if self.review.composer.as_ref().is_some_and(typed) {
             self.submit_composer(window, cx);
@@ -1388,13 +1422,8 @@ impl Differ {
     /// `r`: resolve the sent thread at the cursor (a pending one has no way back from hidden);
     /// with none, `r` refreshes the diff as before.
     pub(crate) fn resolve_thread(&mut self, cx: &mut Context<Self>) {
-        let sent = |s: &Status| {
-            matches!(
-                s,
-                Status::Sent { .. } | Status::Addressed { .. } | Status::Outdated
-            )
-        };
-        match (self.thread_at(cx).and_then(|id| self.comment(id))).filter(|c| sent(&c.status)) {
+        match (self.thread_at(cx).and_then(|id| self.comment(id))).filter(|c| c.status.resolvable())
+        {
             Some(c) => self.set_status(&[c.id], Status::Resolved, cx),
             None => cx.propagate(),
         }
@@ -1477,7 +1506,7 @@ impl Differ {
         };
         let addressed = matches!(c.status, Status::Addressed { .. } | Status::Outdated);
         let mut entries = vec![menu::item(IconName::Pencil, "Edit", act(Self::edit_thread))];
-        if c.status != Status::Resolved {
+        if c.status.resolvable() {
             entries.push(menu::item(
                 IconName::CircleCheck,
                 "Resolve",
@@ -1535,7 +1564,21 @@ impl Differ {
         let Some(c) = self.comment(id).cloned() else {
             return;
         };
+        // Orphans have no row to go to; they show below the diff.
+        if !self.diff_files.iter().any(|f| *f.path() == c.path) {
+            return notify_err(
+                window,
+                cx,
+                "Its file is no longer in the diff: see the threads below it",
+            );
+        }
         self.drop_mouse_selection(window, cx);
+        // A viewed file is folded: its line has no row.
+        self.diff.update(cx, |d, cx| {
+            if d.is_file_collapsed(&c.path) {
+                d.set_file_collapsed(&c.path, false, cx)
+            }
+        });
         self.reveal(&Spot::Line(c.anchor()), 0., cx);
         // `find` lands on the closest row; the thread's own line is what `e`/`x` read.
         let sel = DiffLineRange::new(c.path.clone(), side(c.end.0), c.end.1, c.end.1);
@@ -1551,14 +1594,12 @@ impl Differ {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Top to bottom as the diff shows them (files gone from it last); one row's by id.
+        // Top to bottom as the diff shows them; one row's by id. Orphans (their file left the
+        // diff) have no row, so they are skipped.
         let rows = self.diff_rows(cx);
-        let row = |l: DiffLinePosition| match self.diff_files.iter().any(|f| f.path() == l.path()) {
-            true => find(&rows, &Spot::Line(l)),
-            false => usize::MAX,
-        };
+        let row = |l: DiffLinePosition| find(&rows, &Spot::Line(l));
         let mut threads: Vec<((usize, u64), u64)> = (self.ws_comments().iter())
-            .filter(|c| c.shown())
+            .filter(|c| c.shown() && self.diff_files.iter().any(|f| *f.path() == c.path))
             .map(|c| ((row(c.anchor()), c.id), c.id))
             .collect();
         if threads.is_empty() {

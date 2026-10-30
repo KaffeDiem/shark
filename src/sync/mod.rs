@@ -6,7 +6,7 @@ mod base_tests;
 mod status;
 #[cfg(test)]
 pub(crate) use status::parse_prs;
-pub use status::{Kind, Pr, PrState, Repo, ago, github_url, short};
+pub use status::{Kind, Pr, PrState, Repo, ago, github_url, origin_repo, pick_pr, short};
 
 use crate::app::menus::{each_or_all, pr_entry};
 use crate::app::open_menu;
@@ -124,6 +124,8 @@ struct Job {
     repos: Vec<(PathBuf, String, String)>,
     fetch: bool,
     pr: bool,
+    /// gh is down and its backoff hasn't run out: neither `pr` nor `fetch` asks GitHub.
+    backoff: bool,
     /// The last answer per repo, including its PR target between GitHub polls.
     prev: Vec<Repo>,
     /// With `fetch`: `(repo, source)` whose open PRs to list, for the stack around the branch.
@@ -137,6 +139,7 @@ impl Job {
             repos: worktrees(ws),
             fetch: false,
             pr: true,
+            backoff: false,
             prev: vec![],
             stack: vec![],
         }
@@ -157,7 +160,7 @@ struct Probed {
 
 /// Repos run in parallel, so one hung remote costs one timeout, not one per repo.
 fn run_job(job: &Job) -> Probed {
-    let ask_pr = job.pr || job.fetch;
+    let ask_pr = (job.pr || job.fetch) && !job.backoff;
     let results = par_map(job.repos.iter(), |(wt, saved_base, branch)| {
         let previous = job.prev.iter().find(|r| {
             wt.file_name().is_some_and(|name| name == r.name.as_str()) && r.branch == *branch
@@ -375,6 +378,11 @@ fn due(at: Option<Instant>, every: Duration) -> bool {
     at.is_none_or(|t| t.elapsed() >= every)
 }
 
+/// Whether GitHub is left alone: gh failed for every repo, less than `PR_BACKOFF` ago.
+fn gh_backoff(down: bool, checked: Option<Instant>) -> bool {
+    down && !due(checked, PR_BACKOFF)
+}
+
 impl GitSync {
     pub(crate) fn restore_settings(&mut self, state: &crate::state::State) {
         self.reviewed = state
@@ -535,12 +543,15 @@ impl GitSync {
         let fetch = self.want_fetch
             || due(self.fetched, FETCH_EVERY)
             || (pr_head_moved(&self.repos) && due(self.fetched, FETCH_MOVED));
+        // Turn ends and window focus ask too; a down gh waits out its backoff for them as well.
+        let backoff = gh_backoff(self.gh_down, self.pr_checked);
         let job = Job {
             repos: worktrees(&self.ws),
             // Fetching rewrites refs/remotes; don't fight a pull or push (the agent's or a step's)
             // for the lock.
             fetch: fetch && !self.busy(cx) && self.running.is_none(),
-            pr: self.want_pr || due(self.pr_checked, pr_every),
+            pr: !backoff && (self.want_pr || due(self.pr_checked, pr_every)),
+            backoff,
             prev: self.repos.clone(),
             stack: (self.ws.repos.iter())
                 .map(|r| (r.name.clone(), r.src.clone()))
@@ -767,12 +778,22 @@ impl GitSync {
             .collect()
     }
 
+    /// "Open pull requests": every repo's PR, merged and closed ones too.
     pub fn open_prs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let urls = self.pr_urls();
         if urls.is_empty() {
             return notify_err(window, cx, "No PRs yet: create them from the git menu");
         }
         urls.iter().for_each(|(_, u)| cx.open_url(u));
+    }
+
+    /// The button's wait: opens the open PRs it waits on, not every repo's.
+    fn open_waiting(&mut self, rs: &[String], window: &mut Window, cx: &mut Context<Self>) {
+        let urls = open_pr_urls(&self.repos, rs);
+        if urls.is_empty() {
+            return notify_err(window, cx, "No open PR to show");
+        }
+        urls.iter().for_each(|u| cx.open_url(u));
     }
 
     /// The button: run whatever the workspace needs next.
@@ -814,6 +835,7 @@ impl GitSync {
     }
 
     pub fn fetch_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.gh_down = false; // asked for: retry GitHub now
         self.kick(true, true);
         window.push_notification("Fetching…", cx);
     }
@@ -841,7 +863,7 @@ impl GitSync {
                 notify_err(window, cx, detail.join("\n"))
             }
             Kind::None => {}
-            Kind::OpenPr => self.open_prs(window, cx),
+            Kind::OpenPr => self.open_waiting(&a.repos, window, cx),
             Kind::Archive => cx.emit(SyncEvent::Archive),
             Kind::Restack => cx.emit(self.restack_event(&a.repos)),
             Kind::Merge | Kind::ForcePush => self.confirm(a, check, window, cx),
@@ -921,6 +943,10 @@ impl GitSync {
     }
 
     fn exec(&mut self, a: Action, check: bool, window: &mut Window, cx: &mut Context<Self>) {
+        // A confirm dialog may have sat open while a turn or another step started.
+        if let Some(e) = self.blocked(a.kind.needs_idle(), cx) {
+            return notify_err(window, cx, e);
+        }
         self.running = Some(a.label.clone());
         self.set_hold(true, cx);
         cx.notify();
@@ -1102,9 +1128,8 @@ impl GitSync {
             (Some(r), _) => lines.push(format!("Running: {r}")),
             (None, Some(a)) => {
                 lines.push(a.label.clone());
-                if matches!(a.kind, Kind::Agent(_)) {
-                    lines.push("Adds a prompt to the current chat's queue".into());
-                } else if a.kind.needs_idle() && self.busy(cx) {
+                lines.push(how(&a.kind).into());
+                if a.kind.needs_idle() && self.busy(cx) {
                     lines.push("Waits for the agent to finish".into());
                 }
             }
@@ -1194,11 +1219,11 @@ impl GitSync {
         self.run_kind(Kind::Agent(prompt), "Rebase onto parent", window, cx)
     }
 
-    /// Available even before the agent has made any changes.
+    /// Available even before the agent has made any changes. Targets the repos the button's
+    /// "Commit and push" would: the dirty ones, else all.
     pub fn commit_and_push(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let repos = self.repos.iter().map(|r| (&*r.name, &*r.branch));
-        let prompt = crate::prompts::render_each("commit", repos, |rs| rs.join(", "));
-        self.run_kind(Kind::Agent(prompt), "Commit and push", window, cx)
+        let (rs, prompt) = commit_step(&self.repos);
+        self.run_kind_in(Kind::Agent(prompt), "Commit and push", rs, window, cx)
     }
 
     /// Asks the agent to bring every repo up to date with its base.
@@ -1385,6 +1410,28 @@ fn open_pr(repo: &str, number: u64) -> Pr {
     }
 }
 
+/// The repos "Commit and push" targets (the dirty ones, else all) and its prompt.
+fn commit_step(repos: &[Repo]) -> (Vec<String>, String) {
+    let dirty = |r: &&Repo| r.local.as_ref().is_ok_and(|l| l.changed > 0);
+    let mut rs: Vec<String> = repos.iter().filter(dirty).map(|r| r.name.clone()).collect();
+    if rs.is_empty() {
+        rs = repos.iter().map(|r| r.name.clone()).collect();
+    }
+    let pairs = among(repos, &rs).map(|r| (&*r.name, &*r.branch));
+    let prompt = crate::prompts::render_each("commit", pairs, |rs| rs.join(", "));
+    (rs, prompt)
+}
+
+/// URLs of the PRs the button's wait opens: the open ones in `rs` (empty: all), and a review
+/// checkout's PR whatever its state.
+fn open_pr_urls(repos: &[Repo], rs: &[String]) -> Vec<String> {
+    (repos.iter())
+        .filter(|r| rs.is_empty() || rs.contains(&r.name))
+        .filter_map(|r| r.open_pr().or(r.pr().filter(|_| r.is_review())))
+        .map(|p| p.url.clone())
+        .collect()
+}
+
 /// Open PRs in the repos named in `rs` (empty: all), as [`execute`] targets them.
 fn open_prs_in(repos: &[Repo], rs: &[String]) -> usize {
     (repos.iter())
@@ -1403,6 +1450,14 @@ fn check_review_checkout(repos: &[Repo], rs: &[String]) -> Result<(), String> {
         ));
     }
     Ok(())
+}
+
+/// [`status::step_args`] against the workspace's saved base: [`repos_from`] follows an open PR's
+/// base for display, which would hide a retargeted PR from the merge guard.
+fn planned_args(ws: &Workspace, kind: &Kind, r: &Repo) -> Result<Option<Vec<String>>, String> {
+    let saved = ws.repos.iter().find(|w| w.name == r.name);
+    let base = saved.map_or(&r.base, |w| &w.base).clone();
+    status::step_args(kind, &Repo { base, ..r.clone() })
 }
 
 /// One repo's part of a step: `Ok(None)` when it has nothing to do.
@@ -1457,7 +1512,7 @@ fn execute(
             false => Ok(done.join("\n")),
         }
     };
-    let planned = |r: &Repo| status::step_args(&a.kind, r);
+    let planned = |r: &Repo| planned_args(ws, &a.kind, r);
     match &a.kind {
         Kind::Pull | Kind::Push | Kind::ForcePush => each(&|wt, r| {
             let Some(args) = planned(r)? else {
@@ -1486,12 +1541,10 @@ fn execute(
             selected
                 .repos
                 .retain(|r| targets.iter().any(|target| target.name == r.name));
-            let prs = pr::create_linked_prs(&selected, &dir, &landed, new_pr)?;
-            Ok(prs
-                .iter()
-                .map(|(r, u)| format!("{r}: {u}"))
-                .collect::<Vec<_>>()
-                .join("\n"))
+            let (prs, warning) = pr::create_linked_prs(&selected, &dir, &landed, new_pr)?;
+            let mut lines: Vec<String> = prs.iter().map(|(r, u)| format!("{r}: {u}")).collect();
+            lines.extend(warning);
+            Ok(lines.join("\n"))
         }
         Kind::Reopen => each(&|wt, r| {
             gh_on_pr(
@@ -1687,6 +1740,16 @@ fn merge_method(wt: &std::path::Path) -> Result<&'static str, String> {
     .ok_or_else(|| "the repo allows no merge method".into())
 }
 
+/// What a click does, by kind: the same button queues a prompt, runs git or gh, or opens the browser.
+fn how(kind: &Kind) -> &'static str {
+    match kind {
+        Kind::Agent(_) => "Queues a prompt in the current chat",
+        Kind::OpenPr => "Opens the PR in your browser",
+        Kind::None => "Nothing to run",
+        _ => "Runs git or gh directly, without the chat",
+    }
+}
+
 fn icon(a: &Action) -> IconName {
     match a.kind {
         Kind::Agent(_) if a.attention => IconName::TriangleAlert,
@@ -1695,7 +1758,8 @@ fn icon(a: &Action) -> IconName {
         Kind::Push | Kind::ForcePush => IconName::ArrowUp,
         Kind::CreatePr => IconName::GitPullRequestCreate,
         Kind::CreateDraftPr => IconName::GitPullRequestDraft,
-        Kind::Reopen | Kind::Ready | Kind::OpenPr => IconName::GitPullRequest,
+        Kind::Reopen | Kind::Ready => IconName::GitPullRequest,
+        Kind::OpenPr => IconName::ExternalLink,
         Kind::UpdateBranch => IconName::RefreshCw,
         Kind::Merge => IconName::GitMerge,
         Kind::Archive => IconName::Archive,
@@ -1814,8 +1878,8 @@ impl Render for GitSync {
 #[cfg(test)]
 mod tests {
     use super::{
-        Action, Job, Kind, Local, Pr, background_answer, fresh_or_last, needs_you, repos_from,
-        run_job, status,
+        Action, Instant, Job, Kind, Local, Pr, PrState, background_answer, fresh_or_last,
+        needs_you, repos_from, run_job, status,
     };
 
     #[cfg(feature = "test-support")]
@@ -1889,6 +1953,233 @@ mod tests {
             });
         })
         .unwrap();
+    }
+
+    /// The button queues a prompt, runs git/gh, or opens the browser; the tooltip says which,
+    /// a wait opens only the PRs it waits on, and the menu's commit targets the button's repos.
+    #[cfg(feature = "test-support")]
+    #[gpui_kit::test]
+    fn git_button_says_what_a_click_does(cx: &mut gpui_kit::TestAppContext) {
+        use super::*;
+        let _lock = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cx.update(gpui_kit::init);
+        let ws = crate::state::Workspace {
+            name: "git-button-test".into(),
+            branch: "feature".into(),
+            repos: ["api", "web"]
+                .map(|n| crate::state::WsRepo {
+                    name: n.into(),
+                    src: "/nonexistent".into(),
+                    base: "origin/main".into(),
+                    branch: None,
+                })
+                .into(),
+            ..Default::default()
+        };
+        let (window, sync) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| GitSync::new(ws.clone(), w, cx))
+                })
+            })
+            .unwrap();
+        cx.update_window(window, |_, w, cx| {
+            let chat =
+                cx.new(|cx| Chat::new(ws.clone(), crate::state::ChatMeta::default(), false, w, cx));
+            sync.update(cx, |s, cx| {
+                s.add_chat(chat.clone(), cx);
+                s.set_chat(chat.clone(), cx);
+                let pushed = |changed| {
+                    Ok(Local {
+                        branch: Some("feature".into()),
+                        head: "h".into(),
+                        origin: Some("git@github.com:o/r.git".into()),
+                        remote: Some((0, 0)),
+                        base: (1, 0),
+                        changed,
+                        ..Default::default()
+                    })
+                };
+                // api waits on checks; web's PR has merged.
+                s.repos[0].local = pushed(0);
+                s.repos[1].local = pushed(0);
+                s.repos[0].pr = Some(Ok(Some(Pr {
+                    checks: status::Checks::Pending,
+                    ..open_pr("api", 1)
+                })));
+                s.repos[1].pr = Some(Ok(Some(Pr {
+                    state: PrState::Merged,
+                    ..open_pr("web", 2)
+                })));
+                let wait = next_action(&s.repos, &[]);
+                s.action = Some(wait.clone());
+                assert_eq!(
+                    (wait.label.as_str(), &wait.kind),
+                    ("Checks running", &Kind::OpenPr)
+                );
+                assert_eq!(wait.repos, ["api"]);
+                assert_eq!(
+                    open_pr_urls(&s.repos, &wait.repos),
+                    ["https://github.com/o/api/pull/1"],
+                    "not the merged PR of a repo that isn't waiting"
+                );
+                let tip = s.tooltip(cx);
+                assert!(tip.contains("Opens the PR in your browser"), "{tip}");
+                assert!(!tip.contains("Queues a prompt"), "{tip}");
+                assert_eq!(icon(&wait), IconName::ExternalLink);
+                s.primary(w, cx);
+                assert_eq!(chat.read(cx).queued(), 0, "a wait never posts to the chat");
+                assert!(s.running.is_none());
+
+                // A judgment step queues a prompt and says so.
+                s.repos[0].local = pushed(1);
+                let commit = next_action(&s.repos, &[]);
+                let Kind::Agent(prompt) = commit.kind.clone() else {
+                    panic!("{commit:?}")
+                };
+                s.action = Some(commit);
+                let tip = s.tooltip(cx);
+                assert!(tip.contains("Queues a prompt in the current chat"), "{tip}");
+                s.primary(w, cx);
+                assert_eq!(chat.read(cx).queued(), 1);
+
+                // The menu's Commit and push is the button's step: same repos, same prompt.
+                assert_eq!(commit_step(&s.repos), (vec!["api".to_string()], prompt));
+                s.commit_and_push(w, cx);
+                assert_eq!(chat.read(cx).queued(), 2);
+                s.repos[0].local = pushed(0);
+                assert_eq!(commit_step(&s.repos).0, ["api", "web"], "none dirty: all");
+
+                // A direct step says it runs git or gh.
+                s.action = Some(Action {
+                    kind: Kind::Pull,
+                    ..wait.clone()
+                });
+                let tip = s.tooltip(cx);
+                assert!(tip.contains("Runs git or gh directly"), "{tip}");
+
+                // A confirm dialog opened before a turn began must not start the step.
+                chat.update(cx, |c, _| c.busy = true);
+                let merge = Action {
+                    kind: Kind::Merge,
+                    repos: vec![],
+                    ..wait.clone()
+                };
+                s.exec(merge, false, w, cx);
+                assert!(s.running.is_none(), "exec re-checks that the agent is idle");
+                chat.update(cx, |c, _| c.busy = false);
+
+                // While gh is down, turn ends and focus wait out its backoff too.
+                s.gh_down = true;
+                s.pr_checked = Some(Instant::now());
+                s.want_pr = true;
+                s.want_fetch = true;
+                let job = s.job(cx);
+                assert!(job.backoff && !job.pr);
+            });
+        })
+        .unwrap();
+    }
+
+    #[test]
+    fn a_down_gh_is_left_alone_until_its_backoff_ends() {
+        let now = Instant::now();
+        assert!(super::gh_backoff(true, Some(now)));
+        assert!(!super::gh_backoff(true, Some(now - super::PR_BACKOFF)));
+        assert!(!super::gh_backoff(true, None));
+        assert!(!super::gh_backoff(false, Some(now)));
+        let job = |backoff| Job {
+            repos: vec![("/nonexistent".into(), "origin/main".into(), "feat".into())],
+            fetch: true,
+            pr: true,
+            backoff,
+            prev: vec![],
+            stack: vec![],
+        };
+        assert!(
+            run_job(&job(true)).prs.is_none(),
+            "backoff: no gh, even with a fetch"
+        );
+        assert!(run_job(&job(false)).prs.is_some());
+    }
+
+    #[test]
+    fn a_wait_opens_open_prs_in_its_repos_and_a_review_checkout() {
+        let repo = |name: &str, state: PrState| super::Repo {
+            name: name.into(),
+            base: "origin/main".into(),
+            branch: "feat".into(),
+            local: Ok(Local::default()),
+            pr: Some(Ok(Some(Pr {
+                state,
+                ..super::open_pr(name, 1)
+            }))),
+            parent: None,
+        };
+        let mut review = repo("rev", PrState::Merged);
+        review.local.as_mut().unwrap().review = true;
+        let repos = [
+            repo("api", PrState::Open),
+            repo("web", PrState::Open),
+            repo("old", PrState::Closed),
+            review,
+        ];
+        let urls = |rs: &[&str]| {
+            let rs: Vec<String> = rs.iter().map(|r| r.to_string()).collect();
+            super::open_pr_urls(&repos, &rs)
+        };
+        assert_eq!(urls(&["web"]), ["https://github.com/o/web/pull/1"]);
+        assert!(urls(&["old"]).is_empty(), "closed is not open");
+        assert_eq!(urls(&["rev"]).len(), 1, "a review's PR is what it shows");
+        assert_eq!(urls(&[]).len(), 3, "empty is all open ones");
+    }
+
+    #[test]
+    fn merge_guard_sees_a_retargeted_pr_through_the_saved_base() {
+        let ws = crate::state::Workspace {
+            name: "retarget".into(),
+            branch: "feat".into(),
+            repos: vec![crate::state::WsRepo {
+                name: "api".into(),
+                src: "/unused".into(),
+                base: "origin/main".into(),
+                branch: None,
+            }],
+            ..Default::default()
+        };
+        let probe = |base: &str| {
+            let local = Local {
+                branch: Some("feat".into()),
+                head: "h".into(),
+                remote: Some((0, 0)),
+                origin: Some("git@github.com:o/api.git".into()),
+                base: (1, 0),
+                ..Default::default()
+            };
+            let pr = Pr {
+                base: base.into(),
+                ..super::open_pr("api", 1)
+            };
+            repos_from(&ws, vec![Ok(local)], Some(vec![Ok(Some(pr))]), vec![], &[])
+        };
+        let moved = probe("other");
+        assert_eq!(moved[0].base, "origin/other", "display follows the PR");
+        assert!(
+            status::step_args(&Kind::Merge, &moved[0])
+                .unwrap()
+                .is_some(),
+            "the displayed base always matches, so the guard alone never fires"
+        );
+        let e = super::planned_args(&ws, &Kind::Merge, &moved[0]).unwrap_err();
+        assert!(e.contains("`other`") && e.contains("`main`"), "{e}");
+        let same = probe("main");
+        assert!(
+            super::planned_args(&ws, &Kind::Merge, &same[0])
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[cfg(feature = "test-support")]
@@ -2425,6 +2716,7 @@ esac
                 .collect(),
             fetch: false,
             pr: false,
+            backoff: false,
             prev: vec![],
             stack: vec![],
         };

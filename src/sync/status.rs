@@ -311,10 +311,17 @@ fn checks(rollup: &Value) -> Checks {
             .unwrap_or("")
             .to_string()
     };
-    // A re-run leaves the old run in the rollup; only the newest per name counts.
+    // A re-run leaves the old run in the rollup; only the newest per workflow and name counts
+    // (two workflows may both have a `build`).
+    let key = |c: &Value| {
+        (
+            c["workflowName"].as_str().unwrap_or("").to_string(),
+            name(c),
+        )
+    };
     let mut latest: Vec<&Value> = vec![];
     for c in items {
-        match latest.iter().position(|l| name(l) == name(c)) {
+        match latest.iter().position(|l| key(l) == key(c)) {
             Some(i) if started(latest[i]) <= started(c) => latest[i] = c,
             Some(_) => {}
             None => latest.push(c),
@@ -352,11 +359,19 @@ pub fn parse_prs(json: &str) -> Option<Pr> {
         .iter()
         .filter(|p| p["isCrossRepository"] != true)
         .collect();
-    let pick = own.iter().find(|p| p["state"] == "OPEN").or_else(|| {
-        own.iter()
-            .max_by_key(|p| p["updatedAt"].as_str().unwrap_or("").to_string())
-    })?;
-    Some(parse_pr(pick))
+    Some(parse_pr(pick_pr(&own)?))
+}
+
+/// The open PR, else the most recently updated; also how the Git tab picks, so both agree.
+pub fn pick_pr<'a>(own: &[&'a Value]) -> Option<&'a Value> {
+    own.iter()
+        .copied()
+        .find(|p| p["state"] == "OPEN")
+        .or_else(|| {
+            own.iter()
+                .copied()
+                .max_by_key(|p| p["updatedAt"].as_str().unwrap_or("").to_string())
+        })
 }
 
 fn parse_pr(pick: &Value) -> Pr {
@@ -404,17 +419,22 @@ pub fn fetch_parent(wt: &Path, parent: &str) -> Result<Option<Pr>, String> {
     Ok(pr.filter(|p| p.state == PrState::Open || tip.as_ref().is_none_or(|t| *t == p.head)))
 }
 
+/// Origin's GitHub URL, for `gh --repo`: gh may default to a fork's upstream, but branch
+/// ownership belongs to origin.
+pub fn origin_repo(wt: &Path) -> Option<String> {
+    git(wt, &["config", "--get", "remote.origin.url"])
+        .ok()
+        .and_then(|url| github_url(&url))
+}
+
 /// `Ok(None)` means the branch has no PR. Unlike `gh pr view`, "none" isn't an error exit,
 /// so it can't be confused with being offline or logged out.
 /// `head` is the local HEAD as just probed.
 pub fn fetch_pr(wt: &Path, branch: &str, head: &str) -> Result<Option<Pr>, String> {
     let review = crate::git::review_pr_url(wt, branch);
-    // gh may default to a fork's upstream; branch ownership belongs to origin.
-    let origin = git(wt, &["config", "--get", "remote.origin.url"])
-        .ok()
-        .and_then(|url| github_url(&url));
+    let origin = origin_repo(wt);
     let mut args = vec![
-        "pr", "list", "--head", branch, "--state", "all", "--json", PR_FIELDS,
+        "pr", "list", "--head", branch, "--state", "all", "--json", PR_FIELDS, "--limit", "100",
     ];
     if let Some(origin) = &origin {
         args.extend(["--repo", origin]);
@@ -940,26 +960,28 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
             false => act("Checking PR…", Kind::None, vec![], false),
         };
     }
-    let passive = |l: &str| act(l, Kind::OpenPr, vec![], false);
+    // A wait opens the PRs it waits on in the browser; `rs` are those repos.
+    let passive = |l: &str, rs: Vec<String>| act(l, Kind::OpenPr, rs, false);
     // GitHub computes mergeability lazily, and lags a push by a few seconds.
-    if !prs(&|p, l| p.head != l.head || matches!(p.merge_state.as_str(), "UNKNOWN" | "")).is_empty()
-    {
-        return passive("Checking PR…");
+    let rs = prs(&|p, l| p.head != l.head || matches!(p.merge_state.as_str(), "UNKNOWN" | ""));
+    if !rs.is_empty() {
+        return passive("Checking PR…", rs);
     }
-    if !prs(&|p, _| p.checks == Checks::Pending).is_empty() {
-        return passive("Checks running");
+    let rs = prs(&|p, _| p.checks == Checks::Pending);
+    if !rs.is_empty() {
+        return passive("Checks running", rs);
     }
-    if !prs(&|p, _| p.review == "CHANGES_REQUESTED").is_empty() {
-        return passive("Awaiting re-review");
+    let rs = prs(&|p, _| p.review == "CHANGES_REQUESTED");
+    if !rs.is_empty() {
+        return passive("Awaiting re-review", rs);
     }
-    if !prs(&|p, _| p.merge_state == "BLOCKED").is_empty() {
-        let review =
-            !prs(&|p, _| p.merge_state == "BLOCKED" && p.review == "REVIEW_REQUIRED").is_empty();
-        return passive(if review {
-            "Awaiting review"
-        } else {
-            "Merge blocked"
-        });
+    let blocked = prs(&|p, _| p.merge_state == "BLOCKED");
+    if !blocked.is_empty() {
+        let rs = prs(&|p, _| p.merge_state == "BLOCKED" && p.review == "REVIEW_REQUIRED");
+        return match rs.is_empty() {
+            true => passive("Merge blocked", blocked),
+            false => passive("Awaiting review", rs),
+        };
     }
     // A child merges after its parent; GitHub would otherwise merge it into the parent branch.
     let waiting = |r: &Repo| r.parent_is(PrState::Open).is_some();
@@ -969,7 +991,8 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
     }
     if let Some(r) = repos.iter().find(|r| r.open_pr().is_some() && waiting(r)) {
         let p = r.parent.as_ref().map_or(0, |p| p.number);
-        return passive(&format!("Waiting on parent PR #{p}"));
+        let rs = names(&|r, _| r.open_pr().is_some() && waiting(r));
+        return passive(&format!("Waiting on parent PR #{p}"), rs);
     }
     if repos
         .iter()
@@ -1202,6 +1225,83 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         .unwrap();
         assert_eq!(checks(&rerun), Checks::Passing, "a passing re-run wins");
         assert_eq!(checks(&serde_json::json!([])), Checks::Passing);
+    }
+
+    #[test]
+    fn same_named_checks_of_two_workflows_do_not_hide_each_other() {
+        let rollup: Value = serde_json::from_str(
+            r#"[{"name":"build","workflowName":"ci","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-01-01"},
+                {"name":"build","workflowName":"release","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-01-02"}]"#,
+        )
+        .unwrap();
+        assert_eq!(checks(&rollup), Checks::Failing(vec!["build".into()]));
+        // The same workflow's re-run still replaces its older run.
+        let rerun: Value = serde_json::from_str(
+            r#"[{"name":"build","workflowName":"ci","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-01-01"},
+                {"name":"build","workflowName":"ci","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-01-02"}]"#,
+        )
+        .unwrap();
+        assert_eq!(checks(&rerun), Checks::Passing);
+    }
+
+    #[test]
+    fn button_and_git_tab_pick_the_same_pr() {
+        // gh lists newest created first; the one updated last is not the first.
+        let list: Vec<Value> = serde_json::from_str(
+            r#"[{"url":"new","state":"CLOSED","updatedAt":"2026-01-01"},
+                {"url":"old","state":"MERGED","updatedAt":"2026-03-01"}]"#,
+        )
+        .unwrap();
+        let own: Vec<&Value> = list.iter().collect();
+        assert_eq!(pick_pr(&own).unwrap()["url"], "old");
+        assert_eq!(
+            parse_prs(&serde_json::to_string(&list).unwrap())
+                .unwrap()
+                .url,
+            "old"
+        );
+        let mut open = list.clone();
+        open.push(serde_json::json!({"url":"open","state":"OPEN"}));
+        let own: Vec<&Value> = open.iter().collect();
+        assert_eq!(pick_pr(&own).unwrap()["url"], "open");
+    }
+
+    #[test]
+    fn waits_open_only_the_prs_they_wait_on() {
+        let waiting = |p: Pr| repo("web", clean(1), Some(p));
+        let done = repo("api", clean(1), Some(pr("CLEAN", Checks::Passing)));
+        let api_pending = repo("api", clean(1), Some(pr("CLEAN", Checks::Pending)));
+        let a = next(&[api_pending, waiting(pr("CLEAN", Checks::Passing))]);
+        assert_eq!(
+            (a.label.as_str(), &a.kind),
+            ("Checks running", &Kind::OpenPr)
+        );
+        assert_eq!(a.repos, ["api"]);
+        let a = next(&[done.clone(), waiting(pr("BLOCKED", Checks::Passing))]);
+        assert_eq!(
+            (a.label.as_str(), a.repos),
+            ("Merge blocked", vec!["web".to_string()])
+        );
+        let review = Pr {
+            review: "REVIEW_REQUIRED".into(),
+            ..pr("BLOCKED", Checks::Passing)
+        };
+        let a = next(&[done.clone(), waiting(review)]);
+        assert_eq!(
+            (a.label.as_str(), a.repos),
+            ("Awaiting review", vec!["web".to_string()])
+        );
+        let changes = Pr {
+            review: "CHANGES_REQUESTED".into(),
+            change_requests: vec!["r1".into()],
+            ..pr("CLEAN", Checks::Passing)
+        };
+        // The agent has seen r1; what is left is waiting for the reviewer.
+        let a = next_action(&[done, waiting(changes)], &["r1".into()]);
+        assert_eq!(
+            (a.label.as_str(), a.repos),
+            ("Awaiting re-review", vec!["web".to_string()])
+        );
     }
 
     #[test]

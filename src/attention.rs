@@ -190,7 +190,8 @@ impl Shark {
     }
 
     pub(crate) fn turn_done(&mut self, name: &str, cx: &mut Context<Self>) {
-        let shown = self.active.as_deref() == Some(name);
+        // Home covers the open workspace: its turns end unseen.
+        let shown = self.active.as_deref() == Some(name) && !self.home_shown();
         if !shown {
             self.attn.unread.insert(name.to_string());
             // The agent may have pushed or opened a PR; check again on the next tick.
@@ -274,8 +275,14 @@ fn set_badge(n: usize) {
         .setBadgeLabel(label.as_deref());
 }
 
+/// What tests read back: the last count set.
 #[cfg(test)]
-fn set_badge(_: usize) {}
+pub(crate) static BADGE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+fn set_badge(n: usize) {
+    BADGE.store(n, std::sync::atomic::Ordering::SeqCst);
+}
 
 /// An OS notification. UNUserNotificationCenter throws in a binary without a bundle (`cargo run`),
 /// so this goes through osascript: it shows as Script Editor's, and a failure is only lost.

@@ -355,6 +355,12 @@ async fn diagnostics_from_both_servers_remain_searchable_in_document_order(
     .await;
     let uri = url::Url::from_file_path(&file).unwrap().to_string();
     for (is_companion, lines) in [(false, vec![2, 1]), (true, vec![0])] {
+        // The companion re-serializes the URI (`a` as `%61`); it is still this document.
+        let uri = if is_companion {
+            uri.replace("a.py", "%61.py")
+        } else {
+            uri.clone()
+        };
         cx.update(|cx| {
             session.update(cx, |_, cx| {
                 let diagnostics: Vec<_> = lines.iter().map(|line| json!({
@@ -380,6 +386,20 @@ async fn diagnostics_from_both_servers_remain_searchable_in_document_order(
     client.shutdown();
     companion.shutdown();
     let _ = fs::remove_dir_all(dir);
+}
+
+#[test]
+fn publish_diagnostics_uris_match_by_decoded_path() {
+    use super::intelligence::{file_uri, same_file};
+    // Our own URI for a Next.js route file must be representable at all (`[id]`).
+    let ours = file_uri(std::path::Path::new("/p/app/(shop)/[id]/page.tsx")).unwrap();
+    assert!(same_file(
+        "file:///p/app/%28shop%29/%5Bid%5D/page.tsx",
+        &ours
+    ));
+    assert!(same_file(ours.as_str(), &ours));
+    assert!(!same_file("file:///p/app/(shop)/[id]/other.tsx", &ours));
+    assert!(!same_file("untitled:page.tsx", &ours));
 }
 
 #[gpui_kit::test]

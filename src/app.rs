@@ -425,13 +425,18 @@ impl Shark {
             self.feature_sel = Feature::ALL.iter().position(|f| *f == feature).unwrap();
         }
         self.tab = tab;
+        // Turns that ended under Home are seen now.
+        if let (true, Some(name)) = (self.home.on, &self.active) {
+            self.attn.opened(name);
+        }
         self.home.on = false;
         self.remember_open();
         self.reveal_tab(cx);
         self.configure_differ(cx);
         match tab {
             Tab::Chat => {
-                if let Some(chat) = self.active_chat() {
+                if let Some(chat) = self.active_chat().cloned() {
+                    self.unread.remove(&chat.read(cx).meta.id);
                     let focus = chat.read(cx).focus.clone();
                     focus.focus(window, cx);
                 }

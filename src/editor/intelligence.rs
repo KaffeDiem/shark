@@ -163,10 +163,7 @@ impl FileEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Ok(url) = url::Url::from_file_path(&self.abs) else {
-            return;
-        };
-        let Ok(uri) = url.as_str().parse() else {
+        let Some(uri) = file_uri(&self.abs) else {
             return;
         };
         let subs = vec![
@@ -195,7 +192,7 @@ impl FileEditor {
                         && method == "textDocument/publishDiagnostics"
                         // Every attached editor sees every publish; parse only this document's.
                         && let Some(language) = &e.intelligence
-                        && params["uri"].as_str() == Some(language.uri.as_str())
+                        && params["uri"].as_str().is_some_and(|u| same_file(u, &language.uri))
                         && let Ok(params) =
                             serde_json::from_value::<PublishDiagnosticsParams>(params.clone())
                     {
@@ -522,7 +519,7 @@ impl FileEditor {
         let Some(language) = &mut self.intelligence else {
             return;
         };
-        if params.uri != language.uri {
+        if !same_file(params.uri.as_str(), &language.uri) {
             return;
         }
         let Some(client) = (if companion {
@@ -656,6 +653,26 @@ fn map_offset(old: &str, new: &str, offset: usize, lines: bool) -> usize {
         return new.floor_char_boundary(n + (offset - o).min(b.len()));
     }
     new.len()
+}
+
+/// `path` as a `Uri`. `url` leaves `[ ] ^ |` raw, which `Uri` rejects: Next.js `[id]` routes
+/// would otherwise get no language intelligence.
+pub(super) fn file_uri(path: &std::path::Path) -> Option<Uri> {
+    let url = url::Url::from_file_path(path).ok()?;
+    let encoded = url
+        .as_str()
+        .replace('[', "%5B")
+        .replace(']', "%5D")
+        .replace('^', "%5E")
+        .replace('|', "%7C");
+    encoded.parse().ok()
+}
+
+/// Whether `uri` names the same file as `ours`. Servers re-serialize URIs (`%28` for `(`,
+/// drive-letter case), so compare decoded paths, not strings.
+pub(super) fn same_file(uri: &str, ours: &Uri) -> bool {
+    let path = |u: &str| url::Url::parse(u).ok()?.to_file_path().ok();
+    uri == ours.as_str() || path(uri).is_some_and(|p| Some(p) == path(ours.as_str()))
 }
 
 fn open_params(uri: &Uri, language_id: &str, version: i32, text: &str) -> serde_json::Value {

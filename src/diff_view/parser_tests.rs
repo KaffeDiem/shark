@@ -182,3 +182,11 @@ fn files_report_git_status_and_hidden_lines() {
     assert_eq!(added[0].hidden_lines_before(None), 0);
     let _ = DiffMode::Unified;
 }
+
+#[test]
+fn short_hunk_before_multibyte_text_is_an_error_not_a_panic() {
+    let err = DiffFile::parse("--- a/a\n+++ b/a\n@@ -1,2 +1,2 @@\n-old\né\n")
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("hunk"), "{err}");
+}

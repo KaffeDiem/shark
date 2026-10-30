@@ -258,15 +258,15 @@ impl Shark {
     }
 
     pub(super) fn close_git(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let at = self.active_tab_index(cx);
         let Some(ws) = self.active_ws_mut() else {
             return;
         };
         ws.git_closed = true;
         ws.close_tab(&TabId::Git);
         let _ = self.state.save();
-        if self.tab == Tab::Feature(Feature::Git) {
-            let ix = self.active_ws().unwrap().active_chat;
-            self.select_chat(ix, window, cx);
+        if self.tab == Tab::Feature(Feature::Git) && !self.home_shown() {
+            self.select_neighbor(at.unwrap_or(0), window, cx);
         }
         cx.notify();
     }

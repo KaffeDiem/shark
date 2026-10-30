@@ -264,6 +264,7 @@ fn window_label(value: &Value) -> String {
     match value.as_u64().filter(|n| *n > 0) {
         Some(10080) => "Weekly".into(),
         Some(60) => "1 hour".into(),
+        Some(1440) => "1 day".into(),
         Some(n) if n % 1440 == 0 => format!("{} days", n / 1440),
         Some(n) if n % 60 == 0 => format!("{} hours", n / 60),
         Some(n) => format!("{n} minutes"),
@@ -307,26 +308,44 @@ fn codex(value: &Value) -> Result<Vec<Allowance>, Failure> {
     }
 }
 
+/// The text of an error's message fields (and code), not the ids and durations around them.
+fn message(v: &Value) -> String {
+    let text = |k: &str| crate::agent::text_of(&v[k]);
+    format!(
+        "{}\n{}\n{}\n{}\n{}",
+        text("result"),
+        text("errors"),
+        text("error"),
+        text("message"),
+        v["code"]
+    )
+}
+
 fn failure(value: &str) -> Failure {
     let text = value.to_lowercase();
-    if [
-        "unauthorized",
-        "not authenticated",
-        "unauthenticated",
-        "not logged in",
-        "not signed in",
-        "authentication",
-        "sign in",
-        "sign-in",
-        "login",
-        "log in",
-        "401",
-        "expired token",
-        "invalid token",
-        "invalid api key",
-    ]
-    .iter()
-    .any(|s| text.contains(s))
+    // "401" as a number of its own, not inside "1401" or an id.
+    let alnum = |c: Option<char>| c.is_some_and(char::is_alphanumeric);
+    let http_401 = text.match_indices("401").any(|(i, m)| {
+        !alnum(text[..i].chars().next_back()) && !alnum(text[i + m.len()..].chars().next())
+    });
+    if http_401
+        || [
+            "unauthorized",
+            "not authenticated",
+            "unauthenticated",
+            "not logged in",
+            "not signed in",
+            "authentication",
+            "sign in",
+            "sign-in",
+            "login",
+            "log in",
+            "expired token",
+            "invalid token",
+            "invalid api key",
+        ]
+        .iter()
+        .any(|s| text.contains(s))
     {
         Failure::SignIn
     } else if [
@@ -461,7 +480,7 @@ fn query_with(
                 };
                 match provider {
                     Provider::Claude if v["type"] == "result" && v["is_error"] == true => {
-                        return Err(failure(&v.to_string()));
+                        return Err(failure(&message(&v)));
                     }
                     Provider::Claude
                         if v["type"] == "control_response"
@@ -470,12 +489,12 @@ fn query_with(
                         return if v["response"]["subtype"] == "success" {
                             claude(&v["response"]["response"])
                         } else {
-                            Err(failure(&v["response"].to_string()))
+                            Err(failure(&message(&v["response"])))
                         };
                     }
                     Provider::Codex if !initialized && v["id"] == "init" => {
                         if !v["error"].is_null() {
-                            return Err(failure(&v["error"].to_string()));
+                            return Err(failure(&message(&v["error"])));
                         }
                         if !v["result"].is_object() {
                             return Err(Failure::Unsupported);
@@ -488,7 +507,7 @@ fn query_with(
                         return if v["error"].is_null() {
                             codex(&v["result"])
                         } else {
-                            Err(failure(&v["error"].to_string()))
+                            Err(failure(&message(&v["error"])))
                         };
                     }
                     _ => {}

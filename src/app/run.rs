@@ -4,9 +4,14 @@ use super::*;
 use crate::scripts::{self, Phase, Running};
 
 impl Shark {
-    /// cmd-r: the active workspace's run scripts, in order; again stops them.
+    /// cmd-r: the active workspace's run scripts, in order; again stops them. On Home, the
+    /// highlighted row's.
     pub(super) fn toggle_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.active.as_ref().and_then(|n| self.ws(n)).cloned() else {
+        let name = match self.home_shown() {
+            true => self.home.sel.as_ref(),
+            false => self.active.as_ref(),
+        };
+        let Some(ws) = name.and_then(|n| self.ws(n)).cloned() else {
             return notify_err(window, cx, "Open a workspace first");
         };
         if self.archiving.contains(&ws.name) {

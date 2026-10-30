@@ -13,10 +13,12 @@ mod app_switcher_tests;
 mod audit_tests;
 mod base_adoption_tests;
 pub(crate) mod chrome_tests;
+mod differ_review_fixes_tests;
 mod drag_tests;
 mod editor_pane_tests;
 mod file_changes_tests;
 mod git_tests;
+mod home_tests;
 mod menu_pixels;
 mod mixed_tab_tests;
 mod navigation_pixels;
@@ -202,6 +204,14 @@ async fn settings_apply_and_save(cx: &mut TestAppContext) {
         assert_eq!(saved.appearance.dark, "Sequoia");
         assert_eq!(saved.prompts["commit"], "ship {repos}");
         assert_eq!(crate::prompts::render("commit", "api", "b"), "ship api");
+        // Clearing the editor is the default again, not an empty prompt.
+        view.update(cx, |v, cx| v.set_prompt(0, Some("  \n".into()), cx));
+        assert!(State::load().prompts.is_empty());
+        assert!(crate::prompts::render("commit", "api", "b").starts_with("Commit and push"));
+        // A blank override saved by an older version reads as the default too.
+        crate::prompts::set_overrides(&[("commit".to_string(), " ".to_string())].into());
+        assert!(crate::prompts::render("commit", "api", "b").starts_with("Commit and push"));
+        view.update(cx, |v, cx| v.set_prompt(0, Some("ship {repos}".into()), cx));
 
         view.update(cx, |v, cx| {
             v.appearance(cx, |a| a.mode = Mode::Light);
@@ -2616,7 +2626,8 @@ async fn command_click_file_tabs(cx: &mut TestAppContext) {
     on(cx, &|s, w, cx| s.show(Tab::Feature(Feature::Diff), w, cx));
     press(cx, &["cmd-w"]);
     cx.update(|cx| {
-        assert_eq!(shark.read(cx).tab, Tab::Chat);
+        // The file that slid into Diff's slot, not the chat.
+        assert_eq!(shark.read(cx).tab, Tab::File);
         assert_eq!(
             shark.read(cx).active_ws().unwrap().chats.len(),
             1,

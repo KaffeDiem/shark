@@ -341,3 +341,43 @@ fn changing_presentation_options_keeps_selection_and_scroll(cx: &mut TestAppCont
     });
     assert!(events.borrow().is_empty());
 }
+
+#[gpui_kit::test]
+fn empty_conflicts_do_not_hide_later_conflicts(cx: &mut TestAppContext) {
+    let filler = |from: usize, to: usize| {
+        (from..to)
+            .map(|n| format!("line {n}\n"))
+            .collect::<String>()
+    };
+    let empty = "<<<<<<< HEAD\n=======\n>>>>>>> other\n";
+    let text = format!(
+        "{}{empty}{}{empty}{}<<<<<<< HEAD\nours\n=======\ntheirs\n>>>>>>> feature\n{empty}",
+        filler(0, 10),
+        filler(10, 20),
+        filler(20, 30)
+    );
+    let file = DiffFile::parse_conflicts("merge.txt", &text).unwrap();
+    assert_eq!(file.conflicts().len(), 4);
+    let state = cx.new(|cx| {
+        DiffState::new([file], cx)
+            .with_mode(DiffMode::Split)
+            .with_context_lines(Some(1))
+    });
+    state.update(cx, |state, _| {
+        let headings = state
+            .rows()
+            .iter()
+            .filter_map(|row| match row {
+                DisplayRow::Conflict { conflict, .. } => Some(*conflict),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        // Every conflict keeps its heading: two parts each, empty ones included.
+        for conflict in 0..4 {
+            assert!(
+                headings.contains(&conflict),
+                "conflict {conflict} lost: {headings:?}"
+            );
+        }
+    });
+}

@@ -36,6 +36,9 @@ pub enum Cmd {
     Outline,
     /// `g d`: go to the definition under the cursor.
     Definition,
+    /// `g t` / `g T`: next / previous chat.
+    NextChat,
+    PrevChat,
 }
 
 #[derive(Default, Debug, PartialEq)]
@@ -79,6 +82,8 @@ pub struct Vim {
     keys: String,
     /// Preferred char column for j/k; usize::MAX = end of line.
     want: Option<usize>,
+    /// Where j/k/$ last put the cursor; `want` is stale once the cursor is elsewhere.
+    want_at: Option<usize>,
     /// Visual-mode anchor.
     anchor: usize,
     /// Visual-mode cursor. The editor's caret sits at the selection's end, not on the
@@ -91,6 +96,8 @@ enum Kind {
     Exclusive,
     Inclusive,
     Linewise,
+    /// `$` under an operator: exclusive at the line's end, but never made linewise.
+    Eol,
 }
 
 const MAX_COUNT: usize = 1_000_000;
@@ -150,6 +157,7 @@ impl Vim {
             }
             self.mode = Mode::Normal;
             self.reset();
+            self.want = None;
             let s = lstart(t, row(t, cur));
             let c = if cur > s { prev(t, cur) } else { cur };
             return Out {
@@ -157,11 +165,23 @@ impl Vim {
                 ..Out::at(clamp(t, c))
             };
         }
+        // A click, undo or edit moved the cursor since j/k: forget the preferred column.
+        let moved = self.want_at.take();
+        if moved.is_none_or(|p| clamp(t, p) != cur) {
+            self.want = None;
+        }
         let mut out = if self.cmdline {
             self.cmdline_key(key, esc)
         } else {
             self.normal(key, esc, t, cur, clipboard)
         };
+        if self.want_at.is_none() {
+            if self.keys.is_empty() {
+                self.want = None; // a finished command that is not j/k/$
+            } else {
+                self.want_at = moved; // still typing a count or operator
+            }
+        }
         out.handled = true;
         self.vcur = None;
         if self.visual() {
@@ -271,6 +291,8 @@ impl Vim {
                 cmd: match ch {
                     's' if plain => Some(Cmd::Outline),
                     'd' if plain => Some(Cmd::Definition),
+                    't' if plain => Some(Cmd::NextChat),
+                    'T' if plain => Some(Cmd::PrevChat),
                     _ => None,
                 },
                 ..Out::default()
@@ -373,12 +395,7 @@ impl Vim {
             'A' if simple => insert(self, e),
             'o' | 'O' if simple => {
                 let ind = indent(t, r);
-                // Keep CRLF files CRLF.
-                let nl = if t.line_end_offset(r) > e {
-                    "\r\n"
-                } else {
-                    "\n"
-                };
+                let nl = eol(t);
                 self.mode = Mode::Insert;
                 if ch == 'o' {
                     let c = e + nl.len() + ind.len();
@@ -415,7 +432,6 @@ impl Vim {
                     }
                     Out::default()
                 } else {
-                    let n = if m == '$' { 1 } else { n };
                     let (p, kind) = self.motion(t, cur, m, n, false, false, true).unwrap();
                     self.reset();
                     return self.apply(op, t, cur, p, kind);
@@ -521,7 +537,9 @@ impl Vim {
                     return None;
                 }
                 let want = *self.want.get_or_insert_with(|| col_of(t, cur));
-                (at_col(t, rr, want), Linewise)
+                let p = at_col(t, rr, want);
+                self.want_at = Some(p);
+                (p, Linewise)
             }
             'w' | 'W' => {
                 let big = ch == 'W';
@@ -552,10 +570,9 @@ impl Vim {
             '^' => (first_nonblank(t, r), Exclusive),
             '$' => {
                 self.want = Some(usize::MAX);
-                return Some((
-                    lend(t, (r + n - 1).min(last)),
-                    if op { Exclusive } else { Inclusive },
-                ));
+                let e = lend(t, (r + n - 1).min(last));
+                self.want_at = Some(e);
+                return Some((e, if op { Eol } else { Inclusive }));
             }
             '}' | '{' => {
                 let mut rr = r;
@@ -579,7 +596,16 @@ impl Vim {
 
     /// Apply operator `op` over cursor..target.
     fn apply(&mut self, op: char, t: &Rope, cur: usize, target: usize, kind: Kind) -> Out {
-        let (a, b) = (cur.min(target), cur.max(target));
+        let (a, mut b) = (cur.min(target), cur.max(target));
+        // An exclusive motion ending in column 0 stops at the end of the line before (`d}`),
+        // or covers whole lines when it starts in the indent.
+        if kind == Kind::Exclusive && b > a && b == lstart(t, row(t, b)) && row(t, b) > row(t, a) {
+            let r1 = row(t, b) - 1;
+            if a <= first_nonblank(t, row(t, a)) {
+                return self.apply(op, t, a, lstart(t, r1), Kind::Linewise);
+            }
+            b = lend(t, r1);
+        }
         if kind == Kind::Linewise || matches!(op, '>' | '<') {
             let (r0, r1) = (row(t, a), row(t, b));
             let lines = || format!("{}\n", t.slice(lstart(t, r0)..lend(t, r1)));
@@ -639,7 +665,8 @@ impl Vim {
         } else {
             b
         };
-        let yank = Some(t.slice(a..b).to_string());
+        // An empty yank would blank the clipboard.
+        let yank = (a != b).then(|| t.slice(a..b).to_string());
         match op {
             'd' => {
                 if a == b {
@@ -675,6 +702,11 @@ impl Vim {
     }
 }
 
+/// Where the caret goes after `>>`/`<<`: the first non-blank of the line holding `at`.
+pub fn first_nonblank_at(t: &Rope, at: usize) -> usize {
+    first_nonblank(t, row(t, at))
+}
+
 /// `n` chars right of `p`, stopping at the end of its line.
 fn right_n(t: &Rope, mut p: usize, n: usize) -> usize {
     let e = lend(t, row(t, p));
@@ -706,6 +738,14 @@ fn paste(t: &Rope, cur: usize, n: usize, after: bool, clip: Option<&str>) -> Out
         return Out::default();
     };
     let r = row(t, cur);
+    // Lines pasted into a CRLF buffer get CRLF, and the other way round.
+    let nl = eol(t);
+    let clip = clip.replace("\r\n", "\n");
+    let clip = if nl == "\r\n" {
+        clip.replace('\n', nl)
+    } else {
+        clip
+    };
     if clip.ends_with('\n') {
         let body = clip.repeat(n);
         let (at, text, c) = if !after {
@@ -716,7 +756,11 @@ fn paste(t: &Rope, cur: usize, n: usize, after: bool, clip: Option<&str>) -> Out
             (s, body, s)
         } else {
             let e = t.len();
-            (e, format!("\n{}", &body[..body.len() - 1]), e + 1)
+            (
+                e,
+                format!("{nl}{}", &body[..body.len() - nl.len()]),
+                e + nl.len(),
+            )
         };
         let ind = clip.len() - clip.trim_start_matches([' ', '\t']).len();
         let ind = if clip[..ind].contains('\n') { 0 } else { ind };
@@ -739,6 +783,15 @@ fn paste(t: &Rope, cur: usize, n: usize, after: bool, clip: Option<&str>) -> Out
     }
 }
 
+/// The buffer's line ending: CRLF when its first line has one.
+fn eol(t: &Rope) -> &'static str {
+    if t.lines_len() > 1 && t.line_end_offset(0) > lend(t, 0) {
+        "\r\n"
+    } else {
+        "\n"
+    }
+}
+
 fn join(t: &Rope, r: usize, n: usize) -> Out {
     let last = (r + n - 1).min(nlines(t) - 1);
     if last == r {
@@ -747,13 +800,20 @@ fn join(t: &Rope, r: usize, n: usize) -> Out {
     let start = lend(t, r);
     let mut text = String::new();
     let mut prev_empty = lend(t, r) == lstart(t, r);
+    let ends_blank =
+        |rr: usize| lend(t, rr) > lstart(t, rr) && matches!(t.byte(lend(t, rr) - 1), b' ' | b'\t');
+    let mut trailing = ends_blank(r);
     let mut sep_at = 0;
     for rr in r + 1..=last {
         let fnb = first_nonblank(t, rr);
         let content = t.slice(fnb..lend(t, rr));
         sep_at = text.len();
-        if !prev_empty && content.len() > 0 {
+        // One space, unless the text so far ends in blank or this line starts with ')'.
+        if !prev_empty && content.len() > 0 && !trailing && content.char(0) != ')' {
             text.push(' ');
+        }
+        if content.len() > 0 {
+            trailing = ends_blank(rr);
         }
         if rr < last {
             text.push_str(&content.to_string());
@@ -1525,5 +1585,102 @@ mod tests {
         assert_eq!(e("|abcdef", "vlly").1.as_deref(), Some("abc"));
         assert_eq!(e("abc|def", "vhhd").0, "a|ef");
         assert_eq!(e("a\n|b\nc\n", "Vjd").0, "|a\n");
+    }
+
+    #[test]
+    fn empty_yank_keeps_clipboard() {
+        let keep = |src: &str, keys: &str| run_with(src, keys, Some("keep")).clip;
+        assert_eq!(keep("|\nb", "cw<esc>").as_deref(), Some("keep"));
+        assert_eq!(keep("|abc", "y0").as_deref(), Some("keep"));
+        assert_eq!(keep("|abc", "yl").as_deref(), Some("a"));
+        assert_eq!(keep("|abc", "dl").as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn chat_switching_keys() {
+        assert_eq!(run("|a", "gt").last.cmd, Some(Cmd::NextChat));
+        assert_eq!(run("|a", "gT").last.cmd, Some(Cmd::PrevChat));
+        assert_eq!(run("|a", "dgt").last.cmd, None);
+        assert_eq!(run("a|b", "vgt").last.cmd, None);
+    }
+
+    #[test]
+    fn preferred_column_resets() {
+        // A finished non-motion command forgets the column.
+        assert_eq!(
+            k("abcd|ef\nx\nabcdef\nabcdef", "jddj"),
+            "abcdef\nabcdef\n|abcdef"
+        );
+        assert_eq!(k("abcd|ef\nx\nabcdef", "j~j"), "abcdef\nX\n|abcdef");
+        // j then j keeps it, even through a count.
+        assert_eq!(k("abcd|ef\nx\nabcdef", "j1j"), "abcdef\nx\nabcd|ef");
+        // The cursor moved without Vim (a click, typing in Insert): start over.
+        let t = Rope::from("abcdef\nx\nabcdef\nabcdef");
+        let mut v = Vim::default();
+        v.key("j", &t, 4, None); // line 1, col 0
+        v.key("j", &t, 7, None);
+        let click = lstart(&t, 2) + 1;
+        assert_eq!(v.key("j", &t, click, None).cursor, Some(lstart(&t, 3) + 1));
+        assert_eq!(k("abcd|ef\nx\nabcdef", "jiy<esc>j"), "abcdef\nyx\n|abcdef");
+    }
+
+    #[test]
+    fn indent_caret_goes_to_first_nonblank() {
+        let t = Rope::from("a\n  b\nc");
+        assert_eq!(first_nonblank_at(&t, 2), 4);
+        assert_eq!(first_nonblank_at(&t, 6), 6);
+        assert_eq!(first_nonblank_at(&t, 0), 0);
+    }
+
+    #[test]
+    fn exclusive_motion_ending_in_column_zero() {
+        // Mid-paragraph: stops before the blank separator.
+        let r = run("a |b\nc\n\nd", "d}");
+        assert_eq!(
+            (r.text.as_str(), r.clip.as_deref()),
+            ("a| \n\nd", Some("b\nc"))
+        );
+        // From the indent: whole lines.
+        let r = run("  |a\nb\n\nc", "d}");
+        assert_eq!(
+            (r.text.as_str(), r.clip.as_deref()),
+            ("|\nc", Some("  a\nb\n"))
+        );
+        assert_eq!(k("|a\n\nb", "d}"), "|\nb");
+        assert_eq!(k("a |b\nc\n\nd", "y}p"), "a bb\n|c\nc\n\nd");
+        assert_eq!(k("a |b\nc\n\nd", "c}X<esc>"), "a |X\n\nd");
+        // `$` is inclusive: `2D` into an empty line still joins it.
+        assert_eq!(k("a|b\n\nc", "2D"), "|a\nc");
+    }
+
+    #[test]
+    fn join_spacing() {
+        assert_eq!(k("|a \nb", "J"), "a |b");
+        assert_eq!(k("|a\t\nb", "J"), "a\t|b");
+        assert_eq!(k("|f(a\n  )", "J"), "f(a|)");
+        assert_eq!(k("|a\nb \n c", "3J"), "a b |c");
+        assert_eq!(k("|a\n  \nb", "3J"), "a| b");
+        assert_eq!(k("|a\nb", "J"), "a| b");
+    }
+
+    #[test]
+    fn counted_d_and_c() {
+        assert_eq!(k("a|bc\nde\nf", "2D"), "|a\nf");
+        assert_eq!(k("a|bc\nde\nf", "2CX<esc>"), "a|X\nf");
+        assert_eq!(k("a|bc\nde\nf", "D"), "|a\nde\nf");
+    }
+
+    #[test]
+    fn crlf_paste_and_open() {
+        let p = |src: &str, clip: &str| run_with(src, "p", Some(clip)).text;
+        assert_eq!(p("a|b\r\nc\r\n", "X\n"), "ab\r\n|X\r\nc\r\n");
+        assert_eq!(p("ab\r\n|c", "X\n"), "ab\r\nc\r\n|X");
+        assert_eq!(p("ab\r\n|c", "X\nY\n"), "ab\r\nc\r\n|X\r\nY");
+        // A CRLF yank pasted into an LF buffer.
+        assert_eq!(p("a|b\nc", "X\r\nY\r\n"), "ab\n|X\nY\nc");
+        assert_eq!(k("ab\r\n|c", "ox<esc>"), "ab\r\nc\r\n|x");
+        assert_eq!(k("ab\n|c", "ox<esc>"), "ab\nc\n|x");
+        let r = run("|a\nb\n", "yyjp");
+        assert_eq!(r.text, "a\nb\n|a\n");
     }
 }

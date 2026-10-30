@@ -137,19 +137,21 @@ fn with_newline(s: &str) -> String {
     }
 }
 
-/// Lines, except that a fenced code block is one unit: its lines can't carry marks.
+/// Lines, except that a fenced code block is one unit: its lines can't carry marks. A fence
+/// closes on a run of its own character at least as long as the opener's.
 fn units(s: &str) -> Vec<&str> {
     let mut out = vec![];
-    let mut fence: Option<(usize, &str)> = None;
+    let mut fence: Option<(usize, char, usize)> = None;
     let mut pos = 0;
     for line in s.split_inclusive('\n') {
         let t = line.trim();
+        let run = |c: char| t.chars().take_while(|&x| x == c).count();
         match fence {
-            None if t.starts_with("```") || t.starts_with("~~~") => fence = Some((pos, &t[..3])),
-            None => out.push(line),
-            Some((start, marker))
-                if t.starts_with(marker) && t.trim_matches(|c| c == '`' || c == '~').is_empty() =>
-            {
+            None => match ['`', '~'].into_iter().find(|&c| run(c) >= 3) {
+                Some(c) => fence = Some((pos, c, run(c))),
+                None => out.push(line),
+            },
+            Some((start, c, n)) if run(c) >= n && run(c) == t.chars().count() => {
                 out.push(&s[start..pos + line.len()]);
                 fence = None;
             }
@@ -157,7 +159,7 @@ fn units(s: &str) -> Vec<&str> {
         }
         pos += line.len();
     }
-    if let Some((start, _)) = fence {
+    if let Some((start, ..)) = fence {
         out.push(&s[start..]);
     }
     out
@@ -232,9 +234,11 @@ fn tokens(s: &str) -> Vec<&str> {
                 .find(fence)
                 .map_or(ticks, |end| ticks + end + ticks)
         } else if c == '[' {
-            // [text](url), else just the bracket's word
-            match (rest.find("]("), rest.find(')')) {
-                (Some(m), Some(e)) if m < e && !rest[..m].contains('\n') => e + 1,
+            // [text](url), else just the bracket's word: the first ] must open the (url)
+            match rest.find(']') {
+                Some(m) if rest[m + 1..].starts_with('(') && !rest[..m].contains('\n') => {
+                    rest[m..].find(')').map_or(word_len(rest), |e| m + e + 1)
+                }
                 _ => word_len(rest),
             }
         } else if c.is_whitespace() {
@@ -495,16 +499,9 @@ impl PlanPane {
             versions: self.versions.clone(),
             approved: self.approved,
         };
-        let path = store_path(&self.chat);
-        if let Some(dir) = path.parent() {
-            let _ = std::fs::create_dir_all(dir);
-        }
-        // Written aside and renamed, so a failed write never truncates the history.
-        let tmp = path.with_extension("json.tmp");
-        if let Ok(json) = serde_json::to_vec(&store)
-            && std::fs::write(&tmp, json).is_ok()
-        {
-            let _ = std::fs::rename(&tmp, &path);
+        // Written aside, synced and renamed, so a failed write never truncates the history.
+        if let Ok(json) = serde_json::to_vec(&store) {
+            let _ = crate::state::write(&store_path(&self.chat), &json);
         }
     }
 
@@ -761,7 +758,7 @@ impl Render for PlanPane {
                 .pt_2()
                 .text_size(px(14.))
                 .line_height(relative(1.5))
-                .child(crate::chat::markdown(&self.md, "plan-body").scrollable(true))
+                .child(crate::chat::markdown(&self.md, "plan-body", vec![]).scrollable(true))
                 .into_any_element(),
         };
         let hint = |keys: &[&str], label: &'static str| {
@@ -936,6 +933,28 @@ mod tests {
             r.md,
             format!("```diff\n-make\n```\n{INS}Run make by hand.</mark>\n")
         );
+    }
+
+    #[test]
+    fn a_fence_closes_only_on_a_run_as_long_as_its_opener() {
+        let md = "a\n````md\n```sh\nmake\n```\n````\nb\n";
+        assert_eq!(
+            units(md),
+            ["a\n", "````md\n```sh\nmake\n```\n````\n", "b\n"]
+        );
+        let md = "~~~\n```\n~~~\nb\n";
+        assert_eq!(units(md), ["~~~\n```\n~~~\n", "b\n"]);
+        // Unclosed: the rest is one unit.
+        assert_eq!(units("a\n```\nb\n"), ["a\n", "```\nb\n"]);
+    }
+
+    #[test]
+    fn a_link_needs_its_url_right_after_the_bracket() {
+        assert_eq!(
+            tokens("[WIP] fix [docs](http://x/y) now"),
+            ["[WIP]", " ", "fix", " ", "[docs](http://x/y)", " ", "now"]
+        );
+        assert_eq!(tokens("[a b](u)"), ["[a b](u)"]);
     }
 
     #[test]

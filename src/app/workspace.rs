@@ -851,6 +851,17 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.open_workspace_then(name, window, cx, |_, _, _| {});
+    }
+
+    /// Opens `name`, then runs `then`: at once, or once a discard dialog is confirmed.
+    pub(super) fn open_workspace_then(
+        &mut self,
+        name: &str,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        then: impl FnOnce(&mut Shark, &mut Window, &mut Context<Shark>) + 'static,
+    ) {
         if self.archiving.contains(name) || self.ws(name).is_none() {
             return notify_err(window, cx, "The selected workspace is no longer available");
         }
@@ -859,7 +870,7 @@ impl Shark {
                 self.toggle_home(window, cx);
             }
             self.record_interaction(name, cx);
-            return;
+            return then(self, window, cx);
         }
         let name = name.to_string();
         // Resolve identity before dropping *or marking clean* any buffer: the destination may
@@ -877,6 +888,7 @@ impl Shark {
             };
             s.open_workspace_now(ix, window, cx);
             s.record_interaction(&name, cx);
+            then(s, window, cx);
         });
     }
 
@@ -1179,16 +1191,36 @@ impl Shark {
                         let name = ws.name.clone();
                         s.state.workspaces.push(ws.clone());
                         let _ = s.state.save();
-                        s.open_workspace(s.state.workspaces.len() - 1, window, cx);
-                        s.home_prompt_used(prompt.as_deref(), window, cx);
-                        let chat = (s.active.as_ref() == Some(&name))
-                            .then(|| s.active_chat().cloned())
-                            .flatten();
-                        let then = prompt.zip(chat);
-                        if !s.run_setup(&ws, None, then.clone(), window, cx)
-                            && let Some((p, chat)) = then
-                        {
-                            chat.update(cx, |c, cx| c.ask(&p, window, cx));
+                        // A dirty file tab in the workspace left behind asks first: send once opened.
+                        let deferred = Rc::new(std::cell::Cell::new(false));
+                        let (later, setup_ws, key) = (deferred.clone(), ws.clone(), name.clone());
+                        s.open_workspace_then(&name.clone(), window, cx, move |s, window, cx| {
+                            s.home_prompt_used(prompt.as_deref(), window, cx);
+                            let chat = (s.active.as_ref() == Some(&name))
+                                .then(|| s.active_chat().cloned())
+                                .flatten();
+                            let then = prompt.zip(chat);
+                            if later.get() {
+                                // Setup started without us: still running, the prompt waits typed.
+                                if let Some((p, chat)) = then {
+                                    match s.setting_up.contains(&name) {
+                                        true => chat.update(cx, |c, cx| {
+                                            c.composer
+                                                .update(cx, |t, cx| t.set_value(p, window, cx))
+                                        }),
+                                        false => chat.update(cx, |c, cx| _ = c.ask(&p, window, cx)),
+                                    }
+                                }
+                            } else if !s.run_setup(&ws, None, then.clone(), window, cx)
+                                && let Some((p, chat)) = then
+                            {
+                                chat.update(cx, |c, cx| c.ask(&p, window, cx));
+                            }
+                        });
+                        // Waiting on a dialog, or refused: the new workspace still gets set up.
+                        if s.active.as_ref() != Some(&key) {
+                            deferred.set(true);
+                            s.run_setup(&setup_ws, None, None, window, cx);
                         }
                     }
                     Err(e) => notify_err(window, cx, e),
@@ -1730,13 +1762,14 @@ impl Shark {
         cx.notify();
     }
 
-    /// Row actions hit the workspace under the sidebar cursor when the sidebar is focused, else the open one.
+    /// Row actions hit the workspace under the sidebar cursor when the sidebar is focused, else
+    /// the highlighted Home row while Home shows, else the open one.
     pub(super) fn target(&self, window: &Window) -> Option<Workspace> {
         let name = match (self.sidebar_focus.is_focused(window), self.sel) {
             (true, SideRow::Ws(ix)) => self.state.workspaces.get(ix)?.name.clone(),
             // A heading or repo row is under the cursor: not the open workspace (cmd-backspace).
             (true, _) => return None,
-            _ if self.home.focus.is_focused(window) => self.home.sel.clone()?,
+            _ if self.home_shown() => self.home.sel.clone()?,
             _ => self.active.clone()?,
         };
         self.ws(&name).cloned()
@@ -1913,9 +1946,13 @@ impl Shark {
         cx.spawn_in(window, async move |this, cx| {
             let dir = ws.dir();
             let name = ws.name.clone();
-            let (scripts, result) = cx
+            let (scripts, result, run) = cx
                 .background_executor()
                 .spawn(async move {
+                    // A refused archive must not stop servers or run the archive script.
+                    if let Err(e) = git::archive_preflight(&ws, &dir, force) {
+                        return (None, Err(e), run);
+                    }
                     crate::scripts::Running::stop_all(run, 5);
                     // And those cmd-r stopped just before.
                     crate::scripts::wait_stopping(Some(&ws.name));
@@ -1925,15 +1962,19 @@ impl Shark {
                         return (
                             scripts,
                             Err("Archive script failed; workspace kept.".into()),
+                            None,
                         );
                     }
                     let removed = git::remove_workspace(&ws, &dir, force)
                         .map(|()| git::delete_merged_branches(&ws, &merged));
-                    (scripts, removed)
+                    (scripts, removed, None)
                 })
                 .await;
             this.update_in(cx, |s, window, cx| {
                 s.archiving.remove(&name);
+                if let Some(run) = run {
+                    s.runs.insert(name.clone(), run);
+                }
                 if let Some(e) = scripts {
                     super::run::script_failed(&name, e, window, cx);
                 }
@@ -1944,7 +1985,7 @@ impl Shark {
         .detach();
     }
 
-    fn archived(
+    pub(super) fn archived(
         &mut self,
         name: &str,
         result: Result<Vec<String>, String>,
@@ -1960,12 +2001,18 @@ impl Shark {
         match result {
             Ok(deleted) => {
                 let pos = self.side_rows(false).iter().position(|r| *r == self.sel);
+                // The sidebar cursor follows its workspace, not its row number.
+                let cursor = match self.sel {
+                    SideRow::Ws(ix) => self.state.workspaces.get(ix).map(|w| w.name.clone()),
+                    SideRow::Section(_) => None,
+                };
+                let home_pos = self.home_at(&self.home_rows(cx));
                 // A later workspace with the same name must not replay or resume these chats.
                 if let Some(ws) = self.state.workspaces.iter().find(|w| w.name == name) {
                     for c in ws.chats.iter().chain(&ws.closed) {
                         self.chats.remove(&c.id);
                         self.unread.remove(&c.id);
-                        let _ = std::fs::remove_file(crate::agent::transcript_path(&c.id));
+                        crate::agent::forget(&c.id);
                         crate::plan::delete(&c.id);
                     }
                 }
@@ -1990,12 +2037,25 @@ impl Shark {
                     self.tab = Tab::Chat;
                     self.sidebar_focus.focus(window, cx);
                 }
-                // The cursor stays at the same height, on whatever row moved up into it.
+                // A cursor on the archived row stays at the same height, on whatever moved up into it.
                 let rows = self.side_rows(false);
-                self.sel = pos
-                    .and_then(|p| rows.get(p.min(rows.len().saturating_sub(1))))
-                    .copied()
-                    .unwrap_or(SideRow::Ws(0));
+                let moved = (cursor.as_deref().filter(|c| *c != name))
+                    .and_then(|c| self.state.workspaces.iter().position(|w| w.name == c));
+                self.sel = match (self.sel, moved) {
+                    (SideRow::Section(i), _) => SideRow::Section(i),
+                    (_, Some(ix)) => SideRow::Ws(ix),
+                    _ => pos
+                        .and_then(|p| rows.get(p.min(rows.len().saturating_sub(1))))
+                        .copied()
+                        .unwrap_or(SideRow::Ws(0)),
+                };
+                if self.home.sel.as_deref() == Some(name) {
+                    let rows = self.home_rows(cx);
+                    let at = home_pos.unwrap_or(0).min(rows.len().saturating_sub(1));
+                    self.home.sel = rows
+                        .get(at)
+                        .map(|r| self.state.workspaces[r.ix].name.clone());
+                }
                 let branch = match deleted.is_empty() {
                     true => "branch kept".to_string(),
                     false => format!("merged branch deleted in {}", deleted.join(", ")),

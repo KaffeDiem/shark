@@ -164,6 +164,7 @@ esac
             repos: worktrees(&self.ws),
             fetch,
             pr,
+            backoff: false,
             prev: prev.to_vec(),
             stack: vec![],
         }

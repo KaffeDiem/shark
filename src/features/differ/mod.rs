@@ -141,6 +141,8 @@ pub(crate) struct Differ {
     diff_fp: u64,
     /// Bases used by the displayed patch, including the PR target discovered by polling.
     diff_bases: HashMap<String, String>,
+    /// Per repo, the commit the displayed patch is against (old-side lines are numbered in it).
+    diff_revs: HashMap<String, String>,
     /// Bumped per refresh, so a slow older refresh can't overwrite a newer one.
     diff_gen: u64,
     /// The file last moved to (`}`/`{`, the tree); the diff can't say which one is on screen.
@@ -224,6 +226,7 @@ impl Differ {
             diff_fps: vec![],
             diff_fp: 0,
             diff_bases: HashMap::new(),
+            diff_revs: HashMap::new(),
             diff_gen: 0,
             diff_file: 0,
             diff_loaded: false,
@@ -264,10 +267,13 @@ impl Differ {
     ) {
         let name = snapshot.as_ref().map(|s| s.workspace.name.as_str());
         if self.workspace_name() != name {
+            // Typed words stay a pending comment of the workspace being left.
+            self.keep_draft(window, cx);
             self.diff_gen += 1;
             self.editing = None;
             self.diff_fp = 0;
             self.diff_bases.clear();
+            self.diff_revs.clear();
             self.diff_files.clear();
             self.diff_fps.clear();
             self.viewed_now = Rc::default();
@@ -521,6 +527,11 @@ impl Differ {
         .or_else(|| self.cursor_path(window, cx))
     }
 
+    /// Whether the diff has `path`; true while it is still loading, which says nothing yet.
+    pub(crate) fn in_diff(&self, path: &str) -> bool {
+        !self.diff_loaded || self.diff_files.iter().any(|f| f.path() == path)
+    }
+
     pub(crate) fn cursor_path(&self, window: &Window, cx: &App) -> Option<SharedString> {
         self.cursor_file(window, cx)
             .map(|ix| self.diff_files[ix].path().clone())
@@ -608,6 +619,7 @@ impl Differ {
         self.follow_tree(ix);
         self.review.at_file(path);
         self.diff.update(cx, |d, cx| {
+            d.set_selected_lines(None, cx);
             d.set_file_collapsed(path, false, cx);
             d.scroll_to_file(path, cx);
         });

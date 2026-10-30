@@ -181,8 +181,8 @@ impl Home {
 }
 
 /// A Home workspace row, in display order.
-struct HomeRow {
-    ix: usize,
+pub(super) struct HomeRow {
+    pub(super) ix: usize,
     bucket: Bucket,
     label: Option<String>,
     running: usize,
@@ -190,7 +190,7 @@ struct HomeRow {
 
 impl Shark {
     /// Home is on screen: asked for, or nothing else to show.
-    pub(super) fn home_shown(&self) -> bool {
+    pub(crate) fn home_shown(&self) -> bool {
         self.home.on || self.active.is_none()
     }
 
@@ -308,7 +308,7 @@ impl Shark {
         .detach();
     }
 
-    fn home_rows(&self, cx: &App) -> Vec<HomeRow> {
+    pub(super) fn home_rows(&self, cx: &App) -> Vec<HomeRow> {
         let mut rows: Vec<HomeRow> = (self.ws_order(true).into_iter())
             .map(|ix| {
                 let name = &self.state.workspaces[ix].name;
@@ -328,7 +328,7 @@ impl Shark {
     }
 
     /// The cursor's position in `rows`.
-    fn home_at(&self, rows: &[HomeRow]) -> Option<usize> {
+    pub(super) fn home_at(&self, rows: &[HomeRow]) -> Option<usize> {
         let sel = self.home.sel.as_ref()?;
         rows.iter()
             .position(|r| &self.state.workspaces[r.ix].name == sel)
@@ -761,7 +761,7 @@ impl Shark {
                         .group("home-answer")
                         .text_size(px(14.))
                         .line_height(relative(1.5))
-                        .child(crate::chat::markdown(&ask.answer, "home-answer"))
+                        .child(crate::chat::markdown(&ask.answer, "home-answer", vec![]))
                         .when_some(ask.error.clone(), |d, e| {
                             d.child(div().text_xs().text_color(theme.danger_foreground).child(e))
                         }),

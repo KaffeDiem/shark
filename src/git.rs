@@ -163,11 +163,17 @@ pub fn add_repo(path: &Path, existing: &[Repo]) -> Result<Repo, String> {
     Ok(Repo { name, path: root })
 }
 
+/// The trunk to compare against, or empty when unknown.
 pub(crate) fn default_base(src: &Path) -> String {
     git(
         src,
         &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
     )
+    // `fetch --prune` after a remote rename leaves origin/HEAD pointing at a deleted ref.
+    .and_then(|b| match has_ref(src, &format!("refs/remotes/{b}")) {
+        true => Ok(b),
+        false => Err(String::new()),
+    })
     // Only clone sets origin/HEAD; `git init` + `remote add` leaves it unset.
     .or_else(|_| {
         ["origin/main", "origin/master"]
@@ -176,8 +182,8 @@ pub(crate) fn default_base(src: &Path) -> String {
             .map(String::from)
             .ok_or_else(String::new)
     })
-    .or_else(|_| git(src, &["rev-parse", "--abbrev-ref", "HEAD"]))
-    .unwrap_or_else(|_| "HEAD".into())
+    // Empty when unknown: the current branch is no trunk (in a worktree it is the workspace's own).
+    .unwrap_or_default()
 }
 
 /// `branch` is the workspace's own; each repo comes with the branch it gets, usually the same.
@@ -346,7 +352,11 @@ pub fn branches(src: &Path) -> Result<Vec<Branch>, String> {
             name: name.into(),
             local,
             origin: !local,
-            checked_out: (wts.iter().find(|(_, attrs)| attrs.contains(&head)))
+            checked_out: (wts.iter())
+                // A deleted worktree directory no longer holds its branch.
+                .find(|(_, attrs)| {
+                    attrs.contains(&head) && !attrs.iter().any(|l| l.starts_with("prunable"))
+                })
                 .map(|(p, _)| p.clone()),
         });
     }
@@ -441,6 +451,8 @@ struct Plan {
 /// With a `parent` branch, a new branch starts on it and the base is `origin/<parent>`.
 fn plan_worktree(branch: &str, r: &Repo, parent: Option<&str>) -> Result<Plan, String> {
     let head = format!("branch refs/heads/{branch}");
+    // A workspace dir deleted by hand leaves a worktree entry that still claims its branch.
+    let _ = git(&r.path, &["worktree", "prune"]);
     if let Some((path, _)) = worktree_list(&r.path)?
         .iter()
         .find(|(_, attrs)| attrs.contains(&head))
@@ -461,7 +473,10 @@ fn plan_worktree(branch: &str, r: &Repo, parent: Option<&str>) -> Result<Plan, S
     .is_ok();
     let base = match parent {
         Some(p) => format!("origin/{p}"),
-        None => default_base(&r.path),
+        None => Some(default_base(&r.path))
+            .filter(|b| !b.is_empty())
+            .or_else(|| git(&r.path, &["rev-parse", "--abbrev-ref", "HEAD"]).ok())
+            .unwrap_or_else(|| "HEAD".into()),
     };
     if let Some(p) = parent {
         // An existing branch has its own history, not the parent's.
@@ -602,13 +617,18 @@ fn pr_remote(src: &Path, pr: &PullRequest) -> Result<String, String> {
     let repo = format!("{}/{}", parts[1], parts[2]);
     let remote = format!("https://{}/{repo}.git", parts[0]);
     let origin = git(src, &["remote", "get-url", "origin"]).unwrap_or_default();
-    let origin = origin.trim_end_matches('/').trim_end_matches(".git");
+    // GitHub owners and repo names are case-insensitive.
+    let origin = origin
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_ascii_lowercase();
     let matching_origin = [
         format!("https://{}/{repo}", parts[0]),
         format!("git@{}:{repo}", parts[0]),
         format!("ssh://git@{}/{repo}", parts[0]),
     ]
-    .contains(&origin.to_string());
+    .iter()
+    .any(|c| c.to_ascii_lowercase() == origin);
     Ok(if matching_origin {
         "origin".into()
     } else {
@@ -795,16 +815,33 @@ fn undo_worktree(dir: &Path, branch: &str, r: &Repo, owned: &OwnedWorktree) -> V
 /// `.worktreeinclude` (gitignore syntax), defaulting to `.env*`.
 fn copy_included(src: &Path, wt: &Path) -> Result<Vec<String>, String> {
     let mut copied_files = Vec::new();
-    let exclude = if src.join(".worktreeinclude").exists() {
-        "--exclude-from=.worktreeinclude".to_string()
-    } else {
-        "--exclude=.env*".to_string()
+    let custom = src.join(".worktreeinclude").exists();
+    let exclude = match custom {
+        true => "--exclude-from=.worktreeinclude",
+        false => "--exclude=.env*",
     };
     let ignored = ls_files(src, &["-o", "-i", "--exclude-standard"]);
-    for f in ls_files(src, &["-o", "-i", &exclude])
+    // The default `.env*` would otherwise take a whole ignored `.env/` venv or
+    // `node_modules/x/.env.example`: only files outside ignored directories qualify.
+    let mut dir_ignored = std::collections::HashMap::<PathBuf, bool>::new();
+    for f in ls_files(src, &["-o", "-i", exclude])
         .iter()
         .filter(|f| ignored.contains(f))
     {
+        let mut parent = PathBuf::new();
+        let under_ignored = !custom
+            && (Path::new(f).parent().into_iter())
+                .flat_map(Path::components)
+                .any(|c| {
+                    parent.push(c);
+                    *dir_ignored.entry(parent.clone()).or_insert_with(|| {
+                        let p = parent.to_string_lossy();
+                        git(src, &["check-ignore", "-q", "--", &p]).is_ok()
+                    })
+                });
+        if under_ignored {
+            continue;
+        }
         use std::{
             ffi::CString,
             os::fd::{AsRawFd, FromRawFd},
@@ -1005,7 +1042,9 @@ fn remove_blocker(src: &Path, wt: &Path, force: bool) -> Option<&'static str> {
         .then_some("has submodules (force archive removes them)")
 }
 
-pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), String> {
+/// The refusals of `remove_workspace`, without removing anything: callers run it before any
+/// side effect (stopping servers, archive scripts).
+pub fn archive_preflight(ws: &Workspace, dir: &Path, force: bool) -> Result<(), String> {
     // Up front, so a refusal in the second repo can't leave the first one removed.
     let blocked: Vec<String> = ws
         .repos
@@ -1038,6 +1077,8 @@ pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), S
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
             .filter(|n| !ROOT_DOCS.contains(&n.as_str()) && !ws.repos.iter().any(|r| &r.name == n))
+            // Finder litter, not the user's.
+            .filter(|n| n != ".DS_Store")
             // Ours too: `.context` holding only the dropped and pasted files.
             .filter(|n| {
                 // Unreadable, or a file, counts as unexpected: refuse before removing anything.
@@ -1055,6 +1096,11 @@ pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), S
             ));
         }
     }
+    Ok(())
+}
+
+pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), String> {
+    archive_preflight(ws, dir, force)?;
     for r in &ws.repos {
         let wt = dir.join(&r.name);
         let wt_s = wt.to_string_lossy();
@@ -1064,7 +1110,15 @@ pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), S
                 args.push("--force");
             }
             args.push(&wt_s);
-            git(&r.src, &args)?;
+            // A moved or deleted source repo can't remove it; forced, the directory goes anyway.
+            if let Err(e) = git(&r.src, &args) {
+                match force {
+                    true => {
+                        fs::remove_dir_all(&wt).map_err(|e| format!("{}: {e}", wt.display()))?
+                    }
+                    false => return Err(e),
+                }
+            }
         }
         let _ = git(&r.src, &["worktree", "prune"]);
     }
@@ -1072,7 +1126,7 @@ pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), S
         let _ = fs::remove_dir_all(dir);
     } else {
         // Only our generated file may remain; anything else the user must force away.
-        for f in ROOT_DOCS {
+        for f in ROOT_DOCS.into_iter().chain([".DS_Store"]) {
             let _ = fs::remove_file(dir.join(f));
         }
         // Dropped and pasted files; sent messages may still refer to them until now.
@@ -2339,5 +2393,182 @@ mod tests {
         assert!(dir.join("api/README.md").exists());
         remove_workspace(&ws, &dir, true).unwrap();
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn default_base_skips_pruned_origin_head() {
+        let root = std::env::temp_dir().join(format!("shark-pruned-head-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let repo = init_repo(&root, "api");
+        let origin = root.join("origin.git");
+        git(&root, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
+        let api = &repo.path;
+        // No origin: the current branch is no trunk, but a new workspace still gets a base.
+        assert_eq!(default_base(api), "");
+        let dir = root.join("ws/feat");
+        let ws = create_workspace(
+            &dir,
+            "feat",
+            "feat",
+            &on_branch(std::slice::from_ref(&repo), "feat"),
+        )
+        .unwrap();
+        assert_eq!(ws.repos[0].base, "main");
+        assert_eq!(
+            default_base(&dir.join("api")),
+            "",
+            "not the workspace's own branch"
+        );
+        git(api, &["remote", "add", "origin", &origin.to_string_lossy()]).unwrap();
+        git(api, &["push", "-q", "origin", "main"]).unwrap();
+        git(api, &["fetch", "-q", "origin"]).unwrap();
+        git(api, &["remote", "set-head", "origin", "main"]).unwrap();
+        assert_eq!(default_base(api), "origin/main");
+        // The remote's default was renamed and `fetch --prune` removed the old ref.
+        git(
+            api,
+            &[
+                "symbolic-ref",
+                "refs/remotes/origin/HEAD",
+                "refs/remotes/origin/master",
+            ],
+        )
+        .unwrap();
+        assert_eq!(default_base(api), "origin/main");
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn archive_refusal_is_preflighted_and_tolerates_finder_and_moved_source() {
+        let root = std::env::temp_dir().join(format!("shark-archive-pre-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let repo = init_repo(&root, "api");
+        let dir = root.join("ws/feat");
+        let ws = create_workspace(
+            &dir,
+            "feat",
+            "feat",
+            &on_branch(std::slice::from_ref(&repo), "feat"),
+        )
+        .unwrap();
+        fs::write(dir.join("api/dirty.txt"), "x\n").unwrap();
+        let err = archive_preflight(&ws, &dir, false).unwrap_err();
+        assert!(err.contains("uncommitted changes in: api"), "{err}");
+        archive_preflight(&ws, &dir, true).unwrap();
+        fs::remove_file(dir.join("api/dirty.txt")).unwrap();
+        fs::write(dir.join("notes.md"), "mine\n").unwrap();
+        assert!(archive_preflight(&ws, &dir, false).is_err());
+        fs::remove_file(dir.join("notes.md")).unwrap();
+        // Finder litter alone doesn't block a clean archive.
+        fs::write(dir.join(".DS_Store"), "x").unwrap();
+        archive_preflight(&ws, &dir, false).unwrap();
+        remove_workspace(&ws, &dir, false).unwrap();
+        assert!(!dir.exists());
+
+        // Force still removes the workspace when its source repo was moved away.
+        let dir = root.join("ws/feat2");
+        let ws = create_workspace(
+            &dir,
+            "feat2",
+            "feat2",
+            &on_branch(std::slice::from_ref(&repo), "feat2"),
+        )
+        .unwrap();
+        fs::rename(&repo.path, root.join("moved")).unwrap();
+        assert!(remove_workspace(&ws, &dir, false).is_err());
+        assert!(dir.join("api/README.md").exists());
+        remove_workspace(&ws, &dir, true).unwrap();
+        assert!(!dir.exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hand_deleted_workspace_dir_frees_its_branch() {
+        let root = std::env::temp_dir().join(format!("shark-prunable-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let repo = init_repo(&root, "api");
+        let dir = root.join("ws/feat");
+        create_workspace(
+            &dir,
+            "feat",
+            "feat",
+            &on_branch(std::slice::from_ref(&repo), "feat"),
+        )
+        .unwrap();
+        let checked_out = || {
+            let bs = branches(&repo.path).unwrap();
+            bs.into_iter()
+                .find(|b| b.name == "feat")
+                .unwrap()
+                .checked_out
+        };
+        assert!(checked_out().is_some());
+        fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(
+            checked_out(),
+            None,
+            "prunable entry doesn't hold the branch"
+        );
+        create_workspace(&dir, "feat", "feat", &on_branch(&[repo], "feat")).unwrap();
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn default_env_pattern_skips_ignored_directories() {
+        let root = std::env::temp_dir().join(format!("shark-env-dirs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let src = init_repo(&root, "src");
+        let dst = init_repo(&root, "dst");
+        let ignore = ".env\n.env.prod\nnode_modules\n";
+        for r in [&src, &dst] {
+            fs::write(r.path.join(".gitignore"), ignore).unwrap();
+        }
+        fs::remove_file(src.path.join(".env")).unwrap();
+        fs::remove_file(dst.path.join(".env")).unwrap();
+        for f in [
+            ".env/lib/mod.py",
+            "node_modules/x/.env.example",
+            "pkg/.env.prod",
+            ".env.prod",
+        ] {
+            let p = src.path.join(f);
+            fs::create_dir_all(p.parent().unwrap()).unwrap();
+            fs::write(p, "v\n").unwrap();
+        }
+        let copied = copy_included(&src.path, &dst.path).unwrap();
+        assert_eq!(copied.len(), 2, "{copied:?}");
+        assert!(dst.path.join(".env.prod").exists() && dst.path.join("pkg/.env.prod").exists());
+        assert!(!dst.path.join(".env").exists());
+        assert!(!dst.path.join("node_modules").exists());
+        // A configured `.worktreeinclude` keeps its own reach.
+        fs::write(src.path.join(".worktreeinclude"), ".env.example\n").unwrap();
+        copy_included(&src.path, &dst.path).unwrap();
+        assert!(dst.path.join("node_modules/x/.env.example").exists());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn pr_remote_matches_origin_case_insensitively() {
+        let root = std::env::temp_dir().join(format!("shark-pr-remote-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let repo = init_repo(&root, "api");
+        git(
+            &repo.path,
+            &["remote", "add", "origin", "git@GitHub.com:Owner/Repo.git"],
+        )
+        .unwrap();
+        let pr = |url: &str| PullRequest {
+            number: 3,
+            url: url.into(),
+            base: "main".into(),
+        };
+        let same = pr("https://github.com/owner/repo/pull/3");
+        assert_eq!(pr_remote(&repo.path, &same).unwrap(), "origin");
+        let other = pr("https://github.com/owner/fork/pull/3");
+        assert_eq!(
+            pr_remote(&repo.path, &other).unwrap(),
+            "https://github.com/owner/fork.git"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

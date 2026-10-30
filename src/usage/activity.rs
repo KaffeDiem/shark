@@ -2,7 +2,7 @@
 use super::{Provider, timestamp};
 use objc2_foundation::{NSDate, NSDateFormatter, NSString, NSTimeZone};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
@@ -179,7 +179,7 @@ pub(super) fn parse(
         Provider::Codex => "token_count",
     };
     let mut days: Vec<(i64, u64)> = vec![];
-    let mut seen = HashSet::new();
+    let mut seen = HashMap::new();
     let mut last_total = Value::Null;
     // Split on bytes: a stray invalid UTF-8 line must not end the file early.
     for line in reader.split(b'\n').map_while(Result::ok) {
@@ -191,17 +191,16 @@ pub(super) fn parse(
         let Ok(v) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let n = match provider {
+        let mut key = None;
+        let n: u64 = match provider {
             Provider::Claude => {
                 let (message, usage) = (&v["message"], &v["message"]["usage"]);
-                // Streamed turns repeat one message's usage on several lines.
-                if v["type"] != "assistant"
-                    || !usage.is_object()
-                    || message["id"].is_string()
-                        && !seen.insert((message["id"].to_string(), v["requestId"].to_string()))
-                {
+                if v["type"] != "assistant" || !usage.is_object() {
                     continue;
                 }
+                key = message["id"]
+                    .is_string()
+                    .then(|| (message["id"].to_string(), v["requestId"].to_string()));
                 [
                     "input_tokens",
                     "output_tokens",
@@ -231,6 +230,20 @@ pub(super) fn parse(
         };
         let Some(day) = v["timestamp"].as_str().and_then(|t| day_of(t, hours)) else {
             continue;
+        };
+        // A streamed message repeats on several lines, and only the last carries the final
+        // `output_tokens`: count the growth on the day of its first line.
+        let (day, n) = match key {
+            Some(key) => {
+                let (first_day, prev) = seen.entry(key).or_insert((day, 0));
+                if n <= *prev {
+                    continue;
+                }
+                let grew = n - *prev;
+                *prev = n;
+                (*first_day, grew)
+            }
+            None => (day, n),
         };
         match days.iter_mut().find(|(d, _)| *d == day) {
             Some(entry) => entry.1 += n,

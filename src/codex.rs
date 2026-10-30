@@ -92,12 +92,21 @@ fn flush(s: &mut State, stdin: &Mutex<ChildStdin>) -> std::io::Result<()> {
     };
     for text in std::mem::take(&mut s.pending) {
         s.next += 1;
-        agent::write(
-            stdin,
-            &json!({"id": s.next, "method": "turn/start", "params": turn_params(s, &thread, &text)}),
-        )?;
+        agent::write(stdin, &request(s, &thread, &text))?;
     }
     Ok(())
+}
+
+/// What a message becomes: `/compact` is the thread's own request, which runs as a turn.
+fn request(s: &State, thread: &str, text: &str) -> Value {
+    match text.trim() {
+        "/compact" => {
+            json!({"id": s.next, "method": "thread/compact/start", "params": {"threadId": thread}})
+        }
+        _ => {
+            json!({"id": s.next, "method": "turn/start", "params": turn_params(s, thread, text)})
+        }
+    }
 }
 
 /// A `turn/start`'s params. Mode, sandbox, tier and effort hold for later turns too; sent with
@@ -146,7 +155,14 @@ fn fast_in(config: &str) -> bool {
                 .trim_start()
                 .strip_prefix('=')
         })
-        .any(|v| matches!(v.trim().trim_matches(['"', '\'']), "fast" | "priority"))
+        .any(|v| {
+            let v = v.trim();
+            let v = match v.chars().next() {
+                Some(q @ ('"' | '\'')) => v[1..].split(q).next().unwrap_or(""), // up to the closing quote
+                _ => v.split('#').next().unwrap_or("").trim(),
+            };
+            matches!(v, "fast" | "priority")
+        })
 }
 
 /// Errs before `turn/started` (the server refuses it until then), so the caller stops the
@@ -252,6 +268,10 @@ pub fn parse(v: &Value) -> Vec<Ev> {
         }],
         (Some("item/agentMessage/delta"), _) => vec![Ev::TextDelta(s(&p["delta"]))],
         (Some("item/started"), Some("userMessage")) => vec![Ev::User(text_of(&item["content"]))],
+        // Manual or automatic: codex's own summary stays in its history.
+        (Some("item/completed"), Some("contextCompaction")) => {
+            vec![Ev::Notice("Conversation compacted".into())]
+        }
         (Some("item/completed"), Some("agentMessage")) => vec![Ev::Text(s(&item["text"]))],
         // Plan mode's `<proposed_plan>`, cut out of the reply: a row like claude's
         // ExitPlanMode, then a version for the plan pane. The row comes first because the
@@ -528,6 +548,24 @@ mod tests {
             );
             assert!(live.ends_with(&format!("{} chars total", MAX_OUTPUT + 8)));
         }
+    }
+
+    #[test]
+    fn compact_is_its_own_request_and_a_notice() {
+        let s = State {
+            next: 3,
+            ..Default::default()
+        };
+        let req = request(&s, "th1", " /compact\n");
+        assert_eq!(req["method"], "thread/compact/start");
+        assert_eq!(req["params"], json!({"threadId": "th1"}));
+        assert_eq!(request(&s, "th1", "/compact now")["method"], "turn/start");
+        // Recorded from codex-cli 0.164.0 after `thread/compact/start`.
+        let done = r#"{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"c1"},"threadId":"th1","turnId":"t9"}}"#;
+        let v: Value = serde_json::from_str(done).unwrap();
+        assert_eq!(parse(&v), vec![Ev::Notice("Conversation compacted".into())]);
+        let started = done.replace("completed", "started");
+        assert_eq!(parse(&serde_json::from_str(&started).unwrap()), vec![]);
     }
 
     #[test]
@@ -883,6 +921,9 @@ done
         assert!(fast_in("service_tier='priority'"));
         assert!(!fast_in("service_tier = \"flex\""));
         assert!(!fast_in(""));
+        assert!(fast_in("service_tier = \"fast\" # on"));
+        assert!(fast_in("service_tier = 'priority'# on"));
+        assert!(!fast_in("service_tier = \"flex\" # fast"));
         assert!(
             !fast_in("[profiles.x]\nservice_tier = \"fast\""),
             "a profile's isn't the default"

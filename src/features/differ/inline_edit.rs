@@ -308,7 +308,7 @@ impl Differ {
             return self.focus_edit(window, cx);
         }
         let Some(file) = self.diff_files.iter().find(|f| *f.path() == path) else {
-            return;
+            return notify_err(window, cx, format!("{path} is not in the current diff"));
         };
         let (base, text, added) = match load(ws, file) {
             Ok(loaded) => loaded,

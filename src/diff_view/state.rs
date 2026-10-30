@@ -1874,7 +1874,8 @@ fn project_conflicts(
     let conflicts = document.conflicts();
     let mut next = 0;
     let mut ix = 0;
-    while ix < visible.len() {
+    // An empty conflict at the end of the file starts past the last line.
+    while ix < visible.len() || next < conflicts.len() {
         if let Some(conflict) = conflicts.get(next)
             && conflict.source_lines().start == ix
         {
@@ -1916,7 +1917,11 @@ fn project_conflicts(
             continue;
         }
         let start = ix;
-        while ix < visible.len() && !visible[ix] {
+        // An empty conflict has no visible line of its own to end the fold at.
+        let stop = conflicts
+            .get(next)
+            .map_or(visible.len(), |c| c.source_lines().start);
+        while ix < stop && !visible[ix] {
             ix += 1;
         }
         rows.push(DisplayRow::Fold {

@@ -329,7 +329,8 @@ impl Client {
                 "workspace":{
                     "applyEdit":true,"workspaceFolders":true,"configuration":true,
                     "workspaceEdit":{"documentChanges":true,"failureHandling":"transactional"},
-                    "didChangeWatchedFiles":{"dynamicRegistration":true,"relativePatternSupport":true}
+                    "didChangeWatchedFiles":{"dynamicRegistration":true,"relativePatternSupport":true},
+                    "diagnostics":{"refreshSupport":true}
                 },
                 "window":{"workDoneProgress":true,"showDocument":{"support":true}},
                 "textDocument":{
@@ -449,38 +450,42 @@ impl Client {
     }
 }
 
-/// `Message::read`, except that a corrupt length cannot make Shark allocate it.
+/// `Message::read`, except that a corrupt length cannot make Shark allocate it and a frame whose
+/// payload is not a valid message (e.g. a response with `"id": null`) is skipped: its framing is
+/// intact, so the stream stays usable.
 fn read_message(reader: &mut impl BufRead) -> std::io::Result<Option<Message>> {
     let invalid = |error: String| std::io::Error::new(std::io::ErrorKind::InvalidData, error);
-    let mut size = None;
-    let mut line = String::new();
     loop {
-        line.clear();
-        if reader.by_ref().take(4096).read_line(&mut line)? == 0 {
-            return Ok(None);
+        let mut size = None;
+        let mut line = String::new();
+        loop {
+            line.clear();
+            if reader.by_ref().take(4096).read_line(&mut line)? == 0 {
+                return Ok(None);
+            }
+            let header = line
+                .strip_suffix("\r\n")
+                .ok_or_else(|| invalid(format!("malformed header: {line:?}")))?;
+            if header.is_empty() {
+                break;
+            }
+            let (name, value) = header
+                .split_once(": ")
+                .ok_or_else(|| invalid(format!("malformed header: {header:?}")))?;
+            if name.eq_ignore_ascii_case("Content-Length") {
+                size = Some(value.parse::<usize>().map_err(|e| invalid(e.to_string()))?);
+            }
         }
-        let header = line
-            .strip_suffix("\r\n")
-            .ok_or_else(|| invalid(format!("malformed header: {line:?}")))?;
-        if header.is_empty() {
-            break;
+        let size = size.ok_or_else(|| invalid("no Content-Length".into()))?;
+        if size > MAX_FRAME {
+            return Err(invalid(format!("{size}-byte message exceeds the limit")));
         }
-        let (name, value) = header
-            .split_once(": ")
-            .ok_or_else(|| invalid(format!("malformed header: {header:?}")))?;
-        if name.eq_ignore_ascii_case("Content-Length") {
-            size = Some(value.parse::<usize>().map_err(|e| invalid(e.to_string()))?);
+        let mut body = vec![0; size];
+        reader.read_exact(&mut body)?;
+        if let Ok(message) = serde_json::from_slice(&body) {
+            return Ok(Some(message));
         }
     }
-    let size = size.ok_or_else(|| invalid("no Content-Length".into()))?;
-    if size > MAX_FRAME {
-        return Err(invalid(format!("{size}-byte message exceeds the limit")));
-    }
-    let mut body = vec![0; size];
-    reader.read_exact(&mut body)?;
-    serde_json::from_slice(&body)
-        .map(Some)
-        .map_err(|e| invalid(format!("malformed LSP payload: {e}")))
 }
 
 /// What the coordinator observes of the pipe threads.

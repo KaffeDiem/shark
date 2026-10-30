@@ -276,11 +276,16 @@ pub fn move_item<T>(v: &mut Vec<T>, from: usize, to: usize) {
 #[cfg(test)]
 pub static TEST_HOME: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
 
+/// Tests never reach the real home, even ones that don't set it up themselves.
+#[cfg(test)]
 pub(crate) fn home() -> PathBuf {
-    #[cfg(test)]
-    if let Some(h) = TEST_HOME.get() {
-        return h.clone();
-    }
+    (TEST_HOME
+        .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id()))))
+    .clone()
+}
+
+#[cfg(not(test))]
+pub(crate) fn home() -> PathBuf {
     std::env::var_os("HOME")
         .map(PathBuf::from)
         .unwrap_or_default()
@@ -635,6 +640,13 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tests_never_touch_the_real_home() {
+        for dir in [support_dir(), workspaces_dir()] {
+            assert!(dir.starts_with(std::env::temp_dir()), "{}", dir.display());
+        }
+    }
 
     #[test]
     fn recent_apps_default_and_round_trip() {

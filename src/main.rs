@@ -513,8 +513,11 @@ fn main() {
         .run(|cx| {
             set_dock_icon();
             gpui_kit::init(cx);
-            cx.on_app_quit(|_| lsp::client::Client::terminate_all())
-                .detach();
+            cx.on_app_quit(|_| async {
+                agent::stop_all();
+                lsp::client::Client::terminate_all().await
+            })
+            .detach();
             install_fonts(cx);
             bind_keys(cx);
             menubar::init(cx);

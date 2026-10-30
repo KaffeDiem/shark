@@ -1790,20 +1790,29 @@ fn add_annotation_button(
     file: usize,
     side: DiffSide,
     ix: usize,
+    gutters: &[Option<(DiffSide, Option<usize>)>; 2],
     left: Pixels,
     code: &CodePresentation,
     cx: &App,
 ) -> Option<AnyElement> {
     let handler = code.on_add_annotation.clone()?;
-    let position = code.position(file, side, ix);
+    let hovered_at = code.position(file, side, ix);
+    // An unchanged unified row stands for both sides: use the one the selection is on.
+    let (at_side, at_ix) = gutters
+        .iter()
+        .flatten()
+        .filter_map(|(side, ix)| Some((*side, (*ix)?)))
+        .find(|(side, ix)| code.is_selected(file, *side, *ix))
+        .unwrap_or((side, ix));
+    let position = code.position(file, at_side, at_ix);
     let range = code
         .selected_lines
         .clone()
-        .filter(|_| code.is_selected(file, side, ix))
+        .filter(|_| code.is_selected(file, at_side, at_ix))
         .unwrap_or_else(|| {
             DiffLineRange::new(
                 position.path().clone(),
-                side,
+                at_side,
                 position.line(),
                 position.line(),
             )
@@ -1811,10 +1820,10 @@ fn add_annotation_button(
     let at_selection_end = code
         .selected
         .as_ref()
-        .is_some_and(|selected| selected.is_last(&code.files, file, side, ix));
+        .is_some_and(|selected| selected.is_last(&code.files, file, at_side, at_ix));
     // Shown on the hovered line only: a hover style can outlive the pointer on rows that
     // aren't drawn again.
-    if !at_selection_end && code.hovered.as_ref() != Some(&position) {
+    if !at_selection_end && code.hovered.as_ref() != Some(&hovered_at) {
         return None;
     }
     // Over the change sign, clear of the code.
@@ -1959,8 +1968,15 @@ fn code_line(
         code.hover_highlight,
         DiffHoverHighlight::Line | DiffHoverHighlight::Both
     );
-    let add_button =
-        add_annotation_button(file, side, ix, gutters_width + code.rem / 2., &code, cx);
+    let add_button = add_annotation_button(
+        file,
+        side,
+        ix,
+        &gutters,
+        gutters_width + code.rem / 2.,
+        &code,
+        cx,
+    );
     h_flex()
         .id("line-row")
         .relative()

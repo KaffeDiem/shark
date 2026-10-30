@@ -1134,7 +1134,13 @@ impl Shark {
                             );
                             let disk = read_source(&path)?;
                             if let Some(guard) = &preflight_guard {
-                                ensure_disk_before_request(&path, guard.started)?;
+                                // An open document is also guarded by its disk fingerprint below,
+                                // so a ctime-only change (an xattr write) cannot reject its edit.
+                                ensure_disk_before_request(
+                                    &path,
+                                    guard.started,
+                                    existing.is_none(),
+                                )?;
                             }
                             let (before, version) = match existing {
                                 Some((_, text, snapshot, blocked, fingerprint)) => {
@@ -1332,7 +1338,13 @@ pub(super) fn read_source(path: &Path) -> anyhow::Result<String> {
     Ok(String::from_utf8(bytes)?)
 }
 
-fn ensure_disk_before_request(path: &Path, started: std::time::SystemTime) -> anyhow::Result<()> {
+/// `check_ctime` also rejects changes that left the mtime alone (a replacement preserving it), at
+/// the cost of rejecting metadata-only changes such as xattr writes.
+fn ensure_disk_before_request(
+    path: &Path,
+    started: std::time::SystemTime,
+    check_ctime: bool,
+) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let metadata = path.metadata()?;
     let changed = std::time::UNIX_EPOCH
@@ -1341,7 +1353,7 @@ fn ensure_disk_before_request(path: &Path, started: std::time::SystemTime) -> an
             metadata.ctime_nsec().try_into()?,
         );
     anyhow::ensure!(
-        metadata.modified()? <= started && changed <= started,
+        metadata.modified()? <= started && (!check_ctime || changed <= started),
         "{} changed on disk after the language request; try again",
         path.display()
     );

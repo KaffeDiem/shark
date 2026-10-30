@@ -234,7 +234,7 @@ pub fn discover(wt: &Path, branch: &str) -> Result<Option<Target>, String> {
         "--state",
         "all",
         "--json",
-        "url,state,isCrossRepository",
+        "url,state,isCrossRepository,updatedAt",
         "--limit",
         "100",
     ];
@@ -246,9 +246,7 @@ pub fn discover(wt: &Path, branch: &str) -> Result<Option<Target>, String> {
         .iter()
         .filter(|p| p["isCrossRepository"].as_bool() == Some(false))
         .collect();
-    own.iter()
-        .find(|p| p["state"] == "OPEN")
-        .or_else(|| own.first())
+    crate::sync::pick_pr(&own)
         .map(|p| Target::from_url(string(p, "url")?))
         .transpose()
 }

@@ -127,7 +127,7 @@ impl Shark {
                         if this.active.as_ref() == Some(&name) {
                             this.refresh_diff(cx);
                         }
-                        if this.active_chat() != Some(chat) {
+                        if this.home_shown() || this.active_chat() != Some(chat) {
                             this.unread.insert(id.clone());
                         }
                         this.refresh_home(Some(&name), cx);
@@ -204,7 +204,9 @@ impl Shark {
         }
         let ws = self.active_ws().cloned().unwrap();
         let chat = self.ensure_chat(&ws, &meta, window, cx);
-        self.unread.remove(&meta.id);
+        if self.unread.remove(&meta.id) {
+            self.refresh_attention(cx); // the dock badge counts it
+        }
         if let Some(sync) = self.syncs.get(&ws.name) {
             sync.update(cx, |g, cx| g.set_chat(chat.clone(), cx));
         }
@@ -300,6 +302,21 @@ impl Shark {
         }
     }
 
+    /// After the shown tab at strip slot `at` closed: shows the tab that took its slot, or the
+    /// new last one when it was last, the way browsers do.
+    pub(super) fn select_neighbor(
+        &mut self,
+        at: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ws) = self.active_ws() else { return };
+        let n = self.visible_tabs(ws, cx).len();
+        if n > 0 {
+            self.select_tab(at.min(n - 1), window, cx);
+        }
+    }
+
     /// cmd-t: a new tab at the end of the strip, on the last picked model and thinking level
     /// and the current chat's speed.
     pub(super) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -382,6 +399,8 @@ impl Shark {
                 );
             }
         }
+        // The closed chat's strip slot, used when it is the one shown.
+        let at = self.active_tab_index(cx);
         let Some(ws) = self.ws(workspace) else {
             return;
         };
@@ -400,7 +419,10 @@ impl Shark {
         let selected = ws.chats[ws.active_chat].id.clone();
         let fresh_id = ws.next_chat_id();
         let meta = ws.chats.remove(ix);
-        if ws.chats.is_empty() {
+        let last = ws.chats.is_empty();
+        if last {
+            // The replacement takes the closed chat's slot.
+            ws.replace_tab(&TabId::Chat(id.to_string()), TabId::Chat(fresh_id.clone()));
             ws.chats.push(ChatMeta {
                 id: fresh_id,
                 ..fresh
@@ -426,7 +448,7 @@ impl Shark {
         let evicted: Vec<ChatMeta> = ws.closed.drain(..drop).collect();
         let _ = self.state.save();
         for m in evicted.iter().chain(untouched.then_some(&meta)) {
-            let _ = std::fs::remove_file(crate::agent::transcript_path(&m.id));
+            crate::agent::forget(&m.id);
             crate::plan::delete(&m.id);
         }
         self.unread.remove(&meta.id);
@@ -440,9 +462,13 @@ impl Shark {
         {
             sync.update(cx, |g, cx| g.remove_chat(&chat, cx)); // the last ref; dropping stops claude
         }
+        self.refresh_attention(cx); // an unread or asking tab no longer counts
         if self.active.as_deref() == Some(workspace) && selected == id {
             if self.tab == Tab::Chat && !self.home_shown() {
-                self.select_chat(next, window, cx);
+                match at {
+                    Some(at) if !last => self.select_neighbor(at, window, cx),
+                    _ => self.select_chat(next, window, cx),
+                }
             } else {
                 let ws = self.active_ws().cloned().unwrap();
                 let chat = self.ensure_chat(&ws, &ws.chats[next], window, cx);
@@ -463,13 +489,13 @@ impl Shark {
                 return;
             }
             s.differ.update(cx, |d, cx| d.end_edit(cx));
+            let at = s.active_tab_index(cx);
             let ws = s.active_ws_mut().unwrap();
             ws.diff_closed = true;
             ws.close_tab(&TabId::Diff);
             let _ = s.state.save();
-            if s.tab == Tab::Feature(Feature::Diff) {
-                let ix = s.active_ws().unwrap().active_chat;
-                s.select_chat(ix, w, cx);
+            if s.tab == Tab::Feature(Feature::Diff) && !s.home_shown() {
+                s.select_neighbor(at.unwrap_or(0), w, cx);
             }
             cx.notify();
         });
@@ -588,6 +614,9 @@ impl Shark {
         let Some(chat) = self.active_chat().cloned() else {
             return notify_err(window, cx, "Open a workspace first");
         };
+        if self.home_shown() {
+            self.show(Tab::Chat, window, cx);
+        }
         chat.update(cx, |c, cx| c.open_model_menu(window, cx));
     }
 
@@ -633,6 +662,9 @@ impl Shark {
                 "No plan yet; the agent submits one in plan mode",
             );
         };
+        if from.update(cx, |c, cx| c.refuse_plan(cx)) {
+            return;
+        }
         self.new_chat(window, cx);
         let Some(to) = self.active_chat().cloned().filter(|c| *c != from) else {
             return;

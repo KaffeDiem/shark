@@ -410,6 +410,33 @@ async fn language_batch_touching_a_closed_file_written_since_the_request_is_reje
     });
 }
 
+// Metadata-only changes (xattr writes bump ctime, not mtime) do not fail an open document's edit.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn language_batch_on_an_open_file_survives_an_xattr_write_since_the_request(
+    cx: &mut TestAppContext,
+) {
+    let _guard = ui_tests::UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, window, shark) = fixture(cx).await;
+    let buffers = cx.update(|cx| editors(&shark, cx));
+    let guard = EditGuard::capture();
+    std::thread::sleep(Duration::from_millis(20));
+    for file in ["a.txt", "b.txt"] {
+        let xattr = std::process::Command::new("/usr/bin/xattr")
+            .args(["-w", "com.example.tag", "x"])
+            .arg(root.join(file))
+            .status()
+            .unwrap();
+        assert!(xattr.success());
+    }
+    apply_edit(cx, window, &shark, &root, edits(&root, "one", "two"), guard);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        buffers.iter().all(|e| e.read(cx).dirty)
+    })
+    .await;
+    cx.update(|cx| assert_eq!(text(&buffers[0], cx), "one\n"));
+}
+
 // A dirty diff buffer participates in the same preflight as full-width editor tabs.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]

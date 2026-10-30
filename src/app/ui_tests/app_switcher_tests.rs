@@ -296,3 +296,27 @@ async fn app_switcher_archived_target_does_not_retarget(cx: &mut TestAppContext)
         "a vanished target must never become another workspace"
     );
 }
+
+/// Esc cancels whether or not Command is still held; releasing it afterwards opens nothing.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn app_switcher_escape_cancels(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = fixture(cx);
+    let before = OPENED.lock().unwrap().len();
+    let held = Modifiers {
+        platform: true,
+        ..Default::default()
+    };
+    for esc in ["cmd-escape", "escape"] {
+        modifiers(cx, window, held);
+        press_in(window)(cx, &["cmd-o", "cmd-o", esc]);
+        cx.update(|cx| assert!(shark.read(cx).app_switcher.is_none(), "{esc} cancels"));
+        modifiers(cx, window, Modifiers::default());
+        assert_eq!(
+            OPENED.lock().unwrap().len(),
+            before,
+            "{esc} then release opens nothing"
+        );
+    }
+}

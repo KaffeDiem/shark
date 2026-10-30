@@ -37,6 +37,8 @@ pub enum Ev {
         mcp: Vec<String>,
     },
     User(String),
+    /// A line the CLI wrote itself, like a compaction's; shown as an info row, not a message.
+    Notice(String),
     TextDelta(String),
     Text(String),
     ToolUse {
@@ -169,6 +171,29 @@ pub fn transcript_path(chat: &str) -> PathBuf {
     support_dir()
         .join("transcripts")
         .join(format!("{chat}.jsonl"))
+}
+
+/// Deletes a chat's transcript and stderr log.
+pub fn forget(chat: &str) {
+    let _ = fs::remove_file(transcript_path(chat));
+    let _ = fs::remove_file(logs_dir().join(format!("{chat}.stderr.log")));
+}
+
+/// Pids of the running agent processes, with their `exited` flags. Quitting stops them: macOS
+/// terminate doesn't run `Drop`.
+static LIVE: Mutex<Vec<(u32, Arc<AtomicBool>)>> = Mutex::new(Vec::new());
+
+/// SIGTERMs every running agent process (chats, side chats, the Home ask).
+pub fn stop_all() {
+    term_each(&LIVE.lock().unwrap());
+}
+
+fn term_each(live: &[(u32, Arc<AtomicBool>)]) {
+    for (pid, exited) in live {
+        if !exited.load(Ordering::SeqCst) {
+            crate::git::term(*pid);
+        }
+    }
 }
 
 /// When any of the workspace's chats last wrote to its transcript. Reads file metadata.
@@ -462,6 +487,7 @@ pub(crate) fn start(
     let exited = Arc::new(AtomicBool::new(false));
     let reaped = exited.clone();
     let stdin = Arc::new(Mutex::new(child.stdin.take().unwrap()));
+    LIVE.lock().unwrap().push((child.id(), exited.clone()));
     let agent = Agent {
         pid: child.id(),
         exited,
@@ -486,6 +512,7 @@ pub(crate) fn start(
         }
         let status = child.wait().map(|s| s.to_string()).unwrap_or_default();
         reaped.store(true, Ordering::SeqCst);
+        LIVE.lock().unwrap().retain(|(p, _)| *p != pid);
         let err = fs::read_to_string(&log).unwrap_or_default();
         let lines: Vec<&str> = err.lines().collect();
         let tail = &lines[lines.len().saturating_sub(5)..];
@@ -655,7 +682,7 @@ fn parse_record(v: Value) -> Vec<Ev> {
         // Only the user's own messages: claude also replays ones it wrote itself, like
         // background task notifications, and those carry an `origin`.
         "user" if v["message"]["content"].is_string() && v["origin"].is_null() => {
-            vec![Ev::User(s(&v["message"]["content"]))]
+            user_line(&v).into_iter().collect()
         }
         "user" => blocks(&v)
             .filter_map(|b| match b["type"].as_str()? {
@@ -691,6 +718,27 @@ fn parse_record(v: Value) -> Vec<Ev> {
     }
 }
 
+/// A string-content user line: the user's message, or one the CLI wrote on their behalf. A
+/// compaction's summary (synthetic) and a command's stdout become notices; a slash command's
+/// echo (`<command-name>/x</command-name>…<command-args>a</command-args>`) is the `/x a` typed.
+fn user_line(v: &Value) -> Option<Ev> {
+    let t = v["message"]["content"].as_str()?;
+    let tag = |name: &str| {
+        let rest = &t[t.find(&format!("<{name}>"))? + name.len() + 2..];
+        Some(rest[..rest.find(&format!("</{name}>"))?].trim())
+    };
+    if v["isSynthetic"] == true {
+        Some(Ev::Notice("Conversation compacted".into()))
+    } else if let Some(out) = tag("local-command-stdout") {
+        (!out.is_empty()).then(|| Ev::Notice(out.into()))
+    } else if let Some(name) = tag("command-name") {
+        let args = tag("command-args").unwrap_or_default();
+        Some(Ev::User(format!("{name} {args}").trim().into()))
+    } else {
+        Some(Ev::User(t.into()))
+    }
+}
+
 fn blocks(v: &Value) -> impl Iterator<Item = &Value> {
     blocks_of(&v["message"]["content"])
 }
@@ -702,6 +750,45 @@ fn blocks_of(v: &Value) -> impl Iterator<Item = &Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Quitting stops what `start` registered, and a reaped process leaves the registry.
+    #[test]
+    fn stop_all_signals_registered_children() {
+        let mut cmd = Command::new("sleep");
+        cmd.arg("30");
+        let (agent, rx) = start(cmd, &std::env::temp_dir(), "stop-all-test", None, None).unwrap();
+        let entry = (agent.pid, agent.exited.clone());
+        assert!(LIVE.lock().unwrap().iter().any(|(p, _)| *p == agent.pid));
+        // Only this child: another test's agent shouldn't die with it.
+        term_each(&[entry]);
+        let msg = loop {
+            match rx.recv_blocking() {
+                Ok(Ev::Exited(m)) => break m,
+                Ok(_) => {}
+                Err(e) => panic!("{e}"),
+            }
+        };
+        assert!(msg.contains("SIGTERM"), "{msg}");
+        assert!(!LIVE.lock().unwrap().iter().any(|(p, _)| *p == agent.pid));
+        forget("stop-all-test");
+        assert!(!logs_dir().join("stop-all-test.stderr.log").exists());
+    }
+
+    #[test]
+    fn forget_removes_transcript_and_log() {
+        let id = "forget-test";
+        fs::create_dir_all(logs_dir()).unwrap();
+        fs::create_dir_all(transcript_path(id).parent().unwrap()).unwrap();
+        let files = [
+            transcript_path(id),
+            logs_dir().join(format!("{id}.stderr.log")),
+        ];
+        for f in &files {
+            fs::write(f, "x").unwrap();
+        }
+        forget(id);
+        assert!(files.iter().all(|f| !f.exists()));
+    }
 
     #[test]
     fn completed_answer_appends_are_atomic_recoverable_and_deduplicated() {
@@ -968,6 +1055,50 @@ not json"#;
         };
         assert_eq!(input["content"].as_str().unwrap().len(), MAX_INPUT);
         assert_eq!(input["file_path"], "/a");
+    }
+
+    #[test]
+    fn cli_written_user_lines_are_not_the_users() {
+        let user = |line: &str| parse(line);
+        // Real lines from a /compact (the summary cut short).
+        let summary = r#"{"type":"user","message":{"role":"user","content":"This session is being continued from a previous conversation that ran out of context.\n\nSummary: ..."},"isSynthetic":true,"isReplay":false}"#;
+        assert_eq!(
+            user(summary),
+            vec![Ev::Notice("Conversation compacted".into())]
+        );
+        let stdout = r#"{"type":"user","message":{"role":"user","content":"<local-command-stdout>Compacted </local-command-stdout>"},"isReplay":true}"#;
+        assert_eq!(user(stdout), vec![Ev::Notice("Compacted".into())]);
+        let empty = r#"{"type":"user","message":{"content":"<local-command-stdout></local-command-stdout>"},"isReplay":true}"#;
+        assert_eq!(user(empty), vec![]);
+        let echo = r#"{"type":"user","message":{"role":"user","content":"<command-message>x</command-message>\n<command-name>/x</command-name>\n<command-args>args here</command-args>"},"isReplay":true}"#;
+        assert_eq!(user(echo), vec![Ev::User("/x args here".into())]);
+        let bare = r#"{"type":"user","message":{"content":"<command-message>x</command-message>\n<command-name>/x</command-name>\n<command-args></command-args>"}}"#;
+        assert_eq!(user(bare), vec![Ev::User("/x".into())]);
+        let plain = r#"{"type":"user","message":{"role":"user","content":"hello <b>there</b>"},"isReplay":true}"#;
+        assert_eq!(user(plain), vec![Ev::User("hello <b>there</b>".into())]);
+        let noted = r#"{"type":"user","origin":{"kind":"task-notification"},"message":{"content":"<task-notification>done</task-notification>"}}"#;
+        assert_eq!(user(noted), vec![], "origin lines are still dropped");
+        let result = r#"{"type":"result","subtype":"success","local_command":"compact","is_error":false,"result":"","total_cost_usd":1.5,"duration_ms":2000}"#;
+        assert!(matches!(
+            &user(result)[..],
+            [Ev::Result {
+                is_error: false,
+                ..
+            }]
+        ));
+        let turn = [Ev::Text("Ok?".into()), Ev::Notice("Compacted".into())];
+        let done = Ev::Result {
+            is_error: false,
+            text: String::new(),
+            cost: 0.0,
+            secs: 0,
+        };
+        let evs: Vec<Ev> = turn.into_iter().chain([done]).collect();
+        assert_eq!(
+            waiting(&evs, false),
+            Some(QUESTION),
+            "a notice isn't a user turn"
+        );
     }
 
     #[test]

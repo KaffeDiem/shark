@@ -175,6 +175,10 @@ impl Shark {
                 {
                     return self.show(Tab::Feature(Feature::Diff), window, cx);
                 }
+                // begin_edit would find nothing after the switch and do nothing.
+                if !self.differ.read(cx).in_diff(&path) {
+                    return notify_err(window, cx, format!("{path} is not in the current diff"));
+                }
 
                 let conflict = |s: &Shark, cx: &App| {
                     s.file_tabs.iter().any(|t| {

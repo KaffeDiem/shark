@@ -6,17 +6,17 @@ use std::ops::Range;
 
 #[derive(Default)]
 pub(super) struct Snippets {
-    active: Option<Session>,
+    pub(super) active: Option<Session>,
     accepted: Option<(i32, u64)>,
     /// Resolves the last accepted item's imports; a newer acceptance, undo, reload or closing
     /// cancels it.
     pub(super) resolve: Option<Task<()>>,
 }
 
-struct Session {
-    text: String,
-    stops: Vec<Stop>,
-    index: u32,
+pub(super) struct Session {
+    pub(super) text: String,
+    pub(super) stops: Vec<Stop>,
+    pub(super) index: u32,
 }
 
 impl FileEditor {

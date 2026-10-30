@@ -66,7 +66,11 @@ pub fn move_in_order(order: &mut [String], name: &str, earlier: bool) {
     }
 }
 
-/// Returns `(repo, url)` for every PR created or found. `skip` names repos whose work already
+/// `(repo, url)` per PR, and the warning when linking failed.
+pub type Created = (Vec<(String, String)>, Option<String>);
+
+/// Returns `(repo, url)` for every PR created or found, and a warning when they exist but
+/// linking their bodies failed. `skip` names repos whose work already
 /// landed: after a squash merge their commits still count as ahead of the base, and pushing
 /// them again would open a duplicate PR.
 pub fn create_linked_prs(
@@ -74,7 +78,7 @@ pub fn create_linked_prs(
     dir: &Path,
     skip: &[String],
     new: &NewPr,
-) -> Result<Vec<(String, String)>, String> {
+) -> Result<Created, String> {
     for r in &ws.repos {
         if crate::git::review_pr_url(&dir.join(&r.name), ws.branch_of(r)).is_some() {
             return Err(format!(
@@ -132,12 +136,15 @@ pub fn create_linked_prs(
             &["push", "-u", "origin", &format!("refs/heads/{branch}")],
             120,
         )?;
+        // Same `--repo` as polling, so a fork's upstream never answers for origin.
+        let origin = crate::sync::origin_repo(&wt);
+        let repo_flag = |a| with_repo(a, origin.as_deref());
         // Only an open PR from this repo is reused; `gh pr view <branch>` would also return a
         // merged one, and new commits after a merge need a new PR.
         let open = cmd_bounded(
             &wt,
             "gh",
-            &[
+            &repo_flag(vec![
                 "pr",
                 "list",
                 "--head",
@@ -148,37 +155,56 @@ pub fn create_linked_prs(
                 "url,isCrossRepository",
                 "-q",
                 "[.[] | select(.isCrossRepository | not)][0].url // empty",
-            ],
+            ]),
             30,
         )?;
         let url = match open.is_empty() {
             false => open,
             true => {
                 let base = r.base.strip_prefix("origin/").unwrap_or(&r.base);
-                let out = cmd_bounded(&wt, "gh", &new.args(branch, base), 60)?;
+                let out = cmd_bounded(&wt, "gh", &repo_flag(new.args(branch, base)), 60)?;
                 out.lines().last().unwrap_or_default().to_string()
             }
         };
         prs.push((r.name.clone(), url));
     }
+    // The PRs exist by now: a failed link is a warning, not a lost result.
+    let mut failed = vec![];
     if prs.len() > 1 {
         for (r, url) in &prs {
             let wt = dir.join(r);
-            let body = cmd_bounded(
-                &wt,
-                "gh",
-                &["pr", "view", url, "--json", "body", "-q", ".body"],
-                30,
-            )?;
-            cmd_bounded(
-                &wt,
-                "gh",
-                &["pr", "edit", url, "--body", &link_body(&body, &prs, url)],
-                30,
-            )?;
+            let link = || {
+                let body = cmd_bounded(
+                    &wt,
+                    "gh",
+                    &["pr", "view", url, "--json", "body", "-q", ".body"],
+                    30,
+                )?;
+                cmd_bounded(
+                    &wt,
+                    "gh",
+                    &["pr", "edit", url, "--body", &link_body(&body, &prs, url)],
+                    30,
+                )
+            };
+            if let Err(e) = link() {
+                failed.push(format!("{r}: {e}"));
+            }
         }
     }
-    Ok(prs)
+    let warning = (!failed.is_empty()).then(|| {
+        format!(
+            "The PRs were created, but linking them failed; rerun to retry:\n{}",
+            failed.join("\n")
+        )
+    });
+    Ok((prs, warning))
+}
+
+/// `args` plus `--repo <origin>`, as polling passes it.
+fn with_repo<'a>(mut args: Vec<&'a str>, origin: Option<&'a str>) -> Vec<&'a str> {
+    args.extend(origin.into_iter().flat_map(|o| ["--repo", o]));
+    args
 }
 
 /// Replaces everything after `MARKER` with links to the other PRs, so re-runs are idempotent.
@@ -604,6 +630,126 @@ esac
         assert_eq!(moved("ios", true), o, "already first");
     }
 
+    /// Creation asks gh about origin like polling does (`--repo`), and a failed link step still
+    /// returns the PRs it created, with a warning.
+    #[test]
+    fn creation_targets_origin_and_keeps_prs_when_linking_fails() {
+        use crate::git::{add_repo, create_workspace};
+        use std::fs;
+        #[cfg(feature = "test-support")]
+        let _lock = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        struct Restore(std::ffi::OsString);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                unsafe { std::env::set_var("PATH", &self.0) };
+            }
+        }
+        let _restore = Restore(std::env::var_os("PATH").unwrap());
+        let root = std::env::temp_dir().join(format!("shark-pr-repo-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let c = |dir: &Path, args: &[&str]| {
+            git(
+                dir,
+                &[&["-c", "user.name=t", "-c", "user.email=t@t"], args].concat(),
+            )
+            .unwrap()
+        };
+        let mut repos = vec![];
+        for name in ["api", "web"] {
+            let (origin, src) = (
+                root.join(format!("{name}.git")),
+                root.join("src").join(name),
+            );
+            fs::create_dir_all(&src).unwrap();
+            git(&root, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
+            git(&src, &["init", "-q", "-b", "main"]).unwrap();
+            fs::write(src.join("README.md"), "hi\n").unwrap();
+            c(&src, &["add", "."]);
+            c(&src, &["commit", "-qm", "init"]);
+            // Origin reads as a GitHub remote; git still pushes to the bare repo.
+            let url = format!("git@github.com:o/{name}.git");
+            git(&src, &["remote", "add", "origin", &url]).unwrap();
+            let rewrite = format!("url.{}.insteadOf", origin.display());
+            git(&src, &["config", &rewrite, &url]).unwrap();
+            git(&src, &["push", "-q", "origin", "main"]).unwrap();
+            repos.push(add_repo(&src, &[]).unwrap());
+        }
+        let dir = root.join("ws/feat");
+        let ws =
+            create_workspace(&dir, "feat", "feat", &crate::git::on_branch(&repos, "feat")).unwrap();
+        for name in ["api", "web"] {
+            c(
+                &dir.join(name),
+                &["commit", "-q", "--allow-empty", "-m", "work"],
+            );
+        }
+        let (bin, log) = (root.join("bin"), root.join("gh.log"));
+        fs::create_dir_all(&bin).unwrap();
+        let gh = bin.join("gh");
+        fs::write(
+            &gh,
+            format!(
+                r#"#!/bin/sh
+# PATH is process-wide: other tests running now get the real gh.
+case "$PWD" in */{tag}/*) ;; *) PATH='{orig}' exec gh "$@" ;; esac
+echo "$(basename "$PWD") $*" >> {log}
+case "$1 $2" in
+"pr list") ;;
+"pr create") echo https://github.com/o/$(basename "$PWD")/pull/1 ;;
+"pr view") echo Body ;;
+"pr edit") echo 'gh: edit denied' >&2; exit 1 ;;
+*) exit 1 ;;
+esac
+"#,
+                log = log.display(),
+                orig = std::env::var("PATH").unwrap(),
+                tag = root.file_name().unwrap().to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        std::process::Command::new("chmod")
+            .arg("+x")
+            .arg(&gh)
+            .status()
+            .unwrap();
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        // SAFETY: only prepends a dir holding `gh`; std serializes env access with spawns.
+        unsafe { std::env::set_var("PATH", path) };
+
+        let (prs, warning) = create_linked_prs(&ws, &dir, &[], &NewPr::new("", false)).unwrap();
+        assert_eq!(
+            prs,
+            [
+                (
+                    "api".to_string(),
+                    "https://github.com/o/api/pull/1".to_string()
+                ),
+                ("web".into(), "https://github.com/o/web/pull/1".into())
+            ]
+        );
+        let warning = warning.expect("linking failed");
+        assert!(
+            warning.contains("created") && warning.contains("api:") && warning.contains("web:"),
+            "{warning}"
+        );
+        assert!(warning.contains("edit denied"), "{warning}");
+        let calls = fs::read_to_string(&log).unwrap();
+        for repo in ["api", "web"] {
+            let flag = format!("--repo https://github.com/o/{repo}");
+            for verb in ["pr list", "pr create"] {
+                assert!(
+                    calls
+                        .lines()
+                        .any(|l| l.starts_with(&format!("{repo} {verb}")) && l.contains(&flag)),
+                    "{verb} in {repo} lacks {flag}:\n{calls}"
+                );
+            }
+        }
+        fs::remove_dir_all(&root).unwrap();
+    }
+
     /// Real git against bare origins, a fake `gh` on PATH that logs its argv and runs `-q`
     /// through jq (gh's own filter language) on canned `pr list` JSON.
     #[test]
@@ -775,7 +921,9 @@ esac
         let mut ws = ws;
         ws.repos.iter_mut().find(|r| r.name == "ops").unwrap().base =
             "origin/deleted-parent".into();
-        let prs = create_linked_prs(&ws, &dir, &["ops".into()], &NewPr::new("", false)).unwrap();
+        let (prs, warning) =
+            create_linked_prs(&ws, &dir, &["ops".into()], &NewPr::new("", false)).unwrap();
+        assert_eq!(warning, None);
         assert_eq!(
             prs,
             [
@@ -804,7 +952,8 @@ esac
         selected.repos.retain(|r| r.name == "api");
         fs::write(dir.join("web/not-selected"), "dirty").unwrap();
         fs::write(&log, "").unwrap();
-        let urls = create_linked_prs(&selected, &dir, &[], &NewPr::new("Scoped", true)).unwrap();
+        let (urls, _) =
+            create_linked_prs(&selected, &dir, &[], &NewPr::new("Scoped", true)).unwrap();
         assert_eq!(urls, [("api".into(), "https://gh/api/1".into())]);
         let calls = fs::read_to_string(&log).unwrap();
         assert!(!calls.contains("web") && !calls.contains("pr edit") && calls.contains("--draft"));

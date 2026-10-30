@@ -467,10 +467,11 @@ fn log(provider: Provider, day: i64) -> String {
 #[test]
 fn activity_logs_deduplicate_skip_noise_and_split_at_local_midnight() {
     let day = activity::local_day(now()) - 5;
-    // Claude: 2+100+30 once despite the repeat, plus 1+9 before midnight; cache reads excluded.
+    // Claude: 2+100+50 once despite the repeat (the later line's output_tokens is the real one,
+    // counted on the first line's day), plus 1+9 before midnight; cache reads excluded.
     // Codex: 100-40+10 once despite the repeated total, plus 200-50+20; 10-20 saturates.
     for (provider, expected) in [
-        (Provider::Claude, [(day, 142), (day + 1, 1000)]),
+        (Provider::Claude, [(day, 162), (day + 1, 1000)]),
         (Provider::Codex, [(day, 240), (day + 1, 5)]),
     ] {
         let mut days = activity::parse(
@@ -538,7 +539,7 @@ fn activity_scan_windows_skips_stale_files_and_reuses_cache() {
     let daily = scan(Provider::Claude);
     assert_eq!(daily.first_day, today - 139);
     assert_eq!(daily.tokens.len(), activity::DAYS);
-    assert_eq!(daily.tokens[138..], [284, 2000]);
+    assert_eq!(daily.tokens[138..], [324, 2000]);
     assert_eq!(daily.tokens[..138].iter().sum::<u64>(), 0);
     assert_eq!(scan(Provider::Codex).tokens[138..], [480, 10]);
 
@@ -572,5 +573,34 @@ fn live_activity() {
                 &daily.tokens[activity::DAYS - 3..]
             );
         }
+    }
+}
+
+#[test]
+fn failures_read_message_fields_and_401_as_a_word() {
+    let kind = |v: Value| failure(&message(&v));
+    // Ids, durations and timestamps around a transient error say nothing about auth.
+    assert_eq!(
+        kind(
+            json!({"type":"result","is_error":true,"result":"overloaded","session_id":"s-401-login","duration_ms":1401,"timestamp":"2025-10-04T01:40:12Z"})
+        ),
+        Failure::Temporary
+    );
+    assert_eq!(failure("took 1401ms"), Failure::Temporary);
+    assert_eq!(failure("HTTP 401: nope"), Failure::SignIn);
+    assert_eq!(kind(json!({"code":401,"message":"nope"})), Failure::SignIn);
+    assert_eq!(kind(json!({"errors":["Invalid API key"]})), Failure::SignIn);
+    assert_eq!(kind(json!({"code":-32601})), Failure::Unsupported);
+}
+
+#[test]
+fn window_label_is_singular_for_one() {
+    for (mins, label) in [
+        (1440, "1 day"),
+        (2880, "2 days"),
+        (60, "1 hour"),
+        (10080, "Weekly"),
+    ] {
+        assert_eq!(window_label(&json!(mins)), label);
     }
 }

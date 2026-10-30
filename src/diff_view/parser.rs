@@ -335,7 +335,9 @@ fn parse_hunk(file: &mut File, lines: &[&str], mut ix: usize) -> Result<usize> {
         // context line; `git apply` accepts that, so accept it here too.
         let (tag, text) = match content.as_bytes().first() {
             None => (b' ', ""),
-            Some(&tag) => (tag, &content[1..]),
+            // Only an ASCII tag is sliced past: a multi-byte first char is not a hunk line.
+            Some(&tag) if matches!(tag, b' ' | b'+' | b'-') => (tag, &content[1..]),
+            Some(&tag) => (tag, ""),
         };
         if !matches!(tag, b' ' | b'+' | b'-') {
             return Err(DiffParseError::new(

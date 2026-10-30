@@ -287,6 +287,7 @@ pub fn discover(file: &Path, worktree: &Path) -> Result<Option<Project>> {
                 continue;
             }
             if let Ok(text) = fs::read_to_string(dir.join(name)) {
+                let text = key_text(name, text);
                 toolchain.push_str(&format!("{}:{text}\n", dir.join(name).display()));
             }
         }
@@ -322,6 +323,29 @@ fn language(file: &Path) -> Option<(&'static str, Backend)> {
         "go" => ("go", Backend::Go),
         _ => return None,
     })
+}
+
+/// What of a project file selects its server. Editing a dependency in go.mod or pyproject.toml
+/// must not spawn a second server, so those are reduced to the fields that matter.
+fn key_text(name: &str, text: String) -> String {
+    match name {
+        "go.mod" => text
+            .lines()
+            .filter(|l| matches!(l.split_whitespace().next(), Some("go" | "toolchain")))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        "pyproject.toml" => match toml::from_str::<toml::Value>(&text) {
+            Ok(config) => [
+                config.get("project").and_then(|p| p.get("requires-python")),
+                config.get("tool").and_then(|t| t.get("pyright")),
+                config.get("tool").and_then(|t| t.get("pyrefly")),
+            ]
+            .map(|v| format!("{v:?}"))
+            .join("|"),
+            Err(_) => text,
+        },
+        _ => text,
+    }
 }
 
 fn read_toml(file: &Path) -> Result<toml::Value> {
@@ -437,7 +461,7 @@ fn rust(project: &Project) -> Result<Launch> {
                     15,
                 ) {
                     Ok(installed) => {
-                        if !installed.lines().any(|s| s.starts_with("rust-analyzer"))
+                        let added = if !installed.lines().any(|s| s.starts_with("rust-analyzer"))
                             || !installed.lines().any(|s| s.starts_with("rust-src"))
                         {
                             let mut command = Command::new("rustup");
@@ -458,9 +482,16 @@ fn rust(project: &Project) -> Result<Launch> {
                                     format!(
                                         "Add rust-analyzer and rust-src for the existing toolchain: rustup component add --toolchain {toolchain} rust-analyzer rust-src"
                                     )
-                                })?;
+                                })
+                                .map(drop)
+                        } else {
+                            Ok(())
+                        };
+                        match added {
+                            Ok(()) => which()?,
+                            // Offline: the analyzer already found works; only the sources note remains.
+                            Err(error) => found.map_err(|_| error)?,
                         }
-                        which()?
                     }
                     // Linked/custom toolchains have no components but can ship their own analyzer.
                     Err(error) => found.map_err(|_| error).with_context(|| {
@@ -1024,6 +1055,41 @@ mod tests {
     }
 
     #[test]
+    fn a_found_analyzer_launches_when_adding_rust_src_fails_offline() {
+        #[cfg(feature = "test-support")]
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = fixture("rust-offline", &[("Cargo.toml", "[package]\nname='a'")]);
+        let sysroot = root.join("sysroot");
+        script(&sysroot.join("bin"), "rust-analyzer", "exit 0");
+        let bin = root.join("bin");
+        // rust-analyzer resolves, rust-src is missing, and `component add` cannot download it.
+        script(
+            &bin,
+            "rustup",
+            &format!(
+                "case \"$1\" in\nwhich) echo {}/bin/$4 ;;\ncomponent) [ \"$2\" = list ] && echo rustc || {{ echo 'error: network unreachable' >&2; exit 1; }} ;;\nesac",
+                sysroot.display()
+            ),
+        );
+        let path = format!("{}:{}", bin.display(), std::env::var("PATH").unwrap());
+        let project = Project {
+            root: root.clone(),
+            worktree: root.clone(),
+            language_id: "rust",
+            backend: Backend::Rust,
+            toolchain: String::new(),
+            rust_toolchain: Some("stable".into()),
+            interpreter: None,
+        };
+        let launch = with_env(&[("PATH", Some(path))], || prepare(&project)).unwrap();
+        assert_eq!(launch.program, sysroot.join("bin/rust-analyzer"));
+        assert!(launch.detail.unwrap().contains("standard-library sources"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn rustup_older_than_1_28_is_rejected() {
         assert!(!rustup_is_current("rustup 1.27.1 (54dd3d00f 2024-04-24)"));
         assert!(rustup_is_current("rustup 1.28.0 (6ebc3db2b 2025-03-02)"));
@@ -1321,6 +1387,54 @@ mod tests {
             package.root,
             root.join("Packages/Feature").canonicalize().unwrap()
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn dependency_edits_do_not_change_the_session_key() {
+        #[cfg(feature = "test-support")]
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root = fixture(
+            "dependency-edits",
+            &[
+                ("go.mod", "module m\n\ngo 1.22\n\nrequire a v1.0.0\n"),
+                ("main.go", ""),
+                (
+                    "py/pyproject.toml",
+                    "[project]\nrequires-python='>=3.11'\ndependencies=['a']\n",
+                ),
+                ("py/a.py", ""),
+            ],
+        );
+        let key = |file: &str| {
+            discover(&root.join(file), &root)
+                .unwrap()
+                .unwrap()
+                .session_key()
+        };
+        let (go, py) = (key("main.go"), key("py/a.py"));
+        fs::write(
+            root.join("go.mod"),
+            "module m\n\ngo 1.22\n\nrequire a v1.1.0\nrequire b v2.0.0\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("py/pyproject.toml"),
+            "[project]\nrequires-python='>=3.11'\ndependencies=['a','b']\n",
+        )
+        .unwrap();
+        assert_eq!((key("main.go"), key("py/a.py")), (go.clone(), py.clone()));
+        // The toolchain-selecting fields still split sessions.
+        fs::write(root.join("go.mod"), "module m\n\ngo 1.23\n").unwrap();
+        fs::write(
+            root.join("py/pyproject.toml"),
+            "[project]\nrequires-python='>=3.12'\n",
+        )
+        .unwrap();
+        assert_ne!(key("main.go"), go);
+        assert_ne!(key("py/a.py"), py);
         fs::remove_dir_all(root).unwrap();
     }
 

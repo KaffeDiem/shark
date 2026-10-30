@@ -335,7 +335,12 @@ pub(super) const COMMANDS: &[Row] = &[
         None,
         "forget session thread reset claude codex",
         |s, w, cx| match s.active_chat().cloned() {
-            Some(chat) => chat.update(cx, |c, cx| c.new_conversation(cx)),
+            Some(chat) => {
+                if s.home_shown() {
+                    s.show(Tab::Chat, w, cx);
+                }
+                chat.update(cx, |c, cx| c.new_conversation(cx))
+            }
             None => notify_err(w, cx, "Open a workspace first"),
         },
     ),

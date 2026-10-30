@@ -50,9 +50,11 @@ impl Chat {
         if text.is_empty() {
             return self.open_side(window, cx);
         }
-        self.composer
-            .update(cx, |c, cx| c.set_value("", window, cx));
-        self.ask_side(text, window, cx);
+        // The draft stays if the question didn't go out.
+        if self.ask_side(text, window, cx) {
+            self.composer
+                .update(cx, |c, cx| c.set_value("", window, cx));
+        }
     }
 
     /// Opens the side-question card with an empty field, keeping any draft in the composer.
@@ -82,8 +84,9 @@ impl Chat {
         cx.notify();
     }
 
-    /// Replaces any earlier side question; only the latest is kept.
-    fn ask_side(&mut self, question: String, window: &mut Window, cx: &mut Context<Self>) {
+    /// Replaces any earlier side question; only the latest is kept. Returns whether it started;
+    /// otherwise the card shows why.
+    fn ask_side(&mut self, question: String, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let mut side = Side::new(question.clone(), cx);
         match agent::spawn_side(&self.ws, &self.meta) {
             Ok((mut a, rx)) => match a.send(&question) {
@@ -95,9 +98,11 @@ impl Chat {
             },
             Err(e) => (side.done, side.error) = (true, Some(format!("no side question: {e}"))),
         }
+        let started = !side.done;
         side.focus.focus(window, cx);
         self.side = Some(side);
         cx.notify();
+        started
     }
 
     pub(super) fn apply_side(&mut self, ev: Ev, cx: &mut Context<Self>) {
@@ -151,8 +156,12 @@ impl Chat {
         }
     }
 
-    /// Puts the answer into the composer after any draft, to send or edit.
+    /// Puts the answer into the composer after any draft, to send or edit. Waits for the answer:
+    /// taking the card early would drop the question.
     fn insert_side(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.side.as_ref().is_some_and(|s| s.done) {
+            return;
+        }
         let Some(side) = self.side.take() else { return };
         if !side.text.is_empty() {
             self.composer.update(cx, |c, cx| {
@@ -243,7 +252,7 @@ impl Chat {
                         .on_action(cx.listener(|this, _: &InsertSide, window, cx| {
                             this.insert_side(window, cx)
                         }))
-                        .child(markdown(&side.answer, "side-answer"))
+                        .child(markdown(&side.answer, "side-answer", link_roots(&self.ws)))
                         .when_some(side.error.clone(), |d, e| {
                             d.child(div().text_xs().text_color(theme.danger_foreground).child(e))
                         }),

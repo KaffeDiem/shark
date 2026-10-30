@@ -341,10 +341,10 @@ impl Settings {
         cx.notify();
     }
 
-    /// `None` or the default text drops the override.
+    /// `None`, blank or the default text drops the override.
     pub(crate) fn set_prompt(&mut self, i: usize, text: Option<String>, cx: &mut Context<Self>) {
         let p = &PROMPTS[i];
-        let text = text.filter(|t| t != p.default);
+        let text = text.filter(|t| !t.trim().is_empty() && t != p.default);
         self.with_state(cx, |s| {
             match text {
                 Some(t) => s.prompts.insert(p.id.into(), t),

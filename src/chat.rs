@@ -201,6 +201,15 @@ fn may_report(text: &str) -> bool {
     })
 }
 
+/// A message as it went on the wire, split into the `[shark]` workspace notes put before it
+/// (`repos_changed`) and the text itself.
+fn split_notes(wire: &str) -> (&str, &str) {
+    match wire.split_once("\n\n") {
+        Some((notes, text)) if notes.starts_with("[shark] ") => (notes, text),
+        _ => ("", wire),
+    }
+}
+
 /// A review's prompt (review.rs `prompt`) back as its card, for a replayed transcript: each
 /// `[c<id>] <place>` and its quoted text. The diff it was sent with is unknown by then.
 fn card_of(prompt: &str) -> Option<ReviewCard> {
@@ -262,25 +271,109 @@ pub(crate) fn copy_button(
         .child(Clipboard::new(id).value(text).tooltip("Copy"))
 }
 
+/// Where `cwd`-relative chat links may point: the workspace dir, then each repo's worktree.
+pub(crate) fn link_roots(ws: &Workspace) -> Vec<PathBuf> {
+    let dir = ws.dir();
+    let repos = ws.repos.iter().map(|r| dir.join(&r.name));
+    std::iter::once(dir.clone()).chain(repos).collect()
+}
+
+/// A file URL for `path`; Foundation escapes spaces and Unicode.
+fn file_url(path: &str) -> Option<String> {
+    use objc2_foundation::{NSString, NSURL};
+    let url = NSURL::fileURLWithPath(&NSString::from_str(path)).absoluteString();
+    url.map(|u| u.to_string())
+}
+
+/// `s` with `%XX` escapes decoded; `None` when it has none or they are not valid UTF-8.
+fn percent_decode(s: &str) -> Option<String> {
+    let (b, mut out, mut i) = (s.as_bytes(), Vec::new(), 0);
+    while i < b.len() {
+        let hex = |k: usize| b.get(k).and_then(|c| (*c as char).to_digit(16));
+        match (b[i], hex(i + 1), hex(i + 2)) {
+            (b'%', Some(h), Some(l)) => {
+                out.push((h * 16 + l) as u8);
+                i += 3;
+            }
+            (c, ..) => {
+                out.push(c);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8(out).ok().filter(|d| d != s)
+}
+
+/// What a clicked link opens. URLs pass through; paths (absolute, `~/`, or relative to one
+/// of `roots`, with any `:N[:M]` or `#L..` location dropped) become file URLs.
+fn link_target(url: &str, roots: &[PathBuf]) -> Option<String> {
+    if url.contains("://") || url.starts_with("mailto:") || url.starts_with("tel:") {
+        return Some(url.to_string());
+    }
+    let mut stripped = url;
+    if let Some((p, frag)) = url.rsplit_once('#')
+        && frag
+            .strip_prefix('L')
+            .is_some_and(|d| d.starts_with(|c: char| c.is_ascii_digit()))
+    {
+        stripped = p;
+    }
+    for _ in 0..2 {
+        match stripped.rsplit_once(':') {
+            Some((p, n)) if !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()) => stripped = p,
+            _ => break,
+        }
+    }
+    // A filename may itself contain ':' or '#', so the unstripped form is the fallback.
+    let expand = |p: &str| match p.strip_prefix("~/") {
+        Some(rest) => crate::state::home().join(rest),
+        None => PathBuf::from(p),
+    };
+    let first = expand(stripped);
+    // Links are often percent-encoded (`a%20b.txt`); try the decoded path first.
+    for p in [
+        percent_decode(stripped).map(|d| expand(&d)),
+        Some(first.clone()),
+        Some(expand(url)),
+    ]
+    .into_iter()
+    .flatten()
+    {
+        if p.is_absolute() {
+            if p.exists() {
+                return file_url(&p.to_string_lossy());
+            }
+        } else if let Some(hit) = roots.iter().map(|r| r.join(&p)).find(|c| c.exists()) {
+            // `components` drops a leading `./`.
+            return file_url(&hit.components().collect::<PathBuf>().to_string_lossy());
+        }
+    }
+    if first.is_absolute() {
+        return file_url(&first.to_string_lossy());
+    }
+    Some(if url.starts_with("www.") {
+        format!("https://{url}")
+    } else {
+        url.to_string()
+    })
+}
+
 /// Markdown whose code blocks get the language and a copy button in their top-right corner.
 /// The blocks keep the top padding the language label had, so the corner never covers code.
-pub(crate) fn markdown(md: &Entity<TextViewState>, group: &'static str) -> TextView {
+/// Relative file links resolve against `roots`.
+pub(crate) fn markdown(
+    md: &Entity<TextViewState>,
+    group: &'static str,
+    roots: Vec<PathBuf>,
+) -> TextView {
     TextView::new(md)
         .selectable(true)
-        .on_link_click(|url, event, _, cx| {
+        .on_link_click(move |url, event, _, cx| {
             if !event.standard_click() && !event.is_middle_click() {
                 return;
             }
-            if Path::new(url.as_str()).is_absolute() {
-                use objc2_foundation::{NSString, NSURL};
-                // Bare file paths need a file URL; Foundation escapes spaces and Unicode.
-                if let Some(file_url) =
-                    NSURL::fileURLWithPath(&NSString::from_str(url)).absoluteString()
-                {
-                    cx.open_url(&file_url.to_string());
-                }
-            } else {
-                cx.open_url(url);
+            if let Some(target) = link_target(url, &roots) {
+                cx.open_url(&target);
             }
         })
         .style(TextViewStyle::default().code_block(StyleRefinement::default().pt(px(28.))))
@@ -453,6 +546,8 @@ pub struct Chat {
     unread: VecDeque<usize>,
     /// The turn was interrupted; its result reads "interrupted".
     cut: bool,
+    /// `total_cost_usd` of the last result: claude reports a running total, shown per turn.
+    cost_total: f64,
     /// SIGTERM fallback for an interrupt claude doesn't act on.
     stopping: Option<Task<()>>,
     /// Applying stored history: nothing is emitted to the app.
@@ -814,6 +909,7 @@ impl Chat {
             prs_at: None,
             unread: VecDeque::new(),
             cut: false,
+            cost_total: 0.,
             stopping: None,
             replaying: false,
             queue: vec![],
@@ -873,6 +969,7 @@ impl Chat {
             self.meta.session_id.clone(),
         );
         (self.busy, self.cut, self.replaying) = (false, false, true);
+        self.cost_total = 0.;
         for ev in evs {
             // A turn that never got its result was cut off by quitting (or a crash).
             if matches!(ev, Ev::Init { .. }) && self.busy {
@@ -1105,10 +1202,35 @@ impl Chat {
         cx.notify();
     }
 
+    /// Why the plan can't be approved or built now: none yet, already approved, or an older
+    /// version is on screen (approving always takes the latest).
+    pub fn plan_blocker(&self, cx: &App) -> Option<&'static str> {
+        let p = self.plan.read(cx);
+        let latest = p.versions.len().checked_sub(1);
+        if latest.is_none() {
+            Some("no plan to approve yet; the agent submits one in plan mode (shift-tab)")
+        } else if p.approved == latest {
+            Some("this plan is already approved; ask for a revision to approve a new version")
+        } else if latest != Some(p.shown) {
+            Some("an older version is shown; press l for the latest, then approve")
+        } else {
+            None
+        }
+    }
+
+    /// Says why the plan can't be approved or built, if it can't. Returns whether it refused.
+    pub fn refuse_plan(&mut self, cx: &mut Context<Self>) -> bool {
+        let why = self.plan_blocker(cx);
+        if let Some(why) = why {
+            self.push(Block::Info(why.into()), cx);
+        }
+        why.is_some()
+    }
+
     /// Ends plan mode and tells the agent to build the latest plan. A draft rides along.
     pub fn approve_plan(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let why = if self.plan.read(cx).latest().is_none() {
-            "no plan to approve yet; the agent submits one in plan mode (shift-tab)"
+        let why = if let Some(why) = self.plan_blocker(cx) {
+            why
         } else if self.busy {
             "the agent is still working; approve when the turn ends (ctrl-c stops it)"
         } else {
@@ -2099,12 +2221,19 @@ impl Chat {
                             self.steered = false;
                         }
                     }
-                    None => self.blocks.push(match card_of(&text) {
-                        Some(card) => Block::Review(Rc::new(card), false),
-                        None => Block::User(text, false),
-                    }),
+                    None => {
+                        // A replayed message carries the workspace notes sent with it.
+                        let (notes, text) = split_notes(&text);
+                        self.blocks
+                            .extend(notes.lines().map(|n| Block::Info(n.into())));
+                        self.blocks.push(match card_of(text) {
+                            Some(card) => Block::Review(Rc::new(card), false),
+                            None => Block::User(text.into(), false),
+                        });
+                    }
                 }
             }
+            Ev::Notice(text) => self.blocks.push(Block::Info(text)),
             Ev::TextDelta(s) => match self.live_text() {
                 Some(bi) => {
                     if let Block::Text { md, src, .. } = &mut self.blocks[bi] {
@@ -2252,6 +2381,16 @@ impl Chat {
                 // every resume would fail the same way. (Replay restores the session after.)
                 let gone = is_error && text.starts_with("No conversation found with session ID");
                 let took = duration(secs);
+                // A lower total is a fresh process's: show it as it is.
+                let turn = if cost >= self.cost_total {
+                    cost - self.cost_total
+                } else {
+                    cost
+                };
+                if cost > 0. {
+                    self.cost_total = cost; // codex and failures report none
+                }
+                let cost = turn;
                 self.blocks.push(Block::Info(if cut {
                     format!("interrupted · {took} · ${cost:.2}")
                 } else if is_error {
@@ -2588,7 +2727,7 @@ impl Chat {
             (Block::Text { md, .. }, _) => column()
                 .text_size(px(14.))
                 .line_height(relative(1.5))
-                .child(markdown(md, "row")),
+                .child(markdown(md, "row", link_roots(&self.ws))),
             (Block::Tool(c), _) => column().text_sm().child(tool_row(c)),
             // Calls sit under the group's summary text, past its chevron and gap.
             (Block::Tools { calls, .. }, Some(j)) => {
@@ -3523,6 +3662,108 @@ mod tests {
         assert_eq!(full_input(&bash), "command: a\nb\ntimeout: 5");
         assert_eq!(cap("abcdef", 3), "abc…");
     }
+
+    /// A workspace dir holding `repo/src/lib.rs`, `repo/README.md`, and `repo/a b å.txt`.
+    fn link_fixture(tag: &str) -> (PathBuf, Vec<PathBuf>) {
+        let ws = std::env::temp_dir().join(format!("shark-links-{tag}-{}", std::process::id()));
+        let repo = ws.join("repo");
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        for f in ["src/lib.rs", "README.md", "a b å.txt", "x:1.txt"] {
+            std::fs::write(repo.join(f), "").unwrap();
+        }
+        (ws.clone(), vec![ws, repo])
+    }
+
+    #[test]
+    fn link_target_resolves_relative_paths() {
+        let (ws, roots) = link_fixture("rel");
+        let at = |rel: &str| Some(format!("file://{}/{rel}", ws.display()));
+        // Prefixed by the repo name, resolved from the workspace dir.
+        assert_eq!(
+            link_target("repo/src/lib.rs", &roots),
+            at("repo/src/lib.rs")
+        );
+        // Relative to the repo worktree.
+        assert_eq!(link_target("src/lib.rs", &roots), at("repo/src/lib.rs"));
+        for url in [
+            "src/lib.rs:42",
+            "src/lib.rs:42:7",
+            "src/lib.rs#L10",
+            "src/lib.rs#L10-L20",
+            "src/lib.rs#L10C3",
+        ] {
+            assert_eq!(link_target(url, &roots), at("repo/src/lib.rs"), "{url}");
+        }
+        assert_eq!(link_target("./README.md#L10", &roots), at("repo/README.md"));
+        assert_eq!(
+            link_target("./repo/README.md", &roots),
+            at("repo/README.md")
+        );
+        // Foundation escapes spaces and Unicode.
+        assert_eq!(
+            link_target("a b å.txt", &roots),
+            at("repo/a%20b%20a%CC%8A.txt")
+        );
+        // Percent escapes decode before the lookup, with and without a location suffix.
+        for url in [
+            "a%20b%20%C3%A5.txt",
+            "./a%20b%20a%CC%8A.txt:3",
+            "a%20b å.txt#L2",
+        ] {
+            assert_eq!(
+                link_target(url, &roots),
+                at("repo/a%20b%20a%CC%8A.txt"),
+                "{url}"
+            );
+        }
+        std::fs::create_dir_all(ws.join("docs")).unwrap();
+        std::fs::write(ws.join("docs/caf\u{e9} 1.txt"), "").unwrap();
+        assert_eq!(
+            link_target("docs/caf%C3%A9%201.txt", &roots),
+            at("docs/cafe%CC%81%201.txt")
+        );
+        // A literal '%' in the name still resolves.
+        std::fs::write(ws.join("100%.txt"), "").unwrap();
+        assert_eq!(link_target("100%.txt", &roots), at("100%25.txt"));
+        // A ':' that is part of the filename still resolves.
+        assert_eq!(link_target("x:1.txt", &roots), at("repo/x:1.txt"));
+    }
+
+    #[test]
+    fn link_target_passes_through_and_falls_back() {
+        let (ws, roots) = link_fixture("pass");
+        for url in [
+            "https://example.com/a:1#L2",
+            "http://example.com",
+            "file:///tmp/a%20b.png",
+            "mailto:a@b.c",
+            "tel:+4512345678",
+            "nope/missing.rs",
+            "missing.rs:3",
+            "#section",
+        ] {
+            assert_eq!(link_target(url, &roots).as_deref(), Some(url), "{url}");
+        }
+        assert_eq!(
+            link_target("www.example.com/x", &roots).as_deref(),
+            Some("https://www.example.com/x")
+        );
+        // Without roots a relative path has nowhere to resolve.
+        assert_eq!(
+            link_target("src/lib.rs", &[]).as_deref(),
+            Some("src/lib.rs")
+        );
+        // Absolute paths become file URLs, existing or not.
+        let abs = ws.join("repo/src/lib.rs");
+        assert_eq!(
+            link_target(&format!("{}:42", abs.display()), &roots),
+            Some(format!("file://{}", abs.display()))
+        );
+        assert_eq!(
+            link_target("/tmp/shark-missing/a b.png", &roots).as_deref(),
+            Some("file:///tmp/shark-missing/a%20b.png")
+        );
+    }
 }
 
 #[cfg(all(test, feature = "test-support"))]
@@ -3545,14 +3786,21 @@ pub(crate) mod ui_tests {
 
     #[gpui_kit::test]
     fn markdown_links_open_local_previews_and_web_urls(cx: &mut TestAppContext) {
-        struct Links(Entity<TextViewState>);
+        struct Links(Entity<TextViewState>, Vec<PathBuf>);
         impl Render for Links {
             fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-                markdown(&self.0, "links")
+                markdown(&self.0, "links", self.1.clone())
             }
         }
         cx.update(gpui_kit::init);
+        let ws = std::env::temp_dir().join(format!("shark-link-ui-{}", std::process::id()));
+        std::fs::create_dir_all(ws.join("api/src")).unwrap();
+        std::fs::write(ws.join("api/src/lib.rs"), "").unwrap();
+        let roots = vec![ws.clone(), ws.join("api")];
+        let lib = format!("file://{}/api/src/lib.rs", ws.display());
         for (target, expected) in [
+            ("api/src/lib.rs", lib.as_str()),
+            ("src/lib.rs:42", lib.as_str()),
             (
                 "/tmp/shark-better-bg-render/activity-dark-hover.png",
                 "file:///tmp/shark-better-bg-render/activity-dark-hover.png",
@@ -3575,7 +3823,10 @@ pub(crate) mod ui_tests {
             ),
         ] {
             let (_, view) = cx.add_window_view(|_, cx| {
-                Links(cx.new(|cx| TextViewState::markdown(&format!("[Preview](<{target}>)"), cx)))
+                Links(
+                    cx.new(|cx| TextViewState::markdown(&format!("[Preview](<{target}>)"), cx)),
+                    roots.clone(),
+                )
             });
             let view: &mut VisualTestContext = view;
             let before = view.opened_url();
@@ -3995,6 +4246,54 @@ exec cat >/dev/null
         let _ = std::fs::remove_file(ws.dir());
     }
 
+    /// claude's `total_cost_usd` runs across turns (and resumes): each turn shows its share, in
+    /// replayed history too, and a lower total counts as a reset.
+    #[gpui_kit::test]
+    fn turn_cost_is_the_running_totals_delta(cx: &mut TestAppContext) {
+        cx.update(gpui_kit::init);
+        let ws = Workspace {
+            name: format!("cost-test-{}", std::process::id()),
+            ..Default::default()
+        };
+        let meta = ChatMeta {
+            id: ws.name.clone(),
+            ..Default::default()
+        };
+        let (_, chat) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| Chat::new(ws.clone(), meta, false, w, cx))
+                })
+            })
+            .unwrap();
+        let result = |cost| Ev::Result {
+            is_error: false,
+            text: String::new(),
+            cost,
+            secs: 1,
+        };
+        let infos = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                (chat.read(cx).blocks.iter())
+                    .filter_map(|b| match b {
+                        Block::Info(t) => t.rsplit_once('$').map(|(_, c)| c.to_string()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+            })
+        };
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.load_history(vec![result(1.5), result(1.75)], cx);
+                c.apply(result(2.0), cx); // a live turn goes on from the history's total
+                c.apply(result(0.5), cx); // a new process starts over
+                c.apply(result(0.), cx); // codex: no price
+                c.apply(result(0.75), cx);
+            })
+        });
+        assert_eq!(infos(cx), ["1.50", "0.25", "0.25", "0.50", "0.00", "0.25"]);
+    }
+
     /// cmd-shift-enter asks the draft on the side: the answer streams into the card, the chat
     /// never sees it, and enter puts the answer into the composer.
     #[gpui_kit::test]
@@ -4041,6 +4340,12 @@ exec cat >/dev/null
         });
         act(cx, &|w, cx| w.input("what is x?", cx));
         act(cx, &|w, cx| w.press("cmd-shift-enter", cx));
+        // Enter before the answer is in would drop the card and the question with it.
+        act(cx, &|w, cx| w.press("enter", cx));
+        cx.update(|cx| {
+            let side = chat.read(cx).side.as_ref().expect("still asking");
+            assert!(!side.done && side.question == "what is x?");
+        });
         let result = || Ev::Result {
             is_error: false,
             text: String::new(),
@@ -4105,6 +4410,21 @@ exec cat >/dev/null
                 let side = c.side.as_ref().unwrap();
                 assert!(side.done && side.error.as_deref() == Some("No conversation found"));
             })
+        });
+
+        // A question that can't start (codex has no side questions) keeps the draft.
+        act(cx, &|w, cx| {
+            chat.update(cx, |c, cx| {
+                c.meta.model = Some("codex:gpt-6-astra".into());
+                c.composer.update(cx, |i, cx| i.set_value("keep me", w, cx));
+                c.ask_draft_aside(w, cx);
+            })
+        });
+        cx.update(|cx| {
+            let c = chat.read(cx);
+            assert_eq!(c.composer.read(cx).value().as_ref(), "keep me");
+            let err = c.side.as_ref().and_then(|s| s.error.as_deref());
+            assert!(err.is_some_and(|e| e.contains("Claude model")), "{err:?}");
         });
         let _ = std::fs::remove_file(ws.dir());
     }
@@ -4202,6 +4522,24 @@ exec cat >/dev/null
             assert_eq!((p.shown, p.changes), (1, true), "the new version, redlined");
             assert_eq!(p.number_of("t1"), Some(1));
         });
+        // An older version on screen (h) isn't approved by `a`: only the latest is.
+        let users = |cx: &mut TestAppContext| {
+            cx.update(|cx| {
+                (chat.read(cx).blocks.iter())
+                    .filter(|b| matches!(b, Block::User(t, _) if t == APPROVED))
+                    .count()
+            })
+        };
+        cx.update(|cx| chat.update(cx, |c, cx| c.plan.update(cx, |p, _| p.shown = 0)));
+        act(cx, &|w, cx| chat.update(cx, |c, cx| c.approve_plan(w, cx)));
+        cx.update(|cx| {
+            let c = chat.read(cx);
+            assert!(matches!(c.blocks.last(), Some(Block::Info(t)) if t.contains("older version")));
+            assert_eq!(c.plan.read(cx).approved, None);
+            assert!(c.meta.plan, "still planning");
+        });
+        cx.update(|cx| chat.update(cx, |c, cx| c.plan.update(cx, |p, _| p.shown = 1)));
+        assert_eq!(users(cx), 0);
         act(cx, &|w, cx| chat.update(cx, |c, cx| c.approve_plan(w, cx)));
         cx.update(|cx| {
             let c = chat.read(cx);
@@ -4210,6 +4548,17 @@ exec cat >/dev/null
             assert_eq!(c.plan.read(cx).approved, Some(1));
             assert!(matches!(c.blocks.last(), Some(Block::User(t, _)) if t == APPROVED));
         });
+        // Approved already: a second `a` or `n` says so instead of sending it again.
+        cx.update(|cx| chat.update(cx, |c, _| c.busy = false));
+        act(cx, &|w, cx| chat.update(cx, |c, cx| c.approve_plan(w, cx)));
+        cx.update(|cx| {
+            let c = chat.read(cx);
+            assert!(
+                matches!(c.blocks.last(), Some(Block::Info(t)) if t.contains("already approved"))
+            );
+            assert!(!c.busy);
+        });
+        assert_eq!(users(cx), 1, "approved once");
         act(cx, &|w, cx| {
             chat.update(cx, |c, cx| {
                 c.busy = false;
@@ -4691,6 +5040,36 @@ exec cat >/dev/null
         });
     }
 
+    /// A replayed message that went out with workspace notes shows them as Info rows, not in
+    /// the user's bubble.
+    #[gpui_kit::test]
+    fn replay_splits_workspace_notes_from_the_message(cx: &mut TestAppContext) {
+        let chat = open_chat("note-replay", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.replaying = true;
+                let wire = "[shark] New base: `api` now targets `dev` (was `main`).\n[shark] Repo `web` joined.\n\nfix it";
+                c.apply(Ev::User(wire.into()), cx);
+                c.replaying = false;
+                let kinds: Vec<String> = (c.blocks.iter())
+                    .map(|b| match b {
+                        Block::Info(t) => format!("info {t}"),
+                        Block::User(t, _) => format!("user {t}"),
+                        _ => "other".into(),
+                    })
+                    .collect();
+                assert_eq!(
+                    kinds,
+                    [
+                        "info [shark] New base: `api` now targets `dev` (was `main`).",
+                        "info [shark] Repo `web` joined.",
+                        "user fix it"
+                    ]
+                );
+            })
+        });
+    }
+
     /// A codex turn as the chat sees it: a message sent mid-turn joins the running turn with no
     /// new init, and once read nothing stays unread or steered. One codex refuses is never
     /// echoed, and doesn't hold up the next.
@@ -4864,6 +5243,51 @@ exec cat >/dev/null
             })
         });
         assert_eq!(emitted.get(), 1, "only the live TurnDone");
+    }
+
+    /// What the CLI writes for /compact is notices, not the user's messages, live or replayed;
+    /// a slash command's echo folds into the bubble that was typed.
+    #[gpui_kit::test]
+    fn cli_lines_are_not_user_bubbles(cx: &mut TestAppContext) {
+        let lines = [
+            r#"{"type":"user","isSynthetic":true,"isReplay":false,"message":{"content":"This session is being continued from a previous conversation..."}}"#,
+            r#"{"type":"user","isReplay":true,"message":{"content":"<local-command-stdout>Compacted </local-command-stdout>"}}"#,
+            r#"{"type":"result","subtype":"success","local_command":"compact","is_error":false,"result":"","total_cost_usd":0,"duration_ms":0}"#,
+        ];
+        let evs = || lines.iter().flat_map(|l| crate::agent::parse(l));
+        let infos = |c: &Chat| {
+            (c.blocks.iter())
+                .filter_map(|b| match b {
+                    Block::Info(t) => Some(t.clone()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+        };
+        let live = open_chat("compact-live", cx);
+        cx.update(|cx| {
+            live.update(cx, |c, cx| {
+                c.busy = true; // a message sent mid-turn is queued until echoed
+                c.sent("/compact".into(), None, cx);
+                assert!(matches!(&c.blocks[0], Block::User(_, true)));
+                evs().for_each(|e| c.apply(e, cx));
+                assert!(matches!(&c.blocks[0], Block::User(_, true)), "not echoed yet");
+                let echo = r#"{"type":"user","isReplay":true,"message":{"content":"<command-message>compact</command-message>\n<command-name>/compact</command-name>\n<command-args></command-args>"}}"#;
+                crate::agent::parse(echo).into_iter().for_each(|e| c.apply(e, cx));
+                let users: Vec<_> = (c.blocks.iter())
+                    .filter(|b| matches!(b, Block::User(..)))
+                    .collect();
+                assert!(matches!(users[..], [Block::User(t, false)] if t == "/compact"));
+                assert_eq!(infos(c)[..2], ["Conversation compacted", "Compacted"]);
+            })
+        });
+        let replay = open_chat("compact-replay", cx);
+        cx.update(|cx| {
+            replay.update(cx, |c, cx| {
+                c.load_history(evs().collect(), cx);
+                assert!(!c.blocks.iter().any(|b| matches!(b, Block::User(..))));
+                assert_eq!(infos(c)[..2], ["Conversation compacted", "Compacted"]);
+            })
+        });
     }
 
     /// While a turn runs Enter queues; the queue is driven from the keyboard, steers with

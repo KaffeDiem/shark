@@ -8,7 +8,7 @@ use gpui_kit::component::input::{
     Search, Undo,
 };
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{RopeExt as _, WindowExt as _};
+use gpui_kit::component::{Rope, RopeExt as _, WindowExt as _};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -89,6 +89,9 @@ pub struct FileEditor {
     /// `outline` indices around the cursor, outermost first: the jump bar's path.
     pub(crate) crumbs: Vec<usize>,
     snippets: snippets::Snippets,
+    /// Text before and after the last change command (`cw`, `o`, ...): GPUI records its edit
+    /// and its typing as two undo steps, Vim as one.
+    change: Option<(Rope, Option<Rope>)>,
     _subs: Vec<Subscription>,
     _poll: Task<()>,
 }
@@ -178,6 +181,7 @@ impl FileEditor {
             outline: vec![],
             crumbs: vec![],
             snippets: snippets::Snippets::default(),
+            change: None,
             _subs: subs,
             _poll,
         };
@@ -247,10 +251,16 @@ impl FileEditor {
 
     /// Reads the file again: replaces a clean buffer, flags a conflict on a dirty one.
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.read_disk(false, window, cx);
+    }
+
+    /// `discard`: take the disk version even over unsaved edits, which stay if the read fails.
+    fn read_disk(&mut self, discard: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.saving {
             return;
         }
-        let (abs, saves, seen) = (self.abs.clone(), self.saves, self.stat);
+        let seen = if discard { None } else { self.stat };
+        let (abs, saves) = (self.abs.clone(), self.saves);
         cx.spawn_in(window, async move |this, cx| {
             let read = cx
                 .background_executor()
@@ -272,18 +282,25 @@ impl FileEditor {
                 e.stat = read.as_ref().ok().map(|(stat, _)| *stat);
                 let text = read.map(|(_, b)| b);
                 let fp = text.as_ref().map(fingerprint).ok();
-                if e.loaded && fp == Some(e.disk) {
+                if e.loaded && !discard && fp == Some(e.disk) {
                     return;
                 }
                 // Deleted or no longer UTF-8: keep the buffer and let the user decide.
+                let bad_utf8 =
+                    !e.loaded && text.as_ref().is_ok_and(|b| std::str::from_utf8(b).is_err());
                 let text = text.ok().and_then(|b| String::from_utf8(b).ok());
+                if bad_utf8 {
+                    let msg = format!("{} is not UTF-8 text and cannot be edited", e.path);
+                    window.push_notification(Notification::error(msg), cx);
+                }
                 match (text, fp) {
-                    (Some(_), _) if e.dirty => e.conflict = true,
+                    (Some(_), _) if e.dirty && !discard => e.conflict = true,
                     (None, _) => e.conflict = e.loaded,
                     (Some(text), Some(fp)) => {
                         e.snippets.resolve = None;
                         e.language_changed();
                         e.disk = fp;
+                        e.dirty = false;
                         e.conflict = false;
                         e.input.update(cx, |i, cx| {
                             let pos = i.cursor_position();
@@ -314,10 +331,7 @@ impl FileEditor {
     /// Throws the edits away and takes the disk version.
     pub fn discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.saves += 1; // Invalidate reads started before the discard.
-        self.dirty = false;
-        self.disk = 0;
-        self.stat = None;
-        self.reload(window, cx);
+        self.read_disk(true, window, cx);
     }
 
     /// Writes the buffer unless someone else changed the file since it was read (then `force`).
@@ -380,12 +394,23 @@ impl FileEditor {
     /// Runs one key through Vim; returns whether it was consumed.
     fn vim_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let before = self.vim.mode;
+        let text_before = self.input.read(cx).text().clone();
         let Some((edited, cmd)) =
             apply_vim_key_to(&mut self.vim, &self.input, key, self.external, window, cx)
         else {
             return false;
         };
         self.dirty |= edited;
+        if self.vim.mode == vim::Mode::Insert && before != vim::Mode::Insert {
+            self.change = edited.then_some((text_before, None));
+        } else if before == vim::Mode::Insert {
+            let text = self.input.read(cx).text().clone();
+            if let Some(c) = &mut self.change {
+                c.1 = Some(text);
+            }
+        } else if edited {
+            self.change = None;
+        }
         if let Some(cmd) = cmd {
             self.run(cmd, window, cx);
         }
@@ -394,6 +419,17 @@ impl FileEditor {
         }
         cx.notify();
         true
+    }
+
+    /// The text an undo (or redo) of the last change command ends at, when it takes two steps.
+    fn change_target(&self, redo: bool, cx: &App) -> Option<Rope> {
+        let (before, after) = self.change.as_ref()?;
+        let (from, to) = if redo {
+            (before, after.as_ref()?)
+        } else {
+            (after.as_ref()?, before)
+        };
+        (self.input.read(cx).text() == from).then(|| to.clone())
     }
 
     fn run(&mut self, cmd: vim::Cmd, window: &mut Window, cx: &mut Context<Self>) {
@@ -405,6 +441,8 @@ impl FileEditor {
                 return self.save(false, window, cx);
             }
             SaveQuit | Quit => return window.dispatch_action(Box::new(CloseFile), cx),
+            NextChat => return window.dispatch_action(Box::new(crate::NextChat), cx),
+            PrevChat => return window.dispatch_action(Box::new(crate::PrevChat), cx),
             Outline => return window.dispatch_action(Box::new(crate::DocumentSymbols), cx),
             Definition => {
                 return window.dispatch_action(Box::new(gpui_kit::base::input::GoToDefinition), cx);
@@ -433,19 +471,60 @@ impl FileEditor {
             Indent => Box::new(self::Indent),
             Outdent => Box::new(self::Outdent),
         };
+        let indent = matches!(cmd, Indent | Outdent);
+        let again = match cmd {
+            Undo | Redo => self
+                .change_target(cmd == Redo, cx)
+                .map(|t| (cmd == Redo, t, 8)),
+            _ => None,
+        };
         // Undo, indent and friends edit even in normal mode.
         self.vim_action = true;
         self.input.update(cx, |i, cx| i.set_readonly(false, cx));
         window.dispatch_action(action, cx);
         let this = cx.entity().downgrade();
-        window.defer(cx, move |_, cx| {
-            this.update(cx, |e, cx| {
-                e.vim_action = false;
-                e.sync_readonly(cx);
-                e.clamp_cursor(cx);
-            })
-            .ok();
+        window.defer(cx, move |window, cx| {
+            this.update(cx, |e, cx| e.after_action(indent, again, window, cx))
+                .ok();
         });
+    }
+
+    /// Steps undo/redo on until the text is the target, then restores Normal mode.
+    fn after_action(
+        &mut self,
+        indent: bool,
+        again: Option<(bool, Rope, u8)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((redo, target, left)) = again
+            && left > 0
+            && *self.input.read(cx).text() != target
+        {
+            let action: Box<dyn Action> = if redo {
+                Box::new(self::Redo)
+            } else {
+                Box::new(self::Undo)
+            };
+            window.dispatch_action(action, cx);
+            let this = cx.entity().downgrade();
+            return window.defer(cx, move |window, cx| {
+                let again = Some((redo, target, left - 1));
+                this.update(cx, |e, cx| e.after_action(indent, again, window, cx))
+                    .ok();
+            });
+        }
+        self.vim_action = false;
+        self.sync_readonly(cx);
+        if indent {
+            // `>>` and `V>` leave the caret on the first line's first non-blank.
+            self.input.update(cx, |i, cx| {
+                let r = i.selected_range();
+                let at = vim::first_nonblank_at(i.text(), r.start.min(r.end));
+                i.set_selected_range(at..at, cx);
+            });
+        }
+        self.clamp_cursor(cx);
     }
 }
 
@@ -1064,6 +1143,209 @@ mod ui_tests {
             let i = editor.read(cx).input.read(cx);
             assert_eq!((i.value().as_ref(), i.cursor()), ("one\ntwo\n", 4));
         });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Only Enter accepts a completion (Tab would indent), so Tab keeps walking the tabstops.
+    #[gpui_kit::test]
+    async fn tab_with_a_completion_menu_open_moves_to_the_next_tabstop(cx: &mut TestAppContext) {
+        use crate::lsp::document::Stop;
+        let (dir, _, window, editor) = open_editor("a.py", "tab-menu", "foo(va, y)", cx).await;
+        cx.update_window(window, |_, w, cx| {
+            editor.update(cx, |e, cx| {
+                e.set_vim(false, cx);
+                let stops = [(1, 4, 6), (2, 8, 9)];
+                e.snippets.active = Some(snippets::Session {
+                    text: "foo(va, y)".into(),
+                    stops: stops
+                        .map(|(index, start, end)| Stop { index, start, end })
+                        .into(),
+                    index: 1,
+                });
+                e.input.update(cx, |i, cx| {
+                    i.set_selected_range(6..6, cx);
+                    let item = lsp_types::CompletionItem {
+                        label: "value".into(),
+                        ..Default::default()
+                    };
+                    i.present_completion_items(4, "va", vec![item], cx);
+                });
+            });
+            focus(&editor, w, cx);
+            w.render_frame(cx); // the menu hosts its actions once drawn
+            w.press("tab", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let i = editor.read(cx).input.read(cx);
+            assert_eq!(i.value().as_ref(), "foo(va, y)");
+            assert_eq!(i.selected_value().as_ref(), "y");
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Types `text` in Insert mode (`keys` first), then Escape.
+    fn type_in(cx: &mut TestAppContext, window: AnyWindowHandle, keys: &[&str], text: &str) {
+        cx.update_window(window, |_, w, cx| {
+            for k in keys {
+                w.press(k, cx);
+            }
+            w.input(text, cx);
+            w.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    fn state(
+        cx: &mut TestAppContext,
+        editor: &Entity<FileEditor>,
+    ) -> (String, std::ops::Range<usize>) {
+        cx.update(|cx| {
+            let i = editor.read(cx).input.read(cx);
+            (i.value().to_string(), i.selected_range())
+        })
+    }
+
+    #[gpui_kit::test]
+    async fn failed_discard_keeps_the_edits_marked_dirty(cx: &mut TestAppContext) {
+        let (dir, file, window, editor) = open_editor("a.txt", "discard", "one\n", cx).await;
+        cx.update_window(window, |_, w, cx| focus(&editor, w, cx))
+            .unwrap();
+        type_in(cx, window, &["i"], "x");
+        cx.update(|cx| assert!(editor.read(cx).dirty));
+        // The file is gone: the reload fails, and closing must still ask.
+        fs::remove_file(&file).unwrap();
+        cx.update_window(window, |_, w, cx| {
+            editor.update(cx, |e, cx| e.discard(w, cx))
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let e = editor.read(cx);
+            assert!(e.dirty && e.conflict);
+        });
+        assert_eq!(state(cx, &editor).0, "xone\n");
+        // A readable file is taken over the edits.
+        fs::write(&file, "two\n").unwrap();
+        cx.update_window(window, |_, w, cx| {
+            editor.update(cx, |e, cx| e.discard(w, cx))
+        })
+        .unwrap();
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            editor.read(cx).input.read(cx).value().as_ref() == "two\n"
+        })
+        .await;
+        cx.update(|cx| {
+            let e = editor.read(cx);
+            assert!(!e.dirty && !e.conflict);
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    async fn non_utf8_file_says_why_it_is_blank(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("shark-utf8-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        fs::write(&file, [b'a', 0xff, 0xfe]).unwrap();
+        cx.update(gpui_kit::init);
+        let (window, editor) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| FileEditor::new("r/a.txt".into(), file, true, w, cx))
+                })
+            })
+            .unwrap();
+        cx.wait_for(window, Duration::from_secs(10), |w, cx| {
+            !w.notifications(cx).is_empty()
+        })
+        .await;
+        cx.update(|cx| assert!(!editor.read(cx).loaded));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    async fn g_t_and_g_shift_t_switch_chats(cx: &mut TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+        let (dir, _, window, editor) = open_editor("a.txt", "gt", "one\n", cx).await;
+        let seen = Rc::new((Cell::new(0), Cell::new(0)));
+        let s = seen.clone();
+        cx.update(|cx| {
+            cx.on_action(move |_: &crate::NextChat, _| s.0.set(s.0.get() + 1));
+            let s = seen.clone();
+            cx.on_action(move |_: &crate::PrevChat, _| s.1.set(s.1.get() + 1));
+        });
+        cx.update_window(window, |_, w, cx| {
+            focus(&editor, w, cx);
+            w.press("g", cx);
+            w.press("t", cx);
+            w.press("g", cx);
+            w.press("shift-t", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!((seen.0.get(), seen.1.get()), (1, 1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    async fn indent_leaves_the_caret_on_the_first_nonblank(cx: &mut TestAppContext) {
+        let (dir, _, window, editor) = open_editor("a.txt", "indent", "a\nb\nc\n", cx).await;
+        cx.update_window(window, |_, w, cx| {
+            focus(&editor, w, cx);
+            w.press("j", cx);
+            w.press(">", cx);
+            w.press(">", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let (text, sel) = state(cx, &editor);
+        let at = text.find('b').unwrap();
+        assert!(at > 2, "b was indented: {text:?}");
+        assert_eq!(sel, at..at);
+        // Visual-line: the caret leaves the selection end.
+        cx.update_window(window, |_, w, cx| {
+            w.press("g", cx);
+            w.press("g", cx);
+            w.press("V", cx);
+            w.press("j", cx);
+            w.press(">", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let (text, sel) = state(cx, &editor);
+        let at = text.find('a').unwrap();
+        assert!(at > 0, "a was indented: {text:?}");
+        assert_eq!(sel, at..at);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    async fn one_undo_reverts_a_whole_change_command(cx: &mut TestAppContext) {
+        let (dir, _, window, editor) = open_editor("a.txt", "undo", "foo bar\n", cx).await;
+        cx.update_window(window, |_, w, cx| focus(&editor, w, cx))
+            .unwrap();
+        type_in(cx, window, &["c", "w"], "X");
+        assert_eq!(state(cx, &editor).0, "X bar\n");
+        cx.update_window(window, |_, w, cx| w.press("u", cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(state(cx, &editor).0, "foo bar\n");
+        cx.update_window(window, |_, w, cx| w.press("ctrl-r", cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(state(cx, &editor).0, "X bar\n");
+        cx.update_window(window, |_, w, cx| w.press("u", cx))
+            .unwrap();
+        cx.run_until_parked();
+        type_in(cx, window, &["o"], "new");
+        assert_eq!(state(cx, &editor).0, "foo bar\nnew\n");
+        cx.update_window(window, |_, w, cx| w.press("u", cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(state(cx, &editor).0, "foo bar\n");
         let _ = fs::remove_dir_all(&dir);
     }
 }

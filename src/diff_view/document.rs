@@ -682,7 +682,7 @@ fn source_line(source: &str, range: Range<usize>, line_number: usize) -> SourceL
                 column += spaces;
             } else {
                 display.push(ch);
-                column += 1;
+                column += unicode_width::UnicodeWidthChar::width(ch).unwrap_or(0);
             }
         }
         (display.into(), display_tabs)
@@ -874,6 +874,15 @@ mod tests {
     }
 
     #[test]
+    fn tabs_stop_at_display_columns_of_wide_chars() {
+        let doc = fixture::modified("a.txt", "", "漢\tx\na\u{301}\tx\n");
+        let lines = doc.lines(DiffSide::Modified);
+        // Two cells of CJK reach column 2; a tab pads to 4. A combining mark takes none.
+        assert_eq!(lines[0].display().as_str(), "漢  x");
+        assert_eq!(lines[1].display().as_str(), "a\u{301}   x");
+    }
+
+    #[test]
     fn alignment_covers_each_source_line_once() {
         for (old, new) in [
             ("one\ntwo\n", "one\ninserted\ntwo\n"),
@@ -962,12 +971,12 @@ mod tests {
         let lines = source_lines("é\t中\t\r\nlast\r");
         let first = &lines[0];
         assert_eq!(first.text.as_str(), "é\t中\t");
-        assert_eq!(first.display.as_str(), "é   中   ");
+        assert_eq!(first.display.as_str(), "é   中  ");
         assert_eq!(first.source, 0..9);
         assert_eq!(first.content_end, 7);
         assert_eq!(first.display_tabs.len(), 2);
         assert_eq!(first.display_range(2..3), 2..5);
-        assert_eq!(first.display_range(6..7), 8..11);
+        assert_eq!(first.display_range(6..7), 8..10);
         assert_eq!(
             first.display_range(0..first.text.len()),
             0..first.display.len()
@@ -992,11 +1001,11 @@ mod tests {
         // Compare every byte against the former dense mapping, including
         // UTF-8 interiors and all spaces belonging to each expanded tab.
         for (display_offset, source_offset) in
-            [0, 1, 2, 2, 2, 3, 4, 5, 6, 6, 6, 7].into_iter().enumerate()
+            [0, 1, 2, 2, 2, 3, 4, 5, 6, 6, 7].into_iter().enumerate()
         {
             assert_eq!(first.source_offset(display_offset), source_offset);
         }
-        for (source_offset, display_offset) in [0, 1, 2, 5, 6, 7, 8, 11].into_iter().enumerate() {
+        for (source_offset, display_offset) in [0, 1, 2, 5, 6, 7, 8, 10].into_iter().enumerate() {
             assert_eq!(
                 first.display_range(source_offset..source_offset),
                 display_offset..display_offset
