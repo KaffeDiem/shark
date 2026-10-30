@@ -4,6 +4,7 @@ use lsp_types::{
     DocumentChangeOperation, DocumentChanges, OneOf, Position, PositionEncodingKind, Range,
     TextDocumentContentChangeEvent, TextEdit, Uri, WorkspaceEdit,
 };
+use std::collections::{HashMap, HashSet};
 use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
@@ -313,7 +314,7 @@ pub fn workspace_edits(edit: WorkspaceEdit) -> Result<Vec<DocumentEdits>> {
             result.push((edit.text_document.uri, edit.text_document.version, edits));
         }
     }
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = HashSet::new();
     for (uri, _, _) in &result {
         ensure!(
             uri.scheme().is_some_and(|s| s.as_str() == "file"),
@@ -340,7 +341,7 @@ pub fn snippet(source: &str) -> Result<Snippet> {
         text: String::new(),
         tabstops: vec![],
     };
-    let mut values = std::collections::HashMap::<u32, String>::new();
+    let mut values = HashMap::<u32, String>::new();
     expand_snippet(source, &mut out, &mut values, 0)?;
     // A bare tabstop may precede the occurrence that supplies its default.
     out.text.clear();
@@ -385,7 +386,7 @@ pub struct CompletionMeta {
 fn expand_snippet(
     source: &str,
     out: &mut Snippet,
-    values: &mut std::collections::HashMap<u32, String>,
+    values: &mut HashMap<u32, String>,
     depth: usize,
 ) -> Result<()> {
     ensure!(depth < 32, "snippet nesting too deep");
@@ -580,39 +581,6 @@ mod tests {
     }
     #[test]
     fn incremental_updates_reconstruct_document() {
-        for (old, new) in [
-            ("a😀\r\nb", "a🌟\r\nb"),
-            ("a\r\nb", "a\nb"),
-            ("", "é"),
-            ("😀", ""),
-            ("a\r\nb", "a\r\nxb"),
-            ("éé", "é"),
-            ("x\n", "x\r\n"),
-            ("x\r", "x\r\n"),
-            ("x\r", "x"),
-        ] {
-            for encoding in [Encoding::Utf8, Encoding::Utf16, Encoding::Utf32] {
-                let change = incremental_change(old, new, encoding).unwrap().unwrap();
-                assert_eq!(
-                    apply_edits(
-                        &snapshot(old),
-                        Some(4),
-                        &[TextEdit::new(change.range.unwrap(), change.text)],
-                        encoding
-                    )
-                    .unwrap(),
-                    new
-                );
-            }
-        }
-        assert!(
-            incremental_change("x", "x", Encoding::Utf16)
-                .unwrap()
-                .is_none()
-        );
-    }
-    #[test]
-    fn incremental_updates_reconstruct_short_unicode_and_newline_pairs() {
         let atoms = ["a", "é", "😀", "\r", "\n"];
         let mut texts = vec![String::new()];
         for a in atoms {
@@ -621,30 +589,44 @@ mod tests {
                 texts.push(format!("{a}{b}"));
             }
         }
-        for old in &texts {
-            for new in &texts {
-                for encoding in [Encoding::Utf8, Encoding::Utf16, Encoding::Utf32] {
-                    if let Some(change) = incremental_change(old, new, encoding).unwrap() {
-                        let result = apply_edits(
-                            &snapshot(old),
-                            None,
-                            &[TextEdit::new(change.range.unwrap(), change.text)],
-                            encoding,
-                        )
-                        .unwrap();
-                        assert_eq!(
-                            result, *new,
-                            "old={old:?}, new={new:?}, encoding={encoding:?}"
-                        );
-                    } else {
-                        assert_eq!(old, new);
-                    }
+        let mut pairs: Vec<(String, String)> = texts
+            .iter()
+            .flat_map(|old| texts.iter().map(move |new| (old.clone(), new.clone())))
+            .collect();
+        pairs.extend(
+            [
+                ("a😀\r\nb", "a🌟\r\nb"),
+                ("a\r\nb", "a\nb"),
+                ("a\r\nb", "a\r\nxb"),
+                ("éé", "é"),
+                ("x\n", "x\r\n"),
+                ("x\r", "x\r\n"),
+                ("x\r", "x"),
+            ]
+            .map(|(old, new)| (old.into(), new.into())),
+        );
+        for (old, new) in &pairs {
+            for encoding in [Encoding::Utf8, Encoding::Utf16, Encoding::Utf32] {
+                let change = incremental_change(old, new, encoding).unwrap();
+                assert_eq!(change.is_none(), old == new, "old={old:?}, new={new:?}");
+                if let Some(change) = change {
+                    let result = apply_edits(
+                        &snapshot(old),
+                        Some(4),
+                        &[TextEdit::new(change.range.unwrap(), change.text)],
+                        encoding,
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        result, *new,
+                        "old={old:?}, new={new:?}, encoding={encoding:?}"
+                    );
                 }
             }
         }
     }
     #[test]
-    fn preflight_rejects_stale_invalid_and_overlapping_edits() {
+    fn preflight_rejects_stale_and_overlapping_edits() {
         let s = snapshot("a😀bc");
         let edit = TextEdit::new(
             Range::new(Position::new(0, 1), Position::new(0, 3)),

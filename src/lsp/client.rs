@@ -147,7 +147,6 @@ enum CommandMessage {
 
 struct Pending {
     token: u64,
-    deadline: Instant,
     reply: async_channel::Sender<Result<Value>>,
 }
 
@@ -427,12 +426,6 @@ impl Client {
         let _ = self.0.tx.send(CommandMessage::Terminate);
     }
 
-    #[cfg(test)]
-    pub async fn stopped(&self) {
-        // Closing a channel wakes every waiter, including clones from different editors.
-        let _ = self.0.stopped.recv().await;
-    }
-
     /// Include clients still initializing, which are not attached to an editor yet.
     pub async fn terminate_all() {
         QUITTING.store(true, Ordering::Release);
@@ -513,10 +506,11 @@ fn coordinate(
         writing,
     }: Pipes,
 ) {
-    let mut queue: ReqQueue<Instant, Pending> = ReqQueue::default();
+    let mut queue: ReqQueue<(), Pending> = ReqQueue::default();
     let mut outgoing: HashMap<u64, (RequestId, Instant)> = HashMap::new();
     let mut incoming: HashMap<RequestId, Instant> = HashMap::new();
     let mut shutdown: Option<(RequestId, Instant)> = None;
+    let mut terminated = false;
     let mut reason = "Language server stopped".to_string();
     loop {
         // Sleep until the next deadline. The idle cap only bounds how late an exit is noticed
@@ -537,15 +531,9 @@ fn coordinate(
                 timeout,
             }) if shutdown.is_none() => {
                 let deadline = Instant::now() + timeout;
-                let request = queue.outgoing.register(
-                    method,
-                    params,
-                    Pending {
-                        token,
-                        deadline,
-                        reply,
-                    },
-                );
+                let request = queue
+                    .outgoing
+                    .register(method, params, Pending { token, reply });
                 outgoing.insert(token, (request.id.clone(), deadline));
                 // A writer that stopped has already queued PipeClosed with its reason.
                 let _ = writer.send(request.into());
@@ -582,9 +570,7 @@ fn coordinate(
                     reason = "Language server reused an unfinished request id".into();
                     break;
                 }
-                let now = Instant::now();
-                queue.incoming.register(id.clone(), now);
-                incoming.insert(id.clone(), now);
+                incoming.insert(id.clone(), Instant::now());
                 let reply = Reply {
                     id: Some(id),
                     tx: tx.clone(),
@@ -625,7 +611,7 @@ fn coordinate(
                             reply,
                         });
                     }
-                    // Nothing offers the actions yet, so the user's answer is "dismissed" (null).
+                    // Forwarded to the editor as notifications; the server gets a null reply ("dismissed").
                     "window/showMessageRequest"
                     | "workspace/diagnostic/refresh"
                     | "workspace/semanticTokens/refresh"
@@ -641,8 +627,8 @@ fn coordinate(
                 }
             }
             Ok(CommandMessage::Reply(response)) => {
-                if queue.incoming.complete(&response.id).is_some() {
-                    incoming.remove(&response.id);
+                // A request that timed out was already answered; drop the editor's late reply.
+                if incoming.remove(&response.id).is_some() {
                     let _ = writer.send(response.into());
                 }
             }
@@ -657,10 +643,7 @@ fn coordinate(
                 break;
             }
             Ok(CommandMessage::Terminate) => {
-                shutdown = Some((
-                    RequestId::from("shark-terminate".to_string()),
-                    Instant::now(),
-                ));
+                terminated = true;
                 break;
             }
             Ok(CommandMessage::Shutdown) => {
@@ -684,7 +667,6 @@ fn coordinate(
         for token in expired {
             if let Some((id, _)) = outgoing.remove(&token) {
                 if let Some(pending) = queue.outgoing.complete(id.clone()) {
-                    debug_assert!(pending.deadline <= now);
                     let _ = pending
                         .reply
                         .try_send(Err(anyhow!("Language server request timed out")));
@@ -700,7 +682,6 @@ fn coordinate(
             .collect();
         for id in expired {
             incoming.remove(&id);
-            queue.incoming.complete(&id);
             let _ = writer.send(
                 Response::new_err(
                     id,
@@ -747,7 +728,7 @@ fn coordinate(
     }
     let _ = child.kill();
     let _ = child.wait();
-    if shutdown.is_none() {
+    if shutdown.is_none() && !terminated {
         // The last stderr lines usually say why the server failed.
         let _ = stderr_done.recv_timeout(Duration::from_millis(100));
         let tail = String::from_utf8_lossy(&stderr.lock().unwrap())

@@ -1,26 +1,26 @@
 use super::*;
-use std::{
-    future::Future,
-    pin::pin,
-    task::{Context, Poll, Wake, Waker},
-};
+use crate::lsp::test_support::{block_on, fake_server, logged};
+use std::task::{Context, Waker};
 
-struct Unpark(thread::Thread);
-impl Wake for Unpark {
-    fn wake(self: Arc<Self>) {
-        self.0.unpark();
-    }
+/// The pid the fake server logged, once it has seen `test/ignoreShutdown`.
+fn server_pid(log: &std::path::Path) -> i32 {
+    logged(log)
+        .iter()
+        .find_map(|v| v["pid"].as_i64())
+        .expect("fake server did not log its pid") as i32
 }
-fn block_on<T>(future: impl Future<Output = T>) -> T {
-    let waker = Waker::from(Arc::new(Unpark(thread::current())));
-    let mut context = Context::from_waker(&waker);
-    let mut future = pin!(future);
-    loop {
-        match future.as_mut().poll(&mut context) {
-            Poll::Ready(result) => return result,
-            Poll::Pending => thread::park_timeout(Duration::from_secs(1)),
-        }
+
+/// Whether the process is gone, polling briefly in case the reaping is still in flight.
+fn reaped(pid: i32) -> bool {
+    unsafe extern "C" {
+        fn kill(pid: i32, signal: i32) -> i32;
     }
+    let deadline = Instant::now() + Duration::from_secs(2);
+    // SAFETY: signal zero checks the process's existence and does not send a signal.
+    while unsafe { kill(pid, 0) } == 0 && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    unsafe { kill(pid, 0) != 0 }
 }
 
 struct Peer {
@@ -35,38 +35,24 @@ impl Peer {
             std::process::id(),
             ID.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut command = Command::new("/usr/bin/python3");
-        command
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/lsp/client_tests/server.py"
-            ))
-            .arg(&log);
         let client = Client::start(
-            command,
+            fake_server(&log),
             &std::env::temp_dir(),
             json!({"python":{"analysis":{"typeCheckingMode":"strict"}}}),
         )
         .unwrap();
         Self { client, log }
     }
-    fn messages(&self) -> Vec<Value> {
-        std::fs::read_to_string(&self.log)
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect()
-    }
     fn wait_for(&self, predicate: impl Fn(&Value) -> bool) -> Value {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Some(message) = self.messages().into_iter().find(&predicate) {
+            if let Some(message) = logged(&self.log).into_iter().find(&predicate) {
                 return message;
             }
             assert!(
                 Instant::now() < deadline,
                 "fake peer did not receive expected message: {:?}",
-                self.messages()
+                logged(&self.log)
             );
             thread::sleep(Duration::from_millis(10));
         }
@@ -116,8 +102,7 @@ fn lifecycle_orders_unsaved_text_requests_configuration_and_diagnostics() {
         .unwrap();
     peer.client.shutdown();
     peer.wait_for(|v| v["method"] == "exit");
-    let methods: Vec<_> = peer
-        .messages()
+    let methods: Vec<_> = logged(&peer.log)
         .iter()
         .filter_map(|v| v["method"].as_str().map(str::to_string))
         .collect();
@@ -137,7 +122,7 @@ fn shutdown_flushes_exit_before_closing_the_write_pipe() {
         .unwrap();
     peer.client.shutdown();
     peer.wait_for(|v| v["exit_followed_by_eof"] == true);
-    let messages = peer.messages();
+    let messages = logged(&peer.log);
     let at = |method| messages.iter().position(|v| v["method"] == method).unwrap();
     assert!(at("test/finalNotification") < at("shutdown"));
     assert!(at("shutdown") < at("exit"));
@@ -166,8 +151,7 @@ fn timeout_cancels_request_without_blocking_following_requests() {
 fn dropped_request_cancels_and_late_response_cannot_complete_another_request() {
     let peer = Peer::new();
     block_on(peer.client.initialize()).unwrap();
-    let waker = Waker::from(Arc::new(Unpark(thread::current())));
-    let mut context = Context::from_waker(&waker);
+    let mut context = Context::from_waker(Waker::noop());
     let mut request = Box::pin(peer.client.request("test/wait", Value::Null));
     assert!(request.as_mut().poll(&mut context).is_pending());
     drop(request);
@@ -310,25 +294,10 @@ fn nested_configuration_is_resolved_without_rewriting_settings() {
 fn last_handle_drop_reaps_a_server_that_ignores_shutdown() {
     let log =
         std::env::temp_dir().join(format!("shark-lsp-last-drop-{}.jsonl", std::process::id()));
-    let mut command = Command::new("/usr/bin/python3");
-    command
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/src/lsp/client_tests/server.py"
-        ))
-        .arg(&log);
-    let client = Client::start(command, &std::env::temp_dir(), json!({})).unwrap();
+    let client = Client::start(fake_server(&log), &std::env::temp_dir(), json!({})).unwrap();
     block_on(client.initialize()).unwrap();
     block_on(client.request("test/ignoreShutdown", Value::Null)).unwrap();
-    let pid = std::fs::read_to_string(&log)
-        .unwrap()
-        .lines()
-        .find_map(|line| {
-            serde_json::from_str::<Value>(line)
-                .ok()
-                .and_then(|v| v["pid"].as_i64())
-        })
-        .unwrap() as i32;
+    let pid = server_pid(&log);
     let events = client.events();
     let started = Instant::now();
     drop(client);
@@ -338,15 +307,7 @@ fn last_handle_drop_reaps_a_server_that_ignores_shutdown() {
         }
     }
     assert!(started.elapsed() < Duration::from_secs(5));
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
-    }
-    let deadline = Instant::now() + Duration::from_secs(2);
-    // SAFETY: signal zero checks the process's existence and does not send a signal.
-    while unsafe { kill(pid, 0) } == 0 && Instant::now() < deadline {
-        thread::sleep(Duration::from_millis(10));
-    }
-    assert_ne!(unsafe { kill(pid, 0) }, 0, "server was not reaped");
+    assert!(reaped(pid), "server was not reaped");
     let _ = std::fs::remove_file(log);
 }
 
@@ -379,20 +340,13 @@ fn immediate_termination_reaps_without_the_graceful_shutdown_timeout() {
     let peer = Peer::new();
     block_on(peer.client.initialize()).unwrap();
     block_on(peer.client.request("test/ignoreShutdown", Value::Null)).unwrap();
-    let pid = peer
-        .messages()
-        .iter()
-        .find_map(|v| v["pid"].as_i64())
-        .unwrap() as i32;
+    let pid = server_pid(&peer.log);
     let started = Instant::now();
     peer.client.terminate();
-    block_on(peer.client.stopped());
+    // Closing the channel wakes every waiter, including clones from different editors.
+    let _ = block_on(peer.client.0.stopped.recv());
     assert!(started.elapsed() < Duration::from_secs(1));
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
-    }
-    // SAFETY: signal zero only checks existence; stopped() waits until wait() has reaped the child.
-    assert_ne!(unsafe { kill(pid, 0) }, 0);
+    assert!(reaped(pid));
 }
 
 #[test]
@@ -409,19 +363,11 @@ fn app_quit_can_reap_a_coordinator_after_its_last_editor_closed() {
         .find(|entry| entry.stopped.same_channel(&peer.client.0.stopped))
         .unwrap()
         .clone();
-    let pid = peer
-        .messages()
-        .iter()
-        .find_map(|v| v["pid"].as_i64())
-        .unwrap() as i32;
+    let pid = server_pid(&peer.log);
     drop(peer);
     let started = Instant::now();
     cleanup.tx.send(CommandMessage::Terminate).unwrap();
     let _ = block_on(cleanup.stopped.recv());
     assert!(started.elapsed() < Duration::from_secs(1));
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
-    }
-    // SAFETY: signal zero checks existence without sending a signal.
-    assert_ne!(unsafe { kill(pid, 0) }, 0);
+    assert!(reaped(pid));
 }

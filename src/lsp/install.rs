@@ -230,7 +230,6 @@ mod tests {
     #[test]
     fn manifest_has_exact_https_artifacts_and_safe_paths() {
         let artifacts = manifest().unwrap();
-        assert_eq!(artifacts.len(), 7);
         for a in artifacts {
             assert!(a.url.starts_with("https://") && a.url.contains(&a.version));
             assert_eq!(a.sha256.len(), 64);

@@ -423,18 +423,39 @@ impl CodeActionProvider for Provider {
             .unwrap_or_default();
         let executor = cx.background_executor().clone();
         cx.spawn(async move |_| {
-            let snapshot = this.synchronized(&text,&executor).await?;
-            let range = Range::new(document::position(&text,range.start,this.encoding())?,document::position(&text,range.end,this.encoding())?);
-            let response = this.client.request("textDocument/codeAction",json!({"textDocument":{"uri":this.uri},"range":range,"context":{"diagnostics":diagnostics}})).await?;
+            let snapshot = this.synchronized(&text, &executor).await?;
+            let encoding = this.encoding();
+            let range = Range::new(
+                document::position(&text, range.start, encoding)?,
+                document::position(&text, range.end, encoding)?,
+            );
+            let params = json!({
+                "textDocument": {"uri": this.uri},
+                "range": range,
+                "context": {"diagnostics": diagnostics},
+            });
+            let response = this
+                .client
+                .request("textDocument/codeAction", params)
+                .await?;
             this.current(&snapshot)?;
             let actions: Option<CodeActionResponse> = serde_json::from_value(response)?;
-            Ok(actions.unwrap_or_default().into_iter().filter_map(|a| match a {
-                CodeActionOrCommand::CodeAction(mut a) if a.disabled.is_none() => {
-                    a.data = Some(json!({"sharkVersion":snapshot.version,"sharkGuard":guard,"serverData":a.data}));
-                    Some(a)
-                },
-                _ => None,
-            }).collect())
+            let usable = actions
+                .unwrap_or_default()
+                .into_iter()
+                .filter_map(|a| match a {
+                    CodeActionOrCommand::CodeAction(mut a) if a.disabled.is_none() => {
+                        a.data = Some(json!({
+                            "sharkVersion": snapshot.version,
+                            "sharkGuard": guard,
+                            "serverData": a.data,
+                        }));
+                        Some(a)
+                    }
+                    _ => None,
+                })
+                .collect();
+            Ok(usable)
         })
     }
 
@@ -450,21 +471,57 @@ impl CodeActionProvider for Provider {
         let snapshot = self.snapshot.lock().unwrap().clone();
         window.spawn(cx, async move |cx| {
             let result: Result<()> = async {
-            let data = action.data.take().unwrap_or_default();
-            let guard: EditGuard = serde_json::from_value(data["sharkGuard"].clone())?;
-            ensure!(guard.is_current(), "Workspace changed; request the quick fix again");
-            ensure!(data["sharkVersion"].as_i64() == Some(snapshot.version as i64), "quick fix is stale");
-            action.data = data.get("serverData").cloned().filter(|v| !v.is_null());
-            if action.edit.is_none() && this.client.capabilities().and_then(|c| c.code_action_provider).is_some_and(|p| matches!(p, CodeActionProviderCapability::Options(o) if o.resolve_provider == Some(true))) {
-                action = serde_json::from_value(this.client.request("codeAction/resolve",serde_json::to_value(action)?).await?)?;
+                let data = action.data.take().unwrap_or_default();
+                let guard: EditGuard = serde_json::from_value(data["sharkGuard"].clone())?;
+                ensure!(
+                    guard.is_current(),
+                    "Workspace changed; request the quick fix again"
+                );
+                ensure!(
+                    data["sharkVersion"].as_i64() == Some(snapshot.version as i64),
+                    "quick fix is stale"
+                );
+                action.data = data.get("serverData").cloned().filter(|v| !v.is_null());
+                let resolves = this
+                    .client
+                    .capabilities()
+                    .and_then(|c| c.code_action_provider)
+                    .is_some_and(|p| {
+                        matches!(
+                            p,
+                            CodeActionProviderCapability::Options(o)
+                                if o.resolve_provider == Some(true)
+                        )
+                    });
+                if action.edit.is_none() && resolves {
+                    let resolved = this
+                        .client
+                        .request("codeAction/resolve", serde_json::to_value(action)?)
+                        .await?;
+                    action = serde_json::from_value(resolved)?;
+                }
+                this.current(&snapshot)?;
+                ensure!(
+                    action.command.is_none(),
+                    "command-based quick fixes are not supported"
+                );
+                let edit = action
+                    .edit
+                    .ok_or_else(|| anyhow::anyhow!("quick fix contains no supported edits"))?;
+                document::workspace_edits(edit.clone())?;
+                let event = ProviderEvent::Apply {
+                    edit,
+                    snapshot,
+                    encoding: this.encoding(),
+                    guard,
+                };
+                this.events
+                    .send(event)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("editor closed"))?;
+                Ok(())
             }
-            this.current(&snapshot)?;
-            ensure!(action.command.is_none(), "command-based quick fixes are not supported");
-            let edit = action.edit.ok_or_else(|| anyhow::anyhow!("quick fix contains no supported edits"))?;
-            document::workspace_edits(edit.clone())?;
-            this.events.send(ProviderEvent::Apply { edit, snapshot, encoding: this.encoding(), guard }).await.map_err(|_| anyhow::anyhow!("editor closed"))?;
-            Ok(())
-            }.await;
+            .await;
             if let Err(error) = &result {
                 let message = format!("Could not apply quick fix: {error}");
                 let _ = cx.update(|window, cx| window.push_notification(message, cx));

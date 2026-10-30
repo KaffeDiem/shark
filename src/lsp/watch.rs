@@ -452,6 +452,7 @@ fn diff(before: &Snapshot, after: &Snapshot) -> Vec<(PathBuf, u32)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lsp::test_support;
 
     #[test]
     fn globs_respect_relative_roots_kinds_and_worktree_boundaries() {
@@ -596,11 +597,6 @@ mod tests {
         std::fs::remove_dir_all(&outside).unwrap();
         assert!(walk(&root, true, &stop).is_err());
     }
-}
-
-#[cfg(test)]
-mod registration_tests {
-    use super::*;
 
     #[test]
     fn registration_batches_are_atomic_and_unregistration_is_validated() {
@@ -644,11 +640,6 @@ mod registration_tests {
         drop(watcher);
         std::fs::remove_dir_all(root).unwrap();
     }
-}
-
-#[cfg(test)]
-mod readiness_tests {
-    use super::*;
 
     #[test]
     fn changes_after_registration_acknowledgement_are_observed() {
@@ -657,36 +648,25 @@ mod readiness_tests {
         let file = root.join("file.rs");
         let log = root.join("peer.jsonl");
         std::fs::write(&file, "old").unwrap();
-        let mut command = std::process::Command::new("/usr/bin/python3");
-        command
-            .arg(concat!(
-                env!("CARGO_MANIFEST_DIR"),
-                "/src/lsp/client_tests/server.py"
-            ))
-            .arg(&log);
-        let client = Client::start(command, &root, Value::Null).unwrap();
+        let client = Client::start(test_support::fake_server(&log), &root, Value::Null).unwrap();
         let watcher = Watcher::new(&root, client.clone()).unwrap();
         let ready = watcher.register(&json!({"registrations":[{"id":"source","method":"workspace/didChangeWatchedFiles","registerOptions":{"watchers":[{"globPattern":"**/*.rs","kind":2}]}}]})).unwrap();
         ready.recv_blocking().unwrap().unwrap();
         std::fs::write(&file, "changed immediately after ack").unwrap();
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let messages = std::fs::read_to_string(&log).unwrap_or_default();
-            let found = messages
-                .lines()
-                .filter_map(|line| serde_json::from_str::<Value>(line).ok())
-                .any(|message| {
-                    message["method"] == "workspace/didChangeWatchedFiles"
-                        && message["params"]["changes"]
-                            .as_array()
-                            .is_some_and(|changes| {
-                                changes.iter().any(|change| {
-                                    change["type"] == 2
-                                        && change["uri"]
-                                            == url::Url::from_file_path(&file).unwrap().as_str()
-                                })
+            let found = test_support::logged(&log).iter().any(|message| {
+                message["method"] == "workspace/didChangeWatchedFiles"
+                    && message["params"]["changes"]
+                        .as_array()
+                        .is_some_and(|changes| {
+                            changes.iter().any(|change| {
+                                change["type"] == 2
+                                    && change["uri"]
+                                        == url::Url::from_file_path(&file).unwrap().as_str()
                             })
-                });
+                        })
+            });
             if found {
                 break;
             }

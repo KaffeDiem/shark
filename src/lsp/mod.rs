@@ -3,6 +3,8 @@ pub mod client;
 pub mod document;
 mod install;
 pub mod providers;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod tools;
 pub mod watch;
 
@@ -49,15 +51,19 @@ pub struct Session {
 impl EventEmitter<SessionEvent> for Session {}
 
 impl Session {
-    #[cfg(all(test, feature = "test-support"))]
-    pub(crate) fn with_client(project: tools::Project, client: client::Client) -> Self {
+    fn build(
+        project: tools::Project,
+        client: Option<client::Client>,
+        status: &str,
+        generation: u64,
+    ) -> Self {
         Self {
             project,
-            client: Some(client),
+            client,
             companion: None,
-            status: "Ready".into(),
+            status: status.into(),
             detail: None,
-            generation: 1,
+            generation,
             watcher: None,
             companion_watcher: None,
             choices: vec![],
@@ -69,35 +75,48 @@ impl Session {
         }
     }
 
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn with_client(project: tools::Project, client: client::Client) -> Self {
+        Self::build(project, Some(client), "Ready", 1)
+    }
+
     pub fn new(project: tools::Project, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mut session = Self {
-            project,
-            client: None,
-            companion: None,
-            status: "Starting".into(),
-            detail: None,
-            generation: 0,
-            watcher: None,
-            companion_watcher: None,
-            choices: vec![],
-            awaiting_build: false,
-            progress: vec![],
-            task: Task::ready(()),
-            companion_task: Task::ready(()),
-            watch_tasks: vec![],
-        };
+        let mut session = Self::build(project, None, "Starting", 0);
         session.restart(window, cx);
         session
     }
 
-    pub fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.client = None;
+    /// What the server is busy with, for a loading indicator: the newest reported work, or
+    /// "Starting" while the server launches. None when idle or broken.
+    pub fn activity(&self) -> Option<Work> {
+        match self.status.as_str() {
+            "Starting" => Some(Work {
+                title: "Starting".into(),
+                ..Default::default()
+            }),
+            "Setup needed" => None,
+            _ => self.progress.last().map(|(_, w)| w.clone()),
+        }
+    }
+
+    /// The companion is gone; its task is the caller, so it is left running.
+    fn drop_companion(&mut self) {
         self.companion = None;
-        self.companion_task = Task::ready(());
-        self.watch_tasks.clear();
-        self.watcher = None;
         self.companion_watcher = None;
         self.generation += 1;
+    }
+
+    /// Drops both servers and everything that serves them.
+    fn drop_servers(&mut self) {
+        self.client = None;
+        self.watcher = None;
+        self.watch_tasks.clear();
+        self.companion_task = Task::ready(());
+        self.drop_companion();
+    }
+
+    pub fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.drop_servers();
         self.status = "Starting".into();
         self.detail = None;
         self.choices.clear();
@@ -167,9 +186,7 @@ impl Session {
                                 client::Event::Notification { method, params } => cx.emit(SessionEvent::Notification { method, params, companion: true }),
                                 client::Event::Stopped(error) => {
                                     s.detail = Some(tools::companion_note(&anyhow::anyhow!(error)));
-                                    s.companion = None;
-                                    s.companion_watcher = None;
-                                    s.generation += 1;
+                                    s.drop_companion();
                                     cx.notify();
                                 }
                                 event @ (client::Event::RegisterCapability { .. } | client::Event::UnregisterCapability { .. }) => {
@@ -198,13 +215,7 @@ impl Session {
                         client::Event::Stopped(error) => {
                             s.status = "Setup needed".into();
                             s.detail = Some(error);
-                            s.client = None;
-                            s.companion = None;
-                            s.watcher = None;
-                            s.companion_watcher = None;
-                            s.watch_tasks.clear();
-                            s.companion_task = Task::ready(());
-                            s.generation += 1;
+                            s.drop_servers();
                             cx.notify();
                         }
                         event @ (client::Event::RegisterCapability { .. } | client::Event::UnregisterCapability { .. }) => {
@@ -269,21 +280,6 @@ async fn initialize_companion(
     match result.await {
         Ok(client) => (client, None),
         Err(error) => (None, Some(tools::companion_note(&error))),
-    }
-}
-
-impl Session {
-    /// What the server is busy with, for a loading indicator: the newest reported work, or
-    /// "Starting" while the server launches. None when idle or broken.
-    pub fn activity(&self) -> Option<Work> {
-        match self.status.as_str() {
-            "Starting" => Some(Work {
-                title: "Starting".into(),
-                ..Default::default()
-            }),
-            "Setup needed" => None,
-            _ => self.progress.last().map(|(_, w)| w.clone()),
-        }
     }
 }
 

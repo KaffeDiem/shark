@@ -12,7 +12,7 @@ use std::{
     },
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Backend {
     Rust,
     Pyrefly,
@@ -22,7 +22,7 @@ pub enum Backend {
     Go,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Project {
     pub root: PathBuf,
     pub worktree: PathBuf,
@@ -128,7 +128,7 @@ pub fn discover(file: &Path, worktree: &Path) -> Result<Option<Project>> {
             .iter()
             .find(|d| d.join("Cargo.toml").is_file())
             .copied(),
-        Backend::Pyrefly => dirs
+        Backend::Pyrefly | Backend::Pyright => dirs
             .iter()
             .find(|d| {
                 [
@@ -167,7 +167,6 @@ pub fn discover(file: &Path, worktree: &Path) -> Result<Option<Project>> {
                     .copied()
             })
             .or_else(|| dirs.iter().find(|d| d.join("go.mod").is_file()).copied()),
-        Backend::Pyright => unreachable!(),
     }
     .unwrap_or(&worktree)
     .to_path_buf();
@@ -445,15 +444,29 @@ fn rust(project: &Project) -> Result<Launch> {
                             command.env("RUSTUP_AUTO_INSTALL", "0");
                             // A generous limit: interrupting an install can leave the toolchain
                             // half-written. On expiry rustup gets TERM, not a process-group KILL.
-                            crate::git::wait_bounded(command, root, "rustup", &["component", "add", "--toolchain", toolchain, "rust-analyzer", "rust-src"], 900, false)
+                            let args = [
+                                "component",
+                                "add",
+                                "--toolchain",
+                                toolchain,
+                                "rust-analyzer",
+                                "rust-src",
+                            ];
+                            crate::git::wait_bounded(command, root, "rustup", &args, 900, false)
                                 .map_err(anyhow::Error::msg)
-                                .with_context(|| format!("Add rust-analyzer and rust-src for the existing toolchain: rustup component add --toolchain {toolchain} rust-analyzer rust-src"))?;
+                                .with_context(|| {
+                                    format!(
+                                        "Add rust-analyzer and rust-src for the existing toolchain: rustup component add --toolchain {toolchain} rust-analyzer rust-src"
+                                    )
+                                })?;
                         }
                         which()?
                     }
                     // Linked/custom toolchains have no components but can ship their own analyzer.
                     Err(error) => found.map_err(|_| error).with_context(|| {
-                        format!("Toolchain {toolchain} does not support rustup components; add rust-analyzer to it or select a rustup-distributed toolchain")
+                        format!(
+                            "Toolchain {toolchain} does not support rustup components; add rust-analyzer to it or select a rustup-distributed toolchain"
+                        )
                     })?,
                 }
             }
@@ -666,9 +679,10 @@ fn swift(project: &Project) -> Result<Launch> {
         .map(serde_json::from_slice)
         .transpose()
         .context("Fix invalid buildServer.json; Shark preserves your custom BSP configuration")?;
-    let owned = current.as_ref().is_some_and(|v| {
-        v["_shark"]["owner"] == "shark" && matches!(v["_shark"]["version"].as_u64(), Some(1 | 2))
-    });
+    // Any Shark-written file is ours; one whose `_shark` differs from today's is regenerated.
+    let owned = current
+        .as_ref()
+        .is_some_and(|v| v["_shark"]["owner"] == "shark");
     if let Some(config) = current.as_ref().filter(|_| !owned) {
         ensure!(
             ["name", "version", "bspVersion"]
@@ -716,7 +730,6 @@ fn swift(project: &Project) -> Result<Launch> {
         }
     }
     let sweetpad = managed("sweetpad")?;
-    // Version 2 names the configuration; version 1 files are regenerated.
     let expected = json!({"owner":"shark", "version":2, "root": project.root, "tool": sweetpad, "container": containers[0].file_name()});
     if current.as_ref().and_then(|v| v.get("_shark")) != Some(&expected) {
         let staged = project
@@ -774,9 +787,8 @@ fn swift(project: &Project) -> Result<Launch> {
         let _ = fs::remove_file(staged);
         generated?;
     }
-    // SweetPad answers sourcekit-lsp's prepare only after its startup xcodebuild of every target,
-    // so background indexing would hold diagnostics for minutes on each launch. Those builds
-    // still write the index sourcekit-lsp reads.
+    // Background indexing waits on SweetPad's prepare, which builds every target first and
+    // holds diagnostics back. SweetPad's builds still write the index sourcekit-lsp reads.
     result.initialization_options = json!({"backgroundIndexing": false});
     Ok(result)
 }
@@ -924,14 +936,18 @@ mod tests {
         }
         root
     }
-    /// Runs `f` with environment overrides, restoring them afterwards. Callers hold UI_LOCK.
+    /// Runs `f` with environment overrides, restoring them afterwards. Tests that call it also
+    /// hold UI_LOCK (when built) so the other modules that set PATH or SHARK_* stay out.
     fn with_env<T>(vars: &[(&str, Option<String>)], f: impl FnOnce() -> T) -> T {
+        static ENV: Mutex<()> = Mutex::new(());
+        let _env = ENV.lock().unwrap_or_else(|e| e.into_inner());
         let saved: Vec<_> = vars
             .iter()
             .map(|(k, _)| (*k, std::env::var_os(k)))
             .collect();
         let set = |k: &str, v: Option<std::ffi::OsString>| match v {
-            // SAFETY: tests that mutate the environment are serialized by UI_LOCK.
+            // SAFETY: ENV serializes this module's mutations; UI_LOCK, held by callers under
+            // test-support, serializes them against other modules' tests.
             Some(v) => unsafe { std::env::set_var(k, v) },
             None => unsafe { std::env::remove_var(k) },
         };
