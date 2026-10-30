@@ -1176,14 +1176,16 @@ impl Shark {
                         let (model, effort) = s.state.defaults_for(&ws);
                         ws.fill_models(&model, effort.as_ref());
                         let name = ws.name.clone();
-                        let setup = s.run_setup(&ws, None, prompt.clone(), window, cx);
-                        s.state.workspaces.push(ws);
+                        s.state.workspaces.push(ws.clone());
                         let _ = s.state.save();
                         s.open_workspace(s.state.workspaces.len() - 1, window, cx);
                         s.home_prompt_used(prompt.as_deref(), window, cx);
-                        if let Some(p) = prompt.filter(|_| !setup)
-                            && s.active.as_ref() == Some(&name)
-                            && let Some(chat) = s.active_chat().cloned()
+                        let chat = (s.active.as_ref() == Some(&name))
+                            .then(|| s.active_chat().cloned())
+                            .flatten();
+                        let then = prompt.zip(chat);
+                        if !s.run_setup(&ws, None, then.clone(), window, cx)
+                            && let Some((p, chat)) = then
                         {
                             chat.update(cx, |c, cx| c.ask(&p, window, cx));
                         }
@@ -1899,8 +1901,8 @@ impl Shark {
                 .get(name)
                 .map_or(vec![], |g| g.read(cx).merged_branches()),
         };
-        // Its dev servers would run on in a removed worktree.
-        self.runs.remove(name);
+        // Its dev servers would run on in a removed worktree: stopped (and waited for) first.
+        let run = self.runs.remove(name);
         let jobs = crate::scripts::jobs(&self.state, &ws, crate::scripts::Phase::Archive, None);
         // `worktree remove` deletes node_modules, target and the like: seconds, off the UI thread.
         window.push_notification(format!("Archiving {name}…"), cx);
@@ -1910,6 +1912,7 @@ impl Shark {
             let (scripts, result) = cx
                 .background_executor()
                 .spawn(async move {
+                    crate::scripts::Running::stop_all(run, 5);
                     // A failed archive script keeps the worktree, unless forced.
                     let scripts = crate::scripts::run_all(&ws.name, &jobs).err();
                     if scripts.is_some() && !force {

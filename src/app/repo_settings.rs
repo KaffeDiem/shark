@@ -220,7 +220,7 @@ impl RepoSettingsView {
 
     fn move_script(&mut self, d: &ScriptDrag, to: usize, cx: &mut Context<Self>) {
         let list = &mut self.scripts[d.phase];
-        if d.ix < list.len() && to < list.len() {
+        if d.ix != to && d.ix < list.len() && to < list.len() {
             move_item(list, d.ix, to);
             self.save_scripts(cx);
         }
@@ -238,9 +238,12 @@ impl RepoSettingsView {
         let name = self.repo.name.clone();
         let used: Vec<String> = (self.shark.upgrade())
             .map(|s| {
-                (s.read(cx).state.workspaces.iter())
+                let s = s.read(cx);
+                // A workspace being created or getting a repo isn't in `workspaces` yet.
+                (s.state.workspaces.iter())
                     .filter(|w| w.repos.iter().any(|r| r.name == name))
                     .map(|w| w.name.clone())
+                    .chain(s.creating.iter().chain(&s.adding_repos).cloned())
                     .collect()
             })
             .unwrap_or_default();

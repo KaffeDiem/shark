@@ -232,9 +232,7 @@ impl Shark {
         ];
         // Dev servers started by cmd-r don't outlive Shark.
         _subs.push(cx.on_app_quit(|s, _| {
-            for (_, r) in s.runs.drain() {
-                r.shutdown();
-            }
+            crate::scripts::Running::stop_all(s.runs.drain().map(|(_, r)| r), 2);
             async {}
         }));
         _subs.push(cx.observe(&differ, |_, _, cx| cx.notify()));

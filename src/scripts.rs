@@ -67,7 +67,9 @@ fn spawn(ws: &str, job: &Job, port: Option<u16>, log: &mut File) -> Result<Child
     let _ = writeln!(log, "\n$ {}: {}", job.repo, job.script);
     let out = log.try_clone().map_err(|e| e.to_string())?;
     let err = log.try_clone().map_err(|e| e.to_string())?;
-    let shell = std::env::var("SHELL").unwrap_or_else(|_| "/bin/zsh".into());
+    let shell = (std::env::var("SHELL").ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/bin/zsh".into());
     let mut cmd = Command::new(shell);
     if let Some(p) = port {
         cmd.env("SHARK_PORT", p.to_string());
@@ -106,11 +108,14 @@ pub fn run_all(ws: &str, jobs: &[Job]) -> Result<(), String> {
 pub const PORTS: u16 = 10;
 const FIRST_PORT: u16 = 51000;
 
-/// The first block of `PORTS` not held by a running workspace.
+/// The first block of `PORTS` not held by a running workspace and whose first port is free, so a
+/// server still shutting down (or started outside Shark) isn't handed out again.
 pub fn free_port(held: impl Iterator<Item = u16> + Clone) -> u16 {
     (0..)
         .map(|i| FIRST_PORT + i * PORTS)
-        .find(|p| !held.clone().any(|h| h == *p))
+        .find(|p| {
+            !held.clone().any(|h| h == *p) && std::net::TcpListener::bind(("127.0.0.1", *p)).is_ok()
+        })
         .unwrap()
 }
 
@@ -169,9 +174,12 @@ impl Running {
         }
     }
 
-    /// At quit: stop everything before Shark exits.
-    pub fn shutdown(mut self) {
-        Self::stop(std::mem::take(&mut self.groups), 2);
+    /// Stops `runs` together and waits, up to `secs` before KILL (at quit, before archiving).
+    pub fn stop_all(runs: impl IntoIterator<Item = Running>, secs: u64) {
+        let groups = (runs.into_iter())
+            .flat_map(|mut r| std::mem::take(&mut r.groups))
+            .collect();
+        Self::stop(groups, secs);
     }
 }
 
@@ -197,9 +205,16 @@ impl Drop for Running {
     }
 }
 
-/// The last lines of `ws`'s log, for an error notice.
+/// The last lines of `ws`'s log, for an error notice. Reads only its end: a dev server's log grows.
 pub fn tail(ws: &str) -> String {
-    let text = fs::read_to_string(log_path(ws)).unwrap_or_default();
+    use std::io::{Read, Seek, SeekFrom};
+    let mut bytes = vec![];
+    if let Ok(mut f) = File::open(log_path(ws)) {
+        let len = f.metadata().map_or(0, |m| m.len());
+        let _ = f.seek(SeekFrom::Start(len.saturating_sub(8192)));
+        let _ = f.read_to_end(&mut bytes);
+    }
+    let text = String::from_utf8_lossy(&bytes);
     let lines: Vec<&str> = text.lines().collect();
     lines[lines.len().saturating_sub(8)..].join("\n")
 }
@@ -220,6 +235,13 @@ mod tests {
 
     #[test]
     fn runs_in_order_and_stops_at_failure() {
+        // The log goes under the support dir: the UI tests' home, never the real one.
+        #[cfg(feature = "test-support")]
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        crate::state::TEST_HOME
+            .get_or_init(|| std::env::temp_dir().join(format!("shark-ui-{}", std::process::id())));
         let dir = std::env::temp_dir().join(format!("shark-scripts-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let ws = format!("scripts-test-{}", std::process::id());
@@ -234,19 +256,49 @@ mod tests {
         assert_eq!(out, format!("first\n{ws}\n"));
         assert!(tail(&ws).contains("$ api: exit 3"));
 
-        // Dropping stops a long-running script and what it started.
-        // A script that leaves a process behind stays running until that's gone too.
-        let mut running = Running::start(&ws, &[job(&dir, "sleep 30 &")], 1).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        let (exited, all) = running.reap();
+        // A script that leaves a process behind stays running until that's gone too; stopping
+        // takes what it started with it, even one that ignores TERM.
+        let reaped = |r: &mut Running| {
+            let mut exited = vec![];
+            for _ in 0..100 {
+                let (e, all) = r.reap();
+                exited.extend(e);
+                if !exited.is_empty() {
+                    return (exited, all);
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            (exited, false)
+        };
+        let script = "trap '' TERM; (trap '' TERM; sleep 30) &";
+        let mut running = Running::start(&ws, &[job(&dir, script)], 1).unwrap();
+        let (exited, all) = reaped(&mut running);
         assert_eq!((exited.len(), all), (1, false), "its sleep is still up");
-        running.shutdown();
+        let shell = running.groups[0].1.id();
+        Running::stop_all([running], 1);
+        // KILLed children are reaped by launchd, so give it a moment.
+        let alive = || {
+            (Command::new("/bin/kill").args(["-0", "--", &format!("-{shell}")]))
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!((0..40).any(|_| {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            !alive()
+        }));
         let mut quick =
             Running::start(&ws, &[job(&dir, "echo $SHARK_PORT > port")], 51010).unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(500));
-        assert_eq!(quick.reap(), (vec!["api (exit status: 0)".into()], true));
+        assert_eq!(
+            reaped(&mut quick),
+            (vec!["api (exit status: 0)".into()], true)
+        );
         assert_eq!(fs::read_to_string(dir.join("port")).unwrap(), "51010\n");
-        assert_eq!(free_port([51000, 51020].into_iter()), 51010);
+        assert!(![51000, 51010].contains(&free_port([51000, 51010].into_iter())));
+        let p = free_port(std::iter::empty());
+        let _taken = std::net::TcpListener::bind(("127.0.0.1", p)).unwrap();
+        assert_ne!(free_port(std::iter::empty()), p, "a port in use is skipped");
         let _ = fs::remove_dir_all(&dir);
         let _ = fs::remove_file(log_path(&ws));
     }

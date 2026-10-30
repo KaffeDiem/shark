@@ -527,15 +527,13 @@ impl State {
         state
     }
 
-    /// The model and level a new chat in `ws` starts on: the first of its repos with a default,
-    /// else the last picked.
+    /// The model and level a new chat in `ws` starts on: each from the first of its repos that
+    /// sets it, else the last picked.
     pub fn defaults_for(&self, ws: &Workspace) -> (String, Option<String>) {
         let valid = |m: &String| crate::chat::MODELS.contains(&m.as_str());
-        let s = (ws.repos.iter())
-            .filter_map(|r| self.repo_settings.get(&r.name))
-            .find(|s| s.model.as_ref().is_some_and(valid) || s.effort.is_some());
-        let model = s.and_then(|s| s.model.clone().filter(valid));
-        let effort = s.and_then(|s| s.effort.clone());
+        let mut settings = (ws.repos.iter()).filter_map(|r| self.repo_settings.get(&r.name));
+        let model = settings.clone().find_map(|s| s.model.clone().filter(valid));
+        let effort = settings.find_map(|s| s.effort.clone());
         (
             model.unwrap_or_else(|| self.new_model()),
             effort.or(self.last_effort.clone()),
@@ -894,6 +892,24 @@ mod tests {
         assert_eq!(
             (new.model.as_deref(), new.effort.as_deref()),
             (Some("opus"), Some("max"))
+        );
+        // Model and level each come from the first repo that sets them.
+        let web = WsRepo {
+            name: "web".into(),
+            ..st.workspaces[0].repos[0].clone()
+        };
+        st.workspaces[0].repos.insert(0, web);
+        st.repo_settings.insert(
+            "web".into(),
+            RepoSettings {
+                effort: Some("low".into()),
+                ..Default::default()
+            },
+        );
+        let new = st.new_chat(&st.workspaces[0], "z".into());
+        assert_eq!(
+            (new.model.as_deref(), new.effort.as_deref()),
+            (Some("opus"), Some("low"))
         );
         let mut w: Workspace = serde_json::from_str(
             r#"{"name":"w","branch":"w","repos":[],"chats":[{"id":"a"},{"id":"b","session_id":"s"}]}"#,

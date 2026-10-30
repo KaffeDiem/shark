@@ -9,6 +9,9 @@ impl Shark {
         let Some(ws) = self.active.as_ref().and_then(|n| self.ws(n)).cloned() else {
             return notify_err(window, cx, "Open a workspace first");
         };
+        if self.archiving.contains(&ws.name) {
+            return notify_err(window, cx, format!("{} is being archived", ws.name));
+        }
         if self.runs.remove(&ws.name).is_some() {
             window.push_notification(format!("Stopped {}'s run scripts", ws.name), cx);
             return cx.notify();
@@ -73,13 +76,14 @@ impl Shark {
     }
 
     /// Setup scripts for a new workspace, or only `repo`'s for one just added, in the background.
-    /// `then` is sent to the open chat once they're done, so the agent never works on a half-set-up
-    /// worktree. False when there's nothing to run (and `then` wasn't taken).
+    /// `then`'s prompt is sent to its chat once they succeed, so the agent never works on a
+    /// half-set-up worktree; if they fail or the chat is busy, it waits in the composer.
+    /// False when there's nothing to run (and `then` wasn't taken).
     pub(super) fn run_setup(
         &mut self,
         ws: &Workspace,
         repo: Option<&str>,
-        then: Option<String>,
+        then: Option<(String, Entity<Chat>)>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> bool {
@@ -94,7 +98,8 @@ impl Shark {
             let result = (cx.background_executor())
                 .spawn(async move { scripts::run_all(&ws, &jobs) })
                 .await;
-            this.update_in(cx, |s, window, cx| {
+            this.update_in(cx, |_, window, cx| {
+                let ok = result.is_ok();
                 match result {
                     Ok(()) => window.push_notification(
                         Notification::success(format!("Setup done in {name}")),
@@ -102,11 +107,20 @@ impl Shark {
                     ),
                     Err(e) => script_failed(&name, e, window, cx),
                 }
-                if let Some(p) = then
-                    && s.active.as_ref() == Some(&name)
-                    && let Some(chat) = s.active_chat().cloned()
-                {
-                    chat.update(cx, |c, cx| c.ask(&p, window, cx));
+                if let Some((p, chat)) = then {
+                    chat.update(cx, |c, cx| {
+                        if !(ok && c.ask(&p, window, cx)) {
+                            c.composer.update(cx, |t, cx| {
+                                // Keep what was typed meanwhile, after the prompt.
+                                let draft = t.value().trim().to_string();
+                                let text = match draft.is_empty() || draft == p.trim() {
+                                    true => p,
+                                    false => format!("{p}\n\n{draft}"),
+                                };
+                                t.set_value(text, window, cx)
+                            });
+                        }
+                    });
                 }
             })
             .ok();
