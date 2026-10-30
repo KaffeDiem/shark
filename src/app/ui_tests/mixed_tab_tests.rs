@@ -633,3 +633,98 @@ async fn review_file_tab_scale(cx: &mut TestAppContext) {
         .unwrap();
     }
 }
+
+/// Closing the shown tab shows its strip neighbor of any kind, not the next chat.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn closing_shows_the_strip_neighbor(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(cx, fixture(&home), WindowOptions::default());
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).file_tabs.len() == 2
+    })
+    .await;
+    press(cx, &["cmd-t"]);
+    let shown = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let s = shark.read(cx);
+            let ws = s.active_ws().unwrap();
+            s.visible_tab_ids(ws, cx)[s.active_tab_index(cx).unwrap()].clone()
+        })
+    };
+    let strip = cx.update(|cx| {
+        let s = shark.read(cx);
+        s.visible_tab_ids(s.active_ws().unwrap(), cx)
+    });
+    let second =
+        TabId::Chat(cx.update(|cx| shark.read(cx).active_ws().unwrap().chats[1].id.clone()));
+    assert_eq!(
+        strip,
+        [
+            TabId::Chat("mixed".into()),
+            TabId::File("api/a.txt".into()),
+            TabId::Diff,
+            TabId::File("api/b.txt".into()),
+            TabId::Git,
+            second.clone(),
+        ]
+    );
+    on(cx, &|s, w, cx| s.select_chat(0, w, cx));
+    // Each close shows the tab that slid into the closed one's slot.
+    for next in &strip[1..] {
+        press(cx, &["cmd-w"]);
+        cx.run_until_parked();
+        assert_eq!(&shown(cx), next);
+    }
+    // Closing the last tab in the strip shows the one before it.
+    press(cx, &["cmd-t"]);
+    assert_ne!(shown(cx), second);
+    press(cx, &["cmd-w"]);
+    cx.run_until_parked();
+    assert_eq!(shown(cx), second);
+    // Closing a tab that isn't shown keeps the shown one.
+    press(cx, &["cmd-t"]);
+    let third = shown(cx);
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.pointer_move(w.find(element(&second)).bounds().center(), None, cx);
+        w.within(element(&second)).click("close-chat", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(shown(cx), third);
+    assert_eq!(
+        cx.update(|cx| shark.read(cx).active_ws().unwrap().chats.len()),
+        1
+    );
+}
+
+/// Closing the only chat puts its fresh replacement in the same slot, and shows it.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn replacement_chat_keeps_the_slot(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(cx, fixture(&home), WindowOptions::default());
+    let on = on_app(window, shark.clone());
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).file_tabs.len() == 2
+    })
+    .await;
+    on(cx, &|s, w, cx| s.select_chat(0, w, cx));
+    press_in(window)(cx, &["cmd-w"]);
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        let ws = s.active_ws().unwrap();
+        let fresh = TabId::Chat(ws.chats[0].id.clone());
+        assert_ne!(fresh, TabId::Chat("mixed".into()));
+        let strip = s.visible_tab_ids(ws, cx);
+        assert_eq!(strip[0], fresh);
+        assert_eq!(strip.len(), 5);
+        assert_eq!(s.active_tab_index(cx), Some(0));
+    });
+}

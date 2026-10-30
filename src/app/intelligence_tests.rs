@@ -1,23 +1,15 @@
 //! The language edit path uses real GPUI buffers and the normal mixed-tab workspace.
 use super::*;
-use crate::lsp::document::{EditGuard, Encoding};
+use crate::lsp::document::{EditGuard, Encoding, file_uri};
 use core::prelude::v1::test;
 use gpui_kit::test::{TestAppContextExt, TestWindowExt};
 use lsp_types::{Position, Range, TextEdit, WorkspaceEdit};
 use std::time::Duration;
 
-fn file_uri(path: &Path) -> lsp_types::Uri {
-    url::Url::from_file_path(path)
-        .unwrap()
-        .as_str()
-        .parse()
-        .unwrap()
-}
-
 /// A definition result for `path` at `line`, columns `start..end`.
 fn link(path: &Path, line: u32, start: u32, end: u32) -> lsp_types::LocationLink {
     let range = Range::new(Position::new(line, start), Position::new(line, end));
-    crate::lsp::providers::location_link(lsp_types::Location::new(file_uri(path), range))
+    crate::lsp::providers::location_link(lsp_types::Location::new(file_uri(path).unwrap(), range))
 }
 
 fn edits(root: &Path, first: &str, second: &str) -> WorkspaceEdit {
@@ -29,8 +21,8 @@ fn edits(root: &Path, first: &str, second: &str) -> WorkspaceEdit {
     };
     WorkspaceEdit {
         changes: Some(HashMap::from([
-            (file_uri(&root.join("a.txt")), edit(first)),
-            (file_uri(&root.join("b.txt")), edit(second)),
+            (file_uri(&root.join("a.txt")).unwrap(), edit(first)),
+            (file_uri(&root.join("b.txt")).unwrap(), edit(second)),
         ])),
         ..Default::default()
     }
@@ -137,7 +129,6 @@ fn fake_session(root: &Path, toolchain: &str) -> (crate::lsp::Session, PathBuf) 
     let project = crate::lsp::tools::Project {
         root: root.to_owned(),
         worktree: root.to_owned(),
-        language_id: "python",
         backend: crate::lsp::tools::Backend::Pyrefly,
         toolchain: toolchain.into(),
         rust_toolchain: None,
@@ -338,8 +329,8 @@ async fn language_invalid_workspace_edits_change_nothing(cx: &mut TestAppContext
     let (root, window, shark) = fixture(cx).await;
     let buffers = cx.update(|cx| editors(&shark, cx));
     for invalid in [
-        serde_json::json!({"documentChanges":[{"textDocument":{"uri":file_uri(&root.join("a.txt")),"version":999},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}},"newText":"stale"}]}]}),
-        serde_json::json!({"documentChanges":[{"textDocument":{"uri":file_uri(&root.join("a.txt")),"version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}},"newText":"first"}]},{"kind":"delete","uri":file_uri(&root.join("b.txt"))}]}),
+        serde_json::json!({"documentChanges":[{"textDocument":{"uri":file_uri(&root.join("a.txt")).unwrap(),"version":999},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}},"newText":"stale"}]}]}),
+        serde_json::json!({"documentChanges":[{"textDocument":{"uri":file_uri(&root.join("a.txt")).unwrap(),"version":null},"edits":[{"range":{"start":{"line":0,"character":0},"end":{"line":0,"character":5}},"newText":"first"}]},{"kind":"delete","uri":file_uri(&root.join("b.txt")).unwrap()}]}),
     ] {
         let edit = serde_json::from_value(invalid).unwrap();
         notified(cx, window, |cx| {
@@ -390,7 +381,7 @@ async fn language_batch_touching_a_closed_file_written_since_the_request_is_reje
     std::fs::write(root.join("c.txt"), "agent\n").unwrap();
     let mut edit = edits(&root, "wrong", "wrong");
     edit.changes.as_mut().unwrap().insert(
-        file_uri(&root.join("c.txt")),
+        file_uri(&root.join("c.txt")).unwrap(),
         vec![TextEdit::new(
             Range::new(Position::new(0, 0), Position::new(0, 5)),
             "wrong".into(),
@@ -408,6 +399,33 @@ async fn language_batch_touching_a_closed_file_written_since_the_request_is_reje
         assert_eq!(shark.read(cx).file_tabs.len(), 2);
         assert_eq!(text(&buffers[0], cx), "alpha\n");
     });
+}
+
+// Metadata-only changes (xattr writes bump ctime, not mtime) do not fail an open document's edit.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn language_batch_on_an_open_file_survives_an_xattr_write_since_the_request(
+    cx: &mut TestAppContext,
+) {
+    let _guard = ui_tests::UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (root, window, shark) = fixture(cx).await;
+    let buffers = cx.update(|cx| editors(&shark, cx));
+    let guard = EditGuard::capture();
+    std::thread::sleep(Duration::from_millis(20));
+    for file in ["a.txt", "b.txt"] {
+        let xattr = std::process::Command::new("/usr/bin/xattr")
+            .args(["-w", "com.example.tag", "x"])
+            .arg(root.join(file))
+            .status()
+            .unwrap();
+        assert!(xattr.success());
+    }
+    apply_edit(cx, window, &shark, &root, edits(&root, "one", "two"), guard);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        buffers.iter().all(|e| e.read(cx).dirty)
+    })
+    .await;
+    cx.update(|cx| assert_eq!(text(&buffers[0], cx), "one\n"));
 }
 
 // A dirty diff buffer participates in the same preflight as full-width editor tabs.
@@ -1521,4 +1539,98 @@ async fn retry_reattaches_dependency_sources_and_format_refuses_them(cx: &mut Te
         assert_eq!(session_of(&a, cx), Some(fresh.clone()));
         assert_eq!(session_of(&dep, cx), Some(fresh.clone()));
     });
+}
+
+fn visit(name: &str) -> super::intelligence::Visit {
+    super::intelligence::Visit {
+        path: name.into(),
+        selection: 0..0,
+        scroll: Default::default(),
+        session: None,
+    }
+}
+
+fn names(stack: &[super::intelligence::Visit]) -> Vec<&str> {
+    stack.iter().map(|v| v.path.to_str().unwrap()).collect()
+}
+
+#[test]
+fn history_push_stack_prune_and_step_keep_back_forward_accounting() {
+    use super::intelligence::History;
+    let mut h = History::default();
+    h.back = vec![visit("a"), visit("b"), visit("c")];
+    h.forward = vec![visit("z")];
+    h.push(visit("x"));
+    assert_eq!(names(&h.back), ["a", "b", "c", "x"]);
+    assert!(h.forward.is_empty());
+    assert_eq!(names(h.stack(false)), ["a", "b", "c", "x"]);
+    assert!(h.stack(true).is_empty());
+
+    // Two quick Back presses land on `b`; `c` and the old position go on Forward.
+    h.back.pop();
+    h.step(false, 2, Some(visit("x")));
+    assert_eq!(names(&h.back), ["a"]);
+    assert_eq!(names(&h.forward), ["x", "c"]);
+
+    // A missing entry leaves the stack; an earlier one remains to try.
+    h.back = vec![visit("a"), visit("b"), visit("c")];
+    assert!(h.prune(false, 2, 9));
+    assert_eq!(names(&h.back), ["a", "c"]);
+    assert_eq!(h.pending, Some((false, 1, 9)));
+    // The oldest entry has nothing before it; too many steps removes nothing.
+    assert!(!h.prune(false, 2, 9));
+    assert_eq!(names(&h.back), ["c"]);
+    assert!(!h.prune(false, 5, 9));
+    assert_eq!(names(&h.back), ["c"]);
+}
+
+#[test]
+fn stage_edits_checks_the_worktree_and_computes_the_new_text() {
+    use super::intelligence::stage_edits;
+    let dir = std::env::temp_dir().join(format!("shark-stage-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    let root = dir.join("api");
+    std::fs::create_dir_all(&root).unwrap();
+    std::fs::write(root.join("a.txt"), "alpha\n").unwrap();
+    std::fs::write(dir.join("outside.txt"), "alpha\n").unwrap();
+    let guard = EditGuard::capture();
+    let stage = |edit| {
+        stage_edits(
+            edit,
+            Encoding::Utf16,
+            root.clone(),
+            dir.clone(),
+            Some(guard.clone()),
+            &[],
+        )
+    };
+    let one = WorkspaceEdit {
+        changes: Some(HashMap::from([(
+            file_uri(&root.join("a.txt")).unwrap(),
+            vec![TextEdit::new(
+                Range::new(Position::new(0, 0), Position::new(0, 5)),
+                "first".into(),
+            )],
+        )])),
+        ..Default::default()
+    };
+    let staged = stage(one.clone()).unwrap();
+    assert_eq!(staged.len(), 1);
+    assert_eq!(staged[0].relative, "api/a.txt");
+    assert_eq!(staged[0].before, "alpha\n");
+    assert_eq!(staged[0].after, "first\n");
+    assert_eq!(staged[0].version, None);
+    // Without a guard, an unversioned edit is refused.
+    let error = stage_edits(one, Encoding::Utf16, root.clone(), dir.clone(), None, &[]);
+    assert!(error.unwrap_err().to_string().contains("Unversioned"));
+    let outside = WorkspaceEdit {
+        changes: Some(HashMap::from([(
+            file_uri(&dir.join("outside.txt")).unwrap(),
+            vec![],
+        )])),
+        ..Default::default()
+    };
+    let error = stage(outside).unwrap_err().to_string();
+    assert!(error.contains("leaves the current worktree"), "{error}");
+    let _ = std::fs::remove_dir_all(&dir);
 }

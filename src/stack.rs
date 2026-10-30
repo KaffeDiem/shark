@@ -1,6 +1,6 @@
 //! PR stacks: a branch based on another branch with an open PR, as `main ← logic ← ui`.
 //! Pure, from the local workspaces and a repo's open PRs; nothing about stacks is stored.
-use crate::complete::Pr;
+use crate::prs::Pr;
 
 /// One branch of a stack: its open PR, the local workspace on it, either or both.
 #[derive(Clone, Debug, PartialEq)]
@@ -30,7 +30,7 @@ pub fn chain(
     local: &[(String, String, String)],
     prs: &[Pr],
 ) -> (Vec<Node>, usize) {
-    let trunk_name = trunk.strip_prefix("origin/").unwrap_or(trunk);
+    let trunk_name = crate::sync::short(trunk);
     let own: Vec<&Pr> = prs.iter().filter(|p| !p.is_cross_repository).collect();
     let node = |b: &str| Node {
         branch: b.to_string(),

@@ -13,10 +13,12 @@ mod app_switcher_tests;
 mod audit_tests;
 mod base_adoption_tests;
 pub(crate) mod chrome_tests;
+mod differ_review_fixes_tests;
 mod drag_tests;
 mod editor_pane_tests;
 mod file_changes_tests;
 mod git_tests;
+mod home_tests;
 mod menu_pixels;
 mod mixed_tab_tests;
 mod navigation_pixels;
@@ -43,21 +45,7 @@ pub(super) fn test_home() -> PathBuf {
 pub(super) fn init_repo(repo: &std::path::Path) {
     fs::create_dir_all(repo).unwrap();
     git::git(repo, &["init", "-q", "-b", "main"]).unwrap();
-    git::git(
-        repo,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-q",
-            "--allow-empty",
-            "-m",
-            "i",
-        ],
-    )
-    .unwrap();
+    git::commit(repo, &["-q", "--allow-empty", "-m", "i"]);
 }
 
 /// Repos `home/src/<name>`, each with one commit.
@@ -202,6 +190,14 @@ async fn settings_apply_and_save(cx: &mut TestAppContext) {
         assert_eq!(saved.appearance.dark, "Sequoia");
         assert_eq!(saved.prompts["commit"], "ship {repos}");
         assert_eq!(crate::prompts::render("commit", "api", "b"), "ship api");
+        // Clearing the editor is the default again, not an empty prompt.
+        view.update(cx, |v, cx| v.set_prompt(0, Some("  \n".into()), cx));
+        assert!(State::load().prompts.is_empty());
+        assert!(crate::prompts::render("commit", "api", "b").starts_with("Commit and push"));
+        // A blank override saved by an older version reads as the default too.
+        crate::prompts::set_overrides(&[("commit".to_string(), " ".to_string())].into());
+        assert!(crate::prompts::render("commit", "api", "b").starts_with("Commit and push"));
+        view.update(cx, |v, cx| v.set_prompt(0, Some("ship {repos}".into()), cx));
 
         view.update(cx, |v, cx| {
             v.appearance(cx, |a| a.mode = Mode::Light);
@@ -343,19 +339,7 @@ async fn pull_request_picker(cx: &mut TestAppContext) {
     git::git(src, &["checkout", "-qb", "colleague/long-feature-branch"]).unwrap();
     fs::write(src.join("review.txt"), "colleague's change\n").unwrap();
     git::git(src, &["add", "."]).unwrap();
-    git::git(
-        src,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "review",
-        ],
-    )
-    .unwrap();
+    git::commit(src, &["-qm", "review"]);
     let head = git::git(src, &["rev-parse", "HEAD"]).unwrap();
     git::git(src, &["push", "-q", "origin", "HEAD:refs/pull/7/head"]).unwrap();
     git::git(src, &["checkout", "-q", "main"]).unwrap();
@@ -1351,7 +1335,7 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
         .iter()
         .position(|r| r.0.starts_with("Start a new conversation"))
         .unwrap();
-    on(cx, &|s, w, cx| (COMMANDS[row].4)(s, w, cx));
+    on(cx, &|s, w, cx| COMMANDS[row].run(s, w, cx));
     assert_eq!(State::load().workspaces[0].chats[0].session_id, None);
 
     // Archive runs in the background, once.
@@ -1368,7 +1352,7 @@ async fn diff_states_and_archive(cx: &mut TestAppContext) {
         let s = shark.read(cx);
         assert!(s.archiving.is_empty());
         assert!(
-            !s.differ.read(cx).review().comments.contains_key("st"),
+            !s.differ.read(cx).review().store.comments.contains_key("st"),
             "its comments go too"
         );
     });
@@ -2616,7 +2600,8 @@ async fn command_click_file_tabs(cx: &mut TestAppContext) {
     on(cx, &|s, w, cx| s.show(Tab::Feature(Feature::Diff), w, cx));
     press(cx, &["cmd-w"]);
     cx.update(|cx| {
-        assert_eq!(shark.read(cx).tab, Tab::Chat);
+        // The file that slid into Diff's slot, not the chat.
+        assert_eq!(shark.read(cx).tab, Tab::File);
         assert_eq!(
             shark.read(cx).active_ws().unwrap().chats.len(),
             1,
@@ -2715,19 +2700,7 @@ async fn media_in_diff(cx: &mut TestAppContext) {
     fs::copy(&icon, src.join("a.png")).unwrap();
     fs::copy(&icon, src.join("del.png")).unwrap();
     git::git(src, &["add", "."]).unwrap();
-    git::git(
-        src,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "media",
-        ],
-    )
-    .unwrap();
+    git::commit(src, &["-qm", "media"]);
     let (window, shark) = boot(
         cx,
         State {
@@ -3212,19 +3185,7 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     fs::create_dir_all(repos[0].path.join("App.xcodeproj")).unwrap();
     fs::write(repos[0].path.join("App.xcodeproj/project.pbxproj"), "").unwrap();
     git::git(&repos[0].path, &["add", "."]).unwrap();
-    git::git(
-        &repos[0].path,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "x",
-        ],
-    )
-    .unwrap();
+    git::commit(&repos[0].path, &["-qm", "x"]);
     let (window, shark) = boot(
         cx,
         State {
@@ -3670,19 +3631,7 @@ async fn file_picker_opens_selected_file(cx: &mut TestAppContext) {
         )
         .unwrap();
         git::git(&repo.path, &["add", "."]).unwrap();
-        git::git(
-            &repo.path,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-qm",
-                "file",
-            ],
-        )
-        .unwrap();
+        git::commit(&repo.path, &["-qm", "file"]);
     }
     let (window, shark) = boot(
         cx,
@@ -4101,11 +4050,15 @@ async fn home_ask_shark(cx: &mut TestAppContext) {
             cx,
         );
         let ask = s.home.ask.as_ref().unwrap();
-        assert_eq!(
-            (ask.text.as_str(), &ask.error, ask.done),
-            ("Forty-two", &None, true)
-        );
+        assert_eq!((&ask.error, ask.done), (&None, true));
     });
+    let answer = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let ask = shark.read(cx).home.ask.as_ref().unwrap();
+            ask.answer.read(cx).rendered_text().as_str().trim().to_string()
+        })
+    };
+    assert_eq!(answer(cx), "Forty-two");
 
     on(cx, &|s, w, cx| {
         s.ask("again?".into(), w, cx);
@@ -4134,12 +4087,12 @@ async fn home_ask_shark(cx: &mut TestAppContext) {
             cx,
         );
         let ask = s.home.ask.as_ref().unwrap();
-        assert_eq!(ask.text, "", "not also as the answer");
         assert_eq!(
             ask.error.as_deref(),
             Some("claude isn't logged in: run `claude` in a terminal and log in")
         );
     });
+    assert_eq!(answer(cx), "", "not also as the answer");
 }
 
 /// The prompt's text survives a cancelled New workspace dialog and clears once the workspace
@@ -4206,7 +4159,7 @@ async fn home_prompt_and_chat_keys(cx: &mut TestAppContext) {
 
     let chat = cx.update(|cx| shark.read(cx).active_chat().cloned().unwrap());
     let id = cx.update(|cx| chat.read(cx).meta.id.clone());
-    let path = crate::agent::transcript_path(&id);
+    let path = crate::transcript::transcript_path(&id);
     fs::create_dir_all(path.parent().unwrap()).unwrap();
     let said = |t: &str| {
         format!(
@@ -4228,7 +4181,7 @@ async fn home_prompt_and_chat_keys(cx: &mut TestAppContext) {
     };
     assert_eq!(
         waiting(cx, said("Shall I push it?")),
-        Some(crate::agent::QUESTION)
+        Some(crate::transcript::QUESTION)
     );
     assert_eq!(
         waiting(cx, said("Pushed.")),
@@ -4277,7 +4230,7 @@ async fn home_checklist(cx: &mut TestAppContext) {
         shark.read(cx).active.is_some()
     })
     .await;
-    let plan = crate::plan::tests_store_path("ws");
+    let plan = crate::plan::store_path("ws");
     fs::create_dir_all(plan.parent().unwrap()).unwrap();
     fs::write(
         &plan,
@@ -4503,19 +4456,7 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
 
     // Committed branch changes disappear in the HEAD comparison; local changes remain.
     git::git(&api, &["add", "."]).unwrap();
-    git::git(
-        &api,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "branch changes",
-        ],
-    )
-    .unwrap();
+    git::commit(&api, &["-qm", "branch changes"]);
     fs::write(api.join("a.md"), "staged\n").unwrap();
     git::git(&api, &["add", "a.md"]).unwrap();
     fs::write(api.join("a.md"), "unstaged\n").unwrap();
@@ -4613,19 +4554,7 @@ async fn changes_toolbar_and_files_panel(cx: &mut TestAppContext) {
     on(cx, &|s, _, cx| s.refresh_diff(cx));
     cx.update(|cx| assert_eq!(shark.read(cx).differ.read(cx).diff_files().len(), 3));
     git::git(&api, &["add", "."]).unwrap();
-    git::git(
-        &api,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "-qm",
-            "local changes",
-        ],
-    )
-    .unwrap();
+    git::commit(&api, &["-qm", "local changes"]);
     on(cx, &|s, _, cx| s.refresh_diff(cx));
     cx.update(|cx| assert!(shark.read(cx).differ.read(cx).diff_files().is_empty()));
     click_scope(cx);
@@ -4920,17 +4849,7 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
     )
     .unwrap();
     git::git(&repos[0].path, &["add", "."]).unwrap();
-    let commit = [
-        "-c",
-        "user.name=t",
-        "-c",
-        "user.email=t@t",
-        "commit",
-        "-q",
-        "-m",
-        "f",
-    ];
-    git::git(&repos[0].path, &commit).unwrap();
+    git::commit(&repos[0].path, &["-q", "-m", "f"]);
     let (window, shark) = boot(
         cx,
         State {
@@ -5612,7 +5531,7 @@ async fn review_queue(cx: &mut TestAppContext) {
             s.differ
                 .read(cx)
                 .review()
-                .failed_saves
+                .store.failed_saves
                 .contains_key(s.active.as_deref().unwrap())
         );
         s.differ.update(cx, |d, cx| d.open_share(1, w, cx));
@@ -5626,7 +5545,7 @@ async fn review_queue(cx: &mut TestAppContext) {
     fs::remove_dir(&store).unwrap();
     on(cx, &|s, _, cx| {
         s.retry_saves(cx);
-        assert!(s.differ.read(cx).review().failed_saves.is_empty());
+        assert!(s.differ.read(cx).review().store.failed_saves.is_empty());
     });
     assert!(
         fs::read_to_string(&store)
@@ -5748,12 +5667,12 @@ async fn review_queue(cx: &mut TestAppContext) {
     });
     let github_in = |cx: &mut TestAppContext, id: u64| {
         cx.update(|cx| {
-            let l = &shark.read(cx).differ.read(cx).review().comments[&ws];
+            let l = &shark.read(cx).differ.read(cx).review().store.comments[&ws];
             l.iter().find(|c| c.id == id).unwrap().github.clone()
         })
     };
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).review().comments[&ws][0]
+        shark.read(cx).differ.read(cx).review().store.comments[&ws][0]
             .github
             .is_some()
     })
@@ -5773,7 +5692,7 @@ async fn review_queue(cx: &mut TestAppContext) {
                 .differ
                 .read(cx)
                 .review()
-                .comments
+                .store.comments
                 .contains_key("elsewhere")
         )
     });
@@ -5826,7 +5745,7 @@ async fn review_queue(cx: &mut TestAppContext) {
     fs::write(dir.join("bad.json"), "{oops").unwrap();
     on(cx, &|s, _, cx| {
         s.differ
-            .update(cx, |d, _| d.review_mut().load_comments("bad"))
+            .update(cx, |d, _| d.review_mut().store.load("bad"))
     });
     assert!(dir.join("bad.json.1.bak").exists() && !dir.join("bad.json").exists());
     fs::write(
@@ -5836,10 +5755,10 @@ async fn review_queue(cx: &mut TestAppContext) {
     .unwrap();
     on(cx, &|s, _, cx| {
         s.differ
-            .update(cx, |d, _| d.review_mut().load_comments("old"))
+            .update(cx, |d, _| d.review_mut().store.load("old"))
     });
     cx.update(|cx| {
-        let c = &shark.read(cx).differ.read(cx).review().comments["old"][0];
+        let c = &shark.read(cx).differ.read(cx).review().store.comments["old"][0];
         assert_eq!((&c.status, &c.chat), (&Status::Pending, &None));
     });
 
@@ -6195,17 +6114,7 @@ async fn inline_edit_round2(cx: &mut TestAppContext) {
     )
     .unwrap();
     git::git(&repos[0].path, &["add", "."]).unwrap();
-    let commit = [
-        "-c",
-        "user.name=t",
-        "-c",
-        "user.email=t@t",
-        "commit",
-        "-q",
-        "-m",
-        "f",
-    ];
-    git::git(&repos[0].path, &commit).unwrap();
+    git::commit(&repos[0].path, &["-q", "-m", "f"]);
     let (window, shark) = boot(
         cx,
         State {
@@ -6824,9 +6733,9 @@ async fn review_round3(cx: &mut TestAppContext) {
         s.differ
             .update(cx, |d, cx| d.edit_comments(cx, |l| l.push(web)));
         s.differ.update(cx, |d, cx| d.open_sheet(w, cx));
-        assert_eq!(s.differ.read(cx).sheet_prs(cx), [("api".to_string(), 7)]);
+        assert_eq!(s.differ.read(cx).sheet_prs(), [("api".to_string(), 7)]);
         s.differ.update(cx, |d, cx| d.sheet_toggle(cx)); // unticks api's row
-        assert!(s.differ.read(cx).sheet_prs(cx).is_empty(), "web has no PR");
+        assert!(s.differ.read(cx).sheet_prs().is_empty(), "web has no PR");
         s.differ.update(cx, |d, cx| d.sheet_toggle(cx));
         s.differ.update(cx, |d, cx| d.sheet_publish(true, cx));
         assert!(s.differ.read(cx).review().sheet.as_ref().unwrap().preview);
@@ -6965,17 +6874,7 @@ async fn inline_edit_round3(cx: &mut TestAppContext) {
     fs::write(repos[0].path.join("f.txt"), "fn a() {\n    b();\n}\n").unwrap();
     fs::write(repos[0].path.join("h.txt"), "h\n").unwrap();
     git::git(&repos[0].path, &["add", "."]).unwrap();
-    let commit = [
-        "-c",
-        "user.name=t",
-        "-c",
-        "user.email=t@t",
-        "commit",
-        "-q",
-        "-m",
-        "f",
-    ];
-    git::git(&repos[0].path, &commit).unwrap();
+    git::commit(&repos[0].path, &["-q", "-m", "f"]);
     let (window, shark) = boot(
         cx,
         State {
@@ -7280,17 +7179,7 @@ async fn inline_edit_round4(cx: &mut TestAppContext) {
     fs::write(repos[0].path.join("f.txt"), "f\n").unwrap();
     fs::write(repos[0].path.join("g.txt"), "g\n").unwrap();
     git::git(&repos[0].path, &["add", "."]).unwrap();
-    let commit = [
-        "-c",
-        "user.name=t",
-        "-c",
-        "user.email=t@t",
-        "commit",
-        "-q",
-        "-m",
-        "f",
-    ];
-    git::git(&repos[0].path, &commit).unwrap();
+    git::commit(&repos[0].path, &["-q", "-m", "f"]);
     let (window, shark) = boot(
         cx,
         State {

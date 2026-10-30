@@ -1,19 +1,15 @@
 //! Home (cmd-0): a prompt to start the next workspace or ask Shark, setup, every workspace by
 //! what it needs from you, and appearance. It is what shows while no workspace is open, and
 //! over the open one while `Home::on`.
+use super::ask::Ask;
 use super::*;
-use crate::agent::{self, Agent, Ev};
-use crate::settings::{card, close_button, pill};
-use crate::state::{Appearance, Mode};
+use crate::state::Appearance;
 use crate::sync::PrState;
-use gpui_kit::component::text::TextViewState;
+use crate::ui::{card, close_button, mode_pills};
 use std::time::SystemTime;
 
 const BUILD: &str = "Describe the change; enter picks repos and a branch";
 const ASK: &str = "Ask how to do something in Shark";
-const ASK_PROMPT: &str = "You answer questions about Shark, a macOS app for running Claude Code \
-    on features that span several repos. Answer briefly, from the README and the shortcut list \
-    below only; name the key or the cmd-k command to use. If they don't cover it, say so.";
 const RELEASES: &str = "https://github.com/KaffeDiem/shark/releases/tag/v";
 
 /// Home's workspace groups, in the order they're shown.
@@ -53,16 +49,6 @@ pub(super) fn bucket(
     }
 }
 
-/// claude's error, or what to do when it's the login one (it says "/login", a chat command).
-fn ask_error(text: String) -> String {
-    let t = text.to_lowercase();
-    match t.contains("/login") || t.contains("not logged in") {
-        true => "claude isn't logged in: run `claude` in a terminal and log in".into(),
-        false if text.trim().is_empty() => "claude stopped without an answer".into(),
-        false => text,
-    }
-}
-
 /// A repo's line on a Home row. gh logged out or a remote that isn't GitHub isn't news here
 /// (the sidebar's git button says so); the rest is the same as the sidebar's.
 fn home_summary(r: &crate::sync::Repo) -> String {
@@ -78,26 +64,10 @@ fn home_summary(r: &crate::sync::Repo) -> String {
 
 type Go = fn(&mut Shark, &mut Window, &mut Context<Shark>);
 
-fn new_ws(s: &mut Shark, w: &mut Window, cx: &mut Context<Shark>) {
-    s.new_workspace(s.state.last_repos.clone(), None, w, cx)
-}
-
 /// A button that runs `go`, and its shortcut.
 fn key_button(b: Button, keys: &str, go: Go, cx: &Context<Shark>) -> Div {
     let b = b.on_click(cx.listener(move |s, _, w, cx| go(s, w, cx)));
     h_flex().gap_2().child(b).child(kbd(keys))
-}
-
-/// One Ask Shark question and its streamed answer; dropping it stops claude.
-pub(super) struct Ask {
-    pub(super) question: String,
-    answer: Entity<TextViewState>,
-    pub(super) text: String,
-    pub(super) done: bool,
-    pub(super) error: Option<String>,
-    /// Before `agent`: dropped first, so the kill's exit isn't read.
-    _reader: Option<Task<()>>,
-    pub(super) agent: Option<Agent>,
 }
 
 /// What each workspace waits on and when it last changed. Reads transcript tails.
@@ -106,20 +76,11 @@ fn scan(wss: Vec<Workspace>) -> Vec<(String, Option<&'static str>, Option<System
         .map(|ws| {
             (
                 ws.name.clone(),
-                agent::waiting_on_user(&ws),
-                agent::last_activity(&ws),
+                crate::transcript::waiting_on_user(&ws),
+                crate::transcript::last_activity(&ws),
             )
         })
         .collect()
-}
-
-impl Ask {
-    /// Stops reading before the kill, so its exit isn't read.
-    fn stop(&mut self) {
-        self.done = true;
-        self._reader = None;
-        self.agent = None;
-    }
 }
 
 pub(crate) struct Home {
@@ -181,16 +142,21 @@ impl Home {
 }
 
 /// A Home workspace row, in display order.
-struct HomeRow {
-    ix: usize,
+pub(super) struct HomeRow {
+    pub(super) ix: usize,
     bucket: Bucket,
     label: Option<String>,
     running: usize,
 }
 
 impl Shark {
+    /// A new workspace on the repos of the last one.
+    pub(super) fn new_workspace_default(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_workspace(self.state.last_repos.clone(), None, window, cx)
+    }
+
     /// Home is on screen: asked for, or nothing else to show.
-    pub(super) fn home_shown(&self) -> bool {
+    pub(crate) fn home_shown(&self) -> bool {
         self.home.on || self.active.is_none()
     }
 
@@ -203,8 +169,8 @@ impl Shark {
     }
 
     fn leave_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(name) = self.active.clone() {
-            self.record_interaction(&name, cx);
+        if self.active.is_some() {
+            self.record_active_interaction(cx);
             let tab = self.tab;
             self.show(tab, window, cx); // clears `home.on`
         }
@@ -244,6 +210,19 @@ impl Shark {
                 }
             }
             (false, _) => self.sidebar_focus.focus(window, cx),
+        }
+    }
+
+    /// Refocuses `prev`, else the fallback.
+    pub(super) fn restore_focus(
+        &mut self,
+        prev: Option<FocusHandle>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match prev {
+            Some(focus) => focus.focus(window, cx),
+            None => self.focus_fallback(window, cx),
         }
     }
 
@@ -308,7 +287,7 @@ impl Shark {
         .detach();
     }
 
-    fn home_rows(&self, cx: &App) -> Vec<HomeRow> {
+    pub(super) fn home_rows(&self, cx: &App) -> Vec<HomeRow> {
         let mut rows: Vec<HomeRow> = (self.ws_order(true).into_iter())
             .map(|ix| {
                 let name = &self.state.workspaces[ix].name;
@@ -328,21 +307,23 @@ impl Shark {
     }
 
     /// The cursor's position in `rows`.
-    fn home_at(&self, rows: &[HomeRow]) -> Option<usize> {
+    pub(super) fn home_at(&self, rows: &[HomeRow]) -> Option<usize> {
         let sel = self.home.sel.as_ref()?;
         rows.iter()
             .position(|r| &self.state.workspaces[r.ix].name == sel)
     }
 
-    fn home_move(&mut self, to: impl FnOnce(usize, usize) -> usize, cx: &mut Context<Self>) {
+    /// The cursor's position in `rows`, else the first row.
+    pub(super) fn home_cursor(&self, rows: &[HomeRow]) -> Option<usize> {
+        self.home_at(rows).or((!rows.is_empty()).then_some(0))
+    }
+
+    fn home_move(&mut self, nav: Nav, cx: &mut Context<Self>) {
         let rows = self.home_rows(cx);
         if rows.is_empty() {
             return;
         }
-        let to = self
-            .home_at(&rows)
-            .map_or(0, |at| to(at, rows.len()))
-            .min(rows.len() - 1);
+        let to = nav.to(self.home_at(&rows).unwrap_or(0), rows.len(), 10);
         self.home.sel = Some(self.state.workspaces[rows[to].ix].name.clone());
         // The list's children are the rows with a heading before each group's first.
         let headings = rows[..=to].chunk_by(|a, b| a.bucket == b.bucket).count();
@@ -367,7 +348,7 @@ impl Shark {
 
     fn home_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.home_rows(cx);
-        if let Some(r) = self.home_at(&rows).or((!rows.is_empty()).then_some(0)) {
+        if let Some(r) = self.home_cursor(&rows) {
             self.open_workspace(rows[r].ix, window, cx)
         }
     }
@@ -424,97 +405,14 @@ impl Shark {
         }
     }
 
-    /// One question at a time: a new one replaces (and stops) the last.
-    pub(super) fn ask(&mut self, question: String, window: &mut Window, cx: &mut Context<Self>) {
-        let keys: Vec<String> = (palette::keymap_summary(window).into_iter())
-            .map(|(label, key)| format!("- {key}: {label}"))
-            .collect();
-        let system = format!(
-            "{ASK_PROMPT}\n\n# Shortcuts\n{}\n\n# README\n{}",
-            keys.join("\n"),
-            agent::README
-        );
-        let mut ask = Ask {
-            question: question.clone(),
-            answer: cx.new(|cx| TextViewState::markdown("", cx)),
-            text: String::new(),
-            done: false,
-            error: None,
-            agent: None,
-            _reader: None,
-        };
-        // The setup rows for a missing claude show right below.
-        let failed = |e| {
-            format!(
-                "Couldn't start {}.",
-                crate::git::spawn_err(Path::new("/"), "claude", e)
-            )
-        };
-        let started = agent::spawn_ask("haiku", &system)
-            .and_then(|(mut a, rx)| a.send(&question).map(|()| (a, rx)));
-        match started {
-            Ok((a, rx)) => {
-                ask.agent = Some(a);
-                ask._reader = Some(cx.spawn(async move |this, cx| {
-                    while let Ok(ev) = rx.recv().await {
-                        if this.update(cx, |s, cx| s.apply_ask(ev, cx)).is_err() {
-                            break;
-                        }
-                    }
-                }));
-            }
-            Err(e) => (ask.done, ask.error) = (true, Some(failed(e))),
-        }
-        self.home.ask = Some(ask);
-        cx.notify();
-    }
-
-    pub(super) fn apply_ask(&mut self, ev: Ev, cx: &mut Context<Self>) {
-        let Some(ask) = &mut self.home.ask else {
-            return;
-        };
-        match ev {
-            Ev::TextDelta(d) => {
-                ask.text.push_str(&d);
-                ask.answer.update(cx, |m, cx| m.push_str(&d, cx));
-            }
-            Ev::Text(full) => {
-                ask.answer.update(cx, |m, cx| m.set_text(&full, cx));
-                ask.text = full;
-            }
-            Ev::Result { is_error, text, .. } => {
-                // Kill it (it waits on stdin otherwise).
-                ask.stop();
-                if is_error {
-                    // claude also streams the error as its answer: show it once.
-                    ask.text.clear();
-                    ask.answer.update(cx, |m, cx| m.set_text("", cx));
-                    ask.error = Some(ask_error(text));
-                }
-            }
-            Ev::Exited(msg) if !ask.done => (ask.done, ask.error) = (true, Some(ask_error(msg))),
-            _ => return,
-        }
-        cx.notify();
-    }
-
-    /// Stops an answer still being written; false when there is none.
-    pub(super) fn cancel_ask(&mut self, cx: &mut Context<Self>) -> bool {
-        match &mut self.home.ask {
-            Some(ask) if !ask.done => {
-                ask.stop();
-                ask.error = Some("Stopped".into());
-                cx.notify();
-                true
-            }
-            _ => false,
-        }
-    }
-
-    fn set_appearance(&mut self, cx: &mut Context<Self>, f: impl FnOnce(&mut Appearance)) {
+    pub(crate) fn set_appearance(
+        &mut self,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut Appearance),
+    ) {
         f(&mut self.state.appearance);
         let _ = self.state.save();
-        crate::settings::apply(&self.state.appearance, cx);
+        crate::theme::apply(&self.state.appearance, cx);
         cx.notify();
     }
 
@@ -552,7 +450,7 @@ impl Shark {
     /// "Approve a plan": plan mode on in the cursor's (or the first) workspace.
     pub(super) fn try_plan_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.home_rows(cx);
-        let Some(r) = self.home_at(&rows).or((!rows.is_empty()).then_some(0)) else {
+        let Some(r) = self.home_cursor(&rows) else {
             return notify_err(window, cx, "Create a workspace first (cmd-n)");
         };
         let ix = rows[r].ix;
@@ -716,67 +614,10 @@ impl Shark {
                     .gap_3()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(crate::chat::hint("enter", enter))
-                    .child(crate::chat::hint("tab", other)),
+                    .child(crate::ui::hint("enter", enter))
+                    .child(crate::ui::hint("tab", other)),
             )
             .into_any_element()
-    }
-
-    fn render_ask(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
-        let ask = self.home.ask.as_ref()?;
-        let theme = cx.theme();
-        Some(
-            v_flex()
-                .p_3()
-                .gap_2()
-                .rounded(theme.radius_lg)
-                .border_1()
-                .border_color(theme.border)
-                .bg(theme.muted)
-                .child(
-                    h_flex()
-                        .gap_2()
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(Icon::new(IconName::MessageCircleQuestionMark).with_size(px(14.)))
-                        .child("Ask Shark")
-                        .child(div().flex_1())
-                        .when(!ask.done, |d| d.child(Spinner::new().with_size(px(12.))))
-                        .child(close_button("close-ask", "Dismiss").on_click(cx.listener(
-                            |this, _, _, cx| {
-                                this.home.ask = None;
-                                cx.notify()
-                            },
-                        ))),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme.foreground)
-                        .child(ask.question.clone()),
-                )
-                .child(
-                    div()
-                        .group("home-answer")
-                        .text_size(px(14.))
-                        .line_height(relative(1.5))
-                        .child(crate::chat::markdown(&ask.answer, "home-answer"))
-                        .when_some(ask.error.clone(), |d, e| {
-                            d.child(div().text_xs().text_color(theme.danger_foreground).child(e))
-                        }),
-                )
-                .when(!ask.done, |d| {
-                    d.child(
-                        h_flex()
-                            .gap_3()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(crate::chat::hint("escape", "stop")),
-                    )
-                })
-                .into_any_element(),
-        )
     }
 
     /// The Get started checklist and the cmd-k hint; `None` once there's neither.
@@ -860,7 +701,7 @@ impl Shark {
             .children(items.iter().enumerate().map(|(i, (label, done))| {
                 let (btn, keys, go): (_, _, Go) = match i {
                     1 => ("Add repo", "cmd-k", Shark::add_repo),
-                    2 => ("New workspace", "cmd-n", new_ws),
+                    2 => ("New workspace", "cmd-n", Shark::new_workspace_default),
                     3 => ("Use plan mode", "shift-tab", Shark::try_plan_mode),
                     _ => ("Create PRs", "cmd-k", Shark::toggle_palette),
                 };
@@ -929,60 +770,14 @@ impl Shark {
             .key_context("Home")
             .track_focus(&self.home.focus)
             .track_scroll(&self.home.rows)
-            .gap_1()
-            .on_action(
-                cx.listener(|this, _: &SelectNext, _, cx| this.home_move(|at, _| at + 1, cx)),
-            )
-            .on_action(cx.listener(|this, _: &SelectPrev, _, cx| {
-                this.home_move(|at, _| at.saturating_sub(1), cx)
-            }))
-            .on_action(cx.listener(|this, _: &SelectFirst, _, cx| this.home_move(|_, _| 0, cx)))
-            .on_action(cx.listener(|this, _: &SelectLast, _, cx| this.home_move(|_, n| n - 1, cx)))
-            .on_action(cx.listener(|this, _: &PageDown, _, cx| this.home_move(|at, _| at + 10, cx)))
-            .on_action(cx.listener(|this, _: &PageUp, _, cx| {
-                this.home_move(|at, _| at.saturating_sub(10), cx)
-            }))
+            .gap_1();
+        let list = nav_actions(list, true, cx, Shark::home_move)
             .on_action(cx.listener(|this, _: &Confirm, w, cx| this.home_confirm(w, cx)))
             .on_action(cx.listener(|this, _: &FocusComposer, w, cx| {
                 this.home.prompt.update(cx, |p, cx| p.focus(w, cx))
             }));
         if rows.is_empty() {
-            let no_repos = self.state.repos.is_empty();
-            let add = Button::new("home-add-repo").label("Add repo");
-            let add = add
-                .when(no_repos, |b| b.primary())
-                .on_click(cx.listener(|s, _, w, cx| s.add_repo(w, cx)));
-            let new = Button::new("home-new-ws").label("New workspace");
-            let new = key_button(new.when(!no_repos, |b| b.primary()), "cmd-n", new_ws, cx);
-            return list
-                .py_8()
-                .items_center()
-                .gap_3()
-                .child(
-                    Icon::new(IconName::Fish)
-                        .with_size(px(32.))
-                        .text_color(faint(theme)),
-                )
-                .child(
-                    div()
-                        .text_base()
-                        .text_color(theme.foreground)
-                        .child("No workspaces yet"),
-                )
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child(match no_repos {
-                            true => "Add a git repo, then start a workspace on a new branch",
-                            false => "A workspace is a branch with a worktree of each repo",
-                        }),
-                )
-                .child(match no_repos {
-                    true => h_flex().gap_4().child(add).child(new),
-                    false => h_flex().gap_4().child(new).child(add),
-                })
-                .into_any_element();
+            return self.render_empty(list, cx);
         }
         let now = SystemTime::now();
         let mut items: Vec<AnyElement> = vec![];
@@ -1003,153 +798,7 @@ impl Shark {
                     )
                     .into_any_element(),
             );
-            for r in group {
-                let w = &self.state.workspaces[r.ix];
-                let ix = r.ix;
-                let selected = self.home.sel.as_deref() == Some(w.name.as_str());
-                let repos = self.overview_repos(&w.name, cx);
-                let merged = (repos.iter().copied().flatten())
-                    .any(|r| r.pr().is_some_and(|p| p.state == PrState::Merged));
-                let when = (self.home.activity.get(&w.name))
-                    .and_then(|t| now.duration_since(*t).ok())
-                    .map(crate::sync::ago);
-                let names = (w.repos.iter().map(|r| r.name.as_str()))
-                    .collect::<Vec<_>>()
-                    .join(" · ");
-                let chats = match w.chats.len() {
-                    1 => "1 chat".to_string(),
-                    n => format!("{n} chats"),
-                };
-                let (icon, color) = match r.bucket {
-                    Bucket::Needs => (IconName::CircleAlert, theme.warning_foreground),
-                    Bucket::Unread => (IconName::CircleCheck, theme.success_foreground),
-                    _ => (IconName::CircleDashed, theme.muted_foreground),
-                };
-                let name = w.name.clone();
-                let ws = w.clone();
-                items.push(
-                    h_flex()
-                        .id(("home-ws", ix))
-                        .items_start()
-                        .px_3()
-                        .py_2()
-                        .gap_3()
-                        .rounded(theme.radius)
-                        .map(|d| list_cursor_row(d, selected, focused, theme))
-                        .on_mouse_down(MouseButton::Left, {
-                            let name = name.clone();
-                            cx.listener(move |this, _, _, cx| {
-                                this.home.sel = Some(name.clone());
-                                cx.notify()
-                            })
-                        })
-                        .on_click(cx.listener(move |this, _, w, cx| this.open_workspace(ix, w, cx)))
-                        .on_mouse_down(
-                            MouseButton::Right,
-                            cx.listener(move |this, e: &MouseDownEvent, w, cx| {
-                                this.home.sel = Some(ws.name.clone());
-                                this.home.focus.focus(w, cx);
-                                let entries = ws_menu(this, &ws, cx);
-                                this.show_menu(e.position, entries, w, cx);
-                            }),
-                        )
-                        .child(
-                            div().mt(px(3.)).child(match r.bucket {
-                                Bucket::Running => Spinner::new()
-                                    .icon(IconName::LoaderCircle)
-                                    .color(theme.primary)
-                                    .with_size(px(14.))
-                                    .into_any_element(),
-                                _ => Icon::new(icon)
-                                    .with_size(px(14.))
-                                    .text_color(color)
-                                    .into_any_element(),
-                            }),
-                        )
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .gap_0p5()
-                                .child(
-                                    h_flex()
-                                        .gap_2()
-                                        .text_sm()
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .truncate()
-                                                .font_weight(FontWeight::MEDIUM)
-                                                .child(name),
-                                        )
-                                        .when(merged, |d| {
-                                            d.child(
-                                                h_flex()
-                                                    .gap_1()
-                                                    .text_xs()
-                                                    .text_color(theme.success_foreground)
-                                                    .child(
-                                                        Icon::new(IconName::GitMerge)
-                                                            .with_size(px(12.)),
-                                                    )
-                                                    .child("Merged"),
-                                            )
-                                        })
-                                        .child(div().flex_1())
-                                        .children(when.map(|t| {
-                                            div()
-                                                .flex_none()
-                                                .text_xs()
-                                                .text_color(theme.muted_foreground)
-                                                .child(t)
-                                        })),
-                                )
-                                .children(r.label.clone().map(|l| {
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.warning_foreground)
-                                        .child(l)
-                                }))
-                                .when(r.running > 1, |d| {
-                                    d.child(
-                                        div()
-                                            .text_xs()
-                                            .text_color(theme.muted_foreground)
-                                            .child(format!("{} chats running", r.running)),
-                                    )
-                                })
-                                .child(
-                                    h_flex()
-                                        .min_w_0()
-                                        .gap_1p5()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child(Icon::new(IconName::GitBranch).with_size(px(12.)))
-                                        .child(
-                                            div()
-                                                .min_w_0()
-                                                .truncate()
-                                                .child(format!("{} · {names} · {chats}", w.branch)),
-                                        ),
-                                )
-                                .children(match repos {
-                                    None => vec![
-                                        div().text_xs().text_color(faint(theme)).child("checking…"),
-                                    ],
-                                    Some(repos) => (repos.iter())
-                                        .map(|r| {
-                                            div()
-                                                .truncate()
-                                                .text_xs()
-                                                .text_color(theme.muted_foreground)
-                                                .child(home_summary(r))
-                                        })
-                                        .collect(),
-                                }),
-                        )
-                        .into_any_element(),
-                );
-            }
+            items.extend(group.iter().map(|r| self.home_ws_row(r, focused, now, cx)));
         }
         list.children(items)
             .child(
@@ -1158,10 +807,192 @@ impl Shark {
                     .gap_3()
                     .text_xs()
                     .text_color(faint(theme))
-                    .child(crate::chat::hint("enter", "open"))
-                    .child(crate::chat::hint("i", "prompt"))
-                    .child(crate::chat::hint("cmd-backspace", "archive"))
+                    .child(crate::ui::hint("enter", "open"))
+                    .child(crate::ui::hint("i", "prompt"))
+                    .child(crate::ui::hint("cmd-backspace", "archive"))
                     .child(div().child("right-click for more")),
+            )
+            .into_any_element()
+    }
+
+    /// The list with no workspaces: add a repo, then start one.
+    fn render_empty(&self, list: Stateful<Div>, cx: &Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        let no_repos = self.state.repos.is_empty();
+        let add = Button::new("home-add-repo").label("Add repo");
+        let add = add
+            .when(no_repos, |b| b.primary())
+            .on_click(cx.listener(|s, _, w, cx| s.add_repo(w, cx)));
+        let new = Button::new("home-new-ws").label("New workspace");
+        let new = key_button(
+            new.when(!no_repos, |b| b.primary()),
+            "cmd-n",
+            Shark::new_workspace_default,
+            cx,
+        );
+        list.py_8()
+            .items_center()
+            .gap_3()
+            .child(
+                Icon::new(IconName::Fish)
+                    .with_size(px(32.))
+                    .text_color(faint(theme)),
+            )
+            .child(
+                div()
+                    .text_base()
+                    .text_color(theme.foreground)
+                    .child("No workspaces yet"),
+            )
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(match no_repos {
+                        true => "Add a git repo, then start a workspace on a new branch",
+                        false => "A workspace is a branch with a worktree of each repo",
+                    }),
+            )
+            .child(match no_repos {
+                true => h_flex().gap_4().child(add).child(new),
+                false => h_flex().gap_4().child(new).child(add),
+            })
+            .into_any_element()
+    }
+
+    /// One workspace's row on the list.
+    fn home_ws_row(
+        &self,
+        r: &HomeRow,
+        focused: bool,
+        now: SystemTime,
+        cx: &Context<Self>,
+    ) -> AnyElement {
+        let theme = cx.theme();
+        let w = &self.state.workspaces[r.ix];
+        let ix = r.ix;
+        let selected = self.home.sel.as_deref() == Some(w.name.as_str());
+        let repos = self.overview_repos(&w.name, cx);
+        let merged = (repos.iter().copied().flatten())
+            .any(|r| r.pr().is_some_and(|p| p.state == PrState::Merged));
+        let when = (self.home.activity.get(&w.name))
+            .and_then(|t| now.duration_since(*t).ok())
+            .map(crate::sync::ago);
+        let names = (w.repos.iter().map(|r| r.name.as_str()))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let chats = match w.chats.len() {
+            1 => "1 chat".to_string(),
+            n => format!("{n} chats"),
+        };
+        let name = w.name.clone();
+        let ws = w.clone();
+        h_flex()
+            .id(("home-ws", ix))
+            .items_start()
+            .px_3()
+            .py_2()
+            .gap_3()
+            .rounded(theme.radius)
+            .map(|d| list_cursor_row(d, selected, focused, theme))
+            .on_mouse_down(MouseButton::Left, {
+                let name = name.clone();
+                cx.listener(move |this, _, _, cx| {
+                    this.home.sel = Some(name.clone());
+                    cx.notify()
+                })
+            })
+            .on_click(cx.listener(move |this, _, w, cx| this.open_workspace(ix, w, cx)))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, w, cx| {
+                    this.home.sel = Some(ws.name.clone());
+                    this.home.focus.focus(w, cx);
+                    let entries = ws_menu(this, &ws, cx);
+                    this.show_menu(e.position, entries, w, cx);
+                }),
+            )
+            .child(div().mt(px(3.)).child(super::sidebar::indicator(
+                r.bucket,
+                theme.muted_foreground,
+                px(14.),
+                theme,
+            )))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_0p5()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .text_sm()
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .child(name),
+                            )
+                            .when(merged, |d| {
+                                d.child(
+                                    h_flex()
+                                        .gap_1()
+                                        .text_xs()
+                                        .text_color(theme.success_foreground)
+                                        .child(Icon::new(IconName::GitMerge).with_size(px(12.)))
+                                        .child("Merged"),
+                                )
+                            })
+                            .child(div().flex_1())
+                            .children(when.map(|t| {
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(t)
+                            })),
+                    )
+                    .children(r.label.clone().map(|l| {
+                        div()
+                            .text_xs()
+                            .text_color(theme.warning_foreground)
+                            .child(l)
+                    }))
+                    .when(r.running > 1, |d| {
+                        d.child(
+                            div()
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("{} chats running", r.running)),
+                        )
+                    })
+                    .child(
+                        h_flex()
+                            .min_w_0()
+                            .gap_1p5()
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child(Icon::new(IconName::GitBranch).with_size(px(12.)))
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .truncate()
+                                    .child(format!("{} · {names} · {chats}", w.branch)),
+                            ),
+                    )
+                    .children(match repos {
+                        None => vec![div().text_xs().text_color(faint(theme)).child("checking…")],
+                        Some(repos) => (repos.iter())
+                            .map(|r| {
+                                div()
+                                    .truncate()
+                                    .text_xs()
+                                    .text_color(theme.muted_foreground)
+                                    .child(home_summary(r))
+                            })
+                            .collect(),
+                    }),
             )
             .into_any_element()
     }
@@ -1169,11 +1000,6 @@ impl Shark {
     fn render_appearance(&self, cx: &mut Context<Self>) -> AnyElement {
         let mode = self.state.appearance.mode;
         let theme = cx.theme();
-        let modes = [
-            (Mode::System, "System", IconName::Monitor),
-            (Mode::Light, "Light", IconName::Sun),
-            (Mode::Dark, "Dark", IconName::Moon),
-        ];
         card(theme)
             .child(
                 h_flex()
@@ -1181,10 +1007,10 @@ impl Shark {
                     .px_3()
                     .gap_3()
                     .child(div().text_sm().child("Appearance"))
-                    .child(h_flex().gap_1().children(modes.map(|(m, label, icon)| {
-                        pill(label, Some(icon), m == mode).on_click(cx.listener(
-                            move |this, _, _, cx| this.set_appearance(cx, |a| a.mode = m),
-                        ))
+                    .child(h_flex().gap_1().children(mode_pills(mode).map(|(m, pill)| {
+                        pill.on_click(cx.listener(move |this, _, _, cx| {
+                            this.set_appearance(cx, |a| a.mode = m)
+                        }))
                     })))
                     .child(div().flex_1())
                     .child(
@@ -1245,7 +1071,7 @@ mod tests {
     #[test]
     fn buckets_by_precedence() {
         let needs = Attn::Needs("Fix checks · api".into());
-        let plan = Some(crate::agent::PLAN_TO_APPROVE);
+        let plan = Some(crate::transcript::PLAN_TO_APPROVE);
         assert_eq!(
             bucket(2, &needs, plan),
             (Bucket::Running, None),

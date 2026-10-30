@@ -1,8 +1,9 @@
 //! Share to GitHub (07–08): one thread to its repo's PR as a reviewer note (`gh pr comment`)
 //! or a PR review (`gh pr review --comment`), previewed first. The AI context is untouched;
 //! a failed post keeps the comment and the dialog, to retry.
-use super::review::{Comment, fenced};
+use super::review_comment::{Comment, fenced};
 use super::*;
+use crate::pr::Anchor;
 use crate::sync::Pr;
 use gpui_kit::component::radio::{Radio, RadioGroup};
 
@@ -48,6 +49,47 @@ pub(crate) fn github_body(comments: &[Comment], note: &str) -> String {
     out.trim_end().to_string()
 }
 
+/// The comments not yet on GitHub, a group per repo (file order within it).
+pub(crate) fn unposted_by_repo(comments: &[Comment]) -> Vec<Vec<Comment>> {
+    let mut todo: Vec<Comment> = (comments.iter())
+        .filter(|c| c.github.is_none())
+        .cloned()
+        .collect();
+    todo.sort_by(|a, b| a.repo().cmp(b.repo())); // stable: file order within a repo
+    todo.chunk_by(|a, b| a.repo() == b.repo())
+        .map(<[Comment]>::to_vec)
+        .collect()
+}
+
+/// The blocking part of a post to PR `pr`: a review, else a reviewer note. An inline review
+/// on the old side first checks that GitHub's diff has the lines (`revision`); if not, or if
+/// it can't tell, it goes without the anchor, with `fallback` as its body.
+fn post(
+    wt: &Path,
+    pr: &Pr,
+    revision: &str,
+    review: bool,
+    mut body: String,
+    mut inline: Option<(Anchor, String)>,
+    fallback: String,
+) -> Result<String, String> {
+    let mut head = pr.head.clone();
+    if let Some((anchor, _)) = inline.as_ref().filter(|(a, _)| a.left) {
+        let verified = crate::pr::verify_original_anchor(wt, pr.number, revision, anchor);
+        if let Some((captured, _)) = &verified {
+            head = captured.clone();
+        }
+        if !verified.is_some_and(|(_, valid)| valid) {
+            (inline, body) = (None, fallback);
+        }
+    }
+    let inline = inline.as_ref().map(|(a, t)| (a, t.as_str()));
+    match review {
+        true => crate::pr::publish_review(wt, pr.number, &head, &body, inline),
+        false => crate::pr::publish_note(wt, pr.number, &body),
+    }
+}
+
 /// An inline comment's text: GitHub shows a suggestion it can apply.
 fn inline_body(c: &Comment) -> String {
     match &c.suggestion {
@@ -58,15 +100,14 @@ fn inline_body(c: &Comment) -> String {
 
 impl Differ {
     /// The open PR of `c`'s repo, and whether the lines are on GitHub (head pushed, clean).
-    pub(crate) fn pr_of(&self, c: &Comment, _cx: &App) -> Option<(Pr, bool)> {
-        let repo = c.repo();
-        self.prs.get(repo).cloned()
+    pub(crate) fn pr_of(&self, c: &Comment) -> Option<(Pr, bool)> {
+        self.prs.get(c.repo()).cloned()
     }
 
     /// "Share to GitHub…" on a thread: the dialog (07) over the window.
     pub(crate) fn open_share(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(c) = self.comment(id) else { return };
-        if self.pr_of(c, cx).is_none() {
+        if self.pr_of(c).is_none() {
             let repo = c.repo().to_string();
             return notify_err(window, cx, format!("{repo} has no open PR to share to"));
         }
@@ -126,13 +167,8 @@ impl Differ {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let mut todo: Vec<Comment> = (comments.iter())
-            .filter(|c| c.github.is_none())
-            .cloned()
-            .collect();
-        todo.sort_by(|a, b| a.repo().cmp(b.repo())); // stable: file order within a repo
-        for group in todo.chunk_by(|a, b| a.repo() == b.repo()) {
-            self.publish_repo(group, note, review, window, cx);
+        for group in unposted_by_repo(comments) {
+            self.publish_repo(&group, note, review, window, cx);
         }
     }
 
@@ -155,7 +191,7 @@ impl Differ {
             return;
         };
         let repo = first.repo();
-        let Some((pr, pushed)) = self.pr_of(first, cx) else {
+        let Some((pr, pushed)) = self.pr_of(first) else {
             // Also publish lists only repos with a PR: a note, not an error.
             let msg = format!("{repo} has no open PR; its comments stay unpublished");
             return window.push_notification(msg, cx);
@@ -190,34 +226,7 @@ impl Differ {
         cx.notify();
         cx.spawn_in(window, async move |this, cx| {
             let res = (cx.background_executor())
-                .spawn(async move {
-                    let mut head = pr.head.clone();
-                    let mut body = body;
-                    let mut inline = inline;
-                    if inline.as_ref().is_some_and(|(a, _)| a.left) {
-                        let verified = crate::pr::verify_original_anchor(
-                            &wt,
-                            pr.number,
-                            &revision,
-                            &inline.as_ref().unwrap().0,
-                        );
-                        let valid = if let Some((captured, valid)) = verified {
-                            head = captured;
-                            valid
-                        } else {
-                            false
-                        };
-                        if !valid {
-                            inline = None;
-                            body = fallback;
-                        }
-                    }
-                    let inline = inline.as_ref().map(|(a, t)| (a, t.as_str()));
-                    match review {
-                        true => crate::pr::publish_review(&wt, pr.number, &head, &body, inline),
-                        false => crate::pr::publish_note(&wt, pr.number, &body),
-                    }
-                })
+                .spawn(async move { post(&wt, &pr, &revision, review, body, inline, fallback) })
                 .await;
             this.update_in(cx, |s, window, cx| {
                 let ours = s.shares(&ws_name, &ids);
@@ -225,7 +234,7 @@ impl Differ {
                     Ok(url) => {
                         cx.emit(DifferEvent::Interacted(ws_name.clone()));
                         // Into the workspace they came from, even if another one is open now.
-                        s.review.edit(&ws_name, |l| {
+                        s.review.store.edit(&ws_name, |l| {
                             for c in l.iter_mut().filter(|c| ids.contains(&c.id)) {
                                 c.github = Some(url.clone());
                             }
@@ -263,7 +272,7 @@ impl Differ {
         let (Some(c), Some(ws)) = (self.comment(s.id), self.active_ws()) else {
             return d;
         };
-        let Some((pr, pushed)) = self.pr_of(c, cx) else {
+        let Some((pr, pushed)) = self.pr_of(c) else {
             return d;
         };
         let theme = cx.theme();
@@ -273,8 +282,7 @@ impl Differ {
         let branch = wr.map_or(ws.branch.clone(), |r| ws.branch_of(r).to_string());
         let this = cx.entity().downgrade();
         let gone = this.clone();
-        d.font_features(inter_features())
-            .entrance(DialogEntrance::None)
+        crate::ui::dialog(d)
             .title("Share to GitHub")
             .w(px(440.))
             .on_ok(move |_, w, cx| {

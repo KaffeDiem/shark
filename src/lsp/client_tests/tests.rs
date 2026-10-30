@@ -12,15 +12,11 @@ fn server_pid(log: &std::path::Path) -> i32 {
 
 /// Whether the process is gone, polling briefly in case the reaping is still in flight.
 fn reaped(pid: i32) -> bool {
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
-    }
     let deadline = Instant::now() + Duration::from_secs(2);
-    // SAFETY: signal zero checks the process's existence and does not send a signal.
-    while unsafe { kill(pid, 0) } == 0 && Instant::now() < deadline {
+    while crate::proc::signal(pid, 0) && Instant::now() < deadline {
         thread::sleep(Duration::from_millis(10));
     }
-    unsafe { kill(pid, 0) != 0 }
+    !crate::proc::signal(pid, 0)
 }
 
 struct Peer {
@@ -69,11 +65,16 @@ impl Drop for Peer {
 fn lifecycle_orders_unsaved_text_requests_configuration_and_diagnostics() {
     let peer = Peer::new();
     block_on(peer.client.initialize()).unwrap();
-    assert_eq!(peer.client.encoding(), PositionEncodingKind::UTF16);
+    assert_eq!(peer.client.encoding(), Encoding::Utf16);
     let initialize = peer.wait_for(|v| v["method"] == "initialize");
     // Pyrefly returns no outline unless the client advertises hierarchy support.
     assert_eq!(
         initialize["params"]["capabilities"]["textDocument"]["documentSymbol"]["hierarchicalDocumentSymbolSupport"],
+        true
+    );
+    // Servers send workspace/diagnostic/refresh only when the client declares it.
+    assert_eq!(
+        initialize["params"]["capabilities"]["workspace"]["diagnostics"]["refreshSupport"],
         true
     );
     let uri = "file:///tmp/example.py";
@@ -277,6 +278,28 @@ fn oversized_or_malformed_frames_are_rejected_before_allocation() {
         read(&frame).unwrap(),
         Some(Message::Notification(n)) if n.method == "initialized"
     ));
+}
+
+#[test]
+fn a_frame_with_an_invalid_payload_is_skipped_not_fatal() {
+    // lsp-server cannot deserialize a response whose id is null.
+    let frame = |body: &[u8]| {
+        let mut f = format!("Content-Length: {}\r\n\r\n", body.len()).into_bytes();
+        f.extend_from_slice(body);
+        f
+    };
+    let mut bytes =
+        frame(br#"{"jsonrpc":"2.0","id":null,"error":{"code":-32700,"message":"parse"}}"#);
+    bytes.extend(frame(b"not json"));
+    bytes.extend(frame(
+        br#"{"jsonrpc":"2.0","method":"initialized","params":{}}"#,
+    ));
+    let mut reader = std::io::Cursor::new(bytes);
+    assert!(matches!(
+        read_message(&mut reader).unwrap(),
+        Some(Message::Notification(n)) if n.method == "initialized"
+    ));
+    assert!(read_message(&mut reader).unwrap().is_none());
 }
 
 #[test]

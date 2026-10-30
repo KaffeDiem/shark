@@ -2,16 +2,16 @@
 //! comments that stay pending until sent as one prompt (⇧C, review_send.rs), then show what
 //! the agent made of them (Addressed / Outdated), and can go to GitHub (review_share.rs).
 //!
-//! gpui-kit's `DiffState` keeps its scroll offset private and `set_files` resets it, so the
-//! keyboard view is tracked here instead: `j/k` move a cursor over a model of the diff's rows
-//! and scroll by putting a row at the top with `scroll_to_line`. A refresh puts the same row
-//! back. Mouse scrolling loses the model; `j/k` then scroll natively until the next jump.
+//! The keyboard view: `j/k` move a cursor over a model of the diff's rows and scroll by
+//! putting a row at the top with `scroll_to_line`; a refresh puts the same row back. Mouse
+//! scrolling loses the model; `j/k` then scroll natively until the next jump. The comment
+//! model is review_comment.rs, its persistence review_store.rs.
+use super::review_comment::{Comment, Status, judge, lines_now, posted_as, side, slice};
+use super::review_store::CommentStore;
 use super::*;
 use crate::chat::parse_reports;
 use crate::diff_view::{DiffAnnotation, DiffLinePosition, DiffLineRange, DiffSide};
-use crate::state::support_dir;
 use gpui_kit::component::input::{Enter, Escape, Textarea, TextareaState};
-use serde::{Deserialize, Serialize};
 use std::cell::Cell;
 
 /// One hunk's patch lines: kind (`b' '`, `b'-'`, `b'+'`), old and new one-based line numbers.
@@ -216,363 +216,6 @@ fn next_change(rows: &[Row], cur: usize, forward: bool) -> Option<usize> {
     .copied()
 }
 
-/// Where a thread stands. Files from before statuses load as `Pending`.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
-pub(crate) enum Status {
-    /// Waiting for the next send (⇧C).
-    #[default]
-    Pending,
-    /// Waiting in `Comment::chat`'s queue.
-    Queued,
-    /// In `Comment::chat`, read in this turn.
-    Sent { turn: usize },
-    /// The agent's reply reported it done (`[c<id>] addressed: <note>`).
-    Addressed { turn: usize, note: String },
-    /// Its lines changed and no report came.
-    Outdated,
-    /// Hidden; kept in the store.
-    Resolved,
-}
-
-/// A comment on lines of the diff: pending until sent, then followed to an answer.
-#[derive(Serialize, Deserialize, Clone, Debug, PartialEq, Default)]
-pub(crate) struct Comment {
-    #[serde(default)]
-    pub(crate) id: u64,
-    pub(crate) path: String,
-    /// `(on the old side, one-based line)` of the first and last commented line.
-    start: (bool, usize),
-    end: (bool, usize),
-    pub(crate) text: String,
-    /// The commented lines when it was written; kept when they change or go.
-    #[serde(default)]
-    pub(crate) snapshot: String,
-    /// Code proposed to replace them.
-    #[serde(default)]
-    pub(crate) suggestion: Option<String>,
-    /// What the lines were compared at: the base commit for the old side, else "working tree".
-    #[serde(default)]
-    pub(crate) rev: String,
-    #[serde(default)]
-    pub(crate) status: Status,
-    /// The chat it was sent to.
-    #[serde(default)]
-    pub(crate) chat: Option<String>,
-    /// Posted to GitHub: the comment's (or review's) URL.
-    #[serde(default)]
-    pub(crate) github: Option<String>,
-    /// The file text its working-copy lines were last read in.
-    #[serde(skip)]
-    seen: Seen,
-}
-
-/// Memory only, and not part of a comment's equality (that decides saving).
-#[derive(Clone, Debug, Default)]
-struct Seen(Option<String>);
-
-impl PartialEq for Seen {
-    fn eq(&self, _: &Self) -> bool {
-        true
-    }
-}
-
-impl Comment {
-    fn from_range(r: &DiffLineRange) -> Self {
-        let old = |s: DiffSide| s == DiffSide::Original;
-        Comment {
-            path: r.path().to_string(),
-            start: (old(r.side()), r.start()),
-            end: (old(r.end_side()), r.end()),
-            ..Default::default()
-        }
-    }
-
-    /// `api/a.rs:12`, `api/a.rs:12-14`, `api/a.rs:7 (old)`; across sides `7 (old)-9 (new)`.
-    pub(crate) fn place(&self) -> String {
-        let n = |(old, line): (bool, usize)| match old {
-            true => format!("{line} (old)"),
-            false => line.to_string(),
-        };
-        match self.start == self.end {
-            true => format!("{}:{}", self.path, n(self.start)),
-            false if self.start.0 == self.end.0 => {
-                format!("{}:{}-{}", self.path, self.start.1, n(self.end))
-            }
-            false => {
-                let n = |(old, line)| format!("{line} ({})", if old { "old" } else { "new" });
-                format!("{}:{}-{}", self.path, n(self.start), n(self.end))
-            }
-        }
-    }
-
-    /// The repo its path starts with.
-    pub(crate) fn repo(&self) -> &str {
-        self.path.split('/').next().unwrap_or_default()
-    }
-
-    /// `631–632`, `12`.
-    pub(crate) fn lines(&self) -> String {
-        match self.start.1 == self.end.1 {
-            true => self.end.1.to_string(),
-            false => format!("{}–{}", self.start.1, self.end.1),
-        }
-    }
-
-    pub(crate) fn side(&self) -> &'static str {
-        if self.end.0 {
-            "original"
-        } else {
-            "working copy"
-        }
-    }
-
-    /// `app.rs · Working copy · lines 631–632`, as the chat card and GitHub preview say it.
-    pub(crate) fn card_place(&self) -> String {
-        let name = self.path.rsplit('/').next().unwrap_or(&self.path);
-        let side = if self.end.0 {
-            "Original"
-        } else {
-            "Working copy"
-        };
-        let s = crate::chat::plural(self.start.1.abs_diff(self.end.1) + 1);
-        format!("{name} · {side} · line{s} {}", self.lines())
-    }
-
-    /// Its lines in the PR, for an inline review comment; `None` across both sides.
-    pub(crate) fn gh_anchor(&self) -> Option<crate::pr::Anchor> {
-        let (_, rel) = self.path.split_once('/')?;
-        (self.start.0 == self.end.0).then(|| crate::pr::Anchor {
-            path: rel.to_string(),
-            line: self.end.1,
-            start: (self.start.1 < self.end.1).then_some(self.start.1),
-            left: self.end.0,
-        })
-    }
-
-    fn anchor(&self) -> DiffLinePosition {
-        DiffLinePosition::new(self.path.clone(), side(self.end.0), self.end.1)
-    }
-
-    fn shown(&self) -> bool {
-        self.status != Status::Resolved
-    }
-
-    /// Whether line `l` of the diff falls inside this comment.
-    fn covers(&self, l: &DiffLinePosition) -> bool {
-        l.path().as_str() == self.path
-            && side(self.end.0) == l.side()
-            && (if self.start.0 == self.end.0 {
-                self.start.1
-            } else {
-                self.end.1
-            }..=self.end.1)
-                .contains(&l.line())
-    }
-}
-
-fn side(old: bool) -> DiffSide {
-    if old {
-        DiffSide::Original
-    } else {
-        DiffSide::Modified
-    }
-}
-
-/// `s` as a code block (`info` after the opening fence), its fence longer than any backtick
-/// run in it.
-pub(crate) fn fenced(s: &str, info: &str) -> String {
-    let mut f = "```".to_string();
-    while s.contains(&f) {
-        f.push('`');
-    }
-    format!("{f}{info}\n{s}\n{f}")
-}
-
-/// The comments as one prompt, in file order, with the overall `note`. Each carries its id,
-/// revision and the lines as they were, and the agent is asked to report back per id.
-pub(crate) fn prompt(comments: &[Comment], note: &str) -> String {
-    let mut out = String::from(
-        "Review comments on the diff. Paths are workspace-relative; \"(old)\" is a line number \
-         in the base version (a removed line). Each comment quotes the lines as they were when \
-         it was written. Address each comment:\n",
-    );
-    for c in comments {
-        let rev = match c.rev.as_str() {
-            "" => String::new(),
-            "working tree" => " · working tree".into(),
-            r => format!(" · base {}", &r[..r.len().min(10)]),
-        };
-        out.push_str(&format!("\n[c{}] {}{rev}\n", c.id, c.place()));
-        if !c.snapshot.is_empty() {
-            out.push_str(&format!("{}\n", fenced(&c.snapshot, "")));
-        }
-        for l in c.text.lines() {
-            out.push_str(&format!("> {l}\n"));
-        }
-        if let Some(s) = &c.suggestion {
-            out.push_str(&format!("Suggested change:\n{}\n", fenced(s, "")));
-        }
-    }
-    if !note.trim().is_empty() {
-        out.push_str(&format!("\nOverall: {}\n", note.trim()));
-    }
-    out.push_str(
-        "\nEnd your reply with one line per comment you addressed, exactly like:\n\
-         [c<id>] addressed: <what you changed, in one line>\n",
-    );
-    out
-}
-
-/// A sent comment after turn `turn` ended: reported → Addressed; its lines no longer read like
-/// the snapshot (`now`, `None` when unknown) → Outdated; else as it was.
-pub(crate) fn judge(
-    status: &Status,
-    turn: usize,
-    report: Option<&str>,
-    now: Option<&str>,
-    snapshot: &str,
-) -> Status {
-    match (status, report, now) {
-        (Status::Sent { .. }, Some(note), _) => Status::Addressed {
-            turn,
-            note: note.to_string(),
-        },
-        (Status::Sent { .. }, None, Some(now)) if !snapshot.is_empty() && now != snapshot => {
-            Status::Outdated
-        }
-        _ => status.clone(),
-    }
-}
-
-/// Lines `start..=end` (one-based) of `src`.
-fn slice(src: &str, start: usize, end: usize) -> String {
-    (src.lines().skip(start.saturating_sub(1)))
-        .take((end + 1).saturating_sub(start))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-/// Moves a working-copy comment along with its lines from the text they were last read in to
-/// `src`: only when they are unchanged and shifted. Edited or gone, it stays, so judging finds
-/// them changed. Never read yet (loaded from disk), it goes to its snapshot only if `src` has
-/// it once.
-fn reanchor(c: &mut Comment, src: &str) {
-    if c.start.0 || c.end.0 {
-        return;
-    }
-    let (s, e) = (c.start.1.saturating_sub(1), c.end.1.saturating_sub(1));
-    let Some(old) = c.seen.0.replace(src.to_string()) else {
-        let want: Vec<&str> = c.snapshot.split('\n').collect();
-        let lines: Vec<&str> = src.lines().collect();
-        let mut found = (lines.windows(want.len()).enumerate())
-            .filter(|(_, w)| !c.snapshot.is_empty() && *w == &want[..])
-            .map(|(i, _)| i);
-        if let (Some(i), None) = (found.next(), found.next()) {
-            (c.start.1, c.end.1) = (i + 1, i + 1 + e - s);
-        }
-        return;
-    };
-    // ponytail: one copy of the file per thread; share per path if threads get many.
-    let diff = similar::TextDiff::configure()
-        .timeout(std::time::Duration::from_millis(30))
-        .diff_lines(old.as_str(), src);
-    let mut to = vec![None; diff.old_slices().len()];
-    for op in diff.ops() {
-        if let similar::DiffOp::Equal {
-            old_index,
-            new_index,
-            len,
-        } = *op
-        {
-            (0..len).for_each(|i| to[old_index + i] = Some(new_index + i));
-        }
-    }
-    if let Some(&Some(n)) = to.get(s)
-        && (s..=e).all(|i| to.get(i) == Some(&Some(n + i - s)))
-    {
-        (c.start.1, c.end.1) = (n + 1, n + 1 + e - s);
-    }
-}
-
-/// The comment's lines as they are now: the working tree's on the new side (the comment
-/// re-anchored to where they moved), the base commit's (`rev`) on the old one. A deleted file
-/// reads empty; `None` for a range across both sides.
-fn lines_now(dir: &Path, c: &mut Comment) -> Option<String> {
-    if c.start.0 != c.end.0 {
-        return None;
-    }
-    let src = match c.end.0 {
-        false => {
-            let src = std::fs::read_to_string(dir.join(&c.path)).unwrap_or_default();
-            reanchor(c, &src);
-            src
-        }
-        // No base known (merge-base failed): `git show :path` would read the index.
-        true if c.rev.is_empty() => return None,
-        true => {
-            let (repo, rel) = c.path.split_once('/')?;
-            let o = std::process::Command::new("git")
-                .current_dir(dir.join(repo))
-                .args(["show", &format!("{}:{rel}", c.rev)])
-                .output()
-                .ok()?;
-            o.status
-                .success()
-                .then(|| String::from_utf8_lossy(&o.stdout).into_owned())?
-        }
-    };
-    Some(slice(&src, c.start.1, c.end.1))
-}
-
-/// Ids for comments saved before there were any (they load as 0), counting on from `last`;
-/// true if any got one.
-fn give_ids(c: &mut [Comment], last: &mut u64) -> bool {
-    *last = c.iter().map(|c| c.id).fold(*last, u64::max);
-    let fresh = c.iter().any(|c| c.id == 0);
-    for c in c.iter_mut().filter(|c| c.id == 0) {
-        *last += 1;
-        c.id = *last;
-    }
-    fresh
-}
-
-/// Comments that never reached an agent are pending again; true if any was. With `chat`
-/// (closed): its queue and the reviews it hadn't read (`unread`). Without (loading, after a
-/// restart): every queue, and reviews sent to a chat that is gone.
-pub(crate) fn unqueue(l: &mut [Comment], chat: Option<&str>, unread: &[u64]) -> bool {
-    let mut any = false;
-    for c in l.iter_mut() {
-        let to = c.chat.as_deref();
-        let lost = match (&c.status, chat) {
-            (Status::Queued, None) => true,
-            (Status::Queued, Some(id)) => to == Some(id),
-            (Status::Sent { .. }, Some(id)) => to == Some(id) && unread.contains(&c.id),
-            (Status::Sent { .. }, None) => {
-                to.is_some_and(|id| !crate::agent::transcript_path(id).exists())
-            }
-            _ => false,
-        };
-        if lost {
-            (c.status, c.chat) = (Status::Pending, None);
-            any = true;
-        }
-    }
-    any
-}
-
-/// comments/<ws>.json: the comments and the last id given out, so a deleted comment's id
-/// isn't reused (old review cards link to it). Older files are the list alone.
-#[derive(Serialize, Deserialize)]
-#[serde(untagged)]
-enum Store {
-    Ids { last: u64, comments: Vec<Comment> },
-    List(Vec<Comment>),
-}
-
-pub(crate) fn comments_path(ws: &str) -> PathBuf {
-    support_dir().join("comments").join(format!("{ws}.json"))
-}
-
 /// The inline composer (A·01): under the commented lines, on their side.
 pub(crate) struct Composer {
     /// The comment being edited; id 0 for a new one on its lines.
@@ -591,15 +234,7 @@ pub(crate) struct Review {
     pub(crate) hunks: HashMap<SharedString, Vec<Hunk>>,
     /// The diff pane as last painted.
     viewport: Rc<Cell<Bounds<Pixels>>>,
-    /// Comments per workspace, loaded from disk on first use.
-    pub(crate) comments: HashMap<String, Vec<Comment>>,
-    /// The last comment id given out per workspace.
-    last_id: HashMap<String, u64>,
-    /// Workspaces whose comments file couldn't be read or moved aside: never saved over.
-    unsaved: Vec<String>,
-    pub(crate) failed_saves: HashMap<String, String>,
-    /// Why, for the window to show once.
-    pub(crate) warning: Option<String>,
+    pub(crate) store: CommentStore,
     pub(crate) composer: Option<Composer>,
     pub(crate) sheet: Option<review_send::Sheet>,
     pub(crate) share: Option<review_share::Share>,
@@ -614,109 +249,11 @@ impl Review {
         let s = Spot::File(path.to_string().into());
         self.view = Some((s.clone(), s));
     }
+}
 
-    /// Writes the file whole (a temp file renamed over it), so a crash can't leave half.
-    pub(crate) fn save_comments(&mut self, ws: &str) {
-        let path = comments_path(ws);
-        let result = if self.unsaved.iter().any(|w| w == ws) {
-            Err(std::io::Error::other(
-                "The unreadable comments store is protected",
-            ))
-        } else {
-            serde_json::to_vec(&Store::Ids {
-                last: self.last_id.get(ws).copied().unwrap_or(0),
-                comments: self.comments.get(ws).cloned().unwrap_or_default(),
-            })
-            .map_err(std::io::Error::other)
-            .and_then(|json| crate::state::write(&path, &json))
-        };
-        match result {
-            Ok(()) => {
-                self.failed_saves.remove(ws);
-            }
-            Err(e) => {
-                self.failed_saves.insert(ws.to_string(), e.to_string());
-            }
-        }
-    }
-
-    pub(crate) fn retry_saves(&mut self) {
-        for ws in self.failed_saves.keys().cloned().collect::<Vec<_>>() {
-            self.save_comments(&ws);
-        }
-    }
-
-    /// Loads once; comments saved before ids get their own, ones queued in a chat that is
-    /// gone now are pending. A file that doesn't parse is kept aside as `.json.<n>.bak`; one
-    /// that can't be read (or moved) is left alone and not saved over.
-    pub(crate) fn load_comments(&mut self, ws: &str) {
-        if self.comments.contains_key(ws) {
-            return;
-        }
-        let path = comments_path(ws);
-        let (store, read) = match std::fs::read(&path) {
-            Ok(b) => (
-                Some(serde_json::from_slice(&b).map_err(|e| e.to_string())),
-                true,
-            ),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => (None, true),
-            Err(e) => (Some(Err(e.to_string())), false),
-        };
-        let (mut last, mut c) = match store {
-            Some(Ok(Store::Ids { last, comments })) => (last, comments),
-            Some(Ok(Store::List(c))) => (0, c),
-            Some(Err(e)) => {
-                let bak = (1..)
-                    .map(|n| path.with_extension(format!("json.{n}.bak")))
-                    .find(|p| !p.exists())
-                    .unwrap();
-                let file = path.display();
-                self.warning = Some(match read && std::fs::rename(&path, &bak).is_ok() {
-                    true => format!("Couldn't read {file} ({e}); moved it to {}", bak.display()),
-                    false => {
-                        self.unsaved.push(ws.to_string());
-                        format!("Couldn't read {file} ({e}); nothing is saved until it's fixed")
-                    }
-                });
-                (0, vec![])
-            }
-            None => (0, vec![]),
-        };
-        let fresh = give_ids(&mut c, &mut last) | unqueue(&mut c, None, &[]);
-        self.comments.insert(ws.to_string(), c);
-        self.last_id.insert(ws.to_string(), last);
-        if fresh {
-            self.save_comments(ws);
-        }
-    }
-
-    /// A new comment id in workspace `ws`, never one given out before.
-    fn new_id(&mut self, ws: &str) -> u64 {
-        self.load_comments(ws);
-        let last = self.last_id.entry(ws.to_string()).or_default();
-        *last += 1;
-        *last
-    }
-
-    /// A removed workspace's comments, so a later one of the same name starts with none.
-    pub(crate) fn forget(&mut self, ws: &str) {
-        self.comments.remove(ws);
-        self.last_id.remove(ws);
-        self.unsaved.retain(|w| w != ws);
-        self.failed_saves.remove(ws);
-        let _ = std::fs::remove_file(comments_path(ws));
-    }
-
-    /// Edits workspace `ws`'s comments and saves them if that changed them.
-    pub(crate) fn edit(&mut self, ws: &str, f: impl FnOnce(&mut Vec<Comment>)) {
-        self.load_comments(ws);
-        let l = self.comments.get_mut(ws).unwrap();
-        let before = l.clone();
-        f(l);
-        if *l != before || self.failed_saves.contains_key(ws) {
-            self.save_comments(ws);
-        }
-    }
+/// How many of `cs` have a status `f` accepts.
+fn count(cs: &[&Comment], f: fn(&Status) -> bool) -> usize {
+    cs.iter().filter(|c| f(&c.status)).count()
 }
 
 /// A small status chip: a colored dot and a label.
@@ -905,7 +442,7 @@ impl Differ {
 
     pub(crate) fn ws_comments(&self) -> &[Comment] {
         self.workspace_name()
-            .and_then(|ws| self.review.comments.get(ws))
+            .and_then(|ws| self.review.store.comments.get(ws))
             .map_or(&[], |c| &c[..])
     }
 
@@ -921,7 +458,7 @@ impl Differ {
         f: impl FnOnce(&mut Vec<Comment>),
     ) {
         if let Some(ws) = self.workspace_name().map(str::to_string) {
-            self.review.edit(&ws, f);
+            self.review.store.edit(&ws, f);
             cx.notify();
         }
     }
@@ -994,8 +531,13 @@ impl Differ {
         h.is_some() && self.hunk_of(c, c.start.1) == h
     }
 
-    /// The hunk of the diff showing line `line` of the comment's side.
+    /// The hunk of the diff showing line `line` of the comment's side. Old-side numbers count
+    /// in the commit the comment was made against, so another compare commit shows none.
     fn hunk_of(&self, c: &Comment, line: usize) -> Option<usize> {
+        let now = (c.path.split_once('/')).and_then(|(repo, _)| self.diff_revs.get(repo));
+        if c.end.0 && now.is_some_and(|r| !r.is_empty() && !c.rev.is_empty() && *r != c.rev) {
+            return None;
+        }
         (self.review.hunks.get(c.path.as_str()))?
             .iter()
             .position(|h| {
@@ -1006,19 +548,14 @@ impl Differ {
             })
     }
 
-    /// Moves workspace `ws`'s working-copy threads to where their lines are on disk now, so
+    /// Moves the open workspace's working-copy threads to where their lines are on disk now, so
     /// lines added above one don't leave it beside other code.
-    pub(crate) fn reanchor_comments(&mut self, ws: &str) {
-        let Some(dir) = self
-            .workspace
-            .as_ref()
-            .filter(|w| w.name == ws)
-            .map(Workspace::dir)
-        else {
+    pub(crate) fn reanchor_comments(&mut self) {
+        let Some((ws, dir)) = self.active_ws().map(|w| (w.name.clone(), w.dir())) else {
             return;
         };
         // ponytail: reads each thread's file on every diff refresh; group by path if many.
-        self.review.edit(ws, |l| {
+        self.review.store.edit(&ws, |l| {
             for c in l.iter_mut().filter(|c| c.shown() && !c.end.0) {
                 lines_now(&dir, c);
             }
@@ -1108,18 +645,9 @@ impl Differ {
         };
         let rev = match c.end.0 {
             false => "working tree".to_string(),
+            // The base the diff compares against, as `DiffData::load` found it.
             true => (c.path.split_once('/'))
-                .and_then(|(repo, _)| {
-                    let base = self.diff_base(repo);
-                    // ponytail: merge-base (and lines_now's git show) block the UI thread as
-                    // the composer opens; move them to the background executor if big repos lag.
-                    let args = if self.preferences.uncommitted_only {
-                        vec!["rev-parse", "HEAD"]
-                    } else {
-                        vec!["merge-base", base, "HEAD"]
-                    };
-                    crate::git::git(&ws.dir().join(repo), &args).ok()
-                })
+                .and_then(|(repo, _)| self.diff_revs.get(repo).cloned())
                 .unwrap_or_default(),
         };
         // A file being edited in place shows its buffer, not what is on disk.
@@ -1127,6 +655,8 @@ impl Differ {
             .filter(|e| !c.end.0 && c.start.0 == c.end.0 && *e.path == c.path)
             .map(|e| slice(&e.buf.text(), c.start.1, c.end.1));
         let mut c = Comment { rev, ..c.clone() };
+        // ponytail: lines_now's git show blocks the UI thread as the composer opens; move it
+        // to the background executor if big repos lag.
         let now = edited.or_else(|| lines_now(&ws.dir(), &mut c));
         Comment {
             snapshot: now.unwrap_or_default(),
@@ -1197,7 +727,7 @@ impl Differ {
 
     /// A composer open elsewhere with text in it is added (or saved), not lost, before
     /// another opens.
-    fn keep_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(crate) fn keep_draft(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let typed = |c: &Composer| !c.input.read(cx).value().trim().is_empty();
         if self.review.composer.as_ref().is_some_and(typed) {
             self.submit_composer(window, cx);
@@ -1289,7 +819,7 @@ impl Differ {
             return;
         };
         let id = match comp.draft.id {
-            0 => self.review.new_id(&ws),
+            0 => self.review.store.new_id(&ws),
             id => id,
         };
         self.edit_comments(cx, |list| {
@@ -1388,13 +918,8 @@ impl Differ {
     /// `r`: resolve the sent thread at the cursor (a pending one has no way back from hidden);
     /// with none, `r` refreshes the diff as before.
     pub(crate) fn resolve_thread(&mut self, cx: &mut Context<Self>) {
-        let sent = |s: &Status| {
-            matches!(
-                s,
-                Status::Sent { .. } | Status::Addressed { .. } | Status::Outdated
-            )
-        };
-        match (self.thread_at(cx).and_then(|id| self.comment(id))).filter(|c| sent(&c.status)) {
+        match (self.thread_at(cx).and_then(|id| self.comment(id))).filter(|c| c.status.resolvable())
+        {
             Some(c) => self.set_status(&[c.id], Status::Resolved, cx),
             None => cx.propagate(),
         }
@@ -1442,10 +967,7 @@ impl Differ {
     pub(crate) fn discard_pending(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let n = self.with_status(|s| *s == Status::Pending).len();
         confirm(
-            format!(
-                "Discard {n} pending comment{}?",
-                if n == 1 { "" } else { "s" }
-            ),
+            format!("Discard {n} pending comment{}?", crate::ui::plural(n)),
             "They have not been sent to a chat or GitHub.",
             "Discard",
             |s, _, cx| s.edit_comments(cx, |l| l.retain(|c| c.status != Status::Pending)),
@@ -1477,7 +999,7 @@ impl Differ {
         };
         let addressed = matches!(c.status, Status::Addressed { .. } | Status::Outdated);
         let mut entries = vec![menu::item(IconName::Pencil, "Edit", act(Self::edit_thread))];
-        if c.status != Status::Resolved {
+        if c.status.resolvable() {
             entries.push(menu::item(
                 IconName::CircleCheck,
                 "Resolve",
@@ -1495,7 +1017,7 @@ impl Differ {
             let view = act(Self::view_change);
             entries.push(menu::item(IconName::FileDiff, "View change", view));
         }
-        if matches!(c.status, Status::Queued | Status::Sent { .. }) || addressed {
+        if c.status.in_context() {
             let show = act(Self::show_thread_chat);
             entries.push(menu::item(IconName::MessageSquare, "Show chat", show));
         }
@@ -1535,7 +1057,21 @@ impl Differ {
         let Some(c) = self.comment(id).cloned() else {
             return;
         };
+        // Orphans have no row to go to; they show below the diff.
+        if !self.diff_files.iter().any(|f| *f.path() == c.path) {
+            return notify_err(
+                window,
+                cx,
+                "Its file is no longer in the diff: see the threads below it",
+            );
+        }
         self.drop_mouse_selection(window, cx);
+        // A viewed file is folded: its line has no row.
+        self.diff.update(cx, |d, cx| {
+            if d.is_file_collapsed(&c.path) {
+                d.set_file_collapsed(&c.path, false, cx)
+            }
+        });
         self.reveal(&Spot::Line(c.anchor()), 0., cx);
         // `find` lands on the closest row; the thread's own line is what `e`/`x` read.
         let sel = DiffLineRange::new(c.path.clone(), side(c.end.0), c.end.1, c.end.1);
@@ -1551,15 +1087,13 @@ impl Differ {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Top to bottom as the diff shows them (files gone from it last); one row's by id.
+        // Top to bottom as the diff shows them; one row's by id. Orphans (their file left the
+        // diff) have no row, so they are skipped.
         let rows = self.diff_rows(cx);
-        let row = |l: DiffLinePosition| match self.diff_files.iter().any(|f| f.path() == l.path()) {
-            true => find(&rows, &Spot::Line(l)),
-            false => usize::MAX,
-        };
-        let mut threads: Vec<((usize, u64), u64)> = (self.ws_comments().iter())
-            .filter(|c| c.shown())
-            .map(|c| ((row(c.anchor()), c.id), c.id))
+        let row = |l: DiffLinePosition| find(&rows, &Spot::Line(l));
+        let mut threads: Vec<(usize, u64)> = (self.ws_comments().iter())
+            .filter(|c| c.shown() && self.diff_files.iter().any(|f| *f.path() == c.path))
+            .map(|c| (row(c.anchor()), c.id))
             .collect();
         if threads.is_empty() {
             return self.diff_change(forward, window, cx);
@@ -1572,8 +1106,8 @@ impl Differ {
         });
         let next = match (forward, at) {
             (_, None) => threads.first(),
-            (true, Some(at)) => threads.iter().find(|t| t.0 > at).or(threads.first()),
-            (false, Some(at)) => threads.iter().rev().find(|t| t.0 < at).or(threads.last()),
+            (true, Some(at)) => threads.iter().find(|&&t| t > at).or(threads.first()),
+            (false, Some(at)) => threads.iter().rev().find(|&&t| t < at).or(threads.last()),
         };
         if let Some(&(_, id)) = next {
             self.jump_to_comment(id, window, cx);
@@ -1609,13 +1143,13 @@ impl Differ {
         cx: &mut Context<Self>,
     ) {
         let reports: HashMap<u64, String> = parse_reports(reply).into_iter().collect();
-        self.review.edit(ws, |list| {
+        self.review.store.edit(ws, |list| {
             for c in list.iter_mut() {
                 let ours = c.chat.as_deref() == Some(id) && !held.contains(&c.id);
                 if !ours || !matches!(c.status, Status::Sent { .. }) {
                     continue;
                 }
-                let now = (!c.end.0).then(|| lines_now(&dir, c)).flatten();
+                let now = (!c.end.0).then(|| lines_now(dir, c)).flatten();
                 let report = reports.get(&c.id).map(|s| s.as_str());
                 c.status = judge(&c.status, turn, report, now.as_deref(), &c.snapshot);
             }
@@ -1634,7 +1168,7 @@ impl Differ {
         turn: Option<usize>,
         cx: &mut Context<Self>,
     ) {
-        self.review.edit(ws, |l| {
+        self.review.store.edit(ws, |l| {
             let ours = |c: &Comment| ids.contains(&c.id) && c.chat.as_deref() == Some(chat);
             for c in l.iter_mut().filter(|c| ours(c)) {
                 match (turn, &c.status) {
@@ -1824,10 +1358,7 @@ impl Differ {
             ),
             Status::Resolved => ("Resolved".into(), theme.muted_foreground, ""),
         };
-        let in_context = matches!(
-            c.status,
-            Status::Queued | Status::Sent { .. } | Status::Addressed { .. } | Status::Outdated
-        );
+        let in_context = c.status.in_context();
         // Off its line (gone from the diff): the lines as they were, so it still reads.
         let snapshot =
             (!self.on_its_line(&c) && !c.snapshot.is_empty()).then(|| c.snapshot.clone());
@@ -2045,21 +1576,23 @@ impl Differ {
         let threads: Vec<&Comment> = (self.ws_comments().iter())
             .filter(|c| c.shown() && c.path == path.as_str())
             .collect();
-        let count = |f: &dyn Fn(&Status) -> bool| threads.iter().filter(|c| f(&c.status)).count();
-        let pending = count(&|s| *s == Status::Pending);
+        let pending = count(&threads, |s| *s == Status::Pending);
         let chip = match () {
             _ if pending > 0 => Some(chip(
                 format!("{pending} pending"),
                 theme.warning_foreground,
                 theme,
             )),
-            _ if count(&|s| *s == Status::Outdated) > 0 => {
+            _ if count(&threads, |s| *s == Status::Outdated) > 0 => {
                 Some(chip("Outdated".into(), theme.warning_foreground, theme))
             }
-            _ if count(&|s| matches!(s, Status::Addressed { .. })) > 0 => {
+            _ if count(&threads, |s| matches!(s, Status::Addressed { .. })) > 0 => {
                 Some(chip("Addressed".into(), theme.success_foreground, theme))
             }
-            _ if count(&|s| matches!(s, Status::Queued | Status::Sent { .. })) > 0 => {
+            _ if count(&threads, |s| {
+                matches!(s, Status::Queued | Status::Sent { .. })
+            }) > 0 =>
+            {
                 Some(chip("Sent".into(), theme.primary, theme))
             }
             _ => None,
@@ -2124,10 +1657,9 @@ impl Differ {
     ) -> AnyElement {
         let theme = cx.theme();
         let shown: Vec<&Comment> = self.ws_comments().iter().filter(|c| c.shown()).collect();
-        let count = |f: &dyn Fn(&Status) -> bool| shown.iter().filter(|c| f(&c.status)).count();
-        let pending = count(&|s| *s == Status::Pending);
-        let addressed = count(&|s| matches!(s, Status::Addressed { .. }));
-        let outdated = count(&|s| *s == Status::Outdated);
+        let pending = count(&shown, |s| *s == Status::Pending);
+        let addressed = count(&shown, |s| matches!(s, Status::Addressed { .. }));
+        let outdated = count(&shown, |s| *s == Status::Outdated);
         // 28 tall with just a hint, 40 with the review's buttons.
         let bar = h_flex()
             .flex_none()
@@ -2222,19 +1754,6 @@ impl Differ {
     }
 }
 
-/// "a reviewer note to shark #128" from a GitHub URL (`…/shark/pull/128#issuecomment-1`);
-/// anything else on the PR was a review.
-pub(crate) fn posted_as(url: &str) -> String {
-    let mut parts = url.split('/').rev();
-    let tail = parts.next().unwrap_or_default();
-    let (n, frag) = tail.split_once('#').unwrap_or((tail, ""));
-    let repo = parts.nth(1).unwrap_or_default();
-    let kind = match frag.starts_with("issuecomment") {
-        true => "a reviewer note",
-        false => "a PR review",
-    };
-    format!("{kind} to {repo} #{n}")
-}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2294,221 +1813,5 @@ mod tests {
         // the point where the end shows.
         assert_eq!(fit(&unified, 0, 8, 10.), 2);
         assert_eq!(fit(&unified, 5, 1, 10.), 0, "scrolloff above");
-    }
-
-    #[::core::prelude::v1::test]
-    fn prompt_lists_places_ids_and_suggestions() {
-        let c = |id, start, end, text: &str| Comment {
-            id,
-            path: "api/a.rs".into(),
-            start,
-            end,
-            text: text.into(),
-            ..Default::default()
-        };
-        let p = prompt(
-            &[
-                Comment {
-                    snapshot: "let x = 1;".into(),
-                    rev: "working tree".into(),
-                    suggestion: Some("let y = 1;".into()),
-                    ..c(1, (false, 12), (false, 12), "rename")
-                },
-                Comment {
-                    rev: "0123456789abcdef".into(),
-                    ..c(2, (true, 3), (true, 5), "keep\nthis")
-                },
-                c(3, (true, 7), (false, 8), "x"),
-            ],
-            "Run cargo test.",
-        );
-        assert!(
-            p.contains("\n[c1] api/a.rs:12 · working tree\n```\nlet x = 1;\n```\n> rename\nSuggested change:\n```\nlet y = 1;\n```\n"),
-            "{p}"
-        );
-        assert!(
-            p.contains("\n[c2] api/a.rs:3-5 (old) · base 0123456789\n> keep\n> this\n"),
-            "{p}"
-        );
-        assert!(p.contains("\n[c3] api/a.rs:7 (old)-8 (new)\n"));
-        assert!(p.contains("\nOverall: Run cargo test.\n"));
-        assert!(p.contains("[c<id>] addressed: "));
-        assert!(!prompt(&[], "  ").contains("Overall"));
-        assert_eq!(fenced("a ``` b", "x"), "````x\na ``` b\n````");
-    }
-
-    /// An old-side comment without a base reads nothing, not the index (`git show :path`).
-    #[::core::prelude::v1::test]
-    fn old_lines_without_a_base() {
-        let dir = std::env::temp_dir().join(format!("shark-rev-{}", std::process::id()));
-        let repo = dir.join("api");
-        std::fs::create_dir_all(&repo).unwrap();
-        crate::git::git(&repo, &["init", "-q"]).unwrap();
-        std::fs::write(repo.join("f"), "staged\n").unwrap();
-        crate::git::git(&repo, &["add", "f"]).unwrap();
-        let mut c = Comment {
-            path: "api/f".into(),
-            start: (true, 1),
-            end: (true, 1),
-            ..Default::default()
-        };
-        assert_eq!(lines_now(&dir, &mut c), None);
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    /// A working-copy thread follows its lines through edits above it. Its own line edited,
-    /// it stays, so it reads Outdated, though the same text is further down; never read, it
-    /// only goes to a snapshot found once.
-    #[::core::prelude::v1::test]
-    fn reanchors_through_the_diff() {
-        let file = |ten: &str, top: &str| {
-            let mut l: Vec<String> = (1..=20).map(|i| format!("l{i}")).collect();
-            (l[9], l[19]) = (ten.into(), "return None;".into());
-            format!("{top}{}\n", l.join("\n"))
-        };
-        let mut c = Comment {
-            start: (false, 10),
-            end: (false, 10),
-            snapshot: "return None;".into(),
-            ..Default::default()
-        };
-        reanchor(&mut c, &file("return None;", ""));
-        assert_eq!((c.start, c.end), ((false, 10), (false, 10)));
-        reanchor(&mut c, &file("return None;", "a\nb\n"));
-        assert_eq!((c.start, c.end), ((false, 12), (false, 12)));
-        let edited = file("return Some(1);", "a\nb\n");
-        reanchor(&mut c, &edited);
-        assert_eq!((c.start, c.end), ((false, 12), (false, 12)));
-        let now = slice(&edited, c.start.1, c.end.1);
-        let sent = Status::Sent { turn: 1 };
-        assert_eq!(
-            judge(&sent, 1, None, Some(&now), &c.snapshot),
-            Status::Outdated
-        );
-        reanchor(&mut c, "gone\n");
-        assert_eq!((c.start, c.end), ((false, 12), (false, 12)));
-
-        let mut d = Comment {
-            start: (false, 2),
-            end: (false, 3),
-            snapshot: "l2\nl3".into(),
-            ..Default::default()
-        };
-        reanchor(&mut d, &file("x", "a\n"));
-        assert_eq!((d.start, d.end), ((false, 3), (false, 4)));
-    }
-
-    #[::core::prelude::v1::test]
-    fn reports_and_judging() {
-        // The prompt's own instruction line, quoted back, is no report.
-        let reply = "Done.\n\n[c1] addressed: Ratio stored once.\n- `[c12] Addressed: renamed`\n[c3] skipped: no\n[cx] addressed: bad\n[c<id>] addressed: <what you changed, in one line>\n";
-        assert_eq!(
-            parse_reports(reply),
-            [
-                (1, "Ratio stored once.".to_string()),
-                (12, "renamed".into())
-            ]
-        );
-        let sent = Status::Sent { turn: 2 };
-        assert_eq!(
-            judge(&sent, 3, Some("done"), Some("new"), "old"),
-            Status::Addressed {
-                turn: 3,
-                note: "done".into()
-            }
-        );
-        assert_eq!(judge(&sent, 3, None, Some("new"), "old"), Status::Outdated);
-        assert_eq!(judge(&sent, 3, None, Some("old"), "old"), sent);
-        assert_eq!(judge(&sent, 3, None, None, "old"), sent, "unknown lines");
-        assert_eq!(judge(&sent, 3, None, Some("x"), ""), sent, "no snapshot");
-        assert_eq!(
-            judge(&Status::Pending, 3, Some("done"), None, ""),
-            Status::Pending
-        );
-        assert_eq!(slice("a\nb\nc\nd", 2, 3), "b\nc");
-        assert_eq!(slice("a", 4, 5), "");
-        assert_eq!(
-            posted_as("https://github.com/o/shark/pull/128#issuecomment-9"),
-            "a reviewer note to shark #128"
-        );
-        assert_eq!(
-            posted_as("https://github.com/o/shark/pull/7"),
-            "a PR review to shark #7"
-        );
-    }
-
-    /// comments/<ws>.json from before ids and statuses still loads; each gets its own id.
-    #[::core::prelude::v1::test]
-    fn old_comment_files_load() {
-        let old = r#"[{"path":"api/a","start":[false,1],"end":[false,2],"text":"one"},
-                      {"path":"api/b","start":[true,3],"end":[true,3],"text":"two"}]"#;
-        let c: Vec<Comment> = serde_json::from_str(old).unwrap();
-        assert_eq!(
-            (c[0].id, &c[0].status, c[1].start),
-            (0, &Status::Pending, (true, 3))
-        );
-        let mut c = c;
-        let mut last = 0;
-        assert!(give_ids(&mut c, &mut last));
-        assert_eq!(c.iter().map(|c| c.id).collect::<Vec<_>>(), [1, 2]);
-        assert!(!give_ids(&mut c, &mut last), "only once");
-        assert_eq!(last, 2);
-        // The list alone (older files) and with the last id both load.
-        let Ok(Store::List(l)) = serde_json::from_str(old) else {
-            panic!("old list")
-        };
-        assert_eq!(l.len(), 2);
-        let new = r#"{"last":9,"comments":[{"id":3,"path":"api/a","start":[false,1],"end":[false,1],"text":"x"}]}"#;
-        let Ok(Store::Ids { last, comments }) = serde_json::from_str(new) else {
-            panic!("new store")
-        };
-        assert_eq!((last, comments[0].id), (9, 3));
-        // A comment queued in a chat that is gone is pending again; others stay.
-        let mut l = vec![
-            Comment {
-                id: 1,
-                status: Status::Queued,
-                chat: Some("a".into()),
-                ..Default::default()
-            },
-            Comment {
-                id: 2,
-                status: Status::Queued,
-                chat: Some("b".into()),
-                ..Default::default()
-            },
-            Comment {
-                id: 3,
-                status: Status::Sent { turn: 1 },
-                chat: Some("a".into()),
-                ..Default::default()
-            },
-        ];
-        assert!(unqueue(&mut l, Some("a"), &[]));
-        assert_eq!((&l[0].status, &l[0].chat), (&Status::Pending, &None));
-        assert_eq!(l[1].status, Status::Queued);
-        assert_eq!(
-            l[2].status,
-            Status::Sent { turn: 1 },
-            "read before it closed"
-        );
-        // Closed before reading it: pending again.
-        l[2].status = Status::Sent { turn: 1 };
-        assert!(unqueue(&mut l, Some("a"), &[3]));
-        assert_eq!((&l[2].status, &l[2].chat), (&Status::Pending, &None));
-        // After a restart: sent to a chat that is gone (no transcript), pending again.
-        l[2].status = Status::Sent { turn: 1 };
-        l[2].chat = Some("no-such-chat-r3".into());
-        assert!(unqueue(&mut l, None, &[]) && !unqueue(&mut l, None, &[]));
-        assert_eq!(
-            (&l[1].status, &l[2].status),
-            (&Status::Pending, &Status::Pending)
-        );
-        let s = Status::Addressed {
-            turn: 5,
-            note: "n".into(),
-        };
-        let back: Status = serde_json::from_str(&serde_json::to_string(&s).unwrap()).unwrap();
-        assert_eq!(back, s);
     }
 }

@@ -4,9 +4,7 @@ use crate::apps::{self, Kind};
 
 /// `/Users/me/x` → `~/x`: paths in menus are read, so keep them short.
 pub(super) fn tilde(path: &Path) -> String {
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_default();
+    let home = crate::state::home();
     match path.strip_prefix(&home) {
         Ok(rest) if !home.as_os_str().is_empty() => format!("~/{}", rest.display()),
         _ => path.display().to_string(),
@@ -95,19 +93,16 @@ pub(super) fn path_submenu(
 /// and keeps the destructive items last. Shortcuts live in the palette, not here (Apple HIG).
 pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<Entry> {
     let paths: Vec<(String, PathBuf)> = std::iter::once(("Workspace folder".into(), ws.dir()))
-        .chain(super::palette::repo_paths(ws))
+        .chain(ws.repo_paths())
         .collect();
-    let (n1, n2, n3) = (ws.name.clone(), ws.name.clone(), ws.name.clone());
     let mut entries = vec![];
     if this.home_shown() || this.active.as_deref() != Some(ws.name.as_str()) {
         // By name: the list can change under an open menu (a background auto-archive).
         entries.push(menu::item(
             IconName::MessageSquare,
             "Open workspace",
-            on_shark(cx, move |s, w, cx| {
-                if let Some(ix) = s.state.workspaces.iter().position(|w| w.name == n1) {
-                    s.open_workspace(ix, w, cx)
-                }
+            on_ws(cx, &ws.name, |s, n, w, cx| {
+                s.open_workspace_named(&n, w, cx)
             }),
         ));
     }
@@ -150,12 +145,12 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
         menu::item(
             IconName::Archive,
             "Archive",
-            on_shark(cx, move |s, w, cx| s.archive_ws(n2.clone(), false, w, cx)),
+            on_ws(cx, &ws.name, |s, n, w, cx| s.archive_ws(n, false, w, cx)),
         ),
         menu::item(
             IconName::ArchiveX,
             "Force archive…",
-            on_shark(cx, move |s, w, cx| s.archive_ws(n3.clone(), true, w, cx)),
+            on_ws(cx, &ws.name, |s, n, w, cx| s.archive_ws(n, true, w, cx)),
         ),
     ]);
     entries
@@ -244,7 +239,7 @@ fn stack_rows(
             let (icon, status, url) = match (&n.pr, merged) {
                 (Some(p), _) => {
                     let icon = match p.status() {
-                        complete::PrStatus::Draft => IconName::GitPullRequestDraft,
+                        crate::prs::PrStatus::Draft => IconName::GitPullRequestDraft,
                         _ => IconName::GitPullRequest,
                     };
                     (
@@ -274,11 +269,7 @@ fn stack_rows(
                 icon,
                 n.branch.clone(),
                 on_shark(cx, move |s, w, cx| match (&target, &url) {
-                    (Some(name), _) => {
-                        if let Some(ix) = s.state.workspaces.iter().position(|x| &x.name == name) {
-                            s.open_workspace(ix, w, cx)
-                        }
-                    }
+                    (Some(name), _) => s.open_workspace_named(name, w, cx),
                     (None, Some(u)) => cx.open_url(u),
                     _ => {}
                 }),
@@ -330,11 +321,10 @@ pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) 
     let links = (branches.into_iter())
         .filter_map(|b| Some((b.repo, String::new(), b.url?)))
         .collect();
-    let name = ws.name.clone();
     let base = menu::item(
         IconName::Target,
         "Change base…",
-        on_shark(cx, move |s, w, cx| s.change_base(name.clone(), w, cx)),
+        on_ws(cx, &ws.name, |s, n, w, cx| s.change_base(n, w, cx)),
     )
     .hint(base_hint(ws));
     let stacks = stacks(this, ws, cx);
@@ -402,15 +392,12 @@ fn stack_actions(
     let stacked: Vec<&crate::sync::Repo> = repos.iter().filter(|r| r.stacked().is_some()).collect();
     let mut out = vec![];
     if let Some(onto) = (repos.iter().find(|r| r.parent_merged())).and_then(|r| r.parent.as_ref()) {
-        let (label, n) = (
-            format!("Parent merged · rebase onto {}", onto.base),
-            name.clone(),
-        );
+        let label = format!("Parent merged · rebase onto {}", onto.base);
         out.push(
             menu::item(
                 IconName::Layers,
                 label.clone(),
-                on_shark(cx, move |s, w, cx| {
+                on_ws(cx, &name, move |s, n, w, cx| {
                     if let Some(g) = s.syncs.get(&n).cloned() {
                         let (label, rs) = (label.clone(), merged.clone());
                         g.update(cx, |g, cx| {
@@ -428,12 +415,11 @@ fn stack_actions(
             _ => "Rebase onto parent".to_string(),
         };
         let behind = r.local.as_ref().map_or(0, |l| l.base.1);
-        let n = name.clone();
         out.push(
             menu::item(
                 IconName::GitCompareArrows,
                 label,
-                on_shark(cx, move |s, w, cx| {
+                on_ws(cx, &name, |s, n, w, cx| {
                     if let Some(g) = s.syncs.get(&n).cloned() {
                         g.update(cx, |g, cx| g.restack_onto_parent(w, cx));
                     }
@@ -445,12 +431,11 @@ fn stack_actions(
             }),
         );
     }
-    let (n1, n2) = (name.clone(), name.clone());
     out.push(
         menu::item(
             IconName::Layers,
             "New workspace on top…",
-            on_shark(cx, move |s, w, cx| s.stack_from(n1.clone(), false, w, cx)),
+            on_ws(cx, &name, |s, n, w, cx| s.stack_from(n, false, w, cx)),
         )
         .hint(ws.branch.clone()),
     );
@@ -462,7 +447,7 @@ fn stack_actions(
         menu::item(
             IconName::ListPlus,
             "Insert workspace below…",
-            on_shark(cx, move |s, w, cx| s.stack_from(n2.clone(), true, w, cx)),
+            on_ws(cx, &name, |s, n, w, cx| s.stack_from(n, true, w, cx)),
         )
         .hint(below),
     );
@@ -527,6 +512,61 @@ pub(crate) fn each_or_all(
     Some(menu::sub(icon, label, entries))
 }
 
+/// Right-click menu of a sidebar repo row.
+pub(super) fn repo_menu(this: &Shark, repo: &Repo, cx: &Context<Shark>) -> Vec<Entry> {
+    let (name, path) = (repo.name.clone(), repo.path.clone());
+    let (settings, picked, p1, p3) = (repo.clone(), vec![name.clone()], path.clone(), path.clone());
+    let mut entries = vec![
+        menu::item(
+            IconName::Settings,
+            "Repository settings…",
+            on_shark(cx, move |s, w, cx| {
+                repo_settings::open(s, settings.clone(), w, cx)
+            }),
+        ),
+        menu::item(
+            IconName::Plus,
+            "New workspace…",
+            on_shark(cx, move |s, w, cx| {
+                s.new_workspace(picked.clone(), None, w, cx)
+            }),
+        ),
+        Entry::Sep,
+        menu::item(IconName::FolderOpen, "Reveal in Finder", move |_, cx| {
+            cx.reveal_path(&p1)
+        })
+        .hint(tilde(&path)),
+    ];
+    // Active workspace first: the likeliest target.
+    let mut targets: Vec<&Workspace> = (this.state.workspaces.iter())
+        .filter(|w| !w.repos.iter().any(|r| r.name == name))
+        .collect();
+    targets.sort_by_key(|w| this.active.as_ref() != Some(&w.name));
+    let rows: Vec<Entry> = (targets.into_iter())
+        .map(|w| {
+            let (ws, repo) = (w.name.clone(), repo.clone());
+            menu::item(
+                IconName::MessageSquare,
+                w.name.clone(),
+                on_shark(cx, move |s, win, cx| {
+                    s.add_repo_to_workspace(ws.clone(), repo.clone(), win, cx)
+                }),
+            )
+        })
+        .collect();
+    if !rows.is_empty() {
+        entries.insert(2, menu::sub(IconName::FolderPlus, "Add to workspace", rows));
+    }
+    entries.extend(open_in_entries(None, &[(name, path.clone())], cx));
+    entries.push(
+        menu::item(IconName::Copy, "Copy path", move |w, cx| {
+            copy(p3.display().to_string(), w, cx)
+        })
+        .hint(tilde(&path)),
+    );
+    entries
+}
+
 /// A menu callback that runs `f` on Shark.
 pub(super) fn on_shark(
     cx: &Context<Shark>,
@@ -536,6 +576,16 @@ pub(super) fn on_shark(
     move |window, cx| {
         shark.update(cx, |s, cx| f(s, window, cx)).ok();
     }
+}
+
+/// `on_shark` that hands `f` its own copy of the workspace `name`.
+pub(super) fn on_ws(
+    cx: &Context<Shark>,
+    name: &str,
+    f: impl Fn(&mut Shark, String, &mut Window, &mut Context<Shark>) + 'static,
+) -> impl Fn(&mut Window, &mut App) + 'static {
+    let name = name.to_string();
+    on_shark(cx, move |s, w, cx| f(s, name.clone(), w, cx))
 }
 
 #[cfg(test)]

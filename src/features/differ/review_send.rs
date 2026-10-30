@@ -1,8 +1,10 @@
 //! ⇧C: the send sheet (A·03). Pending threads as a checklist, an overall note, an optional
 //! PR review; what is ticked goes to the chat as one message, the rest stays pending.
-use super::review::{Comment, Status, prompt};
+use super::review_comment::{Comment, Status, prompt};
+use super::review_share::{github_body, unposted_by_repo};
 use super::*;
-use crate::chat::{ReviewCard, ReviewItem, plural};
+use crate::chat::{ReviewCard, ReviewItem};
+use crate::ui::plural;
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::input::{Enter, Escape};
 
@@ -94,7 +96,7 @@ impl Differ {
         let ids: Vec<u64> = s.rows.iter().filter(|r| r.1).map(|r| r.0).collect();
         let note = s.note.read(cx).value().to_string();
         // Also publish shows only while a ticked row's repo has a PR.
-        let publish = s.publish && !self.sheet_prs(cx).is_empty();
+        let publish = s.publish && !self.sheet_prs().is_empty();
         self.send_review(&ids, &note, publish, window, cx);
     }
 
@@ -115,9 +117,7 @@ impl Differ {
             return;
         };
         let workspace = ws.name.clone();
-        if let Some(ws) = self.workspace_name().map(str::to_string) {
-            self.reanchor_comments(&ws); // the lines as the agent will read them
-        }
+        self.reanchor_comments(); // the lines as the agent will read them
         let comments: Vec<Comment> = (self.ws_comments().iter())
             .filter(|c| c.status == Status::Pending && ids.contains(&c.id))
             .cloned()
@@ -198,7 +198,7 @@ impl Differ {
 
     /// The repo and PR number of each repo of the ticked rows with an open PR: where Also
     /// publish posts.
-    pub(crate) fn sheet_prs(&self, cx: &App) -> Vec<(String, u64)> {
+    pub(crate) fn sheet_prs(&self) -> Vec<(String, u64)> {
         let Some(s) = &self.review.sheet else {
             return vec![];
         };
@@ -206,12 +206,31 @@ impl Differ {
         for c in (s.rows.iter().filter(|r| r.1)).filter_map(|r| self.comment(r.0)) {
             let repo = c.repo();
             if !out.iter().any(|p| p.0 == repo)
-                && let Some((pr, _)) = self.pr_of(c, cx)
+                && let Some((pr, _)) = self.pr_of(c)
             {
                 out.push((repo.to_string(), pr.number));
             }
         }
         out
+    }
+
+    /// What the sheet sends, as the preview shows it: the prompt, then with Also publish one
+    /// review per repo, without the threads already on GitHub, as `publish` posts.
+    fn sheet_preview(&self, cx: &App) -> Option<String> {
+        let s = self.review.sheet.as_ref().filter(|s| s.preview)?;
+        let picked: Vec<Comment> = (s.rows.iter())
+            .filter(|r| r.1)
+            .filter_map(|r| self.comment(r.0).cloned())
+            .collect();
+        let note = s.note.read(cx).value();
+        let mut p = prompt(&picked, &note);
+        let groups = unposted_by_repo(&picked);
+        for (repo, n) in self.sheet_prs().iter().filter(|_| s.publish) {
+            let group = (groups.iter()).find(|g| g[0].repo() == repo);
+            let body = github_body(group.map_or(&[][..], |g| &g[..]), &note);
+            p += &format!("\n— {repo} PR #{n} Comment review —\n\n{body}");
+        }
+        Some(p)
     }
 
     /// Ticks Also publish; the preview opens, so what GitHub gets is seen first.
@@ -237,7 +256,7 @@ impl Differ {
             .collect();
         let ticked = s.rows.iter().filter(|r| r.1).count();
         let focused = s.focus.is_focused(window);
-        let prs = self.sheet_prs(cx);
+        let prs = self.sheet_prs();
         // One PR as the design says it; several by repo.
         let to = match &prs[..] {
             [] => None,
@@ -288,28 +307,11 @@ impl Differ {
                 )
                 .child(div().flex_1().min_w_0().truncate().child(text))
         });
-        let preview = s.preview.then(|| {
-            let picked: Vec<Comment> = (s.rows.iter())
-                .filter(|r| r.1)
-                .filter_map(|r| comments.iter().find(|c| c.id == r.0).cloned())
-                .collect();
-            let note = s.note.read(cx).value();
-            let mut p = prompt(&picked, &note);
-            // One review per repo, without the threads already on GitHub, as `publish` posts.
-            for (repo, n) in prs.iter().filter(|_| s.publish) {
-                let group: Vec<Comment> = (picked.iter())
-                    .filter(|c| c.repo() == repo && c.github.is_none())
-                    .cloned()
-                    .collect();
-                let body = super::review_share::github_body(&group, &note);
-                p += &format!("\n— {repo} PR #{n} Comment review —\n\n{body}");
-            }
-            p
-        });
+        let preview = self.sheet_preview(cx);
         let unpushed = s.publish
             && (s.rows.iter().filter(|r| r.1))
                 .filter_map(|r| self.comment(r.0))
-                .any(|c| self.pr_of(c, cx).is_some_and(|(_, pushed)| !pushed));
+                .any(|c| self.pr_of(c).is_some_and(|(_, pushed)| !pushed));
         let n = s.rows.len();
         let sheet = v_flex()
             .id("review-sheet")

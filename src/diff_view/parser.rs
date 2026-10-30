@@ -12,12 +12,6 @@ pub struct DiffParseError {
 }
 
 impl DiffParseError {
-    pub fn line(&self) -> usize {
-        self.line
-    }
-    pub fn message(&self) -> &SharedString {
-        &self.message
-    }
     pub(crate) fn new(line: usize, message: &'static str) -> Self {
         Self {
             line,
@@ -165,9 +159,7 @@ pub(crate) fn parse(patch: &str) -> Result<Vec<DiffFile>> {
             ));
         }
         if let Some(paths) = line.strip_prefix("diff --git ") {
-            if let Some(file) = current.take() {
-                files.push(file.finish());
-            }
+            flush(&mut current, &mut files);
             let (old, new, prefixes) = git_paths(paths)
                 .ok_or_else(|| DiffParseError::new(ix + 1, "invalid Git file header"))?;
             current = Some(File {
@@ -182,15 +174,13 @@ pub(crate) fn parse(patch: &str) -> Result<Vec<DiffFile>> {
         // `git format-patch` ends each message with a `-- ` signature line,
         // followed by the Git version. Mail clients may strip its trailing space.
         if line == "-- " || line == "--" {
-            if let Some(file) = current.take() {
-                files.push(file.finish());
-            }
+            flush(&mut current, &mut files);
             ix += 1;
             continue;
         }
         if let Some(path) = line.strip_prefix("--- ") {
             if current.as_ref().is_some_and(|file| file.headers) {
-                files.push(current.take().unwrap().finish());
+                flush(&mut current, &mut files);
             }
             let file = current.get_or_insert_with(File::default);
             let old = header_path(path, ix + 1)?;
@@ -272,13 +262,18 @@ pub(crate) fn parse(patch: &str) -> Result<Vec<DiffFile>> {
         }
         ix += 1;
     }
-    if let Some(file) = current {
-        files.push(file.finish());
-    }
+    flush(&mut current, &mut files);
     if files.is_empty() && !patch.trim().is_empty() {
         return Err(DiffParseError::new(1, "expected a unified or Git diff"));
     }
     Ok(files)
+}
+
+/// Finishes the file being built, if any.
+fn flush(current: &mut Option<File>, files: &mut Vec<DiffFile>) {
+    if let Some(file) = current.take() {
+        files.push(file.finish());
+    }
 }
 
 /// Parses the hunk whose header is `lines[ix]` and returns the next line index.
@@ -335,7 +330,9 @@ fn parse_hunk(file: &mut File, lines: &[&str], mut ix: usize) -> Result<usize> {
         // context line; `git apply` accepts that, so accept it here too.
         let (tag, text) = match content.as_bytes().first() {
             None => (b' ', ""),
-            Some(&tag) => (tag, &content[1..]),
+            // Only an ASCII tag is sliced past: a multi-byte first char is not a hunk line.
+            Some(&tag) if matches!(tag, b' ' | b'+' | b'-') => (tag, &content[1..]),
+            Some(&tag) => (tag, ""),
         };
         if !matches!(tag, b' ' | b'+' | b'-') {
             return Err(DiffParseError::new(
@@ -402,13 +399,13 @@ fn parse_hunk(file: &mut File, lines: &[&str], mut ix: usize) -> Result<usize> {
         pairs_start..file.pairs.len(),
         original_start..file.original.lines.len(),
         modified_start..file.modified.lines.len(),
-        header.to_owned().into(),
         first_original..first_original + old_count,
     ));
     Ok(ix)
 }
 
-fn hunk_header(line: &str, number: usize) -> Result<(usize, usize, usize, usize)> {
+/// Parses `@@ -a,b +c,d @@` into `(a, b, c, d)`; a missing count is one.
+pub(crate) fn hunk_header(line: &str, number: usize) -> Result<(usize, usize, usize, usize)> {
     let invalid = || DiffParseError::new(number, "invalid hunk header");
     let body = line.strip_prefix("@@ ").ok_or_else(invalid)?;
     let (ranges, _) = body.split_once(" @@").ok_or_else(invalid)?;

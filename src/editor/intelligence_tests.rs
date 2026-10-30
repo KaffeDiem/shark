@@ -86,7 +86,6 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
     let project = Project {
         root: dir.clone(),
         worktree: dir.clone(),
-        language_id: "python",
         backend: Backend::Pyrefly,
         toolchain: String::new(),
         rust_toolchain: None,
@@ -135,7 +134,7 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
     });
     cx.update(|cx| {
         session.update(cx, |s, cx| {
-            s.status = "Preparing index".into();
+            s.status = crate::lsp::Status::Preparing;
             cx.notify();
         })
     });
@@ -248,7 +247,7 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
         session.update(cx, |s, cx| {
             s.client = Some(restarted.clone());
             s.generation += 1;
-            s.status = "Ready".into();
+            s.status = crate::lsp::Status::Ready;
             cx.notify();
         })
     });
@@ -261,7 +260,7 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
     cx.update(|cx| {
         let e = editor.read(cx);
         assert!(e.lsp_error.is_none());
-        assert_eq!(e.language_status(cx).unwrap().0, "Ready");
+        assert_eq!(e.language_status(cx).unwrap().0, crate::lsp::Status::Ready);
     });
     assert_eq!(
         block_on(restarted.request(
@@ -322,7 +321,6 @@ async fn diagnostics_from_both_servers_remain_searchable_in_document_order(
     let project = Project {
         root: dir.clone(),
         worktree: dir.clone(),
-        language_id: "python",
         backend: Backend::Pyrefly,
         toolchain: String::new(),
         rust_toolchain: None,
@@ -355,6 +353,12 @@ async fn diagnostics_from_both_servers_remain_searchable_in_document_order(
     .await;
     let uri = url::Url::from_file_path(&file).unwrap().to_string();
     for (is_companion, lines) in [(false, vec![2, 1]), (true, vec![0])] {
+        // The companion re-serializes the URI (`a` as `%61`); it is still this document.
+        let uri = if is_companion {
+            uri.replace("a.py", "%61.py")
+        } else {
+            uri.clone()
+        };
         cx.update(|cx| {
             session.update(cx, |_, cx| {
                 let diagnostics: Vec<_> = lines.iter().map(|line| json!({
@@ -382,6 +386,20 @@ async fn diagnostics_from_both_servers_remain_searchable_in_document_order(
     let _ = fs::remove_dir_all(dir);
 }
 
+#[test]
+fn publish_diagnostics_uris_match_by_decoded_path() {
+    use crate::lsp::document::{file_uri, same_file};
+    // Our own URI for a Next.js route file must be representable at all (`[id]`).
+    let ours = file_uri(std::path::Path::new("/p/app/(shop)/[id]/page.tsx")).unwrap();
+    assert!(same_file(
+        "file:///p/app/%28shop%29/%5Bid%5D/page.tsx",
+        &ours
+    ));
+    assert!(same_file(ours.as_str(), &ours));
+    assert!(!same_file("file:///p/app/(shop)/[id]/other.tsx", &ours));
+    assert!(!same_file("untitled:page.tsx", &ours));
+}
+
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn completion_acceptance_applies_autoimport_snippet_mirrors_and_undo(
@@ -402,7 +420,6 @@ async fn completion_acceptance_applies_autoimport_snippet_mirrors_and_undo(
     let project = Project {
         root: dir.clone(),
         worktree: dir.clone(),
-        language_id: "python",
         backend: Backend::Pyrefly,
         toolchain: String::new(),
         interpreter: None,
@@ -536,7 +553,6 @@ async fn accepting_an_unresolved_completion_adds_its_import_as_a_second_undo_ste
     let project = Project {
         root: dir.clone(),
         worktree: dir.clone(),
-        language_id: "python",
         backend: Backend::Pyrefly,
         toolchain: String::new(),
         interpreter: None,
@@ -653,7 +669,6 @@ async fn snippet_completion_inside_an_active_field_starts_its_own_tabstops(
     let project = Project {
         root: dir.clone(),
         worktree: dir.clone(),
-        language_id: "python",
         backend: Backend::Pyrefly,
         toolchain: String::new(),
         interpreter: None,

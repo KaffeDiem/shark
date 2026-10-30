@@ -2,6 +2,8 @@
 use super::*;
 use crate::apps::OpenApp;
 
+const CELL: f32 = 96.;
+
 pub(super) struct AppSwitcher {
     pub(super) apps: Vec<&'static OpenApp>,
     pub(super) selected: usize,
@@ -74,7 +76,7 @@ impl Shark {
             let scroll = ScrollHandle::new();
             // The scroll handle learns its overflow after the first layout; start at the end.
             if backwards {
-                scroll.set_offset(point(-px(apps.len() as f32 * 96.), px(0.)));
+                scroll.set_offset(point(-px(apps.len() as f32 * CELL), px(0.)));
             }
             self.app_switcher = Some(AppSwitcher {
                 apps,
@@ -134,11 +136,7 @@ impl Shark {
             return;
         }
         // Restore focus before the launch path can open a repo/project picker.
-        if let Some(focus) = s.previous_focus {
-            focus.focus(window, cx);
-        } else {
-            self.focus_fallback(window, cx);
-        }
+        self.restore_focus(s.previous_focus, window, cx);
         if open {
             match self.ws(&s.workspace).cloned() {
                 Some(ws) => self.open_in_workspace(s.apps[s.selected], &ws, window, cx),
@@ -155,7 +153,7 @@ impl Shark {
     ) -> Option<AnyElement> {
         let s = self.app_switcher.as_ref()?;
         let theme = cx.theme();
-        let width = px((s.apps.len() as f32 * 96. + 40.).min(760.))
+        let width = px((s.apps.len() as f32 * CELL + 40.).min(760.))
             .min((window.viewport_size().width - px(32.)).max(px(0.)));
         let (layout, scroll, selected) = (s.width.clone(), s.scroll.clone(), s.selected);
         let hint = if s.command_held {
@@ -200,7 +198,7 @@ impl Shark {
                             .aria_label(app.name.clone())
                             .aria_selected(selected)
                             .when(selected, |d| d.aria_active_descendant())
-                            .size(px(96.))
+                            .size(px(CELL))
                             .flex_none()
                             .items_center()
                             .justify_center()

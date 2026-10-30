@@ -144,7 +144,7 @@ async fn file_chat_focus_and_hover(cx: &mut TestAppContext) {
     for mode in [crate::state::Mode::Dark, crate::state::Mode::Light] {
         for width in [800., 1440.] {
             on(cx, &|s, w, cx| {
-                crate::settings::apply(
+                crate::theme::apply(
                     &crate::state::Appearance {
                         mode,
                         ..Default::default()
@@ -495,8 +495,9 @@ async fn diff_closure_navigation_and_discard(cx: &mut TestAppContext) {
             .unwrap();
         }
         assert!(!State::load().workspaces[0].diff_closed);
+        // Diff is last in the strip: the file before it shows.
         press(cx, &["cmd-w"]);
-        cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::Chat));
+        cx.update(|cx| assert_eq!(shark.read(cx).tab, Tab::File));
         assert!(State::load().workspaces[0].diff_closed);
     }
     // Last-file fallback respects closure, and does not reopen Diff as a side effect.
@@ -706,5 +707,117 @@ async fn zen_shows_only_the_tab(cx: &mut TestAppContext) {
     assert_eq!(focused(cx), side);
     press(cx, &["cmd-."]);
     assert_eq!(focused(cx), side);
+    fs::remove_dir_all(&home).ok();
+}
+
+/// The dock badge counts a workspace with an unread chat; reading the chat (selecting its tab)
+/// or closing it clears the count at once.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn dock_badge_follows_unread_chats(cx: &mut TestAppContext) {
+    use crate::attention::BADGE;
+    use std::sync::atomic::Ordering::SeqCst;
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace(
+            "badge".into(),
+            git::on_branch(&repos, "badge"),
+            vec![],
+            None,
+            w,
+            cx,
+        );
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    press_in(window)(cx, &["cmd-t"]);
+    // The second chat is shown; the first finishes a turn unseen.
+    let first = cx.update(|cx| shark.read(cx).active_ws().unwrap().chats[0].id.clone());
+    let mark = |cx: &mut TestAppContext| {
+        let first = first.clone();
+        on(cx, &move |s, _, cx| {
+            s.unread.insert(first.clone());
+            s.refresh_attention(cx);
+        })
+    };
+    mark(cx);
+    assert_eq!(BADGE.load(SeqCst), 1);
+    on(cx, &|s, w, cx| s.select_chat(0, w, cx));
+    assert_eq!(BADGE.load(SeqCst), 0, "reading the chat clears the badge");
+    mark(cx); // unread again, and now it is the one closed
+    assert_eq!(BADGE.load(SeqCst), 1);
+    on(cx, &|s, w, cx| s.close_chat(w, cx));
+    assert_eq!(BADGE.load(SeqCst), 0, "closing an unread chat clears it");
+    fs::remove_dir_all(&home).ok();
+}
+
+/// `n` builds the latest plan in a new chat once: not when it is already approved, and not
+/// with an older version on screen.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn build_plan_in_new_chat_refuses_stale_plans(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace(
+            "plan-n".into(),
+            git::on_branch(&repos, "plan-n"),
+            vec![],
+            None,
+            w,
+            cx,
+        );
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let chat = cx.update(|cx| shark.read(cx).active_chat().cloned().unwrap());
+    let plan = cx.update(|cx| chat.read(cx).plan.clone());
+    let chats =
+        |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).active_ws().unwrap().chats.len());
+    cx.update(|cx| {
+        plan.update(cx, |p, cx| {
+            p.add("t1".into(), "# One\n\nfirst\n".into(), cx);
+            p.add("t2".into(), "# One\n\nsecond\n".into(), cx);
+            p.shown = 0;
+        })
+    });
+    let before = chats(cx);
+    on(cx, &|s, w, cx| s.build_plan_in_new_chat(w, cx));
+    assert_eq!(chats(cx), before, "an older version is shown: no new chat");
+    cx.update(|cx| {
+        plan.update(cx, |p, cx| {
+            p.shown = 1;
+            p.approve(cx);
+        })
+    });
+    on(cx, &|s, w, cx| s.build_plan_in_new_chat(w, cx));
+    assert_eq!(chats(cx), before, "already approved: no new chat");
+    let id = cx.update(|cx| chat.read(cx).meta.id.clone());
+    crate::plan::delete(&id);
     fs::remove_dir_all(&home).ok();
 }

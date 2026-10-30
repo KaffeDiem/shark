@@ -23,10 +23,10 @@ pub struct Dep {
 /// The login shell's PATH. Bounded: an rc file that blocks (pinentry, a network call) must
 /// not hang launch. In its own process group so a timeout also kills what the rc started.
 pub fn login_path() -> Result<String, String> {
-    let shell = std::env::var("SHELL").unwrap_or("/bin/zsh".into());
+    let shell = crate::scripts::shell();
     let probe = ["-lic", "printf '__P__%s' \"$PATH\""];
     let c = std::process::Command::new(&shell);
-    let out = crate::git::wait_bounded(c, Path::new("/"), &shell, &probe, 5, true)?;
+    let out = crate::proc::wait_bounded(c, Path::new("/"), &shell, &probe, 5, true)?;
     let path = (out.split("__P__").nth(1)).ok_or(format!("{shell} printed no PATH"))?;
     Ok(path.trim().to_string())
 }
@@ -40,7 +40,7 @@ fn gh_auth() -> Result<String, String> {
 
 /// Blocking (spawns `gh auth status`, maybe a login shell); run it off the UI thread.
 pub fn check() -> Vec<Dep> {
-    let claude = std::env::var("SHARK_CLAUDE").unwrap_or("claude".into());
+    let claude = crate::proc::claude_bin().to_string_lossy().into_owned();
     let path = std::env::var("PATH").unwrap_or_default();
     let path_err = PATH_ERROR.get().map(|s| s.as_str());
     let mut deps = rows(path_err, |p| on_path(p, &path), &claude, gh_auth);

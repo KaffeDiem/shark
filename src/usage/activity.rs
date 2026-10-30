@@ -1,15 +1,16 @@
 //! Daily token totals from the agents' own local logs. Read-only; the aggregate stays in memory.
 use super::{Provider, timestamp};
-use objc2_foundation::{NSDate, NSDateFormatter, NSString, NSTimeZone};
+use objc2_foundation::{NSDate, NSTimeZone};
 use serde_json::Value;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::time::UNIX_EPOCH;
 
-/// Days shown: 20 weeks.
-pub const DAYS: usize = 140;
+/// Weeks shown, and the days in them.
+pub const WEEKS: i64 = 20;
+pub const DAYS: usize = WEEKS as usize * 7;
 
 /// Tokens per local day, oldest first; `first_day` is a [`local_day`] number.
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -33,50 +34,10 @@ pub fn local_day(seconds: f64) -> i64 {
     ((seconds + offset as f64) / 86400.).floor() as i64
 }
 
-/// Formats [`local_day`]s for display from a localized template: `"EEEMMMd"` → "Tue, Oct 28".
-pub fn day_labels(template: &str) -> impl Fn(i64) -> String {
-    let formatter = NSDateFormatter::new();
-    formatter.setLocalizedDateFormatFromTemplate(&NSString::from_str(template));
-    formatter.setTimeZone(Some(&NSTimeZone::timeZoneForSecondsFromGMT(0)));
-    move |day| {
-        formatter
-            .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(day as f64 * 86400.))
-            .to_string()
-    }
-}
-
-/// (year, month 1-12, day 1-31) of a [`local_day`] in the Gregorian calendar, whatever the locale.
-pub fn civil(day: i64) -> (i64, u32, u32) {
-    // Hinnant's civil_from_days.
-    let z = day + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z.rem_euclid(146097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let (d, m) = (
-        (doy - (153 * mp + 2) / 5 + 1) as u32,
-        (if mp < 10 { mp + 3 } else { mp - 9 }) as u32,
-    );
-    (yoe + era * 400 + i64::from(m <= 2), m, d)
-}
-
 /// Tokens for the [`DAYS`] ending on `now`'s local day, from `$CLAUDE_CONFIG_DIR` or `$CODEX_HOME`.
 /// Keep one [`Cache`] per provider: a scan drops entries it did not see.
 pub fn scan(provider: Provider, cache: &mut Cache, now: f64) -> Daily {
-    let (var, dir) = match provider {
-        Provider::Claude => ("CLAUDE_CONFIG_DIR", ".claude"),
-        Provider::Codex => ("CODEX_HOME", ".codex"),
-    };
-    let root = std::env::var_os(var)
-        .map(PathBuf::from)
-        .or_else(|| std::env::home_dir().map(|home| home.join(dir)));
-    scan_in(
-        provider,
-        root.as_deref().unwrap_or(Path::new("/var/empty")),
-        cache,
-        now,
-    )
+    scan_in(provider, &super::config_dir(provider), cache, now)
 }
 
 pub(super) fn scan_in(provider: Provider, root: &Path, cache: &mut Cache, now: f64) -> Daily {
@@ -179,7 +140,7 @@ pub(super) fn parse(
         Provider::Codex => "token_count",
     };
     let mut days: Vec<(i64, u64)> = vec![];
-    let mut seen = HashSet::new();
+    let mut seen = HashMap::new();
     let mut last_total = Value::Null;
     // Split on bytes: a stray invalid UTF-8 line must not end the file early.
     for line in reader.split(b'\n').map_while(Result::ok) {
@@ -191,17 +152,16 @@ pub(super) fn parse(
         let Ok(v) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
-        let n = match provider {
+        let mut key = None;
+        let n: u64 = match provider {
             Provider::Claude => {
                 let (message, usage) = (&v["message"], &v["message"]["usage"]);
-                // Streamed turns repeat one message's usage on several lines.
-                if v["type"] != "assistant"
-                    || !usage.is_object()
-                    || message["id"].is_string()
-                        && !seen.insert((message["id"].to_string(), v["requestId"].to_string()))
-                {
+                if v["type"] != "assistant" || !usage.is_object() {
                     continue;
                 }
+                key = message["id"]
+                    .is_string()
+                    .then(|| (message["id"].to_string(), v["requestId"].to_string()));
                 [
                     "input_tokens",
                     "output_tokens",
@@ -231,6 +191,20 @@ pub(super) fn parse(
         };
         let Some(day) = v["timestamp"].as_str().and_then(|t| day_of(t, hours)) else {
             continue;
+        };
+        // A streamed message repeats on several lines, and only the last carries the final
+        // `output_tokens`: count the growth on the day of its first line.
+        let (day, n) = match key {
+            Some(key) => {
+                let (first_day, prev) = seen.entry(key).or_insert((day, 0));
+                if n <= *prev {
+                    continue;
+                }
+                let grew = n - *prev;
+                *prev = n;
+                (*first_day, grew)
+            }
+            None => (day, n),
         };
         match days.iter_mut().find(|(d, _)| *d == day) {
             Some(entry) => entry.1 += n,
