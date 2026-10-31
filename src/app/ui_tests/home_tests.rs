@@ -328,7 +328,8 @@ async fn palette_rows_dispatch_their_actions(cx: &mut TestAppContext) {
             .unwrap();
         press(cx, &["enter"]);
     };
-    let chats = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.workspaces[0].chats.len());
+    let chats =
+        |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.workspaces[0].chats.len());
     let before = chats(cx);
     pick(cx, "New chat");
     assert_eq!(chats(cx), before + 1, "New chat");

@@ -4,8 +4,8 @@ use super::status::{
     self, Action, Kind, Local, Pr, PrState, Repo, diverged, fetch_pr, in_scope, next_action, probe,
 };
 use crate::git::cmd_bounded;
-use crate::proc::par_map;
 use crate::pr;
+use crate::proc::par_map;
 use crate::state::Workspace;
 use std::path::PathBuf;
 
@@ -276,10 +276,7 @@ pub(super) fn repo_diff_base(repo: &Repo) -> Option<String> {
 }
 
 pub(super) fn check_review_checkout(repos: &[Repo], rs: &[String]) -> Result<(), String> {
-    if let Some(r) = repos
-        .iter()
-        .find(|r| in_scope(rs, r) && r.is_review())
-    {
+    if let Some(r) = repos.iter().find(|r| in_scope(rs, r) && r.is_review()) {
         return Err(format!(
             "{}: this is a local PR review checkout; use the original PR on GitHub to manage it",
             r.name
@@ -290,7 +287,11 @@ pub(super) fn check_review_checkout(repos: &[Repo], rs: &[String]) -> Result<(),
 
 /// [`status::step_args`] against the workspace's saved base: [`repos_from`] follows an open PR's
 /// base for display, which would hide a retargeted PR from the merge guard.
-pub(super) fn planned_args(ws: &Workspace, kind: &Kind, r: &Repo) -> Result<Option<Vec<String>>, String> {
+pub(super) fn planned_args(
+    ws: &Workspace,
+    kind: &Kind,
+    r: &Repo,
+) -> Result<Option<Vec<String>>, String> {
     let saved = ws.repos.iter().find(|w| w.name == r.name);
     let base = saved.map_or(&r.base, |w| &w.base).clone();
     status::step_args(kind, &Repo { base, ..r.clone() })
@@ -347,33 +348,36 @@ pub(super) fn execute(
     };
     let planned = |r: &Repo| planned_args(ws, &a.kind, r);
     match &a.kind {
-        Kind::Pull | Kind::Push | Kind::ForcePush | Kind::Reopen | Kind::UpdateBranch | Kind::Ready => {
-            each(&|wt, r| {
-                let Some(args) = planned(r)? else {
-                    return Ok(None);
-                };
-                let (prog, secs) = match a.kind {
-                    Kind::Pull | Kind::Push | Kind::ForcePush => ("git", 120),
-                    _ => ("gh", 60),
-                };
-                cmd_bounded(wt, prog, &argv(&args), secs).map_err(|e| match a.kind {
-                    Kind::Pull if diverged(&e) => {
-                        format!("{e}\nThe branches diverged; use “Sync with remote”.")
-                    }
-                    Kind::Push => format!("{e}\nIf the remote moved, pull first."),
-                    _ => e,
-                })?;
-                let n = r.pr().map_or(0, |p| p.number);
-                Ok(Some(match a.kind {
-                    Kind::Pull => "pulled".into(),
-                    Kind::Push => "pushed".into(),
-                    Kind::ForcePush => "force-pushed".into(),
-                    Kind::Reopen => format!("#{n} reopened"),
-                    Kind::UpdateBranch => format!("#{n} updated from base"),
-                    _ => format!("#{n} ready for review"),
-                }))
-            })
-        }
+        Kind::Pull
+        | Kind::Push
+        | Kind::ForcePush
+        | Kind::Reopen
+        | Kind::UpdateBranch
+        | Kind::Ready => each(&|wt, r| {
+            let Some(args) = planned(r)? else {
+                return Ok(None);
+            };
+            let (prog, secs) = match a.kind {
+                Kind::Pull | Kind::Push | Kind::ForcePush => ("git", 120),
+                _ => ("gh", 60),
+            };
+            cmd_bounded(wt, prog, &argv(&args), secs).map_err(|e| match a.kind {
+                Kind::Pull if diverged(&e) => {
+                    format!("{e}\nThe branches diverged; use “Sync with remote”.")
+                }
+                Kind::Push => format!("{e}\nIf the remote moved, pull first."),
+                _ => e,
+            })?;
+            let n = r.pr().map_or(0, |p| p.number);
+            Ok(Some(match a.kind {
+                Kind::Pull => "pulled".into(),
+                Kind::Push => "pushed".into(),
+                Kind::ForcePush => "force-pushed".into(),
+                Kind::Reopen => format!("#{n} reopened"),
+                Kind::UpdateBranch => format!("#{n} updated from base"),
+                _ => format!("#{n} ready for review"),
+            }))
+        }),
         Kind::CreatePr | Kind::CreateDraftPr => {
             let landed: Vec<String> = repos
                 .iter()
