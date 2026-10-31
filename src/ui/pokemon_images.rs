@@ -40,11 +40,6 @@ fn existing(path: &Path, floor: std::time::Duration, trim: bool) -> Option<Arc<R
             e.image.clone()
         })
 }
-#[cfg(test)]
-fn render_image(asset: Arc<Asset>) -> Arc<RenderImage> {
-    render_variant(asset, std::time::Duration::ZERO, false)
-}
-
 pub(crate) fn render_capped(asset: Arc<Asset>, floor: std::time::Duration) -> Arc<RenderImage> {
     render_variant(asset, floor, true)
 }
@@ -285,8 +280,8 @@ mod tests {
     #[test]
     fn shared_native_bitmap_preserves_frames_and_bgra_pixels() {
         let source = asset("native-bitmap");
-        let first = render_image(source.clone());
-        let second = render_image(source);
+        let first = render_variant(source.clone(), std::time::Duration::ZERO, false);
+        let second = render_variant(source, std::time::Duration::ZERO, false);
         assert!(Arc::ptr_eq(&first, &second));
         assert_eq!(first.frame_count(), 2);
         assert_eq!(
@@ -298,8 +293,8 @@ mod tests {
     }
     #[test]
     fn new_decoded_asset_at_same_path_replaces_previous_bitmap() {
-        let first = render_image(asset("new-identity"));
-        let second = render_image(asset("new-identity"));
+        let first = render_variant(asset("new-identity"), std::time::Duration::ZERO, false);
+        let second = render_variant(asset("new-identity"), std::time::Duration::ZERO, false);
         assert!(!Arc::ptr_eq(&first, &second));
     }
     #[test]
@@ -326,6 +321,9 @@ mod tests {
         assert_eq!(source.frames.len(), 2);
         let still = render_variant(source.clone(), std::time::Duration::MAX, false);
         assert_eq!(still.frame_count(), 1);
-        assert!(!Arc::ptr_eq(&still, &render_image(source)));
+        assert!(!Arc::ptr_eq(
+            &still,
+            &render_variant(source, std::time::Duration::ZERO, false)
+        ));
     }
 }
