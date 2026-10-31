@@ -40,7 +40,8 @@ fn existing(path: &Path, floor: std::time::Duration, trim: bool) -> Option<Arc<R
             e.image.clone()
         })
 }
-pub(crate) fn render_image(asset: Arc<Asset>) -> Arc<RenderImage> {
+#[cfg(test)]
+fn render_image(asset: Arc<Asset>) -> Arc<RenderImage> {
     render_variant(asset, std::time::Duration::ZERO, false)
 }
 
