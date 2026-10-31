@@ -116,7 +116,7 @@ impl Shark {
                         }
                     });
                     let entries = vec![
-                        menu::item(icon, verb, toggle).hint("cmd-r"),
+                        menu::item(icon, verb, toggle),
                         menu::item(
                             IconName::ScrollText,
                             "Show script output",
