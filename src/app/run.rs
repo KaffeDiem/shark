@@ -81,6 +81,61 @@ impl Shark {
         self.runs.contains_key(ws)
     }
 
+    /// Header button, a filled square (`secondary`, unlike the git button's variants): run/stop
+    /// the active workspace; while running, its port in green beside it.
+    /// Right-click: the same toggle, and the script output.
+    pub(super) fn render_run(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let port = self
+            .active
+            .as_ref()
+            .and_then(|n| self.runs.get(n))
+            .map(|r| r.port);
+        let (icon, verb) = match port {
+            Some(_) => (IconName::Square, "Stop"),
+            None => (IconName::Play, "Run"),
+        };
+        let tip = format!("{verb} (cmd-r)");
+        let button = Button::new("run")
+            .secondary()
+            .small()
+            .size(px(28.))
+            .flex_none()
+            .accessibility_label(tip.clone())
+            .tooltip(tip)
+            .icon(icon)
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_run(window, cx)))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                    // Only what it says: scripts that exit while the menu is open aren't rerun.
+                    let stop = port.is_some();
+                    let ws = this.active.clone();
+                    let toggle = on_shown(cx, ws.clone(), move |s, w, cx| {
+                        if s.active.as_ref().is_some_and(|n| s.running(n)) == stop {
+                            s.toggle_run(w, cx)
+                        }
+                    });
+                    let log = on_shown(cx, ws, |s, w, cx| s.show_script_log(w, cx));
+                    let entries = vec![
+                        menu::item(icon, verb, toggle),
+                        menu::item(IconName::ScrollText, "Show script output", log),
+                    ];
+                    this.show_menu(e.position, entries, window, cx);
+                }),
+            );
+        h_flex()
+            .flex_none()
+            .gap_1p5()
+            .child(button)
+            .children(port.map(|p| {
+                div()
+                    .text_xs()
+                    .text_color(theme.success_foreground)
+                    .child(format!("Running :{p}"))
+            }))
+    }
+
     /// Setup scripts for a new workspace, or only `repo`'s for one just added, in the background.
     /// `then`'s prompt is sent to its chat once they succeed, so the agent never works on a
     /// half-set-up worktree; if they fail or the chat is busy, it waits in the composer.
@@ -150,6 +205,20 @@ impl Shark {
             false => notify_err(window, cx, "No script has run in this workspace yet"),
         }
     }
+}
+
+/// A run-menu action that runs only while `ws`, whose menu it is, is still the one shown: the
+/// menu outlives workspace switches.
+fn on_shown(
+    cx: &Context<Shark>,
+    ws: Option<String>,
+    f: impl Fn(&mut Shark, &mut Window, &mut Context<Shark>) + 'static,
+) -> impl Fn(&mut Window, &mut App) + 'static {
+    on_shark(cx, move |s, w, cx| {
+        if !s.home_shown() && s.active == ws {
+            f(s, w, cx)
+        }
+    })
 }
 
 /// An error notice with the end of the log, kept until dismissed.
