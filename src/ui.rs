@@ -1,8 +1,8 @@
 //! Shared UI styling and dialogs used by the host and workspace features.
 use crate::state::Mode;
+use crate::{PageDown, PageUp, SelectFirst, SelectLast, SelectNext, SelectPrev};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{ResizeHandleRenderer, ResizeHandleState};
-use crate::{PageDown, PageUp, SelectFirst, SelectLast, SelectNext, SelectPrev};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::command::CommandItem;
 use gpui_kit::component::dialog::{Dialog, DialogEntrance};

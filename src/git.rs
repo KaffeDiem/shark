@@ -1,6 +1,7 @@
 use crate::state::{Repo, Workspace, WsRepo};
 mod changes;
 mod copy;
+pub mod history;
 use copy::{copy_included, untracked_fingerprint};
 #[cfg(test)]
 mod tests;
@@ -69,6 +70,17 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 /// Runs git, returning stdout untouched (no trim, any bytes), or stderr as the error.
 pub fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     finish_bytes("git", args, run(dir, "git", args)?)
+}
+
+/// Like `git_bytes`, but a hung process is killed after `secs`.
+pub fn git_bytes_bounded(dir: &Path, args: &[&str], secs: u64) -> Result<Vec<u8>, String> {
+    let mut c = Command::new("git");
+    c.env("GIT_TERMINAL_PROMPT", "0");
+    finish_bytes(
+        "git",
+        args,
+        crate::proc::wait_output(c, dir, "git", args, secs, false)?,
+    )
 }
 
 /// Commits with a fixed identity; `extra` is the rest of the `commit` args. Returns git's output.

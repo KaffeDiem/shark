@@ -1188,7 +1188,10 @@ mod tests {
         assert_eq!(ws.chats[ws.active_chat].id, "b");
         assert_eq!(ws.closed.len(), 20);
         assert_eq!(ws.closed.last().unwrap().id, "a");
-        assert_eq!(r.evicted.iter().map(|c| &c.id[..]).collect::<Vec<_>>(), ["old0"]);
+        assert_eq!(
+            r.evicted.iter().map(|c| &c.id[..]).collect::<Vec<_>>(),
+            ["old0"]
+        );
         let r = ws.remove_chat("b", chat(""), |_| true).unwrap();
         assert!(r.last && r.untouched);
         assert_eq!(ws.closed.len(), 20);

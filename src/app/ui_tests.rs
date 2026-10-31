@@ -42,10 +42,31 @@ pub(super) fn test_home() -> PathBuf {
     home
 }
 
+/// Commits what is staged as the test user (empty commits allowed); returns the new HEAD.
+fn commit_staged(dir: &std::path::Path, msg: &str) -> String {
+    git::commit(dir, &["--allow-empty", "-m", msg]);
+    git::git(dir, &["rev-parse", "HEAD"]).unwrap()
+}
+
+/// Stages everything, then [`commit_staged`].
+fn commit_all(dir: &std::path::Path, msg: &str) -> String {
+    git::git(dir, &["add", "-A"]).unwrap();
+    commit_staged(dir, msg)
+}
+
+/// Waits for `ready` (checked once per frame) for up to 10 s of test time.
+async fn until(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    ready: impl FnMut(&mut Window, &mut App) -> bool,
+) {
+    cx.wait_for(window, Duration::from_secs(10), ready).await;
+}
+
 pub(super) fn init_repo(repo: &std::path::Path) {
     fs::create_dir_all(repo).unwrap();
     git::git(repo, &["init", "-q", "-b", "main"]).unwrap();
-    git::commit(repo, &["-q", "--allow-empty", "-m", "i"]);
+    commit_staged(repo, "i");
 }
 
 /// Repos `home/src/<name>`, each with one commit.
@@ -4055,7 +4076,12 @@ async fn home_ask_shark(cx: &mut TestAppContext) {
     let answer = |cx: &mut TestAppContext| {
         cx.update(|cx| {
             let ask = shark.read(cx).home.ask.as_ref().unwrap();
-            ask.answer.read(cx).rendered_text().as_str().trim().to_string()
+            ask.answer
+                .read(cx)
+                .rendered_text()
+                .as_str()
+                .trim()
+                .to_string()
         })
     };
     assert_eq!(answer(cx), "Forty-two");
@@ -5531,7 +5557,8 @@ async fn review_queue(cx: &mut TestAppContext) {
             s.differ
                 .read(cx)
                 .review()
-                .store.failed_saves
+                .store
+                .failed_saves
                 .contains_key(s.active.as_deref().unwrap())
         );
         s.differ.update(cx, |d, cx| d.open_share(1, w, cx));
@@ -5692,7 +5719,8 @@ async fn review_queue(cx: &mut TestAppContext) {
                 .differ
                 .read(cx)
                 .review()
-                .store.comments
+                .store
+                .comments
                 .contains_key("elsewhere")
         )
     });
@@ -5744,8 +5772,7 @@ async fn review_queue(cx: &mut TestAppContext) {
     let dir = crate::state::support_dir().join("comments");
     fs::write(dir.join("bad.json"), "{oops").unwrap();
     on(cx, &|s, _, cx| {
-        s.differ
-            .update(cx, |d, _| d.review_mut().store.load("bad"))
+        s.differ.update(cx, |d, _| d.review_mut().store.load("bad"))
     });
     assert!(dir.join("bad.json.1.bak").exists() && !dir.join("bad.json").exists());
     fs::write(
@@ -5754,8 +5781,7 @@ async fn review_queue(cx: &mut TestAppContext) {
     )
     .unwrap();
     on(cx, &|s, _, cx| {
-        s.differ
-            .update(cx, |d, _| d.review_mut().store.load("old"))
+        s.differ.update(cx, |d, _| d.review_mut().store.load("old"))
     });
     cx.update(|cx| {
         let c = &shark.read(cx).differ.read(cx).review().store.comments["old"][0];

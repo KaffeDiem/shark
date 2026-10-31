@@ -1,21 +1,28 @@
-//! Images and videos in the diff: a before/after row under the file's header.
+//! Images and videos shared by Diff and Git: a before/after row, or one side alone.
 //!
-//! Both sides are named by the blob hash git prints on the patch's `index` line (git hashes
-//! working-tree files too), so every byte copy and preview is cached on disk by content and
-//! never goes stale. Previews are capped at `MAX` px: gpui keeps every decoded image at full
+//! Each side names where its bytes come from: the working tree, an exact Git blob, or a
+//! downloaded file. Blob sides are named by their hash (git hashes working-tree files too), so
+//! every byte copy and preview is cached on disk by content and never goes stale. Previews are capped at `MAX` px: gpui keeps every decoded image at full
 //! size, in memory and on the GPU, until it is dropped, and `Lru` drops the oldest ones.
 //! Videos play inline through AVFoundation, which hands decoded NV12 frames straight to gpui's
 //! `surface()`, one video at a time.
-use super::*;
+use gpui_kit::assets::IconName;
+use gpui_kit::component::spinner::Spinner;
+use gpui_kit::component::{ActiveTheme, Icon, Sizable as _, h_flex, v_flex};
+use gpui_kit::prelude::FluentBuilder as _;
+use gpui_kit::*;
 use objc2_av_foundation::AVPlayerItemStatus;
 use player::Player;
 use prepare::{Preview, ext, playable, touch};
 use std::collections::VecDeque;
+use std::rc::Rc;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+pub(crate) mod fetch;
 mod player;
 mod prepare;
-pub(crate) use prepare::{Kind, MediaFile, prune_cache};
+pub(crate) use prepare::{Kind, MediaFile, Side, Source, cache_dir, kind, produce, prune_cache};
 
 /// Height of the before/after boxes, fixed so a row never jumps when its image loads.
 const BOX: f32 = 280.;
@@ -79,6 +86,8 @@ pub(crate) struct MediaView {
     window: Option<AnyWindowHandle>,
     /// The diff pane's width, measured last frame.
     width: Rc<std::cell::Cell<Pixels>>,
+    /// Shows one side alone, under this label (a historical Before/After or a document image).
+    only: Option<(usize, SharedString)>,
 }
 
 impl MediaView {
@@ -96,7 +105,13 @@ impl MediaView {
             player: None,
             pumping: false,
             window: None,
+            only: None,
         }
+    }
+
+    pub(crate) fn only(mut self, side: usize, label: impl Into<SharedString>) -> MediaView {
+        self.only = Some((side, label.into()));
+        self
     }
 
     /// Loads both sides off the main thread, the first time the row is drawn.
@@ -105,6 +120,9 @@ impl MediaView {
         let sides = [self.file.old.clone(), self.file.new.clone()];
         for (ix, side) in sides.into_iter().enumerate() {
             let Some(side) = side else { continue };
+            if self.only.as_ref().is_some_and(|(only, _)| *only != ix) {
+                continue;
+            }
             self.slots[ix] = Some(Slot::Loading);
             let (path, kind) = (self.file.path.to_string(), self.file.kind);
             cx.spawn(async move |this, cx| {
@@ -141,7 +159,11 @@ impl MediaView {
 
     /// Play/pause: the new side, or the old one when the file was deleted.
     pub(crate) fn toggle_default(&mut self, cx: &mut Context<Self>) {
-        let side = if self.file.new.is_some() { 1 } else { 0 };
+        let side = match &self.only {
+            Some((side, _)) => *side,
+            None if self.file.new.is_some() => 1,
+            None => 0,
+        };
         self.toggle(side, cx);
     }
 
@@ -231,21 +253,23 @@ impl MediaView {
         let theme = cx.theme();
         let (muted, faint_bg) = (theme.muted_foreground, theme.muted.opacity(0.4));
         let missing = [&self.file.old, &self.file.new][side].is_none();
+        let name = match &self.only {
+            Some((_, label)) => label.to_string(),
+            None => if side == 0 { "Before" } else { "After" }.to_string(),
+        };
         let label = match (side, &self.slots[side]) {
+            _ if missing && self.only.is_some() => format!("{name} · none"),
             (0, _) if missing => "Before · none".to_string(),
             (_, _) if missing => "After · deleted".to_string(),
             (_, Some(Slot::Ready(p))) => {
-                let mut s = vec![
-                    if side == 0 { "Before" } else { "After" }.to_string(),
-                    ext(&self.file.path).to_uppercase(),
-                ];
+                let mut s = vec![name, ext(&self.file.path).to_uppercase()];
                 if let Some((w, h)) = p.size {
                     s.push(format!("{w}×{h}"));
                 }
                 s.push(human_bytes(p.bytes));
                 s.join(" · ")
             }
-            _ => if side == 0 { "Before" } else { "After" }.to_string(),
+            _ => name,
         };
         let playing = self.player.as_ref().filter(|p| p.side == side);
         let body: AnyElement = match (&self.slots[side], playing) {
@@ -343,7 +367,7 @@ fn play_badge() -> impl IntoElement {
         .child(Icon::new(IconName::Play).with_size(px(20.)))
 }
 
-fn human_bytes(n: u64) -> String {
+pub(crate) fn human_bytes(n: u64) -> String {
     match n {
         n if n < 1024 => format!("{n} B"),
         n if n < 1024 * 1024 => format!("{:.1} KB", n as f64 / 1024.),
@@ -377,8 +401,10 @@ impl Render for MediaView {
             })
             .gap_3()
             .items_start()
-            .child(self.tile(0, cx))
-            .child(self.tile(1, cx))
+            .map(|d| match self.only.as_ref().map(|(side, _)| *side) {
+                Some(side) => d.child(self.tile(side, cx)),
+                None => d.child(self.tile(0, cx)).child(self.tile(1, cx)),
+            })
     }
 }
 
@@ -390,7 +416,10 @@ impl MediaView {
 
     /// Every side the file has is loaded (or failed).
     pub(crate) fn ready(&self) -> bool {
-        let has = [self.file.old.is_some(), self.file.new.is_some()];
+        let mut has = [self.file.old.is_some(), self.file.new.is_some()];
+        if let Some((side, _)) = &self.only {
+            has[1 - side] = false;
+        }
         (0..2).all(|i| !has[i] || matches!(self.slots[i], Some(Slot::Ready(_) | Slot::Failed(_))))
     }
 
@@ -403,7 +432,10 @@ impl MediaView {
 
     /// A loaded side: what is drawn, and the source's size.
     #[allow(clippy::type_complexity)]
-    pub(crate) fn shown(&self, side: usize) -> Option<(Option<PathBuf>, Option<(usize, usize)>)> {
+    pub(crate) fn shown(
+        &self,
+        side: usize,
+    ) -> Option<(Option<std::path::PathBuf>, Option<(usize, usize)>)> {
         match &self.slots[side] {
             Some(Slot::Failed(e)) => panic!("{}: {e}", self.file.path),
             _ => self.preview(side).map(|p| (p.image.clone(), p.size)),

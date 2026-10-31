@@ -25,6 +25,7 @@ objc2-core-foundation = { version = "0.3", default-features = false, features = 
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGImage"] }
 objc2-core-services = { version = "0.3", default-features = false, features = ["std", "LaunchServices", "LSInfo", "LSConstants"] }
 resvg = { version = "0.46", default-features = false }
+merman = { version = "=0.9.2", default-features = false, features = ["svg", "layout-cytoscape", "all-diagrams"] }
 lsp-server = "=0.10.0"
 lsp-types = "=0.97.0"
 anyhow = "1"

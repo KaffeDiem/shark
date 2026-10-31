@@ -245,7 +245,7 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Option<Entity<git_feature::GitFeature>> {
-        let ws = self.active_ws()?.clone();
+        let ws = self.effective_workspace(self.active_ws()?.clone(), cx);
         let archiving = self.archiving.contains(&ws.name);
         if let Some(git) = self.git_features.get(&ws.name).cloned() {
             git.update(cx, |g, cx| {

@@ -1,5 +1,5 @@
 //! Producing the previews of a media file's sides: byte copies and downscaled images in an
-//! on-disk cache keyed by blob hash.
+//! on-disk cache keyed by where each side comes from and its hash.
 use gpui_kit::SharedString;
 use objc2_av_foundation::{AVMediaTypeVideo, AVURLAsset};
 use objc2_foundation::{NSString, NSURL};
@@ -46,14 +46,36 @@ pub(super) fn playable(ext: &str) -> bool {
     matches!(ext, "mp4" | "mov" | "m4v")
 }
 
-/// One side of a changed media file.
+/// Where one side's bytes come from.
+#[derive(Clone, PartialEq, Debug)]
+pub(crate) enum Source {
+    /// A working-tree file, which must still hash to `Side::sha`.
+    Working(PathBuf),
+    /// The exact blob `Side::sha`, read from the repository.
+    Blob,
+    /// A file `fetch` put in the cache; `Side::sha` is its cache key.
+    Downloaded,
+}
+
+/// One side of a media file.
 #[derive(Clone, PartialEq, Debug)]
 pub(crate) struct Side {
     pub(crate) sha: String,
     /// The worktree, for `git cat-file`.
-    repo: PathBuf,
-    /// The working-tree file (the new side); `None` reads the blob from git (the old side).
-    file: Option<PathBuf>,
+    pub(crate) repo: PathBuf,
+    pub(crate) source: Source,
+}
+
+impl Side {
+    /// Cache name. A working file can hash to a blob while holding other bytes (Git LFS and
+    /// other clean filters), so working copies and raw blobs never share an entry.
+    fn key(&self) -> String {
+        match self.source {
+            Source::Working(_) => format!("w-{}", self.sha),
+            Source::Blob => format!("b-{}", self.sha),
+            Source::Downloaded => self.sha.clone(),
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Debug)]
@@ -76,18 +98,18 @@ impl MediaFile {
             .next()?
             .split_once("..")?;
         let repo = ws_dir.join(path.split('/').next()?);
-        let side = |sha: &str, file| {
+        let side = |sha: &str, source| {
             (!sha.bytes().all(|b| b == b'0')).then(|| Side {
                 sha: sha.to_string(),
                 repo: repo.clone(),
-                file,
+                source,
             })
         };
         Some(MediaFile {
             path: path.to_string().into(),
             kind,
-            old: side(old, None),
-            new: side(new, Some(ws_dir.join(path))),
+            old: side(old, Source::Blob),
+            new: side(new, Source::Working(ws_dir.join(path))),
         })
     }
 }
@@ -110,7 +132,10 @@ pub(crate) fn cache_dir() -> PathBuf {
 }
 
 /// Writes `out` through a temp file, so a crash or a concurrent load never leaves half a file.
-fn produce(out: &Path, make: impl FnOnce(&Path) -> Result<(), String>) -> Result<(), String> {
+pub(crate) fn produce(
+    out: &Path,
+    make: impl FnOnce(&Path) -> Result<(), String>,
+) -> Result<(), String> {
     if out.exists() {
         return Ok(());
     }
@@ -141,11 +166,12 @@ pub(crate) fn prepare(side: &Side, path: &str, kind: Kind) -> Result<Preview, St
     let dir = cache_dir();
     fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
     let ext = ext(path);
-    let source = dir.join(format!("{}.{ext}", side.sha));
-    produce(&source, |tmp| match &side.file {
+    let key = side.key();
+    let source = dir.join(format!("{key}.{ext}"));
+    produce(&source, |tmp| match &side.source {
         // The row loads after the diff ran; a file rewritten in between must not be cached
         // under the older hash. `--path` applies the same filters git diff hashed with.
-        Some(f) => {
+        Source::Working(f) => {
             fs::copy(f, tmp).map_err(|e| e.to_string())?;
             let rel = path.split_once('/').map_or(path, |(_, r)| r);
             let hash = crate::git::git(
@@ -161,10 +187,21 @@ pub(crate) fn prepare(side: &Side, path: &str, kind: Kind) -> Result<Preview, St
                 false => Err("changed on disk since the diff; refresh (r)".into()),
             }
         }
-        None => {
-            let blob = crate::git::git_bytes(&side.repo, &["cat-file", "blob", &side.sha])?;
-            fs::write(tmp, blob).map_err(|e| e.to_string())
+        // Raw bytes, bounded: a historical side never comes from the working tree. Blobs are
+        // read whole into memory, so huge ones are refused first.
+        Source::Blob => {
+            let size = crate::git::history::blob_size(&side.repo, &side.sha)?;
+            if size > super::fetch::MAX_BYTES {
+                return Err(format!(
+                    "too large to preview ({})",
+                    super::human_bytes(size)
+                ));
+            }
+            let bytes = crate::git::history::blob(&side.repo, &side.sha)?;
+            fs::write(tmp, bytes).map_err(|e| e.to_string())
         }
+        // `fetch` already wrote it under this name; absent, it was pruned since.
+        Source::Downloaded => Err("the download expired; reload the document".into()),
     })?;
     let bytes = fs::metadata(&source).map_err(|e| e.to_string())?.len();
     if bytes == 0 {
@@ -195,7 +232,7 @@ pub(crate) fn prepare(side: &Side, path: &str, kind: Kind) -> Result<Preview, St
     let big = size.is_some_and(|(w, h)| w.max(h) > MAX);
     let image = match kind {
         Kind::Image if let Some(tree) = svg.filter(|_| big) => {
-            let out = dir.join(format!("{}.preview.png", side.sha));
+            let out = dir.join(format!("{key}.preview.png"));
             produce(&out, |tmp| {
                 let scale = MAX as f32 / tree.size().width().max(tree.size().height());
                 let (w, h) = (tree.size().width() * scale, tree.size().height() * scale);
@@ -209,7 +246,7 @@ pub(crate) fn prepare(side: &Side, path: &str, kind: Kind) -> Result<Preview, St
         }
         Kind::Image if native(&ext) && !big => Some(source.clone()),
         Kind::Image => {
-            let out = dir.join(format!("{}.preview.png", side.sha));
+            let out = dir.join(format!("{key}.preview.png"));
             produce(&out, |tmp| {
                 let mut sips = Command::new("sips");
                 if big {
@@ -225,10 +262,10 @@ pub(crate) fn prepare(side: &Side, path: &str, kind: Kind) -> Result<Preview, St
             Some(out)
         }
         Kind::Video if playable(&ext) => {
-            let out = dir.join(format!("{}.poster.png", side.sha));
+            let out = dir.join(format!("{key}.poster.png"));
             // Quick Look's thumbnailer decodes one frame; it hangs on broken files, so it gets
             // a deadline, and a failure is remembered so it costs that wait once, not per launch.
-            let failed = dir.join(format!("{}.poster.none", side.sha));
+            let failed = dir.join(format!("{key}.poster.none"));
             (!failed.exists())
                 .then(|| {
                     produce(&out, |tmp| {
@@ -344,5 +381,15 @@ mod tests {
         assert!(m.new.is_none(), "all-zero hash is a missing side");
         assert!(MediaFile::parse("web/a.rs", chunk, Path::new("/ws")).is_none());
         assert_eq!(kind("x/Clip.MOV"), Some(Kind::Video));
+        let new = Side {
+            sha: old.sha.clone(),
+            repo: old.repo.clone(),
+            source: Source::Working("/ws/web/a.png".into()),
+        };
+        assert_ne!(
+            new.key(),
+            old.key(),
+            "working copies never reuse a blob's cache entry"
+        );
     }
 }

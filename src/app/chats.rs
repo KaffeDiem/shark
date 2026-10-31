@@ -88,7 +88,10 @@ impl Shark {
                         this.record_interaction(&name, cx);
                         // The level the chat runs at, so an old chat with none doesn't clear it.
                         let m = &chat.read(cx).meta;
-                        let pick = (m.model.clone(), Some(crate::models::effort_of(m).to_string()));
+                        let pick = (
+                            m.model.clone(),
+                            Some(crate::models::effort_of(m).to_string()),
+                        );
                         let st = &mut this.state;
                         if (&st.last_model, &st.last_effort) != (&pick.0, &pick.1) {
                             (st.last_model, st.last_effort) = pick;

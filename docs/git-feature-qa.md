@@ -187,11 +187,17 @@ remote mutation validation at submission. The new acceptance test is
 | Jump from an inline thread to current code | Partial by design | Matching Diff file opens; missing/outdated code retains GitHub context; no exact thread-line navigation event |
 | Use keyboard navigation without stealing input keystrokes | Covered in tested scenarios | Arrows/Vim/rail/large-list tests pass; Q1 focus regression is fixed |
 | Keep existing Differ edits/reviews safe across workspace switches | Covered in tested scenarios | Stale refresh/menu/dialog, same-path buffer, publication, draft, and persistence tests |
+| Browse the branch's own commits, newest first, and read one commit's message and files | Covered | Real-repo history fixtures; UI test for list, keyboard, selection and Escape; a missing base is an error, never all history; HEAD, index and working files unchanged |
+| Read either side or the diff of a changed file, including images and deleted files | Covered | UI test per file view (Before, After, Diff, Source); images match their blobs, not the working file |
+| Switch commits quickly or change the base while loading | Smoke-tested | Selection settles on the last request (ordering is not forced); late results for another base are dropped |
+| See Mermaid diagrams in descriptions, comments and historical Markdown | Covered | Rendered from the PR head or the viewed commit; failures show the error and source; native rendering at both widths |
+| See images and videos referenced by a document | Covered offline | Relative images come from the captured revision, missing ones explain why, HTTP is rejected; remote downloads are covered by cache-lookup tests only, not live network |
+| Read a long message in full and copy its source | Covered locally | Reader past the compact preview, Source in the read-only editor; `cmd-s` in the reader or Commits never posts a hidden draft |
 | Finish a formal review with Approve or Request changes | Product gap | New artifact reads review states but does not submit these decisions |
 | Push, create PR, mark ready, merge, archive | Available elsewhere | Existing workspace Git controls; no duplicate controls required in this artifact |
 
-Staging/hunk staging, a commit-history browser, stash management, and a general
-branch-management client are not part of the documented new artifact. Decide
+Staging/hunk staging, stash management, and a general branch-management client are
+not part of the documented new artifact; commit history is a read-only browser. Decide
 explicitly whether the label “Git” is intended to promise those workflows. For
 Shark's existing agent-oriented workflow, their absence alone is not a regression.
 

@@ -40,13 +40,25 @@ pub(crate) fn spawn_err(dir: &Path, prog: &str, e: std::io::Error) -> String {
 /// A session, not just a group: an interactive shell in a background group of the terminal
 /// Shark was started from stops on SIGTTOU.
 pub fn wait_bounded(
-    mut c: Command,
+    c: Command,
     dir: &Path,
     prog: &str,
     args: &[&str],
     secs: u64,
     group: bool,
 ) -> Result<String, String> {
+    finish(prog, args, wait_output(c, dir, prog, args, secs, group)?)
+}
+
+/// `wait_bounded`, returning the raw output whatever the exit status.
+pub(crate) fn wait_output(
+    mut c: Command,
+    dir: &Path,
+    prog: &str,
+    args: &[&str],
+    secs: u64,
+    group: bool,
+) -> Result<std::process::Output, String> {
     if group {
         unsafe extern "C" {
             fn setsid() -> i32;
@@ -73,7 +85,7 @@ pub fn wait_bounded(
     // wait_with_output drains both pipes, so a big gh response can't fill one and deadlock.
     std::thread::spawn(move || tx.send(child.wait_with_output()));
     match rx.recv_timeout(Duration::from_secs(secs)) {
-        Ok(out) => finish(prog, args, out.map_err(|e| format!("{prog}: {e}"))?),
+        Ok(out) => out.map_err(|e| format!("{prog}: {e}")),
         Err(_) => {
             // The waiting thread reaps it. An interactive shell ignores TERM.
             match group {

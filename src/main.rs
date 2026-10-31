@@ -16,6 +16,7 @@ mod file_icon;
 mod files;
 mod git;
 mod lsp;
+mod media;
 mod menu;
 mod menubar;
 mod models;
@@ -386,6 +387,7 @@ fn bind_keys(cx: &mut App) {
         // Back to reviewing, also when the line input lost focus.
         KeyBinding::new("escape", CancelEdit, Some(DIFF)),
         KeyBinding::new("escape", CancelEdit, Some("GitFeature")),
+        KeyBinding::new("enter", Confirm, Some("GitCommits && !Input")),
         KeyBinding::new("c", AddComment, Some(DIFF)),
         // Plan mode; in the composer shift-tab is caught before the input outdents.
         KeyBinding::new(

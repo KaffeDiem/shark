@@ -1,10 +1,10 @@
 //! Root view: sidebar of repos and workspaces, Chat/Diff tabs, palette and dialogs.
 use crate::attention::Attn;
 use crate::chat::{Chat, ChatEvent};
-use crate::models::MODELS;
 use crate::checkbox::Checkbox;
 use crate::editor::{EditorEvent, FileEditor};
 use crate::menu::{self, Entry};
+use crate::models::MODELS;
 use crate::state::{ChatMeta, Repo, Section, State, TabId, Workspace, move_item, workspaces_dir};
 use crate::sync::{GitSync, SyncEvent};
 use crate::*;
@@ -981,7 +981,9 @@ impl Render for Shark {
             .text_color(theme.foreground)
             .font_features(inter_features())
             .on_action(cx.listener(|this, _: &TogglePalette, w, cx| this.toggle_palette(w, cx)))
-            .on_action(cx.listener(|this, _: &NewWorkspace, w, cx| this.new_workspace_default(w, cx)))
+            .on_action(
+                cx.listener(|this, _: &NewWorkspace, w, cx| this.new_workspace_default(w, cx)),
+            )
             .on_action(cx.listener(|this, _: &ArchiveWorkspace, w, cx| this.archive(false, w, cx)))
             .on_action(
                 cx.listener(|this, _: &ForceArchiveWorkspace, w, cx| this.archive(true, w, cx)),
