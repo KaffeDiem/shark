@@ -5,6 +5,7 @@ mod detail_appearance;
 mod dex;
 mod evolution_line;
 mod footer_animation;
+mod footer_usage;
 use crate::ui::pokemon_images as images;
 mod activity;
 #[cfg(all(test, feature = "test-support"))]
@@ -751,91 +752,62 @@ impl Shark {
     }
 
     pub(super) fn render_pokemon_footer(&self, cx: &Context<Self>) -> AnyElement {
-        let (used, target) = self.state.pokemon.progress();
-        let today = self
-            .usage_reports
+        let now = crate::usage::now();
+        let quotas: Vec<_> = self
+            .usage_providers
             .iter()
-            .filter_map(|report| report.daily.tokens.last())
-            .copied()
-            .fold(0u64, u64::saturating_add);
-        let title = self
-            .state
-            .pokemon
-            .representative_subject()
-            .and_then(|(id, _)| {
-                self.state
-                    .pokemon
-                    .collection
-                    .iter()
-                    .chain(self.state.pokemon.active.iter())
-                    .find(|m| m.reached_species().any(|s| s == id))
-                    .map(|m| m.line.name(id))
-            })
-            .unwrap_or_else(|| self.state.pokemon.title());
-        let progress = (used as f64 / target.max(1) as f64).clamp(0., 1.) as f32;
-        let quota = self
-            .highest_used_headline_limit()
-            .map_or_else(String::new, |used| {
-                format!(
-                    " · {:.0}% remaining in your tightest active quota",
-                    100. - used
+            .map(|provider| {
+                (
+                    provider.id(),
+                    footer_usage::quota_lines(
+                        provider.name(),
+                        &self.usage[provider.index()],
+                        now,
+                        self.rail,
+                    ),
                 )
-            });
+            })
+            .collect();
+        let quota = self
+            .usage_providers
+            .iter()
+            .flat_map(|provider| {
+                footer_usage::quota_details(provider.name(), &self.usage[provider.index()], now)
+            })
+            .collect::<Vec<_>>()
+            .join(" · ");
         Button::new("pokemon-footer")
             .ghost()
             .h_auto()
             .p_1()
             .w_full()
-            .accessibility_label(format!(
-                "{title}, {} tokens today. Open Pokémon companion",
-                compact(today)
-            ))
-            .tooltip(format!("{} tokens today{quota}", compact(today)))
+            .accessibility_label(format!("{quota}. Open Pokémon companion"))
+            .tooltip(quota)
             .on_click(cx.listener(|s, _, w, cx| s.show_pokemon(w, cx)))
             .child(
-                h_flex()
+                div()
+                    .flex()
                     .gap_2()
                     .w_full()
-                    .when(self.rail, |d| d.justify_center())
+                    .items_center()
+                    .when(self.rail, |d| d.flex_col())
                     .child(self.pokemon_art(40.))
-                    .when(!self.rail, |d| {
-                        d.child(
-                            v_flex()
-                                .min_w_0()
-                                .flex_1()
-                                .items_start()
-                                .gap_1()
-                                .child(
-                                    div()
-                                        .w_full()
-                                        .text_ellipsis()
-                                        .overflow_hidden()
-                                        .text_sm()
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .child(title),
-                                )
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(cx.theme().muted_foreground)
-                                        .child(format!("{} tokens today", compact(today))),
-                                )
-                                .child(
-                                    div()
-                                        .h(px(3.))
-                                        .w_full()
-                                        .rounded_full()
-                                        .bg(cx.theme().muted)
-                                        .child(
-                                            div()
-                                                .h_full()
-                                                .w(relative(progress))
-                                                .rounded_full()
-                                                .bg(cx.theme().primary),
-                                        ),
-                                ),
-                        )
-                    }),
+                    .child(
+                        v_flex()
+                            .min_w_0()
+                            .flex_1()
+                            .when(self.rail, |d| d.w_full().items_center())
+                            .when(!self.rail, |d| d.items_start())
+                            .gap_1()
+                            .children(quotas.into_iter().map(|(id, lines)| {
+                                v_flex()
+                                    .id(format!("pokemon-footer-quota-{id}"))
+                                    .text_xs()
+                                    .when(self.rail, |d| d.text_size(px(10.)).items_center())
+                                    .children(lines.into_iter().map(|line| div().child(line)))
+                                    .test_support()
+                            })),
+                    ),
             )
             .into_any_element()
     }

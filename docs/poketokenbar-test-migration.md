@@ -6,8 +6,8 @@ The [case inventory](poketokenbar-test-migration.csv) records **every one of the
 
 | Status | Cases |
 | --- | ---: |
-| translated | 858 |
-| adapted | 67 |
+| translated | 857 |
+| adapted | 68 |
 | out-of-scope | 304 |
 | retained-shark-fetcher | 237 |
 | retained-shark-host | 119 |

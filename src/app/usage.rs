@@ -6,9 +6,7 @@ use crate::usage::activity::{self, Daily, WEEKS};
 use crate::usage::providers::ProviderHandle;
 use crate::usage::{Allowance, Failure, Snapshot, Status};
 use gpui_kit::component::FocusTrapElement as _;
-use gpui_kit::component::plot::shape::{Arc, ArcData};
 use objc2_foundation::{NSDate, NSDateFormatter, NSDateFormatterStyle, NSString, NSTimeZone};
-use std::f32::consts::TAU;
 use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(300);
@@ -239,15 +237,6 @@ impl Shark {
 
     pub(super) fn render_usage_footer(&self, cx: &Context<Self>) -> impl IntoElement {
         let at = self.usage_at.clone();
-        let providers: Vec<_> = self
-            .usage_providers
-            .iter()
-            .copied()
-            .filter(|p| !self.usage[p.index()].allowances.is_empty())
-            .collect();
-        let fallback = providers.is_empty();
-        let theme = cx.theme();
-        let hover = side_hover(theme);
         div()
             .id("usage-footer")
             .relative()
@@ -259,7 +248,7 @@ impl Shark {
                     .when(!self.state.pokemon_disabled, |d| {
                         d.child(self.render_pokemon_footer(cx))
                     })
-                    .when(fallback, |d| {
+                    .when(self.state.pokemon_disabled, |d| {
                         d.child(
                             Button::new("show-usage")
                                 .ghost()
@@ -270,67 +259,7 @@ impl Shark {
                                 .tooltip("Show account usage")
                                 .on_click(cx.listener(|s, _, w, cx| s.show_usage(w, cx))),
                         )
-                    })
-                    .children(providers.into_iter().map(|provider| {
-                        let snapshot = &self.usage[provider.index()];
-                        let now = crate::usage::now();
-                        let limiting = snapshot.limiting();
-                        let remaining = limiting.and_then(|row| row.remaining);
-                        let pace = limiting.and_then(|row| row.pace(now));
-                        let description = ring_description(provider, snapshot);
-                        let left = left_label(limiting, now);
-                        let ring = ring(
-                            remaining.unwrap_or(0.),
-                            pace,
-                            fill_color(remaining, snapshot.outdated, theme),
-                            theme.sidebar,
-                            theme,
-                        );
-                        // Expanded: a side row (ring, name, what's left). Rail: the ring over its name.
-                        let trigger = if self.rail {
-                            v_flex()
-                                .w(px(56.))
-                                .py_1p5()
-                                .gap_1()
-                                .items_center()
-                                .rounded(theme.radius)
-                                .text_xs()
-                                .text_color(theme.sidebar_foreground)
-                                .child(ring)
-                                .child(provider.name())
-                        } else {
-                            side_row(theme)
-                                .mx_0()
-                                .text_color(theme.sidebar_foreground)
-                                .child(ring)
-                                .child(div().flex_1().child(provider.name()))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .when_some(
-                                            label_color(remaining, snapshot.outdated, theme),
-                                            |d, c| d.text_color(c),
-                                        )
-                                        .child(left),
-                                )
-                        };
-                        let (snapshot, daily) = (
-                            snapshot.clone(),
-                            self.usage_activity[provider.index()].clone(),
-                        );
-                        HoverCard::new(format!("usage-card-{}", provider.id()))
-                            .anchor(Anchor::BottomLeft)
-                            .trigger(
-                                trigger
-                                    .id(format!("usage-trigger-{}", provider.id()))
-                                    .role(Role::Button)
-                                    .aria_label(description)
-                                    .hover(move |d| d.bg(hover))
-                                    .on_click(cx.listener(|s, _, w, cx| s.show_usage(w, cx)))
-                                    .test_support(),
-                            )
-                            .content(move |_, _, cx| card(provider, &snapshot, &daily, cx))
-                    })),
+                    }),
             )
             .child(
                 canvas(
@@ -760,18 +689,6 @@ fn companion_accounting(
         .into_any_element()
 }
 
-/// What's left: `sidebar_foreground` like the rest of the navigation, `warning` / `danger`
-/// fills when low. Never `primary`, which is reserved for focus, running agents and the
-/// primary button.
-fn fill_color(remaining: Option<f64>, outdated: bool, theme: &Theme) -> Hsla {
-    match remaining {
-        _ if outdated => faint(theme),
-        Some(n) if n <= 5. => theme.danger,
-        Some(n) if n <= 20. => theme.warning,
-        _ => theme.sidebar_foreground,
-    }
-}
-
 fn pace_color(remaining: f64, elapsed: Option<f64>, outdated: bool, theme: &Theme) -> Hsla {
     use crate::usage::pace::{Tier, gauge};
     if outdated {
@@ -787,107 +704,6 @@ fn pace_color(remaining: f64, elapsed: Option<f64>, outdated: bool, theme: &Them
     }
 }
 
-/// The footer label's text: the brighter `*_foreground` at `fill_color`'s thresholds.
-fn label_color(remaining: Option<f64>, outdated: bool, theme: &Theme) -> Option<Hsla> {
-    match remaining {
-        _ if outdated => None,
-        Some(n) if n <= 5. => Some(theme.danger_foreground),
-        Some(n) if n <= 20. => Some(theme.warning_foreground),
-        _ => None,
-    }
-}
-
-/// "62% left · 5h"; when low, the reset instead: "18% left · resets 3d".
-fn left_label(row: Option<&Allowance>, now: f64) -> String {
-    let Some((row, n)) = row.and_then(|row| Some((row, row.remaining?))) else {
-        return "Unknown".into();
-    };
-    match row.resets_at {
-        Some(at) if n <= 20. => format!("{}% left · resets {}", n.ceil(), countdown(at - now)),
-        _ => format!("{}% left · {}", n.ceil(), short_window(&row.label)),
-    }
-}
-
-/// "5 hours" → "5h", "Weekly" → "week", "gpt-5 · Weekly" → "gpt-5 week", "Fable" as is.
-fn short_window(label: &str) -> String {
-    label
-        .split(" · ")
-        .map(short_part)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn short_part(label: &str) -> String {
-    match label.split_once(' ') {
-        _ if label == "Weekly" => "week".into(),
-        Some((n, "hour" | "hours")) => format!("{n}h"),
-        Some((n, "days")) => format!("{n}d"),
-        Some((n, "minutes")) => format!("{n}m"),
-        _ if label.chars().count() > 10 => {
-            format!("{}…", label.chars().take(9).collect::<String>())
-        }
-        _ => label.into(),
-    }
-}
-
-/// A 16px ring of what's left, clockwise from the top, on a track tinted like the fill so an
-/// empty red ring still reads as red. A tick crossing it, knocked out of the band in the row
-/// background `bg`, marks what would be left at an even pace: an arc past the tick is ahead
-/// of the limit.
-fn ring(left: f64, pace: Option<f64>, fill: Hsla, bg: Hsla, theme: &Theme) -> impl IntoElement {
-    let (track, tick) = (fill.opacity(0.25), theme.sidebar_foreground);
-    let (left, pace) = (left as f32, pace.map(|p| p as f32));
-    canvas(
-        |_, _, _| {},
-        move |b, _, w, _| {
-            let band = Arc::new().inner_radius(4.).outer_radius(7.5);
-            band.paint(&ArcData::new(&(), 0, 100., 0., TAU), track, &b, w);
-            if left > 0. {
-                let end = left / 100. * TAU;
-                band.paint(&ArcData::new(&(), 1, left, 0., end), fill, &b, w);
-            }
-            if let Some(p) = pace {
-                let (sin, cos) = (p / 100. * TAU).sin_cos();
-                let at = |r: f32| b.center() + point(px(r * sin), px(-r * cos));
-                // The knockout stays within the band, so a hovered row's background can't show it.
-                for (width, from, to, color) in [(4.5, 4., 7.5, bg), (1.5, 2.5, 8., tick)] {
-                    let mut line = PathBuilder::stroke(px(width));
-                    line.move_to(at(from));
-                    line.line_to(at(to));
-                    if let Ok(path) = line.build() {
-                        w.paint_path(path, color);
-                    }
-                }
-            }
-        },
-    )
-    .size(px(16.))
-    .flex_none()
-}
-
-/// One allowance: "5 hours · 62% left · resets in 2h 14m (Thu 11:00 PM) · even pace 40%".
-fn limit_line(row: &Allowance, now: f64) -> String {
-    let mut text = format!(
-        "{} · {}",
-        row.label,
-        row.remaining.map_or_else(
-            || "Remaining unknown".into(),
-            |n| format!("{}% left", n.ceil())
-        )
-    );
-    if let Some(at) = row.resets_at {
-        text.push_str(&format!(
-            " · resets in {} ({})",
-            countdown(at - now),
-            short_time(at)
-        ));
-    }
-    if let Some(p) = row.pace(now) {
-        text.push_str(&format!(" · even pace {}%", p.round()));
-    }
-    text
-}
-
 /// "Resets Oct 28, 2026 at 11:00 PM", or that it's unknown.
 fn resets(at: Option<f64>) -> String {
     at.map_or_else(
@@ -901,48 +717,6 @@ fn even_pace(p: f64) -> String {
     format!(" · Even pace: {}% left", p.round())
 }
 
-fn ring_description(provider: ProviderHandle, snapshot: &Snapshot) -> String {
-    let mut text = match snapshot.limiting() {
-        Some(row) => format!(
-            "{} · {} · {}% remaining · {}",
-            provider.name(),
-            row.label,
-            row.remaining.unwrap().ceil(),
-            resets(row.resets_at)
-        ),
-        None => format!("{} · Remaining unknown", provider.name()),
-    };
-    if let Some(p) = snapshot
-        .limiting()
-        .and_then(|row| row.pace(crate::usage::now()))
-    {
-        text.push_str(&even_pace(p));
-    }
-    text.push_str(&status_note(snapshot));
-    text
-}
-
-fn status_note(snapshot: &Snapshot) -> String {
-    let mut text = String::new();
-    if snapshot
-        .allowances
-        .iter()
-        .any(|row| row.remaining.is_none())
-    {
-        text.push_str(" · Some allowances unknown");
-    }
-    if snapshot.outdated {
-        text.push_str(" · Outdated");
-    }
-    if snapshot.status == Status::Loading {
-        text.push_str(" · Checking…");
-    }
-    if let Some(at) = snapshot.checked_at {
-        text.push_str(&format!(" · Last checked {}", local_time(at)));
-    }
-    text
-}
-
 fn local_time(seconds: f64) -> String {
     let formatter = NSDateFormatter::new();
     formatter.setDateStyle(NSDateFormatterStyle::MediumStyle);
@@ -951,26 +725,6 @@ fn local_time(seconds: f64) -> String {
     formatter
         .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(seconds))
         .to_string()
-}
-
-/// Weekday and time, e.g. "Thu 11:00 PM", in the user's locale.
-fn short_time(seconds: f64) -> String {
-    let formatter = NSDateFormatter::new();
-    formatter.setLocalizedDateFormatFromTemplate(&NSString::from_str("EEEjmm"));
-    formatter.setTimeZone(Some(&NSTimeZone::localTimeZone()));
-    formatter
-        .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(seconds))
-        .to_string()
-}
-
-/// Time until a reset: "3d", "2h 14m", "5m".
-fn countdown(seconds: f64) -> String {
-    let m = (seconds.max(0.) / 60.).ceil() as u64;
-    match (m / 1440, m / 60 % 24, m % 60) {
-        (0, 0, m) => format!("{m}m"),
-        (0, h, m) => format!("{h}h {m}m"),
-        (d, _, _) => format!("{d}d"),
-    }
 }
 
 /// Token counts: "950", "412k", "38.2M".
@@ -1041,41 +795,6 @@ fn cell(level: usize, theme: &Theme) -> Div {
         .flex_none()
         .rounded(px(2.))
         .bg(level_color(level, theme))
-}
-
-/// The footer hover card: each allowance, then a GitHub-style calendar of daily tokens.
-fn card(
-    provider: ProviderHandle,
-    snapshot: &Snapshot,
-    daily: &Daily,
-    cx: &App,
-) -> impl IntoElement + use<> {
-    let theme = cx.theme();
-    let now = crate::usage::now();
-    let muted = theme.muted_foreground;
-    v_flex()
-        .id(format!("usage-card-{}", provider.id()))
-        .w(px(304.))
-        .gap_2()
-        .text_xs()
-        .child(
-            div()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(provider.name()),
-        )
-        .children(
-            snapshot
-                .allowances
-                .iter()
-                .map(|row| div().text_color(muted).child(limit_line(row, now))),
-        )
-        .children(
-            Some(status_note(snapshot).trim_start_matches(" · ").to_string())
-                .filter(|t| !t.is_empty())
-                .map(|t| div().text_color(muted).child(t)),
-        )
-        .child(heatmap(provider, daily, now, theme))
-        .test_support()
 }
 
 /// Each month over the column holding its 1st; the first column's only if it has room.
@@ -1198,12 +917,7 @@ fn heatmap(provider: ProviderHandle, daily: &Daily, now: f64, theme: &Theme) -> 
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Allowance, Failure, Provider, Snapshot, Theme, fill_color, label_color, left_label, levels,
-        limit_line, ring_description,
-    };
-    use super::{civil, countdown, local_time, month_marks, tokens};
-    use gpui_kit::rgb;
+    use super::{civil, levels, local_time, month_marks, tokens};
 
     #[test]
     fn civil_dates_ignore_the_locale() {
@@ -1230,100 +944,7 @@ mod tests {
     }
 
     #[test]
-    fn usage_ring_thresholds_and_unknown_stale_labels() {
-        let mut theme = Theme::default();
-        theme.warning = rgb(0x654321).into();
-        theme.danger = rgb(0xff0000).into();
-        theme.sidebar_foreground = rgb(0x888888).into();
-        for (remaining, expected) in [
-            (Some(21.), theme.sidebar_foreground),
-            (Some(20.), theme.warning),
-            (Some(5.1), theme.warning),
-            (Some(5.), theme.danger),
-            (Some(0.), theme.danger),
-            (None, theme.sidebar_foreground),
-        ] {
-            assert_eq!(fill_color(remaining, false, &theme), expected);
-            assert_eq!(
-                fill_color(remaining, true, &theme),
-                crate::ui::faint(&theme)
-            );
-        }
-        let mut snapshot = Snapshot::default();
-        snapshot.finish(Ok(vec![
-            crate::usage::Allowance {
-                label: "Weekly".into(),
-                remaining: Some(0.),
-                resets_at: Some(0.),
-                window: None,
-            },
-            crate::usage::Allowance {
-                label: "Model".into(),
-                remaining: None,
-                resets_at: None,
-                window: None,
-            },
-        ]));
-        snapshot.finish(Err(Failure::Temporary));
-        snapshot.begin();
-        let text = ring_description(Provider::Claude.into(), &snapshot);
-        for part in [
-            "Claude",
-            "Weekly",
-            "0% remaining",
-            "Resets",
-            "Some allowances unknown",
-            "Outdated",
-            "Checking",
-            "Last checked",
-        ] {
-            assert!(text.contains(part), "{text} should contain {part}");
-        }
-        snapshot.allowances.remove(0);
-        assert!(ring_description(Provider::Claude.into(), &snapshot).contains("Remaining unknown"));
-
-        let row = |label: &str, remaining: f64| Allowance {
-            label: label.into(),
-            remaining: Some(remaining),
-            resets_at: Some(1000. + 2. * 3600. + 14. * 60.),
-            window: Some(5. * 3600.),
-        };
-        for (label, remaining, expected) in [
-            ("5 hours", 61.2, "62% left · 5h"),
-            ("Weekly", 21., "21% left · week"),
-            (
-                "gpt-5.5-codex-max · Weekly",
-                50.,
-                "50% left · gpt-5.5-c… week",
-            ),
-            ("Fable", 30., "30% left · Fable"),
-            ("5 hours", 4., "4% left · resets 2h 14m"),
-        ] {
-            assert_eq!(left_label(Some(&row(label, remaining)), 1000.), expected);
-        }
-        let mut weekly = row("Weekly", 18.);
-        weekly.resets_at = Some(1000. + 3. * 86400. + 60.);
-        assert_eq!(left_label(Some(&weekly), 1000.), "18% left · resets 3d");
-        assert_eq!(left_label(None, 0.), "Unknown");
-        assert_eq!(label_color(Some(21.), false, &theme), None);
-        assert_eq!(
-            label_color(Some(20.), false, &theme),
-            Some(theme.warning_foreground)
-        );
-        assert_eq!(
-            label_color(Some(5.), false, &theme),
-            Some(theme.danger_foreground)
-        );
-        let line = limit_line(&row("5 hours", 61.2), 1000. + 3600.);
-        assert!(
-            line.starts_with("5 hours · 62% left · resets in 1h 14m ("),
-            "{line}"
-        );
-        assert!(line.ends_with(") · even pace 25%"), "{line}");
-        snapshot.finish(Ok(vec![row("5 hours", 61.234)]));
-        let text = ring_description(Provider::Claude.into(), &snapshot);
-        assert!(text.contains("· 62% remaining ·"), "{text}");
-        assert_eq!(countdown(59.), "1m");
+    fn token_labels_and_activity_levels() {
         assert_eq!(tokens(412_345), "412k");
         assert_eq!(tokens(38_200_000), "38.2M");
         assert_eq!(tokens(999_999), "1.0M");
@@ -1489,7 +1110,8 @@ mod lifecycle_tests {
             });
             w.render_frame(cx);
             assert!(w.try_find("usage-future-tool").is_some());
-            assert!(w.try_find("usage-trigger-future-tool").is_some());
+            assert!(w.try_find("usage-trigger-future-tool").is_none());
+            assert!(w.find("pokemon-footer").visible());
         })
         .unwrap();
     }

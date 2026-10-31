@@ -1,8 +1,8 @@
 //! Short-lived, prompt-free account queries. No chat state or snapshots go to disk.
 pub mod activity;
 pub mod logs;
-pub mod providers;
 pub mod pace;
+pub mod providers;
 pub mod summary;
 
 use objc2_foundation::{NSISO8601DateFormatOptions, NSISO8601DateFormatter, NSString};
@@ -121,14 +121,6 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// The tightest known allowance; unknown windows cannot imply available capacity.
-    pub fn limiting(&self) -> Option<&Allowance> {
-        self.allowances
-            .iter()
-            .filter(|row| row.remaining.is_some())
-            .min_by(|a, b| a.remaining.unwrap().total_cmp(&b.remaining.unwrap()))
-    }
-
     /// One in-flight query per provider, shared by opening, refresh and polling.
     pub fn begin(&mut self) -> bool {
         if self.status == Status::Loading {

@@ -33,15 +33,29 @@ async fn pokemon_footer_rail_disable_and_usage_access(cx: &mut TestAppContext) {
     state.pokemon = companion();
     let (window, shark) = boot(cx, state, WindowOptions::default());
     cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| {
+            for (index, snapshot) in s.usage.iter_mut().enumerate() {
+                snapshot.finish(Ok(vec![Allowance {
+                    label: "Weekly".into(),
+                    remaining: Some(if index == 0 { 42. } else { 68. }),
+                    resets_at: None,
+                    window: Some(604800.),
+                }]));
+            }
+            cx.notify();
+        });
         w.render_frame(cx);
+        assert!(w.try_find("usage-trigger-claude").is_none());
+        assert!(w.try_find("usage-trigger-codex").is_none());
+        assert!(w.try_find("show-usage").is_none());
         assert!(w.find("pokemon-footer").visible());
         w.click("pokemon-footer", cx);
         w.render_frame(cx);
         assert!(w.find("pokemon-home").visible());
         w.click("pokemon-tab-Usage", cx);
         w.render_frame(cx);
-        assert!(w.find("usage-status-claude").visible());
-        assert!(w.find("usage-status-codex").visible());
+        assert!(w.find("usage-claude-0").visible());
+        assert!(w.find("usage-codex-0").visible());
         w.press("escape", cx);
         shark.update(cx, |s, cx| {
             s.rail = true;
@@ -51,10 +65,26 @@ async fn pokemon_footer_rail_disable_and_usage_access(cx: &mut TestAppContext) {
         let footer = w.find("usage-footer").bounds();
         let pokemon = w.find("pokemon-footer").bounds();
         assert!(pokemon.left() >= footer.left() && pokemon.right() <= footer.right());
+        assert!(w.try_find("usage-trigger-claude").is_none());
+        assert!(w.try_find("usage-trigger-codex").is_none());
+        assert!(w.try_find("show-usage").is_none());
+        w.click("pokemon-footer", cx);
+        w.click("pokemon-tab-Usage", cx);
+        w.render_frame(cx);
+        assert!(w.find("usage-claude-0").visible());
+        assert!(w.find("usage-codex-0").visible());
+        w.press("escape", cx);
         shark.update(cx, |s, cx| s.set_pokemon_enabled(false, cx));
         w.render_frame(cx);
         assert!(w.try_find("pokemon-footer").is_none());
         assert!(w.find("show-usage").visible());
+        assert!(w.try_find("usage-trigger-claude").is_none());
+        assert!(w.try_find("usage-trigger-codex").is_none());
+        w.click("show-usage", cx);
+        w.render_frame(cx);
+        assert!(w.find("usage-claude-0").visible());
+        assert!(w.find("usage-codex-0").visible());
+        w.press("escape", cx);
         assert_eq!(
             shark
                 .read(cx)
@@ -71,6 +101,9 @@ async fn pokemon_footer_rail_disable_and_usage_access(cx: &mut TestAppContext) {
         w.render_frame(cx);
         assert!(w.find("pokemon-footer").visible());
         assert!(!State::load().pokemon_disabled);
+        assert!(w.try_find("show-usage").is_none());
+        assert!(w.try_find("usage-trigger-claude").is_none());
+        assert!(w.try_find("usage-trigger-codex").is_none());
     })
     .unwrap();
 }
@@ -310,15 +343,31 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 })
                 .unwrap();
             for page in [
-                "footer", "home", "dex", "shop", "usage", "settings", "license",
+                "footer",
+                "footer-disabled",
+                "home",
+                "dex",
+                "shop",
+                "usage",
+                "settings",
+                "license",
             ] {
                 cx.update_window(window, |_, w, cx| {
                     shark.update(cx, |s, cx| {
                         s.rail = rail;
+                        s.state.pokemon_disabled = page == "footer-disabled";
+                        for (index, snapshot) in s.usage.iter_mut().enumerate() {
+                            snapshot.finish(Ok(vec![Allowance {
+                                label: "5 hours".into(),
+                                remaining: Some(if index == 0 { 42. } else { 68. }),
+                                resets_at: Some(crate::usage::now() + 3600.),
+                                window: Some(18000.),
+                            }]));
+                        }
                         if let Some(path) = std::env::var_os("SHARK_POKEMON_PREVIEW_SPRITES") {
                             s.seed_pokemon_preview_sprites(&PathBuf::from(path), cx);
                         }
-                        if page == "footer" {
+                        if page == "footer" || page == "footer-disabled" {
                             s.close_usage(w, cx);
                         } else if page == "settings" || page == "license" {
                             s.close_usage(w, cx);
@@ -356,7 +405,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 }
                                 s.usage[i].finish(Ok(vec![crate::usage::Allowance {
                                     label: "5 hours".into(),
-                                    remaining: Some(62.),
+                                    remaining: Some(if i == 0 { 42. } else { 68. }),
                                     resets_at: Some(crate::usage::now() + 3600.),
                                     window: Some(18000.),
                                 }]));
@@ -367,6 +416,32 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     w.render_frame(cx);
                     w.refresh();
                     w.render_frame(cx);
+                    assert!(w.try_find("usage-trigger-claude").is_none());
+                    assert!(w.try_find("usage-trigger-codex").is_none());
+                    if page != "footer-disabled" {
+                        let footer = w.find("pokemon-footer").bounds();
+                        assert!(w.try_find("pokemon-footer-tokens").is_none());
+                        for id in ["pokemon-footer-quota-claude", "pokemon-footer-quota-codex"] {
+                            let element = w.find(id);
+                            assert!(element.visible());
+                            let bounds = element.bounds();
+                            assert!(
+                                bounds.left() >= footer.left() && bounds.right() <= footer.right(),
+                                "{id}: {bounds:?} outside {footer:?}"
+                            );
+                        }
+                    }
+                    if page == "footer-disabled" {
+                        assert!(w.find("show-usage").visible());
+                        assert!(w.try_find("pokemon-footer").is_none());
+                        assert!(w.try_find("usage-panel").is_none());
+                    } else {
+                        assert!(w.find("pokemon-footer").visible());
+                        assert!(w.try_find("show-usage").is_none());
+                        if page == "footer" {
+                            assert!(w.try_find("usage-panel").is_none());
+                        }
+                    }
                     if page == "license" {
                         w.click("LICENSE", cx);
                         w.render_frame(cx);

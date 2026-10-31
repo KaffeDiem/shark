@@ -185,41 +185,6 @@ fn snapshot_coalesces_and_keeps_only_temporary_failure_results() {
     assert!(!s.outdated);
 }
 
-#[test]
-fn limiting_allowance_uses_tightest_known_remaining_even_after_reset() {
-    let mut s = Snapshot::default();
-    assert!(s.limiting().is_none());
-    s.finish(Ok(vec![
-        Allowance {
-            label: "5 hours".into(),
-            remaining: Some(80.),
-            resets_at: None,
-            window: None,
-        },
-        Allowance {
-            label: "Weekly".into(),
-            remaining: Some(0.),
-            resets_at: Some(0.),
-            window: None,
-        },
-        Allowance {
-            label: "Model".into(),
-            remaining: None,
-            resets_at: None,
-            window: None,
-        },
-    ]));
-    assert_eq!(s.limiting().unwrap().label, "Weekly");
-    assert_eq!(s.limiting().unwrap().remaining, Some(0.));
-    s.allowances.remove(1);
-    assert_eq!(s.limiting().unwrap().remaining, Some(80.));
-    s.allowances.remove(0);
-    assert!(
-        s.limiting().is_none(),
-        "unknown never implies a full allowance"
-    );
-}
-
 struct Fake {
     dir: std::path::PathBuf,
 }

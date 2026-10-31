@@ -65,6 +65,7 @@ retained_quota_cases.add(('UsageStoreTests.swift','testLimitWarningFromForecastA
 retained_host_cases.update({('UsageStoreTests.swift',name) for name in ('testMenuLimitColorRunsFollowTheMode','testMenuLimitItemsWithoutAPaceUseTheThresholdColors','testMenuLimitColorIsJudgedFromUsageInRemainingMode')})
 # Native Rust contracts intentionally eliminate a few Swift-only intermediate states.
 adaptations = {
+    ('UsageStoreTests.swift', 'testHighestLimitUtilizationIgnoresProviderUnusedToday'): 'User requested both provider quotas remain visible regardless of local token activity; official headline warnings likewise do not hide a provider with zero or yesterday-only local activity',
     **{('LocalUsageParityTests.swift', name): 'Opt-in read-only audit requires an explicitly supplied sanitized corpus instead of implicitly reading the user home; native app publication is separately covered by provider lifecycle tests' for name in ('testFullRefreshPipelineWithRealProviders', 'testPrintRealAggregates', 'testCodexMetadataProbeOnRealRollouts', 'testCodexOrphanedParentDoesNotRescanRealTree', 'testCachePerformance')},
     ('UnownSpriteTests.swift', 'testExistingUnownAndExplicitAKeepLegacyCacheKeys'): 'Implicit and explicit A retain the same Rust cache key; Swift filename spelling is not imported',
     ('SaveSnapshotTests.swift', 'testSnapshotSummariesResolveCurrentAppearanceAcrossLegacyAndEnvelopeFiles'): 'Internal history supports raw Rust companion JSON and envelopes; Swift save layouts are not accepted as Rust saves',

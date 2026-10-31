@@ -136,72 +136,52 @@ async fn usage_independent_states_refresh_and_focus(cx: &mut TestAppContext) {
 async fn usage_footer_availability_and_click(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
-    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    let mut state = State::default();
+    state.pokemon_disabled = true;
+    let (window, shark) = boot(cx, state, WindowOptions::default());
     let on = on_app(window, shark.clone());
-    cx.update_window(window, |_, w, cx| {
-        w.render_frame(cx);
-        assert!(
-            w.find("show-usage").visible(),
-            "no results keeps a neutral control"
-        );
-    })
-    .unwrap();
-    on(cx, &|s, _, cx| {
-        s.usage[0].finish(Ok(vec![Allowance {
-            label: "Weekly".into(),
-            remaining: None,
-            resets_at: None,
-            window: None,
-        }]));
-        s.usage[1].finish(Ok(sample()));
-        cx.notify();
-    });
-    cx.update_window(window, |_, w, cx| {
-        w.render_frame(cx);
-        assert!(w.try_find("show-usage").is_none());
-        assert!(
-            w.find("usage-trigger-claude").visible(),
-            "unknown allowance still gets a neutral ring"
-        );
-        assert!(w.find("usage-trigger-codex").visible());
-        w.click("usage-trigger-claude", cx);
-        assert!(shark.read(cx).usage_panel.is_some());
-        w.press("escape", cx);
-        w.click("usage-trigger-codex", cx);
-        assert!(shark.read(cx).usage_panel.is_some());
-        w.press("escape", cx);
-    })
-    .unwrap();
-    on(cx, &|s, _, cx| {
-        s.usage[0].finish(Err(Failure::Temporary));
-        s.usage[1].finish(Err(Failure::SignIn));
-        cx.notify();
-    });
-    cx.update_window(window, |_, w, cx| {
-        w.render_frame(cx);
-        assert!(
-            w.find("usage-trigger-claude").visible(),
-            "temporary failure keeps cached ring"
-        );
-        assert!(
-            w.try_find("usage-trigger-codex").is_none(),
-            "invalid auth removes ring"
-        );
-    })
-    .unwrap();
-    on(cx, &|s, _, cx| {
-        s.usage[0].finish(Err(Failure::Unsupported));
-        cx.notify();
-    });
-    cx.update_window(window, |_, w, cx| {
-        w.render_frame(cx);
-        assert!(w.find("show-usage").visible());
-        w.click("show-usage", cx);
-        w.render_frame(cx);
-        assert!(w.find("usage-status-claude").visible());
-        assert!(w.find("usage-status-codex").visible());
-    })
-    .unwrap();
+    for rail in [false, true] {
+        for available in ["loading", "both", "cached", "none"] {
+            on(cx, &|s, _, cx| {
+                s.rail = rail;
+                s.usage = vec![crate::usage::Snapshot::default(); s.usage_providers.len()];
+                for snapshot in &mut s.usage {
+                    if available == "loading" {
+                        snapshot.begin();
+                    } else {
+                        snapshot.finish(Ok(sample()));
+                    }
+                }
+                if available == "cached" {
+                    s.usage[0].finish(Err(Failure::Temporary));
+                    s.usage[1].finish(Err(Failure::SignIn));
+                } else if available == "none" {
+                    for snapshot in &mut s.usage {
+                        snapshot.finish(Err(Failure::Unsupported));
+                    }
+                }
+                cx.notify();
+            });
+            cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                assert!(w.find("show-usage").visible());
+                assert!(w.try_find("pokemon-footer").is_none());
+                assert!(w.try_find("usage-trigger-claude").is_none());
+                assert!(w.try_find("usage-trigger-codex").is_none());
+                w.click("show-usage", cx);
+                w.render_frame(cx);
+                assert!(w.find("usage-panel").visible());
+                if available == "both" || available == "cached" {
+                    assert!(w.find("usage-claude-0").visible());
+                }
+                if available == "both" {
+                    assert!(w.find("usage-codex-0").visible());
+                }
+                w.press("escape", cx);
+            })
+            .unwrap();
+        }
+    }
 }
 
 #[gpui_kit::test]
@@ -306,6 +286,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         for width in [800., 1440.] {
             let mut state = State::default();
             state.appearance.mode = mode;
+            state.pokemon_disabled = true;
             state.save().unwrap();
             let (window, shark) = cx
                 .update(|cx| {
@@ -390,13 +371,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             w.refresh();
                             w.render_frame(cx);
                             let footer = w.find("usage-footer").bounds();
-                            let button = w
-                                .find(if available == "none" {
-                                    "show-usage"
-                                } else {
-                                    "usage-trigger-claude"
-                                })
-                                .bounds();
+                            let button = w.find("show-usage").bounds();
                             let panel = w.find("usage-panel").bounds();
                             assert!(
                                 button.left() >= footer.left() && button.right() <= footer.right()
@@ -414,12 +389,10 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             );
                             assert!(panel.left() >= px(8.) && panel.top() >= px(8.));
                             assert!(w.find("refresh-usage").visible());
+                            assert!(w.try_find("usage-trigger-claude").is_none());
+                            assert!(w.try_find("usage-trigger-codex").is_none());
                             if available == "both" {
-                                let codex = w.find("usage-trigger-codex").bounds();
                                 assert!(w.find("usage-codex-0").visible());
-                                assert!(codex.top() >= button.bottom());
-                            } else {
-                                assert!(w.try_find("usage-trigger-codex").is_none());
                             }
                         })
                         .unwrap();
@@ -435,42 +408,6 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 )))
                                 .unwrap();
                         }
-                        if view != "home" || available != "both" {
-                            continue;
-                        }
-                        // The hover card over a seeded heatmap, panel closed.
-                        cx.update_window(window, |_, w, cx| {
-                            shark.update(cx, |s, cx| {
-                                s.close_usage(w, cx);
-                                cx.notify();
-                            });
-                            w.render_frame(cx);
-                            w.hover("usage-trigger-claude", cx);
-                        })
-                        .unwrap();
-                        cx.advance_clock(Duration::from_secs(1));
-                        cx.update_window(window, |_, w, cx| {
-                            w.render_frame(cx);
-                            let card = w.find("usage-card-claude").bounds();
-                            assert!(card.top() >= px(0.) && card.right() <= px(width));
-                            let footer = w.find("usage-footer").bounds();
-                            assert!(card.bottom() <= footer.top() + px(8.), "{card:?}");
-                        })
-                        .unwrap();
-                        let screenshot = cx.capture_screenshot(window).expect("hover card");
-                        if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
-                            screenshot
-                                .save(PathBuf::from(dir).join(format!(
-                                    "usage-hover-{label}-{}-{rail}.png",
-                                    width as usize
-                                )))
-                                .unwrap();
-                        }
-                        cx.update_window(window, |_, w, cx| {
-                            w.pointer_move(point(px(width - 10.), px(10.)), None, cx);
-                        })
-                        .unwrap();
-                        cx.advance_clock(Duration::from_secs(1));
                     }
                 }
             }
@@ -492,7 +429,7 @@ async fn live_usage_panel(cx: &mut TestAppContext) {
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
             s.usage_live = true;
-            s.usage = Default::default();
+            s.usage = vec![crate::usage::Snapshot::default(); s.usage_providers.len()];
             s.usage_queries = vec![0; 2];
             s.usage_poll = None;
             s.usage_due = None;
@@ -536,8 +473,8 @@ async fn live_usage_panel(cx: &mut TestAppContext) {
                         .any(|row| row.remaining.is_some() && row.resets_at.is_some())
                 );
                 assert!(
-                    w.find(format!("usage-trigger-{}", provider.source().id()))
-                        .visible()
+                    w.try_find(format!("usage-trigger-{}", provider.source().id()))
+                        .is_none()
                 );
                 if s.usage_panel.is_some() {
                     assert!(

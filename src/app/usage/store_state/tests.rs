@@ -17,23 +17,26 @@ fn today(tokens: u64) -> Report {
         tokens: vec![tokens],
     })
 }
+// Shark warnings use official quotas regardless of local activity; footer no-activity coverage
+// lives in pokemon::footer_usage tests, adapting upstream
 // upstream: UsageStoreTests.swift::testHighestLimitUtilizationIgnoresProviderUnusedToday
+// Adaptation: user requested both provider quotas remain visible regardless of local activity.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn companion_quota_readout_ignores_unused_and_yesterdays_sources(cx: &mut TestAppContext) {
+async fn observed_headline_warning_is_independent_of_local_activity(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
     let (window, shark) = boot(cx, State::default(), WindowOptions::default());
     cx.update_window(window, |_, _, cx| {
         shark.update(cx, |s, _| {
-            s.usage[0].finish(Ok(vec![quota("5 hours", 10., 18000.)]));
+            s.usage[0].finish(Ok(vec![quota("5 hours", 4., 18000.)]));
             s.usage[1].finish(Ok(vec![quota("5 hours", 60., 18000.)]));
             s.usage_reports[0] = today(0);
             s.usage_reports[1] = today(500000);
-            assert_eq!(s.highest_used_headline_limit(), Some(40.));
+            assert!(s.observed_headline_warning());
             s.usage_reports[0] = today(100000);
             s.usage_reports[0].daily.first_day -= 1;
-            assert_eq!(s.highest_used_headline_limit(), Some(40.));
+            assert!(s.observed_headline_warning());
         })
     })
     .unwrap();
@@ -53,7 +56,6 @@ async fn monetary_and_model_caps_never_drive_companion_token_warning(cx: &mut Te
                 quota("Individual spend", 1., 604800.),
                 quota("Model · Weekly", 0., 604800.),
             ]));
-            assert_eq!(s.highest_used_headline_limit(), Some(30.));
             assert!(!s.observed_headline_warning());
         })
     })

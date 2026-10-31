@@ -1,10 +1,10 @@
 # Pokémon in Shark
 
-The navigation footer raises a Pokémon using Claude Code and Codex token activity. Click it to open Home, Pokédex, Bag, Shop, or the existing Usage view. Egg incubation, evolution, rarity, shiny appearances, natures, individual profiles, forms, and graduation are implemented in Rust.
+The navigation footer pairs a Pokémon with Claude and Codex remaining percentages or account status. Claude Code and Codex token activity raises the Pokémon. Click it to open Home, Pokédex, Bag, Shop, or the existing Usage view. Egg incubation, evolution, rarity, shiny appearances, natures, individual profiles, forms, and graduation are implemented in Rust.
 
 Settings → General also controls animation quality and lets you choose the navigation Pokémon. Navigation animation pauses when Shark is inactive or Reduce Motion is enabled, and adapts to Low Power Mode.
 
-Settings → General → Pokémon companion hides the companion and pauses growth. The collection survives this change. Re-enabling starts from a new usage checkpoint, so tokens consumed while disabled do not retroactively grow a Pokémon. Settings → LICENSE contains Shark's license, PokeTokenBar's complete MIT notice, and Pokémon attribution.
+Settings → General → Pokémon companion hides the companion and pauses growth. A single Usage button takes its place, and the collection survives this change. Re-enabling starts from a new usage checkpoint, so tokens consumed while disabled do not retroactively grow a Pokémon. Settings → LICENSE contains Shark's license, PokeTokenBar's complete MIT notice, and Pokémon attribution.
 
 ## Usage providers
 
