@@ -248,3 +248,27 @@ async fn native_pace_marker_only_extends_two_points_above_and_below_track(cx: &m
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn expired_allowances_do_not_raise_the_headline_warning(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    cx.update_window(window, |_, _, cx| {
+        shark.update(cx, |s, _| {
+            let expired = Allowance {
+                resets_at: Some(crate::usage::now() - 60.),
+                ..quota("5 hours", 2., 18000.)
+            };
+            s.usage[0].finish(Ok(vec![expired.clone()]));
+            assert!(!s.observed_headline_warning());
+            s.usage[0].finish(Ok(vec![Allowance {
+                resets_at: Some(crate::usage::now() + 600.),
+                ..expired
+            }]));
+            assert!(s.observed_headline_warning());
+        })
+    })
+    .unwrap();
+}

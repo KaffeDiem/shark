@@ -21,13 +21,10 @@ impl Shark {
             .items_center()
             .justify_center()
             .when_some(path, |d, path| {
-                d.child(
-                    if let Some(asset) = crate::pokemon::sprites::cached_memory(path) {
-                        images::paint_frame(images::render_image(asset), 0, size)
-                    } else {
-                        div().child("✦").into_any_element()
-                    },
-                )
+                d.child(images::sized(path, size).map_or_else(
+                    || div().child("✦").into_any_element(),
+                    IntoElement::into_any_element,
+                ))
             })
             .when(path.is_none(), |d| d.child("✦"))
             .test_support()

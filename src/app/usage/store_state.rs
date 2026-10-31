@@ -1,6 +1,7 @@
 use super::*;
 impl Shark {
     fn headline_utilization(&self) -> Option<f64> {
+        let now = crate::usage::now();
         self.usage_providers
             .iter()
             .flat_map(|provider| {
@@ -12,6 +13,10 @@ impl Shark {
                 if snapshot.status == Status::Loading {
                     snapshot.status = Status::Ready;
                 }
+                // An allowance that reset since the last poll no longer reflects current usage.
+                snapshot
+                    .allowances
+                    .retain(|row| row.resets_at.is_none_or(|at| at > now));
                 provider.source().candy_windows(&snapshot)
             })
             .map(|window| window.utilization)
