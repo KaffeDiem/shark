@@ -47,7 +47,6 @@ fn disguise() -> Companion {
     s.active.as_mut().unwrap().ditto_disguise = Some(1);
     s
 }
-// upstream: CompanionTests.swift::testInstallBaselineExcludesPreInstallUsage
 #[test]
 fn testInstallBaselineExcludesPreInstallUsage() {
     let mut s = Companion::default();
@@ -57,7 +56,6 @@ fn testInstallBaselineExcludesPreInstallUsage() {
     assert_eq!(s.egg_tokens, 1_000_000);
     assert_eq!(s.lifetime_tokens, 1_000_000);
 }
-// upstream: CompanionTests.swift::testProviderLedgerDoesNotRecreditMissingProviderAfterPartialSnapshotLoss
 #[test]
 fn testProviderLedgerDoesNotRecreditMissingProviderAfterPartialSnapshotLoss() {
     let mut s = Companion::default();
@@ -69,7 +67,6 @@ fn testProviderLedgerDoesNotRecreditMissingProviderAfterPartialSnapshotLoss() {
     s.observe_usage("codex", "d1", 100, true);
     assert_eq!(s.lifetime_tokens, 60);
 }
-// upstream: CompanionTests.swift::testDateRolloverCreditsCurrentDayUsage
 #[test]
 fn testDateRolloverCreditsCurrentDayUsage() {
     let mut s = Companion::default();
@@ -77,7 +74,6 @@ fn testDateRolloverCreditsCurrentDayUsage() {
     s.observe_usage("claude", "d2", 50, true);
     assert_eq!(s.lifetime_tokens, 50);
 }
-// upstream: CompanionTests.swift::testLateProviderRecoveryAfterDateRolloverCreditsCurrentDayUsage
 #[test]
 fn testLateProviderRecoveryAfterDateRolloverCreditsCurrentDayUsage() {
     let mut s = Companion::default();
@@ -88,7 +84,6 @@ fn testLateProviderRecoveryAfterDateRolloverCreditsCurrentDayUsage() {
     s.observe_usage("codex", "d2", 40, true);
     assert_eq!(s.lifetime_tokens, 70);
 }
-// upstream: CompanionTests.swift::testStaleSnapshotDoesNotConsumeDateBoundary
 #[test]
 fn testStaleSnapshotDoesNotConsumeDateBoundary() {
     let mut s = Companion::default();
@@ -99,7 +94,6 @@ fn testStaleSnapshotDoesNotConsumeDateBoundary() {
     s.observe_usage("claude", "d2", 40, true);
     assert_eq!(s.lifetime_tokens, 40);
 }
-// upstream: CompanionTests.swift::testEggDoesNotHatchBelowThreshold
 #[test]
 fn testEggDoesNotHatchBelowThreshold() {
     let mut s = Companion {
@@ -109,14 +103,12 @@ fn testEggDoesNotHatchBelowThreshold() {
     assert!(s.hatch(line(&[1, 2, 3], Rarity::Common)).is_empty());
     assert!(s.active.is_none());
 }
-// upstream: CompanionTests.swift::testEggHatchesAtThreshold
 #[test]
 fn testEggHatchesAtThreshold() {
     let s = companion(&[1, 2, 3], Rarity::Common);
     assert_eq!(s.active.unwrap().species_id(), 1);
     assert_eq!(s.egg_tokens, 0);
 }
-// upstream: CompanionTests.swift::testEggOverflowCarriesToHatchedMon
 #[test]
 fn testEggOverflowCarriesToHatchedMon() {
     let mut s = Companion {
@@ -126,7 +118,6 @@ fn testEggOverflowCarriesToHatchedMon() {
     s.hatch(line(&[1, 2, 3], Rarity::Common));
     assert_eq!(s.active.unwrap().tokens, 1_000_000);
 }
-// upstream: CompanionTests.swift::testNewEggAfterGraduationReincubates
 #[test]
 fn testNewEggAfterGraduationReincubates() {
     let mut s = companion(&[1], Rarity::Common);
@@ -135,14 +126,12 @@ fn testNewEggAfterGraduationReincubates() {
     assert_eq!(s.egg_tokens, 0);
     assert!(!s.ready_to_hatch());
 }
-// upstream: CompanionTests.swift::testStateDecodesWithoutEggUsage
 #[test]
 fn testStateDecodesWithoutEggUsage() {
     let s: Companion = serde_json::from_str("{}").unwrap();
     assert_eq!(s.egg_tokens, 0);
     assert!(s.active.is_none());
 }
-// upstream: CompanionTests.swift::testEvolvesThroughLineAndGraduatesWithFullChain
 #[test]
 fn testEvolvesThroughLineAndGraduatesWithFullChain() {
     let mut s = companion(&[1, 2, 3], Rarity::Common);
@@ -156,14 +145,12 @@ fn testEvolvesThroughLineAndGraduatesWithFullChain() {
     assert_eq!(s.collection[0].path, vec![1, 2, 3]);
     assert!(s.collection[0].graduated);
 }
-// upstream: CompanionTests.swift::testNoEvolutionGraduatesAtSingleThreshold
 #[test]
 fn testNoEvolutionGraduatesAtSingleThreshold() {
     let mut s = companion(&[25], Rarity::Common);
     assert!(s.add_growth(749_999_999).is_empty());
     assert_eq!(s.add_growth(1), vec![Event::Graduated("P25".into())]);
 }
-// upstream: CompanionTests.swift::testPersistenceRoundTrip
 #[test]
 fn testPersistenceRoundTrip() {
     let mut s = companion(&[1, 2, 3], Rarity::Rare);
@@ -179,7 +166,6 @@ fn testPersistenceRoundTrip() {
         s.active.as_ref().unwrap().nature
     );
 }
-// upstream: CompanionTests.swift::testRepeatGrowthPersistsAcrossRestartWhileLegacyActiveDefaultsToStandardGrowth
 #[test]
 fn testRepeatGrowthPersistsAcrossRestartWhileLegacyActiveDefaultsToStandardGrowth() {
     let mut s = companion(&[1, 2, 3], Rarity::Common);
@@ -193,7 +179,6 @@ fn testRepeatGrowthPersistsAcrossRestartWhileLegacyActiveDefaultsToStandardGrowt
     let legacy: Companion = serde_json::from_value(value).unwrap();
     assert_eq!(legacy.progress().1, 125_000_000);
 }
-// upstream: CompanionTests.swift::testHatchPreselectsWurmpleRouteAndEvolutionDoesNotConsumeRNG
 #[test]
 fn testHatchPreselectsWurmpleRouteAndEvolutionDoesNotConsumeRNG() {
     let mut s = Companion {
@@ -210,7 +195,6 @@ fn testHatchPreselectsWurmpleRouteAndEvolutionDoesNotConsumeRNG() {
     assert_eq!(s.random_seed, seed);
     assert_eq!(s.active.as_ref().unwrap().species_id(), planned[1]);
 }
-// upstream: CompanionTests.swift::testRepeatGrowthIsDecidedFromTheCollectedBaseNotThePlannedFinal
 #[test]
 fn testRepeatGrowthIsDecidedFromTheCollectedBaseNotThePlannedFinal() {
     let mut s = companion(&[265, 266, 267], Rarity::Common);
@@ -222,7 +206,6 @@ fn testRepeatGrowthIsDecidedFromTheCollectedBaseNotThePlannedFinal() {
     assert_eq!(s.active.as_ref().unwrap().path, vec![265, 268, 269]);
     assert!(s.active.unwrap().growth_boost);
 }
-// upstream: CompanionTests.swift::testBranchingPrefersUncollectedFinals
 #[test]
 fn testBranchingPrefersUncollectedFinals() {
     for seed in 0..100 {
@@ -236,7 +219,6 @@ fn testBranchingPrefersUncollectedFinals() {
         assert_eq!(s.active.unwrap().path, vec![265, 268, 269]);
     }
 }
-// upstream: CompanionTests.swift::testAsymmetricBranchGraduatesSafely
 #[test]
 fn testAsymmetricBranchGraduatesSafely() {
     let mut l = line(&[1, 2, 3], Rarity::Common);
@@ -255,7 +237,6 @@ fn testAsymmetricBranchGraduatesSafely() {
         assert_eq!(s.collection.len(), 1);
     }
 }
-// upstream: CompanionTests.swift::testGraduateCarriesIdentityToDex
 #[test]
 fn testGraduateCarriesIdentityToDex() {
     let mut s = companion(&[1, 2, 3], Rarity::Common);
@@ -270,7 +251,6 @@ fn testGraduateCarriesIdentityToDex() {
     );
     assert_eq!(d.profile.as_ref().unwrap().level, 100);
 }
-// upstream: CompanionTests.swift::testHatchAssignsDeterministicShinyAndNature
 #[test]
 fn testHatchAssignsDeterministicShinyAndNature() {
     let a = companion(&[1, 2, 3], Rarity::Common);
@@ -285,7 +265,6 @@ fn testHatchAssignsDeterministicShinyAndNature() {
     );
     assert!(NATURES.contains(&a.active.unwrap().nature.as_str()));
 }
-// upstream: CompanionTests.swift::testShinyPathReachable
 #[test]
 fn testShinyPathReachable() {
     assert!((0..1000).any(|seed| {
@@ -298,14 +277,12 @@ fn testShinyPathReachable() {
         s.active.unwrap().shiny
     }));
 }
-// upstream: CompanionTests.swift::testCurrentIDFallsBackToBaseWhenPathEmpty
 #[test]
 fn testCurrentIDFallsBackToBaseWhenPathEmpty() {
     let mut s = companion(&[25], Rarity::Common);
     s.active.as_mut().unwrap().path.clear();
     assert_eq!(s.active.unwrap().species_id(), 25);
 }
-// upstream: CompanionTests.swift::testCelebrationFiresOnHatchAndEvolve
 #[test]
 fn testCelebrationFiresOnHatchAndEvolve() {
     let mut s = Companion {
@@ -318,7 +295,6 @@ fn testCelebrationFiresOnHatchAndEvolve() {
     );
     assert_eq!(s.add_growth(125_000_000), vec![Event::Evolved("P2".into())]);
 }
-// upstream: CompanionTests.swift::testValidatedChainURLAcceptsPokeapiHttps
 #[test]
 fn testValidatedChainURLAcceptsPokeapiHttps() {
     assert_eq!(
@@ -326,7 +302,6 @@ fn testValidatedChainURLAcceptsPokeapiHttps() {
         Some(123)
     );
 }
-// upstream: CompanionTests.swift::testValidatedChainURLRejectsUntrusted
 #[test]
 fn testValidatedChainURLRejectsUntrusted() {
     for value in [
@@ -341,7 +316,6 @@ fn testValidatedChainURLRejectsUntrusted() {
         assert_eq!(api::validated_chain_id(value), None, "{value}");
     }
 }
-// upstream: CompanionTests.swift::testSamplerCaptureRateIsWeight
 #[test]
 fn testSamplerCaptureRateIsWeight() {
     let entries = [
@@ -361,7 +335,6 @@ fn testSamplerCaptureRateIsWeight() {
         );
     }
 }
-// upstream: CompanionTests.swift::testSamplerHalvesCollectedWeight
 #[test]
 fn testSamplerHalvesCollectedWeight() {
     let entries = [
@@ -391,7 +364,6 @@ fn testSamplerHalvesCollectedWeight() {
     assert_eq!(api::weighted_pick(&entries, &owned, roll), Some(2));
 }
 
-// upstream: CompanionTests.swift::testSamplerWeightedPickDeterministic
 #[test]
 fn testSamplerWeightedPickDeterministic() {
     let entries = [
@@ -417,38 +389,32 @@ fn testSamplerWeightedPickDeterministic() {
         );
     }
 }
-// upstream: DittoTests.swift::testHitCommonMultiFormOnMultipleOfDenominator
 #[test]
 fn testHitCommonMultiFormOnMultipleOfDenominator() {
     for (forms, roll) in [(2, 0), (3, 128), (3, 256)] {
         assert!(ditto::disguise_hit(Rarity::Common, forms, roll));
     }
 }
-// upstream: DittoTests.swift::testMissWhenRollNotMultipleOfDenominator
 #[test]
 fn testMissWhenRollNotMultipleOfDenominator() {
     for roll in [1, 127, 129] {
         assert!(!ditto::disguise_hit(Rarity::Common, 3, roll));
     }
 }
-// upstream: DittoTests.swift::testExcludesSingleForm
 #[test]
 fn testExcludesSingleForm() {
     assert!(!ditto::disguise_hit(Rarity::Common, 1, 0));
 }
-// upstream: DittoTests.swift::testExcludesNonCommon
 #[test]
 fn testExcludesNonCommon() {
     for rarity in [Rarity::Uncommon, Rarity::Rare, Rarity::Legendary] {
         assert!(!ditto::disguise_hit(rarity, 3, 0));
     }
 }
-// upstream: DittoTests.swift::testDenominatorIs128
 #[test]
 fn testDenominatorIs128() {
     assert_eq!(ditto::DENOMINATOR, 128);
 }
-// upstream: DittoTests.swift::testShinyHiddenDuringDisguise
 #[test]
 fn testShinyHiddenDuringDisguise() {
     let mut s = disguise();
@@ -457,7 +423,6 @@ fn testShinyHiddenDuringDisguise() {
     assert!(!s.active.as_ref().unwrap().displays_shiny());
     assert_eq!(s.representative_subject(), Some((1, false)));
 }
-// upstream: DittoTests.swift::testRevealAtFirstEvolution
 #[test]
 fn testRevealAtFirstEvolution() {
     let mut s = disguise();
@@ -474,7 +439,6 @@ fn testRevealAtFirstEvolution() {
     assert!(mon.ditto_revealed);
     assert_eq!(mon.ditto_disguise, Some(1));
 }
-// upstream: DittoTests.swift::testBoostedDisguiseRevealsAtTheHalvedThresholdAndANewDittoDropsTheBoost
 #[test]
 fn testBoostedDisguiseRevealsAtTheHalvedThresholdAndANewDittoDropsTheBoost() {
     let mut s = disguise();
@@ -484,7 +448,6 @@ fn testBoostedDisguiseRevealsAtTheHalvedThresholdAndANewDittoDropsTheBoost() {
     assert_eq!(s.progress(), (0, 3_000_000_000));
     assert!(!s.active.unwrap().growth_boost);
 }
-// upstream: DittoTests.swift::testRevealingAnAlreadyGraduatedDittoGrantsTheRepeatBoost
 #[test]
 fn testRevealingAnAlreadyGraduatedDittoGrantsTheRepeatBoost() {
     let mut s = disguise();
@@ -496,7 +459,6 @@ fn testRevealingAnAlreadyGraduatedDittoGrantsTheRepeatBoost() {
     assert!(s.active.as_ref().unwrap().growth_boost);
     assert_eq!(s.progress().1, 1_500_000_000);
 }
-// upstream: DittoTests.swift::testRevealClearsRepresentativePinnedToDisguiseAndFollowsDitto
 #[test]
 fn testRevealClearsRepresentativePinnedToDisguiseAndFollowsDitto() {
     let mut s = disguise();
@@ -508,7 +470,6 @@ fn testRevealClearsRepresentativePinnedToDisguiseAndFollowsDitto() {
     assert_eq!(s.representative, None);
     assert_eq!(s.representative_subject(), Some((132, true)));
 }
-// upstream: DittoTests.swift::testPrunedLeafDisguiseRevealsBeforeGraduation
 #[test]
 fn testPrunedLeafDisguiseRevealsBeforeGraduation() {
     let mut s = companion(&[206], Rarity::Common);
@@ -520,7 +481,6 @@ fn testPrunedLeafDisguiseRevealsBeforeGraduation() {
     assert_eq!(s.active.unwrap().species_id(), 132);
     assert!(s.collection.is_empty());
 }
-// upstream: DittoTests.swift::testShinyUnmaskedAfterReveal
 #[test]
 fn testShinyUnmaskedAfterReveal() {
     let mut s = disguise();
@@ -529,7 +489,6 @@ fn testShinyUnmaskedAfterReveal() {
     s.reveal_ditto(line(&[132], Rarity::Rare));
     assert!(s.active.unwrap().displays_shiny());
 }
-// upstream: DittoTests.swift::testNoRevealBelowThreshold
 #[test]
 fn testNoRevealBelowThreshold() {
     let mut s = disguise();
@@ -538,7 +497,6 @@ fn testNoRevealBelowThreshold() {
     assert!(s.reveal_ditto(line(&[132], Rarity::Rare)).is_empty());
     assert_eq!(s.active.unwrap().species_id(), 1);
 }
-// upstream: DittoTests.swift::testApparentGraduationBatchPreservesUnusedCandiesAtDittoReveal
 #[test]
 fn testApparentGraduationBatchPreservesUnusedCandiesAtDittoReveal() {
     let mut s = disguise();
@@ -549,7 +507,6 @@ fn testApparentGraduationBatchPreservesUnusedCandiesAtDittoReveal() {
     s.reveal_ditto(line(&[132], Rarity::Rare));
     assert_eq!(s.active.unwrap().tokens, 75_000_000);
 }
-// upstream: DittoTests.swift::testCandyBatchStopsExactlyAtRevealWithoutOverflow
 #[test]
 fn testCandyBatchStopsExactlyAtRevealWithoutOverflow() {
     let mut s = disguise();
@@ -560,7 +517,6 @@ fn testCandyBatchStopsExactlyAtRevealWithoutOverflow() {
     s.reveal_ditto(line(&[132], Rarity::Rare));
     assert_eq!(s.active.unwrap().tokens, 0);
 }
-// upstream: DittoTests.swift::testBackwardCompatDecodeNoDittoFields
 #[test]
 fn testBackwardCompatDecodeNoDittoFields() {
     let s = companion(&[1, 2, 3], Rarity::Common);
@@ -572,7 +528,6 @@ fn testBackwardCompatDecodeNoDittoFields() {
     assert_eq!(restored.active.as_ref().unwrap().ditto_disguise, None);
     assert!(!restored.active.unwrap().ditto_revealed);
 }
-// upstream: DittoTests.swift::testBoostedEasyDittoRetainsLevelAndIdentityAcrossReveal
 #[test]
 fn testBoostedEasyDittoRetainsLevelAndIdentityAcrossReveal() {
     let mut s = disguise();
@@ -594,7 +549,6 @@ fn testBoostedEasyDittoRetainsLevelAndIdentityAcrossReveal() {
         100
     );
 }
-// upstream: UnownTests.swift::testAllLettersAndPunctuationAreSelectable
 #[test]
 fn testAllLettersAndPunctuationAreSelectable() {
     let fs = forms::forms(201);
@@ -620,7 +574,6 @@ fn testAllLettersAndPunctuationAreSelectable() {
     );
     assert!(fs.contains(&forms::roll(u64::MAX, &fs, &Default::default()).unwrap()));
 }
-// upstream: UnownTests.swift::testFormWeightsAreTwoForMissingAndOneForCollectedWithoutGuaranteeingNewForms
 #[test]
 fn testFormWeightsAreTwoForMissingAndOneForCollectedWithoutGuaranteeingNewForms() {
     let fs = forms::forms(201);
@@ -645,7 +598,6 @@ fn testFormWeightsAreTwoForMissingAndOneForCollectedWithoutGuaranteeingNewForms(
         }
     }
 }
-// upstream: UnownTests.swift::testSharedCollectedAdjustmentPreservesCaptureRateRoundingAndMinimum
 #[test]
 fn testSharedCollectedAdjustmentPreservesCaptureRateRoundingAndMinimum() {
     for weight in 0..=255 {
@@ -653,7 +605,6 @@ fn testSharedCollectedAdjustmentPreservesCaptureRateRoundingAndMinimum() {
         assert_eq!(api::adjusted_weight(weight, true), (weight / 2).max(1));
     }
 }
-// upstream: UnownTests.swift::testEveryFormRoundTripsAndSharesOneSpeciesCell
 #[test]
 fn testEveryFormRoundTripsAndSharesOneSpeciesCell() {
     let mut s = Companion::default();
@@ -665,10 +616,7 @@ fn testEveryFormRoundTripsAndSharesOneSpeciesCell() {
     }
     let restored = roundtrip(&s);
     assert_eq!(restored.collection.len(), 28);
-    assert_eq!(restored.dex_species().len(), 1);
-    assert_eq!(restored.collected_forms(201).len(), 28);
 }
-// upstream: UnownTests.swift::testRepresentativeUsesExactLetterAndPersistsSelection
 #[test]
 fn testRepresentativeUsesExactLetterAndPersistsSelection() {
     let mut s = companion(&[201], Rarity::Common);
@@ -683,7 +631,6 @@ fn testRepresentativeUsesExactLetterAndPersistsSelection() {
     );
     assert!(!s.pin_appearance(201, true, Some(forms::Form("a".into()))));
 }
-// upstream: UnownTests.swift::testHatchGraduationAndReloadPreserveLetterAndShiny
 #[test]
 fn testHatchGraduationAndReloadPreserveLetterAndShiny() {
     let mut s = companion(&[201], Rarity::Common);
@@ -694,7 +641,6 @@ fn testHatchGraduationAndReloadPreserveLetterAndShiny() {
     assert_eq!(r.collection[0].form, form);
     assert!(r.collection[0].shiny);
 }
-// upstream: UnownTests.swift::testNonUnownHatchDoesNotConsumeAnExtraRandomDraw
 #[test]
 fn testNonUnownHatchDoesNotConsumeAnExtraRandomDraw() {
     let s = companion(&[25], Rarity::Common);
@@ -705,7 +651,6 @@ fn testNonUnownHatchDoesNotConsumeAnExtraRandomDraw() {
     assert_eq!(s.random_seed, expected);
     assert_eq!(s.active.unwrap().form, None);
 }
-// upstream: CompanionTests.swift::testCorruptDexEntryDroppedWhileRestSurvives
 #[test]
 fn testCorruptDexEntryDroppedWhileRestSurvives() {
     let mut s = companion(&[1], Rarity::Common);
@@ -719,7 +664,6 @@ fn testCorruptDexEntryDroppedWhileRestSurvives() {
     assert_eq!(r.collection.len(), 1);
     assert_eq!(r.collection[0].species_id(), 1);
 }
-// upstream: CompanionTests.swift::testCorruptActiveFallsBackToEggWhileRestSurvives
 #[test]
 fn testCorruptActiveFallsBackToEggWhileRestSurvives() {
     let mut s = companion(&[1], Rarity::Common);
@@ -730,7 +674,6 @@ fn testCorruptActiveFallsBackToEggWhileRestSurvives() {
     assert!(r.active.is_none());
     assert_eq!(r.lifetime_tokens, 123);
 }
-// upstream: CompanionTests.swift::testEmptyPathIDsActiveFallsBackToNilPreservingRest
 #[test]
 fn testEmptyPathIDsActiveFallsBackToNilPreservingRest() {
     let mut s = companion(&[1], Rarity::Common);
@@ -740,7 +683,6 @@ fn testEmptyPathIDsActiveFallsBackToNilPreservingRest() {
     assert!(r.active.is_none());
     assert_eq!(r.lifetime_tokens, 123);
 }
-// upstream: CompanionTests.swift::testGraduationStoresChainNames
 #[test]
 fn testGraduationStoresChainNames() {
     let mut s = companion(&[1, 2, 3], Rarity::Common);
@@ -748,127 +690,6 @@ fn testGraduationStoresChainNames() {
     s.add_growth(750_000_000);
     assert_eq!(s.collection[0].line.names, names);
 }
-// upstream: CompanionTests.swift::testDexSpeciesFoldsDuplicateLinesToOneCellPerSpecies
-#[test]
-fn testDexSpeciesFoldsDuplicateLinesToOneCellPerSpecies() {
-    let mut s = companion(&[1, 2, 3], Rarity::Common);
-    s.add_growth(750_000_000);
-    s.collection.push(s.collection[0].clone());
-    assert_eq!(s.collection.len(), 2);
-    let cells = s.dex_species();
-    assert_eq!(
-        cells.iter().map(|d| d.id).collect::<Vec<_>>(),
-        vec![1, 2, 3]
-    );
-    assert_eq!(
-        cells.iter().map(|d| d.name.as_str()).collect::<Vec<_>>(),
-        vec!["P1", "P2", "P3"]
-    );
-    assert!(cells.iter().all(|d| d.rarity == Rarity::Common));
-}
-// upstream: CompanionTests.swift::testDexSpeciesCountsOnlyReachedStagesOfActive
-#[test]
-fn testDexSpeciesCountsOnlyReachedStagesOfActive() {
-    let s = companion(&[1, 2, 3], Rarity::Common);
-    assert!(s.collection.is_empty());
-    assert_eq!(
-        s.dex_species().iter().map(|d| d.id).collect::<Vec<_>>(),
-        vec![1]
-    );
-}
-// upstream: CompanionTests.swift::testDexSpeciesMarksShinyAcrossTheChain
-#[test]
-fn testDexSpeciesMarksShinyAcrossTheChain() {
-    let mut s = companion(&[1, 2, 3], Rarity::Common);
-    s.active.as_mut().unwrap().shiny = true;
-    s.add_growth(750_000_000);
-    assert!(s.dex_species().iter().all(|d| d.shiny));
-}
-// upstream: CompanionTests.swift::testDexAppearancesPreserveBothColorsRegardlessOfCatchOrder
-#[test]
-fn testDexAppearancesPreserveBothColorsRegardlessOfCatchOrder() {
-    let mut s = companion(&[605, 606], Rarity::Rare);
-    s.add_growth(3_000_000_000);
-    let mut normal = s.collection[0].clone();
-    normal.shiny = false;
-    let mut shiny = normal.clone();
-    shiny.shiny = true;
-    for records in [
-        vec![normal.clone(), shiny.clone()],
-        vec![shiny.clone(), normal.clone()],
-        vec![normal],
-        vec![shiny],
-    ] {
-        s.collection = records;
-        let cells = s.dex_species();
-        assert_eq!(
-            cells.iter().map(|d| d.id).collect::<Vec<_>>(),
-            vec![605, 606]
-        );
-        assert!(
-            cells
-                .iter()
-                .all(|d| d.normal_owned == s.collection.iter().any(|m| !m.shiny))
-        );
-        assert!(
-            cells
-                .iter()
-                .all(|d| d.shiny == s.collection.iter().any(|m| m.shiny))
-        );
-    }
-}
-// upstream: CompanionTests.swift::testActiveCompanionAppearsInDexBeforeGraduationWithoutDuplicate
-#[test]
-fn testActiveCompanionAppearsInDexBeforeGraduationWithoutDuplicate() {
-    let mut s = companion(&[1], Rarity::Common);
-    assert_eq!(s.dex_species().len(), 1);
-    assert!(s.collection.is_empty());
-    s.add_growth(750_000_000);
-    assert_eq!(s.dex_species().len(), 1);
-    assert_eq!(s.collection.len(), 1);
-}
-// upstream: CompanionTests.swift::testLoadedActiveCompanionPreventsEmptyDexState
-#[test]
-fn testLoadedActiveCompanionPreventsEmptyDexState() {
-    let s = roundtrip(&companion(&[1], Rarity::Common));
-    assert!(!s.dex_species().is_empty());
-}
-// upstream: CompanionTests.swift::testDexSpeciesMarksOnlyCurrentEvolutionStageAsRaising
-#[test]
-fn testDexSpeciesMarksOnlyCurrentEvolutionStageAsRaising() {
-    let mut s = companion(&[1, 2, 3], Rarity::Common);
-    s.add_growth(125_000_000);
-    assert_eq!(
-        s.dex_species()
-            .iter()
-            .map(|d| (d.id, d.raising))
-            .collect::<Vec<_>>(),
-        vec![(1, false), (2, true)]
-    );
-}
-// upstream: CompanionTests.swift::testAlreadyGraduatedLineStillMarksOnlyCurrentStageAsRaising
-#[test]
-fn testAlreadyGraduatedLineStillMarksOnlyCurrentStageAsRaising() {
-    let mut s = companion(&[1, 2, 3], Rarity::Common);
-    s.add_growth(750_000_000);
-    s.egg_tokens = 5_000_000;
-    s.hatch(line(&[1, 2, 3], Rarity::Common));
-    assert_eq!(
-        s.dex_species()
-            .iter()
-            .map(|d| (d.id, d.raising))
-            .collect::<Vec<_>>(),
-        vec![(1, true), (2, false), (3, false)]
-    );
-}
-// upstream: CompanionTests.swift::testGraduatedOnlyDexHasNoRaisingMark
-#[test]
-fn testGraduatedOnlyDexHasNoRaisingMark() {
-    let mut s = companion(&[1, 2, 3], Rarity::Common);
-    s.add_growth(750_000_000);
-    assert!(s.dex_species().iter().all(|d| !d.raising));
-}
-// upstream: CompanionTests.swift::testReleasingMidChainCreditsOnlyReachedForms
 #[test]
 fn testReleasingMidChainCreditsOnlyReachedForms() {
     let mut s = companion(&[1, 2, 3], Rarity::Common);
@@ -876,14 +697,9 @@ fn testReleasingMidChainCreditsOnlyReachedForms() {
     s.add_growth(125_000_000);
     s.fresh_egg(None).unwrap();
     assert_eq!(s.collection[0].path, vec![1, 2]);
-    assert_eq!(
-        s.dex_species().iter().map(|d| d.id).collect::<Vec<_>>(),
-        vec![1, 2]
-    );
     assert!(!s.collection[0].graduated);
     assert!(s.collection[0].released);
 }
-// upstream: CompanionTests.swift::testReleasingDisguisedDittoKeepsShinyHidden
 #[test]
 fn testReleasingDisguisedDittoKeepsShinyHidden() {
     let mut s = disguise();
@@ -891,22 +707,7 @@ fn testReleasingDisguisedDittoKeepsShinyHidden() {
     s.lifetime_tokens = 2_000_000_000;
     s.fresh_egg(None).unwrap();
     assert!(!s.collection[0].shiny);
-    assert!(!s.dex_species()[0].shiny);
 }
-// upstream: CompanionTests.swift::testDexSpeciesHidesShinyWhileDittoIsDisguised
-#[test]
-fn testDexSpeciesHidesShinyWhileDittoIsDisguised() {
-    let mut s = disguise();
-    s.active.as_mut().unwrap().shiny = true;
-    assert!(!s.dex_species()[0].shiny);
-}
-// upstream: CompanionTests.swift::testDexSpeciesNamesActiveSpeciesFromLoadedLine
-#[test]
-fn testDexSpeciesNamesActiveSpeciesFromLoadedLine() {
-    let s = companion(&[1, 2, 3], Rarity::Common);
-    assert_eq!(s.dex_species()[0].name, "P1");
-}
-// upstream: CompanionTests.swift::testRepresentativeDefaultsToCurrentCompanionForLegacySave
 #[test]
 fn testRepresentativeDefaultsToCurrentCompanionForLegacySave() {
     let s = companion(&[1], Rarity::Common);
@@ -915,7 +716,6 @@ fn testRepresentativeDefaultsToCurrentCompanionForLegacySave() {
     let r: Companion = serde_json::from_value(v).unwrap();
     assert_eq!(r.representative_subject(), s.representative_subject());
 }
-// upstream: CompanionTests.swift::testRepresentativeSelectionUsesOwnedShinySpeciesAndPersists
 #[test]
 fn testRepresentativeSelectionUsesOwnedShinySpeciesAndPersists() {
     let mut s = companion(&[1, 2, 3], Rarity::Common);
@@ -926,7 +726,6 @@ fn testRepresentativeSelectionUsesOwnedShinySpeciesAndPersists() {
     assert!(!s.pin(Some(999)));
     assert_eq!(s.representative, Some(2));
 }
-// upstream: CompanionTests.swift::testRepresentativeSelectionSurvivesGraduation
 #[test]
 fn testRepresentativeSelectionSurvivesGraduation() {
     let mut s = companion(&[1, 2, 3], Rarity::Common);
@@ -935,7 +734,6 @@ fn testRepresentativeSelectionSurvivesGraduation() {
     s.add_growth(750_000_000);
     assert_eq!(s.representative_subject(), before);
 }
-// upstream: CompanionTests.swift::testFreshEggKeepsRepresentativeSelectionOfReleasedSpecies
 #[test]
 fn testFreshEggKeepsRepresentativeSelectionOfReleasedSpecies() {
     let mut s = companion(&[1, 2, 3], Rarity::Common);
@@ -945,7 +743,6 @@ fn testFreshEggKeepsRepresentativeSelectionOfReleasedSpecies() {
     s.fresh_egg(None).unwrap();
     assert_eq!(s.representative_subject(), before);
 }
-// upstream: CompanionTests.swift::testUnavailableRepresentativeSelectionIsDroppedAtLoad
 #[test]
 fn testUnavailableRepresentativeSelectionIsDroppedAtLoad() {
     let mut s = companion(&[1], Rarity::Common);
@@ -953,7 +750,6 @@ fn testUnavailableRepresentativeSelectionIsDroppedAtLoad() {
     s.sanitize();
     assert_eq!(s.representative, None);
 }
-// upstream: CompanionTests.swift::testLocalizedName
 #[test]
 fn testLocalizedName() {
     let mut l = line(&[1], Rarity::Common);
@@ -966,7 +762,6 @@ fn testLocalizedName() {
     assert_eq!(l.localized_name(1, "ja"), "P1");
     assert_eq!(l.localized_name(999, "en"), "#999");
 }
-// upstream: CompanionTests.swift::testDexStoredChainNamesResolvePerLanguage
 #[test]
 fn testDexStoredChainNamesResolvePerLanguage() {
     let l = line(&[1, 2, 3], Rarity::Common);
@@ -975,7 +770,6 @@ fn testDexStoredChainNamesResolvePerLanguage() {
         assert_eq!(l.localized_name(id, "de"), format!("D{id}"));
     }
 }
-// upstream: CompanionTests.swift::testLineNodesPreviewsCompleteLinearEvolution
 #[test]
 fn testLineNodesPreviewsCompleteLinearEvolution() {
     use evolution::{LineContent::*, LineState::*};
@@ -992,7 +786,6 @@ fn testLineNodesPreviewsCompleteLinearEvolution() {
         ]
     );
 }
-// upstream: CompanionTests.swift::testRealizedLineItemsUsesStageIndexForCurrentMarker
 #[test]
 fn testRealizedLineItemsUsesStageIndexForCurrentMarker() {
     use evolution::LineState::*;
@@ -1004,14 +797,6 @@ fn testRealizedLineItemsUsesStageIndexForCurrentMarker() {
         vec![Done, Current, Done]
     );
 }
-// upstream: CompanionTests.swift::testRepairedPlanAppendsFallbackRouteToCurrentPath
-#[test]
-fn testRepairedPlanAppendsFallbackRouteToCurrentPath() {
-    assert_eq!(evolution::repaired_plan(&[1, 2], 1, &[2, 3]), vec![1, 2, 3]);
-    assert_eq!(evolution::repaired_plan(&[], 0, &[1, 2]), vec![1, 2]);
-    assert_eq!(evolution::repaired_plan(&[1, 2], 1, &[99]), vec![1, 2]);
-}
-// upstream: CompanionTests.swift::testLineNodesHidesUnresolvedWurmpleBranchAsSingleMystery
 #[test]
 fn testLineNodesHidesUnresolvedWurmpleBranchAsSingleMystery() {
     use evolution::{LineContent::*, LineState::*};
@@ -1030,7 +815,6 @@ fn testLineNodesHidesUnresolvedWurmpleBranchAsSingleMystery() {
         vec![(Species(265), Current), (Mystery, Future)]
     );
 }
-// upstream: CompanionTests.swift::testLineNodesShowsKnownPrefixBeforeDownstreamBranchAsMystery
 #[test]
 fn testLineNodesShowsKnownPrefixBeforeDownstreamBranchAsMystery() {
     use evolution::{LineContent::*, LineState::*};
@@ -1053,7 +837,6 @@ fn testLineNodesShowsKnownPrefixBeforeDownstreamBranchAsMystery() {
         ]
     );
 }
-// upstream: CompanionTests.swift::testLineNodesRevealsChosenWurmpleBranchAfterEvolution
 #[test]
 fn testLineNodesRevealsChosenWurmpleBranchAfterEvolution() {
     use evolution::{LineContent::*, LineState::*};
@@ -1078,7 +861,6 @@ fn testLineNodesRevealsChosenWurmpleBranchAfterEvolution() {
         ]
     );
 }
-// upstream: PokemonFormTests.swift::testStoredFormIsNormalizedAgainstTheLine
 #[test]
 fn testStoredFormIsNormalizedAgainstTheLine() {
     let mut s = companion(&[412, 413], Rarity::Common);
@@ -1090,7 +872,6 @@ fn testStoredFormIsNormalizedAgainstTheLine() {
     assert_eq!(s.active.unwrap().form, Some(forms::Form("plant".into())));
     assert_eq!(s.collection[0].form, None);
 }
-// upstream: PokemonFormTests.swift::testEvolutionKeepsTheCloakAndMothimKeepsItsSingleLook
 #[test]
 fn testEvolutionKeepsTheCloakAndMothimKeepsItsSingleLook() {
     let mut s = companion(&[412, 413], Rarity::Common);
@@ -1104,17 +885,7 @@ fn testEvolutionKeepsTheCloakAndMothimKeepsItsSingleLook() {
     assert!(s.owns_species(413, Some(&sandy)));
     assert!(!s.owns_species(413, Some(&forms::Form("plant".into()))));
     assert!(s.owns_species(414, None));
-    assert_eq!(
-        s.collected_forms(412),
-        std::collections::BTreeSet::from([sandy.clone()])
-    );
-    assert_eq!(
-        s.collected_forms(413),
-        std::collections::BTreeSet::from([sandy])
-    );
-    assert!(s.collected_forms(414).is_empty());
 }
-// upstream: PokemonFormTests.swift::testLineFormCountsOnlyOnceEverySpeciesShowingItIsOwned
 #[test]
 fn testLineFormCountsOnlyOnceEverySpeciesShowingItIsOwned() {
     let sandy = forms::Form("sandy".into());
@@ -1132,7 +903,6 @@ fn testLineFormCountsOnlyOnceEverySpeciesShowingItIsOwned() {
     );
     assert!(s.collected_line_forms(201).is_empty());
 }
-// upstream: PokemonFormTests.swift::testDetailListsOwnedFormsAndMainDexKeepsOneCell
 #[test]
 fn testDetailListsOwnedFormsAndMainDexKeepsOneCell() {
     let mut s = Companion::default();
@@ -1142,7 +912,6 @@ fn testDetailListsOwnedFormsAndMainDexKeepsOneCell() {
         m.graduated = true;
         s.collection.push(m);
     }
-    assert_eq!(s.dex_species().len(), 1);
     assert_eq!(s.form_species(492).len(), 2);
     assert_eq!(
         s.form_species(492)
@@ -1152,7 +921,6 @@ fn testDetailListsOwnedFormsAndMainDexKeepsOneCell() {
         vec!["land", "sky"]
     );
 }
-// upstream: PokemonFormTests.swift::testHatchWithoutPreparationRollsAmongTheLineForms
 #[test]
 fn testHatchWithoutPreparationRollsAmongTheLineForms() {
     let mut seen = std::collections::BTreeSet::new();
@@ -1167,7 +935,6 @@ fn testHatchWithoutPreparationRollsAmongTheLineForms() {
     }
     assert_eq!(seen, forms::forms(492).into_iter().collect());
 }
-// upstream: PokemonFormTests.swift::testRevealedDittoDropsTheDisguiseForm
 #[test]
 fn testRevealedDittoDropsTheDisguiseForm() {
     let mut s = companion(&[412, 413], Rarity::Common);
@@ -1177,7 +944,6 @@ fn testRevealedDittoDropsTheDisguiseForm() {
     s.reveal_ditto(line(&[132], Rarity::Rare));
     assert_eq!(s.active.unwrap().form, None);
 }
-// upstream: UnownTests.swift::testCollectionIncludesLegacyActiveAndReleasedFormsButCountsShinyOnlyOnce
 #[test]
 fn testCollectionIncludesLegacyActiveAndReleasedFormsButCountsShinyOnlyOnce() {
     let mut s = companion(&[201], Rarity::Common);
@@ -1197,11 +963,6 @@ fn testCollectionIncludesLegacyActiveAndReleasedFormsButCountsShinyOnlyOnce() {
     }
     s.collection
         .push(companion(&[25], Rarity::Common).active.unwrap());
-    assert_eq!(s.collected_forms(201).len(), 4);
-    assert_eq!(
-        s.dex_species().iter().map(|d| d.id).collect::<Vec<_>>(),
-        vec![25, 201]
-    );
     let fs = s.form_species(201);
     assert_eq!(
         fs.iter()
@@ -1218,7 +979,6 @@ fn testCollectionIncludesLegacyActiveAndReleasedFormsButCountsShinyOnlyOnce() {
         vec![false, false, false, true]
     );
 }
-// upstream: UnownTests.swift::testMissingADoesNotCreateAnOwnedFormOrPermitAnUncollectedRepresentative
 #[test]
 fn testMissingADoesNotCreateAnOwnedFormOrPermitAnUncollectedRepresentative() {
     let mut s = companion(&[201], Rarity::Common);
@@ -1233,7 +993,6 @@ fn testMissingADoesNotCreateAnOwnedFormOrPermitAnUncollectedRepresentative() {
     assert!(!s.pin_appearance(201, true, Some(forms::Form("a".into()))));
     assert!(s.pin_appearance(201, true, Some(forms::Form("question".into()))));
 }
-// upstream: UnownTests.swift::testLegacyAndInvalidFormFieldsDefaultToAWithoutLosingProgress
 #[test]
 fn testLegacyAndInvalidFormFieldsDefaultToAWithoutLosingProgress() {
     for form in [None, Some(forms::Form("future".into()))] {
@@ -1248,7 +1007,6 @@ fn testLegacyAndInvalidFormFieldsDefaultToAWithoutLosingProgress() {
         assert_eq!(s.active.unwrap().tokens, 123);
     }
 }
-// upstream: UnownTests.swift::testAppearanceOwnershipIsIndependentForEachUnownForm
 #[test]
 fn testAppearanceOwnershipIsIndependentForEachUnownForm() {
     let mut s = companion(&[201], Rarity::Common);
@@ -1263,7 +1021,6 @@ fn testAppearanceOwnershipIsIndependentForEachUnownForm() {
     assert!(s.pin_appearance(201, false, Some(forms::Form("a".into()))));
     assert!(s.pin_appearance(201, true, Some(forms::Form("b".into()))));
 }
-// upstream: UnownTests.swift::testFormIsOnlyAppliedToUnown
 #[test]
 fn testFormIsOnlyAppliedToUnown() {
     let mut s = companion(&[25], Rarity::Common);
@@ -1271,7 +1028,6 @@ fn testFormIsOnlyAppliedToUnown() {
     s.sanitize();
     assert_eq!(s.active.unwrap().form, None);
 }
-// upstream: UnownTests.swift::testReleasingActiveLetterPreservesFormProfileAndRepresentative
 #[test]
 fn testReleasingActiveLetterPreservesFormProfileAndRepresentative() {
     let mut s = companion(&[201], Rarity::Common);
@@ -1289,7 +1045,6 @@ fn testReleasingActiveLetterPreservesFormProfileAndRepresentative() {
         Some(forms::Form("question".into()))
     );
 }
-// upstream: UnownTests.swift::testDifferentLettersKeepSpeciesBasedRepeatGrowthAtEveryDifficulty
 #[test]
 fn testDifferentLettersKeepSpeciesBasedRepeatGrowthAtEveryDifficulty() {
     for difficulty in [0.1, 1., 2.] {
@@ -1303,7 +1058,6 @@ fn testDifferentLettersKeepSpeciesBasedRepeatGrowthAtEveryDifficulty() {
         assert_eq!(s.progress().1, Balance::scaled(375_000_000, difficulty));
     }
 }
-// upstream: UnownTests.swift::testFormOwnershipDoesNotChangeSpeciesSelectionOrShinyRolls
 #[test]
 fn testFormOwnershipDoesNotChangeSpeciesSelectionOrShinyRolls() {
     let a = companion(&[201], Rarity::Common);
@@ -1329,7 +1083,6 @@ fn testFormOwnershipDoesNotChangeSpeciesSelectionOrShinyRolls() {
         b.active.unwrap().line.base_id
     );
 }
-// upstream: DittoTests.swift::testRevealRebasesDisguiseProfileAndLoadsDittoDetails
 #[test]
 fn testRevealRebasesDisguiseProfileAndLoadsDittoDetails() {
     let mut s = disguise();
@@ -1381,7 +1134,6 @@ fn testRevealRebasesDisguiseProfileAndLoadsDittoDetails() {
     assert_eq!(p.growth_tokens, 500_000_000);
     assert_eq!(p.level, 20);
 }
-// upstream: PokemonFormTests.swift::testHatchUsesThePreparedFormOfAnyLine
 #[test]
 fn testHatchUsesThePreparedFormOfAnyLine() {
     let mut s = Companion {
@@ -1396,7 +1148,6 @@ fn testHatchUsesThePreparedFormOfAnyLine() {
     assert!(s.pending_line.is_none());
     assert!(s.pending_form.is_none());
 }
-// upstream: CompanionTests.swift::testEggPrefetchStoresPendingAndHatchUsesIt
 #[test]
 fn testEggPrefetchStoresPendingAndHatchUsesIt() {
     let mut s = Companion::default();
@@ -1408,7 +1159,6 @@ fn testEggPrefetchStoresPendingAndHatchUsesIt() {
     assert_eq!(restored.active.unwrap().line.base_id, 1);
     assert!(restored.pending_line.is_none());
 }
-// upstream: UnownTests.swift::testPrefetchPersistsLetterAndHatchConsumesItAfterRNGChanges
 #[test]
 fn testPrefetchPersistsLetterAndHatchConsumesItAfterRNGChanges() {
     let mut s = Companion {
@@ -1424,7 +1174,6 @@ fn testPrefetchPersistsLetterAndHatchConsumesItAfterRNGChanges() {
     assert_eq!(r.active.unwrap().form, form);
     assert_eq!(r.pending_form, None);
 }
-// upstream: UnownTests.swift::testLegacyPendingUnownKeepsDefaultAAtHatch
 #[test]
 fn testLegacyPendingUnownKeepsDefaultAAtHatch() {
     let mut s = Companion {
@@ -1435,7 +1184,6 @@ fn testLegacyPendingUnownKeepsDefaultAAtHatch() {
     s.hatch_prepared();
     assert_eq!(s.active.unwrap().form, Some(forms::Form("a".into())));
 }
-// upstream: UnownTests.swift::testSanitizationClearsPendingLetterWithoutMatchingEgg
 #[test]
 fn testSanitizationClearsPendingLetterWithoutMatchingEgg() {
     let mut s = Companion {
@@ -1455,7 +1203,6 @@ fn testSanitizationClearsPendingLetterWithoutMatchingEgg() {
     assert!(s.pending_line.is_none());
     assert!(s.pending_form.is_none());
 }
-// upstream: UnownTests.swift::testSaveExportAndImportPreservePendingEggLetter
 #[test]
 fn testSaveExportAndImportPreservePendingEggLetter() {
     let mut s = Companion {
@@ -1469,7 +1216,6 @@ fn testSaveExportAndImportPreservePendingEggLetter() {
     assert_eq!(r.pending_form, s.pending_form);
     assert_eq!(r.pending_line.as_ref().unwrap().base_id, 201);
 }
-// upstream: UnownTests.swift::testSaveExportAndImportPreserveActiveDexAndRepresentativeForms
 #[test]
 fn testSaveExportAndImportPreserveActiveDexAndRepresentativeForms() {
     let mut s = companion(&[201], Rarity::Common);
@@ -1487,20 +1233,6 @@ fn testSaveExportAndImportPreserveActiveDexAndRepresentativeForms() {
     assert_eq!(r.collection[0].form, Some(forms::Form("b".into())));
     assert_eq!(r.representative_form, Some(forms::Form("question".into())));
 }
-// upstream: CompanionTests.swift::testLegacyDexEntriesDecodeAsGraduated
-#[test]
-fn testLegacyDexEntriesDecodeAsGraduated() {
-    let mut s = companion(&[1], Rarity::Common);
-    s.add_growth(750_000_000);
-    let mut value = serde_json::to_value(s).unwrap();
-    value["collection"][0]
-        .as_object_mut()
-        .unwrap()
-        .remove("graduated");
-    let r: Companion = serde_json::from_value(value).unwrap();
-    assert!(r.collection[0].graduated);
-}
-// upstream: CompanionTests.swift::testReloadPreservesCompleteShortPlannedRouteLength
 #[test]
 fn testReloadPreservesCompleteShortPlannedRouteLength() {
     let mut s = companion(&[1, 4], Rarity::Common);
@@ -1516,7 +1248,6 @@ fn testReloadPreservesCompleteShortPlannedRouteLength() {
     assert_eq!(r.active.as_ref().unwrap().path, vec![1, 4]);
     assert_eq!(r.progress().1, 250_000_000);
 }
-// upstream: CompanionTests.swift::testReloadLegacyIncompletePlanMigratesToPersistedCompleteRoute
 #[test]
 fn testReloadLegacyIncompletePlanMigratesToPersistedCompleteRoute() {
     let mut s = companion(&[1, 2, 3], Rarity::Common);
@@ -1525,7 +1256,6 @@ fn testReloadLegacyIncompletePlanMigratesToPersistedCompleteRoute() {
     assert_eq!(s.active.as_ref().unwrap().path, vec![1, 2, 3]);
     assert_eq!(s.active.unwrap().stage, 0);
 }
-// upstream: CompanionTests.swift::testReloadRepairsInvalidPlanSuffixWithoutRewindingRealizedPath
 #[test]
 fn testReloadRepairsInvalidPlanSuffixWithoutRewindingRealizedPath() {
     let mut s = companion(&[1, 2, 3], Rarity::Common);
@@ -1535,7 +1265,6 @@ fn testReloadRepairsInvalidPlanSuffixWithoutRewindingRealizedPath() {
     assert_eq!(s.active.as_ref().unwrap().path, vec![1, 2, 3]);
     assert_eq!(s.active.unwrap().stage, 1);
 }
-// upstream: CompanionTests.swift::testReloadWrongRootNormalizesPathWithoutChangingIdentityOrDisguise
 #[test]
 fn testReloadWrongRootNormalizesPathWithoutChangingIdentityOrDisguise() {
     let mut s = disguise();
@@ -1551,7 +1280,6 @@ fn testReloadWrongRootNormalizesPathWithoutChangingIdentityOrDisguise() {
     assert_eq!(m.nature, "Timid");
     assert_eq!(m.ditto_disguise, Some(1));
 }
-// upstream: CompanionTests.swift::testReloadLeafCurrentPlanDoesNotConsumeRNG
 #[test]
 fn testReloadLeafCurrentPlanDoesNotConsumeRNG() {
     let mut s = companion(&[1], Rarity::Common);
@@ -1560,7 +1288,6 @@ fn testReloadLeafCurrentPlanDoesNotConsumeRNG() {
     assert_eq!(s.random_seed, seed);
     assert_eq!(s.active.unwrap().path, vec![1]);
 }
-// upstream: DittoTests.swift::testCandyPickerMatchesApparentPokemonButOnlySpendsEnoughToReveal
 #[test]
 fn testCandyPickerMatchesApparentPokemonButOnlySpendsEnoughToReveal() {
     let mut s = disguise();
@@ -1569,22 +1296,15 @@ fn testCandyPickerMatchesApparentPokemonButOnlySpendsEnoughToReveal() {
         model.add_growth(100_000_000);
         model.inventory.candies = 5;
     }
-    assert_eq!(s.max_candy_use_count(), normal.max_candy_use_count());
-    for quantity in 1..=5 {
-        assert_eq!(s.plan_candy_use(quantity), normal.plan_candy_use(quantity));
-    }
     s.use_candy(5).unwrap();
     assert_eq!(s.inventory.candies, 4);
-    assert_eq!(s.feedback.candy_amount, CANDY_XP);
     assert!(s.use_candy(5).is_err());
     s.reveal_ditto(line(&[132], Rarity::Rare));
     assert_eq!(s.active.as_ref().unwrap().tokens, 75_000_000);
-    assert_eq!(s.max_candy_use_count(), 4);
     s.use_candy(2).unwrap();
     assert_eq!(s.active.unwrap().tokens, 275_000_000);
     assert_eq!(s.inventory.candies, 2);
 }
-// upstream: DittoTests.swift::testDittoExcludedFromRestFallback
 #[test]
 fn testDittoExcludedFromRestFallback() {
     assert!(
@@ -1594,38 +1314,6 @@ fn testDittoExcludedFromRestFallback() {
             .is_none()
     );
 }
-// upstream: CompanionTests.swift::testSortRankOrdersRarityAscendingByValue
-#[test]
-fn testSortRankOrdersRarityAscendingByValue() {
-    assert!(Rarity::Common.rank() < Rarity::Uncommon.rank());
-    assert!(Rarity::Uncommon.rank() < Rarity::Rare.rank());
-    assert!(Rarity::Rare.rank() < Rarity::Legendary.rank());
-}
-// upstream: CompanionTests.swift::testSpriteCacheKeyScheme
-#[test]
-fn testSpriteCacheKeyScheme() {
-    assert_eq!(forms::cache_key(25, true, false, None), "25-a");
-    assert_eq!(forms::cache_key(25, false, false, None), "25-s");
-    assert_eq!(forms::cache_key(25, true, true, None), "25-sha");
-    assert_eq!(forms::cache_key(25, false, true, None), "25-shs");
-}
-// upstream: CompanionTests.swift::testDexAppearancesCombineActiveAndArchivedWithoutFutureForms
-#[test]
-fn testDexAppearancesCombineActiveAndArchivedWithoutFutureForms() {
-    let mut s = companion(&[1, 2, 3], Rarity::Common);
-    s.active.as_mut().unwrap().shiny = false;
-    let mut archived = s.active.clone().unwrap();
-    archived.shiny = true;
-    archived.path = vec![1, 2];
-    archived.stage = 1;
-    archived.released = true;
-    s.collection.push(archived);
-    let cells = s.dex_species();
-    assert_eq!(cells.iter().map(|d| d.id).collect::<Vec<_>>(), vec![1, 2]);
-    assert!(cells[0].normal_owned && cells[0].shiny_owned);
-    assert!(!cells[1].normal_owned && cells[1].shiny_owned);
-}
-// upstream: UnownTests.swift::testPrefetchUsesOwnedFormWeights
 #[test]
 fn testPrefetchUsesOwnedFormWeights() {
     let mut s = Companion {
@@ -1645,7 +1333,6 @@ fn testPrefetchUsesOwnedFormWeights() {
     s.prepare_egg(line(&[201], Rarity::Common));
     assert_eq!(s.pending_form, expected);
 }
-// upstream: UnownTests.swift::testHatchUsesOwnedFormWeightsAfterUnchangedShinyNatureAndProfileRolls
 #[test]
 fn testHatchUsesOwnedFormWeightsAfterUnchangedShinyNatureAndProfileRolls() {
     let mut s = Companion {

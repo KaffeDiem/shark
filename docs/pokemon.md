@@ -2,9 +2,9 @@
 
 The navigation footer pairs a small Pokémon with one line of Claude and Codex remaining percentages, colored by usage pace. Hover for provider names, quota windows, pace labels, and refresh/error status. Unknown or outdated quotas show a neutral dash, and refreshing keeps the layout still. Claude Code and Codex token activity raises the Pokémon. Click it to open Home, Pokédex, Bag, Shop, or the existing Usage view. Egg incubation, evolution, rarity, shiny appearances, natures, individual profiles, forms, and graduation are implemented in Rust.
 
-Settings → General also controls animation quality and lets you choose the navigation Pokémon. Navigation animation pauses when Shark is inactive or Reduce Motion is enabled, and adapts to Low Power Mode.
+Settings → General also controls animation quality; choose the navigation Pokémon in the companion's Pokédex. Navigation animation pauses when Shark is inactive or Reduce Motion is enabled, and adapts to Low Power Mode.
 
-Settings → General → Pokémon companion hides the companion and pauses growth. A single Usage button takes its place, and the collection survives this change. Re-enabling starts from a new usage checkpoint, so tokens consumed while disabled do not retroactively grow a Pokémon. Settings → LICENSE contains Shark's license, PokeTokenBar's complete MIT notice, and Pokémon attribution.
+Settings → General → Pokémon companion hides the companion and pauses growth. A single Usage button takes its place, and the collection survives this change. Re-enabling starts from a new usage checkpoint, so tokens consumed while disabled do not retroactively grow a Pokémon. The About dialog contains Shark's license, PokeTokenBar's complete MIT notice, and Pokémon attribution.
 
 ## Usage providers
 
@@ -22,6 +22,8 @@ Settings → Token sources accepts additional local scan folders for each suppor
 
 The first observation establishes a baseline. Repeated observations and restarts cannot credit the same usage twice. Same-day lower totals preserve the high-water mark, so temporarily missing logs cannot award tokens again when restored. Switching Pokémon off and on invalidates pending observations and establishes a fresh baseline. Candy rewards apply to the headline five-hour and weekly windows; model-specific and monetary caps do not earn duplicate rewards.
 
+Home artwork opens the growing individual's details, independent of the Pokémon pinned in navigation. Providers that do not report cost show no monetary values in Usage summaries, charts, or detail rows.
+
 ## Data and recovery
 
 Companion state lives in Shark's existing atomic `state.json` save. Pokémon data comes from PokéAPI and sprites from the PokeAPI sprite repository, fetched on background workers and cached in Shark's application-support directory. The binary contains no Pokémon artwork. Requests contain public species or resource identifiers only, never usage logs, prompts, credentials, or workspace paths. Sprite and metadata caches are validated and bounded. Both Claude and Codex transcript readers stream records instead of allocating an entire transcript.
@@ -30,22 +32,12 @@ Settings → General offers manual snapshots, snapshot history, and import/expor
 
 Shark exports its own `shark.pokemon.save` envelope, schema 1. This is a Rust save format, not a claim of compatibility with Swift PokeTokenBar save files. Decoding rejects foreign/future schemas and files over 8 MiB. Numeric values and Pokémon paths are sanitized on import and ordinary state load. If Shark's main state file is corrupt, its existing preservation mechanism keeps the unreadable file and the Pokémon collection is recovered from the newest valid snapshot when available.
 
+Background agents in chat borrow Pokémon from your collection, including your currently hatched companion. Each agent keeps its individual Pokémon as other tasks finish or reorder; shiny and form appearances are preserved. The row shows up to six portraits, with all tasks and their Pokémon in the hover details. Shell tasks retain their terminal icon. Disabling Pokémon, an unhatched first egg, or an unavailable image leaves a neutral task indicator. Reduced motion keeps the portraits still.
+
 ## Host integration
 
-The embedded companion uses Shark’s English interface, application lifecycle and official CLI quota queries. It does not install PokeTokenBar’s standalone macOS menu-bar item, floating desktop pet, self-updater, authentication store, status-page poller or OS quota notifications. The migration inventory identifies those retained host boundaries explicitly.
+The embedded companion uses Shark’s English interface, application lifecycle and official CLI quota queries. It does not install PokeTokenBar’s standalone macOS menu-bar item, floating desktop pet, self-updater, authentication store, status-page poller or OS quota notifications.
 
-## Upstream and validation
+## Upstream
 
 Adapted from [PokeTokenBar](https://github.com/chattymin/PokeTokenBar/tree/32ebe4cac2aca1d298d71e7cbc70a507015470f9), revision `32ebe4cac2aca1d298d71e7cbc70a507015470f9`, under the [MIT license](../licenses/PokeTokenBar-MIT.txt). Shark remains GPL-3.0.
-
-The [test migration inventory](poketokenbar-test-migration.md) tracks all upstream test methods, including unfinished translations and the user's provider-scope exclusions. It is the authoritative record of migration completeness. The implementation uses Rust tests; no Swift runtime or test runner is required.
-
-Run checks from this repository directory so `rust-toolchain.toml` selects the correct compiler:
-
-```sh
-cargo check
-cargo test --features test-support -- --test-threads=1
-SHARK_RENDER_DIR=/tmp/shark-pokemon-renders cargo test --features test-support --test rendering
-```
-
-Background agents in chat borrow Pokémon from your collection, including your currently hatched companion. Each agent keeps its individual Pokémon as other tasks finish or reorder; shiny and form appearances are preserved. The row shows up to six portraits, with all tasks and their Pokémon in the hover details. Shell tasks retain their terminal icon. Disabling Pokémon, an unhatched first egg, or an unavailable image leaves a neutral task indicator. Reduced motion keeps the portraits still.

@@ -125,8 +125,6 @@ fn validate_marker(component: &image::RgbaImage, percent: Option<f64>, ink: [u8;
     );
 }
 
-// upstream: ScreenshotGenTests.swift::testGenerateDailyTrendScreenshots
-// upstream: ScreenshotGenTests.swift::testGeneratePaceMarkerScreenshots
 // Native host-language artifacts; exact chart crop equality and painted pace geometry are verified.
 pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());

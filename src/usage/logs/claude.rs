@@ -1,8 +1,7 @@
 use super::{Entry, dedup_claude, token};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{collections::BTreeMap, path::Path};
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default)]
 pub struct Parsed {
     pub entries: Vec<Entry>,
     pub ledger: BTreeMap<String, f64>,
@@ -28,6 +27,7 @@ pub fn session(path: &Path) -> String {
         .map(|s| s.to_string_lossy().into_owned())
         .unwrap_or_default()
 }
+#[cfg(test)]
 pub fn parse(bytes: &[u8], path: &Path, base: u64) -> Parsed {
     parse_reader(std::io::Cursor::new(bytes), path, base)
         .expect("reading an in-memory log cannot fail")
@@ -48,6 +48,9 @@ pub fn parse_reader(
         at = at.saturating_add(consumed);
         if terminated {
             result.offset = at
+        }
+        if !super::mentions(&line, &[b"\"usage\"", b"cost-state"]) {
+            continue;
         }
         let Ok(v) = serde_json::from_slice::<Value>(&line) else {
             continue;
@@ -77,12 +80,17 @@ pub fn parse_reader(
         let Some(date) = crate::usage::timestamp(&v["timestamp"]) else {
             continue;
         };
+        let (message, request) = (
+            m["id"].as_str().unwrap_or(""),
+            v["requestId"].as_str().unwrap_or(""),
+        );
         result.entries.push(Entry {
-            id: format!(
-                "{}|{}",
-                m["id"].as_str().unwrap_or(""),
-                v["requestId"].as_str().unwrap_or("")
-            ),
+            // Records with no identity cannot be duplicates of each other.
+            id: if message.is_empty() && request.is_empty() {
+                format!("anon|{}|{at}", path.display())
+            } else {
+                format!("{message}|{request}")
+            },
             date,
             model: m["model"].as_str().unwrap_or("unknown").into(),
             input: token(&u["input_tokens"]),

@@ -40,7 +40,6 @@ fn sources(s: &mut Shark, count: usize) {
     s.usage_reports = vec![Report::default(); count];
     s.pokemon_ui.scanning = vec![false; count];
 }
-// upstream: ProviderTabLayoutTests.swift::testTabListMatchesTheRegisteredProviders
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn native_tabs_come_from_registered_sources(cx: &mut TestAppContext) {
@@ -68,7 +67,6 @@ async fn native_tabs_come_from_registered_sources(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
-// upstream: ProviderTabLayoutTests.swift::testAllProviderTabsExceedPopoverContentWidthWhenLaidOutInOneRow
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn future_source_tabs_reproduce_natural_overflow_without_expanding_parent(
@@ -102,7 +100,6 @@ async fn future_source_tabs_reproduce_natural_overflow_without_expanding_parent(
     })
     .unwrap();
 }
-// upstream: ProviderTabLayoutTests.swift::testProviderTabBarStaysSingleRowWithAllProviders
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn native_provider_tabs_keep_one_row_for_two_or_fourteen_sources(cx: &mut TestAppContext) {
@@ -129,7 +126,6 @@ async fn native_provider_tabs_keep_one_row_for_two_or_fourteen_sources(cx: &mut 
     })
     .unwrap();
 }
-// upstream: ProviderTabLayoutTests.swift::testProviderTabBarFitsPopoverContentWidth
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn scrollable_source_tabs_stay_inside_popover_width(cx: &mut TestAppContext) {
@@ -149,7 +145,6 @@ async fn scrollable_source_tabs_stay_inside_popover_width(cx: &mut TestAppContex
     })
     .unwrap();
 }
-// upstream: ProviderTabLayoutTests.swift::testNoSingleProviderTabExceedsContentWidth
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn even_a_long_future_source_name_cannot_expand_one_tab_past_content(

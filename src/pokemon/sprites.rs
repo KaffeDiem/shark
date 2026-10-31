@@ -16,7 +16,6 @@ pub struct Request {
     animated: bool,
     shiny: bool,
     form: Option<Form>,
-    item: Option<String>,
 }
 impl Request {
     pub fn pokemon(species: u16, animated: bool, shiny: bool, form: Option<&Form>) -> Self {
@@ -25,22 +24,9 @@ impl Request {
             animated,
             shiny,
             form: forms::resolved(species, form),
-            item: None,
-        }
-    }
-    pub fn item(name: &str) -> Self {
-        Self {
-            species: 0,
-            animated: false,
-            shiny: false,
-            form: None,
-            item: Some(name.into()),
         }
     }
     pub fn filename(&self) -> String {
-        if let Some(name) = &self.item {
-            return format!("item-{name}.png");
-        }
         format!(
             "sprite-{}-{}.{}",
             forms::asset_name(self.species, self.form.as_ref()),
@@ -49,30 +35,13 @@ impl Request {
         )
     }
     fn valid(&self) -> bool {
-        if let Some(name) = &self.item {
-            !name.is_empty()
-                && name.len() < 80
-                && name
-                    .bytes()
-                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == b'-')
-        } else {
-            (1..=649).contains(&self.species)
-        }
+        (1..=649).contains(&self.species)
     }
     pub fn url(&self) -> String {
-        if let Some(name) = &self.item {
-            format!(
-                "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/items/{name}.png"
-            )
-        } else {
-            forms::sprite_url(self.species, self.animated, self.shiny, self.form.as_ref())
-        }
+        forms::sprite_url(self.species, self.animated, self.shiny, self.form.as_ref())
     }
     fn candidates(&self) -> Vec<Self> {
         let mut result = vec![self.clone()];
-        if self.item.is_some() {
-            return result;
-        }
         if self.shiny {
             let mut normal = self.clone();
             normal.shiny = false;
@@ -104,9 +73,6 @@ pub struct Asset {
     pub encoded: Arc<Vec<u8>>,
 }
 impl Asset {
-    pub fn dimensions(&self) -> (u32, u32) {
-        self.frames[0].buffer().dimensions()
-    }
     pub fn byte_size(&self) -> usize {
         self.encoded.len() + self.frames.iter().map(|f| f.buffer().len()).sum::<usize>()
     }
@@ -244,6 +210,7 @@ pub fn cached_memory(path: &Path) -> Option<Arc<Asset>> {
 }
 
 /// Warm lookups retain the same decoded frames even when the file has disappeared.
+#[cfg(test)]
 pub fn cached(path: &Path) -> Option<Arc<Asset>> {
     cached_checked(path, || true)
 }
@@ -263,15 +230,6 @@ fn cached_checked(path: &Path, allowed: impl Fn() -> bool) -> Option<Arc<Asset>>
         .ok()?;
     let asset = decode(path, bytes).ok()?;
     allowed().then(|| remember(asset))
-}
-pub fn cached_request(directory: &Path, request: Request) -> Option<Arc<Asset>> {
-    if !request.valid() {
-        return None;
-    }
-    request
-        .candidates()
-        .into_iter()
-        .find_map(|r| cached(&directory.join(r.filename())))
 }
 /// Calls may run concurrently on workers. Publication coalesces decoded identity; failures and
 /// fallback lookups are never inserted under the requested variant's key.

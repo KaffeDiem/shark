@@ -39,9 +39,7 @@ use gpui_kit::component::shimmer::ShimmerText;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{
-    ActiveTheme, Icon, Selectable as _, WindowExt as _, h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme, Icon, Selectable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 pub(crate) use links::{copy_button, link_roots, markdown};
@@ -2249,7 +2247,10 @@ pub(crate) mod ui_tests {
                     still = Some(shot.clone());
                 }
                 if state == "static-next" {
-                    assert!(still.as_ref().unwrap() == &shot, "reduced motion keeps portraits still");
+                    assert!(
+                        still.as_ref().unwrap() == &shot,
+                        "reduced motion keeps portraits still"
+                    );
                 }
                 if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
                     let dir = PathBuf::from(dir);

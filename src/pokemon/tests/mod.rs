@@ -24,8 +24,4 @@ mod precious_guard;
 
 mod performance;
 
-mod catalog_network;
-
 mod name_migration;
-
-mod localization;

@@ -45,81 +45,19 @@ pub enum Error {
     NewerSchema(u32),
     TooLarge,
     Io(String),
-    BackupFailed(String),
 }
 
-impl Error {
-    /// Keep diagnostic detail in the error value; show stable, translated instructions to users.
-    pub fn user_message(&self, language: super::format::Language) -> String {
-        use super::format::Language;
-        let index = match language {
-            Language::Ko => 0,
-            Language::En => 1,
-            Language::Ja => 2,
-            Language::Es => 3,
-            Language::Fr => 4,
-            Language::Pt => 5,
-            Language::De => 6,
-            Language::Ru => 7,
-        };
-        let messages = match self {
-            Self::NotASave => [
-                "올바른 Shark 포켓몬 저장 파일이 아닙니다.",
-                "This is not a valid Shark Pokémon save",
-                "有効な Shark ポケモンのセーブファイルではありません。",
-                "Este no es un archivo válido de Pokémon de Shark.",
-                "Ce fichier de sauvegarde Pokémon de Shark n’est pas valide.",
-                "Este não é um arquivo válido de Pokémon do Shark.",
-                "Dies ist kein gültiger Pokémon-Spielstand von Shark.",
-                "Это недопустимое сохранение покемонов Shark.",
-            ],
-            Self::NewerSchema(_) => [
-                "이 저장 파일을 가져오려면 Shark를 업데이트하세요.",
-                "Update Shark before importing this newer save",
-                "この新しいセーブを読み込むには Shark を更新してください。",
-                "Actualiza Shark antes de importar este archivo más reciente.",
-                "Mettez Shark à jour avant d’importer cette sauvegarde plus récente.",
-                "Atualize o Shark antes de importar este arquivo mais recente.",
-                "Aktualisiere Shark, bevor du diesen neueren Spielstand importierst.",
-                "Обновите Shark перед импортом этого нового сохранения.",
-            ],
-            Self::TooLarge => [
-                "저장 파일은 8 MiB 이하여야 합니다.",
-                "Pokémon saves must be no larger than 8 MiB",
-                "セーブファイルは 8 MiB 以下にしてください。",
-                "El archivo debe tener como máximo 8 MiB.",
-                "La sauvegarde ne doit pas dépasser 8 MiB.",
-                "O arquivo deve ter no máximo 8 MiB.",
-                "Der Spielstand darf höchstens 8 MiB groß sein.",
-                "Сохранение не должно превышать 8 МиБ.",
-            ],
-            Self::Io(_) => [
-                "파일을 읽거나 쓸 수 없습니다. 위치와 접근 권한을 확인하세요.",
-                "Could not read or write the save. Check its location and file permissions",
-                "ファイルを読み書きできません。場所とアクセス権を確認してください。",
-                "No se pudo leer o escribir el archivo. Comprueba su ubicación y permisos.",
-                "Impossible de lire ou d’écrire le fichier. Vérifiez son emplacement et ses autorisations.",
-                "Não foi possível ler ou gravar o arquivo. Verifique o local e as permissões.",
-                "Die Datei konnte nicht gelesen oder geschrieben werden. Prüfe Ort und Zugriffsrechte.",
-                "Не удалось прочитать или записать файл. Проверьте его расположение и права доступа.",
-            ],
-            Self::BackupFailed(_) => [
-                "백업에 실패하여 진행 상황을 바꾸지 않았습니다.",
-                "Progress was not replaced because its backup could not be saved",
-                "バックアップを保存できなかったため、進行状況は変更されませんでした。",
-                "No se reemplazó el progreso porque no se pudo guardar su copia de seguridad.",
-                "La progression n’a pas été remplacée car sa copie de secours n’a pas pu être enregistrée.",
-                "O progresso não foi substituído porque não foi possível salvar sua cópia de segurança.",
-                "Der Fortschritt wurde nicht ersetzt, weil die Sicherung nicht gespeichert werden konnte.",
-                "Прогресс не заменён, поскольку не удалось сохранить резервную копию.",
-            ],
-        };
-        messages[index].into()
-    }
-}
+/// Diagnostic detail stays in the error value; users see stable, fixed instructions.
 impl std::fmt::Display for Error {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.user_message(super::format::Language::En))
+        f.write_str(match self {
+            Self::NotASave => "This is not a valid Shark Pokémon save",
+            Self::NewerSchema(_) => "Update Shark before importing this newer save",
+            Self::TooLarge => "Pokémon saves must be no larger than 8 MiB",
+            Self::Io(_) => {
+                "Could not read or write the save. Check its location and file permissions"
+            }
+        })
     }
 }
 impl std::error::Error for Error {}
@@ -173,47 +111,6 @@ pub fn read(path: &Path) -> Result<Envelope, Error> {
     decode(&bytes)
 }
 
-/// Internal history also accepts the earlier raw Rust companion shape. External imports
-/// still require the branded envelope, so unrelated JSON cannot replace a collection.
-pub(crate) fn read_snapshot(path: &Path) -> Result<Envelope, Error> {
-    let mut bytes = Vec::new();
-    let file = fs::File::open(path)?;
-    let modified = file
-        .metadata()?
-        .modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|t| t.as_secs())
-        .unwrap_or(0);
-    file.take(MAX_FILE_BYTES as u64 + 1)
-        .read_to_end(&mut bytes)?;
-    match decode(&bytes) {
-        Ok(envelope) => Ok(envelope),
-        Err(Error::NotASave) => {
-            let value: serde_json::Value =
-                serde_json::from_slice(&bytes).map_err(|_| Error::NotASave)?;
-            let object = value.as_object().ok_or(Error::NotASave)?;
-            if object.contains_key("format")
-                || object.contains_key("schema")
-                || !object.contains_key("active")
-            {
-                return Err(Error::NotASave);
-            }
-            let mut state: Companion =
-                serde_json::from_value(value).map_err(|_| Error::NotASave)?;
-            state.sanitize();
-            Ok(Envelope {
-                format: FORMAT.into(),
-                schema: SCHEMA,
-                app_version: "legacy-rust".into(),
-                exported_at: modified,
-                state,
-            })
-        }
-        Err(error) => Err(error),
-    }
-}
-
 /// Preserve progress, use this device's usage checkpoints, and merge already claimed rewards.
 /// Settings such as visibility/language live in Shark's State and are never imported here.
 pub fn rebase(
@@ -259,9 +156,6 @@ pub struct Snapshot {
     pub exported_at: u64,
     pub lifetime_tokens: u64,
     pub collection_count: usize,
-    pub current_species_id: Option<u16>,
-    pub current_is_shiny: bool,
-    pub current_form: Option<super::forms::Form>,
 }
 
 fn summary(path: PathBuf, state: &Companion, exported_at: u64) -> Snapshot {
@@ -270,15 +164,6 @@ fn summary(path: PathBuf, state: &Companion, exported_at: u64) -> Snapshot {
         exported_at,
         lifetime_tokens: state.lifetime_tokens,
         collection_count: state.collection.len(),
-        current_species_id: state.active.as_ref().map(super::Mon::species_id),
-        current_is_shiny: state
-            .active
-            .as_ref()
-            .is_some_and(super::Mon::displays_shiny),
-        current_form: state
-            .active
-            .as_ref()
-            .and_then(|m| super::forms::resolved(m.species_id(), m.form.as_ref())),
     }
 }
 
@@ -292,6 +177,30 @@ impl Snapshots {
         Self { directory }
     }
 
+    /// Snapshot files newest first, from the `companion-snapshot-{time:020}-{n:05}.json` name alone.
+    /// Writers run this on every state save, so it must not read file contents.
+    fn named(&self) -> Vec<(u64, PathBuf)> {
+        let Ok(entries) = fs::read_dir(&self.directory) else {
+            return vec![];
+        };
+        let mut files: Vec<_> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let time = name
+                    .strip_prefix("companion-snapshot-")?
+                    .strip_suffix(".json")?
+                    .split('-')
+                    .next()?
+                    .parse()
+                    .ok()?;
+                Some((time, entry.path()))
+            })
+            .collect();
+        files.sort_by(|a, b| b.cmp(a));
+        files
+    }
+
     pub fn list(&self) -> Vec<Snapshot> {
         let Ok(entries) = fs::read_dir(&self.directory) else {
             return vec![];
@@ -303,7 +212,7 @@ impl Snapshots {
                 if !name.starts_with("companion-snapshot-") || !name.ends_with(".json") {
                     return None;
                 }
-                let envelope = read_snapshot(&entry.path()).ok()?;
+                let envelope = read(&entry.path()).ok()?;
                 Some(summary(entry.path(), &envelope.state, envelope.exported_at))
             })
             .collect();
@@ -341,13 +250,13 @@ impl Snapshots {
                         let snapshot = summary(path, state, now);
                         // This is also the mandatory pre-restore backup. Never prune it
                         // immediately when the system clock moved behind existing snapshots.
-                        for old in self
-                            .list()
+                        for (_, old) in self
+                            .named()
                             .into_iter()
-                            .filter(|old| old.path != snapshot.path)
+                            .filter(|(_, old)| *old != snapshot.path)
                             .skip(KEEP_SNAPSHOTS - 1)
                         {
-                            let _ = fs::remove_file(old.path);
+                            let _ = fs::remove_file(old);
                         }
                         return Ok(snapshot);
                     }
@@ -364,10 +273,12 @@ impl Snapshots {
     }
 
     pub fn maybe_create(&self, state: &Companion, now: u64) -> Result<Option<Snapshot>, Error> {
+        // A snapshot stamped after `now` (clock moved back) must not block new ones.
         if self
-            .list()
-            .first()
-            .is_some_and(|s| now.saturating_sub(s.exported_at) < AUTO_INTERVAL)
+            .named()
+            .iter()
+            .find(|(time, _)| *time <= now)
+            .is_some_and(|(time, _)| now - time < AUTO_INTERVAL)
         {
             return Ok(None);
         }
@@ -377,23 +288,8 @@ impl Snapshots {
     pub fn latest(&self) -> Option<Companion> {
         self.list()
             .first()
-            .and_then(|s| read_snapshot(&s.path).ok())
+            .and_then(|s| read(&s.path).ok())
             .map(|e| e.state)
-    }
-
-    /// Decode before creating a backup: pruning must not remove a requested old snapshot first.
-    /// Callers persist the returned state only after this method succeeds.
-    pub fn prepare_restore(
-        &self,
-        path: &Path,
-        current: &Companion,
-        now: u64,
-        usage: BTreeMap<String, UsageBaseline>,
-    ) -> Result<Companion, Error> {
-        let imported = read_snapshot(path)?.state;
-        self.create(current, now)
-            .map_err(|e| Error::BackupFailed(e.to_string()))?;
-        Ok(rebase(imported, current, usage))
     }
 }
 

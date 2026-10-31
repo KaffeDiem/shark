@@ -25,7 +25,6 @@ fn companion() -> Companion {
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-// upstream: PopoverNavigationTests.swift::testDefaultsToHome
 async fn pokemon_footer_rail_disable_and_usage_access(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
@@ -192,8 +191,6 @@ async fn pokemon_limit_candy_uses_official_rows_once_per_epoch(cx: &mut TestAppC
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-// upstream: RareCandyTests.swift::testCandyGraduationFiresSpriteIdentityObservation
-// upstream: DifficultySaveTests.swift::testDraftDoesNotApplyUntilSaveAndSavesBothControls
 async fn pokemon_shop_bag_difficulty_and_candy_graduation_updates_footer(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
@@ -244,8 +241,6 @@ async fn pokemon_shop_bag_difficulty_and_candy_graduation_updates_footer(cx: &mu
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-// upstream: DexBackNavigationTests.swift::testBackFromDetailReturnsToThePageOfThatSpecies
-// upstream: PopoverNavigationTests.swift::testOpenDexEntryShowsDetailInCollection
 async fn pokemon_dex_pages_filter_details_back_and_pin(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
@@ -350,7 +345,6 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 "shop",
                 "usage",
                 "settings",
-                "license",
             ] {
                 cx.update_window(window, |_, w, cx| {
                     shark.update(cx, |s, cx| {
@@ -369,7 +363,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         }
                         if page == "footer" || page == "footer-disabled" {
                             s.close_usage(w, cx);
-                        } else if page == "settings" || page == "license" {
+                        } else if page == "settings" {
                             s.close_usage(w, cx);
                             crate::settings::open(&s.state, w, cx);
                         } else {
@@ -447,10 +441,6 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             assert!(w.try_find("usage-panel").is_none());
                         }
                     }
-                    if page == "license" {
-                        w.click("LICENSE", cx);
-                        w.render_frame(cx);
-                    }
                 })
                 .unwrap();
                 // Let cached GIF decoding settle, then render the production widget again.
@@ -527,7 +517,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         )))
                         .unwrap();
                 }
-                if page == "settings" || page == "license" {
+                if page == "settings" {
                     cx.update_window(window, |_, w, cx| w.close_dialog(cx))
                         .unwrap();
                 }

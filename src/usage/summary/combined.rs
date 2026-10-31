@@ -22,21 +22,18 @@ impl BurnTier {
 }
 pub struct Source<'a> {
     pub id: &'a str,
-    pub name: &'a str,
     pub report: &'a Report,
     pub reports_cost: bool,
 }
 #[derive(Clone, Debug)]
 pub struct ProviderSummary {
     pub id: String,
-    pub name: String,
     pub today: Bucket,
     pub week: Bucket,
     pub month: Bucket,
     pub rate: f64,
     pub last_usage: Option<f64>,
     pub month_daily: Vec<Day>,
-    pub error: Option<String>,
 }
 #[derive(Clone, Debug, Default)]
 pub struct Summary {
@@ -60,14 +57,12 @@ impl Summary {
             let r = source.report;
             let mut p = ProviderSummary {
                 id: source.id.into(),
-                name: source.name.into(),
                 today: r.period(today, tomorrow),
                 week: r.period(week, tomorrow),
                 month: r.period(month, tomorrow),
                 rate: r.active_block(now).map_or(0., |b| b.tokens_per_minute),
                 last_usage: r.last_usage(),
                 month_daily: r.month_daily(now),
-                error: r.error.clone(),
             };
             if !source.reports_cost {
                 for b in [&mut p.today, &mut p.week, &mut p.month] {
@@ -101,9 +96,5 @@ impl Summary {
         out.month_daily = combine_series(out.providers.iter().map(|p| p.month_daily.clone()));
         out.burn = BurnTier::from_rate(out.rate);
         out
-    }
-    pub fn preferring(&self, id: Option<&str>) -> Option<&ProviderSummary> {
-        id.and_then(|id| self.providers.iter().find(|p| p.id == id))
-            .or_else(|| self.providers.first())
     }
 }

@@ -23,7 +23,6 @@ fn final_details(species: u16) -> profile::Details {
         }],
     }
 }
-// upstream: ProfileGrowthIntegrationTests.swift::testEveryDifficultyAndRepeatHatchGraduatesAtLevel100
 #[test]
 fn testEveryDifficultyAndRepeatHatchGraduatesAtLevel100() {
     for difficulty in [0.1, 1., 2.] {
@@ -56,7 +55,6 @@ fn testEveryDifficultyAndRepeatHatchGraduatesAtLevel100() {
         }
     }
 }
-// upstream: ProfileGrowthIntegrationTests.swift::testDifficultyChangesAndRestartNeverUndoEarnedLevels
 #[test]
 fn testDifficultyChangesAndRestartNeverUndoEarnedLevels() {
     let mut s = raised(0.5, 1);
@@ -91,21 +89,6 @@ fn testDifficultyChangesAndRestartNeverUndoEarnedLevels() {
         100
     );
 }
-// upstream: ProfileGrowthIntegrationTests.swift::testLegacyStageMigrationUsesBoostAndDifficulty
-#[test]
-fn testLegacyStageMigrationUsesBoostAndDifficulty() {
-    let mut s = raised(0.1, 3);
-    let mon = s.active.as_mut().unwrap();
-    mon.stage = 1;
-    mon.tokens = 6_250_000;
-    mon.growth_boost = true;
-    mon.profile = None;
-    s.sanitize();
-    let profile = s.active.unwrap().profile.unwrap();
-    assert_eq!(profile.growth_tokens, 250_000_000);
-    assert_eq!(profile.level, 36);
-}
-// upstream: ProfileGrowthIntegrationTests.swift::testImportOntoHarderDeviceKeepsEarnedIdentityAndLevel
 #[test]
 fn testImportOntoHarderDeviceKeepsEarnedIdentityAndLevel() {
     let mut source = raised(0.1, 1);
@@ -139,7 +122,6 @@ fn testImportOntoHarderDeviceKeepsEarnedIdentityAndLevel() {
         100
     );
 }
-// upstream: ProfileGrowthIntegrationTests.swift::testRareCandyFinalizesGraduationProfile
 #[test]
 fn testRareCandyFinalizesGraduationProfile() {
     let mut s = raised(0.1, 3);
@@ -155,7 +137,6 @@ fn testRareCandyFinalizesGraduationProfile() {
     );
 }
 // The Rust save persists its validated evolution tree, so growth does not depend on a line download.
-// upstream: ProfileGrowthIntegrationTests.swift::testOfflineOverflowCatchesUpWhenLineLoads
 #[test]
 fn testOfflineOverflowCatchesUpWhenLineLoads() {
     let mut s = raised(0.1, 3);

@@ -192,10 +192,6 @@ pub fn resolved_line(base: u16, form: Option<&Form>) -> Option<Form> {
 pub fn is_default(species: u16, form: Option<&Form>) -> bool {
     forms(species).first().cloned() == resolved(species, form)
 }
-pub fn sort_order(species: u16, form: Option<&Form>) -> usize {
-    form.and_then(|f| forms(species).iter().position(|v| v == f))
-        .unwrap_or(0)
-}
 pub fn roll(random: u64, pool: &[Form], collected: &BTreeSet<Form>) -> Option<Form> {
     let total: u64 = pool
         .iter()
@@ -246,27 +242,15 @@ pub fn label(
     species: u16,
     form: Option<&Form>,
     names: Option<&BTreeMap<String, String>>,
-    language: &str,
 ) -> Option<String> {
     let form = resolved(species, form)?;
     if species == 201 {
         return Some(form.symbol());
     }
     if [351, 479, 646, 649].contains(&species) && is_default(species, Some(&form)) {
-        return Some(
-            match language {
-                "ko" => "노말폼",
-                "ja" => "ノーマルフォルム",
-                "es" | "pt" => "Forma Normal",
-                "fr" => "Forme Normale",
-                "de" => "Normalform",
-                "ru" => "Обычная форма",
-                _ => "Normal Form",
-            }
-            .into(),
-        );
+        return Some("Normal Form".into());
     }
-    if let Some(name) = names.and_then(|names| super::evolution::resolve_name(names, &[language])) {
+    if let Some(name) = names.and_then(|names| super::evolution::resolve_name(names, &["en"])) {
         return Some(name);
     }
     Some(
@@ -306,7 +290,6 @@ impl Form {
         }
     }
 }
-
 pub fn sprite_url(species: u16, animated: bool, shiny: bool, form: Option<&Form>) -> String {
     let base = "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon";
     let color = if shiny { "shiny/" } else { "" };
@@ -319,14 +302,6 @@ pub fn sprite_url(species: u16, animated: bool, shiny: bool, form: Option<&Form>
         format!("{base}/{color}{}.png", static_asset_name(species, form))
     }
 }
-pub fn cache_key(species: u16, animated: bool, shiny: bool, form: Option<&Form>) -> String {
-    format!(
-        "{}-{}{}",
-        asset_name(species, form),
-        if shiny { "sh" } else { "" },
-        if animated { "a" } else { "s" }
-    )
-}
 
 #[cfg(test)]
 #[allow(non_snake_case)]
@@ -335,7 +310,6 @@ mod tests {
     fn f(s: &str) -> Form {
         Form(s.into())
     }
-    // upstream: PokemonFormTests.swift::testCatalogListsDefaultFirstWithinTheHatchableRange
     #[test]
     fn testCatalogListsDefaultFirstWithinTheHatchableRange() {
         assert_eq!(SPECIES.len(), 23);
@@ -359,7 +333,6 @@ mod tests {
             assert!(forms(s).is_empty());
         }
     }
-    // upstream: PokemonFormTests.swift::testLinesCarryFormsFromTheirBaseEvenWhenTheBaseLooksTheSame
     #[test]
     fn testLinesCarryFormsFromTheirBaseEvenWhenTheBaseLooksTheSame() {
         assert_eq!(form_species(412), vec![412, 413]);
@@ -371,7 +344,6 @@ mod tests {
         assert_eq!(resolved_line(420, None), Some(f("overcast")));
         assert_eq!(resolved(420, Some(&f("sunshine"))), None);
     }
-    // upstream: PokemonFormTests.swift::testFormResolvesPerSpeciesOfTheLine
     #[test]
     fn testFormResolvesPerSpeciesOfTheLine() {
         for s in [412, 413] {
@@ -382,7 +354,6 @@ mod tests {
         assert_eq!(resolved(492, Some(&f("future"))), Some(f("land")));
         assert_eq!(resolved(25, Some(&f("sky"))), None);
     }
-    // upstream: PokemonFormTests.swift::testVarietyFormsUseTheVarietyPNGAndTheFormGIF
     #[test]
     fn testVarietyFormsUseTheVarietyPNGAndTheFormGIF() {
         let base = "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/pokemon";
@@ -409,20 +380,6 @@ mod tests {
         assert_eq!(
             sprite_url(414, true, false, Some(&f("sandy"))),
             format!("{base}/versions/generation-v/black-white/animated/414.gif")
-        );
-    }
-    // upstream: PokemonFormTests.swift::testCacheKeysSeparateFormsAndKeepDefaultKeys
-    #[test]
-    fn testCacheKeysSeparateFormsAndKeepDefaultKeys() {
-        assert_eq!(cache_key(492, false, false, Some(&f("sky"))), "492-sky-s");
-        assert_eq!(cache_key(492, true, true, Some(&f("sky"))), "492-sky-sha");
-        assert_eq!(
-            cache_key(492, false, false, Some(&f("land"))),
-            cache_key(492, false, false, None)
-        );
-        assert_eq!(
-            cache_key(413, false, false, Some(&f("sandy"))),
-            "413-sandy-s"
         );
     }
     #[test]

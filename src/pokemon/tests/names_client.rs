@@ -41,7 +41,6 @@ impl Drop for Temp {
         let _ = fs::remove_dir_all(&self.0);
     }
 }
-// upstream: PokemonNameLocalizationTests.swift::testMemoryAndDiskCacheKeepAllLanguagesWithoutRefetchOnLanguageChange
 #[test]
 fn memory_and_disk_keep_every_language_without_refetch() {
     let dir = Temp::new();
@@ -61,7 +60,6 @@ fn memory_and_disk_keep_every_language_without_refetch() {
     );
     assert_eq!(server.calls.load(Ordering::SeqCst), 1);
 }
-// upstream: PokemonNameLocalizationTests.swift::testDuplicateVisibleRowsShareOneRequest
 #[test]
 fn concurrent_rows_share_one_request() {
     let server = Arc::new(Server::default());
@@ -85,7 +83,6 @@ fn concurrent_rows_share_one_request() {
     assert_eq!(values.0, values.1);
     assert_eq!(server.calls.load(Ordering::SeqCst), 1);
 }
-// upstream: PokemonNameLocalizationTests.swift::testExpiredDiskSurvivesOfflineAndDoesNotBecomeFresh
 #[test]
 fn stale_offline_fallback_keeps_original_timestamp_and_retries() {
     let dir = Temp::new();
@@ -104,7 +101,6 @@ fn stale_offline_fallback_keeps_original_timestamp_and_retries() {
     stale.names(&resource()).unwrap();
     assert_eq!(server.calls.load(Ordering::SeqCst), 3);
 }
-// upstream: PokemonNameLocalizationTests.swift::testColdFailureCanRetryAndInvalidResourceNeverFetches
 #[test]
 fn cold_failure_retries_and_invalid_resources_never_fetch() {
     let server = Arc::new(Server::default());
@@ -129,7 +125,6 @@ fn cold_failure_retries_and_invalid_resources_never_fetch() {
     assert!(serde_json::from_str::<Kind>("\"../move\"").is_err());
     assert_eq!(server.calls.load(Ordering::SeqCst), 2);
 }
-// upstream: PokemonNameLocalizationTests.swift::testResourceKindsDoNotCollideAndCorruptCacheRefetches
 #[test]
 fn kinds_have_distinct_cache_keys_and_corruption_recovers() {
     let dir = Temp::new();
@@ -146,7 +141,6 @@ fn kinds_have_distinct_cache_keys_and_corruption_recovers() {
     }
     assert_eq!(server.calls.load(Ordering::SeqCst), 3);
 }
-// upstream: PokemonFormTests.swift::testFormNamesComeFromFormNamesOfPokemonForm
 #[test]
 fn form_resources_use_bare_form_names_and_exact_endpoints() {
     let captured = Arc::new(Mutex::new(Vec::new()));
@@ -192,7 +186,6 @@ fn form_resources_use_bare_form_names_and_exact_endpoints() {
         assert_eq!(ids, expected);
     }
 }
-// upstream: PokemonNameLocalizationTests.swift::testLoadingNamesNeverShowsEnglishAndReopeningUsesSnapshot
 #[test]
 fn pending_labels_do_not_flash_english_and_reopen_from_shared_snapshot() {
     let items = [Item {
@@ -225,7 +218,6 @@ fn pending_labels_do_not_flash_english_and_reopen_from_shared_snapshot() {
         "몸통박치기 · …"
     );
 }
-// upstream: PokemonNameLocalizationTests.swift::testFailedNameLoadFallsBackAndRetryRestoresTranslation
 #[test]
 fn failed_labels_use_identifiers_without_poisoning_snapshots() {
     let items = [Item {
@@ -242,7 +234,6 @@ fn failed_labels_use_identifiers_without_poisoning_snapshots() {
     );
     assert_eq!(text(&items, &["ko"], &snapshots, &failed), "몸통박치기");
 }
-// upstream: PokemonNameLocalizationTests.swift::testRenderedNamesResolveLanguageAndEnglishFallbackWithoutChangingKeys
 #[test]
 fn every_language_resolves_joined_metadata_without_changing_keys() {
     let ability = Resource::new(Kind::Ability, "overgrow");

@@ -1,6 +1,5 @@
 use super::super::pricing::*;
 use super::*;
-// upstream: ModelPricingTests.swift::testCurrentOpenAIStandardRates
 #[test]
 fn openai_rates() {
     for (id, r) in [
@@ -18,7 +17,6 @@ fn openai_rates() {
         assert_eq!(rate(id), Some(Rate(r)))
     }
 }
-// upstream: ModelPricingTests.swift::testCurrentClaudeStandardRates
 #[test]
 fn claude_rates() {
     for (id, r) in [
@@ -30,7 +28,6 @@ fn claude_rates() {
         assert_eq!(rate(id), Some(Rate(r)))
     }
 }
-// upstream: ModelPricingTests.swift::testModelsReadFromProviderLogsAreAllPriced
 #[test]
 fn known_log_identities_priced() {
     for m in [
@@ -48,14 +45,6 @@ fn known_log_identities_priced() {
         assert!(estimate(m, 2, 175, 26939, 42676).unwrap() > 0., "{m}")
     }
 }
-// upstream: ModelPricingTests.swift::testUnpricedModelIsReportedOnlyOnFirstSighting
-#[test]
-fn unpriced_sighting_normalizes() {
-    assert!(first_unpriced_sighting("test-first-unpriced"));
-    assert!(!first_unpriced_sighting("test-first-unpriced"));
-    assert!(!first_unpriced_sighting(" ANTHROPIC/TEST-FIRST-UNPRICED "))
-}
-// upstream: ModelPricingTests.swift::testAggregatingAnUnpricedModelReportsItButNotASourceUnavailableRow
 #[test]
 fn bucket_records_unknown_only_when_missing_rate() {
     let mut b = Bucket::default();
@@ -64,16 +53,8 @@ fn bucket_records_unknown_only_when_missing_rate() {
         input: 10,
         ..Entry::default()
     });
-    b.add(&Entry {
-        model: "test-bucket-source-unavailable".into(),
-        input: 10,
-        cost_unavailable: Some(true),
-        ..Entry::default()
-    });
-    assert!(!first_unpriced_sighting("test-bucket-unknown"));
-    assert!(first_unpriced_sighting("test-bucket-source-unavailable"))
+    assert!(b.coverage.unknown && !b.coverage.has_known());
 }
-// upstream: ModelPricingTests.swift::testUnknownNamesNeverBorrowFamilyPrices
 #[test]
 fn unknown_names_never_guess() {
     for m in [
@@ -95,7 +76,6 @@ fn unknown_names_never_guess() {
         assert_eq!(estimate(m, 100, 20, 0, 40), None)
     }
 }
-// upstream: ModelPricingTests.swift::testExplicitAliasesAndProviderPrefixes
 #[test]
 fn aliases_and_prefixes() {
     assert_eq!(rate("openai/gpt-5.4-2026-03-05"), rate("gpt-5.4"));
@@ -105,7 +85,6 @@ fn aliases_and_prefixes() {
     );
     assert_eq!(rate("models/gemini-2.5-pro"), rate("gemini-2.5-pro"))
 }
-// upstream: ModelPricingTests.swift::testRequestContextThresholdIncludesCacheRead
 #[test]
 fn request_context_threshold() {
     close(estimate("gpt-5.5", 2000, 1000, 0, 270000).unwrap(), 0.175);
@@ -119,7 +98,6 @@ fn request_context_threshold() {
     }
     close(estimate("gpt-5.3-codex", 300000, 0, 0, 0).unwrap(), 0.525)
 }
-// upstream: ModelPricingTests.swift::testGemini25FlashLiteUsesOfficialTextRates
 #[test]
 fn generic_flash_lite_price_table() {
     assert_eq!(
@@ -141,7 +119,6 @@ fn generic_flash_lite_price_table() {
     assert_eq!(estimate("gemini-2.5-flash-lite", 0, 0, 1, 0), None);
     assert_eq!(rate("gemini-3-flash-lite"), None)
 }
-// upstream: ModelPricingTests.swift::testGeminiTextCacheAndLongContext
 #[test]
 fn generic_gemini_price_table() {
     assert_eq!(rate("gemini-2.5-flash"), Some(Rate([0.3, 2.5, 0., 0.03])));
@@ -154,7 +131,6 @@ fn generic_gemini_price_table() {
         0.2900025,
     )
 }
-// upstream: ModelPricingTests.swift::testUnsupportedCacheWriteRateIsUnavailableInsteadOfFree
 #[test]
 fn unsupported_write_not_free() {
     for m in ["gpt-5.5", "gpt-5.3-codex", "gemini-2.5-pro"] {
@@ -162,7 +138,6 @@ fn unsupported_write_not_free() {
     }
     close(estimate("gpt-6-astra", 0, 0, 100000, 0).unwrap(), 1.25)
 }
-// upstream: ModelPricingTests.swift::testCacheWriteAndInvalidBuckets
 #[test]
 fn valid_and_invalid_buckets() {
     close(

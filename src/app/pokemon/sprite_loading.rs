@@ -188,7 +188,6 @@ impl Shark {
 mod tests {
     use super::*;
     use core::prelude::v1::test;
-    // upstream: SpriteAnimationRecoveryTests.swift::testRepeatedFailuresBackOffWithoutAnAttemptLimit
     #[test]
     fn retry_backoff_is_bounded_without_attempt_cutoff() {
         assert_eq!(
@@ -222,12 +221,6 @@ mod native_tests {
     fn key(letter: &str, shiny: bool) -> SpriteIdentity {
         (201, shiny, Some(crate::pokemon::forms::Form(letter.into())))
     }
-    // upstream: UnownSpriteViewTests.swift::testCachedAToBToAReturnsToAWhileBLoadIsPending
-    // upstream: UnownSpriteViewTests.swift::testCachedNormalToShinyToNormalReturnsToNormalWhileShinyLoadIsPending
-    // upstream: SpriteSubjectTests.swift::testCancelledLoadLeavesSubjectUntouched
-    // upstream: SpriteSubjectTests.swift::testCancelledLoadArrivingLateCannotRestorePreviousSubject
-    // upstream: SpriteSubjectTests.swift::testCancelledFramesArrivingLateCannotResurrectPreviousSpecies
-    // upstream: SpriteSubjectTests.swift::testFramesDroppedWhenCancelled
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn late_variant_load_cannot_replace_returned_cached_appearance(cx: &mut TestAppContext) {
@@ -277,10 +270,6 @@ mod native_tests {
         })
         .unwrap();
     }
-    // upstream: SpriteSubjectTests.swift::testBecomingEggDropsPreviousSpeciesPixels
-    // upstream: SpriteSubjectTests.swift::testBecomingEggWithColdCacheClearsToGlyph
-    // upstream: SpriteSubjectTests.swift::testBecomingEggLeavesAnExistingEggAlone
-    // upstream: SpriteSubjectTests.swift::testEggImageAppliesOnlyWhenNotCancelled
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn egg_drops_old_pixels_and_late_species_cannot_restore_them(cx: &mut TestAppContext) {
@@ -316,10 +305,6 @@ mod native_tests {
         })
         .unwrap();
     }
-    // upstream: SpriteSubjectTests.swift::testAcceptedLoadUpdatesImageAndID
-    // upstream: SpriteSubjectTests.swift::testFailedButNotCancelledLoadStillMarksTheAttempt
-    // upstream: SpriteAnimationRecoveryTests.swift::testInitialFailureKeepsFallbackThenRecoversTheSameSubject
-    // upstream: SpriteAnimationRecoveryTests.swift::testRetrySeesGIFCachedByAnotherSurface
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn failed_animation_keeps_static_fallback_and_retry_publishes_preferred_variant(
@@ -371,9 +356,6 @@ mod native_tests {
         })
         .unwrap();
     }
-    // upstream: SpriteAnimationRecoveryTests.swift::testCancellationInterruptsTheProductionBackoff
-    // upstream: SpriteAnimationRecoveryTests.swift::testAlreadyCancelledLoadDoesNotRequestOrApplyFallback
-    // upstream: SpriteAnimationRecoveryTests.swift::testCancellationWhileApplyingFallbackDoesNotScheduleRetry
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn disabling_cancels_backoff_and_cannot_publish_or_restart_a_load(

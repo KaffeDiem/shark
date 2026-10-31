@@ -24,8 +24,6 @@ fn observe(state: &mut Companion, provider: &str, snapshot: &Snapshot) -> u64 {
         .sum()
 }
 
-// upstream: RareCandyTests.swift::testEligibleWindowsClaudeSessionAndWeekly
-// upstream: RareCandyTests.swift::testEligibleWindowNamesForNotificationBody
 #[test]
 fn headline_windows_have_distinct_keys_and_readable_names() {
     for provider in ["claude", "codex"] {
@@ -42,8 +40,6 @@ fn headline_windows_have_distinct_keys_and_readable_names() {
     }
 }
 
-// upstream: RareCandyTests.swift::testEligibleWindowsExcludeOpusSonnet
-// upstream: RareCandyTests.swift::testEligibleWindowsCodexClassificationExcludesSpend
 #[test]
 fn model_and_spend_caps_do_not_duplicate_headline_rewards() {
     let mut snapshot = snapshot(Some(0.), Some(0.));
@@ -59,7 +55,6 @@ fn model_and_spend_caps_do_not_duplicate_headline_rewards() {
     assert_eq!(eligible_candy_windows("codex", &snapshot).len(), 2);
 }
 
-// upstream: RareCandyTests.swift::testLimitsReadyReflectsLoad
 #[test]
 fn reward_windows_wait_for_fresh_successful_limits() {
     let mut snapshot = snapshot(Some(0.), Some(0.));
@@ -79,11 +74,6 @@ fn reward_windows_wait_for_fresh_successful_limits() {
     assert_eq!(eligible_candy_windows("claude", &snapshot).len(), 2);
 }
 
-// upstream: RareCandyTests.swift::testClaudeSessionLimitGrantsOneCandy
-// upstream: RareCandyTests.swift::testClaudeWeeklyLimitGrantsFive
-// upstream: RareCandyTests.swift::testSessionAndWeeklyTogetherGrantSix
-// upstream: RareCandyTests.swift::testCodexPrimaryLimitGrantsOne
-// upstream: RareCandyTests.swift::testRepeatedRefreshGrantsOnce
 #[test]
 fn headline_limits_award_one_or_five_once_per_window() {
     for (provider, session, weekly, expected) in [
@@ -105,8 +95,6 @@ fn headline_limits_award_one_or_five_once_per_window() {
     }
 }
 
-// upstream: RareCandyTests.swift::testJustUnder100NoGrant
-// upstream: RareCandyTests.swift::testCandyThresholdSeparateFromAlertThreshold
 #[test]
 fn warning_percentages_never_award_candy() {
     let mut state = Companion::default();
@@ -120,8 +108,6 @@ fn warning_percentages_never_award_candy() {
     assert_eq!(state.inventory.candies, 0);
 }
 
-// upstream: RareCandyTests.swift::testFirstRunAt100SeedsNoGrant
-// upstream: RareCandyTests.swift::testStaggeredProviderSeedRetroactiveGrant
 #[test]
 fn newly_seen_provider_never_awards_preinstallation_candy() {
     // Intentional correction of upstream's staggered-provider bug: baseline each window.
@@ -138,7 +124,6 @@ fn newly_seen_provider_never_awards_preinstallation_candy() {
     assert_eq!(state.limit_baselines.len(), 4);
 }
 
-// upstream: RareCandyTests.swift::testEligibleWindowsSkipNilUtilization
 #[test]
 fn unknown_and_nonfinite_percentages_are_not_reward_signals() {
     for remaining in [None, Some(f64::NAN), Some(f64::INFINITY)] {
@@ -156,7 +141,6 @@ fn corrupt_future_provider_percentages_are_not_clamped_into_rewards() {
     }
 }
 
-// upstream: RareCandyTests.swift::testNoSeedWhenLimitsNotReady
 #[test]
 fn unloaded_limits_do_not_establish_reward_baselines() {
     let mut state = Companion::default();

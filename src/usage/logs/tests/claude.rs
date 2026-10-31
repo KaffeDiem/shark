@@ -12,7 +12,6 @@ fn ledger(v: Value) -> Value {
 fn a(id: &str, model: &str, tokens: u64, day: u8) -> Value {
     assistant(id, model, tokens, 0, 0, 0, day)
 }
-// upstream: ClaudeReportedCostTests.swift::testUnpricedModelUsesReportedCost
 #[test]
 fn unpriced_reported_cost() {
     let m = "claude-future-unpriced-model";
@@ -26,7 +25,6 @@ fn unpriced_reported_cost() {
     assert!(b.coverage.reported);
     assert!(!b.coverage.unknown)
 }
-// upstream: ClaudeReportedCostTests.swift::testContextWindowVariantMatchesBaseModel
 #[test]
 fn context_variants_pool() {
     close(
@@ -38,7 +36,6 @@ fn context_variants_pool() {
         5.,
     )
 }
-// upstream: ClaudeReportedCostTests.swift::testReportedCostOverridesTableEstimate
 #[test]
 fn reported_overrides_estimate() {
     let m = "claude-haiku-4-5-20251001";
@@ -55,7 +52,6 @@ fn reported_overrides_estimate() {
         7.25,
     )
 }
-// upstream: ClaudeReportedCostTests.swift::testLastCostStateWins
 #[test]
 fn final_ledger_wins() {
     close(
@@ -69,7 +65,6 @@ fn final_ledger_wins() {
         9.,
     )
 }
-// upstream: ClaudeReportedCostTests.swift::testCostSplitsAcrossDaysAndSumsExactly
 #[test]
 fn attribution_splits_days_exactly() {
     let e = parse_lines(&[
@@ -86,7 +81,6 @@ fn attribution_splits_days_exactly() {
     close(e[1].explicit_cost.unwrap(), 2.5);
     close(bucket(&e).cost, 10.)
 }
-// upstream: ClaudeReportedCostTests.swift::testUnattributableModelCostIsNotReassigned
 #[test]
 fn missing_models_not_reassigned() {
     close(
@@ -100,7 +94,6 @@ fn missing_models_not_reassigned() {
         2.,
     )
 }
-// upstream: ClaudeReportedCostTests.swift::testNoCostStateFallsBackToTable
 #[test]
 fn absent_ledger_estimates_or_unknown() {
     let priced = bucket(&parse_lines(&[a(
@@ -115,7 +108,6 @@ fn absent_ledger_estimates_or_unknown() {
     assert_eq!(unknown.cost, 0.);
     assert!(unknown.coverage.unknown)
 }
-// upstream: ClaudeReportedCostTests.swift::testZeroTokenEntriesDoNotAbsorbCost
 #[test]
 fn zero_tokens_no_share() {
     let e = parse_lines(&[
@@ -127,7 +119,6 @@ fn zero_tokens_no_share() {
     close(e[1].explicit_cost.unwrap(), 6.);
     close(bucket(&e).cost, 6.)
 }
-// upstream: ClaudeReportedCostTests.swift::testIncrementalAppendReattributesTheWholeSessionToLatestLedger
 #[test]
 fn appended_ledger_reattributes_whole_session() {
     let d = Temp::new();
@@ -152,18 +143,16 @@ fn appended_ledger_reattributes_whole_session() {
     close(bucket(&c.entries(Provider::Claude, &d.roots())).cost, 9.);
     assert_eq!(c.parsed_files, 2)
 }
-// upstream: ClaudeReportedCostTests.swift::testPersistedLedgerIsRetainedWhenTheAppendedTailHasNoLedger
 #[test]
-fn persisted_ledger_retained_on_plain_tail() {
+fn ledger_retained_on_plain_tail() {
     let d = Temp::new();
-    let cache = d.0.join("cache.bin");
     let mut vs = vec![
         a("a", "future", 10, 15),
         ledger(json!({"future":{"costUSD":4}})),
     ];
     d.write("session.jsonl", lines(&vs));
-    Cache::at(cache.clone()).entries(Provider::Claude, &d.roots());
-    let mut c = Cache::at(cache);
+    let mut c = Cache::default();
+    c.entries(Provider::Claude, &d.roots());
     vs.push(a("b", "future", 10, 16));
     d.write("session.jsonl", lines(&vs));
     let e = c.entries(Provider::Claude, &d.roots());
@@ -171,7 +160,6 @@ fn persisted_ledger_retained_on_plain_tail() {
     assert!(e.iter().all(|e| e.explicit_cost == Some(2.)));
     close(bucket(&e).cost, 4.)
 }
-// upstream: ClaudeReportedCostTests.swift::testTruncationDiscardsTheCachedLedger
 #[test]
 fn truncation_discards_ledger() {
     let d = Temp::new();
@@ -188,7 +176,6 @@ fn truncation_discards_ledger() {
     assert_eq!(e[0].explicit_cost, None);
     assert!(bucket(&e).coverage.unknown)
 }
-// upstream: ClaudeReportedCostTests.swift::testHalfWrittenCostStateIsRetriedOnAppend
 #[test]
 fn partial_ledger_retried() {
     let d = Temp::new();
@@ -208,7 +195,6 @@ fn partial_ledger_retried() {
     assert_eq!(e.len(), 1);
     close(bucket(&e).cost, 9.)
 }
-// upstream: LocalUsageReaderTests.swift::testClaudeDedupKeepsMaxOutput
 #[test]
 fn streamed_keep_largest_and_earliest() {
     let e = parse_lines(&[
@@ -219,7 +205,6 @@ fn streamed_keep_largest_and_earliest() {
     assert_eq!(e[0].total(), 180);
     assert_eq!(e[0].date, epoch(15))
 }
-// upstream: LocalUsageReaderTests.swift::testClaudeDailyAndCost
 #[test]
 fn claude_daily_cost() {
     let e = parse_lines(&[assistant("a", "claude-sonnet-4", 1000, 100, 200, 300, 15)]);
@@ -249,4 +234,15 @@ fn subagent_provenance_parent_session() {
     assert_eq!(e[0].session_ids.len(), 2);
     assert_eq!(e[0].date, 1.);
     assert_eq!(e[0].total(), 30)
+}
+#[test]
+fn records_without_any_id_are_not_merged() {
+    let anon = |output| {
+        let mut v = assistant("", "claude-sonnet-5", 1, output, 0, 0, 15);
+        v["message"].as_object_mut().unwrap().remove("id");
+        v.as_object_mut().unwrap().remove("requestId");
+        v
+    };
+    let e = parse_lines(&[anon(2), anon(3)]);
+    assert_eq!(e.iter().map(|e| e.output).sum::<u64>(), 5);
 }

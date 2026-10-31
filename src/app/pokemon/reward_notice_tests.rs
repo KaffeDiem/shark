@@ -4,7 +4,6 @@ use crate::usage::Provider;
 use core::prelude::v1::test;
 use gpui::TestAppContext;
 
-// upstream: RareCandyTests.swift::testGrantCarriesWindowName
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn candy_notice_identifies_the_window_once(cx: &mut TestAppContext) {

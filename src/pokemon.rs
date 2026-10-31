@@ -11,9 +11,7 @@ pub mod ditto;
 pub mod evolution;
 pub mod format;
 pub mod forms;
-pub mod interface_labels;
 pub mod limits;
-pub mod localization;
 pub mod names;
 pub mod names_client;
 pub mod profile;
@@ -22,7 +20,6 @@ pub mod sprites;
 pub mod storage;
 pub mod types;
 pub use api::PokeApi;
-pub use shop::ShopEntry;
 #[cfg(test)]
 mod lifecycle_tests;
 #[cfg(test)]
@@ -40,9 +37,6 @@ pub enum Rarity {
     Legendary,
 }
 impl Rarity {
-    pub fn rank(self) -> u8 {
-        self as u8
-    }
     pub fn capture_rate_ceiling(self) -> Option<u16> {
         match self {
             Self::Common => Some(255),
@@ -86,7 +80,6 @@ impl Rarity {
 pub struct Balance;
 impl Balance {
     pub const EGG_HATCH_THRESHOLD: u64 = 5_000_000;
-    pub const REPEAT_GROWTH_MULTIPLIER: u64 = 2;
     pub fn phase_threshold(
         rarity: Rarity,
         forms: usize,
@@ -109,31 +102,6 @@ impl Balance {
     pub fn scaled(base: u64, difficulty: f64) -> u64 {
         (base as f64 * Self::clamp_difficulty(difficulty)).round() as u64
     }
-    pub fn difficulty_position(value: f64) -> f64 {
-        (Self::clamp_difficulty(value) / 0.1).ln() / 20_f64.ln()
-    }
-    pub fn difficulty_at_position(position: f64) -> f64 {
-        let p = if position.is_finite() {
-            position.clamp(0., 1.)
-        } else {
-            Self::difficulty_position(1.)
-        };
-        if (p - Self::difficulty_position(1.)).abs() < 0.01 {
-            1.
-        } else {
-            Self::snap_difficulty(0.1 * 20_f64.powf(p))
-        }
-    }
-    pub fn snap_difficulty(value: f64) -> f64 {
-        if !value.is_finite() {
-            return 1.;
-        }
-        if value <= 0. {
-            return 0.1;
-        }
-        let magnitude = 10_f64.powf(value.log10().floor() - 1.);
-        (value / magnitude).round() * magnitude
-    }
 }
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum Item {
@@ -142,15 +110,19 @@ pub enum Item {
     ShinyCharm,
 }
 impl Item {
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::RareCandy => "Rare Candy",
+            Self::Mint => "Mint",
+            Self::ShinyCharm => "Shiny Charm",
+        }
+    }
     pub fn price(self) -> u64 {
         match self {
             Self::RareCandy => 500_000_000,
             Self::Mint => 100_000_000,
             Self::ShinyCharm => 3_000_000_000,
         }
-    }
-    pub fn is_passive(self) -> bool {
-        self == Self::ShinyCharm
     }
 }
 pub struct FreshEgg;
@@ -221,7 +193,7 @@ impl EvoLine {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Mon {
     pub line: EvoLine,
-    #[serde(default, alias = "unown_form")]
+    #[serde(default)]
     pub form: Option<forms::Form>,
     pub path: Vec<u16>,
     #[serde(default, deserialize_with = "decode_stage")]
@@ -260,7 +232,7 @@ impl Mon {
             .unwrap_or(self.line.base_id)
     }
     pub fn name(&self) -> String {
-        let label = forms::label(self.species_id(), self.form.as_ref(), None, "en");
+        let label = forms::label(self.species_id(), self.form.as_ref(), None);
         forms::display_name(
             &self.line.name(self.species_id()),
             self.species_id(),
@@ -285,16 +257,6 @@ impl Mon {
         let candidate = completed
             .saturating_add((standard as f64 * fraction).floor() as u64)
             .min(self.line.rarity.graduation_total());
-        if self.profile.is_none() {
-            let seed = profile::migration_seed(&format!(
-                "{}:{}:{}",
-                self.line.base_id, self.caught_at, self.nature
-            ));
-            self.profile = Some(profile::Profile::generate(
-                seed,
-                format!("legacy-{seed:016x}"),
-            ));
-        }
         if let Some(profile) = &mut self.profile {
             profile.advance_growth(candidate, self.line.rarity);
         }
@@ -336,15 +298,12 @@ pub struct Companion {
     pub active: Option<Mon>,
     pub egg_tokens: u64,
     pub pending_line: Option<EvoLine>,
-    #[serde(alias = "pending_unown_form")]
     pub pending_form: Option<forms::Form>,
     #[serde(default, deserialize_with = "decode_collection")]
     pub collection: Vec<Mon>,
     pub lifetime_tokens: u64,
     pub spent_tokens: u64,
     pub inventory: Inventory,
-    #[serde(skip)]
-    pub feedback: shop::Feedback,
     #[serde(skip)]
     pub profile_details: BTreeMap<u16, profile::Details>,
     pub growth_difficulty: f64,
@@ -354,7 +313,6 @@ pub struct Companion {
     #[serde(default, deserialize_with = "shop::decode_egg_tier")]
     pub egg_tier: Option<Rarity>,
     pub representative: Option<u16>,
-    #[serde(alias = "representative_unown_form")]
     pub representative_form: Option<forms::Form>,
     pub representative_shiny: Option<bool>,
     /// Persist the random sequence so reopening the app cannot reroll an existing individual.
@@ -371,7 +329,6 @@ impl Default for Companion {
             lifetime_tokens: 0,
             spent_tokens: 0,
             inventory: Inventory::default(),
-            feedback: shop::Feedback::default(),
             profile_details: BTreeMap::new(),
             growth_difficulty: 1.,
             shop_difficulty: 1.,
@@ -432,7 +389,6 @@ impl Companion {
         self.egg_tokens = self.egg_tokens.min(MAX);
         self.inventory.candies = self.inventory.candies.min(MAX / CANDY_XP);
         self.inventory.mints = self.inventory.mints.min(MAX);
-        let previous_difficulty = self.growth_difficulty;
         self.growth_difficulty = Balance::clamp_difficulty(self.growth_difficulty);
         self.shop_difficulty = Balance::clamp_difficulty(self.shop_difficulty);
         if self.active.is_some()
@@ -506,13 +462,7 @@ impl Companion {
                 .unwrap_or("Hardy")
                 .into();
             if let Some(profile) = &mut mon.profile {
-                let missing_identity = profile.instance_id.is_empty();
                 profile.sanitize();
-                // Batch recovery assigns a unique deterministic ID without changing
-                // this otherwise recoverable profile's IVs or species metadata.
-                if missing_identity {
-                    profile.instance_id.clear();
-                }
             }
             true
         }
@@ -520,105 +470,12 @@ impl Companion {
             self.active = None;
         }
         self.collection.retain_mut(mon);
-        if previous_difficulty.is_finite()
-            && previous_difficulty > 0.
-            && previous_difficulty != self.growth_difficulty
-        {
-            // Old saves may predate today's difficulty range. Reprice their raw
-            // phase credits once, preserving the fraction before the old value is lost.
-            let base = self
-                .active
-                .as_ref()
-                .map_or(Balance::EGG_HATCH_THRESHOLD, |mon| {
-                    Balance::phase_threshold(
-                        mon.line.rarity,
-                        mon.path.len(),
-                        mon.stage,
-                        if mon.growth_boost { 2 } else { 1 },
-                    )
-                });
-            let old_threshold = (base as f64 * previous_difficulty).round().max(1.) as u64;
-            let new_threshold = self.progress().1;
-            let reprice = |tokens: u64| {
-                let scaled =
-                    (tokens as f64 / old_threshold as f64 * new_threshold as f64).round() as u64;
-                if tokens < old_threshold {
-                    scaled.min(new_threshold.saturating_sub(1)).min(MAX)
-                } else {
-                    scaled.min(MAX)
-                }
-            };
-            if let Some(mon) = &mut self.active {
-                mon.tokens = reprice(mon.tokens);
-            } else {
-                self.egg_tokens = reprice(self.egg_tokens);
-            }
-        }
-        // Reserve every persisted identity before generating any recovered individual.
-        // Two old catches can share species, nature, and second-resolution timestamps.
-        let mut profile_ids = self
-            .active
-            .iter()
-            .chain(self.collection.iter())
-            .filter_map(|mon| mon.profile.as_ref())
-            .filter(|profile| !profile.instance_id.is_empty())
-            .map(|profile| profile.instance_id.clone())
-            .collect::<std::collections::BTreeSet<_>>();
-        fn recover_identity(
-            mon: &mut Mon,
-            used: &mut std::collections::BTreeSet<String>,
-            generated: bool,
-        ) {
-            let Some(profile) = &mut mon.profile else {
-                return;
-            };
-            if !generated && !profile.instance_id.is_empty() {
-                return;
-            }
-            let base = if generated {
-                profile.instance_id.clone()
-            } else {
-                format!("recovered-{:016x}", profile.seed)
-            };
-            let mut ordinal = 0u64;
-            let id = loop {
-                let candidate = if ordinal == 0 {
-                    base.clone()
-                } else {
-                    format!("{base}-{ordinal}")
-                };
-                if used.insert(candidate.clone()) {
-                    break candidate;
-                }
-                ordinal += 1;
-            };
-            if generated && ordinal > 0 {
-                let seed = profile::migration_seed(&format!("{:016x}:{ordinal}", profile.seed));
-                let mut recovered = profile::Profile::generate(seed, id);
-                recovered.advance_growth(profile.growth_tokens, mon.line.rarity);
-                *profile = recovered;
-            } else {
-                profile.instance_id = id;
-            }
-        }
         if let Some(active) = &mut self.active {
-            let generated = active.profile.is_none();
             active.reconcile_profile(self.growth_difficulty);
-            recover_identity(active, &mut profile_ids, generated);
         }
-        for mon in &mut self.collection {
-            // Released individuals store only their reached ancestry. Reconstruct legacy
-            // metadata once; repricing an existing profile against that shorter path would
-            // invent completed growth on every reload.
-            let generated = mon.profile.is_none();
-            if generated {
-                mon.reconcile_profile(self.growth_difficulty);
-            }
-            recover_identity(mon, &mut profile_ids, generated);
-            if mon.graduated {
-                if let Some(profile) = &mut mon.profile {
-                    profile.advance_growth(mon.line.rarity.graduation_total(), mon.line.rarity);
-                }
+        for mon in self.collection.iter_mut().filter(|mon| mon.graduated) {
+            if let Some(profile) = &mut mon.profile {
+                profile.advance_growth(mon.line.rarity.graduation_total(), mon.line.rarity);
             }
         }
         if self.active.is_some()
@@ -735,11 +592,6 @@ impl Companion {
         self.representative_shiny = Some(shiny);
         self.representative_form = resolved;
         true
-    }
-    pub fn sprite_url(&self) -> Option<String> {
-        self.representative_subject().map(|(id, shiny)| {
-            forms::sprite_url(id, true, shiny, self.representative_sprite_form().as_ref())
-        })
     }
     pub fn pin(&mut self, id: Option<u16>) -> bool {
         if id.is_some_and(|id| {
@@ -1077,8 +929,6 @@ impl Companion {
         }
         let consumed = quantity.min(needed).min(self.inventory.candies);
         self.inventory.candies -= consumed;
-        self.feedback.candy_seq = self.feedback.candy_seq.wrapping_add(1);
-        self.feedback.candy_amount = consumed.saturating_mul(CANDY_XP);
         Ok(self.add_growth(consumed.saturating_mul(CANDY_XP)))
     }
     pub fn use_mint(&mut self) -> Result<(), String> {
@@ -1096,8 +946,6 @@ impl Companion {
         mon.nature =
             (*choices[(next_random(&mut self.random_seed) % choices.len() as u64) as usize]).into();
         self.inventory.mints -= 1;
-        self.feedback.mint_seq = self.feedback.mint_seq.wrapping_add(1);
-        self.feedback.mint_nature = Some(mon.nature.clone());
         Ok(())
     }
     pub fn fresh_egg(&mut self, tier: Option<Rarity>) -> Result<(), String> {
@@ -1244,20 +1092,7 @@ fn decode_collection<'de, D: serde::Deserializer<'de>>(
         .as_array()
         .into_iter()
         .flatten()
-        .filter_map(|v| {
-            let mut value = v.clone();
-            if let Some(map) = value.as_object_mut() {
-                if !map.contains_key("graduated")
-                    && !map
-                        .get("released")
-                        .and_then(serde_json::Value::as_bool)
-                        .unwrap_or(false)
-                {
-                    map.insert("graduated".into(), true.into());
-                }
-            }
-            serde_json::from_value::<Mon>(value).ok()
-        })
+        .filter_map(|v| serde_json::from_value::<Mon>(v.clone()).ok())
         .filter(|m| !m.path.is_empty())
         .collect())
 }

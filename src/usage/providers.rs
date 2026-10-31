@@ -4,10 +4,7 @@
 //! stable persistence keys, independent of labels and list order. A provider owns its
 //! incremental cache; callers run its blocking methods on a background executor.
 //! The built-ins deliberately retain Shark's proven CLI account-query protocols.
-use super::{
-    Allowance, Failure, Provider, Snapshot, Status,
-    activity::{self, Cache, Daily},
-};
+use super::{Allowance, Failure, Provider, Snapshot, Status, activity::Daily};
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -173,6 +170,7 @@ impl Registry {
             .map(Box::as_ref)
     }
 
+    #[cfg(test)]
     pub fn iter(&self) -> impl Iterator<Item = &dyn UsageProvider> {
         self.sources.iter().map(Box::as_ref)
     }
@@ -188,10 +186,17 @@ impl Registry {
     }
 }
 
+/// Resolving roots can walk thousands of directories, so it is redone only when the
+/// configuration changes or every few minutes (new Claude Desktop sessions appear).
+struct Scanner {
+    custom: String,
+    roots: Option<(f64, super::logs::Roots)>,
+    cache: super::logs::Cache,
+}
+
 struct LocalProvider {
     provider: Provider,
-    cache: Mutex<Cache>,
-    companion_cache: Mutex<(String, super::logs::Cache)>,
+    scanner: Mutex<Scanner>,
     companion_roots: Mutex<String>,
 }
 
@@ -212,8 +217,7 @@ impl UsageProvider for LocalProvider {
     }
 
     fn activity(&self, now: f64) -> Daily {
-        let mut cache = self.cache.lock().unwrap_or_else(|e| e.into_inner());
-        activity::scan(self.provider, &mut cache, now)
+        self.observations(now).activity
     }
     fn supports_custom_roots(&self) -> bool {
         true
@@ -230,28 +234,41 @@ impl UsageProvider for LocalProvider {
         *roots = raw.to_owned();
         true
     }
+    /// One pass over the logs feeds both the companion report and the heatmap.
     fn observations(&self, now: f64) -> Observation {
-        let activity = self.activity(now);
         let raw = self
             .companion_roots
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        let mut cached = self
-            .companion_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if cached.0 != raw {
-            *cached = (raw.clone(), Default::default());
+        let mut scanner = self.scanner.lock().unwrap_or_else(|e| e.into_inner());
+        let scanner = &mut *scanner;
+        if scanner.custom != raw {
+            *scanner = Scanner {
+                custom: raw,
+                roots: None,
+                cache: Default::default(),
+            };
         }
-        let roots = super::logs::Roots::for_provider_with_custom(self.provider, Some(&raw));
-        let companion = super::logs::scan(self.provider, &roots, &mut cached.1, now);
+        let roots = match &scanner.roots {
+            Some((at, roots)) if (0. ..ROOTS_TTL).contains(&(now - at)) => roots,
+            _ => {
+                let roots = super::logs::Roots::for_provider_with_custom(
+                    self.provider,
+                    Some(&scanner.custom),
+                );
+                &scanner.roots.insert((now, roots)).1
+            }
+        };
+        let companion = super::logs::scan(self.provider, roots, &mut scanner.cache, now);
         Observation {
-            activity,
+            activity: companion.heatmap(),
             companion,
         }
     }
 }
+
+const ROOTS_TTL: f64 = 300.;
 
 pub fn builtins() -> &'static Registry {
     static SOURCES: OnceLock<Registry> = OnceLock::new();
@@ -261,8 +278,11 @@ pub fn builtins() -> &'static Registry {
             sources
                 .register(LocalProvider {
                     provider,
-                    cache: Mutex::default(),
-                    companion_cache: Mutex::default(),
+                    scanner: Mutex::new(Scanner {
+                        custom: String::new(),
+                        roots: None,
+                        cache: Default::default(),
+                    }),
                     companion_roots: Mutex::default(),
                 })
                 .expect("unique built-in provider ID");

@@ -17,9 +17,6 @@ impl Roots {
     pub fn new(paths: Vec<PathBuf>) -> Self {
         Self(normalized(paths))
     }
-    pub fn for_provider(provider: Provider) -> Self {
-        Self::for_provider_with_custom(provider, None)
-    }
     pub fn for_provider_with_custom(provider: Provider, custom: Option<&str>) -> Self {
         let home = crate::state::home();
         let environment = environment();
@@ -87,7 +84,9 @@ pub fn parse_paths(raw: &str, home: &Path) -> Vec<PathBuf> {
             } else {
                 PathBuf::from(part)
             };
-            (!part.is_empty() && path.is_absolute()).then_some(path)
+            // A bare `/` or home directory would scan the whole disk or account.
+            (!part.is_empty() && path.is_absolute() && path != Path::new("/") && path != home)
+                .then_some(path)
         })
         .collect()
 }
@@ -143,27 +142,6 @@ pub fn with_custom(defaults: Vec<PathBuf>, custom: Option<&str>, home: &Path) ->
         .filter(|p| !defaults.iter().any(|d| d != p && d.starts_with(p)))
         .collect::<Vec<_>>();
     Roots::new(defaults.into_iter().chain(extra).collect())
-}
-pub fn extra_count(defaults: Vec<PathBuf>, custom: &str, home: &Path) -> usize {
-    let defaults = normalized(defaults);
-    with_custom(defaults.clone(), Some(custom), home)
-        .0
-        .iter()
-        .filter(|p| !defaults.contains(p))
-        .count()
-}
-pub fn stored<'a>(values: &'a BTreeMap<String, String>, provider: &str) -> Option<&'a str> {
-    values
-        .get(provider)
-        .map(String::as_str)
-        .filter(|s| !s.trim().is_empty())
-}
-pub fn set_stored(values: &mut BTreeMap<String, String>, provider: &str, raw: &str) {
-    if raw.trim().is_empty() {
-        values.remove(provider);
-    } else {
-        values.insert(provider.into(), raw.into());
-    }
 }
 pub fn claude_roots(home: &Path, config: Option<&str>) -> Roots {
     let mut paths = vec![

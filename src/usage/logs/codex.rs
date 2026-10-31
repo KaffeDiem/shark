@@ -1,12 +1,11 @@
 use super::{Entry, token};
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::{self, Read},
     path::Path,
 };
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Vector(pub [u64; 6]);
 impl Vector {
     fn read(v: &Value) -> Self {
@@ -35,7 +34,7 @@ impl Vector {
         self.0.map(|v| v.to_string()).join(",")
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct State {
     pub cumulative: Vector,
     pub last: Vector,
@@ -49,13 +48,13 @@ impl State {
         )
     }
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 pub struct Event {
     pub entry: Entry,
     pub state: Option<State>,
     pub session: Option<String>,
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default)]
 pub struct Rollout {
     pub path: String,
     pub session: Option<String>,
@@ -77,6 +76,7 @@ fn meta(v: &Value) -> Option<(Option<String>, Option<String>, bool)> {
         p["thread_source"] == "subagent" || !p["source"]["subagent"].is_null(),
     ))
 }
+#[cfg(test)]
 pub fn parse(bytes: &[u8], path: &Path) -> Rollout {
     parse_reader(std::io::Cursor::new(bytes), path)
         .expect("reading an in-memory rollout cannot fail")
@@ -96,6 +96,9 @@ pub fn parse_reader(mut reader: impl std::io::BufRead, path: &Path) -> std::io::
     let mut turn = 0;
     let mut line = Vec::new();
     while next_line(&mut reader, &mut line)? {
+        if !super::mentions(&line, &[b"token_count", b"session_meta", b"turn_context"]) {
+            continue;
+        }
         let Ok(v) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
@@ -138,7 +141,7 @@ pub fn parse_reader(mut reader: impl std::io::BufRead, path: &Path) -> std::io::
             last: last.clone(),
         });
         turn += 1;
-        if current.is_some() && state.is_some() && previous == state {
+        if state.is_some() && previous == state {
             continue;
         }
         previous = state.clone();
@@ -284,6 +287,7 @@ fn resolve_one(
     memo.insert(i, out.clone());
     out
 }
+#[cfg(test)]
 pub fn resolve(rollouts: Vec<Rollout>) -> Vec<Entry> {
     let included = rollouts.iter().map(|r| r.path.clone()).collect();
     resolve_included(rollouts, &included)

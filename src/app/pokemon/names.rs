@@ -85,7 +85,7 @@ impl Shark {
     pub(super) fn resource_text(&self, items: &[NameItem]) -> String {
         crate::pokemon::names_client::text(
             items,
-            crate::pokemon::format::Language::En.api_codes(),
+            &["en"],
             &self.pokemon_ui.resource_names,
             &self.pokemon_ui.resource_failed,
         )
@@ -93,7 +93,7 @@ impl Shark {
     pub(super) fn resource_label(&self, kind: NameKind, name: &str) -> String {
         crate::pokemon::names_client::label(
             &NameResource::new(kind, name),
-            crate::pokemon::format::Language::En.api_codes(),
+            &["en"],
             &self.pokemon_ui.resource_names,
             &self.pokemon_ui.resource_failed,
         )
@@ -108,7 +108,7 @@ impl Shark {
         let names = resource
             .as_ref()
             .and_then(|resource| self.pokemon_ui.resource_names.get(resource));
-        crate::pokemon::forms::label(species, form, names, "en")
+        crate::pokemon::forms::label(species, form, names)
     }
     pub(super) fn sync_profile_names(&mut self, retry: bool, cx: &mut Context<Self>) {
         let mut wanted = BTreeSet::new();

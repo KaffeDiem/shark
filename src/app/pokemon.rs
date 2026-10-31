@@ -51,7 +51,8 @@ pub(super) struct CompanionUi {
     footer_key: Option<footer_animation::Key>,
     footer_render: Option<std::sync::Arc<RenderImage>>,
     footer_asset: Option<std::sync::Arc<crate::pokemon::sprites::Asset>>,
-    footer_frame: usize,
+    footer_view: Option<Entity<footer_animation::FooterSprite>>,
+    chat_pokemon_active: bool,
     hatch_retry_delayed: bool,
     name_pending: BTreeSet<u16>,
     name_failed: BTreeSet<u16>,
@@ -112,13 +113,6 @@ fn mon_sprite_identity(mon: &Mon, species: u16) -> SpriteIdentity {
         mon.displays_shiny(),
         crate::pokemon::forms::resolved(species, mon.form.as_ref()),
     )
-}
-fn sprite_needs_reload(
-    current: &Option<SpriteIdentity>,
-    loaded: bool,
-    desired: &Option<SpriteIdentity>,
-) -> bool {
-    current != desired || (!loaded && desired.is_some())
 }
 
 fn api() -> PokeApi {
@@ -186,9 +180,12 @@ impl Shark {
         self.state.pokemon = companion;
         let generation = self.pokemon_ui.generation.wrapping_add(1);
         let scanning = std::mem::take(&mut self.pokemon_ui.scanning);
+        let (window_active, low_power) = (self.pokemon_ui.window_active, self.pokemon_ui.low_power);
         self.pokemon_ui = CompanionUi {
             generation,
             scanning,
+            window_active,
+            low_power,
             ..Default::default()
         };
         self.save_pokemon();
@@ -266,7 +263,7 @@ impl Shark {
         self.pokemon_ui.footer_key = None;
         self.pokemon_ui.footer_render = None;
         self.pokemon_ui.footer_asset = None;
-        self.pokemon_ui.footer_frame = 0;
+        self.pokemon_ui.footer_view = None;
         self.cancel_pokemon_sprite();
         self.pokemon_ui.sprite_retry_task.take();
         self.pokemon_ui.sprite_retry_count = 0;
@@ -295,15 +292,21 @@ impl Shark {
             .as_ref()
             .and_then(|m| m.profile.as_ref())
             .map(|p| p.instance_id.clone());
-        let summary = crate::pokemon::format::Language::En
-            .egg_confirm(&self.state.pokemon.title(), "a fresh egg");
-        let warning = crate::pokemon::format::Language::En.valuable_warning(
-            self.state
-                .pokemon
-                .active
-                .as_ref()
-                .is_some_and(Mon::displays_shiny),
+        let summary = format!(
+            "Release {} and start a a fresh egg?",
+            self.state.pokemon.title()
         );
+        let warning = if self
+            .state
+            .pokemon
+            .active
+            .as_ref()
+            .is_some_and(Mon::displays_shiny)
+        {
+            "⚠️ This one is shiny! Really send it off?"
+        } else {
+            "⚠️ This is a Legendary Pokémon! Really send it off?"
+        };
         window.open_dialog(cx, move |d, _, _| {
             let this = this.clone();
             let individual = individual.clone();
@@ -324,10 +327,7 @@ impl Shark {
                         .child(
                             Button::new("pokemon-egg-confirm")
                                 .danger()
-                                .label(format!(
-                                    "{} and start egg",
-                                    crate::pokemon::format::Language::En.send_off()
-                                ))
+                                .label("Send off and start egg")
                                 .on_click(move |_, w, cx| {
                                     _ = this.update(cx, |s, cx| {
                                         let current = s
@@ -369,6 +369,7 @@ impl Shark {
         let windows = provider
             .source()
             .candy_windows(&self.usage[provider.index()]);
+        let before = format!("{:?}", self.state.pokemon.limit_baselines);
         let mut notices = vec![];
         for window in windows {
             let count = self.state.pokemon.observe_limit(
@@ -388,7 +389,9 @@ impl Shark {
         if !notices.is_empty() {
             self.pokemon_ui.notice = Some(notices.join(" · "));
         }
-        self.save_pokemon();
+        if format!("{:?}", self.state.pokemon.limit_baselines) != before {
+            self.save_pokemon();
+        }
     }
 
     #[cfg(test)]
@@ -414,25 +417,35 @@ impl Shark {
             return;
         };
         let day = daily.first_day + daily.tokens.len() as i64 - 1;
+        let fingerprint = |p: &Companion| {
+            (
+                p.baselines
+                    .get(provider.source().id())
+                    .map(|b| (b.day.clone(), b.total)),
+                p.lifetime_tokens,
+            )
+        };
+        let before = fingerprint(&self.state.pokemon);
         let events = self.state.pokemon.observe_usage(
             provider.source().id(),
             &format!("{day:010}"),
             total,
             !self.state.pokemon_disabled,
         );
+        let changed = !events.is_empty() || fingerprint(&self.state.pokemon) != before;
         self.pokemon_events(events);
-        self.save_pokemon();
+        if changed {
+            self.save_pokemon();
+        }
         self.load_pokemon(cx);
     }
 
     fn pokemon_events(&mut self, events: Vec<Event>) {
         if !events.is_empty() {
-            let lang = crate::pokemon::format::Language::En;
             let notice = events
                 .iter()
                 .map(|event| match event {
-                    Event::Hatched(n) => lang.hatch(n),
-                    Event::Evolved(n) => lang.evolved(n),
+                    Event::Hatched(n) => format!("{n} hatched from the egg!"),
                     _ => event.to_string(),
                 })
                 .collect::<Vec<_>>()
@@ -493,6 +506,8 @@ impl Shark {
                             s.pokemon_ui.low_power = power;
                             cx.notify();
                         }
+                        // Low power and Reduce Motion have no change event; this poll restarts or stops the footer timer.
+                        s.refresh_pokemon_animation(cx);
                         true
                     })
                     .unwrap_or(false);
@@ -527,6 +542,19 @@ impl Shark {
             burn,
             warning,
         )
+    }
+
+    /// Idle chats have nothing to publish; only chats with background tasks, or ones that just
+    /// finished them, need the roster sync.
+    pub(super) fn sync_chat_pokemon(&mut self, cx: &mut Context<Self>) {
+        let active = self
+            .chats
+            .values()
+            .any(|chat| !chat.read(cx).background.is_empty());
+        if active || self.pokemon_ui.chat_pokemon_active {
+            self.pokemon_ui.chat_pokemon_active = active;
+            self.refresh_chat_pokemon(cx);
+        }
     }
 
     fn save_pokemon(&mut self) {
@@ -605,7 +633,6 @@ impl Shark {
             })
             .detach();
         }
-        self.load_active_pokemon_profile(cx);
     }
 
     fn complete_pokemon_hatch(
@@ -680,13 +707,7 @@ impl Shark {
     pub(super) fn show_pokemon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_companion_panel(window, cx);
         if self.pokemon_ui.search.is_none() {
-            let input = cx.new(|cx| {
-                InputState::new(window, cx).placeholder(
-                    crate::pokemon::format::Language::En.interface_text(
-                        crate::pokemon::interface_labels::Label::DexSearchPlaceholder,
-                    ),
-                )
-            });
+            let input = cx.new(|cx| InputState::new(window, cx).placeholder("Search name or #…"));
             self.pokemon_ui.search_sub = Some(cx.subscribe(&input, |s, _, event, cx| {
                 if matches!(event, InputEvent::Change) {
                     s.pokemon_ui.dex_page = 0;
@@ -706,22 +727,14 @@ impl Shark {
         cx.notify();
     }
 
-    pub(crate) fn show_pokemon_dex(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.show_pokemon(window, cx);
-        self.pokemon_ui.tab = Page::Dex;
-        self.pokemon_ui.catch_log = false;
-        self.load_dex_assets(cx);
-        cx.notify();
-    }
-
     fn pokemon_art(&self, size: f32) -> AnyElement {
-        if let (Some(path), Some(image), Some(key)) = (
+        if let (Some(path), Some(view), Some(key)) = (
             &self.pokemon_ui.sprite,
-            &self.pokemon_ui.footer_render,
+            &self.pokemon_ui.footer_view,
             &self.pokemon_ui.footer_key,
         ) {
             if &key.path == path {
-                return images::paint_frame(image.clone(), self.pokemon_ui.footer_frame, size);
+                return view.clone().into_any_element();
             }
         }
         if let Some(image) = self.pokemon_ui.sprite.as_ref().and_then(|path| {
@@ -787,7 +800,7 @@ impl Shark {
                     .w_full()
                     .items_center()
                     .when(self.rail, |d| d.flex_col())
-                    .child(self.pokemon_art(24.))
+                    .child(self.pokemon_art(footer_animation::ART))
                     .child(
                         h_flex()
                             .id("pokemon-footer-quotas")
@@ -799,24 +812,17 @@ impl Shark {
                             .whitespace_nowrap()
                             .children(quotas.into_iter().enumerate().map(
                                 |(index, (id, name, value))| {
-                                    let color = value.remaining.map_or(
-                                        cx.theme().sidebar_foreground,
-                                        |n| {
-                                            // Keep the sidebar's quiet text tone, with a hint of pace hue.
-                                            cx.theme().sidebar_foreground.blend(
-                                                super::usage::pace_color(
-                                                    n,
-                                                    value.elapsed,
-                                                    false,
-                                                    cx.theme(),
-                                                )
-                                                .opacity(0.25),
-                                            )
-                                        },
-                                    );
+                                    let dot = value.remaining.map(|n| {
+                                        super::usage::pace_color(
+                                            n,
+                                            value.elapsed,
+                                            false,
+                                            cx.theme(),
+                                        )
+                                    });
                                     h_flex()
                                         .flex_none()
-                                        .gap(px(3.))
+                                        .gap(px(if self.rail { 2. } else { 3. }))
                                         .when(index > 0, |d| {
                                             d.child(
                                                 div()
@@ -824,10 +830,21 @@ impl Shark {
                                                     .child("·"),
                                             )
                                         })
+                                        .when_some(dot, |d, color| {
+                                            // Pace hue stays out of the text so light themes keep sidebar contrast.
+                                            d.items_center().child(
+                                                div()
+                                                    .id(format!("pokemon-footer-pace-{id}"))
+                                                    .size(px(if self.rail { 5. } else { 6. }))
+                                                    .flex_none()
+                                                    .rounded_full()
+                                                    .bg(color),
+                                            )
+                                        })
                                         .child(
                                             div()
                                                 .id(format!("pokemon-footer-quota-{id}"))
-                                                .text_color(color)
+                                                .text_color(cx.theme().sidebar_foreground)
                                                 .child(if self.rail {
                                                     value.text
                                                 } else {
@@ -867,12 +884,16 @@ impl Shark {
                 .then_some(self.pokemon_ui.sprite.as_ref())
                 .flatten()
         });
-        if let Some(path) = path {
-            images::sized(path, size)
-                .id("pokemon-active-sprite")
-                .object_fit(ObjectFit::Contain)
-                .into_any_element()
+        let art = if let Some(path) = path {
+            images::sized(path, size).map(|img| {
+                img.id("pokemon-active-sprite")
+                    .object_fit(ObjectFit::Contain)
+                    .into_any_element()
+            })
         } else {
+            None
+        };
+        art.unwrap_or_else(|| {
             div()
                 .size(px(size))
                 .flex()
@@ -881,7 +902,7 @@ impl Shark {
                 .text_size(px(size * 0.6))
                 .child("✦")
                 .into_any_element()
-        }
+        })
     }
 
     pub(super) fn render_pokemon_panel(&self, cx: &Context<Self>) -> AnyElement {
@@ -988,7 +1009,7 @@ impl Shark {
             .children(p.active.as_ref().map(|mon| {
                 div().text_xs().child(format!(
                     "{} nature{}",
-                    crate::pokemon::format::Language::En.nature_name(&mon.nature),
+                    mon.nature,
                     if mon.displays_shiny() {
                         " · ✨ Shiny"
                     } else {
@@ -1001,7 +1022,10 @@ impl Shark {
                     .text_xs()
                     .text_color(cx.theme().muted_foreground)
                     .child(if p.active.is_none() {
-                        crate::pokemon::format::Language::En.egg_hint(&compact(target))
+                        format!(
+                            "Grows from your local AI coding usage. Your egg hatches after ~{} tokens.",
+                            compact(target)
+                        )
                     } else {
                         "Keep coding to evolve and graduate".into()
                     }),
@@ -1055,7 +1079,7 @@ impl Shark {
                     .text_xs()
                     .aria_label(self.pokemon_mood().label())
                     .child(if self.pokemon_ui.hatch_retry_delayed {
-                        crate::pokemon::format::Language::En.egg_delayed()
+                        "⏳ Hatching is delayed — retrying on the next refresh"
                     } else {
                         self.pokemon_mood().label()
                     })
@@ -1137,7 +1161,11 @@ impl Shark {
 
     fn load_pokemon_thumbnail(&mut self, key: SpriteIdentity, cx: &mut Context<Self>) {
         if self.state.pokemon_disabled
-            || self.pokemon_ui.thumbnails.contains_key(&key)
+            || self
+                .pokemon_ui
+                .thumbnails
+                .get(&key)
+                .is_some_and(|path| images::is_warm(path))
             || self.pokemon_ui.thumbnail_failed.contains(&key)
             || self.pokemon_ui.thumbnail_pending.len() >= 16
             || !self.pokemon_ui.thumbnail_pending.insert(key.clone())
@@ -1252,8 +1280,22 @@ impl Shark {
             return;
         }
         if let Some(details) = self.pokemon_ui.details.get(&species) {
+            let profiles = |p: &Companion| {
+                format!(
+                    "{:?}",
+                    p.active
+                        .iter()
+                        .chain(&p.collection)
+                        .filter(|m| m.species_id() == species)
+                        .map(|m| &m.profile)
+                        .collect::<Vec<_>>()
+                )
+            };
+            let before = profiles(&self.state.pokemon);
             self.state.pokemon.enrich_profiles(details);
-            self.save_pokemon();
+            if profiles(&self.state.pokemon) != before {
+                self.save_pokemon();
+            }
             self.sync_profile_names(false, cx);
             return;
         }
@@ -1468,16 +1510,14 @@ impl Shark {
                                     .pokemon_ui
                                     .thumbnails
                                     .get(&mon_sprite_identity(&mon, species))
+                                    .and_then(|path| images::sized(path, 48.))
                                 {
-                                    Some(path) => div()
+                                    Some(img) => div()
                                         .size(px(48.))
                                         .flex()
                                         .items_center()
                                         .justify_center()
-                                        .child(
-                                            images::sized(path, 48.)
-                                                .id(format!("pokemon-dex-sprite-{species}")),
-                                        )
+                                        .child(img.id(format!("pokemon-dex-sprite-{species}")))
                                         .into_any_element(),
                                     None => div()
                                         .size(px(48.))
@@ -1521,14 +1561,7 @@ impl Shark {
                                                 self.state.pokemon.active.as_ref().is_some_and(
                                                     |active| active.species_id() == species,
                                                 ),
-                                                |d| {
-                                                    d.child(
-                                                        div().text_xs().child(
-                                                            crate::pokemon::format::Language::En
-                                                                .dex_raising(),
-                                                        ),
-                                                    )
-                                                },
+                                                |d| d.child(div().text_xs().child("Raising")),
                                             )
                                             .when(mon.displays_shiny(), |d| {
                                                 d.child(div().text_xs().child("✨"))
@@ -1578,9 +1611,7 @@ impl Shark {
                 Button::new("pokemon-follow")
                     .ghost()
                     .small()
-                    .label(crate::pokemon::format::Language::En.interface_text(
-                        crate::pokemon::interface_labels::Label::RepresentativeFollowCurrent,
-                    ))
+                    .label("Follow current companion")
                     .on_click(cx.listener(|s, _, _, cx| {
                         s.state.pokemon.pin(None);
                         s.save_pokemon();
@@ -1678,7 +1709,7 @@ impl Shark {
             .child(format!(
                 "{} · {} nature",
                 mon.line.rarity.label(),
-                crate::pokemon::format::Language::En.nature_name(&mon.nature)
+                mon.nature
             ))
             .children(
                 self.selected_form_label(species, mon.form.as_ref())
@@ -1778,16 +1809,8 @@ impl Shark {
                     .w(px(28.))
                     .h(px(28.))
                     .icon(IconName::Check)
-                    .accessibility_label(
-                        crate::pokemon::format::Language::En.interface_text(
-                            crate::pokemon::interface_labels::Label::RepresentativeSet,
-                        ),
-                    )
-                    .tooltip(
-                        crate::pokemon::format::Language::En.interface_text(
-                            crate::pokemon::interface_labels::Label::RepresentativeSet,
-                        ),
-                    )
+                    .accessibility_label("Set as representative")
+                    .tooltip("Set as representative")
                     .on_click(cx.listener(move |s, _, _, cx| {
                         s.state.pokemon.pin_appearance(
                             species,
@@ -1987,7 +2010,7 @@ impl Shark {
                 [Item::RareCandy, Item::Mint, Item::ShinyCharm]
                     .into_iter()
                     .map(|item| {
-                        let label = crate::pokemon::format::Language::En.item_name(item);
+                        let label = item.name();
                         let quantity = if item == Item::ShinyCharm {
                             1
                         } else {
@@ -2040,73 +2063,19 @@ impl Shark {
             .test_support()
             .into_any_element()
     }
-}
 
-#[cfg(test)]
-mod sprite_tests {
-    use super::*;
-    use core::prelude::v1::test;
-
-    // upstream: ShinyCharmTests.swift::testShinyFlipReloadsSpriteForSameSpecies
-    #[test]
-    fn same_species_shiny_flip_reloads_sprite() {
-        assert!(sprite_needs_reload(
-            &Some((25, true, None)),
-            true,
-            &Some((25, false, None))
-        ));
-        assert!(sprite_needs_reload(
-            &Some((25, false, None)),
-            true,
-            &Some((25, true, None))
-        ));
-    }
-    // upstream: ShinyCharmTests.swift::testUnchangedSpriteSkipsReload
-    #[test]
-    fn unchanged_species_and_shiny_does_not_reload_sprite() {
-        assert!(!sprite_needs_reload(
-            &Some((25, false, None)),
-            true,
-            &Some((25, false, None))
-        ));
-        assert!(!sprite_needs_reload(
-            &Some((25, true, None)),
-            true,
-            &Some((25, true, None))
-        ));
-    }
-    // upstream: ShinyCharmTests.swift::testSpeciesChangeReloadsRegardlessOfShiny
-    #[test]
-    fn changed_species_reloads_sprite() {
-        assert!(sprite_needs_reload(&None, false, &Some((25, false, None))));
-        assert!(sprite_needs_reload(
-            &Some((25, false, None)),
-            true,
-            &Some((26, true, None))
-        ));
-        assert!(sprite_needs_reload(
-            &Some((25, false, None)),
-            true,
-            &Some((26, false, None))
-        ));
-    }
-    #[test]
-    fn changed_form_reloads_sprite() {
-        assert!(sprite_needs_reload(
-            &Some((422, false, Some(crate::pokemon::forms::Form("west".into())))),
-            true,
-            &Some((422, false, Some(crate::pokemon::forms::Form("east".into()))))
-        ));
-    }
-    #[test]
-    fn failed_image_retries_and_new_egg_clears_old_sprite() {
-        assert!(sprite_needs_reload(
-            &Some((25, false, None)),
-            false,
-            &Some((25, false, None))
-        ));
-        assert!(sprite_needs_reload(&Some((25, false, None)), true, &None));
-        assert!(!sprite_needs_reload(&None, false, &None));
+    pub(crate) fn set_pokemon_animation_quality(
+        &mut self,
+        quality: crate::pokemon::animation::Quality,
+        cx: &mut Context<Self>,
+    ) {
+        if self.state.pokemon_animation_quality == quality {
+            return;
+        }
+        self.state.pokemon_animation_quality = quality;
+        self.save_pokemon();
+        self.refresh_pokemon_animation(cx);
+        cx.notify();
     }
 }
 
@@ -2134,7 +2103,6 @@ mod async_tests {
         p
     }
 
-    // upstream: PokemonProfileTests.swift::testDetailFetchFailureSetsRetryStateAndClearsLoadingState
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn detail_failure_clears_loading_and_can_retry(cx: &mut TestAppContext) {
@@ -2157,7 +2125,6 @@ mod async_tests {
         .unwrap();
     }
 
-    // upstream: PokemonProfileTests.swift::testStartupWarmupLoadsOnlyTheActivePokemon
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn startup_warms_only_active_profile(cx: &mut TestAppContext) {
@@ -2180,7 +2147,6 @@ mod async_tests {
         .unwrap();
     }
 
-    // upstream: PokemonProfileTests.swift::testLineLoadReleasesHatchingLockBeforeDetailRequestCompletes
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn hatch_releases_line_lock_before_profile_request_finishes(cx: &mut TestAppContext) {
@@ -2201,10 +2167,6 @@ mod async_tests {
         .unwrap();
     }
 
-    // upstream: DittoTests.swift::testDelayedRevealDoesNotConvertSameBaseReplacementDisguise
-    // upstream: SaveTransferTests.swift::testImportDuringHatchDiscardsTheHatch
-    // upstream: SaveTransferTests.swift::testImportDuringSpeciesRollDiscardsTheHatch
-    // upstream: SaveTransferTests.swift::testImportDuringHatchStillLoadsTheImportedLine
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn stale_hatch_and_detail_completions_cannot_change_imported_save(
@@ -2267,7 +2229,6 @@ mod async_tests {
         })
         .unwrap();
     }
-    // upstream: PokemonProfileTests.swift::testPathNormalizationLoadsDetailsForTheRecoveredCurrentSpecies
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn normalized_path_requests_recovered_species_and_persists_details(
@@ -2329,7 +2290,6 @@ mod async_tests {
         .unwrap();
     }
 
-    // upstream: PokemonProfileTests.swift::testPokemonIndividualsIncludesSyntheticActiveAndMatchingStoredIndividuals
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn individual_picker_uses_ui_identity_without_changing_profile_identity(
@@ -2465,6 +2425,26 @@ mod async_tests {
                 s.complete_pokemon_thumbnail((17, false, None), old, Ok("stale.gif".into()), cx);
                 assert!(s.pokemon_ui.thumbnail_pending.is_empty());
                 assert!(!s.pokemon_ui.thumbnails.contains_key(&(17, false, None)));
+            });
+        })
+        .unwrap();
+    }
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn evicted_thumbnails_are_requeued_from_the_retained_path(cx: &mut TestAppContext) {
+        let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        test_home();
+        let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+        cx.update_window(window, |_, _, cx| {
+            shark.update(cx, |s, cx| {
+                s.state.pokemon = hatched(25);
+                let key = (25, false, None);
+                s.pokemon_ui
+                    .thumbnails
+                    .insert(key.clone(), "evicted-thumbnail.gif".into());
+                assert!(!images::is_warm(Path::new("evicted-thumbnail.gif")));
+                s.load_pokemon_thumbnail(key.clone(), cx);
+                assert!(s.pokemon_ui.thumbnail_pending.contains(&key));
             });
         })
         .unwrap();

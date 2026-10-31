@@ -297,7 +297,6 @@ mod tests {
             .map(|(id, _)| *id)
             .collect()
     }
-    // upstream: DexSearchAndFilterTests.swift::testDexSpeciesSearchByIDAndName
     #[test]
     fn search_numbers_all_localizations_and_missing() {
         let p = fixture();
@@ -318,7 +317,6 @@ mod tests {
             [1, 2, 3, 25, 26, 150]
         );
     }
-    // upstream: DexSearchAndFilterTests.swift::testNameSearchIgnoresCaseAndDiacriticsInPokedexAndCatchLog
     #[test]
     fn accent_search_matches_both_surfaces() {
         let mut p = fixture();
@@ -334,7 +332,6 @@ mod tests {
             assert_eq!(catches(&p, q, None, false, Sort::RecentFirst).len(), 1);
         }
     }
-    // upstream: DexSearchAndFilterTests.swift::testDexSpeciesFilterByShinyAndRarity
     #[test]
     fn shiny_rarity_and_combined_filters() {
         let p = fixture();
@@ -353,7 +350,6 @@ mod tests {
         );
         assert!(ids(&p, "", Some(Rarity::Legendary), true, Sort::NumberAsc).is_empty());
     }
-    // upstream: DexSearchAndFilterTests.swift::testDexSpeciesSorting
     #[test]
     fn grid_all_five_sort_orders() {
         let p = fixture();
@@ -374,7 +370,6 @@ mod tests {
             [150, 25, 26, 1, 2, 3]
         );
     }
-    // upstream: DexSearchAndFilterTests.swift::testCatchLogSearchAndFilters
     #[test]
     fn catch_search_includes_chain_and_filters() {
         let p = fixture();
@@ -395,7 +390,6 @@ mod tests {
             150
         );
     }
-    // upstream: DexSearchAndFilterTests.swift::testCatchLogSorting
     #[test]
     fn catch_all_five_sort_orders() {
         let p = fixture();
@@ -411,8 +405,6 @@ mod tests {
         assert_eq!(by(Sort::NumberDesc), [150, 26, 3]);
         assert_eq!(by(Sort::RarityDesc), [150, 26, 3]);
     }
-    // upstream: DexSearchAndFilterTests.swift::testDexLinkTargetsCoverOnlySpeciesInTheDex
-    // upstream: DexSearchAndFilterTests.swift::testEggHasNoDexLinkTarget
     #[test]
     fn links_include_only_owned_reached_species() {
         let mut p = fixture();
@@ -433,8 +425,6 @@ mod tests {
         p.active = None;
         assert!(p.active.as_ref().map(|m| m.species_id()).is_none());
     }
-    // upstream: DexScrollPagerTests.swift::testNextAndPreviousPage
-    // upstream: DexScrollPagerTests.swift::testClampsAtBothEnds
     #[test]
     fn page_changes_clamp() {
         assert_eq!(page_after(1, 3, 1), 2);
@@ -443,9 +433,6 @@ mod tests {
             assert_eq!(page_after(c, n, s), w);
         }
     }
-    // upstream: DexScrollPagerTests.swift::testPageContainingFindsThePageOfTheSpecies
-    // upstream: DexScrollPagerTests.swift::testPageContainingSplitsAtThePageBoundary
-    // upstream: DexScrollPagerTests.swift::testPageContainingFallsBackToFirstPage
     #[test]
     fn return_page_boundaries_and_missing() {
         for (id, w) in [(0, 0), (15, 0), (16, 1), (20, 1), (32, 2), (39, 2)] {
@@ -455,7 +442,6 @@ mod tests {
         assert_eq!(containing(Some(99), 0..40), 0);
         assert_eq!(containing(Some(1), []), 0);
     }
-    // upstream: DexScrollPagerTests.swift::testWheelNotchPagesOncePerEvent
     #[test]
     fn wheel_each_notch() {
         let mut p = ScrollPager::default();
@@ -463,7 +449,6 @@ mod tests {
             assert_eq!(p.step(d, false, TouchPhase::Moved), w);
         }
     }
-    // upstream: DexScrollPagerTests.swift::testTrackpadBelowThresholdIsNoOp
     #[test]
     fn trackpad_resets_small_gestures() {
         let mut p = ScrollPager::default();
@@ -472,8 +457,6 @@ mod tests {
         assert_eq!(p.step(0., true, TouchPhase::Ended), 0);
         assert_eq!(p.step(-12., true, TouchPhase::Started), 0);
     }
-    // upstream: DexScrollPagerTests.swift::testTrackpadGesturePagesOnceAfterThreshold
-    // upstream: DexScrollPagerTests.swift::testMomentumTailIsIgnored
     #[test]
     fn trackpad_latches_and_rejects_ended_tail() {
         let mut p = ScrollPager::default();

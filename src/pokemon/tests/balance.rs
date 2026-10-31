@@ -7,7 +7,6 @@ const RARITIES: [Rarity; 4] = [
     Rarity::Legendary,
 ];
 
-// upstream: CompanionTests.swift::testGraduationTotalIsConstantPerRarityRegardlessOfStages
 #[test]
 fn testGraduationTotalIsConstantPerRarityRegardlessOfStages() {
     for rarity in RARITIES {
@@ -20,7 +19,6 @@ fn testGraduationTotalIsConstantPerRarityRegardlessOfStages() {
     }
 }
 
-// upstream: CompanionTests.swift::testRepeatGrowthHalvesEveryPhaseThreshold
 #[test]
 fn testRepeatGrowthHalvesEveryPhaseThreshold() {
     for rarity in RARITIES {
@@ -37,7 +35,6 @@ fn testRepeatGrowthHalvesEveryPhaseThreshold() {
     }
 }
 
-// upstream: CompanionTests.swift::testHigherStageCostsMore
 #[test]
 fn testHigherStageCostsMore() {
     let thresholds: Vec<_> = (0..3)
@@ -46,7 +43,6 @@ fn testHigherStageCostsMore() {
     assert_eq!(thresholds, [125_000_000, 250_000_000, 375_000_000]);
 }
 
-// upstream: CompanionTests.swift::testRarerCostsMore
 #[test]
 fn testRarerCostsMore() {
     assert!(
@@ -56,7 +52,6 @@ fn testRarerCostsMore() {
     );
 }
 
-// upstream: CompanionTests.swift::testRarityDerivation
 #[test]
 fn testRarityDerivation() {
     assert_eq!(Rarity::from_capture_rate(255, false, false), Rarity::Common);
@@ -69,7 +64,6 @@ fn testRarityDerivation() {
     assert_eq!(Rarity::from_capture_rate(3, false, true), Rarity::Legendary);
 }
 
-// upstream: ModelLogicTests.swift::testCaptureRateBoundaries
 #[test]
 fn testCaptureRateBoundaries() {
     for (rate, expected) in [
@@ -82,7 +76,6 @@ fn testCaptureRateBoundaries() {
     }
 }
 
-// upstream: ModelLogicTests.swift::testLegendaryAndMythicalOverrideCaptureRate
 #[test]
 fn testLegendaryAndMythicalOverrideCaptureRate() {
     assert_eq!(
@@ -95,7 +88,6 @@ fn testLegendaryAndMythicalOverrideCaptureRate() {
     );
 }
 
-// upstream: DifficultyTests.swift::testGarbageDefaultsAreClamped
 #[test]
 fn testGarbageDefaultsAreClamped() {
     assert_eq!(Balance::clamp_difficulty(0.0), 0.1);
@@ -106,42 +98,6 @@ fn testGarbageDefaultsAreClamped() {
     }
 }
 
-// upstream: DifficultyTests.swift::testPositionRoundTripsThroughDifficulty
-#[test]
-fn testPositionRoundTripsThroughDifficulty() {
-    for value in [0.1, 0.25, 0.5, 1.0, 1.5, 2.0] {
-        let back = Balance::difficulty_at_position(Balance::difficulty_position(value));
-        assert!((back - value).abs() <= value * 0.02, "{value} -> {back}");
-    }
-}
-
-// upstream: DifficultyTests.swift::testPositionEndpointsMapToRangeBounds
-#[test]
-fn testPositionEndpointsMapToRangeBounds() {
-    assert!((Balance::difficulty_at_position(0.0) - 0.1).abs() < 1e-9);
-    assert!((Balance::difficulty_at_position(1.0) - 2.0).abs() < 1e-6);
-    assert!(Balance::difficulty_position(0.1).abs() < 1e-9);
-    assert!((Balance::difficulty_position(2.0) - 1.0).abs() < 1e-9);
-}
-
-// upstream: DifficultyTests.swift::testDefaultIsReachableByDragging
-#[test]
-fn testDefaultIsReachableByDragging() {
-    let position = Balance::difficulty_position(1.0);
-    for offset in [-0.009, -0.005, 0.0, 0.005, 0.009] {
-        assert!((Balance::difficulty_at_position(position + offset) - 1.0).abs() < 1e-9);
-    }
-}
-
-// upstream: DifficultyTests.swift::testSnapKeepsTwoSignificantDigits
-#[test]
-fn testSnapKeepsTwoSignificantDigits() {
-    for (value, expected) in [(1.234, 1.2), (15.7, 16.0), (0.0123, 0.012)] {
-        assert!((Balance::snap_difficulty(value) - expected).abs() < 1e-9);
-    }
-}
-
-// upstream: FreshEggTests.swift::testPriceIsOneBillion
 #[test]
 fn testPriceIsOneBillion() {
     assert_eq!(FreshEgg::price(None), 1_000_000_000);

@@ -30,7 +30,6 @@ fn names() -> EvoLine {
         ]),
     }
 }
-// upstream: ModelLogicTests.swift::testPicksLanguageSpecificThenFallsBackToEnglishThenID
 #[test]
 fn name_fallback_order() {
     let line = names();
@@ -46,14 +45,12 @@ fn name_fallback_order() {
         assert_eq!(line.localized_name(id, lang), expected);
     }
 }
-// upstream: ModelLogicTests.swift::testJaFallsBackFromHrktToPlainJa
 #[test]
 fn japanese_plain_fallback() {
     let mut line = names();
     line.names.get_mut(&1).unwrap().remove("ja-Hrkt");
     assert_eq!(line.localized_name(1, "ja"), "ピカチュウ");
 }
-// upstream: ModelLogicTests.swift::testGermanNameUsesGermanThenFallsBackToEnglish
 #[test]
 fn german_name_fallback() {
     let mut line = names();
@@ -64,7 +61,6 @@ fn german_name_fallback() {
     assert_eq!(line.localized_name(1, "de"), "Bisasam");
     assert_eq!(line.localized_name(2, "de"), "Eevee");
 }
-// upstream: ModelLogicTests.swift::testRussianNameUsesRussianThenFallsBackToEnglish
 #[test]
 fn russian_name_fallback() {
     let mut line = names();
@@ -79,7 +75,6 @@ fn russian_name_fallback() {
     assert_eq!(line.localized_name(1, "ru"), "Бульбазавр");
     assert_eq!(line.localized_name(2, "ru"), "Eevee");
 }
-// upstream: ModelLogicTests.swift::testKeepsOnlyFormsWithAnimatedAssets
 #[test]
 fn unsupported_evolutions_pruned() {
     let tree = node(56, vec![node(57, vec![node(979, vec![])])])
@@ -89,13 +84,11 @@ fn unsupported_evolutions_pruned() {
     assert_eq!(tree.final_ids(), [57]);
     assert!(tree.node(979).is_none());
 }
-// upstream: ModelLogicTests.swift::testDepthIsLongestPath
 #[test]
 fn tree_depth() {
     assert_eq!(tree().depth(), 3);
     assert_eq!(node(20, vec![]).depth(), 1);
 }
-// upstream: ModelLogicTests.swift::testNodeLookupByID
 #[test]
 fn tree_lookup() {
     let t = tree();
@@ -103,13 +96,11 @@ fn tree_lookup() {
     assert_eq!(t.node(4).unwrap().species_id, 4);
     assert!(t.node(99).is_none());
 }
-// upstream: ModelLogicTests.swift::testFinalIDsAreLeaves
 #[test]
 fn final_species_are_leaves() {
     assert_eq!(tree().final_ids(), [3, 4]);
     assert_eq!(node(20, vec![]).final_ids(), [20]);
 }
-// upstream: ModelLogicTests.swift::testParsesMicroMilliAndPlainSeconds
 #[test]
 fn iso_epoch_precisions() {
     for text in [
@@ -120,14 +111,12 @@ fn iso_epoch_precisions() {
         assert!(limits::parse_epoch(text).is_some(), "{text}");
     }
 }
-// upstream: ModelLogicTests.swift::testReturnsNilForGarbage
 #[test]
 fn invalid_epoch() {
     for text in ["not-a-date", ""] {
         assert_eq!(limits::parse_epoch(text), None);
     }
 }
-// upstream: ModelLogicTests.swift::testMicroAndMilliResolveToSameInstant
 #[test]
 fn equivalent_epoch_precision() {
     assert_eq!(
@@ -135,7 +124,6 @@ fn equivalent_epoch_precision() {
         limits::parse_epoch("2026-06-10T11:10:00Z")
     );
 }
-// upstream: ModelLogicTests.swift::testCurrentIDClampsToPath
 #[test]
 fn current_species_clamps_path() {
     let mut mon = super::economy::hatched().active.unwrap();
@@ -146,7 +134,6 @@ fn current_species_clamps_path() {
     assert_eq!(mon.species_id(), 1);
 }
 // Rust performs path-dependent repair at the Companion trust boundary via sanitize().
-// upstream: ModelLogicTests.swift::testMonStateDecodeClampsStageIndexToRealizedPathBounds
 #[test]
 fn loaded_stage_clamped_at_trust_boundary() {
     let state = super::economy::hatched();
@@ -159,7 +146,6 @@ fn loaded_stage_clamped_at_trust_boundary() {
     }
 }
 // Rust stores the complete plan with stage as its realized-prefix boundary.
-// upstream: ModelLogicTests.swift::testMonStateRoundTripPreservesDistinctPlannedPath
 #[test]
 fn planned_path_round_trip_keeps_realized_prefix() {
     let state = super::economy::hatched();
@@ -169,7 +155,6 @@ fn planned_path_round_trip_keeps_realized_prefix() {
     assert_eq!(restored.reached_species().collect::<Vec<_>>(), [1]);
 }
 // Rust required nature strings use Hardy as the legacy empty-identity default.
-// upstream: CompanionTests.swift::testBackwardCompatibleDecode
 #[test]
 fn legacy_identity_defaults_preserve_active_and_collection() {
     let mut state = super::economy::hatched();
@@ -192,7 +177,6 @@ fn legacy_identity_defaults_preserve_active_and_collection() {
     assert_eq!(round.active.unwrap().nature, "Hardy");
 }
 
-// upstream: ModelLogicTests.swift::testCompanionStateEncodeDecodeRoundTrip
 #[test]
 fn companion_state_round_trip() {
     let mut state = super::economy::hatched();
@@ -217,7 +201,6 @@ fn companion_state_round_trip() {
 }
 
 // An empty observation is represented by no provider row; empty IDs cannot replace a ledger.
-// upstream: CompanionTests.swift::testEmptyUsageSnapshotDoesNotRebaseDailyLedger
 #[test]
 fn empty_observation_does_not_rebase_usage() {
     let mut state = Companion::default();
@@ -231,7 +214,6 @@ fn empty_observation_does_not_rebase_usage() {
     assert_eq!(state.lifetime_tokens, 250);
 }
 
-// upstream: CompanionTests.swift::testLegacyAggregateLedgerSeedsProviderMapWithoutRetrospectiveCredit
 #[test]
 fn legacy_aggregate_does_not_retroactively_credit_providers() {
     let mut state: Companion = serde_json::from_value(serde_json::json!({
@@ -245,7 +227,6 @@ fn legacy_aggregate_does_not_retroactively_credit_providers() {
     assert_eq!(state.lifetime_tokens, 10_200);
 }
 
-// upstream: CompanionTests.swift::testDexResolveChainNamesOfflineFallback
 #[test]
 fn missing_archived_chain_names_resolve_without_network() {
     let mut state = super::economy::hatched();
@@ -254,17 +235,15 @@ fn missing_archived_chain_names_resolve_without_network() {
     mon.stage = 2;
     mon.graduated = true;
     state.collection.push(mon);
+    let mon = &state.collection[0];
     assert_eq!(
-        state
-            .dex_species()
-            .iter()
-            .map(|cell| (cell.id, cell.name.as_str()))
+        mon.reached_species()
+            .map(|id| mon.line.name(id))
             .collect::<Vec<_>>(),
-        [(1, "#1"), (2, "#2"), (3, "#3")]
+        ["#1", "#2", "#3"]
     );
 }
 
-// upstream: UnownTests.swift::testDexDeduplicatesPerLetterAndScopesShinyAndRaisingFlags
 #[test]
 fn unown_forms_scope_ownership_shiny_and_raising() {
     let line = EvoLine {
@@ -288,9 +267,6 @@ fn unown_forms_scope_ownership_shiny_and_raising() {
     state.collection = vec![template, b, shiny_b];
     state.active = Some(c);
     assert_eq!(state.collection.len(), 3);
-    assert_eq!(state.dex_species().len(), 1);
-    assert!(state.dex_species()[0].shiny);
-    assert!(state.dex_species()[0].raising);
     let appearances = state.form_species(201);
     assert_eq!(
         appearances
@@ -315,7 +291,6 @@ fn unown_forms_scope_ownership_shiny_and_raising() {
     assert!(!state.owns_species(201, Some(&forms::Form("z".into()))));
 }
 
-// upstream: PokemonFormTests.swift::testEvolutionNamesTheFormLikeHatchAndGraduation
 #[test]
 fn evolution_event_preserves_nondefault_form_name() {
     let mut state = Companion::default();
@@ -341,7 +316,6 @@ fn evolution_event_preserves_nondefault_form_name() {
 }
 
 // Metadata language selection is shared; Shark keeps its existing interface language.
-// upstream: PokemonNameLocalizationTests.swift::testSelectedLanguageThenEnglishWithCurrentAndLegacyCodes
 #[test]
 fn translated_name_selection_supports_current_and_legacy_codes() {
     let names = BTreeMap::from([
@@ -378,7 +352,6 @@ fn translated_name_selection_supports_current_and_legacy_codes() {
         None
     );
 }
-// upstream: PokemonNameLocalizationTests.swift::testParserPreservesFutureLanguagesAndIgnoresEmptyValues
 #[test]
 fn language_map_normalization_preserves_future_languages() {
     let names = evolution::normalized_names(&BTreeMap::from([
@@ -419,26 +392,22 @@ fn assert_recovered_plan(mut state: Companion) {
     assert_eq!(state.random_seed, seed);
 }
 // Rust persists its canonical tree and expands the complete plan while preserving reached stages.
-// upstream: ModelLogicTests.swift::testMonStateLegacyDecodeUsesRealizedPathAsPlan
 #[test]
 fn legacy_realized_prefix_recovers_complete_plan() {
     let saved = serde_json::to_value(partial_plan()).unwrap();
     assert_recovered_plan(serde_json::from_value(saved).unwrap());
 }
-// upstream: ModelLogicTests.swift::testMonStateEmptySavedPlanUsesRealizedPath
 #[test]
 fn empty_saved_separate_plan_cannot_erase_realized_prefix() {
     let mut saved = serde_json::to_value(partial_plan()).unwrap();
     saved["active"]["planned_path"] = serde_json::json!([]);
     assert_recovered_plan(serde_json::from_value(saved).unwrap());
 }
-// upstream: ModelLogicTests.swift::testMonStateEmptyInitialPlanUsesRealizedPath
 #[test]
 fn incomplete_initial_plan_recovers_without_reroll() {
     assert_recovered_plan(partial_plan());
 }
 
-// upstream: CompanionDisplayStateTests.swift::testEggProgressAndTokensToHatch
 #[test]
 fn egg_progress_and_remaining_hatch_usage() {
     let mut state = Companion::default();
@@ -453,7 +422,6 @@ fn egg_progress_and_remaining_hatch_usage() {
     assert!(used > 0);
 }
 // Rust persists complete trees, so offline usage catches up immediately without a line request.
-// upstream: CompanionTests.swift::testUsageAccruesWhileLineUnloadedThenEvolvesOnLoad
 #[test]
 fn offline_persisted_tree_never_loses_growth_delta() {
     let state = super::economy::hatched();
@@ -465,7 +433,6 @@ fn offline_persisted_tree_never_loses_growth_delta() {
     assert_eq!(mon.tokens, 175_000_000);
 }
 // Rust repairs unsupported persisted species before network work at its save trust boundary.
-// upstream: CompanionTests.swift::testLineLoadMigratesPersistedUnsupportedEvolution
 #[test]
 fn persisted_unsupported_evolution_repairs_to_last_supported_species() {
     let mut state = super::economy::hatched();
@@ -485,7 +452,6 @@ fn persisted_unsupported_evolution_repairs_to_last_supported_species() {
     assert_eq!(mon.line.tree.depth(), 2);
 }
 
-// upstream: CompanionTests.swift::testEggHatchesViaRESTFallbackWhenIndexDown
 #[test]
 fn rest_sampler_hatches_when_graphql_index_is_down() {
     let mut random = 7;
@@ -517,96 +483,38 @@ fn rest_sampler_hatches_when_graphql_index_is_down() {
     assert_eq!(state.egg_tokens, 0);
 }
 
-// Rust legacy aliases are supported inside the Rust save envelope; Swift envelopes remain distinct.
-// upstream: PokemonFormTests.swift::testSavesWrittenBeforeGenericFormsKeepTheirUnownLetters
-#[test]
-fn legacy_unown_form_aliases_survive_generic_form_reencoding() {
-    let line = EvoLine {
-        base_id: 201,
-        tree: node(201, vec![]),
-        rarity: Rarity::Common,
-        names: BTreeMap::new(),
-    };
-    let mut state = Companion::default();
-    state.egg_tokens = state.progress().1;
-    state.hatch_with_disguise_roll(line.clone(), false);
-    state.active.as_mut().unwrap().form = Some(forms::Form("z".into()));
-    let mut archived = state.active.clone().unwrap();
-    archived.form = Some(forms::Form("q".into()));
-    state.collection.push(archived);
-    state.pending_line = Some(line);
-    state.pending_form = Some(forms::Form("k".into()));
-    state.representative = Some(201);
-    state.representative_form = Some(forms::Form("q".into()));
-    let mut json = serde_json::to_value(state).unwrap();
-    let map = json.as_object_mut().unwrap();
-    for (new, old) in [
-        ("pending_form", "pending_unown_form"),
-        ("representative_form", "representative_unown_form"),
-    ] {
-        let value = map.remove(new).unwrap();
-        map.insert(old.into(), value);
-    }
-    let map = json["active"].as_object_mut().unwrap();
-    let value = map.remove("form").unwrap();
-    map.insert("unown_form".into(), value);
-    let map = json["collection"][0].as_object_mut().unwrap();
-    let value = map.remove("form").unwrap();
-    map.insert("unown_form".into(), value);
-    let restored: Companion = serde_json::from_value(json).unwrap();
-    assert_eq!(restored.pending_form, Some(forms::Form("k".into())));
-    assert_eq!(
-        restored.active.as_ref().unwrap().form,
-        Some(forms::Form("z".into()))
-    );
-    assert_eq!(restored.collection[0].form, Some(forms::Form("q".into())));
-    assert_eq!(restored.representative_form, Some(forms::Form("q".into())));
-    let round = serde_json::to_value(restored).unwrap();
-    assert_eq!(round["active"]["form"], "z");
-    assert!(round["active"].get("unown_form").is_none());
-    assert!(round.get("pending_unown_form").is_none());
-}
-
-// upstream: PokemonFormTests.swift::testUnnamedUsualLooksUseLocalizedNormalForm
 #[test]
 fn unnamed_usual_looks_use_normal_form_label() {
     for id in [351, 479, 646, 649] {
-        assert_eq!(
-            forms::label(id, None, None, "fr").as_deref(),
-            Some("Forme Normale")
-        );
+        assert_eq!(forms::label(id, None, None).as_deref(), Some("Normal Form"));
     }
     assert_eq!(
-        forms::label(479, Some(&forms::Form("normal".into())), None, "de").as_deref(),
-        Some("Normalform")
+        forms::label(479, Some(&forms::Form("normal".into())), None).as_deref(),
+        Some("Normal Form")
     );
     assert_eq!(
-        forms::label(479, Some(&forms::Form("heat".into())), None, "fr").as_deref(),
+        forms::label(479, Some(&forms::Form("heat".into())), None).as_deref(),
         Some("Heat")
     );
     assert_eq!(forms::display_name("Motisma", 479, None, None), "Motisma");
 }
-// upstream: PokemonFormTests.swift::testDisplayNameShowsOnlyNonDefaultFormsExceptUnown
 #[test]
 fn form_labels_use_metadata_then_fallback_and_hide_default_suffixes() {
     let sky = forms::Form("sky".into());
-    assert_eq!(
-        forms::label(492, Some(&sky), None, "fr").as_deref(),
-        Some("Sky")
-    );
+    assert_eq!(forms::label(492, Some(&sky), None).as_deref(), Some("Sky"));
     let names = BTreeMap::from([
         ("fr".into(), "Forme Céleste".into()),
         ("en".into(), "Sky Forme".into()),
     ]);
     assert_eq!(
-        forms::label(492, Some(&sky), Some(&names), "fr").as_deref(),
-        Some("Forme Céleste")
+        forms::label(492, Some(&sky), Some(&names)).as_deref(),
+        Some("Sky Forme")
     );
     assert_eq!(
-        forms::label(201, Some(&forms::Form("question".into())), None, "fr").as_deref(),
+        forms::label(201, Some(&forms::Form("question".into())), None).as_deref(),
         Some("?")
     );
-    assert_eq!(forms::label(25, Some(&sky), None, "fr"), None);
+    assert_eq!(forms::label(25, Some(&sky), None), None);
     assert_eq!(
         forms::display_name("Shaymin", 492, Some(&sky), Some("Forme Céleste")),
         "Shaymin [Forme Céleste]"
@@ -630,7 +538,6 @@ fn form_labels_use_metadata_then_fallback_and_hide_default_suffixes() {
     );
 }
 // Root's shared provider boundary ignores carrier rows that do not report today's usage.
-// upstream: CompanionTests.swift::testCarrierWithoutTodayDataDoesNotRebaseProviderLedger
 #[test]
 fn carrier_without_today_data_preserves_provider_ledger() {
     let mut state = Companion::default();
@@ -643,7 +550,6 @@ fn carrier_without_today_data_preserves_provider_ledger() {
     assert_eq!(state.lifetime_tokens, 2200);
 }
 
-// upstream: UnownTests.swift::testDetailIndividualsAndRaisingFlagAreScopedToExactLetter
 #[test]
 fn individual_profiles_and_raising_are_scoped_to_exact_unown_letter() {
     let line = EvoLine {

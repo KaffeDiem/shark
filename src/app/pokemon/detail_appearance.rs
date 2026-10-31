@@ -98,10 +98,7 @@ impl Shark {
                                 .selected_form_label(species, Some(&form))
                                 .unwrap_or_else(|| form.0.clone());
                             let caption = if owned_form.is_some_and(|entry| entry.raising) {
-                                format!(
-                                    "{label} · {}",
-                                    crate::pokemon::format::Language::En.dex_raising()
-                                )
+                                format!("{label} · Raising")
                             } else {
                                 label.clone()
                             };
@@ -115,7 +112,8 @@ impl Shark {
                                 .pokemon_ui
                                 .thumbnails
                                 .get(&key)
-                                .map(|path| images::sized(path, 28.).into_any_element())
+                                .and_then(|path| images::sized(path, 28.))
+                                .map(|img| img.into_any_element())
                                 .unwrap_or_else(|| {
                                     div()
                                         .size(px(28.))
@@ -252,7 +250,6 @@ impl Shark {
 mod tests {
     use super::*;
     use core::prelude::v1::test;
-    // upstream: PokemonFormTests.swift::testFormPickerKeepsSevenColumnsForUnownAndWidensNamedForms
     #[test]
     fn form_grid_geometry_matches_label_density() {
         assert_eq!(form_columns(28), 7);

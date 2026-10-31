@@ -19,7 +19,6 @@ fn today(tokens: u64) -> Report {
 }
 // Shark warnings use official quotas regardless of local activity; footer no-activity coverage
 // lives in pokemon::footer_usage tests, adapting upstream
-// upstream: UsageStoreTests.swift::testHighestLimitUtilizationIgnoresProviderUnusedToday
 // Adaptation: user requested both provider quotas remain visible regardless of local activity.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -41,7 +40,6 @@ async fn observed_headline_warning_is_independent_of_local_activity(cx: &mut Tes
     })
     .unwrap();
 }
-// upstream: UsageStoreTests.swift::testHighestLimitUtilizationExcludesCodexIndividualSpendLimit
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn monetary_and_model_caps_never_drive_companion_token_warning(cx: &mut TestAppContext) {
@@ -61,9 +59,6 @@ async fn monetary_and_model_caps_never_drive_companion_token_warning(cx: &mut Te
     })
     .unwrap();
 }
-// upstream: UsageStoreTests.swift::testLimitWarningWhenClaudeOverCritical
-// upstream: UsageStoreTests.swift::testNoLimitWarningWhenUnderCritical
-// upstream: UsageStoreTests.swift::testLimitWarningFromCodexSecondary
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn observed_critical_warning_uses_official_headline_windows_and_fixed_shark_thresholds(
@@ -92,7 +87,6 @@ async fn observed_critical_warning_uses_official_headline_windows_and_fixed_shar
     })
     .unwrap();
 }
-// upstream: UsageStoreTests.swift::testDefaultProviderRegistryHasUniqueIds
 #[test]
 fn scoped_registry_ids_remain_unique_and_stable() {
     let ids: Vec<_> = crate::usage::providers::builtins()
@@ -108,7 +102,6 @@ fn scoped_registry_ids_remain_unique_and_stable() {
         ids.len()
     );
 }
-// upstream: UsageStoreTests.swift::testIsStaleBeforeFirstRefreshThenFreshAfter
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn native_snapshots_distinguish_no_result_fresh_and_failed_refresh(cx: &mut TestAppContext) {
@@ -139,7 +132,6 @@ async fn native_snapshots_distinguish_no_result_fresh_and_failed_refresh(cx: &mu
     })
     .unwrap();
 }
-// upstream: UsageStoreTests.swift::testConcurrentRefreshIsCoalescedNotDropped
 // Adaptation: preserve Shark's per-provider in-flight query sharing; an invalidated configuration always queues a fresh result.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -171,9 +163,6 @@ async fn repeated_refreshes_share_queries_but_configuration_refresh_is_not_lost(
     })
     .unwrap();
 }
-// upstream: UsageStoreTests.swift::testLimitDisplayPercentModes
-// upstream: UsageStoreTests.swift::testMenuBarLimitRemainingModeInvertsPercents
-// upstream: LimitProgressRenderingTests.swift::testRemainingModeReversesRenderedFillAndClampsExhaustedQuota
 // Adaptation: Shark always displays remaining quota; percentages come from the retained CLI decoder, not a new display-mode setting.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -201,7 +190,6 @@ async fn native_remaining_gauges_keep_official_fraction_and_clamp_fill(cx: &mut 
     })
     .unwrap();
 }
-// upstream: UsageStoreTests.swift::testMenuLimitPartsCarryThePaceOfTheirOwnWindow
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn each_native_quota_window_uses_its_own_reset_pace(cx: &mut TestAppContext) {
@@ -230,7 +218,6 @@ async fn each_native_quota_window_uses_its_own_reset_pace(cx: &mut TestAppContex
     })
     .unwrap();
 }
-// upstream: LimitProgressRenderingTests.swift::testPaceMarkerRendersAtElapsedPositionAndMirrorsInRemainingMode
 #[test]
 fn marker_geometry_mirrors_elapsed_time_and_clamps_at_both_track_ends() {
     assert!((marker_left(75., 200.) + 2.25 - 150.).abs() < 0.01);
@@ -239,7 +226,6 @@ fn marker_geometry_mirrors_elapsed_time_and_clamps_at_both_track_ends() {
     assert_eq!(marker_left(-20., 200.), 0.);
     assert_eq!(marker_left(120., 200.), 195.5);
 }
-// upstream: LimitProgressRenderingTests.swift::testPaceMarkerStaysCloseToPaintedTrackHeight
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn native_pace_marker_only_extends_two_points_above_and_below_track(cx: &mut TestAppContext) {

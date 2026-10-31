@@ -4,7 +4,7 @@ use super::{
     Provider,
     activity::{DAYS, Daily, local_day},
 };
-use serde::{Deserialize, Serialize};
+use objc2_foundation::NSTimeZone;
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 pub mod cache;
@@ -17,8 +17,7 @@ pub mod timing;
 pub use cache::Cache;
 pub use roots::Roots;
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq)]
-#[serde(default)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Entry {
     pub id: String,
     pub date: f64,
@@ -40,8 +39,7 @@ impl Entry {
             .saturating_add(self.cache_read)
     }
 }
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(default)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct CostCoverage {
     pub reported: bool,
     pub estimated: bool,
@@ -57,7 +55,7 @@ impl CostCoverage {
         self.reported || self.estimated
     }
 }
-#[derive(Clone, Debug, Default, Serialize, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct Bucket {
     pub input: u64,
     pub output: u64,
@@ -96,7 +94,6 @@ impl Bucket {
                 self.coverage.estimated = true
             } else {
                 self.coverage.unknown = true;
-                pricing::first_unpriced_sighting(&e.model);
             }
         } else {
             self.coverage.unknown = true
@@ -170,25 +167,29 @@ impl Report {
     pub fn today(&self) -> u64 {
         self.daily.tokens.last().copied().unwrap_or(0)
     }
-    pub fn bucket_between(&self, start: f64, end: f64) -> Bucket {
-        let mut b = Bucket::default();
+    /// The navigation heatmap's definition: everything except cache reads.
+    pub fn heatmap(&self) -> Daily {
+        let first_day = self.daily.first_day;
+        let mut tokens = vec![0u64; DAYS];
         for e in &self.entries {
-            if e.date >= start && e.date < end {
-                b.add(e)
+            if let Some(n) = usize::try_from(local_day(e.date) - first_day)
+                .ok()
+                .and_then(|i| tokens.get_mut(i))
+            {
+                let tokens = e
+                    .input
+                    .saturating_add(e.output)
+                    .saturating_add(e.cache_write);
+                *n = n.saturating_add(tokens);
             }
         }
-        b
-    }
-    pub fn daily_buckets(&self) -> BTreeMap<i64, Bucket> {
-        let mut days = BTreeMap::<i64, Bucket>::new();
-        for e in &self.entries {
-            days.entry(local_day(e.date)).or_default().add(e)
-        }
-        days
+        Daily { first_day, tokens }
     }
 }
 pub fn scan(provider: Provider, roots: &Roots, cache: &mut Cache, now: f64) -> Report {
-    let entries = cache.entries_since(provider, roots, now - (DAYS as f64 + 1.) * 86400., now);
+    // Pick up a system time zone change before bucketing days.
+    NSTimeZone::resetSystemTimeZone();
+    let entries = cache.entries_since(provider, roots, now - (DAYS as f64 + 1.) * 86400.);
     let mut report = Report::from_entries(entries, now);
     report.error = cache.last_error.clone();
     report
@@ -199,6 +200,12 @@ pub fn token(v: &Value) -> u64 {
         .filter(|n| n.is_finite() && *n > 0.)
         .map(|n| n.min(1_000_000_000_000_000.) as u64)
         .unwrap_or(0)
+}
+/// Cheap prefilter before JSON parsing: most log lines are prompts and tool output.
+fn mentions(line: &[u8], needles: &[&[u8]]) -> bool {
+    needles
+        .iter()
+        .any(|n| line.windows(n.len()).any(|w| w == *n))
 }
 pub fn dedup_claude(entries: Vec<Entry>) -> Vec<Entry> {
     let mut map = BTreeMap::<String, Entry>::new();

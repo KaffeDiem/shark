@@ -1,5 +1,4 @@
 use super::super::*;
-// upstream: DexNameMigrationTests.swift::testNewNamesSkipMigrationButEmptyAndMissingSpeciesRetry
 #[test]
 fn complete_names_version_requires_every_reached_species() {
     let mut state = super::economy::hatched();

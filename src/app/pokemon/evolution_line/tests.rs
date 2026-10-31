@@ -2,12 +2,6 @@ use super::*;
 use crate::app::ui_tests::{UI_LOCK, boot, test_home};
 use core::prelude::v1::test;
 use gpui_kit::test::TestWindowExt;
-// upstream: EvoLineLayoutTests.swift::testNeedsScrollBoundaryForHomeLine
-// upstream: EvoLineLayoutTests.swift::testNeedsScrollBoundaryForDexRow
-// upstream: EvoLineLayoutTests.swift::testUnboundedWidthNeverScrolls
-// upstream: EvoLineLayoutTests.swift::testAffordanceShowsOnlyWhereContentRemains
-// upstream: EvoLineLayoutTests.swift::testAffordanceHiddenWhenContentFits
-// upstream: EvoLineLayoutTests.swift::testPageTargetAdvancesAndStaysInBounds
 #[test]
 fn boundaries_and_affordances_match_content_and_position() {
     assert!(!needs_scroll(6, 40., false, 332.));
@@ -28,7 +22,6 @@ fn boundaries_and_affordances_match_content_and_position() {
     assert_eq!(page_target(false, 0., 9, 40., false, 332.), 0);
     assert_eq!(page_target(false, 140., 9, 40., false, 332.), 0);
 }
-// upstream: EvoLineLayoutTests.swift::testDexLinkTargetOnlyForSpeciesInTheDex
 #[test]
 fn only_owned_species_link_to_dex() {
     let owned = BTreeSet::from([1, 2]);
@@ -86,12 +79,6 @@ fn mon() -> Mon {
     });
     c.active.unwrap()
 }
-// upstream: EvoLineLayoutTests.swift::testLongEvolutionLineWithoutMaxWidthOverflowsPopoverContent
-// upstream: EvoLineLayoutTests.swift::testLongEvolutionLineFitsPopoverContentWidth
-// upstream: EvoLineLayoutTests.swift::testLongDexChainFitsCardWidth
-// upstream: EvoLineLayoutTests.swift::testShortChainRendersInlineAtNaturalWidth
-// upstream: EvoLineLayoutTests.swift::testRowWidthMatchesRenderedWidth
-// upstream: EvoLineLayoutTests.swift::testNamedMysteryCellReservesNameColumnWidth
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn native_evolution_rows_match_measured_width_and_scroll_limits(cx: &mut TestAppContext) {

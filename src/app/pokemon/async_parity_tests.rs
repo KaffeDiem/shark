@@ -24,9 +24,6 @@ fn hatched(id: u16) -> Companion {
     state
 }
 
-// upstream: CompanionTests.swift::testFailedHatchRetriesAfterProviderRecovers
-// upstream: CompanionTests.swift::testFailedHatchShowsDelayUntilNextRefresh
-// upstream: CompanionTests.swift::testSamplerOfflineKeepsEgg
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn failed_hatch_keeps_progress_releases_lock_and_recovers(cx: &mut TestAppContext) {
@@ -57,7 +54,6 @@ async fn failed_hatch_keeps_progress_releases_lock_and_recovers(cx: &mut TestApp
     .unwrap();
 }
 
-// upstream: CompanionTests.swift::testPrefetchFailureMarksEggThatBecameReadyDuringRequest
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn prefetch_failure_uses_current_hatch_readiness(cx: &mut TestAppContext) {
@@ -80,7 +76,6 @@ async fn prefetch_failure_uses_current_hatch_readiness(cx: &mut TestAppContext) 
     .unwrap();
 }
 
-// upstream: CompanionTests.swift::testApplySaveResetsHatchRetryDelay
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn importing_fresh_egg_clears_old_retry_delay(cx: &mut TestAppContext) {
@@ -108,8 +103,6 @@ async fn importing_fresh_egg_clears_old_retry_delay(cx: &mut TestAppContext) {
 }
 
 // Rust combines selection and line loading in one request; both stale source phases share this guard.
-// upstream: CompanionTests.swift::testStaleSpeciesSelectionFailureDoesNotMarkImportedEggDelayed
-// upstream: CompanionTests.swift::testStaleLineFailureDoesNotMarkImportedEggDelayed
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn stale_egg_failures_cannot_mark_imported_save_delayed(cx: &mut TestAppContext) {
@@ -162,7 +155,6 @@ async fn successful_prefetch_clears_obsolete_failure_before_hatch(cx: &mut TestA
 }
 
 // The persisted Rust tree eliminates suspended active-line loading; metadata callbacks enrich live state.
-// upstream: CompanionTests.swift::testLineLoadPreservesUpdatesMadeWhileProviderIsSuspended
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn late_metadata_completion_preserves_live_growth_and_minted_nature(cx: &mut TestAppContext) {
@@ -200,7 +192,6 @@ async fn late_metadata_completion_preserves_live_growth_and_minted_nature(cx: &m
     .unwrap();
 }
 
-// upstream: CompanionTests.swift::testShinyBurstSurvivesOverflowEvolve
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn shiny_hatch_celebration_survives_immediate_overflow_evolution(cx: &mut TestAppContext) {
@@ -250,7 +241,6 @@ async fn shiny_hatch_celebration_survives_immediate_overflow_evolution(cx: &mut 
     .unwrap();
 }
 
-// upstream: CompanionTests.swift::testHatchCelebrationSkippedOnInstantGraduate
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn instant_graduation_does_not_celebrate_a_departed_hatch(cx: &mut TestAppContext) {
@@ -272,7 +262,6 @@ async fn instant_graduation_does_not_celebrate_a_departed_hatch(cx: &mut TestApp
 }
 
 // The complete persisted pre-roll survives a failed request instead of re-rolling its form.
-// upstream: UnownTests.swift::testPendingLetterSurvivesFailedLineLoadAndHatchesOnRetry
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn prepared_form_survives_failure_save_and_retry(cx: &mut TestAppContext) {

@@ -127,18 +127,16 @@ impl Shark {
             }
             let label = match node.content {
                 LineContent::Species(id) => mon.line.name(id),
-                LineContent::Mystery => crate::pokemon::format::Language::En
-                    .unknown_next_evolution()
-                    .into(),
+                LineContent::Mystery => "Unknown next evolution".into(),
             };
             let art = match node.content {
                 LineContent::Species(id) => self
                     .pokemon_ui
                     .thumbnails
                     .get(&mon_sprite_identity(mon, id))
-                    .map(|path| {
-                        super::images::sized(path, thumb)
-                            .id(format!("{prefix}-sprite-{index}"))
+                    .and_then(|path| super::images::sized(path, thumb))
+                    .map(|img| {
+                        img.id(format!("{prefix}-sprite-{index}"))
                             .into_any_element()
                     })
                     .unwrap_or_else(|| {
@@ -154,7 +152,7 @@ impl Shark {
                 LineContent::Mystery => div()
                     .id(format!("{prefix}-mystery-{index}"))
                     .role(Role::Image)
-                    .aria_label(crate::pokemon::format::Language::En.unknown_next_evolution())
+                    .aria_label("Unknown next evolution")
                     .size(px(thumb))
                     .flex()
                     .items_center()

@@ -29,7 +29,7 @@ async fn pokemon_toggle_persists_without_deleting_progress(cx: &mut TestAppConte
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn settings_exposes_license_and_pokemon_switch(cx: &mut TestAppContext) {
+async fn settings_exposes_pokemon_switch_and_no_license_page(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
     let (window, shark) = boot(cx, State::default(), WindowOptions::default());
@@ -44,12 +44,39 @@ async fn settings_exposes_license_and_pokemon_switch(cx: &mut TestAppContext) {
         );
         w.click("pokemon-enabled", cx);
         assert!(State::load().pokemon_disabled);
-        w.click("LICENSE", cx);
-        w.render_frame(cx);
-        assert!(w.find("license-shark").visible());
-        assert!(w.find("license-poketokenbar").visible());
+        assert!(w.try_find("LICENSE").is_none());
+        assert!(w.try_find("pokemon-choose-navigation").is_none());
     })
     .unwrap();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn about_dialog_holds_licenses_and_pokemon_attribution(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, _) = boot(cx, State::default(), WindowOptions::default());
+    cx.update_window(window, |_, w, cx| {
+        crate::settings::about(w, cx);
+        w.render_frame(cx);
+        assert!(w.find("license-shark").visible());
+        let initial = w.find("license-pokeapi").bounds().top();
+        w.scroll("about", ScrollDelta::Pixels(point(px(0.), px(-1600.))), cx);
+        w.render_frame(cx);
+        assert!(w.find("license-pokeapi").visible());
+        assert!(w.find("license-pokeapi").bounds().top() < initial);
+        assert!(w.try_find("license-poketokenbar").is_some());
+    })
+    .unwrap();
+}
+
+#[test]
+fn folder_entries_the_scan_drops_are_listed_as_ignored() {
+    let home = std::path::Path::new("/Users/me");
+    assert_eq!(
+        crate::settings::ignored_roots("/a, rel,\n~/x, ./y, ,/, ~", home),
+        ["rel", "./y", "/", "~"]
+    );
 }
 
 #[test]
@@ -62,8 +89,6 @@ fn old_shark_state_enables_pokemon_and_creates_a_fresh_save() {
     assert_eq!(state.pokemon.egg_tokens, 0);
 }
 
-// upstream: SaveTransferTests.swift::testCancelIsTheDefaultButtonOnTheImportConfirmation
-// upstream: SaveTransferTests.swift::testImportKeepsThisDevicesLanguage
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn pokemon_import_return_cancels_and_explicit_replace_keeps_settings(
@@ -104,8 +129,6 @@ async fn pokemon_import_return_cancels_and_explicit_replace_keeps_settings(
     .unwrap();
 }
 
-// upstream: CustomScanRootsTests.swift::testSettingsUsesProviderPickerAndCommitsOnSubmit
-// upstream: CustomScanRootsTests.swift::testEveryRegisteredProviderConsultsItsOwnCustomScanRootsKey
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn pokemon_source_folder_drafts_commit_only_the_selected_provider(cx: &mut TestAppContext) {
@@ -145,14 +168,34 @@ async fn pokemon_source_folder_drafts_commit_only_the_selected_provider(cx: &mut
         w.render_frame(cx);
         w.click("Token sources", cx);
         w.render_frame(cx);
-        assert!(w.find("token-roots-save-claude").visible());
-        assert!(w.find("token-roots-save-codex").visible());
+        assert!(w.try_find("token-roots-save-claude").is_none());
+        assert!(w.try_find("token-roots-save-codex").is_none());
     })
     .unwrap();
 }
 
-// upstream: SaveTransferTests.swift::testImportedCompanionIsNotShownAsEggBeforeUsageArrives
-// upstream: SaveTransferTests.swift::testApplySaveSetsDisplayStateFromWhetherACompanionCameIn
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn pokemon_source_folders_are_saved_when_the_dialog_closes(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+    cx.update_window(window, |_, w, cx| {
+        let state = shark.read(cx).state.clone();
+        let settings =
+            cx.new(|cx| crate::settings::Settings::new(shark.downgrade(), &state, w, cx));
+        let claude = settings.read(cx).roots_input("claude");
+        let codex = settings.read(cx).roots_input("codex");
+        codex.update(cx, |input, cx| input.set_value("/tmp/close-b", w, cx));
+        assert!(!State::load().usage_roots.contains_key("codex"));
+        // Blur saves too (see Settings::new); closing must not lose a field that never blurred.
+        drop((settings, claude, codex));
+    })
+    .unwrap();
+    // Release callbacks run when the update that dropped the entity ends.
+    assert_eq!(State::load().usage_roots["codex"], "/tmp/close-b");
+}
+
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn pokemon_import_displays_current_species_without_waiting_for_usage(
@@ -202,7 +245,6 @@ async fn pokemon_import_displays_current_species_without_waiting_for_usage(
     .unwrap();
 }
 
-// upstream: SnapshotHistoryRenderingTests.swift::testTenSnapshotsStartCollapsedAndExpandAllRowsThenCollapseAndReopen
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn pokemon_snapshot_history_collapses_and_reopens_with_all_ten_rows(cx: &mut TestAppContext) {
@@ -254,7 +296,6 @@ async fn pokemon_snapshot_history_collapses_and_reopens_with_all_ten_rows(cx: &m
     .unwrap();
 }
 
-// upstream: SnapshotHistoryRenderingTests.swift::testEmptyHistoryIsDisclosedAndManualCreationRemainsAvailable
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn pokemon_empty_snapshot_history_explains_and_allows_creation(cx: &mut TestAppContext) {
@@ -279,20 +320,21 @@ async fn pokemon_empty_snapshot_history_explains_and_allows_creation(cx: &mut Te
     .unwrap();
 }
 
-// upstream: UsageStoreTests.swift::testAnimationQualityPersistsAcrossRestart
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn animation_quality_button_cycles_and_persists_for_restart(cx: &mut TestAppContext) {
+async fn animation_quality_select_is_shown_and_choice_persists_for_restart(
+    cx: &mut TestAppContext,
+) {
     use crate::pokemon::animation::Quality;
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
     let (window, shark) = boot(cx, State::default(), WindowOptions::default());
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| crate::settings::open(&s.state, w, cx));
+        w.render_frame(cx);
+        assert!(w.find("pokemon-animation-quality").visible());
         for quality in [Quality::Balanced, Quality::Smooth, Quality::PowerSaver] {
-            w.render_frame(cx);
-            assert!(w.find("pokemon-animation-quality").visible());
-            w.click("pokemon-animation-quality", cx);
+            shark.update(cx, |s, cx| s.set_pokemon_animation_quality(quality, cx));
             assert_eq!(shark.read(cx).state.pokemon_animation_quality, quality);
             assert_eq!(State::load().pokemon_animation_quality, quality);
         }

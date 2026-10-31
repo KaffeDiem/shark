@@ -32,7 +32,6 @@ lsp-types = "=0.97.0"
 anyhow = "1"
 async-channel = "2"
 globset = "0.4"
-flate2 = "1"
 chrono = "0.4"
 ignore = "0.4"
 url = "2"
@@ -53,7 +52,3 @@ harness = false
 test = false
 required-features = ["test-support"]
 
-
-[dev-dependencies]
-libc = "0.2"
-chrono-tz = "0.10"

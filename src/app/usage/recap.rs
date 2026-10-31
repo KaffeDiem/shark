@@ -1,6 +1,6 @@
 //! A native, coverage-aware usage recap. It shares the persisted ledger with the month chart.
 use super::*;
-use crate::pokemon::format::{Language, compact, grouped};
+use crate::pokemon::format::{compact, grouped};
 use crate::pokemon::{Mon, forms};
 use crate::usage::summary::{Graduation, Meter, Period, Recap, Scope, local_date};
 use chrono::{Datelike, Days};
@@ -29,84 +29,43 @@ pub(super) fn scope_name(scope: Scope) -> &'static str {
         Scope::Year => "Year",
     }
 }
-pub(super) fn current_label(scope: Scope, language: Language) -> &'static str {
-    let index = language as usize;
+pub(super) fn current_label(scope: Scope) -> &'static str {
     match scope {
-        Scope::Week => [
-            "이번 주",
-            "This week",
-            "今週",
-            "Esta semana",
-            "Cette semaine",
-            "Esta semana",
-            "Diese Woche",
-            "Эта неделя",
-        ][index],
-        Scope::Month => [
-            "이번 달",
-            "This month",
-            "今月",
-            "Este mes",
-            "Ce mois-ci",
-            "Este mês",
-            "Dieser Monat",
-            "Этот месяц",
-        ][index],
-        Scope::Year => [
-            "올해",
-            "This year",
-            "今年",
-            "Este año",
-            "Cette année",
-            "Este ano",
-            "Dieses Jahr",
-            "Этот год",
-        ][index],
+        Scope::Week => "This week",
+        Scope::Month => "This month",
+        Scope::Year => "This year",
     }
 }
-pub(super) fn meter_label(meter: &Meter, scope: Scope, language: Language) -> String {
-    let labels = DateText::new(
-        language,
-        if scope == Scope::Year {
-            "MMMMy"
-        } else {
-            "EEEEdMMM"
-        },
-    );
-    let missing = [
-        "데이터 없음",
-        "no data",
-        "データなし",
-        "sin datos",
-        "aucune donnée",
-        "sem dados",
-        "keine Daten",
-        "нет данных",
-    ][language as usize];
+pub(super) fn meter_label(meter: &Meter, scope: Scope) -> String {
+    let labels = DateText::new(if scope == Scope::Year {
+        "MMMMy"
+    } else {
+        "EEEEdMMM"
+    });
     format!(
         "{}, {}",
         labels.stamp(meter.date),
         if meter.has_data {
             grouped(meter.tokens, ',')
         } else {
-            missing.into()
+            "no data".into()
         }
     )
 }
 fn period_label(period: Period) -> String {
     match period.scope {
         Scope::Year => period.start.year().to_string(),
-        Scope::Month => DateText::new(Language::En, "MMMMy").stamp(period.start),
+        Scope::Month => DateText::new("MMMMy").stamp(period.start),
         Scope::Week => format!(
             "{} – {}",
-            DateText::new(Language::En, "dMMM").stamp(period.start),
-            DateText::new(Language::En, "dMMMy").stamp(period.end - Days::new(1))
+            DateText::new("dMMM").stamp(period.start),
+            DateText::new("dMMMy").stamp(period.end - Days::new(1))
         ),
     }
 }
 fn bucket_tick(meter: &Meter, scope: Scope) -> String {
     match scope {
-        Scope::Week => DateText::new(Language::En, "EEE")
+        Scope::Week => DateText::new("EEE")
             .stamp(meter.date)
             .chars()
             .take(2)
@@ -118,7 +77,7 @@ fn bucket_tick(meter: &Meter, scope: Scope) -> String {
                 String::new()
             }
         }
-        Scope::Year => DateText::new(Language::En, "MMMMM").stamp(meter.date),
+        Scope::Year => DateText::new("MMMMM").stamp(meter.date),
     }
 }
 
@@ -266,7 +225,7 @@ impl Shark {
                         Button::new("usage-recap-current")
                             .ghost()
                             .xsmall()
-                            .label(current_label(scope, Language::En))
+                            .label(current_label(scope))
                             .disabled(offset == 0)
                             .on_click(cx.listener(move |s, _, _, cx| s.set_recap_scope(scope, cx))),
                     )
@@ -327,7 +286,7 @@ impl Shark {
                             .items_end()
                             .gap(px(if scope == Scope::Month { 1.5 } else { 4. }))
                             .children(recap.buckets.iter().map(|meter| {
-                                let label = meter_label(meter, scope, Language::En);
+                                let label = meter_label(meter, scope);
                                 let lit = if meter.tokens > 0 && meter.has_data {
                                     ((meter.tokens as f64 / peak as f64) * 8.)
                                         .round()
@@ -431,7 +390,7 @@ impl Shark {
             .when_some(recap.best_day, |d, (date, n)| {
                 d.child(div().text_xs().child(format!(
                     "Best day: {} · {} tokens",
-                    DateText::new(Language::En, "EEEEdMMM").stamp(date),
+                    DateText::new("EEEEdMMM").stamp(date),
                     grouped(n, ',')
                 )))
             })

@@ -28,13 +28,6 @@ impl Quality {
             Self::Smooth => "Smooth",
         }
     }
-    pub fn next(self) -> Self {
-        match self {
-            Self::PowerSaver => Self::Balanced,
-            Self::Balanced => Self::Smooth,
-            Self::Smooth => Self::PowerSaver,
-        }
-    }
     pub fn frame_floor(self) -> Duration {
         Duration::from_millis(match self {
             Self::PowerSaver => 400,
@@ -111,9 +104,6 @@ mod tests {
     fn frames(n: usize, ms: u64) -> Vec<Duration> {
         vec![Duration::from_millis(ms); n]
     }
-    // upstream: PerformanceTests.swift::testEveryPresetCapsFramesWithoutChangingSpeed
-    // upstream: PerformanceTests.swift::testNoAnimationQualityPresetDisablesTheCap
-    // upstream: PerformanceTests.swift::testAnimationQualityPresetsAreOrdered
     #[test]
     fn every_preset_caps_without_slowing() {
         for q in Quality::ALL {
@@ -128,9 +118,6 @@ mod tests {
         assert!(Quality::PowerSaver.frame_floor() > Quality::Balanced.frame_floor());
         assert!(Quality::Balanced.frame_floor() > Quality::Smooth.frame_floor());
     }
-    // upstream: PerformanceTests.swift::testTransientSpriteKeepsNativeDelay
-    // upstream: PerformanceTests.swift::testCapIsIdentityAtZeroFloor
-    // upstream: PerformanceTests.swift::testTransientSurfaceIsTheOnlyUncappedOne
     #[test]
     fn transient_is_the_only_native_rate() {
         let native = frames(55, 50);
@@ -138,8 +125,6 @@ mod tests {
         assert_eq!(output.iter().map(|(_, d)| *d).collect::<Vec<_>>(), native);
         assert!(Quality::ALL.iter().all(|q| !q.frame_floor().is_zero()));
     }
-    // upstream: PerformanceTests.swift::testCapPreservesPlaybackSpeed
-    // upstream: PerformanceTests.swift::testCapLeavesAlreadySlowFramesAlone
     #[test]
     fn cap_conserves_long_and_slow_loops() {
         for floor in [200, 400] {
@@ -156,8 +141,6 @@ mod tests {
             4
         );
     }
-    // upstream: PerformanceTests.swift::testLowPowerCapsEffectiveFloorAtPowerSaverAndDerivationRestoresChoice
-    // upstream: PerformanceTests.swift::testLowPowerToggleChangesMenuSpriteKeyForFasterPresets
     #[test]
     fn low_power_is_derived_and_restores_original_choice() {
         for q in Quality::ALL {
@@ -174,7 +157,6 @@ mod tests {
             Quality::PowerSaver.effective_floor(false)
         );
     }
-    // upstream: PerformanceTests.swift::testToleranceDoesNotVisiblyStretchPlayback
     #[test]
     fn late_wakes_catch_up_without_changing_loop_phase() {
         let delays = frames(4, 100);

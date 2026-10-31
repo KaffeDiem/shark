@@ -53,9 +53,9 @@ impl Shark {
             .pokemon_ui
             .thumbnails
             .get(&mon_sprite_identity(mon, species))
-            .map(|path| {
-                images::sized(path, 40.)
-                    .id(format!("pokemon-catch-sprite-{index}"))
+            .and_then(|path| images::sized(path, 40.))
+            .map(|img| {
+                img.id(format!("pokemon-catch-sprite-{index}"))
                     .into_any_element()
             })
             .unwrap_or_else(|| div().child(format!("#{species}")).into_any_element());
@@ -122,7 +122,6 @@ mod tests {
     use crate::app::ui_tests::{UI_LOCK, boot, test_home};
     use core::prelude::v1::test;
     use gpui_kit::test::TestWindowExt;
-    // upstream: CatchLogRenderingTests.swift::testOpeningAndReopeningLargeLogOnlyLaysOutViewportSprites
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn large_log_reopen_lays_out_only_visible_sprite_rows(cx: &mut TestAppContext) {

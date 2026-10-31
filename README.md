@@ -24,7 +24,7 @@
 
 ## Pokémon companion
 
-Raise Pokémon with Claude Code and Codex token activity in the bottom-left navigation, alongside each provider’s remaining allowance. Open the companion for its Pokédex, Bag, Shop, and Shark's existing account usage view. Enable or disable it in Settings → General; find attribution in Settings → LICENSE. See [Pokémon usage and saves](docs/pokemon.md) and the [Rust test migration inventory](docs/poketokenbar-test-migration.md).
+Raise a Pokémon with your Claude Code and Codex token activity in the bottom-left navigation; see [Pokémon usage and saves](docs/pokemon.md). Adapted from [PokeTokenBar](https://github.com/chattymin/PokeTokenBar) (MIT); not affiliated with or endorsed by its authors, Nintendo, or The Pokémon Company.
 
 ## Install
 ```sh

@@ -29,7 +29,6 @@ fn recap(l: &UsageLedger, scope: Scope, offset: i32) -> Recap {
         now(),
     )
 }
-// upstream: UsageRecapTests.swift::testADayNeverGoesDown
 #[test]
 fn day_highwater() {
     let mut l = ledger(
@@ -40,7 +39,6 @@ fn day_highwater() {
     assert_eq!(l.tokens(date(2026, 9, 10)), 500);
     assert_eq!(l.tokens(date(2026, 9, 11)), 900)
 }
-// upstream: UsageRecapTests.swift::testTheSeriesVouchesForItsEmptyDaysToo
 #[test]
 fn coverage_includes_zero_days() {
     let mut l = ledger(date(2026, 9, 1), &[(date(2026, 9, 2), 40)]);
@@ -51,7 +49,6 @@ fn coverage_includes_zero_days() {
     l.merge(&[day(date(2026, 9, 5), 10)]);
     assert_eq!(l.covered_since.as_deref(), Some("2026-09-01"))
 }
-// upstream: UsageRecapTests.swift::testPruningForgetsTheCoverageItDrops
 #[test]
 fn pruning_forgets_coverage() {
     let mut l = ledger(
@@ -63,7 +60,6 @@ fn pruning_forgets_coverage() {
     assert_eq!(l.tokens(date(2026, 2, 1)), 200);
     assert_eq!(l.covered_since.as_deref(), Some("2026-01-01"))
 }
-// upstream: UsageRecapTests.swift::testJunkIsDroppedOnLoad
 #[test]
 fn junk_ledger_dropped() {
     let l:UsageLedger=serde_json::from_value(json!({"tokens_by_day":{"2026-09-10":400,"nope":10,"0000-00-00":10,"2026-09-11":0,"2026-09-12":-20},"covered_since":"0000-00-00"})).unwrap();
@@ -71,7 +67,6 @@ fn junk_ledger_dropped() {
     assert_eq!(l.tokens(date(2026, 9, 10)), 400);
     assert_eq!(l.covered_since, None)
 }
-// upstream: UsageRecapTests.swift::testSaveAndLoadRoundTrip
 #[test]
 fn ledger_roundtrip() {
     let l = ledger(date(2026, 9, 1), &[(date(2026, 9, 10), 700)]);
@@ -80,7 +75,6 @@ fn ledger_roundtrip() {
         l
     )
 }
-// upstream: UsageRecapTests.swift::testAWeekStartsOnTheRegionsFirstWeekday
 #[test]
 fn regional_week_start() {
     let mon = Period::containing(Scope::Week, now(), 0);
@@ -91,7 +85,6 @@ fn regional_week_start() {
         date(2026, 9, 13)
     )
 }
-// upstream: UsageRecapTests.swift::testSteppingBackLandsOnWholePeriods
 #[test]
 fn shift_whole_periods() {
     let feb = Period::containing(Scope::Month, date(2026, 3, 31), 0).shifted(-1);
@@ -99,7 +92,6 @@ fn shift_whole_periods() {
     let year = Period::containing(Scope::Year, now(), 0).shifted(-1);
     assert_eq!((year.start, year.end), (date(2025, 1, 1), date(2026, 1, 1)))
 }
-// upstream: UsageRecapTests.swift::testEachScopeDrawsItsOwnMeters
 #[test]
 fn scope_meters() {
     let l = ledger(
@@ -130,7 +122,6 @@ fn scope_meters() {
     assert!(year.buckets[8].current);
     assert_eq!(year.total, 35)
 }
-// upstream: UsageRecapTests.swift::testFutureAndUnrecordedDaysAreNotZeros
 #[test]
 fn missing_not_zero() {
     let l = ledger(date(2026, 9, 16), &[(date(2026, 9, 17), 50)]);
@@ -149,7 +140,6 @@ fn missing_not_zero() {
         ]
     )
 }
-// upstream: UsageRecapTests.swift::testARunningPeriodIsComparedOverTheSameDays
 #[test]
 fn running_comparison_elapsed_days() {
     let l = ledger(
@@ -165,7 +155,6 @@ fn running_comparison_elapsed_days() {
     assert_eq!(month.previous_total, Some(40));
     assert_eq!(month.delta(), Some(1.5))
 }
-// upstream: UsageRecapTests.swift::testAFinishedPeriodIsComparedWhole
 #[test]
 fn finished_comparison_whole() {
     let l = ledger(
@@ -177,7 +166,6 @@ fn finished_comparison_whole() {
     assert_eq!(august.previous_total, Some(100));
     assert_eq!(august.delta(), Some(2.))
 }
-// upstream: UsageRecapTests.swift::testAHalfCoveredPreviousPeriodIsNotAComparison
 #[test]
 fn partial_previous_no_comparison() {
     let l = ledger(
@@ -188,7 +176,6 @@ fn partial_previous_no_comparison() {
     assert_eq!(week.previous_total, None);
     assert_eq!(week.delta(), None)
 }
-// upstream: UsageRecapTests.swift::testTheBestStreakStaysInsideThePeriod
 #[test]
 fn streak_stays_in_period() {
     let l = ledger(
@@ -198,7 +185,6 @@ fn streak_stays_in_period() {
     assert_eq!(recap(&l, Scope::Week, 0).best_streak, 3);
     assert_eq!(recap(&l, Scope::Month, 0).best_streak, 6)
 }
-// upstream: UsageRecapTests.swift::testGraduationsInThePeriodOnly
 #[test]
 fn graduations_exclude_released_outside() {
     let graduates = [
@@ -249,7 +235,6 @@ fn graduations_exclude_released_outside() {
         3
     )
 }
-// upstream: UsageRecapTests.swift::testGoingBackStopsWhereTheLedgerStarts
 #[test]
 fn navigation_stops_before_coverage() {
     let l = ledger(date(2026, 9, 1), &[(date(2026, 9, 2), 10)]);
@@ -258,7 +243,6 @@ fn navigation_stops_before_coverage() {
     assert!(!recap(&l, Scope::Week, -2).can_go_back);
     assert!(!recap(&l, Scope::Year, 0).can_go_back)
 }
-// upstream: UsageRecapTests.swift::testAnEmptyLedgerStillDrawsThePeriod
 #[test]
 fn empty_ledger_has_unknown_meters() {
     let week = recap(&UsageLedger::default(), Scope::Week, 0);
@@ -284,7 +268,6 @@ fn entry(day: NaiveDate, output: u64) -> Entry {
 fn report(entries: Vec<Entry>, now: NaiveDate) -> Report {
     Report::from_entries(entries, entry(now, 0).date)
 }
-// upstream: MonthDailyTrendTests.swift::testEnrichmentSeriesAndMonthTotalStayInAgreement
 #[test]
 fn month_series_matches_scalar() {
     let now = date(2026, 7, 10);
@@ -306,7 +289,6 @@ fn month_series_matches_scalar() {
     let cost = series.iter().map(|d| d.bucket.cost).sum::<f64>();
     assert!((cost - month.cost).abs() < 1e-9)
 }
-// upstream: MonthDailyTrendTests.swift::testEnrichmentLastUsageIgnoresZeroTokenEntries
 #[test]
 fn last_usage_excludes_synthetic() {
     let real = entry(date(2026, 7, 6), 300);
@@ -320,7 +302,6 @@ fn last_usage_excludes_synthetic() {
         None
     )
 }
-// upstream: MonthDailyTrendTests.swift::testUnusedDaysAreExplicitZerosSoTheAxisCannotShift
 #[test]
 fn monthly_empty_days_explicit() {
     let now = date(2026, 7, 10);
@@ -338,7 +319,6 @@ fn monthly_empty_days_explicit() {
         [date(2026, 7, 3)]
     )
 }
-// upstream: MonthDailyTrendTests.swift::testSeriesStopsAtTodayAndNeverRunsToTheEndOfTheMonth
 #[test]
 fn month_series_stops_today() {
     let now = date(2026, 7, 10);
@@ -346,41 +326,6 @@ fn month_series_stops_today() {
     assert_eq!(series.len(), 10);
     assert_eq!(series.last().unwrap().date, now)
 }
-// upstream: MonthDailyTrendTests.swift::testAxisLengthMatchesTheDayOfMonthInEveryMonthAndAcrossDSTTimeZones
-#[test]
-fn all_month_lengths_and_dst_zones() {
-    for name in [
-        "Asia/Seoul",
-        "America/Los_Angeles",
-        "Australia/Lord_Howe",
-        "Pacific/Chatham",
-        "Europe/Berlin",
-    ] {
-        let tz: name_type::Tz = name.parse().unwrap();
-        for (y, m, d) in (1..=12).map(|m| (2026, m, 27)).chain([(2028, 2, 29)]) {
-            let now = tz.with_ymd_and_hms(y, m, d, 12, 0, 0).unwrap();
-            let synthetic = Entry {
-                date: now.timestamp() as f64,
-                ..Default::default()
-            };
-            let r = Report::from_entries(vec![synthetic], now.timestamp() as f64);
-            let series = r.month_daily_in(now);
-            assert_eq!(series.len(), d as usize, "{name}");
-            assert_eq!(series.first().unwrap().date, date(y, m, 1));
-            assert_eq!(series.last().unwrap().date, date(y, m, d));
-            assert_eq!(
-                series
-                    .iter()
-                    .map(|d| d.date)
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len(),
-                series.len()
-            )
-        }
-    }
-}
-use chrono_tz as name_type;
-// upstream: MonthDailyTrendTests.swift::testEstimatedCostAndCoverageAgreeAcrossSeriesAndPeriods
 #[test]
 fn monthly_cost_coverage_matches() {
     let now = date(2026, 7, 10);
@@ -435,44 +380,6 @@ fn daily_only_future_provider_is_summarized() {
     assert_eq!(b.total(), 120);
     assert!(b.coverage.unknown)
 }
-// upstream: MonthDailyTrendTests.swift::testProvidersWithoutASeriesDropOutWhileTheRestStillAggregate
-#[test]
-fn provider_series_optional_and_cost_capability() {
-    let mut yesterday = day(now().pred_opt().unwrap(), 100);
-    yesterday.bucket.cost = 1.;
-    let mut today = day(now(), 20);
-    today.bucket.cost = 0.5;
-    let mut flat = day(now(), 7);
-    flat.bucket.cost = 99.;
-    let providers = [
-        ProviderSeries {
-            id: "priced".into(),
-            name: "Priced".into(),
-            days: Some(vec![yesterday, today]),
-            reports_cost: true,
-        },
-        ProviderSeries {
-            id: "flat".into(),
-            name: "Flat".into(),
-            days: Some(vec![flat]),
-            reports_cost: false,
-        },
-        ProviderSeries {
-            id: "blind".into(),
-            name: "Blind".into(),
-            days: None,
-            reports_cost: true,
-        },
-    ];
-    let series = combined_provider_series(&providers);
-    assert_eq!(series.len(), 2);
-    assert_eq!(series[0].date, now().pred_opt().unwrap());
-    assert_eq!(series[0].bucket.total(), 100);
-    assert_eq!(series[0].bucket.cost, 1.);
-    assert_eq!(series[1].bucket.total(), 27);
-    assert_eq!(series[1].bucket.cost, 0.5)
-}
-// upstream: MonthDailyTrendTests.swift::testCrossMonthSessionDoesNotLeakLastMonthIntoTheSeries
 #[test]
 fn cross_month_file_mtime_scan_preserves_but_filters_entries() {
     use std::{
@@ -509,8 +416,7 @@ fn cross_month_file_mtime_scan_preserves_but_filters_entries() {
     let entries = cache.entries_since(
         crate::usage::Provider::Claude,
         &crate::usage::logs::Roots(vec![root.clone()]),
-        crate::usage::logs::timing::enrichment_start(stamp),
-        stamp,
+        0.,
     );
     assert_eq!(entries.len(), 2);
     assert!(entries.iter().any(|e| local_date(e.date).month() == 6));

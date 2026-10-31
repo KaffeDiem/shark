@@ -38,7 +38,6 @@ fn labels(today: &str) -> Vec<String> {
         .collect()
 }
 
-// upstream: MonthDailyTrendTests.swift::testBarHeightBoundaries
 #[test]
 fn heights_preserve_quiet_days_and_cap_peak() {
     assert_eq!(bar_height(0, 1000), BASELINE);
@@ -49,7 +48,6 @@ fn heights_preserve_quiet_days_and_cap_peak() {
     assert!(bar_height(1, 10_000_000) >= BASELINE);
     assert!(bar_height(999, 1000) <= TRACK);
 }
-// upstream: MonthDailyTrendTests.swift::testAxisLabelsCoverTheFirstDayEverySeventhAndAlwaysToday
 #[test]
 fn regular_axis_labels_and_today() {
     let today = date("2026-08-24");
@@ -63,7 +61,6 @@ fn regular_axis_labels_and_today() {
         assert_eq!(axis_label(today.with_day(n).unwrap(), today), None);
     }
 }
-// upstream: MonthDailyTrendTests.swift::testAxisLabelCountForAFullMonthStaysSmallEnoughToFit
 #[test]
 fn full_month_has_at_most_six_axis_labels() {
     assert_eq!(labels("2026-08-31"), ["1", "7", "14", "21", "28", "31"]);
@@ -72,7 +69,6 @@ fn full_month_has_at_most_six_axis_labels() {
         assert!(labels(&format!("2026-08-{n:02}")).len() <= 6);
     }
 }
-// upstream: MonthDailyTrendTests.swift::testARegularLabelNextToTodayIsDroppedSoTheTwoCannotCollide
 #[test]
 fn neighboring_axis_labels_are_suppressed() {
     for (today, want) in [
@@ -86,7 +82,6 @@ fn neighboring_axis_labels_are_suppressed() {
         assert_eq!(labels(today), want);
     }
 }
-// upstream: MonthDailyTrendTests.swift::testTodayIsNeverSuppressedSoTheAxisIsNeverEmpty
 #[test]
 fn every_today_is_labeled_without_collisions() {
     for n in 1..=31 {
@@ -96,7 +91,6 @@ fn every_today_is_labeled_without_collisions() {
         assert!(ns.windows(2).all(|w| w[1] - w[0] >= 3));
     }
 }
-// upstream: MonthDailyTrendTests.swift::testColumnsSpanTheWholeCalendarMonthEvenOnTheFirst
 #[test]
 fn columns_always_span_calendar_month() {
     for (today, length) in [
@@ -115,7 +109,6 @@ fn columns_always_span_calendar_month() {
         assert_eq!(columns.last().unwrap().date.day(), length as u32);
     }
 }
-// upstream: MonthDailyTrendTests.swift::testDaysAfterTodayAreFutureAndMissingPastDaysAreZero
 #[test]
 fn missing_past_is_zero_future_is_blank() {
     let columns = columns(
@@ -133,7 +126,6 @@ fn missing_past_is_zero_future_is_blank() {
     assert!(columns[..3].iter().all(|c| !c.future));
     assert!(columns[3..].iter().all(|c| c.future && c.tokens == 0));
 }
-// upstream: MonthDailyTrendTests.swift::testDaysFromAnotherMonthStayOffTheAxis
 #[test]
 fn stale_previous_month_never_enters_axis() {
     let columns = columns(
@@ -144,7 +136,6 @@ fn stale_previous_month_never_enters_axis() {
     assert!(columns.iter().all(|c| c.date.month() == 10));
     assert_eq!(columns.iter().map(|c| c.tokens).max(), Some(3));
 }
-// upstream: MonthDailyTrendTests.swift::testWeekendTicksStopAtToday
 #[test]
 fn weekends_are_not_painted_in_future_columns() {
     let columns = columns(&[day("2026-10-03", 5)], date("2026-10-03"));
@@ -155,7 +146,6 @@ fn weekends_are_not_painted_in_future_columns() {
     assert!(!tick(2));
     assert!(is_weekend(date("2026-10-11"), Some("ko_KR")));
 }
-// upstream: MonthDailyTrendTests.swift::testPeakIsShownOnlyOnceMoreThanOneDayHasUsage
 #[test]
 fn peak_requires_two_used_days() {
     for (values, want) in [
@@ -173,7 +163,6 @@ fn peak_requires_two_used_days() {
         );
     }
 }
-// upstream: MonthDailyTrendTests.swift::testWeekendMarkingFollowsTheInjectedCalendarLocale
 #[test]
 fn weekend_calendar_follows_region() {
     for (text, want) in [
@@ -187,31 +176,12 @@ fn weekend_calendar_follows_region() {
     assert!(is_weekend(date("2026-08-07"), Some("he_IL")));
     assert!(!is_weekend(date("2026-08-02"), Some("he_IL")));
 }
-// upstream: MonthDailyTrendTests.swift::testDayStampWeekdayFollowsTheAppLanguageNotTheSystemLocale
 #[test]
-fn date_stamps_follow_display_language() {
-    let stamp = |l| DateText::new(l, "MdE").stamp(date("2026-08-24"));
-    assert!(stamp(Language::Ko).contains('월'));
-    assert!(stamp(Language::En).contains("Mon"));
-    assert!(stamp(Language::Ja).contains('月'));
-    assert!(stamp(Language::Es).to_lowercase().contains("lun"));
-    assert!(stamp(Language::En).contains("8/24"));
-    for l in [Language::Fr, Language::Pt] {
-        assert!(stamp(l).contains("24/08"));
-    }
-    let stamps: std::collections::BTreeSet<_> = [
-        Language::Ko,
-        Language::En,
-        Language::Ja,
-        Language::Es,
-        Language::Fr,
-        Language::Pt,
-    ]
-    .map(stamp)
-    .into();
-    assert_eq!(stamps.len(), 6);
+fn date_stamps_use_english() {
+    let stamp = DateText::new("MdE").stamp(date("2026-08-24"));
+    assert!(stamp.contains("Mon"));
+    assert!(stamp.contains("8/24"));
 }
-// upstream: DailyTrendStackTests.swift::testOrderIsByMonthTotalWithUnusedProvidersDroppedAndTiesBrokenById
 #[test]
 fn stacks_order_by_month_then_stable_id() {
     let ps = vec![
@@ -229,7 +199,6 @@ fn stacks_order_by_month_then_stable_id() {
         ["big", "tie-a", "tie-b", "small"]
     );
 }
-// upstream: DailyTrendStackTests.swift::testStackingNeedsTwoProvidersThatActuallyUsedSomethingThisMonth
 #[test]
 fn stacking_requires_two_used_providers() {
     assert!(ordered(&[]).is_empty());
@@ -253,7 +222,6 @@ fn stacking_requires_two_used_providers() {
         assert_eq!(ordered(&ps).len() > 1, want);
     }
 }
-// upstream: DailyTrendStackTests.swift::testSegmentsAddUpExactlyToTheBarHeight
 #[test]
 fn cumulative_segments_exactly_fill_track() {
     let ps = vec![
@@ -283,7 +251,6 @@ fn cumulative_segments_exactly_fill_track() {
         [16., 8.]
     );
 }
-// upstream: DailyTrendStackTests.swift::testZeroTokenProvidersAreOmittedAndTheMonthLeaderStaysAtTheBottom
 #[test]
 fn daily_segments_keep_month_order_and_omit_idle() {
     let ps = vec![
@@ -307,7 +274,6 @@ fn daily_segments_keep_month_order_and_omit_idle() {
     );
     assert!(segments(date("2026-08-03"), &stack, 20.).is_empty());
 }
-// upstream: DailyTrendStackTests.swift::testColorsFollowRegistrationOrderNotUsageRank
 #[test]
 fn colors_do_not_follow_usage_rank() {
     let registry = vec!["first".into(), "second".into(), "third".into()];
@@ -329,7 +295,6 @@ fn colors_do_not_follow_usage_rank() {
     assert_eq!(before, after);
     assert_eq!(color_slot("third", &registry, 8), 2);
 }
-// upstream: DailyTrendStackTests.swift::testAProvidersColorDoesNotDependOnWhichOthersAreActive
 #[test]
 fn colors_do_not_shift_when_other_providers_activate() {
     let registry: Vec<_> = (0..14).map(|i| format!("p{i}")).collect();
@@ -343,7 +308,6 @@ fn colors_do_not_shift_when_other_providers_activate() {
         assert_eq!(color_slot("p8", &registry, 8), 0);
     }
 }
-// upstream: DailyTrendStackTests.swift::testEveryRegisteredProviderGetsItsOwnColor
 #[test]
 fn registered_sources_have_distinct_palette_slots() {
     let registry: Vec<_> = crate::usage::providers::builtins()
@@ -356,11 +320,10 @@ fn registered_sources_have_distinct_palette_slots() {
         .collect();
     assert_eq!(slots.len(), registry.len());
 }
-// upstream: DailyTrendStackTests.swift::testTheCaptionReadsTodaysCombinedTotalAndCost
 #[test]
 fn caption_is_combined_today_and_cost() {
     let days = vec![day("2026-08-23", 4_000_000), day("2026-08-24", 2_500_000)];
-    let labels = DateText::new(Language::En, "MdE");
+    let labels = DateText::new("MdE");
     assert_eq!(
         readout(&days, date("2026-08-24"), true, &labels),
         format!(
@@ -374,7 +337,6 @@ fn caption_is_combined_today_and_cost() {
         format!("{} 2.5M", labels.stamp(date("2026-08-24")))
     );
 }
-// upstream: DailyTrendStackTests.swift::testTheTooltipNamesTheDayTotalAndEachProviderThatUsedIt
 #[test]
 fn tooltip_names_day_total_and_used_provider_split() {
     let mut ps = vec![
@@ -388,7 +350,7 @@ fn tooltip_names_day_total_and_used_provider_split() {
     ps[1].name = "Codex".into();
     ps[1].reports_cost = false;
     let total = vec![day("2026-08-23", 4_000_000), day("2026-08-24", 2_000_000)];
-    let labels = DateText::new(Language::En, "MdE");
+    let labels = DateText::new("MdE");
     let text = hover_text(date("2026-08-23"), &total, &ordered(&ps), true, &labels).unwrap();
     assert!(text.contains("4M tokens"));
     assert!(text.contains("Claude Code · 3M · $"));
@@ -397,7 +359,6 @@ fn tooltip_names_day_total_and_used_provider_split() {
     assert!(!quiet.contains("Codex"));
     assert!(!quiet.contains('$'));
 }
-// upstream: DailyTrendStackTests.swift::testASingleProviderTooltipHasNoSplit
 #[test]
 fn single_provider_tooltip_has_no_duplicate_breakdown() {
     let ps = vec![provider("claude", &[("2026-08-24", 1000)])];
@@ -406,7 +367,7 @@ fn single_provider_tooltip_has_no_duplicate_breakdown() {
         &[day("2026-08-24", 1000)],
         &ordered(&ps),
         true,
-        &DateText::new(Language::En, "MdE"),
+        &DateText::new("MdE"),
     )
     .unwrap();
     assert!(!tip.contains('\n'));
@@ -452,8 +413,6 @@ fn fixture(
     cx.notify();
 }
 
-// upstream: MonthDailyTrendTests.swift::testAnAllZeroMonthRendersNothingWhileOneUsedDayRendersTheRow
-// upstream: MonthDailyTrendTests.swift::testEmptySeriesRendersNothing
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn native_chart_is_absent_until_a_day_has_usage(cx: &mut TestAppContext) {
@@ -474,8 +433,6 @@ async fn native_chart_is_absent_until_a_day_has_usage(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
-// upstream: MonthDailyTrendTests.swift::testFirstOfTheMonthRendersTheSameRowAsMidMonth
-// upstream: MonthDailyTrendTests.swift::testTrendRowIncludesTheAxisAndTickRowsBelowTheBars
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn native_month_structure_and_height_are_stable_on_day_one(cx: &mut TestAppContext) {
@@ -520,7 +477,6 @@ async fn native_month_structure_and_height_are_stable_on_day_one(cx: &mut TestAp
     })
     .unwrap();
 }
-// upstream: MonthDailyTrendTests.swift::testCaptionStaysOnOneLineInEveryLanguageAtWorstCaseNumbers
 // Adaptation: Shark retains English interface; locale date-format contracts are tested above.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -548,7 +504,6 @@ async fn native_worst_case_caption_stays_on_one_line(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
-// upstream: DailyTrendStackTests.swift::testASingleProviderMonthRendersPixelIdenticalToTheUnstackedRow
 // Adaptation: native geometry/state equality here; Metal screenshot comparison accompanies the render suite.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -612,7 +567,6 @@ impl UsageProvider for FutureSource {
         Daily::default()
     }
 }
-// upstream: DailyTrendStackTests.swift::testTheLegendWrapsWithinThePopoverWidth
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn native_legend_wraps_for_future_sources_with_long_names(cx: &mut TestAppContext) {

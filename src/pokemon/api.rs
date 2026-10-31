@@ -35,10 +35,6 @@ fn now() -> u64 {
         .as_secs()
 }
 
-pub fn sprite_url(id: u16, shiny: bool) -> String {
-    super::forms::sprite_url(id, true, shiny, None)
-}
-
 impl PokeApi {
     pub fn new(cache: PathBuf) -> Self {
         Self { cache }
@@ -209,9 +205,6 @@ impl PokeApi {
             names,
         })
     }
-    pub fn random_line(&self, min_rarity: Option<Rarity>) -> Result<EvoLine, String> {
-        self.random_line_with_collection(min_rarity, &BTreeSet::new())
-    }
     pub fn random_line_with_collection(
         &self,
         min_rarity: Option<Rarity>,
@@ -247,9 +240,6 @@ impl PokeApi {
             id,
             capture_rate: rate as u16,
         }))
-    }
-    pub fn cached_sprite(&self, id: u16, shiny: bool) -> Result<PathBuf, String> {
-        self.cached_sprite_form(id, shiny, None)
     }
     pub fn cached_sprite_form_cancellable(
         &self,
@@ -793,7 +783,7 @@ mod cache_tests {
         assert!(valid_gif(bytes));
         let decoded =
             super::super::sprites::decode(PathBuf::from("pixel.gif"), bytes.to_vec()).unwrap();
-        assert_eq!(decoded.dimensions(), (1, 1));
+        assert_eq!(decoded.frames[0].buffer().dimensions(), (1, 1));
         assert_eq!(decoded.frames.len(), 1);
         assert!(!valid_gif(&bytes[..bytes.len() - 3]));
     }

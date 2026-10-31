@@ -1,6 +1,6 @@
 use super::*;
 use std::{
-    io::{Read, Write},
+    io::Write,
     time::{Duration, UNIX_EPOCH},
 };
 fn a(id: &str, out: u64) -> Value {
@@ -15,18 +15,7 @@ fn stamp(path: &Path, seconds: u64) {
         .unwrap()
 }
 fn entries(c: &mut Cache, d: &Temp) -> Vec<Entry> {
-    c.entries_since(Provider::Claude, &d.roots(), 0., 10000000.)
-}
-fn snapshot(path: &Path) -> Value {
-    let raw = fs::read(path).unwrap();
-    let mut plain = vec![];
-    flate2::read::ZlibDecoder::new(raw.as_slice())
-        .read_to_end(&mut plain)
-        .unwrap();
-    serde_json::from_slice(&plain).unwrap()
-}
-fn save_snapshot(path: &Path, v: &Value) {
-    fs::write(path, serde_json::to_vec(v).unwrap()).unwrap()
+    c.entries_since(Provider::Claude, &d.roots(), 0.)
 }
 fn v(i: u64, o: u64) -> [u64; 6] {
     [i, 0, 0, o, 0, i + o]
@@ -48,36 +37,22 @@ fn orphan_tree(d: &Temp) {
     stamp(&p, 3000)
 }
 fn codex(c: &mut Cache, d: &Temp) -> Vec<Entry> {
-    c.entries_since(Provider::Codex, &d.roots(), 2000., 10000000.)
+    c.entries_since(Provider::Codex, &d.roots(), 2000.)
 }
 fn total(es: &[Entry]) -> Vec<u64> {
     let mut ns: Vec<_> = es.iter().map(Entry::total).collect();
     ns.sort();
     ns
 }
-// upstream: LocalUsageCacheTests.swift::testDefaultPathCacheNeitherReadsNorWritesUserFile
 #[test]
 fn default_cache_is_memory_only() {
     let d = Temp::new();
     d.write("a.jsonl", lines(&[a("a", 42)]));
     let mut c = Cache::default();
-    assert!(!c.persists_to_disk());
     assert_eq!(entries(&mut c, &d)[0].output, 42);
     assert_eq!(c.blob_count(), 1);
     assert_eq!(fs::read_dir(&d.0).unwrap().count(), 1)
 }
-// upstream: LocalUsageCacheTests.swift::testInjectedPathCacheStillPersists
-#[test]
-fn explicit_cache_persists() {
-    let d = Temp::new();
-    d.write("a.jsonl", lines(&[a("a", 7)]));
-    let p = d.0.join("cache.bin");
-    let mut c = Cache::at(p.clone());
-    assert!(c.persists_to_disk());
-    entries(&mut c, &d);
-    assert!(p.is_file())
-}
-// upstream: LocalUsageCacheTests.swift::testUnchangedFileIsNotReparsed
 #[test]
 fn unchanged_not_reparsed() {
     let d = Temp::new();
@@ -87,8 +62,6 @@ fn unchanged_not_reparsed() {
     assert_eq!(entries(&mut c, &d), first);
     assert_eq!(c.parsed_files, 1)
 }
-// upstream: LocalUsageCacheTests.swift::testMultipleRootsAreScannedAndDedupedAcrossRoots
-// upstream: LocalUsageReaderTests.swift::testMultipleRootsSumButShareGlobalDedup
 #[test]
 fn cross_root_global_dedup() {
     let aroot = Temp::new();
@@ -100,7 +73,6 @@ fn cross_root_global_dedup() {
     assert_eq!(e.len(), 3);
     assert_eq!(e.iter().map(|e| e.output).sum::<u64>(), 15)
 }
-// upstream: LocalUsageCacheTests.swift::testChangedFileIsReparsed
 #[test]
 fn changed_file_reparsed() {
     let d = Temp::new();
@@ -113,7 +85,6 @@ fn changed_file_reparsed() {
     assert_eq!(entries(&mut c, &d)[0].output, 8);
     assert_eq!(c.parsed_files, 2)
 }
-// upstream: LocalUsageCacheTests.swift::testAppendedFileParsesOnlyTheNewTail
 #[test]
 fn append_reads_only_tail() {
     let d = Temp::new();
@@ -131,7 +102,6 @@ fn append_reads_only_tail() {
     assert_eq!(entries(&mut c, &d).len(), 2);
     assert_eq!(c.parsed_bytes, (first.len() + next.len()) as u64)
 }
-// upstream: LocalUsageCacheTests.swift::testTruncatedFileIsReparsedFromStart
 #[test]
 fn truncation_restarts() {
     let d = Temp::new();
@@ -144,7 +114,6 @@ fn truncation_restarts() {
     assert_eq!(e[0].output, 3);
     assert_eq!(c.parsed_files, 2)
 }
-// upstream: LocalUsageCacheTests.swift::testHalfWrittenTrailingLineIsRetriedOnNextRefresh
 #[test]
 fn half_line_retried() {
     let d = Temp::new();
@@ -160,23 +129,6 @@ fn half_line_retried() {
     d.write("a.jsonl", complete);
     assert_eq!(entries(&mut c, &d).len(), 2)
 }
-// upstream: LocalUsageCacheTests.swift::testBlobWithoutOffsetStillDecodes
-#[test]
-fn old_blob_without_offset() {
-    let d = Temp::new();
-    d.write("a.jsonl", lines(&[a("a", 7)]));
-    let p = d.0.join("cache.bin");
-    entries(&mut Cache::at(p.clone()), &d);
-    let mut s = snapshot(&p);
-    for b in s["blobs"].as_object_mut().unwrap().values_mut() {
-        b.as_object_mut().unwrap().remove("offset");
-    }
-    save_snapshot(&p, &s);
-    let mut c = Cache::at(p);
-    assert_eq!(entries(&mut c, &d)[0].output, 7);
-    assert_eq!(c.parsed_files, 0)
-}
-// upstream: LocalUsageCacheTests.swift::testCodexCacheDropsForkedReplayBurst
 #[test]
 fn codex_cache_fork_burst() {
     let d = Temp::new();
@@ -193,7 +145,6 @@ fn codex_cache_fork_burst() {
     assert_eq!(e.len(), 1);
     assert_eq!(e[0].output, 52)
 }
-// upstream: LocalUsageCacheTests.swift::testCodexCacheDropsSameStateRerecord
 #[test]
 fn codex_cache_same_state() {
     let d = Temp::new();
@@ -210,7 +161,6 @@ fn codex_cache_same_state() {
         1
     )
 }
-// upstream: LocalUsageCacheTests.swift::testCodexCacheDeduplicatesRolloutAcrossActiveAndArchivedRoots
 #[test]
 fn active_archive_duplicate() {
     let d = Temp::new();
@@ -226,7 +176,6 @@ fn active_archive_duplicate() {
         [110]
     )
 }
-// upstream: LocalUsageCacheTests.swift::testCodexCacheFollowsRolloutWhenMovedToArchivedRoot
 #[test]
 fn move_to_archive() {
     let d = Temp::new();
@@ -245,7 +194,6 @@ fn move_to_archive() {
     assert_eq!(c.entries(Provider::Codex, &roots), before);
     assert_eq!(c.blob_count(), 1)
 }
-// upstream: LocalUsageCacheTests.swift::testCodexCacheKeepsSubagentFirstTurnWhenParentIsMissing
 #[test]
 fn orphan_subagent_first_turn() {
     let d = Temp::new();
@@ -261,30 +209,6 @@ fn orphan_subagent_first_turn() {
         [110]
     )
 }
-// upstream: LocalUsageCacheTests.swift::testCodexCacheInvalidatesOutdatedParserVersion
-#[test]
-fn outdated_parser_reparsed() {
-    let d = Temp::new();
-    d.write(
-        "c.jsonl",
-        lines(&[
-            meta("s", None, false),
-            event(1., Some(v(100, 10)), v(100, 10)),
-        ]),
-    );
-    let p = d.0.join("cache.bin");
-    Cache::at(p.clone()).entries(Provider::Codex, &d.roots());
-    let mut s = snapshot(&p);
-    s["version"] = json!(0);
-    for b in s["blobs"].as_object_mut().unwrap().values_mut() {
-        b["rollout"]["events"][0]["entry"]["output"] = json!(999);
-    }
-    save_snapshot(&p, &s);
-    let mut c = Cache::at(p);
-    assert_eq!(total(&c.entries(Provider::Codex, &d.roots())), [110]);
-    assert_eq!(c.parsed_files, 1)
-}
-// upstream: LocalUsageCacheTests.swift::testCodexCacheLoadsParentOutsideModifiedSinceForSubagentResolution
 #[test]
 fn old_parent_closure_no_old_usage() {
     let d = Temp::new();
@@ -309,7 +233,6 @@ fn old_parent_closure_no_old_usage() {
     assert_eq!(total(&es), [55, 65]);
     assert!(es.iter().all(|e| e.id.starts_with("codex|child|")))
 }
-// upstream: LocalUsageCacheTests.swift::testCodexOrphanedParentIsNotRescannedOnEveryRefresh
 #[test]
 fn orphan_index_reused() {
     let d = Temp::new();
@@ -322,35 +245,18 @@ fn orphan_index_reused() {
     assert_eq!(c.probes, 2);
     assert_eq!(c.parsed_files, parses)
 }
-// upstream: LocalUsageCacheTests.swift::testCodexSessionIndexPersistsAcrossInstances
 #[test]
-fn index_persists() {
-    let d = Temp::new();
-    orphan_tree(&d);
-    let p = d.0.join("cache.bin");
-    codex(&mut Cache::at(p.clone()), &d);
-    let mut c = Cache::at(p);
-    codex(&mut c, &d);
-    assert_eq!(c.probes, 0)
-}
-// upstream: LocalUsageCacheTests.swift::testCodexNegativeSessionIDProbePersistsAcrossRefreshesAndInstances
-#[test]
-fn negative_probes_persist() {
+fn negative_probes_cached() {
     let d = Temp::new();
     orphan_tree(&d);
     let path = d.write("no-meta.jsonl", b"{\"type\":\"noise\"}\n");
     stamp(&path, 1000);
-    let p = d.0.join("cache.bin");
-    let mut c = Cache::at(p.clone());
+    let mut c = Cache::default();
     codex(&mut c, &d);
     assert_eq!(c.probes, 3);
     codex(&mut c, &d);
     assert_eq!(c.probes, 3);
-    let mut restored = Cache::at(p);
-    codex(&mut restored, &d);
-    assert_eq!(restored.probes, 0)
 }
-// upstream: LocalUsageCacheTests.swift::testCodexProbeReadFailureIsRetriedInsteadOfPersisted
 #[test]
 fn failed_probe_retried() {
     let d = Temp::new();
@@ -358,7 +264,7 @@ fn failed_probe_retried() {
     let mut c = Cache::default();
     let mut calls = BTreeMap::<PathBuf, usize>::new();
     for _ in 0..3 {
-        c.entries_with_probe(Provider::Codex, &d.roots(), 2000., 10000000., |p| {
+        c.entries_with_probe(Provider::Codex, &d.roots(), 2000., |p| {
             let count = calls.entry(p.to_owned()).or_default();
             *count += 1;
             if p.file_name().unwrap() == "a.jsonl" && *count == 1 {
@@ -371,80 +277,28 @@ fn failed_probe_retried() {
     assert_eq!(calls[&d.0.join("a.jsonl").canonicalize().unwrap()], 2);
     assert_eq!(calls[&d.0.join("b.jsonl").canonicalize().unwrap()], 1)
 }
-// upstream: LocalUsageCacheTests.swift::testCodexProbeReadFailureIsNotPersistedToSnapshot
-#[test]
-fn failed_probe_not_persisted() {
-    let d = Temp::new();
-    orphan_tree(&d);
-    let p = d.0.join("cache.bin");
-    let mut c = Cache::at(p.clone());
-    c.entries_with_probe(Provider::Codex, &d.roots(), 2000., 10000000., |p| {
-        if p.file_name().unwrap() == "a.jsonl" {
-            Err(std::io::ErrorKind::PermissionDenied.into())
-        } else {
-            super::super::codex::probe(p, 1 << 20)
-        }
-    });
-    let mut restored = Cache::at(p);
-    codex(&mut restored, &d);
-    assert_eq!(restored.probes, 1)
-}
-// upstream: LocalUsageCacheTests.swift::testCodexSessionIndexVersionBumpRebuildsIndexWithoutReparsingBlobs
-#[test]
-fn index_version_preserves_blobs() {
-    let d = Temp::new();
-    orphan_tree(&d);
-    let p = d.0.join("cache.bin");
-    Cache::at(p.clone()).entries_since(Provider::Codex, &d.roots(), 2000., 4000.);
-    let mut s = snapshot(&p);
-    s["index_version"] = json!(0);
-    save_snapshot(&p, &s);
-    let mut c = Cache::at(p);
-    c.entries_since(Provider::Codex, &d.roots(), 2000., 4000.);
-    assert_eq!(c.parsed_files, 0);
-    assert_eq!(c.probes, 2)
-}
-// upstream: LocalUsageCacheTests.swift::testCodexSessionIndexReprobesOnlyChangedFile
 #[test]
 fn index_only_changed_probe() {
     let d = Temp::new();
     orphan_tree(&d);
-    let p = d.0.join("cache.bin");
-    codex(&mut Cache::at(p.clone()), &d);
+    let mut c = Cache::default();
+    codex(&mut c, &d);
+    let probes = c.probes;
     let a = d.write("a.jsonl", lines(&[meta("changed-longer", None, false)]));
     stamp(&a, 1500);
-    let mut c = Cache::at(p);
     codex(&mut c, &d);
-    assert_eq!(c.probes, 1)
+    assert_eq!(c.probes, probes + 1)
 }
-// upstream: LocalUsageCacheTests.swift::testCodexSessionIndexOutlivesBlobPrune
-#[test]
-fn index_survives_blob_prune() {
-    let d = Temp::new();
-    orphan_tree(&d);
-    let p = d.0.join("cache.bin");
-    codex(&mut Cache::at(p.clone()), &d);
-    let s = snapshot(&p);
-    assert!(s["blobs"].as_object().unwrap().is_empty());
-    assert_eq!(s["index"].as_object().unwrap().len(), 3);
-    let mut c = Cache::at(p);
-    codex(&mut c, &d);
-    assert_eq!(c.probes, 0);
-    assert_eq!(c.parsed_files, 1)
-}
-// upstream: LocalUsageCacheTests.swift::testCodexSessionIndexDropsDeletedFiles
 #[test]
 fn deleted_index_removed_and_saved() {
     let d = Temp::new();
     orphan_tree(&d);
-    let p = d.0.join("cache.bin");
-    let mut c = Cache::at(p.clone());
+    let mut c = Cache::default();
     codex(&mut c, &d);
     assert_eq!(c.index_count(), 3);
     fs::remove_file(d.0.join("a.jsonl")).unwrap();
-    c.entries_since(Provider::Codex, &d.roots(), 2000., 10000120.);
-    assert_eq!(c.index_count(), 2);
-    assert_eq!(Cache::at(p).index_count(), 2)
+    c.entries_since(Provider::Codex, &d.roots(), 2000.);
+    assert_eq!(c.index_count(), 2)
 }
 fn parent(d: &Temp, name: &str) {
     let p = d.write(
@@ -457,7 +311,6 @@ fn parent(d: &Temp, name: &str) {
     );
     stamp(&p, 1000)
 }
-// upstream: LocalUsageCacheTests.swift::testCodexStaleFilenameHintDoesNotBlockContentProbe
 #[test]
 fn false_filename_hint_does_not_hide_parent() {
     let d = Temp::new();
@@ -467,7 +320,6 @@ fn false_filename_hint_does_not_hide_parent() {
     parent(&d, "real.jsonl");
     assert_eq!(total(&codex(&mut Cache::default(), &d)), [330])
 }
-// upstream: LocalUsageCacheTests.swift::testCodexRestoredParentIsFoundAfterNegativeProbe
 #[test]
 fn restored_parent_found() {
     let d = Temp::new();
@@ -477,76 +329,6 @@ fn restored_parent_found() {
     parent(&d, "real.jsonl");
     assert_eq!(total(&codex(&mut c, &d)), [330])
 }
-// upstream: LocalUsageCacheTests.swift::testCodexParsedRolloutCacheRoundTripsAcrossInstances
-#[test]
-fn codex_disk_roundtrip() {
-    let d = Temp::new();
-    let source = d.write(
-        "a.jsonl",
-        lines(&[
-            meta("s", None, false),
-            event(1., Some(v(100, 10)), v(100, 10)),
-        ]),
-    );
-    stamp(&source, 5000);
-    let p = d.0.join("cache.bin");
-    let a = Cache::at(p.clone()).entries_since(Provider::Codex, &d.roots(), 0., 6000.);
-    d.write(
-        "a.jsonl",
-        lines(&[
-            meta("s", None, false),
-            event(1., Some(v(100, 20)), v(100, 20)),
-        ]),
-    );
-    stamp(&source, 5000);
-    let mut c = Cache::at(p);
-    assert_eq!(c.entries_since(Provider::Codex, &d.roots(), 0., 6000.), a);
-    assert_eq!(c.parsed_files, 0)
-}
-// upstream: LocalUsageCacheTests.swift::testDiskRoundTripAcrossInstances
-#[test]
-fn claude_disk_roundtrip() {
-    let d = Temp::new();
-    let source = d.write("a.jsonl", lines(&[a("a", 42)]));
-    stamp(&source, 9000000);
-    let p = d.0.join("cache.bin");
-    entries(&mut Cache::at(p.clone()), &d);
-    d.write("a.jsonl", lines(&[a("a", 43)]));
-    stamp(&source, 9000000);
-    let mut c = Cache::at(p);
-    assert_eq!(entries(&mut c, &d)[0].output, 42);
-    assert_eq!(c.parsed_files, 0)
-}
-// upstream: LocalUsageCacheTests.swift::testPruneDropsBlobsOlderThan40Days
-#[test]
-fn prune_old_disk_blobs() {
-    let d = Temp::new();
-    let old = d.write("old.jsonl", lines(&[a("old", 1)]));
-    stamp(&old, 1);
-    d.write("new.jsonl", lines(&[a("new", 2)]));
-    let p = d.0.join("cache.bin");
-    let e = entries(&mut Cache::at(p.clone()), &d);
-    assert_eq!(e.len(), 2);
-    let s = snapshot(&p).to_string();
-    assert!(!s.contains("old.jsonl"));
-    assert!(s.contains("new.jsonl"))
-}
-// upstream: LocalUsageCacheTests.swift::testSaveThrottle60s
-#[test]
-fn save_throttle() {
-    let d = Temp::new();
-    d.write("a.jsonl", lines(&[a("a", 1)]));
-    let p = d.0.join("cache.bin");
-    let mut c = Cache::at(p.clone());
-    c.entries_since(Provider::Claude, &d.roots(), 0., 10000000.);
-    let first = fs::read(&p).unwrap();
-    d.write("a.jsonl", lines(&[a("a", 22)]));
-    c.entries_since(Provider::Claude, &d.roots(), 0., 10000030.);
-    assert_eq!(fs::read(&p).unwrap(), first);
-    c.entries_since(Provider::Claude, &d.roots(), 0., 10000091.);
-    assert_ne!(fs::read(&p).unwrap(), first)
-}
-// upstream: LocalUsageCacheTests.swift::testModifiedSinceFilters
 #[test]
 fn mtime_filter() {
     let d = Temp::new();
@@ -554,36 +336,10 @@ fn mtime_filter() {
     stamp(&p, 1000);
     let p = d.write("new.jsonl", lines(&[a("new", 2)]));
     stamp(&p, 3000);
-    let e = Cache::default().entries_since(Provider::Claude, &d.roots(), 2000., 4000.);
+    let e = Cache::default().entries_since(Provider::Claude, &d.roots(), 2000.);
     assert_eq!(e.len(), 1);
     assert_eq!(e[0].output, 2)
 }
-// upstream: LocalUsageCacheTests.swift::testLegacyPlainJSONCacheLoads
-#[test]
-fn plain_snapshot_compatibility() {
-    let d = Temp::new();
-    d.write("a.jsonl", lines(&[a("a", 42)]));
-    let p = d.0.join("cache.bin");
-    entries(&mut Cache::at(p.clone()), &d);
-    save_snapshot(&p, &snapshot(&p));
-    let mut c = Cache::at(p);
-    assert_eq!(entries(&mut c, &d)[0].output, 42);
-    assert_eq!(c.parsed_files, 0)
-}
-// upstream: LocalUsageCacheTests.swift::testSnapshotIsCompressed
-#[test]
-fn compressed_snapshot() {
-    let d = Temp::new();
-    d.write(
-        "a.jsonl",
-        lines(&(0..50).map(|i| a(&format!("id{i}"), i)).collect::<Vec<_>>()),
-    );
-    let p = d.0.join("cache.bin");
-    entries(&mut Cache::at(p.clone()), &d);
-    let plain = serde_json::to_vec(&snapshot(&p)).unwrap();
-    assert!(fs::read(p).unwrap().len() < plain.len())
-}
-// upstream: LocalUsageCacheTests.swift::testCodexEntriesParseModelAndCachedInput
 #[test]
 fn codex_payload_context_model() {
     let d = Temp::new();
@@ -602,7 +358,6 @@ fn codex_payload_context_model() {
         (20, 80, 7, 0)
     )
 }
-// upstream: LocalUsageReaderTests.swift::testDegenerateParentHintIsNotUsedToNarrowCandidates
 // Rust indexes complete metadata IDs instead of using filename-substring hints.
 #[test]
 fn degenerate_parent_ids_never_trigger_whole_tree_parse() {
@@ -641,30 +396,6 @@ fn degenerate_parent_ids_never_trigger_whole_tree_parse() {
 }
 
 #[test]
-fn compressed_snapshot_expansion_is_bounded() {
-    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(&vec![b' '; 4096]).unwrap();
-    let bytes = encoder.finish().unwrap();
-    assert!(bytes.len() < 256);
-    assert!(super::super::cache::inflate_limited(&bytes, 256).is_err());
-    assert_eq!(
-        super::super::cache::inflate_limited(&bytes, 4096)
-            .unwrap()
-            .len(),
-        4096
-    )
-}
-#[test]
-fn oversized_snapshot_is_ignored() {
-    let d = Temp::new();
-    let p = d.0.join("cache.bin");
-    fs::File::create(&p)
-        .unwrap()
-        .set_len(32 * 1024 * 1024 + 1)
-        .unwrap();
-    assert_eq!(Cache::at(p).blob_count(), 0)
-}
-#[test]
 fn scan_io_error_is_distinct_from_successful_empty() {
     let d = Temp::new();
     let loop_path = d.0.join("loop");
@@ -688,8 +419,6 @@ fn scan_io_error_is_distinct_from_successful_empty() {
     assert_eq!(report.today(), 0)
 }
 
-// upstream: CustomScanRootsTests.swift::testCodexCacheKeepsSessionIndexAcrossMultipleRoots
-// upstream: CustomScanRootsTests.swift::testCodexCacheFindsParentInASiblingRoot
 #[test]
 fn codex_parent_index_spans_default_and_custom_roots_without_reprobing() {
     let a = Temp::new();
@@ -707,15 +436,12 @@ fn codex_parent_index_spans_default_and_custom_roots_without_reprobing() {
     stamp(&child, 3000);
     let roots = Roots::new(vec![a.0.clone(), b.0.clone()]);
     let mut c = Cache::default();
-    let first = c.entries_since(Provider::Codex, &roots, 2000., 10000000.);
+    let first = c.entries_since(Provider::Codex, &roots, 2000.);
     assert_eq!(total(&first), [330]);
     assert_eq!(c.index_count(), 2);
     let probes = c.probes;
     let parses = c.parsed_files;
-    assert_eq!(
-        c.entries_since(Provider::Codex, &roots, 2000., 10000000.),
-        first
-    );
+    assert_eq!(c.entries_since(Provider::Codex, &roots, 2000.), first);
     assert_eq!(c.probes, probes);
     assert_eq!(c.parsed_files, parses);
 }
@@ -773,4 +499,38 @@ fn inaccessible_parent_retained_in_index_does_not_panic_or_duplicate_fork_replay
     assert!(cache.last_error.is_some());
     assert_eq!(child.iter().map(Entry::total).sum::<u64>(), 110);
     assert_eq!(cache.entries(Provider::Codex, &roots), child);
+}
+#[test]
+fn walk_skips_symlinks_and_tolerates_unreadable_directories() {
+    use std::os::unix::fs::{PermissionsExt, symlink};
+    let d = Temp::new();
+    let outside = Temp::new();
+    d.write("a.jsonl", lines(&[a("a", 1)]));
+    outside.write("out.jsonl", lines(&[a("out", 2)]));
+    symlink(&outside.0, d.0.join("link")).unwrap();
+    symlink(outside.0.join("out.jsonl"), d.0.join("file.jsonl")).unwrap();
+    let locked = d.0.join("locked");
+    fs::create_dir(&locked).unwrap();
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0)).unwrap();
+    let mut c = Cache::default();
+    let e = entries(&mut c, &d);
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+    assert_eq!(e.len(), 1);
+    assert_eq!(e[0].output, 1);
+    assert!(c.last_error.is_none());
+}
+#[test]
+fn codex_repeated_state_without_session_meta_is_dropped() {
+    let d = Temp::new();
+    d.write(
+        "c.jsonl",
+        lines(&[
+            event(1., Some(v(100, 10)), v(100, 10)),
+            event(3., Some(v(100, 10)), v(100, 10)),
+        ]),
+    );
+    assert_eq!(
+        Cache::default().entries(Provider::Codex, &d.roots()).len(),
+        1
+    )
 }

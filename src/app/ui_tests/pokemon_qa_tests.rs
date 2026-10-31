@@ -90,37 +90,6 @@ async fn pokemon_large_individual_picker_stays_inside_panel(cx: &mut TestAppCont
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn pokemon_license_full_attribution_is_scrollable(cx: &mut TestAppContext) {
-    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    test_home();
-    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
-    cx.update_window(window, |_, w, cx| {
-        shark.update(cx, |s, cx| crate::settings::open(&s.state, w, cx));
-        w.render_frame(cx);
-        w.click("LICENSE", cx);
-        w.render_frame(cx);
-        assert!(w.find("license-shark").visible());
-        let initial = w.find("license-pokeapi").bounds().top();
-        w.scroll(
-            "settings-page",
-            ScrollDelta::Pixels(point(px(0.), px(-1600.))),
-            cx,
-        );
-        w.render_frame(cx);
-        assert!(
-            w.find("license-pokeapi").visible(),
-            "last attribution link must be reachable"
-        );
-        assert!(
-            w.find("license-pokeapi").bounds().top() < initial,
-            "long license content must scroll"
-        );
-    })
-    .unwrap();
-}
-
-#[gpui_kit::test]
-#[allow(clippy::await_holding_lock)]
 async fn pokemon_footer_and_popover_fit_small_windows_and_scroll(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
@@ -186,7 +155,6 @@ async fn pokemon_footer_and_popover_fit_small_windows_and_scroll(cx: &mut TestAp
     }
 }
 
-// upstream: PopoverNavigationTests.swift::testOpenDexEntryShowsDetailInCollection
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn pokemon_home_opens_growing_species_when_navigation_is_pinned(cx: &mut TestAppContext) {
@@ -210,7 +178,7 @@ async fn pokemon_home_opens_growing_species_when_navigation_is_pinned(cx: &mut T
             w.find("pokemon-footer")
                 .label()
                 .unwrap()
-                .starts_with("Bulbasaur,")
+                .ends_with("Open Pokémon companion")
         );
         w.click("pokemon-footer", cx);
         w.render_frame(cx);

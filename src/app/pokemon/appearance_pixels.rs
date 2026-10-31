@@ -103,11 +103,6 @@ fn save(cx: &mut gpui_kit::HeadlessAppContext, window: AnyWindowHandle, name: &s
             .unwrap();
     }
 }
-// upstream: DexColorRenderingTests.swift::testDetailSelectorChangesMountedPixelsAndReturnsToNormal
-// upstream: DexColorRenderingTests.swift::testCatchLogRendersEachIndividualsColorInBothAcquisitionOrdersAndOnReentry
-// upstream: DexColorRenderingTests.swift::testPokedexGridRendersShinySpeciesColor
-// upstream: CollectionReadabilityRenderingTests.swift::testGenerateCollectionReadabilityEvidence
-// upstream: CompanionTests.swift::testRepresentativeSubjectNotifiesImmediatelyWhenSelectionChanges
 pub(crate) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     let home = test_home();
     let directory = home.join("appearance-render-sprites");

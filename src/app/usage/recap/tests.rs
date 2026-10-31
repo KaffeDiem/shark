@@ -67,82 +67,39 @@ fn open(s: &mut Shark, w: &mut Window, cx: &mut Context<Shark>) {
     s.open_usage_recap(cx);
 }
 
-// upstream: UsageRecapTests.swift::testCurrentPeriodLabelsFollowTheScopeInEveryLanguage
 #[test]
-fn current_period_labels_follow_scope_for_all_supported_languages() {
-    let years = [
-        "올해",
-        "This year",
-        "今年",
-        "Este año",
-        "Cette année",
-        "Este ano",
-        "Dieses Jahr",
-        "Этот год",
-    ];
-    let weeks = [
-        "이번 주",
-        "This week",
-        "今週",
-        "Esta semana",
-        "Cette semaine",
-        "Esta semana",
-        "Diese Woche",
-        "Эта неделя",
-    ];
-    let months = [
-        "이번 달",
-        "This month",
-        "今月",
-        "Este mes",
-        "Ce mois-ci",
-        "Este mês",
-        "Dieser Monat",
-        "Этот месяц",
-    ];
-    for (i, language) in Language::ALL.into_iter().enumerate() {
-        assert_eq!(current_label(Scope::Year, language), years[i]);
-        assert_eq!(current_label(Scope::Week, language), weeks[i]);
-        assert_eq!(current_label(Scope::Month, language), months[i]);
-    }
+fn current_period_labels_follow_scope() {
+    assert_eq!(current_label(Scope::Year), "This year");
+    assert_eq!(current_label(Scope::Week), "This week");
+    assert_eq!(current_label(Scope::Month), "This month");
 }
-// upstream: UsageRecapTests.swift::testBucketDescriptionsDistinguishUsageZeroAndMissingDataInEveryLanguage
 #[test]
 fn accessible_meter_descriptions_distinguish_zero_from_unrecorded() {
     let mut observed = ledger();
     observed.tokens_by_day.retain(|key, _| key == "2026-09-17");
-    for language in Language::ALL {
-        for scope in Scope::ALL {
-            let period = Period::containing(scope, date("2026-09-18"), 0);
-            let recap = Recap::make(&observed, &[], period, date("2026-09-18"));
-            let used = recap
-                .buckets
-                .iter()
-                .find(|b| b.tokens == 12345)
-                .unwrap_or_else(|| recap.buckets.iter().find(|b| b.tokens > 0).unwrap());
-            let zero = recap
-                .buckets
-                .iter()
-                .find(|b| b.has_data && b.tokens == 0)
-                .unwrap();
-            let missing = recap.buckets.iter().rev().find(|b| !b.has_data).unwrap();
-            assert!(
-                meter_label(used, scope, language)
-                    .ends_with(&format!(", {}", grouped(used.tokens, ',')))
-            );
-            assert!(meter_label(zero, scope, language).ends_with(", 0"));
-            assert!(!meter_label(missing, scope, language).ends_with(", 0"));
-            if scope == Scope::Year && matches!(language, Language::En) {
-                assert!(meter_label(used, scope, language).starts_with("September 2026, "));
-                assert!(
-                    meter_label(recap.buckets.first().unwrap(), scope, language)
-                        .ends_with(", no data")
-                );
-            }
+    for scope in Scope::ALL {
+        let period = Period::containing(scope, date("2026-09-18"), 0);
+        let recap = Recap::make(&observed, &[], period, date("2026-09-18"));
+        let used = recap
+            .buckets
+            .iter()
+            .find(|b| b.tokens == 12345)
+            .unwrap_or_else(|| recap.buckets.iter().find(|b| b.tokens > 0).unwrap());
+        let zero = recap
+            .buckets
+            .iter()
+            .find(|b| b.has_data && b.tokens == 0)
+            .unwrap();
+        let missing = recap.buckets.iter().rev().find(|b| !b.has_data).unwrap();
+        assert!(meter_label(used, scope).ends_with(&format!(", {}", grouped(used.tokens, ','))));
+        assert!(meter_label(zero, scope).ends_with(", 0"));
+        assert!(!meter_label(missing, scope).ends_with(", 0"));
+        if scope == Scope::Year {
+            assert!(meter_label(used, scope).starts_with("September 2026, "));
+            assert!(meter_label(recap.buckets.first().unwrap(), scope).ends_with(", no data"));
         }
     }
 }
-// upstream: UsageRecapTests.swift::testTheCardRendersInEveryLanguageAndScope
 // Adaptation: native Shark interface remains English; localized formatter/labels are tested above.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -182,7 +139,6 @@ async fn native_recap_card_renders_every_scope_and_preserves_layout(cx: &mut Tes
     })
     .unwrap();
 }
-// upstream: UsageRecapTests.swift::testTheGraduateStripCarriesTheUnownLetterAndOnlyTheSpriteOfOtherForms
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn native_graduate_strip_keeps_forms_and_current_companion_identity(cx: &mut TestAppContext) {

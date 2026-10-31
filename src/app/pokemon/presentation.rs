@@ -39,7 +39,6 @@ impl Celebration {
             *self = Self::default();
             return;
         }
-        let lang = crate::pokemon::format::Language::En;
         let hatched = events.iter().find_map(|e| {
             if let Event::Hatched(n) = e {
                 Some(n)
@@ -55,23 +54,18 @@ impl Celebration {
             }
         });
         if let Some(name) = hatched {
-            self.message = Some(lang.hatch(name));
+            self.message = Some(format!("{name} hatched from the egg!"));
             self.shiny = companion
                 .active
                 .as_ref()
                 .is_some_and(|m| m.displays_shiny());
         } else if let Some(name) = evolved {
-            self.message = Some(lang.evolved(name));
+            self.message = Some(format!("Evolved into {name}!"));
             self.shiny = false;
         } else {
             return;
         }
         self.until = now + 4.;
-    }
-    pub fn expire(&mut self, now: f64) {
-        if now >= self.until {
-            *self = Self::default();
-        }
     }
 }
 pub(super) fn mood(
@@ -123,7 +117,6 @@ mod tests {
         });
         p
     }
-    // upstream: CompanionDisplayStateTests.swift::testEggWhenNoUsageData
     #[test]
     fn egg_without_usage() {
         assert_eq!(
@@ -131,8 +124,6 @@ mod tests {
             Mood::Egg
         );
     }
-    // upstream: CompanionDisplayStateTests.swift::testLevelUpDuringEventWindow
-    // upstream: CompanionDisplayStateTests.swift::testWorkingAfterEventExpires
     #[test]
     fn event_then_working() {
         let mut c = Celebration::default();
@@ -146,9 +137,6 @@ mod tests {
             Mood::Working
         );
     }
-    // upstream: CompanionDisplayStateTests.swift::testFocusOnHighBurn
-    // upstream: CompanionDisplayStateTests.swift::testTiredWhenLimitWarning
-    // upstream: CompanionDisplayStateTests.swift::testSleepWhenZeroUsageToday
     #[test]
     fn focus_tired_sleep_priorities() {
         let c = Celebration::default();
@@ -157,7 +145,6 @@ mod tests {
         assert_eq!(mood(true, &c, 0., true, 0, 0., false), Mood::Sleep);
         assert_eq!(mood(true, &c, 0., false, 100, 10_000., false), Mood::Sleep);
     }
-    // upstream: CompanionDisplayStateTests.swift::testEvolveStatusSurvivesUpdateWithinEventWindow
     #[test]
     fn empty_update_preserves_evolution_until_expiry() {
         let mut c = Celebration::default();
@@ -170,8 +157,6 @@ mod tests {
             mood(true, &c, 102., true, 100, 10_000., false),
             Mood::LevelUp
         );
-        c.expire(105.);
-        assert!(c.message.is_none());
         assert_eq!(
             mood(true, &c, 105., true, 100, 10_000., false),
             Mood::Working
@@ -191,10 +176,7 @@ mod tests {
             100.,
         );
         assert!(c.shiny);
-        assert_eq!(
-            c.message,
-            Some(crate::pokemon::format::Language::En.hatch("Bulbasaur"))
-        );
+        assert_eq!(c.message, Some("Bulbasaur hatched from the egg!".into()));
         p.active = None;
         c.observe(
             &[

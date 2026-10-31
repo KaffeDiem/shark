@@ -12,11 +12,6 @@ pub const STAT_ORDER: [&str; 6] = [
     "special-defense",
     "speed",
 ];
-pub const NATURES: [&str; 25] = [
-    "hardy", "lonely", "brave", "adamant", "naughty", "bold", "docile", "relaxed", "impish", "lax",
-    "timid", "hasty", "serious", "jolly", "naive", "modest", "mild", "quiet", "bashful", "rash",
-    "calm", "gentle", "sassy", "careful", "quirky",
-];
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Details {
@@ -168,9 +163,6 @@ impl Profile {
         self.moves = moves.into_iter().rev().take(4).collect();
         self.moves.reverse();
     }
-    pub fn apply_growth(&mut self, delta: u64, rarity: Rarity) {
-        self.advance_growth(self.growth_tokens.saturating_add(delta), rarity);
-    }
     pub fn advance_growth(&mut self, candidate: u64, rarity: Rarity) {
         self.growth_tokens = self.growth_tokens.max(candidate).min(MAX_TOKENS);
         let progress = (self.growth_tokens as f64 / rarity.graduation_total() as f64).min(1.0);
@@ -264,15 +256,6 @@ pub fn computed_stats(
         })
         .collect()
 }
-pub fn display_scale_maximum(values: &[i32]) -> i32 {
-    let maximum = values.iter().copied().max().unwrap_or(300).max(300);
-    maximum.saturating_add(99) / 100 * 100
-}
-pub fn migration_seed(text: &str) -> u64 {
-    text.bytes().fold(0xcbf2_9ce4_8422_2325, |hash, byte| {
-        (hash ^ byte as u64).wrapping_mul(0x0000_0100_0000_01B3)
-    })
-}
 struct ProfileRng(u64);
 impl ProfileRng {
     fn new(seed: u64) -> Self {
@@ -305,9 +288,6 @@ impl super::Companion {
         for mon in self.active.iter_mut().chain(self.collection.iter_mut()) {
             if mon.species_id() != details.species_id {
                 continue;
-            }
-            if mon.profile.is_none() {
-                mon.reconcile_profile(self.growth_difficulty);
             }
             if let Some(profile) = &mut mon.profile {
                 profile.enrich(details);

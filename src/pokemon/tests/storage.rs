@@ -48,7 +48,6 @@ fn value(s: &Companion) -> serde_json::Value {
     serde_json::to_value(s).unwrap()
 }
 
-// upstream: SaveTransferTests.swift::testRoundTripPreservesProgress
 #[test]
 fn round_trip_preserves_progress() {
     let mut s = sample(5_000_000_000);
@@ -62,7 +61,6 @@ fn round_trip_preserves_progress() {
     assert_eq!(value(&result.state), value(&s));
 }
 
-// upstream: SaveTransferTests.swift::testRoundTripPreservesActiveRepeatGrowthBoost
 #[test]
 fn repeat_growth_survives_transfer() {
     let mut s = sample(0);
@@ -75,7 +73,6 @@ fn repeat_growth_survives_transfer() {
     assert_eq!(m.threshold(1.), 62_500_000);
 }
 
-// upstream: SaveTransferTests.swift::testForeignJSONIsRejectedRatherThanImportedAsEmptyState
 #[test]
 fn foreign_json_rejected() {
     for raw in [
@@ -93,7 +90,6 @@ fn foreign_json_rejected() {
     );
 }
 
-// upstream: SaveTransferTests.swift::testValidEnvelopeWithWrongFormatIDIsRejected
 #[test]
 fn wrong_format_rejected() {
     let mut envelope: serde_json::Value =
@@ -105,8 +101,6 @@ fn wrong_format_rejected() {
     );
 }
 
-// upstream: SaveTransferTests.swift::testNewerSchemaIsRejected
-// upstream: SaveTransferTests.swift::testNewerSchemaIsReportedEvenWhenTheBodyIsUnreadable
 #[test]
 fn future_schema_reported_before_body_decoding() {
     for mut envelope in [
@@ -121,7 +115,6 @@ fn future_schema_reported_before_body_decoding() {
     }
 }
 
-// upstream: SaveTransferTests.swift::testOversizedFileIsRejectedBeforeParsing
 #[test]
 fn oversized_input_rejected_before_parsing() {
     assert_eq!(
@@ -137,7 +130,6 @@ fn oversized_input_rejected_before_parsing() {
     assert_eq!(read(&path).unwrap_err(), Error::TooLarge);
 }
 
-// upstream: SaveTransferTests.swift::testTransferDayTokensStillCountAfterRebase
 #[test]
 fn imported_usage_rebased_to_local_checkpoint() {
     let mut imported = sample(3_000_000);
@@ -155,8 +147,6 @@ fn imported_usage_rebased_to_local_checkpoint() {
     assert_eq!(result.lifetime_tokens, 3_000_600);
 }
 
-// upstream: SaveTransferTests.swift::testImportWithoutUsageDataDefersBaselineInsteadOfCreditingWholeDay
-// upstream: SaveTransferTests.swift::testImportWithStaleOnlyUsageDefersBaselineInsteadOfSeedingEmptyLedger
 #[test]
 fn no_current_usage_defers_install_baseline() {
     for current in [Companion::default(), sample(50_000)] {
@@ -171,8 +161,6 @@ fn no_current_usage_defers_install_baseline() {
     }
 }
 
-// upstream: SaveTransferTests.swift::testImportKeepsProgressAndCandyGrantLedger
-// upstream: SaveTransferTests.swift::testCandyGrantLedgerMergesInsteadOfBeingReplacedByAnOlderSave
 #[test]
 fn import_preserves_claimed_rewards_from_both_devices() {
     let mut local = sample(0);
@@ -194,7 +182,6 @@ fn import_preserves_claimed_rewards_from_both_devices() {
     );
 }
 
-// upstream: SaveTransferTests.swift::testExtremeValuesAreClampedAtTheTrustBoundary
 #[test]
 fn extreme_values_sanitized_before_use() {
     let mut state = sample(u64::MAX);
@@ -216,7 +203,6 @@ fn extreme_values_sanitized_before_use() {
     assert_eq!(result.balance(), 0);
 }
 
-// upstream: SaveSnapshotTests.swift::testSnapshotCreationAndListing
 #[test]
 fn snapshots_list_newest_first() {
     let temp = Temp::new();
@@ -231,7 +217,6 @@ fn snapshots_list_newest_first() {
     assert_eq!(read(&older.path).unwrap().state.lifetime_tokens, 100);
 }
 
-// upstream: SaveSnapshotTests.swift::testSnapshotPruningKeepsAtMostTen
 #[test]
 fn snapshot_retention_keeps_newest_ten() {
     let temp = Temp::new();
@@ -245,7 +230,6 @@ fn snapshot_retention_keeps_newest_ten() {
     assert_eq!(list[9].exported_at, 6);
 }
 
-// upstream: SaveSnapshotTests.swift::testAutoSnapshotIntervalGuard
 #[test]
 fn automatic_snapshots_wait_twelve_hours() {
     let temp = Temp::new();
@@ -261,78 +245,28 @@ fn automatic_snapshots_wait_twelve_hours() {
     assert_eq!(snapshots.list().len(), 2);
 }
 
-// upstream: SaveSnapshotTests.swift::testRestoreSnapshotRollsBackProgressAndPreservesCurrentAsSnapshot
-// upstream: SaveTransferTests.swift::testPreviousStateIsBackedUpBeforeOverwrite
 #[test]
-fn restore_creates_backup_before_replacing_progress() {
+fn future_stamped_snapshot_does_not_block_automatic_snapshots() {
     let temp = Temp::new();
     let snapshots = temp.snapshots();
-    let old = snapshots.create(&sample(123), 1).unwrap();
-    let current = sample(456);
-    let restored = snapshots
-        .prepare_restore(&old.path, &current, 2, BTreeMap::new())
-        .unwrap();
-    assert_eq!(restored.lifetime_tokens, 123);
-    assert_eq!(snapshots.latest().unwrap().lifetime_tokens, 456);
-    assert_eq!(current.lifetime_tokens, 456);
+    snapshots.create(&sample(1), 1_000_000).unwrap();
+    assert!(snapshots.maybe_create(&sample(2), 100).unwrap().is_some());
+    assert!(snapshots.maybe_create(&sample(3), 200).unwrap().is_none());
 }
 
-// upstream: SaveSnapshotTests.swift::testRestoreOldestSnapshotAtRetentionLimit
 #[test]
-fn restore_reads_oldest_before_backup_prunes_it() {
-    let temp = Temp::new();
-    let snapshots = temp.snapshots();
-    let oldest = snapshots.create(&sample(1), 1).unwrap();
-    for now in 2..=10 {
-        snapshots.create(&sample(now), now).unwrap();
-    }
-    let restored = snapshots
-        .prepare_restore(&oldest.path, &sample(999), 11, BTreeMap::new())
-        .unwrap();
-    assert_eq!(restored.lifetime_tokens, 1);
-    assert!(!oldest.path.exists());
-    assert_eq!(snapshots.list().len(), 10);
-    assert_eq!(snapshots.latest().unwrap().lifetime_tokens, 999);
-}
-
-// upstream: SaveSnapshotTests.swift::testRestoreUnreadableSnapshotLeavesStateAndSnapshotsUntouched
-// upstream: SaveSnapshotTests.swift::testCorruptSnapshotFileIsSkippedGracefully
-#[test]
-fn corrupt_snapshot_does_not_change_state_or_backup_history() {
+fn corrupt_snapshot_is_skipped() {
     let temp = Temp::new();
     let snapshots = temp.snapshots();
     snapshots.create(&sample(123), 1).unwrap();
     let bad = snapshots.directory.join("companion-snapshot-bad.json");
     fs::write(&bad, "{bad").unwrap();
     assert_eq!(snapshots.list().len(), 1);
-    let current = sample(456);
-    assert_eq!(
-        snapshots
-            .prepare_restore(&bad, &current, 2, BTreeMap::new())
-            .unwrap_err(),
-        Error::NotASave
-    );
+    assert_eq!(read(&bad).unwrap_err(), Error::NotASave);
     assert_eq!(snapshots.list().len(), 1);
     assert_eq!(snapshots.latest().unwrap().lifetime_tokens, 123);
-    assert_eq!(current.lifetime_tokens, 456);
 }
 
-// upstream: SaveTransferTests.swift::testImportAbortsWhenBackupCannotBeWritten
-#[test]
-fn backup_failure_aborts_restore() {
-    let temp = Temp::new();
-    let snapshots = temp.snapshots();
-    let source = snapshots.create(&sample(123), 1).unwrap();
-    let blocked = temp.0.join("file-not-directory");
-    fs::write(&blocked, "x").unwrap();
-    let broken = Snapshots::new(blocked);
-    assert!(matches!(
-        broken.prepare_restore(&source.path, &sample(456), 2, BTreeMap::new()),
-        Err(Error::BackupFailed(_))
-    ));
-}
-
-// upstream: SaveTransferTests.swift::testSecondImportDoesNotDestroyTheOriginalBackup
 #[test]
 fn same_second_snapshots_never_overwrite_original() {
     let temp = Temp::new();
@@ -345,7 +279,6 @@ fn same_second_snapshots_never_overwrite_original() {
     assert_eq!(snapshots.list()[0].path, second.path);
 }
 
-// upstream: SaveTransferTests.swift::testDuplicateSpeciesInSavedChainsAreRemovedOnLoad
 #[test]
 fn duplicate_path_keeps_current_species_in_active_and_released_records() {
     let mut state = sample(0);
@@ -365,7 +298,6 @@ fn duplicate_path_keeps_current_species_in_active_and_released_records() {
     assert_eq!(decoded.collection[0].species_id(), 2);
 }
 
-// upstream: SaveTransferTests.swift::testEveryCompanionStateFieldIsClassifiedForTransfer
 #[test]
 fn all_persisted_fields_have_an_explicit_transfer_policy() {
     let state = value(&sample(123));
@@ -400,7 +332,6 @@ fn all_persisted_fields_have_an_explicit_transfer_policy() {
     );
 }
 
-// upstream: SaveTransferTests.swift::testSuggestedFileNameCarriesDate
 #[test]
 fn export_name_carries_date() {
     assert_eq!(
@@ -414,151 +345,26 @@ fn export_name_carries_date() {
     );
 }
 
-// upstream: SaveSnapshotTests.swift::testSnapshotKeepsNonDefaultFormInSummaryAndRestoredState
 #[test]
-fn snapshot_summary_keeps_nondefault_form() {
-    let temp = Temp::new();
-    let snapshots = temp.snapshots();
-    let mut state = Companion::default();
-    state.egg_tokens = Balance::EGG_HATCH_THRESHOLD;
-    state.hatch(EvoLine {
-        base_id: 492,
-        rarity: Rarity::Legendary,
-        names: BTreeMap::new(),
-        tree: EvoNode {
-            species_id: 492,
-            children: vec![],
-        },
-    });
-    state.active.as_mut().unwrap().form = Some(crate::pokemon::forms::Form("sky".into()));
-    let saved = snapshots.create(&state, 1).unwrap();
-    assert_eq!(saved.current_species_id, Some(492));
-    assert_eq!(
-        saved.current_form.as_ref().map(|f| f.0.as_str()),
-        Some("sky")
-    );
-    assert_eq!(snapshots.list()[0].current_form, saved.current_form);
-    assert_eq!(
-        read(&saved.path).unwrap().state.active.unwrap().form,
-        saved.current_form
-    );
-}
-
-// upstream: SaveSnapshotTests.swift::testSnapshotDoesNotRevealShinyOfDisguisedDitto
-#[test]
-fn snapshots_do_not_reveal_disguised_shiny_ditto() {
-    let temp = Temp::new();
-    let snapshots = temp.snapshots();
-    let mut state = sample(0);
-    let mon = state.active.as_mut().unwrap();
-    mon.shiny = true;
-    mon.ditto_disguise = Some(1);
-    mon.ditto_revealed = false;
-    let saved = snapshots.create(&state, 1).unwrap();
-    assert_eq!(saved.current_species_id, Some(1));
-    assert!(!saved.current_is_shiny);
-    assert!(!snapshots.list()[0].current_is_shiny);
-    assert!(
-        read(&saved.path).unwrap().state.active.unwrap().shiny,
-        "save retains true identity while summaries hide the reveal"
-    );
-}
-
-// upstream: SaveTransferTests.swift::testImportErrorMessagesAreLocalizedNotRawSwiftText
-// upstream: LocalizationErrorsTests.swift::testErrorsHaveSelectedLanguageMessagesWithoutSystemDescription
-// upstream: LocalizationErrorsTests.swift::testStoredErrorsFollowLanguageChangesAndKeepDiagnostics
-#[test]
-fn save_errors_are_localized_without_losing_diagnostic_detail() {
-    use crate::pokemon::format::Language;
+fn save_errors_hide_diagnostic_detail_from_users() {
     let errors = [
         Error::NotASave,
         Error::NewerSchema(2),
         Error::TooLarge,
         Error::Io("NSError: private/path permission denied".into()),
-        Error::BackupFailed("private/path ENOSPC".into()),
     ];
-    for error in &errors {
-        let translations = Language::ALL.map(|language| error.user_message(language));
-        assert_eq!(
-            translations
-                .iter()
-                .collect::<std::collections::BTreeSet<_>>()
-                .len(),
-            8
-        );
-        assert!(translations.iter().all(|s| !s.is_empty()
-            && !s.contains("NSError")
-            && !s.contains("private/path")
-            && !s.contains("NotASave")
-            && !s.contains("couldn't be completed")));
-        assert_eq!(error.to_string(), translations[1]);
-        assert_eq!(error.user_message(Language::Ja), translations[2]);
-    }
+    let messages = errors.each_ref().map(|error| error.to_string());
+    assert_eq!(
+        messages
+            .iter()
+            .collect::<std::collections::BTreeSet<_>>()
+            .len(),
+        4
+    );
+    assert!(messages.iter().all(|s| !s.is_empty()
+        && !s.contains("NSError")
+        && !s.contains("private/path")
+        && !s.contains("NotASave")
+        && !s.contains("couldn't be completed")));
     assert!(format!("{:?}", errors[3]).contains("permission denied"));
-}
-
-// upstream: SaveSnapshotTests.swift::testSnapshotSummariesResolveCurrentAppearanceAcrossLegacyAndEnvelopeFiles
-#[test]
-fn snapshot_summaries_resolve_forms_from_raw_rust_and_envelope_saves() {
-    use crate::pokemon::forms::Form;
-    for (species, raw, expected) in [
-        (492, Some("sky"), Some("sky")),
-        (492, None, Some("land")),
-        (492, Some("future"), Some("land")),
-        (201, Some("b"), Some("b")),
-        (420, Some("sunshine"), None),
-        (25, Some("future"), None),
-    ] {
-        let t = Temp::new();
-        let snapshots = t.snapshots();
-        fs::create_dir_all(&snapshots.directory).unwrap();
-        let mut state = Companion::default();
-        state.egg_tokens = Balance::EGG_HATCH_THRESHOLD;
-        state.hatch(EvoLine {
-            base_id: species,
-            rarity: Rarity::Common,
-            names: BTreeMap::new(),
-            tree: EvoNode {
-                species_id: species,
-                children: vec![],
-            },
-        });
-        state.active.as_mut().unwrap().form = raw.map(|v| Form(v.into()));
-        let legacy = snapshots.directory.join("companion-snapshot-legacy.json");
-        fs::write(&legacy, serde_json::to_vec(&state).unwrap()).unwrap();
-        assert!(
-            matches!(read(&legacy), Err(Error::NotASave)),
-            "external imports remain envelope-only"
-        );
-        let created = snapshots.create(&state, 1_700_000_000).unwrap();
-        assert_eq!(created.current_species_id, Some(species));
-        assert_eq!(
-            created.current_form.as_ref().map(|f| f.0.as_str()),
-            expected
-        );
-        let listed = snapshots.list();
-        assert_eq!(listed.len(), 2);
-        for entry in listed {
-            assert_eq!(entry.current_species_id, Some(species));
-            assert_eq!(entry.current_form.as_ref().map(|f| f.0.as_str()), expected);
-        }
-        let restored = snapshots
-            .prepare_restore(
-                &legacy,
-                &Companion::default(),
-                1_700_000_001,
-                BTreeMap::new(),
-            )
-            .unwrap();
-        let mon = restored.active.unwrap();
-        assert_eq!(
-            crate::pokemon::forms::resolved(mon.species_id(), mon.form.as_ref())
-                .as_ref()
-                .map(|f| f.0.as_str()),
-            expected
-        );
-    }
-    let t = Temp::new();
-    let egg = t.snapshots().create(&Companion::default(), 1).unwrap();
-    assert!(egg.current_species_id.is_none() && egg.current_form.is_none());
 }

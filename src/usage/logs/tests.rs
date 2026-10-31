@@ -9,8 +9,6 @@ mod cache;
 mod claude;
 mod codex;
 mod cost;
-mod large;
-mod parity;
 mod pricing;
 struct Temp(PathBuf);
 impl Temp {
@@ -64,6 +62,24 @@ fn bucket(es: &[Entry]) -> Bucket {
         b.add(e)
     }
     b
+}
+fn between(r: &Report, start: f64, end: f64) -> Bucket {
+    bucket(
+        &r.entries
+            .iter()
+            .filter(|e| e.date >= start && e.date < end)
+            .cloned()
+            .collect::<Vec<_>>(),
+    )
+}
+fn daily_buckets(r: &Report) -> std::collections::BTreeMap<i64, Bucket> {
+    let mut days = std::collections::BTreeMap::<i64, Bucket>::new();
+    for e in &r.entries {
+        days.entry(crate::usage::activity::local_day(e.date))
+            .or_default()
+            .add(e)
+    }
+    days
 }
 fn close(a: f64, b: f64) {
     assert!((a - b).abs() < 1e-10, "{a} != {b}")

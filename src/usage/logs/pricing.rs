@@ -1,6 +1,4 @@
 //! Pinned upstream API-equivalent estimates; exact model IDs only.
-use std::collections::BTreeSet;
-use std::sync::{Mutex, OnceLock};
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Rate(pub [f64; 4]);
 pub fn model_key(model: &str) -> String {
@@ -86,11 +84,4 @@ pub fn estimate(model: &str, input: u64, output: u64, write: u64, read: u64) -> 
             + output as f64 * o * if long { 1.5 } else { 1. })
             / 1000000.,
     )
-}
-pub fn first_unpriced_sighting(model: &str) -> bool {
-    static SEEN: OnceLock<Mutex<BTreeSet<String>>> = OnceLock::new();
-    SEEN.get_or_init(Default::default)
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .insert(model_key(model))
 }

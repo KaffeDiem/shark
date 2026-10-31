@@ -32,6 +32,15 @@ fn names() -> crate::pokemon::EvoLine {
         ]),
     }
 }
+fn reached_names(p: &Companion) -> Vec<String> {
+    let mut names = BTreeMap::new();
+    for mon in p.collection.iter().chain(p.active.iter()) {
+        for id in mon.reached_species() {
+            names.insert(id, mon.line.name(id));
+        }
+    }
+    names.into_values().collect()
+}
 fn legacy() -> Companion {
     let mut state = Companion::default();
     state.egg_tokens = state.progress().1;
@@ -54,8 +63,6 @@ fn legacy() -> Companion {
     state.inventory.candies = 3;
     state
 }
-// upstream: DexNameMigrationTests.swift::testLegacyNamedEntriesRefreshAllLanguagesOnceAndPreserveProgress
-// upstream: DexNameMigrationTests.swift::testSimultaneouslyMountedCatchRowsShareOneRequest
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn legacy_name_upgrade_coalesces_by_base_and_preserves_individuals(cx: &mut TestAppContext) {
@@ -119,8 +126,6 @@ async fn legacy_name_upgrade_coalesces_by_base_and_preserves_individuals(cx: &mu
     })
     .unwrap();
 }
-// upstream: DexNameMigrationTests.swift::testOfflineLegacyCacheRemainsVisibleAndRetriesAfterRecovery
-// upstream: CompanionTests.swift::testBackfillRetriesAfterAnOfflineAttempt
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn offline_name_refresh_preserves_fallback_and_retries_on_navigation(
@@ -153,7 +158,6 @@ async fn offline_name_refresh_preserves_fallback_and_retries_on_navigation(
     })
     .unwrap();
 }
-// upstream: DexNameMigrationTests.swift::testPartialResponsePreservesOldNamesWithoutMarkingMigrationComplete
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn partial_name_response_preserves_old_species_and_remains_retryable(
@@ -187,9 +191,6 @@ async fn partial_name_response_preserves_old_species_and_remains_retryable(
     })
     .unwrap();
 }
-// upstream: CompanionTests.swift::testBackfillFillsNamesForEntriesSavedBeforeNamesExisted
-// upstream: CompanionTests.swift::testDexResolveChainNamesFetchesWhenUnstored
-// upstream: CompanionTests.swift::testDexResolveChainNamesBackfillsLegacyEntry
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn missing_chain_names_are_backfilled_and_saved(cx: &mut TestAppContext) {
@@ -203,27 +204,11 @@ async fn missing_chain_names_are_backfilled_and_saved(cx: &mut TestAppContext) {
     let (window, shark) = boot(cx, state, WindowOptions::default());
     cx.update_window(window, |_, _, cx| {
         shark.update(cx, |s, cx| {
-            assert_eq!(
-                s.state
-                    .pokemon
-                    .dex_species()
-                    .iter()
-                    .map(|cell| cell.name.as_str())
-                    .collect::<Vec<_>>(),
-                ["#1", "#2"]
-            );
+            assert_eq!(reached_names(&s.state.pokemon), ["#1", "#2"]);
             s.request_dex_names(cx);
             assert_eq!(s.pokemon_ui.name_pending, BTreeSet::from([1]));
             s.complete_pokemon_names(1, s.pokemon_ui.generation, Ok(names()), cx);
-            assert_eq!(
-                s.state
-                    .pokemon
-                    .dex_species()
-                    .iter()
-                    .map(|cell| cell.name.as_str())
-                    .collect::<Vec<_>>(),
-                ["Bulbasaur", "Ivysaur"]
-            );
+            assert_eq!(reached_names(&s.state.pokemon), ["Bulbasaur", "Ivysaur"]);
             assert_eq!(
                 State::load().pokemon.collection[0].line.names[&2]["ko"],
                 "이상해풀"
@@ -232,7 +217,6 @@ async fn missing_chain_names_are_backfilled_and_saved(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
-// upstream: CompanionTests.swift::testBackfillDoesNotFetchWhenNamesAreAlreadyStored
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn complete_versioned_names_skip_network_backfill(cx: &mut TestAppContext) {

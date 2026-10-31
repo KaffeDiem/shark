@@ -42,36 +42,22 @@ fn details(species: u16) -> profile::Details {
         moves: vec![],
     }
 }
-// upstream: UnownSpriteViewTests.swift::testAnimationIdentitiesSeparateAllLettersAndShinyVariants
-// upstream: UnownSpriteViewTests.swift::testChangingUnownLetterReloadsEvenWhenSpeciesAndShinyMatch
-// upstream: UnownSpriteViewTests.swift::testSameUnownLetterStillReloadsOnShinyToggle
 #[test]
 fn all_unown_letters_and_colors_have_distinct_subject_identities() {
     let mut identities: BTreeSet<SpriteIdentity> = BTreeSet::new();
     for form in crate::pokemon::forms::forms(201) {
         for shiny in [false, true] {
             let identity = mon_sprite_identity(&mon(201, shiny, Some(form.clone())), 201);
-            for previous in &identities {
-                assert!(sprite_needs_reload(
-                    &Some(previous.clone()),
-                    true,
-                    &Some(identity.clone())
-                ));
-            }
             assert!(identities.insert(identity));
         }
     }
     assert_eq!(identities.len(), 56);
 }
-// upstream: UnownSpriteViewTests.swift::testAnimationIdentitiesNormalizeLegacyAAndIgnoreFormsForOtherSpecies
-// upstream: UnownSpriteViewTests.swift::testLegacyUnownFormUsesTheSameSpriteAsExplicitA
-// upstream: UnownSpriteViewTests.swift::testUnownFormDoesNotAffectOtherSpeciesSprites
 #[test]
 fn legacy_a_is_canonical_and_unrelated_species_ignore_unown_letters() {
     let legacy = mon_sprite_identity(&mon(201, false, None), 201);
     let explicit = mon_sprite_identity(&mon(201, false, Some(Form("a".into()))), 201);
     assert_eq!(legacy, explicit);
-    assert!(!sprite_needs_reload(&Some(legacy), true, &Some(explicit)));
     for form in crate::pokemon::forms::forms(201) {
         assert_eq!(
             mon_sprite_identity(&mon(25, false, Some(form)), 25),
@@ -79,8 +65,6 @@ fn legacy_a_is_canonical_and_unrelated_species_ignore_unown_letters() {
         );
     }
 }
-// upstream: FormMetadataNoteRenderingTests.swift::testHomeExplainsLoadedAlternateMetadataOnly
-// upstream: FormMetadataNoteRenderingTests.swift::testDexExplainsTheDisplayedFormRatherThanTheOriginalSelection
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn form_notes_follow_loaded_metadata_and_the_displayed_individual(cx: &mut TestAppContext) {
@@ -157,8 +141,6 @@ fn png(directory: &Path, shiny: bool) -> Arc<crate::pokemon::sprites::Asset> {
     )
     .unwrap()
 }
-// upstream: UnownSpriteViewTests.swift::testStaticShinyToggleLoadsShinyWhenOnlyNormalImageIsCached
-// upstream: UnownSpriteViewTests.swift::testStaticInitiallyShinyLoadsShinyWhenOnlyNormalImageIsCached
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn static_unown_never_uses_a_normal_cache_entry_for_a_shiny_subject(cx: &mut TestAppContext) {

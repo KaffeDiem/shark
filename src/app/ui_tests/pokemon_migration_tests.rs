@@ -31,8 +31,6 @@ fn collection(count: u16) -> State {
 }
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-// upstream: DexPageButtonHitAreaTests.swift::testClickOutsideGlyphButInsideHitAreaPages
-// upstream: DexPageButtonHitAreaTests.swift::testHitAreaMeetsPointerTargetMinimum
 async fn dex_pager_corners_and_wheel_are_real_targets(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
@@ -56,9 +54,6 @@ async fn dex_pager_corners_and_wheel_are_real_targets(cx: &mut TestAppContext) {
 }
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-// upstream: DexBackNavigationTests.swift::testBackFromDetailReturnsToThePageOfThatSpecies
-// upstream: DexBackNavigationTests.swift::testReturnPageIsUsedOnlyOnce
-// upstream: DexBackNavigationTests.swift::testBackToTheLogLeavesTheGridOnItsFirstPage
 async fn home_detail_back_finds_species_page_and_segment_resets_it(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
@@ -86,7 +81,6 @@ async fn home_detail_back_finds_species_page_and_segment_resets_it(cx: &mut Test
 }
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-// upstream: DexBackNavigationTests.swift::testBackFromDetailReturnsTheLogToWhereItWas
 async fn catch_log_back_retains_scroll_until_segment_changes(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
@@ -178,8 +172,6 @@ async fn precious_companion_egg_requires_explicit_review(cx: &mut TestAppContext
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-// upstream: DifficultySaveTests.swift::testDraftDoesNotApplyUntilSaveAndSavesBothControls
-// upstream: DifficultySaveTests.swift::testSaveButtonAppearsBelowEditedSlidersInEveryLanguage
 async fn difficulty_draft_is_discarded_on_close_and_save_appears_below_controls(
     cx: &mut TestAppContext,
 ) {
@@ -212,10 +204,6 @@ async fn difficulty_draft_is_discarded_on_close_and_save_appears_below_controls(
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-// upstream: OutsideClickMonitorTests.swift::testStartTwiceKeepsFirstTokenAndDoesNotRegisterAgain
-// upstream: OutsideClickMonitorTests.swift::testStopWhenIdleDoesNotRemove
-// upstream: OutsideClickMonitorTests.swift::testStartAfterStopRegistersAgain
-// upstream: OutsideClickMonitorTests.swift::testNilRegisterDoesNotOccupyTheSlot
 async fn window_owned_popover_coalesces_open_and_releases_on_close(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
@@ -262,10 +250,6 @@ async fn window_owned_popover_coalesces_open_and_releases_on_close(cx: &mut Test
 }
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-// upstream: PopoverNavigationTests.swift::testResetReturnsToHomeFromSettings
-// upstream: PopoverNavigationTests.swift::testOpenRepresentativeDexLeavesSettingsForCollection
-// upstream: PopoverNavigationTests.swift::testDexDetailDroppedWhenCollectionContentLeavesScreen
-// upstream: PopoverNavigationTests.swift::testDexDetailKeptWhileCollectionContentStaysOnScreen
 async fn selected_collection_retap_keeps_detail_and_settings_reentry_starts_home(
     cx: &mut TestAppContext,
 ) {
@@ -290,9 +274,8 @@ async fn selected_collection_retap_keeps_detail_and_settings_reentry_starts_home
         w.click("pokemon-footer", cx);
         assert!(w.find("pokemon-home").visible());
         w.press("escape", cx);
-        shark.update(cx, |s, cx| crate::settings::open(&s.state, w, cx));
-        w.render_frame(cx);
-        w.click("pokemon-choose-navigation", cx);
+        w.click("pokemon-footer", cx);
+        w.click("pokemon-tab-Pokédex", cx);
         assert!(w.find("pokemon-dex").visible());
         assert!(w.try_find("pokemon-home").is_none());
     })
@@ -300,9 +283,6 @@ async fn selected_collection_retap_keeps_detail_and_settings_reentry_starts_home
 }
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-// upstream: DexEntryLinkCursorTests.swift::testHoverShowsHandAndLeavingRestoresArrow
-// upstream: DexEntryLinkCursorTests.swift::testDisappearingWhileHoveredRestoresArrow
-// upstream: DexEntryLinkCursorTests.swift::testDisappearingUnhoveredLeavesOtherViewsCursorAlone
 async fn frame_owned_links_leave_no_stale_interactive_hitbox_when_detail_replaces_grid(
     cx: &mut TestAppContext,
 ) {
@@ -331,7 +311,6 @@ async fn frame_owned_links_leave_no_stale_interactive_hitbox_when_detail_replace
 }
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-// upstream: RepresentativeFooterLayoutTests.swift::testRepresentativeActionStaysIconWidthInEveryLocaleAndState
 async fn representative_pin_action_stays_icon_width_before_and_after_selection(
     cx: &mut TestAppContext,
 ) {
@@ -346,13 +325,7 @@ async fn representative_pin_action_stays_icon_width_before_and_after_selection(
         for _ in 0..2 {
             let action = w.find("pokemon-pin-selected");
             assert!(action.bounds().size.width <= px(40.));
-            assert_eq!(
-                action.label(),
-                Some(
-                    crate::pokemon::format::Language::En
-                        .interface_text(crate::pokemon::interface_labels::Label::RepresentativeSet)
-                )
-            );
+            assert_eq!(action.label(), Some("Set as representative"));
             w.click("pokemon-pin-selected", cx);
         }
     })
@@ -360,7 +333,6 @@ async fn representative_pin_action_stays_icon_width_before_and_after_selection(
 }
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-// upstream: IndividualPickerRenderingTests.swift::testMountedSingleAndMultipleIndividuals
 async fn individual_selector_is_mounted_only_for_multiple_matching_individuals(
     cx: &mut TestAppContext,
 ) {

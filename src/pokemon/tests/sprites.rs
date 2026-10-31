@@ -47,10 +47,6 @@ fn form(name: &str) -> Form {
 fn off(_: &str) -> Result<Vec<u8>, String> {
     Err("offline".into())
 }
-// upstream: UnownSpriteTests.swift::testExistingUnownAndExplicitAKeepLegacyCacheKeys
-// upstream: UnownSpriteTests.swift::testAll28FormsHaveIndependentNormalShinyAndAnimatedCaches
-// upstream: UnownSpriteTests.swift::testFormURLsMatchPokeAPIAssetsInAllFourDirectories
-// upstream: UnownSpriteTests.swift::testOtherSpeciesIgnoreAnUnownForm
 #[test]
 fn unown_all_variants_have_distinct_safe_paths_and_official_urls() {
     let mut keys = std::collections::BTreeSet::new();
@@ -87,8 +83,6 @@ fn unown_all_variants_have_distinct_safe_paths_and_official_urls() {
         }
     }
 }
-// upstream: SpriteImageCacheTests.swift::testSynchronousLoadsReuseImagesAndKeepVariantsSeparate
-// upstream: UnownSpriteTests.swift::testByteAndImageCachesKeepLettersSeparateAcrossAllFormats
 #[test]
 fn decoded_cache_reuses_frames_and_separates_forms_colors_formats_and_directories() {
     let t = Temp::new();
@@ -100,7 +94,10 @@ fn decoded_cache_reuses_frames_and_separates_forms_colors_formats_and_directorie
                 let r = Request::pokemon(201, animated, shiny, Some(&form(name)));
                 let path = t.write(&r, 4 + index as u32, 6 + index as u32);
                 let a = cached(&path).unwrap();
-                assert_eq!(a.dimensions(), (4 + index as u32, 6 + index as u32));
+                assert_eq!(
+                    a.frames[0].buffer().dimensions(),
+                    (4 + index as u32, 6 + index as u32)
+                );
                 assert!(all.iter().all(|old| !Arc::ptr_eq(old, &a)));
                 fs::remove_file(&path).unwrap();
                 assert!(Arc::ptr_eq(&a, &cached(&path).unwrap()));
@@ -112,7 +109,6 @@ fn decoded_cache_reuses_frames_and_separates_forms_colors_formats_and_directorie
     let path = other.write(&r, 9, 9);
     assert!(!Arc::ptr_eq(&all[0], &cached(&path).unwrap()));
 }
-// upstream: SpriteImageCacheTests.swift::testMissingOrInvalidImageDoesNotPreventALaterLoad
 #[test]
 fn misses_and_bad_images_do_not_poison_later_reads() {
     let t = Temp::new();
@@ -122,36 +118,17 @@ fn misses_and_bad_images_do_not_poison_later_reads() {
     fs::write(&path, b"invalid").unwrap();
     assert!(cached(&path).is_none());
     t.write(&r, 2, 2);
-    assert_eq!(cached(&path).unwrap().dimensions(), (2, 2));
+    assert_eq!(
+        cached(&path).unwrap().frames[0].buffer().dimensions(),
+        (2, 2)
+    );
 }
-// upstream: SpriteImageCacheTests.swift::testNormalFallbackDoesNotMaskALaterShinyImage
-// upstream: UnownSpriteTests.swift::testShinyStaticFallbackKeepsLetterAndDoesNotHideALaterShiny
-#[test]
-fn fallback_keeps_the_same_form_and_never_masks_a_later_shiny() {
-    let t = Temp::new();
-    t.write(&Request::pokemon(201, false, false, None), 12, 12);
-    let shiny = Request::pokemon(201, false, true, Some(&form("b")));
-    assert!(cached_request(&t.0, shiny.clone()).is_none());
-    let normal = Request::pokemon(201, false, false, Some(&form("b")));
-    let normalpath = t.write(&normal, 4, 6);
-    let first = cached_request(&t.0, shiny.clone()).unwrap();
-    assert_eq!(first.path, normalpath);
-    let shinypath = t.write(&shiny, 5, 7);
-    let second = cached_request(&t.0, shiny).unwrap();
-    assert_eq!(second.path, shinypath);
-    assert!(!Arc::ptr_eq(&first, &second));
-    assert!(Arc::ptr_eq(&first, &cached(&normalpath).unwrap()));
-}
-// upstream: SpriteImageCacheTests.swift::testAsyncLoadsPopulateTheSynchronousCacheAndReuseEachOther
-// upstream: SpriteImageCacheTests.swift::testItemLoadsShareTheImageCacheInBothDirections
 #[test]
 fn worker_loads_and_synchronous_lookups_share_decoded_identity() {
     let t = Temp::new();
     for r in [
         Request::pokemon(25, true, false, None),
         Request::pokemon(25, false, true, None),
-        Request::item("rare-candy"),
-        Request::item("shiny-charm"),
     ] {
         let path = t.write(&r, 4, 6);
         let assets = std::thread::scope(|scope| {
@@ -165,9 +142,6 @@ fn worker_loads_and_synchronous_lookups_share_decoded_identity() {
         assert!(Arc::ptr_eq(&assets.0, &load_with(&t.0, r, off).unwrap()));
     }
 }
-// upstream: SpriteImageCacheTests.swift::testAsyncFallbacksStillReachNormalStaticImages
-// upstream: UnownSpriteTests.swift::testAsyncAnimationAndShinyImageFallbacksKeepSelectedLetter
-// upstream: UnownSpriteTests.swift::testDecodedShinyFallbackUsesTheSameLetter
 #[test]
 fn worker_fallback_reaches_same_form_normal_static_with_no_key_pollution() {
     let t = Temp::new();
@@ -180,7 +154,7 @@ fn worker_fallback_reaches_same_form_normal_static_with_no_key_pollution() {
     let normalpath = t.write(&normal, 4, 7);
     let asset = load_with(&t.0, r.clone(), off).unwrap();
     assert_eq!(asset.path, normalpath);
-    assert_eq!(asset.dimensions(), (4, 7));
+    assert_eq!(asset.frames[0].buffer().dimensions(), (4, 7));
     assert!(!is_exact_animated(&asset.path, 201, true, Some(&form("b"))));
     assert!(cached(&t.0.join(r.filename())).is_none());
     let exact = t.write(&r, 5, 8);
@@ -193,7 +167,6 @@ fn worker_fallback_reaches_same_form_normal_static_with_no_key_pollution() {
         Some(&form("b"))
     ));
 }
-// upstream: UnownSpriteTests.swift::testDecodedAnimationCacheKeepsLettersColorsAndCanvasSeparate
 #[test]
 fn decoded_animations_keep_canvas_delays_and_variant_identity() {
     let t = Temp::new();
@@ -206,7 +179,10 @@ fn decoded_animations_keep_canvas_delays_and_variant_identity() {
             })
             .unwrap();
             assert_eq!(a.frames.len(), 2);
-            assert_eq!(a.dimensions(), (4 + index as u32, 7 + index as u32));
+            assert_eq!(
+                a.frames[0].buffer().dimensions(),
+                (4 + index as u32, 7 + index as u32)
+            );
             assert_eq!(a.frames[0].delay().numer_denom_ms(), (100, 1));
             assert_eq!(a.frames[1].delay().numer_denom_ms(), (200, 1));
             assert!(all.iter().all(|old| !Arc::ptr_eq(old, &a)));
@@ -215,22 +191,13 @@ fn decoded_animations_keep_canvas_delays_and_variant_identity() {
     }
 }
 #[test]
-fn unsafe_items_oversized_and_mismatched_images_are_rejected() {
+fn oversized_and_mismatched_images_are_rejected() {
     let t = Temp::new();
-    for name in ["../secret", "foo/bar", "", "UPPER"] {
-        assert!(
-            load_with(&t.0, Request::item(name), |_| panic!(
-                "unsafe name cannot reach fetch"
-            ))
-            .is_err()
-        );
-    }
     assert!(decode(t.0.join("x.png"), vec![0; MAX_FILE + 1]).is_err());
     assert!(decode(t.0.join("x.gif"), pixels(2, 2, false)).is_err());
     assert!(decode(t.0.join("x.png"), pixels(1025, 1, false)).is_err());
 }
 
-// upstream: SpriteAnimationRecoveryTests.swift::testCancelledShinyRequestDoesNotStartNormalFallbackOrApplyAResult
 #[test]
 fn cancellation_prevents_new_fallbacks_and_cache_publication() {
     use std::sync::atomic::{AtomicBool, Ordering};
@@ -284,7 +251,6 @@ fn gif_delays_under_twenty_milliseconds_normalize_to_one_hundred() {
     );
 }
 
-// upstream: SpriteAnimationRecoveryTests.swift::testShinyMissStillUsesNormalGIFWithoutWaiting
 #[test]
 fn shiny_gif_miss_uses_normal_animation_in_the_same_attempt() {
     let t = Temp::new();
@@ -306,7 +272,6 @@ fn shiny_gif_miss_uses_normal_animation_in_the_same_attempt() {
     assert_eq!(asset.path.file_name().unwrap(), "sprite-176-normal.gif");
 }
 
-// upstream: SpriteAnimationRecoveryTests.swift::testWarmShinyFormCacheSkipsFallbackNetworkAndBackoff
 #[test]
 fn warm_shiny_form_animation_is_immediately_available_without_network() {
     let t = Temp::new();
@@ -320,7 +285,6 @@ fn warm_shiny_form_animation_is_immediately_available_without_network() {
     assert_eq!(asset.path, path);
 }
 
-// upstream: SpriteAnimationRecoveryTests.swift::testUnsupportedSpeciesLoadsStaticOnceWithoutRetry
 #[test]
 fn species_outside_the_gen_one_to_five_catalog_never_start_network() {
     let t = Temp::new();

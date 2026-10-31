@@ -103,7 +103,7 @@ fn footer_pace_covers_all_colors_and_missing_window_fallback() {
         assert!(
             quota_details("Claude", &snapshot, 1000.)
                 .join(" ")
-                .contains(tier.label(crate::pokemon::format::Language::En))
+                .contains(tier.label())
         );
     }
     let mut snapshot = quota(Some(15.));

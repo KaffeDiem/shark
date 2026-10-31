@@ -3,7 +3,7 @@ use super::{
     Companion, Mon, Rarity,
     forms::{self, Form},
 };
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 #[derive(Clone, Debug, PartialEq)]
 pub struct DexSpecies {
     pub id: u16,
@@ -22,14 +22,6 @@ impl Companion {
             m.reached_species().any(|s| s == id)
                 && form.is_none_or(|f| forms::resolved(id, m.form.as_ref()).as_ref() == Some(f))
         })
-    }
-    pub fn collected_forms(&self, id: u16) -> BTreeSet<Form> {
-        self.collection
-            .iter()
-            .chain(self.active.iter())
-            .filter(|m| m.reached_species().any(|s| s == id))
-            .filter_map(|m| forms::resolved(id, m.form.as_ref()))
-            .collect()
     }
     pub fn collected_line_forms(&self, base: u16) -> BTreeSet<Form> {
         forms::line_forms(base)
@@ -51,32 +43,6 @@ impl Companion {
                     && form.is_none_or(|f| forms::resolved(id, m.form.as_ref()).as_ref() == Some(f))
             })
             .collect()
-    }
-    pub fn dex_species(&self) -> Vec<DexSpecies> {
-        let mut cells = BTreeMap::new();
-        for mon in self.collection.iter().chain(self.active.iter()) {
-            let raising = self.active.as_ref().is_some_and(|a| std::ptr::eq(a, mon));
-            for id in mon.reached_species() {
-                let shiny = mon.displays_shiny();
-                let cell = cells.entry(id).or_insert_with(|| DexSpecies {
-                    id,
-                    name: mon.line.name(id),
-                    rarity: mon.line.rarity,
-                    shiny: false,
-                    raising: false,
-                    normal_owned: false,
-                    shiny_owned: false,
-                    count: 0,
-                    form: None,
-                });
-                cell.shiny |= shiny;
-                cell.shiny_owned |= shiny;
-                cell.normal_owned |= !shiny;
-                cell.raising |= raising && id == mon.species_id();
-                cell.count += 1;
-            }
-        }
-        cells.into_values().collect()
     }
     pub fn form_species(&self, id: u16) -> Vec<DexSpecies> {
         forms::forms(id)
@@ -112,12 +78,5 @@ impl Companion {
         let mut archived: Vec<_> = self.collection.iter().rev().collect();
         archived.sort_by(|a, b| b.caught_at.cmp(&a.caught_at));
         self.active.iter().chain(archived).collect()
-    }
-    pub fn rarity_count(&self, rarity: Rarity) -> usize {
-        self.collection
-            .iter()
-            .chain(self.active.iter())
-            .filter(|m| m.line.rarity == rarity)
-            .count()
     }
 }

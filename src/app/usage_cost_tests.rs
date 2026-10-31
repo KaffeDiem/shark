@@ -15,7 +15,6 @@ fn entry(model: &str, now: f64) -> Entry {
         ..Default::default()
     }
 }
-// upstream: UsageCostTests.swift::testStoreCarriesCoverageToMenuAndDailyTrend
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn cost_coverage_survives_store_and_native_usage(cx: &mut TestAppContext) {
@@ -76,7 +75,6 @@ async fn cost_coverage_survives_store_and_native_usage(cx: &mut TestAppContext) 
     })
     .unwrap();
 }
-// upstream: UsageCostTests.swift::testNativeCostRenderingAndAllLocalizedStates
 // Shark retains its interface language; pure cost localization tests cover all upstream languages.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -121,7 +119,6 @@ async fn native_cost_states_have_accessible_labels_and_layout(cx: &mut TestAppCo
         .unwrap();
     }
 }
-// upstream: UsageStoreTests.swift::testProviderFailureKeepsPreviousTodayValue
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn failed_local_usage_scan_preserves_prior_report_and_recovers(cx: &mut TestAppContext) {
@@ -248,7 +245,6 @@ async fn stale_source_report_cannot_pollute_another_sources_ledger_refresh(
     })
     .unwrap();
 }
-// upstream: UsageStoreTests.swift::testRefreshPreservesProviderIdentityAcrossPartialSnapshotLossAndRecovery
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn provider_identity_survives_empty_and_recovered_reports(cx: &mut TestAppContext) {
@@ -292,7 +288,6 @@ async fn provider_identity_survives_empty_and_recovered_reports(cx: &mut TestApp
     })
     .unwrap();
 }
-// upstream: UsageStoreTests.swift::testWeekMonthPersistAcrossRefreshWhenEnrichmentSkips
 // Rust publishes one atomic report; a failed refresh retains its complete period data.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -339,7 +334,6 @@ async fn failed_atomic_report_retains_week_and_month(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
-// upstream: UsageStoreTests.swift::testIdleHistoryPersistsAcrossRefreshAndEnrichmentFailure
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn failed_idle_history_retained_but_successful_empty_clears_snapshot(

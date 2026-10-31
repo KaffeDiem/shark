@@ -22,7 +22,7 @@ pub(super) fn quota_details(name: &str, snapshot: &Snapshot, now: f64) -> Vec<St
                     80.,
                     95.,
                 )
-                .label(crate::pokemon::format::Language::En)
+                .label()
             });
         lines.push(format!(
             "{name} · {label} · {remaining}{}",

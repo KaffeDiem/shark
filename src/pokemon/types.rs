@@ -66,10 +66,6 @@ pub fn color(name: &str) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    // upstream: PokemonTypeColorTests.swift::testKnownTypesUseClassicTypeChartColors
-    // upstream: PokemonTypeColorTests.swift::testEnumCoversAllEighteenMainSeriesTypes
-    // upstream: PokemonTypeColorTests.swift::testLookupIsCaseInsensitive
-    // upstream: PokemonTypeColorTests.swift::testUnknownTypesFallBackToGray
     #[test]
     fn classic_type_palette_and_unknown_fallback() {
         assert_eq!(color("fire"), 0xFF4422);

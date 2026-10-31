@@ -8,7 +8,6 @@ fn totals(es: &[Entry]) -> Vec<u64> {
     v.sort();
     v
 }
-// upstream: LocalUsageReaderTests.swift::testCodexParsing
 #[test]
 fn codex_disjoint_buckets() {
     let r = rollout(
@@ -21,7 +20,6 @@ fn codex_disjoint_buckets() {
     assert_eq!(e[0].total(), 110);
     assert_eq!(e[0].model, "gpt-5.5")
 }
-// upstream: LocalUsageReaderTests.swift::testCodexNonForkResolverPreservesParsedEntriesExceptCanonicalIDs
 #[test]
 fn nonfork_preserves_records() {
     let r = rollout(
@@ -40,7 +38,6 @@ fn nonfork_preserves_records() {
     }
     assert_eq!(actual, expected)
 }
-// upstream: LocalUsageReaderTests.swift::testCodexDropsConsecutiveSameStateRerecordsAndMatchesCumulativeTotal
 #[test]
 fn repeated_full_state_suppressed() {
     let r = rollout(
@@ -56,7 +53,6 @@ fn repeated_full_state_suppressed() {
     assert_eq!(totals(&e), [110, 220]);
     assert_eq!(bucket(&e).total(), 330)
 }
-// upstream: LocalUsageReaderTests.swift::testCodexSameScalarTotalsWithDifferentFullVectorsArePreserved
 #[test]
 fn full_vector_identity_not_scalar() {
     let e = resolve(vec![rollout(
@@ -70,7 +66,6 @@ fn full_vector_identity_not_scalar() {
     assert_eq!(e.len(), 2);
     assert_ne!(e[0].id, e[1].id)
 }
-// upstream: LocalUsageReaderTests.swift::testCodexUnchangedCumulativeWithDifferentLastVectorIsPreserved
 #[test]
 fn last_vector_is_part_of_identity() {
     let e = resolve(vec![rollout(
@@ -83,7 +78,6 @@ fn last_vector_is_part_of_identity() {
     )]);
     assert_eq!(totals(&e), [55, 110])
 }
-// upstream: LocalUsageReaderTests.swift::testCodexTotalOnlyLastUsageCountsWhenItMatchesSessionTotal
 #[test]
 fn total_only_matches_cumulative() {
     let e = resolve(vec![rollout(
@@ -96,14 +90,12 @@ fn total_only_matches_cumulative() {
     assert_eq!(totals(&e), [110]);
     assert_eq!(e[0].cost_unavailable, Some(true))
 }
-// upstream: LocalUsageReaderTests.swift::testCodexTotalOnlyLastUsageCountsWhenCumulativeIsAbsent
 #[test]
 fn total_only_without_cumulative() {
     let e = resolve(vec![rollout("a", &[event(1., None, [0, 0, 0, 0, 0, 110])])]);
     assert_eq!(totals(&e), [110]);
     assert!(bucket(&e).coverage.unknown)
 }
-// upstream: LocalUsageReaderTests.swift::testCodexTotalOnlyLastUsageCountsWhenCumulativeGrew
 #[test]
 fn total_only_cumulative_grew() {
     let e = resolve(vec![rollout(
@@ -123,7 +115,6 @@ fn total_only_cumulative_grew() {
             .unwrap()
     )
 }
-// upstream: LocalUsageReaderTests.swift::testCodexSessionChangeResetsSameStateComparison
 #[test]
 fn session_change_resets_rerecord() {
     let e = resolve(vec![rollout(
@@ -138,7 +129,6 @@ fn session_change_resets_rerecord() {
     assert_eq!(totals(&e), [110, 110]);
     assert_ne!(e[0].id, e[1].id)
 }
-// upstream: LocalUsageReaderTests.swift::testCodexMissingCumulativeUsagePreservesRepeatedRecords
 #[test]
 fn missing_cumulative_keeps_repeats() {
     let e = resolve(vec![rollout(
@@ -151,7 +141,6 @@ fn missing_cumulative_keeps_repeats() {
     )]);
     assert_eq!(totals(&e), [110, 110])
 }
-// upstream: LocalUsageReaderTests.swift::testCodexManualForkFallsBackWhenParentUsageStateIsUnavailable
 #[test]
 fn fork_old_logs_fallback() {
     let parent = rollout(
@@ -173,7 +162,6 @@ fn fork_old_logs_fallback() {
     );
     assert_eq!(totals(&resolve(vec![parent, child])), [110, 220, 330])
 }
-// upstream: LocalUsageReaderTests.swift::testCodexManualForkFallsBackWhenFoundParentPrefixDoesNotMatch
 #[test]
 fn fork_mismatch_uses_timing_fallback() {
     let parent = rollout(
@@ -193,7 +181,6 @@ fn fork_mismatch_uses_timing_fallback() {
     );
     assert_eq!(totals(&resolve(vec![parent, child])), [110, 220])
 }
-// upstream: LocalUsageReaderTests.swift::testCodexCumulativeUsageClampsOutOfRangeNumber
 #[test]
 fn huge_cumulative_clamped() {
     let mut e = event(1., Some(v(100, 10)), v(100, 10));
@@ -203,7 +190,6 @@ fn huge_cumulative_clamped() {
         [110]
     )
 }
-// upstream: LocalUsageReaderTests.swift::testCodexForkTrimsReplayBeforeDroppingActualSameStateRerecord
 #[test]
 fn fork_replay_then_rerecord() {
     let e = resolve(vec![rollout(
@@ -217,7 +203,6 @@ fn fork_replay_then_rerecord() {
     )]);
     assert_eq!(totals(&e), [220])
 }
-// upstream: LocalUsageReaderTests.swift::testCodexForkedRolloutDropsLeadingReplayBurst
 #[test]
 fn fork_leading_burst() {
     let e = resolve(vec![rollout(
@@ -231,7 +216,6 @@ fn fork_leading_burst() {
     )]);
     assert_eq!(e.iter().map(|e| e.output).collect::<Vec<_>>(), [52])
 }
-// upstream: LocalUsageReaderTests.swift::testCodexForkDropsReplayBurstThatStartsAfterMetadataDelay
 #[test]
 fn fork_metadata_delay_not_usage() {
     let e = resolve(vec![rollout(
@@ -246,7 +230,6 @@ fn fork_metadata_delay_not_usage() {
     )]);
     assert_eq!(e.iter().map(|e| e.output).collect::<Vec<_>>(), [99])
 }
-// upstream: LocalUsageReaderTests.swift::testCodexForkKeepsRealTurnsAfterReplayBurstWhenTheyAreLessThanTwoSecondsApart
 #[test]
 fn fork_real_turns_less_than_two_seconds() {
     let e = resolve(vec![rollout(
@@ -266,7 +249,6 @@ fn fork_real_turns_less_than_two_seconds() {
     out.sort();
     assert_eq!(out, [11, 22, 33, 44])
 }
-// upstream: LocalUsageReaderTests.swift::testCodexForkDetectsMetadataAfterLeadingNonTokenRecord
 #[test]
 fn metadata_after_context() {
     let e = resolve(vec![rollout(
@@ -286,14 +268,12 @@ fn padded(id: &str, n: usize) -> Value {
     m["payload"]["base_instructions"] = json!("a".repeat(n));
     m
 }
-// upstream: LocalUsageReaderTests.swift::testCodexProbeReadsSessionIDWhenMetadataLineExceedsChunk
 #[test]
 fn probe_large_metadata() {
     let d = Temp::new();
     let p = d.write("p.jsonl", lines(&[padded("large", 200000)]));
     assert_eq!(probe(&p, 1 << 20).unwrap(), Some("large".into()))
 }
-// upstream: LocalUsageReaderTests.swift::testCodexProbeDecodesMultibyteStraddlingChunkBoundary
 #[test]
 fn probe_multibyte_chunk_boundary() {
     let d = Temp::new();
@@ -305,7 +285,6 @@ fn probe_multibyte_chunk_boundary() {
     let p = d.write("p.jsonl", bytes);
     assert_eq!(probe(&p, 1 << 20).unwrap(), Some("utf8".into()))
 }
-// upstream: LocalUsageReaderTests.swift::testCodexProbeScansManyLinesAcrossChunks
 #[test]
 fn probe_many_lines() {
     let d = Temp::new();
@@ -314,14 +293,12 @@ fn probe_many_lines() {
     let p = d.write("p.jsonl", lines(&vs));
     assert_eq!(probe(&p, 1 << 20).unwrap(), Some("late".into()))
 }
-// upstream: LocalUsageReaderTests.swift::testCodexProbeStopsAtByteLimit
 #[test]
 fn probe_budget() {
     let d = Temp::new();
     let p = d.write("p.jsonl", lines(&[padded("large", 200000)]));
     assert_eq!(probe(&p, 65536).unwrap(), None)
 }
-// upstream: LocalUsageReaderTests.swift::testCodexProbeStopsAtInvalidUTF8BeforeSessionMeta
 #[test]
 fn probe_invalid_utf8_stops() {
     let d = Temp::new();
@@ -330,7 +307,6 @@ fn probe_invalid_utf8_stops() {
     let p = d.write("p.jsonl", bytes);
     assert_eq!(probe(&p, 1 << 20).unwrap(), None)
 }
-// upstream: LocalUsageReaderTests.swift::testCodexProbeStopsAtTokenCountBeforeSessionMeta
 #[test]
 fn probe_token_before_metadata_stops() {
     let d = Temp::new();
@@ -340,7 +316,6 @@ fn probe_token_before_metadata_stops() {
     );
     assert_eq!(probe(&p, 1 << 20).unwrap(), None)
 }
-// upstream: LocalUsageReaderTests.swift::testCodexProbeFindsMetadataAfterLeadingNonTokenRecord
 #[test]
 fn probe_context_before_metadata() {
     let d = Temp::new();
@@ -357,7 +332,6 @@ fn fixture(group: &str, name: &str) -> Rollout {
         .join(format!("{name}.jsonl"));
     parse(&fs::read(&path).unwrap(), &path)
 }
-// upstream: LocalUsageReaderTests.swift::testCodexManualForkFixtureKeepsOnlyPostReplayUsage
 #[test]
 fn real_manual_fork_child() {
     assert_eq!(
@@ -365,7 +339,6 @@ fn real_manual_fork_child() {
         [0, 28138]
     )
 }
-// upstream: LocalUsageReaderTests.swift::testCodexManualForkFixtureKeepsParentAndChildUsageOnTheirOwnDays
 #[test]
 fn real_manual_fork_days() {
     let e = resolve(vec![
@@ -374,7 +347,7 @@ fn real_manual_fork_days() {
     ]);
     assert_eq!(bucket(&e).total(), 340952);
     let r = Report::from_entries(e.clone(), epoch(15));
-    let mut totals: Vec<_> = r.daily_buckets().values().map(Bucket::total).collect();
+    let mut totals: Vec<_> = daily_buckets(&r).values().map(Bucket::total).collect();
     totals.sort();
     assert_eq!(totals, [28138, 312814]);
     assert_eq!(
@@ -382,7 +355,6 @@ fn real_manual_fork_days() {
         e.len()
     )
 }
-// upstream: LocalUsageReaderTests.swift::testCodexSiblingForkFixturesKeepIndependentPostReplayUsage
 #[test]
 fn real_sibling_forks() {
     let e = resolve(vec![
@@ -394,7 +366,6 @@ fn real_sibling_forks() {
     assert!(totals(&e).contains(&28138));
     assert!(totals(&e).contains(&28263))
 }
-// upstream: LocalUsageReaderTests.swift::testCodexSubagentFixturesKeepAllOwnUsageWithoutReplayPrefix
 #[test]
 fn real_subagents() {
     for (p, c, expected, total) in [
@@ -424,7 +395,6 @@ fn real_subagents() {
         )
     }
 }
-// upstream: LocalUsageReaderTests.swift::testCodexSubagentChildFixturesKeepFirstTurnWhenParentIsMissing
 #[test]
 fn real_subagent_missing_parent() {
     for (c, expected) in [
@@ -440,7 +410,6 @@ fn real_subagent_missing_parent() {
         assert!(e.iter().all(|e| e.id.starts_with(&format!("codex|{id}|"))))
     }
 }
-// upstream: LocalUsageReaderTests.swift::testCodexForkOfForkReusesResolvedAncestorHistory
 #[test]
 fn nested_fork_history() {
     let a = event(1., Some(v(100, 10)), v(100, 10));
@@ -453,7 +422,6 @@ fn nested_fork_history() {
     ]);
     assert_eq!(totals(&e), [110, 220, 330])
 }
-// upstream: LocalUsageReaderTests.swift::testCodexSiblingForksWithIdenticalOwnUsageKeepDistinctIDs
 #[test]
 fn sibling_equal_usage_distinct_owner() {
     let a = event(1., Some(v(100, 10)), v(100, 10));
@@ -465,7 +433,6 @@ fn sibling_equal_usage_distinct_owner() {
     ]);
     assert_eq!(totals(&e), [110, 220, 220])
 }
-// upstream: LocalUsageReaderTests.swift::testCodexCumulativeResetStartsNewCanonicalEpoch
 #[test]
 fn reset_epoch_changes_identity() {
     let a = event(1., Some(v(100, 10)), v(100, 10));
@@ -476,7 +443,6 @@ fn reset_epoch_changes_identity() {
     assert_eq!(totals(&e), [110, 110, 220]);
     assert!(e.iter().any(|e| e.id.starts_with("codex|s|1|")))
 }
-// upstream: LocalUsageReaderTests.swift::testCodexCanonicalIDCollapsesSameSessionStateAcrossFilesKeepingEarliestDate
 #[test]
 fn canonical_cross_file_earliest() {
     let early = event(1., Some(v(100, 10)), v(100, 10));
@@ -491,7 +457,6 @@ fn canonical_cross_file_earliest() {
         crate::usage::timestamp(&early["timestamp"]).unwrap()
     )
 }
-// upstream: LocalUsageReaderTests.swift::testDegenerateParentHintStillResolvesUsageCorrectly
 #[test]
 fn degenerate_parent_id_fallback() {
     let e = resolve(vec![rollout(
@@ -504,7 +469,6 @@ fn degenerate_parent_id_fallback() {
     )]);
     assert_eq!(totals(&e), [220])
 }
-// upstream: LocalUsageReaderTests.swift::testForkReplayIsTrimmedAgainstTheParentRollout
 #[test]
 fn parent_state_trims_replay() {
     let a = event(1., Some(v(100, 10)), v(100, 10));

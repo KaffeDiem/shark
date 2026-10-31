@@ -1,5 +1,4 @@
 //! Quota pace presentation. Allowance fetching and authentication remain Shark's own.
-use crate::pokemon::format::Language;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier {
     WayUnder,
@@ -10,6 +9,7 @@ pub enum Tier {
     WayOver,
 }
 impl Tier {
+    #[cfg(test)]
     pub const ALL: [Self; 6] = [
         Self::WayUnder,
         Self::Under,
@@ -18,77 +18,15 @@ impl Tier {
         Self::Over,
         Self::WayOver,
     ];
-    pub fn calm(self) -> bool {
-        matches!(self, Self::WayUnder | Self::Under | Self::OnPace)
-    }
-    pub fn label(self, language: Language) -> &'static str {
-        let labels = match language {
-            Language::Ko => [
-                "아주 여유로움",
-                "여유로움",
-                "페이스대로",
-                "조금 빠름",
-                "빠름",
-                "매우 빠름",
-            ],
-            Language::En => [
-                "Well below pace",
-                "Below pace",
-                "On pace",
-                "Slightly above pace",
-                "Above pace",
-                "Well above pace",
-            ],
-            Language::Ja => [
-                "かなりゆっくり",
-                "ゆっくり",
-                "適切なペース",
-                "やや速い",
-                "速い",
-                "かなり速い",
-            ],
-            Language::Es => [
-                "Muy por debajo",
-                "Por debajo",
-                "Al ritmo",
-                "Algo por encima",
-                "Por encima",
-                "Muy por encima",
-            ],
-            Language::Fr => [
-                "Très en dessous",
-                "En dessous",
-                "Au rythme",
-                "Légèrement au-dessus",
-                "Au-dessus",
-                "Très au-dessus",
-            ],
-            Language::Pt => [
-                "Muito abaixo",
-                "Abaixo",
-                "No ritmo",
-                "Um pouco acima",
-                "Acima",
-                "Muito acima",
-            ],
-            Language::De => [
-                "Weit darunter",
-                "Darunter",
-                "Im Tempo",
-                "Etwas darüber",
-                "Darüber",
-                "Weit darüber",
-            ],
-            Language::Ru => [
-                "Гораздо медленнее",
-                "Медленнее",
-                "В темпе",
-                "Немного быстрее",
-                "Быстрее",
-                "Гораздо быстрее",
-            ],
-        };
-        labels[self as usize]
+    pub fn label(self) -> &'static str {
+        [
+            "Well below pace",
+            "Below pace",
+            "On pace",
+            "Slightly above pace",
+            "Above pace",
+            "Well above pace",
+        ][self as usize]
     }
 }
 pub fn elapsed(reset: Option<f64>, span: Option<f64>, now: f64) -> Option<f64> {
@@ -140,29 +78,16 @@ pub fn marker(pace: Option<f64>, remaining: bool) -> Option<f64> {
         }
     })
 }
-pub fn delta_text(delta: i64, language: Language) -> Option<String> {
+pub fn delta_text(delta: i64) -> Option<String> {
     if delta == 0 {
         return None;
     }
-    let n = delta.unsigned_abs();
-    let over = delta > 0;
-    let (below, above) = match language {
-        Language::Ko => ("포인트 덜 사용", "포인트 더 사용"),
-        Language::En => ("pts under", "pts over"),
-        Language::Ja => ("ポイント下", "ポイント上"),
-        Language::Es => ("puntos por debajo", "puntos por encima"),
-        Language::Fr => ("points en dessous", "points au-dessus"),
-        Language::Pt => ("pontos abaixo", "pontos acima"),
-        Language::De => ("Punkte darunter", "Punkte darüber"),
-        Language::Ru => ("пунктов ниже", "пунктов выше"),
-    };
-    Some(format!("{n} {}", if over { above } else { below }))
+    let suffix = if delta > 0 { "pts over" } else { "pts under" };
+    Some(format!("{} {suffix}", delta.unsigned_abs()))
 }
 #[cfg(test)]
 mod tests {
     use super::*;
-    // upstream: PaceTierTests.swift::testBoundariesOnBothSides
-    // upstream: PaceTierTests.swift::testTierFollowsRoundedDelta
     #[test]
     fn boundaries_and_rounded_deltas() {
         use Tier::*;
@@ -186,9 +111,6 @@ mod tests {
         assert_eq!(rounded_delta(54.6, 0.5), 5);
         assert_eq!(rounded_delta(38.5, 0.5), -12);
     }
-    // upstream: PaceTierTests.swift::testCritOverridesPace
-    // upstream: PaceTierTests.swift::testNoPaceMeansNoTier
-    // upstream: PaceTierTests.swift::testHeldEarlyInWindow
     #[test]
     fn critical_missing_and_early_window() {
         assert_eq!(tier(95., Some(0.99), 95.), Some(Tier::WayOver));
@@ -199,9 +121,6 @@ mod tests {
         assert_eq!(tier(10., Some(0.1), 95.), Some(Tier::OnPace));
         assert!(tier(f64::NAN, Some(0.5), 95.).is_none());
     }
-    // upstream: PaceTierTests.swift::testAKnownPaceUsesTheSixTiers
-    // upstream: PaceTierTests.swift::testWithoutAPaceTheThresholdsPickTheColor
-    // upstream: PaceTierTests.swift::testCalmMeansOnPaceOrSlower
     #[test]
     fn gauge_fallback_and_calm_tiers() {
         assert_eq!(gauge(20., Some(0.5), 80., 95.), Tier::WayUnder);
@@ -216,40 +135,26 @@ mod tests {
                 assert_eq!(gauge(n, pace, 80., 95.), t);
             }
         }
+    }
+    #[test]
+    fn labels_preserve_distinction_and_unsigned_delta() {
+        assert!(delta_text(0).is_none());
+        assert_ne!(delta_text(-12), delta_text(12));
+        assert!(!delta_text(-12).unwrap().contains("-12"));
         assert_eq!(
             Tier::ALL
+                .map(Tier::label)
                 .into_iter()
-                .filter(|t| t.calm())
-                .collect::<Vec<_>>(),
-            [Tier::WayUnder, Tier::Under, Tier::OnPace]
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            6
         );
-    }
-    // upstream: PaceTierTests.swift::testDeltaTextCarriesNoSignAndSkipsZero
-    // upstream: PaceTierTests.swift::testTierLabelsDistinctInEveryLanguage
-    #[test]
-    fn localized_labels_preserve_distinction_and_unsigned_delta() {
-        for lang in Language::ALL {
-            assert!(delta_text(0, lang).is_none());
-            assert_ne!(delta_text(-12, lang), delta_text(12, lang));
-            assert!(!delta_text(-12, lang).unwrap().contains("-12"));
-            assert_eq!(
-                Tier::ALL
-                    .map(|t| t.label(lang))
-                    .into_iter()
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len(),
-                6
-            );
-        }
         assert!(
-            delta_text(i64::MIN, Language::En)
+            delta_text(i64::MIN)
                 .unwrap()
                 .contains("9223372036854775808")
         );
     }
-    // upstream: LimitPaceTests.swift::testPaceFractionTracksElapsedPortionOfWindow
-    // upstream: LimitPaceTests.swift::testPaceFractionRejectsWindowsOutsideItsOwnSpan
-    // upstream: LimitPaceTests.swift::testMarkerFractionMirrorsRemainingDisplayMode
     #[test]
     fn elapsed_windows_and_remaining_markers() {
         for (left, p) in [(18000., 0.), (9000., 0.5), (4500., 0.75), (0., 1.)] {

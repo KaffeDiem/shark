@@ -1,6 +1,6 @@
 //! The month chart used by the native Usage popover. Future days are layout, never ledger data.
 use super::*;
-use crate::pokemon::format::{Language, compact};
+use crate::pokemon::format::compact;
 use crate::usage::summary::{Day, ProviderSeries, dates};
 use chrono::{Datelike, Local, Months, NaiveDate, TimeZone};
 use objc2_foundation::{NSCalendar, NSLocale};
@@ -78,20 +78,10 @@ pub(super) struct DateText {
     formatter: objc2::rc::Retained<NSDateFormatter>,
 }
 impl DateText {
-    pub fn new(language: Language, template: &str) -> Self {
-        let locale = match language {
-            Language::Ko => "ko_KR",
-            Language::En => "en_US",
-            Language::Ja => "ja_JP",
-            Language::Es => "es_ES",
-            Language::Fr => "fr_FR",
-            Language::Pt => "pt_PT",
-            Language::De => "de_DE",
-            Language::Ru => "ru_RU",
-        };
+    pub fn new(template: &str) -> Self {
         let formatter = NSDateFormatter::new();
         formatter.setLocale(Some(&NSLocale::localeWithLocaleIdentifier(
-            &NSString::from_str(locale),
+            &NSString::from_str("en_US"),
         )));
         formatter.setLocalizedDateFormatFromTemplate(&NSString::from_str(template));
         Self { formatter }
@@ -242,7 +232,7 @@ impl Shark {
         let theme = cx.theme();
         let stack = ordered(providers);
         let stacked = stack.len() > 1;
-        let labels = DateText::new(Language::En, "MdE");
+        let labels = DateText::new("MdE");
         let caption = readout(series, today, shows_cost, &labels);
         let hovered = self.usage_panel.as_ref().and_then(|p| p.hovered_day);
         let tip = hovered.and_then(|date| hover_text(date, series, &stack, shows_cost, &labels));

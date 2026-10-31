@@ -1,7 +1,8 @@
 //! Calendar summaries of local usage. Dates are calendar days, never fixed 24-hour increments.
-use super::logs::{Bucket, Entry, Report};
+#[cfg(test)]
+use super::logs::Entry;
+use super::logs::{Bucket, Report};
 pub mod combined;
-pub mod external;
 use chrono::{DateTime, Datelike, Days, Local, Months, NaiveDate, TimeZone, Utc};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::BTreeMap;
@@ -384,23 +385,5 @@ pub struct ProviderSeries {
     pub days: Option<Vec<Day>>,
     pub reports_cost: bool,
 }
-pub fn combined_provider_series(providers: &[ProviderSeries]) -> Vec<Day> {
-    combine_series(providers.iter().filter_map(|p| {
-        p.days.as_ref().map(|days| {
-            days.iter()
-                .cloned()
-                .map(|mut d| {
-                    if !p.reports_cost {
-                        d.bucket.cost = 0.;
-                        d.bucket.coverage = Default::default()
-                    }
-                    d
-                })
-                .collect()
-        })
-    }))
-}
 #[cfg(test)]
 mod combined_tests;
-#[cfg(test)]
-mod external_tests;

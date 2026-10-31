@@ -63,7 +63,6 @@ fn publish(s: &mut Shark, kind: NameKind, name: &str, label: &str, cx: &mut Cont
     );
 }
 // Native English rendering retains Shark's interface language; multilingual resolution is covered by the shared pure labels.
-// upstream: PokemonNameLocalizationTests.swift::testMountedLabelLoadsTranslationsAndReopensWithoutEnglishFrame
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn mounted_labels_update_and_reopen_from_snapshot_without_placeholder(
@@ -125,7 +124,6 @@ async fn mounted_labels_update_and_reopen_from_snapshot_without_placeholder(
     })
     .unwrap();
 }
-// upstream: PokemonNameLocalizationTests.swift::testCancelledLoadDoesNotPublishSnapshot
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn cancelled_view_does_not_publish_late_name_snapshot(cx: &mut TestAppContext) {

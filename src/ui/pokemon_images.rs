@@ -47,9 +47,6 @@ pub(crate) fn render_image(asset: Arc<Asset>) -> Arc<RenderImage> {
 pub(crate) fn render_capped(asset: Arc<Asset>, floor: std::time::Duration) -> Arc<RenderImage> {
     render_variant(asset, floor, true)
 }
-pub(crate) fn render_placeholder(asset: Arc<Asset>) -> Arc<RenderImage> {
-    render_variant(asset, std::time::Duration::ZERO, true)
-}
 fn render_variant(asset: Arc<Asset>, floor: std::time::Duration, trim: bool) -> Arc<RenderImage> {
     let key = (asset.path.clone(), floor, trim);
     let mut c = cache().lock().unwrap_or_else(|e| e.into_inner());
@@ -171,34 +168,34 @@ pub(crate) fn fitted_size(width: u32, height: u32, box_size: f32) -> gpui_kit::S
         )
         .size
 }
-pub(crate) fn sized(path: &Path, box_size: f32) -> Img {
+/// A single still frame for lists, grids and thumbnails. A multi-frame `Img` requests an animation
+/// frame every vsync regardless of focus or power, so only the footer timer animates sprites.
+/// Returns `None` until the decoded asset is warm; callers show their placeholder, never a disk path.
+fn still_variant(path: &Path) -> (std::time::Duration, bool) {
+    if path.extension().is_some_and(|ext| ext == "png") {
+        (std::time::Duration::ZERO, true)
+    } else {
+        (std::time::Duration::MAX, false)
+    }
+}
+/// Whether `sized` can draw `path` now; false means the decoded bitmap was evicted.
+pub(crate) fn is_warm(path: &Path) -> bool {
+    let (floor, trim) = still_variant(path);
+    crate::pokemon::sprites::cached_memory(path).is_some() || existing(path, floor, trim).is_some()
+}
+pub(crate) fn sized(path: &Path, box_size: f32) -> Option<Img> {
+    let (floor, trim) = still_variant(path);
     let image = crate::pokemon::sprites::cached_memory(path)
-        .map(|asset| {
-            if path.extension().is_some_and(|ext| ext == "png") {
-                render_placeholder(asset)
-            } else {
-                render_image(asset)
-            }
-        })
-        .or_else(|| {
-            existing(
-                path,
-                std::time::Duration::ZERO,
-                path.extension().is_some_and(|ext| ext == "png"),
-            )
-        });
-    if let Some(image) = image {
-        let source = image.size(0);
-        let fitted = fitted_size(source.width.into(), source.height.into(), box_size);
+        .map(|asset| render_variant(asset, floor, trim))
+        .or_else(|| existing(path, floor, trim))?;
+    let source = image.size(0);
+    let fitted = fitted_size(source.width.into(), source.height.into(), box_size);
+    Some(
         gpui_kit::img(image)
             .w(fitted.width)
             .h(fitted.height)
-            .object_fit(ObjectFit::Contain)
-    } else {
-        gpui_kit::img(path.to_path_buf())
-            .size(px(box_size))
-            .object_fit(ObjectFit::Contain)
-    }
+            .object_fit(ObjectFit::Contain),
+    )
 }
 /// Paint a selected frame without `Img`'s display-rate animation requests. The caller owns
 /// the timer, so a 400ms persistent-frame delay produces one wake every 400ms, not every vsync.
@@ -259,11 +256,6 @@ mod tests {
             ],
         })
     }
-    // upstream: SpriteAspectRatioTests.swift::testNonSquareSpriteDoesNotRenderSquare
-    // upstream: SpriteAspectRatioTests.swift::testFittedSizePreservesSourceAspectRatio
-    // upstream: SpriteAspectRatioTests.swift::testFittedSizeFillsTheBoxOnItsLongerAxisAndNeverOverflows
-    // upstream: SpriteAspectRatioTests.swift::testSquareSourceStillFillsTheSquareBox
-    // upstream: SpriteAspectRatioTests.swift::testSpriteViewImageSizeMatchesFittedSize
     #[test]
     fn native_contain_preserves_every_canvas_ratio() {
         for (w, h) in [(36, 66), (50, 46), (74, 75), (96, 96), (137, 69), (57, 19)] {
@@ -283,17 +275,12 @@ mod tests {
             }
         }
     }
-    // upstream: SpriteAspectRatioTests.swift::testDegenerateSourceFallsBackToBoxWithoutDividingByZero
     #[test]
     fn empty_canvas_uses_finite_fallback_slot() {
         for (w, h) in [(0, 0), (0, 66), (36, 0)] {
             assert_eq!(fitted_size(w, h, 22.), size(px(22.), px(22.)));
         }
     }
-    // upstream: SpriteAspectRatioTests.swift::testMenuBarFramesConvertToLayerBitmaps
-    // upstream: SpriteAspectRatioTests.swift::testSpriteContentsScaleFollowsTheBitmapNotTheScreen
-    // upstream: SpriteAnimationPreviewTests.swift::testDetailFirstRenderUsesCachedAnimationCanvasAndPixels
-    // upstream: SpriteSubjectTests.swift::testMultiFrameAcceptedWhenNotCancelled
     #[test]
     fn shared_native_bitmap_preserves_frames_and_bgra_pixels() {
         let source = asset("native-bitmap");
@@ -314,7 +301,6 @@ mod tests {
         let second = render_image(asset("new-identity"));
         assert!(!Arc::ptr_eq(&first, &second));
     }
-    // upstream: PerformanceTests.swift::testIdentityKeysIncludeTheFrameFloor
     #[test]
     fn renderer_cache_keys_include_floor_and_variant() {
         let source = asset("floor-key");
@@ -333,34 +319,12 @@ mod tests {
             )
         ));
     }
-    // upstream: SpriteAnimationPreviewTests.swift::testAnimatedPlaceholderRemovesPaddingWithoutChangingStaticThumbnail
-    // upstream: SpriteSubjectTests.swift::testSingleFrameFallsBackToStatic
     #[test]
-    fn animated_placeholder_trims_padding_without_changing_static_asset() {
-        let mut pixels = image::RgbaImage::new(96, 96);
-        for y in 24..72 {
-            for x in 24..72 {
-                pixels.put_pixel(x, y, image::Rgba([255, 0, 0, 255]));
-            }
-        }
-        let asset = Arc::new(Asset {
-            path: std::env::temp_dir().join("shark-placeholder-normal.png"),
-            frames: vec![image::Frame::new(pixels)],
-            encoded: Arc::new(vec![]),
-        });
-        let full = render_image(asset.clone());
-        let cropped = render_placeholder(asset.clone());
-        assert_eq!(asset.dimensions(), (96, 96));
-        assert_eq!(
-            full.size(0),
-            size(DevicePixels::from(96), DevicePixels::from(96))
-        );
-        assert_eq!(
-            cropped.size(0),
-            size(DevicePixels::from(48), DevicePixels::from(48))
-        );
-        assert!(Arc::ptr_eq(&cropped, &render_placeholder(asset)));
-        assert_eq!(cropped.frame_count(), 1);
-        assert!(!Arc::ptr_eq(&full, &cropped));
+    fn list_images_are_single_frame() {
+        let source = asset("list-still");
+        assert_eq!(source.frames.len(), 2);
+        let still = render_variant(source.clone(), std::time::Duration::MAX, false);
+        assert_eq!(still.frame_count(), 1);
+        assert!(!Arc::ptr_eq(&still, &render_image(source)));
     }
 }

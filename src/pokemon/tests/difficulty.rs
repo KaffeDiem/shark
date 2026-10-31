@@ -13,7 +13,6 @@ fn remaining(s: &Companion) -> u64 {
     let (used, total) = s.progress();
     total.saturating_sub(used)
 }
-// upstream: DifficultyTests.swift::testRepeatBoostComposesWithDifficultyAndLiveChanges
 #[test]
 fn testRepeatBoostComposesWithDifficultyAndLiveChanges() {
     let mut s = raised(0.5, 1.);
@@ -39,7 +38,6 @@ fn testRepeatBoostComposesWithDifficultyAndLiveChanges() {
     assert!(s.active.is_none());
     assert_eq!(s.collection.last().unwrap().species_id(), 3);
 }
-// upstream: DifficultyTests.swift::testSameTokensEvolveOnlyWhenDifficultyLowered
 #[test]
 fn testSameTokensEvolveOnlyWhenDifficultyLowered() {
     let mut normal = raised(1., 1.);
@@ -51,7 +49,6 @@ fn testSameTokensEvolveOnlyWhenDifficultyLowered() {
     assert_eq!(stage(&easy), Some(1));
     assert_eq!(easy.active.unwrap().species_id(), 2);
 }
-// upstream: DifficultyTests.swift::testHarderDifficultyBlocksEvolutionThatWouldOtherwiseHappen
 #[test]
 fn testHarderDifficultyBlocksEvolutionThatWouldOtherwiseHappen() {
     let mut normal = raised(1., 1.);
@@ -61,7 +58,6 @@ fn testHarderDifficultyBlocksEvolutionThatWouldOtherwiseHappen() {
     hard.add_growth(125_000_000);
     assert_eq!(stage(&hard), Some(0));
 }
-// upstream: DifficultyTests.swift::testDisplayedTokensToNextMatchesTheThresholdThatActuallyEvolves
 #[test]
 fn testDisplayedTokensToNextMatchesTheThresholdThatActuallyEvolves() {
     let mut s = raised(0.5, 1.);
@@ -73,7 +69,6 @@ fn testDisplayedTokensToNextMatchesTheThresholdThatActuallyEvolves() {
     s.add_growth(1);
     assert_eq!(stage(&s), Some(1));
 }
-// upstream: DifficultyTests.swift::testEggHatchPointMovesWithDifficulty
 #[test]
 fn testEggHatchPointMovesWithDifficulty() {
     for (difficulty, expected) in [(1., false), (0.5, true)] {
@@ -85,20 +80,18 @@ fn testEggHatchPointMovesWithDifficulty() {
         assert_eq!(s.active.is_some(), expected);
     }
 }
-// upstream: DifficultyTests.swift::testShopGateAndChargedAmountFollowDifficulty
 #[test]
 fn testShopGateAndChargedAmountFollowDifficulty() {
     let mut normal = raised(1., 1.);
     normal.lifetime_tokens = 250_000_000;
-    assert!(!normal.can_buy(Item::RareCandy));
+    assert!(normal.balance() < normal.price(Item::RareCandy));
     let mut cheap = raised(1., 0.5);
     cheap.lifetime_tokens = 250_000_000;
-    assert!(cheap.can_buy(Item::RareCandy));
+    assert!(cheap.balance() >= cheap.price(Item::RareCandy));
     cheap.buy(Item::RareCandy, 1).unwrap();
     assert_eq!(cheap.spent_tokens, 250_000_000);
     assert_eq!(cheap.inventory.candies, 1);
 }
-// upstream: DifficultyTests.swift::testEggPriceScalesAndIsActuallyCharged
 #[test]
 fn testEggPriceScalesAndIsActuallyCharged() {
     let mut s = raised(1., 0.5);
@@ -107,7 +100,6 @@ fn testEggPriceScalesAndIsActuallyCharged() {
     s.fresh_egg(None).unwrap();
     assert_eq!(s.spent_tokens, 500_000_000);
 }
-// upstream: DifficultyTests.swift::testGrowthSliderDoesNotMoveShopPricesAndViceVersa
 #[test]
 fn testGrowthSliderDoesNotMoveShopPricesAndViceVersa() {
     let growth = raised(0.1, 1.);
@@ -116,7 +108,6 @@ fn testGrowthSliderDoesNotMoveShopPricesAndViceVersa() {
     let shop = raised(1., 0.1);
     assert_eq!(remaining(&shop), 125_000_000);
 }
-// upstream: DifficultyTests.swift::testGradedEggRatioSurvivesScaling
 #[test]
 fn testGradedEggRatioSurvivesScaling() {
     let s = raised(1., 0.4);
@@ -124,7 +115,6 @@ fn testGradedEggRatioSurvivesScaling() {
     assert_eq!(s.egg_price(Some(Rarity::Uncommon)) as f64 / plain, 2.5);
     assert_eq!(s.egg_price(Some(Rarity::Rare)) as f64 / plain, 4.);
 }
-// upstream: DifficultyTests.swift::testLoweringDifficultyPreservesIncompleteStage
 #[test]
 fn testLoweringDifficultyPreservesIncompleteStage() {
     let mut s = raised(1., 1.);
@@ -138,7 +128,6 @@ fn testLoweringDifficultyPreservesIncompleteStage() {
     s.add_growth(1);
     assert_eq!(stage(&s), Some(1));
 }
-// upstream: DifficultyTests.swift::testShopPriceChangesLiveWithoutRestart
 #[test]
 fn testShopPriceChangesLiveWithoutRestart() {
     let mut s = raised(1., 1.);
@@ -146,7 +135,6 @@ fn testShopPriceChangesLiveWithoutRestart() {
     s.set_shop_difficulty(0.5);
     assert_eq!(s.price(Item::RareCandy), 250_000_000);
 }
-// upstream: DifficultyTests.swift::testDifficultyPersistsToDefaults
 #[test]
 fn testDifficultyPersistsToDefaults() {
     let mut s = hatched();
@@ -156,7 +144,6 @@ fn testDifficultyPersistsToDefaults() {
     assert_eq!(decoded.growth_difficulty, 0.3);
     assert_eq!(decoded.shop_difficulty, 1.7);
 }
-// upstream: DifficultyTests.swift::testZeroInDefaultsCannotProduceZeroThreshold
 #[test]
 fn testZeroInDefaultsCannotProduceZeroThreshold() {
     let s = raised(0., 1.);
@@ -166,7 +153,6 @@ fn testZeroInDefaultsCannotProduceZeroThreshold() {
     egg.set_growth_difficulty(0.);
     assert!(egg.progress().1 > 0);
 }
-// upstream: DifficultyTests.swift::testNothingCollapsesToZeroAtMinimumDifficulty
 #[test]
 fn testNothingCollapsesToZeroAtMinimumDifficulty() {
     assert!(Balance::scaled(Balance::EGG_HATCH_THRESHOLD, 0.1) > 0);
@@ -185,16 +171,17 @@ fn testNothingCollapsesToZeroAtMinimumDifficulty() {
         }
     }
     let s = raised(1., 0.1);
-    for entry in s.shop_entries() {
-        assert!(
-            match entry {
-                ShopEntry::Item(i) => s.price(i),
-                ShopEntry::Egg(t) => s.egg_price(t),
-            } > 0
-        );
+    for price in [
+        s.price(Item::RareCandy),
+        s.price(Item::Mint),
+        s.price(Item::ShinyCharm),
+        s.egg_price(None),
+        s.egg_price(Some(Rarity::Uncommon)),
+        s.egg_price(Some(Rarity::Rare)),
+    ] {
+        assert!(price > 0);
     }
 }
-// upstream: ProfileGrowthIntegrationTests.swift::testSmallUsageChunksMatchSingleDeltaAtHardDifficulty
 #[test]
 fn testSmallUsageChunksMatchSingleDeltaAtHardDifficulty() {
     let mut small = raised(2., 1.);

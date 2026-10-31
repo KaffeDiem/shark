@@ -1,6 +1,17 @@
 //! Persistent footer frames use a deadline timer, not native Img's per-vsync animation loop.
+//! The sprite is its own view, so a frame tick repaints only that view, never `Shark`.
 use super::*;
 use std::sync::Arc;
+pub(super) const ART: f32 = 24.;
+pub(super) struct FooterSprite {
+    image: Arc<RenderImage>,
+    frame: usize,
+}
+impl Render for FooterSprite {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        images::paint_frame(self.image.clone(), self.frame, ART)
+    }
+}
 #[derive(Clone, PartialEq, Eq)]
 pub(super) struct Key {
     pub path: PathBuf,
@@ -30,10 +41,12 @@ impl Shark {
             });
         let Some(source) = source else {
             self.pokemon_ui.footer_task.take();
-            self.pokemon_ui.footer_key = None;
+            if self.pokemon_ui.footer_key.take().is_some() {
+                cx.notify();
+            }
             self.pokemon_ui.footer_render = None;
             self.pokemon_ui.footer_asset = None;
-            self.pokemon_ui.footer_frame = 0;
+            self.pokemon_ui.footer_view = None;
             return;
         };
         let floor = self
@@ -79,7 +92,11 @@ impl Shark {
         self.pokemon_ui.footer_task.take();
         self.pokemon_ui.footer_key = Some(key.clone());
         self.pokemon_ui.footer_render = Some(image.clone());
-        self.pokemon_ui.footer_frame = 0;
+        self.pokemon_ui.footer_view = Some(cx.new(|_| FooterSprite {
+            image: image.clone(),
+            frame: 0,
+        }));
+        cx.notify();
         if !animate {
             return;
         }
@@ -109,12 +126,15 @@ impl Shark {
                         }
                         if !s.pokemon_ui.window_active || cx.reduce_motion() {
                             s.refresh_pokemon_animation(cx);
-                            cx.notify();
                             return false;
                         }
-                        if s.pokemon_ui.footer_frame != index {
-                            s.pokemon_ui.footer_frame = index;
-                            cx.notify();
+                        if let Some(view) = &s.pokemon_ui.footer_view {
+                            view.update(cx, |sprite, cx| {
+                                if sprite.frame != index {
+                                    sprite.frame = index;
+                                    cx.notify();
+                                }
+                            });
                         }
                         true
                     })
@@ -134,6 +154,9 @@ mod tests {
     use crate::pokemon::{Balance, Companion, EvoLine, EvoNode, Rarity, animation::Quality};
     use core::prelude::v1::test;
     use gpui_kit::test::TestWindowExt;
+    fn frame(s: &Shark, cx: &App) -> usize {
+        s.pokemon_ui.footer_view.as_ref().unwrap().read(cx).frame
+    }
     fn asset(directory: &Path) -> Arc<crate::pokemon::sprites::Asset> {
         let mut bytes = vec![];
         {
@@ -209,7 +232,7 @@ mod tests {
         cx.run_until_parked();
         cx.update_window(window, |_, _, cx| {
             shark.update(cx, |s, cx| {
-                assert_eq!(s.pokemon_ui.footer_frame, 1);
+                assert_eq!(frame(s, cx), 1);
                 s.state.pokemon_animation_quality = Quality::PowerSaver;
                 s.refresh_pokemon_animation(cx);
                 assert_eq!(
@@ -227,7 +250,7 @@ mod tests {
                 cx.set_reduce_motion(true);
                 s.refresh_pokemon_animation(cx);
                 assert!(s.pokemon_ui.footer_task.is_none());
-                assert_eq!(s.pokemon_ui.footer_frame, 0);
+                assert_eq!(frame(s, cx), 0);
                 cx.set_reduce_motion(false);
                 s.refresh_pokemon_animation(cx);
                 assert!(s.pokemon_ui.footer_task.is_some());
@@ -247,7 +270,7 @@ mod tests {
     }
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
-    async fn render_resumes_motion_and_rebuilds_quality_after_cache_eviction(
+    async fn events_resume_motion_and_rebuild_quality_after_cache_eviction(
         cx: &mut TestAppContext,
     ) {
         let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -278,6 +301,7 @@ mod tests {
                 s.pokemon_ui.window_active = true;
                 s.pokemon_ui.low_power = false;
                 cx.set_reduce_motion(false);
+                s.refresh_pokemon_animation(cx);
             });
             w.render_frame(cx);
             assert!(shark.read(cx).pokemon_ui.footer_task.is_some());
@@ -298,44 +322,37 @@ mod tests {
         }
         assert!(crate::pokemon::sprites::cached_memory(&image.path).is_none());
         cx.update_window(window, |_, w, cx| {
-            shark.update(cx, |s, cx| {
-                s.state.pokemon_animation_quality = Quality::Balanced;
-                cx.notify();
-            });
-            w.render_frame(cx);
-            assert_eq!(
+            let frames = |cx: &App| {
                 shark
                     .read(cx)
                     .pokemon_ui
                     .footer_render
                     .as_ref()
                     .unwrap()
-                    .frame_count(),
-                2
-            );
+                    .frame_count()
+            };
+            shark.update(cx, |s, cx| {
+                s.state.pokemon_animation_quality = Quality::Balanced;
+                s.refresh_pokemon_animation(cx);
+            });
+            w.render_frame(cx);
+            assert_eq!(frames(cx), 2);
             assert!(shark.read(cx).pokemon_ui.footer_task.is_some());
             cx.set_reduce_motion(true);
+            shark.update(cx, |s, cx| s.refresh_pokemon_animation(cx));
             w.render_frame(cx);
             assert!(shark.read(cx).pokemon_ui.footer_task.is_none());
-            assert_eq!(shark.read(cx).pokemon_ui.footer_frame, 0);
+            assert_eq!(frame(shark.read(cx), cx), 0);
             cx.set_reduce_motion(false);
+            shark.update(cx, |s, cx| s.refresh_pokemon_animation(cx));
             w.render_frame(cx);
             assert!(shark.read(cx).pokemon_ui.footer_task.is_some());
             shark.update(cx, |s, cx| {
                 s.pokemon_ui.low_power = true;
-                cx.notify();
+                s.refresh_pokemon_animation(cx);
             });
             w.render_frame(cx);
-            assert_eq!(
-                shark
-                    .read(cx)
-                    .pokemon_ui
-                    .footer_render
-                    .as_ref()
-                    .unwrap()
-                    .frame_count(),
-                1
-            );
+            assert_eq!(frames(cx), 1);
             assert!(shark.read(cx).pokemon_ui.footer_task.is_none());
             // Returning from another subject must queue disk decode instead of using native uncapped GIF.
             shark.update(cx, |s, cx| {
@@ -352,5 +369,57 @@ mod tests {
             });
         })
         .unwrap();
+    }
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn frame_ticks_repaint_only_the_footer_view(cx: &mut TestAppContext) {
+        let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let home = test_home();
+        let image = asset(&home.join("footer-isolated-fixture"));
+        let mut state = State::default();
+        state.pokemon_animation_quality = Quality::Smooth;
+        state.pokemon.egg_tokens = Balance::EGG_HATCH_THRESHOLD;
+        state.pokemon.hatch(EvoLine {
+            base_id: 25,
+            tree: EvoNode {
+                species_id: 25,
+                children: vec![],
+            },
+            rarity: Rarity::Common,
+            names: BTreeMap::new(),
+        });
+        state.pokemon.active.as_mut().unwrap().shiny = false;
+        let (window, shark) = boot(cx, state, WindowOptions::default());
+        let shark_notifies = Rc::new(std::cell::Cell::new(0));
+        let sprite_notifies = Rc::new(std::cell::Cell::new(0));
+        cx.update_window(window, |_, _, cx| {
+            shark.update(cx, |s, cx| {
+                s.cancel_pokemon_sprite();
+                s.pokemon_ui.sprite = Some(image.path.clone());
+                s.pokemon_ui.sprite_key = Some((25, false, None));
+                s.pokemon_ui.window_active = true;
+                s.pokemon_ui.low_power = false;
+                cx.set_reduce_motion(false);
+                s.refresh_pokemon_animation(cx);
+            });
+            let count = shark_notifies.clone();
+            cx.observe(&shark, move |_, _| count.set(count.get() + 1))
+                .detach();
+            let count = sprite_notifies.clone();
+            let view = shark.read(cx).pokemon_ui.footer_view.clone().unwrap();
+            cx.observe(&view, move |_, _| count.set(count.get() + 1))
+                .detach();
+        })
+        .unwrap();
+        // Let unrelated startup work settle so only frame ticks are counted.
+        cx.run_until_parked();
+        shark_notifies.set(0);
+        sprite_notifies.set(0);
+        for _ in 0..3 {
+            cx.executor().advance_clock(Duration::from_millis(100));
+            cx.run_until_parked();
+        }
+        assert_eq!(shark_notifies.get(), 0);
+        assert_eq!(sprite_notifies.get(), 3);
     }
 }

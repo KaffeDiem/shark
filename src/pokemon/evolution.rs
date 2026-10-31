@@ -29,17 +29,6 @@ pub fn realized_line_items(path: &[u16], stage: usize) -> Vec<LineItem> {
         })
         .collect()
 }
-pub fn repaired_plan(realized: &[u16], stage: usize, fallback: &[u16]) -> Vec<u16> {
-    if realized.is_empty() {
-        return fallback.to_vec();
-    }
-    let end = stage.min(realized.len() - 1);
-    let mut path = realized[..=end].to_vec();
-    if fallback.first() == path.last() {
-        path.extend(fallback.iter().skip(1));
-    }
-    path
-}
 impl Companion {
     pub fn line_nodes(&self) -> Vec<LineItem> {
         let Some(mon) = &self.active else {

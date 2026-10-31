@@ -284,7 +284,6 @@ impl Shark {
                 .iter()
                 .map(|provider| crate::usage::summary::combined::Source {
                     id: provider.id(),
-                    name: provider.name(),
                     report: &self.usage_reports[provider.index()],
                     reports_cost: provider.source().reports_cost(),
                 }),
@@ -497,12 +496,10 @@ fn section(
             if let Some(remaining) = row.remaining.filter(|_| !snapshot.outdated) {
                 let tier = crate::usage::pace::gauge(100. - remaining, elapsed, 80., 95.);
                 reset.push_str(" · ");
-                reset.push_str(tier.label(crate::pokemon::format::Language::En));
+                reset.push_str(tier.label());
                 if let Some(elapsed) = elapsed.filter(|p| *p >= 0.1) {
                     let delta = crate::usage::pace::rounded_delta(100. - remaining, elapsed);
-                    if let Some(text) =
-                        crate::usage::pace::delta_text(delta, crate::pokemon::format::Language::En)
-                    {
+                    if let Some(text) = crate::usage::pace::delta_text(delta) {
                         reset.push_str(&format!(" ({text})"));
                     }
                 }
@@ -1120,8 +1117,6 @@ mod lifecycle_tests {
         })
         .unwrap();
     }
-    // upstream: UsageRecapTests.swift::testTheFirstRefreshAlreadyFillsTheLedger
-    // upstream: UsageRecapTests.swift::testARefreshKeepsLastYearAndDropsTheYearBefore
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn first_usage_refresh_persists_ledger_and_prunes_only_older_years(
@@ -1182,8 +1177,6 @@ mod lifecycle_tests {
         .unwrap();
     }
 
-    // upstream: PaceTierTests.swift::testTheFallbackTiersMatchTheThresholdColors
-    // upstream: LimitPaceTests.swift::testEveryPopoverLimitBarFollowsTheDisplayMode
     #[gpui_kit::test]
     #[allow(clippy::await_holding_lock)]
     async fn native_quota_gauges_use_remaining_width_and_pace_threshold_colors(

@@ -197,38 +197,7 @@ fn qa_missing_reset_timestamp_cannot_rearm_an_already_claimed_known_epoch() {
     assert_eq!(state.inventory.candies, 1);
 }
 
-#[test]
-fn qa_restore_backup_survives_clock_rollback_at_retention_limit() {
-    let dir = std::env::temp_dir().join(format!(
-        "shark-pokemon-qa-clock-{}-{}",
-        std::process::id(),
-        seed()
-    ));
-    let snapshots = storage::Snapshots::new(dir.clone());
-    let mut original = Companion::default();
-    original.lifetime_tokens = 123;
-    let oldest = snapshots.create(&original, 100).unwrap();
-    for now in 101..110 {
-        snapshots.create(&original, now).unwrap();
-    }
-    let mut current = Companion::default();
-    current.lifetime_tokens = 456;
-    let restored = snapshots
-        .prepare_restore(&oldest.path, &current, 50, BTreeMap::new())
-        .unwrap();
-    assert_eq!(restored.lifetime_tokens, 123);
-    let backups = snapshots.list();
-    let current_was_backed_up = backups.iter().any(|s| s.lifetime_tokens == 456);
-    let _ = std::fs::remove_dir_all(dir);
-    assert!(
-        current_was_backed_up,
-        "restore must preserve current progress even if the clock moved backward"
-    );
-    assert_eq!(backups.len(), storage::KEEP_SNAPSHOTS);
-}
-
 // Intentional anti-duplication adaptation: retain the day's high-water mark.
-// upstream: CompanionTests.swift::testUsageIncreaseAfterValidDropContinuesEggProgress
 #[test]
 fn qa_restored_logs_cannot_recredit_same_day_usage_after_regression() {
     let mut state = Companion::default();
@@ -303,78 +272,4 @@ fn qa_mint_never_repeats_a_legacy_lowercase_nature() {
             "seed={seed}"
         );
     }
-}
-
-#[test]
-fn qa_recovered_profile_ids_are_unique_deterministic_and_preserve_existing_ids() {
-    let mut original = hatched();
-    let active = original.active.as_mut().unwrap();
-    active.nature = "Hardy".into();
-    active.caught_at = 123;
-    let legacy_seed = profile::migration_seed("1:123:Hardy");
-    active.profile.as_mut().unwrap().instance_id = format!("legacy-{legacy_seed:016x}");
-    let existing = active.profile.clone().unwrap();
-    for _ in 0..2 {
-        let mut archived = active.clone();
-        archived.stage = 2;
-        archived.graduated = true;
-        archived.profile = None;
-        original.collection.push(archived);
-    }
-    let mut recovered = original.clone();
-    recovered.sanitize();
-    assert_eq!(
-        recovered.active.as_ref().unwrap().profile.as_ref().unwrap(),
-        &existing
-    );
-    let ids = recovered
-        .active
-        .iter()
-        .chain(recovered.collection.iter())
-        .map(|mon| mon.profile.as_ref().unwrap().instance_id.clone())
-        .collect::<std::collections::BTreeSet<_>>();
-    assert_eq!(ids.len(), 3);
-    assert_eq!(recovered.collection[0].profile.as_ref().unwrap().level, 100);
-    assert_ne!(
-        recovered.collection[0].profile.as_ref().unwrap().seed,
-        recovered.collection[1].profile.as_ref().unwrap().seed
-    );
-    let once = serde_json::to_value(&recovered).unwrap();
-    recovered.sanitize();
-    assert_eq!(serde_json::to_value(&recovered).unwrap(), once);
-    let mut independently_recovered = original;
-    independently_recovered.sanitize();
-    assert_eq!(serde_json::to_value(independently_recovered).unwrap(), once);
-    for archived in &recovered.collection {
-        assert_ne!(
-            archived.profile.as_ref().unwrap().instance_id,
-            existing.instance_id
-        );
-    }
-}
-
-#[test]
-fn qa_empty_profile_ids_recover_without_rerolling_valid_profile_fields() {
-    let mut state = hatched();
-    let mut archived = state.active.clone().unwrap();
-    state
-        .active
-        .as_mut()
-        .unwrap()
-        .profile
-        .as_mut()
-        .unwrap()
-        .instance_id
-        .clear();
-    archived.profile.as_mut().unwrap().instance_id.clear();
-    let before = archived.profile.clone().unwrap();
-    state.collection.push(archived);
-    state.sanitize();
-    let active = state.active.as_ref().unwrap().profile.as_ref().unwrap();
-    let archived = state.collection[0].profile.as_ref().unwrap();
-    assert_ne!(active.instance_id, archived.instance_id);
-    assert_eq!(archived.seed, before.seed);
-    assert_eq!(archived.ivs, before.ivs);
-    assert_eq!(archived.gender, before.gender);
-    assert_eq!(archived.moves, before.moves);
 }

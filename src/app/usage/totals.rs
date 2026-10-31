@@ -1,5 +1,5 @@
 use super::*;
-use crate::pokemon::format::{Language, compact};
+use crate::pokemon::format::compact;
 use crate::usage::summary::combined::Summary;
 impl Shark {
     pub(super) fn shows_usage_cost(&self, summary: &Summary) -> bool {
@@ -49,7 +49,7 @@ impl Shark {
                         .role(Role::Label)
                         .aria_label(text.clone())
                         .aria_description(if shows_cost {
-                            bucket.cost_explanation(Language::En)
+                            bucket.cost_explanation()
                         } else {
                             ""
                         })

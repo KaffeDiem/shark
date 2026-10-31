@@ -976,8 +976,7 @@ impl Shark {
 
 impl Render for Shark {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.refresh_pokemon_animation(cx);
-        self.refresh_chat_pokemon(cx);
+        self.sync_chat_pokemon(cx);
         self.prune_reorder(cx);
         // Toasts clear the toolbar, Features rail, and visible Files controls.
         let mut side = if self.right_rail_shown() {
@@ -1162,7 +1161,7 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &OpenAnyFile, w, cx| this.open_any_file(w, cx)))
             .on_action(cx.listener(|this, _: &RunScripts, w, cx| this.toggle_run(w, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, w, cx| {
-                this.close_usage(w,cx);
+                this.close_usage(w, cx);
                 crate::settings::open(&this.state, w, cx)
             }))
             .children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))

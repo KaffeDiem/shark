@@ -1,14 +1,12 @@
 use super::{Entry, Provider, Roots, claude, codex, dedup_claude};
-use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     fs,
-    io::{self, Read, Seek, SeekFrom, Write},
+    io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
-const VERSION: u32 = 2;
-#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Stamp {
     size: u64,
     modified: u128,
@@ -34,8 +32,7 @@ impl Stamp {
         self.modified as f64 / 1e9
     }
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Clone, Debug, Default)]
 struct Blob {
     stamp: Stamp,
     offset: Option<u64>,
@@ -44,81 +41,45 @@ struct Blob {
     ledger: BTreeMap<String, f64>,
     rollout: Option<codex::Rollout>,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug)]
 struct Probe {
     stamp: Stamp,
     session: Option<String>,
 }
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
-#[serde(default)]
+#[derive(Clone, Debug, Default)]
 struct Snapshot {
-    version: u32,
-    index_version: u32,
     blobs: BTreeMap<PathBuf, Blob>,
     index: BTreeMap<PathBuf, Probe>,
 }
 #[derive(Default)]
 pub struct Cache {
     snapshot: Snapshot,
-    path: Option<PathBuf>,
-    last_save: Option<f64>,
-    dirty: bool,
     pub parsed_files: usize,
     pub parsed_bytes: u64,
     pub probes: usize,
     pub last_error: Option<String>,
 }
 impl Cache {
-    /// Default is memory-only. Disk I/O requires an explicitly selected Shark-owned path.
-    pub fn at(path: PathBuf) -> Self {
-        let mut out = Self {
-            path: Some(path.clone()),
-            ..Self::default()
-        };
-        if let Ok(bytes) = read_bounded(&path, 32 * 1024 * 1024) {
-            let plain = inflate_limited(&bytes, 128 * 1024 * 1024).ok();
-            let data = plain.as_deref().unwrap_or(&bytes);
-            if let Ok(snapshot) = serde_json::from_slice(data) {
-                out.snapshot = snapshot
-            }
-        }
-        if out.snapshot.version != VERSION {
-            out.snapshot.blobs.clear()
-        }
-        if out.snapshot.index_version != VERSION {
-            out.snapshot.index.clear()
-        }
-        out.snapshot.version = VERSION;
-        out.snapshot.index_version = VERSION;
-        out
-    }
-    pub fn persists_to_disk(&self) -> bool {
-        self.path.is_some()
-    }
+    #[cfg(test)]
     pub fn blob_count(&self) -> usize {
         self.snapshot.blobs.len()
     }
+    #[cfg(test)]
     pub fn index_count(&self) -> usize {
         self.snapshot.index.len()
     }
+    #[cfg(test)]
     pub fn entries(&mut self, provider: Provider, roots: &Roots) -> Vec<Entry> {
-        self.entries_since(provider, roots, f64::NEG_INFINITY, crate::usage::now())
+        self.entries_since(provider, roots, f64::NEG_INFINITY)
     }
-    pub fn entries_since(
-        &mut self,
-        provider: Provider,
-        roots: &Roots,
-        since: f64,
-        now: f64,
-    ) -> Vec<Entry> {
-        self.entries_with_probe(provider, roots, since, now, |p| codex::probe(p, 1 << 20))
+    pub fn entries_since(&mut self, provider: Provider, roots: &Roots, since: f64) -> Vec<Entry> {
+        self.entries_with_probe(provider, roots, since, |p| codex::probe(p, 1 << 20))
     }
     pub fn entries_with_probe(
         &mut self,
         provider: Provider,
         roots: &Roots,
         since: f64,
-        now: f64,
         mut probe: impl FnMut(&Path) -> io::Result<Option<String>>,
     ) -> Vec<Entry> {
         self.last_error = None;
@@ -131,20 +92,13 @@ impl Cache {
 
         let stamps: BTreeMap<_, _> = files
             .into_iter()
-            .filter_map(|p| match Stamp::at(&p) {
-                Ok(s) => Some((p, s)),
-                Err(error) => {
-                    self.last_error = Some(format!("Local usage scan failed: {error}"));
-                    None
-                }
-            })
+            // A file that vanished since the walk is gone, not a failed scan.
+            .filter_map(|p| Stamp::at(&p).ok().map(|s| (p, s)))
             .collect();
-        let before = self.snapshot.blobs.len() + self.snapshot.index.len();
         if self.last_error.is_none() {
             self.snapshot.blobs.retain(|p, _| stamps.contains_key(p));
             self.snapshot.index.retain(|p, _| stamps.contains_key(p));
         }
-        self.dirty |= before != self.snapshot.blobs.len() + self.snapshot.index.len();
         let included: BTreeSet<_> = stamps
             .iter()
             .filter(|(_, s)| s.seconds() >= since)
@@ -182,7 +136,6 @@ impl Cache {
                                     session,
                                 },
                             );
-                            self.dirty = true
                         }
                         Err(error) => {
                             self.last_error =
@@ -249,7 +202,6 @@ impl Cache {
                     .collect(),
             )
         };
-        self.save(now);
         result
     }
     fn load(&mut self, provider: Provider, path: &Path, stamp: &Stamp) {
@@ -265,12 +217,14 @@ impl Cache {
         let mut file = match fs::File::open(path) {
             Ok(file) => file,
             Err(error) => {
-                self.last_error = Some(format!("Local usage read failed: {error}"));
+                if error.kind() != io::ErrorKind::NotFound {
+                    self.last_error = Some(format!("Local usage read failed: {error}"));
+                }
                 return;
             }
         };
         // A larger replacement is not an append. Identity and bounded edge fingerprints
-        // protect rotations and in-place rewrites without persisting transcript text.
+        // protect rotations and in-place rewrites without keeping transcript text.
         let offset = if provider == Provider::Claude {
             old.filter(|b| {
                 stamp.size > b.stamp.size
@@ -314,7 +268,6 @@ impl Cache {
                             ..Blob::default()
                         },
                     );
-                    self.dirty = true;
                 }
                 Err(error) => self.last_error = Some(format!("Local usage read failed: {error}")),
             }
@@ -357,39 +310,6 @@ impl Cache {
             }
         };
         self.snapshot.blobs.insert(path.to_owned(), blob);
-        self.dirty = true;
-    }
-    pub fn save(&mut self, now: f64) {
-        let Some(path) = &self.path else { return };
-        if !self.dirty || self.last_save.is_some_and(|t| now - t < 60.) {
-            return;
-        }
-        let mut snapshot = self.snapshot.clone();
-        snapshot.version = VERSION;
-        snapshot.index_version = VERSION;
-        snapshot
-            .blobs
-            .retain(|_, b| now - b.stamp.seconds() <= 40. * 86400.);
-        let Ok(plain) = serde_json::to_vec(&snapshot) else {
-            return;
-        };
-        let mut encoder =
-            flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
-        if encoder.write_all(&plain).is_err() {
-            return;
-        }
-        let Ok(bytes) = encoder.finish() else { return };
-        let temporary = path.with_extension("tmp");
-        if let Some(parent) = path.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        if fs::write(&temporary, bytes)
-            .and_then(|_| fs::rename(&temporary, path))
-            .is_ok()
-        {
-            self.dirty = false;
-            self.last_save = Some(now)
-        }
     }
 }
 fn append_guard(file: &mut fs::File, length: u64) -> io::Result<(u64, u64)> {
@@ -406,6 +326,8 @@ fn append_guard(file: &mut fs::File, length: u64) -> io::Result<(u64, u64)> {
     Ok((hash_at(0)?, hash_at(length.saturating_sub(count as u64))?))
 }
 
+/// Roots are the user's choice, so a symlinked root is followed; below them symlinks are
+/// skipped and unreadable or vanished entries are ignored rather than aborting the scan.
 fn walk(
     path: &Path,
     files: &mut BTreeSet<PathBuf>,
@@ -419,52 +341,30 @@ fn walk(
     if !seen.insert(canonical.clone()) {
         return Ok(());
     }
-    let meta = fs::metadata(&canonical)?;
-    if meta.is_file() {
+    if fs::metadata(&canonical)?.is_file() {
         if canonical.extension().is_some_and(|e| e == "jsonl") {
             files.insert(canonical);
         }
         return Ok(());
     }
-    for entry in fs::read_dir(canonical)? {
-        let entry = entry?;
+    visit(&canonical, files)
+}
+
+fn visit(dir: &Path, files: &mut BTreeSet<PathBuf>) -> io::Result<()> {
+    for entry in fs::read_dir(dir)?.flatten() {
+        let path = entry.path();
         if entry.file_name().to_string_lossy().starts_with('.') {
             continue;
         }
-        walk(&entry.path(), files, seen)?;
+        match entry.file_type() {
+            Ok(kind) if kind.is_dir() => {
+                let _ = visit(&path, files);
+            }
+            Ok(kind) if kind.is_file() && path.extension().is_some_and(|e| e == "jsonl") => {
+                files.insert(path);
+            }
+            _ => {}
+        }
     }
     Ok(())
-}
-
-fn read_bounded(path: &Path, max: u64) -> io::Result<Vec<u8>> {
-    let f = fs::File::open(path)?;
-    if f.metadata()?.len() > max {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "cache too large",
-        ));
-    }
-    let mut b = vec![];
-    f.take(max + 1).read_to_end(&mut b)?;
-    if b.len() as u64 > max {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "cache too large",
-        ));
-    }
-    Ok(b)
-}
-
-pub(super) fn inflate_limited(bytes: &[u8], limit: u64) -> io::Result<Vec<u8>> {
-    let mut plain = vec![];
-    flate2::read::ZlibDecoder::new(bytes)
-        .take(limit.saturating_add(1))
-        .read_to_end(&mut plain)?;
-    if plain.len() as u64 > limit {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "inflated cache too large",
-        ));
-    }
-    Ok(plain)
 }

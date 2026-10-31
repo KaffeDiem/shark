@@ -26,7 +26,6 @@ fn sample(egg: bool, boost: bool) -> Companion {
     );
     state
 }
-// upstream: DifficultySaveTests.swift::testSavedDifficultyPreservesEggAndActiveProgressAndActualUsage
 #[test]
 fn difficulty_save_keeps_progress_profile_and_usage() {
     for egg in [false, true] {
@@ -58,37 +57,6 @@ fn difficulty_save_keeps_progress_profile_and_usage() {
         }
     }
 }
-// upstream: DifficultySaveTests.swift::testLegacyRangeMigrationPreservesFractionAndDoesNotRepeatOnRestart
-#[test]
-fn legacy_difficulty_migration_preserves_fraction_once() {
-    for old in [0.0001, 0.01, 20.] {
-        for egg in [false, true] {
-            let mut state = sample(egg, true);
-            if let Some(mon) = state.active.as_mut() {
-                mon.tokens = (mon.tokens as f64 * old).round() as u64;
-            } else {
-                state.egg_tokens = (state.egg_tokens as f64 * old).round() as u64;
-            }
-            state.growth_difficulty = old;
-            state.shop_difficulty = 20.;
-            state.sanitize();
-            assert_eq!(state.growth_difficulty, Balance::clamp_difficulty(old));
-            assert_eq!(state.shop_difficulty, 2.);
-            assert_eq!(
-                state.progress().0 * 2,
-                state.progress().1,
-                "old={old},egg={egg}"
-            );
-            let once = serde_json::to_value(&state).unwrap();
-            let mut again: Companion = serde_json::from_value(once.clone()).unwrap();
-            again.sanitize();
-            assert_eq!(serde_json::to_value(again).unwrap(), once);
-            assert_eq!(state.lifetime_tokens, 900_000_000);
-            assert!(state.collection.is_empty());
-        }
-    }
-}
-// upstream: DifficultySaveTests.swift::testNewRangeClampsBothControls
 #[test]
 fn both_difficulty_controls_clamp_to_new_range() {
     let mut state = sample(false, false);

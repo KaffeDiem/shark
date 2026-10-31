@@ -6,7 +6,6 @@ fn egg(tier: Option<Rarity>) -> Companion {
     s.egg_tokens = s.progress().1;
     s
 }
-// upstream: PremiumEggTests.swift::testCaptureRateCeilingIsTheSameThresholdAsClassification
 #[test]
 fn testCaptureRateCeilingIsTheSameThresholdAsClassification() {
     for rate in 0..=255 {
@@ -14,13 +13,12 @@ fn testCaptureRateCeilingIsTheSameThresholdAsClassification() {
         for tier in [Rarity::Common, Rarity::Uncommon, Rarity::Rare] {
             assert_eq!(
                 tier.includes(rate),
-                classified.rank() >= tier.rank(),
+                classified as u8 >= tier as u8,
                 "{rate} {tier:?}"
             );
         }
     }
 }
-// upstream: PremiumEggTests.swift::testLegendaryHasNoCaptureRateCeilingButPassesLowerTierFilters
 #[test]
 fn testLegendaryHasNoCaptureRateCeilingButPassesLowerTierFilters() {
     assert_eq!(Rarity::Legendary.capture_rate_ceiling(), None);
@@ -29,31 +27,13 @@ fn testLegendaryHasNoCaptureRateCeilingButPassesLowerTierFilters() {
         assert!(Rarity::Rare.includes(rate));
         assert!(Rarity::Uncommon.includes(rate));
     }
-    assert!(
-        !hatched()
-            .shop_entries()
-            .contains(&ShopEntry::Egg(Some(Rarity::Legendary)))
-    );
 }
-// upstream: PremiumEggTests.swift::testPricesFollowGraduationTotalRatio
 #[test]
 fn testPricesFollowGraduationTotalRatio() {
     assert_eq!(FreshEgg::price(None), 1_000_000_000);
     assert_eq!(FreshEgg::price(Some(Rarity::Uncommon)), 2_500_000_000);
     assert_eq!(FreshEgg::price(Some(Rarity::Rare)), 4_000_000_000);
-    assert_eq!(
-        hatched()
-            .shop_entries()
-            .iter()
-            .filter_map(|e| match e {
-                ShopEntry::Egg(tier) => Some(*tier),
-                _ => None,
-            })
-            .collect::<Vec<_>>(),
-        [None, Some(Rarity::Uncommon), Some(Rarity::Rare)]
-    );
 }
-// upstream: PremiumEggTests.swift::testRareEggIsNotDominatedAtMeasuredPoolComposition
 #[test]
 fn testRareEggIsNotDominatedAtMeasuredPoolComposition() {
     let uncommon = 3135.;
@@ -65,11 +45,9 @@ fn testRareEggIsNotDominatedAtMeasuredPoolComposition() {
     assert!(share < uncommon_price / rare_price);
     assert!(rare_plus / (uncommon * 0.7 + rare_plus) < uncommon_price / rare_price);
 }
-// upstream: PremiumEggTests.swift::testBuyPremiumEggRecordsGuaranteeAndDebitsTierPrice
 #[test]
 fn testBuyPremiumEggRecordsGuaranteeAndDebitsTierPrice() {
     let mut s = hatched();
-    assert!(s.can_buy_egg(Some(Rarity::Rare)));
     s.fresh_egg(Some(Rarity::Rare)).unwrap();
     assert_eq!(s.min_rarity(), Some(Rarity::Rare));
     assert_eq!(s.spent_tokens, 4_000_000_000);
@@ -79,30 +57,23 @@ fn testBuyPremiumEggRecordsGuaranteeAndDebitsTierPrice() {
     assert!(s.collection[0].released);
     assert!(!s.collection[0].graduated);
 }
-// upstream: PremiumEggTests.swift::testCannotBuyAnyEggWhileIncubating
 #[test]
 fn testCannotBuyAnyEggWhileIncubating() {
     let mut s = egg(None);
     s.lifetime_tokens = 20_000_000_000;
     for tier in [None, Some(Rarity::Uncommon), Some(Rarity::Rare)] {
-        assert!(!s.can_buy_egg(tier));
         assert!(s.fresh_egg(tier).is_err());
     }
     assert_eq!(s.spent_tokens, 0);
 }
-// upstream: PremiumEggTests.swift::testFundsAreCheckedAgainstTierPrice
 #[test]
 fn testFundsAreCheckedAgainstTierPrice() {
     let mut s = hatched();
     s.lifetime_tokens = 3_000_000_000;
-    assert!(s.can_buy_egg(None));
-    assert!(s.can_buy_egg(Some(Rarity::Uncommon)));
-    assert!(!s.can_buy_egg(Some(Rarity::Rare)));
     assert!(s.fresh_egg(Some(Rarity::Rare)).is_err());
     assert!(s.active.is_some());
     assert_eq!(s.spent_tokens, 0);
 }
-// upstream: PremiumEggTests.swift::testPurchaseStartsFromCleanRollState
 #[test]
 fn testPurchaseStartsFromCleanRollState() {
     let mut s = hatched();
@@ -111,7 +82,6 @@ fn testPurchaseStartsFromCleanRollState() {
     assert_eq!(s.egg_tokens, 0);
     assert!(s.active.is_none());
 }
-// upstream: PremiumEggTests.swift::testGuaranteeSurvivesRestart
 #[test]
 fn testGuaranteeSurvivesRestart() {
     let mut s = hatched();
@@ -120,7 +90,6 @@ fn testGuaranteeSurvivesRestart() {
     assert_eq!(restored.egg_tier, Some(Rarity::Uncommon));
     assert_eq!(restored.min_rarity(), Some(Rarity::Uncommon));
 }
-// upstream: PremiumEggTests.swift::testHatchDiscardsSpeciesBelowGuaranteeWhenIndexIsStale
 #[test]
 fn testHatchDiscardsSpeciesBelowGuaranteeWhenIndexIsStale() {
     let mut s = egg(Some(Rarity::Rare));
@@ -129,14 +98,12 @@ fn testHatchDiscardsSpeciesBelowGuaranteeWhenIndexIsStale() {
     assert_eq!(s.egg_tier, Some(Rarity::Rare));
     assert_eq!(s.egg_tokens, Balance::EGG_HATCH_THRESHOLD);
 }
-// upstream: PremiumEggTests.swift::testSameSpeciesHatchesNormallyWithoutGuarantee
 #[test]
 fn testSameSpeciesHatchesNormallyWithoutGuarantee() {
     let mut s = egg(None);
     s.hatch(line(1));
     assert_eq!(s.active.unwrap().line.rarity, Rarity::Common);
 }
-// upstream: PremiumEggTests.swift::testHatchConsumesGuarantee
 #[test]
 fn testHatchConsumesGuarantee() {
     let mut s = egg(Some(Rarity::Rare));
@@ -147,7 +114,6 @@ fn testHatchConsumesGuarantee() {
     assert_eq!(s.egg_tier, None);
     assert_eq!(s.min_rarity(), None);
 }
-// upstream: PremiumEggTests.swift::testGuaranteeDoesNotSurviveIntoTheNextEgg
 #[test]
 fn testGuaranteeDoesNotSurviveIntoTheNextEgg() {
     let mut s = egg(Some(Rarity::Rare));
@@ -161,19 +127,16 @@ fn testGuaranteeDoesNotSurviveIntoTheNextEgg() {
     assert_eq!(s.egg_tier, None);
     assert_eq!(s.min_rarity(), None);
 }
-// upstream: PremiumEggTests.swift::testCannotBuyTierThatIsNotSold
 #[test]
 fn testCannotBuyTierThatIsNotSold() {
     let mut s = hatched();
     s.lifetime_tokens = 20_000_000_000;
     for tier in [Rarity::Common, Rarity::Legendary] {
-        assert!(!s.can_buy_egg(Some(tier)));
         assert!(s.fresh_egg(Some(tier)).is_err());
     }
     assert_eq!(s.spent_tokens, 0);
     assert!(s.active.is_some());
 }
-// upstream: PremiumEggTests.swift::testGuaranteeTravelsWithSave
 #[test]
 fn testGuaranteeTravelsWithSave() {
     let mut s = Companion::default();
@@ -193,7 +156,6 @@ fn testGuaranteeTravelsWithSave() {
     );
     assert_eq!(imported.egg_tier, Some(Rarity::Uncommon));
 }
-// upstream: PremiumEggTests.swift::testSanitizedDropsGuaranteeAndItsPreRollWhenActiveExists
 #[test]
 fn testSanitizedDropsGuaranteeAndItsPreRollWhenActiveExists() {
     let mut s = hatched();
@@ -204,7 +166,6 @@ fn testSanitizedDropsGuaranteeAndItsPreRollWhenActiveExists() {
     s.sanitize();
     assert_eq!(s.egg_tier, Some(Rarity::Rare));
 }
-// upstream: PremiumEggTests.swift::testUnsatisfiableGuaranteeIsNormalizedAwayAndEggStillHatches
 #[test]
 fn testUnsatisfiableGuaranteeIsNormalizedAwayAndEggStillHatches() {
     let mut s = egg(Some(Rarity::Legendary));
@@ -213,7 +174,6 @@ fn testUnsatisfiableGuaranteeIsNormalizedAwayAndEggStillHatches() {
     s.hatch(line(1));
     assert!(s.active.is_some());
 }
-// upstream: PremiumEggTests.swift::testUnknownGuaranteeDecodesAsNoGuarantee
 #[test]
 fn testUnknownGuaranteeDecodesAsNoGuarantee() {
     let s: Companion = serde_json::from_str(r#"{"egg_tier":"mythic"}"#).unwrap();
@@ -248,7 +208,6 @@ fn sampled(seed: u64, tier: Option<Rarity>) -> Rarity {
     s.hatch(l);
     s.active.unwrap().line.rarity
 }
-// upstream: PremiumEggTests.swift::testWeightedRollNeverGoesBelowGuarantee
 #[test]
 fn testWeightedRollNeverGoesBelowGuarantee() {
     let guaranteed: Vec<_> = (1..=20)
@@ -259,7 +218,6 @@ fn testWeightedRollNeverGoesBelowGuarantee() {
     assert!(guaranteed.iter().all(|&r| r >= Rarity::Rare));
     assert!(controls.contains(&Rarity::Common));
 }
-// upstream: PremiumEggTests.swift::testUncommonEggHatchesUncommonAndExcludesOnlyCommon
 #[test]
 fn testUncommonEggHatchesUncommonAndExcludesOnlyCommon() {
     let sampled: Vec<_> = (1..=20)
@@ -268,7 +226,6 @@ fn testUncommonEggHatchesUncommonAndExcludesOnlyCommon() {
     assert!(!sampled.contains(&Rarity::Common));
     assert!(sampled.contains(&Rarity::Uncommon));
 }
-// upstream: PremiumEggTests.swift::testLegendaryStillReachableFromPremiumEgg
 #[test]
 fn testLegendaryStillReachableFromPremiumEgg() {
     assert!((1..=60).any(|seed| sampled(seed, Some(Rarity::Rare)) == Rarity::Legendary));
@@ -307,7 +264,6 @@ fn rest_sample(seed: u64, tier: Option<Rarity>) -> Option<Rarity> {
     s.hatch(l);
     Some(s.active.unwrap().line.rarity)
 }
-// upstream: PremiumEggTests.swift::testRestFallbackRespectsGuarantee
 #[test]
 fn testRestFallbackRespectsGuarantee() {
     let outcomes: Vec<_> = (1..=10)
@@ -316,7 +272,6 @@ fn testRestFallbackRespectsGuarantee() {
     assert!(!outcomes.is_empty());
     assert!(outcomes.iter().all(|&r| r == Rarity::Rare));
 }
-// upstream: PremiumEggTests.swift::testRestFallbackHonoursUncommonTierWithoutOverFiltering
 #[test]
 fn testRestFallbackHonoursUncommonTierWithoutOverFiltering() {
     let outcomes: Vec<_> = (1..=20)
@@ -325,7 +280,6 @@ fn testRestFallbackHonoursUncommonTierWithoutOverFiltering() {
     assert!(!outcomes.contains(&Rarity::Common));
     assert!(outcomes.contains(&Rarity::Uncommon));
 }
-// upstream: PremiumEggTests.swift::testRestFallbackWithoutGuaranteeCanHatchCommon
 #[test]
 fn testRestFallbackWithoutGuaranteeCanHatchCommon() {
     assert!(

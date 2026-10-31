@@ -25,7 +25,7 @@ impl Shark {
                     if let Some(asset) = crate::pokemon::sprites::cached_memory(path) {
                         images::paint_frame(images::render_image(asset), 0, size)
                     } else {
-                        images::sized(path, size).into_any_element()
+                        div().child("✦").into_any_element()
                     },
                 )
             })

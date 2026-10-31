@@ -25,14 +25,12 @@ fn combine(reports: &[(&str, Report)]) -> Summary {
     Summary::from_sources(
         reports.iter().map(|(id, r)| Source {
             id,
-            name: id,
             report: r,
             reports_cost: true,
         }),
         now(),
     )
 }
-// upstream: UsageStoreTests.swift::testAggregatesTodayTokensAcrossProviders
 #[test]
 fn today_across_sources() {
     let s = combine(&[
@@ -46,7 +44,6 @@ fn today_across_sources() {
     );
     assert_eq!(s.today_by_provider.values().sum::<u64>(), s.today.total())
 }
-// upstream: UsageStoreTests.swift::testCodexOnlyWhenClaudeHasNoData
 #[test]
 fn absent_claude_keeps_codex() {
     let s = combine(&[
@@ -58,7 +55,6 @@ fn absent_claude_keeps_codex() {
     assert_eq!(s.providers[0].id, "codex");
     assert_eq!(s.today_by_provider.len(), 1)
 }
-// upstream: UsageStoreTests.swift::testStaleDatedSnapshotExcludedFromTodayTotal
 #[test]
 fn stale_day_excluded_today() {
     let s = combine(&[
@@ -71,7 +67,6 @@ fn stale_day_excluded_today() {
         BTreeMap::from([("claude".into(), 100000000)])
     )
 }
-// upstream: UsageStoreTests.swift::testBurnTierThresholds
 #[test]
 fn burn_boundaries() {
     for (rate, tier) in [
@@ -85,7 +80,6 @@ fn burn_boundaries() {
         assert_eq!(combine(&[("claude", r)]).burn, tier)
     }
 }
-// upstream: UsageStoreTests.swift::testBurnTierFromNonClaudeProvider
 #[test]
 fn codex_burn() {
     assert_eq!(
@@ -93,7 +87,6 @@ fn codex_burn() {
         BurnTier::Fast
     )
 }
-// upstream: UsageStoreTests.swift::testBurnTierCombinesProviders
 #[test]
 fn combined_burn() {
     let s = combine(&[
@@ -103,7 +96,6 @@ fn combined_burn() {
     assert_eq!(s.rate, 120000.);
     assert_eq!(s.burn, BurnTier::Fast)
 }
-// upstream: UsageStoreTests.swift::testCarrierForWeekMonthOnlyWithoutActiveBlock
 #[test]
 fn history_visible_without_today_or_burn() {
     let s = combine(&[(
@@ -117,14 +109,12 @@ fn history_visible_without_today_or_burn() {
     assert_eq!(s.month.total(), 80000000);
     assert_eq!(s.burn, BurnTier::Idle)
 }
-// upstream: UsageStoreTests.swift::testNoCarrierForZeroTokenActiveBlock
 #[test]
 fn zero_synthetic_no_provider() {
     let s = combine(&[("claude", report(&[(now() - 60., 0)]))]);
     assert!(s.providers.is_empty());
     assert_eq!(s.rate, 0.)
 }
-// upstream: UsageStoreTests.swift::testCarrierForProviderUsedWithinRecentWindowAcrossCalendarBoundaries
 #[test]
 fn recent_use_crosses_calendar_boundary() {
     let monday = Local
@@ -142,7 +132,6 @@ fn recent_use_crosses_calendar_boundary() {
     let s = Summary::from_sources(
         [Source {
             id: "codex",
-            name: "Codex",
             report: &r,
             reports_cost: true,
         }],
@@ -155,7 +144,6 @@ fn recent_use_crosses_calendar_boundary() {
     assert!(s.today_by_provider.is_empty());
     assert_eq!(s.burn, BurnTier::Idle)
 }
-// upstream: UsageStoreTests.swift::testNoCarrierForProviderIdleBeyondRecentWindow
 #[test]
 fn older_than_week_without_current_period_hidden() {
     let day = Local
@@ -174,7 +162,6 @@ fn older_than_week_without_current_period_hidden() {
         Summary::from_sources(
             [Source {
                 id: "codex",
-                name: "Codex",
                 report: &r,
                 reports_cost: true
             }],
@@ -184,7 +171,6 @@ fn older_than_week_without_current_period_hidden() {
         .is_empty()
     )
 }
-// upstream: UsageStoreTests.swift::testSnapshotOrderFollowsProviderRegistrationOrder
 #[test]
 fn provider_order_registration() {
     let s = combine(&[
@@ -199,7 +185,6 @@ fn provider_order_registration() {
         ["claude", "codex"]
     )
 }
-// upstream: UsageStoreTests.swift::testUnknownFutureProviderFlowsThroughAllAggregation
 #[test]
 fn arbitrary_future_source_all_aggregates() {
     let r = report(&[
@@ -212,24 +197,8 @@ fn arbitrary_future_source_all_aggregates() {
     assert_eq!(s.today.total(), 42000000);
     assert_eq!(s.week.total(), 90000000);
     assert_eq!(s.month.total(), 300000000);
-    assert_eq!(s.burn, BurnTier::Fast);
-    assert_eq!(
-        s.preferring(Some("future_tool_xyz")).unwrap().id,
-        "future_tool_xyz"
-    )
+    assert_eq!(s.burn, BurnTier::Fast)
 }
-// upstream: UsageStoreTests.swift::testSnapshotPreferringSelection
-#[test]
-fn preferred_source_or_stable_first() {
-    let s = combine(&[
-        ("claude", report(&[(now(), 1000)])),
-        ("future-tool", report(&[(now(), 2000)])),
-    ]);
-    assert_eq!(s.preferring(Some("future-tool")).unwrap().id, "future-tool");
-    assert_eq!(s.preferring(None).unwrap().id, "claude");
-    assert_eq!(s.preferring(Some("missing")).unwrap().id, "claude")
-}
-// upstream: UsageStoreTests.swift::testMidnightCarrierSnapshotFromActiveBlock
 #[test]
 fn midnight_preserves_active_usage_and_periods() {
     let now = Local
@@ -254,20 +223,17 @@ fn midnight_preserves_active_usage_and_periods() {
     let s = Summary::from_sources(
         [Source {
             id: "claude",
-            name: "Claude",
             report: &r,
             reports_cost: true,
         }],
         now,
     );
     assert_eq!(s.providers.len(), 1);
-    assert_eq!(s.preferring(Some("claude")).unwrap().id, "claude");
     assert_eq!(s.today.total(), 0);
     assert_eq!(s.week.total(), 90000000);
     assert_eq!(s.month.total(), 300000000);
     assert_eq!(s.burn, BurnTier::Fast)
 }
-// upstream: UsageStoreTests.swift::testIdleCarrierRequiresPositiveHistoricalValue
 #[test]
 fn historical_visibility_requires_positive_usage() {
     for source in ["week", "month", "series", "empty", "failed"] {
