@@ -39,6 +39,7 @@ release:
 	plutil -insert NSHighResolutionCapable -bool YES $(APP)/Contents/Info.plist
 	plutil -insert NSHumanReadableCopyright -string "© Kasper Munch Jensen. GPL-3.0." $(APP)/Contents/Info.plist
 	cp LICENSE $(APP)/Contents/Resources/LICENSE
+	cp licenses/PokeTokenBar-MIT.txt $(APP)/Contents/Resources/PokeTokenBar-MIT.txt
 	@test -n "$(GOPLS_VERSION)" && test -f target/language-tools/gopls/$(GOPLS_VERSION)/gopls || (echo "Run scripts/build-gopls.sh before make release"; exit 1)
 	mkdir -p $(GOPLS)
 	cp -R target/language-tools/gopls/$(GOPLS_VERSION)/ $(GOPLS)/

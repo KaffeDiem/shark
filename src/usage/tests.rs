@@ -647,3 +647,41 @@ fn exchange_reads_each_providers_protocol_from_pipes() {
         Err(Failure::Unsupported)
     );
 }
+
+#[test]
+fn activity_corrupt_extreme_counts_saturate_fields_days_and_files() {
+    let mut claude = vec![];
+    let mut codex = vec![];
+    let timestamp = NSISO8601DateFormatter::new()
+        .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(now()))
+        .to_string();
+    for id in 1..=2 {
+        claude.push(json!({"type":"assistant", "timestamp":timestamp, "requestId":id.to_string(), "message":{"id":id.to_string(),"usage":{"input_tokens":u64::MAX,"output_tokens":1,"cache_creation_input_tokens":1}}}).to_string());
+        codex.push(json!({"type":"event_msg","timestamp":timestamp,"payload":{"type":"token_count","info":{"total_token_usage":{"total_tokens":id},"last_token_usage":{"input_tokens":u64::MAX,"cached_input_tokens":0,"output_tokens":1}}}}).to_string());
+    }
+    let today = activity::local_day(now());
+    for (provider, lines) in [(Provider::Claude, claude), (Provider::Codex, codex)] {
+        let text = lines.join("\n");
+        assert_eq!(
+            activity::parse(provider, text.as_bytes(), &mut Default::default()),
+            vec![(today, u64::MAX)]
+        );
+        let root = std::env::temp_dir().join(format!(
+            "shark-extreme-{}-{}",
+            std::process::id(),
+            provider.index()
+        ));
+        let logs = root.join(if provider == Provider::Claude {
+            "projects/p"
+        } else {
+            "sessions/2026"
+        });
+        std::fs::create_dir_all(&logs).unwrap();
+        for name in ["a.jsonl", "b.jsonl"] {
+            std::fs::write(logs.join(name), &text).unwrap();
+        }
+        let daily = activity::scan_in(provider, &root, &mut Default::default(), now());
+        assert_eq!(daily.tokens.last(), Some(&u64::MAX));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+}

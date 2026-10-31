@@ -1,5 +1,9 @@
 //! Short-lived, prompt-free account queries. No chat state or snapshots go to disk.
 pub mod activity;
+pub mod logs;
+pub mod providers;
+pub mod pace;
+pub mod summary;
 
 use objc2_foundation::{NSISO8601DateFormatOptions, NSISO8601DateFormatter, NSString};
 use serde_json::{Value, json};
@@ -17,6 +21,16 @@ pub enum Provider {
 
 impl Provider {
     pub const ALL: [Self; 2] = [Self::Claude, Self::Codex];
+
+    /// Adapter for Shark's existing account query and local activity reader.
+    pub fn source(self) -> &'static dyn providers::UsageProvider {
+        providers::builtins()
+            .get(match self {
+                Self::Claude => "claude",
+                Self::Codex => "codex",
+            })
+            .expect("built-in usage provider registered")
+    }
 
     pub fn name(self) -> &'static str {
         match self {

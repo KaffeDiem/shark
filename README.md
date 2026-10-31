@@ -22,6 +22,10 @@
 <tr><td colspan="2" valign="top"><b>Native and keyboard-first</b><br>GPUI on Metal, not Electron. Everything is in <code>cmd-k</code>, with an optional Vim mode.<br><br><img src="docs/images/palette.png" alt="The cmd-k command palette"></td></tr>
 </table>
 
+## Pokémon companion
+
+Raise Pokémon with Claude Code and Codex token activity in the bottom-left navigation. Open the companion for its Pokédex, Bag, Shop, and Shark's existing account usage view. Enable or disable it in Settings → General; find attribution in Settings → LICENSE. See [Pokémon usage and saves](docs/pokemon.md) and the [Rust test migration inventory](docs/poketokenbar-test-migration.md).
+
 ## Install
 ```sh
 brew tap KaffeDiem/shark https://github.com/KaffeDiem/shark

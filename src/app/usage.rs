@@ -1,24 +1,58 @@
 //! Account usage belongs to the window, independent of the selected workspace.
 use super::*;
+#[cfg(test)]
+use crate::usage::Provider;
 use crate::usage::activity::{self, Daily, WEEKS};
-use crate::usage::{Allowance, Failure, Provider, Snapshot, Status};
+use crate::usage::providers::ProviderHandle;
+use crate::usage::{Allowance, Failure, Snapshot, Status};
+use gpui_kit::component::FocusTrapElement as _;
 use gpui_kit::component::plot::shape::{Arc, ArcData};
 use objc2_foundation::{NSDate, NSDateFormatter, NSDateFormatterStyle, NSString, NSTimeZone};
 use std::f32::consts::TAU;
 use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(300);
+#[cfg(all(test, feature = "test-support"))]
+mod pixels;
+mod provider_tabs;
+mod recap;
+mod store_state;
+mod totals;
+mod trend;
+#[cfg(all(test, feature = "test-support"))]
+pub(in crate::app) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
+    pixels::render_pixels(cx);
+}
 
 pub(super) struct Panel {
     focus: FocusHandle,
     previous_focus: Option<FocusHandle>,
+    companion: bool,
+    pub(super) recap: Option<(crate::usage::summary::Scope, i32)>,
+    hovered_day: Option<chrono::NaiveDate>,
+    selected_provider: Option<String>,
+    #[cfg(test)]
+    reference_time: Option<f64>,
     _keys: Subscription,
 }
 
 impl Shark {
     pub(super) fn show_usage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(panel) = &self.usage_panel {
+        self.open_usage_panel(false, window, cx);
+    }
+
+    pub(super) fn show_companion_panel(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.open_usage_panel(true, window, cx);
+    }
+
+    fn open_usage_panel(&mut self, companion: bool, window: &mut Window, cx: &mut Context<Self>) {
+        self.pokemon_ui.tab = pokemon::Page::Usage;
+        self.cancel_profile_names();
+        if let Some(panel) = &mut self.usage_panel {
+            panel.companion = companion;
+            panel.recap = None;
             panel.focus.focus(window, cx);
+            cx.notify();
             return;
         }
         let previous_focus = window.focused(cx);
@@ -32,15 +66,12 @@ impl Shark {
                     return;
                 }
                 match ev.keystroke.key.as_str() {
+                    "escape" if panel.recap.is_some() => {
+                        s.usage_panel.as_mut().unwrap().recap = None;
+                        cx.notify();
+                    }
                     "escape" => s.close_usage(w, cx),
                     "enter" | "space" if panel.focus.is_focused(w) => s.refresh_usage(cx),
-                    "tab" => {
-                        if panel.focus.is_focused(w) {
-                            w.focus_next(cx);
-                        } else {
-                            panel.focus.focus(w, cx);
-                        }
-                    }
                     _ => return,
                 }
                 cx.stop_propagation();
@@ -50,6 +81,12 @@ impl Shark {
         self.usage_panel = Some(Panel {
             focus,
             previous_focus,
+            companion,
+            recap: None,
+            hovered_day: None,
+            selected_provider: None,
+            #[cfg(test)]
+            reference_time: None,
             _keys: keys,
         });
         self.refresh_usage(cx);
@@ -60,53 +97,119 @@ impl Shark {
         let Some(panel) = self.usage_panel.take() else {
             return;
         };
+        self.cancel_profile_names();
         self.restore_focus(panel.previous_focus, window, cx);
+        self.pokemon_ui.growth_draft = None;
+        self.pokemon_ui.shop_draft = None;
+        self.pokemon_ui.selected_species = None;
+        self.cancel_profile_names();
         cx.notify();
     }
 
     pub(super) fn refresh_usage(&mut self, cx: &mut Context<Self>) {
-        for provider in Provider::ALL {
-            if !self.usage[provider.index()].begin() {
-                continue;
-            }
+        for provider in self.usage_providers.clone() {
+            let query = self.usage[provider.index()].begin();
             // Headless tests complete snapshots explicitly; never query the user's account.
             #[cfg(test)]
             {
-                self.usage_queries[provider.index()] += 1;
+                if query {
+                    self.usage_queries[provider.index()] += 1;
+                }
                 if !self.usage_live {
                     continue;
                 }
             }
-            cx.spawn(async move |this, cx| {
-                let result = cx
-                    .background_executor()
-                    .spawn(async move { crate::usage::query(provider) })
-                    .await;
-                this.update(cx, |s, cx| {
-                    s.usage[provider.index()].finish(result);
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
-            let cache = self.activity_cache.clone();
-            cx.spawn(async move |this, cx| {
-                let daily = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let mut cache = cache[provider.index()]
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        crate::usage::activity::scan(provider, &mut cache, crate::usage::now())
+            if query {
+                let generation = self.pokemon_ui.generation;
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move { provider.source().remaining_usage() })
+                        .await;
+                    this.update(cx, |s, cx| {
+                        s.complete_usage_query(provider, generation, result, cx);
                     })
+                    .ok();
+                })
+                .detach();
+            }
+            // Token scans are independent of a slow or unavailable quota endpoint.
+            if self.pokemon_ui.scanning[provider.index()] {
+                continue;
+            }
+            self.pokemon_ui.scanning[provider.index()] = true;
+            let generation = self.pokemon_ui.generation;
+            cx.spawn(async move |this, cx| {
+                let observation = cx
+                    .background_executor()
+                    .spawn(async move { provider.source().observations(crate::usage::now()) })
                     .await;
                 this.update(cx, |s, cx| {
-                    s.usage_activity[provider.index()] = daily;
-                    cx.notify();
+                    s.complete_usage_activity(provider, generation, observation, cx);
                 })
                 .ok();
             })
             .detach();
+        }
+        cx.notify();
+    }
+
+    fn complete_usage_activity(
+        &mut self,
+        provider: ProviderHandle,
+        generation: u64,
+        observation: crate::usage::providers::Observation,
+        cx: &mut Context<Self>,
+    ) {
+        self.pokemon_ui.scanning[provider.index()] = false;
+        // An invalidated scan must not enter the shared report set: the next provider's
+        // successful scan records that entire set in the persistent recap ledger.
+        if self.pokemon_ui.generation != generation {
+            self.refresh_usage(cx);
+            cx.notify();
+            return;
+        }
+        self.usage_activity[provider.index()] = observation.activity;
+        if let Some(error) = observation.companion.error.as_ref() {
+            self.usage_reports[provider.index()].error = Some(error.clone());
+            cx.notify();
+            return;
+        }
+        let companion_daily = observation.companion.daily.clone();
+        self.usage_reports[provider.index()] = observation.companion;
+        {
+            let now = crate::usage::now();
+            let days = crate::usage::summary::combine_series(
+                self.usage_reports
+                    .iter()
+                    .map(|report| report.month_daily(now)),
+            );
+            let previous = self.state.usage_ledger.clone();
+            self.state
+                .usage_ledger
+                .record(&days, crate::usage::summary::local_date(now));
+            if self.state.usage_ledger != previous {
+                let _ = self.state.save();
+            }
+            self.observe_pokemon_usage_daily(provider, &companion_daily, cx);
+        }
+        cx.notify();
+    }
+
+    fn complete_usage_query(
+        &mut self,
+        provider: ProviderHandle,
+        generation: u64,
+        result: Result<Vec<Allowance>, Failure>,
+        cx: &mut Context<Self>,
+    ) {
+        // Always release the quota request lock, including requests started before an
+        // import or enable toggle. Only a fresh request may mutate companion rewards.
+        self.usage[provider.index()].finish(result);
+        if self.pokemon_ui.generation == generation {
+            self.observe_pokemon_limits(provider);
+        } else {
+            self.refresh_usage(cx);
         }
         cx.notify();
     }
@@ -136,8 +239,10 @@ impl Shark {
 
     pub(super) fn render_usage_footer(&self, cx: &Context<Self>) -> impl IntoElement {
         let at = self.usage_at.clone();
-        let providers: Vec<_> = Provider::ALL
-            .into_iter()
+        let providers: Vec<_> = self
+            .usage_providers
+            .iter()
+            .copied()
             .filter(|p| !self.usage[p.index()].allowances.is_empty())
             .collect();
         let fallback = providers.is_empty();
@@ -151,6 +256,9 @@ impl Shark {
             .child(
                 v_flex()
                     .when(self.rail, |d| d.items_center().gap_1())
+                    .when(!self.state.pokemon_disabled, |d| {
+                        d.child(self.render_pokemon_footer(cx))
+                    })
                     .when(fallback, |d| {
                         d.child(
                             Button::new("show-usage")
@@ -210,11 +318,11 @@ impl Shark {
                             snapshot.clone(),
                             self.usage_activity[provider.index()].clone(),
                         );
-                        HoverCard::new(format!("usage-card-{}", provider.name()))
+                        HoverCard::new(format!("usage-card-{}", provider.id()))
                             .anchor(Anchor::BottomLeft)
                             .trigger(
                                 trigger
-                                    .id(format!("usage-trigger-{}", provider.name()))
+                                    .id(format!("usage-trigger-{}", provider.id()))
                                     .role(Role::Button)
                                     .aria_label(description)
                                     .hover(move |d| d.bg(hover))
@@ -241,6 +349,30 @@ impl Shark {
             .test_support()
     }
 
+    pub(super) fn usage_summary(&self, now: f64) -> crate::usage::summary::combined::Summary {
+        crate::usage::summary::combined::Summary::from_sources(
+            self.usage_providers
+                .iter()
+                .map(|provider| crate::usage::summary::combined::Source {
+                    id: provider.id(),
+                    name: provider.name(),
+                    report: &self.usage_reports[provider.index()],
+                    reports_cost: provider.source().reports_cost(),
+                }),
+            now,
+        )
+    }
+    fn usage_view_now(&self) -> f64 {
+        #[cfg(test)]
+        if let Some(now) = self
+            .usage_panel
+            .as_ref()
+            .and_then(|panel| panel.reference_time)
+        {
+            return now;
+        }
+        crate::usage::now()
+    }
     pub(super) fn render_usage(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
         let panel = self.usage_panel.as_ref()?;
         let viewport = window.viewport_size();
@@ -250,11 +382,22 @@ impl Shark {
             .max(px(8.))
             .min((viewport.width - px(352.)).max(px(8.)));
         let bottom = (viewport.height - footer.top() + px(4.)).max(px(8.));
+        let companion = !self.state.pokemon_disabled && panel.companion;
+        let pokemon = companion && self.pokemon_ui.tab != pokemon::Page::Usage;
+        let recap = panel.recap.is_some();
         let content = menu::chrome(cx.theme())
             .id("usage-panel")
             .role(Role::Dialog)
-            .aria_label("Account usage")
-            .aria_description("Subscription allowances. Enter to refresh. Escape to close.")
+            .aria_label(if companion {
+                "Pokémon companion"
+            } else {
+                "Account usage"
+            })
+            .aria_description(if companion {
+                "Raise Pokémon with coding usage. Tab to move between controls. Escape to close."
+            } else {
+                "Subscription allowances. Enter to refresh. Escape to close."
+            })
             .track_focus(&panel.focus)
             .w(px(344.).min(viewport.width - px(16.)))
             .max_h((viewport.height - bottom - px(8.)).max(px(0.)))
@@ -262,25 +405,86 @@ impl Shark {
             .p_4()
             .gap_4()
             .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Usage"))
-                    .child(
-                        Button::new("refresh-usage")
-                            .ghost()
-                            .xsmall()
-                            .label("Refresh")
-                            .icon(IconName::RefreshCw)
-                            .on_click(cx.listener(|s, _, _, cx| s.refresh_usage(cx))),
-                    ),
-            )
-            .children(Provider::ALL.map(|provider| {
-                let i = provider.index();
-                section(provider, &self.usage[i], &self.usage_activity[i], cx)
-            }))
-            .test_support();
+            .when(recap, |d| d.child(self.render_usage_recap(cx)))
+            .when(companion && !recap, |d| {
+                d.child(self.render_pokemon_panel(cx))
+            })
+            .when(!pokemon && !recap, |d| {
+                d.child(
+                    h_flex()
+                        .justify_between()
+                        .items_center()
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child("Usage"))
+                        .child(
+                            Button::new("usage-open-recap")
+                                .ghost()
+                                .xsmall()
+                                .label("Recap")
+                                .on_click(cx.listener(|s, _, _, cx| s.open_usage_recap(cx))),
+                        )
+                        .child(
+                            Button::new("refresh-usage")
+                                .ghost()
+                                .xsmall()
+                                .label("Refresh")
+                                .icon(IconName::RefreshCw)
+                                .on_click(cx.listener(|s, _, _, cx| s.refresh_usage(cx))),
+                        ),
+                )
+            })
+            .when(!pokemon && !recap, |d| {
+                let now = self.usage_view_now();
+                let summary = self.usage_summary(now);
+                let series: Vec<_> = self
+                    .usage_providers
+                    .iter()
+                    .map(|p| crate::usage::summary::ProviderSeries {
+                        id: p.id().into(),
+                        name: p.name().into(),
+                        days: Some(self.usage_reports[p.index()].month_daily(now)),
+                        reports_cost: p.source().reports_cost(),
+                    })
+                    .collect();
+                let registry: Vec<_> = self
+                    .usage_providers
+                    .iter()
+                    .map(|p| p.id().to_owned())
+                    .collect();
+                let shows_cost = self.shows_usage_cost(&summary);
+                d.child(self.render_usage_totals(&summary, cx))
+                    .child(self.render_month_trend(
+                        &summary.month_daily,
+                        &series,
+                        &registry,
+                        crate::usage::summary::local_date(now),
+                        shows_cost,
+                        cx,
+                    ))
+            })
+            .when(!pokemon && !recap, |d| {
+                d.child(self.render_usage_provider_tabs(cx))
+            })
+            .when(!pokemon && !recap, |d| {
+                let selected = self.selected_usage_provider();
+                d.children(
+                    self.usage_providers
+                        .iter()
+                        .copied()
+                        .filter(|provider| selected.is_none_or(|id| provider.id() == id))
+                        .map(|provider| {
+                            let i = provider.index();
+                            section(
+                                provider,
+                                &self.usage[i],
+                                &self.usage_activity[i],
+                                &self.usage_reports[i],
+                                cx,
+                            )
+                        }),
+                )
+            })
+            .test_support()
+            .focus_trap("usage-panel", &panel.focus);
         Some(
             deferred(
                 anchored().position(point(px(0.), px(0.))).child(
@@ -301,14 +505,21 @@ impl Shark {
                         .child(content),
                 ),
             )
-            .with_priority(100)
+            // Root dialogs paint at priority 10; companion confirmations must stay above this popover.
+            .with_priority(5)
             .into_any_element(),
         )
     }
 }
 
 /// The calendar is here too, so its daily values are reachable without a pointer.
-fn section(provider: Provider, snapshot: &Snapshot, daily: &Daily, cx: &App) -> impl IntoElement {
+fn section(
+    provider: ProviderHandle,
+    snapshot: &Snapshot,
+    daily: &Daily,
+    report: &crate::usage::logs::Report,
+    cx: &App,
+) -> impl IntoElement {
     let theme = cx.theme();
     let status = match snapshot.status {
         Status::Idle => Some("Not checked"),
@@ -321,7 +532,7 @@ fn section(provider: Provider, snapshot: &Snapshot, daily: &Daily, cx: &App) -> 
         Status::Failed(error) => Some(error.message()),
     };
     v_flex()
-        .id(format!("usage-{}", provider.name()))
+        .id(format!("usage-{}", provider.id()))
         .gap_2()
         .child(
             div()
@@ -330,7 +541,7 @@ fn section(provider: Provider, snapshot: &Snapshot, daily: &Daily, cx: &App) -> 
         )
         .children(status.map(|text| {
             div()
-                .id(format!("usage-status-{}", provider.name()))
+                .id(format!("usage-status-{}", provider.id()))
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .child(text)
@@ -347,13 +558,28 @@ fn section(provider: Provider, snapshot: &Snapshot, daily: &Daily, cx: &App) -> 
                     }
                 },
             );
-            let pace = row.pace(crate::usage::now());
+            let elapsed =
+                crate::usage::pace::elapsed(row.resets_at, row.window, crate::usage::now());
+            let pace = crate::usage::pace::marker(elapsed, true).map(|p| p * 100.);
             let mut reset = resets(row.resets_at);
             if let Some(p) = pace {
                 reset.push_str(&even_pace(p));
             }
+            if let Some(remaining) = row.remaining.filter(|_| !snapshot.outdated) {
+                let tier = crate::usage::pace::gauge(100. - remaining, elapsed, 80., 95.);
+                reset.push_str(" · ");
+                reset.push_str(tier.label(crate::pokemon::format::Language::En));
+                if let Some(elapsed) = elapsed.filter(|p| *p >= 0.1) {
+                    let delta = crate::usage::pace::rounded_delta(100. - remaining, elapsed);
+                    if let Some(text) =
+                        crate::usage::pace::delta_text(delta, crate::pokemon::format::Language::En)
+                    {
+                        reset.push_str(&format!(" ({text})"));
+                    }
+                }
+            }
             v_flex()
-                .id(format!("usage-{}-{ix}", provider.name()))
+                .id(format!("usage-{}-{ix}", provider.id()))
                 .gap_1()
                 .child(
                     h_flex()
@@ -369,33 +595,25 @@ fn section(provider: Provider, snapshot: &Snapshot, daily: &Daily, cx: &App) -> 
                         .h(px(4.))
                         .rounded_full()
                         .bg(theme.muted)
-                        .id(format!("usage-bar-{}-{ix}", provider.name()))
+                        .id(format!("usage-bar-{}-{ix}", provider.id()))
                         .role(Role::ProgressIndicator)
                         .aria_label(format!("{}: {remaining}", row.label))
                         .when_some(row.remaining, |d, n| {
                             d.child(
                                 div()
+                                    .id(format!("usage-fill-{}-{ix}", provider.id()))
                                     .h_full()
-                                    .w(relative(n as f32 / 100.))
+                                    .w(relative(n.clamp(0., 100.) as f32 / 100.))
                                     .rounded_full()
-                                    .bg(fill_color(Some(n), snapshot.outdated, theme)),
+                                    .bg(pace_color(n, elapsed, snapshot.outdated, theme))
+                                    .test_support(),
                             )
                         })
                         .when_some(pace, |d, p| {
                             // A 1.5px line, knocked out of the bar by 1.5px of panel background.
-                            d.child(
-                                div()
-                                    .absolute()
-                                    .top(px(-3.))
-                                    .left(relative(p as f32 / 100.))
-                                    .ml(px(-2.25))
-                                    .w(px(4.5))
-                                    .h(px(10.))
-                                    .border_x(px(1.5))
-                                    .border_color(theme.popover)
-                                    .bg(theme.popover_foreground),
-                            )
-                        }),
+                            d.child(quota_marker(provider, ix, p, theme))
+                        })
+                        .test_support(),
                 )
                 .child(
                     div()
@@ -410,6 +628,9 @@ fn section(provider: Provider, snapshot: &Snapshot, daily: &Daily, cx: &App) -> 
                 .text_xs()
                 .child(heatmap(provider, daily, crate::usage::now(), theme)),
         )
+        .when(!report.entries.is_empty() || report.error.is_some(), |d| {
+            d.child(companion_accounting(provider, report, cx))
+        })
         .child(div().text_xs().text_color(theme.muted_foreground).child(
             snapshot.checked_at.map_or_else(
                 || "Last checked: never".into(),
@@ -427,6 +648,118 @@ fn section(provider: Provider, snapshot: &Snapshot, daily: &Daily, cx: &App) -> 
         .test_support()
 }
 
+fn marker_left(remaining: f64, width: f32) -> f32 {
+    ((remaining.clamp(0., 100.) / 100.) as f32 * width - 2.25).clamp(0., (width - 4.5).max(0.))
+}
+fn quota_marker(
+    provider: ProviderHandle,
+    index: usize,
+    remaining: f64,
+    theme: &Theme,
+) -> AnyElement {
+    let background = theme.popover;
+    let ink = theme.popover_foreground;
+    div()
+        .id(format!("usage-marker-{}-{index}", provider.id()))
+        .role(Role::Label)
+        .aria_label(format!(
+            "Even pace: {:.1}% remaining",
+            remaining.clamp(0., 100.)
+        ))
+        .absolute()
+        .top(px(-2.))
+        .left_0()
+        .w_full()
+        .h(px(8.))
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    let left =
+                        bounds.left() + px(marker_left(remaining, f32::from(bounds.size.width)));
+                    window.paint_quad(fill(
+                        Bounds::new(point(left, bounds.top()), size(px(4.5), bounds.size.height)),
+                        background,
+                    ));
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(left + px(1.5), bounds.top()),
+                            size(px(1.5), bounds.size.height),
+                        ),
+                        ink,
+                    ));
+                },
+            )
+            .size_full(),
+        )
+        .test_support()
+        .into_any_element()
+}
+
+fn companion_accounting(
+    provider: ProviderHandle,
+    report: &crate::usage::logs::Report,
+    cx: &App,
+) -> AnyElement {
+    if report.entries.is_empty() && report.error.is_some() {
+        return div()
+            .id(format!("usage-scan-error-{}", provider.id()))
+            .text_xs()
+            .aria_label("Local usage unavailable; refresh failed")
+            .child("Local usage unavailable; refresh failed")
+            .test_support()
+            .into_any_element();
+    }
+    let bucket = &report.totals;
+    let coverage = bucket.coverage;
+    let note = match (coverage.reported, coverage.estimated, coverage.unknown) {
+        (_, _, true) if coverage.reported || coverage.estimated => " · partial coverage",
+        (_, _, true) => "",
+        (_, true, false) => " · includes estimates",
+        (true, false, false) => " · reported",
+        _ => "",
+    };
+    v_flex()
+        .id(format!("usage-accounting-{}", provider.id()))
+        .gap_1()
+        .text_xs()
+        .text_color(cx.theme().muted_foreground)
+        .when(report.error.is_some(), |d| {
+            d.child(
+                div()
+                    .id(format!("usage-scan-error-{}", provider.id()))
+                    .aria_label("Local usage refresh failed; showing previous totals")
+                    .child("Local usage refresh failed; showing previous totals")
+                    .test_support(),
+            )
+        })
+        .child(format!(
+            "Tokens including cache ({WEEKS} weeks): {}",
+            tokens(bucket.total())
+        ))
+        .child(format!(
+            "Input {} · Output {}",
+            tokens(bucket.input),
+            tokens(bucket.output)
+        ))
+        .child(format!(
+            "Cache writes {} · Cache reads {}",
+            tokens(bucket.cache_write),
+            tokens(bucket.cache_read)
+        ))
+        .when(provider.source().reports_cost(), |d| {
+            d.child(
+                div()
+                    .id(format!("usage-cost-{}", provider.id()))
+                    .aria_label(format!("Token cost: {}{note}", bucket.cost_text(false)))
+                    .child(format!("Token cost: {}{note}", bucket.cost_text(false)))
+                    .test_support(),
+            )
+        })
+        .test_support()
+        .into_any_element()
+}
+
 /// What's left: `sidebar_foreground` like the rest of the navigation, `warning` / `danger`
 /// fills when low. Never `primary`, which is reserved for focus, running agents and the
 /// primary button.
@@ -436,6 +769,21 @@ fn fill_color(remaining: Option<f64>, outdated: bool, theme: &Theme) -> Hsla {
         Some(n) if n <= 5. => theme.danger,
         Some(n) if n <= 20. => theme.warning,
         _ => theme.sidebar_foreground,
+    }
+}
+
+fn pace_color(remaining: f64, elapsed: Option<f64>, outdated: bool, theme: &Theme) -> Hsla {
+    use crate::usage::pace::{Tier, gauge};
+    if outdated {
+        return faint(theme);
+    }
+    match gauge(100. - remaining, elapsed, 80., 95.) {
+        Tier::WayUnder => rgb(0x3b82f6).into(),
+        Tier::Under => rgb(0x06b6d4).into(),
+        Tier::OnPace => theme.success,
+        Tier::SlightlyOver => rgb(0xeab308).into(),
+        Tier::Over => theme.warning,
+        Tier::WayOver => theme.danger,
     }
 }
 
@@ -553,7 +901,7 @@ fn even_pace(p: f64) -> String {
     format!(" · Even pace: {}% left", p.round())
 }
 
-fn ring_description(provider: Provider, snapshot: &Snapshot) -> String {
+fn ring_description(provider: ProviderHandle, snapshot: &Snapshot) -> String {
     let mut text = match snapshot.limiting() {
         Some(row) => format!(
             "{} · {} · {}% remaining · {}",
@@ -697,7 +1045,7 @@ fn cell(level: usize, theme: &Theme) -> Div {
 
 /// The footer hover card: each allowance, then a GitHub-style calendar of daily tokens.
 fn card(
-    provider: Provider,
+    provider: ProviderHandle,
     snapshot: &Snapshot,
     daily: &Daily,
     cx: &App,
@@ -706,7 +1054,7 @@ fn card(
     let now = crate::usage::now();
     let muted = theme.muted_foreground;
     v_flex()
-        .id(format!("usage-card-{}", provider.name()))
+        .id(format!("usage-card-{}", provider.id()))
         .w(px(304.))
         .gap_2()
         .text_xs()
@@ -744,7 +1092,7 @@ fn month_marks(first: i64, today: i64) -> Vec<(i64, i64)> {
     months
 }
 
-fn heatmap(provider: Provider, daily: &Daily, now: f64, theme: &Theme) -> AnyElement {
+fn heatmap(provider: ProviderHandle, daily: &Daily, now: f64, theme: &Theme) -> AnyElement {
     let today = activity::local_day(now);
     // Columns run Monday to Sunday; the last one holds today.
     let first = today - (today + 3).rem_euclid(7) - (WEEKS - 1) * 7;
@@ -755,7 +1103,7 @@ fn heatmap(provider: Provider, daily: &Daily, now: f64, theme: &Theme) -> AnyEle
             .unwrap_or(0)
     };
     let shown: Vec<u64> = (first..=today).map(at).collect();
-    let total: u64 = shown.iter().sum();
+    let total = shown.iter().copied().fold(0u64, u64::saturating_add);
     let empty = match () {
         _ if daily.tokens.is_empty() => Some("Reading local logs…"),
         _ if total == 0 => Some("No local activity found"),
@@ -784,7 +1132,7 @@ fn heatmap(provider: Provider, daily: &Daily, now: f64, theme: &Theme) -> AnyEle
             v_flex()
                 .id(SharedString::from(format!(
                     "usage-heatmap-{}",
-                    provider.name()
+                    provider.id()
                 )))
                 .role(Role::Group)
                 .aria_label(format!("{} tokens per day", provider.name()))
@@ -827,7 +1175,7 @@ fn heatmap(provider: Provider, daily: &Daily, now: f64, theme: &Theme) -> AnyEle
                             cell(level(n), theme)
                                 .id(SharedString::from(format!(
                                     "usage-day-{}-{day}",
-                                    provider.name()
+                                    provider.id()
                                 )))
                                 .role(Role::Label)
                                 .aria_label(tip.clone())
@@ -918,7 +1266,7 @@ mod tests {
         ]));
         snapshot.finish(Err(Failure::Temporary));
         snapshot.begin();
-        let text = ring_description(Provider::Claude, &snapshot);
+        let text = ring_description(Provider::Claude.into(), &snapshot);
         for part in [
             "Claude",
             "Weekly",
@@ -932,7 +1280,7 @@ mod tests {
             assert!(text.contains(part), "{text} should contain {part}");
         }
         snapshot.allowances.remove(0);
-        assert!(ring_description(Provider::Claude, &snapshot).contains("Remaining unknown"));
+        assert!(ring_description(Provider::Claude.into(), &snapshot).contains("Remaining unknown"));
 
         let row = |label: &str, remaining: f64| Allowance {
             label: label.into(),
@@ -973,7 +1321,7 @@ mod tests {
         );
         assert!(line.ends_with(") · even pace 25%"), "{line}");
         snapshot.finish(Ok(vec![row("5 hours", 61.234)]));
-        let text = ring_description(Provider::Claude, &snapshot);
+        let text = ring_description(Provider::Claude.into(), &snapshot);
         assert!(text.contains("· 62% remaining ·"), "{text}");
         assert_eq!(countdown(59.), "1m");
         assert_eq!(tokens(412_345), "412k");
@@ -988,3 +1336,400 @@ mod tests {
         assert_eq!(levels(&[7])(7), 4);
     }
 }
+
+#[cfg(all(test, feature = "test-support"))]
+mod lifecycle_tests {
+    use super::*;
+    use crate::app::ui_tests::{UI_LOCK, boot, test_home};
+    use crate::usage::activity::local_day;
+    use core::prelude::v1::test;
+    use gpui_kit::test::TestWindowExt;
+
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn stale_quota_completion_after_toggle_cannot_award_candy(cx: &mut TestAppContext) {
+        let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        test_home();
+        let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+        cx.update_window(window, |_, _, cx| {
+            shark.update(cx, |s, cx| {
+                let old_generation = s.pokemon_ui.generation;
+                s.state.pokemon.observe_limit(
+                    "claude:session",
+                    Some("1800000000"),
+                    50.,
+                    false,
+                    true,
+                );
+                s.set_pokemon_enabled(false, cx);
+                s.set_pokemon_enabled(true, cx);
+                let queries = s.usage_queries[Provider::Claude.index()];
+                s.complete_usage_query(
+                    Provider::Claude.into(),
+                    old_generation,
+                    Ok(vec![Allowance {
+                        label: "5 hours".into(),
+                        remaining: Some(0.),
+                        resets_at: Some(1800000000.),
+                        window: Some(18000.),
+                    }]),
+                    cx,
+                );
+                assert_eq!(s.state.pokemon.inventory.candies, 0);
+                assert!(!s.state.pokemon.limit_baselines["claude:session"].claimed);
+                assert_eq!(
+                    s.usage_queries[Provider::Claude.index()],
+                    queries + 1,
+                    "stale request must release loading lock for a new query"
+                );
+                assert_eq!(s.usage[Provider::Claude.index()].status, Status::Loading);
+                let fresh = s.pokemon_ui.generation;
+                s.complete_usage_query(
+                    Provider::Claude.into(),
+                    fresh,
+                    Ok(vec![Allowance {
+                        label: "5 hours".into(),
+                        remaining: Some(0.),
+                        resets_at: Some(1800000000.),
+                        window: Some(18000.),
+                    }]),
+                    cx,
+                );
+                assert_eq!(s.state.pokemon.inventory.candies, 1);
+            });
+        })
+        .unwrap();
+    }
+    struct TestTool(&'static str, &'static str);
+    impl crate::usage::providers::UsageProvider for TestTool {
+        fn id(&self) -> &str {
+            self.0
+        }
+        fn name(&self) -> &str {
+            self.1
+        }
+        fn remaining_usage(&self) -> Result<Vec<Allowance>, Failure> {
+            Err(Failure::Unsupported)
+        }
+        fn activity(&self, _: f64) -> Daily {
+            Daily {
+                first_day: 20000,
+                tokens: vec![100],
+            }
+        }
+    }
+
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn registered_future_tool_automatically_joins_polling_ui_and_companion(
+        cx: &mut TestAppContext,
+    ) {
+        use gpui_kit::test::TestWindowExt;
+        let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        test_home();
+        let mut registry = crate::usage::providers::Registry::default();
+        registry.register(TestTool("claude", "Claude")).unwrap();
+        registry.register(TestTool("codex", "Codex")).unwrap();
+        registry
+            .register(TestTool("future-tool", "Claude"))
+            .unwrap();
+        let registry = Box::leak(Box::new(registry));
+        let providers: Vec<_> = registry.handles().collect();
+        let future = providers[2];
+        assert_eq!(future.index(), 2);
+        assert_eq!(future.id(), "future-tool");
+        let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+        cx.update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| {
+                s.usage_providers = providers;
+                s.usage = vec![Snapshot::default(); 3];
+                s.usage_activity = vec![Daily::default(); 3];
+                s.usage_reports = (0..3)
+                    .map(|_| crate::usage::logs::Report::from_daily(Daily::default()))
+                    .collect();
+                s.usage_queries = vec![0; 3];
+                s.pokemon_ui.scanning = vec![false; 3];
+                s.refresh_usage(cx);
+                assert_eq!(s.usage_queries, [1, 1, 1]);
+                assert!(
+                    s.usage
+                        .iter()
+                        .all(|snapshot| snapshot.status == Status::Loading)
+                );
+                s.complete_usage_query(
+                    future,
+                    s.pokemon_ui.generation,
+                    Ok(vec![Allowance {
+                        label: "5 hours".into(),
+                        remaining: Some(50.),
+                        resets_at: Some(1800000000.),
+                        window: Some(18000.),
+                    }]),
+                    cx,
+                );
+                assert!(
+                    s.state
+                        .pokemon
+                        .limit_baselines
+                        .contains_key("future-tool:session")
+                );
+                s.usage_activity[future.index()] = future.source().activity(0.);
+                s.observe_pokemon_usage(future, cx);
+                s.usage_activity[future.index()].tokens[0] = 150;
+                s.observe_pokemon_usage(future, cx);
+                assert_eq!(s.state.pokemon.lifetime_tokens, 50);
+                assert!(s.state.pokemon.baselines.contains_key("future-tool"));
+                s.apply_pokemon_save(s.state.pokemon.clone(), cx);
+                assert_eq!(
+                    s.pokemon_ui.scanning.len(),
+                    3,
+                    "imports preserve dynamic provider scan slots"
+                );
+                s.show_usage(w, cx);
+            });
+            w.render_frame(cx);
+            assert!(w.try_find("usage-future-tool").is_some());
+            assert!(w.try_find("usage-trigger-future-tool").is_some());
+        })
+        .unwrap();
+    }
+    // upstream: UsageRecapTests.swift::testTheFirstRefreshAlreadyFillsTheLedger
+    // upstream: UsageRecapTests.swift::testARefreshKeepsLastYearAndDropsTheYearBefore
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn first_usage_refresh_persists_ledger_and_prunes_only_older_years(
+        cx: &mut TestAppContext,
+    ) {
+        use chrono::Datelike;
+        let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        test_home();
+        let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+        cx.update_window(window, |_, _, cx| {
+            shark.update(cx, |s, cx| {
+                let now = crate::usage::now();
+                let today = crate::usage::summary::local_date(now);
+                let previous_year = format!("{}-01-01", today.year() - 1);
+                let older_year = format!("{}-12-31", today.year() - 2);
+                s.state
+                    .usage_ledger
+                    .tokens_by_day
+                    .insert(previous_year.clone(), 500);
+                s.state
+                    .usage_ledger
+                    .tokens_by_day
+                    .insert(older_year.clone(), 700);
+                s.state.usage_ledger.covered_since = Some(older_year.clone());
+                let observation = crate::usage::providers::Observation {
+                    activity: Daily {
+                        first_day: local_day(now),
+                        tokens: vec![100],
+                    },
+                    companion: crate::usage::logs::Report::from_entries(
+                        vec![crate::usage::logs::Entry {
+                            id: "ledger-first".into(),
+                            date: now,
+                            input: 100,
+                            cache_read: 50,
+                            ..Default::default()
+                        }],
+                        now,
+                    ),
+                };
+                s.complete_usage_activity(
+                    Provider::Claude.into(),
+                    s.pokemon_ui.generation,
+                    observation,
+                    cx,
+                );
+                assert_eq!(s.state.usage_ledger.tokens(today), 150);
+                assert_eq!(s.state.usage_ledger.tokens_by_day[&previous_year], 500);
+                assert!(!s.state.usage_ledger.tokens_by_day.contains_key(&older_year));
+                assert_eq!(s.state.usage_ledger.covered_since, Some(previous_year));
+                assert_eq!(State::load().usage_ledger, s.state.usage_ledger);
+                assert_eq!(
+                    s.state.pokemon.lifetime_tokens, 0,
+                    "first observation establishes growth baseline, independently of usage history"
+                );
+            });
+        })
+        .unwrap();
+    }
+
+    // upstream: PaceTierTests.swift::testTheFallbackTiersMatchTheThresholdColors
+    // upstream: LimitPaceTests.swift::testEveryPopoverLimitBarFollowsTheDisplayMode
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn native_quota_gauges_use_remaining_width_and_pace_threshold_colors(
+        cx: &mut TestAppContext,
+    ) {
+        let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        test_home();
+        let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+        cx.update_window(window, |_, w, cx| {
+            let theme = cx.theme();
+            assert_eq!(pace_color(50., None, false, theme), theme.success);
+            assert_eq!(pace_color(20., None, false, theme), theme.warning);
+            assert_eq!(pace_color(5., None, false, theme), theme.danger);
+            assert_eq!(pace_color(5., Some(0.5), true, theme), faint(theme));
+            assert_eq!(crate::usage::pace::marker(Some(0.25), true), Some(0.75));
+            shark.update(cx, |s, cx| {
+                s.usage[0].finish(Ok(vec![Allowance {
+                    label: "5 hours".into(),
+                    remaining: Some(20.),
+                    resets_at: None,
+                    window: Some(18000.),
+                }]));
+                s.show_usage(w, cx);
+            });
+            w.render_frame(cx);
+            let bar = w.find("usage-bar-claude-0").bounds();
+            let fill = w.find("usage-fill-claude-0").bounds();
+            assert!(
+                (fill.size.width / bar.size.width - 0.2).abs() < 0.01,
+                "bar fills remaining20%, consistently with its label"
+            );
+        })
+        .unwrap();
+    }
+
+    fn observation(display: u64, inclusive: u64) -> crate::usage::providers::Observation {
+        crate::usage::providers::Observation {
+            activity: Daily {
+                first_day: 20000,
+                tokens: vec![display],
+            },
+            companion: crate::usage::logs::Report::from_daily(Daily {
+                first_day: 20000,
+                tokens: vec![inclusive],
+            }),
+        }
+    }
+
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn companion_uses_inclusive_tokens_and_stale_scans_cannot_seed_toggle_baseline(
+        cx: &mut TestAppContext,
+    ) {
+        let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        test_home();
+        let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+        cx.update_window(window, |_, _, cx| {
+            shark.update(cx, |s, cx| {
+                let provider: ProviderHandle = Provider::Claude.into();
+                s.complete_usage_activity(
+                    provider,
+                    s.pokemon_ui.generation,
+                    observation(100, 200),
+                    cx,
+                );
+                s.complete_usage_activity(
+                    provider,
+                    s.pokemon_ui.generation,
+                    observation(110, 250),
+                    cx,
+                );
+                assert_eq!(
+                    s.usage_activity[0].tokens,
+                    [110],
+                    "existing heatmap keeps its original definition"
+                );
+                assert_eq!(s.usage_reports[0].daily.tokens, [250]);
+                assert_eq!(
+                    s.state.pokemon.lifetime_tokens, 50,
+                    "growth observes inclusive companion counters"
+                );
+                let stale = s.pokemon_ui.generation;
+                s.pokemon_ui.scanning[0] = true;
+                s.set_pokemon_enabled(false, cx);
+                s.set_pokemon_enabled(true, cx);
+                s.complete_usage_activity(provider, stale, observation(500, 1000), cx);
+                assert!(
+                    s.state.pokemon.baselines.is_empty(),
+                    "stale pre-toggle scan cannot seed a new baseline"
+                );
+                assert!(
+                    !s.pokemon_ui.scanning[0],
+                    "stale completion releases its scan slot"
+                );
+                s.complete_usage_activity(
+                    provider,
+                    s.pokemon_ui.generation,
+                    observation(120, 300),
+                    cx,
+                );
+                assert_eq!(s.state.pokemon.lifetime_tokens, 50);
+                s.complete_usage_activity(
+                    provider,
+                    s.pokemon_ui.generation,
+                    observation(125, 350),
+                    cx,
+                );
+                assert_eq!(s.state.pokemon.lifetime_tokens, 100);
+            });
+        })
+        .unwrap();
+    }
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn changing_custom_roots_rebases_only_that_source_and_rejects_pending_scan(
+        cx: &mut TestAppContext,
+    ) {
+        let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        test_home();
+        let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+        cx.update_window(window, |_, _, cx| {
+            shark.update(cx, |s, cx| {
+                for provider in ["claude", "codex"] {
+                    s.state.pokemon.observe_usage(provider, "20000", 100, true);
+                }
+                let old = s.pokemon_ui.generation;
+                s.pokemon_ui.scanning[0] = true;
+                s.set_usage_roots("claude", "  /tmp/shark-custom-logs  ", cx);
+                assert_ne!(s.pokemon_ui.generation, old);
+                assert_eq!(
+                    s.state.usage_roots.get("claude").map(String::as_str),
+                    Some("/tmp/shark-custom-logs")
+                );
+                assert_eq!(State::load().usage_roots, s.state.usage_roots);
+                assert!(!s.state.pokemon.baselines.contains_key("claude"));
+                assert_eq!(s.state.pokemon.baselines["codex"].total, 100);
+                s.complete_usage_activity(
+                    Provider::Claude.into(),
+                    old,
+                    observation(1000, 1000),
+                    cx,
+                );
+                assert!(!s.state.pokemon.baselines.contains_key("claude"));
+                s.complete_usage_activity(
+                    Provider::Claude.into(),
+                    s.pokemon_ui.generation,
+                    observation(1000, 1000),
+                    cx,
+                );
+                assert_eq!(
+                    s.state.pokemon.lifetime_tokens, 0,
+                    "historical folders cannot grant currency"
+                );
+                s.complete_usage_activity(
+                    Provider::Claude.into(),
+                    s.pokemon_ui.generation,
+                    observation(1010, 1010),
+                    cx,
+                );
+                assert_eq!(s.state.pokemon.lifetime_tokens, 10);
+                let current = s.pokemon_ui.generation;
+                s.set_usage_roots("claude", "/tmp/shark-custom-logs", cx);
+                s.set_usage_roots("missing", "/tmp/ignored", cx);
+                assert_eq!(s.pokemon_ui.generation, current);
+                s.set_usage_roots("claude", "", cx);
+                assert!(!s.state.usage_roots.contains_key("claude"));
+                assert!(!s.state.pokemon.baselines.contains_key("claude"));
+            });
+        })
+        .unwrap();
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+#[path = "usage_cost_tests.rs"]
+mod cost_tests;

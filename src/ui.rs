@@ -1,4 +1,5 @@
 //! Shared UI styling and dialogs used by the host and workspace features.
+pub(crate) mod pokemon_images;
 use crate::state::Mode;
 use gpui_kit::assets::IconName;
 use gpui_kit::base::{ResizeHandleRenderer, ResizeHandleState};
@@ -347,8 +348,8 @@ pub(crate) fn row(
         .px_3()
         .gap_3()
         .when(sep, |r| r.border_t_1().border_color(theme.border))
-        .child(caption(theme, label, desc).flex_1())
-        .child(div().w(px(240.)).flex().justify_end().child(control))
+        .child(caption(theme, label, desc).flex_1().min_w_0())
+        .child(div().w(px(240.)).flex_none().flex().justify_end().child(control))
 }
 
 /// A command-menu row with an image icon (an app's or a file's) before its label.

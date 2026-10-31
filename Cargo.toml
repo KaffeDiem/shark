@@ -16,11 +16,13 @@ smallvec = "1"
 unicode-segmentation = "1"
 objc2 = "0.6"
 objc2-app-kit = { version = "0.3", default-features = false, features = ["std", "NSApplication", "NSDockTile", "NSImage", "NSResponder", "NSWorkspace", "NSImageRep", "NSBitmapImageRep", "NSGraphicsContext", "objc2-core-graphics"] }
-objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSString", "NSDictionary", "NSValue", "NSURL", "NSArray", "NSGeometry", "NSFileManager", "NSError", "NSDate", "NSDateFormatter", "NSISO8601DateFormatter", "NSFormatter", "NSTimeZone"] }
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSData", "NSString", "NSDictionary", "NSValue", "NSURL", "NSArray", "NSGeometry", "NSFileManager", "NSError", "NSDate", "NSDateFormatter", "NSISO8601DateFormatter", "NSFormatter", "NSTimeZone", "NSProcessInfo", "NSCalendar", "NSLocale"] }
 objc2-av-foundation = { version = "0.3", default-features = false, features = ["std", "block2", "objc2-core-media", "objc2-core-video", "AVPlayer", "AVPlayerItem", "AVPlayerItemOutput", "AVAsset", "AVTime", "AVAssetTrack", "AVMediaFormat", "AVVideoComposition", "objc2-core-foundation"] }
 objc2-core-video = { version = "0.3", default-features = false, features = ["std", "CVPixelBuffer", "CVBuffer", "CVImageBuffer", "CVReturn"] }
 objc2-core-media = { version = "0.3", default-features = false, features = ["std", "CMTime"] }
 imagesize = "0.14"
+gif = "0.14.2"
+image = { version = "0.25.10", default-features = false, features = ["gif", "png"] }
 objc2-core-foundation = { version = "0.3", default-features = false, features = ["std", "CFCGTypes", "CFArray", "CFString"] }
 objc2-core-graphics = { version = "0.3", default-features = false, features = ["std", "CGImage"] }
 objc2-core-services = { version = "0.3", default-features = false, features = ["std", "LaunchServices", "LSInfo", "LSConstants"] }
@@ -30,6 +32,8 @@ lsp-types = "=0.97.0"
 anyhow = "1"
 async-channel = "2"
 globset = "0.4"
+flate2 = "1"
+chrono = "0.4"
 ignore = "0.4"
 url = "2"
 toml = "0.9"
@@ -49,3 +53,7 @@ harness = false
 test = false
 required-features = ["test-support"]
 
+
+[dev-dependencies]
+libc = "0.2"
+chrono-tz = "0.10"

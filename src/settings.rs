@@ -1,6 +1,6 @@
 //! Settings dialog (cmd-,): general (stay awake, Vim mode), appearance (mode, light and dark theme, fonts)
-//! and the git button's agent prompts. Every change applies and saves at once; there is no Save
-//! button.
+//! and the git button's agent prompts. Preferences apply immediately; custom token-source folders
+//! are saved explicitly so partially typed paths never start scans.
 use crate::SwitchField;
 use crate::app::Shark;
 use crate::prompts::{self, PROMPTS};
@@ -14,8 +14,8 @@ use gpui_kit::component::link::Link;
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectState};
 use gpui_kit::component::switch::Switch;
 use gpui_kit::component::{
-    ActiveTheme, IndexPath, Sizable as _, Theme, ThemeConfig, WindowExt, h_flex, try_parse_color,
-    v_flex,
+    ActiveTheme, Disableable as _, IndexPath, Sizable as _, Theme, ThemeConfig, WindowExt, h_flex,
+    try_parse_color, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
@@ -92,6 +92,9 @@ pub struct Settings {
     ui_font: Choice,
     mono_font: Choice,
     prompts: Vec<Entity<TextareaState>>,
+    roots: Vec<(String, String, Entity<TextareaState>)>,
+    snapshots: Vec<crate::pokemon::storage::Snapshot>,
+    show_snapshots: bool,
     _subs: Vec<Subscription>,
 }
 
@@ -195,6 +198,28 @@ impl Settings {
             })
             .collect();
 
+        let roots = crate::usage::providers::builtins()
+            .handles()
+            .filter(|provider| provider.source().supports_custom_roots())
+            .map(|provider| {
+                let value = state
+                    .usage_roots
+                    .get(provider.id())
+                    .cloned()
+                    .unwrap_or_default();
+                let input = cx.new(|cx| {
+                    TextareaState::new(window, cx)
+                        .auto_grow(2, 6)
+                        .default_value(value)
+                });
+                subs.push(cx.subscribe_in(&input, window, |_, _, _, _, cx| cx.notify()));
+                (
+                    provider.id().to_string(),
+                    provider.name().to_string(),
+                    input,
+                )
+            })
+            .collect();
         Settings {
             shark,
             tab: 0,
@@ -204,6 +229,9 @@ impl Settings {
             ui_font,
             mono_font,
             prompts,
+            roots,
+            snapshots: State::pokemon_snapshots().list(),
+            show_snapshots: false,
             _subs: subs,
         }
     }
@@ -238,6 +266,164 @@ impl Settings {
     pub(crate) fn set_vim(&mut self, on: bool, cx: &mut Context<Self>) {
         self.shark.update(cx, |s, cx| s.set_vim(on, cx)).ok();
         cx.notify();
+    }
+
+    pub(crate) fn set_pokemon(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.shark
+            .update(cx, |s, cx| s.set_pokemon_enabled(on, cx))
+            .ok();
+        cx.notify();
+    }
+
+    fn snapshot_pokemon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(shark) = self.shark.upgrade() else {
+            return;
+        };
+        match State::pokemon_snapshots()
+            .create(&shark.read(cx).state.pokemon, crate::usage::now() as u64)
+        {
+            Ok(_) => {
+                self.snapshots = State::pokemon_snapshots().list();
+                self.show_snapshots = true;
+            }
+            Err(error) => crate::ui::notify_err(window, cx, error.to_string()),
+        }
+        cx.notify();
+    }
+
+    fn export_pokemon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(shark) = self.shark.upgrade() else {
+            return;
+        };
+        let state = shark.read(cx).state.pokemon.clone();
+        let name = crate::pokemon::storage::suggested_file_name(crate::usage::now() as u64);
+        let path = cx.prompt_for_new_path(&crate::state::home(), Some(&name));
+        cx.spawn_in(window, async move |_, cx| {
+            let Ok(Ok(Some(path))) = path.await else {
+                return;
+            };
+            let result = cx
+                .background_executor()
+                .spawn(async move {
+                    crate::pokemon::storage::encode(&state, crate::usage::now() as u64)
+                        .and_then(|bytes| crate::state::write(&path, &bytes).map_err(Into::into))
+                })
+                .await;
+            if let Err(error) = result {
+                let _ =
+                    cx.update(|window, cx| crate::ui::notify_err(window, cx, error.to_string()));
+            }
+        })
+        .detach();
+    }
+
+    fn import_pokemon(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: false,
+            prompt: Some("Import Pokémon save".into()),
+        });
+        cx.spawn_in(window, async move |this, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let Some(path) = paths.into_iter().next() else {
+                return;
+            };
+            let result = cx
+                .background_executor()
+                .spawn(async move { crate::pokemon::storage::read(&path) })
+                .await;
+            let _ = this.update_in(cx, |s, window, cx| match result {
+                Ok(envelope) => s.confirm_pokemon_restore(envelope.state, window, cx),
+                Err(error) => crate::ui::notify_err(window, cx, error.to_string()),
+            });
+        })
+        .detach();
+    }
+
+    fn restore_pokemon_snapshot(
+        &mut self,
+        path: &std::path::Path,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        match crate::pokemon::storage::read_snapshot(path) {
+            Ok(envelope) => self.confirm_pokemon_restore(envelope.state, window, cx),
+            Err(error) => crate::ui::notify_err(window, cx, error.to_string()),
+        }
+    }
+
+    pub(crate) fn confirm_pokemon_restore(
+        &mut self,
+        imported: crate::pokemon::Companion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let this = cx.entity().downgrade();
+        let summary = format!(
+            "Replace Pokémon progress with {} collected companions and {} earned tokens? A snapshot of your current progress will be saved first.",
+            imported.collection.len(),
+            imported.lifetime_tokens
+        );
+        window.open_dialog(cx, move |d, _, _| {
+            let this = this.clone();
+            let imported = imported.clone();
+            // Return dispatches Confirm, which only closes this dialog. Replacing progress
+            // requires activating the explicitly labelled button; Escape also cancels.
+            dialog(d)
+                .title("Restore Pokémon save")
+                .w(px(520.))
+                .on_ok(|_, _, _| true)
+                .child(summary.clone())
+                .footer(
+                    h_flex()
+                        .gap_2()
+                        .child(
+                            Button::new("pokemon-import-cancel")
+                                .label("Cancel")
+                                .on_click(|_, w, cx| w.close_dialog(cx)),
+                        )
+                        .child(
+                            Button::new("pokemon-import-replace")
+                                .danger()
+                                .label("Replace progress")
+                                .on_click(move |_, window, cx| {
+                                    this.update(cx, |s, cx| {
+                                        let Some(shark) = s.shark.upgrade() else {
+                                            return;
+                                        };
+                                        let current = shark.read(cx).state.pokemon.clone();
+                                        match State::pokemon_snapshots()
+                                            .create(&current, crate::usage::now() as u64)
+                                        {
+                                            Ok(_) => {
+                                                let rebased = crate::pokemon::storage::rebase(
+                                                    imported.clone(),
+                                                    &current,
+                                                    current.baselines.clone(),
+                                                );
+                                                shark.update(cx, |shark, cx| {
+                                                    shark.apply_pokemon_save(rebased, cx)
+                                                });
+                                                s.snapshots = State::pokemon_snapshots().list();
+                                                s.show_snapshots = true;
+                                                window.close_dialog(cx);
+                                                cx.notify();
+                                            }
+                                            Err(error) => crate::ui::notify_err(
+                                                window,
+                                                cx,
+                                                format!("Progress was not replaced: {error}"),
+                                            ),
+                                        }
+                                    })
+                                    .ok();
+                                }),
+                        ),
+                )
+        });
     }
 
     /// `None`, blank or the default text drops the override.
@@ -324,12 +510,15 @@ impl Settings {
     }
 
     fn render_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (awake, vim) = (self.shark.upgrade())
-            .map(|s| (s.read(cx).state.stay_awake, s.read(cx).state.vim))
+        let (awake, vim, pokemon) = (self.shark.upgrade())
+            .map(|s| {
+                let state = &s.read(cx).state;
+                (state.stay_awake, state.vim, !state.pokemon_disabled)
+            })
             .unwrap_or_default();
         let this = cx.entity().downgrade();
         let theme = cx.theme();
-        card(theme)
+        card(theme).w_full().min_w_0()
             .child(row(
                 theme,
                 false,
@@ -347,10 +536,107 @@ impl Settings {
                 true,
                 "Vim mode",
                 "Vim keys in the file editor, the composer and lists (ctrl-cmd-v)",
-                Switch::new("vim").checked(vim).on_click(move |&v, _, cx| {
-                    this.update(cx, |s, cx| s.set_vim(v, cx)).ok();
+                Switch::new("vim").checked(vim).on_click({
+                    let this = this.clone();
+                    move |&v, _, cx| {
+                        this.update(cx, |s, cx| s.set_vim(v, cx)).ok();
+                    }
                 }),
             ))
+            .child(row(
+                theme,
+                true,
+                "Pokémon companion",
+                "Raise Pokémon with Claude Code and Codex tokens. Turning this off keeps your collection and pauses growth.",
+                v_flex().gap_1().items_start()
+                    .child(Switch::new("pokemon-enabled").checked(pokemon).on_click(move |&v, _, cx| {
+                        this.update(cx, |s, cx| s.set_pokemon(v, cx)).ok();
+                    }))
+                    .child(Button::new("pokemon-choose-navigation").ghost().xsmall().label("Choose navigation Pokémon")
+                        .on_click(cx.listener(|s,_,window,cx| {
+                            window.close_dialog(cx);
+                            s.shark.update(cx,|shark,cx|shark.show_pokemon_dex(window,cx)).ok();
+                        }))),
+            ))
+            .child(row(theme,true,"Pokémon animation","Balance animation smoothness and battery use. Low Power Mode always limits the frame rate.",
+                Button::new("pokemon-animation-quality").small()
+                    .label(self.shark.upgrade().map(|shark|shark.read(cx).state.pokemon_animation_quality.name()).unwrap_or("Power saver"))
+                    .on_click(cx.listener(|s,_,_,cx| {
+                        s.shark.update(cx,|shark,cx| {shark.state.pokemon_animation_quality=shark.state.pokemon_animation_quality.next();shark.refresh_pokemon_animation(cx);let _=shark.state.save();cx.notify();}).ok();cx.notify();
+                    }))))
+            .child(stacked(theme, "Pokémon saves", "Snapshots keep your collection recoverable. Export a Shark save to move it to another Mac.",
+                v_flex().gap_2()
+                    .child(h_flex().gap_2()
+                        .child(Button::new("pokemon-snapshot").small().label("Create snapshot").on_click(cx.listener(|s, _, w, cx| s.snapshot_pokemon(w, cx))))
+                        .child(Button::new("pokemon-export").small().label("Export").on_click(cx.listener(|s, _, w, cx| s.export_pokemon(w, cx))))
+                        .child(Button::new("pokemon-import").small().label("Import").on_click(cx.listener(|s, _, w, cx| s.import_pokemon(w, cx)))))
+                    .child(Button::new("pokemon-snapshot-history").ghost().small()
+                        .label(if self.show_snapshots { "Hide snapshot history" } else { "Show snapshot history" })
+                        .on_click(cx.listener(|s, _, _, cx| { s.show_snapshots = !s.show_snapshots; cx.notify(); })))
+                    .when(self.show_snapshots && self.snapshots.is_empty(), |d| d.child(div().id("pokemon-snapshots-empty").text_sm().child("No snapshots yet").test_support()))
+                    .when(self.show_snapshots, |d| d.children(self.snapshots.iter().enumerate().map(|(i, snapshot)| {
+                        let path = snapshot.path.clone();
+                        let formatter = objc2_foundation::NSDateFormatter::new();
+                        formatter.setDateFormat(Some(&objc2_foundation::NSString::from_str("yyyy-MM-dd HH:mm")));
+                        let date = formatter.stringFromDate(&objc2_foundation::NSDate::dateWithTimeIntervalSince1970(snapshot.exported_at as f64));
+                        Button::new(("pokemon-restore", i)).ghost().small()
+                            .label(format!("{} · {} collected · {} tokens", date, snapshot.collection_count, snapshot.lifetime_tokens))
+                            .on_click(cx.listener(move |s, _, w, cx| s.restore_pokemon_snapshot(&path, w, cx)))
+                    }))),
+            ))
+    }
+
+    pub(crate) fn save_roots(&mut self, index: usize, cx: &mut Context<Self>) {
+        let (id, _, input) = &self.roots[index];
+        let raw = input.read(cx).value().to_string();
+        self.shark
+            .update(cx, |shark, cx| shark.set_usage_roots(id, &raw, cx))
+            .ok();
+        cx.notify();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn roots_input(&self, id: &str) -> Entity<TextareaState> {
+        self.roots
+            .iter()
+            .find(|(key, _, _)| key == id)
+            .unwrap()
+            .2
+            .clone()
+    }
+
+    fn render_roots(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        v_flex().w_full().min_w_0().gap_4()
+            .child("Shark finds the standard log folders automatically. Add folders for other local installations here; each tool keeps its own list.")
+            .child(div().text_sm().text_color(cx.theme().muted_foreground)
+                .child("Use one path per line or separate paths with commas. ~ and directory wildcards are supported. Save an empty list to use only the standard folders."))
+            .children(self.roots.iter().enumerate().map(|(index, (id, name, input))| {
+                let saved = self.shark.upgrade().map(|shark| shark.read(cx).state.usage_roots.get(id).cloned().unwrap_or_default()).unwrap_or_default();
+                let changed = input.read(cx).value().trim() != saved.trim();
+                v_flex().w_full().min_w_0().gap_2()
+                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(name.clone()))
+                    .child(Textarea::new(input))
+                    .child(Button::new(SharedString::from(format!("token-roots-save-{id}")))
+                        .small().label("Save folders").disabled(!changed)
+                        .on_click(cx.listener(move |this, _, _, cx| this.save_roots(index, cx))))
+            }))
+    }
+
+    fn render_license(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        v_flex()
+            .gap_4()
+            .child(section(theme, "Shark · GPL-3.0"))
+            .child("Copyright Kasper Munch Jensen. Shark is free software distributed under the GNU General Public License, version 3.")
+            .child(Button::new("license-shark").ghost().small().role(Role::Link).label("Read Shark’s full license").on_click(|_, _, cx| cx.open_url("https://github.com/KaffeDiem/shark/blob/master/LICENSE")))
+            .child(section(theme, "PokeTokenBar · MIT"))
+            .child("The Pokémon companion is a Rust adaptation of PokeTokenBar by chattymin and contributors.")
+            .child(Button::new("license-poketokenbar").ghost().small().role(Role::Link).label("PokeTokenBar source").on_click(|_, _, cx| cx.open_url("https://github.com/chattymin/PokeTokenBar")))
+            .child(div().text_xs().child(include_str!("../licenses/PokeTokenBar-MIT.txt")))
+            .child(section(theme, "Pokémon data and artwork"))
+            .child("Pokémon names, characters and artwork belong to their respective owners. Shark is not affiliated with or endorsed by Nintendo, Game Freak, Creatures Inc. or The Pokémon Company. The MIT license applies to the adapted source code; it grants no rights to Pokémon artwork or trademarks.")
+            .child("Species data and sprites are downloaded from PokéAPI and its sprite repository, cached locally, and are not bundled with Shark. No usage logs, prompts or project paths are sent to these services.")
+            .child(Button::new("license-pokeapi").ghost().small().role(Role::Link).label("PokéAPI").on_click(|_, _, cx| cx.open_url("https://pokeapi.co/")))
     }
 
     fn render_appearance(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -499,6 +785,17 @@ const PAGES: &[(IconName, (&str, &str))] = &[
             "Sent to the agent by the git button; {repos} and {branch} are filled in when the step runs",
         ),
     ),
+    (
+        IconName::BookOpen,
+        ("LICENSE", "Open-source licenses and Pokémon attribution"),
+    ),
+    (
+        IconName::Folder,
+        (
+            "Token sources",
+            "Extra local log folders for Pokémon growth and token totals",
+        ),
+    ),
 ];
 
 /// A tiny mock of the app in a theme's colors: sidebar, text lines and a primary button.
@@ -548,6 +845,7 @@ fn stacked(
     control: impl IntoElement,
 ) -> impl IntoElement {
     v_flex()
+        .min_w_0()
         .p_3()
         .gap_2()
         .border_t_1()
@@ -561,7 +859,9 @@ impl Render for Settings {
         let body = match self.tab {
             0 => self.render_general(cx).into_any_element(),
             1 => self.render_appearance(cx).into_any_element(),
-            _ => self.render_prompts(cx).into_any_element(),
+            2 => self.render_prompts(cx).into_any_element(),
+            3 => self.render_license(cx).into_any_element(),
+            _ => self.render_roots(cx).into_any_element(),
         };
         let (title, desc) = PAGES[self.tab].1;
         let theme = cx.theme();
@@ -599,6 +899,7 @@ impl Render for Settings {
                             this.tab = i;
                             cx.notify();
                         }))
+                        .test_support()
                 }),
             ))
             .child(
@@ -627,7 +928,8 @@ impl Render for Settings {
                                     .child(desc),
                             ),
                     )
-                    .child(body),
+                    .child(body)
+                    .test_support(),
             )
     }
 }

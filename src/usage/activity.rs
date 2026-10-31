@@ -64,7 +64,7 @@ pub(super) fn scan_in(provider: Provider, root: &Path, cache: &mut Cache, now: f
     );
     let mut old = std::mem::take(&mut cache.0);
     let mut hours = HashMap::new();
-    let mut tokens = vec![0; DAYS];
+    let mut tokens = vec![0u64; DAYS];
     for path in files {
         let Ok(meta) = fs::metadata(&path) else {
             continue;
@@ -89,7 +89,7 @@ pub(super) fn scan_in(provider: Provider, root: &Path, cache: &mut Cache, now: f
                 .ok()
                 .and_then(|i| tokens.get_mut(i))
             {
-                *slot += n;
+                *slot = slot.saturating_add(n);
             }
         }
         cache.0.insert(path, (meta.len(), mtime, days));
@@ -169,7 +169,7 @@ pub(super) fn parse(
                 ]
                 .iter()
                 .map(|k| usage[k].as_u64().unwrap_or(0))
-                .sum()
+                .fold(0u64, u64::saturating_add)
             }
             Provider::Codex => {
                 let info = &v["payload"]["info"];
@@ -185,8 +185,9 @@ pub(super) fn parse(
                 last_total = total.clone();
                 let usage = &info["last_token_usage"];
                 let get = |k: &str| usage[k].as_u64().unwrap_or(0);
-                get("input_tokens").saturating_sub(get("cached_input_tokens"))
-                    + get("output_tokens")
+                get("input_tokens")
+                    .saturating_sub(get("cached_input_tokens"))
+                    .saturating_add(get("output_tokens"))
             }
         };
         let Some(day) = v["timestamp"].as_str().and_then(|t| day_of(t, hours)) else {
@@ -207,7 +208,7 @@ pub(super) fn parse(
             None => (day, n),
         };
         match days.iter_mut().find(|(d, _)| *d == day) {
-            Some(entry) => entry.1 += n,
+            Some(entry) => entry.1 = entry.1.saturating_add(n),
             None => days.push((day, n)),
         }
     }

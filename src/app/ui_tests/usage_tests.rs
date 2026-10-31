@@ -43,8 +43,8 @@ async fn usage_independent_states_refresh_and_focus(cx: &mut TestAppContext) {
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         assert!(w.find("usage-panel").visible());
-        assert!(w.find("usage-status-Claude").visible());
-        assert!(w.find("usage-status-Codex").visible());
+        assert!(w.find("usage-status-claude").visible());
+        assert!(w.find("usage-status-codex").visible());
         assert!(
             shark
                 .read(cx)
@@ -60,9 +60,9 @@ async fn usage_independent_states_refresh_and_focus(cx: &mut TestAppContext) {
     });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        assert!(w.find("usage-Claude-0").visible());
-        assert!(w.try_find("usage-status-Claude").is_none());
-        assert!(w.find("usage-status-Codex").visible());
+        assert!(w.find("usage-claude-0").visible());
+        assert!(w.try_find("usage-status-claude").is_none());
+        assert!(w.find("usage-status-codex").visible());
         w.click("refresh-usage", cx);
         assert!(
             shark
@@ -86,11 +86,11 @@ async fn usage_independent_states_refresh_and_focus(cx: &mut TestAppContext) {
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         assert!(
-            w.find("usage-Claude-0").visible(),
+            w.find("usage-claude-0").visible(),
             "temporary errors keep previous rows"
         );
-        assert!(w.find("usage-status-Claude").visible());
-        assert!(w.try_find("usage-Codex-0").is_none());
+        assert!(w.find("usage-status-claude").visible());
+        assert!(w.try_find("usage-codex-0").is_none());
         w.press("escape", cx);
     })
     .unwrap();
@@ -160,14 +160,14 @@ async fn usage_footer_availability_and_click(cx: &mut TestAppContext) {
         w.render_frame(cx);
         assert!(w.try_find("show-usage").is_none());
         assert!(
-            w.find("usage-trigger-Claude").visible(),
+            w.find("usage-trigger-claude").visible(),
             "unknown allowance still gets a neutral ring"
         );
-        assert!(w.find("usage-trigger-Codex").visible());
-        w.click("usage-trigger-Claude", cx);
+        assert!(w.find("usage-trigger-codex").visible());
+        w.click("usage-trigger-claude", cx);
         assert!(shark.read(cx).usage_panel.is_some());
         w.press("escape", cx);
-        w.click("usage-trigger-Codex", cx);
+        w.click("usage-trigger-codex", cx);
         assert!(shark.read(cx).usage_panel.is_some());
         w.press("escape", cx);
     })
@@ -180,11 +180,11 @@ async fn usage_footer_availability_and_click(cx: &mut TestAppContext) {
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         assert!(
-            w.find("usage-trigger-Claude").visible(),
+            w.find("usage-trigger-claude").visible(),
             "temporary failure keeps cached ring"
         );
         assert!(
-            w.try_find("usage-trigger-Codex").is_none(),
+            w.try_find("usage-trigger-codex").is_none(),
             "invalid auth removes ring"
         );
     })
@@ -198,8 +198,8 @@ async fn usage_footer_availability_and_click(cx: &mut TestAppContext) {
         assert!(w.find("show-usage").visible());
         w.click("show-usage", cx);
         w.render_frame(cx);
-        assert!(w.find("usage-status-Claude").visible());
-        assert!(w.find("usage-status-Codex").visible());
+        assert!(w.find("usage-status-claude").visible());
+        assert!(w.find("usage-status-codex").visible());
     })
     .unwrap();
 }
@@ -394,7 +394,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 .find(if available == "none" {
                                     "show-usage"
                                 } else {
-                                    "usage-trigger-Claude"
+                                    "usage-trigger-claude"
                                 })
                                 .bounds();
                             let panel = w.find("usage-panel").bounds();
@@ -415,11 +415,11 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             assert!(panel.left() >= px(8.) && panel.top() >= px(8.));
                             assert!(w.find("refresh-usage").visible());
                             if available == "both" {
-                                let codex = w.find("usage-trigger-Codex").bounds();
-                                assert!(w.find("usage-Codex-0").visible());
+                                let codex = w.find("usage-trigger-codex").bounds();
+                                assert!(w.find("usage-codex-0").visible());
                                 assert!(codex.top() >= button.bottom());
                             } else {
-                                assert!(w.try_find("usage-trigger-Codex").is_none());
+                                assert!(w.try_find("usage-trigger-codex").is_none());
                             }
                         })
                         .unwrap();
@@ -445,13 +445,13 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 cx.notify();
                             });
                             w.render_frame(cx);
-                            w.hover("usage-trigger-Claude", cx);
+                            w.hover("usage-trigger-claude", cx);
                         })
                         .unwrap();
                         cx.advance_clock(Duration::from_secs(1));
                         cx.update_window(window, |_, w, cx| {
                             w.render_frame(cx);
-                            let card = w.find("usage-card-Claude").bounds();
+                            let card = w.find("usage-card-claude").bounds();
                             assert!(card.top() >= px(0.) && card.right() <= px(width));
                             let footer = w.find("usage-footer").bounds();
                             assert!(card.bottom() <= footer.top() + px(8.), "{card:?}");
@@ -493,7 +493,7 @@ async fn live_usage_panel(cx: &mut TestAppContext) {
         shark.update(cx, |s, cx| {
             s.usage_live = true;
             s.usage = Default::default();
-            s.usage_queries = [0; 2];
+            s.usage_queries = vec![0; 2];
             s.usage_poll = None;
             s.usage_due = None;
             s.usage_polling(w, cx);
@@ -536,11 +536,14 @@ async fn live_usage_panel(cx: &mut TestAppContext) {
                         .any(|row| row.remaining.is_some() && row.resets_at.is_some())
                 );
                 assert!(
-                    w.find(format!("usage-trigger-{}", provider.name()))
+                    w.find(format!("usage-trigger-{}", provider.source().id()))
                         .visible()
                 );
                 if s.usage_panel.is_some() {
-                    assert!(w.find(format!("usage-{}-0", provider.name())).visible());
+                    assert!(
+                        w.find(format!("usage-{}-0", provider.source().id()))
+                            .visible()
+                    );
                 }
             }
             eprintln!("live panel round {round}: both providers rendered real allowances");

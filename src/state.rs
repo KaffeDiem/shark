@@ -22,6 +22,20 @@ pub struct State {
     /// Vim keys in the file editor.
     #[serde(default)]
     pub vim: bool,
+    /// Hide the Pokémon companion and pause its growth without deleting its collection.
+    #[serde(default)]
+    pub pokemon_disabled: bool,
+    #[serde(default)]
+    pub pokemon_animation_quality: crate::pokemon::animation::Quality,
+    /// Locally persisted PokeTokenBar progress and provider usage checkpoints.
+    #[serde(default)]
+    pub pokemon: crate::pokemon::Companion,
+    /// Additional token log roots, keyed by the provider's stable ID.
+    #[serde(default)]
+    pub usage_roots: BTreeMap<String, String>,
+    /// Numeric local-day history for usage recaps, independent of companion growth.
+    #[serde(default)]
+    pub usage_ledger: crate::usage::summary::UsageLedger,
     /// The file editor's code size in logical px (cmd-=/cmd--); None is
     /// `editor::FONT_SIZE`.
     #[serde(default)]
@@ -582,6 +596,20 @@ pub(crate) fn write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 impl State {
+    pub(crate) fn pokemon_snapshots() -> crate::pokemon::storage::Snapshots {
+        Self::pokemon_snapshots_at(&state_file())
+    }
+
+    fn pokemon_snapshots_at(path: &Path) -> crate::pokemon::storage::Snapshots {
+        crate::pokemon::storage::Snapshots::new(
+            path.parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(".snapshots")
+                .join(path.file_name().unwrap_or_default())
+                .join("pokemon"),
+        )
+    }
+
     pub fn load() -> State {
         Self::load_at(&state_file())
     }
@@ -616,10 +644,35 @@ impl State {
                 ..State::default()
             }
         });
+        if state.corrupt_backup.is_some() {
+            if let Some(pokemon) = Self::pokemon_snapshots_at(path).latest() {
+                state.pokemon = pokemon;
+            }
+        }
+        let migrate_profiles = state
+            .pokemon
+            .active
+            .iter()
+            .chain(state.pokemon.collection.iter())
+            .any(|mon| mon.profile.is_none());
+        if migrate_profiles && !state.read_only {
+            if let Err(error) =
+                Self::pokemon_snapshots_at(path).create(&state.pokemon, crate::usage::now() as u64)
+            {
+                // Keep the original file protected if its promised migration backup cannot be made.
+                state.read_only = true;
+                *state.save_error.borrow_mut() =
+                    Some(format!("Pokémon migration backup failed: {error}"));
+            }
+        }
+        state.pokemon.sanitize();
         let (model, effort) = (state.new_model(), state.last_effort.clone());
         for ws in &mut state.workspaces {
             ws.migrate();
             ws.fill_models(&model, effort.as_ref());
+        }
+        if migrate_profiles && !state.read_only {
+            let _ = state.save_at(path);
         }
         state
     }
@@ -745,6 +798,17 @@ impl State {
                 .and_then(|bytes| write(path, &bytes))
         };
         *self.save_error.borrow_mut() = result.as_ref().err().map(ToString::to_string);
+        if result.is_ok()
+            && (self.pokemon.lifetime_tokens > 0
+                || self.pokemon.active.is_some()
+                || !self.pokemon.collection.is_empty())
+        {
+            if let Err(error) = Self::pokemon_snapshots_at(path)
+                .maybe_create(&self.pokemon, crate::usage::now() as u64)
+            {
+                eprintln!("Pokémon snapshot could not be written: {error}");
+            }
+        }
         result
     }
 }
@@ -752,6 +816,118 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // upstream: PokemonProfileTests.swift::testLegacyActiveAndDexProfilesMigrateOnceAndAreBackedUp
+    #[test]
+    fn legacy_pokemon_profiles_are_backed_up_and_migrate_once() {
+        use crate::pokemon::{Balance, EvoLine, EvoNode, Rarity};
+        let dir = std::env::temp_dir().join(format!(
+            "shark-pokemon-profile-{}-{}",
+            std::process::id(),
+            crate::pokemon::seed()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut state = State::default();
+        state.pokemon.egg_tokens = Balance::EGG_HATCH_THRESHOLD;
+        state.pokemon.hatch(EvoLine {
+            base_id: 1,
+            tree: EvoNode {
+                species_id: 1,
+                children: vec![],
+            },
+            rarity: Rarity::Common,
+            names: BTreeMap::new(),
+        });
+        state.pokemon.active.as_mut().unwrap().profile = None;
+        state
+            .pokemon
+            .collection
+            .push(state.pokemon.active.clone().unwrap());
+        fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let migrated = State::load_at(&path);
+        let profile = migrated
+            .pokemon
+            .active
+            .as_ref()
+            .unwrap()
+            .profile
+            .as_ref()
+            .unwrap();
+        assert!(migrated.pokemon.collection[0].profile.is_some());
+        let snapshots = State::pokemon_snapshots_at(&path).list();
+        assert_eq!(snapshots.len(), 1);
+        let original: Value =
+            serde_json::from_slice(&fs::read(&snapshots[0].path).unwrap()).unwrap();
+        assert!(original["state"]["active"]["profile"].is_null());
+        let reloaded = State::load_at(&path);
+        assert_eq!(
+            reloaded
+                .pokemon
+                .active
+                .as_ref()
+                .unwrap()
+                .profile
+                .as_ref()
+                .unwrap(),
+            profile
+        );
+        assert_eq!(State::pokemon_snapshots_at(&path).list().len(), 1);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // upstream: SaveSnapshotTests.swift::testAutoCorruptionRecoveryFromLatestSnapshot
+    #[test]
+    fn pokemon_recovers_from_snapshot_when_state_is_corrupt() {
+        let dir = std::env::temp_dir().join(format!(
+            "shark-pokemon-recovery-{}-{}",
+            std::process::id(),
+            crate::pokemon::seed()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut state = State::default();
+        state.pokemon.lifetime_tokens = 77_777;
+        state.pokemon.inventory.candies = 5;
+        state.save_at(&path).unwrap();
+        assert_eq!(State::pokemon_snapshots_at(&path).list().len(), 1);
+        fs::write(&path, "{ corrupted").unwrap();
+        let recovered = State::load_at(&path);
+        assert_eq!(recovered.pokemon.lifetime_tokens, 77_777);
+        assert_eq!(recovered.pokemon.inventory.candies, 5);
+        assert_eq!(
+            fs::read_to_string(recovered.corrupt_backup.unwrap()).unwrap(),
+            "{ corrupted"
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    // upstream: SaveTransferTests.swift::testCorruptStateOnDiskIsClampedOnLoadNotJustOnImport
+    #[test]
+    fn pokemon_state_load_sanitizes_extreme_values() {
+        let dir = std::env::temp_dir().join(format!(
+            "shark-pokemon-sanitize-{}-{}",
+            std::process::id(),
+            crate::pokemon::seed()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        let mut state = State::default();
+        state.pokemon.lifetime_tokens = u64::MAX;
+        state.pokemon.spent_tokens = u64::MAX;
+        fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
+        let mut loaded = State::load_at(&path);
+        assert_eq!(loaded.pokemon.lifetime_tokens, 1_000_000_000_000_000);
+        assert_eq!(loaded.pokemon.spent_tokens, 1_000_000_000_000_000);
+        loaded
+            .pokemon
+            .observe_usage("claude", "2026-08-03", 10, true);
+        loaded
+            .pokemon
+            .observe_usage("claude", "2026-08-03", 1010, true);
+        assert_eq!(loaded.pokemon.balance(), 1000);
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn tests_never_touch_the_real_home() {
@@ -866,6 +1042,7 @@ mod tests {
         assert_eq!(ws.chats[ws.active_chat].id, "w~2");
     }
 
+    // upstream: CompanionTests.swift::testCorruptStateFileBackedUpBeforeReset
     #[test]
     fn corrupt_state_is_kept() {
         use std::os::unix::fs::PermissionsExt as _;
@@ -884,6 +1061,8 @@ mod tests {
         fs::write(&path, "{ first").unwrap();
         let st = State::load_at(&path);
         let first = st.corrupt_backup.clone().unwrap();
+        assert!(st.pokemon.collection.is_empty());
+        assert!(st.pokemon.active.is_none());
         assert!(!st.read_only && !path.exists());
         assert_eq!(baks().len(), 1);
         st.save_at(&path).unwrap();
@@ -1188,7 +1367,10 @@ mod tests {
         assert_eq!(ws.chats[ws.active_chat].id, "b");
         assert_eq!(ws.closed.len(), 20);
         assert_eq!(ws.closed.last().unwrap().id, "a");
-        assert_eq!(r.evicted.iter().map(|c| &c.id[..]).collect::<Vec<_>>(), ["old0"]);
+        assert_eq!(
+            r.evicted.iter().map(|c| &c.id[..]).collect::<Vec<_>>(),
+            ["old0"]
+        );
         let r = ws.remove_chat("b", chat(""), |_| true).unwrap();
         assert!(r.last && r.untouched);
         assert_eq!(ws.closed.len(), 20);
