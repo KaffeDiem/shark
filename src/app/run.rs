@@ -81,7 +81,8 @@ impl Shark {
         self.runs.contains_key(ws)
     }
 
-    /// Header button: run/stop the active workspace; while running, its port in green.
+    /// Header button, a filled square (`secondary`, unlike the git button's variants): run/stop
+    /// the active workspace; while running, its port in green beside it.
     /// Right-click: the same toggle, and the script output.
     pub(super) fn render_run(&self, cx: &Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
@@ -95,22 +96,14 @@ impl Shark {
             None => (IconName::Play, "Run"),
         };
         let tip = format!("{verb} (cmd-r)");
-        Button::new("run")
-            .ghost()
-            .xsmall()
-            .h(px(28.))
+        let button = Button::new("run")
+            .secondary()
+            .small()
+            .size(px(28.))
             .flex_none()
-            .gap_1p5()
-            .text_xs()
-            .text_color(theme.muted_foreground)
             .accessibility_label(tip.clone())
             .tooltip(tip)
             .icon(icon)
-            .children(port.map(|p| {
-                div()
-                    .text_color(theme.success_foreground)
-                    .child(format!("Running :{p}"))
-            }))
             .on_click(cx.listener(|this, _, window, cx| this.toggle_run(window, cx)))
             .on_mouse_down(
                 MouseButton::Right,
@@ -126,7 +119,17 @@ impl Shark {
                     ];
                     this.show_menu(e.position, entries, window, cx);
                 }),
-            )
+            );
+        h_flex()
+            .flex_none()
+            .gap_1p5()
+            .child(button)
+            .children(port.map(|p| {
+                div()
+                    .text_xs()
+                    .text_color(theme.success_foreground)
+                    .child(format!("Running :{p}"))
+            }))
     }
 
     /// Setup scripts for a new workspace, or only `repo`'s for one just added, in the background.
