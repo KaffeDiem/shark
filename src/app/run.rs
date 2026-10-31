@@ -81,6 +81,54 @@ impl Shark {
         self.runs.contains_key(ws)
     }
 
+    /// Header button: run/stop the active workspace; while running, its port in green.
+    /// Right-click: the same toggle, and the script output.
+    pub(super) fn render_run(&self, cx: &Context<Self>) -> impl IntoElement {
+        let theme = cx.theme();
+        let port = self
+            .active
+            .as_ref()
+            .and_then(|n| self.runs.get(n))
+            .map(|r| r.port);
+        let (icon, verb) = match port {
+            Some(_) => (IconName::Square, "Stop"),
+            None => (IconName::Play, "Run"),
+        };
+        let tip = format!("{verb} (cmd-r)");
+        Button::new("run")
+            .ghost()
+            .xsmall()
+            .h(px(28.))
+            .flex_none()
+            .gap_1p5()
+            .text_xs()
+            .text_color(theme.muted_foreground)
+            .accessibility_label(tip.clone())
+            .tooltip(tip)
+            .icon(icon)
+            .children(port.map(|p| {
+                div()
+                    .text_color(theme.success_foreground)
+                    .child(format!("Running :{p}"))
+            }))
+            .on_click(cx.listener(|this, _, window, cx| this.toggle_run(window, cx)))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                    let entries = vec![
+                        menu::item(icon, verb, on_shark(cx, |s, w, cx| s.toggle_run(w, cx)))
+                            .hint("cmd-r"),
+                        menu::item(
+                            IconName::ScrollText,
+                            "Show script output",
+                            on_shark(cx, |s, w, cx| s.show_script_log(w, cx)),
+                        ),
+                    ];
+                    this.show_menu(e.position, entries, window, cx);
+                }),
+            )
+    }
+
     /// Setup scripts for a new workspace, or only `repo`'s for one just added, in the background.
     /// `then`'s prompt is sent to its chat once they succeed, so the agent never works on a
     /// half-set-up worktree; if they fail or the chat is busy, it waits in the composer.

@@ -741,6 +741,7 @@ impl Shark {
                     .gap(px(8.))
                     .border_b_1()
                     .border_color(theme.border)
+                    .child(self.render_run(cx))
                     .child(
                         div()
                             .flex_shrink_1()
