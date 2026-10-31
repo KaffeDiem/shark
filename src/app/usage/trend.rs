@@ -3,7 +3,7 @@ use super::*;
 use crate::pokemon::format::compact;
 use crate::usage::summary::{Day, ProviderSeries, dates};
 use chrono::{Datelike, Local, Months, NaiveDate, TimeZone};
-use objc2_foundation::{NSCalendar, NSLocale};
+use objc2_foundation::{NSCalendar, NSLocale, NSString};
 use std::collections::BTreeMap;
 
 pub(super) const TRACK: f32 = 26.;

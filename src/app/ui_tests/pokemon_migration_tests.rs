@@ -38,6 +38,7 @@ async fn dex_pager_corners_and_wheel_are_real_targets(cx: &mut TestAppContext) {
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.click("pokemon-footer", cx);
+        w.click("pokemon-usage-open-home", cx);
         w.click("pokemon-tab-Pokédex", cx);
         let next = w.find("pokemon-page-next").bounds();
         assert!(next.size.height >= px(24.) && next.size.width >= px(24.));
@@ -63,6 +64,7 @@ async fn home_detail_back_finds_species_page_and_segment_resets_it(cx: &mut Test
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.click("pokemon-footer", cx);
+        w.click("pokemon-usage-open-home", cx);
         w.click("pokemon-home-open-details", cx);
         w.click("pokemon-dex-back", cx);
         assert!(w.find("pokemon-dex-20").visible());
@@ -88,6 +90,7 @@ async fn catch_log_back_retains_scroll_until_segment_changes(cx: &mut TestAppCon
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.click("pokemon-footer", cx);
+        w.click("pokemon-usage-open-home", cx);
         w.click("pokemon-tab-Pokédex", cx);
         w.click("pokemon-segment-log", cx);
         assert!(w.find("pokemon-catch-0").visible());
@@ -124,6 +127,7 @@ async fn dex_native_search_filters_clear_and_sort_controls(cx: &mut TestAppConte
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.click("pokemon-footer", cx);
+        w.click("pokemon-usage-open-home", cx);
         w.click("pokemon-tab-Pokédex", cx);
         w.click("pokemon-dex-search", cx);
         w.input("Bulbizarre", cx);
@@ -157,6 +161,7 @@ async fn precious_companion_egg_requires_explicit_review(cx: &mut TestAppContext
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.click("pokemon-footer", cx);
+        w.click("pokemon-usage-open-home", cx);
         w.click("pokemon-tab-Shop", cx);
         w.click("pokemon-buy-Pokémon Egg", cx);
         assert!(w.find("pokemon-egg-confirm").visible());
@@ -181,6 +186,7 @@ async fn difficulty_draft_is_discarded_on_close_and_save_appears_below_controls(
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.click("pokemon-footer", cx);
+        w.click("pokemon-usage-open-home", cx);
         assert!(w.try_find("pokemon-save-difficulty").is_none());
         w.click("pokemon-Growth-less", cx);
         w.click("pokemon-Shop prices-less", cx);
@@ -190,6 +196,7 @@ async fn difficulty_draft_is_discarded_on_close_and_save_appears_below_controls(
         assert!(save.top() >= w.find("pokemon-Shop prices-more").bounds().bottom());
         w.press("escape", cx);
         w.click("pokemon-footer", cx);
+        w.click("pokemon-usage-open-home", cx);
         assert!(w.try_find("pokemon-save-difficulty").is_none());
         assert_eq!(State::load().pokemon.growth_difficulty, 1.);
         w.click("pokemon-Growth-less", cx);
@@ -250,7 +257,7 @@ async fn window_owned_popover_coalesces_open_and_releases_on_close(cx: &mut Test
 }
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn selected_collection_retap_keeps_detail_and_settings_reentry_starts_home(
+async fn selected_collection_retap_keeps_detail_and_settings_reentry_starts_usage(
     cx: &mut TestAppContext,
 ) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -259,6 +266,7 @@ async fn selected_collection_retap_keeps_detail_and_settings_reentry_starts_home
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.click("pokemon-footer", cx);
+        w.click("pokemon-usage-open-home", cx);
         w.click("pokemon-tab-Pokédex", cx);
         w.click("pokemon-dex-2", cx);
         assert_eq!(w.find("pokemon-tab-Pokédex").checked(), Some(true));
@@ -272,9 +280,11 @@ async fn selected_collection_retap_keeps_detail_and_settings_reentry_starts_home
         assert!(shark.read(cx).usage_panel.is_none());
         w.press("escape", cx);
         w.click("pokemon-footer", cx);
-        assert!(w.find("pokemon-home").visible());
+        assert!(w.try_find("pokemon-tab-Home").is_none());
+        assert!(w.try_find("pokemon-home").is_none());
         w.press("escape", cx);
         w.click("pokemon-footer", cx);
+        w.click("pokemon-usage-open-home", cx);
         w.click("pokemon-tab-Pokédex", cx);
         assert!(w.find("pokemon-dex").visible());
         assert!(w.try_find("pokemon-home").is_none());
@@ -292,6 +302,7 @@ async fn frame_owned_links_leave_no_stale_interactive_hitbox_when_detail_replace
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.click("pokemon-footer", cx);
+        w.click("pokemon-usage-open-home", cx);
         w.click("pokemon-tab-Pokédex", cx);
         let cell = w.find("pokemon-dex-1");
         assert_eq!(cell.role(), Some(Role::Button));
@@ -320,6 +331,7 @@ async fn representative_pin_action_stays_icon_width_before_and_after_selection(
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.click("pokemon-footer", cx);
+        w.click("pokemon-usage-open-home", cx);
         w.click("pokemon-tab-Pokédex", cx);
         w.click("pokemon-dex-1", cx);
         for _ in 0..2 {
@@ -349,6 +361,7 @@ async fn individual_selector_is_mounted_only_for_multiple_matching_individuals(
         cx.update_window(window, |_, w, cx| {
             w.render_frame(cx);
             w.click("pokemon-footer", cx);
+            w.click("pokemon-usage-open-home", cx);
             w.click("pokemon-tab-Pokédex", cx);
             w.click("pokemon-dex-25", cx);
             assert_eq!(

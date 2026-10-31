@@ -2,11 +2,13 @@
 use super::*;
 #[cfg(test)]
 use crate::usage::Provider;
-use crate::usage::activity::{self, Daily, WEEKS};
+use crate::usage::activity::WEEKS;
+#[cfg(test)]
+use crate::usage::activity::{self, Daily};
 use crate::usage::providers::ProviderHandle;
 use crate::usage::{Allowance, Failure, Snapshot, Status};
 use gpui_kit::component::FocusTrapElement as _;
-use objc2_foundation::{NSDate, NSDateFormatter, NSDateFormatterStyle, NSString, NSTimeZone};
+use objc2_foundation::{NSDate, NSDateFormatter, NSDateFormatterStyle, NSTimeZone};
 use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(300);
@@ -23,9 +25,10 @@ pub(in crate::app) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
 }
 
 pub(super) struct Panel {
-    focus: FocusHandle,
+    pub(super) focus: FocusHandle,
     previous_focus: Option<FocusHandle>,
     companion: bool,
+    details: bool,
     pub(super) recap: Option<(crate::usage::summary::Scope, i32)>,
     hovered_day: Option<chrono::NaiveDate>,
     selected_provider: Option<String>,
@@ -80,6 +83,7 @@ impl Shark {
             focus,
             previous_focus,
             companion,
+            details: false,
             recap: None,
             hovered_day: None,
             selected_provider: None,
@@ -317,12 +321,12 @@ impl Shark {
             .id("usage-panel")
             .role(Role::Dialog)
             .aria_label(if companion {
-                "Pokémon companion"
+                "AI usage and Pokémon"
             } else {
                 "Account usage"
             })
             .aria_description(if companion {
-                "Raise Pokémon with coding usage. Tab to move between controls. Escape to close."
+                "AI model usage and Pokémon progress. Tab to move between controls. Escape to close."
             } else {
                 "Subscription allowances. Enter to refresh. Escape to close."
             })
@@ -334,9 +338,6 @@ impl Shark {
             .gap_4()
             .on_any_mouse_down(|_, _, cx| cx.stop_propagation())
             .when(recap, |d| d.child(self.render_usage_recap(cx)))
-            .when(companion && !recap, |d| {
-                d.child(self.render_pokemon_panel(cx))
-            })
             .when(!pokemon && !recap, |d| {
                 d.child(
                     h_flex()
@@ -354,13 +355,54 @@ impl Shark {
                             Button::new("refresh-usage")
                                 .ghost()
                                 .xsmall()
-                                .label("Refresh")
+                                .accessibility_label("Refresh usage")
+                                .tooltip("Refresh usage")
                                 .icon(IconName::RefreshCw)
                                 .on_click(cx.listener(|s, _, _, cx| s.refresh_usage(cx))),
                         ),
                 )
             })
             .when(!pokemon && !recap, |d| {
+                let summary = self.usage_summary(self.usage_view_now());
+                d.child(self.render_usage_totals(&summary, cx))
+            })
+            .when(!pokemon && !recap, |d| {
+                d.child(self.render_usage_provider_tabs(cx))
+            })
+            .when(!pokemon && !recap, |d| {
+                let selected = self.selected_usage_provider();
+                d.children(
+                    self.usage_providers
+                        .iter()
+                        .copied()
+                        .filter(|provider| selected.is_none_or(|id| provider.id() == id))
+                        .map(|provider| {
+                            let i = provider.index();
+                            section(provider, &self.usage[i], &self.usage_reports[i], panel.details, cx)
+                        }),
+                )
+            })
+            .when(companion && !recap, |d| {
+                d.child(self.render_pokemon_panel(cx))
+            })
+            .when(!pokemon && !recap, |d| {
+                d.child(
+                    Button::new("usage-toggle-details")
+                        .ghost()
+                        .xsmall()
+                        .label(if panel.details { "Hide details" } else { "Details" })
+                        .toggled(panel.details)
+                        .icon(if panel.details { IconName::ChevronUp } else { IconName::ChevronDown })
+                        .accessibility_label(if panel.details { "Hide usage details" } else { "Show usage details" })
+                        .on_click(cx.listener(|s, _, _, cx| {
+                            if let Some(panel) = s.usage_panel.as_mut() {
+                                panel.details = !panel.details;
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
+            .when(!pokemon && !recap && panel.details, |d| {
                 let now = self.usage_view_now();
                 let summary = self.usage_summary(now);
                 let series: Vec<_> = self
@@ -379,8 +421,7 @@ impl Shark {
                     .map(|p| p.id().to_owned())
                     .collect();
                 let shows_cost = self.shows_usage_cost(&summary);
-                d.child(self.render_usage_totals(&summary, cx))
-                    .child(self.render_month_trend(
+                d.child(self.render_month_trend(
                         &summary.month_daily,
                         &series,
                         &registry,
@@ -389,25 +430,30 @@ impl Shark {
                         cx,
                     ))
             })
-            .when(!pokemon && !recap, |d| {
-                d.child(self.render_usage_provider_tabs(cx))
-            })
-            .when(!pokemon && !recap, |d| {
+            .when(!pokemon && !recap && panel.details, |d| {
                 let selected = self.selected_usage_provider();
                 d.children(
                     self.usage_providers
                         .iter()
                         .copied()
                         .filter(|provider| selected.is_none_or(|id| provider.id() == id))
+                        .filter(|provider| {
+                            let report = &self.usage_reports[provider.index()];
+                            !report.entries.is_empty()
+                        })
                         .map(|provider| {
-                            let i = provider.index();
-                            section(
-                                provider,
-                                &self.usage[i],
-                                &self.usage_activity[i],
-                                &self.usage_reports[i],
-                                cx,
-                            )
+                            v_flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .child(format!("{} token details", provider.name())),
+                                )
+                                .child(companion_accounting(
+                                    provider,
+                                    &self.usage_reports[provider.index()],
+                                    cx,
+                                ))
                         }),
                 )
             })
@@ -440,12 +486,11 @@ impl Shark {
     }
 }
 
-/// The calendar is here too, so its daily values are reachable without a pointer.
 fn section(
     provider: ProviderHandle,
     snapshot: &Snapshot,
-    daily: &Daily,
     report: &crate::usage::logs::Report,
+    details: bool,
     cx: &App,
 ) -> impl IntoElement {
     let theme = cx.theme();
@@ -461,7 +506,17 @@ fn section(
     };
     v_flex()
         .id(format!("usage-{}", provider.id()))
+        .role(Role::Group)
+        .aria_label(provider.name().to_owned())
+        .aria_description(snapshot.checked_at.map_or_else(
+            || "Last checked: never".into(),
+            |at| format!("Last checked: {}", local_time(at)),
+        ))
         .gap_2()
+        .p_3()
+        .border_1()
+        .border_color(theme.border)
+        .rounded_lg()
         .child(
             div()
                 .font_weight(FontWeight::SEMIBOLD)
@@ -506,6 +561,8 @@ fn section(
             }
             v_flex()
                 .id(format!("usage-{}-{ix}", provider.id()))
+                .role(Role::Group)
+                .aria_description(reset.clone())
                 .gap_1()
                 .child(
                     h_flex()
@@ -545,25 +602,40 @@ fn section(
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child(reset),
+                        .child(if details {
+                            reset
+                        } else {
+                            short_reset(row.resets_at, crate::usage::now())
+                        }),
                 )
                 .test_support()
         }))
-        .child(
-            div()
-                .text_xs()
-                .child(heatmap(provider, daily, crate::usage::now(), theme)),
-        )
-        .when(!report.entries.is_empty() || report.error.is_some(), |d| {
-            d.child(companion_accounting(provider, report, cx))
+        .when(report.error.is_some(), |d| {
+            let message = if report.entries.is_empty() {
+                "Local usage unavailable; refresh failed"
+            } else {
+                "Local usage refresh failed; showing previous totals"
+            };
+            d.child(
+                div()
+                    .id(format!("usage-scan-error-{}", provider.id()))
+                    .text_xs()
+                    .text_color(theme.danger)
+                    .role(Role::Label)
+                    .aria_label(message)
+                    .child(message)
+                    .test_support(),
+            )
         })
-        .child(div().text_xs().text_color(theme.muted_foreground).child(
-            snapshot.checked_at.map_or_else(
-                || "Last checked: never".into(),
-                |at| format!("Last checked: {}", local_time(at)),
-            ),
-        ))
-        .when(snapshot.outdated, |d| {
+        .when(details, |d| {
+            d.child(div().text_xs().text_color(theme.muted_foreground).child(
+                snapshot.checked_at.map_or_else(
+                    || "Last checked: never".into(),
+                    |at| format!("Last checked: {}", local_time(at)),
+                ),
+            ))
+        })
+        .when(details && snapshot.outdated, |d| {
             d.children(snapshot.fetched_at.map(|at| {
                 div()
                     .text_xs()
@@ -627,15 +699,6 @@ fn companion_accounting(
     report: &crate::usage::logs::Report,
     cx: &App,
 ) -> AnyElement {
-    if report.entries.is_empty() && report.error.is_some() {
-        return div()
-            .id(format!("usage-scan-error-{}", provider.id()))
-            .text_xs()
-            .aria_label("Local usage unavailable; refresh failed")
-            .child("Local usage unavailable; refresh failed")
-            .test_support()
-            .into_any_element();
-    }
     let bucket = &report.totals;
     let coverage = bucket.coverage;
     let note = match (coverage.reported, coverage.estimated, coverage.unknown) {
@@ -650,15 +713,6 @@ fn companion_accounting(
         .gap_1()
         .text_xs()
         .text_color(cx.theme().muted_foreground)
-        .when(report.error.is_some(), |d| {
-            d.child(
-                div()
-                    .id(format!("usage-scan-error-{}", provider.id()))
-                    .aria_label("Local usage refresh failed; showing previous totals")
-                    .child("Local usage refresh failed; showing previous totals")
-                    .test_support(),
-            )
-        })
         .child(format!(
             "Tokens including cache ({WEEKS} weeks): {}",
             tokens(bucket.total())
@@ -706,6 +760,23 @@ pub(super) fn pace_color(
     }
 }
 
+fn short_reset(at: Option<f64>, now: f64) -> String {
+    let Some(seconds) = at.filter(|at| at.is_finite()).map(|at| at - now) else {
+        return "Reset time unknown".into();
+    };
+    if seconds <= 0. {
+        "Reset due".into()
+    } else if seconds < 60. {
+        "Resets in <1m".into()
+    } else if seconds < 3600. {
+        format!("Resets in {}m", (seconds / 60.).ceil() as u64)
+    } else if seconds < 86400. {
+        format!("Resets in {}h", (seconds / 3600.).ceil() as u64)
+    } else {
+        format!("Resets in {}d", (seconds / 86400.).ceil() as u64)
+    }
+}
+
 /// "Resets Oct 28, 2026 at 11:00 PM", or that it's unknown.
 fn resets(at: Option<f64>) -> String {
     at.map_or_else(
@@ -739,202 +810,22 @@ fn tokens(n: u64) -> String {
     }
 }
 
-/// Formats [`local_day`]s for display from a localized template: `"EEEMMMd"` → "Tue, Oct 28".
-fn day_labels(template: &str) -> impl Fn(i64) -> String {
-    let formatter = NSDateFormatter::new();
-    formatter.setLocalizedDateFormatFromTemplate(&NSString::from_str(template));
-    formatter.setTimeZone(Some(&NSTimeZone::timeZoneForSecondsFromGMT(0)));
-    move |day| {
-        formatter
-            .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(day as f64 * 86400.))
-            .to_string()
-    }
-}
-
-/// (year, month 1-12, day 1-31) of a [`local_day`] in the Gregorian calendar, whatever the locale.
-fn civil(day: i64) -> (i64, u32, u32) {
-    // Hinnant's civil_from_days.
-    let z = day + 719468;
-    let era = z.div_euclid(146097);
-    let doe = z.rem_euclid(146097);
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let (d, m) = (
-        (doy - (153 * mp + 2) / 5 + 1) as u32,
-        (if mp < 10 { mp + 3 } else { mp - 9 }) as u32,
-    );
-    (yoe + era * 400 + i64::from(m <= 2), m, d)
-}
-
-const CELL: f32 = 11.;
-const GAP: f32 = 3.;
-
-/// Heatmap level 0–4: 0 for no tokens, else the quartile of non-zero days (GitHub's cut).
-fn levels(tokens: &[u64]) -> impl Fn(u64) -> usize {
-    let mut busy: Vec<u64> = tokens.iter().copied().filter(|n| *n > 0).collect();
-    busy.sort_unstable();
-    // Cut below the maximum so the busiest day always reaches level 4.
-    let top = busy.len().saturating_sub(1);
-    let cut = |q: usize| busy[..top].get(top * q / 4).copied().unwrap_or(0);
-    let cuts = [cut(1), cut(2), cut(3)];
-    move |n| match n {
-        0 => 0,
-        n => 1 + cuts.iter().filter(|c| n > **c).count(),
-    }
-}
-
-fn level_color(level: usize, theme: &Theme) -> Hsla {
-    match level {
-        0 => theme.muted,
-        n => theme.foreground.opacity([0.25, 0.45, 0.7, 1.][n - 1]),
-    }
-}
-
-fn cell(level: usize, theme: &Theme) -> Div {
-    div()
-        .size(px(CELL))
-        .flex_none()
-        .rounded(px(2.))
-        .bg(level_color(level, theme))
-}
-
-/// Each month over the column holding its 1st; the first column's only if it has room.
-fn month_marks(first: i64, today: i64) -> Vec<(i64, i64)> {
-    let mut months: Vec<(i64, i64)> = vec![(0, first)];
-    for day in first + 1..=today {
-        if civil(day).2 == 1 {
-            months.push(((day - first) / 7, day));
-        }
-    }
-    if months.get(1).is_some_and(|(week, _)| *week < 3) {
-        months.remove(0);
-    }
-    months
-}
-
-fn heatmap(provider: ProviderHandle, daily: &Daily, now: f64, theme: &Theme) -> AnyElement {
-    let today = activity::local_day(now);
-    // Columns run Monday to Sunday; the last one holds today.
-    let first = today - (today + 3).rem_euclid(7) - (WEEKS - 1) * 7;
-    let at = |day: i64| {
-        usize::try_from(day - daily.first_day)
-            .ok()
-            .and_then(|i| daily.tokens.get(i).copied())
-            .unwrap_or(0)
-    };
-    let shown: Vec<u64> = (first..=today).map(at).collect();
-    let total = shown.iter().copied().fold(0u64, u64::saturating_add);
-    let empty = match () {
-        _ if daily.tokens.is_empty() => Some("Reading local logs…"),
-        _ if total == 0 => Some("No local activity found"),
-        _ => None,
-    };
-    if let Some(text) = empty {
-        return div()
-            .text_color(faint(theme))
-            .child(text)
-            .into_any_element();
-    }
-    let level = levels(&shown);
-    let busiest = (first..=today).max_by_key(|d| (at(*d), -d)).unwrap();
-    let step = CELL + GAP;
-    let gutter = 28.;
-    let months = month_marks(first, today);
-    let (long, month) = (day_labels("EEEMMMd"), day_labels("MMM"));
-    v_flex()
-        .gap_2()
-        .child(format!(
-            "{} tokens in {WEEKS} weeks · busiest {}",
-            tokens(total),
-            long(busiest)
-        ))
-        .child(
-            v_flex()
-                .id(SharedString::from(format!(
-                    "usage-heatmap-{}",
-                    provider.id()
-                )))
-                .role(Role::Group)
-                .aria_label(format!("{} tokens per day", provider.name()))
-                .gap(px(GAP))
-                .text_color(theme.muted_foreground)
-                .child(div().relative().h(px(16.)).children(months.into_iter().map(
-                    |(week, day)| {
-                        div()
-                            .absolute()
-                            .left(px(gutter + week as f32 * step))
-                            .child(month(day))
-                    },
-                )))
-                .children((0..7i64).map(|row| {
-                    h_flex()
-                        .gap(px(GAP))
-                        .h(px(CELL))
-                        .child(
-                            div()
-                                .w(px(gutter - GAP))
-                                .line_height(px(CELL))
-                                .when(row % 2 == 0 && row < 6, |d| {
-                                    d.child(["Mon", "Wed", "Fri"][row as usize / 2])
-                                }),
-                        )
-                        .children((0..WEEKS).map(|week| {
-                            let day = first + week * 7 + row;
-                            if day > today {
-                                return div().size(px(CELL)).flex_none().into_any_element();
-                            }
-                            let n = at(day);
-                            let tip = format!(
-                                "{} · {}",
-                                long(day),
-                                match n {
-                                    0 => "No activity".into(),
-                                    n => format!("{} tokens", tokens(n)),
-                                }
-                            );
-                            cell(level(n), theme)
-                                .id(SharedString::from(format!(
-                                    "usage-day-{}-{day}",
-                                    provider.id()
-                                )))
-                                .role(Role::Label)
-                                .aria_label(tip.clone())
-                                .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
-                                .into_any_element()
-                        }))
-                })),
-        )
-        .child(
-            h_flex()
-                .justify_end()
-                .gap(px(GAP))
-                .text_color(theme.muted_foreground)
-                .child(div().mr_1().child("Less"))
-                .children((0..5).map(|n| cell(n, theme)))
-                .child(div().ml_1().child("More")),
-        )
-        .into_any_element()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::{civil, levels, local_time, month_marks, tokens};
+    use super::{local_time, tokens};
 
     #[test]
-    fn civil_dates_ignore_the_locale() {
-        assert_eq!(civil(20390), (2025, 10, 29));
-        assert_eq!(civil(0), (1970, 1, 1));
-        assert_eq!(civil(-1), (1969, 12, 31));
-        assert_eq!(civil(11016), (2000, 2, 29));
-    }
-
-    #[test]
-    fn month_marks_drop_a_leading_label_without_room() {
-        // 20372 is Oct 11, 2025 and 20393 is Nov 1.
-        assert_eq!(month_marks(20372, 20400), [(0, 20372), (3, 20393)]);
-        assert_eq!(month_marks(20382, 20400), [(1, 20393)]);
-        assert_eq!(month_marks(20390, 20392), [(0, 20390)]);
+    fn short_reset_handles_missing_due_and_relative_times() {
+        assert_eq!(super::short_reset(None, 100.), "Reset time unknown");
+        assert_eq!(
+            super::short_reset(Some(f64::NAN), 100.),
+            "Reset time unknown"
+        );
+        assert_eq!(super::short_reset(Some(99.), 100.), "Reset due");
+        assert_eq!(super::short_reset(Some(120.), 100.), "Resets in <1m");
+        assert_eq!(super::short_reset(Some(161.), 100.), "Resets in 2m");
+        assert_eq!(super::short_reset(Some(7300.), 100.), "Resets in 2h");
+        assert_eq!(super::short_reset(Some(172900.), 100.), "Resets in 2d");
     }
 
     #[test]
@@ -946,17 +837,10 @@ mod tests {
     }
 
     #[test]
-    fn token_labels_and_activity_levels() {
+    fn token_labels() {
         assert_eq!(tokens(412_345), "412k");
         assert_eq!(tokens(38_200_000), "38.2M");
         assert_eq!(tokens(999_999), "1.0M");
-        let level = levels(&[0, 1, 2, 3, 4, 5, 6, 7, 8]);
-        assert_eq!(
-            [0, 1, 2, 3, 4, 5, 6, 7, 8].map(&level),
-            [0, 1, 1, 2, 2, 3, 3, 4, 4]
-        );
-        assert_eq!([0, 5, 9].map(levels(&[0, 5, 9])), [0, 1, 4]);
-        assert_eq!(levels(&[7])(7), 4);
     }
 }
 

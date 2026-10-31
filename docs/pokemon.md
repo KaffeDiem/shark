@@ -1,6 +1,6 @@
 # Pokémon in Shark
 
-The navigation footer pairs a small Pokémon with one line of Claude and Codex remaining percentages, colored by usage pace. Hover for provider names, quota windows, pace labels, and refresh/error status. Unknown or outdated quotas show a neutral dash, and refreshing keeps the layout still. Claude Code and Codex token activity raises the Pokémon. Click it to open Home, Pokédex, Bag, Shop, or the existing Usage view. Egg incubation, evolution, rarity, shiny appearances, natures, individual profiles, forms, and graduation are implemented in Rust.
+The navigation footer pairs a small Pokémon with one line of Claude and Codex remaining percentages, colored by usage pace. Hover for provider names, quota windows, pace labels, and refresh/error status. Unknown or outdated quotas show a neutral dash, and refreshing keeps the layout still. Claude Code and Codex token activity raises the Pokémon. Click it to open Usage, with compact allowance cards, token totals, and a Pokémon growth card. Open the growth card to reach Home, Pokédex, Bag, and Shop. Expand Details for exact reset times, pace explanations, historical charts, and token accounting. Egg incubation, evolution, rarity, shiny appearances, natures, individual profiles, forms, and graduation are implemented in Rust.
 
 Settings → General also controls animation quality; choose the navigation Pokémon in the companion's Pokédex. Navigation animation pauses when Shark is inactive or Reduce Motion is enabled, and adapts to Low Power Mode.
 
@@ -16,7 +16,7 @@ The app derives polling, daily activity, Usage rows, and companion observations 
 
 The built-in adapters call Shark's existing account query and local-log readers. No PokeTokenBar OAuth, Keychain, or session-key fetching replaces those protocols. Queries run in the background and cannot start a model turn. Quota percentages are supplied by the CLI, not estimated from token totals. Token growth and quota rewards have independent persisted checkpoints.
 
-The existing Usage heatmap keeps Shark's original token definition. Companion accounting includes input, output, cache writes, and cache reads; Usage shows this breakdown separately. Cost metadata distinguishes reported values, estimates from the pinned upstream pricing table, partial coverage, and unavailable prices. These costs never determine subscription allowances.
+Usage shows account allowances, token summaries, and a monthly trend, without contribution calendars. Companion accounting includes input, output, cache writes, and cache reads; Usage shows this breakdown separately. Cost metadata distinguishes reported values, estimates from the pinned upstream pricing table, partial coverage, and unavailable prices. These costs never determine subscription allowances.
 
 Settings → Token sources accepts additional local scan folders for each supported provider. Changing folders invalidates pending observations and establishes a new checkpoint for that provider, so adding old logs cannot grant historical currency. This preference does not replace the CLI's account query.
 

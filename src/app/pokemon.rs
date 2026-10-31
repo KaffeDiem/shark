@@ -717,7 +717,7 @@ impl Shark {
             }));
             self.pokemon_ui.search = Some(input);
         }
-        self.pokemon_ui.tab = Page::Home;
+        self.pokemon_ui.tab = Page::Usage;
         self.pokemon_ui
             .evolution_home_scroll
             .set_offset(point(px(0.), px(0.)));
@@ -908,6 +908,7 @@ impl Shark {
     pub(super) fn render_pokemon_panel(&self, cx: &Context<Self>) -> AnyElement {
         let page = self.pokemon_ui.tab;
         let body = match page {
+            Page::Usage => self.pokemon_usage_progress(cx),
             Page::Dex => self.pokemon_dex(cx),
             Page::Details => self.pokemon_details(cx),
             Page::Bag => self.pokemon_bag(cx),
@@ -917,55 +918,64 @@ impl Shark {
         v_flex()
             .id("pokemon-panel")
             .gap_3()
-            .child(
-                h_flex()
-                    .justify_between()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Pokémon"))
-                    .child(
-                        Button::new("pokemon-refresh")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::RefreshCw)
-                            .accessibility_label("Refresh Pokémon and usage")
-                            .on_click(cx.listener(|s, _, _, cx| {
-                                s.refresh_pokemon_artwork(cx);
-                                s.refresh_usage(cx);
-                                s.load_pokemon(cx);
-                            })),
+            .when(page != Page::Usage, |d| {
+                d.child(
+                    h_flex()
+                        .justify_between()
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child("Pokémon"))
+                        .child(
+                            Button::new("pokemon-refresh")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::RefreshCw)
+                                .accessibility_label("Refresh Pokémon and usage")
+                                .on_click(cx.listener(|s, _, _, cx| {
+                                    s.refresh_pokemon_artwork(cx);
+                                    s.refresh_usage(cx);
+                                    s.load_pokemon(cx);
+                                })),
+                        ),
+                )
+                .child(
+                    h_flex().gap_1().children(
+                        [
+                            (Page::Usage, "Usage"),
+                            (Page::Home, "Home"),
+                            (Page::Dex, "Pokédex"),
+                            (Page::Bag, "Bag"),
+                            (Page::Shop, "Shop"),
+                        ]
+                        .into_iter()
+                        .map(|(tab, label)| {
+                            Button::new(format!("pokemon-tab-{label}"))
+                                .ghost()
+                                .xsmall()
+                                .label(label)
+                                .selected(
+                                    page == tab || (page == Page::Details && tab == Page::Dex),
+                                )
+                                .toggled(page == tab || (page == Page::Details && tab == Page::Dex))
+                                .on_click(cx.listener(move |s, _, w, cx| {
+                                    if s.pokemon_ui.tab == Page::Details && tab == Page::Dex {
+                                        return;
+                                    }
+                                    if tab == Page::Usage {
+                                        if let Some(panel) = &s.usage_panel {
+                                            panel.focus.focus(w, cx);
+                                        }
+                                    }
+                                    s.pokemon_ui.tab = tab;
+                                    s.pokemon_ui.selected_species = None;
+                                    s.sync_profile_names(false, cx);
+                                    if tab == Page::Dex {
+                                        s.load_dex_assets(cx);
+                                    }
+                                    cx.notify();
+                                }))
+                        }),
                     ),
-            )
-            .child(
-                h_flex().gap_1().children(
-                    [
-                        (Page::Home, "Home"),
-                        (Page::Dex, "Pokédex"),
-                        (Page::Bag, "Bag"),
-                        (Page::Shop, "Shop"),
-                        (Page::Usage, "Usage"),
-                    ]
-                    .into_iter()
-                    .map(|(tab, label)| {
-                        Button::new(format!("pokemon-tab-{label}"))
-                            .ghost()
-                            .xsmall()
-                            .label(label)
-                            .selected(page == tab || (page == Page::Details && tab == Page::Dex))
-                            .toggled(page == tab || (page == Page::Details && tab == Page::Dex))
-                            .on_click(cx.listener(move |s, _, _, cx| {
-                                if s.pokemon_ui.tab == Page::Details && tab == Page::Dex {
-                                    return;
-                                }
-                                s.pokemon_ui.tab = tab;
-                                s.pokemon_ui.selected_species = None;
-                                s.sync_profile_names(false, cx);
-                                if tab == Page::Dex {
-                                    s.load_dex_assets(cx);
-                                }
-                                cx.notify();
-                            }))
-                    }),
-                ),
-            )
+                )
+            })
             .children(self.pokemon_ui.notice.as_ref().map(|text| {
                 div()
                     .id("pokemon-notice")
@@ -974,7 +984,80 @@ impl Shark {
                     .child(text.clone())
                     .test_support()
             }))
-            .when(page != Page::Usage, |d| d.child(body))
+            .child(body)
+            .test_support()
+            .into_any_element()
+    }
+
+    fn pokemon_usage_progress(&self, cx: &Context<Self>) -> AnyElement {
+        let p = &self.state.pokemon;
+        let (used, target) = p.progress();
+        let progress = (used as f64 / target.max(1) as f64).clamp(0., 1.);
+        h_flex()
+            .id("pokemon-usage-progress")
+            .p_3()
+            .rounded_lg()
+            .bg(cx.theme().muted.opacity(0.35))
+            .gap_3()
+            .items_center()
+            .child(self.active_pokemon_art(40.))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
+                            .child(p.title()),
+                    )
+                    .child(
+                        div()
+                            .id("pokemon-usage-growth-bar")
+                            .role(Role::ProgressIndicator)
+                            .aria_label(format!(
+                                "Growth: {:.0} percent, {used} of {target} tokens",
+                                progress * 100.
+                            ))
+                            .h(px(4.))
+                            .w_full()
+                            .rounded_full()
+                            .bg(cx.theme().muted)
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(relative(progress as f32))
+                                    .rounded_full()
+                                    .bg(cx.theme().primary),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("pokemon-usage-progress-detail")
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(crate::pokemon::format::progress_detail(used, target))
+                            .test_support(),
+                    ),
+            )
+            .child(
+                Button::new("pokemon-usage-open-home")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::ChevronRight)
+                    .tooltip("Open Pokémon growth and collection")
+                    .accessibility_label("Open Pokémon growth and collection")
+                    .on_click(cx.listener(|s, _, w, cx| {
+                        if let Some(panel) = &s.usage_panel {
+                            panel.focus.focus(w, cx);
+                        }
+                        s.pokemon_ui.tab = Page::Home;
+                        s.pokemon_ui.selected_species = None;
+                        s.sync_profile_names(false, cx);
+                        cx.notify();
+                    })),
+            )
             .test_support()
             .into_any_element()
     }

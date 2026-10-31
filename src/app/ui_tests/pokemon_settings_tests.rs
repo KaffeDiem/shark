@@ -227,6 +227,7 @@ async fn pokemon_import_displays_current_species_without_waiting_for_usage(
         );
         w.render_frame(cx);
         w.click("pokemon-footer", cx);
+        w.click("pokemon-usage-open-home", cx);
         w.render_frame(cx);
         w.click("pokemon-home-open-details", cx);
         w.render_frame(cx);
@@ -239,7 +240,8 @@ async fn pokemon_import_displays_current_species_without_waiting_for_usage(
         w.render_frame(cx);
         w.click("pokemon-footer", cx);
         w.render_frame(cx);
-        assert!(w.find("pokemon-home").visible());
+        assert!(w.try_find("pokemon-tab-Home").is_none());
+        assert!(w.try_find("pokemon-home").is_none());
         assert!(w.try_find("pokemon-details").is_none());
     })
     .unwrap();

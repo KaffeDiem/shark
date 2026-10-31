@@ -58,7 +58,8 @@ async fn cost_coverage_survives_store_and_native_usage(cx: &mut TestAppContext) 
                     .tokens(crate::usage::summary::local_date(now)),
                 3200
             );
-            s.show_usage(w, cx)
+            s.show_usage(w, cx);
+            s.usage_panel.as_mut().unwrap().details = true
         });
         w.render_frame(cx);
         let priced = w.find("usage-cost-claude");
@@ -107,7 +108,8 @@ async fn native_cost_states_have_accessible_labels_and_layout(cx: &mut TestAppCo
                     },
                     cx,
                 );
-                s.show_usage(w, cx)
+                s.show_usage(w, cx);
+                s.usage_panel.as_mut().unwrap().details = true
             });
             w.render_frame(cx);
             let node = w.find("usage-cost-claude");

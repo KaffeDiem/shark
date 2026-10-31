@@ -80,6 +80,7 @@ async fn form_notes_follow_loaded_metadata_and_the_displayed_individual(cx: &mut
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.click("pokemon-footer", cx);
+        w.click("pokemon-usage-open-home", cx);
         assert!(w.try_find("pokemon-home-form-metadata-note").is_none());
         shark.update(cx, |s, cx| {
             s.pokemon_ui.details.insert(492, details(492));

@@ -33,6 +33,20 @@ async fn pokemon_footer_rail_disable_and_usage_access(cx: &mut TestAppContext) {
     let (window, shark) = boot(cx, state, WindowOptions::default());
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
+            let now = crate::usage::now();
+            for index in 0..s.usage_providers.len() {
+                s.usage_reports[index] = crate::usage::logs::Report::from_entries(
+                    vec![crate::usage::logs::Entry {
+                        id: format!("usage-first-{index}"),
+                        date: now,
+                        model: "fixture".into(),
+                        input: 1000,
+                        ..Default::default()
+                    }],
+                    now,
+                );
+                s.usage_activity[index] = s.usage_reports[index].daily.clone();
+            }
             for (index, snapshot) in s.usage.iter_mut().enumerate() {
                 snapshot.finish(Ok(vec![Allowance {
                     label: "Weekly".into(),
@@ -50,11 +64,44 @@ async fn pokemon_footer_rail_disable_and_usage_access(cx: &mut TestAppContext) {
         assert!(w.find("pokemon-footer").visible());
         w.click("pokemon-footer", cx);
         w.render_frame(cx);
-        assert!(w.find("pokemon-home").visible());
-        w.click("pokemon-tab-Usage", cx);
+        assert!(w.try_find("pokemon-tab-Home").is_none());
+        assert!(w.try_find("pokemon-home").is_none());
+        assert!(w.find("pokemon-usage-progress").visible());
+        let progress = w.find("pokemon-usage-progress").bounds();
+        assert!(w.find("usage-codex-0").bounds().bottom() <= progress.top());
+        assert!(w.try_find("usage-trend").is_none());
+        assert!(w.try_find("usage-accounting-claude").is_none());
+        let before = shark.read(cx).usage_reports[0].today();
+        w.click("usage-toggle-details", cx);
         w.render_frame(cx);
+        assert!(
+            w.find("pokemon-usage-progress").bounds().bottom()
+                <= w.find("usage-trend").bounds().top()
+        );
+        assert!(w.try_find("usage-accounting-claude").is_some());
+        w.click("usage-toggle-details", cx);
+        w.render_frame(cx);
+        assert!(w.try_find("usage-trend").is_none());
+        assert_eq!(shark.read(cx).usage_reports[0].today(), before);
+        for provider in ["claude", "codex"] {
+            assert!(w.try_find(format!("usage-heatmap-{provider}")).is_none());
+        }
         assert!(w.find("usage-claude-0").visible());
         assert!(w.find("usage-codex-0").visible());
+        w.click("pokemon-usage-open-home", cx);
+        w.render_frame(cx);
+        assert!(w.find("pokemon-home").visible());
+        assert_eq!(
+            shark
+                .read(cx)
+                .state
+                .pokemon
+                .active
+                .as_ref()
+                .unwrap()
+                .species_id(),
+            25
+        );
         w.press("escape", cx);
         shark.update(cx, |s, cx| {
             s.rail = true;
@@ -68,7 +115,6 @@ async fn pokemon_footer_rail_disable_and_usage_access(cx: &mut TestAppContext) {
         assert!(w.try_find("usage-trigger-codex").is_none());
         assert!(w.try_find("show-usage").is_none());
         w.click("pokemon-footer", cx);
-        w.click("pokemon-tab-Usage", cx);
         w.render_frame(cx);
         assert!(w.find("usage-claude-0").visible());
         assert!(w.find("usage-codex-0").visible());
@@ -81,6 +127,8 @@ async fn pokemon_footer_rail_disable_and_usage_access(cx: &mut TestAppContext) {
         assert!(w.try_find("usage-trigger-codex").is_none());
         w.click("show-usage", cx);
         w.render_frame(cx);
+        assert!(w.try_find("usage-heatmap-claude").is_none());
+        assert!(w.try_find("usage-heatmap-codex").is_none());
         assert!(w.find("usage-claude-0").visible());
         assert!(w.find("usage-codex-0").visible());
         w.press("escape", cx);
@@ -202,6 +250,7 @@ async fn pokemon_shop_bag_difficulty_and_candy_graduation_updates_footer(cx: &mu
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.click("pokemon-footer", cx);
+        w.click("pokemon-usage-open-home", cx);
         w.render_frame(cx);
         let original = shark.read(cx).state.pokemon.growth_difficulty;
         w.click("pokemon-Growth-less", cx);
@@ -259,6 +308,7 @@ async fn pokemon_dex_pages_filter_details_back_and_pin(cx: &mut TestAppContext) 
         w.render_frame(cx);
         w.click("pokemon-footer", cx);
         w.render_frame(cx);
+        w.click("pokemon-usage-open-home", cx);
         w.click("pokemon-tab-Pokédex", cx);
         w.render_frame(cx);
         assert!(w.find("pokemon-dex-1").visible());
@@ -393,7 +443,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                     crate::usage::now(),
                                 );
                                 s.usage_activity[i] = s.usage_reports[i].daily.clone();
-                                // Shark's heatmap excludes cache; companion accounting includes it.
+                                // Activity excludes cache; companion accounting includes it.
                                 if let Some(today) = s.usage_activity[i].tokens.last_mut() {
                                     *today = 150;
                                 }
@@ -531,7 +581,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn pokemon_refresh_keeps_footer_and_popover_geometry_stable(cx: &mut TestAppContext) {
+async fn pokemon_refresh_keeps_footer_and_popover_anchor_stable(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
     for rail in [false, true] {
@@ -597,6 +647,19 @@ async fn pokemon_refresh_keeps_footer_and_popover_geometry_stable(cx: &mut TestA
                     "opening and refreshing must not resize the footer; rail={rail}"
                 );
                 let panel = w.find("usage-panel").bounds();
+                let viewport = w.viewport_size();
+                let assert_panel = |current: Bounds<Pixels>| {
+                    assert_eq!(current.left(), panel.left());
+                    assert_eq!(current.bottom(), panel.bottom());
+                    assert_eq!(current.size.width, panel.size.width);
+                    assert!(
+                        current.top() >= px(8.)
+                            && current.left() >= px(8.)
+                            && current.right() <= viewport.width - px(8.)
+                            && current.bottom() <= viewport.height - px(8.),
+                        "dynamic Usage content must fit the viewport: {current:?}"
+                    );
+                };
                 for provider in 0..2 {
                     shark.update(cx, |s, cx| {
                         s.usage[provider].finish(Ok(allowances()));
@@ -606,18 +669,15 @@ async fn pokemon_refresh_keeps_footer_and_popover_geometry_stable(cx: &mut TestA
                     w.refresh();
                     w.render_frame(cx);
                     assert_eq!(w.find("usage-footer").bounds(), footer);
-                    assert_eq!(
-                        w.find("usage-panel").bounds(),
-                        panel,
-                        "each completed quota request must keep the panel in place"
-                    );
+                    assert_panel(w.find("usage-panel").bounds());
                 }
-                w.click("pokemon-refresh", cx);
+                assert!(w.find("refresh-usage").visible());
+                w.click("refresh-usage", cx);
                 w.render_frame(cx);
                 w.refresh();
                 w.render_frame(cx);
                 assert_eq!(w.find("usage-footer").bounds(), footer);
-                assert_eq!(w.find("usage-panel").bounds(), panel);
+                assert_panel(w.find("usage-panel").bounds());
                 for result in [
                     Err(crate::usage::Failure::Temporary),
                     Err(crate::usage::Failure::SignIn),
@@ -637,7 +697,7 @@ async fn pokemon_refresh_keeps_footer_and_popover_geometry_stable(cx: &mut TestA
                         footer,
                         "error and recovery states must preserve footer geometry"
                     );
-                    assert_eq!(w.find("usage-panel").bounds(), panel);
+                    assert_panel(w.find("usage-panel").bounds());
                 }
                 w.remove_window();
             })
