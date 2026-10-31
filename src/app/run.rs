@@ -108,9 +108,15 @@ impl Shark {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, e: &MouseDownEvent, window, cx| {
+                    // Only what it says: scripts that exit while the menu is open aren't rerun.
+                    let stop = port.is_some();
+                    let toggle = on_shark(cx, move |s, w, cx| {
+                        if s.active.as_ref().is_some_and(|n| s.running(n)) == stop {
+                            s.toggle_run(w, cx)
+                        }
+                    });
                     let entries = vec![
-                        menu::item(icon, verb, on_shark(cx, |s, w, cx| s.toggle_run(w, cx)))
-                            .hint("cmd-r"),
+                        menu::item(icon, verb, toggle).hint("cmd-r"),
                         menu::item(
                             IconName::ScrollText,
                             "Show script output",
