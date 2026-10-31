@@ -560,22 +560,82 @@ fn pr_remote(src: &Path, pr: &PullRequest) -> Result<String, String> {
     })
 }
 
-/// Refresh only the review comparison ref, from the PR's target repository (possibly not origin).
-pub(crate) fn refresh_review_base(src: &Path, pr: &PullRequest) -> Result<(), String> {
+/// A review checkout's private ref for PR `n`: `side` is `head` or `base`.
+pub(crate) fn review_ref(n: u64, side: &str) -> String {
+    format!("refs/shark/pull/{n}/{side}")
+}
+
+/// Fetches the PR's base ref, and with `head` its head ref, from the PR's target repository
+/// (possibly not origin).
+pub(crate) fn fetch_review_refs(src: &Path, pr: &PullRequest, head: bool) -> Result<(), String> {
     let remote = pr_remote(src, pr)?;
-    cmd_bounded(
-        src,
-        "git",
-        &[
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            &remote,
-            &format!("+refs/heads/{}:refs/shark/pull/{}/base", pr.base, pr.number),
-        ],
-        30,
-    )?;
+    let mut specs = vec![format!(
+        "+refs/heads/{}:{}",
+        pr.base,
+        review_ref(pr.number, "base")
+    )];
+    if head {
+        specs.push(format!(
+            "+refs/pull/{}/head:{}",
+            pr.number,
+            review_ref(pr.number, "head")
+        ));
+    }
+    let mut args = vec!["fetch", "--quiet", "--no-tags", &remote];
+    args.extend(specs.iter().map(String::as_str));
+    cmd_bounded(src, "git", &args, 30)?;
     Ok(())
+}
+
+/// Refresh only the review comparison ref; the head stays put so "Fetch updates" stays offered.
+pub(crate) fn refresh_review_base(src: &Path, pr: &PullRequest) -> Result<(), String> {
+    fetch_review_refs(src, pr, false)
+}
+
+/// Refuses unless `wt` is clean and on `branch` at `old`, the previously fetched PR head.
+fn on_review_head(wt: &Path, branch: &str, old: &str) -> Result<(), String> {
+    if dirty(wt)? {
+        return Err("uncommitted changes; commit or discard them first".into());
+    }
+    let on_branch = git(wt, &["symbolic-ref", "--short", "HEAD"]).is_ok_and(|b| b == branch);
+    if !on_branch || git(wt, &["rev-parse", "HEAD"])? != old {
+        return Err("has commits on top of the PR's previous head; nothing changed".into());
+    }
+    Ok(())
+}
+
+/// Moves review branch `branch` to the PR's new head. Refuses, before fetching, unless the tree
+/// is clean and HEAD is the previously fetched PR head, so nothing local can be lost.
+// ponytail: refs/shark/pull/N/head is shared by every review checkout of PR N; a second one
+// misses the signal once the first fetches. Record the applied head per branch if that matters.
+pub(crate) fn update_review_branch(
+    wt: &Path,
+    branch: &str,
+    pr: &PullRequest,
+) -> Result<Option<String>, String> {
+    let head = review_ref(pr.number, "head");
+    let old = ref_oid(wt, &format!("{head}^{{commit}}")).ok_or("no recorded PR head")?;
+    on_review_head(wt, branch, &old)?;
+    fetch_review_refs(wt, pr, true)?;
+    // ponytail: GitHub's API can show a new headRefOid before refs/pull/N/head moves; then
+    // this is "Nothing to do" and the marker stays until the next poll.
+    let new = git(
+        wt,
+        &["rev-parse", "--verify", &format!("{head}^{{commit}}")],
+    )?;
+    if new == old {
+        return Ok(None);
+    }
+    // Checked again: a commit or checkout during the fetch must not be reset away. A clean tree
+    // on the old head: --keep loses nothing, and the old commits stay in the reflog.
+    let moved = on_review_head(wt, branch, &old)
+        .and_then(|_| git(wt, &["reset", "--quiet", "--keep", &new]));
+    if let Err(e) = moved {
+        // Keep "Fetch updates" offered: the branch didn't move.
+        let _ = git(wt, &["update-ref", &head, &old]);
+        return Err(e);
+    }
+    Ok(Some(format!("{} → {}", &old[..7], &new[..7])))
 }
 
 fn plan_pr_worktree(branch: &str, r: &Repo, pr: &PullRequest) -> Result<Plan, String> {
@@ -585,22 +645,8 @@ fn plan_pr_worktree(branch: &str, r: &Repo, pr: &PullRequest) -> Result<Plan, St
             r.name
         ));
     }
-    let remote = pr_remote(&r.path, pr)?;
-    let head = format!("refs/shark/pull/{}/head", pr.number);
-    let base = format!("refs/shark/pull/{}/base", pr.number);
-    cmd_bounded(
-        &r.path,
-        "git",
-        &[
-            "fetch",
-            "--quiet",
-            "--no-tags",
-            &remote,
-            &format!("+refs/pull/{}/head:{head}", pr.number),
-            &format!("+refs/heads/{}:{base}", pr.base),
-        ],
-        30,
-    )?;
+    fetch_review_refs(&r.path, pr, true)?;
+    let (head, base) = (review_ref(pr.number, "head"), review_ref(pr.number, "base"));
     let from = git(
         &r.path,
         &["rev-parse", "--verify", &format!("{head}^{{commit}}")],

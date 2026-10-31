@@ -18,6 +18,8 @@ pub enum Op {
 pub struct Local {
     /// This branch is an isolated checkout for reviewing somebody else's PR.
     pub review: bool,
+    /// Review checkouts: the PR head last fetched (`refs/shark/pull/N/head`); empty if unknown.
+    pub review_head: String,
     /// `None` when HEAD is detached (also mid-rebase).
     pub branch: Option<String>,
     pub head: String,
@@ -171,6 +173,14 @@ pub fn probe(
     }
     let mut l = parse_status(&out.stdout);
     l.review = crate::git::review_pr_url(wt, branch).is_some();
+    // A review checkout's saved base is `refs/shark/pull/N/base`.
+    let pr_number = base
+        .strip_prefix("refs/shark/pull/")
+        .and_then(|b| b.strip_suffix("/base")?.parse().ok());
+    if let Some(n) = pr_number {
+        let head = crate::git::review_ref(n, "head");
+        l.review_head = crate::git::ref_oid(wt, &head).unwrap_or_default();
+    }
     // Per-worktree state files; --git-path resolves them inside .git/worktrees/<name>/.
     const OPS: [(&str, Op); 6] = [
         ("rebase-merge", Op::Rebase),
@@ -595,6 +605,16 @@ impl Repo {
         self.pr().filter(|p| p.state == PrState::Open)
     }
 
+    /// A reviewed PR got new commits on GitHub since its head was fetched. Local commits or
+    /// changes don't hide it; "Fetch updates" refuses those itself.
+    pub fn review_head_moved(&self) -> bool {
+        let local = self.local.as_ref().map_or("", |l| l.review_head.as_str());
+        self.is_review()
+            && self
+                .open_pr()
+                .is_some_and(|p| !p.head.is_empty() && !local.is_empty() && p.head != local)
+    }
+
     /// The branch it is stacked on: its base is `origin/<parent>` and not the trunk.
     pub fn stacked(&self) -> Option<&str> {
         let trunk = self.local.as_ref().map(|l| l.trunk.as_str()).ok()?;
@@ -732,6 +752,8 @@ pub enum Kind {
     Merge,
     Archive,
     OpenPr,
+    /// A reviewed PR got new commits: move its review branch to them.
+    FetchReview,
     /// Nothing to run; the label is a status.
     None,
 }
@@ -785,7 +807,19 @@ pub fn in_scope(rs: &[String], r: &Repo) -> bool {
 /// "checks running" in one repo can't hide a "ready for review" in another. `handled`: review
 /// IDs already sent to the agent.
 pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
+    let label = |verb: &str, rs: &[String]| match repos.len() {
+        1 => verb.to_string(),
+        _ => format!("{verb} · {}", rs.join(", ")),
+    };
     if repos.iter().any(Repo::is_review) {
+        let moved: Vec<String> = (repos.iter())
+            .filter(|r| r.review_head_moved())
+            .map(|r| r.name.clone())
+            .collect();
+        if !moved.is_empty() {
+            let verb = label("Fetch updates", &moved);
+            return act(verb, Kind::FetchReview, moved, true);
+        }
         let normal: Vec<_> = repos.iter().filter(|r| !r.is_review()).cloned().collect();
         if normal.is_empty() {
             return act(
@@ -811,10 +845,6 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
     // The `restack` prompt for `rs`, each onto its own base.
     let restack =
         |rs: &[String]| restack_prompt(&among(repos, rs).collect::<Vec<_>>(), |r| r.base.clone());
-    let label = |verb: &str, rs: &[String]| match repos.len() {
-        1 => verb.to_string(),
-        _ => format!("{verb} · {}", rs.join(", ")),
-    };
     let with_base = |rs: &[String]| {
         among(repos, rs)
             .map(|r| format!("{} (base `{}`)", r.name, r.base))
@@ -1206,6 +1236,7 @@ mod tests {
             Kind::Ready,
             Kind::Merge,
             Kind::Archive,
+            Kind::FetchReview,
         ] {
             assert!(kind.needs_idle(), "{kind:?}");
         }
@@ -1404,6 +1435,75 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         let action = next_action(&[review, normal], &[]);
         assert_eq!(action.kind, Kind::CreatePr);
         assert_eq!(action.repos, ["work"]);
+    }
+
+    /// A review checkout whose PR head is `remote` on GitHub and `fetched` locally.
+    fn reviewed(name: &str, fetched: &str, remote: &str, l: impl FnOnce(&mut Local)) -> Repo {
+        let mut local = Local {
+            review: true,
+            review_head: fetched.into(),
+            ..clean(1)
+        };
+        l(&mut local);
+        let p = Pr {
+            head: remote.into(),
+            review_checkout: true,
+            ..pr("CLEAN", Checks::Passing)
+        };
+        repo(name, local, Some(p))
+    }
+
+    #[test]
+    fn fetch_updates_when_review_head_moved() {
+        let a = next(&[reviewed("api", "old", "new", |_| {})]);
+        assert_eq!(a.label, "Fetch updates");
+        assert_eq!(a.kind, Kind::FetchReview);
+        assert_eq!(a.repos, ["api"]);
+        assert!(a.attention);
+        assert!(super::super::run::needs_you(&a));
+    }
+
+    #[test]
+    fn fetch_updates_names_repo_in_multi_repo() {
+        let repos = [
+            reviewed("api", "old", "new", |_| {}),
+            reviewed("web", "same", "same", |_| {}),
+        ];
+        let a = next(&repos);
+        assert_eq!(a.label, "Fetch updates · api");
+        assert_eq!(a.repos, ["api"]);
+    }
+
+    #[test]
+    fn fetch_updates_quiet_when_equal_unknown_or_not_open() {
+        for (fetched, remote) in [("h", "h"), ("", "new")] {
+            let a = next(&[reviewed("api", fetched, remote, |_| {})]);
+            assert_eq!(a.label, "Review PR", "{fetched:?} vs {remote:?}");
+        }
+        for state in [PrState::Closed, PrState::Merged] {
+            let mut r = reviewed("api", "old", "new", |_| {});
+            if let Some(Ok(Some(p))) = &mut r.pr {
+                p.state = state;
+            }
+            assert_ne!(next(&[r]).kind, Kind::FetchReview, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn fetch_updates_flags_local_commits_and_dirty() {
+        let committed = reviewed("api", "old", "new", |l| l.base = (3, 0));
+        assert_eq!(next(&[committed]).kind, Kind::FetchReview);
+        let dirty = reviewed("api", "old", "new", |l| l.changed = 2);
+        assert_eq!(next(&[dirty]).kind, Kind::FetchReview);
+    }
+
+    #[test]
+    fn fetch_updates_outranks_normal_repo_in_mixed_workspace() {
+        let work = repo("work", clean(2), None);
+        assert_eq!(next(std::slice::from_ref(&work)).kind, Kind::CreatePr);
+        let a = next(&[reviewed("review", "old", "new", |_| {}), work]);
+        assert_eq!(a.kind, Kind::FetchReview);
+        assert_eq!(a.repos, ["review"]);
     }
 
     fn repo(name: &str, l: Local, pr: Option<Pr>) -> Repo {

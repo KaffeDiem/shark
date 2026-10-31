@@ -1,5 +1,7 @@
+use super::status::{Action, Kind};
 use super::{
-    Job, Pr, PrState, Probed, Repo, open_pr, repo_diff_base, repos_from, run_job, status, worktrees,
+    Job, Pr, PrState, Probed, Repo, open_pr, repo_diff_base, repos_from, run_job, run_step, status,
+    worktrees,
 };
 use crate::git::{git, review_pr_url};
 use crate::state::Workspace;
@@ -159,6 +161,43 @@ esac
 
     fn repos(&self, p: Probed, last: &[Repo]) -> Vec<Repo> {
         repos_from(&self.ws, p.locals, p.prs, p.parents, last)
+    }
+
+    /// A commit on `parent` that no branch holds.
+    fn loose_commit(&self, parent: &str) -> String {
+        let tree = format!("{parent}^{{tree}}");
+        let id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+        let args = ["commit-tree", "-p", parent, "-m", "pushed", &tree];
+        git(&self.wt, &[&id[..], &args].concat()).unwrap()
+    }
+
+    /// A review checkout of PR 7 fetched at `head`, whose author has since pushed `sha`.
+    fn pr_moved_to(&self, sha: &str) {
+        let wt = &self.wt;
+        let pushed = format!("+{sha}:refs/pull/7/head");
+        git(wt, &["push", "-q", "origin", &pushed]).unwrap();
+        git(wt, &["update-ref", "refs/shark/pull/7/head", &self.head]).unwrap();
+        // Review checkouts don't push their branch; a second call finds it gone.
+        let _ = git(wt, &["push", "-q", "origin", "--delete", "feature"]);
+        let _ = git(wt, &["update-ref", "-d", "refs/remotes/origin/feature"]);
+        let mut pr = self.pr(7, "main", "OPEN");
+        pr["headRefOid"] = sha.into();
+        self.write("review.json", pr);
+    }
+
+    /// The current next step, run as the button does.
+    fn click(&self) -> (Result<String, String>, Vec<Repo>) {
+        let repos = self.repos(run_job(&self.job(false, true, &[])), &[]);
+        let a = status::next_action(&repos, &[]);
+        assert_eq!(a.kind, Kind::FetchReview, "{}", a.label);
+        let job = self.job(false, true, &repos);
+        let new_pr = crate::pr::NewPr::new("", false);
+        let r = run_step(a, &self.ws, job, &[], &[], &new_pr, false, true).map(|(_, m)| m);
+        (r, repos)
+    }
+
+    fn oid(&self, rf: &str) -> String {
+        git(&self.wt, &["rev-parse", rf]).unwrap()
     }
 }
 
@@ -882,4 +921,102 @@ fn probe_error_drops_cached_own_pr_after_review_identity_appears() {
         current[0].pr().is_none(),
         "cached ordinary PR must not return after identity and local probe failure"
     );
+}
+
+#[test]
+fn fetch_updates_moves_clean_branch() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates");
+    let fast_forward = f.loose_commit(&f.head);
+    let force_pushed = f.loose_commit(&f.main);
+    for new in [fast_forward, force_pushed] {
+        f.pr_moved_to(&new);
+        let (result, _) = f.click();
+        assert!(result.unwrap().contains(&new[..7]));
+        assert_eq!(f.oid("HEAD"), new);
+        assert_eq!(f.oid("refs/shark/pull/7/head"), new);
+        assert_eq!(f.oid("refs/heads/feature"), new);
+        let repos = f.repos(run_job(&f.job(false, true, &[])), &[]);
+        assert_eq!(status::next_action(&repos, &[]).label, "Review PR");
+        // The next round starts from the old head again.
+        git(&f.wt, &["reset", "-q", "--hard", &f.head]).unwrap();
+    }
+}
+
+#[test]
+fn fetch_updates_refuses_dirty_without_fetching() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-dirty");
+    let new = f.loose_commit(&f.head);
+    f.pr_moved_to(&new);
+    fs::write(f.wt.join("notes.txt"), "mine\n").unwrap();
+    let (result, _) = f.click();
+    assert!(result.unwrap_err().contains("uncommitted"));
+    assert_eq!(f.oid("refs/shark/pull/7/head"), f.head);
+    assert_eq!(f.oid("HEAD"), f.head);
+    let notes = fs::read_to_string(f.wt.join("notes.txt")).unwrap();
+    assert_eq!(notes, "mine\n");
+    let repos = f.repos(run_job(&f.job(false, true, &[])), &[]);
+    assert_eq!(status::next_action(&repos, &[]).kind, Kind::FetchReview);
+}
+
+#[test]
+fn fetch_updates_refuses_local_commits() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-ahead");
+    let new = f.loose_commit(&f.head);
+    f.pr_moved_to(&new);
+    crate::git::commit(&f.wt, &["--allow-empty", "-qm", "my fixup"]);
+    let mine = f.oid("HEAD");
+    let (result, _) = f.click();
+    assert!(result.unwrap_err().contains("commits on top"));
+    assert_eq!(f.oid("refs/shark/pull/7/head"), f.head);
+    assert_eq!(f.oid("HEAD"), mine);
+    let repos = f.repos(run_job(&f.job(false, true, &[])), &[]);
+    assert_eq!(status::next_action(&repos, &[]).kind, Kind::FetchReview);
+}
+
+#[test]
+fn poll_never_fetches_review_head() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("poll-review-head");
+    let new = f.loose_commit(&f.head);
+    f.pr_moved_to(&new);
+    let mut pr = f.pr(7, "release", "OPEN");
+    pr["headRefOid"] = new.clone().into();
+    f.write("review.json", pr);
+    let p = run_job(&f.job(true, true, &[]));
+    assert_eq!(p.fetch_error, None);
+    assert_eq!(f.oid("refs/shark/pull/7/base"), f.release);
+    assert_eq!(f.oid("refs/shark/pull/7/head"), f.head);
+    let repos = f.repos(p, &[]);
+    assert_eq!(status::next_action(&repos, &[]).kind, Kind::FetchReview);
+}
+
+#[test]
+fn review_guard_still_blocks_other_kinds() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("review-guard");
+    let repos = f.repos(run_job(&f.job(false, true, &[])), &[]);
+    let a = Action {
+        label: "Pull".into(),
+        kind: Kind::Pull,
+        repos: vec![],
+        attention: false,
+        reviews: vec![],
+    };
+    let job = f.job(false, true, &repos);
+    let new_pr = crate::pr::NewPr::new("", false);
+    let err = run_step(a, &f.ws, job, &[], &[], &new_pr, false, false).unwrap_err();
+    assert!(err.contains("local PR review checkout"), "{err}");
 }

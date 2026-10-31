@@ -117,14 +117,7 @@ pub(super) fn run_job(job: &Job) -> Probed {
                     && p.state == PrState::Open
                     && review_url.as_ref() == Some(&p.url)
                 {
-                    crate::git::refresh_review_base(
-                        wt,
-                        &crate::git::PullRequest {
-                            number: p.number,
-                            url: p.url.clone(),
-                            base: p.base.clone(),
-                        },
-                    )
+                    crate::git::refresh_review_base(wt, &p.into())
                 } else {
                     Ok(())
                 }
@@ -309,7 +302,9 @@ pub(super) fn execute(
     delete_remote: bool,
     primary: bool,
 ) -> Result<String, String> {
-    check_review_checkout(repos, &a.repos)?;
+    if a.kind != Kind::FetchReview {
+        check_review_checkout(repos, &a.repos)?;
+    }
     let dir = ws.dir();
     // The next-step button also links existing PRs after a partial creation; explicit scopes stay narrow.
     let wanted =
@@ -410,9 +405,23 @@ pub(super) fn execute(
                 r.open_pr().map_or(0, |p| p.number)
             )))
         }),
+        Kind::FetchReview => each(&|wt, r| match r.pr() {
+            Some(p) if r.is_review() => crate::git::update_review_branch(wt, &r.branch, &p.into()),
+            _ => Ok(None),
+        }),
         // `run` handles these without a step.
         Kind::Agent(_) | Kind::Archive | Kind::Restack | Kind::OpenPr | Kind::None => {
             unreachable!()
+        }
+    }
+}
+
+impl From<&Pr> for crate::git::PullRequest {
+    fn from(p: &Pr) -> Self {
+        crate::git::PullRequest {
+            number: p.number,
+            url: p.url.clone(),
+            base: p.base.clone(),
         }
     }
 }
