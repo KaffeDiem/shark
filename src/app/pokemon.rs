@@ -799,22 +799,28 @@ impl Shark {
                             .whitespace_nowrap()
                             .children(quotas.into_iter().enumerate().map(
                                 |(index, (id, name, value))| {
-                                    let color =
-                                        value.remaining.map_or(cx.theme().muted_foreground, |n| {
-                                            super::usage::pace_color(
-                                                n,
-                                                value.elapsed,
-                                                false,
-                                                cx.theme(),
+                                    let color = value.remaining.map_or(
+                                        cx.theme().sidebar_foreground,
+                                        |n| {
+                                            // Keep the sidebar's quiet text tone, with a hint of pace hue.
+                                            cx.theme().sidebar_foreground.blend(
+                                                super::usage::pace_color(
+                                                    n,
+                                                    value.elapsed,
+                                                    false,
+                                                    cx.theme(),
+                                                )
+                                                .opacity(0.25),
                                             )
-                                        });
+                                        },
+                                    );
                                     h_flex()
                                         .flex_none()
                                         .gap(px(3.))
                                         .when(index > 0, |d| {
                                             d.child(
                                                 div()
-                                                    .text_color(cx.theme().muted_foreground)
+                                                    .text_color(cx.theme().sidebar_foreground)
                                                     .child("·"),
                                             )
                                         })
@@ -832,7 +838,11 @@ impl Shark {
                                 },
                             ))
                             .when(!self.rail, |d| {
-                                d.child(div().text_color(cx.theme().muted_foreground).child("left"))
+                                d.child(
+                                    div()
+                                        .text_color(cx.theme().sidebar_foreground)
+                                        .child("left"),
+                                )
                             })
                             .test_support(),
                     ),
