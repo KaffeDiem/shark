@@ -11,7 +11,23 @@ pub(super) fn quota_details(name: &str, snapshot: &Snapshot, now: f64) -> Vec<St
     {
         let label = &row.label;
         let remaining = percent(row.remaining.filter(valid_percent));
-        lines.push(format!("{name} · {label} · {remaining}"));
+        let pace = row
+            .remaining
+            .filter(valid_percent)
+            .filter(|_| !snapshot.outdated)
+            .map(|left| {
+                crate::usage::pace::gauge(
+                    100. - left,
+                    crate::usage::pace::elapsed(row.resets_at, row.window, now),
+                    80.,
+                    95.,
+                )
+                .label(crate::pokemon::format::Language::En)
+            });
+        lines.push(format!(
+            "{name} · {label} · {remaining}{}",
+            pace.map(|p| format!(" · {p}")).unwrap_or_default()
+        ));
     }
     if let Some(state) = state {
         lines.push(format!("{name} · {state}"));
@@ -21,33 +37,50 @@ pub(super) fn quota_details(name: &str, snapshot: &Snapshot, now: f64) -> Vec<St
     lines
 }
 
-/// One headline per provider keeps the navigation compact even with many model windows.
-pub(super) fn quota_lines(name: &str, snapshot: &Snapshot, now: f64, rail: bool) -> Vec<String> {
-    let remaining = snapshot
+/// The percentage and pace must come from the same active quota window.
+pub(super) struct Headline {
+    pub text: String,
+    pub remaining: Option<f64>,
+    pub elapsed: Option<f64>,
+}
+
+pub(super) fn headline(snapshot: &Snapshot, now: f64) -> Headline {
+    let row = snapshot
         .allowances
         .iter()
         .filter(|row| row.resets_at.is_none_or(|at| at > now))
-        .filter_map(|row| row.remaining.filter(valid_percent))
-        .min_by(f64::total_cmp);
-    let state = status(snapshot);
-    let value = if remaining.is_none() {
-        state.map(str::to_owned).unwrap_or_else(|| percent(None))
-    } else {
-        percent(remaining)
-    };
-    let mut lines = if rail {
-        vec![name.into(), value]
-    } else {
-        vec![format!("{name} {value}")]
-    };
-    if let Some(state) = state.filter(|_| remaining.is_some()) {
-        lines.push(if rail {
-            state.into()
-        } else {
-            format!("{name} · {state}")
-        });
+        .filter(|row| row.remaining.is_some_and(|n| valid_percent(&n)))
+        .min_by(|a, b| a.remaining.unwrap().total_cmp(&b.remaining.unwrap()));
+    // Keep successful percentages during refresh, without adding/removing status rows.
+    // Unknown or outdated values stay neutral; full status remains in the tooltip.
+    let remaining = row
+        .filter(|_| !snapshot.outdated)
+        .and_then(|row| row.remaining);
+    let elapsed = row
+        .filter(|_| remaining.is_some())
+        .and_then(|row| crate::usage::pace::elapsed(row.resets_at, row.window, now));
+    let text = remaining.map_or_else(
+        || {
+            if snapshot.status == Status::Loading && !snapshot.outdated {
+                "…"
+            } else {
+                "—"
+            }
+            .into()
+        },
+        |n| {
+            if n > 0. && n < 1. {
+                "<1%".into()
+            } else {
+                format!("{:.0}%", n.ceil())
+            }
+        },
+    );
+    Headline {
+        text,
+        remaining,
+        elapsed,
     }
-    lines
 }
 
 fn valid_percent(value: &f64) -> bool {

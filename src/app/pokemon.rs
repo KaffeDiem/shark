@@ -759,12 +759,8 @@ impl Shark {
             .map(|provider| {
                 (
                     provider.id(),
-                    footer_usage::quota_lines(
-                        provider.name(),
-                        &self.usage[provider.index()],
-                        now,
-                        self.rail,
-                    ),
+                    provider.name(),
+                    footer_usage::headline(&self.usage[provider.index()], now),
                 )
             })
             .collect();
@@ -780,33 +776,65 @@ impl Shark {
             .ghost()
             .h_auto()
             .p_1()
+            .when(self.rail, |b| b.px_0())
             .w_full()
             .accessibility_label(format!("{quota}. Open Pokémon companion"))
             .tooltip(quota)
             .on_click(cx.listener(|s, _, w, cx| s.show_pokemon(w, cx)))
             .child(
-                div()
-                    .flex()
-                    .gap_2()
+                h_flex()
+                    .gap_1()
                     .w_full()
                     .items_center()
                     .when(self.rail, |d| d.flex_col())
-                    .child(self.pokemon_art(40.))
+                    .child(self.pokemon_art(24.))
                     .child(
-                        v_flex()
+                        h_flex()
+                            .id("pokemon-footer-quotas")
                             .min_w_0()
-                            .flex_1()
-                            .when(self.rail, |d| d.w_full().items_center())
-                            .when(!self.rail, |d| d.items_start())
-                            .gap_1()
-                            .children(quotas.into_iter().map(|(id, lines)| {
-                                v_flex()
-                                    .id(format!("pokemon-footer-quota-{id}"))
-                                    .text_xs()
-                                    .when(self.rail, |d| d.text_size(px(10.)).items_center())
-                                    .children(lines.into_iter().map(|line| div().child(line)))
-                                    .test_support()
-                            })),
+                            .overflow_hidden()
+                            .items_center()
+                            .gap(px(3.))
+                            .text_size(px(if self.rail { 9. } else { 12. }))
+                            .whitespace_nowrap()
+                            .children(quotas.into_iter().enumerate().map(
+                                |(index, (id, name, value))| {
+                                    let color =
+                                        value.remaining.map_or(cx.theme().muted_foreground, |n| {
+                                            super::usage::pace_color(
+                                                n,
+                                                value.elapsed,
+                                                false,
+                                                cx.theme(),
+                                            )
+                                        });
+                                    h_flex()
+                                        .flex_none()
+                                        .gap(px(3.))
+                                        .when(index > 0, |d| {
+                                            d.child(
+                                                div()
+                                                    .text_color(cx.theme().muted_foreground)
+                                                    .child("·"),
+                                            )
+                                        })
+                                        .child(
+                                            div()
+                                                .id(format!("pokemon-footer-quota-{id}"))
+                                                .text_color(color)
+                                                .child(if self.rail {
+                                                    value.text
+                                                } else {
+                                                    format!("{name} {}", value.text)
+                                                })
+                                                .test_support(),
+                                        )
+                                },
+                            ))
+                            .when(!self.rail, |d| {
+                                d.child(div().text_color(cx.theme().muted_foreground).child("left"))
+                            })
+                            .test_support(),
                     ),
             )
             .into_any_element()

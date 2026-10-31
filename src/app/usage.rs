@@ -689,7 +689,12 @@ fn companion_accounting(
         .into_any_element()
 }
 
-fn pace_color(remaining: f64, elapsed: Option<f64>, outdated: bool, theme: &Theme) -> Hsla {
+pub(super) fn pace_color(
+    remaining: f64,
+    elapsed: Option<f64>,
+    outdated: bool,
+    theme: &Theme,
+) -> Hsla {
     use crate::usage::pace::{Tier, gauge};
     if outdated {
         return faint(theme);

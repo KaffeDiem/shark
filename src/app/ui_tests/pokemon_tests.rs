@@ -360,7 +360,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             snapshot.finish(Ok(vec![Allowance {
                                 label: "5 hours".into(),
                                 remaining: Some(if index == 0 { 42. } else { 68. }),
-                                resets_at: Some(crate::usage::now() + 3600.),
+                                resets_at: Some(crate::usage::now() + 9000.),
                                 window: Some(18000.),
                             }]));
                         }
@@ -406,7 +406,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 s.usage[i].finish(Ok(vec![crate::usage::Allowance {
                                     label: "5 hours".into(),
                                     remaining: Some(if i == 0 { 42. } else { 68. }),
-                                    resets_at: Some(crate::usage::now() + 3600.),
+                                    resets_at: Some(crate::usage::now() + 9000.),
                                     window: Some(18000.),
                                 }]));
                             }
@@ -421,6 +421,11 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     if page != "footer-disabled" {
                         let footer = w.find("pokemon-footer").bounds();
                         assert!(w.try_find("pokemon-footer-tokens").is_none());
+                        let claude = w.find("pokemon-footer-quota-claude").bounds();
+                        let codex = w.find("pokemon-footer-quota-codex").bounds();
+                        assert_eq!(claude.top(), codex.top(), "both providers share one line");
+                        assert!(codex.left() > claude.right());
+                        assert!(footer.size.height <= px(if rail { 48. } else { 32. }));
                         for id in ["pokemon-footer-quota-claude", "pokemon-footer-quota-codex"] {
                             let element = w.find(id);
                             assert!(element.visible());
@@ -532,4 +537,121 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         }
     }
     super::super::pokemon::appearance_pixels::render_pixels(cx);
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn pokemon_refresh_keeps_footer_and_popover_geometry_stable(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    for rail in [false, true] {
+        for (width, height) in [(640., 480.), (1120., 840.)] {
+            let mut state = State::default();
+            state.pokemon = companion();
+            let (window, shark) = boot(
+                cx,
+                state,
+                WindowOptions {
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                        point(px(0.), px(0.)),
+                        size(px(width), px(height)),
+                    ))),
+                    ..Default::default()
+                },
+            );
+            cx.update_window(window, |_, w, cx| {
+                let allowances = || {
+                    vec![Allowance {
+                        label: "Weekly".into(),
+                        remaining: Some(42.),
+                        resets_at: Some(crate::usage::now() + 3600.),
+                        window: Some(604800.),
+                    }]
+                };
+                shark.update(cx, |s, cx| {
+                    s.rail = rail;
+                    for snapshot in &mut s.usage {
+                        snapshot.finish(Ok(allowances()));
+                    }
+                    cx.notify();
+                });
+                w.render_frame(cx);
+                w.refresh();
+                w.render_frame(cx);
+                let footer = w.find("usage-footer").bounds();
+                for remaining in [100., 42.] {
+                    shark.update(cx, |s, cx| {
+                        for snapshot in &mut s.usage {
+                            snapshot.allowances[0].remaining = Some(remaining);
+                        }
+                        cx.notify();
+                    });
+                    w.render_frame(cx);
+                    let claude = w.find("pokemon-footer-quota-claude").bounds();
+                    let codex = w.find("pokemon-footer-quota-codex").bounds();
+                    assert_eq!(claude.top(), codex.top());
+                    assert!(codex.left() > claude.right());
+                    assert!(
+                        codex.right() <= footer.right(),
+                        "quotas must fit the navigation"
+                    );
+                    assert!(footer.size.height <= px(if rail { 64. } else { 48. }));
+                }
+                w.click("pokemon-footer", cx);
+                w.render_frame(cx);
+                w.refresh();
+                w.render_frame(cx);
+                assert_eq!(
+                    w.find("usage-footer").bounds(),
+                    footer,
+                    "opening and refreshing must not resize the footer; rail={rail}"
+                );
+                let panel = w.find("usage-panel").bounds();
+                for provider in 0..2 {
+                    shark.update(cx, |s, cx| {
+                        s.usage[provider].finish(Ok(allowances()));
+                        cx.notify();
+                    });
+                    w.render_frame(cx);
+                    w.refresh();
+                    w.render_frame(cx);
+                    assert_eq!(w.find("usage-footer").bounds(), footer);
+                    assert_eq!(
+                        w.find("usage-panel").bounds(),
+                        panel,
+                        "each completed quota request must keep the panel in place"
+                    );
+                }
+                w.click("pokemon-refresh", cx);
+                w.render_frame(cx);
+                w.refresh();
+                w.render_frame(cx);
+                assert_eq!(w.find("usage-footer").bounds(), footer);
+                assert_eq!(w.find("usage-panel").bounds(), panel);
+                for result in [
+                    Err(crate::usage::Failure::Temporary),
+                    Err(crate::usage::Failure::SignIn),
+                    Ok(allowances()),
+                ] {
+                    shark.update(cx, |s, cx| {
+                        for snapshot in &mut s.usage {
+                            snapshot.finish(result.clone());
+                        }
+                        cx.notify();
+                    });
+                    w.render_frame(cx);
+                    w.refresh();
+                    w.render_frame(cx);
+                    assert_eq!(
+                        w.find("usage-footer").bounds(),
+                        footer,
+                        "error and recovery states must preserve footer geometry"
+                    );
+                    assert_eq!(w.find("usage-panel").bounds(), panel);
+                }
+                w.remove_window();
+            })
+            .unwrap();
+        }
+    }
 }
