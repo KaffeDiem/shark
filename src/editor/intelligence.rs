@@ -2,27 +2,16 @@ use super::*;
 use crate::lsp::{
     Session, SessionEvent,
     client::Client,
-    document::{self, Encoding, Lines, Snapshot},
-    providers::{Provider, ProviderEvent},
+    document::{self, Encoding, Lines, Snapshot, file_uri, same_file},
+    providers::Provider,
 };
-use lsp_types::{LocationLink, PublishDiagnosticsParams, Uri, WorkspaceEdit};
+use lsp_types::{PublishDiagnosticsParams, Uri};
 use serde::Deserialize as _;
 use serde_json::json;
 use std::sync::{
     Arc, Mutex,
     atomic::{AtomicBool, AtomicU64, Ordering},
 };
-
-pub enum LanguageEvent {
-    /// Locations to open; true opens a new tab rather than replacing the current one.
-    Navigate(Vec<LocationLink>, Encoding, bool),
-    Apply {
-        edit: WorkspaceEdit,
-        snapshot: Snapshot,
-        encoding: Encoding,
-        guard: document::EditGuard,
-    },
-}
 
 /// A document symbol, flattened in document order; `depth` nests it under the symbols before it.
 /// Byte offsets into the text the server saw.
@@ -103,11 +92,19 @@ pub(crate) struct Language {
     _subs: Vec<Subscription>,
 }
 
-impl Drop for Language {
-    fn drop(&mut self) {
+impl Language {
+    /// Stops syncing and tells the servers the document is closed. Closing waits for any
+    /// in-flight notification, so `didClose` never overtakes `didChange`.
+    fn close(&mut self) {
         self.alive.store(false, Ordering::Release);
         let _guard = self.snapshot.lock().unwrap();
         notify_close(&self.uri, [self.client.take(), self.companion.take()]);
+    }
+}
+
+impl Drop for Language {
+    fn drop(&mut self) {
+        self.close();
     }
 }
 
@@ -120,13 +117,13 @@ impl FileEditor {
             language.diagnostics = Default::default();
         }
     }
-    pub(crate) fn language_status(&self, cx: &App) -> Option<(String, Option<String>)> {
+    pub(crate) fn language_status(&self, cx: &App) -> Option<(crate::lsp::Status, Option<String>)> {
         if let Some(error) = &self.lsp_error {
-            return Some(("Setup needed".into(), Some(error.clone())));
+            return Some((crate::lsp::Status::SetupNeeded, Some(error.clone())));
         }
         self.intelligence.as_ref().map(|l| {
             let s = l.session.read(cx);
-            (s.status.clone(), s.detail.clone())
+            (s.status, s.detail.clone())
         })
     }
     /// Busy work of the language server, for the loading indicator.
@@ -134,6 +131,20 @@ impl FileEditor {
         (self.lsp_error.is_none())
             .then(|| self.intelligence.as_ref()?.session.read(cx).activity())
             .flatten()
+    }
+
+    /// Clears the outline, crumbs, providers and diagnostics a language session left in the view.
+    pub(crate) fn clear_language_view(&mut self, cx: &mut Context<Self>) {
+        self.outline.clear();
+        self.crumbs.clear();
+        self.input.update(cx, |i, cx| {
+            *i.lsp_mut() = Default::default();
+            if let Some(diagnostics) = i.diagnostics_mut() {
+                diagnostics.clear();
+            }
+            cx.notify();
+        });
+        cx.notify();
     }
 
     /// Recomputes the symbols around the cursor; notifies only when they change.
@@ -163,10 +174,7 @@ impl FileEditor {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Ok(url) = url::Url::from_file_path(&self.abs) else {
-            return;
-        };
-        let Ok(uri) = url.as_str().parse() else {
+        let Some(uri) = file_uri(&self.abs) else {
             return;
         };
         let subs = vec![
@@ -195,7 +203,7 @@ impl FileEditor {
                         && method == "textDocument/publishDiagnostics"
                         // Every attached editor sees every publish; parse only this document's.
                         && let Some(language) = &e.intelligence
-                        && params["uri"].as_str() == Some(language.uri.as_str())
+                        && params["uri"].as_str().is_some_and(|u| same_file(u, &language.uri))
                         && let Ok(params) =
                             serde_json::from_value::<PublishDiagnosticsParams>(params.clone())
                     {
@@ -240,98 +248,30 @@ impl FileEditor {
                 session.generation,
                 session.client.clone(),
                 session.companion.clone(),
-                crate::lsp::tools::language_id(&self.abs).unwrap_or(session.project.language_id),
+                crate::lsp::tools::language_id(&self.abs).unwrap_or("plaintext"),
             )
         };
         if language.generation != generation {
-            self.lsp_error = None;
-            language.alive.store(false, Ordering::Release);
-            let _guard = language.snapshot.lock().unwrap();
-            notify_close(
-                &language.uri,
-                [language.client.take(), language.companion.take()],
-            );
+            language.close();
             language.sync = Task::ready(());
             language.generation = generation;
-            drop(_guard);
             language.snapshot = Arc::new(Mutex::new(Snapshot {
                 text: Arc::from(""),
                 version: 0,
             }));
             language.alive = Arc::new(AtomicBool::new(true));
             language.diagnostics = Default::default();
-            self.outline.clear();
-            self.crumbs.clear();
-            self.input.update(cx, |i, cx| {
-                *i.lsp_mut() = Default::default();
-                if let Some(diagnostics) = i.diagnostics_mut() {
-                    diagnostics.clear();
-                }
-                cx.notify();
-            });
+            self.lsp_error = None;
+            self.clear_language_view(cx);
         }
         let Some(client) = ready else { return };
-        let opening = language.client.is_none();
+        let opening = (self.intelligence.as_ref()).is_some_and(|l| l.client.is_none());
         if opening {
-            language.client = Some(client.clone());
-            language.companion = companion.clone();
-            let (tx, rx) = async_channel::unbounded();
-            let provider = Rc::new(Provider::new(
-                client.clone(),
-                language.uri.clone(),
-                language.snapshot.clone(),
-                language.edits.clone(),
-                tx.clone(),
-            ));
-            let ruff = companion.as_ref().map(|c| {
-                Rc::new(Provider::new(
-                    c.clone(),
-                    language.uri.clone(),
-                    language.snapshot.clone(),
-                    language.edits.clone(),
-                    tx,
-                ))
-            });
-            self.input.update(cx, |i, _| {
-                let lsp = i.lsp_mut();
-                lsp.completion_provider = Some(provider.clone());
-                lsp.hover_provider = Some(provider.clone());
-                lsp.definition_provider = Some(provider.clone());
-                lsp.code_action_providers = vec![provider.clone()];
-                if let Some(ruff) = ruff {
-                    lsp.code_action_providers.push(ruff);
-                }
-                lsp.show_document = Some(provider.show_document_handler());
-            });
-            let encoding = Encoding::from(client.encoding());
-            language._events = cx.spawn_in(window, async move |this, cx| {
-                while let Ok(event) = rx.recv().await {
-                    if this
-                        .update(cx, |_, cx| {
-                            cx.emit(EditorEvent::Language(match event {
-                                ProviderEvent::Navigate(links, new_tab) => {
-                                    LanguageEvent::Navigate(links, encoding, new_tab)
-                                }
-                                ProviderEvent::Apply {
-                                    edit,
-                                    snapshot,
-                                    encoding,
-                                    guard,
-                                } => LanguageEvent::Apply {
-                                    edit,
-                                    snapshot,
-                                    encoding,
-                                    guard,
-                                },
-                            }));
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-            });
+            self.install_providers(client.clone(), companion.clone(), window, cx);
         }
+        let Some(language) = &mut self.intelligence else {
+            return;
+        };
         language.version += 1;
         let version = language.version;
         let uri = language.uri.clone();
@@ -349,115 +289,27 @@ impl FileEditor {
                 .background_executor()
                 .spawn(async move {
                     let text: Arc<str> = Arc::from(rope.to_string());
-                    loop {
-                        let previous = snapshot.lock().unwrap().clone();
-                        if previous.version >= version {
-                            return Ok::<_, anyhow::Error>(None);
-                        }
-                        let encoding = Encoding::from(client.encoding());
-                        let ruff_change = companion
-                            .as_ref()
-                            .map(|c| {
-                                document::incremental_change(
-                                    &previous.text,
-                                    &text,
-                                    c.encoding().into(),
-                                )
-                            })
-                            .transpose()?
-                            .flatten();
-                        let change = if previous.version == 0 {
-                            None
-                        } else {
-                            document::incremental_change(&previous.text, &text, encoding)?
-                        };
-                        let mut current = snapshot.lock().unwrap();
-                        if !alive.load(Ordering::Acquire) {
-                            return Ok(None);
-                        }
-                        if current.version != previous.version {
-                            continue;
-                        }
-                        if previous.version == 0 {
-                            let params = open_params(&uri, language_id, version, &text);
-                            client.notify("textDocument/didOpen", params.clone())?;
-                            if let Some(ruff) = &companion {
-                                ruff.notify("textDocument/didOpen", params)?;
-                            }
-                        } else if previous.text != text {
-                            let kind = client
-                                .capabilities()
-                                .and_then(|c| c.text_document_sync)
-                                .map(|s| match s {
-                                    lsp_types::TextDocumentSyncCapability::Kind(k) => k,
-                                    lsp_types::TextDocumentSyncCapability::Options(o) => {
-                                        o.change.unwrap_or(lsp_types::TextDocumentSyncKind::NONE)
-                                    }
-                                })
-                                .unwrap_or(lsp_types::TextDocumentSyncKind::NONE);
-                            let change = if kind == lsp_types::TextDocumentSyncKind::INCREMENTAL {
-                                change
-                            } else if kind == lsp_types::TextDocumentSyncKind::FULL {
-                                Some(lsp_types::TextDocumentContentChangeEvent {
-                                    range: None,
-                                    range_length: None,
-                                    text: text.to_string(),
-                                })
-                            } else {
-                                None
-                            };
-                            if let Some(change) = change {
-                                client.notify(
-                                    "textDocument/didChange",
-                                    json!({
-                                        "textDocument": {"uri": uri, "version": version},
-                                        "contentChanges": [change],
-                                    }),
-                                )?;
-                            }
-                            if let (Some(ruff), Some(change)) = (&companion, ruff_change) {
-                                ruff.notify(
-                                    "textDocument/didChange",
-                                    json!({
-                                        "textDocument": {"uri": uri, "version": version},
-                                        "contentChanges": [change],
-                                    }),
-                                )?;
-                            }
-                        }
-                        if previous.version == 0 || previous.text != text {
-                            *current = Snapshot { text, version };
-                        }
-                        if let Some(saved) = saved.lock().unwrap().take() {
-                            notify_save(&client, &uri, &saved)?;
-                            if let Some(ruff) = &companion {
-                                notify_save(ruff, &uri, &saved)?;
-                            }
-                        }
-                        let version = current.version;
-                        let text = current.text.clone();
-                        let symbols = Some(client.clone()).filter(|c| {
-                            c.capabilities()
-                                .and_then(|c| c.document_symbol_provider)
-                                .is_some_and(|p| !matches!(p, lsp_types::OneOf::Left(false)))
-                        });
-                        let clients: Vec<_> = [(Some(client), false), (companion, true)]
-                            .into_iter()
-                            .filter_map(|(client, companion)| {
-                                client
-                                    .filter(|c| {
-                                        c.capabilities()
-                                            .is_some_and(|c| c.diagnostic_provider.is_some())
-                                    })
-                                    .map(|c| (c, companion))
-                            })
-                            .collect();
-                        return Ok(Some((clients, uri, version, symbols, text)));
-                    }
+                    push_document(
+                        client,
+                        companion,
+                        uri,
+                        language_id,
+                        version,
+                        &snapshot,
+                        &alive,
+                        &saved,
+                        text,
+                    )
                 })
                 .await;
             match diagnostics {
-                Ok(Some((clients, uri, version, symbols, text))) => {
+                Ok(Some(Pushed {
+                    clients,
+                    uri,
+                    version,
+                    symbols,
+                    text,
+                })) => {
                     for (client, companion) in clients {
                         if let Ok(report) = client
                             .request(
@@ -490,7 +342,7 @@ impl FileEditor {
                             )
                             .await
                     {
-                        let encoding = Encoding::from(client.encoding());
+                        let encoding = client.encoding();
                         let symbols = cx
                             .background_executor()
                             .spawn(async move { outline(&result, &text, encoding) })
@@ -513,6 +365,55 @@ impl FileEditor {
         });
     }
 
+    /// Gives the editor's completion, hover, definition and code-action providers to `client`
+    /// (and `companion`), and forwards their events.
+    fn install_providers(
+        &mut self,
+        client: Client,
+        companion: Option<Client>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(language) = &mut self.intelligence else {
+            return;
+        };
+        language.client = Some(client.clone());
+        language.companion = companion.clone();
+        let (tx, rx) = async_channel::unbounded();
+        let provider = |c: Client| {
+            Rc::new(Provider::new(
+                c,
+                language.uri.clone(),
+                language.snapshot.clone(),
+                language.edits.clone(),
+                tx.clone(),
+            ))
+        };
+        let main = provider(client);
+        let ruff = companion.map(provider);
+        self.input.update(cx, |i, _| {
+            let lsp = i.lsp_mut();
+            lsp.completion_provider = Some(main.clone());
+            lsp.hover_provider = Some(main.clone());
+            lsp.definition_provider = Some(main.clone());
+            lsp.code_action_providers = vec![main.clone()];
+            if let Some(ruff) = ruff {
+                lsp.code_action_providers.push(ruff);
+            }
+            lsp.show_document = Some(main.show_document_handler());
+        });
+        language._events = cx.spawn_in(window, async move |this, cx| {
+            while let Ok(event) = rx.recv().await {
+                if this
+                    .update(cx, |_, cx| cx.emit(EditorEvent::Language(event)))
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+    }
+
     fn language_diagnostics(
         &mut self,
         mut params: PublishDiagnosticsParams,
@@ -522,7 +423,7 @@ impl FileEditor {
         let Some(language) = &mut self.intelligence else {
             return;
         };
-        if params.uri != language.uri {
+        if !same_file(params.uri.as_str(), &language.uri) {
             return;
         }
         let Some(client) = (if companion {
@@ -538,7 +439,7 @@ impl FileEditor {
         {
             return;
         }
-        let encoding = Encoding::from(client.encoding());
+        let encoding = client.encoding();
         let lines = Lines::new(&snapshot.text);
         params.diagnostics.retain_mut(|d| {
             match lines.convert_range(d.range, encoding, Encoding::Editor) {
@@ -694,4 +595,141 @@ fn notify_save(client: &Client, uri: &Uri, text: &str) -> anyhow::Result<()> {
         params["text"] = json!(text);
     }
     client.notify("textDocument/didSave", params)
+}
+
+/// What the background push leaves for the diagnostics and outline requests.
+struct Pushed {
+    /// Servers to ask for diagnostics; true marks the companion.
+    clients: Vec<(Client, bool)>,
+    uri: Uri,
+    version: i32,
+    /// The server to ask for the outline, if it has one.
+    symbols: Option<Client>,
+    text: Arc<str>,
+}
+
+/// How the server wants changes: full text, increments, or none.
+fn text_sync_kind(client: &Client) -> lsp_types::TextDocumentSyncKind {
+    client
+        .capabilities()
+        .and_then(|c| c.text_document_sync)
+        .map(|s| match s {
+            lsp_types::TextDocumentSyncCapability::Kind(k) => k,
+            lsp_types::TextDocumentSyncCapability::Options(o) => {
+                o.change.unwrap_or(lsp_types::TextDocumentSyncKind::NONE)
+            }
+        })
+        .unwrap_or(lsp_types::TextDocumentSyncKind::NONE)
+}
+
+/// Brings the servers up to `text` with didOpen, didChange and didSave. `None`: a newer version
+/// already landed, or the document closed.
+#[allow(clippy::too_many_arguments)]
+fn push_document(
+    client: Client,
+    companion: Option<Client>,
+    uri: Uri,
+    language_id: &str,
+    version: i32,
+    snapshot: &Mutex<Snapshot>,
+    alive: &AtomicBool,
+    saved: &Mutex<Option<String>>,
+    text: Arc<str>,
+) -> anyhow::Result<Option<Pushed>> {
+    loop {
+        let previous = snapshot.lock().unwrap().clone();
+        if previous.version >= version {
+            return Ok(None);
+        }
+        let encoding = client.encoding();
+        let ruff_change = companion
+            .as_ref()
+            .map(|c| document::incremental_change(&previous.text, &text, c.encoding()))
+            .transpose()?
+            .flatten();
+        let change = if previous.version == 0 {
+            None
+        } else {
+            document::incremental_change(&previous.text, &text, encoding)?
+        };
+        let mut current = snapshot.lock().unwrap();
+        if !alive.load(Ordering::Acquire) {
+            return Ok(None);
+        }
+        if current.version != previous.version {
+            continue;
+        }
+        if previous.version == 0 {
+            let params = open_params(&uri, language_id, version, &text);
+            client.notify("textDocument/didOpen", params.clone())?;
+            if let Some(ruff) = &companion {
+                ruff.notify("textDocument/didOpen", params)?;
+            }
+        } else if previous.text != text {
+            let kind = text_sync_kind(&client);
+            let change = if kind == lsp_types::TextDocumentSyncKind::INCREMENTAL {
+                change
+            } else if kind == lsp_types::TextDocumentSyncKind::FULL {
+                Some(lsp_types::TextDocumentContentChangeEvent {
+                    range: None,
+                    range_length: None,
+                    text: text.to_string(),
+                })
+            } else {
+                None
+            };
+            if let Some(change) = change {
+                client.notify(
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": {"uri": uri, "version": version},
+                        "contentChanges": [change],
+                    }),
+                )?;
+            }
+            if let (Some(ruff), Some(change)) = (&companion, ruff_change) {
+                ruff.notify(
+                    "textDocument/didChange",
+                    json!({
+                        "textDocument": {"uri": uri, "version": version},
+                        "contentChanges": [change],
+                    }),
+                )?;
+            }
+        }
+        if previous.version == 0 || previous.text != text {
+            *current = Snapshot { text, version };
+        }
+        if let Some(saved) = saved.lock().unwrap().take() {
+            notify_save(&client, &uri, &saved)?;
+            if let Some(ruff) = &companion {
+                notify_save(ruff, &uri, &saved)?;
+            }
+        }
+        let version = current.version;
+        let text = current.text.clone();
+        let symbols = Some(client.clone()).filter(|c| {
+            c.capabilities()
+                .and_then(|c| c.document_symbol_provider)
+                .is_some_and(|p| !matches!(p, lsp_types::OneOf::Left(false)))
+        });
+        let clients: Vec<_> = [(Some(client), false), (companion, true)]
+            .into_iter()
+            .filter_map(|(client, companion)| {
+                client
+                    .filter(|c| {
+                        c.capabilities()
+                            .is_some_and(|c| c.diagnostic_provider.is_some())
+                    })
+                    .map(|c| (c, companion))
+            })
+            .collect();
+        return Ok(Some(Pushed {
+            clients,
+            uri,
+            version,
+            symbols,
+            text,
+        }));
+    }
 }

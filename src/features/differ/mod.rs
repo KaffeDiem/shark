@@ -7,8 +7,7 @@ use crate::files::{self, Row};
 use crate::menu::{self, Entry};
 use crate::state::{State, Workspace};
 use crate::ui::{
-    confirm, copy, faint, inter_features, kbd, list_cursor_row, notify_err, quiet_edge,
-    side_header, side_row,
+    confirm, copy, faint, kbd, list_cursor_row, notify_err, quiet_edge, side_header, side_row,
 };
 use crate::{
     AddComment, CancelEdit, CollapseDir, Confirm, DeleteThread, EditThread, EditWorkingCopy,
@@ -19,7 +18,7 @@ use crate::{
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
-use gpui_kit::component::dialog::{Dialog, DialogEntrance};
+use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::{
@@ -37,8 +36,10 @@ mod diff;
 mod inline_edit;
 use crate::media;
 mod review;
+mod review_comment;
 mod review_send;
 mod review_share;
+mod review_store;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod test_support;
 pub(crate) use diff::Viewed;
@@ -140,6 +141,8 @@ pub(crate) struct Differ {
     diff_fp: u64,
     /// Bases used by the displayed patch, including the PR target discovered by polling.
     diff_bases: HashMap<String, String>,
+    /// Per repo, the commit the displayed patch is against (old-side lines are numbered in it).
+    diff_revs: HashMap<String, String>,
     /// Bumped per refresh, so a slow older refresh can't overwrite a newer one.
     diff_gen: u64,
     /// The file last moved to (`}`/`{`, the tree); the diff can't say which one is on screen.
@@ -206,12 +209,13 @@ impl Differ {
                     _ => {}
                 },
             ),
-            cx.subscribe(&diff, |s, _, ev: &DiffEvent, cx| {
-                if let DiffEvent::SplitRatioChanged(r) = ev {
+            cx.subscribe(
+                &diff,
+                |s, _, DiffEvent::SplitRatioChanged(r): &DiffEvent, cx| {
                     s.preferences.split_ratio = Some(*r);
                     cx.emit(DifferEvent::Preference(Preference::SplitRatio(*r)));
-                }
-            }),
+                },
+            ),
         ];
         Self {
             workspace: None,
@@ -223,6 +227,7 @@ impl Differ {
             diff_fps: vec![],
             diff_fp: 0,
             diff_bases: HashMap::new(),
+            diff_revs: HashMap::new(),
             diff_gen: 0,
             diff_file: 0,
             diff_loaded: false,
@@ -263,10 +268,13 @@ impl Differ {
     ) {
         let name = snapshot.as_ref().map(|s| s.workspace.name.as_str());
         if self.workspace_name() != name {
+            // Typed words stay a pending comment of the workspace being left.
+            self.keep_draft(window, cx);
             self.diff_gen += 1;
             self.editing = None;
             self.diff_fp = 0;
             self.diff_bases.clear();
+            self.diff_revs.clear();
             self.diff_files.clear();
             self.diff_fps.clear();
             self.viewed_now = Rc::default();
@@ -322,6 +330,11 @@ impl Differ {
         }
     }
 
+    /// True while `path` is being edited in the diff with unsaved or in-flight changes.
+    pub(crate) fn has_unsaved_edit(&self, path: &str) -> bool {
+        (self.editing.as_ref()).is_some_and(|e| e.path == path && (e.dirty || e.saving))
+    }
+
     pub(crate) fn edit_snapshot(&self) -> Option<EditSnapshot> {
         let e = self.editing.as_ref()?;
         Some(EditSnapshot {
@@ -345,6 +358,12 @@ impl Differ {
         true
     }
 
+    /// The file list or its filter has the focus.
+    fn tree_has_focus(&self, window: &Window, cx: &App) -> bool {
+        self.tree_focus.is_focused(window)
+            || (self.tree_filter.read(cx).focus_handle(cx)).is_focused(window)
+    }
+
     pub(crate) fn focus_targets(&self) -> Vec<FeatureFocus> {
         let mut targets = vec![FeatureFocus::Main];
         if self.tree_shown() {
@@ -354,14 +373,7 @@ impl Differ {
     }
 
     pub(crate) fn focused(&self, window: &Window, cx: &App) -> Option<FeatureFocus> {
-        if self.tree_shown()
-            && (self.tree_focus.is_focused(window)
-                || self
-                    .tree_filter
-                    .read(cx)
-                    .focus_handle(cx)
-                    .is_focused(window))
-        {
+        if self.tree_shown() && self.tree_has_focus(window, cx) {
             Some(FeatureFocus::Files)
         } else if self
             .diff
@@ -403,14 +415,7 @@ impl Differ {
 
     pub(crate) fn toggle_tree(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.show_tree = !self.show_tree;
-        if !self.show_tree
-            && (self.tree_focus.is_focused(window)
-                || self
-                    .tree_filter
-                    .read(cx)
-                    .focus_handle(cx)
-                    .is_focused(window))
-        {
+        if !self.show_tree && self.tree_has_focus(window, cx) {
             self.focus_diff(window, cx);
         }
         cx.notify();
@@ -424,12 +429,7 @@ impl Differ {
         cx: &mut Context<Self>,
     ) {
         let m = menu::open(entries, pos, window, cx);
-        let sub = cx.subscribe(&m, |s, _, _: &DismissEvent, cx| {
-            s.menu = None;
-            cx.notify();
-        });
-        self.menu = Some((m, sub));
-        cx.notify();
+        menu::hold(self, m, |s| &mut s.menu, cx);
     }
 }
 
@@ -453,7 +453,7 @@ fn on_differ(
 
 impl Render for Differ {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if let Some(msg) = self.review.warning.take() {
+        if let Some(msg) = self.review.store.warning.take() {
             window.push_notification(Notification::warning(msg).autohide(false), cx);
         }
         div()
@@ -518,6 +518,11 @@ impl Differ {
                 .map(|r| r.path().clone())
         })
         .or_else(|| self.cursor_path(window, cx))
+    }
+
+    /// Whether the diff has `path`; true while it is still loading, which says nothing yet.
+    pub(crate) fn in_diff(&self, path: &str) -> bool {
+        !self.diff_loaded || self.diff_files.iter().any(|f| f.path() == path)
     }
 
     pub(crate) fn cursor_path(&self, window: &Window, cx: &App) -> Option<SharedString> {
@@ -603,13 +608,10 @@ impl Differ {
             self.request_discard(AfterDiscard::OpenPath(path.into()), window, cx);
             return false;
         }
-        self.diff_file = ix;
         self.follow_tree(ix);
-        self.review.at_file(path);
-        self.diff.update(cx, |d, cx| {
-            d.set_file_collapsed(path, false, cx);
-            d.scroll_to_file(path, cx);
-        });
+        self.diff
+            .update(cx, |d, cx| d.set_file_collapsed(path, false, cx));
+        self.goto_file(ix, cx);
         cx.notify();
         true
     }
@@ -675,16 +677,17 @@ impl Differ {
 
     pub(crate) fn storage_errors(&self) -> Vec<(String, String)> {
         self.review
+            .store
             .failed_saves
             .iter()
             .map(|(ws, e)| (ws.clone(), e.clone()))
             .collect()
     }
     pub(crate) fn retry_saves(&mut self) {
-        self.review.retry_saves();
+        self.review.store.retry();
     }
     pub(crate) fn forget_workspace(&mut self, name: &str) {
-        self.review.forget(name);
+        self.review.store.forget(name);
     }
     pub(crate) fn unqueue_review(
         &mut self,
@@ -693,8 +696,8 @@ impl Differ {
         unread: &[u64],
         cx: &mut Context<Self>,
     ) {
-        self.review.edit(name, |l| {
-            review::unqueue(l, Some(chat), unread);
+        self.review.store.edit(name, |l| {
+            review_store::unqueue(l, Some(chat), unread);
         });
         cx.notify();
     }

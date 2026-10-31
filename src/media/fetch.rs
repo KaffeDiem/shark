@@ -168,7 +168,7 @@ fn download(url: &str, out: &Path, dir: &Path) -> Result<String, String> {
     c.env_remove("NETRC").env_remove("CURL_HOME");
     // The kernel stops curl writing past the cap (SIGXFSZ), whatever the response says.
     cap_file_size(&mut c, MAX_BYTES + 1);
-    crate::git::wait_bounded(c, dir, "curl", &args, 75, false).map_err(|e| {
+    crate::proc::wait_bounded(c, dir, "curl", &args, 75, false).map_err(|e| {
         match e.find("curl: (") {
             Some(at) => e[at + 6..].trim().to_string(),
             None if e.contains("timed out") => "download timed out".into(),

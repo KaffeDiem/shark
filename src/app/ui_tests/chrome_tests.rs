@@ -269,7 +269,7 @@ pub(crate) fn render_pixels() {
         (crate::state::Mode::Light, "light"),
     ] {
         cx.update(|cx| {
-            crate::settings::apply(
+            crate::theme::apply(
                 &crate::state::Appearance {
                     mode,
                     ..Default::default()
@@ -596,7 +596,7 @@ fn render_menu_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         (crate::state::Mode::Light, "light"),
     ] {
         cx.update(|cx| {
-            crate::settings::apply(
+            crate::theme::apply(
                 &crate::state::Appearance {
                     mode,
                     ..Default::default()

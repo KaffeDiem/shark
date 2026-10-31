@@ -21,15 +21,22 @@ pub(super) struct Artifact {
 }
 
 pub(super) fn run(root: &Path, program: &str, args: &[&str], seconds: u64) -> Result<String> {
-    crate::git::wait_bounded(
-        std::process::Command::new(program),
-        root,
-        program,
-        args,
-        seconds,
-        true,
-    )
-    .map_err(anyhow::Error::msg)
+    run_env(&[], root, program, args, seconds, true)
+}
+
+/// `run` with extra environment variables; `group` puts the child in its own killable session.
+pub(super) fn run_env(
+    envs: &[(&str, &str)],
+    root: &Path,
+    program: &str,
+    args: &[&str],
+    seconds: u64,
+    group: bool,
+) -> Result<String> {
+    let mut command = std::process::Command::new(program);
+    command.envs(envs.iter().copied());
+    crate::proc::wait_bounded(command, root, program, args, seconds, group)
+        .map_err(anyhow::Error::msg)
 }
 
 pub(super) fn path(path: &Path) -> Result<&str> {
@@ -73,9 +80,10 @@ fn install(artifact: &Artifact, cache: &Path) -> Result<PathBuf> {
     if let Some(executable) = verified(artifact, &destination) {
         return Ok(executable);
     }
-    // Never erase an existing installation, even when it needs repair.
+    // A complete install of an older manifest hash (pin re-published without a version bump) is
+    // replaced after the new one downloads; anything else is never erased, even when it needs repair.
     ensure!(
-        !destination.exists(),
+        stale(artifact, &destination) || !destination.exists(),
         "Incomplete {} installation at {}; move it aside and Retry",
         artifact.name,
         destination.display()
@@ -163,8 +171,38 @@ fn verified(artifact: &Artifact, destination: &Path) -> Option<PathBuf> {
     .then_some(executable)
 }
 
+/// A complete install whose recorded hash is not the manifest's.
+fn stale(artifact: &Artifact, destination: &Path) -> bool {
+    fs::read_to_string(destination.join(".verified")).is_ok_and(|hash| hash != artifact.sha256)
+}
+
 /// Another Shark process may have activated the same version first; reuse its install.
+/// A stale install is moved aside, not deleted, and returns if the swap fails.
 fn activate(artifact: &Artifact, stage: &Path, destination: &Path) -> Result<()> {
+    let old = destination.with_file_name(format!(
+        "{}.superseded",
+        destination
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+    ));
+    let replaced = stale(artifact, destination);
+    if replaced {
+        let _ = fs::remove_dir_all(&old);
+        fs::rename(destination, &old)?;
+    }
+    let result = activate_new(artifact, stage, destination);
+    if replaced {
+        let _ = if result.is_ok() {
+            fs::remove_dir_all(&old)
+        } else {
+            fs::rename(&old, destination)
+        };
+    }
+    result
+}
+
+fn activate_new(artifact: &Artifact, stage: &Path, destination: &Path) -> Result<()> {
     if let Err(error) = fs::rename(stage, destination) {
         ensure!(verified(artifact, destination).is_some(), error);
         let _ = fs::remove_dir_all(stage);
@@ -175,9 +213,6 @@ fn activate(artifact: &Artifact, stage: &Path, destination: &Path) -> Result<()>
 /// Stages are named `.stage-<pid>-…`; one whose process is gone was interrupted mid-install.
 /// The caller holds this tool's lock, so this process has no live stage here either.
 fn remove_interrupted_stages(parent: &Path) {
-    unsafe extern "C" {
-        fn kill(pid: i32, signal: i32) -> i32;
-    }
     const ESRCH: i32 = 3;
     for entry in fs::read_dir(parent).into_iter().flatten().flatten() {
         let name = entry.file_name();
@@ -190,9 +225,9 @@ fn remove_interrupted_stages(parent: &Path) {
         }) else {
             continue;
         };
-        // SAFETY: signal zero only checks whether the process exists.
+        // Signal zero only checks whether the process exists; EPERM means it does.
         let gone = pid == std::process::id() as i32
-            || (unsafe { kill(pid, 0) } != 0
+            || (!crate::proc::signal(pid, 0)
                 && std::io::Error::last_os_error().raw_os_error() == Some(ESRCH));
         if gone {
             let _ = fs::remove_dir_all(entry.path());
@@ -274,6 +309,37 @@ mod tests {
             fs::read_to_string(live.join("download.tar.gz")).unwrap(),
             "partial"
         );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn an_install_with_a_changed_manifest_hash_is_replaced_and_restored_on_failure() {
+        let root = std::env::temp_dir().join(format!("shark-install-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let a = manifest().unwrap().remove(0);
+        let (stage, destination) = (root.join(".stage"), root.join(&a.version));
+        let write = |dir: &Path, content: &str, hash: &str| {
+            fs::create_dir_all(dir.join(Path::new(&a.executable).parent().unwrap())).unwrap();
+            fs::write(dir.join(&a.executable), content).unwrap();
+            fs::write(dir.join(".verified"), hash).unwrap();
+        };
+        write(&destination, "old", "0".repeat(64).as_str());
+        assert!(stale(&a, &destination));
+        // A failed swap (stage is gone) leaves the old install in place.
+        assert!(activate(&a, &stage, &destination).is_err());
+        assert_eq!(
+            fs::read_to_string(destination.join(&a.executable)).unwrap(),
+            "old"
+        );
+        assert!(!root.join(format!("{}.superseded", a.version)).exists());
+        write(&stage, "new", &a.sha256);
+        activate(&a, &stage, &destination).unwrap();
+        assert_eq!(
+            fs::read_to_string(destination.join(&a.executable)).unwrap(),
+            "new"
+        );
+        assert!(verified(&a, &destination).is_some());
+        assert!(!root.join(format!("{}.superseded", a.version)).exists());
         fs::remove_dir_all(root).unwrap();
     }
 

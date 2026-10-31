@@ -527,7 +527,7 @@ impl RichDoc {
                         state
                     }
                 };
-                crate::chat::markdown(&state, "git-row").into_any_element()
+                crate::chat::markdown(&state, "git-row", vec![]).into_any_element()
             }
             Block::Mermaid(src) => match &self.items[ix].view {
                 Some(View::Diagram(d)) => div()
@@ -557,7 +557,7 @@ impl RichDoc {
                             .child(Icon::new(IconName::TriangleAlert).with_size(px(12.)))
                             .child(format!("Mermaid diagram not rendered: {e}")),
                     )
-                    .child(crate::chat::markdown(source, "git-row"))
+                    .child(crate::chat::markdown(source, "git-row", vec![]))
                     .into_any_element(),
                 Some(_) => loading(cx).into_any_element(),
                 None => {

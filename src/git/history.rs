@@ -1,6 +1,6 @@
 //! Read-only branch history addressed by immutable SHAs. Nothing here reads, writes or checks
 //! out the working tree, the index or HEAD.
-use super::git_bytes;
+use super::git_bytes_bounded as git_bytes;
 use std::path::Path;
 
 // ponytail: one unpaged `git log`; branches beyond this show the newest N, page it if that bites.

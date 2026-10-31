@@ -3,6 +3,7 @@ pub mod client;
 pub mod document;
 mod install;
 pub mod providers;
+mod swift;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tools;
@@ -29,11 +30,30 @@ pub struct Work {
     pub percentage: Option<u32>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Status {
+    Starting,
+    Preparing,
+    Ready,
+    SetupNeeded,
+}
+
+impl Status {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Starting => "Starting",
+            Self::Preparing => "Preparing index",
+            Self::Ready => "Ready",
+            Self::SetupNeeded => "Setup needed",
+        }
+    }
+}
+
 pub struct Session {
     pub project: tools::Project,
     pub client: Option<client::Client>,
     pub companion: Option<client::Client>,
-    pub status: String,
+    pub status: Status,
     pub detail: Option<String>,
     pub generation: u64,
     pub watcher: Option<watch::Watcher>,
@@ -54,14 +74,14 @@ impl Session {
     fn build(
         project: tools::Project,
         client: Option<client::Client>,
-        status: &str,
+        status: Status,
         generation: u64,
     ) -> Self {
         Self {
             project,
             client,
             companion: None,
-            status: status.into(),
+            status,
             detail: None,
             generation,
             watcher: None,
@@ -77,11 +97,11 @@ impl Session {
 
     #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn with_client(project: tools::Project, client: client::Client) -> Self {
-        Self::build(project, Some(client), "Ready", 1)
+        Self::build(project, Some(client), Status::Ready, 1)
     }
 
     pub fn new(project: tools::Project, window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let mut session = Self::build(project, None, "Starting", 0);
+        let mut session = Self::build(project, None, Status::Starting, 0);
         session.restart(window, cx);
         session
     }
@@ -89,12 +109,12 @@ impl Session {
     /// What the server is busy with, for a loading indicator: the newest reported work, or
     /// "Starting" while the server launches. None when idle or broken.
     pub fn activity(&self) -> Option<Work> {
-        match self.status.as_str() {
-            "Starting" => Some(Work {
+        match self.status {
+            Status::Starting => Some(Work {
                 title: "Starting".into(),
                 ..Default::default()
             }),
-            "Setup needed" => None,
+            Status::SetupNeeded => None,
             _ => self.progress.last().map(|(_, w)| w.clone()),
         }
     }
@@ -117,27 +137,38 @@ impl Session {
 
     pub fn restart(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.drop_servers();
-        self.status = "Starting".into();
+        self.status = Status::Starting;
         self.detail = None;
         self.choices.clear();
         self.awaiting_build = false;
         self.progress.clear();
         let project = self.project.clone();
         self.task = cx.spawn_in(window, async move |this, cx| {
-            let prepared = cx.background_executor().spawn(async move {
-                let launch = tools::prepare(&project)?;
-                let client = start(&launch)?;
-                let companion = launch.companion.as_deref().map(|c| start(c).map(|client| (client, c.initialization_options.clone())));
-                Ok::<_, anyhow::Error>((client, launch, companion))
-            }).await;
+            let prepared =
+                cx.background_executor()
+                    .spawn(async move {
+                        let launch = tools::prepare(&project)?;
+                        let client = start(&launch)?;
+                        let companion = launch.companion.as_deref().map(|c| {
+                            start(c).map(|client| (client, c.initialization_options.clone()))
+                        });
+                        Ok::<_, anyhow::Error>((client, launch, companion))
+                    })
+                    .await;
             let result = match prepared {
                 Ok((client, launch, companion)) => {
                     async {
-                        client.initialize_with_options(launch.initialization_options).await?;
+                        client
+                            .initialize_with_options(launch.initialization_options)
+                            .await?;
                         let (companion, note) = initialize_companion(companion).await;
-                        let detail = [launch.detail, note].into_iter().flatten().reduce(|a, b| format!("{a}\n{b}"));
+                        let detail = [launch.detail, note]
+                            .into_iter()
+                            .flatten()
+                            .reduce(|a, b| format!("{a}\n{b}"));
                         Ok((client, detail, launch.awaiting_build, companion))
-                    }.await
+                    }
+                    .await
                 }
                 Err(error) => Err(error),
             };
@@ -145,88 +176,133 @@ impl Session {
                 Ok(ready) => ready,
                 Err(error) => {
                     let _ = this.update(cx, |s, cx| {
-                        s.status = "Setup needed".into();
+                        s.status = Status::SetupNeeded;
                         s.detail = Some(format!("{error:#}"));
-                        s.choices = error.downcast_ref::<tools::XcodeChoice>().map(|e| e.options.clone()).unwrap_or_default();
+                        s.choices = error
+                            .downcast_ref::<tools::XcodeChoice>()
+                            .map(|e| e.options.clone())
+                            .unwrap_or_default();
                         cx.notify();
                     });
                     return;
                 }
             };
             let events = client.events();
-            if this.update(cx, |s, cx| {
-                s.awaiting_build = awaiting_build;
-                s.status = progress_status("Starting", awaiting_build).into();
-                s.detail = detail;
-                for (client, is_companion) in [(Some(&client), false), (companion.as_ref(), true)] {
-                    let Some(client) = client else { continue };
-                    match watch::Watcher::new(&s.project.worktree, client.clone()) {
-                        Ok(watcher) => {
-                            let errors = watcher.errors();
-                            s.watch_tasks.push(cx.spawn(async move |this, cx| {
-                                while let Ok(error) = errors.recv().await {
-                                    // The server keeps working without change notifications.
-                                    if this.update(cx, |s, cx| {
-                                        s.detail = Some(error);
-                                        cx.notify();
-                                    }).is_err() { break; }
-                                }
-                            }));
-                            if is_companion { s.companion_watcher = Some(watcher); } else { s.watcher = Some(watcher); }
+            if this
+                .update(cx, |s, cx| {
+                    s.awaiting_build = awaiting_build;
+                    s.status = progress_status(Status::Starting, awaiting_build);
+                    s.detail = detail;
+                    for (client, is_companion) in
+                        [(Some(&client), false), (companion.as_ref(), true)]
+                    {
+                        if let Some(client) = client {
+                            s.attach_watcher(client, is_companion, cx);
                         }
-                        Err(error) => s.detail = Some(format!("File watching: {error}")),
                     }
-                }
-                s.client = Some(client);
-                if let Some(companion) = &companion {
-                    let events = companion.events();
-                    s.companion_task = cx.spawn(async move |this, cx| {
-                        while let Ok(event) = events.recv().await {
-                            if this.update(cx, |s, cx| match event {
-                                client::Event::Notification { method, params } => cx.emit(SessionEvent::Notification { method, params, companion: true }),
-                                client::Event::Stopped(error) => {
-                                    s.detail = Some(tools::companion_note(&anyhow::anyhow!(error)));
-                                    s.drop_companion();
-                                    cx.notify();
-                                }
-                                event @ (client::Event::RegisterCapability { .. } | client::Event::UnregisterCapability { .. }) => {
-                                    watch_request(s.companion_watcher.as_ref(), event, cx)
-                                }
-                                client::Event::ApplyEdit { reply, .. } => reply.respond(serde_json::json!({"applied":false,"failureReason":"Use Ruff quick fixes from the editor"})),
-                                _ => {}
-                            }).is_err() { break; }
-                        }
-                    });
-                }
-                s.companion = companion;
-                cx.notify();
-            }).is_err() { return; }
+                    s.client = Some(client);
+                    if let Some(companion) = &companion {
+                        s.spawn_companion_loop(companion, cx);
+                    }
+                    s.companion = companion;
+                    cx.notify();
+                })
+                .is_err()
+            {
+                return;
+            }
             while let Ok(event) = events.recv().await {
-                if this.update(cx, |s, cx| {
-                    match event {
+                if this
+                    .update(cx, |s, cx| match event {
                         client::Event::Notification { method, params } => {
                             if method == "$/progress" {
                                 track_progress(&mut s.progress, &params);
-                                s.status = progress_status(&s.status, !s.progress.is_empty() || s.awaiting_build).into();
+                                s.status = progress_status(
+                                    s.status,
+                                    !s.progress.is_empty() || s.awaiting_build,
+                                );
                                 cx.notify();
                             }
-                            cx.emit(SessionEvent::Notification { method, params, companion: false });
+                            cx.emit(SessionEvent::Notification {
+                                method,
+                                params,
+                                companion: false,
+                            });
                         }
                         client::Event::Stopped(error) => {
-                            s.status = "Setup needed".into();
+                            s.status = Status::SetupNeeded;
                             s.detail = Some(error);
                             s.drop_servers();
                             cx.notify();
                         }
-                        event @ (client::Event::RegisterCapability { .. } | client::Event::UnregisterCapability { .. }) => {
+                        event @ (client::Event::RegisterCapability { .. }
+                        | client::Event::UnregisterCapability { .. }) => {
                             watch_request(s.watcher.as_ref(), event, cx)
                         }
                         event => cx.emit(SessionEvent::Request(RefCell::new(Some(event)))),
-                    }
-                }).is_err() { break; }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
             }
         });
         cx.notify();
+    }
+
+    /// Watches the worktree for this server; watcher failures only update the detail line.
+    fn attach_watcher(
+        &mut self,
+        client: &client::Client,
+        is_companion: bool,
+        cx: &mut Context<Self>,
+    ) {
+        match watch::Watcher::new(&self.project.worktree, client.clone()) {
+            Ok(watcher) => {
+                let errors = watcher.errors();
+                self.watch_tasks.push(cx.spawn(async move |this, cx| {
+                    while let Ok(error) = errors.recv().await {
+                        // The server keeps working without change notifications.
+                        if this
+                            .update(cx, |s, cx| {
+                                s.detail = Some(error);
+                                cx.notify();
+                            })
+                            .is_err()
+                        {
+                            break;
+                        }
+                    }
+                }));
+                if is_companion {
+                    self.companion_watcher = Some(watcher);
+                } else {
+                    self.watcher = Some(watcher);
+                }
+            }
+            Err(error) => self.detail = Some(format!("File watching: {error}")),
+        }
+    }
+
+    fn spawn_companion_loop(&mut self, companion: &client::Client, cx: &mut Context<Self>) {
+        let events = companion.events();
+        self.companion_task = cx.spawn(async move |this, cx| {
+            while let Ok(event) = events.recv().await {
+                if this.update(cx, |s, cx| match event {
+                    client::Event::Notification { method, params } => cx.emit(SessionEvent::Notification { method, params, companion: true }),
+                    client::Event::Stopped(error) => {
+                        s.detail = Some(tools::companion_note(&anyhow::anyhow!(error)));
+                        s.drop_companion();
+                        cx.notify();
+                    }
+                    event @ (client::Event::RegisterCapability { .. } | client::Event::UnregisterCapability { .. }) => {
+                        watch_request(s.companion_watcher.as_ref(), event, cx)
+                    }
+                    client::Event::ApplyEdit { reply, .. } => reply.respond(serde_json::json!({"applied":false,"failureReason":"Use Ruff quick fixes from the editor"})),
+                    _ => {}
+                }).is_err() { break; }
+            }
+        });
     }
 }
 
@@ -318,19 +394,21 @@ fn track_progress(progress: &mut Vec<(String, Work)>, params: &Value) {
     }
 }
 
-fn progress_status(current: &str, indexing: bool) -> &'static str {
-    if current == "Setup needed" {
-        "Setup needed"
+fn progress_status(current: Status, indexing: bool) -> Status {
+    if current == Status::SetupNeeded {
+        Status::SetupNeeded
     } else if indexing {
-        "Preparing index"
+        Status::Preparing
     } else {
-        "Ready"
+        Status::Ready
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{Work, initialize_companion, progress_status, start, tools, track_progress};
+    use super::{
+        Status, Work, initialize_companion, progress_status, start, tools, track_progress,
+    };
     use serde_json::json;
 
     #[test]
@@ -371,10 +449,17 @@ mod tests {
     }
     #[test]
     fn progress_does_not_hide_setup_failures() {
-        assert_eq!(progress_status("Setup needed", true), "Setup needed");
-        assert_eq!(progress_status("Setup needed", false), "Setup needed");
-        assert_eq!(progress_status("Ready", true), "Preparing index");
-        assert_eq!(progress_status("Preparing index", false), "Ready");
+        assert_eq!(
+            progress_status(Status::SetupNeeded, true),
+            Status::SetupNeeded
+        );
+        assert_eq!(
+            progress_status(Status::SetupNeeded, false),
+            Status::SetupNeeded
+        );
+        assert_eq!(progress_status(Status::Ready, true), Status::Preparing);
+        assert_eq!(progress_status(Status::Preparing, false), Status::Ready);
+        assert_eq!(Status::Preparing.label(), "Preparing index");
     }
 
     #[test]

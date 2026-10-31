@@ -12,11 +12,15 @@ use std::{
     thread::JoinHandle,
 };
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Phase {
     Setup,
     Run,
     Archive,
+}
+
+impl Phase {
+    pub const ALL: [Phase; 3] = [Phase::Setup, Phase::Run, Phase::Archive];
 }
 
 /// One script: the repo it's from, its source checkout and worktree, the command.
@@ -37,11 +41,7 @@ pub fn jobs(state: &State, ws: &Workspace, phase: Phase, only: Option<&str>) -> 
         .filter(|r| only.is_none_or(|o| o == r.name))
         .flat_map(|r| {
             let s = state.repo_settings.get(&r.name);
-            let list = s.map_or(&[][..], |s| match phase {
-                Phase::Setup => &s.setup,
-                Phase::Run => &s.run,
-                Phase::Archive => &s.archive,
-            });
+            let list = s.map_or(&[][..], |s| s.phase(phase));
             (list.iter().filter(|c| !c.trim().is_empty())).map(|c| Job {
                 repo: r.name.clone(),
                 src: r.src.clone(),
@@ -65,14 +65,18 @@ fn open_log(ws: &str) -> Result<File, String> {
         .map_err(|e| format!("{}: {e}", path.display()))
 }
 
+/// `$SHELL`, or zsh.
+pub fn shell() -> String {
+    (std::env::var("SHELL").ok())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| "/bin/zsh".into())
+}
+
 fn spawn(ws: &str, job: &Job, port: Option<u16>, log: &mut File) -> Result<Child, String> {
     let _ = writeln!(log, "\n$ {}: {}", job.repo, job.script);
     let out = log.try_clone().map_err(|e| e.to_string())?;
     let err = log.try_clone().map_err(|e| e.to_string())?;
-    let shell = (std::env::var("SHELL").ok())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "/bin/zsh".into());
-    let mut cmd = Command::new(shell);
+    let mut cmd = Command::new(shell());
     if let Some(p) = port {
         cmd.env("SHARK_PORT", p.to_string());
     }
@@ -200,7 +204,7 @@ impl Running {
     /// TERM, then KILL what's still up after `secs`; blocks, so call it off the UI thread or at quit.
     fn stop(mut groups: Vec<(String, Child, bool)>, secs: u64) {
         for (_, c, _) in &groups {
-            signal_group("-TERM", c);
+            signal_group(crate::proc::SIGTERM, c);
         }
         for _ in 0..secs * 10 {
             groups.retain_mut(|(_, c, _)| {
@@ -213,7 +217,7 @@ impl Running {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         for (_, c, _) in &mut groups {
-            signal_group("-KILL", c);
+            signal_group(crate::proc::SIGKILL, c);
             let _ = c.wait();
         }
     }
@@ -227,16 +231,13 @@ impl Running {
     }
 }
 
-fn signal_group(sig: &str, c: &Child) -> bool {
-    (Command::new("/bin/kill").args([sig, "--", &format!("-{}", c.id())]))
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+fn signal_group(sig: i32, c: &Child) -> bool {
+    crate::proc::signal(-(c.id() as i32), sig)
 }
 
 /// Any process left in the script's group (its pid is the group id).
 fn group_alive(c: &Child) -> bool {
-    signal_group("-0", c)
+    signal_group(0, c)
 }
 
 impl Drop for Running {
@@ -322,13 +323,7 @@ mod tests {
         let shell = running.groups[0].1.id();
         Running::stop_all([running], 1);
         // KILLed children are reaped by launchd, so give it a moment.
-        let alive = || {
-            (Command::new("/bin/kill").args(["-0", "--", &format!("-{shell}")]))
-                .stderr(Stdio::null())
-                .status()
-                .unwrap()
-                .success()
-        };
+        let alive = || crate::proc::signal(-(shell as i32), 0);
         assert!((0..40).any(|_| {
             std::thread::sleep(std::time::Duration::from_millis(50));
             !alive()

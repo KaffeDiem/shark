@@ -36,8 +36,9 @@ impl Pattern {
 
 type Stamp = (u64, Option<SystemTime>);
 type Snapshot = HashMap<PathBuf, Stamp>;
-/// Registrations by server id; the key changes whenever the id is registered again.
-type Registrations = HashMap<String, (u64, Vec<Pattern>)>;
+/// Registrations by server id; the key changes whenever the id is registered again. The third
+/// field is the key and patterns of the registration this one replaced, whose baseline it inherits.
+type Registrations = HashMap<String, (u64, Vec<Pattern>, Option<(u64, Vec<Pattern>)>)>;
 
 #[derive(Default)]
 struct Tree {
@@ -77,39 +78,30 @@ impl Watcher {
             let mut previous: HashMap<u64, Snapshot> = HashMap::new();
             while !worker_stop.load(Ordering::Relaxed) {
                 let registrations = worker_registrations.lock().unwrap().clone();
-                previous.retain(|key, _| registrations.values().any(|(k, _)| k == key));
+                // A re-registered id keeps the replaced registration's baseline, so changes made
+                // before the next poll are still reported. ponytail: a second replacement within
+                // one poll has no baseline to inherit and starts fresh.
+                let mut inherited = HashMap::new();
+                for (key, _, replaced) in registrations.values() {
+                    if let Some((old, old_patterns)) = replaced
+                        && !previous.contains_key(key)
+                        && let Some(baseline) = previous.remove(old)
+                    {
+                        previous.insert(*key, baseline);
+                        inherited.insert(*key, old_patterns);
+                    }
+                }
+                previous.retain(|key, _| registrations.values().any(|(k, ..)| k == key));
                 if !registrations.is_empty() {
                     // A new baseline must postdate its registration, so it cannot reuse a shared walk.
                     let fresh = registrations
                         .values()
-                        .any(|(key, _)| !previous.contains_key(key));
+                        .any(|(key, ..)| !previous.contains_key(key));
                     match snapshot(&worker_root, &registrations, fresh, &worker_stop) {
                         _ if worker_stop.load(Ordering::Relaxed) => break,
                         Ok(trees) => {
-                            let mut changes = HashMap::<PathBuf, u32>::new();
-                            for (key, patterns) in registrations.values() {
-                                let current: Snapshot = trees
-                                    .iter()
-                                    .flat_map(|tree| &tree.files)
-                                    .filter(|(path, _)| patterns.iter().any(|p| p.matches(path)))
-                                    .map(|(path, stamp)| (path.clone(), *stamp))
-                                    .collect();
-                                if let Some(old) = previous.insert(*key, current.clone()) {
-                                    for (path, kind) in diff(&old, &current) {
-                                        let bit = match kind {
-                                            1 => 1,
-                                            2 => 2,
-                                            _ => 4,
-                                        };
-                                        if patterns
-                                            .iter()
-                                            .any(|p| p.kind & bit != 0 && p.matches(&path))
-                                        {
-                                            changes.insert(path, kind);
-                                        }
-                                    }
-                                }
-                            }
+                            let changes =
+                                poll_changes(&registrations, &mut previous, &trees, &inherited);
                             // The server may assume watching is active after registration succeeds.
                             // Acknowledge only once every pattern in the batch has its baseline.
                             let current = worker_registrations.lock().unwrap();
@@ -117,7 +109,7 @@ impl Watcher {
                                 if pending.ids.iter().all(|id| {
                                     current
                                         .get(id)
-                                        .is_some_and(|(key, _)| previous.contains_key(key))
+                                        .is_some_and(|(key, ..)| previous.contains_key(key))
                                 }) {
                                     let _ = pending.ready.try_send(Ok(()));
                                     false
@@ -129,7 +121,9 @@ impl Watcher {
                             if !changes.is_empty() {
                                 let changes: Vec<_> = changes
                                     .into_iter()
-                                    .filter_map(|(path, kind)| {
+                                    .filter_map(|(path, bit)| {
+                                        // Watch-kind bits 1, 2, 4 are LSP change types 1, 2, 3.
+                                        let kind = bit.trailing_zeros() + 1;
                                         url::Url::from_file_path(path)
                                             .ok()
                                             .map(|uri| json!({"uri":uri.as_str(),"type":kind}))
@@ -220,11 +214,13 @@ impl Watcher {
         let mut current = self.registrations.lock().unwrap();
         let ids = parsed.keys().cloned().collect();
         // rust-analyzer re-registers its fixed id to replace its watchers, without unregistering.
-        current.extend(
-            parsed
-                .into_iter()
-                .map(|(id, patterns)| (id, (NEXT.fetch_add(1, Ordering::Relaxed), patterns))),
-        );
+        for (id, patterns) in parsed {
+            let replaced = current
+                .get(&id)
+                .map(|(key, patterns, _)| (*key, patterns.clone()));
+            let key = NEXT.fetch_add(1, Ordering::Relaxed);
+            current.insert(id, (key, patterns, replaced));
+        }
         let (ready, receiver) = async_channel::bounded(1);
         self.pending
             .lock()
@@ -309,8 +305,7 @@ fn pattern(root: &Path, watcher: &Value) -> Result<Option<Pattern>> {
             .as_str()
             .or_else(|| value["baseUri"]["uri"].as_str())
             .ok_or_else(|| anyhow!("Missing relative watch base URI"))?;
-        let base = url::Url::parse(uri)?
-            .to_file_path()
+        let base = super::document::uri_path(uri)
             .map_err(|_| anyhow!("Watcher base URI must be a local file"))?;
         validate_absolute(&base)?;
         if !base.starts_with(root) {
@@ -351,7 +346,7 @@ fn snapshot(
     let real_root = std::fs::canonicalize(root)?;
     let bases: HashSet<_> = registrations
         .values()
-        .flat_map(|(_, patterns)| patterns.iter().map(|p| p.base.as_path()))
+        .flat_map(|(_, patterns, _)| patterns.iter().map(|p| p.base.as_path()))
         .filter(|base| !tree.dirs.contains(*base))
         // A base reached through a symlink would lead the walk out of the worktree.
         .filter(|base| {
@@ -431,6 +426,45 @@ fn walk(base: &Path, ignores: bool, stop: &AtomicBool) -> Result<Tree> {
     Ok(tree)
 }
 
+/// Records each registration's new baseline and returns the changed paths with their watch-kind
+/// bit (create 1, change 2, delete 4), for registrations whose patterns subscribe to it.
+fn poll_changes(
+    registrations: &Registrations,
+    previous: &mut HashMap<u64, Snapshot>,
+    trees: &[Arc<Tree>],
+    inherited: &HashMap<u64, &Vec<Pattern>>,
+) -> HashMap<PathBuf, u32> {
+    let mut changes = HashMap::new();
+    for (key, patterns, _) in registrations.values() {
+        let current: Snapshot = trees
+            .iter()
+            .flat_map(|tree| &tree.files)
+            .filter(|(path, _)| patterns.iter().any(|p| p.matches(path)))
+            .map(|(path, stamp)| (path.clone(), *stamp))
+            .collect();
+        if let Some(mut old) = previous.insert(*key, current.clone()) {
+            // Files only the new patterns cover have no old stamp; they existed, they were not created.
+            for (path, stamp) in &current {
+                if inherited
+                    .get(key)
+                    .is_some_and(|ps| !ps.iter().any(|p| p.matches(path)))
+                {
+                    old.entry(path.clone()).or_insert(*stamp);
+                }
+            }
+            for (path, bit) in diff(&old, &current) {
+                if patterns
+                    .iter()
+                    .any(|p| p.kind & u64::from(bit) != 0 && p.matches(&path))
+                {
+                    changes.insert(path, bit);
+                }
+            }
+        }
+    }
+    changes
+}
+
 fn diff(before: &Snapshot, after: &Snapshot) -> Vec<(PathBuf, u32)> {
     let mut changes = Vec::new();
     for (path, stamp) in after {
@@ -444,7 +478,7 @@ fn diff(before: &Snapshot, after: &Snapshot) -> Vec<(PathBuf, u32)> {
         before
             .keys()
             .filter(|path| !after.contains_key(*path))
-            .map(|path| (path.clone(), 3)),
+            .map(|path| (path.clone(), 4)),
     );
     changes
 }
@@ -500,7 +534,7 @@ mod tests {
         assert_eq!(changes.len(), 3);
         assert_eq!(changes[Path::new("created")], 1);
         assert_eq!(changes[Path::new("changed")], 2);
-        assert_eq!(changes[Path::new("deleted")], 3);
+        assert_eq!(changes[Path::new("deleted")], 4);
     }
 
     #[test]
@@ -571,6 +605,7 @@ mod tests {
                     .iter()
                     .map(|watcher| pattern(&root, watcher).unwrap().unwrap())
                     .collect(),
+                None,
             ),
         )]);
         let files: Vec<_> = snapshot(&root, &registrations, true, &stop)
@@ -676,6 +711,47 @@ mod tests {
             );
             thread::sleep(Duration::from_millis(20));
         }
+        drop(watcher);
+        client.terminate();
+        let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn re_registering_an_id_keeps_the_baseline_of_the_one_it_replaces() {
+        let root = std::env::temp_dir().join(format!("shark-watch-rereg-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let (file, other) = (root.join("file.rs"), root.join("Cargo.toml"));
+        let log = root.join("peer.jsonl");
+        std::fs::write(&file, "old").unwrap();
+        std::fs::write(&other, "old").unwrap();
+        let client = Client::start(test_support::fake_server(&log), &root, Value::Null).unwrap();
+        let watcher = Watcher::new(&root, client.clone()).unwrap();
+        let register = |glob: &str| {
+            watcher.register(&json!({"registrations":[{"id":"source","method":"workspace/didChangeWatchedFiles","registerOptions":{"watchers":[{"globPattern":glob}]}}]})).unwrap()
+        };
+        register("**/*.rs").recv_blocking().unwrap().unwrap();
+        // Changed after the first baseline, before the replacement's own would be taken.
+        std::fs::write(&file, "changed between registrations").unwrap();
+        register("**/*.{rs,toml}").recv_blocking().unwrap().unwrap();
+        let uri = |path: &Path| url::Url::from_file_path(path).unwrap().to_string();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let changes = loop {
+            let found = test_support::logged(&log)
+                .into_iter()
+                .filter(|m| m["method"] == "workspace/didChangeWatchedFiles")
+                .filter_map(|m| m["params"]["changes"].as_array().cloned())
+                .find(|c| c.iter().any(|c| c["uri"] == uri(&file).as_str()));
+            if let Some(found) = found {
+                break found;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the change between registrations was missed"
+            );
+            thread::sleep(Duration::from_millis(20));
+        };
+        // Cargo.toml only became covered by the new patterns; it existed, it was not created.
+        assert!(changes.iter().all(|c| c["uri"] != uri(&other).as_str()));
         drop(watcher);
         client.terminate();
         let _ = std::fs::remove_dir_all(root);

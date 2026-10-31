@@ -8,6 +8,7 @@ use std::{
 
 use gpui_kit::base::{
     TextSelection, TextSelectionContentKey, TextSelectionEvent, TextSelectionHandle,
+    TextSelectionSnapshot,
 };
 use gpui_kit::{
     App, AppContext as _, Context, ElementId, EventEmitter, FocusHandle, Focusable, ListAlignment,
@@ -16,54 +17,14 @@ use gpui_kit::{
 };
 
 use super::{
-    DiffAnnotation, DiffConflictResolution, DiffFile, DiffFileStatus, DiffInlineUnit,
-    DiffLinePosition, DiffLineRange, DiffMode, DiffSide,
-    conflict::ConflictPart,
+    DiffAnnotation, DiffFile, DiffLinePosition, DiffLineRange, DiffMode, DiffSide,
     presentation::{FilePresentation, PresentationOptions, SyntaxHighlighters},
+    rows::{
+        CONTEXT_LINES, DisplayRow, EXPANSION_LINES, FileRows, changed_groups, project_rows,
+        source_rows,
+    },
     selection::SelectionGeometry,
 };
-
-/// One virtualized row. Every row belongs to exactly one file.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) enum DisplayRow {
-    /// The file header, with any file-level annotations.
-    File(usize),
-    /// Binary, metadata-only or empty file summary, for a file without source rows.
-    Notice(usize),
-    Hunk {
-        file: usize,
-        hunk: usize,
-    },
-    Fold {
-        file: usize,
-        pairs: Range<usize>,
-    },
-    /// The heading of one part of a merge conflict; for a resolved conflict,
-    /// the [`ConflictPart::Current`] heading stands for the whole conflict.
-    Conflict {
-        file: usize,
-        conflict: usize,
-        part: ConflictPart,
-    },
-    Code {
-        file: usize,
-        original: Option<usize>,
-        modified: Option<usize>,
-        changed: bool,
-    },
-}
-
-impl DisplayRow {
-    pub(crate) fn file(&self) -> usize {
-        match self {
-            Self::File(file) | Self::Notice(file) => *file,
-            Self::Hunk { file, .. }
-            | Self::Fold { file, .. }
-            | Self::Conflict { file, .. }
-            | Self::Code { file, .. } => *file,
-        }
-    }
-}
 
 /// Which part of a collapsed unchanged range a disclosure reveals.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,23 +36,9 @@ pub(crate) enum FoldExpansion {
     All,
 }
 
-/// Notifications from the readonly comparison surface.
+/// Notifications from the comparison surface.
 #[derive(Clone, Debug)]
-#[non_exhaustive]
 pub enum DiffEvent {
-    /// A pointer gesture began selecting source lines from a line number.
-    SelectionStarted(DiffLineRange),
-    /// A pointer, gutter or keyboard operation changed the selected source lines.
-    SelectionChanged(Option<DiffLineRange>),
-    /// A selection gesture finished; the range is ready to act on.
-    SelectionEnded(DiffLineRange),
-    /// The user expanded a collapsed file from its header.
-    FileExpanded(SharedString),
-    /// The user collapsed a file from its header.
-    FileCollapsed(SharedString),
-    /// The user resolved a merge conflict, or undid its resolution; read it
-    /// with [`DiffState::conflict_resolution`].
-    ConflictResolved(SharedString, usize),
     /// The user finished dragging the Split divider; read the ratio with
     /// [`DiffState::split_ratio`].
     SplitRatioChanged(f32),
@@ -104,8 +51,6 @@ pub(crate) struct LayoutKey {
     font_size: Pixels,
     font_family: SharedString,
     mode: DiffMode,
-    line_number: bool,
-    soft_wrap: bool,
 }
 
 impl LayoutKey {
@@ -114,25 +59,14 @@ impl LayoutKey {
         font_size: Pixels,
         font_family: SharedString,
         mode: DiffMode,
-        line_number: bool,
-        soft_wrap: bool,
     ) -> Self {
         Self {
             rem,
             font_size,
             font_family,
             mode,
-            line_number,
-            soft_wrap,
         }
     }
-}
-
-/// The row showing each source line, or the disclosure hiding it.
-#[derive(Default)]
-struct FileRows {
-    original: Vec<Option<usize>>,
-    modified: Vec<Option<usize>>,
 }
 
 /// The selected source lines of one file, resolved for membership tests.
@@ -211,11 +145,8 @@ pub struct DiffState {
     file_ixs: HashMap<SharedString, usize>,
     mode: DiffMode,
     context_lines: Option<usize>,
-    expansion_lines: usize,
-    min_collapsed_lines: usize,
     expanded: Vec<Vec<Range<usize>>>,
     collapsed: HashSet<SharedString>,
-    resolutions: HashMap<(SharedString, usize), DiffConflictResolution>,
     file_rows: Vec<FileRows>,
     header_rows: Vec<usize>,
     rows: Rc<Vec<DisplayRow>>,
@@ -229,7 +160,6 @@ pub struct DiffState {
     selection_anchor: Option<DiffLinePosition>,
     selection_cursor: Option<DiffLinePosition>,
     selecting: bool,
-    presentation_options: PresentationOptions,
     presentations: Vec<Option<Arc<FilePresentation>>>,
     /// Files replaced since their presentation was prepared; it is drawn until a new one is.
     stale_presentations: HashSet<usize>,
@@ -248,13 +178,19 @@ pub struct DiffState {
     pub(crate) hovered: Option<DiffLinePosition>,
     annotations: HashSet<(Option<DiffLinePosition>, SharedString, ElementId)>,
     window: Option<WindowId>,
-    /// Bumped when files or presentation options change, so a preparation
+    /// Bumped when files change, so a preparation
     /// started for earlier ones never installs its results.
     presentation_generation: usize,
     preparing: Option<usize>,
     _presentation: Task<()>,
     _selection_subscription: Subscription,
 }
+
+/// Longest line, in bytes, compared for inline changes and given syntax emphasis.
+const PRESENTATION_OPTIONS: PresentationOptions = PresentationOptions {
+    inline_max_line_length: 1000,
+    syntax_max_line_length: 1000,
+};
 
 impl EventEmitter<DiffEvent> for DiffState {}
 impl Focusable for DiffState {
@@ -276,10 +212,8 @@ impl DiffState {
                 let geometry = geometry.clone();
                 move |point, cx| {
                     let state = weak.upgrade()?;
-                    let snapshot = state.read(cx).selection.snapshot(cx);
                     let entity = Some(state.read(cx).selection.entity_id());
-                    let snapshot =
-                        snapshot.filter(|snapshot| snapshot.anchor().entity_id() == entity);
+                    let snapshot = state.read(cx).local_snapshot(cx);
                     let side = snapshot
                         .and_then(|snapshot| snapshot.anchor().content_key())
                         .map(|key| decode_key(key.value()).1);
@@ -319,22 +253,14 @@ impl DiffState {
                     if !state.selection.has_local_selection(cx) {
                         match event {
                             TextSelectionEvent::SelectionChanged(Some(_)) => {
-                                let changed = state.selected_lines.take().is_some();
+                                state.selected_lines = None;
                                 // A new text gesture ends the previous gutter anchor.
                                 state.selection_anchor = None;
                                 state.selection_cursor = None;
-                                if changed {
-                                    cx.emit(DiffEvent::SelectionChanged(None));
-                                }
                             }
-                            TextSelectionEvent::Cleared => {
-                                // A replacement gutter gesture has local selection and
-                                // skips this branch. Keep its anchor for Shift-click,
-                                // but report a clear that leaves no replacement range.
-                                if state.selected_lines.take().is_some() {
-                                    cx.emit(DiffEvent::SelectionChanged(None));
-                                }
-                            }
+                            // A replacement gutter gesture has local selection and
+                            // skips this branch. Keep its anchor for Shift-click.
+                            TextSelectionEvent::Cleared => state.selected_lines = None,
                             _ => {}
                         }
                     }
@@ -350,11 +276,8 @@ impl DiffState {
             file_ixs: file_ixs(&files),
             files,
             mode: DiffMode::Unified,
-            context_lines: Some(3),
-            expansion_lines: 20,
-            min_collapsed_lines: 2,
+            context_lines: Some(CONTEXT_LINES),
             collapsed: HashSet::new(),
-            resolutions: HashMap::new(),
             file_rows: Vec::new(),
             header_rows: Vec::new(),
             rows: Rc::default(),
@@ -368,11 +291,6 @@ impl DiffState {
             selection_anchor: None,
             selection_cursor: None,
             selecting: false,
-            presentation_options: PresentationOptions {
-                inline_unit: Some(DiffInlineUnit::Word),
-                inline_max_line_length: 1000,
-                syntax_max_line_length: 1000,
-            },
             stale_presentations: HashSet::new(),
             viewport: Size::default(),
             layout: None,
@@ -401,128 +319,12 @@ impl DiffState {
         self
     }
 
-    /// Sets the initial unchanged context around each change. Default is
-    /// `Some(3)`; `None` shows every supplied patch line.
-    pub fn with_context_lines(mut self, lines: Option<usize>) -> Self {
-        self.context_lines = lines;
-        self.rebuild(true);
-        self
-    }
-
-    /// Sets how many lines an up or down disclosure reveals. Default is 20.
-    pub fn with_expansion_lines(mut self, lines: usize) -> Self {
-        self.expansion_lines = lines.max(1);
-        self
-    }
-
-    /// Sets the shortest unchanged range that collapses; shorter ranges stay
-    /// visible. Default is 2.
-    pub fn with_min_collapsed_lines(mut self, lines: usize) -> Self {
-        self.min_collapsed_lines = lines.max(1);
-        self.rebuild(true);
-        self
-    }
-
-    /// Sets the unit inline changes between paired lines are emphasized in,
-    /// or `None` to emphasize whole lines only. Default is [`DiffInlineUnit::Word`].
-    pub fn with_inline_unit(mut self, unit: Option<DiffInlineUnit>) -> Self {
-        self.presentation_options.inline_unit = unit;
-        self.reset_presentation();
-        self
-    }
-
-    /// Sets the longest line, in bytes, compared for inline changes. Default is 1,000.
-    pub fn with_inline_max_line_length(mut self, length: usize) -> Self {
-        self.presentation_options.inline_max_line_length = length;
-        self.reset_presentation();
-        self
-    }
-
-    /// Sets the longest line, in bytes, given syntax emphasis. Default is 1,000.
-    pub fn with_syntax_max_line_length(mut self, length: usize) -> Self {
-        self.presentation_options.syntax_max_line_length = length;
-        self.reset_presentation();
-        self
-    }
-
-    /// Changes the number of lines each disclosure reveals, preserving selection and scrolling.
-    pub fn set_expansion_lines(&mut self, lines: usize, cx: &mut Context<Self>) {
-        let lines = lines.max(1);
-        if self.expansion_lines == lines {
-            return;
-        }
-        self.expansion_lines = lines;
-        cx.notify();
-    }
-
-    /// Changes the shortest unchanged range that collapses, preserving selection and scrolling.
-    pub fn set_min_collapsed_lines(&mut self, lines: usize, cx: &mut Context<Self>) {
-        let lines = lines.max(1);
-        if self.min_collapsed_lines == lines {
-            return;
-        }
-        self.min_collapsed_lines = lines;
-        self.rebuild_at_anchor();
-        cx.notify();
-    }
-
-    /// Changes the inline comparison unit without resetting selection or scrolling.
-    pub fn set_inline_unit(&mut self, unit: Option<DiffInlineUnit>, cx: &mut Context<Self>) {
-        if self.presentation_options.inline_unit == unit {
-            return;
-        }
-        self.presentation_options.inline_unit = unit;
-        self.reset_presentation();
-        self.ensure_presentation(cx);
-        cx.notify();
-    }
-
-    /// Changes the inline comparison line limit in bytes without resetting selection or scrolling.
-    pub fn set_inline_max_line_length(&mut self, length: usize, cx: &mut Context<Self>) {
-        if self.presentation_options.inline_max_line_length == length {
-            return;
-        }
-        self.presentation_options.inline_max_line_length = length;
-        self.reset_presentation();
-        self.ensure_presentation(cx);
-        cx.notify();
-    }
-
-    /// Changes the syntax emphasis line limit in bytes without resetting selection or scrolling.
-    pub fn set_syntax_max_line_length(&mut self, length: usize, cx: &mut Context<Self>) {
-        if self.presentation_options.syntax_max_line_length == length {
-            return;
-        }
-        self.presentation_options.syntax_max_line_length = length;
-        self.reset_presentation();
-        self.ensure_presentation(cx);
-        cx.notify();
-    }
-
     /// The files in patch order.
     pub fn files(&self) -> &[DiffFile] {
         &self.files
     }
     pub fn mode(&self) -> DiffMode {
         self.mode
-    }
-    pub fn context_lines(&self) -> Option<usize> {
-        self.context_lines
-    }
-    pub fn expansion_lines(&self) -> usize {
-        self.expansion_lines
-    }
-    pub fn min_collapsed_lines(&self) -> usize {
-        self.min_collapsed_lines
-    }
-    pub fn inline_unit(&self) -> Option<DiffInlineUnit> {
-        self.presentation_options.inline_unit
-    }
-    pub fn inline_max_line_length(&self) -> usize {
-        self.presentation_options.inline_max_line_length
-    }
-    pub fn syntax_max_line_length(&self) -> usize {
-        self.presentation_options.syntax_max_line_length
     }
     pub fn selected_lines(&self) -> Option<DiffLineRange> {
         self.selected_lines.clone()
@@ -586,11 +388,6 @@ impl DiffState {
             return;
         }
         self.split_ratio = ratio;
-        // Wrapped rows change height with their column width.
-        if self.layout.as_ref().is_some_and(|layout| layout.soft_wrap) {
-            self.list.remeasure();
-            self.apply_row_height_hint();
-        }
         cx.notify();
     }
 
@@ -607,7 +404,9 @@ impl DiffState {
         }
     }
 
-    pub(crate) fn end_divider_drag(&mut self, cx: &mut Context<Self>) {
+    /// Finishes a line-number or divider gesture, which may end anywhere.
+    pub(crate) fn end_gesture(&mut self, cx: &mut Context<Self>) {
+        self.selecting = false;
         if self.divider_drag.take().is_some() {
             cx.emit(DiffEvent::SplitRatioChanged(self.split_ratio));
         }
@@ -615,14 +414,13 @@ impl DiffState {
 
     /// Replaces the file with the same [`DiffFile::path`] in place, keeping
     /// scrolling, collapse, disclosures and selection, so an owner can show
-    /// live edits. Disclosures and selection are clipped to the new file;
-    /// conflict resolutions past its conflicts are dropped.
+    /// live edits. Disclosures and selection are clipped to the new file.
     pub fn replace_file(&mut self, file: DiffFile, cx: &mut Context<Self>) {
         let Some(ix) = self.file_ix(file.path()) else {
             return;
         };
         let path = file.path().clone();
-        let (pairs, conflicts) = (file.pairs().len(), file.conflicts().len());
+        let pairs = file.pairs().len();
         let old = std::mem::replace(&mut self.files[ix], file);
         // Opened folds past the first changed pair move with their lines.
         let first = (old.pairs().iter())
@@ -645,8 +443,6 @@ impl DiffState {
             *range = start.min(pairs)..end.min(pairs);
         }
         self.expanded[ix].retain(|range| !range.is_empty());
-        self.resolutions
-            .retain(|(resolved, conflict), _| *resolved != path || *conflict < conflicts);
         if let Some(range) = self.selected_lines.clone()
             && *range.path() == path
         {
@@ -661,9 +457,7 @@ impl DiffState {
         self.geometry.borrow_mut().clear();
         // Cancel a preparation of the old file; the others prepare again if pending. The old
         // presentation is drawn until the new one is ready, so colors don't flash per keystroke.
-        self.presentation_generation += 1;
-        self.preparing = None;
-        self._presentation = Task::ready(());
+        self.cancel_presentation();
         self.stale_presentations.insert(ix);
         // No re-measure of every row (this runs per keystroke while editing); the next render
         // measures the longest line again, so the horizontal scroll range can shrink too.
@@ -682,6 +476,7 @@ impl DiffState {
     }
 
     /// The first visible row and how far it is scrolled.
+    #[cfg(test)]
     pub fn scroll_top(&self) -> ListOffset {
         self.list.logical_scroll_top()
     }
@@ -710,7 +505,6 @@ impl DiffState {
         self.file_ixs = file_ixs(&self.files);
         self.collapsed
             .retain(|path| self.file_ixs.contains_key(path));
-        self.resolutions.clear();
         self.expanded = vec![Vec::new(); self.files.len()];
         self.reset_presentation();
         self.layout = None;
@@ -741,6 +535,7 @@ impl DiffState {
     }
 
     /// Sets surrounding context. `None` shows every supplied patch line.
+    #[cfg(test)]
     pub fn set_context_lines(&mut self, lines: Option<usize>, cx: &mut Context<Self>) {
         if self.context_lines == lines {
             return;
@@ -752,6 +547,7 @@ impl DiffState {
     }
 
     /// Reveals all unchanged source while preserving the configured context count.
+    #[cfg(test)]
     pub fn expand_unchanged(&mut self, cx: &mut Context<Self>) {
         for (expanded, file) in self.expanded.iter_mut().zip(&self.files) {
             *expanded = vec![0..file.pairs().len()];
@@ -761,6 +557,7 @@ impl DiffState {
     }
 
     /// Restores the configured context disclosures.
+    #[cfg(test)]
     pub fn collapse_unchanged(&mut self, cx: &mut Context<Self>) {
         self.expanded.iter_mut().for_each(Vec::clear);
         self.rebuild_at_anchor();
@@ -783,70 +580,6 @@ impl DiffState {
             self.rebuild_at_anchor();
             cx.notify();
         }
-    }
-
-    /// The resolution of conflict `ix` in the file at `path`, if any.
-    /// Use [`DiffFile::conflicts`] to enumerate valid indices; `None` means
-    /// unresolved, or that the file or index does not exist.
-    pub fn conflict_resolution(&self, path: &str, ix: usize) -> Option<DiffConflictResolution> {
-        let file = &self.files[self.file_ix(path)?];
-        self.resolutions.get(&(file.path().clone(), ix)).copied()
-    }
-
-    /// Resolves conflict `ix` (an index in [`DiffFile::conflicts`]) in the file
-    /// at `path`, or clears its resolution
-    /// with `None`, without emitting a user event.
-    pub fn resolve_conflict(
-        &mut self,
-        path: &str,
-        ix: usize,
-        resolution: Option<DiffConflictResolution>,
-        cx: &mut Context<Self>,
-    ) {
-        let Some(file) = self.file_ix(path) else {
-            return;
-        };
-        if ix >= self.files[file].conflicts().len() {
-            return;
-        }
-        let key = (self.files[file].path().clone(), ix);
-        let previous = match resolution {
-            Some(resolution) => self.resolutions.insert(key, resolution),
-            None => self.resolutions.remove(&key),
-        };
-        if previous != resolution {
-            self.rebuild_at_anchor();
-            cx.notify();
-        }
-    }
-
-    /// The working file with every conflict replaced by its resolution, or
-    /// `None` while a conflict is unresolved or `path` names no conflicted file.
-    pub fn resolved_text(&self, path: &str) -> Option<String> {
-        let file = &self.files[self.file_ix(path)?];
-        if file.status() != DiffFileStatus::Conflicted {
-            return None;
-        }
-        let lines = file.lines(DiffSide::Modified);
-        let source = file.source(DiffSide::Modified);
-        let mut text = String::with_capacity(source.len());
-        let mut ix = 0;
-        for (conflict_ix, conflict) in file.conflicts().iter().enumerate() {
-            let resolution = *self.resolutions.get(&(file.path().clone(), conflict_ix))?;
-            for line in &lines[ix..conflict.source_lines().start] {
-                text.push_str(&source[line.source()]);
-            }
-            for range in conflict.kept(resolution) {
-                for line in &lines[range] {
-                    text.push_str(&source[line.source()]);
-                }
-            }
-            ix = conflict.source_lines().end;
-        }
-        for line in &lines[ix..] {
-            text.push_str(&source[line.source()]);
-        }
-        Some(text)
     }
 
     /// Synchronizes source-line selection without emitting a user event.
@@ -961,7 +694,7 @@ impl DiffState {
         expansion: FoldExpansion,
         cx: &mut Context<Self>,
     ) {
-        let lines = self.expansion_lines;
+        let lines = EXPANSION_LINES;
         let revealed = match expansion {
             FoldExpansion::All => pairs,
             FoldExpansion::Up => pairs.end.saturating_sub(lines).max(pairs.start)..pairs.end,
@@ -974,29 +707,11 @@ impl DiffState {
         }
     }
 
-    /// Resolves a conflict from its heading and reports the user's change.
-    pub(crate) fn choose_conflict(
-        &mut self,
-        file: usize,
-        ix: usize,
-        resolution: Option<DiffConflictResolution>,
-        cx: &mut Context<Self>,
-    ) {
-        let path = self.files[file].path().clone();
-        self.resolve_conflict(&path, ix, resolution, cx);
-        cx.emit(DiffEvent::ConflictResolved(path, ix));
-    }
-
-    /// Toggles a file from its header and reports the user's change.
+    /// Toggles a file from its header.
     pub(crate) fn toggle_file_collapsed(&mut self, file: usize, cx: &mut Context<Self>) {
         let path = self.files[file].path().clone();
         let collapsed = !self.collapsed.contains(&path);
         self.set_file_collapsed(&path, collapsed, cx);
-        cx.emit(if collapsed {
-            DiffEvent::FileCollapsed(path)
-        } else {
-            DiffEvent::FileExpanded(path)
-        });
     }
 
     /// Starts a line-number selection gesture, extending the current anchor in
@@ -1019,9 +734,6 @@ impl DiffState {
         TextSelection::clear(window, cx);
         window.focus(&self.focus, cx);
         self.selecting = true;
-        cx.emit(DiffEvent::SelectionStarted(range_between(
-            &anchor, &position,
-        )));
         self.select_user_range(anchor, position, cx);
     }
 
@@ -1052,16 +764,6 @@ impl DiffState {
             && (anchor.side() == position.side() || self.mode == DiffMode::Unified)
     }
 
-    /// Finishes an active line-number gesture.
-    pub(crate) fn end_line_selection(&mut self, cx: &mut Context<Self>) {
-        if !std::mem::take(&mut self.selecting) {
-            return;
-        }
-        if let Some(range) = self.selected_lines.clone() {
-            cx.emit(DiffEvent::SelectionEnded(range));
-        }
-    }
-
     /// Selects one line, or extends to it, as a complete gesture.
     #[cfg(test)]
     pub(crate) fn click_line(
@@ -1072,7 +774,7 @@ impl DiffState {
         cx: &mut Context<Self>,
     ) {
         self.begin_line_selection(position, extend, window, cx);
-        self.end_line_selection(cx);
+        self.selecting = false;
     }
 
     pub(crate) fn keyboard_select(
@@ -1095,7 +797,7 @@ impl DiffState {
             .and_then(|position| self.line_index(position))
             .map(|ix| ix.saturating_add_signed(direction).min(count - 1))
             .unwrap_or(0);
-        let position = self.position(file, side, ix);
+        let position = self.files[file].position(side, ix);
         let anchor = self
             .selection_anchor
             .clone()
@@ -1103,8 +805,7 @@ impl DiffState {
             .unwrap_or_else(|| position.clone());
         TextSelection::clear(window, cx);
         window.focus(&self.focus, cx);
-        let range = self.select_user_range(anchor, position.clone(), cx);
-        cx.emit(DiffEvent::SelectionEnded(range));
+        self.select_user_range(anchor, position.clone(), cx);
         if let Some(row) = self.expand_line(&position) {
             self.reveal_row(row);
         }
@@ -1117,12 +818,11 @@ impl DiffState {
         let count = self.files[file].lines_count(side);
         TextSelection::clear(window, cx);
         window.focus(&self.focus, cx);
-        let range = self.select_user_range(
-            self.position(file, side, 0),
-            self.position(file, side, count - 1),
+        self.select_user_range(
+            self.files[file].position(side, 0),
+            self.files[file].position(side, count - 1),
             cx,
         );
-        cx.emit(DiffEvent::SelectionEnded(range));
     }
 
     /// The selected lines, resolved for membership tests.
@@ -1130,10 +830,7 @@ impl DiffState {
         let range = self.selected_lines.as_ref()?;
         let file = self.file_ix(range.path())?;
         if range.is_single_side() {
-            let (start, end) = (
-                range.start().min(range.end()),
-                range.start().max(range.end()),
-            );
+            let (start, end) = range.ordered();
             return Some(SelectedLines::Side {
                 file,
                 side: range.side(),
@@ -1207,15 +904,6 @@ impl DiffState {
         self.annotations = current;
     }
 
-    pub(crate) fn position(&self, file: usize, side: DiffSide, ix: usize) -> DiffLinePosition {
-        let document = &self.files[file];
-        DiffLinePosition::new(
-            document.path().clone(),
-            side,
-            document.line_number(side, ix),
-        )
-    }
-
     fn file_ix(&self, path: &str) -> Option<usize> {
         self.file_ixs.get(path).copied()
     }
@@ -1241,10 +929,7 @@ impl DiffState {
                 .map(|ix| lines[ix].line_number())
         };
         if range.is_single_side() {
-            let (start, end) = (
-                range.start().min(range.end()),
-                range.start().max(range.end()),
-            );
+            let (start, end) = range.ordered();
             let start = first_at_or_after(range.side(), start)?;
             let end = last_at_or_before(range.side(), end)?;
             return (start <= end)
@@ -1260,11 +945,14 @@ impl DiffState {
         )
     }
 
-    fn selection_is_local(&self, cx: &App) -> bool {
+    /// The text selection's snapshot, if it is anchored in this state.
+    fn local_snapshot(&self, cx: &App) -> Option<TextSelectionSnapshot> {
         let entity = Some(self.selection.entity_id());
-        self.selection
-            .snapshot(cx)
-            .is_some_and(|snapshot| snapshot.anchor().entity_id() == entity)
+        (self.selection.snapshot(cx)).filter(|snapshot| snapshot.anchor().entity_id() == entity)
+    }
+
+    fn selection_is_local(&self, cx: &App) -> bool {
+        self.local_snapshot(cx).is_some()
     }
 
     /// The file and side that keyboard selection and Select All act on.
@@ -1301,24 +989,18 @@ impl DiffState {
         self.source_row(position)
     }
 
-    /// Selects from `anchor` to `cursor` in one file and reports a change.
+    /// Selects from `anchor` to `cursor` in one file.
     fn select_user_range(
         &mut self,
         anchor: DiffLinePosition,
         cursor: DiffLinePosition,
         cx: &mut Context<Self>,
-    ) -> DiffLineRange {
-        let range = range_between(&anchor, &cursor);
-        let changed = self.selected_lines.as_ref() != Some(&range);
-        self.selected_lines = Some(range.clone());
+    ) {
+        self.selected_lines = Some(range_between(&anchor, &cursor));
         self.selection_anchor = Some(anchor);
         self.selection_cursor = Some(cursor);
         self.selection.set_local_selection(true, cx);
-        if changed {
-            cx.emit(DiffEvent::SelectionChanged(Some(range.clone())));
-        }
         cx.notify();
-        range
     }
 
     fn move_change(&mut self, forward: bool, cx: &mut Context<Self>) {
@@ -1363,8 +1045,8 @@ impl DiffState {
         let file = row.file();
         let pair_position = |original: Option<usize>, modified: Option<usize>| {
             modified
-                .map(|ix| self.position(file, DiffSide::Modified, ix))
-                .or_else(|| original.map(|ix| self.position(file, DiffSide::Original, ix)))
+                .map(|ix| self.files[file].position(DiffSide::Modified, ix))
+                .or_else(|| original.map(|ix| self.files[file].position(DiffSide::Original, ix)))
         };
         match row {
             DisplayRow::Code {
@@ -1374,10 +1056,7 @@ impl DiffState {
                 .pairs()
                 .get(pairs.start)
                 .and_then(|pair| pair_position(pair.original(), pair.modified())),
-            DisplayRow::File(_)
-            | DisplayRow::Notice(_)
-            | DisplayRow::Hunk { .. }
-            | DisplayRow::Conflict { .. } => self
+            DisplayRow::File(_) | DisplayRow::Notice(_) | DisplayRow::Hunk { .. } => self
                 .rows
                 .get(ix + 1)
                 .filter(|next| next.file() == file)
@@ -1428,7 +1107,13 @@ impl DiffState {
     /// measured heights of unchanged rows survive disclosure changes. Returns the old rows
     /// replaced.
     fn rebuild(&mut self, reset: bool) -> Range<usize> {
-        let rows = self.project_rows();
+        let rows = project_rows(
+            &self.files,
+            &self.collapsed,
+            self.mode,
+            self.context_lines,
+            &self.expanded,
+        );
         self.file_rows = source_rows(&self.files, &rows);
         self.change_rows = changed_groups(&rows);
         self.header_rows = rows
@@ -1458,52 +1143,6 @@ impl DiffState {
         spliced
     }
 
-    fn project_rows(&self) -> Vec<DisplayRow> {
-        let mut rows = Vec::new();
-        for (ix, file) in self.files.iter().enumerate() {
-            rows.push(DisplayRow::File(ix));
-            if self.collapsed.contains(file.path()) {
-                continue;
-            }
-            if file.pairs().is_empty() {
-                rows.push(DisplayRow::Notice(ix));
-            } else if file.status() == DiffFileStatus::Unchanged {
-                rows.extend((0..file.pairs().len()).map(|line| DisplayRow::Code {
-                    file: ix,
-                    original: None,
-                    modified: Some(line),
-                    changed: false,
-                }));
-            } else if file.status() == DiffFileStatus::Conflicted {
-                let resolutions = (0..file.conflicts().len())
-                    .map(|conflict| {
-                        self.resolutions
-                            .get(&(file.path().clone(), conflict))
-                            .copied()
-                    })
-                    .collect::<Vec<_>>();
-                let visible = visible_pairs(
-                    file,
-                    self.context_lines,
-                    self.min_collapsed_lines,
-                    &self.expanded[ix],
-                );
-                project_conflicts(&mut rows, ix, file, &visible, &resolutions);
-            } else {
-                project_file(
-                    &mut rows,
-                    ix,
-                    file,
-                    self.mode,
-                    self.context_lines,
-                    self.min_collapsed_lines,
-                    &self.expanded[ix],
-                );
-            }
-        }
-        rows
-    }
-
     /// Applies the row-height hint again once the list has laid out at a new
     /// width. Returns whether it did, so the frame must be laid out again.
     ///
@@ -1530,10 +1169,15 @@ impl DiffState {
         }
     }
 
-    /// Discards prepared emphasis after files or options change.
+    /// Discards prepared emphasis after files change.
     fn reset_presentation(&mut self) {
         self.presentations = vec![None; self.files.len()];
         self.stale_presentations.clear();
+        self.cancel_presentation();
+    }
+
+    /// Stops a preparation in flight, so it never installs its results.
+    fn cancel_presentation(&mut self) {
         self.presentation_generation += 1;
         self.preparing = None;
         self._presentation = Task::ready(());
@@ -1559,7 +1203,6 @@ impl DiffState {
         if pending.is_empty() {
             return;
         }
-        let options = self.presentation_options;
         self.preparing = Some(generation);
         self._presentation = cx.spawn(async move |this, cx| {
             let mut highlighters = Some(SyntaxHighlighters::default());
@@ -1569,7 +1212,7 @@ impl DiffState {
                     .background_spawn(async move {
                         let presentation = FilePresentation::prepare(
                             &file,
-                            options,
+                            PRESENTATION_OPTIONS,
                             moved.get_or_insert_default(),
                         );
                         (presentation, moved)
@@ -1623,59 +1266,6 @@ fn file_ixs(files: &[DiffFile]) -> HashMap<SharedString, usize> {
     ixs
 }
 
-/// Every source line maps to its code row or the disclosure hiding it; lines
-/// of a collapsed file have no row. Disjoint folds visit each pair once, so
-/// building the maps is linear.
-fn source_rows(files: &[DiffFile], rows: &[DisplayRow]) -> Vec<FileRows> {
-    let mut file_rows = files
-        .iter()
-        .map(|file| FileRows {
-            original: vec![None; file.lines_count(DiffSide::Original)],
-            modified: vec![None; file.lines_count(DiffSide::Modified)],
-        })
-        .collect::<Vec<_>>();
-    for (row_ix, row) in rows.iter().enumerate() {
-        let mut map = |file: usize, original: Option<usize>, modified: Option<usize>| {
-            if let Some(line) = original {
-                file_rows[file].original[line] = Some(row_ix);
-            }
-            if let Some(line) = modified {
-                file_rows[file].modified[line] = Some(row_ix);
-            }
-        };
-        match row {
-            DisplayRow::Code {
-                file,
-                original,
-                modified,
-                ..
-            } => map(*file, *original, *modified),
-            DisplayRow::Fold { file, pairs } => {
-                for pair in &files[*file].pairs()[pairs.clone()] {
-                    map(*file, pair.original(), pair.modified());
-                }
-            }
-            DisplayRow::File(_)
-            | DisplayRow::Notice(_)
-            | DisplayRow::Hunk { .. }
-            | DisplayRow::Conflict { .. } => {}
-        }
-    }
-    file_rows
-}
-
-fn changed_groups(rows: &[DisplayRow]) -> Vec<usize> {
-    let changed = |row: &DisplayRow| matches!(row, DisplayRow::Code { changed: true, .. });
-    rows.iter()
-        .enumerate()
-        .filter_map(|(ix, row)| {
-            (changed(row)
-                && (ix == 0 || !changed(&rows[ix - 1]) || rows[ix - 1].file() != row.file()))
-            .then_some(ix)
-        })
-        .collect()
-}
-
 const SIDE_BIT: u64 = 1 << 40;
 const OFFSET_MASK: u64 = SIDE_BIT - 1;
 
@@ -1699,231 +1289,6 @@ pub(crate) fn decode_key(key: u64) -> (usize, DiffSide, usize) {
         },
         (key & OFFSET_MASK) as usize,
     )
-}
-
-/// The end of the hunk containing each pair; a fixture without hunks is one.
-fn hunk_ends(document: &DiffFile) -> Vec<usize> {
-    let pairs = document.pairs();
-    let mut hunk_end = vec![pairs.len(); pairs.len()];
-    for hunk in document.hunks() {
-        hunk_end[hunk.pairs()].fill(hunk.pairs().end);
-    }
-    hunk_end
-}
-
-/// Which pairs show as code: changes with their context, expanded ranges,
-/// and collapsed ranges shorter than `min_collapsed_lines`.
-fn visible_pairs(
-    document: &DiffFile,
-    context: Option<usize>,
-    min_collapsed_lines: usize,
-    expanded: &[Range<usize>],
-) -> Vec<bool> {
-    let pairs = document.pairs();
-    let hunks = document.hunks();
-    let mut hunk_end = vec![pairs.len(); pairs.len()];
-    let mut hunk_start = vec![0; pairs.len()];
-    for hunk in hunks {
-        hunk_start[hunk.pairs()].fill(hunk.pairs().start);
-        hunk_end[hunk.pairs()].fill(hunk.pairs().end);
-    }
-    // Interval boundaries avoid repeatedly filling overlapping context windows.
-    // Projection remains linear in source lines plus the number of disclosures.
-    let mut boundaries = vec![0isize; pairs.len() + 1];
-    if let Some(context) = context {
-        let mut ix = 0;
-        while ix < pairs.len() {
-            if !pairs[ix].is_changed() {
-                ix += 1;
-                continue;
-            }
-            let start = ix;
-            while ix < pairs.len() && ix < hunk_end[start] && pairs[ix].is_changed() {
-                ix += 1;
-            }
-            boundaries[start.saturating_sub(context).max(hunk_start[start])] += 1;
-            boundaries[ix.saturating_add(context).min(hunk_end[start])] -= 1;
-        }
-    } else {
-        boundaries[0] += 1;
-        boundaries[pairs.len()] -= 1;
-    }
-    for range in expanded {
-        let start = range.start.min(pairs.len());
-        let end = range.end.min(pairs.len());
-        if start < end {
-            boundaries[start] += 1;
-            boundaries[end] -= 1;
-        }
-    }
-    let mut active = 0;
-    let mut visible = boundaries[..pairs.len()]
-        .iter()
-        .map(|boundary| {
-            active += boundary;
-            active > 0
-        })
-        .collect::<Vec<_>>();
-    // A disclosure shorter than the threshold would hide almost nothing.
-    let mut ix = 0;
-    while ix < pairs.len() {
-        if visible[ix] {
-            ix += 1;
-            continue;
-        }
-        let start = ix;
-        while ix < pairs.len() && ix < hunk_end[start] && !visible[ix] {
-            ix += 1;
-        }
-        if ix - start < min_collapsed_lines {
-            visible[start..ix].fill(true);
-        }
-    }
-    visible
-}
-
-fn project_file(
-    rows: &mut Vec<DisplayRow>,
-    file: usize,
-    document: &DiffFile,
-    mode: DiffMode,
-    context: Option<usize>,
-    min_collapsed_lines: usize,
-    expanded: &[Range<usize>],
-) {
-    let pairs = document.pairs();
-    let hunks = document.hunks();
-    let hunk_end = hunk_ends(document);
-    let visible = visible_pairs(document, context, min_collapsed_lines, expanded);
-    let mut hunk_ix = 0;
-    let mut ix = 0;
-    while ix < pairs.len() {
-        while let Some(hunk) = hunks.get(hunk_ix) {
-            if hunk.pairs().start != ix {
-                break;
-            }
-            rows.push(DisplayRow::Hunk {
-                file,
-                hunk: hunk_ix,
-            });
-            hunk_ix += 1;
-        }
-        if !visible[ix] {
-            let start = ix;
-            while ix < pairs.len() && ix < hunk_end[start] && !visible[ix] {
-                ix += 1;
-            }
-            rows.push(DisplayRow::Fold {
-                file,
-                pairs: start..ix,
-            });
-        } else if mode == DiffMode::Unified && pairs[ix].is_changed() {
-            let start = ix;
-            while ix < pairs.len() && ix < hunk_end[start] && pairs[ix].is_changed() {
-                ix += 1;
-            }
-            for pair in &pairs[start..ix] {
-                if let Some(original) = pair.original() {
-                    rows.push(DisplayRow::Code {
-                        file,
-                        original: Some(original),
-                        modified: None,
-                        changed: true,
-                    });
-                }
-            }
-            for pair in &pairs[start..ix] {
-                if let Some(modified) = pair.modified() {
-                    rows.push(DisplayRow::Code {
-                        file,
-                        original: None,
-                        modified: Some(modified),
-                        changed: true,
-                    });
-                }
-            }
-        } else {
-            let pair = pairs[ix];
-            rows.push(DisplayRow::Code {
-                file,
-                original: pair.original(),
-                modified: pair.modified(),
-                changed: pair.is_changed(),
-            });
-            ix += 1;
-        }
-    }
-}
-
-/// Projects a conflicted working file: shared lines fold like context, and
-/// each conflict shows its parts, or only the kept lines once resolved.
-fn project_conflicts(
-    rows: &mut Vec<DisplayRow>,
-    file: usize,
-    document: &DiffFile,
-    visible: &[bool],
-    resolutions: &[Option<DiffConflictResolution>],
-) {
-    // Each line of a conflicted file is its own pair.
-    let code = |line: usize, changed: bool| DisplayRow::Code {
-        file,
-        original: None,
-        modified: Some(line),
-        changed,
-    };
-    let conflicts = document.conflicts();
-    let mut next = 0;
-    let mut ix = 0;
-    while ix < visible.len() {
-        if let Some(conflict) = conflicts.get(next)
-            && conflict.source_lines().start == ix
-        {
-            match resolutions[next] {
-                None => {
-                    for part in [
-                        ConflictPart::Current,
-                        ConflictPart::Base,
-                        ConflictPart::Incoming,
-                    ] {
-                        if let Some(lines) = conflict.part(part) {
-                            rows.push(DisplayRow::Conflict {
-                                file,
-                                conflict: next,
-                                part,
-                            });
-                            rows.extend(lines.map(|line| code(line, true)));
-                        }
-                    }
-                }
-                Some(resolution) => {
-                    rows.push(DisplayRow::Conflict {
-                        file,
-                        conflict: next,
-                        part: ConflictPart::Current,
-                    });
-                    for lines in conflict.kept(resolution) {
-                        rows.extend(lines.map(|line| code(line, false)));
-                    }
-                }
-            }
-            ix = conflict.source_lines().end;
-            next += 1;
-            continue;
-        }
-        if visible[ix] {
-            rows.push(code(ix, false));
-            ix += 1;
-            continue;
-        }
-        let start = ix;
-        while ix < visible.len() && !visible[ix] {
-            ix += 1;
-        }
-        rows.push(DisplayRow::Fold {
-            file,
-            pairs: start..ix,
-        });
-    }
 }
 
 /// The lines of `side` that source bytes `range` touch.

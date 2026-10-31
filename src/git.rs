@@ -1,14 +1,16 @@
 use crate::state::{Repo, Workspace, WsRepo};
 mod changes;
+mod copy;
 pub mod history;
+use copy::{copy_included, untracked_fingerprint};
+#[cfg(test)]
+mod tests;
 pub use changes::{discard_file, uncommitted_files};
 use std::{
     fs,
-    io::{self, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt},
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
-    process::{Command, Output, Stdio},
-    time::Duration,
+    process::{Command, Output},
 };
 
 pub fn run(dir: &Path, prog: &str, args: &[&str]) -> Result<Output, String> {
@@ -16,30 +18,22 @@ pub fn run(dir: &Path, prog: &str, args: &[&str]) -> Result<Output, String> {
         .current_dir(dir)
         .args(args)
         .output()
-        .map_err(|e| spawn_err(dir, prog, e))
+        .map_err(|e| crate::proc::spawn_err(dir, prog, e))
 }
 
-/// A missing program reads better than `git: No such file or directory`. `dir` is checked
-/// because a missing working directory fails the same way.
-pub(crate) fn spawn_err(dir: &Path, prog: &str, e: std::io::Error) -> String {
-    match e.kind() == std::io::ErrorKind::NotFound && dir.is_dir() {
-        true => format!("{prog} not found on PATH"),
-        false => format!("{prog}: {e}"),
-    }
+pub(crate) fn finish(prog: &str, args: &[&str], out: Output) -> Result<String, String> {
+    finish_bytes(prog, args, out).map(|b| String::from_utf8_lossy(&b).trim().to_string())
 }
 
-fn failed(prog: &str, args: &[&str], out: &Output) -> String {
-    format!(
-        "{prog} {}: {}",
-        args.join(" "),
-        String::from_utf8_lossy(&out.stderr).trim()
-    )
-}
-
-fn finish(prog: &str, args: &[&str], out: Output) -> Result<String, String> {
-    match out.status.success() {
-        true => Ok(String::from_utf8_lossy(&out.stdout).trim().to_string()),
-        false => Err(failed(prog, args, &out)),
+fn finish_bytes(prog: &str, args: &[&str], out: Output) -> Result<Vec<u8>, String> {
+    if out.status.success() {
+        Ok(out.stdout)
+    } else {
+        Err(format!(
+            "{prog} {}: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        ))
     }
 }
 
@@ -47,7 +41,7 @@ fn finish(prog: &str, args: &[&str], out: Output) -> Result<String, String> {
 /// after `secs` so a hung fetch or gh can't stall whoever waits on it.
 pub fn cmd_bounded(dir: &Path, prog: &str, args: &[&str], secs: u64) -> Result<String, String> {
     let mut c = Command::new(if prog == "gh" {
-        crate::pr::gh()
+        crate::proc::gh()
     } else {
         prog.into()
     });
@@ -65,83 +59,7 @@ pub fn cmd_bounded(dir: &Path, prog: &str, args: &[&str], secs: u64) -> Result<S
     }
     c.env("GIT_TERMINAL_PROMPT", "0")
         .env("GH_PROMPT_DISABLED", "1");
-    wait_bounded(c, dir, prog, args, secs, false)
-}
-
-/// Runs `c` like `cmd_bounded`. With `group` it gets its own session (and process group), all
-/// of which a timeout kills: a shell's children would otherwise hold stdout open and the waiter
-/// with it. A session, not just a group: an interactive shell in a background group of the
-/// terminal Shark was started from stops on SIGTTOU.
-pub fn wait_bounded(
-    c: Command,
-    dir: &Path,
-    prog: &str,
-    args: &[&str],
-    secs: u64,
-    group: bool,
-) -> Result<String, String> {
-    finish(prog, args, wait_output(c, dir, prog, args, secs, group)?)
-}
-
-/// Like `git`, but stdout stays raw bytes (blobs are binary) and a hung process is killed after
-/// `secs`.
-pub fn git_bytes(dir: &Path, args: &[&str], secs: u64) -> Result<Vec<u8>, String> {
-    let mut c = Command::new("git");
-    c.env("GIT_TERMINAL_PROMPT", "0");
-    let out = wait_output(c, dir, "git", args, secs, false)?;
-    match out.status.success() {
-        true => Ok(out.stdout),
-        false => Err(failed("git", args, &out)),
-    }
-}
-
-fn wait_output(
-    mut c: Command,
-    dir: &Path,
-    prog: &str,
-    args: &[&str],
-    secs: u64,
-    group: bool,
-) -> Result<Output, String> {
-    if group {
-        unsafe extern "C" {
-            fn setsid() -> i32;
-        }
-        // SAFETY: setsid is async-signal-safe; it fails only for a group leader, which a
-        // freshly forked child isn't.
-        unsafe {
-            std::os::unix::process::CommandExt::pre_exec(&mut c, || {
-                setsid();
-                Ok(())
-            })
-        };
-    }
-    let child = c
-        .current_dir(dir)
-        .args(args)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|e| spawn_err(dir, prog, e))?;
-    let pid = child.id();
-    let (tx, rx) = std::sync::mpsc::channel();
-    // wait_with_output drains both pipes, so a big gh response can't fill one and deadlock.
-    std::thread::spawn(move || tx.send(child.wait_with_output()));
-    match rx.recv_timeout(Duration::from_secs(secs)) {
-        Ok(out) => out.map_err(|e| format!("{prog}: {e}")),
-        Err(_) => {
-            // The waiting thread reaps it. An interactive shell ignores TERM.
-            match group {
-                true => kill("-KILL", &format!("-{pid}")),
-                false => term(pid),
-            }
-            Err(format!(
-                "{prog} {}: timed out after {secs}s",
-                args.join(" ")
-            ))
-        }
-    }
+    crate::proc::wait_bounded(c, dir, prog, args, secs, false)
 }
 
 /// Runs git, returning trimmed stdout, or stderr as the error on non-zero exit.
@@ -149,12 +67,31 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
     finish("git", args, run(dir, "git", args)?)
 }
 
-pub fn term(pid: u32) {
-    kill("-TERM", &pid.to_string())
+/// Runs git, returning stdout untouched (no trim, any bytes), or stderr as the error.
+pub fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
+    finish_bytes("git", args, run(dir, "git", args)?)
 }
 
-fn kill(sig: &str, target: &str) {
-    let _ = Command::new("kill").args([sig, "--", target]).status();
+/// Like `git_bytes`, but a hung process is killed after `secs`.
+pub fn git_bytes_bounded(dir: &Path, args: &[&str], secs: u64) -> Result<Vec<u8>, String> {
+    let mut c = Command::new("git");
+    c.env("GIT_TERMINAL_PROMPT", "0");
+    finish_bytes(
+        "git",
+        args,
+        crate::proc::wait_output(c, dir, "git", args, secs, false)?,
+    )
+}
+
+/// Commits with a fixed identity; `extra` is the rest of the `commit` args. Returns git's output.
+#[cfg(test)]
+pub fn commit(dir: &Path, extra: &[&str]) -> String {
+    let args = [
+        &["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q"][..],
+        extra,
+    ]
+    .concat();
+    git(dir, &args).unwrap()
 }
 
 /// Uncommitted changes; `Err` when `git status` fails.
@@ -190,11 +127,17 @@ pub fn add_repo(path: &Path, existing: &[Repo]) -> Result<Repo, String> {
     Ok(Repo { name, path: root })
 }
 
+/// The trunk to compare against, or empty when unknown.
 pub(crate) fn default_base(src: &Path) -> String {
     git(
         src,
         &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"],
     )
+    // `fetch --prune` after a remote rename leaves origin/HEAD pointing at a deleted ref.
+    .and_then(|b| match has_ref(src, &format!("refs/remotes/{b}")) {
+        true => Ok(b),
+        false => Err(String::new()),
+    })
     // Only clone sets origin/HEAD; `git init` + `remote add` leaves it unset.
     .or_else(|_| {
         ["origin/main", "origin/master"]
@@ -203,8 +146,8 @@ pub(crate) fn default_base(src: &Path) -> String {
             .map(String::from)
             .ok_or_else(String::new)
     })
-    .or_else(|_| git(src, &["rev-parse", "--abbrev-ref", "HEAD"]))
-    .unwrap_or_else(|_| "HEAD".into())
+    // Empty when unknown: the current branch is no trunk (in a worktree it is the workspace's own).
+    .unwrap_or_default()
 }
 
 /// `branch` is the workspace's own; each repo comes with the branch it gets, usually the same.
@@ -246,7 +189,7 @@ pub fn create_workspace_with_prs(
     }
     // Every repo is checked (and fetched) before any worktree is added, so a refusal in one
     // repo leaves nothing behind in the others.
-    let plans = par_map(repos, |(r, b)| {
+    let plans = crate::proc::par_map(repos, |(r, b)| {
         match prs.iter().find(|(name, _)| name == &r.name) {
             Some((_, pr)) => plan_pr_worktree(b, r, pr),
             None => {
@@ -261,7 +204,7 @@ pub fn create_workspace_with_prs(
         .map_err(|e| e.to_string())?;
     fs::create_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let root_identity = fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
-    let attempts = par_map(repos.iter().zip(&plans), |((r, b), p)| {
+    let attempts = crate::proc::par_map(repos.iter().zip(&plans), |((r, b), p)| {
         let mut owned = OwnedWorktree::default();
         let result = add_worktree(dir, b, r, p, &mut owned).map(|w| WsRepo {
             branch: (b != branch).then(|| b.clone()),
@@ -338,6 +281,17 @@ pub struct Branch {
     pub checked_out: Option<String>,
 }
 
+/// The worktree with `branch` checked out. A deleted worktree directory (prunable) no longer
+/// holds its branch.
+fn holder<'a>(wts: &'a [(String, Vec<String>)], branch: &str) -> Option<&'a str> {
+    let head = format!("branch refs/heads/{branch}");
+    (wts.iter())
+        .find(|(_, attrs)| {
+            attrs.contains(&head) && !attrs.iter().any(|l| l.starts_with("prunable"))
+        })
+        .map(|(p, _)| p.as_str())
+}
+
 /// `src`'s local and origin branches, most recent commit first, as of the last fetch.
 pub fn branches(src: &Path) -> Result<Vec<Branch>, String> {
     let wts = worktree_list(src)?;
@@ -367,40 +321,25 @@ pub fn branches(src: &Path) -> Result<Vec<Branch>, String> {
             b.origin |= !local;
             continue;
         }
-        let head = format!("branch refs/heads/{name}");
         seen.insert(name, out.len());
         out.push(Branch {
             name: name.into(),
             local,
             origin: !local,
-            checked_out: (wts.iter().find(|(_, attrs)| attrs.contains(&head)))
-                .map(|(p, _)| p.clone()),
+            checked_out: holder(&wts, name).map(String::from),
         });
     }
     Ok(out)
 }
 
 /// NUL-separated `git ls-files -z` output; avoids git's quoting of unusual filenames.
-pub fn ls_files(dir: &Path, args: &[&str]) -> Vec<String> {
-    let out = run(dir, "git", &[&["ls-files", "-z"], args].concat())
-        .map(|o| o.stdout)
-        .unwrap_or_default();
-    out.split(|b| *b == 0)
+pub fn ls_files(dir: &Path, args: &[&str]) -> Result<Vec<String>, String> {
+    let out = git_bytes(dir, &[&["ls-files", "-z"], args].concat())?;
+    Ok(out
+        .split(|b| *b == 0)
         .filter(|f| !f.is_empty())
         .map(|f| String::from_utf8_lossy(f).into_owned())
-        .collect()
-}
-
-/// Runs `f` on every item on its own thread; results in input order.
-pub(crate) fn par_map<T: Send, R: Send>(
-    items: impl IntoIterator<Item = T>,
-    f: impl Fn(T) -> R + Sync,
-) -> Vec<R> {
-    let f = &f;
-    std::thread::scope(|s| {
-        let jobs: Vec<_> = items.into_iter().map(|i| s.spawn(move || f(i))).collect();
-        jobs.into_iter().map(|j| j.join().unwrap()).collect()
-    })
+        .collect())
 }
 
 /// `origin/*` branches of `dir` as `(commit time, origin/name)`, newest first.
@@ -449,8 +388,14 @@ pub fn base_choices(repos: &[RepoBranches]) -> Vec<(String, Vec<String>)> {
     out
 }
 
-fn has_ref(dir: &Path, rf: &str) -> bool {
-    git(dir, &["rev-parse", "--verify", "--quiet", rf]).is_ok()
+/// Whether `rf` resolves in `dir`.
+pub(crate) fn has_ref(dir: &Path, rf: &str) -> bool {
+    ref_oid(dir, rf).is_some()
+}
+
+/// The commit `rf` resolves to in `dir`, if any.
+pub(crate) fn ref_oid(dir: &Path, rf: &str) -> Option<String> {
+    git(dir, &["rev-parse", "--verify", "--quiet", rf]).ok()
 }
 
 struct Plan {
@@ -464,14 +409,23 @@ struct Plan {
     tip: Option<String>,
 }
 
+impl Plan {
+    fn new(base: String, from: Option<String>) -> Self {
+        Plan {
+            base,
+            from,
+            pr_url: None,
+            tip: None,
+        }
+    }
+}
+
 /// Checks a repo can take the branch and decides where it starts. Fetches, so it blocks.
 /// With a `parent` branch, a new branch starts on it and the base is `origin/<parent>`.
 fn plan_worktree(branch: &str, r: &Repo, parent: Option<&str>) -> Result<Plan, String> {
-    let head = format!("branch refs/heads/{branch}");
-    if let Some((path, _)) = worktree_list(&r.path)?
-        .iter()
-        .find(|(_, attrs)| attrs.contains(&head))
-    {
+    // A workspace dir deleted by hand leaves a worktree entry that still claims its branch.
+    let _ = git(&r.path, &["worktree", "prune"]);
+    if let Some(path) = holder(&worktree_list(&r.path)?, branch) {
         return Err(format!(
             "{}: branch `{branch}` is already checked out at {path}",
             r.name
@@ -486,41 +440,30 @@ fn plan_worktree(branch: &str, r: &Repo, parent: Option<&str>) -> Result<Plan, S
         30,
     )
     .is_ok();
-    let base = match parent {
-        Some(p) => format!("origin/{p}"),
-        None => default_base(&r.path),
-    };
+    let (local, remote) = (
+        format!("refs/heads/{branch}"),
+        format!("refs/remotes/origin/{branch}"),
+    );
+    let (has_local, has_remote) = (has_ref(&r.path, &local), has_ref(&r.path, &remote));
     if let Some(p) = parent {
         // An existing branch has its own history, not the parent's.
-        let exists = |rf: String| has_ref(&r.path, &rf);
-        if exists(format!("refs/heads/{branch}")) || exists(format!("refs/remotes/origin/{branch}"))
-        {
+        if has_local || has_remote {
             return Err(format!(
                 "{}: `{branch}` already exists; stacking on `{p}` needs a new branch name",
                 r.name
             ));
         }
-        let from = parent_start(r, p)?;
-        let tip = git(&r.path, &["rev-parse", &from])?;
-        return Ok(Plan {
-            base,
-            from: Some(from),
-            pr_url: None,
-            tip: Some(tip),
-        });
+        return plan_stacked(r, p);
     }
-    let from = match (
-        has_ref(&r.path, &format!("refs/heads/{branch}")),
-        has_ref(&r.path, &format!("refs/remotes/origin/{branch}")),
-    ) {
+    let base = Some(default_base(&r.path))
+        .filter(|b| !b.is_empty())
+        .or_else(|| git(&r.path, &["rev-parse", "--abbrev-ref", "HEAD"]).ok())
+        .unwrap_or_else(|| "HEAD".into());
+    let from = match (has_local, has_remote) {
         (true, true) => {
             // Behind origin with nothing of its own: catch up first. Nothing has it checked out
             // (see above). Diverged keeps local; the git button offers "Sync with remote".
-            let (local, remote) = (
-                format!("refs/heads/{branch}"),
-                format!("refs/remotes/origin/{branch}"),
-            );
-            if let Ok(old) = git(&r.path, &["rev-parse", &local])
+            if let Some(old) = ref_oid(&r.path, &local)
                 && git(&r.path, &["merge-base", "--is-ancestor", &local, &remote]).is_ok()
             {
                 let _ = git(&r.path, &["update-ref", &local, &remote, &old]);
@@ -532,17 +475,7 @@ fn plan_worktree(branch: &str, r: &Repo, parent: Option<&str>) -> Result<Plan, S
         // is unpushed work and is reused. Only refused when origin answered: offline or
         // without origin, a local branch is all there is.
         (true, false)
-            if fetched
-                && git(
-                    &r.path,
-                    &[
-                        "merge-base",
-                        "--is-ancestor",
-                        &format!("refs/heads/{branch}"),
-                        &base,
-                    ],
-                )
-                .is_ok() =>
+            if fetched && git(&r.path, &["merge-base", "--is-ancestor", &local, &base]).is_ok() =>
         {
             return Err(format!(
                 "{}: a local branch `{branch}` exists that origin doesn't have and is already merged into {base} (left from an archived workspace?). Pick another name, or rename it: git -C {} branch -m {branch} {branch}-old",
@@ -554,11 +487,16 @@ fn plan_worktree(branch: &str, r: &Repo, parent: Option<&str>) -> Result<Plan, S
         (false, true) => Some(format!("origin/{branch}")),
         (false, false) => Some(base.clone()),
     };
+    Ok(Plan::new(base, from))
+}
+
+/// A new branch stacked on `p`: it starts on `origin/<p>`, which is also its base.
+fn plan_stacked(r: &Repo, p: &str) -> Result<Plan, String> {
+    let from = parent_start(r, p)?;
+    let tip = git(&r.path, &["rev-parse", &from])?;
     Ok(Plan {
-        base,
-        from,
-        pr_url: None,
-        tip: None,
+        tip: Some(tip),
+        ..Plan::new(format!("origin/{p}"), Some(from))
     })
 }
 
@@ -604,38 +542,29 @@ fn pr_remote(src: &Path, pr: &PullRequest) -> Result<String, String> {
             "Pull request base is missing; refresh pull requests and select it again".into(),
         );
     }
-    let path = pr
-        .url
-        .strip_prefix("https://")
+    let t = crate::pr::git_feature::Target::from_url(&pr.url)
+        .ok()
+        .filter(|t| t.number == pr.number)
         .ok_or("Invalid pull request URL")?;
-    let parts: Vec<_> = path.split('/').collect();
-    if parts.len() != 5
-        || parts[3] != "pull"
-        || parts[4].parse::<u64>().ok() != Some(pr.number)
-        || pr.number == 0
-        || parts[..3].iter().any(|p| {
-            p.is_empty()
-                || !p
-                    .bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b".-_:".contains(&b))
-        })
-    {
-        return Err("Invalid pull request URL".into());
-    }
     git(
         src,
         &["check-ref-format", &format!("refs/heads/{}", pr.base)],
     )?;
-    let repo = format!("{}/{}", parts[1], parts[2]);
-    let remote = format!("https://{}/{repo}.git", parts[0]);
+    let (host, repo) = (&t.host, format!("{}/{}", t.owner, t.repo));
+    let remote = format!("https://{host}/{repo}.git");
     let origin = git(src, &["remote", "get-url", "origin"]).unwrap_or_default();
-    let origin = origin.trim_end_matches('/').trim_end_matches(".git");
+    // GitHub owners and repo names are case-insensitive.
+    let origin = origin
+        .trim_end_matches('/')
+        .trim_end_matches(".git")
+        .to_ascii_lowercase();
     let matching_origin = [
-        format!("https://{}/{repo}", parts[0]),
-        format!("git@{}:{repo}", parts[0]),
-        format!("ssh://git@{}/{repo}", parts[0]),
+        format!("https://{host}/{repo}"),
+        format!("git@{host}:{repo}"),
+        format!("ssh://git@{host}/{repo}"),
     ]
-    .contains(&origin.to_string());
+    .iter()
+    .any(|c| c.to_ascii_lowercase() == origin);
     Ok(if matching_origin {
         "origin".into()
     } else {
@@ -689,10 +618,8 @@ fn plan_pr_worktree(branch: &str, r: &Repo, pr: &PullRequest) -> Result<Plan, St
         &["rev-parse", "--verify", &format!("{head}^{{commit}}")],
     )?;
     Ok(Plan {
-        base,
-        from: Some(from),
         pr_url: Some(pr.url.clone()),
-        tip: None,
+        ..Plan::new(base, Some(from))
     })
 }
 
@@ -750,36 +677,6 @@ fn add_worktree(
     })
 }
 
-fn untracked_fingerprint(wt: &Path, copied: &[String]) -> Result<u64, String> {
-    use std::hash::{Hash, Hasher};
-    let mut hash = std::collections::hash_map::DefaultHasher::new();
-    let output = run(wt, "git", &["ls-files", "-z", "--others"])?;
-    if !output.status.success() {
-        return Err("Cannot inspect untracked files".into());
-    }
-    let output = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
-    let paths: Vec<_> = output.split('\0').filter(|p| !p.is_empty()).collect();
-    if paths.len() != copied.len() || paths.iter().any(|p| !copied.iter().any(|c| c == p)) {
-        return Err("The worktree contains files this operation did not create".into());
-    }
-    for path in paths {
-        path.hash(&mut hash);
-        let path = wt.join(path);
-        let metadata = fs::symlink_metadata(&path).map_err(|e| e.to_string())?;
-        (metadata.dev(), metadata.ino(), metadata.mode()).hash(&mut hash);
-        if metadata.file_type().is_symlink() {
-            fs::read_link(path)
-                .map_err(|e| e.to_string())?
-                .hash(&mut hash);
-        } else if metadata.is_file() {
-            fs::read(path).map_err(|e| e.to_string())?.hash(&mut hash);
-        } else {
-            return Err(format!("Unexpected untracked file: {}", path.display()));
-        }
-    }
-    Ok(hash.finish())
-}
-
 fn rollback_error(error: String, remaining: Vec<String>) -> String {
     if remaining.is_empty() {
         error
@@ -804,8 +701,7 @@ fn undo_worktree(dir: &Path, branch: &str, r: &Repo, owned: &OwnedWorktree) -> V
     }
     if let Some(commit) = &owned.branch {
         let reference = format!("refs/heads/{branch}");
-        let unchecked = git(&r.path, &["worktree", "list", "--porcelain"])
-            .is_ok_and(|list| !list.lines().any(|l| l == format!("branch {reference}")));
+        let unchecked = worktree_list(&r.path).is_ok_and(|wts| holder(&wts, branch).is_none());
         if !unchecked || git(&r.path, &["update-ref", "-d", &reference, commit]).is_err() {
             remaining.push(format!("{}:{reference}", r.path.display()));
         } else if !has_ref(&r.path, &reference) {
@@ -818,117 +714,6 @@ fn undo_worktree(dir: &Path, branch: &str, r: &Repo, owned: &OwnedWorktree) -> V
     remaining
 }
 
-/// Copy gitignored files like `.env` into the new worktree. Patterns come from
-/// `.worktreeinclude` (gitignore syntax), defaulting to `.env*`.
-fn copy_included(src: &Path, wt: &Path) -> Result<Vec<String>, String> {
-    let mut copied_files = Vec::new();
-    let exclude = if src.join(".worktreeinclude").exists() {
-        "--exclude-from=.worktreeinclude".to_string()
-    } else {
-        "--exclude=.env*".to_string()
-    };
-    let ignored = ls_files(src, &["-o", "-i", "--exclude-standard"]);
-    for f in ls_files(src, &["-o", "-i", &exclude])
-        .iter()
-        .filter(|f| ignored.contains(f))
-    {
-        use std::{
-            ffi::CString,
-            os::fd::{AsRawFd, FromRawFd},
-            os::unix::ffi::OsStrExt,
-        };
-        unsafe extern "C" {
-            fn openat(fd: i32, path: *const std::ffi::c_char, flags: i32, ...) -> i32;
-            fn mkdirat(fd: i32, path: *const std::ffi::c_char, mode: u16) -> i32;
-            fn unlinkat(fd: i32, path: *const std::ffi::c_char, flags: i32) -> i32;
-        }
-        // Darwin flags, from sys/fcntl.h. Directory descriptors pin parents across renames.
-        const DIRECTORY_NOFOLLOW: i32 = 0x00100000 | 0x00000100;
-        let to = wt.join(f);
-        if fs::symlink_metadata(&to).is_ok() {
-            continue;
-        }
-        let mut parent = fs::OpenOptions::new()
-            .read(true)
-            .custom_flags(DIRECTORY_NOFOLLOW)
-            .open(wt)
-            .map_err(|e| format!("copy {f}: {e}"))?;
-        for part in Path::new(f).parent().into_iter().flat_map(Path::components) {
-            if !matches!(part, std::path::Component::Normal(_)) {
-                return Err(format!("copy {f}: invalid parent"));
-            }
-            let name = CString::new(part.as_os_str().as_bytes()).map_err(|e| e.to_string())?;
-            // SAFETY: valid directory fd and NUL-terminated single component, no borrowed fd is closed.
-            let fd = unsafe {
-                mkdirat(parent.as_raw_fd(), name.as_ptr(), 0o700);
-                openat(parent.as_raw_fd(), name.as_ptr(), DIRECTORY_NOFOLLOW)
-            };
-            if fd < 0 {
-                return Err(format!(
-                    "copy {f}: unsafe or inaccessible parent: {}",
-                    io::Error::last_os_error()
-                ));
-            }
-            parent = unsafe { fs::File::from_raw_fd(fd) };
-        }
-        if git(wt, &["check-ignore", "-q", "--", f]).is_err()
-            || !git(wt, &["ls-files", "--", f])?.is_empty()
-        {
-            continue;
-        }
-        let leaf = CString::new(
-            Path::new(f)
-                .file_name()
-                .ok_or("Missing file name")?
-                .as_bytes(),
-        )
-        .map_err(|e| e.to_string())?;
-        let mut source = fs::File::open(src.join(f)).map_err(|e| format!("copy {f}: {e}"))?;
-        let metadata = source.metadata().map_err(|e| e.to_string())?;
-        if !metadata.is_file() {
-            continue;
-        }
-        // O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, initially private.
-        let fd = unsafe {
-            openat(
-                parent.as_raw_fd(),
-                leaf.as_ptr(),
-                0x0001 | 0x0200 | 0x0800 | 0x0100,
-                0o600u32,
-            )
-        };
-        if fd < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::AlreadyExists {
-                continue;
-            }
-            return Err(format!("copy {f}: {e}"));
-        }
-        let mut dest = unsafe { fs::File::from_raw_fd(fd) };
-        let identity = dest.metadata().map_err(|e| e.to_string())?;
-        let copied = io::copy(&mut source, &mut dest)
-            .and_then(|_| dest.flush())
-            .and_then(|_| dest.set_permissions(metadata.permissions()));
-        if let Err(e) = copied {
-            let fd = unsafe { openat(parent.as_raw_fd(), leaf.as_ptr(), 0x0100) };
-            if fd >= 0 {
-                let current = unsafe { fs::File::from_raw_fd(fd) };
-                if current
-                    .metadata()
-                    .is_ok_and(|m| m.dev() == identity.dev() && m.ino() == identity.ino())
-                {
-                    unsafe {
-                        unlinkat(parent.as_raw_fd(), leaf.as_ptr(), 0);
-                    }
-                }
-            }
-            return Err(format!("copy {f}: {e}"));
-        }
-        copied_files.push(f.clone());
-    }
-    Ok(copied_files)
-}
-
 /// Rewrites the root CLAUDE.md and AGENTS.md from the workspace's repo list; a failure only
 /// leaves them stale.
 pub fn write_claude_md(ws: &Workspace) {
@@ -939,9 +724,33 @@ pub fn write_claude_md(ws: &Workspace) {
 const ROOT_DOCS: [&str; 2] = ["CLAUDE.md", "AGENTS.md"];
 
 fn write_root_docs(ws: &Workspace, dir: &Path) -> Result<(), String> {
-    fs::write(dir.join("CLAUDE.md"), claude_md(ws, dir))
-        .and_then(|()| fs::write(dir.join("AGENTS.md"), agents_md(ws, dir)))
+    let [claude, agents] = ROOT_DOCS;
+    fs::write(dir.join(claude), claude_md(ws, dir))
+        .and_then(|()| fs::write(dir.join(agents), agents_md(ws, dir)))
         .map_err(|e| e.to_string())
+}
+
+/// What Shark itself leaves in a workspace root: its docs, Finder litter, and the `.context`
+/// folder of attachments.
+fn root_owned() -> [&'static str; 4] {
+    let [claude, agents] = ROOT_DOCS;
+    [claude, agents, ".DS_Store", attachments_parts().0]
+}
+
+fn attachments_parts() -> (&'static str, &'static str) {
+    crate::complete::ATTACHMENTS
+        .split_once('/')
+        .unwrap_or((crate::complete::ATTACHMENTS, ""))
+}
+
+/// Whether `name` in the root is Shark's, not the user's: `.context` only counts while it
+/// holds nothing but attachments (unreadable, or a file, is unexpected: refuse before removing).
+fn shark_owned(dir: &Path, name: &str) -> bool {
+    let (context, attachments) = attachments_parts();
+    root_owned().contains(&name)
+        && (name != context
+            || fs::read_dir(dir.join(name))
+                .is_ok_and(|mut es| es.all(|e| e.is_ok_and(|e| e.file_name() == attachments))))
 }
 
 fn claude_md(ws: &Workspace, dir: &Path) -> String {
@@ -954,14 +763,18 @@ fn claude_md(ws: &Workspace, dir: &Path) -> String {
     s
 }
 
+/// The rules file a repo has, AGENTS.md before CLAUDE.md.
+pub fn rules_file(repo_dir: &Path) -> Option<&'static str> {
+    ["AGENTS.md", "CLAUDE.md"]
+        .into_iter()
+        .find(|f| repo_dir.join(f).exists())
+}
+
 /// Codex has no `@` imports and reads AGENTS.md only from here, so it is pointed at each repo's.
 fn agents_md(ws: &Workspace, dir: &Path) -> String {
     let mut s = header(ws);
     for r in &ws.repos {
-        if let Some(f) = ["AGENTS.md", "CLAUDE.md"]
-            .into_iter()
-            .find(|f| dir.join(&r.name).join(f).exists())
-        {
+        if let Some(f) = rules_file(&dir.join(&r.name)) {
             s += &format!(
                 "- Before working in `{0}/`, read `{0}/{f}`: its instructions apply there.\n",
                 r.name
@@ -1032,7 +845,9 @@ fn remove_blocker(src: &Path, wt: &Path, force: bool) -> Option<&'static str> {
         .then_some("has submodules (force archive removes them)")
 }
 
-pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), String> {
+/// The refusals of `remove_workspace`, without removing anything: callers run it before any
+/// side effect (stopping servers, archive scripts).
+pub fn archive_preflight(ws: &Workspace, dir: &Path, force: bool) -> Result<(), String> {
     // Up front, so a refusal in the second repo can't leave the first one removed.
     let blocked: Vec<String> = ws
         .repos
@@ -1064,15 +879,7 @@ pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), S
             .flatten()
             .flatten()
             .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| !ROOT_DOCS.contains(&n.as_str()) && !ws.repos.iter().any(|r| &r.name == n))
-            // Ours too: `.context` holding only the dropped and pasted files.
-            .filter(|n| {
-                // Unreadable, or a file, counts as unexpected: refuse before removing anything.
-                n != ".context"
-                    || fs::read_dir(dir.join(n)).map_or(true, |mut es| {
-                        es.any(|e| e.map_or(true, |e| e.file_name() != "attachments"))
-                    })
-            })
+            .filter(|n| !ws.repos.iter().any(|r| &r.name == n) && !shark_owned(dir, n))
             .collect();
         if !extra.is_empty() {
             return Err(format!(
@@ -1082,6 +889,11 @@ pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), S
             ));
         }
     }
+    Ok(())
+}
+
+pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), String> {
+    archive_preflight(ws, dir, force)?;
     for r in &ws.repos {
         let wt = dir.join(&r.name);
         let wt_s = wt.to_string_lossy();
@@ -1091,19 +903,27 @@ pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), S
                 args.push("--force");
             }
             args.push(&wt_s);
-            git(&r.src, &args)?;
+            // A moved or deleted source repo can't remove it; forced, the directory goes anyway.
+            if let Err(e) = git(&r.src, &args) {
+                match force {
+                    true => {
+                        fs::remove_dir_all(&wt).map_err(|e| format!("{}: {e}", wt.display()))?
+                    }
+                    false => return Err(e),
+                }
+            }
         }
         let _ = git(&r.src, &["worktree", "prune"]);
     }
     if force {
         let _ = fs::remove_dir_all(dir);
     } else {
-        // Only our generated file may remain; anything else the user must force away.
-        for f in ROOT_DOCS {
-            let _ = fs::remove_file(dir.join(f));
+        // Only our own files may remain; anything else the user must force away. Dropped and
+        // pasted files go too; sent messages may still refer to them until now.
+        for f in root_owned() {
+            let p = dir.join(f);
+            let _ = fs::remove_file(&p).or_else(|_| fs::remove_dir_all(&p));
         }
-        // Dropped and pasted files; sent messages may still refer to them until now.
-        let _ = fs::remove_dir_all(dir.join(".context"));
         fs::remove_dir(dir)
             .map_err(|e| format!("{}: {e} (unexpected files left)", dir.display()))?;
     }
@@ -1128,6 +948,16 @@ pub fn delete_merged_branches(ws: &Workspace, merged: &[(String, String)]) -> Ve
         })
         .map(|r| r.name.clone())
         .collect()
+}
+
+/// The commit the diff of `repo_dir` compares against: HEAD when only uncommitted changes show,
+/// else the merge-base with `base`. Empty when git fails.
+pub fn compare_rev(repo_dir: &Path, base: &str, uncommitted_only: bool) -> String {
+    let args = match uncommitted_only {
+        true => vec!["rev-parse", "HEAD"],
+        false => vec!["merge-base", base, "HEAD"],
+    };
+    git(repo_dir, &args).unwrap_or_default()
 }
 
 /// One unified patch for all repos. Every path is prefixed with the repo name.
@@ -1188,1183 +1018,4 @@ pub fn combined_diff(ws: &Workspace, dir: &Path, uncommitted_only: bool) -> Resu
         out += &String::from_utf8_lossy(&o.stdout);
     }
     Ok(out)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn included_secrets_require_absent_ignored_destination() {
-        use std::os::unix::fs::symlink;
-        let root = std::env::temp_dir().join(format!("shark-secret-copy-{}", std::process::id()));
-        let src = init_repo(&root, "src");
-        let dst = init_repo(&root, "dst");
-        fs::remove_file(dst.path.join(".env")).unwrap();
-        copy_included(&src.path, &dst.path).unwrap();
-        assert_eq!(fs::read(dst.path.join(".env")).unwrap(), b"SECRET=1\n");
-        assert!(
-            !git(&dst.path, &["status", "--porcelain"])
-                .unwrap()
-                .contains(".env\n")
-        );
-        fs::write(dst.path.join(".env"), "keep").unwrap();
-        copy_included(&src.path, &dst.path).unwrap();
-        assert_eq!(fs::read(dst.path.join(".env")).unwrap(), b"keep");
-        fs::remove_file(dst.path.join(".env")).unwrap();
-        let outside = root.join("outside");
-        fs::write(&outside, "outside").unwrap();
-        symlink(&outside, dst.path.join(".env")).unwrap();
-        copy_included(&src.path, &dst.path).unwrap();
-        assert_eq!(fs::read(&outside).unwrap(), b"outside");
-        fs::remove_file(dst.path.join(".env")).unwrap();
-        fs::create_dir(dst.path.join(".env")).unwrap();
-        copy_included(&src.path, &dst.path).unwrap();
-        assert!(dst.path.join(".env").is_dir());
-        fs::remove_dir(dst.path.join(".env")).unwrap();
-        fs::write(dst.path.join(".env"), "tracked").unwrap();
-        git(&dst.path, &["add", "-f", ".env"]).unwrap();
-        fs::remove_file(dst.path.join(".env")).unwrap();
-        copy_included(&src.path, &dst.path).unwrap();
-        assert!(
-            !dst.path.join(".env").exists(),
-            "tracked but missing is not a copy destination"
-        );
-        git(&dst.path, &["rm", "--cached", "-f", ".env"]).unwrap();
-        fs::write(dst.path.join(".gitignore"), "").unwrap();
-        copy_included(&src.path, &dst.path).unwrap();
-        assert!(!dst.path.join(".env").exists());
-        fs::write(src.path.join(".gitignore"), "nested/\n").unwrap();
-        fs::write(src.path.join(".worktreeinclude"), "nested/\n").unwrap();
-        fs::create_dir(src.path.join("nested")).unwrap();
-        fs::write(src.path.join("nested/secret"), "secret").unwrap();
-        fs::write(dst.path.join(".gitignore"), "nested/\n").unwrap();
-        symlink(&root, dst.path.join("nested")).unwrap();
-        assert!(copy_included(&src.path, &dst.path).is_err());
-        assert!(!root.join("secret").exists());
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn rollback_only_deletes_owned_unchanged_refs() {
-        let root =
-            std::env::temp_dir().join(format!("shark-owned-rollback-{}", std::process::id()));
-        let repo = init_repo(&root, "api");
-        git(&repo.path, &["branch", "existing"]).unwrap();
-        assert!(undo_worktree(&root, "existing", &repo, &OwnedWorktree::default()).is_empty());
-        assert!(has_ref(&repo.path, "refs/heads/existing"));
-        let tip = git(&repo.path, &["rev-parse", "HEAD"]).unwrap();
-        let owned = OwnedWorktree {
-            branch: Some(tip.clone()),
-            worktree: None,
-            untracked: None,
-        };
-        git(&repo.path, &["branch", "owned"]).unwrap();
-        assert!(undo_worktree(&root, "owned", &repo, &owned).is_empty());
-        assert!(!has_ref(&repo.path, "refs/heads/owned"));
-        git(&repo.path, &["branch", "advanced"]).unwrap();
-        let owned = OwnedWorktree {
-            branch: Some("0000000000000000000000000000000000000001".into()),
-            worktree: None,
-            untracked: None,
-        };
-        assert!(!undo_worktree(&root, "advanced", &repo, &owned).is_empty());
-        assert_eq!(git(&repo.path, &["rev-parse", "advanced"]).unwrap(), tip);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn rollback_preserves_changed_worktrees_and_cleanup_failures() {
-        let root =
-            std::env::temp_dir().join(format!("shark-owned-worktrees-{}", std::process::id()));
-        let repo = init_repo(&root, "api");
-        let dir = root.join("ws");
-        fs::create_dir(&dir).unwrap();
-        for (branch, change) in [
-            ("dirty", 0),
-            ("secret", 1),
-            ("advanced", 2),
-            ("locked", 3),
-            ("foreign", 4),
-        ] {
-            let plan = plan_worktree(branch, &repo, None).unwrap();
-            let mut owned = OwnedWorktree::default();
-            add_worktree(&dir, branch, &repo, &plan, &mut owned).unwrap();
-            let wt = dir.join("api");
-            match change {
-                0 => fs::write(wt.join("README.md"), "new edits").unwrap(),
-                1 => fs::write(wt.join(".env"), "changed secret").unwrap(),
-                2 => {
-                    git(
-                        &wt,
-                        &[
-                            "-c",
-                            "user.name=t",
-                            "-c",
-                            "user.email=t@t",
-                            "commit",
-                            "--allow-empty",
-                            "-qm",
-                            "advanced",
-                        ],
-                    )
-                    .unwrap();
-                }
-                3 => {
-                    git(&repo.path, &["worktree", "lock", &wt.to_string_lossy()]).unwrap();
-                }
-                _ => {
-                    fs::write(repo.path.join(".git/info/exclude"), "foreign\n").unwrap();
-                    fs::write(wt.join("foreign"), "another writer's ignored file").unwrap();
-                }
-            }
-            let remaining = undo_worktree(&dir, branch, &repo, &owned);
-            assert!(remaining.iter().any(|p| p == &wt.display().to_string()));
-            assert!(wt.exists() && has_ref(&repo.path, &format!("refs/heads/{branch}")));
-            if change == 3 {
-                git(&repo.path, &["worktree", "unlock", &wt.to_string_lossy()]).unwrap();
-            }
-            git(
-                &repo.path,
-                &["worktree", "remove", "--force", &wt.to_string_lossy()],
-            )
-            .unwrap();
-        }
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn base_choices_merge_newest_first() {
-        let b = |t, n: &str| (t, format!("origin/{n}"));
-        // web is on its own branch `x`; api's `feat` is still a base web may take.
-        let repos = [
-            (
-                "api".to_string(),
-                "feat".to_string(),
-                vec![b(9, "feat"), b(5, "main"), b(1, "old")],
-            ),
-            (
-                "web".to_string(),
-                "x".to_string(),
-                vec![b(8, "feat"), b(7, "main"), b(3, "x")],
-            ),
-        ];
-        let got = base_choices(&repos);
-        let names: Vec<_> = got
-            .iter()
-            .map(|(n, rs)| (n.as_str(), rs.join(",")))
-            .collect();
-        assert_eq!(
-            names,
-            [
-                ("origin/feat", "web".into()),
-                ("origin/main", "web,api".into()),
-                ("origin/old", "api".into())
-            ]
-        );
-    }
-
-    /// A timeout kills the whole group: a background child holding stdout open dies too.
-    #[test]
-    fn group_timeout_kills_grandchildren() {
-        let pidfile = std::env::temp_dir().join(format!("shark-grp-{}", std::process::id()));
-        let script = format!("sleep 30 & echo $! > {}; wait", pidfile.display());
-        let started = std::time::Instant::now();
-        let c = Command::new("sh");
-        let e = wait_bounded(c, Path::new("/"), "sh", &["-c", &script], 1, true).unwrap_err();
-        assert!(
-            e.contains("timed out") && started.elapsed().as_secs() < 5,
-            "{e}"
-        );
-        let pid = fs::read_to_string(&pidfile).unwrap();
-        // Killed at once, but `kill -0` sees it until launchd reaps the orphan.
-        let alive = || {
-            let s = Command::new("kill").args(["-0", pid.trim()]).status();
-            s.unwrap().success()
-        };
-        let reaped = (0..40).any(|_| {
-            std::thread::sleep(Duration::from_millis(50));
-            !alive()
-        });
-        assert!(reaped, "sleep {pid} outlived the timeout");
-        fs::remove_file(&pidfile).ok();
-    }
-
-    fn init_repo(root: &Path, name: &str) -> Repo {
-        let p = root.join("src").join(name);
-        fs::create_dir_all(&p).unwrap();
-        git(&p, &["init", "-q", "-b", "main"]).unwrap();
-        fs::write(p.join("README.md"), "hi\n").unwrap();
-        fs::write(p.join("CLAUDE.md"), format!("{name} rules\n")).unwrap();
-        fs::write(p.join(".gitignore"), ".env\n").unwrap();
-        fs::write(p.join(".env"), "SECRET=1\n").unwrap();
-        git(&p, &["add", "."]).unwrap();
-        fs::write(p.join(".env.local"), "untracked, not ignored\n").unwrap();
-        git(
-            &p,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-qm",
-                "init",
-            ],
-        )
-        .unwrap();
-        add_repo(&p, &[]).unwrap()
-    }
-
-    #[test]
-    fn pr_checkout_uses_exact_tip_base_and_rolls_back() {
-        let root = std::env::temp_dir().join(format!("shark-pr-checkout-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let repo = init_repo(&root, "api");
-        let other = init_repo(&root, "web");
-        let remote = root.join("upstream.git");
-        git(&root, &["init", "-q", "--bare", &remote.to_string_lossy()]).unwrap();
-        // The fork's namesake target differs from the PR repository's target.
-        git(
-            &repo.path,
-            &["update-ref", "refs/remotes/origin/release", "HEAD"],
-        )
-        .unwrap();
-        fs::write(repo.path.join("parent.txt"), "parent change\n").unwrap();
-        git(&repo.path, &["add", "parent.txt"]).unwrap();
-        git(
-            &repo.path,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-qm",
-                "parent",
-            ],
-        )
-        .unwrap();
-        let base = git(&repo.path, &["rev-parse", "HEAD"]).unwrap();
-        git(
-            &repo.path,
-            &[
-                "push",
-                "-q",
-                &remote.to_string_lossy(),
-                "HEAD:refs/heads/release",
-            ],
-        )
-        .unwrap();
-        fs::write(repo.path.join("child.txt"), "child change\n").unwrap();
-        git(&repo.path, &["add", "child.txt"]).unwrap();
-        git(
-            &repo.path,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-q",
-                "-m",
-                "PR tip",
-            ],
-        )
-        .unwrap();
-        let tip = git(&repo.path, &["rev-parse", "HEAD"]).unwrap();
-        git(
-            &repo.path,
-            &[
-                "push",
-                "-q",
-                &remote.to_string_lossy(),
-                "HEAD:refs/pull/7/head",
-            ],
-        )
-        .unwrap();
-        git(
-            &repo.path,
-            &[
-                "config",
-                &format!("url.{}.insteadOf", remote.display()),
-                "https://github.com/o/upstream.git",
-            ],
-        )
-        .unwrap();
-        let pr = PullRequest {
-            number: 7,
-            url: "https://github.com/o/upstream/pull/7".into(),
-            base: "release".into(),
-        };
-        let picked = [(repo.clone(), "pr/7".into())];
-        let prs = [(repo.name.clone(), pr.clone())];
-        let dir = root.join("ws/review");
-        let ws = create_workspace_with_prs(&dir, "review", "pr/7", &picked, &prs, &[]).unwrap();
-        let wt = dir.join("api");
-        assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), tip);
-        assert_eq!(git(&wt, &["rev-parse", &ws.repos[0].base]).unwrap(), base);
-        assert_eq!(ws.repos[0].base, "refs/shark/pull/7/base");
-        let patch = combined_diff(&ws, &dir, false).unwrap();
-        assert!(patch.contains("+++ b/api/child.txt"), "{patch}");
-        assert!(!patch.contains("parent.txt"), "{patch}");
-        assert_eq!(review_pr_url(&wt, "pr/7"), Some(pr.url));
-        assert_eq!(
-            git(&repo.path, &["branch", "--show-current"]).unwrap(),
-            "main"
-        );
-        let collision = root.join("ws/collision");
-        assert!(
-            create_workspace_with_prs(&collision, "collision", "pr/7", &picked, &prs, &[])
-                .err()
-                .unwrap()
-                .contains("already exists")
-        );
-        assert!(!collision.exists());
-        assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), tip);
-        let missing = [(
-            repo.name.clone(),
-            PullRequest {
-                number: 404,
-                url: "https://github.com/o/upstream/pull/404".into(),
-                base: "release".into(),
-            },
-        )];
-        let failed = root.join("ws/missing");
-        assert!(
-            create_workspace_with_prs(
-                &failed,
-                "missing",
-                "pr/404",
-                &[(repo.clone(), "pr/404".into())],
-                &missing,
-                &[]
-            )
-            .is_err()
-        );
-        assert!(!failed.exists() && !has_ref(&repo.path, "refs/heads/pr/404"));
-        git(&other.path, &["branch", "blocked"]).unwrap();
-        let failed = root.join("ws/rollback");
-        let picked = [
-            (repo.clone(), "review-again".into()),
-            (other, "blocked/child".into()),
-        ];
-        assert!(
-            create_workspace_with_prs(&failed, "rollback", "review-again", &picked, &prs, &[])
-                .is_err()
-        );
-        assert!(!failed.exists() && !has_ref(&repo.path, "refs/heads/review-again"));
-        assert_eq!(review_pr_url(&repo.path, "review-again"), None);
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn review_base_refresh_follows_target_and_preserves_worktree() {
-        let root =
-            std::env::temp_dir().join(format!("shark-review-refresh-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let repo = init_repo(&root, "api");
-        let upstream = root.join("upstream.git");
-        let fork = root.join("fork.git");
-        let initial = git(&repo.path, &["rev-parse", "HEAD"]).unwrap();
-        for (remote, url) in [
-            (&upstream, "https://github.com/o/upstream.git"),
-            (&fork, "https://github.com/me/fork.git"),
-        ] {
-            git(&root, &["init", "-q", "--bare", &remote.to_string_lossy()]).unwrap();
-            git(
-                &repo.path,
-                &[
-                    "push",
-                    "-q",
-                    &remote.to_string_lossy(),
-                    "HEAD:refs/heads/release",
-                ],
-            )
-            .unwrap();
-            git(
-                &repo.path,
-                &[
-                    "config",
-                    &format!("url.{}.insteadOf", remote.display()),
-                    url,
-                ],
-            )
-            .unwrap();
-        }
-        git(
-            &repo.path,
-            &["remote", "add", "origin", "https://github.com/me/fork.git"],
-        )
-        .unwrap();
-        git(&repo.path, &["fetch", "-q", "origin"]).unwrap();
-        git(
-            &repo.path,
-            &[
-                "push",
-                "-q",
-                &upstream.to_string_lossy(),
-                "HEAD:refs/pull/7/head",
-                "HEAD:refs/heads/other",
-            ],
-        )
-        .unwrap();
-        let mut pr = PullRequest {
-            number: 7,
-            url: "https://github.com/o/upstream/pull/7".into(),
-            base: "release".into(),
-        };
-        let dir = root.join("ws/review");
-        let ws = create_workspace_with_prs(
-            &dir,
-            "review",
-            "review-7",
-            &[(repo.clone(), "review-7".into())],
-            &[(repo.name.clone(), pr.clone())],
-            &[],
-        )
-        .unwrap();
-        let wt = dir.join("api");
-        fs::write(wt.join("README.md"), "staged\n").unwrap();
-        git(&wt, &["add", "README.md"]).unwrap();
-        fs::write(wt.join("README.md"), "unstaged\n").unwrap();
-        fs::write(wt.join("untracked.txt"), "keep me\n").unwrap();
-        let status = git(&wt, &["status", "--porcelain"]).unwrap();
-        let index = git(&wt, &["diff", "--cached"]).unwrap();
-        git(
-            &repo.path,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-qm",
-                "advance",
-                "--allow-empty",
-            ],
-        )
-        .unwrap();
-        let advanced = git(&repo.path, &["rev-parse", "HEAD"]).unwrap();
-        git(
-            &repo.path,
-            &[
-                "push",
-                "-q",
-                &upstream.to_string_lossy(),
-                "HEAD:refs/heads/release",
-            ],
-        )
-        .unwrap();
-        refresh_review_base(&wt, &pr).unwrap();
-        assert_eq!(
-            git(&wt, &["rev-parse", &ws.repos[0].base]).unwrap(),
-            advanced
-        );
-        assert_eq!(git(&wt, &["rev-parse", "origin/release"]).unwrap(), initial);
-
-        pr.base = "other".into();
-        refresh_review_base(&wt, &pr).unwrap();
-        assert_eq!(
-            git(&wt, &["rev-parse", &ws.repos[0].base]).unwrap(),
-            initial
-        );
-        pr.base = "missing".into();
-        assert!(refresh_review_base(&wt, &pr).is_err());
-        assert_eq!(
-            git(&wt, &["rev-parse", &ws.repos[0].base]).unwrap(),
-            initial
-        );
-        pr.base = "../invalid".into();
-        assert!(refresh_review_base(&wt, &pr).is_err());
-        pr.base = "release".into();
-        pr.url = "https://github.com/o/upstream/pull/8".into();
-        assert!(refresh_review_base(&wt, &pr).is_err());
-        assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), initial);
-        assert_eq!(
-            git(&wt, &["rev-parse", "refs/shark/pull/7/head"]).unwrap(),
-            initial
-        );
-        assert_eq!(git(&wt, &["status", "--porcelain"]).unwrap(), status);
-        assert_eq!(git(&wt, &["diff", "--cached"]).unwrap(), index);
-        assert_eq!(
-            fs::read_to_string(wt.join("README.md")).unwrap(),
-            "unstaged\n"
-        );
-        assert_eq!(
-            fs::read_to_string(wt.join("untracked.txt")).unwrap(),
-            "keep me\n"
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn stacked_diff_uses_target_merge_base_and_preserves_index() {
-        let root = std::env::temp_dir().join(format!("shark-stacked-diff-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let repo = init_repo(&root, "api");
-        let commit = |at: &Path, file: &str| {
-            fs::write(at.join(file), format!("{file}\n")).unwrap();
-            git(at, &["add", file]).unwrap();
-            git(
-                at,
-                &[
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@t",
-                    "commit",
-                    "-qm",
-                    file,
-                ],
-            )
-            .unwrap();
-        };
-        git(&repo.path, &["checkout", "-qb", "parent"]).unwrap();
-        commit(&repo.path, "parent.txt");
-        git(
-            &repo.path,
-            &["update-ref", "refs/remotes/origin/parent", "HEAD"],
-        )
-        .unwrap();
-        let dir = root.join("ws/child");
-        let mut ws = create_workspace_with_prs(
-            &dir,
-            "child",
-            "child",
-            &on_branch(std::slice::from_ref(&repo), "child"),
-            &[],
-            &[("api".into(), "parent".into())],
-        )
-        .unwrap();
-        let wt = dir.join("api");
-        commit(&wt, "child.txt");
-        // Changes made only on the target must not appear as deletions in the PR.
-        commit(&repo.path, "target-only.txt");
-        git(
-            &repo.path,
-            &["update-ref", "refs/remotes/origin/parent", "HEAD"],
-        )
-        .unwrap();
-        fs::write(wt.join("README.md"), "unstaged\n").unwrap();
-        fs::write(wt.join("staged.txt"), "staged\n").unwrap();
-        git(&wt, &["add", "staged.txt"]).unwrap();
-        fs::write(wt.join("untracked.txt"), "untracked\n").unwrap();
-        let index = git(
-            &wt,
-            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
-        )
-        .unwrap();
-        let before = fs::read(&index).unwrap();
-        let patch = combined_diff(&ws, &dir, false).unwrap();
-        for file in ["child.txt", "README.md", "staged.txt", "untracked.txt"] {
-            assert!(patch.contains(&format!("+++ b/api/{file}")), "{patch}");
-        }
-        for file in ["parent.txt", "target-only.txt"] {
-            assert!(!patch.contains(file), "{patch}");
-        }
-        let local = combined_diff(&ws, &dir, true).unwrap();
-        assert!(!local.contains("child.txt"), "{local}");
-        for file in ["README.md", "staged.txt", "untracked.txt"] {
-            assert!(local.contains(&format!("+++ b/api/{file}")), "{local}");
-        }
-        assert_eq!(
-            fs::read(&index).unwrap(),
-            before,
-            "diff leaves staging intact"
-        );
-        ws.repos[0].base = "origin/missing-target".into();
-        assert!(
-            combined_diff(&ws, &dir, false)
-                .unwrap_err()
-                .starts_with("api: git diff:")
-        );
-        assert_eq!(combined_diff(&ws, &dir, true).unwrap(), local);
-        assert_eq!(
-            fs::read(&index).unwrap(),
-            before,
-            "errors leave staging intact"
-        );
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn workspace_roundtrip() {
-        let root = std::env::temp_dir().join(format!("shark-test-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let repos = vec![init_repo(&root, "api"), init_repo(&root, "web")];
-        let dir = root.join("ws/feat");
-        let ws = create_workspace(&dir, "feat", "feat-x", &on_branch(&repos, "feat-x")).unwrap();
-
-        assert_eq!(
-            git(&dir.join("api"), &["branch", "--show-current"]).unwrap(),
-            "feat-x"
-        );
-        assert!(dir.join("web/.env").exists(), ".env copied");
-        let md = fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
-        assert!(
-            md.contains("@api/CLAUDE.md") && md.contains("@web/CLAUDE.md"),
-            "{md}"
-        );
-        let agents = fs::read_to_string(dir.join("AGENTS.md")).unwrap();
-        assert!(
-            agents.contains("read `api/CLAUDE.md`") && agents.contains("branch `feat-x`"),
-            "{agents}"
-        );
-        assert!(
-            create_workspace(
-                &root.join("ws/other"),
-                "other",
-                "feat-x",
-                &on_branch(&repos, "feat-x")
-            )
-            .is_err(),
-            "branch collision"
-        );
-        // `git init` + `remote add` leaves origin/HEAD unset; the base is still origin/main.
-        let origin = root.join("origin.git");
-        git(&root, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
-        let api = &repos[0].path;
-        git(api, &["remote", "add", "origin", &origin.to_string_lossy()]).unwrap();
-        git(api, &["push", "-q", "origin", "main"]).unwrap();
-        git(api, &["checkout", "-q", "-b", "side"]).unwrap();
-        let other = create_workspace(
-            &root.join("ws/other"),
-            "other",
-            "feat-y",
-            &on_branch(&repos[..1], "feat-y"),
-        )
-        .unwrap();
-        assert_eq!(other.repos[0].base, "origin/main");
-        remove_workspace(&other, &root.join("ws/other"), true).unwrap();
-
-        fs::write(dir.join("web/dirty.txt"), "x\n").unwrap();
-        let err = remove_workspace(&ws, &dir, false).unwrap_err();
-        assert!(err.contains("web") && !err.contains("api"), "{err}");
-        assert!(
-            dir.join("api/README.md").exists(),
-            "clean api kept while web is dirty"
-        );
-        fs::remove_file(dir.join("web/dirty.txt")).unwrap();
-
-        fs::write(dir.join("api/README.md"), "changed\n").unwrap();
-        fs::write(dir.join("web/new.txt"), "new\n").unwrap();
-        fs::write(dir.join("web/résumé.txt"), "new\n").unwrap();
-        git(&dir.join("web"), &["mv", "CLAUDE.md", "RULES.md"]).unwrap();
-        let diff = combined_diff(&ws, &dir, false).unwrap();
-        assert!(diff.contains("+++ b/api/README.md"), "{diff}");
-        assert!(
-            diff.contains("--- a/web/CLAUDE.md") && diff.contains("+++ b/web/RULES.md"),
-            "pure rename keeps the repo prefix: {diff}"
-        );
-        let mut bad = ws.clone();
-        bad.repos[0].base = "origin/nope".into();
-        assert!(
-            combined_diff(&bad, &dir, false)
-                .unwrap_err()
-                .starts_with("api: ")
-        );
-        assert!(diff.contains("+++ b/web/new.txt"), "{diff}");
-        assert!(diff.contains("b/web/r"), "{diff}");
-        assert!(
-            !dir.join("api/.env.local").exists(),
-            "non-ignored files are not copied"
-        );
-
-        fs::write(dir.join("notes.md"), "mine\n").unwrap();
-        assert!(
-            remove_workspace(&ws, &dir, false).is_err(),
-            "unexpected root file blocks non-forced archive"
-        );
-        assert!(dir.join("notes.md").exists());
-        remove_workspace(&ws, &dir, true).unwrap();
-        assert!(!dir.exists());
-        assert!(
-            !git(&repos[0].path, &["worktree", "list"])
-                .unwrap()
-                .contains("feat")
-        );
-        // Only a branch still at the merged head goes; a moved one (web) is kept.
-        let head = |r: &Repo| git(&r.path, &["rev-parse", "feat-x"]).unwrap();
-        let merged = [
-            ("api".into(), head(&repos[0])),
-            ("web".into(), "moved".into()),
-        ];
-        assert_eq!(delete_merged_branches(&ws, &merged), ["api"]);
-        assert!(
-            git(
-                &repos[0].path,
-                &["rev-parse", "--verify", "--quiet", "feat-x"]
-            )
-            .is_err()
-        );
-        assert!(
-            git(
-                &repos[1].path,
-                &["rev-parse", "--verify", "--quiet", "feat-x"]
-            )
-            .is_ok()
-        );
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn per_repo_branches() {
-        let root = std::env::temp_dir().join(format!("shark-test-prb-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let (api, web) = (init_repo(&root, "api"), init_repo(&root, "web"));
-        let origin = root.join("origin.git");
-        git(&root, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
-        let a = &api.path;
-        git(a, &["remote", "add", "origin", &origin.to_string_lossy()]).unwrap();
-        git(a, &["push", "-q", "origin", "main", "main:kd/x"]).unwrap();
-        git(a, &["remote", "set-head", "origin", "main"]).unwrap();
-        // `behind`: origin has one commit more than the local branch.
-        git(a, &["checkout", "-q", "-b", "behind"]).unwrap();
-        let commit = ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q"];
-        git(a, &[&commit[..], &["--allow-empty", "-m", "more"]].concat()).unwrap();
-        git(a, &["push", "-q", "origin", "behind"]).unwrap();
-        let tip = git(a, &["rev-parse", "HEAD"]).unwrap();
-        git(a, &["reset", "-q", "--hard", "HEAD~1"]).unwrap();
-        git(a, &["checkout", "-q", "main"]).unwrap();
-
-        // api on an origin-only branch, web on the new one.
-        let dir = root.join("ws/feat");
-        let ws = create_workspace(
-            &dir,
-            "feat",
-            "feat",
-            &[(api.clone(), "kd/x".into()), (web.clone(), "feat".into())],
-        )
-        .unwrap();
-        let on = |r: &str| git(&dir.join(r), &["branch", "--show-current"]).unwrap();
-        assert_eq!((on("api"), on("web")), ("kd/x".into(), "feat".into()));
-        assert_eq!(ws.repos[0].branch.as_deref(), Some("kd/x"));
-        assert_eq!(ws.repos[1].branch, None);
-        let md = fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
-        assert!(
-            md.contains("worktree:\n") && md.contains(" on `kd/x` ") && md.contains(" on `feat` "),
-            "{md}"
-        );
-
-        let bs = branches(a).unwrap();
-        let get = |n: &str| bs.iter().find(|b| b.name == n).cloned();
-        let x = get("kd/x").unwrap();
-        assert!(x.local && x.origin, "{x:?}");
-        assert!(x.checked_out.unwrap().ends_with("ws/feat/api"));
-        let main = get("main").unwrap();
-        assert!(
-            main.local && main.origin && main.checked_out.is_some(),
-            "{main:?}"
-        );
-        assert!(get("HEAD").is_none(), "origin/HEAD is dropped");
-
-        // A branch checked out in the source checkout is refused; nothing is left behind.
-        let err = create_workspace(
-            &root.join("ws/m"),
-            "m",
-            "m",
-            &[(web.clone(), "m".into()), (api.clone(), "main".into())],
-        )
-        .err()
-        .unwrap();
-        assert!(
-            err.contains("api: branch `main` is already checked out"),
-            "{err}"
-        );
-        assert!(!root.join("ws/m").exists());
-        assert!(
-            git(
-                &web.path,
-                &["rev-parse", "--verify", "--quiet", "refs/heads/m"]
-            )
-            .is_err()
-        );
-
-        // A local branch behind origin is fast-forwarded first.
-        let b = root.join("ws/b");
-        let bws = create_workspace(
-            &b,
-            "b",
-            "behind",
-            &on_branch(std::slice::from_ref(&api), "behind"),
-        )
-        .unwrap();
-        assert_eq!(git(&b.join("api"), &["rev-parse", "HEAD"]).unwrap(), tip);
-        remove_workspace(&bws, &b, true).unwrap();
-
-        // Archive deletes each repo's own branch.
-        remove_workspace(&ws, &dir, true).unwrap();
-        let x_head = git(a, &["rev-parse", "kd/x"]).unwrap();
-        let merged = [("api".into(), x_head), ("web".into(), "moved".into())];
-        assert_eq!(delete_merged_branches(&ws, &merged), ["api"]);
-        assert!(git(a, &["rev-parse", "--verify", "--quiet", "refs/heads/kd/x"]).is_err());
-        assert!(
-            git(
-                &web.path,
-                &["rev-parse", "--verify", "--quiet", "refs/heads/feat"]
-            )
-            .is_ok()
-        );
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    /// A new branch stacked on a parent starts at `origin/<parent>` (never the local parent's
-    /// unpushed commits), targets it, and records it as its parent tip; another repo of the same
-    /// workspace stays on its trunk. An unpushed or missing parent (a fork's PR) or an existing
-    /// branch name refuses and leaves nothing behind.
-    #[test]
-    fn stacks_new_branches_on_a_parent() {
-        let root = std::env::temp_dir().join(format!("shark-test-stack-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let (api, web) = (init_repo(&root, "api"), init_repo(&root, "web"));
-        let commit = ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q"];
-        let empty_commit = |dir: &Path, msg: &str| {
-            git(dir, &[&commit[..], &["--allow-empty", "-m", msg]].concat()).unwrap();
-            git(dir, &["rev-parse", "HEAD"]).unwrap()
-        };
-        for r in [&api, &web] {
-            let origin = root.join(format!("{}.git", r.name));
-            git(&root, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
-            (git(
-                &r.path,
-                &["remote", "add", "origin", &origin.to_string_lossy()],
-            ))
-            .unwrap();
-            git(&r.path, &["push", "-q", "origin", "main"]).unwrap();
-            git(&r.path, &["remote", "set-head", "origin", "main"]).unwrap();
-        }
-        let a = &api.path;
-        let branch = |name: &str, f: &dyn Fn()| {
-            git(a, &["checkout", "-q", "-b", name, "main"]).unwrap();
-            f();
-            git(a, &["checkout", "-q", "main"]).unwrap();
-        };
-        // Only on origin.
-        let mut remote_tip = String::new();
-        branch("remote", &|| {
-            empty_commit(a, "remote");
-        });
-        git(a, &["push", "-q", "origin", "remote"]).unwrap();
-        remote_tip.push_str(&git(a, &["rev-parse", "remote"]).unwrap());
-        git(a, &["branch", "-q", "-D", "remote"]).unwrap();
-        // Local is ahead of origin: your own parent workspace with an unpushed commit.
-        branch("ahead", &|| {
-            empty_commit(a, "pushed");
-            git(a, &["push", "-q", "origin", "ahead"]).unwrap();
-            empty_commit(a, "unpushed");
-        });
-        // Local is behind origin: someone pushed to the parent since.
-        branch("behind", &|| {
-            empty_commit(a, "old");
-            empty_commit(a, "new");
-            git(a, &["push", "-q", "origin", "behind"]).unwrap();
-            git(a, &["reset", "-q", "--hard", "HEAD~1"]).unwrap();
-        });
-        // Never pushed.
-        branch("local", &|| {
-            empty_commit(a, "local");
-        });
-        let head = |dir: &Path| git(dir, &["rev-parse", "HEAD"]).unwrap();
-        let cases = [
-            ("remote", remote_tip.clone()),
-            ("ahead", git(a, &["rev-parse", "origin/ahead"]).unwrap()),
-            ("behind", git(a, &["rev-parse", "origin/behind"]).unwrap()),
-        ];
-        for (parent, tip) in cases {
-            let name = format!("on-{parent}");
-            let dir = root.join("ws").join(&name);
-            let parents = [("api".to_string(), parent.to_string())];
-            let ws = create_workspace_with_prs(
-                &dir,
-                &name,
-                &name,
-                &on_branch(&[api.clone(), web.clone()], &name),
-                &[],
-                &parents,
-            )
-            .unwrap();
-            assert_eq!(head(&dir.join("api")), tip, "{parent}");
-            let key = parent_tip_key(&name);
-            assert_eq!(git(a, &["config", &key]).unwrap(), tip);
-            assert_eq!(ws.repos[0].base, format!("origin/{parent}"));
-            assert_eq!(ws.repos[1].base, "origin/main", "web isn't stacked");
-            assert_eq!(head(&dir.join("web")), head(&web.path));
-        }
-        for (parent, name, want) in [
-            ("fork-only", "on-fork", "`fork-only` isn't a branch here"),
-            (
-                "local",
-                "on-local",
-                "`local` isn't on GitHub yet; push it first",
-            ),
-            (
-                "remote",
-                "ahead",
-                "`ahead` already exists; stacking on `remote` needs a new",
-            ),
-        ] {
-            let dir = root.join("ws").join(name);
-            let parents = [("api".to_string(), parent.to_string())];
-            let picked = on_branch(&[web.clone(), api.clone()], name);
-            let err = create_workspace_with_prs(&dir, name, name, &picked, &[], &parents)
-                .err()
-                .unwrap();
-            assert!(err.contains(want), "{err}");
-            assert!(!dir.exists());
-            assert!(!has_ref(&web.path, &format!("refs/heads/{name}")));
-        }
-        let _ = fs::remove_dir_all(&root);
-    }
-
-    /// The edge cases of picking existing branches per repo.
-    #[test]
-    fn per_repo_branch_edges() {
-        let root = std::env::temp_dir().join(format!("shark-test-pre-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let (api, web) = (init_repo(&root, "api"), init_repo(&root, "web"));
-        let commit = ["-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q"];
-        let empty_commit = |dir: &Path, msg: &str| {
-            git(dir, &[&commit[..], &["--allow-empty", "-m", msg]].concat()).unwrap();
-            git(dir, &["rev-parse", "HEAD"]).unwrap()
-        };
-        for r in [&api, &web] {
-            let origin = root.join(format!("{}.git", r.name));
-            git(&root, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
-            git(
-                &r.path,
-                &["remote", "add", "origin", &origin.to_string_lossy()],
-            )
-            .unwrap();
-            git(&r.path, &["push", "-q", "origin", "main", "main:shared"]).unwrap();
-        }
-        let a = &api.path;
-
-        // Diverged: local and origin each have a commit; local is kept, not reset.
-        git(a, &["checkout", "-q", "-b", "div"]).unwrap();
-        let theirs = empty_commit(a, "theirs");
-        git(a, &["push", "-q", "origin", "div"]).unwrap();
-        git(a, &["reset", "-q", "--hard", "HEAD~1"]).unwrap();
-        let mine = empty_commit(a, "mine");
-        git(a, &["checkout", "-q", "main"]).unwrap();
-        let d = root.join("ws/d");
-        let dws = create_workspace(
-            &d,
-            "d",
-            "div",
-            &on_branch(std::slice::from_ref(&api), "div"),
-        )
-        .unwrap();
-        assert_eq!(git(&d.join("api"), &["rev-parse", "HEAD"]).unwrap(), mine);
-        assert_eq!(git(a, &["rev-parse", "origin/div"]).unwrap(), theirs);
-        remove_workspace(&dws, &d, true).unwrap();
-
-        // The same existing branch in both repos, under another workspace name: each checks
-        // out its own, and CLAUDE.md names the one they share.
-        let s = root.join("ws/s");
-        let mut sws = create_workspace(
-            &s,
-            "s",
-            "s",
-            &[
-                (api.clone(), "shared".into()),
-                (web.clone(), "shared".into()),
-            ],
-        )
-        .unwrap();
-        for r in ["api", "web"] {
-            let b = git(&s.join(r), &["branch", "--show-current"]).unwrap();
-            assert_eq!(b, "shared");
-        }
-        assert!(
-            sws.repos
-                .iter()
-                .all(|r| r.branch.as_deref() == Some("shared"))
-        );
-        let md = fs::read_to_string(s.join("CLAUDE.md")).unwrap();
-        assert!(
-            md.contains("worktree on branch `shared`:") && !md.contains(" on `"),
-            "{md}"
-        );
-        // A repo added later gets the workspace branch, and CLAUDE.md now tells them apart.
-        let cli = init_repo(&root, "cli");
-        sws = add_to_workspace(&sws, &s, &cli).unwrap();
-        assert_eq!(
-            git(&s.join("cli"), &["branch", "--show-current"]).unwrap(),
-            "s"
-        );
-        assert_eq!(sws.repos[2].branch, None);
-        let md = fs::read_to_string(s.join("CLAUDE.md")).unwrap();
-        assert!(
-            md.contains(" on `shared` ") && md.contains(" on `s` "),
-            "{md}"
-        );
-        remove_workspace(&sws, &s, true).unwrap();
-
-        // A ref clash (`kd` exists, `kd/y` can't): everything is rolled back.
-        git(a, &["branch", "kd"]).unwrap();
-        let c = root.join("ws/c");
-        let err = create_workspace(
-            &c,
-            "c",
-            "c",
-            &[(web.clone(), "c".into()), (api.clone(), "kd/y".into())],
-        )
-        .err()
-        .unwrap();
-        assert!(err.contains("kd/y"), "{err}");
-        assert!(!c.exists());
-        let has = |r: &Repo, b: &str| {
-            git(
-                &r.path,
-                &[
-                    "rev-parse",
-                    "--verify",
-                    "--quiet",
-                    &format!("refs/heads/{b}"),
-                ],
-            )
-            .is_ok()
-        };
-        assert!(!has(&web, "c") && !has(&api, "kd/y"));
-        for r in [&api, &web] {
-            let wts = git(&r.path, &["worktree", "list"]).unwrap();
-            assert_eq!(wts.lines().count(), 1, "{wts}");
-        }
-
-        // An invalid name for any repo is refused before anything happens.
-        let err = create_workspace(
-            &root.join("ws/bad"),
-            "bad",
-            "ok",
-            &[
-                (web.clone(), "ok".into()),
-                (api.clone(), "bad..name".into()),
-            ],
-        )
-        .err()
-        .unwrap();
-        assert!(err.contains("bad..name"), "{err}");
-        assert!(!has(&web, "ok"));
-        fs::remove_dir_all(&root).unwrap();
-    }
-
-    #[test]
-    fn readable_add_repo_errors() {
-        let dir = std::env::temp_dir().join(format!("shark-test-norepo-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let e = add_repo(&dir, &[]).err().unwrap();
-        assert_eq!(e, format!("Not a git repository: {}", dir.display()));
-        let e = run(&dir, "shark-no-such-prog", &[]).unwrap_err();
-        assert_eq!(e, "shark-no-such-prog not found on PATH");
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
-    #[test]
-    fn branch_reuse_add_repo_and_blockers() {
-        let root = std::env::temp_dir().join(format!("shark-test-br-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&root);
-        let repos = vec![init_repo(&root, "api"), init_repo(&root, "web")];
-        let origin = root.join("origin.git");
-        git(&root, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
-        let api = &repos[0].path;
-        git(api, &["remote", "add", "origin", &origin.to_string_lossy()]).unwrap();
-        git(api, &["push", "-q", "origin", "main", "main:remote-only"]).unwrap();
-        git(api, &["branch", "local-only"]).unwrap();
-
-        // Origin-only: reused from origin, without tracking it.
-        let dir = root.join("ws/r");
-        let on = on_branch(&repos[..1], "remote-only");
-        let ws = create_workspace(&dir, "r", "remote-only", &on).unwrap();
-        let wt = dir.join("api");
-        assert_eq!(
-            git(&wt, &["branch", "--show-current"]).unwrap(),
-            "remote-only"
-        );
-        assert!(
-            git(&wt, &["rev-parse", "--abbrev-ref", "@{u}"]).is_err(),
-            "--no-track"
-        );
-
-        // Local-only (an archived workspace's leftover): refused, and nothing is left behind.
-        let on = on_branch(&repos, "local-only");
-        let err = create_workspace(&root.join("ws/l"), "l", "local-only", &on)
-            .err()
-            .unwrap();
-        assert!(err.contains("api: a local branch"), "{err}");
-        assert!(!root.join("ws/l").exists());
-        assert!(
-            git(
-                &repos[1].path,
-                &["rev-parse", "--verify", "--quiet", "refs/heads/local-only"]
-            )
-            .is_err()
-        );
-
-        // Local-only with unpushed commits: live work, reused.
-        git(api, &["checkout", "-q", "-b", "unpushed"]).unwrap();
-        git(
-            api,
-            &[
-                "-c",
-                "user.name=t",
-                "-c",
-                "user.email=t@t",
-                "commit",
-                "-q",
-                "--allow-empty",
-                "-m",
-                "wip",
-            ],
-        )
-        .unwrap();
-        let wip = git(api, &["rev-parse", "HEAD"]).unwrap();
-        git(api, &["checkout", "-q", "main"]).unwrap();
-        let u = root.join("ws/u");
-        let uws =
-            create_workspace(&u, "u", "unpushed", &on_branch(&repos[..1], "unpushed")).unwrap();
-        assert_eq!(git(&u.join("api"), &["rev-parse", "HEAD"]).unwrap(), wip);
-        remove_workspace(&uws, &u, true).unwrap();
-
-        // A third repo joins on the same branch; CLAUDE.md lists it.
-        let ws = add_to_workspace(&ws, &dir, &repos[1]).unwrap();
-        assert_eq!(
-            git(&dir.join("web"), &["branch", "--show-current"]).unwrap(),
-            "remote-only"
-        );
-        assert!(
-            fs::read_to_string(dir.join("CLAUDE.md"))
-                .unwrap()
-                .contains("@web/CLAUDE.md")
-        );
-        assert!(
-            add_to_workspace(&ws, &dir, &repos[1]).is_err(),
-            "already in it"
-        );
-
-        // A locked worktree blocks archive up front: the other repo stays.
-        git(api, &["worktree", "lock", &wt.to_string_lossy()]).unwrap();
-        for force in [false, true] {
-            let err = remove_workspace(&ws, &dir, force).unwrap_err();
-            assert!(err.contains("api: locked"), "{err}");
-            assert!(dir.join("web/README.md").exists());
-        }
-        git(api, &["worktree", "unlock", &wt.to_string_lossy()]).unwrap();
-        fs::create_dir_all(dir.join("web/sub/.git")).unwrap();
-        git(
-            &dir.join("web"),
-            &[
-                "update-index",
-                "--add",
-                "--cacheinfo",
-                &format!("160000,{},sub", git(api, &["rev-parse", "HEAD"]).unwrap()),
-            ],
-        )
-        .unwrap();
-        let err = remove_workspace(&ws, &dir, false).unwrap_err();
-        assert!(err.contains("web: has submodules"), "{err}");
-        assert!(dir.join("api/README.md").exists());
-        remove_workspace(&ws, &dir, true).unwrap();
-        fs::remove_dir_all(&root).unwrap();
-    }
 }

@@ -1,5 +1,5 @@
 //! A file opened in a full-width editor tab, with optional Vim keys.
-use crate::files::fingerprint;
+use crate::files::{fingerprint, write_checked};
 use crate::vim::{self, Vim};
 use crate::*;
 use gpui_kit::base::input::{InputBaseState, InputModeKind};
@@ -8,7 +8,7 @@ use gpui_kit::component::input::{
     Search, Undo,
 };
 use gpui_kit::component::notification::Notification;
-use gpui_kit::component::{RopeExt as _, WindowExt as _};
+use gpui_kit::component::{Rope, RopeExt as _, WindowExt as _};
 use std::path::PathBuf;
 use std::time::{Duration, SystemTime};
 
@@ -16,7 +16,6 @@ mod intelligence;
 #[cfg(all(test, feature = "test-support"))]
 mod intelligence_tests;
 mod snippets;
-pub(crate) use intelligence::LanguageEvent;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) use intelligence::Symbol;
 
@@ -30,7 +29,7 @@ pub enum EditorEvent {
     Leave,
     /// A completed :wq closes this editor even if another tab is now selected.
     Close,
-    Language(LanguageEvent),
+    Language(crate::lsp::providers::ProviderEvent),
 }
 
 /// Code size and line height; rationale in docs/editor-typography.md.
@@ -89,6 +88,9 @@ pub struct FileEditor {
     /// `outline` indices around the cursor, outermost first: the jump bar's path.
     pub(crate) crumbs: Vec<usize>,
     snippets: snippets::Snippets,
+    /// Text before and after the last change command (`cw`, `o`, ...): GPUI records its edit
+    /// and its typing as two undo steps, Vim as one.
+    change: Option<(Rope, Option<Rope>)>,
     _subs: Vec<Subscription>,
     _poll: Task<()>,
 }
@@ -178,6 +180,7 @@ impl FileEditor {
             outline: vec![],
             crumbs: vec![],
             snippets: snippets::Snippets::default(),
+            change: None,
             _subs: subs,
             _poll,
         };
@@ -199,8 +202,8 @@ impl FileEditor {
             return false;
         }
         let input = self.input.read(cx);
-        if ks.key == "escape"
-            && ks.modifiers.number_of_modifiers() == 0
+        let bare_escape = ks.key == "escape" && ks.modifiers.number_of_modifiers() == 0;
+        if bare_escape
             && (input.completion_menu_state().open || input.code_action_menu_state().open)
         {
             // The platform menus bubble Escape after dismissal; consume it before it leaves the editor.
@@ -210,7 +213,7 @@ impl FileEditor {
         if self.snippet_key(ks, cx) {
             return true;
         }
-        if self.idle() && ks.key == "escape" && ks.modifiers.number_of_modifiers() == 0 {
+        if bare_escape && self.idle() {
             // Let input cancellation run before the bubbled Escape leaves the editor.
             return false;
         }
@@ -218,7 +221,7 @@ impl FileEditor {
     }
 
     fn idle(&self) -> bool {
-        !self.vim_on || (self.vim.mode == vim::Mode::Normal && self.vim.pending().is_empty())
+        !self.vim_on || self.vim.idle()
     }
 
     pub fn is_focused(&self, window: &Window, cx: &App) -> bool {
@@ -240,17 +243,21 @@ impl FileEditor {
     }
 
     fn readonly(&self) -> bool {
-        self.external
-            || !self.loaded
-            || (self.vim_on && self.vim.mode != vim::Mode::Insert && !self.vim_action)
+        self.external || !self.loaded || (self.vim_on && !self.vim.typing() && !self.vim_action)
     }
 
     /// Reads the file again: replaces a clean buffer, flags a conflict on a dirty one.
     pub fn reload(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.read_disk(false, window, cx);
+    }
+
+    /// `discard`: take the disk version even over unsaved edits, which stay if the read fails.
+    fn read_disk(&mut self, discard: bool, window: &mut Window, cx: &mut Context<Self>) {
         if self.saving {
             return;
         }
-        let (abs, saves, seen) = (self.abs.clone(), self.saves, self.stat);
+        let seen = if discard { None } else { self.stat };
+        let (abs, saves) = (self.abs.clone(), self.saves);
         cx.spawn_in(window, async move |this, cx| {
             let read = cx
                 .background_executor()
@@ -272,18 +279,25 @@ impl FileEditor {
                 e.stat = read.as_ref().ok().map(|(stat, _)| *stat);
                 let text = read.map(|(_, b)| b);
                 let fp = text.as_ref().map(fingerprint).ok();
-                if e.loaded && fp == Some(e.disk) {
+                if e.loaded && !discard && fp == Some(e.disk) {
                     return;
                 }
                 // Deleted or no longer UTF-8: keep the buffer and let the user decide.
+                let bad_utf8 =
+                    !e.loaded && text.as_ref().is_ok_and(|b| std::str::from_utf8(b).is_err());
                 let text = text.ok().and_then(|b| String::from_utf8(b).ok());
+                if bad_utf8 {
+                    let msg = format!("{} is not UTF-8 text and cannot be edited", e.path);
+                    window.push_notification(Notification::error(msg), cx);
+                }
                 match (text, fp) {
-                    (Some(_), _) if e.dirty => e.conflict = true,
+                    (Some(_), _) if e.dirty && !discard => e.conflict = true,
                     (None, _) => e.conflict = e.loaded,
                     (Some(text), Some(fp)) => {
                         e.snippets.resolve = None;
                         e.language_changed();
                         e.disk = fp;
+                        e.dirty = false;
                         e.conflict = false;
                         e.input.update(cx, |i, cx| {
                             let pos = i.cursor_position();
@@ -314,10 +328,7 @@ impl FileEditor {
     /// Throws the edits away and takes the disk version.
     pub fn discard(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.saves += 1; // Invalidate reads started before the discard.
-        self.dirty = false;
-        self.disk = 0;
-        self.stat = None;
-        self.reload(window, cx);
+        self.read_disk(true, window, cx);
     }
 
     /// Writes the buffer unless someone else changed the file since it was read (then `force`).
@@ -380,12 +391,23 @@ impl FileEditor {
     /// Runs one key through Vim; returns whether it was consumed.
     fn vim_key(&mut self, key: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let before = self.vim.mode;
+        let text_before = self.input.read(cx).text().clone();
         let Some((edited, cmd)) =
-            apply_vim_key_to(&mut self.vim, &self.input, key, self.external, window, cx)
+            apply_vim_key(&mut self.vim, &self.input, key, self.external, window, cx)
         else {
             return false;
         };
         self.dirty |= edited;
+        if self.vim.mode == vim::Mode::Insert && before != vim::Mode::Insert {
+            self.change = edited.then_some((text_before, None));
+        } else if before == vim::Mode::Insert {
+            let text = self.input.read(cx).text().clone();
+            if let Some(c) = &mut self.change {
+                c.1 = Some(text);
+            }
+        } else if edited {
+            self.change = None;
+        }
         if let Some(cmd) = cmd {
             self.run(cmd, window, cx);
         }
@@ -394,6 +416,17 @@ impl FileEditor {
         }
         cx.notify();
         true
+    }
+
+    /// The text an undo (or redo) of the last change command ends at, when it takes two steps.
+    fn change_target(&self, redo: bool, cx: &App) -> Option<Rope> {
+        let (before, after) = self.change.as_ref()?;
+        let (from, to) = if redo {
+            (before, after.as_ref()?)
+        } else {
+            (after.as_ref()?, before)
+        };
+        (self.input.read(cx).text() == from).then(|| to.clone())
     }
 
     fn run(&mut self, cmd: vim::Cmd, window: &mut Window, cx: &mut Context<Self>) {
@@ -405,6 +438,8 @@ impl FileEditor {
                 return self.save(false, window, cx);
             }
             SaveQuit | Quit => return window.dispatch_action(Box::new(CloseFile), cx),
+            NextChat => return window.dispatch_action(Box::new(crate::NextChat), cx),
+            PrevChat => return window.dispatch_action(Box::new(crate::PrevChat), cx),
             Outline => return window.dispatch_action(Box::new(crate::DocumentSymbols), cx),
             Definition => {
                 return window.dispatch_action(Box::new(gpui_kit::base::input::GoToDefinition), cx);
@@ -433,36 +468,67 @@ impl FileEditor {
             Indent => Box::new(self::Indent),
             Outdent => Box::new(self::Outdent),
         };
+        let indent = matches!(cmd, Indent | Outdent);
+        let again = match cmd {
+            Undo | Redo => self
+                .change_target(cmd == Redo, cx)
+                .map(|t| (cmd == Redo, t, 8)),
+            _ => None,
+        };
         // Undo, indent and friends edit even in normal mode.
         self.vim_action = true;
         self.input.update(cx, |i, cx| i.set_readonly(false, cx));
         window.dispatch_action(action, cx);
         let this = cx.entity().downgrade();
-        window.defer(cx, move |_, cx| {
-            this.update(cx, |e, cx| {
-                e.vim_action = false;
-                e.sync_readonly(cx);
-                e.clamp_cursor(cx);
-            })
-            .ok();
+        window.defer(cx, move |window, cx| {
+            this.update(cx, |e, cx| e.after_action(indent, again, window, cx))
+                .ok();
         });
+    }
+
+    /// Steps undo/redo on until the text is the target, then restores Normal mode.
+    fn after_action(
+        &mut self,
+        indent: bool,
+        again: Option<(bool, Rope, u8)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if let Some((redo, target, left)) = again
+            && left > 0
+            && *self.input.read(cx).text() != target
+        {
+            let action: Box<dyn Action> = if redo {
+                Box::new(self::Redo)
+            } else {
+                Box::new(self::Undo)
+            };
+            window.dispatch_action(action, cx);
+            let this = cx.entity().downgrade();
+            return window.defer(cx, move |window, cx| {
+                let again = Some((redo, target, left - 1));
+                this.update(cx, |e, cx| e.after_action(indent, again, window, cx))
+                    .ok();
+            });
+        }
+        self.vim_action = false;
+        self.sync_readonly(cx);
+        if indent {
+            // `>>` and `V>` leave the caret on the first line's first non-blank.
+            self.input.update(cx, |i, cx| {
+                let r = i.selected_range();
+                let at = vim::first_nonblank_at(i.text(), r.start.min(r.end));
+                i.set_selected_range(at..at, cx);
+            });
+        }
+        self.clamp_cursor(cx);
     }
 }
 
 /// Runs one key through `vim` on `input` and applies the edit, cursor, selection and yank.
 /// `None` when Vim declined the key; else whether the text changed and the command to run.
-pub(crate) fn apply_vim_key<M: InputModeKind>(
-    vim: &mut Vim,
-    input: &Entity<InputBaseState<M>>,
-    key: &str,
-    window: &mut Window,
-    cx: &mut App,
-) -> Option<(bool, Option<vim::Cmd>)> {
-    apply_vim_key_to(vim, input, key, false, window, cx)
-}
-
 /// `readonly` keeps motions, search and yank, and swallows keys that would edit or insert.
-fn apply_vim_key_to<M: InputModeKind>(
+pub(crate) fn apply_vim_key<M: InputModeKind>(
     vim: &mut Vim,
     input: &Entity<InputBaseState<M>>,
     key: &str,
@@ -510,164 +576,6 @@ fn apply_vim_key_to<M: InputModeKind>(
         cx.write_to_clipboard(ClipboardItem::new_string(y));
     }
     Some((edited, out.cmd))
-}
-
-/// Writes `text` unless the file no longer has fingerprint `expected` (then only with `force`);
-/// `Ok(None)` when someone else changed it. Returns the new fingerprint. Blocking.
-pub fn write_checked(
-    abs: &std::path::Path,
-    expected: u64,
-    text: &str,
-    force: bool,
-) -> std::io::Result<Option<u64>> {
-    write_staged(abs, expected, text, force, || {})
-}
-
-fn write_staged(
-    abs: &std::path::Path,
-    expected: u64,
-    text: &str,
-    force: bool,
-    before_replace: impl FnOnce(),
-) -> std::io::Result<Option<u64>> {
-    use objc2_foundation::{NSFileManager, NSFileManagerItemReplacementOptions, NSString, NSURL};
-    use std::{
-        fs,
-        io::{self, Write},
-        os::unix::fs::{MetadataExt, OpenOptionsExt},
-        sync::atomic::{AtomicU64, Ordering},
-    };
-    static NEXT: AtomicU64 = AtomicU64::new(0);
-    let parent = abs
-        .parent()
-        .filter(|p| !p.as_os_str().is_empty())
-        .unwrap_or(std::path::Path::new("."));
-    let (target, original) = match fs::canonicalize(abs) {
-        Ok(path) => {
-            let original = fs::metadata(&path)?;
-            (path, Some(original))
-        }
-        Err(e) if force && e.kind() == io::ErrorKind::NotFound => {
-            match fs::symlink_metadata(abs) {
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
-                Err(e) => return Err(e),
-                Ok(_) => return Err(e), // A dangling symlink is not a deleted file.
-            }
-            let name = abs
-                .file_name()
-                .ok_or_else(|| io::Error::other("Save requires a file name"))?;
-            (fs::canonicalize(parent)?.join(name), None)
-        }
-        Err(_) if !force => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    if original.as_ref().is_some_and(|m| !m.is_file()) {
-        return Err(io::Error::other("Save requires a regular file"));
-    }
-    if original.as_ref().is_some_and(|m| m.nlink() > 1) {
-        return Err(io::Error::other(
-            "This file has hard links. Use an external editor to save it; your buffer has been retained.",
-        ));
-    }
-    target
-        .to_str()
-        .ok_or_else(|| io::Error::other("File path is not UTF-8"))?;
-    let before = match original.as_ref().map(|_| fs::read(&target)).transpose() {
-        Ok(None) => Vec::new(),
-        Ok(Some(bytes)) => bytes,
-        Err(_) if !force => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    if !force && fingerprint(&before) != expected {
-        return Ok(None);
-    }
-    let (stage, mut file) = loop {
-        let path = target.with_file_name(format!(
-            ".shark-save-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&path)
-        {
-            Ok(file) => break (path, file),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => continue,
-            Err(e) => return Err(e),
-        }
-    };
-    let staged = file
-        .write_all(text.as_bytes())
-        .and_then(|_| {
-            original
-                .as_ref()
-                .map_or(Ok(()), |m| file.set_permissions(m.permissions()))
-        })
-        .and_then(|_| file.sync_all());
-    if let Err(e) = staged {
-        let _ = fs::remove_file(&stage);
-        return Err(e);
-    }
-    before_replace();
-    let Some(original) = original else {
-        if !fs::canonicalize(parent).is_ok_and(|p| Some(p.as_path()) == target.parent()) {
-            let _ = fs::remove_file(&stage);
-            return Ok(None);
-        }
-        // Linking publishes the complete file without replacing a concurrent writer's file.
-        let created = fs::hard_link(&stage, &target);
-        let _ = fs::remove_file(&stage);
-        return match created {
-            Ok(()) => Ok(Some(fingerprint(text.as_bytes()))),
-            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => Ok(None),
-            Err(e) => Err(e),
-        };
-    };
-    let unchanged = fs::canonicalize(abs).is_ok_and(|p| p == target)
-        && fs::metadata(&target).is_ok_and(|m| {
-            m.dev() == original.dev() && m.ino() == original.ino() && m.nlink() == 1
-        })
-        && fs::read(&target).is_ok_and(|bytes| bytes == before);
-    if !unchanged {
-        let _ = fs::remove_file(&stage);
-        return Ok(None);
-    }
-    let url = |p: &std::path::Path| -> io::Result<_> {
-        Ok(NSURL::fileURLWithPath(&NSString::from_str(
-            p.to_str()
-                .ok_or_else(|| io::Error::other("File path is not UTF-8"))?,
-        )))
-    };
-    let result = NSFileManager::defaultManager()
-        .replaceItemAtURL_withItemAtURL_backupItemName_options_resultingItemURL_error(
-            &*url(&target)?,
-            &*url(&stage)?,
-            None,
-            NSFileManagerItemReplacementOptions::empty(),
-            None,
-        );
-    if let Err(error) = result {
-        // Foundation can move the original to a recovery URL; never delete files after a native failure.
-        return Err(replacement_error(&error, &stage));
-    }
-    Ok(Some(fingerprint(text.as_bytes())))
-}
-
-fn replacement_error(error: &objc2_foundation::NSError, stage: &std::path::Path) -> std::io::Error {
-    use objc2_foundation::{NSString, NSURL};
-    let recovery = error
-        .userInfo()
-        .objectForKey(&NSString::from_str("NSFileOriginalItemLocationKey"))
-        .and_then(|value| value.downcast_ref::<NSURL>().and_then(NSURL::path))
-        .map(|path| format!("; original recovery location: {path}"))
-        .unwrap_or_default();
-    std::io::Error::other(format!(
-        "{}; staged contents: {}{recovery}",
-        error.localizedDescription(),
-        stage.display()
-    ))
 }
 
 pub fn focus(editor: &Entity<FileEditor>, window: &mut Window, cx: &mut App) {
@@ -754,204 +662,6 @@ impl Render for FileEditor {
 
 #[cfg(test)]
 mod tests {
-    use super::{fingerprint, write_checked, write_staged};
-
-    #[test]
-    fn confirmed_save_restores_deleted_file_without_replacing_new_entries() {
-        use std::{
-            fs,
-            os::unix::fs::{MetadataExt, symlink},
-        };
-        let dir = std::env::temp_dir().join(format!("shark-restore-save-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("file");
-        fs::write(&file, "old").unwrap();
-        let fp = fingerprint(b"old");
-        fs::remove_file(&file).unwrap();
-        assert_eq!(write_checked(&file, fp, "ours", false).unwrap(), None);
-        assert!(!file.exists());
-        assert_eq!(
-            write_checked(&file, fp, "ours", true).unwrap(),
-            Some(fingerprint(b"ours"))
-        );
-        assert_eq!(fs::read(&file).unwrap(), b"ours");
-        assert_eq!(fs::metadata(&file).unwrap().nlink(), 1);
-        fs::remove_file(&file).unwrap();
-
-        let other = dir.join("other");
-        fs::write(&other, "theirs").unwrap();
-        for linked in [false, true] {
-            assert_eq!(
-                write_staged(&file, fp, "ours", true, || {
-                    if linked {
-                        symlink(&other, &file).unwrap();
-                    } else {
-                        fs::write(&file, "theirs").unwrap();
-                    }
-                })
-                .unwrap(),
-                None
-            );
-            assert_eq!(fs::read(&file).unwrap(), b"theirs");
-            assert_eq!(
-                fs::symlink_metadata(&file)
-                    .unwrap()
-                    .file_type()
-                    .is_symlink(),
-                linked
-            );
-            fs::remove_file(&file).unwrap();
-        }
-        let missing = dir.join("missing");
-        symlink(&missing, &file).unwrap();
-        assert!(write_checked(&file, fp, "ours", true).is_err());
-        assert!(
-            fs::symlink_metadata(&file)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert!(!missing.exists());
-        assert!(!fs::read_dir(&dir).unwrap().any(|p| {
-            p.unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".shark-save-")
-        }));
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn native_recovery_error_shows_the_file_location() {
-        use objc2_foundation::{NSDictionary, NSError, NSString, NSURL};
-        let key = NSString::from_str("NSFileOriginalItemLocationKey");
-        let recovery = NSURL::fileURLWithPath(&NSString::from_str("/tmp/shark-original-recovery"));
-        let info = NSDictionary::<NSString, objc2::runtime::AnyObject>::from_slices(
-            &[&*key],
-            &[&*recovery],
-        );
-        let error = unsafe {
-            NSError::errorWithDomain_code_userInfo(
-                &NSString::from_str("NSCocoaErrorDomain"),
-                512,
-                Some(&info),
-            )
-        };
-        let message =
-            super::replacement_error(&error, std::path::Path::new("/tmp/stage")).to_string();
-        assert!(message.contains("original recovery location: /tmp/shark-original-recovery"));
-        assert!(message.contains("staged contents: /tmp/stage"));
-    }
-
-    #[test]
-    fn replacement_rechecks_identity_and_preserves_failed_native_stage() {
-        use std::{fs, os::unix::fs::PermissionsExt};
-        let dir = std::env::temp_dir().join(format!("shark-save-race-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("file");
-        fs::write(&file, "old").unwrap();
-        let fp = fingerprint(b"old");
-        for force in [false, true] {
-            fs::write(&file, "old").unwrap();
-            assert_eq!(
-                write_staged(&file, fp, "ours", force, || {
-                    fs::write(&file, "theirs").unwrap();
-                })
-                .unwrap(),
-                None
-            );
-            assert_eq!(fs::read(&file).unwrap(), b"theirs");
-        }
-        fs::write(&file, "old").unwrap();
-        assert_eq!(
-            write_staged(&file, fp, "ours", false, || {
-                fs::rename(&file, dir.join("previous")).unwrap();
-                fs::write(&file, "old").unwrap();
-            })
-            .unwrap(),
-            None,
-            "identical bytes on a new inode still conflict"
-        );
-        let failed = write_staged(&file, fp, "ours", false, || {
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
-        });
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(failed.unwrap_err().to_string().contains("staged contents:"));
-        assert_eq!(fs::read(&file).unwrap(), b"old");
-        assert!(fs::read_dir(&dir).unwrap().any(|p| {
-            p.unwrap()
-                .file_name()
-                .to_string_lossy()
-                .starts_with(".shark-save-")
-        }));
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn replacement_preserves_links_mode_metadata_and_conflicts() {
-        use std::{
-            fs,
-            os::unix::fs::{PermissionsExt, symlink},
-        };
-        let dir = std::env::temp_dir().join(format!("shark-safe-save-{}", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("script");
-        let link = dir.join("link");
-        fs::write(&file, "old").unwrap();
-        fs::set_permissions(&file, fs::Permissions::from_mode(0o751)).unwrap();
-        symlink(&file, &link).unwrap();
-        let attribute = "com.apple.metadata:kMDItemFinderComment";
-        assert!(
-            std::process::Command::new("xattr")
-                .args(["-w", attribute, "shark metadata"])
-                .arg(&file)
-                .status()
-                .unwrap()
-                .success()
-        );
-        let fp = fingerprint(b"old");
-        assert_eq!(write_checked(&link, fp + 1, "new", false).unwrap(), None);
-        assert_eq!(fs::read(&file).unwrap(), b"old");
-        assert!(write_checked(&link, fp + 1, "new", true).unwrap().is_some());
-        assert!(
-            fs::symlink_metadata(&link)
-                .unwrap()
-                .file_type()
-                .is_symlink()
-        );
-        assert_eq!(fs::read(&file).unwrap(), b"new");
-        let attr = std::process::Command::new("xattr")
-            .args(["-p", attribute])
-            .arg(&file)
-            .output()
-            .unwrap();
-        assert!(attr.status.success());
-        assert_eq!(
-            String::from_utf8(attr.stdout).unwrap().trim(),
-            "shark metadata"
-        );
-        assert_eq!(
-            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
-            0o751
-        );
-        let hard = dir.join("hard");
-        fs::hard_link(&file, &hard).unwrap();
-        assert!(
-            write_checked(&file, fingerprint(b"new"), "bad", true)
-                .unwrap_err()
-                .to_string()
-                .contains("external editor")
-        );
-        assert_eq!(fs::read(&hard).unwrap(), b"new");
-        fs::remove_file(&hard).unwrap();
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
-        let failed = write_checked(&file, fingerprint(b"new"), "bad", false);
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
-        assert!(failed.is_err());
-        assert_eq!(fs::read(&file).unwrap(), b"new");
-        fs::remove_dir_all(&dir).unwrap();
-    }
-
     #[test]
     fn language_tokens() {
         assert_eq!(super::language("api/src/main.rs"), "rs");
@@ -1064,6 +774,209 @@ mod ui_tests {
             let i = editor.read(cx).input.read(cx);
             assert_eq!((i.value().as_ref(), i.cursor()), ("one\ntwo\n", 4));
         });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Only Enter accepts a completion (Tab would indent), so Tab keeps walking the tabstops.
+    #[gpui_kit::test]
+    async fn tab_with_a_completion_menu_open_moves_to_the_next_tabstop(cx: &mut TestAppContext) {
+        use crate::lsp::document::Stop;
+        let (dir, _, window, editor) = open_editor("a.py", "tab-menu", "foo(va, y)", cx).await;
+        cx.update_window(window, |_, w, cx| {
+            editor.update(cx, |e, cx| {
+                e.set_vim(false, cx);
+                let stops = [(1, 4, 6), (2, 8, 9)];
+                e.snippets.active = Some(snippets::Session {
+                    text: "foo(va, y)".into(),
+                    stops: stops
+                        .map(|(index, start, end)| Stop { index, start, end })
+                        .into(),
+                    index: 1,
+                });
+                e.input.update(cx, |i, cx| {
+                    i.set_selected_range(6..6, cx);
+                    let item = lsp_types::CompletionItem {
+                        label: "value".into(),
+                        ..Default::default()
+                    };
+                    i.present_completion_items(4, "va", vec![item], cx);
+                });
+            });
+            focus(&editor, w, cx);
+            w.render_frame(cx); // the menu hosts its actions once drawn
+            w.press("tab", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let i = editor.read(cx).input.read(cx);
+            assert_eq!(i.value().as_ref(), "foo(va, y)");
+            assert_eq!(i.selected_value().as_ref(), "y");
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Types `text` in Insert mode (`keys` first), then Escape.
+    fn type_in(cx: &mut TestAppContext, window: AnyWindowHandle, keys: &[&str], text: &str) {
+        cx.update_window(window, |_, w, cx| {
+            for k in keys {
+                w.press(k, cx);
+            }
+            w.input(text, cx);
+            w.press("escape", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    }
+
+    fn state(
+        cx: &mut TestAppContext,
+        editor: &Entity<FileEditor>,
+    ) -> (String, std::ops::Range<usize>) {
+        cx.update(|cx| {
+            let i = editor.read(cx).input.read(cx);
+            (i.value().to_string(), i.selected_range())
+        })
+    }
+
+    #[gpui_kit::test]
+    async fn failed_discard_keeps_the_edits_marked_dirty(cx: &mut TestAppContext) {
+        let (dir, file, window, editor) = open_editor("a.txt", "discard", "one\n", cx).await;
+        cx.update_window(window, |_, w, cx| focus(&editor, w, cx))
+            .unwrap();
+        type_in(cx, window, &["i"], "x");
+        cx.update(|cx| assert!(editor.read(cx).dirty));
+        // The file is gone: the reload fails, and closing must still ask.
+        fs::remove_file(&file).unwrap();
+        cx.update_window(window, |_, w, cx| {
+            editor.update(cx, |e, cx| e.discard(w, cx))
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| {
+            let e = editor.read(cx);
+            assert!(e.dirty && e.conflict);
+        });
+        assert_eq!(state(cx, &editor).0, "xone\n");
+        // A readable file is taken over the edits.
+        fs::write(&file, "two\n").unwrap();
+        cx.update_window(window, |_, w, cx| {
+            editor.update(cx, |e, cx| e.discard(w, cx))
+        })
+        .unwrap();
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            editor.read(cx).input.read(cx).value().as_ref() == "two\n"
+        })
+        .await;
+        cx.update(|cx| {
+            let e = editor.read(cx);
+            assert!(!e.dirty && !e.conflict);
+        });
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    async fn non_utf8_file_says_why_it_is_blank(cx: &mut TestAppContext) {
+        let dir = std::env::temp_dir().join(format!("shark-utf8-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("a.txt");
+        fs::write(&file, [b'a', 0xff, 0xfe]).unwrap();
+        cx.update(gpui_kit::init);
+        let (window, editor) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| FileEditor::new("r/a.txt".into(), file, true, w, cx))
+                })
+            })
+            .unwrap();
+        cx.wait_for(window, Duration::from_secs(10), |w, cx| {
+            !w.notifications(cx).is_empty()
+        })
+        .await;
+        cx.update(|cx| assert!(!editor.read(cx).loaded));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    async fn g_t_and_g_shift_t_switch_chats(cx: &mut TestAppContext) {
+        use std::{cell::Cell, rc::Rc};
+        let (dir, _, window, editor) = open_editor("a.txt", "gt", "one\n", cx).await;
+        let seen = Rc::new((Cell::new(0), Cell::new(0)));
+        let s = seen.clone();
+        cx.update(|cx| {
+            cx.on_action(move |_: &crate::NextChat, _| s.0.set(s.0.get() + 1));
+            let s = seen.clone();
+            cx.on_action(move |_: &crate::PrevChat, _| s.1.set(s.1.get() + 1));
+        });
+        cx.update_window(window, |_, w, cx| {
+            focus(&editor, w, cx);
+            w.press("g", cx);
+            w.press("t", cx);
+            w.press("g", cx);
+            w.press("shift-t", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert_eq!((seen.0.get(), seen.1.get()), (1, 1));
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    async fn indent_leaves_the_caret_on_the_first_nonblank(cx: &mut TestAppContext) {
+        let (dir, _, window, editor) = open_editor("a.txt", "indent", "a\nb\nc\n", cx).await;
+        cx.update_window(window, |_, w, cx| {
+            focus(&editor, w, cx);
+            w.press("j", cx);
+            w.press(">", cx);
+            w.press(">", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let (text, sel) = state(cx, &editor);
+        let at = text.find('b').unwrap();
+        assert!(at > 2, "b was indented: {text:?}");
+        assert_eq!(sel, at..at);
+        // Visual-line: the caret leaves the selection end.
+        cx.update_window(window, |_, w, cx| {
+            w.press("g", cx);
+            w.press("g", cx);
+            w.press("V", cx);
+            w.press("j", cx);
+            w.press(">", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let (text, sel) = state(cx, &editor);
+        let at = text.find('a').unwrap();
+        assert!(at > 0, "a was indented: {text:?}");
+        assert_eq!(sel, at..at);
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[gpui_kit::test]
+    async fn one_undo_reverts_a_whole_change_command(cx: &mut TestAppContext) {
+        let (dir, _, window, editor) = open_editor("a.txt", "undo", "foo bar\n", cx).await;
+        cx.update_window(window, |_, w, cx| focus(&editor, w, cx))
+            .unwrap();
+        type_in(cx, window, &["c", "w"], "X");
+        assert_eq!(state(cx, &editor).0, "X bar\n");
+        cx.update_window(window, |_, w, cx| w.press("u", cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(state(cx, &editor).0, "foo bar\n");
+        cx.update_window(window, |_, w, cx| w.press("ctrl-r", cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(state(cx, &editor).0, "X bar\n");
+        cx.update_window(window, |_, w, cx| w.press("u", cx))
+            .unwrap();
+        cx.run_until_parked();
+        type_in(cx, window, &["o"], "new");
+        assert_eq!(state(cx, &editor).0, "foo bar\nnew\n");
+        cx.update_window(window, |_, w, cx| w.press("u", cx))
+            .unwrap();
+        cx.run_until_parked();
+        assert_eq!(state(cx, &editor).0, "foo bar\n");
         let _ = fs::remove_dir_all(&dir);
     }
 }

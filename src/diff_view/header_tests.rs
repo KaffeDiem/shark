@@ -16,22 +16,17 @@ fn test_diff_builder(cx: &mut TestAppContext) {
     let state = cx.new(|cx| DiffState::new([document.clone()], cx));
     let defaults = Diff::new(&state);
     assert_eq!(defaults.state.entity_id(), state.entity_id());
-    assert!(defaults.header_visible && defaults.line_number);
-    assert!(defaults.syntax_highlight);
-    assert!(defaults.annotations.items.is_empty());
-    assert!(defaults.header.content.is_none());
-    assert!(defaults.annotation_content.is_none());
+    assert!(defaults.options.annotations.items.is_empty());
+    assert!(defaults.options.header_prefix.is_none());
+    assert!(defaults.options.annotation_content.is_none());
 
     let header_calls = Rc::new(RefCell::new(Vec::new()));
     let position = DiffLinePosition::new("after.rs", DiffSide::Modified, 1);
     let annotation = DiffAnnotation::line("review-comment", position.clone());
     let annotation_calls = Rc::new(RefCell::new(Vec::new()));
     let diff = Diff::new(&state)
-        .header_visible(false)
-        .line_number(false)
-        .syntax_highlight(false)
         .annotations([annotation.clone()])
-        .render_header({
+        .render_header_prefix({
             let header_calls = header_calls.clone();
             move |document: &DiffFile, _, _| {
                 header_calls.borrow_mut().push((
@@ -53,32 +48,18 @@ fn test_diff_builder(cx: &mut TestAppContext) {
         });
 
     assert_eq!(diff.state.entity_id(), state.entity_id());
-    assert!(!diff.header_visible && !diff.line_number);
-    assert!(!diff.syntax_highlight);
-    assert_eq!(diff.annotations.items.len(), 1);
-    assert_eq!(diff.annotations.items[0].id(), annotation.id());
-    assert_eq!(diff.annotations.items[0].position(), Some(&position));
-    assert_eq!(diff.annotations.lines[&position], [0]);
-
-    // Existing consumers keep the original builder spellings.
-    let compatibility = Diff::new(&state)
-        .header(|_, _, _| div().child("header"))
-        .header_prefix(|_, _, _| div().child("prefix"))
-        .header_title_suffix(|_, _, _| div().child("title suffix"))
-        .header_suffix(|_, _, _| div().child("suffix"))
-        .annotation_content(|_, _, _| div().child("annotation"));
-    assert!(compatibility.header.content.is_some());
-    assert!(compatibility.header.prefix.is_some());
-    assert!(compatibility.header.title_suffix.is_some());
-    assert!(compatibility.header.suffix.is_some());
-    assert!(compatibility.annotation_content.is_some());
+    let options = &diff.options;
+    assert_eq!(options.annotations.items.len(), 1);
+    assert_eq!(options.annotations.items[0].id(), annotation.id());
+    assert_eq!(options.annotations.items[0].position(), Some(&position));
+    assert_eq!(options.annotations.lines[&position], [0]);
 
     let window = cx.add_empty_window();
     window.update(|window, cx| {
-        let render = diff.header.content.as_ref().unwrap();
+        let render = options.header_prefix.as_ref().unwrap();
         let _ = render(&document, window, cx);
-        let render = diff.annotation_content.as_ref().unwrap();
-        let _ = render(&diff.annotations.items[0], window, cx);
+        let render = options.annotation_content.as_ref().unwrap();
+        let _ = render(&options.annotations.items[0], window, cx);
     });
     assert_eq!(
         header_calls.borrow().as_slice(),

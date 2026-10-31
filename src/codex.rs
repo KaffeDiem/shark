@@ -2,8 +2,9 @@
 //! with the user's own `codex login` (a ChatGPT subscription or an API key). Its notifications
 //! become the same `Ev`s claude's stream-json does; tool items take claude's tool names so the
 //! chat summarizes them the same way.
-use crate::agent::{self, Agent, Ev, MAX_OUTPUT, clip_strings, cut, output, text_of};
+use crate::agent::{self, Agent, Ev, SESSION_GONE, text_of};
 use crate::state::{ChatMeta, Workspace};
+use crate::transcript::{clip_output, clip_strings, output, transcript_path};
 use gpui_kit::base::async_util::Receiver;
 use serde_json::{Value, json};
 use std::{
@@ -15,9 +16,14 @@ use std::{
 // common .git as a writable root when a sandbox is wanted
 const SANDBOX: &str = "danger-full-access";
 
+/// The id of a codex model, `codex:<model id>`; `None` for any other.
+pub fn model_id(m: Option<&str>) -> Option<&str> {
+    m?.strip_prefix("codex:")
+}
+
 /// A codex model: `codex:<model id>`.
 pub fn is_codex(model: Option<&str>) -> bool {
-    model.is_some_and(|m| m.starts_with("codex:"))
+    model_id(model).is_some()
 }
 
 /// The thread messages go to, the running turn an interrupt names, and the settings each
@@ -41,12 +47,12 @@ pub struct State {
 
 pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receiver<Ev>)> {
     // SHARK_CODEX swaps in another binary, like SHARK_CLAUDE.
-    let mut cmd = Command::new(std::env::var("SHARK_CODEX").unwrap_or("codex".into()));
+    let mut cmd = Command::new(crate::proc::codex_bin());
     cmd.arg("app-server");
     let st = Arc::new(Mutex::new(State {
         plan: chat.plan,
         fast: chat.fast,
-        effort: crate::chat::effort_of(chat).into(),
+        effort: crate::models::effort_of(chat).into(),
         ..Default::default()
     }));
     if !ws.dir().join("AGENTS.md").exists() {
@@ -56,11 +62,11 @@ pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receive
         cmd,
         &ws.dir(),
         &chat.id,
-        Some(agent::transcript_path(&chat.id)),
+        Some(transcript_path(&chat.id)),
         Some(st),
     )?;
     let mut params = json!({"cwd": ws.dir(), "approvalPolicy": "never", "sandbox": SANDBOX});
-    if let Some(m) = chat.model.as_deref().and_then(|m| m.strip_prefix("codex:")) {
+    if let Some(m) = model_id(chat.model.as_deref()) {
         params["model"] = m.into();
     }
     // The server takes requests in order, so nothing waits for a reply here; `track` sends
@@ -79,7 +85,7 @@ pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receive
         None => json!({"id": "start", "method": "thread/start", "params": params}),
     });
     for l in &lines {
-        agent.write_line(l)?;
+        agent.write(l)?;
     }
     Ok((agent, rx))
 }
@@ -92,12 +98,21 @@ fn flush(s: &mut State, stdin: &Mutex<ChildStdin>) -> std::io::Result<()> {
     };
     for text in std::mem::take(&mut s.pending) {
         s.next += 1;
-        agent::write(
-            stdin,
-            &json!({"id": s.next, "method": "turn/start", "params": turn_params(s, &thread, &text)}),
-        )?;
+        agent::write(stdin, &request(s, &thread, &text))?;
     }
     Ok(())
+}
+
+/// What a message becomes: `/compact` is the thread's own request, which runs as a turn.
+fn request(s: &State, thread: &str, text: &str) -> Value {
+    match text.trim() {
+        "/compact" => {
+            json!({"id": s.next, "method": "thread/compact/start", "params": {"threadId": thread}})
+        }
+        _ => {
+            json!({"id": s.next, "method": "turn/start", "params": turn_params(s, thread, text)})
+        }
+    }
 }
 
 /// A `turn/start`'s params. Mode, sandbox, tier and effort hold for later turns too; sent with
@@ -132,9 +147,8 @@ pub fn send(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, text: &str) -> std::io
 /// Whether codex's config puts threads on the Fast tier: what a chat gets until it toggles.
 // ponytail: top-level `service_tier` only; a profile or `-c` override isn't seen
 pub fn fast_by_config() -> bool {
-    let home = std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from);
-    let home = home.unwrap_or_else(|| crate::state::home().join(".codex"));
-    fast_in(&std::fs::read_to_string(home.join("config.toml")).unwrap_or_default())
+    let dir = crate::usage::config_dir(crate::usage::Provider::Codex);
+    fast_in(&std::fs::read_to_string(dir.join("config.toml")).unwrap_or_default())
 }
 
 fn fast_in(config: &str) -> bool {
@@ -146,7 +160,14 @@ fn fast_in(config: &str) -> bool {
                 .trim_start()
                 .strip_prefix('=')
         })
-        .any(|v| matches!(v.trim().trim_matches(['"', '\'']), "fast" | "priority"))
+        .any(|v| {
+            let v = v.trim();
+            let v = match v.chars().next() {
+                Some(q @ ('"' | '\'')) => v[1..].split(q).next().unwrap_or(""), // up to the closing quote
+                _ => v.split('#').next().unwrap_or("").trim(),
+            };
+            matches!(v, "fast" | "priority")
+        })
 }
 
 /// Errs before `turn/started` (the server refuses it until then), so the caller stops the
@@ -225,7 +246,7 @@ pub fn track(st: &Mutex<State>, stdin: &Mutex<ChildStdin>, pid: u32, line: &str)
         return false;
     }
     match (id, method) {
-        (Some("start" | "resume"), _) if v["error"].is_object() => crate::git::term(pid),
+        (Some("start" | "resume"), _) if v["error"].is_object() => crate::proc::term(pid),
         (Some("start" | "resume"), _) => {
             let r = &v["result"];
             s.thread = r["thread"]["id"].as_str().map(Into::into);
@@ -252,6 +273,10 @@ pub fn parse(v: &Value) -> Vec<Ev> {
         }],
         (Some("item/agentMessage/delta"), _) => vec![Ev::TextDelta(s(&p["delta"]))],
         (Some("item/started"), Some("userMessage")) => vec![Ev::User(text_of(&item["content"]))],
+        // Manual or automatic: codex's own summary stays in its history.
+        (Some("item/completed"), Some("contextCompaction")) => {
+            vec![Ev::Notice("Conversation compacted".into())]
+        }
         (Some("item/completed"), Some("agentMessage")) => vec![Ev::Text(s(&item["text"]))],
         // Plan mode's `<proposed_plan>`, cut out of the reply: a row like claude's
         // ExitPlanMode, then a version for the plan pane. The row comes first because the
@@ -335,10 +360,7 @@ pub fn parse(v: &Value) -> Vec<Ev> {
         {
             vec![Ev::Result {
                 is_error: true,
-                text: format!(
-                    "No conversation found with session ID ({})",
-                    s(&v["error"]["message"])
-                ),
+                text: format!("{SESSION_GONE} ({})", s(&v["error"]["message"])),
                 cost: 0.0,
                 secs: 0,
             }]
@@ -397,22 +419,20 @@ fn tool_use(kind: &str, item: &Value) -> Option<Ev> {
 
 fn result_text(kind: &str, item: &Value) -> String {
     match kind {
-        "commandExecution" => output(
-            &json!({"content": item["aggregatedOutput"], "total_chars": item["total_chars"]}),
-        ),
+        "commandExecution" => output(&item["aggregatedOutput"], &item["total_chars"]),
         "fileChange" => (item["changes"].as_array().into_iter().flatten())
-            .map(|c| output(&json!({"content": c["diff"], "total_chars": c["total_chars"]})))
+            .map(|c| output(&c["diff"], &c["total_chars"]))
             .collect::<Vec<_>>()
             .join("\n"),
-        "mcpToolCall" if item["error"].is_object() => output(
-            &json!({"content": item["error"]["message"], "total_chars": item["error"]["total_chars"]}),
-        ),
-        "mcpToolCall" => output(&item["result"]),
+        "mcpToolCall" if item["error"].is_object() => {
+            output(&item["error"]["message"], &item["error"]["total_chars"])
+        }
+        "mcpToolCall" => output(&item["result"]["content"], &item["result"]["total_chars"]),
         _ => String::new(),
     }
 }
 
-/// Clips a line for the transcript, like `agent::compact`: a finished turn repeats its items,
+/// Clips a line for the transcript, like `transcript::compact`: a finished turn repeats its items,
 /// and command output and diffs can be long.
 pub fn compact(v: &mut Value) -> bool {
     let mut changed = false;
@@ -451,23 +471,10 @@ pub fn compact(v: &mut Value) -> bool {
     changed
 }
 
-/// Cuts `v[key]` to what `output` shows, noting the full length as `output` expects.
-fn clip_output(v: &mut Value, key: &str) -> bool {
-    let Some(Value::String(out)) = v.get_mut(key) else {
-        return false;
-    };
-    let Some(i) = cut(out, MAX_OUTPUT) else {
-        return false;
-    };
-    let total = out.chars().count();
-    out.truncate(i);
-    v["total_chars"] = total.into();
-    true
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::transcript::{self, MAX_OUTPUT};
     use std::borrow::Cow;
 
     // Recorded from codex-cli 0.164.0 (`codex app-server`), trimmed.
@@ -528,6 +535,24 @@ mod tests {
             );
             assert!(live.ends_with(&format!("{} chars total", MAX_OUTPUT + 8)));
         }
+    }
+
+    #[test]
+    fn compact_is_its_own_request_and_a_notice() {
+        let s = State {
+            next: 3,
+            ..Default::default()
+        };
+        let req = request(&s, "th1", " /compact\n");
+        assert_eq!(req["method"], "thread/compact/start");
+        assert_eq!(req["params"], json!({"threadId": "th1"}));
+        assert_eq!(request(&s, "th1", "/compact now")["method"], "turn/start");
+        // Recorded from codex-cli 0.164.0 after `thread/compact/start`.
+        let done = r#"{"method":"item/completed","params":{"item":{"type":"contextCompaction","id":"c1"},"threadId":"th1","turnId":"t9"}}"#;
+        let v: Value = serde_json::from_str(done).unwrap();
+        assert_eq!(parse(&v), vec![Ev::Notice("Conversation compacted".into())]);
+        let started = done.replace("completed", "started");
+        assert_eq!(parse(&serde_json::from_str(&started).unwrap()), vec![]);
     }
 
     #[test]
@@ -674,7 +699,7 @@ mod tests {
         let long = "é".repeat(MAX_OUTPUT + 5);
         let line = json!({"method": "item/completed", "params": {"item": {"type": "commandExecution", "id": "x", "aggregatedOutput": long, "exitCode": 0}}}).to_string();
         let live = agent::parse(&line);
-        let stored = agent::compact(&line);
+        let stored = transcript::compact(&line);
         assert_eq!(
             agent::parse(&stored),
             live,
@@ -685,18 +710,18 @@ mod tests {
         let line = json!({"method": "item/completed", "params": {"item": {"type": "fileChange", "id": "f", "status": "completed", "changes": [{"path": "/a", "diff": diff}]}}}).to_string();
         let live = agent::parse(&line);
         assert_eq!(
-            agent::parse(&agent::compact(&line)),
+            agent::parse(&transcript::compact(&line)),
             live,
             "a long diff replays the same"
         );
         assert!(matches!(&live[..], [Ev::ToolResult { text, .. }] if text.contains("truncated")));
         let done = SESSION.lines().nth(16).unwrap();
         assert!(
-            !agent::compact(done).contains("Running it."),
+            !transcript::compact(done).contains("Running it."),
             "a turn's items are dropped"
         );
         let short = SESSION.lines().nth(11).unwrap();
-        assert!(matches!(agent::compact(short), Cow::Borrowed(_)));
+        assert!(matches!(transcript::compact(short), Cow::Borrowed(_)));
     }
 
     #[test]
@@ -705,7 +730,7 @@ mod tests {
         let codex = SESSION.lines().nth(5).unwrap();
         let path = std::env::temp_dir().join(format!("shark-mixed-{}.jsonl", std::process::id()));
         std::fs::write(&path, format!("{claude}\n{codex}\n")).unwrap();
-        let evs = agent::read_history(&path, u64::MAX);
+        let evs = transcript::read_history(&path, u64::MAX);
         std::fs::remove_file(&path).unwrap();
         assert_eq!(
             evs,
@@ -810,7 +835,7 @@ done
         }
         drop(a);
         let _ = std::fs::remove_file(ws.dir());
-        let _ = std::fs::remove_file(agent::transcript_path(&meta.id));
+        let _ = std::fs::remove_file(transcript_path(&meta.id));
         evs
     }
 
@@ -859,7 +884,7 @@ done
         let evs = run_fake(Some("old"), "gone", false);
         assert!(
             matches!(&evs[..], [Ev::Result { is_error: true, text, .. }, Ev::Exited(_)]
-                if text.starts_with("No conversation found with session ID")),
+                if text.starts_with(SESSION_GONE)),
             "{evs:?}"
         );
     }
@@ -883,6 +908,9 @@ done
         assert!(fast_in("service_tier='priority'"));
         assert!(!fast_in("service_tier = \"flex\""));
         assert!(!fast_in(""));
+        assert!(fast_in("service_tier = \"fast\" # on"));
+        assert!(fast_in("service_tier = 'priority'# on"));
+        assert!(!fast_in("service_tier = \"flex\" # fast"));
         assert!(
             !fast_in("[profiles.x]\nservice_tier = \"fast\""),
             "a profile's isn't the default"

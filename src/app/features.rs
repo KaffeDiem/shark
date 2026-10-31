@@ -24,6 +24,22 @@ impl Feature {
         }
     }
 
+    /// The workspace's closed flag for this feature.
+    pub(crate) fn closed_mut(self, ws: &mut Workspace) -> &mut bool {
+        match self {
+            Self::Diff => &mut ws.diff_closed,
+            Self::Git => &mut ws.git_closed,
+        }
+    }
+
+    /// Whether the workspace has this feature's tab open.
+    pub(crate) fn is_open(self, ws: &Workspace) -> bool {
+        !match self {
+            Self::Diff => ws.diff_closed,
+            Self::Git => ws.git_closed,
+        }
+    }
+
     fn metadata(self) -> Metadata {
         match self {
             Self::Diff => Metadata {
@@ -71,22 +87,12 @@ impl Shark {
             .on_action(cx.listener(|s, _: &Confirm, w, cx| {
                 s.show(Tab::Feature(Feature::ALL[s.feature_sel]), w, cx)
             }))
-            .on_action(cx.listener(|s, _: &SelectNext, _, cx| {
-                s.feature_sel = (s.feature_sel + 1).min(Feature::ALL.len() - 1);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|s, _: &SelectPrev, _, cx| {
-                s.feature_sel = s.feature_sel.saturating_sub(1);
-                cx.notify();
-            }))
-            .on_action(cx.listener(|s, _: &SelectFirst, _, cx| {
-                s.feature_sel = 0;
-                cx.notify();
-            }))
-            .on_action(cx.listener(|s, _: &SelectLast, _, cx| {
-                s.feature_sel = Feature::ALL.len() - 1;
-                cx.notify();
-            }))
+            .map(|d| {
+                nav_actions(d, false, cx, |s, nav, cx| {
+                    s.feature_sel = nav.to(s.feature_sel, Feature::ALL.len(), 0);
+                    cx.notify();
+                })
+            })
             .w(px(72.))
             .h_full()
             .flex_none()
@@ -161,30 +167,28 @@ impl Shark {
         let theme = cx.theme();
         let on = self.tab == Tab::Feature(feature);
         pill(meta.tab_id, on, theme)
-            .map(|d| self.tab_drag(d, feature.tab_id(), meta.title.into(), cx))
+            .map(|d| self.tab_drag(d, feature.tab_id(), meta.title.into()))
             .aria_label(meta.title)
             .pl_2p5()
             .pr_1()
             .on_click(cx.listener(move |s, _, w, cx| s.show(Tab::Feature(feature), w, cx)))
-            .child(if ctrl_held && ix < 9 {
-                kbd(&format!("ctrl-{}", ix + 1)).into_any_element()
-            } else {
+            .child(chats::ctrl_chip(ctrl_held, ix).unwrap_or_else(|| {
                 Icon::new(meta.tab_icon)
                     .with_size(px(14.))
                     .into_any_element()
-            })
+            }))
             .child(
                 tab_label(meta.title.into(), on, theme)
                     .id("tab-label")
                     .test_support(),
             )
             .child(tab_close(
-                crate::settings::close_button(meta.close_id, meta.close_label).on_click(
-                    cx.listener(move |s, _, w, cx| {
+                crate::ui::close_button(meta.close_id, meta.close_label).on_click(cx.listener(
+                    move |s, _, w, cx| {
                         cx.stop_propagation();
                         s.close_feature(feature, w, cx);
-                    }),
-                ),
+                    },
+                )),
                 theme,
             ))
             .tooltip(move |w, cx| Tooltip::new(meta.tab_tip).build(w, cx))
@@ -198,10 +202,38 @@ impl Shark {
         w: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match feature {
-            Feature::Diff => self.close_diff(w, cx),
-            Feature::Git => self.close_git(w, cx),
+        if feature == Feature::Git {
+            return self.finish_close_feature(feature, w, cx);
         }
+        let Some(name) = self.active.clone() else {
+            return;
+        };
+        self.confirm_discard(false, true, w, cx, move |s, w, cx| {
+            if s.active.as_ref() != Some(&name) {
+                return;
+            }
+            s.differ.update(cx, |d, cx| d.end_edit(cx));
+            s.finish_close_feature(feature, w, cx);
+        });
+    }
+
+    fn finish_close_feature(
+        &mut self,
+        feature: Feature,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let at = self.active_tab_index(cx);
+        let Some(ws) = self.active_ws_mut() else {
+            return;
+        };
+        *feature.closed_mut(ws) = true;
+        ws.close_tab(&feature.tab_id());
+        let _ = self.state.save();
+        if self.tab == Tab::Feature(feature) && !self.home_shown() {
+            self.select_neighbor(at.unwrap_or(0), window, cx);
+        }
+        cx.notify();
     }
 
     pub(super) fn active_git_feature(&self) -> Option<&Entity<git_feature::GitFeature>> {
@@ -255,20 +287,6 @@ impl Shark {
         {
             self.show(Tab::Feature(Feature::Diff), window, cx);
         }
-    }
-
-    pub(super) fn close_git(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws_mut() else {
-            return;
-        };
-        ws.git_closed = true;
-        ws.close_tab(&TabId::Git);
-        let _ = self.state.save();
-        if self.tab == Tab::Feature(Feature::Git) {
-            let ix = self.active_ws().unwrap().active_chat;
-            self.select_chat(ix, window, cx);
-        }
-        cx.notify();
     }
 }
 
@@ -338,7 +356,7 @@ impl Shark {
         }
     }
 
-    pub(super) fn render_feature(&self, feature: Feature, _cx: &App) -> AnyElement {
+    pub(super) fn render_feature(&self, feature: Feature) -> AnyElement {
         let content = match feature {
             Feature::Diff => self.differ.clone().into_any_element(),
             Feature::Git => self

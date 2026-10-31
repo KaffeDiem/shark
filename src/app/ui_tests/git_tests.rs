@@ -1400,7 +1400,7 @@ async fn git_feature_corrupt_drafts_are_protected_and_reported(cx: &mut TestAppC
         w.input("new draft must not destroy the old file", cx);
         feature.update(cx, |f, cx| f.retry_save(cx));
         assert!(feature.read(cx).inspect().save_error.is_some());
-        assert!(!shark.read(cx).unsaved_data(cx).is_empty());
+        assert!(!shark.read(cx).unsaved_data(None, cx).is_empty());
     })
     .unwrap();
     assert_eq!(
@@ -1728,7 +1728,7 @@ async fn git_feature_home_save_keeps_hidden_draft_local(cx: &mut TestAppContext)
             .iter()
             .find(|row| row.0 == "Save file")
             .unwrap();
-        (command.4)(s, w, cx);
+        command.run(s, w, cx);
     });
     cx.run_until_parked();
     cx.update(|cx| {
@@ -1891,7 +1891,7 @@ async fn git_feature_failed_draft_save_retries_without_losing_text(cx: &mut Test
             feature.read(cx).draft_text(cx).as_deref(),
             Some("Recover this draft")
         );
-        assert!(!shark.read(cx).unsaved_data(cx).is_empty());
+        assert!(!shark.read(cx).unsaved_data(None, cx).is_empty());
     });
     fs::remove_file(&directory).unwrap();
     cx.update(|cx| feature.update(cx, |g, cx| g.retry_save(cx)));

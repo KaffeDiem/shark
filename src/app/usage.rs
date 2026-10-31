@@ -1,8 +1,9 @@
 //! Account usage belongs to the window, independent of the selected workspace.
 use super::*;
-use crate::usage::activity::{self, Daily};
-use crate::usage::{Allowance, Failure, Provider, Snapshot, Status, countdown};
+use crate::usage::activity::{self, Daily, WEEKS};
+use crate::usage::{Allowance, Failure, Provider, Snapshot, Status};
 use gpui_kit::component::plot::shape::{Arc, ArcData};
+use objc2_foundation::{NSDate, NSDateFormatter, NSDateFormatterStyle, NSString, NSTimeZone};
 use std::f32::consts::TAU;
 use std::time::Duration;
 
@@ -59,11 +60,7 @@ impl Shark {
         let Some(panel) = self.usage_panel.take() else {
             return;
         };
-        if let Some(focus) = panel.previous_focus {
-            focus.focus(window, cx);
-        } else {
-            self.focus_fallback(window, cx);
-        }
+        self.restore_focus(panel.previous_focus, window, cx);
         cx.notify();
     }
 
@@ -351,12 +348,9 @@ fn section(provider: Provider, snapshot: &Snapshot, daily: &Daily, cx: &App) -> 
                 },
             );
             let pace = row.pace(crate::usage::now());
-            let mut reset = row.resets_at.map_or_else(
-                || "Reset time unknown".into(),
-                |at| format!("Resets {}", crate::usage::local_time(at)),
-            );
+            let mut reset = resets(row.resets_at);
             if let Some(p) = pace {
-                reset.push_str(&format!(" · Even pace: {}% left", p.round()));
+                reset.push_str(&even_pace(p));
             }
             v_flex()
                 .id(format!("usage-{}-{ix}", provider.name()))
@@ -419,7 +413,7 @@ fn section(provider: Provider, snapshot: &Snapshot, daily: &Daily, cx: &App) -> 
         .child(div().text_xs().text_color(theme.muted_foreground).child(
             snapshot.checked_at.map_or_else(
                 || "Last checked: never".into(),
-                |at| format!("Last checked: {}", crate::usage::local_time(at)),
+                |at| format!("Last checked: {}", local_time(at)),
             ),
         ))
         .when(snapshot.outdated, |d| {
@@ -427,7 +421,7 @@ fn section(provider: Provider, snapshot: &Snapshot, daily: &Daily, cx: &App) -> 
                 div()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(format!("Previous result: {}", crate::usage::local_time(at)))
+                    .child(format!("Previous result: {}", local_time(at)))
             }))
         })
         .test_support()
@@ -537,13 +531,26 @@ fn limit_line(row: &Allowance, now: f64) -> String {
         text.push_str(&format!(
             " · resets in {} ({})",
             countdown(at - now),
-            crate::usage::short_time(at)
+            short_time(at)
         ));
     }
     if let Some(p) = row.pace(now) {
         text.push_str(&format!(" · even pace {}%", p.round()));
     }
     text
+}
+
+/// "Resets Oct 28, 2026 at 11:00 PM", or that it's unknown.
+fn resets(at: Option<f64>) -> String {
+    at.map_or_else(
+        || "Reset time unknown".into(),
+        |at| format!("Resets {}", local_time(at)),
+    )
+}
+
+/// " · Even pace: 40% left", to append to a reset line.
+fn even_pace(p: f64) -> String {
+    format!(" · Even pace: {}% left", p.round())
 }
 
 fn ring_description(provider: Provider, snapshot: &Snapshot) -> String {
@@ -553,10 +560,7 @@ fn ring_description(provider: Provider, snapshot: &Snapshot) -> String {
             provider.name(),
             row.label,
             row.remaining.unwrap().ceil(),
-            row.resets_at.map_or_else(
-                || "Reset time unknown".into(),
-                |at| format!("Resets {}", crate::usage::local_time(at))
-            )
+            resets(row.resets_at)
         ),
         None => format!("{} · Remaining unknown", provider.name()),
     };
@@ -564,7 +568,7 @@ fn ring_description(provider: Provider, snapshot: &Snapshot) -> String {
         .limiting()
         .and_then(|row| row.pace(crate::usage::now()))
     {
-        text.push_str(&format!(" · Even pace: {}% left", p.round()));
+        text.push_str(&even_pace(p));
     }
     text.push_str(&status_note(snapshot));
     text
@@ -586,14 +590,81 @@ fn status_note(snapshot: &Snapshot) -> String {
         text.push_str(" · Checking…");
     }
     if let Some(at) = snapshot.checked_at {
-        text.push_str(&format!(" · Last checked {}", crate::usage::local_time(at)));
+        text.push_str(&format!(" · Last checked {}", local_time(at)));
     }
     text
 }
 
+fn local_time(seconds: f64) -> String {
+    let formatter = NSDateFormatter::new();
+    formatter.setDateStyle(NSDateFormatterStyle::MediumStyle);
+    formatter.setTimeStyle(NSDateFormatterStyle::ShortStyle);
+    formatter.setTimeZone(Some(&NSTimeZone::localTimeZone()));
+    formatter
+        .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(seconds))
+        .to_string()
+}
+
+/// Weekday and time, e.g. "Thu 11:00 PM", in the user's locale.
+fn short_time(seconds: f64) -> String {
+    let formatter = NSDateFormatter::new();
+    formatter.setLocalizedDateFormatFromTemplate(&NSString::from_str("EEEjmm"));
+    formatter.setTimeZone(Some(&NSTimeZone::localTimeZone()));
+    formatter
+        .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(seconds))
+        .to_string()
+}
+
+/// Time until a reset: "3d", "2h 14m", "5m".
+fn countdown(seconds: f64) -> String {
+    let m = (seconds.max(0.) / 60.).ceil() as u64;
+    match (m / 1440, m / 60 % 24, m % 60) {
+        (0, 0, m) => format!("{m}m"),
+        (0, h, m) => format!("{h}h {m}m"),
+        (d, _, _) => format!("{d}d"),
+    }
+}
+
+/// Token counts: "950", "412k", "38.2M".
+fn tokens(n: u64) -> String {
+    match n {
+        0..1_000 => n.to_string(),
+        1_000..999_500 => format!("{:.0}k", n as f64 / 1e3),
+        999_500..999_950_000 => format!("{:.1}M", n as f64 / 1e6),
+        _ => format!("{:.1}B", n as f64 / 1e9),
+    }
+}
+
+/// Formats [`local_day`]s for display from a localized template: `"EEEMMMd"` → "Tue, Oct 28".
+fn day_labels(template: &str) -> impl Fn(i64) -> String {
+    let formatter = NSDateFormatter::new();
+    formatter.setLocalizedDateFormatFromTemplate(&NSString::from_str(template));
+    formatter.setTimeZone(Some(&NSTimeZone::timeZoneForSecondsFromGMT(0)));
+    move |day| {
+        formatter
+            .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(day as f64 * 86400.))
+            .to_string()
+    }
+}
+
+/// (year, month 1-12, day 1-31) of a [`local_day`] in the Gregorian calendar, whatever the locale.
+fn civil(day: i64) -> (i64, u32, u32) {
+    // Hinnant's civil_from_days.
+    let z = day + 719468;
+    let era = z.div_euclid(146097);
+    let doe = z.rem_euclid(146097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let (d, m) = (
+        (doy - (153 * mp + 2) / 5 + 1) as u32,
+        (if mp < 10 { mp + 3 } else { mp - 9 }) as u32,
+    );
+    (yoe + era * 400 + i64::from(m <= 2), m, d)
+}
+
 const CELL: f32 = 11.;
 const GAP: f32 = 3.;
-const WEEKS: i64 = 20;
 
 /// Heatmap level 0–4: 0 for no tokens, else the quartile of non-zero days (GitHub's cut).
 fn levels(tokens: &[u64]) -> impl Fn(u64) -> usize {
@@ -659,6 +730,20 @@ fn card(
         .test_support()
 }
 
+/// Each month over the column holding its 1st; the first column's only if it has room.
+fn month_marks(first: i64, today: i64) -> Vec<(i64, i64)> {
+    let mut months: Vec<(i64, i64)> = vec![(0, first)];
+    for day in first + 1..=today {
+        if civil(day).2 == 1 {
+            months.push(((day - first) / 7, day));
+        }
+    }
+    if months.get(1).is_some_and(|(week, _)| *week < 3) {
+        months.remove(0);
+    }
+    months
+}
+
 fn heatmap(provider: Provider, daily: &Daily, now: f64, theme: &Theme) -> AnyElement {
     let today = activity::local_day(now);
     // Columns run Monday to Sunday; the last one holds today.
@@ -686,22 +771,13 @@ fn heatmap(provider: Provider, daily: &Daily, now: f64, theme: &Theme) -> AnyEle
     let busiest = (first..=today).max_by_key(|d| (at(*d), -d)).unwrap();
     let step = CELL + GAP;
     let gutter = 28.;
-    // Each month over the column holding its 1st; the first column's only if it has room.
-    let mut months: Vec<(i64, i64)> = vec![(0, first)];
-    for day in first + 1..=today {
-        if activity::civil(day).2 == 1 {
-            months.push(((day - first) / 7, day));
-        }
-    }
-    if months.get(1).is_some_and(|(week, _)| *week < 3) {
-        months.remove(0);
-    }
-    let (long, month) = (activity::day_labels("EEEMMMd"), activity::day_labels("MMM"));
+    let months = month_marks(first, today);
+    let (long, month) = (day_labels("EEEMMMd"), day_labels("MMM"));
     v_flex()
         .gap_2()
         .child(format!(
             "{} tokens in {WEEKS} weeks · busiest {}",
-            crate::usage::tokens(total),
+            tokens(total),
             long(busiest)
         ))
         .child(
@@ -745,7 +821,7 @@ fn heatmap(provider: Provider, daily: &Daily, now: f64, theme: &Theme) -> AnyEle
                                 long(day),
                                 match n {
                                     0 => "No activity".into(),
-                                    n => format!("{} tokens", crate::usage::tokens(n)),
+                                    n => format!("{} tokens", tokens(n)),
                                 }
                             );
                             cell(level(n), theme)
@@ -778,7 +854,32 @@ mod tests {
         Allowance, Failure, Provider, Snapshot, Theme, fill_color, label_color, left_label, levels,
         limit_line, ring_description,
     };
+    use super::{civil, countdown, local_time, month_marks, tokens};
     use gpui_kit::rgb;
+
+    #[test]
+    fn civil_dates_ignore_the_locale() {
+        assert_eq!(civil(20390), (2025, 10, 29));
+        assert_eq!(civil(0), (1970, 1, 1));
+        assert_eq!(civil(-1), (1969, 12, 31));
+        assert_eq!(civil(11016), (2000, 2, 29));
+    }
+
+    #[test]
+    fn month_marks_drop_a_leading_label_without_room() {
+        // 20372 is Oct 11, 2025 and 20393 is Nov 1.
+        assert_eq!(month_marks(20372, 20400), [(0, 20372), (3, 20393)]);
+        assert_eq!(month_marks(20382, 20400), [(1, 20393)]);
+        assert_eq!(month_marks(20390, 20392), [(0, 20390)]);
+    }
+
+    #[test]
+    fn reset_and_pace_text() {
+        assert_eq!(super::resets(None), "Reset time unknown");
+        assert!(super::resets(Some(0.)).starts_with("Resets "));
+        assert_eq!(super::even_pace(39.6), " · Even pace: 40% left");
+        assert!(!local_time(1e9).is_empty());
+    }
 
     #[test]
     fn usage_ring_thresholds_and_unknown_stale_labels() {
@@ -874,10 +975,10 @@ mod tests {
         snapshot.finish(Ok(vec![row("5 hours", 61.234)]));
         let text = ring_description(Provider::Claude, &snapshot);
         assert!(text.contains("· 62% remaining ·"), "{text}");
-        assert_eq!(crate::usage::countdown(59.), "1m");
-        assert_eq!(crate::usage::tokens(412_345), "412k");
-        assert_eq!(crate::usage::tokens(38_200_000), "38.2M");
-        assert_eq!(crate::usage::tokens(999_999), "1.0M");
+        assert_eq!(countdown(59.), "1m");
+        assert_eq!(tokens(412_345), "412k");
+        assert_eq!(tokens(38_200_000), "38.2M");
+        assert_eq!(tokens(999_999), "1.0M");
         let level = levels(&[0, 1, 2, 3, 4, 5, 6, 7, 8]);
         assert_eq!(
             [0, 1, 2, 3, 4, 5, 6, 7, 8].map(&level),

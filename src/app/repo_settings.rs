@@ -1,37 +1,41 @@
 //! Repo settings (click a repo in the sidebar): new workspace, default model, setup, run and
 //! archive scripts, removal. Every change saves at once, as in Settings.
 use super::*;
-use crate::chat::{effort_label, efforts, model_label};
-use crate::settings::{card, row, section};
+use crate::chat::{effort_label, model_label};
+use crate::models::efforts;
+use crate::scripts::Phase;
 use crate::state::RepoSettings;
+use crate::ui::{card, row, section};
 use gpui_kit::component::IndexPath;
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectState};
 
-/// Title, description and placeholder, in `RepoSettings` order: setup, run, archive.
-const PHASES: [(&str, &str, &str); 3] = [
-    (
-        "Setup",
-        "Run in each new worktree of this repo, in order",
-        "npm install  or  cp $SHARK_ROOT_PATH/.env .",
-    ),
-    (
-        "Run",
-        "cmd-r starts these and stops them; across repos, drag the repos in the sidebar. $SHARK_PORT is a free block of 10 ports",
-        "npm run dev -- --port $SHARK_PORT",
-    ),
-    (
-        "Archive",
-        "Run before the worktree is removed",
-        "docker compose down",
-    ),
-];
+/// Title, description and placeholder.
+fn info(p: Phase) -> (&'static str, &'static str, &'static str) {
+    match p {
+        Phase::Setup => (
+            "Setup",
+            "Run in each new worktree of this repo, in order",
+            "npm install  or  cp $SHARK_ROOT_PATH/.env .",
+        ),
+        Phase::Run => (
+            "Run",
+            "cmd-r starts these and stops them; across repos, drag the repos in the sidebar. $SHARK_PORT is a free block of 10 ports",
+            "npm run dev -- --port $SHARK_PORT",
+        ),
+        Phase::Archive => (
+            "Archive",
+            "Run before the worktree is removed",
+            "docker compose down",
+        ),
+    }
+}
 
 type Choice = Entity<SelectState<SearchableVec<SharedString>>>;
 
 /// A script row being dragged by its grip: which list and where from.
 #[derive(Clone)]
 struct ScriptDrag {
-    phase: usize,
+    phase: Phase,
     ix: usize,
     label: SharedString,
 }
@@ -59,7 +63,7 @@ pub(super) struct RepoSettingsView {
     last: String,
     model: Choice,
     effort: Choice,
-    /// One input per script, per `PHASES` entry; saved on every change.
+    /// One input per script, per `Phase` (indexed `as usize`); saved on every change.
     scripts: [Vec<Entity<InputState>>; 3],
     _subs: Vec<Subscription>,
 }
@@ -77,10 +81,7 @@ pub(super) fn open(shark: &mut Shark, repo: Repo, window: &mut Window, cx: &mut 
         RepoSettingsView::new(weak, repo, last, settings.unwrap_or_default(), window, cx)
     });
     window.open_dialog(cx, move |d, _, _| {
-        d.font_features(inter_features())
-            .entrance(DialogEntrance::None)
-            .w(px(640.))
-            .child(view.clone())
+        crate::ui::dialog(d).w(px(640.)).child(view.clone())
     });
 }
 
@@ -132,9 +133,9 @@ impl RepoSettingsView {
             _subs: vec![],
         };
         subs.push(this.watch_effort(window, cx));
-        for (p, list) in [s.setup, s.run, s.archive].into_iter().enumerate() {
-            for script in list {
-                this.add_script(p, &script, window, cx);
+        for p in Phase::ALL {
+            for script in s.phase(p) {
+                this.add_script(p, script, window, cx);
             }
         }
         this._subs.extend(subs);
@@ -205,18 +206,20 @@ impl RepoSettingsView {
             })
             .collect();
         self.update(cx, |s| {
-            [s.setup, s.run, s.archive] = [lists[0].clone(), lists[1].clone(), lists[2].clone()];
+            for p in Phase::ALL {
+                *s.phase_mut(p) = lists[p as usize].clone();
+            }
         });
     }
 
     fn add_script(
         &mut self,
-        phase: usize,
+        phase: Phase,
         text: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let hint = PHASES[phase].2;
+        let hint = info(phase).2;
         let input = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder(hint)
@@ -228,16 +231,16 @@ impl RepoSettingsView {
                     this.save_scripts(cx);
                 }
             }));
-        self.scripts[phase].push(input);
+        self.scripts[phase as usize].push(input);
     }
 
-    fn remove_script(&mut self, phase: usize, ix: usize, cx: &mut Context<Self>) {
-        self.scripts[phase].remove(ix);
+    fn remove_script(&mut self, phase: Phase, ix: usize, cx: &mut Context<Self>) {
+        self.scripts[phase as usize].remove(ix);
         self.save_scripts(cx);
     }
 
     fn move_script(&mut self, d: &ScriptDrag, to: usize, cx: &mut Context<Self>) {
-        let list = &mut self.scripts[d.phase];
+        let list = &mut self.scripts[d.phase as usize];
         if d.ix != to && d.ix < list.len() && to < list.len() {
             move_item(list, d.ix, to);
             self.save_scripts(cx);
@@ -290,66 +293,73 @@ impl RepoSettingsView {
         );
     }
 
-    fn render_scripts(&self, phase: usize, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_scripts(&self, phase: Phase, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        let (title, desc, _) = PHASES[phase];
-        let rows = self.scripts[phase].iter().enumerate().map(|(ix, input)| {
-            let label: SharedString = input.read(cx).value().to_string().into();
-            h_flex()
-                .id(("script", phase * 1000 + ix))
-                .px_2()
-                .py_1p5()
-                .gap_2()
-                .when(ix > 0, |r| r.border_t_1().border_color(theme.border))
-                .drag_over::<ScriptDrag>(move |s, d, _, cx| match d.phase == phase {
-                    true => s.bg(cx.theme().accent),
-                    false => s,
-                })
-                .on_drop(cx.listener(move |this, d: &ScriptDrag, _, cx| {
-                    if d.phase == phase {
-                        this.move_script(d, ix, cx)
-                    }
-                }))
-                .child(
-                    div()
-                        .w(px(14.))
-                        .text_xs()
-                        .text_color(theme.muted_foreground)
-                        .child(format!("{}", ix + 1)),
-                )
-                .child(
-                    div()
-                        .id(("grip", phase * 1000 + ix))
-                        .cursor_grab()
-                        .text_color(theme.muted_foreground)
-                        .child(Icon::new(IconName::GripVertical).with_size(px(14.)))
-                        .on_drag(ScriptDrag { phase, ix, label }, |d, _, _, cx| {
-                            cx.new(|_| d.clone())
-                        }),
-                )
-                .child(
-                    div()
-                        .flex_1()
-                        .font_family(theme.mono_font_family.clone())
-                        .text_size(theme.mono_font_size)
-                        .child(Input::new(input).appearance(false).small()),
-                )
-                .child(
-                    Button::new(("remove-script", phase * 1000 + ix))
-                        .ghost()
-                        .xsmall()
-                        .icon(IconName::X)
-                        .tooltip("Remove")
-                        .on_click(
-                            cx.listener(move |this, _, _, cx| this.remove_script(phase, ix, cx)),
-                        ),
-                )
-        });
-        let list = self.scripts[phase].clone();
+        let (title, desc, _) = info(phase);
+        let slot = phase as usize * 1000;
+        let rows =
+            self.scripts[phase as usize]
+                .iter()
+                .enumerate()
+                .map(|(ix, input)| {
+                    let label: SharedString = input.read(cx).value().to_string().into();
+                    h_flex()
+                        .id(("script", slot + ix))
+                        .px_2()
+                        .py_1p5()
+                        .gap_2()
+                        .when(ix > 0, |r| r.border_t_1().border_color(theme.border))
+                        .drag_over::<ScriptDrag>(move |s, d, _, cx| match d.phase == phase {
+                            true => s.bg(cx.theme().accent),
+                            false => s,
+                        })
+                        .on_drop(cx.listener(move |this, d: &ScriptDrag, _, cx| {
+                            if d.phase == phase {
+                                this.move_script(d, ix, cx)
+                            }
+                        }))
+                        .child(
+                            div()
+                                .w(px(14.))
+                                .text_xs()
+                                .text_color(theme.muted_foreground)
+                                .child(format!("{}", ix + 1)),
+                        )
+                        .child(
+                            div()
+                                .id(("grip", slot + ix))
+                                .cursor_grab()
+                                .text_color(theme.muted_foreground)
+                                .child(Icon::new(IconName::GripVertical).with_size(px(14.)))
+                                .on_drag(ScriptDrag { phase, ix, label }, |d, _, _, cx| {
+                                    cx.new(|_| d.clone())
+                                }),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .font_family(theme.mono_font_family.clone())
+                                .text_size(theme.mono_font_size)
+                                .child(Input::new(input).appearance(false).small()),
+                        )
+                        .child(
+                            Button::new(("remove-script", slot + ix))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::X)
+                                .tooltip("Remove")
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.remove_script(phase, ix, cx)
+                                })),
+                        )
+                });
+        let list = self.scripts[phase as usize].clone();
         v_flex()
             .gap_1p5()
             .child(section(theme, title))
-            .when(phase == 1, |d| d.child(Self::start_order_note(theme)))
+            .when(phase == Phase::Run, |d| {
+                d.child(Self::start_order_note(theme))
+            })
             .child(
                 card(theme).children(rows).child(
                     h_flex()
@@ -358,14 +368,14 @@ impl RepoSettingsView {
                             r.border_t_1().border_color(theme.border)
                         })
                         .child(
-                            Button::new(("add-script", phase))
+                            Button::new(("add-script", phase as usize))
                                 .ghost()
                                 .xsmall()
                                 .icon(IconName::Plus)
                                 .label("Add script")
                                 .on_click(cx.listener(move |this, _, w, cx| {
                                     this.add_script(phase, "", w, cx);
-                                    if let Some(i) = this.scripts[phase].last() {
+                                    if let Some(i) = this.scripts[phase as usize].last() {
                                         i.update(cx, |i, cx| i.focus(w, cx));
                                     }
                                     cx.notify();
@@ -417,7 +427,8 @@ impl RepoSettingsView {
 impl Render for RepoSettingsView {
     fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (path, name) = (self.repo.path.clone(), self.repo.name.clone());
-        let scripts: Vec<AnyElement> = (0..PHASES.len())
+        let scripts: Vec<AnyElement> = Phase::ALL
+            .into_iter()
             .map(|p| self.render_scripts(p, cx).into_any_element())
             .collect();
         let theme = cx.theme();
