@@ -110,18 +110,16 @@ impl Shark {
                 cx.listener(move |this, e: &MouseDownEvent, window, cx| {
                     // Only what it says: scripts that exit while the menu is open aren't rerun.
                     let stop = port.is_some();
-                    let toggle = on_shark(cx, move |s, w, cx| {
+                    let ws = this.active.clone();
+                    let toggle = on_shown(cx, ws.clone(), move |s, w, cx| {
                         if s.active.as_ref().is_some_and(|n| s.running(n)) == stop {
                             s.toggle_run(w, cx)
                         }
                     });
+                    let log = on_shown(cx, ws, |s, w, cx| s.show_script_log(w, cx));
                     let entries = vec![
                         menu::item(icon, verb, toggle),
-                        menu::item(
-                            IconName::ScrollText,
-                            "Show script output",
-                            on_shark(cx, |s, w, cx| s.show_script_log(w, cx)),
-                        ),
+                        menu::item(IconName::ScrollText, "Show script output", log),
                     ];
                     this.show_menu(e.position, entries, window, cx);
                 }),
@@ -207,6 +205,20 @@ impl Shark {
             false => notify_err(window, cx, "No script has run in this workspace yet"),
         }
     }
+}
+
+/// A run-menu action that runs only while `ws`, whose menu it is, is still the one shown: the
+/// menu outlives workspace switches.
+fn on_shown(
+    cx: &Context<Shark>,
+    ws: Option<String>,
+    f: impl Fn(&mut Shark, &mut Window, &mut Context<Shark>) + 'static,
+) -> impl Fn(&mut Window, &mut App) + 'static {
+    on_shark(cx, move |s, w, cx| {
+        if !s.home_shown() && s.active == ws {
+            f(s, w, cx)
+        }
+    })
 }
 
 /// An error notice with the end of the log, kept until dismissed.
