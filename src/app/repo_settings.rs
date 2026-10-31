@@ -81,9 +81,7 @@ pub(super) fn open(shark: &mut Shark, repo: Repo, window: &mut Window, cx: &mut 
         RepoSettingsView::new(weak, repo, last, settings.unwrap_or_default(), window, cx)
     });
     window.open_dialog(cx, move |d, _, _| {
-        crate::ui::dialog(d)
-            .w(px(640.))
-            .child(view.clone())
+        crate::ui::dialog(d).w(px(640.)).child(view.clone())
     });
 }
 

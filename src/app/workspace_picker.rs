@@ -23,10 +23,7 @@ pub(super) struct WorkspacePicker {
 #[derive(PartialEq)]
 pub(super) struct PickerWorkspace {
     name: String,
-    repos: Vec<(
-        String,
-        (String, IconName, Option<crate::prs::PrStatus>),
-    )>,
+    repos: Vec<(String, (String, IconName, Option<crate::prs::PrStatus>))>,
     last_interacted_at: Option<u64>,
     running: usize,
     attention: Attn,

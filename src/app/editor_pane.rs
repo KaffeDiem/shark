@@ -879,10 +879,11 @@ impl Shark {
                     .when_some(language_status.clone(), |d, (status, detail)| {
                         let busy = activity.as_ref();
                         // "Indexing 42%"; the server's message (crate, file count) is in the tooltip.
-                        let label = busy.map_or(status.label().to_string(), |w| match w.percentage {
-                            Some(p) => format!("{} {p}%", w.title),
-                            None => w.title.clone(),
-                        });
+                        let label =
+                            busy.map_or(status.label().to_string(), |w| match w.percentage {
+                                Some(p) => format!("{} {p}%", w.title),
+                                None => w.title.clone(),
+                            });
                         let tooltip = (busy.and_then(|w| w.message.clone()))
                             .or(detail)
                             .unwrap_or_else(|| "Restart language tools".into());
@@ -966,7 +967,9 @@ impl Shark {
             })
             .when_some(
                 language_status.and_then(|(status, detail)| {
-                    (status == crate::lsp::Status::SetupNeeded).then_some(detail).flatten()
+                    (status == crate::lsp::Status::SetupNeeded)
+                        .then_some(detail)
+                        .flatten()
                 }),
                 |d, detail| {
                     let deps = [crate::deps::Dep {

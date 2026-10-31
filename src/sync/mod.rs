@@ -5,9 +5,9 @@
 mod base_tests;
 mod run;
 mod status;
+pub use run::check_in_background;
 #[cfg(test)]
 pub(crate) use status::parse_prs;
-pub use run::check_in_background;
 pub use status::{
     Kind, Pr, PrState, Repo, ago, branch_prs, github_url, origin_repo, pick_pr, short,
 };

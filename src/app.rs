@@ -1,10 +1,10 @@
 //! Root view: sidebar of repos and workspaces, Chat/Diff tabs, palette and dialogs.
 use crate::attention::Attn;
 use crate::chat::{Chat, ChatEvent};
-use crate::models::MODELS;
 use crate::checkbox::Checkbox;
 use crate::editor::{EditorEvent, FileEditor};
 use crate::menu::{self, Entry};
+use crate::models::MODELS;
 use crate::state::{ChatMeta, Repo, Section, State, TabId, Workspace, move_item, workspaces_dir};
 use crate::sync::{GitSync, SyncEvent};
 use crate::*;
@@ -50,6 +50,7 @@ pub(crate) mod menus;
 mod new_workspace;
 mod palette;
 mod picker;
+mod pokemon;
 mod reorder;
 mod repo_settings;
 mod run;
@@ -139,12 +140,14 @@ pub struct Shark {
     menu: Option<(Entity<menu::Menu>, Subscription)>,
     app_switcher: Option<app_switcher::AppSwitcher>,
     usage_panel: Option<usage::Panel>,
-    usage: [crate::usage::Snapshot; 2],
+    pokemon_ui: pokemon::CompanionUi,
+    usage_providers: Vec<crate::usage::providers::ProviderHandle>,
+    usage: Vec<crate::usage::Snapshot>,
     /// Daily tokens from the agents' local logs, rescanned with each usage refresh.
-    usage_activity: [crate::usage::activity::Daily; 2],
-    activity_cache: std::sync::Arc<[std::sync::Mutex<crate::usage::activity::Cache>; 2]>,
+    usage_activity: Vec<crate::usage::activity::Daily>,
+    usage_reports: Vec<crate::usage::logs::Report>,
     #[cfg(test)]
-    usage_queries: [usize; 2],
+    usage_queries: Vec<usize>,
     #[cfg(test)]
     usage_live: bool,
     usage_at: Rc<std::cell::Cell<Bounds<Pixels>>>,
@@ -189,6 +192,8 @@ impl Shark {
             s.restore_last_open(window, cx);
             s.check_deps(cx);
             s.usage_polling(window, cx);
+            s.pokemon_window_activity(window, cx);
+            s.load_pokemon(cx);
             let msg = match (backup, read_only) {
                 (Some(bak), _) => Some(format!(
                     "Couldn't read state.json; moved it to {}",
@@ -234,6 +239,7 @@ impl Shark {
             }),
             cx.observe_window_activation(window, |s, w, cx| {
                 s.attn.window_active = w.is_window_active();
+                s.pokemon_window_activity(w, cx);
                 s.usage_polling(w, cx);
                 if !s.attn.window_active {
                     s.close_app_switcher(false, w, cx);
@@ -256,6 +262,19 @@ impl Shark {
         _subs.push(cx.subscribe_in(&differ, window, |s, _, event, w, cx| {
             s.differ_event(event, w, cx)
         }));
+        let usage_providers: Vec<_> = crate::usage::providers::builtins().handles().collect();
+        for provider in &usage_providers {
+            provider.source().configure_scan_roots(
+                state
+                    .usage_roots
+                    .get(provider.id())
+                    .map(String::as_str)
+                    .unwrap_or(""),
+            );
+        }
+        let provider_count = usage_providers.len();
+        let mut pokemon_ui = pokemon::CompanionUi::default();
+        pokemon_ui.scanning = vec![false; provider_count];
         Shark {
             state,
             sel: SideRow::Ws(0),
@@ -293,11 +312,15 @@ impl Shark {
             menu: None,
             app_switcher: None,
             usage_panel: None,
-            usage: Default::default(),
-            usage_activity: Default::default(),
-            activity_cache: Default::default(),
+            pokemon_ui,
+            usage_providers,
+            usage: vec![Default::default(); provider_count],
+            usage_activity: vec![Default::default(); provider_count],
+            usage_reports: (0..provider_count)
+                .map(|_| crate::usage::logs::Report::from_daily(Default::default()))
+                .collect(),
             #[cfg(test)]
-            usage_queries: [0; 2],
+            usage_queries: vec![0; provider_count],
             #[cfg(test)]
             usage_live: false,
             usage_at: Default::default(),
@@ -954,6 +977,7 @@ impl Shark {
 
 impl Render for Shark {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_chat_pokemon(cx);
         self.prune_reorder(cx);
         // Toasts clear the toolbar, Features rail, and visible Files controls.
         let mut side = if self.right_rail_shown() {
@@ -982,7 +1006,9 @@ impl Render for Shark {
             .text_color(theme.foreground)
             .font_features(inter_features())
             .on_action(cx.listener(|this, _: &TogglePalette, w, cx| this.toggle_palette(w, cx)))
-            .on_action(cx.listener(|this, _: &NewWorkspace, w, cx| this.new_workspace_default(w, cx)))
+            .on_action(
+                cx.listener(|this, _: &NewWorkspace, w, cx| this.new_workspace_default(w, cx)),
+            )
             .on_action(cx.listener(|this, _: &ArchiveWorkspace, w, cx| this.archive(false, w, cx)))
             .on_action(
                 cx.listener(|this, _: &ForceArchiveWorkspace, w, cx| this.archive(true, w, cx)),
@@ -1003,6 +1029,7 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &StopAgent, _, cx| this.stop(cx)))
             .on_action(cx.listener(|this, _: &FocusQueue, w, cx| this.focus_queue(w, cx)))
             .on_action(cx.listener(|this, _: &ShowUsage, w, cx| this.show_usage(w, cx)))
+            .on_action(cx.listener(|this, _: &ShowPokemon, w, cx| this.show_pokemon(w, cx)))
             .on_action(cx.listener(|this, _: &ShowChat, w, cx| this.show(Tab::Chat, w, cx)))
             .on_action(cx.listener(|this, _: &NewChat, w, cx| this.new_chat(w, cx)))
             .on_action(cx.listener(|this, _: &CloseChat, w, cx| this.close_chat(w, cx)))
@@ -1135,6 +1162,7 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &OpenAnyFile, w, cx| this.open_any_file(w, cx)))
             .on_action(cx.listener(|this, _: &RunScripts, w, cx| this.toggle_run(w, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, w, cx| {
+                this.close_usage(w, cx);
                 crate::settings::open(&this.state, w, cx)
             }))
             .children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))

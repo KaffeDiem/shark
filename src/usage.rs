@@ -1,7 +1,10 @@
 //! Short-lived, prompt-free account queries. No chat state or snapshots go to disk.
 pub mod activity;
+pub mod logs;
+pub mod pace;
+pub mod providers;
+pub mod summary;
 
-use objc2_foundation::{NSISO8601DateFormatOptions, NSISO8601DateFormatter, NSString};
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::PathBuf;
@@ -18,6 +21,16 @@ pub enum Provider {
 impl Provider {
     pub const ALL: [Self; 2] = [Self::Claude, Self::Codex];
 
+    /// Adapter for Shark's existing account query and local activity reader.
+    pub fn source(self) -> &'static dyn providers::UsageProvider {
+        providers::builtins()
+            .get(match self {
+                Self::Claude => "claude",
+                Self::Codex => "codex",
+            })
+            .expect("built-in usage provider registered")
+    }
+
     pub fn name(self) -> &'static str {
         match self {
             Self::Claude => "Claude",
@@ -25,11 +38,9 @@ impl Provider {
         }
     }
 
+    #[cfg(test)]
     pub fn index(self) -> usize {
-        match self {
-            Self::Claude => 0,
-            Self::Codex => 1,
-        }
+        self as usize
     }
 }
 
@@ -44,14 +55,6 @@ pub struct Allowance {
 
 const HOUR: f64 = 3600.;
 const WEEK: f64 = 7. * 24. * HOUR;
-
-impl Allowance {
-    /// The share that would be left `now` if the window were used evenly: 50 halfway to the reset.
-    pub fn pace(&self, now: f64) -> Option<f64> {
-        let window = self.window.filter(|w| *w > 0.)?;
-        Some(((self.resets_at? - now) / window * 100.).clamp(0., 100.))
-    }
-}
 
 /// The provider's data dir: `$CLAUDE_CONFIG_DIR` or `$CODEX_HOME`, else `~/.claude` or `~/.codex`.
 pub(crate) fn config_dir(p: Provider) -> PathBuf {
@@ -107,14 +110,6 @@ pub struct Snapshot {
 }
 
 impl Snapshot {
-    /// The tightest known allowance; unknown windows cannot imply available capacity.
-    pub fn limiting(&self) -> Option<&Allowance> {
-        self.allowances
-            .iter()
-            .filter(|row| row.remaining.is_some())
-            .min_by(|a, b| a.remaining.unwrap().total_cmp(&b.remaining.unwrap()))
-    }
-
     /// One in-flight query per provider, shared by opening, refresh and polling.
     pub fn begin(&mut self) -> bool {
         if self.status == Status::Loading {
@@ -147,19 +142,8 @@ impl Snapshot {
 }
 
 pub(crate) fn timestamp(value: &Value) -> Option<f64> {
-    let formatter = NSISO8601DateFormatter::new();
-    let text = NSString::from_str(value.as_str()?);
-    for options in [
-        NSISO8601DateFormatOptions::WithInternetDateTime
-            | NSISO8601DateFormatOptions::WithFractionalSeconds,
-        NSISO8601DateFormatOptions::WithInternetDateTime,
-    ] {
-        formatter.setFormatOptions(options);
-        if let Some(date) = formatter.dateFromString(&text) {
-            return Some(date.timeIntervalSince1970());
-        }
-    }
-    None
+    let t = chrono::DateTime::parse_from_rfc3339(value.as_str()?).ok()?;
+    Some(t.timestamp() as f64 + f64::from(t.timestamp_subsec_nanos()) / 1e9)
 }
 
 fn remaining(value: &Value) -> Option<f64> {

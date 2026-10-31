@@ -1,8 +1,10 @@
 //! One agent conversation (a chat tab): transcript blocks, composer, and the claude process.
+pub(crate) mod activity;
+#[cfg(test)]
+mod activity_tests;
 mod completion;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod completion_pixels;
-mod critters;
 mod links;
 mod model;
 mod planmode;
@@ -12,6 +14,7 @@ mod review;
 mod side;
 mod tools;
 
+use self::queue::Queued;
 use crate::agent::{self, Agent, Ev};
 use crate::complete::{self, Item};
 use crate::models::EFFORT;
@@ -36,9 +39,7 @@ use gpui_kit::component::shimmer::ShimmerText;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{
-    ActiveTheme, Icon, Selectable as _, ThemeColor, WindowExt as _, h_flex, v_flex,
-};
+use gpui_kit::component::{ActiveTheme, Icon, Selectable as _, WindowExt as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 pub(crate) use links::{copy_button, link_roots, markdown};
@@ -46,7 +47,6 @@ pub(crate) use links::{copy_button, link_roots, markdown};
 pub(crate) use model::model_entries;
 pub(crate) use model::{effort_label, model_label};
 use planmode::{ENTER_PLAN, NEEDS_APPROVAL, PLAN_SHOWN};
-use self::queue::Queued;
 pub(crate) use review::{ReviewCard, ReviewItem, parse_reports};
 use review::{card_of, hidden_reply, hide_reports, may_report, review_title, split_notes};
 use serde_json::Value;
@@ -124,7 +124,10 @@ pub struct Chat {
     pub busy: bool,
     /// Background tasks (subagents, shells) still running; the turn can end before they do.
     pub background: Vec<agent::Task>,
-    critters: HashMap<String, usize>,
+    task_pokemon: HashMap<String, String>,
+    activity_roster: Vec<activity::Pokemon>,
+    activity_portraits:
+        std::collections::BTreeMap<activity::Appearance, std::sync::Arc<RenderImage>>,
     hop: usize,
     hopping: Option<Task<()>>,
     /// When the running turn started.
@@ -319,7 +322,9 @@ impl Chat {
             sel: 0,
             busy: false,
             background: vec![],
-            critters: HashMap::new(),
+            task_pokemon: HashMap::new(),
+            activity_roster: vec![],
+            activity_portraits: std::collections::BTreeMap::new(),
             hop: 0,
             hopping: None,
             started: None,
@@ -406,7 +411,7 @@ impl Chat {
         let kept = (
             self.busy,
             std::mem::take(&mut self.background),
-            std::mem::take(&mut self.critters),
+            std::mem::take(&mut self.task_pokemon),
             self.hop,
             self.hopping.take(),
             self.started,
@@ -430,7 +435,7 @@ impl Chat {
         (
             self.busy,
             self.background,
-            self.critters,
+            self.task_pokemon,
             self.hop,
             self.hopping,
             self.started,
@@ -2032,7 +2037,7 @@ mod tests {
 pub(crate) mod ui_tests {
     use super::*;
     use crate::models::effort_of;
-    use critters::HOP_INTERVAL;
+    use activity::HOP_INTERVAL;
     use planmode::{APPROVED, BUILD_FRESH};
 
     /// Feeds recorded protocol lines to the chat as its process would.
@@ -2048,6 +2053,66 @@ pub(crate) mod ui_tests {
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
     use gpui_kit::InputEvent as _;
     use gpui_kit::test::TestWindowExt as _;
+
+    pub(crate) fn set_activity_tasks(
+        c: &mut Chat,
+        tasks: Vec<agent::Task>,
+        cx: &mut Context<Chat>,
+    ) {
+        c.apply(Ev::Background(tasks), cx);
+    }
+
+    pub(crate) fn activity_snapshot(c: &Chat) -> (Vec<(String, activity::Appearance, bool)>, bool) {
+        (
+            c.background
+                .iter()
+                .filter_map(|t| {
+                    activity::assigned(t, &c.task_pokemon, &c.activity_roster).map(|p| {
+                        (
+                            t.id.clone(),
+                            p.appearance.clone(),
+                            c.activity_portraits.contains_key(&p.appearance),
+                        )
+                    })
+                })
+                .collect(),
+            c.hopping.is_some(),
+        )
+    }
+
+    pub(crate) fn seed_activity_pokemon(c: &mut Chat, cx: &mut Context<Chat>) {
+        let roster: Vec<_> = [
+            (1, "Bulbasaur"),
+            (4, "Charmander"),
+            (7, "Squirtle"),
+            (25, "Pikachu"),
+        ]
+        .into_iter()
+        .map(|(id, name)| activity::Pokemon {
+            id: format!("caught-{id}"),
+            name: name.into(),
+            appearance: (id, false, None),
+        })
+        .collect();
+        c.sync_activity_roster(&roster, cx);
+        for pokemon in roster {
+            let image = if let Some(dir) = std::env::var_os("SHARK_POKEMON_PREVIEW_SPRITES") {
+                let path = PathBuf::from(dir).join(format!("{}.gif", pokemon.appearance.0));
+                let asset =
+                    crate::pokemon::sprites::cached(&path).expect("validated preview Pokémon");
+                crate::ui::pokemon_images::render_capped(asset, std::time::Duration::MAX)
+            } else {
+                std::sync::Arc::new(RenderImage::new(vec![image::Frame::new(
+                    image::RgbaImage::from_pixel(
+                        16,
+                        16,
+                        image::Rgba([80, 160, (pokemon.appearance.0 * 8) as u8, 255]),
+                    ),
+                )]))
+            };
+            c.set_activity_portrait(pokemon.appearance, image, cx);
+        }
+    }
 
     /// Real-renderer smoke check, also exporting the parade for visual inspection.
     pub(crate) fn render_activity_pixels(cx: &mut HeadlessAppContext) {
@@ -2126,13 +2191,16 @@ pub(crate) mod ui_tests {
                             .collect(),
                         cx,
                     );
+                    seed_activity_pokemon(c, cx);
                 });
             });
             cx.run_until_parked();
             let mut first = None;
-            for state in ["first", "next", "hover", "static"] {
-                if state == "next" {
+            let mut still = None;
+            for state in ["first", "next", "hover", "static", "static-next"] {
+                if state == "next" || state == "static-next" {
                     cx.advance_clock(HOP_INTERVAL);
+                    cx.run_until_parked();
                 }
                 if state == "static" {
                     cx.update(|cx| cx.set_reduce_motion(true));
@@ -2140,15 +2208,27 @@ pub(crate) mod ui_tests {
                 cx.update_window(window, |_, w, cx| {
                     w.render_frame(cx);
                     if state == "hover" {
-                        w.hover(("background-critter", 0usize), cx);
+                        w.hover(("background-pokemon", 0usize), cx);
                     }
                     if state == "static" {
                         w.pointer_move(point(px(450.), px(0.)), None, cx);
                     }
                 })
                 .unwrap();
+                if state == "static" {
+                    // Let the hover-card close delay finish before comparing still frames.
+                    cx.advance_clock(std::time::Duration::from_secs(1));
+                    cx.run_until_parked();
+                }
                 if state == "hover" {
                     cx.advance_clock(std::time::Duration::from_secs(1));
+                    cx.run_until_parked();
+                    cx.update_window(window, |_, w, cx| {
+                        w.render_frame(cx);
+                        assert!(w.find("activity-details").visible());
+                        assert!(w.find(("activity-task", 0usize)).visible());
+                    })
+                    .unwrap();
                 }
                 let shot = cx
                     .capture_screenshot(window)
@@ -2162,6 +2242,15 @@ pub(crate) mod ui_tests {
                 }
                 if state == "first" {
                     first = Some(shot.clone());
+                }
+                if state == "static" {
+                    still = Some(shot.clone());
+                }
+                if state == "static-next" {
+                    assert!(
+                        still.as_ref().unwrap() == &shot,
+                        "reduced motion keeps portraits still"
+                    );
                 }
                 if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
                     let dir = PathBuf::from(dir);
@@ -2191,6 +2280,7 @@ pub(crate) mod ui_tests {
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
                 c.apply(Ev::Background(tasks()), cx);
+                seed_activity_pokemon(c, cx);
                 assert!(!c.busy && c.working());
                 assert!(c.hopping.is_some());
                 assert_eq!(c.list.item_count(), c.rows.len() + 1);
@@ -2203,8 +2293,8 @@ pub(crate) mod ui_tests {
                 assert_eq!(w.find("activity").bounds().size.height, px(24.));
                 (0usize..4)
                     .map(|i| {
-                        let slot = w.find(("background-critter", i)).bounds();
-                        assert_eq!(slot.size, size(px(12.), px(12.)));
+                        let slot = w.find(("background-pokemon", i)).bounds();
+                        assert_eq!(slot.size, size(px(20.), px(20.)));
                         slot
                     })
                     .collect::<Vec<_>>()
@@ -2223,15 +2313,15 @@ pub(crate) mod ui_tests {
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
                 assert_eq!(c.hop, 1);
-                let critters = c.critters.clone();
+                let assignments = c.task_pokemon.clone();
                 c.load_history(vec![Ev::Background(vec![]), Ev::Exited(String::new())], cx);
                 assert_eq!(c.background, tasks());
-                assert_eq!(c.critters, critters);
+                assert_eq!(c.task_pokemon, assignments);
                 assert_eq!(c.hop, 1);
                 assert!(c.hopping.is_some());
                 c.apply(Ev::Background(vec![]), cx);
                 assert!(!c.working());
-                assert!(c.hopping.is_none() && c.critters.is_empty());
+                assert!(c.hopping.is_none() && c.task_pokemon.is_empty());
                 assert_eq!(c.list.item_count(), c.rows.len() + 1);
             })
         });
@@ -2263,7 +2353,7 @@ pub(crate) mod ui_tests {
                     "a changed motion preference stops the timer"
                 );
                 c.apply(Ev::Exited(String::new()), cx);
-                assert!(!c.working() && c.critters.is_empty());
+                assert!(!c.working() && c.task_pokemon.is_empty());
             })
         });
     }
