@@ -1,6 +1,6 @@
 # Pokémon in Shark
 
-The navigation footer pairs a small Pokémon with one line of Claude and Codex remaining percentages, colored by usage pace. Hover for provider names, quota windows, pace labels, and refresh/error status. Unknown or outdated quotas show a neutral dash, and refreshing keeps the layout still. Claude Code and Codex token activity raises the Pokémon. Click it to open Home, Pokédex, Bag, Shop, or the existing Usage view. Egg incubation, evolution, rarity, shiny appearances, natures, individual profiles, forms, and graduation are implemented in Rust.
+The navigation footer pairs a small Pokémon with one line of Claude and Codex remaining percentages, colored by usage pace. Hover for provider names, quota windows, pace labels, and refresh/error status. Unknown or outdated quotas show a neutral dash, and refreshing keeps the layout still. Claude Code and Codex token activity raises the Pokémon. Click it to open Usage, with compact allowance cards, token totals, and a Pokémon growth card. Open the growth card to reach Home, Pokédex, Bag, and Shop. Expand Details for exact reset times, pace explanations, historical charts, and token accounting. Egg incubation, evolution, rarity, shiny appearances, natures, individual profiles, forms, and graduation are implemented in Rust.
 
 Settings → General also controls animation quality; choose the navigation Pokémon in the companion's Pokédex. Navigation animation pauses when Shark is inactive or Reduce Motion is enabled, and adapts to Low Power Mode.
 
@@ -16,13 +16,15 @@ The app derives polling, daily activity, Usage rows, and companion observations 
 
 The built-in adapters call Shark's existing account query and local-log readers. No PokeTokenBar OAuth, Keychain, or session-key fetching replaces those protocols. Queries run in the background and cannot start a model turn. Quota percentages are supplied by the CLI, not estimated from token totals. Token growth and quota rewards have independent persisted checkpoints.
 
-The existing Usage heatmap keeps Shark's original token definition. Companion accounting includes input, output, cache writes, and cache reads; Usage shows this breakdown separately. Cost metadata distinguishes reported values, estimates from the pinned upstream pricing table, partial coverage, and unavailable prices. These costs never determine subscription allowances.
+Usage shows account allowances, token summaries, and a monthly trend, without contribution calendars. Companion accounting includes input, output, cache writes, and cache reads; Usage shows this breakdown separately. Cost metadata distinguishes reported values, estimates from the pinned upstream pricing table, partial coverage, and unavailable prices. These costs never determine subscription allowances.
 
 Settings → Token sources accepts additional local scan folders for each supported provider. Changing folders invalidates pending observations and establishes a new checkpoint for that provider, so adding old logs cannot grant historical currency. This preference does not replace the CLI's account query.
 
 The first observation establishes a baseline. Repeated observations and restarts cannot credit the same usage twice. Same-day lower totals preserve the high-water mark, so temporarily missing logs cannot award tokens again when restored. Switching Pokémon off and on invalidates pending observations and establishes a fresh baseline. Candy rewards apply to the headline five-hour and weekly windows; model-specific and monetary caps do not earn duplicate rewards.
 
 Home artwork opens the growing individual's details, independent of the Pokémon pinned in navigation. Providers that do not report cost show no monetary values in Usage summaries, charts, or detail rows.
+
+Shop cards show item artwork, effects, owned counts, and the total token price for the selected quantity. Rare Candy and Shiny Charm artwork loads from the existing PokéAPI sprite source when Shop or Bag opens, with immediate fallback icons offline; Mint and eggs use native icons. Egg cards identify their guaranteed rarity and explain that buying one archives the current companion. Bag uses the same item cards and links to Shop when empty. Buying and using items still follows the existing balance, inventory, and companion checks.
 
 ## Data and recovery
 

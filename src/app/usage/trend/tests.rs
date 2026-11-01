@@ -407,6 +407,7 @@ fn fixture(
         .unwrap()
         .timestamp() as f64;
     s.show_usage(w, cx);
+    s.usage_panel.as_mut().unwrap().details = true;
     s.usage_panel.as_mut().unwrap().reference_time = Some(now);
     s.usage_reports[0] = report(values, now);
     s.usage_reports[1] = Report::default();
@@ -598,6 +599,7 @@ async fn native_legend_wraps_for_future_sources_with_long_names(cx: &mut TestApp
                     .map(|_| report(&[("2026-08-24", 888888888)], now))
                     .collect();
                 s.show_usage(w, cx);
+                s.usage_panel.as_mut().unwrap().details = true;
                 s.usage_panel.as_mut().unwrap().reference_time = Some(now);
                 cx.notify();
             });

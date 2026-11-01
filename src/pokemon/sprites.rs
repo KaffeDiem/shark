@@ -231,6 +231,26 @@ fn cached_checked(path: &Path, allowed: impl Fn() -> bool) -> Option<Arc<Asset>>
     let asset = decode(path, bytes).ok()?;
     allowed().then(|| remember(asset))
 }
+/// Item identities are a closed allowlist; callers cannot supply paths or URLs.
+pub fn load_item_with(
+    directory: &Path,
+    item: super::Item,
+    fetch: impl FnOnce(&str) -> Result<Vec<u8>, String>,
+) -> Result<Arc<Asset>, String> {
+    let name = item.sprite_name().ok_or("Item has no official sprite")?;
+    let path = directory.join(format!("item-{name}.png"));
+    if let Some(asset) = cached_checked(&path, || true) {
+        return Ok(asset);
+    }
+    let url = format!(
+        "https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/items/{name}.png"
+    );
+    let mut asset = decode(key(&path), fetch(&url)?)?;
+    super::api::atomic_write(&path, &asset.encoded)?;
+    asset.path = key(&path);
+    Ok(remember(asset))
+}
+
 /// Calls may run concurrently on workers. Publication coalesces decoded identity; failures and
 /// fallback lookups are never inserted under the requested variant's key.
 pub fn load_with(

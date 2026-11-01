@@ -38,6 +38,7 @@ fn open(s: &mut Shark, w: &mut Window, cx: &mut Context<Shark>, report: Report) 
     s.usage_reports[0] = report;
     s.usage_reports[1] = Report::default();
     s.show_usage(w, cx);
+    s.usage_panel.as_mut().unwrap().details = true;
     s.usage_panel.as_mut().unwrap().reference_time = Some(at(18));
     cx.notify();
 }
@@ -83,8 +84,14 @@ async fn empty_history_keeps_zero_period_summaries_without_inventing_graph(
                 .unwrap()
                 .contains("0 tokens")
         );
-        assert_eq!(w.find("usage-period-week").label(), Some("This week: 0"));
-        assert_eq!(w.find("usage-period-month").label(), Some("This month: 0"));
+        assert_eq!(
+            w.find("usage-period-week").label(),
+            Some("This week: 0 tokens")
+        );
+        assert_eq!(
+            w.find("usage-period-month").label(),
+            Some("This month: 0 tokens")
+        );
         assert!(w.try_find("usage-trend").is_none());
     })
     .unwrap();
@@ -92,7 +99,7 @@ async fn empty_history_keeps_zero_period_summaries_without_inventing_graph(
 // Adaptation: native host interface is English; exact known currencies stay atomic on their period row.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn known_period_costs_remain_complete_on_single_native_lines(cx: &mut TestAppContext) {
+async fn known_period_costs_remain_complete_in_summary_tiles(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
     let (window, shark) = boot(cx, State::default(), WindowOptions::default());
@@ -106,7 +113,14 @@ async fn known_period_costs_remain_complete_on_single_native_lines(cx: &mut Test
             let row = w.find(id);
             assert!(row.visible());
             assert!(row.label().unwrap().contains(amount));
-            assert!(row.bounds().size.height <= px(20.));
+            assert_eq!(
+                row.bounds().top(),
+                w.find("usage-today-total").bounds().top()
+            );
+            assert_eq!(
+                row.bounds().size.height,
+                w.find("usage-today-total").bounds().size.height
+            );
             assert!(row.bounds().right() <= w.find("usage-panel").bounds().right());
         }
         assert!(w.find("usage-open-recap").visible());
@@ -128,7 +142,14 @@ async fn unknown_period_costs_remain_visible_without_expanding_native_popover(
         for id in ["usage-period-week", "usage-period-month"] {
             let row = w.find(id);
             assert!(row.label().unwrap().contains("Unavailable"));
-            assert!(row.bounds().size.height <= px(20.));
+            assert_eq!(
+                row.bounds().top(),
+                w.find("usage-today-total").bounds().top()
+            );
+            assert_eq!(
+                row.bounds().size.height,
+                w.find("usage-today-total").bounds().size.height
+            );
             assert!(row.bounds().right() <= w.find("usage-panel").bounds().right());
         }
     })
@@ -170,6 +191,7 @@ async fn native_summary_and_chart_omit_money_for_non_cost_sources(cx: &mut TestA
             s.pokemon_ui.scanning.truncate(1);
             s.usage_reports = vec![history(false)];
             s.show_usage(w, cx);
+            s.usage_panel.as_mut().unwrap().details = true;
             s.usage_panel.as_mut().unwrap().reference_time = Some(at(18));
             cx.notify();
         });

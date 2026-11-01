@@ -13,6 +13,7 @@ mod activity_tests;
 mod names;
 mod presentation;
 mod recap_assets;
+mod shop_art;
 mod sprite_loading;
 use crate::pokemon::names_client::{
     Item as NameItem, Kind as NameKind, Names as ResourceNames, Resource as NameResource,
@@ -70,6 +71,8 @@ pub(super) struct CompanionUi {
     sprite_retry_count: u8,
     sprite_key: Option<(u16, bool, Option<crate::pokemon::forms::Form>)>,
     sprite: Option<PathBuf>,
+    pub(super) item_art: BTreeMap<&'static str, std::sync::Arc<crate::pokemon::sprites::Asset>>,
+    item_art_pending: BTreeSet<&'static str>,
     notice: Option<String>,
     search: Option<Entity<InputState>>,
     search_sub: Option<Subscription>,
@@ -96,7 +99,7 @@ pub(super) struct CompanionUi {
     thumbnail_failed: BTreeSet<SpriteIdentity>,
     pub(super) growth_draft: Option<f64>,
     pub(super) shop_draft: Option<f64>,
-    quantity: u64,
+    pub(super) quantity: u64,
 }
 
 use crate::pokemon::format::compact;
@@ -293,7 +296,7 @@ impl Shark {
             .and_then(|m| m.profile.as_ref())
             .map(|p| p.instance_id.clone());
         let summary = format!(
-            "Release {} and start a a fresh egg?",
+            "Release {} and start a fresh egg?",
             self.state.pokemon.title()
         );
         let warning = if self
@@ -717,7 +720,7 @@ impl Shark {
             }));
             self.pokemon_ui.search = Some(input);
         }
-        self.pokemon_ui.tab = Page::Home;
+        self.pokemon_ui.tab = Page::Usage;
         self.pokemon_ui
             .evolution_home_scroll
             .set_offset(point(px(0.), px(0.)));
@@ -823,14 +826,14 @@ impl Shark {
                                     h_flex()
                                         .flex_none()
                                         .gap(px(if self.rail { 2. } else { 3. }))
-                                        .when(index > 0, |d| {
+                                        .when(index > 0 && !self.rail, |d| {
                                             d.child(
                                                 div()
                                                     .text_color(cx.theme().sidebar_foreground)
                                                     .child("·"),
                                             )
                                         })
-                                        .when_some(dot, |d, color| {
+                                        .when_some(dot.filter(|_| !self.rail), |d, color| {
                                             // Pace hue stays out of the text so light themes keep sidebar contrast.
                                             d.items_center().child(
                                                 div()
@@ -908,6 +911,7 @@ impl Shark {
     pub(super) fn render_pokemon_panel(&self, cx: &Context<Self>) -> AnyElement {
         let page = self.pokemon_ui.tab;
         let body = match page {
+            Page::Usage => self.pokemon_usage_progress(cx),
             Page::Dex => self.pokemon_dex(cx),
             Page::Details => self.pokemon_details(cx),
             Page::Bag => self.pokemon_bag(cx),
@@ -917,55 +921,70 @@ impl Shark {
         v_flex()
             .id("pokemon-panel")
             .gap_3()
-            .child(
-                h_flex()
-                    .justify_between()
-                    .child(div().font_weight(FontWeight::SEMIBOLD).child("Pokémon"))
-                    .child(
-                        Button::new("pokemon-refresh")
-                            .ghost()
-                            .xsmall()
-                            .icon(IconName::RefreshCw)
-                            .accessibility_label("Refresh Pokémon and usage")
-                            .on_click(cx.listener(|s, _, _, cx| {
-                                s.refresh_pokemon_artwork(cx);
-                                s.refresh_usage(cx);
-                                s.load_pokemon(cx);
-                            })),
+            .when(page != Page::Usage, |d| {
+                d.child(
+                    h_flex()
+                        .justify_between()
+                        .child(div().font_weight(FontWeight::SEMIBOLD).child("Pokémon"))
+                        .child(
+                            Button::new("pokemon-refresh")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::RefreshCw)
+                                .accessibility_label("Refresh Pokémon and usage")
+                                .on_click(cx.listener(|s, _, _, cx| {
+                                    s.refresh_pokemon_artwork(cx);
+                                    s.refresh_usage(cx);
+                                    s.load_pokemon(cx);
+                                    if matches!(s.pokemon_ui.tab, Page::Shop | Page::Bag) {
+                                        s.load_pokemon_item_art(cx);
+                                    }
+                                })),
+                        ),
+                )
+                .child(
+                    h_flex().gap_1().children(
+                        [
+                            (Page::Usage, "Usage"),
+                            (Page::Home, "Home"),
+                            (Page::Dex, "Pokédex"),
+                            (Page::Bag, "Bag"),
+                            (Page::Shop, "Shop"),
+                        ]
+                        .into_iter()
+                        .map(|(tab, label)| {
+                            Button::new(format!("pokemon-tab-{label}"))
+                                .ghost()
+                                .xsmall()
+                                .label(label)
+                                .selected(
+                                    page == tab || (page == Page::Details && tab == Page::Dex),
+                                )
+                                .toggled(page == tab || (page == Page::Details && tab == Page::Dex))
+                                .on_click(cx.listener(move |s, _, w, cx| {
+                                    if s.pokemon_ui.tab == Page::Details && tab == Page::Dex {
+                                        return;
+                                    }
+                                    if tab == Page::Usage {
+                                        if let Some(panel) = &s.usage_panel {
+                                            panel.focus.focus(w, cx);
+                                        }
+                                    }
+                                    s.pokemon_ui.tab = tab;
+                                    s.pokemon_ui.selected_species = None;
+                                    s.sync_profile_names(false, cx);
+                                    if tab == Page::Dex {
+                                        s.load_dex_assets(cx);
+                                    }
+                                    if matches!(tab, Page::Shop | Page::Bag) {
+                                        s.load_pokemon_item_art(cx);
+                                    }
+                                    cx.notify();
+                                }))
+                        }),
                     ),
-            )
-            .child(
-                h_flex().gap_1().children(
-                    [
-                        (Page::Home, "Home"),
-                        (Page::Dex, "Pokédex"),
-                        (Page::Bag, "Bag"),
-                        (Page::Shop, "Shop"),
-                        (Page::Usage, "Usage"),
-                    ]
-                    .into_iter()
-                    .map(|(tab, label)| {
-                        Button::new(format!("pokemon-tab-{label}"))
-                            .ghost()
-                            .xsmall()
-                            .label(label)
-                            .selected(page == tab || (page == Page::Details && tab == Page::Dex))
-                            .toggled(page == tab || (page == Page::Details && tab == Page::Dex))
-                            .on_click(cx.listener(move |s, _, _, cx| {
-                                if s.pokemon_ui.tab == Page::Details && tab == Page::Dex {
-                                    return;
-                                }
-                                s.pokemon_ui.tab = tab;
-                                s.pokemon_ui.selected_species = None;
-                                s.sync_profile_names(false, cx);
-                                if tab == Page::Dex {
-                                    s.load_dex_assets(cx);
-                                }
-                                cx.notify();
-                            }))
-                    }),
-                ),
-            )
+                )
+            })
             .children(self.pokemon_ui.notice.as_ref().map(|text| {
                 div()
                     .id("pokemon-notice")
@@ -974,7 +993,80 @@ impl Shark {
                     .child(text.clone())
                     .test_support()
             }))
-            .when(page != Page::Usage, |d| d.child(body))
+            .child(body)
+            .test_support()
+            .into_any_element()
+    }
+
+    fn pokemon_usage_progress(&self, cx: &Context<Self>) -> AnyElement {
+        let p = &self.state.pokemon;
+        let (used, target) = p.progress();
+        let progress = (used as f64 / target.max(1) as f64).clamp(0., 1.);
+        h_flex()
+            .id("pokemon-usage-progress")
+            .p_3()
+            .rounded_lg()
+            .bg(cx.theme().muted.opacity(0.35))
+            .gap_3()
+            .items_center()
+            .child(self.active_pokemon_art(40.))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .truncate()
+                            .child(p.title()),
+                    )
+                    .child(
+                        div()
+                            .id("pokemon-usage-growth-bar")
+                            .role(Role::ProgressIndicator)
+                            .aria_label(format!(
+                                "Growth: {:.0} percent, {used} of {target} tokens",
+                                progress * 100.
+                            ))
+                            .h(px(4.))
+                            .w_full()
+                            .rounded_full()
+                            .bg(cx.theme().muted)
+                            .child(
+                                div()
+                                    .h_full()
+                                    .w(relative(progress as f32))
+                                    .rounded_full()
+                                    .bg(cx.theme().primary),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("pokemon-usage-progress-detail")
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(crate::pokemon::format::progress_detail(used, target))
+                            .test_support(),
+                    ),
+            )
+            .child(
+                Button::new("pokemon-usage-open-home")
+                    .ghost()
+                    .xsmall()
+                    .icon(IconName::ChevronRight)
+                    .tooltip("Open Pokémon growth and collection")
+                    .accessibility_label("Open Pokémon growth and collection")
+                    .on_click(cx.listener(|s, _, w, cx| {
+                        if let Some(panel) = &s.usage_panel {
+                            panel.focus.focus(w, cx);
+                        }
+                        s.pokemon_ui.tab = Page::Home;
+                        s.pokemon_ui.selected_species = None;
+                        s.sync_profile_names(false, cx);
+                        cx.notify();
+                    })),
+            )
             .test_support()
             .into_any_element()
     }
@@ -1927,6 +2019,7 @@ impl Shark {
                     .ghost()
                     .xsmall()
                     .label("−")
+                    .accessibility_label("Decrease item quantity")
                     .disabled(quantity <= 1)
                     .on_click(cx.listener(move |s, _, _, cx| {
                         s.pokemon_ui.quantity = quantity.saturating_sub(1).max(1);
@@ -1939,6 +2032,7 @@ impl Shark {
                     .ghost()
                     .xsmall()
                     .label("+")
+                    .accessibility_label("Increase item quantity")
                     .disabled(quantity >= 99)
                     .on_click(cx.listener(move |s, _, _, cx| {
                         s.pokemon_ui.quantity = (quantity + 1).min(99);
@@ -1948,52 +2042,185 @@ impl Shark {
             .into_any_element()
     }
 
+    fn pokemon_item_header(&self, item: Item, cx: &Context<Self>) -> AnyElement {
+        let bag = &self.state.pokemon.inventory;
+        let count = match item {
+            Item::RareCandy => bag.candies,
+            Item::Mint => bag.mints,
+            Item::ShinyCharm => u64::from(bag.shiny_charm),
+        };
+        let effect = match item {
+            Item::RareCandy => "Adds 100M growth XP per candy.",
+            Item::Mint => "Randomly changes your Pokémon’s nature.",
+            Item::ShinyCharm => "Permanently improves shiny hatch odds.",
+        };
+        h_flex()
+            .gap_3()
+            .items_center()
+            .child(self.pokemon_item_art(item, 36.))
+            .child(
+                v_flex()
+                    .flex_1()
+                    .min_w_0()
+                    .gap_1()
+                    .child(div().font_weight(FontWeight::SEMIBOLD).child(item.name()))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(effect),
+                    )
+                    .child(
+                        div()
+                            .id(format!("pokemon-shop-owned-{}", item.name()))
+                            .text_xs()
+                            .text_color(if item == Item::ShinyCharm && count > 0 {
+                                cx.theme().success
+                            } else {
+                                cx.theme().muted_foreground
+                            })
+                            .child(if item == Item::ShinyCharm && count > 0 {
+                                "Owned · active".into()
+                            } else {
+                                format!("Owned ×{count}")
+                            })
+                            .test_support(),
+                    ),
+            )
+            .into_any_element()
+    }
+
     fn pokemon_bag(&self, cx: &Context<Self>) -> AnyElement {
         let bag = &self.state.pokemon.inventory;
+        let empty = bag.candies == 0 && bag.mints == 0 && !bag.shiny_charm;
         v_flex()
             .id("pokemon-bag")
             .gap_2()
-            .child(self.pokemon_quantity(cx))
-            .child(format!("Rare Candy × {}", bag.candies))
-            .child(
-                Button::new("pokemon-use-candy")
-                    .small()
-                    .label("Use Rare Candy")
-                    .disabled(bag.candies == 0)
-                    .on_click(cx.listener(|s, _, _, cx| {
-                        match s.state.pokemon.use_candy(
-                            s.pokemon_ui
-                                .quantity
-                                .max(1)
-                                .min(s.state.pokemon.inventory.candies),
-                        ) {
-                            Ok(events) => s.pokemon_events(events),
-                            Err(e) => s.pokemon_ui.notice = Some(e),
-                        }
-                        s.save_pokemon();
-                        s.load_pokemon(cx);
-                        cx.notify();
-                    })),
+            .when(empty, |d| {
+                d.child(
+                    v_flex()
+                        .items_center()
+                        .gap_3()
+                        .py_4()
+                        .child(div().text_2xl().child("🎒"))
+                        .child(div().text_sm().child("Your Bag is empty"))
+                        .child(
+                            Button::new("pokemon-bag-open-shop")
+                                .small()
+                                .label("Visit Shop")
+                                .accessibility_label("Open Pokémon Shop")
+                                .on_click(cx.listener(|s, _, w, cx| {
+                                    if let Some(panel) = &s.usage_panel {
+                                        panel.focus.focus(w, cx);
+                                    }
+                                    s.load_pokemon_item_art(cx);
+                                    s.pokemon_ui.tab = Page::Shop;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .when(
+                self.state.pokemon.active.is_none() && (bag.candies > 0 || bag.mints > 0),
+                |d| {
+                    d.child(
+                        div()
+                            .id("pokemon-bag-hatch-hint")
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Hatch your egg to use candy and mints.")
+                            .test_support(),
+                    )
+                },
             )
-            .child(format!("Mint × {}", bag.mints))
-            .child(
-                Button::new("pokemon-use-mint")
-                    .small()
-                    .label("Use Mint")
-                    .disabled(bag.mints == 0 || self.state.pokemon.active.is_none())
-                    .on_click(cx.listener(|s, _, _, cx| {
-                        s.pokemon_ui.notice = Some(match s.state.pokemon.use_mint() {
-                            Ok(()) => "Your Pokémon has a new nature.".into(),
-                            Err(e) => e,
-                        });
-                        s.save_pokemon();
-                        cx.notify();
-                    })),
-            )
-            .child(if bag.shiny_charm {
-                "Shiny Charm active"
-            } else {
-                "No Shiny Charm yet"
+            .when(bag.candies > 0, |d| d.child(self.pokemon_quantity(cx)))
+            .when(bag.candies > 0, |d| {
+                d.child(
+                    v_flex()
+                        .id("pokemon-bag-card-Rare Candy")
+                        .test_support()
+                        .gap_2()
+                        .p_3()
+                        .rounded_lg()
+                        .bg(cx.theme().muted.opacity(0.5))
+                        .child(self.pokemon_item_header(Item::RareCandy, cx))
+                        .child(
+                            Button::new("pokemon-use-candy")
+                                .small()
+                                .label(format!(
+                                    "Use up to ×{}",
+                                    self.pokemon_ui.quantity.max(1).min(bag.candies).max(1)
+                                ))
+                                .accessibility_label(format!(
+                                    "Use up to {} Rare Candy items",
+                                    self.pokemon_ui.quantity.max(1).min(bag.candies).max(1)
+                                ))
+                                .disabled(bag.candies == 0 || self.state.pokemon.active.is_none())
+                                .on_click(cx.listener(|s, _, w, cx| {
+                                    match s.state.pokemon.use_candy(
+                                        s.pokemon_ui
+                                            .quantity
+                                            .max(1)
+                                            .min(s.state.pokemon.inventory.candies),
+                                    ) {
+                                        Ok(events) => s.pokemon_events(events),
+                                        Err(e) => s.pokemon_ui.notice = Some(e),
+                                    }
+                                    if s.state.pokemon.inventory.candies == 0
+                                        || s.state.pokemon.active.is_none()
+                                    {
+                                        if let Some(panel) = &s.usage_panel {
+                                            panel.focus.focus(w, cx);
+                                        }
+                                    }
+                                    s.save_pokemon();
+                                    s.load_pokemon(cx);
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .when(bag.mints > 0, |d| {
+                d.child(
+                    v_flex()
+                        .id("pokemon-bag-card-Mint")
+                        .test_support()
+                        .gap_2()
+                        .p_3()
+                        .rounded_lg()
+                        .bg(cx.theme().muted.opacity(0.5))
+                        .child(self.pokemon_item_header(Item::Mint, cx))
+                        .child(
+                            Button::new("pokemon-use-mint")
+                                .small()
+                                .label("Use Mint")
+                                .disabled(bag.mints == 0 || self.state.pokemon.active.is_none())
+                                .on_click(cx.listener(|s, _, w, cx| {
+                                    s.pokemon_ui.notice = Some(match s.state.pokemon.use_mint() {
+                                        Ok(()) => "Your Pokémon has a new nature.".into(),
+                                        Err(e) => e,
+                                    });
+                                    if s.state.pokemon.inventory.mints == 0 {
+                                        if let Some(panel) = &s.usage_panel {
+                                            panel.focus.focus(w, cx);
+                                        }
+                                    }
+                                    s.save_pokemon();
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .when(bag.shiny_charm, |d| {
+                d.child(
+                    v_flex()
+                        .id("pokemon-bag-card-Shiny Charm")
+                        .test_support()
+                        .p_3()
+                        .rounded_lg()
+                        .bg(cx.theme().muted.opacity(0.5))
+                        .child(self.pokemon_item_header(Item::ShinyCharm, cx)),
+                )
             })
             .test_support()
             .into_any_element()
@@ -2004,10 +2231,41 @@ impl Shark {
         v_flex()
             .id("pokemon-shop")
             .gap_2()
-            .child(format!("Balance: {} tokens", compact(p.balance())))
+            .child(
+                v_flex()
+                    .id("pokemon-shop-wallet")
+                    .role(Role::Group)
+                    .aria_label(format!(
+                        "Balance: {} spendable tokens",
+                        compact(p.balance())
+                    ))
+                    .gap_1()
+                    .p_3()
+                    .rounded_lg()
+                    .bg(cx.theme().muted)
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Spendable tokens"),
+                    )
+                    .child(
+                        div()
+                            .text_2xl()
+                            .font_weight(FontWeight::BOLD)
+                            .child(compact(p.balance())),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child("Earned by coding. Spend them on your companion."),
+                    )
+                    .test_support(),
+            )
             .child(self.pokemon_quantity(cx))
             .children(
-                [Item::RareCandy, Item::Mint, Item::ShinyCharm]
+                [Item::Mint, Item::RareCandy, Item::ShinyCharm]
                     .into_iter()
                     .map(|item| {
                         let label = item.name();
@@ -2017,30 +2275,80 @@ impl Shark {
                             self.pokemon_ui.quantity.max(1)
                         };
                         let price = p.price(item).saturating_mul(quantity);
-                        Button::new(format!("pokemon-buy-{label}"))
-                            .small()
-                            .label(format!("{label} · {}", compact(price)))
-                            .disabled(
-                                p.balance() < price
-                                    || (item == Item::ShinyCharm && p.inventory.shiny_charm),
+                        let owned = item == Item::ShinyCharm && p.inventory.shiny_charm;
+                        let affordable = p.balance() >= price;
+                        v_flex()
+                            .id(format!("pokemon-shop-card-{label}"))
+                            .gap_2()
+                            .p_3()
+                            .rounded_lg()
+                            .bg(cx.theme().muted.opacity(0.5))
+                            .child(self.pokemon_item_header(item, cx))
+                            .child(
+                                h_flex()
+                                    .justify_between()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .id(format!("pokemon-shop-price-{label}"))
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .child(format!(
+                                                "{} tokens{}",
+                                                compact(price),
+                                                if quantity > 1 {
+                                                    format!(" · ×{quantity}")
+                                                } else {
+                                                    String::new()
+                                                }
+                                            ))
+                                            .test_support(),
+                                    )
+                                    .child(
+                                        Button::new(format!("pokemon-buy-{label}"))
+                                            .small()
+                                            .label(if owned {
+                                                "Owned".into()
+                                            } else if quantity > 1 {
+                                                format!("Buy ×{quantity}")
+                                            } else {
+                                                "Buy".into()
+                                            })
+                                            .accessibility_label(if owned {
+                                                "Shiny Charm already owned and active".into()
+                                            } else {
+                                                format!(
+                                                    "Buy {label} ×{quantity} for {} tokens",
+                                                    compact(price)
+                                                )
+                                            })
+                                            .disabled(!affordable || owned)
+                                            .on_click(cx.listener(move |s, _, _, cx| {
+                                                s.pokemon_ui.notice = Some(
+                                                    match s.state.pokemon.buy(item, quantity) {
+                                                        Ok(()) => format!(
+                                                            "Bought {label}. Find it in your Bag."
+                                                        ),
+                                                        Err(e) => e,
+                                                    },
+                                                );
+                                                s.save_pokemon();
+                                                cx.notify();
+                                            })),
+                                    ),
                             )
-                            .on_click(cx.listener(move |s, _, _, cx| {
-                                s.pokemon_ui.notice =
-                                    Some(match s.state.pokemon.buy(item, quantity) {
-                                        Ok(()) => format!("Bought {label}. Find it in your Bag."),
-                                        Err(e) => e,
-                                    });
-                                s.save_pokemon();
-                                cx.notify();
-                            }))
+                            .when(!affordable && !owned, |d| {
+                                d.child(
+                                    div()
+                                        .id(format!("pokemon-shop-unavailable-{label}"))
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child("Not enough tokens")
+                                        .test_support(),
+                                )
+                            })
+                            .test_support()
                     }),
-            )
-            .child(
-                div()
-                    .mt_2()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Buying an egg archives your current companion and starts a new egg."),
             )
             .children(
                 [
@@ -2051,13 +2359,95 @@ impl Shark {
                 .into_iter()
                 .map(|(tier, label)| {
                     let price = p.egg_price(tier);
-                    Button::new(format!("pokemon-buy-{label}"))
-                        .small()
-                        .label(format!("{label} · {}", compact(price)))
-                        .disabled(p.balance() < price)
-                        .on_click(cx.listener(move |s, _, window, cx| {
-                            s.review_pokemon_egg(tier, window, cx);
-                        }))
+                    let locked = p.active.is_none();
+                    let affordable = p.balance() >= price;
+                    v_flex()
+                        .id(format!("pokemon-shop-card-{label}"))
+                        .gap_2()
+                        .p_3()
+                        .rounded_lg()
+                        .bg(cx.theme().muted.opacity(0.5))
+                        .child(
+                            h_flex()
+                                .gap_3()
+                                .items_center()
+                                .child(self.pokemon_egg_art(36.))
+                                .child(
+                                    v_flex()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .gap_1()
+                                        .child(div().font_weight(FontWeight::SEMIBOLD).child(label))
+                                        .children(tier.map(|rarity| {
+                                            let tint = if rarity == Rarity::Uncommon {
+                                                cx.theme().success
+                                            } else {
+                                                cx.theme().primary
+                                            };
+                                            h_flex().child(
+                                                div()
+                                                    .id(format!("pokemon-shop-rarity-{label}"))
+                                                    .px_2()
+                                                    .py_1()
+                                                    .rounded_full()
+                                                    .bg(tint.opacity(0.12))
+                                                    .text_xs()
+                                                    .text_color(tint)
+                                                    .child(format!("{} or better", rarity.label()))
+                                                    .test_support(),
+                                            )
+                                        }))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(cx.theme().muted_foreground)
+                                                .child(
+                                                    "Archives your companion. Starts a new egg.",
+                                                ),
+                                        ),
+                                ),
+                        )
+                        .child(
+                            h_flex()
+                                .justify_between()
+                                .items_center()
+                                .child(
+                                    div()
+                                        .id(format!("pokemon-shop-price-{label}"))
+                                        .text_xs()
+                                        .text_color(cx.theme().muted_foreground)
+                                        .child(format!("{} tokens", compact(price)))
+                                        .test_support(),
+                                )
+                                .child(
+                                    Button::new(format!("pokemon-buy-{label}"))
+                                        .small()
+                                        .label("Buy")
+                                        .accessibility_label(format!(
+                                            "Buy {label} for {} tokens",
+                                            compact(price)
+                                        ))
+                                        .disabled(locked || !affordable)
+                                        .on_click(cx.listener(move |s, _, window, cx| {
+                                            s.review_pokemon_egg(tier, window, cx);
+                                        })),
+                                ),
+                        )
+                        .when(locked || !affordable, |d| {
+                            d.child(
+                                div()
+                                    .id(format!("pokemon-shop-unavailable-{label}"))
+                                    .text_xs()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(if locked {
+                                        "Available after your egg hatches"
+                                    } else {
+                                        "Not enough tokens"
+                                    })
+                                    .test_support(),
+                            )
+                        })
+                        .test_support()
                 }),
             )
             .test_support()

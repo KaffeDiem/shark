@@ -2,7 +2,7 @@
 
 Shark retains its existing Claude/Codex remaining-allowance queries. Local transcript scanning never supplies an official quota value.
 
-The navigation heatmap keeps its definition and is derived from the same single scan (`Report::heatmap`), so custom roots feed it too: Claude input, output, and cache creation; Codex uncached input and output. Pokémon growth uses inclusive tokens from the same providers' local logs: disjoint input, output, cache creation, and cache reads. Codex's input already includes cached input, so the parser subtracts cached input before adding the cache-read bucket. Reasoning output is included in output and is not added again.
+Daily activity retains its definition and is derived from the same single scan (`Report::heatmap`), so custom roots feed it too: Claude input, output, and cache creation; Codex uncached input and output. The usage panel no longer renders contribution calendars. Pokémon growth uses inclusive tokens from the same providers' local logs: disjoint input, output, cache creation, and cache reads. Codex's input already includes cached input, so the parser subtracts cached input before adding the cache-read bucket. Reasoning output is included in output and is not added again.
 
 Claude streamed records are deduplicated globally by message/request identity, keeping the largest usage and earliest timestamp. Source `cost-state` ledgers take precedence over estimates, with each model's final session cost distributed proportionally across its positive-token requests. Appends can update the ledger for the whole session. Incomplete trailing lines are retried; truncation discards the former ledger.
 
@@ -14,7 +14,7 @@ The parser cache is memory-only: per-file results are keyed on size, mtime, devi
 
 ## Generic provider API
 
-`usage::providers::UsageProvider` supplies stable `id`/`name`, official `remaining_usage`, the existing heatmap `activity`, and `observations(now) -> Observation { activity, companion: logs::Report }`. The default observation adapts `Daily` into a report; built-ins override it with inclusive parsing. `reports_cost()` defaults to true and lets a future flat-rate source suppress monetary totals without suppressing tokens.
+`usage::providers::UsageProvider` supplies stable `id`/`name`, official `remaining_usage`, daily `activity`, and `observations(now) -> Observation { activity, companion: logs::Report }`. The default observation adapts `Daily` into a report; built-ins override it with inclusive parsing. `reports_cost()` defaults to true and lets a future flat-rate source suppress monetary totals without suppressing tokens.
 
 A `Report` carries raw normalized `Entry` records, `Daily` counters, a `Bucket` total, and an optional scan error. Entries contain disjoint unsigned input/output/cache-write/cache-read counts, a UTC timestamp, model ID, optional reported cost/provenance flags, and session provenance. A failed report preserves the last successful report in Shark and does not update growth or the historical ledger. A successful empty scan clears the current provider summary. Official allowance fetching remains independent.
 

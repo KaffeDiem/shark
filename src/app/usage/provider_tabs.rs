@@ -14,12 +14,6 @@ impl Shark {
             .min_w_0()
             .w_full()
             .child(
-                div()
-                    .text_xs()
-                    .text_color(cx.theme().muted_foreground)
-                    .child("Account details"),
-            )
-            .child(
                 h_flex()
                     .id("usage-provider-tabs")
                     .role(Role::Group)

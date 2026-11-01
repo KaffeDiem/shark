@@ -23,6 +23,31 @@ fn companion() -> Companion {
     p
 }
 
+pub(super) fn reveal_pokemon_control(w: &mut Window, cx: &mut App, id: &str) {
+    for _ in 0..30 {
+        let panel = w.find("usage-panel").bounds();
+        let target = w.find(id.to_owned());
+        if target.visible()
+            && target.bounds().top() >= panel.top()
+            && target.bounds().bottom() <= panel.bottom()
+        {
+            return;
+        }
+        let dy = if target.bounds().top() < panel.top() {
+            100.
+        } else {
+            -100.
+        };
+        w.scroll(
+            "usage-panel",
+            ScrollDelta::Pixels(point(px(0.), px(dy))),
+            cx,
+        );
+        w.render_frame(cx);
+    }
+    panic!("Pokémon control {id} must be reachable by scrolling");
+}
+
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn pokemon_footer_rail_disable_and_usage_access(cx: &mut TestAppContext) {
@@ -33,6 +58,20 @@ async fn pokemon_footer_rail_disable_and_usage_access(cx: &mut TestAppContext) {
     let (window, shark) = boot(cx, state, WindowOptions::default());
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
+            let now = crate::usage::now();
+            for index in 0..s.usage_providers.len() {
+                s.usage_reports[index] = crate::usage::logs::Report::from_entries(
+                    vec![crate::usage::logs::Entry {
+                        id: format!("usage-first-{index}"),
+                        date: now,
+                        model: "fixture".into(),
+                        input: 1000,
+                        ..Default::default()
+                    }],
+                    now,
+                );
+                s.usage_activity[index] = s.usage_reports[index].daily.clone();
+            }
             for (index, snapshot) in s.usage.iter_mut().enumerate() {
                 snapshot.finish(Ok(vec![Allowance {
                     label: "Weekly".into(),
@@ -50,11 +89,44 @@ async fn pokemon_footer_rail_disable_and_usage_access(cx: &mut TestAppContext) {
         assert!(w.find("pokemon-footer").visible());
         w.click("pokemon-footer", cx);
         w.render_frame(cx);
-        assert!(w.find("pokemon-home").visible());
-        w.click("pokemon-tab-Usage", cx);
+        assert!(w.try_find("pokemon-tab-Home").is_none());
+        assert!(w.try_find("pokemon-home").is_none());
+        assert!(w.find("pokemon-usage-progress").visible());
+        let progress = w.find("pokemon-usage-progress").bounds();
+        assert!(w.find("usage-codex-0").bounds().bottom() <= progress.top());
+        assert!(w.try_find("usage-trend").is_none());
+        assert!(w.try_find("usage-accounting-claude").is_none());
+        let before = shark.read(cx).usage_reports[0].today();
+        w.click("usage-toggle-details", cx);
         w.render_frame(cx);
+        assert!(
+            w.find("pokemon-usage-progress").bounds().bottom()
+                <= w.find("usage-trend").bounds().top()
+        );
+        assert!(w.try_find("usage-accounting-claude").is_some());
+        w.click("usage-toggle-details", cx);
+        w.render_frame(cx);
+        assert!(w.try_find("usage-trend").is_none());
+        assert_eq!(shark.read(cx).usage_reports[0].today(), before);
+        for provider in ["claude", "codex"] {
+            assert!(w.try_find(format!("usage-heatmap-{provider}")).is_none());
+        }
         assert!(w.find("usage-claude-0").visible());
         assert!(w.find("usage-codex-0").visible());
+        w.click("pokemon-usage-open-home", cx);
+        w.render_frame(cx);
+        assert!(w.find("pokemon-home").visible());
+        assert_eq!(
+            shark
+                .read(cx)
+                .state
+                .pokemon
+                .active
+                .as_ref()
+                .unwrap()
+                .species_id(),
+            25
+        );
         w.press("escape", cx);
         shark.update(cx, |s, cx| {
             s.rail = true;
@@ -68,7 +140,6 @@ async fn pokemon_footer_rail_disable_and_usage_access(cx: &mut TestAppContext) {
         assert!(w.try_find("usage-trigger-codex").is_none());
         assert!(w.try_find("show-usage").is_none());
         w.click("pokemon-footer", cx);
-        w.click("pokemon-tab-Usage", cx);
         w.render_frame(cx);
         assert!(w.find("usage-claude-0").visible());
         assert!(w.find("usage-codex-0").visible());
@@ -81,6 +152,8 @@ async fn pokemon_footer_rail_disable_and_usage_access(cx: &mut TestAppContext) {
         assert!(w.try_find("usage-trigger-codex").is_none());
         w.click("show-usage", cx);
         w.render_frame(cx);
+        assert!(w.try_find("usage-heatmap-claude").is_none());
+        assert!(w.try_find("usage-heatmap-codex").is_none());
         assert!(w.find("usage-claude-0").visible());
         assert!(w.find("usage-codex-0").visible());
         w.press("escape", cx);
@@ -202,6 +275,7 @@ async fn pokemon_shop_bag_difficulty_and_candy_graduation_updates_footer(cx: &mu
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.click("pokemon-footer", cx);
+        w.click("pokemon-usage-open-home", cx);
         w.render_frame(cx);
         let original = shark.read(cx).state.pokemon.growth_difficulty;
         w.click("pokemon-Growth-less", cx);
@@ -218,14 +292,22 @@ async fn pokemon_shop_bag_difficulty_and_candy_graduation_updates_footer(cx: &mu
         assert_eq!(shark.read(cx).state.pokemon.shop_difficulty, 0.9);
         w.click("pokemon-tab-Shop", cx);
         w.render_frame(cx);
+        reveal_pokemon_control(w, cx, "pokemon-buy-Rare Candy");
+        assert_eq!(
+            w.find("pokemon-item-art-rare-candy").role(),
+            Some(Role::Image)
+        );
+        assert!(w.try_find("pokemon-shop-card-Rare Candy").is_some());
         w.click("pokemon-buy-Rare Candy", cx);
         assert_eq!(shark.read(cx).state.pokemon.inventory.candies, 1);
         assert_eq!(
             shark.read(cx).state.pokemon.spent_tokens,
             shark.read(cx).state.pokemon.price(Item::RareCandy)
         );
+        reveal_pokemon_control(w, cx, "pokemon-tab-Bag");
         w.click("pokemon-tab-Bag", cx);
         w.render_frame(cx);
+        reveal_pokemon_control(w, cx, "pokemon-use-candy");
         w.click("pokemon-use-candy", cx);
         assert!(shark.read(cx).state.pokemon.active.is_none());
         assert_eq!(shark.read(cx).state.pokemon.inventory.candies, 0);
@@ -235,6 +317,143 @@ async fn pokemon_shop_bag_difficulty_and_candy_graduation_updates_footer(cx: &mu
         assert!(w.find("pokemon-footer").visible());
         assert_eq!(shark.read(cx).state.pokemon.title(), "Token Egg");
         assert_eq!(State::load().pokemon.collection.len(), 1);
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn pokemon_shop_cards_quantity_gates_and_bag_loop(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let mut state = State::default();
+    state.pokemon = companion();
+    state.pokemon.lifetime_tokens = 5_000_000_000;
+    state.pokemon.inventory.shiny_charm = true;
+    let (window, shark) = boot(
+        cx,
+        state,
+        WindowOptions {
+            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                point(px(0.), px(0.)),
+                size(px(640.), px(480.)),
+            ))),
+            ..Default::default()
+        },
+    );
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| {
+            s.sidebar_focus.focus(w, cx);
+            s.show_pokemon(w, cx);
+            s.pokemon_ui.tab = super::super::pokemon::Page::Shop;
+        });
+        w.render_frame(cx);
+        assert!(w.find("pokemon-shop-wallet").visible());
+        w.click("pokemon-quantity-more", cx);
+        w.render_frame(cx);
+        reveal_pokemon_control(w, cx, "pokemon-buy-Mint");
+        assert_eq!(w.find("pokemon-item-art-mint").role(), Some(Role::Image));
+        assert_eq!(
+            w.find("pokemon-buy-Mint").label(),
+            Some("Buy Mint ×2 for 200M tokens")
+        );
+        w.click("pokemon-buy-Mint", cx);
+        assert_eq!(shark.read(cx).state.pokemon.inventory.mints, 2);
+        assert_eq!(shark.read(cx).state.pokemon.spent_tokens, 200_000_000);
+        reveal_pokemon_control(w, cx, "pokemon-buy-Shiny Charm");
+        assert_eq!(
+            w.find("pokemon-item-art-shiny-charm").role(),
+            Some(Role::Image)
+        );
+        assert_eq!(w.find("pokemon-buy-Shiny Charm").disabled(), Some(true));
+        let spent = shark.read(cx).state.pokemon.spent_tokens;
+        w.click("pokemon-buy-Shiny Charm", cx);
+        assert_eq!(
+            shark.read(cx).state.pokemon.spent_tokens,
+            spent,
+            "owned charm cannot be charged twice"
+        );
+        reveal_pokemon_control(w, cx, "pokemon-tab-Bag");
+        w.click("pokemon-tab-Bag", cx);
+        w.render_frame(cx);
+        reveal_pokemon_control(w, cx, "pokemon-use-mint");
+        assert!(w.try_find("pokemon-bag-card-Mint").is_some());
+        w.click("pokemon-use-mint", cx);
+        assert_eq!(shark.read(cx).state.pokemon.inventory.mints, 1);
+        shark.update(cx, |s, cx| {
+            s.state.pokemon.spent_tokens = s.state.pokemon.lifetime_tokens;
+            s.pokemon_ui.tab = super::super::pokemon::Page::Shop;
+            cx.notify();
+        });
+        w.render_frame(cx);
+        reveal_pokemon_control(w, cx, "pokemon-buy-Mint");
+        reveal_pokemon_control(w, cx, "pokemon-shop-unavailable-Mint");
+        assert!(w.find("pokemon-shop-unavailable-Mint").visible());
+        assert_eq!(w.find("pokemon-buy-Mint").disabled(), Some(true));
+        w.click("pokemon-buy-Mint", cx);
+        assert_eq!(shark.read(cx).state.pokemon.inventory.mints, 1);
+        shark.update(cx, |s, cx| {
+            s.state.pokemon.spent_tokens = 0;
+            s.state.pokemon.active = None;
+            cx.notify();
+        });
+        w.render_frame(cx);
+        reveal_pokemon_control(w, cx, "pokemon-buy-Pokémon Egg");
+        reveal_pokemon_control(w, cx, "pokemon-shop-unavailable-Pokémon Egg");
+        assert!(w.find("pokemon-shop-unavailable-Pokémon Egg").visible());
+        assert_eq!(w.find("pokemon-buy-Pokémon Egg").disabled(), Some(true));
+        w.click("pokemon-buy-Pokémon Egg", cx);
+        assert_eq!(shark.read(cx).state.pokemon.spent_tokens, 0);
+        assert!(w.try_find("pokemon-egg-confirm").is_none());
+        reveal_pokemon_control(w, cx, "pokemon-tab-Bag");
+        w.click("pokemon-tab-Bag", cx);
+        w.render_frame(cx);
+        reveal_pokemon_control(w, cx, "pokemon-bag-hatch-hint");
+        assert!(w.find("pokemon-bag-hatch-hint").visible());
+        assert_eq!(w.find("pokemon-use-mint").disabled(), Some(true));
+        shark.update(cx, |s, cx| {
+            s.state.pokemon.inventory = Default::default();
+            s.pokemon_ui.tab = super::super::pokemon::Page::Bag;
+            cx.notify();
+        });
+        w.render_frame(cx);
+        reveal_pokemon_control(w, cx, "pokemon-bag-open-shop");
+        w.click("pokemon-bag-open-shop", cx);
+        w.render_frame(cx);
+        assert!(w.find("pokemon-shop-wallet").visible());
+        shark.update(cx, |s, cx| {
+            s.state.pokemon.active = companion().active;
+            s.state.pokemon.inventory.mints = 1;
+            s.pokemon_ui.quantity = 1;
+            s.pokemon_ui.tab = super::super::pokemon::Page::Bag;
+            s.usage_panel.as_ref().unwrap().focus.focus(w, cx);
+            cx.notify();
+        });
+        w.render_frame(cx);
+        for id in [
+            "pokemon-refresh",
+            "pokemon-tab-Usage",
+            "pokemon-tab-Home",
+            "pokemon-tab-Pokédex",
+            "pokemon-tab-Bag",
+            "pokemon-tab-Shop",
+            "pokemon-use-mint",
+        ] {
+            w.press("tab", cx);
+            w.render_frame(cx);
+            assert_eq!(w.find(id).focused(), Some(true), "Tab must reach {id}");
+        }
+        w.press("enter", cx);
+        w.render_frame(cx);
+        assert_eq!(shark.read(cx).state.pokemon.inventory.mints, 0);
+        assert!(w.try_find("pokemon-bag-card-Mint").is_none());
+        assert!(w.find("pokemon-bag-open-shop").visible());
+        w.press("tab", cx);
+        w.render_frame(cx);
+        assert_eq!(w.find("pokemon-refresh").focused(), Some(true));
+        w.press("escape", cx);
+        assert!(shark.read(cx).usage_panel.is_none());
+        assert!(shark.read(cx).sidebar_focus.is_focused(w));
     })
     .unwrap();
 }
@@ -259,6 +478,7 @@ async fn pokemon_dex_pages_filter_details_back_and_pin(cx: &mut TestAppContext) 
         w.render_frame(cx);
         w.click("pokemon-footer", cx);
         w.render_frame(cx);
+        w.click("pokemon-usage-open-home", cx);
         w.click("pokemon-tab-Pokédex", cx);
         w.render_frame(cx);
         assert!(w.find("pokemon-dex-1").visible());
@@ -297,10 +517,44 @@ async fn pokemon_dex_pages_filter_details_back_and_pin(cx: &mut TestAppContext) 
     .unwrap();
 }
 
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn candy_selection_is_an_upper_bound_near_graduation(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let mut state = State::default();
+    state.pokemon = companion();
+    state.pokemon.inventory.candies = 5;
+    let difficulty = state.pokemon.growth_difficulty;
+    let mon = state.pokemon.active.as_mut().unwrap();
+    mon.tokens = mon.threshold(difficulty) - 250_000_000;
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| {
+            s.show_pokemon(w, cx);
+            s.pokemon_ui.tab = super::super::pokemon::Page::Bag;
+            s.pokemon_ui.quantity = 5;
+            cx.notify();
+        });
+        w.render_frame(cx);
+        reveal_pokemon_control(w, cx, "pokemon-use-candy");
+        assert_eq!(
+            w.find("pokemon-use-candy").label(),
+            Some("Use up to 5 Rare Candy items")
+        );
+        w.click("pokemon-use-candy", cx);
+        assert_eq!(shark.read(cx).state.pokemon.inventory.candies, 2);
+        assert!(shark.read(cx).state.pokemon.active.is_none());
+        assert_eq!(State::load().pokemon.inventory.candies, 2);
+    })
+    .unwrap();
+}
+
 /// Opt-in real Metal renders. Artwork comes from a caller-provided runtime cache, never bundled.
 pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
+    let shop_only = std::env::var_os("SHARK_RENDER_SHOP_ONLY").is_some();
     for (mode, label) in [
         (crate::state::Mode::Dark, "dark"),
         (crate::state::Mode::Light, "light"),
@@ -319,6 +573,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 mon.graduated = true;
                 state.pokemon.collection.push(mon);
             }
+            let preview_pokemon = state.pokemon.clone();
             state.save().unwrap();
             let (window, shark) = cx
                 .update(|cx| {
@@ -326,7 +581,10 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         WindowOptions {
                             window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                                 point(px(0.), px(0.)),
-                                size(px(1120.), px(840.)),
+                                size(
+                                    px(if shop_only && rail { 640. } else { 1120. }),
+                                    px(if shop_only && rail { 480. } else { 840. }),
+                                ),
                             ))),
                             focus: false,
                             show: false,
@@ -343,12 +601,44 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 "home",
                 "dex",
                 "shop",
+                "shop-owned",
+                "shop-poor",
+                "shop-egglocked",
+                "shop-fallback",
+                "bag",
                 "usage",
                 "settings",
             ] {
+                if shop_only && !page.starts_with("shop") && page != "bag" {
+                    continue;
+                }
                 cx.update_window(window, |_, w, cx| {
                     shark.update(cx, |s, cx| {
-                        s.rail = rail;
+                        s.rail = rail && !shop_only;
+                        s.state.pokemon = preview_pokemon.clone();
+                        s.state.pokemon.inventory.mints = 2;
+                        s.state.pokemon.inventory.shiny_charm =
+                            page == "shop-owned" || page == "bag";
+                        if page == "shop-poor" {
+                            s.state.pokemon.spent_tokens = s.state.pokemon.lifetime_tokens;
+                        }
+                        if page == "shop-egglocked" {
+                            s.state.pokemon.active = None;
+                        }
+                        s.pokemon_ui.quantity = if page.starts_with("shop") { 3 } else { 1 };
+                        s.pokemon_ui.item_art.clear();
+                        if page != "shop-fallback" {
+                            if let Some(dir) = std::env::var_os("SHARK_POKEMON_ITEM_ART") {
+                                for item in [Item::RareCandy, Item::ShinyCharm] {
+                                    let name = item.sprite_name().unwrap();
+                                    if let Some(asset) = crate::pokemon::sprites::cached(
+                                        &PathBuf::from(&dir).join(format!("item-{name}.png")),
+                                    ) {
+                                        s.pokemon_ui.item_art.insert(name, asset);
+                                    }
+                                }
+                            }
+                        }
                         s.state.pokemon_disabled = page == "footer-disabled";
                         for (index, snapshot) in s.usage.iter_mut().enumerate() {
                             snapshot.finish(Ok(vec![Allowance {
@@ -370,7 +660,9 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             s.show_pokemon(w, cx);
                             s.pokemon_ui.tab = match page {
                                 "dex" => super::super::pokemon::Page::Dex,
-                                "shop" => super::super::pokemon::Page::Shop,
+                                "shop" | "shop-owned" | "shop-poor" | "shop-egglocked"
+                                | "shop-fallback" => super::super::pokemon::Page::Shop,
+                                "bag" => super::super::pokemon::Page::Bag,
                                 "usage" => super::super::pokemon::Page::Usage,
                                 _ => super::super::pokemon::Page::Home,
                             };
@@ -393,7 +685,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                     crate::usage::now(),
                                 );
                                 s.usage_activity[i] = s.usage_reports[i].daily.clone();
-                                // Shark's heatmap excludes cache; companion accounting includes it.
+                                // Activity excludes cache; companion accounting includes it.
                                 if let Some(today) = s.usage_activity[i].tokens.last_mut() {
                                     *today = 150;
                                 }
@@ -410,6 +702,11 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     w.render_frame(cx);
                     w.refresh();
                     w.render_frame(cx);
+                    if page == "shop-owned" {
+                        reveal_pokemon_control(w, cx, "pokemon-buy-Shiny Charm");
+                    } else if page == "shop-egglocked" {
+                        reveal_pokemon_control(w, cx, "pokemon-buy-Pokémon Egg");
+                    }
                     assert!(w.try_find("usage-trigger-claude").is_none());
                     assert!(w.try_find("usage-trigger-codex").is_none());
                     if page != "footer-disabled" {
@@ -513,7 +810,13 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     screenshot
                         .save(directory.join(format!(
                             "pokemon-{page}-{label}-{}.png",
-                            if rail { "rail" } else { "expanded" }
+                            if shop_only && rail {
+                                "small"
+                            } else if rail {
+                                "rail"
+                            } else {
+                                "expanded"
+                            }
                         )))
                         .unwrap();
                 }
@@ -526,12 +829,14 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 .unwrap();
         }
     }
-    super::super::pokemon::appearance_pixels::render_pixels(cx);
+    if !shop_only {
+        super::super::pokemon::appearance_pixels::render_pixels(cx);
+    }
 }
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn pokemon_refresh_keeps_footer_and_popover_geometry_stable(cx: &mut TestAppContext) {
+async fn pokemon_refresh_keeps_footer_and_popover_anchor_stable(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
     for rail in [false, true] {
@@ -597,6 +902,19 @@ async fn pokemon_refresh_keeps_footer_and_popover_geometry_stable(cx: &mut TestA
                     "opening and refreshing must not resize the footer; rail={rail}"
                 );
                 let panel = w.find("usage-panel").bounds();
+                let viewport = w.viewport_size();
+                let assert_panel = |current: Bounds<Pixels>| {
+                    assert_eq!(current.left(), panel.left());
+                    assert_eq!(current.bottom(), panel.bottom());
+                    assert_eq!(current.size.width, panel.size.width);
+                    assert!(
+                        current.top() >= px(8.)
+                            && current.left() >= px(8.)
+                            && current.right() <= viewport.width - px(8.)
+                            && current.bottom() <= viewport.height - px(8.),
+                        "dynamic Usage content must fit the viewport: {current:?}"
+                    );
+                };
                 for provider in 0..2 {
                     shark.update(cx, |s, cx| {
                         s.usage[provider].finish(Ok(allowances()));
@@ -606,18 +924,15 @@ async fn pokemon_refresh_keeps_footer_and_popover_geometry_stable(cx: &mut TestA
                     w.refresh();
                     w.render_frame(cx);
                     assert_eq!(w.find("usage-footer").bounds(), footer);
-                    assert_eq!(
-                        w.find("usage-panel").bounds(),
-                        panel,
-                        "each completed quota request must keep the panel in place"
-                    );
+                    assert_panel(w.find("usage-panel").bounds());
                 }
-                w.click("pokemon-refresh", cx);
+                assert!(w.find("refresh-usage").visible());
+                w.click("refresh-usage", cx);
                 w.render_frame(cx);
                 w.refresh();
                 w.render_frame(cx);
                 assert_eq!(w.find("usage-footer").bounds(), footer);
-                assert_eq!(w.find("usage-panel").bounds(), panel);
+                assert_panel(w.find("usage-panel").bounds());
                 for result in [
                     Err(crate::usage::Failure::Temporary),
                     Err(crate::usage::Failure::SignIn),
@@ -637,7 +952,7 @@ async fn pokemon_refresh_keeps_footer_and_popover_geometry_stable(cx: &mut TestA
                         footer,
                         "error and recovery states must preserve footer geometry"
                     );
-                    assert_eq!(w.find("usage-panel").bounds(), panel);
+                    assert_panel(w.find("usage-panel").bounds());
                 }
                 w.remove_window();
             })

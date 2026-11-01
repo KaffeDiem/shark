@@ -32,12 +32,39 @@ async fn pokemon_keyboard_reaches_each_tab_and_restores_previous_focus(cx: &mut 
         });
         w.render_frame(cx);
         for id in [
-            "pokemon-refresh",
+            "usage-open-recap",
+            "refresh-usage",
+            "usage-provider-all",
+            "usage-provider-tab-claude",
+            "usage-provider-tab-codex",
+            "pokemon-usage-open-home",
+            "usage-toggle-details",
+        ] {
+            w.press("tab", cx);
+            w.render_frame(cx);
+            assert_eq!(w.find(id).focused(), Some(true), "Tab must reach {id}");
+        }
+        w.press("enter", cx);
+        w.render_frame(cx);
+        assert_eq!(w.find("usage-toggle-details").checked(), Some(true));
+        w.press("space", cx);
+        w.render_frame(cx);
+        assert_eq!(w.find("usage-toggle-details").checked(), Some(false));
+        w.press("shift-tab", cx);
+        w.render_frame(cx);
+        assert_eq!(w.find("pokemon-usage-open-home").focused(), Some(true));
+        w.press("enter", cx);
+        w.render_frame(cx);
+        assert!(w.find("pokemon-home").visible());
+        w.press("tab", cx);
+        w.render_frame(cx);
+        assert_eq!(w.find("pokemon-refresh").focused(), Some(true));
+        for id in [
+            "pokemon-tab-Usage",
             "pokemon-tab-Home",
             "pokemon-tab-Pokédex",
             "pokemon-tab-Bag",
             "pokemon-tab-Shop",
-            "pokemon-tab-Usage",
         ] {
             w.press("tab", cx);
             w.render_frame(cx);
@@ -45,10 +72,22 @@ async fn pokemon_keyboard_reaches_each_tab_and_restores_previous_focus(cx: &mut 
         }
         w.press("shift-tab", cx);
         w.render_frame(cx);
-        assert_eq!(w.find("pokemon-tab-Shop").focused(), Some(true));
+        assert_eq!(w.find("pokemon-tab-Bag").focused(), Some(true));
         w.press("enter", cx);
         w.render_frame(cx);
-        assert!(w.find("pokemon-shop").visible());
+        assert!(w.find("pokemon-bag").visible());
+        for _ in 0..3 {
+            w.press("shift-tab", cx);
+        }
+        w.render_frame(cx);
+        assert_eq!(w.find("pokemon-tab-Usage").focused(), Some(true));
+        w.press("enter", cx);
+        w.render_frame(cx);
+        assert!(w.find("pokemon-usage-progress").visible());
+        assert!(w.try_find("pokemon-tab-Home").is_none());
+        w.press("tab", cx);
+        w.render_frame(cx);
+        assert_eq!(w.find("usage-open-recap").focused(), Some(true));
         w.press("escape", cx);
         assert!(shark.read(cx).usage_panel.is_none());
         assert!(shark.read(cx).sidebar_focus.is_focused(w));
@@ -73,6 +112,7 @@ async fn pokemon_large_individual_picker_stays_inside_panel(cx: &mut TestAppCont
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.click("pokemon-footer", cx);
+        w.click("pokemon-usage-open-home", cx);
         w.click("pokemon-tab-Pokédex", cx);
         w.click("pokemon-dex-25", cx);
         w.render_frame(cx);
@@ -129,6 +169,31 @@ async fn pokemon_footer_and_popover_fit_small_windows_and_scroll(cx: &mut TestAp
                         "popover outside viewport {panel:?} vs {:?}",
                         w.viewport_size()
                     );
+                    for _ in 0..10 {
+                        let home = w.find("pokemon-usage-open-home");
+                        if home.visible()
+                            && home.bounds().top() >= panel.top()
+                            && home.bounds().bottom() <= panel.bottom()
+                        {
+                            break;
+                        }
+                        w.scroll(
+                            "usage-panel",
+                            ScrollDelta::Pixels(point(px(0.), px(-100.))),
+                            cx,
+                        );
+                        w.render_frame(cx);
+                    }
+                    let home = w.find("pokemon-usage-open-home");
+                    assert!(
+                        home.visible(),
+                        "Pokémon navigation must be reachable by scrolling"
+                    );
+                    assert!(
+                        home.bounds().top() >= panel.top()
+                            && home.bounds().bottom() <= panel.bottom()
+                    );
+                    w.click("pokemon-usage-open-home", cx);
                     w.scroll(
                         "usage-panel",
                         ScrollDelta::Pixels(point(px(0.), px(-1200.))),
@@ -181,6 +246,7 @@ async fn pokemon_home_opens_growing_species_when_navigation_is_pinned(cx: &mut T
                 .ends_with("Open Pokémon companion")
         );
         w.click("pokemon-footer", cx);
+        w.click("pokemon-usage-open-home", cx);
         w.render_frame(cx);
         assert_eq!(
             w.find("pokemon-home-open-details").label(),
@@ -211,12 +277,11 @@ async fn pokemon_usage_tab_keeps_companion_navigation_and_disable_hides_it(
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.click("pokemon-footer", cx);
-        w.click("pokemon-tab-Usage", cx);
         w.render_frame(cx);
         assert!(w.find("usage-status-claude").visible());
         assert!(w.find("usage-status-codex").visible());
         assert!(w.try_find("pokemon-home").is_none());
-        w.click("pokemon-tab-Home", cx);
+        w.click("pokemon-usage-open-home", cx);
         assert!(w.find("pokemon-home").visible());
         w.click("pokemon-tab-Pokédex", cx);
         assert!(w.find("pokemon-dex").visible());
@@ -289,6 +354,7 @@ async fn pokemon_every_catalog_form_can_be_pinned_from_native_individual_picker(
         cx.update_window(window, |_, w, cx| {
             w.render_frame(cx);
             w.click("pokemon-footer", cx);
+            w.click("pokemon-usage-open-home", cx);
             w.click("pokemon-tab-Pokédex", cx);
             w.click(format!("pokemon-dex-{species}"), cx);
             for (index, entry) in forms.iter().rev().enumerate() {
@@ -355,7 +421,7 @@ async fn pokemon_usage_accounting_scrolls_without_horizontal_clipping(cx: &mut T
             s.show_pokemon(w, cx);
         });
         w.render_frame(cx);
-        w.click("pokemon-tab-Usage", cx);
+        w.click("usage-toggle-details", cx);
         w.render_frame(cx);
         let panel = w.find("usage-panel").bounds();
         for provider in crate::usage::Provider::ALL {
