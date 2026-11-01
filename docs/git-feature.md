@@ -79,8 +79,12 @@ Markdown renderer, which does not load remote or repository-relative images.
   cannot leave the repository; a revision missing locally shows why, with a link to
   GitHub. The working tree is never read.
 - Remote images and videos download in the background with the system `curl`: HTTPS
-  only (redirects too), no `.curlrc`, netrc, cookies or GitHub credentials, bounded in
-  time and size (`src/media/fetch.rs`), written atomically into the media cache. The
+  only (redirects too), no `.curlrc`, netrc or cookies, bounded in time and size
+  (`src/media/fetch.rs`), written atomically into the media cache. Attachments on
+  github.com itself (`/user-attachments/assets/`, `/{owner}/{repo}/assets/`) get the
+  `gh auth token`, since private repositories serve them only to a signed-in user. It is
+  passed in a 0600 header file, not argv, and curl drops it when GitHub redirects to its
+  storage host. No other host gets credentials. The
   size is checked again on the file after the download, because older curl enforces its
   limit only when the response states a length. GitHub attachment URLs have no
   extension; the response's content type decides what they are. Failed, private or

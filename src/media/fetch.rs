@@ -1,6 +1,7 @@
 //! Document-supplied images and videos, downloaded with the system `curl`. HTTPS only, also
-//! for redirects; no credentials, cookies or `.curlrc`; bounded in time and size; written
-//! atomically into the media cache under a key derived from the URL.
+//! for redirects; no cookies or `.curlrc`, and no credentials except the gh token for
+//! attachments on github.com itself; bounded in time and size; written atomically into the
+//! media cache under a key derived from the URL.
 use super::{Kind, Side, Source, cache_dir, ext, kind};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -27,6 +28,39 @@ pub(crate) fn attachment(url: &str) -> bool {
         || rest.starts_with("private-user-images.githubusercontent.com/")
         || rest.starts_with("user-images.githubusercontent.com/")
         || (rest.starts_with("github.com/") && rest.split('/').nth(3) == Some("assets"))
+}
+
+/// Attachments served by github.com itself, which private repositories gate on sign-in.
+fn sends_token(url: &str) -> bool {
+    url.starts_with("https://github.com/") && attachment(url)
+}
+
+/// `Authorization: token …` from `gh auth token`, in a file only the user can read, so the
+/// token never shows in `ps`. None when gh is missing or signed out: the fetch goes anonymous.
+fn auth_header(path: &Path, dir: &Path) -> Option<PathBuf> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let args = ["auth", "token", "--hostname", "github.com"];
+    let gh = crate::proc::gh();
+    let out = crate::proc::wait_bounded(Command::new(&gh), dir, &gh, &args, 10, false).ok()?;
+    let token = out.trim();
+    // Anything else could smuggle a second header line.
+    if token.is_empty()
+        || !token
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+    {
+        return None;
+    }
+    let mut f = (std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600))
+    .open(path)
+    .ok()?;
+    f.write_all(format!("Authorization: token {token}\n").as_bytes())
+        .ok()?;
+    Some(path.to_path_buf())
 }
 
 fn url_path(url: &str) -> &str {
@@ -131,9 +165,15 @@ pub(crate) fn fetch(url: &str) -> Result<Fetched, String> {
 
 /// Runs curl into `out`; returns the final response's content type.
 fn download(url: &str, out: &Path, dir: &Path) -> Result<String, String> {
+    // curl drops a custom Authorization header when a redirect changes host, so the token
+    // reaches github.com only, not the storage host it redirects to.
+    let auth = sends_token(url)
+        .then(|| auth_header(&out.with_extension("auth"), dir))
+        .flatten();
+    let auth_arg = auth.as_ref().map(|p| format!("@{}", p.display()));
     let out = out.to_string_lossy();
     let max = MAX_BYTES.to_string();
-    let args = [
+    let mut args = vec![
         // Must come first: ignores ~/.curlrc, which could add credentials or headers.
         "-q",
         "--silent",
@@ -160,20 +200,24 @@ fn download(url: &str, out: &Path, dir: &Path) -> Result<String, String> {
         &out,
         "--write-out",
         "%{content_type}",
-        "--",
-        url,
     ];
+    if let Some(a) = &auth_arg {
+        args.extend(["--header", a]);
+    }
+    args.extend(["--", url]);
     let mut c = Command::new("curl");
     // No credentials of the user's may reach a document-supplied host.
     c.env_remove("NETRC").env_remove("CURL_HOME");
     // The kernel stops curl writing past the cap (SIGXFSZ), whatever the response says.
     cap_file_size(&mut c, MAX_BYTES + 1);
-    crate::proc::wait_bounded(c, dir, "curl", &args, 75, false).map_err(|e| {
-        match e.find("curl: (") {
-            Some(at) => e[at + 6..].trim().to_string(),
-            None if e.contains("timed out") => "download timed out".into(),
-            None => e,
-        }
+    let result = crate::proc::wait_bounded(c, dir, "curl", &args, 75, false);
+    if let Some(p) = &auth {
+        let _ = std::fs::remove_file(p);
+    }
+    result.map_err(|e| match e.find("curl: (") {
+        Some(at) => e[at + 6..].trim().to_string(),
+        None if e.contains("timed out") => "download timed out".into(),
+        None => e,
     })
 }
 
@@ -215,6 +259,18 @@ mod tests {
         assert!(attachment("https://github.com/o/r/assets/12/0a1b"));
         assert!(!attachment("https://github.com/o/r/blob/main/a.png"));
         assert!(!attachment("http://github.com/user-attachments/assets/x"));
+        assert!(sends_token(
+            "https://github.com/user-attachments/assets/0a1b2c3d-0000-4000-8000-000000000000"
+        ));
+        assert!(sends_token("https://github.com/o/r/assets/12/0a1b"));
+        assert!(!sends_token(
+            "https://private-user-images.githubusercontent.com/1/a.png?jwt=x"
+        ));
+        assert!(!sends_token(
+            "https://github.com.evil.test/user-attachments/assets/x"
+        ));
+        assert!(!sends_token("https://github.com/o/r/blob/main/a.png"));
+        assert!(!sends_token("http://github.com/user-attachments/assets/x"));
         assert_eq!(
             classify("image/png; charset=binary"),
             Some((Kind::Image, "png"))
