@@ -826,14 +826,14 @@ impl Shark {
                                     h_flex()
                                         .flex_none()
                                         .gap(px(if self.rail { 2. } else { 3. }))
-                                        .when(index > 0, |d| {
+                                        .when(index > 0 && !self.rail, |d| {
                                             d.child(
                                                 div()
                                                     .text_color(cx.theme().sidebar_foreground)
                                                     .child("·"),
                                             )
                                         })
-                                        .when_some(dot, |d, color| {
+                                        .when_some(dot.filter(|_| !self.rail), |d, color| {
                                             // Pace hue stays out of the text so light themes keep sidebar contrast.
                                             d.items_center().child(
                                                 div()
@@ -2148,11 +2148,11 @@ impl Shark {
                             Button::new("pokemon-use-candy")
                                 .small()
                                 .label(format!(
-                                    "Use ×{}",
+                                    "Use up to ×{}",
                                     self.pokemon_ui.quantity.max(1).min(bag.candies).max(1)
                                 ))
                                 .accessibility_label(format!(
-                                    "Use Rare Candy ×{}",
+                                    "Use up to {} Rare Candy items",
                                     self.pokemon_ui.quantity.max(1).min(bag.candies).max(1)
                                 ))
                                 .disabled(bag.candies == 0 || self.state.pokemon.active.is_none())

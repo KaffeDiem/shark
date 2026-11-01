@@ -173,6 +173,7 @@ pub(crate) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 shark.update(cx, |s, cx| s.seed_pokemon_preview_sprites(&directory, cx));
                 w.render_frame(cx);
                 w.click("pokemon-footer", cx);
+                w.click("pokemon-usage-open-home", cx);
                 w.click("pokemon-tab-Pokédex", cx);
                 w.render_frame(cx);
             })
@@ -232,6 +233,7 @@ pub(crate) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             for entry in 0..2 {
                 cx.update_window(window, |_, w, cx| {
                     w.click("pokemon-footer", cx);
+                    w.click("pokemon-usage-open-home", cx);
                     w.click("pokemon-tab-Pokédex", cx);
                     w.click("pokemon-segment-log", cx);
                     w.render_frame(cx);

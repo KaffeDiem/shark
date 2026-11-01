@@ -517,6 +517,39 @@ async fn pokemon_dex_pages_filter_details_back_and_pin(cx: &mut TestAppContext) 
     .unwrap();
 }
 
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn candy_selection_is_an_upper_bound_near_graduation(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let mut state = State::default();
+    state.pokemon = companion();
+    state.pokemon.inventory.candies = 5;
+    let difficulty = state.pokemon.growth_difficulty;
+    let mon = state.pokemon.active.as_mut().unwrap();
+    mon.tokens = mon.threshold(difficulty) - 250_000_000;
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| {
+            s.show_pokemon(w, cx);
+            s.pokemon_ui.tab = super::super::pokemon::Page::Bag;
+            s.pokemon_ui.quantity = 5;
+            cx.notify();
+        });
+        w.render_frame(cx);
+        reveal_pokemon_control(w, cx, "pokemon-use-candy");
+        assert_eq!(
+            w.find("pokemon-use-candy").label(),
+            Some("Use up to 5 Rare Candy items")
+        );
+        w.click("pokemon-use-candy", cx);
+        assert_eq!(shark.read(cx).state.pokemon.inventory.candies, 2);
+        assert!(shark.read(cx).state.pokemon.active.is_none());
+        assert_eq!(State::load().pokemon.inventory.candies, 2);
+    })
+    .unwrap();
+}
+
 /// Opt-in real Metal renders. Artwork comes from a caller-provided runtime cache, never bundled.
 pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
