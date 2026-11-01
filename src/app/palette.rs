@@ -209,6 +209,43 @@ pub(super) const COMMANDS: &[Row] = &[
         &PickModel,
         "opus sonnet haiku",
     ),
+    // One per `MODELS` entry, in order, like the ctrl-cmd-N picks.
+    Row::key(
+        "Model: Fable",
+        IconName::Sparkles,
+        &SetModel(0),
+        "switch model fable claude",
+    ),
+    Row::key(
+        "Model: Opus",
+        IconName::Sparkles,
+        &SetModel(1),
+        "switch model opus claude",
+    ),
+    Row::key(
+        "Model: Sonnet",
+        IconName::Sparkles,
+        &SetModel(2),
+        "switch model sonnet claude",
+    ),
+    Row::key(
+        "Model: Haiku",
+        IconName::Sparkles,
+        &SetModel(3),
+        "switch model haiku claude",
+    ),
+    Row::key(
+        "Model: GPT-6.1 Sol",
+        IconName::Sparkles,
+        &SetModel(4),
+        "switch model gpt sol codex openai",
+    ),
+    Row::key(
+        "Model: GPT-6 Astra",
+        IconName::Sparkles,
+        &SetModel(5),
+        "switch model gpt astra codex openai",
+    ),
     Row::key(
         "Toggle fast mode",
         IconName::Zap,
@@ -947,5 +984,26 @@ mod tests {
         for label in CLAUDE_ONLY.iter().chain(CODEX_ONLY).chain(NEED_WORKSPACE) {
             assert!(COMMANDS.iter().any(|r| r.0 == *label), "no row {label}");
         }
+    }
+
+    #[test]
+    fn a_model_row_per_model_in_order() {
+        let rows: Vec<_> = (COMMANDS.iter())
+            .filter_map(|r| {
+                Some((
+                    r.0.strip_prefix("Model: ")?,
+                    r.2?.as_any().downcast_ref::<SetModel>()?.0,
+                ))
+            })
+            .collect();
+        let models: Vec<_> = (MODELS.iter().enumerate())
+            .map(|(i, m)| (crate::chat::model_label(m), i))
+            .collect();
+        assert_eq!(
+            rows.iter()
+                .map(|(l, i)| (l.to_string(), *i))
+                .collect::<Vec<_>>(),
+            models
+        );
     }
 }

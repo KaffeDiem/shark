@@ -547,8 +547,9 @@ fn main() {
             cx.on_action(move |_: &menubar::Quit, cx| {
                 let shark = shark.clone();
                 cx.defer(move |cx| {
-                    let asked =
-                        window.update(cx, |_, w, cx| shark.update(cx, |s, cx| s.quit_or_warn(w, cx)));
+                    let asked = window.update(cx, |_, w, cx| {
+                        shark.update(cx, |s, cx| s.quit_or_warn(w, cx))
+                    });
                     if !matches!(asked, Ok(Ok(()))) {
                         cx.quit()
                     }

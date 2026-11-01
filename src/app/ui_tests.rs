@@ -4055,7 +4055,12 @@ async fn home_ask_shark(cx: &mut TestAppContext) {
     let answer = |cx: &mut TestAppContext| {
         cx.update(|cx| {
             let ask = shark.read(cx).home.ask.as_ref().unwrap();
-            ask.answer.read(cx).rendered_text().as_str().trim().to_string()
+            ask.answer
+                .read(cx)
+                .rendered_text()
+                .as_str()
+                .trim()
+                .to_string()
         })
     };
     assert_eq!(answer(cx), "Forty-two");
@@ -5531,7 +5536,8 @@ async fn review_queue(cx: &mut TestAppContext) {
             s.differ
                 .read(cx)
                 .review()
-                .store.failed_saves
+                .store
+                .failed_saves
                 .contains_key(s.active.as_deref().unwrap())
         );
         s.differ.update(cx, |d, cx| d.open_share(1, w, cx));
@@ -5692,7 +5698,8 @@ async fn review_queue(cx: &mut TestAppContext) {
                 .differ
                 .read(cx)
                 .review()
-                .store.comments
+                .store
+                .comments
                 .contains_key("elsewhere")
         )
     });
@@ -5744,8 +5751,7 @@ async fn review_queue(cx: &mut TestAppContext) {
     let dir = crate::state::support_dir().join("comments");
     fs::write(dir.join("bad.json"), "{oops").unwrap();
     on(cx, &|s, _, cx| {
-        s.differ
-            .update(cx, |d, _| d.review_mut().store.load("bad"))
+        s.differ.update(cx, |d, _| d.review_mut().store.load("bad"))
     });
     assert!(dir.join("bad.json.1.bak").exists() && !dir.join("bad.json").exists());
     fs::write(
@@ -5754,8 +5760,7 @@ async fn review_queue(cx: &mut TestAppContext) {
     )
     .unwrap();
     on(cx, &|s, _, cx| {
-        s.differ
-            .update(cx, |d, _| d.review_mut().store.load("old"))
+        s.differ.update(cx, |d, _| d.review_mut().store.load("old"))
     });
     cx.update(|cx| {
         let c = &shark.read(cx).differ.read(cx).review().store.comments["old"][0];
@@ -7277,6 +7282,60 @@ async fn inline_edit_round4(cx: &mut TestAppContext) {
     on(cx, &|s, w, cx| s.quit(w, cx));
     assert!(dialog(cx), "Quit asks");
     cancel(cx);
+    // ⌘Q with an agent at work, as Chrome's Warn Before Quitting: hold it or press it again.
+    use super::chats::{Q_HELD, QUIT_KEY};
+    use std::sync::atomic::Ordering::SeqCst;
+    let chat = cx.update(|cx| shark.read(cx).active_chat().cloned().unwrap());
+    cx.update(|cx| chat.update(cx, |c, _| c.busy = true));
+    let toasts = |cx: &mut TestAppContext| {
+        (cx.update_window(window, |_, w, cx| w.notifications(cx).len())).unwrap()
+    };
+    let wait = |cx: &mut TestAppContext, ms: u64| {
+        cx.executor().advance_clock(Duration::from_millis(ms));
+        cx.run_until_parked();
+    };
+    let cmd_q = |cx: &mut TestAppContext, repeat: bool, held: bool| {
+        *QUIT_KEY.lock().unwrap() = Some((12, repeat));
+        Q_HELD.store(held, SeqCst);
+        on(cx, &|s, w, cx| s.quit_or_warn(w, cx));
+    };
+    // From the menu: no warning.
+    on(cx, &|s, w, cx| s.quit_or_warn(w, cx));
+    assert!(dialog(cx), "the menu's Quit asks right away");
+    cancel(cx);
+    let before = toasts(cx);
+    // A tap warns; autorepeat and a release before the hold time don't quit.
+    cmd_q(cx, false, true);
+    assert_eq!(toasts(cx), before + 1, "⌘Q warns instead");
+    wait(cx, 200);
+    cmd_q(cx, true, true);
+    Q_HELD.store(false, SeqCst);
+    wait(cx, 100);
+    assert!(!dialog(cx), "released before the hold time");
+    wait(cx, 1300);
+    assert_eq!(
+        toasts(cx),
+        before,
+        "the warning goes a second after release"
+    );
+    // Held past the hold time: quits once released.
+    on(cx, &|s, _, _| s.quit_warned = None);
+    cmd_q(cx, false, true);
+    wait(cx, 600);
+    assert!(!dialog(cx), "waits for the release");
+    Q_HELD.store(false, SeqCst);
+    wait(cx, 100);
+    assert!(dialog(cx), "holding ⌘Q quits");
+    cancel(cx);
+    // Pressed again within a second: quits once released.
+    cmd_q(cx, false, false);
+    wait(cx, 300);
+    cmd_q(cx, false, false);
+    wait(cx, 100);
+    assert!(dialog(cx), "a second ⌘Q quits");
+    cancel(cx);
+    *QUIT_KEY.lock().unwrap() = None;
+    cx.update(|cx| chat.update(cx, |c, _| c.busy = false));
     let mut vcx = VisualTestContext::from_window(window, cx);
     assert!(!vcx.simulate_close(), "the close button waits");
     assert!(dialog(cx), "the close button asks");
