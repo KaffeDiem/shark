@@ -76,6 +76,19 @@ async fn repo_settings_scripts_and_model(cx: &mut TestAppContext) {
         !cx.read(|cx| shark.read(cx).running("scripts")),
         "cmd-r again stops"
     );
+    // The header's run button toggles like cmd-r (a stopped run keeps its port while it stops).
+    for want in [true, false] {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.click("run", cx);
+        })
+        .unwrap();
+        assert_eq!(
+            cx.read(|cx| shark.read(cx).running("scripts")),
+            want,
+            "the run button toggles"
+        );
+    }
 
     on(cx, &|s, w, cx| s.archive_ws("scripts".into(), false, w, cx));
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {

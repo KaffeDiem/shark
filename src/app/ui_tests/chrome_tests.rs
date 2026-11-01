@@ -241,7 +241,18 @@ pub(crate) fn render_pixels() {
         gpui_kit::init(cx);
         crate::install_fonts(cx);
     });
+    if std::env::var_os("SHARK_RENDER_USAGE_ONLY").is_some() {
+        super::super::usage::render_pixels(&mut cx);
+        return;
+    }
+    if std::env::var_os("SHARK_RENDER_POKEMON_ONLY").is_some() {
+        super::pokemon_tests::render_pixels(&mut cx);
+        return;
+    }
     crate::chat::ui_tests::render_activity_pixels(&mut cx);
+    if std::env::var_os("SHARK_RENDER_ACTIVITY_ONLY").is_some() {
+        return;
+    }
     let (window, tabs) = cx
         .update(|cx| {
             gpui_kit::open_window(

@@ -21,6 +21,7 @@ mod menubar;
 mod models;
 mod overflow_fade;
 mod plan;
+mod pokemon;
 mod pr;
 mod proc;
 mod prompts;
@@ -57,6 +58,7 @@ actions!(
         FocusRight,
         ShowChat,
         ShowUsage,
+        ShowPokemon,
         ShowDiff,
         ShowGit,
         CreatePrs,
