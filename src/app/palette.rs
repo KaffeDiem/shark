@@ -636,6 +636,12 @@ pub(super) const COMMANDS: &[Row] = &[
         "preferences theme font prompts",
     ),
     Row::key(
+        "Show Pokémon",
+        IconName::Sparkles,
+        &ShowPokemon,
+        "pokemon companion pokedex egg bag shop tokens",
+    ),
+    Row::key(
         "Show usage",
         IconName::ChartBar,
         &ShowUsage,
