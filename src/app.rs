@@ -100,6 +100,8 @@ pub struct Shark {
     chats: HashMap<String, Entity<Chat>>,
     /// `caffeinate` while agents work and `stay_awake` is on.
     awake: Option<std::process::Child>,
+    /// When ⌘Q last warned that agents are at work; see `quit_or_warn`.
+    quit_warned: Option<std::time::Instant>,
     /// Chats whose turn ended while another chat was shown.
     unread: HashSet<String>,
     tab: Tab,
@@ -263,6 +265,7 @@ impl Shark {
             active: None,
             chats: HashMap::new(),
             awake: None,
+            quit_warned: None,
             unread: HashSet::new(),
             tab: Tab::Chat,
             differ,

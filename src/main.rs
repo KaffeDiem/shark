@@ -548,7 +548,7 @@ fn main() {
                 let shark = shark.clone();
                 cx.defer(move |cx| {
                     let asked =
-                        window.update(cx, |_, w, cx| shark.update(cx, |s, cx| s.quit(w, cx)));
+                        window.update(cx, |_, w, cx| shark.update(cx, |s, cx| s.quit_or_warn(w, cx)));
                     if !matches!(asked, Ok(Ok(()))) {
                         cx.quit()
                     }

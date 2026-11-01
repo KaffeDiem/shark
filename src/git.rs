@@ -7,7 +7,7 @@ mod tests;
 pub use changes::{discard_file, uncommitted_files};
 use std::{
     fs,
-    os::unix::fs::MetadataExt,
+    os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
     process::{Command, Output},
 };
@@ -597,9 +597,39 @@ fn on_review_head(wt: &Path, branch: &str, old: &str) -> Result<(), String> {
     if dirty(wt)? {
         return Err("uncommitted changes; commit or discard them first".into());
     }
-    let on_branch = git(wt, &["symbolic-ref", "--short", "HEAD"]).is_ok_and(|b| b == branch);
-    if !on_branch || git(wt, &["rev-parse", "HEAD"])? != old {
+    // Not --short: it prints `heads/<branch>` when a tag has the same name.
+    if git(wt, &["symbolic-ref", "HEAD"]).is_ok_and(|b| b == format!("refs/heads/{branch}")) {
+        if git(wt, &["rev-parse", "HEAD"])? == old {
+            return Ok(());
+        }
         return Err("has commits on top of the PR's previous head; nothing changed".into());
+    }
+    Err(format!("not on branch `{branch}`; nothing changed"))
+}
+
+/// Refuses if moving `wt` from `old` to `new` would overwrite an ignored file, which `dirty` and
+/// `reset --keep` both miss. On a clean tree, a path new adds that exists on disk is ignored.
+fn no_ignored_clobber(wt: &Path, old: &str, new: &str) -> Result<(), String> {
+    let args = [
+        "diff",
+        "--name-only",
+        "--no-renames",
+        "--diff-filter=A",
+        "-z",
+        old,
+        new,
+    ];
+    for p in git_bytes(wt, &args)?
+        .split(|&b| b == 0)
+        .filter(|p| !p.is_empty())
+    {
+        let p = Path::new(std::ffi::OsStr::from_bytes(p));
+        if wt.join(p).symlink_metadata().is_ok() {
+            let p = p.display();
+            return Err(format!(
+                "would overwrite ignored file `{p}`; move it aside first"
+            ));
+        }
     }
     Ok(())
 }
@@ -629,11 +659,16 @@ pub(crate) fn update_review_branch(
     // Checked again: a commit or checkout during the fetch must not be reset away. A clean tree
     // on the old head: --keep loses nothing, and the old commits stay in the reflog.
     let moved = on_review_head(wt, branch, &old)
+        .and_then(|_| no_ignored_clobber(wt, &old, &new))
         .and_then(|_| git(wt, &["reset", "--quiet", "--keep", &new]));
     if let Err(e) = moved {
         // Keep "Fetch updates" offered: the branch didn't move.
-        let _ = git(wt, &["update-ref", &head, &old]);
-        return Err(e);
+        return Err(match git(wt, &["update-ref", &head, &old]) {
+            Ok(_) => e,
+            Err(r) => format!(
+                "{e}; also failed to restore {head}, so \"Fetch updates\" may not be offered again: {r}"
+            ),
+        });
     }
     Ok(Some(format!("{} → {}", &old[..7], &new[..7])))
 }

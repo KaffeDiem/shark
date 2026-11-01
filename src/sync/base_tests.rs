@@ -171,6 +171,18 @@ esac
         git(&self.wt, &[&id[..], &args].concat()).unwrap()
     }
 
+    /// Like `loose_commit`, but the commit adds `path` (via the index, which is restored).
+    fn loose_commit_adding(&self, parent: &str, path: &str) -> String {
+        fs::write(self.wt.join(path), "from the PR\n").unwrap();
+        git(&self.wt, &["add", "-f", path]).unwrap();
+        let tree = git(&self.wt, &["write-tree"]).unwrap();
+        git(&self.wt, &["rm", "-q", "--cached", path]).unwrap();
+        fs::remove_file(self.wt.join(path)).unwrap();
+        let id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+        let args = ["commit-tree", "-p", parent, "-m", "pushed", &tree];
+        git(&self.wt, &[&id[..], &args].concat()).unwrap()
+    }
+
     /// A review checkout of PR 7 fetched at `head`, whose author has since pushed `sha`.
     fn pr_moved_to(&self, sha: &str) {
         let wt = &self.wt;
@@ -194,6 +206,16 @@ esac
         let new_pr = crate::pr::NewPr::new("", false);
         let r = run_step(a, &self.ws, job, &[], &[], &new_pr, false, true).map(|(_, m)| m);
         (r, repos)
+    }
+
+    /// What the button runs, called directly for states where it is no longer offered.
+    fn update(&self) -> Result<Option<String>, String> {
+        let pr = crate::git::PullRequest {
+            number: 7,
+            url: "https://github.com/o/api/pull/7".into(),
+            base: "main".into(),
+        };
+        crate::git::update_review_branch(&self.wt, "feature", &pr)
     }
 
     fn oid(&self, rf: &str) -> String {
@@ -954,14 +976,12 @@ fn fetch_updates_refuses_dirty_without_fetching() {
     let new = f.loose_commit(&f.head);
     f.pr_moved_to(&new);
     fs::write(f.wt.join("notes.txt"), "mine\n").unwrap();
-    let (result, _) = f.click();
+    let result = f.update();
     assert!(result.unwrap_err().contains("uncommitted"));
     assert_eq!(f.oid("refs/shark/pull/7/head"), f.head);
     assert_eq!(f.oid("HEAD"), f.head);
     let notes = fs::read_to_string(f.wt.join("notes.txt")).unwrap();
     assert_eq!(notes, "mine\n");
-    let repos = f.repos(run_job(&f.job(false, true, &[])), &[]);
-    assert_eq!(status::next_action(&repos, &[]).kind, Kind::FetchReview);
 }
 
 #[test]
@@ -974,12 +994,88 @@ fn fetch_updates_refuses_local_commits() {
     f.pr_moved_to(&new);
     crate::git::commit(&f.wt, &["--allow-empty", "-qm", "my fixup"]);
     let mine = f.oid("HEAD");
-    let (result, _) = f.click();
+    let result = f.update();
     assert!(result.unwrap_err().contains("commits on top"));
     assert_eq!(f.oid("refs/shark/pull/7/head"), f.head);
     assert_eq!(f.oid("HEAD"), mine);
+}
+
+#[test]
+fn fetch_updates_refuses_to_overwrite_ignored_file() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-ignored");
+    let new = f.loose_commit_adding(&f.head, ".env");
+    f.pr_moved_to(&new);
+    fs::write(f.wt.join(".git/info/exclude"), ".env\n").unwrap();
+    fs::write(f.wt.join(".env"), "SECRET=1\n").unwrap();
+    let (result, _) = f.click();
+    let err = result.unwrap_err();
+    assert!(err.contains("overwrite ignored file `.env`"), "{err}");
+    assert_eq!(fs::read_to_string(f.wt.join(".env")).unwrap(), "SECRET=1\n");
+    assert_eq!(f.oid("HEAD"), f.head);
+    assert_eq!(f.oid("refs/shark/pull/7/head"), f.head);
     let repos = f.repos(run_job(&f.job(false, true, &[])), &[]);
     assert_eq!(status::next_action(&repos, &[]).kind, Kind::FetchReview);
+}
+
+#[test]
+fn fetch_updates_ignores_same_named_tag() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-tag");
+    let new = f.loose_commit(&f.head);
+    f.pr_moved_to(&new);
+    git(&f.wt, &["tag", "feature"]).unwrap();
+    let (result, _) = f.click();
+    assert!(result.unwrap().contains(&new[..7]));
+    assert_eq!(f.oid("refs/heads/feature"), new);
+}
+
+#[test]
+fn fetch_updates_refuses_other_branch_or_detached() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-elsewhere");
+    let new = f.loose_commit(&f.head);
+    f.pr_moved_to(&new);
+    // Both at the old head, so only the branch name differs.
+    for checkout in [
+        &["checkout", "-qb", "other"][..],
+        &["checkout", "-q", "--detach"],
+    ] {
+        git(&f.wt, checkout).unwrap();
+        let result = f.update();
+        let err = result.unwrap_err();
+        assert!(err.contains("not on branch `feature`"), "{err}");
+        assert_eq!(f.oid("HEAD"), f.head);
+        assert_eq!(f.oid("refs/shark/pull/7/head"), f.head);
+        git(&f.wt, &["checkout", "-q", "feature"]).unwrap();
+    }
+}
+
+#[test]
+fn fetch_updates_refuses_staged_change() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-staged");
+    let new = f.loose_commit(&f.head);
+    f.pr_moved_to(&new);
+    fs::write(f.wt.join("staged.txt"), "mine\n").unwrap();
+    git(&f.wt, &["add", "staged.txt"]).unwrap();
+    let result = f.update();
+    assert!(result.unwrap_err().contains("uncommitted"));
+    assert_eq!(f.oid("refs/shark/pull/7/head"), f.head);
+    assert_eq!(f.oid("HEAD"), f.head);
+    assert_eq!(
+        fs::read_to_string(f.wt.join("staged.txt")).unwrap(),
+        "mine\n"
+    );
+    git(&f.wt, &["diff", "--cached", "--quiet", "--exit-code"]).unwrap_err();
 }
 
 #[test]

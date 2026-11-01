@@ -605,14 +605,26 @@ impl Repo {
         self.pr().filter(|p| p.state == PrState::Open)
     }
 
-    /// A reviewed PR got new commits on GitHub since its head was fetched. Local commits or
-    /// changes don't hide it; "Fetch updates" refuses those itself.
+    /// A reviewed PR got new commits on GitHub since its head was fetched, whatever the local
+    /// state. Whether "Fetch updates" can run is `review_fetchable`.
     pub fn review_head_moved(&self) -> bool {
         let local = self.local.as_ref().map_or("", |l| l.review_head.as_str());
         self.is_review()
             && self
                 .open_pr()
                 .is_some_and(|p| !p.head.is_empty() && !local.is_empty() && p.head != local)
+    }
+
+    /// `review_head_moved`, and `git::update_review_branch` would not refuse: clean tree
+    /// (untracked counts), no operation in progress, on the review branch at the fetched head.
+    pub fn review_fetchable(&self) -> bool {
+        self.review_head_moved()
+            && self.local.as_ref().is_ok_and(|l| {
+                l.changed == 0
+                    && l.op.is_none()
+                    && l.branch.as_deref() == Some(&self.branch)
+                    && l.head == l.review_head
+            })
     }
 
     /// The branch it is stacked on: its base is `origin/<parent>` and not the trunk.
@@ -813,7 +825,7 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
     };
     if repos.iter().any(Repo::is_review) {
         let moved: Vec<String> = (repos.iter())
-            .filter(|r| r.review_head_moved())
+            .filter(|r| r.review_fetchable())
             .map(|r| r.name.clone())
             .collect();
         if !moved.is_empty() {
@@ -822,6 +834,15 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
         }
         let normal: Vec<_> = repos.iter().filter(|r| !r.is_review()).cloned().collect();
         if normal.is_empty() {
+            // Moved but not fetchable: a hint, not a step, since the click couldn't succeed.
+            let blocked: Vec<String> = (repos.iter())
+                .filter(|r| r.review_head_moved())
+                .map(|r| r.name.clone())
+                .collect();
+            if !blocked.is_empty() {
+                let verb = "PR updated · commit or discard local changes to fetch";
+                return act(verb, Kind::OpenPr, blocked, false);
+            }
             return act(
                 "Review PR",
                 Kind::OpenPr,
@@ -1442,6 +1463,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         let mut local = Local {
             review: true,
             review_head: fetched.into(),
+            head: fetched.into(),
             ..clean(1)
         };
         l(&mut local);
@@ -1490,11 +1512,26 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
     }
 
     #[test]
-    fn fetch_updates_flags_local_commits_and_dirty() {
-        let committed = reviewed("api", "old", "new", |l| l.base = (3, 0));
-        assert_eq!(next(&[committed]).kind, Kind::FetchReview);
-        let dirty = reviewed("api", "old", "new", |l| l.changed = 2);
-        assert_eq!(next(&[dirty]).kind, Kind::FetchReview);
+    fn fetch_updates_blocked_by_local_state_is_a_hint() {
+        let cases = [
+            reviewed("api", "old", "new", |l| l.head = "local".into()),
+            reviewed("api", "old", "new", |l| l.changed = 2),
+            reviewed("api", "old", "new", |l| l.branch = Some("other".into())),
+            reviewed("api", "old", "new", |l| l.branch = None),
+            reviewed("api", "old", "new", |l| l.op = Some(Op::Rebase)),
+        ];
+        for r in cases {
+            assert!(r.review_head_moved() && !r.review_fetchable());
+            let a = next(&[r]);
+            assert_eq!(
+                a.label,
+                "PR updated · commit or discard local changes to fetch"
+            );
+            assert_eq!(a.kind, Kind::OpenPr);
+            assert_eq!(a.repos, ["api"]);
+            assert!(!a.attention);
+            assert!(!super::super::run::needs_you(&a));
+        }
     }
 
     #[test]
@@ -1504,6 +1541,16 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         let a = next(&[reviewed("review", "old", "new", |_| {}), work]);
         assert_eq!(a.kind, Kind::FetchReview);
         assert_eq!(a.repos, ["review"]);
+    }
+
+    #[test]
+    fn blocked_fetch_updates_does_not_outrank_normal_repo() {
+        let work = repo("work", clean(2), None);
+        let blocked = reviewed("review", "old", "new", |l| l.changed = 1);
+        let a = next(&[blocked, work]);
+        assert_eq!(a.kind, Kind::CreatePr);
+        assert_eq!(a.repos, ["work"]);
+        assert!(!a.label.contains("Fetch"));
     }
 
     fn repo(name: &str, l: Local, pr: Option<Pr>) -> Repo {

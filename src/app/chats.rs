@@ -1,6 +1,9 @@
 //! Chat tabs of the open workspace, and the agent status in the header.
 use super::*;
 
+/// Chromium's double-tap window (`kTimeDeltaFuzzFactor`).
+const CONFIRM_QUIT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// The ctrl-N shortcut chip shown over a tab's icon while ctrl is held, for the first nine tabs.
 pub(super) fn ctrl_chip(ctrl_held: bool, ix: usize) -> Option<AnyElement> {
     (ctrl_held && ix < 9).then(|| kbd(&format!("ctrl-{}", ix + 1)).into_any_element())
@@ -963,10 +966,38 @@ impl Shark {
         entries
     }
 
+    /// Chats whose agent is at work, in any workspace.
+    pub(crate) fn working_chats(&self, cx: &App) -> usize {
+        self.chats.values().filter(|c| c.read(cx).working()).count()
+    }
+
+    /// Chrome's Warn Before Quitting: ⌘Q while agents work only warns, and a second ⌘Q within
+    /// `CONFIRM_QUIT` quits. Quit from the menu (no ⌘ held) quits as before.
+    pub fn quit_or_warn(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        struct QuitWarning;
+        let agents = self.working_chats(cx);
+        let again = (self.quit_warned.take()).is_some_and(|t| t.elapsed() < CONFIRM_QUIT);
+        if agents == 0 || again || !window.modifiers().platform {
+            return self.quit(window, cx);
+        }
+        self.quit_warned = Some(std::time::Instant::now());
+        let msg = format!(
+            "{agents} agent{} at work. Press ⌘Q again to quit.",
+            crate::ui::plural(agents)
+        );
+        let n = Notification::warning(msg).id::<QuitWarning>().autohide(false);
+        window.push_notification(n, cx);
+        cx.spawn_in(window, async move |_, cx| {
+            cx.background_executor().timer(CONFIRM_QUIT).await;
+            let _ = cx.update(|w, cx| w.remove_notification::<QuitWarning>(cx));
+        })
+        .detach();
+    }
+
     /// Holds `caffeinate -i` while any agent works and the setting is on: no idle sleep, though
     /// the display may sleep and closing the lid still sleeps. `-w` ends it with us, even on a crash.
     pub(crate) fn update_awake(&mut self, cx: &App) {
-        let want = self.state.stay_awake && self.chats.values().any(|c| c.read(cx).working());
+        let want = self.state.stay_awake && self.working_chats(cx) > 0;
         match (want, &mut self.awake) {
             (true, None) => {
                 let pid = std::process::id().to_string();
