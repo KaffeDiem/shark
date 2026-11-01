@@ -1,7 +1,7 @@
 //! Ordered JSON-RPC over stdio. No pipe I/O or process waits run on the UI thread.
+use super::document::Encoding;
 use anyhow::{Context as _, Result, anyhow, bail};
 use lsp_server::{Message, Notification, ReqQueue, RequestId, Response};
-use super::document::Encoding;
 use lsp_types::{InitializeResult, PositionEncodingKind, ServerCapabilities};
 use serde_json::{Value, json};
 use std::{

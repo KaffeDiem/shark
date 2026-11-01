@@ -153,8 +153,8 @@ fn save_repo_prs(src: &Path, open: bool, prs: &[Pr]) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use crate::complete::{Kind, pr_items};
+    use std::fs;
 
     #[test]
     fn pr_status_survives_cache_and_completion_and_terminal_state_wins() {

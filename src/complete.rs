@@ -549,7 +549,9 @@ mod tests {
             pr(12, "Login page", "3")
         );
         let mut prs = crate::prs::parse_prs("api", &api).unwrap();
-        prs.extend(crate::prs::parse_prs("web", &format!("[{}]", pr(7, "Merged thing", "2"))).unwrap());
+        prs.extend(
+            crate::prs::parse_prs("web", &format!("[{}]", pr(7, "Merged thing", "2"))).unwrap(),
+        );
         let items = pr_items(&prs);
         // Newest first across repos.
         assert_eq!(
@@ -592,7 +594,11 @@ mod tests {
         let items = cached_commands(&ws);
         assert_eq!(items.len(), 1);
         assert_eq!(
-            (items[0].insert.as_str(), items[0].detail.as_str(), items[0].badge.as_str()),
+            (
+                items[0].insert.as_str(),
+                items[0].detail.as_str(),
+                items[0].badge.as_str()
+            ),
             ("/ponytail:review", "Review", "[pr]")
         );
         fs::remove_file(cache_path(&ws)).unwrap();

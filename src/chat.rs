@@ -12,6 +12,7 @@ mod review;
 mod side;
 mod tools;
 
+use self::queue::Queued;
 use crate::agent::{self, Agent, Ev};
 use crate::complete::{self, Item};
 use crate::models::EFFORT;
@@ -46,7 +47,6 @@ pub(crate) use links::{copy_button, link_roots, markdown};
 pub(crate) use model::model_entries;
 pub(crate) use model::{effort_label, model_label};
 use planmode::{ENTER_PLAN, NEEDS_APPROVAL, PLAN_SHOWN};
-use self::queue::Queued;
 pub(crate) use review::{ReviewCard, ReviewItem, parse_reports};
 use review::{card_of, hidden_reply, hide_reports, may_report, review_title, split_notes};
 use serde_json::Value;

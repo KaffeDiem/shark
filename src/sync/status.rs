@@ -1,8 +1,8 @@
 //! Pure git/GitHub state per repo and the step it calls for. No gpui here, so it is unit tested.
-use crate::prs::PrStatus;
 pub use crate::git::Op;
 use crate::git::{cmd_bounded, git, run};
 use crate::prompts;
+use crate::prs::PrStatus;
 use serde_json::Value;
 use std::path::Path;
 
