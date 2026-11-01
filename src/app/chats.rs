@@ -1,5 +1,46 @@
 //! Chat tabs of the open workspace, and the agent status in the header.
 use super::*;
+use std::time::Duration;
+
+// Chrome's Warn Before Quitting, from Chromium's `confirm_quit_panel_controller.mm`.
+/// A second ⌘Q this soon after the first quits (`kTimeDeltaFuzzFactor`).
+const CONFIRM_QUIT: Duration = Duration::from_secs(1);
+/// Holding ⌘Q this long quits (`kShowDuration` less the fuzz factor).
+const HOLD_TO_QUIT: Duration = Duration::from_millis(500);
+/// How often the held key is checked (`kEventQueueWaitTime`).
+const QUIT_POLL: Duration = Duration::from_millis(100);
+
+/// The key-down being handled, as its key code and whether it's autorepeat; None when Quit
+/// came from a click.
+#[cfg(not(test))]
+fn quit_key() -> Option<(u16, bool)> {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::{NSApplication, NSEventType};
+    let event = NSApplication::sharedApplication(MainThreadMarker::new()?).currentEvent()?;
+    (event.r#type() == NSEventType::KeyDown).then(|| (event.keyCode(), event.isARepeat()))
+}
+
+#[cfg(not(test))]
+fn key_down(key: u16) -> bool {
+    use objc2_core_graphics::{CGEventSource, CGEventSourceStateID};
+    CGEventSource::key_state(CGEventSourceStateID::CombinedSessionState, key)
+}
+
+/// What tests press: the ⌘Q key-down, and whether Q is still held.
+#[cfg(test)]
+pub(crate) static QUIT_KEY: std::sync::Mutex<Option<(u16, bool)>> = std::sync::Mutex::new(None);
+#[cfg(test)]
+pub(crate) static Q_HELD: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+#[cfg(test)]
+fn quit_key() -> Option<(u16, bool)> {
+    *QUIT_KEY.lock().unwrap()
+}
+
+#[cfg(test)]
+fn key_down(_: u16) -> bool {
+    Q_HELD.load(std::sync::atomic::Ordering::SeqCst)
+}
 
 /// The ctrl-N shortcut chip shown over a tab's icon while ctrl is held, for the first nine tabs.
 pub(super) fn ctrl_chip(ctrl_held: bool, ix: usize) -> Option<AnyElement> {
@@ -966,10 +1007,70 @@ impl Shark {
         entries
     }
 
+    /// Chats whose agent is at work, in any workspace.
+    pub(crate) fn working_chats(&self, cx: &App) -> usize {
+        self.chats.values().filter(|c| c.read(cx).working()).count()
+    }
+
+    /// Chrome's Warn Before Quitting, while agents work: ⌘Q shows "Hold ⌘Q to Quit"; holding
+    /// it `HOLD_TO_QUIT`, or pressing it again within `CONFIRM_QUIT`, quits once Q is released
+    /// (quitting sooner hands the held ⌘Q to the next app). Quit from the menu doesn't ask.
+    pub fn quit_or_warn(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        struct QuitWarning;
+        let agents = self.working_chats(cx);
+        let Some((key, repeat)) = quit_key().filter(|_| agents > 0) else {
+            return self.quit(window, cx);
+        };
+        // Autorepeat from the held key: the watch below times the hold.
+        if repeat {
+            return;
+        }
+        let warn = move |msg: &'static str| {
+            let title = format!("{agents} agent{} at work", crate::ui::plural(agents));
+            Notification::warning(msg)
+                .title(title)
+                .id::<QuitWarning>()
+                .autohide(false)
+        };
+        let now = std::time::Instant::now();
+        let again = (self.quit_warned).is_some_and(|t| now - t < CONFIRM_QUIT);
+        self.quit_warned = (!again).then_some(now);
+        if !again {
+            window.push_notification(warn("Hold ⌘Q to Quit"), cx);
+        }
+        self.quit_hold = cx.spawn_in(window, async move |this, cx| {
+            let (mut held, mut quit) = (Duration::ZERO, again);
+            loop {
+                cx.background_executor().timer(QUIT_POLL).await;
+                held += QUIT_POLL;
+                if !quit && held >= HOLD_TO_QUIT {
+                    // Chrome fades its windows out here; a toast leaves an unsaved-edits
+                    // dialog somewhere to show.
+                    quit = true;
+                    let _ = cx.update(|w, cx| w.push_notification(warn("Release ⌘Q to Quit"), cx));
+                }
+                if !key_down(key) {
+                    break;
+                }
+            }
+            if !quit {
+                // Chrome's panel stays a second after release.
+                cx.background_executor().timer(CONFIRM_QUIT).await;
+            }
+            let _ = this.update_in(cx, |s, w, cx| {
+                w.remove_notification::<QuitWarning>(cx);
+                if quit {
+                    s.quit_warned = None;
+                    s.quit(w, cx)
+                }
+            });
+        });
+    }
+
     /// Holds `caffeinate -i` while any agent works and the setting is on: no idle sleep, though
     /// the display may sleep and closing the lid still sleeps. `-w` ends it with us, even on a crash.
     pub(crate) fn update_awake(&mut self, cx: &App) {
-        let want = self.state.stay_awake && self.chats.values().any(|c| c.read(cx).working());
+        let want = self.state.stay_awake && self.working_chats(cx) > 0;
         match (want, &mut self.awake) {
             (true, None) => {
                 let pid = std::process::id().to_string();

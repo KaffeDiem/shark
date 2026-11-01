@@ -1157,7 +1157,7 @@ fn icon(a: &Action) -> IconName {
     match a.kind {
         Kind::Agent(_) if a.attention => IconName::TriangleAlert,
         Kind::Agent(_) => IconName::GitCommitHorizontal,
-        Kind::Pull => IconName::ArrowDown,
+        Kind::Pull | Kind::FetchReview => IconName::ArrowDown,
         Kind::Push | Kind::ForcePush => IconName::ArrowUp,
         Kind::CreatePr => IconName::GitPullRequestCreate,
         Kind::CreateDraftPr => IconName::GitPullRequestDraft,
