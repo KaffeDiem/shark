@@ -152,6 +152,7 @@ mod tests {
                 shark.update(cx, |s, _| s.pokemon_ui.catch_layout_count.set(0));
                 w.render_frame(cx);
                 w.click("pokemon-footer", cx);
+                w.click("pokemon-usage-open-home", cx);
                 w.click("pokemon-tab-Pokédex", cx);
                 w.click("pokemon-segment-log", cx);
                 w.render_frame(cx);

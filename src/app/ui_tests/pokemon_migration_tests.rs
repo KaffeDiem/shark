@@ -163,10 +163,12 @@ async fn precious_companion_egg_requires_explicit_review(cx: &mut TestAppContext
         w.click("pokemon-footer", cx);
         w.click("pokemon-usage-open-home", cx);
         w.click("pokemon-tab-Shop", cx);
+        super::pokemon_tests::reveal_pokemon_control(w, cx, "pokemon-buy-Pokémon Egg");
         w.click("pokemon-buy-Pokémon Egg", cx);
         assert!(w.find("pokemon-egg-confirm").visible());
         w.press("enter", cx);
         assert!(shark.read(cx).state.pokemon.active.is_some());
+        super::pokemon_tests::reveal_pokemon_control(w, cx, "pokemon-buy-Pokémon Egg");
         w.click("pokemon-buy-Pokémon Egg", cx);
         w.click("pokemon-egg-confirm", cx);
         assert!(shark.read(cx).state.pokemon.active.is_none());

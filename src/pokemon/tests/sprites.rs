@@ -323,3 +323,53 @@ fn cancellation_during_disk_decode_does_not_publish_decoded_frames() {
     assert!(cached_memory(&path).is_none());
     assert_eq!(cached(&path).unwrap().frames.len(), 2);
 }
+
+#[test]
+fn item_sprites_use_known_urls_and_validated_memory_and_disk_cache() {
+    for (item, name) in [
+        (super::super::Item::RareCandy, "rare-candy"),
+        (super::super::Item::ShinyCharm, "shiny-charm"),
+    ] {
+        let dir = Temp::new();
+        let path = dir.0.join(format!("item-{name}.png"));
+        fs::write(&path, pixels(12, 14, false)).unwrap();
+        let cached =
+            load_item_with(&dir.0, item, |_| panic!("valid disk item must not fetch")).unwrap();
+        assert_eq!(cached.frames[0].buffer().dimensions(), (12, 14));
+        fs::remove_file(&path).unwrap();
+        assert!(Arc::ptr_eq(
+            &cached,
+            &load_item_with(&dir.0, item, |_| panic!("warm item must not fetch")).unwrap()
+        ));
+        let fresh = Temp::new();
+        let asset = load_item_with(&fresh.0, item, |url| {
+            assert_eq!(url, format!("https://raw.githubusercontent.com/PokeAPI/sprites/master/sprites/items/{name}.png"));
+            Ok(pixels(24, 30, false))
+        }).unwrap();
+        assert!(asset.path.is_file());
+    }
+}
+
+#[test]
+fn item_sprites_reject_corrupt_oversized_and_wrong_format_downloads() {
+    use super::super::Item;
+    for bytes in [
+        vec![0; 20],
+        vec![0; MAX_FILE + 1],
+        pixels(1, 1, true),
+        pixels(1025, 1, false),
+    ] {
+        let dir = Temp::new();
+        assert!(load_item_with(&dir.0, Item::RareCandy, |_| Ok(bytes)).is_err());
+        assert!(!dir.0.join("item-rare-candy.png").exists());
+    }
+    let dir = Temp::new();
+    fs::write(dir.0.join("item-shiny-charm.png"), b"corrupt").unwrap();
+    assert!(load_item_with(&dir.0, Item::ShinyCharm, |_| Ok(pixels(8, 8, false))).is_ok());
+    assert!(
+        load_item_with(&dir.0, Item::Mint, |_| panic!(
+            "mint uses fallback without network"
+        ))
+        .is_err()
+    );
+}

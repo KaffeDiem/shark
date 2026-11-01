@@ -241,6 +241,12 @@ impl PokeApi {
             capture_rate: rate as u16,
         }))
     }
+    pub fn cached_item_sprite(
+        &self,
+        item: super::Item,
+    ) -> Result<std::sync::Arc<super::sprites::Asset>, String> {
+        super::sprites::load_item_with(&self.cache, item, |url| fetch(url, None))
+    }
     pub fn cached_sprite_form_cancellable(
         &self,
         id: u16,

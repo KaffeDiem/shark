@@ -117,6 +117,20 @@ impl Item {
             Self::ShinyCharm => "Shiny Charm",
         }
     }
+    pub fn sprite_name(self) -> Option<&'static str> {
+        match self {
+            Self::RareCandy => Some("rare-candy"),
+            Self::Mint => None,
+            Self::ShinyCharm => Some("shiny-charm"),
+        }
+    }
+    pub fn fallback_emoji(self) -> &'static str {
+        match self {
+            Self::RareCandy => "🍬",
+            Self::Mint => "🌿",
+            Self::ShinyCharm => "✨",
+        }
+    }
     pub fn price(self) -> u64 {
         match self {
             Self::RareCandy => 500_000_000,

@@ -24,6 +24,8 @@ The first observation establishes a baseline. Repeated observations and restarts
 
 Home artwork opens the growing individual's details, independent of the Pokémon pinned in navigation. Providers that do not report cost show no monetary values in Usage summaries, charts, or detail rows.
 
+Shop cards show item artwork, effects, owned counts, and the total token price for the selected quantity. Rare Candy and Shiny Charm artwork loads from the existing PokéAPI sprite source when Shop or Bag opens, with immediate fallback icons offline; Mint and eggs use native icons. Egg cards identify their guaranteed rarity and explain that buying one archives the current companion. Bag uses the same item cards and links to Shop when empty. Buying and using items still follows the existing balance, inventory, and companion checks.
+
 ## Data and recovery
 
 Companion state lives in Shark's existing atomic `state.json` save. Pokémon data comes from PokéAPI and sprites from the PokeAPI sprite repository, fetched on background workers and cached in Shark's application-support directory. The binary contains no Pokémon artwork. Requests contain public species or resource identifiers only, never usage logs, prompts, credentials, or workspace paths. Sprite and metadata caches are validated and bounded. Both Claude and Codex transcript readers stream records instead of allocating an entire transcript.
