@@ -84,7 +84,8 @@ pub fn commit(dir: &Path, extra: &[&str]) -> String {
 
 /// Uncommitted changes; `Err` when `git status` fails.
 pub fn dirty(wt: &Path) -> Result<bool, String> {
-    git(wt, &["status", "--porcelain"]).map(|s| !s.is_empty())
+    // Explicit: `status.showUntrackedFiles=no` would hide files `reset --keep` can't protect.
+    git(wt, &["status", "--porcelain", "--untracked-files=normal"]).map(|s| !s.is_empty())
 }
 
 /// `git worktree list --porcelain`: each worktree's path and its other lines.
@@ -581,7 +582,8 @@ pub(crate) fn fetch_review_refs(src: &Path, pr: &PullRequest, head: bool) -> Res
             review_ref(pr.number, "head")
         ));
     }
-    let mut args = vec!["fetch", "--quiet", "--no-tags", &remote];
+    // --atomic: if the base fails to update, the head must not advance alone.
+    let mut args = vec!["fetch", "--quiet", "--no-tags", "--atomic", &remote];
     args.extend(specs.iter().map(String::as_str));
     cmd_bounded(src, "git", &args, 30)?;
     Ok(())
@@ -592,10 +594,44 @@ pub(crate) fn refresh_review_base(src: &Path, pr: &PullRequest) -> Result<(), St
     fetch_review_refs(src, pr, false)
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Op {
+    Merge,
+    Rebase,
+    CherryPick,
+    Revert,
+    Bisect,
+}
+
+/// The merge, rebase, cherry-pick, revert or bisect under way in `wt`.
+pub(crate) fn op_in_progress(wt: &Path) -> Result<Option<Op>, String> {
+    // Per-worktree state files; --git-path resolves them inside .git/worktrees/<name>/.
+    const OPS: [(&str, Op); 6] = [
+        ("rebase-merge", Op::Rebase),
+        ("rebase-apply", Op::Rebase),
+        ("MERGE_HEAD", Op::Merge),
+        ("CHERRY_PICK_HEAD", Op::CherryPick),
+        ("REVERT_HEAD", Op::Revert),
+        ("BISECT_LOG", Op::Bisect),
+    ];
+    let mut args = vec!["rev-parse", "--path-format=absolute"];
+    OPS.iter().for_each(|(f, _)| args.extend(["--git-path", f]));
+    let paths = git(wt, &args)?;
+    Ok(paths
+        .lines()
+        .zip(OPS)
+        .find(|(p, _)| Path::new(p).exists())
+        .map(|(_, (_, op))| op))
+}
+
 /// Refuses unless `wt` is clean and on `branch` at `old`, the previously fetched PR head.
 fn on_review_head(wt: &Path, branch: &str, old: &str) -> Result<(), String> {
     if dirty(wt)? {
         return Err("uncommitted changes; commit or discard them first".into());
+    }
+    if let Some(op) = op_in_progress(wt)? {
+        let op = format!("{op:?}").to_lowercase();
+        return Err(format!("a {op} is in progress; finish or abort it first"));
     }
     // Not --short: it prints `heads/<branch>` when a tag has the same name.
     if git(wt, &["symbolic-ref", "HEAD"]).is_ok_and(|b| b == format!("refs/heads/{branch}")) {
@@ -608,7 +644,8 @@ fn on_review_head(wt: &Path, branch: &str, old: &str) -> Result<(), String> {
 }
 
 /// Refuses if moving `wt` from `old` to `new` would overwrite an ignored file, which `dirty` and
-/// `reset --keep` both miss. On a clean tree, a path new adds that exists on disk is ignored.
+/// `reset --keep` both miss: an ignored path at or under a path `new` adds, or an added path that
+/// exists on disk inside an ignored directory.
 fn no_ignored_clobber(wt: &Path, old: &str, new: &str) -> Result<(), String> {
     let args = [
         "diff",
@@ -619,15 +656,32 @@ fn no_ignored_clobber(wt: &Path, old: &str, new: &str) -> Result<(), String> {
         old,
         new,
     ];
-    for p in git_bytes(wt, &args)?
-        .split(|&b| b == 0)
-        .filter(|p| !p.is_empty())
-    {
-        let p = Path::new(std::ffi::OsStr::from_bytes(p));
-        if wt.join(p).symlink_metadata().is_ok() {
-            let p = p.display();
+    let added = git_bytes(wt, &args)?;
+    let ls = [
+        "ls-files",
+        "-z",
+        "--others",
+        "--ignored",
+        "--exclude-standard",
+        "--directory",
+    ];
+    let ignored = git_bytes(wt, &ls)?;
+    let paths = |b: &[u8]| -> Vec<PathBuf> {
+        b.split(|&b| b == 0)
+            .filter(|p| !p.is_empty())
+            .map(|p| PathBuf::from(std::ffi::OsStr::from_bytes(p)))
+            .collect()
+    };
+    let ignored = paths(&ignored);
+    for a in paths(&added) {
+        // Collapsed ignored directories end in `/`; `Path` comparison drops it.
+        let hit = ignored.iter().any(|i| {
+            i.starts_with(&a) || (a.starts_with(i) && wt.join(&a).symlink_metadata().is_ok())
+        });
+        if hit {
+            let a = a.display();
             return Err(format!(
-                "would overwrite ignored file `{p}`; move it aside first"
+                "would overwrite ignored file `{a}`; move it aside first"
             ));
         }
     }

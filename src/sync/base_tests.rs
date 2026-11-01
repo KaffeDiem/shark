@@ -1021,6 +1021,108 @@ fn fetch_updates_refuses_to_overwrite_ignored_file() {
 }
 
 #[test]
+fn fetch_updates_replaces_tracked_dir_with_file() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-dir-to-file");
+    let new = f.loose_commit_adding(&f.head, "config");
+    fs::create_dir(f.wt.join("config")).unwrap();
+    fs::write(f.wt.join("config/app.toml"), "a = 1\n").unwrap();
+    git(&f.wt, &["add", "config"]).unwrap();
+    crate::git::commit(&f.wt, &["-qm", "add config dir"]);
+    let old = f.oid("HEAD");
+    git(&f.wt, &["update-ref", "refs/shark/pull/7/head", &old]).unwrap();
+    git(
+        &f.wt,
+        &["push", "-q", "origin", &format!("+{new}:refs/pull/7/head")],
+    )
+    .unwrap();
+    assert!(f.update().unwrap().is_some());
+    assert_eq!(f.oid("HEAD"), new);
+    assert!(f.wt.join("config").is_file());
+}
+
+#[test]
+fn fetch_updates_refuses_during_merge_or_bisect() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-op");
+    let new = f.loose_commit(&f.head);
+    f.pr_moved_to(&new);
+    // A merge that changes nothing leaves the tree clean, so only the marker file gives it away.
+    for (start, end, op) in [
+        (
+            &["merge", "--no-commit", "--no-ff", "release"][..],
+            &["merge", "--abort"][..],
+            "merge",
+        ),
+        (&["bisect", "start"], &["bisect", "reset"], "bisect"),
+    ] {
+        git(&f.wt, start).unwrap();
+        assert!(!crate::git::dirty(&f.wt).unwrap());
+        let err = f.update().unwrap_err();
+        assert!(err.contains(&format!("a {op} is in progress")), "{err}");
+        assert_eq!(f.oid("HEAD"), f.head);
+        assert_eq!(f.oid("refs/shark/pull/7/head"), f.head);
+        git(&f.wt, end).unwrap();
+    }
+}
+
+#[test]
+fn fetch_updates_refuses_untracked_file_despite_config() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-untracked");
+    let new = f.loose_commit(&f.head);
+    f.pr_moved_to(&new);
+    git(&f.wt, &["config", "status.showUntrackedFiles", "no"]).unwrap();
+    fs::write(f.wt.join("notes.txt"), "mine\n").unwrap();
+    let l = status::probe(&f.wt, "feature", "origin/release", None, true).unwrap();
+    assert_eq!(l.changed, 1);
+    assert!(f.update().unwrap_err().contains("uncommitted"));
+    assert_eq!(f.oid("HEAD"), f.head);
+    assert_eq!(f.oid("refs/shark/pull/7/head"), f.head);
+}
+
+#[test]
+fn fetch_updates_checks_files_under_ignored_dir() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-ignored-dir");
+    // Commits first: the helper writes and deletes the PR's file in the work tree.
+    fs::create_dir(f.wt.join("build")).unwrap();
+    let fresh = f.loose_commit_adding(&f.head, "build/fresh.txt");
+    let out = f.loose_commit_adding(&f.head, "build/out.txt");
+    fs::write(f.wt.join(".git/info/exclude"), "build/\n").unwrap();
+    fs::write(f.wt.join("build/keep.txt"), "mine\n").unwrap();
+    fs::write(f.wt.join("build/out.txt"), "mine\n").unwrap();
+    // The PR adds a file that is not on disk, then one that is; both sit in an ignored dir.
+    f.pr_moved_to(&fresh);
+    assert!(f.update().unwrap().is_some());
+    assert!(f.wt.join("build/fresh.txt").is_file());
+    assert_eq!(
+        fs::read_to_string(f.wt.join("build/keep.txt")).unwrap(),
+        "mine\n"
+    );
+    git(&f.wt, &["reset", "-q", "--hard", &f.head]).unwrap();
+    f.pr_moved_to(&out);
+    let err = f.update().unwrap_err();
+    assert!(
+        err.contains("overwrite ignored file `build/out.txt`"),
+        "{err}"
+    );
+    assert_eq!(
+        fs::read_to_string(f.wt.join("build/out.txt")).unwrap(),
+        "mine\n"
+    );
+    assert_eq!(f.oid("HEAD"), f.head);
+}
+
+#[test]
 fn fetch_updates_ignores_same_named_tag() {
     let _lock = crate::app::ui_tests::UI_LOCK
         .lock()

@@ -1,18 +1,10 @@
 //! Pure git/GitHub state per repo and the step it calls for. No gpui here, so it is unit tested.
 use crate::prs::PrStatus;
+pub use crate::git::Op;
 use crate::git::{cmd_bounded, git, run};
 use crate::prompts;
 use serde_json::Value;
 use std::path::Path;
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Op {
-    Merge,
-    Rebase,
-    CherryPick,
-    Revert,
-    Bisect,
-}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Local {
@@ -165,6 +157,7 @@ pub fn probe(
             "status",
             "--porcelain=v2",
             "--branch",
+            "--untracked-files=normal",
             "-z",
         ],
     )?;
@@ -181,23 +174,7 @@ pub fn probe(
         let head = crate::git::review_ref(n, "head");
         l.review_head = crate::git::ref_oid(wt, &head).unwrap_or_default();
     }
-    // Per-worktree state files; --git-path resolves them inside .git/worktrees/<name>/.
-    const OPS: [(&str, Op); 6] = [
-        ("rebase-merge", Op::Rebase),
-        ("rebase-apply", Op::Rebase),
-        ("MERGE_HEAD", Op::Merge),
-        ("CHERRY_PICK_HEAD", Op::CherryPick),
-        ("REVERT_HEAD", Op::Revert),
-        ("BISECT_LOG", Op::Bisect),
-    ];
-    let mut args = vec!["rev-parse", "--path-format=absolute"];
-    OPS.iter().for_each(|(f, _)| args.extend(["--git-path", f]));
-    let paths = git(wt, &args)?;
-    l.op = paths
-        .lines()
-        .zip(OPS)
-        .find(|(p, _)| Path::new(p).exists())
-        .map(|(_, (_, op))| op);
+    l.op = crate::git::op_in_progress(wt)?;
     l.origin = git(wt, &["remote", "get-url", "origin"]).ok();
     l.trunk = trunk_of(wt, prev);
     let remote = format!("refs/remotes/origin/{branch}");
