@@ -223,11 +223,7 @@ impl GitFeature {
     pub(crate) fn focus(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.view == GitView::Commits {
             self.commits.update(cx, |c, cx| c.ensure_loaded(cx));
-            self.commits
-                .read(cx)
-                .focus_handle()
-                .clone()
-                .focus(window, cx);
+            self.commits.read(cx).focus_target(cx).focus(window, cx);
         } else {
             self.focus.focus(window, cx);
         }
@@ -694,8 +690,10 @@ impl GitFeature {
         let before = draft.clone();
         let (title, body) = match &kind {
             Editing::Description => {
-                if draft.description.is_none() {
-                    let Some(d) = details else { return };
+                // An unchanged description isn't a draft: start again from GitHub's copy.
+                if !draft.description.as_ref().is_some_and(|d| d.changed())
+                    && let Some(d) = details
+                {
                     draft.description = Some(DescriptionDraft {
                         original_title: d.title.clone(),
                         original_body: d.body.clone(),
@@ -703,7 +701,9 @@ impl GitFeature {
                         body: d.body.clone(),
                     });
                 }
-                let edit = draft.description.as_ref().unwrap();
+                let Some(edit) = draft.description.as_ref() else {
+                    return;
+                };
                 (edit.title.clone(), edit.body.clone())
             }
             Editing::Comment => (String::new(), draft.note.clone()),
@@ -2999,7 +2999,7 @@ impl Render for GitFeature {
                 }
                 // Escape at the commit list keeps focus there, so arrows still move it.
                 match s.view {
-                    GitView::Commits => s.commits.read(cx).focus_handle().clone().focus(w, cx),
+                    GitView::Commits => s.commits.read(cx).focus_target(cx).focus(w, cx),
                     GitView::Conversation => s.focus.focus(w, cx),
                 }
             }))

@@ -131,6 +131,18 @@ impl Commits {
         }
     }
 
+    /// The shown read-only editor, which keys reach only by focus, else the pane.
+    pub(crate) fn focus_target(&self, cx: &App) -> FocusHandle {
+        match (&self.content, &self.editor) {
+            (Some(Content::Text { markdown, .. }), Some(e))
+                if self.file.is_some() && (!markdown || self.source) =>
+            {
+                e.read(cx).focus_handle(cx)
+            }
+            _ => self.focus.clone(),
+        }
+    }
+
     pub(crate) fn focus_handle(&self) -> &FocusHandle {
         &self.focus
     }
@@ -868,9 +880,7 @@ impl Commits {
                                         }
                                         s.source = true;
                                         // A cached editor isn't refocused by render_file.
-                                        if let Some(e) = &s.editor {
-                                            e.read(cx).focus_handle(cx).focus(w, cx);
-                                        }
+                                        s.focus_target(cx).focus(w, cx);
                                         cx.notify();
                                     })),
                             )
@@ -1032,7 +1042,7 @@ fn load(
         return Ok(Loaded::Note(format!("Submodule at commit {}.", blob.id)));
     }
     let size = history::blob_size(wt, &blob.id)?;
-    if blob.symlink() {
+    if blob.symlink() && size <= MAX_TEXT {
         let target = history::blob(wt, &blob.id)?;
         return Ok(Loaded::Note(format!(
             "Symbolic link to {}. Links are shown, never followed.",

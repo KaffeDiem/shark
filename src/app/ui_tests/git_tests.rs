@@ -3031,6 +3031,50 @@ async fn git_refresh_while_editing_description_keeps_editor_and_text(cx: &mut Te
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
+async fn git_unchanged_description_reopens_with_the_remote_edit(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_gh, dir, window, feature) = open_pr(cx, pr_fixture(1)).await;
+    // Open and close without typing: nothing to keep.
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("git-description", cx);
+        w.render_frame(cx);
+        w.press("escape", cx);
+    })
+    .unwrap();
+    let mut changed = pr_fixture(1);
+    changed["body"] = json!("Edited on GitHub meanwhile");
+    fs::write(dir.join("git-pr.json"), changed.to_string()).unwrap();
+    cx.update_window(window, |_, w, cx| {
+        feature.update(cx, |f, cx| f.refresh(w, cx))
+    })
+    .unwrap();
+    until(cx, window, |_, cx| {
+        let f = feature.read(cx);
+        !f.inspect().loading
+            && (f.inspect().details.as_ref())
+                .is_some_and(|d| d.body == "Edited on GitHub meanwhile")
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("git-description", cx);
+        w.render_frame(cx);
+        assert_eq!(
+            feature.read(cx).draft_text(cx).as_deref(),
+            Some("Edited on GitHub meanwhile"),
+            "reopening starts from GitHub's current copy"
+        );
+        assert!(
+            w.try_find("git-description-replace").is_none(),
+            "no conflict without local edits"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
 async fn git_repo_switch_keeps_reply_draft_on_its_own_pr_thread(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
