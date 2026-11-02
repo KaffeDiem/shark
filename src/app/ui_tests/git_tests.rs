@@ -1,5 +1,9 @@
 //! Git is an ordinary workspace artifact: one tab, persisted ordering, independent drafts.
 use super::*;
+use crate::features::git::{
+    GitFeature,
+    commits::{Commits, FileView},
+};
 use gpui_kit::test::TestEventExt;
 use serde_json::{Value, json};
 
@@ -238,13 +242,13 @@ async fn git_feature_description_and_comments_cross_the_cli_boundary(cx: &mut Te
     let (window, shark) = boot(cx, state, WindowOptions::default());
     press_in(window)(cx, &["cmd-shift-g"]);
     let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature.read(cx).inspect().details.as_ref().is_some()
     })
     .await;
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        w.click("git-description-edit", cx);
+        w.click("git-description", cx);
         w.render_frame(cx);
         w.click("git-editor-body", cx);
         w.press("cmd-a", cx);
@@ -255,7 +259,7 @@ async fn git_feature_description_and_comments_cross_the_cli_boundary(cx: &mut Te
         w.click("git-editor-save", cx);
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature
             .read(cx)
             .inspect()
@@ -282,10 +286,7 @@ async fn git_feature_description_and_comments_cross_the_cli_boundary(cx: &mut Te
     fs::write(dir.join("git-fail"), "offline").unwrap();
     cx.update_window(window, |_, w, cx| w.click("git-editor-save", cx))
         .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !feature.read(cx).busy()
-    })
-    .await;
+    until(cx, window, |_, cx| !feature.read(cx).busy()).await;
     cx.update(|cx| {
         assert_eq!(
             feature.read(cx).draft_text(cx).as_deref(),
@@ -306,7 +307,7 @@ async fn git_feature_description_and_comments_cross_the_cli_boundary(cx: &mut Te
         w.click("git-editor-save", cx);
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature
             .read(cx)
             .inspect()
@@ -327,7 +328,7 @@ async fn git_feature_description_and_comments_cross_the_cli_boundary(cx: &mut Te
         w.click("git-editor-save", cx);
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature
             .read(cx)
             .inspect()
@@ -344,7 +345,7 @@ async fn git_feature_description_and_comments_cross_the_cli_boundary(cx: &mut Te
         feature.update(cx, |f, cx| f.resolve("T_0", true, w, cx));
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature
             .read(cx)
             .inspect()
@@ -355,11 +356,10 @@ async fn git_feature_description_and_comments_cross_the_cli_boundary(cx: &mut Te
     .await;
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        w.click("git-show-resolved", cx);
         feature.update(cx, |f, cx| f.resolve("T_0", false, w, cx));
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature
             .read(cx)
             .inspect()
@@ -375,10 +375,7 @@ async fn git_feature_description_and_comments_cross_the_cli_boundary(cx: &mut Te
         "save, comment, reply, resolve and reopen each happen once"
     );
     cx.update(|cx| feature.update(cx, |f, cx| f.retry_save(cx)));
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !feature.read(cx).saving_drafts()
-    })
-    .await;
+    until(cx, window, |_, cx| !feature.read(cx).saving_drafts()).await;
     let drafts =
         fs::read_to_string(crate::state::support_dir().join("git-drafts/git-review.json")).unwrap();
     assert!(!drafts.contains("Retries use exponential backoff."));
@@ -398,13 +395,13 @@ async fn git_feature_description_conflict_and_workspace_changes_keep_drafts(
     let press = press_in(window);
     press(cx, &["cmd-shift-g"]);
     let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature.read(cx).inspect().details.as_ref().is_some()
     })
     .await;
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        w.click("git-description-edit", cx);
+        w.click("git-description", cx);
         w.render_frame(cx);
         w.click("git-editor-body", cx);
         w.press("cmd-a", cx);
@@ -416,10 +413,7 @@ async fn git_feature_description_conflict_and_workspace_changes_keep_drafts(
     fs::write(dir.join("git-pr.json"), changed.to_string()).unwrap();
     cx.update_window(window, |_, w, cx| w.click("git-editor-save", cx))
         .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !feature.read(cx).busy()
-    })
-    .await;
+    until(cx, window, |_, cx| !feature.read(cx).busy()).await;
     cx.update(|cx| {
         assert_eq!(
             feature.read(cx).draft_text(cx).as_deref(),
@@ -430,7 +424,7 @@ async fn git_feature_description_conflict_and_workspace_changes_keep_drafts(
     on_app(window, shark.clone())(cx, &|s, w, cx| s.open_workspace_named("git-other", w, cx));
     press(cx, &["cmd-shift-g"]);
     let other = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         other.read(cx).inspect().details.as_ref().is_some()
     })
     .await;
@@ -452,16 +446,13 @@ async fn git_feature_description_conflict_and_workspace_changes_keep_drafts(
         )
     });
     cx.update(|cx| feature.update(cx, |f, cx| f.retry_save(cx)));
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !feature.read(cx).saving_drafts()
-    })
-    .await;
+    until(cx, window, |_, cx| !feature.read(cx).saving_drafts()).await;
     on_app(window, shark.clone())(cx, &|s, w, cx| {
         s.git_features.remove("git-review");
         s.show(Tab::Feature(Feature::Git), w, cx);
     });
     let restored = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         restored.read(cx).inspect().details.is_some()
     })
     .await;
@@ -479,10 +470,7 @@ async fn git_feature_description_conflict_and_workspace_changes_keep_drafts(
     .unwrap();
     cx.run_until_parked();
     cx.update(|cx| restored.update(cx, |f, cx| f.retry_save(cx)));
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !restored.read(cx).saving_drafts()
-    })
-    .await;
+    until(cx, window, |_, cx| !restored.read(cx).saving_drafts()).await;
     let saved =
         fs::read_to_string(crate::state::support_dir().join("git-drafts/git-review.json")).unwrap();
     assert!(
@@ -517,7 +505,7 @@ async fn git_feature_large_review_virtualizes_and_releases(cx: &mut TestAppConte
             w.render_frame(cx);
         })
         .unwrap();
-        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        until(cx, window, |_, cx| {
             feature.read(cx).markdown_text_len("description", cx) > 0
         })
         .await;
@@ -586,7 +574,7 @@ async fn git_feature_large_review_virtualizes_and_releases(cx: &mut TestAppConte
                 .len(),
             65_000
         );
-        check_full_text_view(w, cx, &feature, "git-long-description");
+        check_full_text_view(w, cx, &feature, 0, "git-long-description");
     })
     .unwrap();
     let started = Instant::now();
@@ -622,7 +610,7 @@ async fn git_feature_large_review_virtualizes_and_releases(cx: &mut TestAppConte
                 .len(),
             65_000
         );
-        check_full_text_view(w, cx, &feature, "git-long-C_1");
+        check_full_text_view(w, cx, &feature, 1, "git-long-C_1");
     })
     .unwrap();
     let weak = feature.downgrade();
@@ -665,7 +653,7 @@ async fn git_feature_loading_empty_and_retry_states(cx: &mut TestAppContext) {
             feature
         })
         .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         !feature.read(cx).inspect().loading && feature.read(cx).inspect().error.is_some()
     })
     .await;
@@ -684,7 +672,7 @@ async fn git_feature_loading_empty_and_retry_states(cx: &mut TestAppContext) {
         assert!(w.find("git-loading").visible());
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature.read(cx).inspect().details.is_some() && !feature.read(cx).inspect().loading
     })
     .await;
@@ -715,12 +703,17 @@ async fn git_feature_loading_empty_and_retry_states(cx: &mut TestAppContext) {
         }
         feature.update(cx, |f, cx| f.inject_details(empty, cx));
         w.render_frame(cx);
-        assert!(w.find("git-resolved-threads").visible());
+        // A resolved thread is one collapsed row until opened.
+        assert!(w.find("git-thread-collapsed-T_0").visible());
+        assert!(w.try_find(("git-thread-path", 0usize)).is_none());
         assert!(w.try_find("git-empty-activity").is_none());
-        w.click("git-resolved-show", cx);
+        w.click("git-thread-collapsed-T_0", cx);
         w.render_frame(cx);
-        assert!(w.try_find("git-resolved-threads").is_none());
+        assert!(w.try_find("git-thread-collapsed-T_0").is_none());
         assert!(w.find(("git-thread-path", 0usize)).visible());
+        w.click("git-thread-collapse-T_0", cx);
+        w.render_frame(cx);
+        assert!(w.find("git-thread-collapsed-T_0").visible());
         feature.update(cx, |f, cx| f.set_workspace(empty_workspace, w, cx));
         w.render_frame(cx);
         assert!(w.find("git-empty-repositories").visible());
@@ -730,25 +723,201 @@ async fn git_feature_loading_empty_and_retry_states(cx: &mut TestAppContext) {
     assert!(!dir.join("git-writes.jsonl").exists());
 }
 
+/// Polls real background work (git, merman, image decoding) in the native harness.
+fn settle(
+    cx: &mut gpui_kit::HeadlessAppContext,
+    window: AnyWindowHandle,
+    mut ready: impl FnMut(&mut Window, &mut App) -> bool,
+) {
+    for _ in 0..500 {
+        cx.run_until_parked();
+        if cx
+            .update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                ready(w, cx)
+            })
+            .unwrap()
+        {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    panic!("native Git render did not settle");
+}
+
+fn render_commits_pixels(
+    cx: &mut gpui_kit::HeadlessAppContext,
+    window: AnyWindowHandle,
+    shark: &Entity<Shark>,
+    label: &str,
+    width: f32,
+) {
+    use crate::features::git::commits::FileView;
+    let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
+    let commits = cx.update(|cx| feature.read(cx).commits().clone());
+    cx.update_window(window, |_, w, cx| {
+        w.click("git-full-close", cx);
+        w.render_frame(cx);
+        w.click("git-view-commits", cx);
+    })
+    .unwrap();
+    settle(cx, window, |_, cx| commits.read(cx).summaries().len() == 3);
+    // Every named element is shown and stays inside the Git pane.
+    let fits = |cx: &mut gpui_kit::HeadlessAppContext, name: &str, ids: Vec<ElementId>| {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            let panel = w.find("git-feature").bounds();
+            for id in ids {
+                let e = w.find(id.clone());
+                let b = e.bounds();
+                assert!(
+                    e.visible() && b.left() >= panel.left() && b.right() <= panel.right(),
+                    "{label}/{width}: {name}: {id}"
+                );
+            }
+        })
+        .unwrap();
+        let shot = cx
+            .capture_screenshot(window)
+            .expect("Git commits Metal render");
+        if let Some(output) = std::env::var_os("SHARK_RENDER_DIR") {
+            shot.save(PathBuf::from(output).join(format!("{name}-{label}-{}.png", width as usize)))
+                .unwrap();
+        }
+    };
+    fits(
+        cx,
+        "git-commits",
+        vec![("git-commit", 0usize).into(), "git-commits-refresh".into()],
+    );
+    cx.update_window(window, |_, w, cx| w.click(("git-commit", 1usize), cx))
+        .unwrap();
+    settle(cx, window, |w, cx| {
+        commits.read(cx).commit().is_some() && w.try_find(("git-commit-file", 0usize)).is_some()
+    });
+    fits(
+        cx,
+        "git-commit",
+        ["git-commit-subject", "git-commit-older", "git-commit-newer"]
+            .map(ElementId::from)
+            .to_vec(),
+    );
+    let readme = cx.update(|cx| {
+        let c = commits.read(cx).commit().unwrap();
+        (c.files.iter())
+            .position(|f| f.path == "docs/readme.md")
+            .unwrap()
+    });
+    cx.update(|cx| {
+        commits.update(cx, |c, cx| {
+            c.open_file_for_test(readme, FileView::Before, cx)
+        })
+    });
+    settle(cx, window, |_, cx| {
+        commits.read(cx).doc().is_some_and(|d| {
+            let d = d.read(cx);
+            d.diagram_state(2).is_some() && d.media_view(1).is_some_and(|m| m.read(cx).ready())
+        })
+    });
+    fits(
+        cx,
+        "git-history-preview",
+        vec![("git-mermaid", 2usize).into()],
+    );
+    cx.update_window(window, |_, w, cx| {
+        assert!(w.find(("git-mermaid", 2usize)).bounds().size.height > px(20.));
+        w.click("git-view-conversation", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+}
+
+/// A conversation with every kind of timeline item: a bot comment full of GFM, a hidden
+/// comment, a review whose thread has a diff hunk and a reply, a resolved thread, and an
+/// approval without a body.
+fn rich_conversation(details: &mut crate::pr::git_feature::Details) {
+    use crate::pr::git_feature::{Comment, Review};
+    details.title =
+        "Keep sign-in sessions reliable when reconnecting after a network interruption".into();
+    details.body = "## Why\nSessions drop when the socket reconnects, so people sign in again after every network blip.\n\n## What\n- Keep the session token across reconnects\n- Back off after a failed reconnect ([design notes](https://example.com/notes))".into();
+    details.created_at = "2026-10-24T09:00:00Z".into();
+    let base = details.comments[0].clone();
+    let at = |id: &str, author: &str, time: &str, body: &str| Comment {
+        id: id.into(),
+        author: author.into(),
+        created_at: time.into(),
+        body: body.into(),
+        ..base.clone()
+    };
+    details.comments = vec![
+        at(
+            "C_1",
+            "reviewer",
+            "2026-10-25T10:00:00Z",
+            "Please explain the retry policy.",
+        ),
+        Comment {
+            bot: true,
+            ..at(
+                "C_bot",
+                "github-actions",
+                "2026-10-25T11:00:00Z",
+                "<!-- coverage-report:v1 eyJmaWxlcyI6MTJ9 -->\n> [!NOTE]\n> Coverage is **91.2%** (+0.4%).\n\n<details><summary>Changed files</summary>\n\n| File | Coverage |\n|---|---|\n| src/login.rs | 94% |\n\n</details>",
+            )
+        },
+        Comment {
+            minimized: true,
+            ..at("C_hidden", "spammer", "2026-10-26T08:00:00Z", "Buy now")
+        },
+    ];
+    let mut review = at(
+        "review-1",
+        "reviewer",
+        "2026-10-26T12:00:00Z",
+        "The reconnect flow reads well. Please keep the retry policy close to the session code.",
+    );
+    review.url = String::new();
+    details.reviews = vec![
+        Review {
+            comment: review,
+            state: "CHANGES_REQUESTED".into(),
+        },
+        Review {
+            comment: at("review-2", "maintainer", "2026-10-28T09:00:00Z", ""),
+            state: "APPROVED".into(),
+        },
+    ];
+    let t = &mut details.threads[0];
+    t.comments[0] = Comment {
+        review_id: Some("review-1".into()),
+        diff_hunk: Some("@@ -10,6 +10,8 @@ fn reconnect()\n     let session = load();\n-    retry(3);\n+    retry_with_backoff(3);\n+    keep(session);".into()),
+        ..at("TC_0", "reviewer", "2026-10-26T12:00:00Z", "Does this retry when the connection drops?")
+    };
+    t.comments.push(at(
+        "TC_0b",
+        "author",
+        "2026-10-27T09:30:00Z",
+        "Yes, `retry_with_backoff` covers drops; the reconnect test exercises it.",
+    ));
+    let t = &mut details.threads[1];
+    t.resolved = true;
+    t.resolved_by = Some("author".into());
+    t.comments[0].created_at = "2026-10-27T15:00:00Z".into();
+}
+
 /// Real Metal rendering of the complete Git artifact, including a draft composer.
+/// Polls real background work (git, merman, image decoding) in the native harness.
 pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
-    let fixture = fixture(&home);
+    let (fixture, _, _) = history_fixture(&home);
     let (_gh, dir) = fake_github(&home, &fixture, 2);
     let target =
         crate::pr::git_feature::Target::from_url("https://github.com/acme/api/pull/7").unwrap();
     let mut details = crate::pr::git_feature::load(&dir, &target).unwrap();
     details.title =
         "Keep sign-in sessions reliable when reconnecting after a network interruption".into();
-    details.reviews.push(crate::pr::git_feature::Review {
-        comment: crate::pr::git_feature::Comment {
-            id: "review-1".into(),
-            body: "The reconnect flow reads well. Please keep the retry policy close to the session code.\n\n- Preserve the existing session\n- Back off after a failed reconnect".into(),
-            ..details.comments[0].clone()
-        },
-        state: "CHANGES_REQUESTED".into(),
-    });
+    rich_conversation(&mut details);
     for width in [800., 1440.] {
         for (mode, label) in [
             (crate::state::Mode::Dark, "dark"),
@@ -797,111 +966,147 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 w.render_frame(cx);
             })
             .unwrap();
-            for editing in [false, true] {
-                cx.update_window(window, |_, w, cx| {
-                    if editing {
-                        shark
-                            .read(cx)
-                            .active_git_feature()
-                            .unwrap()
-                            .clone()
-                            .update(cx, |f, cx| f.start_description(w, cx));
-                    }
-                    w.render_frame(cx);
-                    let island = w.find("content-island").bounds();
-                    let feature = w.find("git-feature").bounds();
-                    assert!(w.find("feature-git").visible());
-                    assert!(w.find("git-tab").visible());
-                    assert_eq!(w.find("features-rail").bounds().size.width, px(72.));
-                    assert!(feature.left() >= island.left() && feature.right() <= island.right());
-                    for id in ["git-refresh", "git-description-edit", "git-comment-new"] {
-                        let element = w.find(id);
-                        assert!(element.visible(), "{label}/{width}: {id}");
-                        assert!(
-                            element.bounds().left() >= feature.left()
-                                && element.bounds().right() <= feature.right()
-                        );
-                    }
-                    let overview = w.find("git-overview").bounds();
-                    assert!(overview.size.width <= px(680.));
-                    assert!((overview.center().x - feature.center().x).abs() <= px(1.));
-                    let title = w.find("git-pr-title").bounds();
-                    assert!(
-                        title.size.height > px(30.),
-                        "long title must wrap, not truncate"
-                    );
-                    assert!(title.right() <= overview.right());
-                    if editing {
-                        let composer = w.find("git-composer").bounds();
-                        assert_eq!(composer.left(), overview.left());
-                        assert_eq!(composer.size.width, overview.size.width);
-                        for id in [
-                            "git-editor-title",
-                            "git-editor-body",
-                            "git-editor-save",
-                            "git-editor-discard",
-                        ] {
-                            let element = w.find(id);
-                            assert!(element.visible(), "{label}/{width}: {id}");
-                            assert!(
-                                element.bounds().bottom() <= feature.bottom(),
-                                "{id} clipped below artifact"
-                            );
-                        }
-                    }
-                })
-                .unwrap();
+            let shot = |cx: &mut gpui_kit::HeadlessAppContext, name: &str| {
                 let screenshot = cx.capture_screenshot(window).expect("Git Metal render");
                 if let Some(output) = std::env::var_os("SHARK_RENDER_DIR") {
                     let output = PathBuf::from(output);
                     fs::create_dir_all(&output).unwrap();
                     screenshot
-                        .save(output.join(format!(
-                            "git-{label}-{}-editing-{editing}.png",
-                            width as usize
-                        )))
+                        .save(output.join(format!("git-{name}-{label}-{}.png", width as usize)))
                         .unwrap();
                 }
+            };
+            let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
+            // Every named element is shown and stays inside the Git pane.
+            let inside = |w: &mut Window, ids: &[ElementId]| {
+                let panel = w.find("git-feature").bounds();
+                for id in ids {
+                    let e = w.find(id.clone());
+                    let b = e.bounds();
+                    assert!(e.visible(), "{label}/{width}: {id} hidden");
+                    assert!(
+                        b.left() >= panel.left() && b.right() <= panel.right(),
+                        "{label}/{width}: {id} escapes the pane"
+                    );
+                }
+            };
+            let mut read_boxes: Option<(Bounds<Pixels>, Bounds<Pixels>)> = None;
+            for editing in [false, true] {
+                cx.update_window(window, |_, w, cx| {
+                    if editing {
+                        feature.update(cx, |f, cx| f.start_description(w, cx));
+                        // Auto-growing fields take their wrapped height after one layout.
+                        w.render_frame(cx);
+                    }
+                    w.render_frame(cx);
+                    let island = w.find("content-island").bounds();
+                    let pane = w.find("git-feature").bounds();
+                    assert!(w.find("feature-git").visible());
+                    assert!(w.find("git-tab").visible());
+                    assert_eq!(w.find("features-rail").bounds().size.width, px(72.));
+                    assert!(pane.left() >= island.left() && pane.right() <= island.right());
+                    inside(w, &["git-refresh".into(), "git-open-pr".into()]);
+                    assert!(
+                        w.try_find("git-repo-0").is_none(),
+                        "one repo needs no picker"
+                    );
+                    let overview = w.find("git-overview").bounds();
+                    assert!(overview.size.width <= px(680.));
+                    assert!((overview.center().x - pane.center().x).abs() <= px(1.));
+                    if editing {
+                        inside(
+                            w,
+                            &[
+                                "git-editor-title",
+                                "git-editor-body",
+                                "git-editor-save",
+                                "git-editor-discard",
+                            ]
+                            .map(ElementId::from),
+                        );
+                        // Editing swaps the content of the same boxes: nothing moves.
+                        let (title, body) = read_boxes.take().unwrap();
+                        let near = |a: Pixels, b: Pixels| (a - b).abs() <= px(1.);
+                        let edit = w.find("git-editor-title").bounds();
+                        assert!(
+                            near(edit.left(), title.left())
+                                && near(edit.top(), title.top())
+                                && near(edit.size.width, title.size.width)
+                                && near(edit.size.height, title.size.height),
+                            "{label}/{width}: title box {edit:?} vs {title:?}"
+                        );
+                        let edit = w.find("git-editor-body").bounds();
+                        assert!(
+                            near(edit.left(), body.left())
+                                && near(edit.top(), body.top())
+                                && near(edit.size.width, body.size.width),
+                            "{label}/{width}: description box {edit:?} vs {body:?}"
+                        );
+                    } else {
+                        let title = w.find("git-pr-title").bounds();
+                        read_boxes = Some((title, w.find("git-description").bounds()));
+                        assert!(
+                            title.size.height > px(30.),
+                            "long title must wrap, not truncate"
+                        );
+                        assert!(title.right() <= overview.right() + px(10.));
+                        inside(w, &["git-description".into()]);
+                    }
+                })
+                .unwrap();
+                shot(cx, if editing { "editing" } else { "overview" });
             }
             cx.update_window(window, |_, w, cx| {
-                w.click("git-editor-cancel", cx);
-                let feature = shark.read(cx).active_git_feature().unwrap().clone();
-                feature.update(cx, |f, cx| f.scroll_row(3, cx));
+                w.press("escape", cx);
+                feature.update(cx, |f, cx| f.scroll_row(1, cx));
                 w.render_frame(cx);
                 assert!(
                     w.try_find("git-pr-title")
                         .is_none_or(|title| !title.visible()),
                     "overview scrolls with the conversation"
                 );
-                assert!(
-                    w.find("git-comment-new").visible(),
-                    "comment action remains available while reading"
-                );
             })
             .unwrap();
-            let activity = cx
-                .capture_screenshot(window)
-                .expect("Git activity Metal render");
-            if let Some(output) = std::env::var_os("SHARK_RENDER_DIR") {
-                activity
-                    .save(
-                        PathBuf::from(output)
-                            .join(format!("git-activity-{label}-{}.png", width as usize)),
-                    )
-                    .unwrap();
-            }
+            shot(cx, "activity");
             cx.update_window(window, |_, w, cx| {
-                let feature = shark.read(cx).active_git_feature().unwrap().clone();
                 feature.update(cx, |f, cx| f.start_reply("T_0", w, cx));
                 w.render_frame(cx);
                 w.input("Preserve the existing session after reconnecting.", cx);
+                w.render_frame(cx);
+            })
+            .unwrap();
+            shot(cx, "reply");
+            cx.update_window(window, |_, w, _| {
+                inside(
+                    w,
+                    &[
+                        "git-editor-body".into(),
+                        "git-editor-save".into(),
+                        ("git-thread", 0usize).into(),
+                    ],
+                );
+            })
+            .unwrap();
+            cx.update_window(window, |_, w, cx| {
+                w.press("escape", cx);
+                feature.update(cx, |f, cx| f.start_comment(w, cx));
+                // The second frame scrolls the measured editor into view.
+                w.render_frame(cx);
+                w.render_frame(cx);
+                inside(w, &["git-composer".into(), "git-editor-save".into()]);
+            })
+            .unwrap();
+            shot(cx, "comment");
+            cx.update_window(window, |_, w, cx| {
                 w.press("escape", cx);
                 w.render_frame(cx);
                 w.click("git-local-drafts", cx);
                 w.render_frame(cx);
                 let panel = w.find("git-feature").bounds();
                 assert!(w.find("git-local-drafts-list").visible());
-                for i in 0..2usize {
+                // The opened but unchanged description is no draft; the reply is.
+                assert!(w.try_find(("git-local-draft", 1usize)).is_none());
+                for i in 0..1usize {
                     let draft = w.find(("git-local-draft", i));
                     assert!(draft.visible());
                     assert!(
@@ -911,17 +1116,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 }
             })
             .unwrap();
-            let screenshot = cx
-                .capture_screenshot(window)
-                .expect("local Git drafts Metal render");
-            if let Some(output) = std::env::var_os("SHARK_RENDER_DIR") {
-                screenshot
-                    .save(
-                        PathBuf::from(output)
-                            .join(format!("git-local-drafts-{label}-{}.png", width as usize)),
-                    )
-                    .unwrap();
-            }
+            shot(cx, "local-drafts");
             cx.update_window(window, |_, w, cx| {
                 w.click("git-local-drafts", cx);
                 let feature = shark.read(cx).active_git_feature().unwrap().clone();
@@ -931,7 +1126,12 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 long.body.truncate(65_000);
                 feature.update(cx, |f, cx| f.inject_details(long, cx));
                 w.render_frame(cx);
+                feature.update(cx, |f, cx| f.scroll_row_end(0, cx));
+                w.render_frame(cx);
                 w.click("git-long-description", cx);
+                w.render_frame(cx);
+                assert!(w.find("git-full-reader").visible());
+                w.click("git-full-source", cx);
                 w.render_frame(cx);
                 assert_eq!(feature.read(cx).full_text_len(cx), 65_000);
                 let panel = w.find("git-feature").bounds();
@@ -956,6 +1156,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     )
                     .unwrap();
             }
+            render_commits_pixels(cx, window, &shark, label, width);
             for (state, expected) in [
                 ("loading", "git-loading"),
                 ("no-pr", "git-empty-pr"),
@@ -963,7 +1164,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 ("refreshing", "git-overview"),
                 ("stale", "git-error"),
                 ("empty", "git-empty-activity"),
-                ("resolved", "git-resolved-threads"),
+                ("resolved", "git-thread-collapsed-T_1"),
                 ("no-repositories", "git-empty-repositories"),
             ] {
                 cx.update_window(window, |_, w, cx| {
@@ -1051,7 +1252,7 @@ async fn git_feature_thread_context_opens_diff_and_preserves_missing_context(
     .unwrap();
     let (window, shark) = boot(cx, state, WindowOptions::default());
     press_in(window)(cx, &["cmd-shift-g"]);
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         shark
             .read(cx)
             .differ
@@ -1094,7 +1295,7 @@ async fn git_feature_thread_context_opens_diff_and_preserves_missing_context(
     on_app(window, shark.clone())(cx, &|s, w, cx| {
         s.edit_working_copy(Some("api/other.rs".into()), w, cx)
     });
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         shark.read(cx).differ.read(cx).editing().is_some()
     })
     .await;
@@ -1158,7 +1359,7 @@ async fn git_feature_repository_drafts_and_offline_refresh_are_isolated(cx: &mut
     let (window, shark) = boot(cx, state, WindowOptions::default());
     press_in(window)(cx, &["cmd-shift-g"]);
     let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature.read(cx).inspect().details.is_some()
     })
     .await;
@@ -1176,7 +1377,7 @@ async fn git_feature_repository_drafts_and_offline_refresh_are_isolated(cx: &mut
         w.click("git-repo-1", cx);
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature
             .read(cx)
             .inspect()
@@ -1194,7 +1395,7 @@ async fn git_feature_repository_drafts_and_offline_refresh_are_isolated(cx: &mut
         w.click("git-repo-0", cx);
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature
             .read(cx)
             .inspect()
@@ -1227,10 +1428,7 @@ async fn git_feature_repository_drafts_and_offline_refresh_are_isolated(cx: &mut
         );
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !feature.read(cx).inspect().loading
-    })
-    .await;
+    until(cx, window, |_, cx| !feature.read(cx).inspect().loading).await;
     cx.update(|cx| {
         let f = feature.read(cx);
         assert!(f.inspect().error.as_ref().unwrap().contains("503"));
@@ -1260,10 +1458,7 @@ async fn git_feature_repository_drafts_and_offline_refresh_are_isolated(cx: &mut
         })
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !feature.read(cx).inspect().loading
-    })
-    .await;
+    until(cx, window, |_, cx| !feature.read(cx).inspect().loading).await;
     cx.update(|cx| {
         let f = feature.read(cx);
         assert_eq!(f.inspect().selected, 0);
@@ -1293,7 +1488,7 @@ async fn git_feature_corrupt_drafts_are_protected_and_reported(cx: &mut TestAppC
     let (window, shark) = boot(cx, state, WindowOptions::default());
     press_in(window)(cx, &["cmd-shift-g"]);
     let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature.read(cx).inspect().details.is_some()
     })
     .await;
@@ -1322,7 +1517,7 @@ async fn git_feature_stale_description_requires_reviewed_replacement(cx: &mut Te
     let (window, shark) = boot(cx, state, WindowOptions::default());
     press_in(window)(cx, &["cmd-shift-g"]);
     let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature.read(cx).inspect().details.is_some()
     })
     .await;
@@ -1344,19 +1539,13 @@ async fn git_feature_stale_description_requires_reviewed_replacement(cx: &mut Te
         );
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !feature.read(cx).busy()
-    })
-    .await;
+    until(cx, window, |_, cx| !feature.read(cx).busy()).await;
     assert!(!dir.join("git-writes.jsonl").exists());
     cx.update_window(window, |_, w, cx| {
         feature.update(cx, |f, cx| f.refresh(w, cx))
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !feature.read(cx).inspect().loading
-    })
-    .await;
+    until(cx, window, |_, cx| !feature.read(cx).inspect().loading).await;
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.click("git-description-replace", cx);
@@ -1375,7 +1564,7 @@ async fn git_feature_stale_description_requires_reviewed_replacement(cx: &mut Te
         w.press("enter", cx);
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature
             .read(cx)
             .inspect()
@@ -1463,8 +1652,11 @@ fn check_full_text_view(
     w: &mut Window,
     cx: &mut App,
     feature: &Entity<crate::features::git::GitFeature>,
+    row: usize,
     button: &'static str,
 ) {
+    feature.update(cx, |f, cx| f.scroll_row_end(row, cx));
+    w.render_frame(cx);
     let source = feature
         .read(cx)
         .inspect()
@@ -1476,6 +1668,24 @@ fn check_full_text_view(
     let offset = feature.read(cx).scroll_offset().item_ix;
     let started = Instant::now();
     w.click(button, cx);
+    w.render_frame(cx);
+    let read = started.elapsed();
+    let reader = feature
+        .read(cx)
+        .reader()
+        .expect("the rich reader opens")
+        .clone();
+    assert_eq!(
+        reader.read(cx).source().len(),
+        65_000,
+        "nothing beyond 4 KB is cut"
+    );
+    assert!(
+        read < Duration::from_millis(300),
+        "the virtualized reader lays out only visible blocks: {read:?}"
+    );
+    let started = Instant::now();
+    w.click("git-full-source", cx);
     w.render_frame(cx);
     let opened = started.elapsed();
     assert_eq!(feature.read(cx).full_text_len(cx), 65_000);
@@ -1559,7 +1769,7 @@ async fn inactive_git_write_blocks_close_and_archive(cx: &mut TestAppContext) {
     let (window, shark) = boot(cx, state, WindowOptions::default());
     press_in(window)(cx, &["cmd-shift-g"]);
     let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature.read(cx).inspect().details.is_some()
     })
     .await;
@@ -1580,10 +1790,7 @@ async fn inactive_git_write_blocks_close_and_archive(cx: &mut TestAppContext) {
         });
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !feature.read(cx).busy()
-    })
-    .await;
+    until(cx, window, |_, cx| !feature.read(cx).busy()).await;
     assert_eq!(
         fs::read_to_string(dir.join("git-writes.jsonl"))
             .unwrap()
@@ -1603,7 +1810,7 @@ async fn git_feature_home_save_keeps_hidden_draft_local(cx: &mut TestAppContext)
     let (window, shark) = boot(cx, state, WindowOptions::default());
     press_in(window)(cx, &["cmd-shift-g"]);
     let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature.read(cx).inspect().details.is_some()
     })
     .await;
@@ -1648,7 +1855,7 @@ async fn git_feature_keyboard_reaches_offscreen_threads_without_stealing_input(
     let press = press_in(window);
     press(cx, &["cmd-shift-g"]);
     let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature.read(cx).inspect().details.is_some()
     })
     .await;
@@ -1659,44 +1866,95 @@ async fn git_feature_keyboard_reaches_offscreen_threads_without_stealing_input(
             (at.item_ix, at.offset_in_item)
         })
     };
+    let cursor = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let s = feature.read(cx).inspect();
+            s.rows[s.cursor].clone()
+        })
+    };
+    // Arrows move an item cursor; Page keys scroll; Home/End jump.
     press(cx, &["home", "down"]);
-    assert!(offset(cx) != (0, px(0.)));
-    press(cx, &["up"]);
-    assert_eq!(offset(cx), (0, px(0.)));
+    assert_eq!(cursor(cx), "comment:C_1");
+    press(cx, &["down"]);
+    assert_eq!(cursor(cx), "thread:T_0");
+    press(cx, &["up", "up"]);
+    assert_eq!((cursor(cx), offset(cx)), ("header".into(), (0, px(0.))));
     press(cx, &["pagedown"]);
     assert!(offset(cx) != (0, px(0.)));
     press(cx, &["pageup", "home"]);
     assert_eq!(offset(cx), (0, px(0.)));
     press(cx, &["end"]);
+    assert_eq!(cursor(cx), "composer");
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
+        assert!(w.find("git-comment-new").visible());
         assert!(w.try_find("git-thread-reply-T_99").is_some());
     })
     .unwrap();
+    assert!(offset(cx).0 > 90);
     on_app(window, shark.clone())(cx, &|s, _, cx| s.set_vim(true, cx));
     press(cx, &["g", "g", "j"]);
-    assert!(offset(cx) != (0, px(0.)));
+    assert_eq!(cursor(cx), "comment:C_1");
     press(cx, &["k"]);
-    assert_eq!(offset(cx), (0, px(0.)));
+    assert_eq!((cursor(cx), offset(cx)), ("header".into(), (0, px(0.))));
     press(cx, &["ctrl-d"]);
     assert!(offset(cx) != (0, px(0.)));
     press(cx, &["ctrl-u", "g", "g"]);
     assert_eq!(offset(cx), (0, px(0.)));
     press(cx, &["shift-g"]);
     assert!(offset(cx).0 > 90);
-    cx.update_window(window, |_, w, cx| {
-        feature.update(cx, |g, cx| g.start_comment(w, cx));
-        w.render_frame(cx);
-    })
-    .unwrap();
-    let before = offset(cx);
-    press(cx, &["j", "k", "g", "g", "down", "up", "home", "end"]);
+    // Enter on a thread opens its reply in place; Esc closes it, keeps the draft and the cursor.
+    press(cx, &["g", "g", "j", "j", "enter"]);
+    cx.update(|cx| {
+        assert_eq!(
+            feature.read(cx).inspect().editing.as_deref(),
+            Some("Reply(\"T_0\")")
+        )
+    });
+    cx.update_window(window, |_, w, cx| w.input("Kept", cx))
+        .unwrap();
+    press(cx, &["escape"]);
+    cx.update(|cx| assert!(feature.read(cx).inspect().editing.is_none()));
+    assert_eq!(cursor(cx), "thread:T_0");
+    // `r` resumes the reply at the cursor, `e` edits the description, `c` writes a comment.
+    press(cx, &["j", "r"]);
+    cx.update(|cx| {
+        assert_eq!(
+            feature.read(cx).inspect().editing.as_deref(),
+            Some("Reply(\"T_1\")")
+        )
+    });
+    press(cx, &["escape", "k", "r"]);
+    cx.update(|cx| assert_eq!(feature.read(cx).draft_text(cx).as_deref(), Some("Kept")));
+    press(cx, &["escape", "e"]);
+    cx.update(|cx| {
+        assert_eq!(
+            feature.read(cx).inspect().editing.as_deref(),
+            Some("Description")
+        )
+    });
+    assert_eq!(cursor(cx), "header");
+    press(cx, &["escape", "c"]);
+    cx.update(|cx| {
+        assert_eq!(
+            feature.read(cx).inspect().editing.as_deref(),
+            Some("Comment")
+        )
+    });
+    assert_eq!(cursor(cx), "composer");
+    let before = (offset(cx), cursor(cx));
+    press(
+        cx,
+        &[
+            "j", "k", "g", "g", "down", "up", "home", "end", "e", "r", "c",
+        ],
+    );
     assert_eq!(
-        offset(cx),
+        (offset(cx), cursor(cx)),
         before,
         "conversation shortcuts must not run in an input"
     );
-    cx.update(|cx| assert_eq!(feature.read(cx).draft_text(cx).as_deref(), Some("jkgg")));
+    cx.update(|cx| assert_eq!(feature.read(cx).draft_text(cx).as_deref(), Some("jkggerc")));
 }
 
 #[gpui_kit::test]
@@ -1710,7 +1968,7 @@ async fn git_feature_slow_save_keeps_input_responsive_and_discard_ordered(cx: &m
     let press = press_in(window);
     press(cx, &["cmd-shift-g"]);
     let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature.read(cx).inspect().details.is_some()
     })
     .await;
@@ -1723,10 +1981,7 @@ async fn git_feature_slow_save_keeps_input_responsive_and_discard_ordered(cx: &m
         w.input("older snapshot", cx);
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        feature.read(cx).save_started() > 0
-    })
-    .await;
+    until(cx, window, |_, cx| feature.read(cx).save_started() > 0).await;
     cx.update_window(window, |_, w, cx| {
         assert!(feature.read(cx).saving_drafts());
         w.input(" plus newer input", cx);
@@ -1746,10 +2001,7 @@ async fn git_feature_slow_save_keeps_input_responsive_and_discard_ordered(cx: &m
         assert!(!s.archiving.contains("git-review"));
     });
     cx.executor().advance_clock(Duration::from_secs(61));
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !feature.read(cx).saving_drafts()
-    })
-    .await;
+    until(cx, window, |_, cx| !feature.read(cx).saving_drafts()).await;
     let saved =
         fs::read_to_string(crate::state::support_dir().join("git-drafts/git-review.json")).unwrap();
     assert!(
@@ -1769,7 +2021,7 @@ async fn git_feature_failed_draft_save_retries_without_losing_text(cx: &mut Test
     let (window, shark) = boot(cx, state, WindowOptions::default());
     press_in(window)(cx, &["cmd-shift-g"]);
     let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature.read(cx).inspect().details.is_some()
     })
     .await;
@@ -1781,7 +2033,7 @@ async fn git_feature_failed_draft_save_retries_without_losing_text(cx: &mut Test
         w.input("Recover this draft", cx);
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature.read(cx).storage_error().is_some()
     })
     .await;
@@ -1795,7 +2047,7 @@ async fn git_feature_failed_draft_save_retries_without_losing_text(cx: &mut Test
     });
     fs::remove_file(&directory).unwrap();
     cx.update(|cx| feature.update(cx, |g, cx| g.retry_save(cx)));
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         !feature.read(cx).saving_drafts() && feature.read(cx).storage_error().is_none()
     })
     .await;
@@ -1816,7 +2068,7 @@ async fn qa_git_post_restores_conversation_keyboard_navigation(cx: &mut TestAppC
     let (window, shark) = boot(cx, state, WindowOptions::default());
     press_in(window)(cx, &["cmd-shift-g"]);
     let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature.read(cx).inspect().details.is_some()
     })
     .await;
@@ -1827,7 +2079,7 @@ async fn qa_git_post_restores_conversation_keyboard_navigation(cx: &mut TestAppC
         w.press("cmd-s", cx);
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature
             .read(cx)
             .inspect()
@@ -1858,7 +2110,7 @@ async fn qa_git_saved_draft_accessible_after_permissions_revoked(cx: &mut TestAp
     let (window, shark) = boot(cx, state, WindowOptions::default());
     press_in(window)(cx, &["cmd-shift-g"]);
     let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature.read(cx).inspect().details.is_some()
     })
     .await;
@@ -1869,10 +2121,7 @@ async fn qa_git_saved_draft_accessible_after_permissions_revoked(cx: &mut TestAp
         w.press("escape", cx);
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !feature.read(cx).saving_drafts()
-    })
-    .await;
+    until(cx, window, |_, cx| !feature.read(cx).saving_drafts()).await;
     assert!(
         fs::read_to_string(crate::state::support_dir().join("git-drafts/git-review.json"))
             .unwrap()
@@ -1899,10 +2148,7 @@ async fn qa_git_saved_draft_accessible_after_permissions_revoked(cx: &mut TestAp
         feature.update(cx, |g, cx| g.refresh(w, cx));
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !feature.read(cx).inspect().loading
-    })
-    .await;
+    until(cx, window, |_, cx| !feature.read(cx).inspect().loading).await;
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         feature.update(cx, |g, cx| g.start_comment(w, cx));
@@ -1957,7 +2203,7 @@ async fn git_feature_local_drafts_recover_offline_and_keep_remote_targets(cx: &m
     let (window, shark) = boot(cx, state, WindowOptions::default());
     press_in(window)(cx, &["cmd-shift-g"]);
     let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature.read(cx).inspect().error.is_some() && !feature.read(cx).inspect().loading
     })
     .await;
@@ -2006,10 +2252,7 @@ async fn git_feature_local_drafts_recover_offline_and_keep_remote_targets(cx: &m
         w.press("enter", cx);
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        !feature.read(cx).saving_drafts()
-    })
-    .await;
+    until(cx, window, |_, cx| !feature.read(cx).saving_drafts()).await;
     let saved: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
     assert_eq!(saved[target]["note"], "Edited offline");
     assert_eq!(
@@ -2024,7 +2267,7 @@ async fn git_feature_local_drafts_recover_offline_and_keep_remote_targets(cx: &m
         feature.update(cx, |g, cx| g.refresh(w, cx))
     })
     .unwrap();
-    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+    until(cx, window, |_, cx| {
         feature.read(cx).inspect().details.is_some() && !feature.read(cx).inspect().loading
     })
     .await;
@@ -2044,4 +2287,1313 @@ async fn git_feature_local_drafts_recover_offline_and_keep_remote_targets(cx: &m
     })
     .unwrap();
     assert!(!dir.join("git-writes.jsonl").exists());
+}
+
+fn png(w: u32, h: u32) -> Vec<u8> {
+    resvg::tiny_skia::Pixmap::new(w, h)
+        .unwrap()
+        .encode_png()
+        .unwrap()
+}
+
+fn history_fixture(home: &Path) -> (State, PathBuf, [String; 3]) {
+    let mut state = fixture(home);
+    let wt = state.workspaces[0].dir().join("api");
+    git::git(&wt, &["branch", "start"]).unwrap();
+    state.workspaces[0].repos[0].base = "start".into();
+    fs::create_dir_all(wt.join("docs")).unwrap();
+    fs::write(
+        wt.join("docs/readme.md"),
+        "# Doc\n\n![logo](logo.png)\n\n```mermaid\nflowchart TD\n  A --> B\n```\n",
+    )
+    .unwrap();
+    fs::write(wt.join("docs/logo.png"), png(1, 1)).unwrap();
+    fs::write(wt.join("gone.txt"), "bye\n").unwrap();
+    let first = commit_all(&wt, "Add docs");
+    fs::write(wt.join("docs/readme.md"), "# Doc v2\n\n![logo](logo.png)\n").unwrap();
+    fs::write(wt.join("docs/logo.png"), png(2, 3)).unwrap();
+    fs::remove_file(wt.join("gone.txt")).unwrap();
+    let second = commit_all(&wt, "Update docs\n\nWith a body.");
+    let third = commit_all(&wt, "Empty");
+    // Later local work must never leak into history views.
+    fs::write(wt.join("docs/readme.md"), "UNSAVED WORKING COPY\n").unwrap();
+    fs::write(wt.join("docs/logo.png"), b"not a png").unwrap();
+    fs::write(wt.join("new.txt"), "untracked\n").unwrap();
+    git::git(&wt, &["add", "new.txt"]).unwrap();
+    (state, wt, [first, second, third])
+}
+
+fn repo_snapshot(wt: &Path) -> (String, String, String, Vec<u8>) {
+    (
+        git::git(wt, &["rev-parse", "HEAD"]).unwrap(),
+        git::git(wt, &["status", "--porcelain"]).unwrap(),
+        git::git(wt, &["ls-files", "-s"]).unwrap(),
+        fs::read(wt.join("docs/readme.md")).unwrap(),
+    )
+}
+
+/// The commit browser opened on [`history_fixture`], newest commit first in `shas`.
+struct Browser {
+    window: AnyWindowHandle,
+    shark: Entity<Shark>,
+    feature: Entity<GitFeature>,
+    commits: Entity<Commits>,
+    wt: PathBuf,
+    /// [`repo_snapshot`] before the app touched the repository.
+    before: (String, String, String, Vec<u8>),
+    shas: [String; 3],
+}
+
+async fn open_commits(cx: &mut TestAppContext) -> Browser {
+    let home = test_home();
+    let (state, wt, [first, second, third]) = history_fixture(&home);
+    let before = repo_snapshot(&wt);
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    press_in(window)(cx, &["cmd-shift-g"]);
+    let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("git-view-commits", cx);
+    })
+    .unwrap();
+    let commits = cx.update(|cx| feature.read(cx).commits().clone());
+    until(cx, window, |_, cx| commits.read(cx).summaries().len() == 3).await;
+    Browser {
+        window,
+        shark,
+        feature,
+        commits,
+        wt,
+        before,
+        shas: [third, second, first],
+    }
+}
+
+impl Browser {
+    fn assert_untouched(&self) {
+        assert_eq!(
+            repo_snapshot(&self.wt),
+            self.before,
+            "HEAD, index and working files are untouched"
+        );
+    }
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_commits_list_keyboard_and_selection(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let b = open_commits(cx).await;
+    let (window, commits) = (b.window, b.commits.clone());
+    let [third, second, first] = b.shas.clone();
+    cx.update_window(window, |_, w, cx| {
+        let shas: Vec<_> = (commits.read(cx).summaries().iter())
+            .map(|c| c.sha.clone())
+            .collect();
+        assert_eq!(
+            shas,
+            [third.clone(), second.clone(), first.clone()],
+            "newest first"
+        );
+        // Keyboard: down to the second commit, enter opens it.
+        w.press("down", cx);
+        w.press("enter", cx);
+    })
+    .unwrap();
+    until(cx, window, |_, cx| commits.read(cx).commit().is_some()).await;
+    let files = cx
+        .update_window(window, |_, w, cx| {
+            let c = commits.read(cx).commit().unwrap();
+            assert_eq!(c.sha, second);
+            assert!(w.find("git-commit-message").visible());
+            assert!(w.find("git-commit-comparison").visible());
+            (c.files.iter())
+                .map(|f| (f.path.clone(), f.status))
+                .collect::<Vec<_>>()
+        })
+        .unwrap();
+    assert!(files.contains(&("gone.txt".into(), 'D')), "{files:?}");
+
+    // Older reaches the root of the range; Escape walks out.
+    cx.update(|cx| commits.update(cx, |c, cx| c.step_for_test(true, cx)));
+    until(cx, window, |_, cx| {
+        commits.read(cx).commit().is_some_and(|c| c.sha == first)
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("git-view-conversation", cx);
+        w.render_frame(cx);
+        w.click("git-view-commits", cx);
+        w.render_frame(cx);
+        assert_eq!(
+            commits.read(cx).commit().unwrap().sha,
+            first,
+            "selection survives view switches"
+        );
+        w.press("escape", cx);
+        w.render_frame(cx);
+        assert!(commits.read(cx).commit().is_none());
+        // Escape at the list root keeps the arrows on the list.
+        w.press("escape", cx);
+        w.render_frame(cx);
+        let at = commits.read(cx).cursor();
+        w.press(if at == 0 { "down" } else { "up" }, cx);
+        assert_ne!(commits.read(cx).cursor(), at);
+    })
+    .unwrap();
+    cx.update_window(window, |_, w, cx| w.click(("git-commit", 0usize), cx))
+        .unwrap();
+    until(cx, window, |w, cx| {
+        commits.read(cx).commit().is_some_and(|c| c.sha == third)
+            && w.try_find("git-commit-empty").is_some()
+    })
+    .await;
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_commit_files_read_each_side_of_the_commit(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let b = open_commits(cx).await;
+    let (window, commits) = (b.window, b.commits.clone());
+    cx.update(|cx| commits.update(cx, |c, cx| c.open_commit(1, cx)));
+    until(cx, window, |_, cx| commits.read(cx).commit().is_some()).await;
+    let files: Vec<String> = cx.update(|cx| {
+        let c = commits.read(cx).commit().unwrap();
+        assert_eq!(c.sha, b.shas[1]);
+        c.files.iter().map(|f| f.path.clone()).collect()
+    });
+    let ix = |p: &str| files.iter().position(|f| f == p).unwrap();
+    let open = |cx: &mut TestAppContext, i: usize, view: FileView| {
+        cx.update(|cx| commits.update(cx, |c, cx| c.open_file_for_test(i, view, cx)));
+    };
+    let shown = |cx: &mut TestAppContext| cx.update(|cx| commits.read(cx).shown(cx));
+
+    open(cx, ix("docs/readme.md"), FileView::After);
+    until(cx, window, |_, cx| {
+        commits.read(cx).shown(cx).starts_with("text:")
+    })
+    .await;
+    assert_eq!(shown(cx), "text:# Doc v2\n\n![logo](logo.png)\n");
+    // The preview resolves its image from this commit's tree, not the working file.
+    let doc = cx.update(|cx| commits.read(cx).doc().unwrap().clone());
+    until(cx, window, |_, cx| {
+        (doc.read(cx).media_view(1)).is_some_and(|m| m.read(cx).ready())
+    })
+    .await;
+    cx.update(|cx| {
+        let m = doc.read(cx).media_view(1).unwrap();
+        assert_eq!(m.read(cx).shown(1).unwrap().1, Some((2, 3)));
+    });
+
+    open(cx, ix("docs/readme.md"), FileView::Before);
+    until(cx, window, |_, cx| {
+        commits.read(cx).shown(cx).starts_with("text:")
+    })
+    .await;
+    assert!(shown(cx).starts_with("text:# Doc\n"), "{}", shown(cx));
+    // Blocks of the parent's readme: 0 heading, 1 logo, 2 mermaid.
+    let doc = cx.update(|cx| commits.read(cx).doc().unwrap().clone());
+    cx.wait_for(window, Duration::from_secs(20), |_, cx| {
+        let d = doc.read(cx);
+        d.media_view(1).is_some_and(|m| m.read(cx).ready()) && d.diagram_state(2).is_some()
+    })
+    .await;
+    cx.update(|cx| {
+        let d = doc.read(cx);
+        let m = d.media_view(1).unwrap();
+        assert_eq!(
+            m.read(cx).shown(1).unwrap().1,
+            Some((1, 1)),
+            "Before reads the parent"
+        );
+        assert!(
+            d.diagram_state(2).unwrap().unwrap().exists(),
+            "Mermaid rendered"
+        );
+    });
+    cx.update(|cx| commits.update(cx, |c, cx| c.set_source(true, cx)));
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(
+            w.find("git-file-text").visible(),
+            "Source opens the read-only editor"
+        );
+    })
+    .unwrap();
+    cx.update(|cx| commits.update(cx, |c, cx| c.set_source(false, cx)));
+    // Back to a cached Source editor: keys reach it by focus, so it must take focus again.
+    for id in ["git-file-source", "git-file-preview", "git-file-source"] {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.click(id, cx);
+        })
+        .unwrap();
+    }
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(
+            commits.read(cx).source_focused(w, cx),
+            "Source refocuses its editor"
+        );
+    })
+    .unwrap();
+    cx.update(|cx| commits.update(cx, |c, cx| c.set_source(false, cx)));
+
+    open(cx, ix("docs/readme.md"), FileView::Diff);
+    until(cx, window, |_, cx| {
+        commits.read(cx).shown(cx).starts_with("diff:")
+    })
+    .await;
+
+    for (view, size) in [(FileView::Before, (1, 1)), (FileView::After, (2, 3))] {
+        open(cx, ix("docs/logo.png"), view);
+        until(cx, window, |_, cx| {
+            commits.read(cx).media().is_some_and(|m| m.read(cx).ready())
+        })
+        .await;
+        cx.update(|cx| {
+            let m = commits.read(cx).media().unwrap().read(cx);
+            let side = if view == FileView::Before { 0 } else { 1 };
+            assert_eq!(m.shown(side).unwrap().1, Some(size));
+        });
+    }
+    open(cx, ix("docs/logo.png"), FileView::Diff);
+    until(cx, window, |_, cx| {
+        commits.read(cx).media().is_some_and(|m| m.read(cx).ready())
+    })
+    .await;
+
+    open(cx, ix("gone.txt"), FileView::After);
+    until(cx, window, |_, cx| {
+        commits.read(cx).shown(cx).starts_with("text:")
+    })
+    .await;
+    assert_eq!(
+        shown(cx),
+        "text:bye\n",
+        "a deleted file exposes only its earlier side"
+    );
+    b.assert_untouched();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_commits_survive_rapid_switching_and_a_missing_base(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let b = open_commits(cx).await;
+    let (window, commits) = (b.window, b.commits.clone());
+    // Smoke check: both loads race, so which result lands last is not forced; the selection
+    // must settle on the last request.
+    cx.update(|cx| {
+        commits.update(cx, |c, cx| {
+            c.open_commit(1, cx);
+            c.open_commit(2, cx);
+        })
+    });
+    until(cx, window, |_, cx| commits.read(cx).commit().is_some()).await;
+    cx.run_until_parked();
+    cx.update(|cx| assert_eq!(commits.read(cx).commit().unwrap().sha, b.shas[2]));
+
+    // A missing base is an explicit error, never all of history.
+    let ws = cx.update(|cx| {
+        let mut ws = b.shark.read(cx).active_ws().unwrap().clone();
+        ws.repos[0].base = "origin/nope".into();
+        ws
+    });
+    cx.update_window(window, |_, w, cx| {
+        b.feature.update(cx, |g, cx| g.set_workspace(ws, w, cx))
+    })
+    .unwrap();
+    until(cx, window, |_, cx| {
+        (commits.read(cx).error()).is_some_and(|e| e.contains("origin/nope"))
+    })
+    .await;
+    cx.update(|cx| assert!(commits.read(cx).summaries().is_empty()));
+    b.assert_untouched();
+}
+
+/// A PR whose description is the rich-content fixture, open on the Git tab.
+struct RichPr {
+    _gh: GhGuard,
+    dir: PathBuf,
+    window: AnyWindowHandle,
+    feature: Entity<GitFeature>,
+    head: String,
+}
+
+async fn open_rich_pr(cx: &mut TestAppContext) -> RichPr {
+    let home = test_home();
+    let (state, _, [_, second, _]) = history_fixture(&home);
+    let (_gh, dir) = fake_github(&home, &state, 0);
+    // The PR head is captured with the conversation; relative assets come from that commit.
+    let mut pr: Value =
+        serde_json::from_slice(&fs::read(dir.join("git-pr.json")).unwrap()).unwrap();
+    pr["headRefOid"] = json!(second);
+    // Blocks: 0 heading, 1 mermaid, 2 logo, 3 missing image, 4 insecure image, 5 the unclosed
+    // fence plus long text (the tests below index into these).
+    pr["body"] = json!(format!(
+        "## Why\n\n```mermaid\nflowchart LR\n  A --> B\n```\n\n![logo](docs/logo.png)\n\n\
+         ![missing](docs/none.png)\n\n![insecure](http://insecure.test/a.png)\n\n```mermaid\nflowchart\n\n{}tail-marker\n",
+        "long paragraph text. ".repeat(400)
+    ));
+    fs::write(dir.join("git-pr.json"), serde_json::to_vec(&pr).unwrap()).unwrap();
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    press_in(window)(cx, &["cmd-shift-g"]);
+    let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
+    until(cx, window, |_, cx| {
+        feature.read(cx).inspect().details.is_some()
+    })
+    .await;
+    RichPr {
+        _gh,
+        dir,
+        window,
+        feature,
+        head: second,
+    }
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_conversation_renders_mermaid_and_images_from_the_pr_head(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let pr = open_rich_pr(cx).await;
+    let (window, feature) = (pr.window, pr.feature.clone());
+    cx.update(|cx| {
+        let details = feature.read(cx).inspect().details.as_ref().unwrap();
+        assert_eq!(details.head_sha.as_deref(), Some(pr.head.as_str()));
+    });
+    let doc = |cx: &App| {
+        feature
+            .read(cx)
+            .markdown_doc("description")
+            .unwrap()
+            .clone()
+    };
+    cx.wait_for(window, Duration::from_secs(20), |_, cx| {
+        let Some(doc) = feature.read(cx).markdown_doc("description") else {
+            return false;
+        };
+        let d = doc.read(cx);
+        d.diagram_state(1).is_some()
+            && d.media_view(2).is_some_and(|m| m.read(cx).ready())
+            && d.media_error(3).is_some()
+    })
+    .await;
+    cx.update(|cx| {
+        let doc = doc(cx).read(cx);
+        assert!(doc.diagram_state(1).unwrap().is_ok());
+        let logo = doc.media_view(2).unwrap();
+        assert_eq!(
+            logo.read(cx).shown(1).unwrap().1,
+            Some((2, 3)),
+            "the PR head's blob, not the working file"
+        );
+        assert!(doc.media_error(3).unwrap().contains("not found"));
+    });
+    until(cx, window, |_, cx| {
+        doc(cx).read(cx).media_error(4).is_some()
+    })
+    .await;
+    cx.update(|cx| assert!(doc(cx).read(cx).media_error(4).unwrap().contains("HTTPS")));
+    // The full reader keeps content past the 4 KB preview (the unclosed fence stays source).
+    cx.update_window(window, |_, w, cx| {
+        feature.update(cx, |f, cx| f.scroll_row_end(0, cx));
+        w.render_frame(cx);
+        w.click("git-long-description", cx);
+        w.render_frame(cx);
+        let reader = feature.read(cx).reader().unwrap().read(cx);
+        assert!(reader.source().ends_with("tail-marker\n"));
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_reader_and_view_switches_never_post_a_hidden_draft(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let pr = open_rich_pr(cx).await;
+    let (window, feature) = (pr.window, pr.feature.clone());
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("git-comment-new", cx);
+        w.render_frame(cx);
+        w.input("draft survives", cx);
+        w.render_frame(cx);
+        feature.update(cx, |f, cx| f.scroll_row_end(0, cx));
+        w.render_frame(cx);
+        w.click("git-long-description", cx);
+        w.render_frame(cx);
+        // cmd-s in the reader never posts the hidden comment.
+        w.press("cmd-s", cx);
+        w.press("escape", cx);
+        w.render_frame(cx);
+        w.click("git-view-commits", cx);
+        w.render_frame(cx);
+        w.press("cmd-s", cx);
+        w.click("git-view-conversation", cx);
+        w.render_frame(cx);
+        assert_eq!(
+            feature.read(cx).draft_text(cx).as_deref(),
+            Some("draft survives")
+        );
+    })
+    .unwrap();
+    assert!(
+        !pr.dir.join("git-writes.jsonl").exists(),
+        "nothing was posted"
+    );
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_description_edits_in_place_and_cmd_enter_saves(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let state = fixture(&home);
+    let (_gh, dir) = fake_github(&home, &state, 1);
+    let mut pr = pr_fixture(1);
+    pr["body"] = json!("[docs](https://example.com/docs) explain the retry policy in detail.");
+    fs::write(dir.join("git-pr.json"), pr.to_string()).unwrap();
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    press_in(window)(cx, &["cmd-shift-g"]);
+    let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
+    until(cx, window, |_, cx| {
+        feature.read(cx).markdown_text_len("description", cx) > 0
+    })
+    .await;
+    let editing = |cx: &mut TestAppContext| cx.update(|cx| feature.read(cx).inspect().editing);
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        // A link follows the link; a drag selects text. Neither starts editing.
+        w.click_at("git-description", point(px(14.), px(14.)), cx);
+        w.render_frame(cx);
+        let b = w.find("git-description").bounds();
+        w.drag(
+            point(b.left() + px(60.), b.top() + px(14.)),
+            point(b.left() + px(200.), b.top() + px(14.)),
+            cx,
+        );
+        w.render_frame(cx);
+    })
+    .unwrap();
+    assert_eq!(cx.opened_url().as_deref(), Some("https://example.com/docs"));
+    assert_eq!(editing(cx), None);
+    // A plain click on the title edits title and description in place.
+    cx.update_window(window, |_, w, cx| {
+        w.click("git-pr-title", cx);
+        w.render_frame(cx);
+        assert!(w.find("git-editor-title").visible());
+        assert!(w.try_find("git-pr-title").is_none());
+        w.press("cmd-a", cx);
+        w.input("Reliable sign-in", cx);
+        // Enter moves from the title to the start of the description.
+        w.press("enter", cx);
+        w.input("Edited. ", cx);
+        w.press("escape", cx);
+        w.render_frame(cx);
+    })
+    .unwrap();
+    // Esc keeps the draft locally and says so; the shown text stays GitHub's.
+    assert_eq!(editing(cx), None);
+    cx.update_window(window, |_, w, cx| {
+        assert!(w.find("git-description-resume").visible());
+        w.click("git-description-resume", cx);
+        w.render_frame(cx);
+        assert!(
+            feature
+                .read(cx)
+                .draft_text(cx)
+                .is_some_and(|t| t.starts_with("Edited. [docs]"))
+        );
+        w.press("cmd-enter", cx);
+    })
+    .unwrap();
+    until(cx, window, |_, cx| {
+        feature
+            .read(cx)
+            .inspect()
+            .details
+            .as_ref()
+            .is_some_and(|d| d.title == "Reliable sign-in")
+    })
+    .await;
+    let writes = fs::read_to_string(dir.join("git-writes.jsonl")).unwrap();
+    assert_eq!(writes.lines().count(), 1);
+    assert!(writes.contains("updatePullRequest") || writes.contains("Reliable sign-in"));
+    let body = feature.read_with(cx, |f, _| {
+        f.inspect().details.as_ref().unwrap().body.clone()
+    });
+    assert!(body.starts_with("Edited. [docs]"), "{body}");
+    assert_eq!(editing(cx), None);
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_threads_reply_inline_and_collapse(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let state = fixture(&home);
+    let (_gh, dir) = fake_github(&home, &state, 2);
+    let mut pr = pr_fixture(2);
+    pr["reviewThreads"]["nodes"][0]["isResolved"] = json!(true);
+    pr["reviewThreads"]["nodes"][0]["resolvedBy"] = json!({"login": "author"});
+    pr["comments"]["nodes"][0]["isMinimized"] = json!(true);
+    fs::write(dir.join("git-pr.json"), pr.to_string()).unwrap();
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    let press = press_in(window);
+    press(cx, &["cmd-shift-g"]);
+    let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
+    until(cx, window, |_, cx| {
+        feature.read(cx).inspect().details.is_some()
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        // Hidden comments and resolved threads are single rows until opened.
+        assert!(w.find("git-hidden-C_1").visible());
+        assert!(w.find("git-thread-collapsed-T_0").visible());
+        assert!(w.try_find(("git-thread-path", 0usize)).is_none());
+        w.click("git-hidden-C_1", cx);
+        w.render_frame(cx);
+        assert!(w.find("git-comment-C_1").visible());
+    })
+    .unwrap();
+    // Enter on a resolved row expands it.
+    press(cx, &["home", "down", "down", "enter"]);
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.find(("git-thread-path", 0usize)).visible());
+        // "Leave a reply…" opens the editor inside its own thread.
+        w.click("git-thread-reply-T_1", cx);
+        w.render_frame(cx);
+        assert!(
+            w.within(("git-thread", 1usize))
+                .try_find("git-editor-body")
+                .is_some()
+        );
+        w.input("Covered by the reconnect test.", cx);
+        w.press("cmd-enter", cx);
+    })
+    .unwrap();
+    until(cx, window, |_, cx| {
+        feature
+            .read(cx)
+            .inspect()
+            .details
+            .as_ref()
+            .is_some_and(|d| d.threads[1].comments.len() == 2)
+    })
+    .await;
+    let writes = fs::read_to_string(dir.join("git-writes.jsonl")).unwrap();
+    let last: Value = serde_json::from_str(writes.lines().last().unwrap()).unwrap();
+    assert_eq!(writes.lines().count(), 1);
+    assert_eq!(last["id"], "T_1");
+    assert_eq!(last["body"], "Covered by the reconnect test.");
+    cx.update(|cx| assert!(feature.read(cx).inspect().editing.is_none()));
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_other_editors_stay_usable_while_one_posts(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let state = fixture(&home);
+    let (_gh, dir) = fake_github(&home, &state, 1);
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    press_in(window)(cx, &["cmd-shift-g"]);
+    let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
+    until(cx, window, |_, cx| {
+        feature.read(cx).inspect().details.is_some()
+    })
+    .await;
+    fs::write(dir.join("git-delay"), "0.3").unwrap();
+    cx.update_window(window, |_, w, cx| {
+        feature.update(cx, |g, cx| g.start_comment(w, cx));
+        w.render_frame(cx);
+        w.input("First comment", cx);
+        w.press("cmd-enter", cx);
+        assert!(feature.read(cx).busy());
+        // While it posts, a reply can be written; it is not closed by the comment finishing.
+        feature.update(cx, |g, cx| g.start_reply("T_0", w, cx));
+        w.render_frame(cx);
+        w.input("Reply while posting", cx);
+        w.press("cmd-enter", cx);
+    })
+    .unwrap();
+    until(cx, window, |_, cx| !feature.read(cx).busy()).await;
+    cx.update(|cx| {
+        assert_eq!(
+            feature.read(cx).draft_text(cx).as_deref(),
+            Some("Reply while posting"),
+            "one write at a time; the reply waits, open"
+        );
+    });
+    let writes = fs::read_to_string(dir.join("git-writes.jsonl")).unwrap();
+    assert_eq!(writes.lines().count(), 1, "the second write never started");
+}
+
+/// Boots on the Git tab serving `pr` from the fake GitHub; returns once it has loaded.
+async fn open_pr(
+    cx: &mut TestAppContext,
+    pr: Value,
+) -> (GhGuard, PathBuf, AnyWindowHandle, Entity<GitFeature>) {
+    let home = test_home();
+    let state = fixture(&home);
+    let (gh, dir) = fake_github(&home, &state, 0);
+    fs::write(dir.join("git-pr.json"), pr.to_string()).unwrap();
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    press_in(window)(cx, &["cmd-shift-g"]);
+    let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
+    until(cx, window, |_, cx| {
+        feature.read(cx).inspect().details.is_some()
+    })
+    .await;
+    (gh, dir, window, feature)
+}
+
+/// GitHub writes the fake recorded in `dir`.
+fn writes(dir: &Path) -> Vec<Value> {
+    fs::read_to_string(dir.join("git-writes.jsonl"))
+        .unwrap_or_default()
+        .lines()
+        .map(|l| serde_json::from_str(l).unwrap())
+        .collect()
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_refresh_while_editing_description_keeps_editor_and_text(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_gh, dir, window, feature) = open_pr(cx, pr_fixture(1)).await;
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("git-description", cx);
+    })
+    .unwrap();
+    // `click` sends down and up in one dispatch, so the description text's deferred selection
+    // focus lands after the editor opened (the real event loop runs it between the two).
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("git-editor-body", cx);
+        w.press("cmd-a", cx);
+        w.input("Local text", cx);
+    })
+    .unwrap();
+    // GitHub changes under the open editor: a new comment and a new description.
+    let mut changed = pr_fixture(1);
+    changed["body"] = json!("Edited on GitHub meanwhile");
+    let extra = json!({"id":"C_2","body":"New remote comment","author":{"login":"reviewer"},"url":"https://github.com/acme/api/pull/7#issuecomment-2","createdAt":"2026-10-28T10:00:00Z"});
+    changed["comments"]["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .push(extra);
+    fs::write(dir.join("git-pr.json"), changed.to_string()).unwrap();
+    cx.update_window(window, |_, w, cx| {
+        feature.update(cx, |f, cx| f.refresh(w, cx))
+    })
+    .unwrap();
+    until(cx, window, |_, cx| {
+        let f = feature.read(cx);
+        !f.inspect().loading
+            && f.inspect()
+                .details
+                .as_ref()
+                .is_some_and(|d| d.comments.len() == 2)
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert_eq!(
+            feature.read(cx).inspect().editing.as_deref(),
+            Some("Description")
+        );
+        assert_eq!(
+            feature.read(cx).draft_text(cx).as_deref(),
+            Some("Local text")
+        );
+        assert!(
+            w.find("git-description-replace").visible(),
+            "the remote edit is announced, not silently overwritten"
+        );
+        // Focus stays in the editor: typing continues where it was.
+        w.input(" kept typing", cx);
+        assert_eq!(
+            feature.read(cx).draft_text(cx).as_deref(),
+            Some("Local text kept typing")
+        );
+    })
+    .unwrap();
+    assert!(writes(&dir).is_empty(), "a refresh never writes");
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_unchanged_description_reopens_with_the_remote_edit(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_gh, dir, window, feature) = open_pr(cx, pr_fixture(1)).await;
+    // Open and close without typing: nothing to keep.
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("git-description", cx);
+        w.render_frame(cx);
+        w.press("escape", cx);
+    })
+    .unwrap();
+    let mut changed = pr_fixture(1);
+    changed["body"] = json!("Edited on GitHub meanwhile");
+    fs::write(dir.join("git-pr.json"), changed.to_string()).unwrap();
+    cx.update_window(window, |_, w, cx| {
+        feature.update(cx, |f, cx| f.refresh(w, cx))
+    })
+    .unwrap();
+    until(cx, window, |_, cx| {
+        let f = feature.read(cx);
+        !f.inspect().loading
+            && (f.inspect().details.as_ref())
+                .is_some_and(|d| d.body == "Edited on GitHub meanwhile")
+    })
+    .await;
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("git-description", cx);
+        w.render_frame(cx);
+        assert_eq!(
+            feature.read(cx).draft_text(cx).as_deref(),
+            Some("Edited on GitHub meanwhile"),
+            "reopening starts from GitHub's current copy"
+        );
+        assert!(
+            w.try_find("git-description-replace").is_none(),
+            "no conflict without local edits"
+        );
+    })
+    .unwrap();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_repo_switch_keeps_reply_draft_on_its_own_pr_thread(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let mut state = fixture(&home);
+    let ws = &mut state.workspaces[0];
+    init_repo(&ws.dir().join("web"));
+    ws.repos.push(crate::state::WsRepo {
+        name: "web".into(),
+        src: home.join("src/web"),
+        base: "main".into(),
+        branch: None,
+    });
+    let (_gh, api) = fake_github(&home, &state, 1);
+    // Both PRs have a thread with the id `T_0`: drafts must be keyed by PR as well.
+    let web = state.workspaces[0].dir().join("web");
+    let mut second = pr_fixture(1);
+    second["url"] = json!("https://github.com/acme/web/pull/9");
+    second["number"] = json!(9);
+    second["id"] = json!("PR_9");
+    fs::write(web.join("git-pr.json"), second.to_string()).unwrap();
+    git::git(
+        &web,
+        &[
+            "config",
+            "branch.main.shark-pr-url",
+            "https://github.com/acme/web/pull/9",
+        ],
+    )
+    .unwrap();
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    press_in(window)(cx, &["cmd-shift-g"]);
+    let feature = cx.update(|cx| shark.read(cx).active_git_feature().unwrap().clone());
+    let number = |cx: &App| {
+        let f = feature.read(cx);
+        (!f.inspect().loading)
+            .then(|| f.inspect().details.as_ref().map(|d| d.target.number))
+            .flatten()
+    };
+    until(cx, window, |_, cx| number(cx) == Some(7)).await;
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("git-thread-reply-T_0", cx);
+        w.render_frame(cx);
+        w.input("API reply", cx);
+        w.click("git-repo-1", cx);
+    })
+    .unwrap();
+    until(cx, window, |_, cx| number(cx) == Some(9)).await;
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(feature.read(cx).inspect().editing.is_none());
+        w.click("git-thread-reply-T_0", cx);
+        w.render_frame(cx);
+        assert_eq!(
+            feature.read(cx).draft_text(cx).as_deref(),
+            Some(""),
+            "the same thread id on another PR starts empty"
+        );
+        w.input("Web reply", cx);
+        w.press("cmd-enter", cx);
+    })
+    .unwrap();
+    until(cx, window, |_, cx| {
+        !feature.read(cx).busy()
+            && number(cx) == Some(9)
+            && feature
+                .read(cx)
+                .inspect()
+                .details
+                .as_ref()
+                .is_some_and(|d| d.threads[0].comments.len() == 2)
+    })
+    .await;
+    let posted = writes(&web);
+    assert_eq!(posted.len(), 1);
+    assert_eq!(posted[0]["body"], "Web reply");
+    assert!(writes(&api).is_empty(), "nothing reaches the other PR");
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("git-repo-0", cx);
+    })
+    .unwrap();
+    until(cx, window, |_, cx| number(cx) == Some(7)).await;
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("git-thread-reply-T_0", cx);
+        w.render_frame(cx);
+        assert_eq!(
+            feature.read(cx).draft_text(cx).as_deref(),
+            Some("API reply")
+        );
+    })
+    .unwrap();
+    assert!(writes(&api).is_empty());
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_failed_reply_keeps_editor_open_and_focused(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_gh, dir, window, feature) = open_pr(cx, pr_fixture(1)).await;
+    fs::write(dir.join("git-fail"), "offline").unwrap();
+    cx.update_window(window, |_, w, cx| {
+        feature.update(cx, |f, cx| f.start_reply("T_0", w, cx));
+        w.render_frame(cx);
+        w.input("Covered by the reconnect test", cx);
+        w.press("cmd-enter", cx);
+    })
+    .unwrap();
+    until(cx, window, |_, cx| !feature.read(cx).busy()).await;
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        let f = feature.read(cx);
+        assert_eq!(f.inspect().editing.as_deref(), Some("Reply(\"T_0\")"));
+        assert!(f.inspect().error.as_ref().unwrap().contains("503"));
+        assert!(w.find("git-error").visible());
+        assert!(
+            w.within(("git-thread", 0usize))
+                .try_find("git-editor-body")
+                .is_some()
+        );
+        // The editor was disabled while sending; typing must still reach it afterwards.
+        w.input(", twice", cx);
+        assert_eq!(
+            feature.read(cx).draft_text(cx).as_deref(),
+            Some("Covered by the reconnect test, twice")
+        );
+    })
+    .unwrap();
+    assert!(writes(&dir).is_empty());
+    fs::remove_file(dir.join("git-fail")).unwrap();
+    cx.update_window(window, |_, w, cx| w.press("cmd-enter", cx))
+        .unwrap();
+    until(cx, window, |_, cx| {
+        feature
+            .read(cx)
+            .inspect()
+            .details
+            .as_ref()
+            .is_some_and(|d| d.threads[0].comments.len() == 2)
+    })
+    .await;
+    let posted = writes(&dir);
+    assert_eq!(posted.len(), 1);
+    assert_eq!(posted[0]["body"], "Covered by the reconnect test, twice");
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_empty_description_placeholder_click_starts_editing(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pr = pr_fixture(1);
+    pr["body"] = json!("");
+    let (_gh, dir, window, feature) = open_pr(cx, pr).await;
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.find("git-empty-description").visible());
+        w.click("git-empty-description", cx);
+        w.render_frame(cx);
+        assert_eq!(
+            feature.read(cx).inspect().editing.as_deref(),
+            Some("Description")
+        );
+        assert!(w.find("git-editor-body").visible());
+        w.input("First description", cx);
+        assert_eq!(
+            feature.read(cx).draft_text(cx).as_deref(),
+            Some("First description")
+        );
+    })
+    .unwrap();
+    assert!(writes(&dir).is_empty());
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_cursor_stays_on_its_thread_when_refresh_removes_an_earlier_one(
+    cx: &mut TestAppContext,
+) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_gh, dir, window, feature) = open_pr(cx, pr_fixture(3)).await;
+    let cursor = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let s = feature.read(cx).inspect();
+            s.rows[s.cursor].clone()
+        })
+    };
+    let press = press_in(window);
+    press(cx, &["home", "down", "down", "down"]);
+    assert_eq!(cursor(cx), "thread:T_1");
+    // Someone deletes the first thread's only comment on GitHub; the thread disappears.
+    let mut fewer = pr_fixture(3);
+    fewer["reviewThreads"]["nodes"]
+        .as_array_mut()
+        .unwrap()
+        .remove(0);
+    fs::write(dir.join("git-pr.json"), fewer.to_string()).unwrap();
+    cx.update_window(window, |_, w, cx| {
+        feature.update(cx, |f, cx| f.refresh(w, cx))
+    })
+    .unwrap();
+    until(cx, window, |_, cx| {
+        let f = feature.read(cx);
+        !f.inspect().loading
+            && f.inspect()
+                .details
+                .as_ref()
+                .is_some_and(|d| d.threads.len() == 2)
+    })
+    .await;
+    assert_eq!(
+        cursor(cx),
+        "thread:T_1",
+        "the cursor follows its item, not its index"
+    );
+    press(cx, &["r"]);
+    cx.update(|cx| {
+        assert_eq!(
+            feature.read(cx).inspect().editing.as_deref(),
+            Some("Reply(\"T_1\")"),
+            "`r` replies to the thread the user was looking at"
+        )
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_r_on_resolved_thread_expands_it_and_replies(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pr = pr_fixture(1);
+    pr["reviewThreads"]["nodes"][0]["isResolved"] = json!(true);
+    pr["reviewThreads"]["nodes"][0]["resolvedBy"] = json!({"login": "author"});
+    let (_gh, dir, window, feature) = open_pr(cx, pr).await;
+    let press = press_in(window);
+    press(cx, &["home", "down", "down"]);
+    cx.update(|cx| {
+        let s = feature.read(cx).inspect();
+        assert_eq!(s.rows[s.cursor], "thread:T_0");
+    });
+    press(cx, &["r"]);
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert_eq!(
+            feature.read(cx).inspect().editing.as_deref(),
+            Some("Reply(\"T_0\")")
+        );
+        assert!(w.try_find("git-thread-collapsed-T_0").is_none());
+        assert!(
+            w.within(("git-thread", 0usize))
+                .try_find("git-editor-body")
+                .is_some(),
+            "the reply opens inside the expanded thread, not pinned below"
+        );
+        assert!(w.try_find("git-composer").is_none());
+        w.input("Still relevant", cx);
+    })
+    .unwrap();
+    press(cx, &["escape", "r"]);
+    cx.update(|cx| {
+        assert_eq!(
+            feature.read(cx).draft_text(cx).as_deref(),
+            Some("Still relevant")
+        )
+    });
+    assert!(writes(&dir).is_empty());
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_escape_closes_the_reader_before_the_editor_under_it(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pr = pr_fixture(1);
+    pr["comments"]["nodes"][0]["body"] = json!("A long review note. ".repeat(400));
+    let (_gh, dir, window, feature) = open_pr(cx, pr).await;
+    cx.update_window(window, |_, w, cx| {
+        feature.update(cx, |f, cx| f.start_comment(w, cx));
+        w.render_frame(cx);
+        w.input("Half-written", cx);
+        feature.update(cx, |f, cx| f.scroll_row_end(1, cx));
+        w.render_frame(cx);
+        w.click("git-long-C_1", cx);
+        w.render_frame(cx);
+        assert!(feature.read(cx).reader().is_some());
+        assert_eq!(
+            feature.read(cx).inspect().editing.as_deref(),
+            Some("Comment")
+        );
+        w.press("escape", cx);
+        w.render_frame(cx);
+        assert!(feature.read(cx).reader().is_none());
+        assert_eq!(
+            feature.read(cx).inspect().editing.as_deref(),
+            Some("Comment"),
+            "one Escape closes one thing"
+        );
+        w.press("escape", cx);
+        assert!(feature.read(cx).inspect().editing.is_none());
+        feature.update(cx, |f, cx| f.start_comment(w, cx));
+        assert_eq!(
+            feature.read(cx).draft_text(cx).as_deref(),
+            Some("Half-written")
+        );
+    })
+    .unwrap();
+    assert!(writes(&dir).is_empty());
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_cmd_enter_with_blank_text_posts_nothing(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_gh, dir, window, feature) = open_pr(cx, pr_fixture(1)).await;
+    cx.update_window(window, |_, w, cx| {
+        feature.update(cx, |f, cx| f.start_comment(w, cx));
+        w.render_frame(cx);
+        w.press("cmd-enter", cx);
+        w.input("   ", cx);
+        w.press("cmd-enter", cx);
+        assert!(!feature.read(cx).busy());
+        assert_eq!(
+            feature.read(cx).draft_text(cx).as_deref(),
+            Some("   "),
+            "cmd-enter neither posts nor inserts a line break"
+        );
+        feature.update(cx, |f, cx| f.start_reply("T_0", w, cx));
+        w.render_frame(cx);
+        w.press("cmd-enter", cx);
+        w.press("cmd-s", cx);
+        assert!(!feature.read(cx).busy());
+        assert_eq!(
+            feature.read(cx).inspect().editing.as_deref(),
+            Some("Reply(\"T_0\")")
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(writes(&dir).is_empty());
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_details_toggle_in_description_does_not_start_editing(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pr = pr_fixture(1);
+    pr["body"] = json!(
+        "Intro paragraph.\n\n<details><summary>Build logs</summary>\n\nHidden build output that only shows when opened.\n\n</details>\n"
+    );
+    let (_gh, dir, window, feature) = open_pr(cx, pr).await;
+    until(cx, window, |_, cx| {
+        feature.read(cx).markdown_text_len("description", cx) > 0
+    })
+    .await;
+    let before = cx.update(|cx| feature.read(cx).markdown_text_len("description", cx));
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click(("git-details", 1usize), cx);
+        w.render_frame(cx);
+        assert_eq!(feature.read(cx).inspect().editing, None);
+    })
+    .unwrap();
+    until(cx, window, |_, cx| {
+        feature.read(cx).markdown_text_len("description", cx) > before
+    })
+    .await;
+    cx.update(|cx| assert_eq!(feature.read(cx).inspect().editing, None));
+    assert!(writes(&dir).is_empty());
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_reader_stays_open_when_a_background_post_finishes(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pr = pr_fixture(1);
+    pr["comments"]["nodes"][0]["body"] = json!("A long review note. ".repeat(400));
+    let (_gh, dir, window, feature) = open_pr(cx, pr).await;
+    fs::write(dir.join("git-delay"), "0.3").unwrap();
+    cx.update_window(window, |_, w, cx| {
+        feature.update(cx, |f, cx| f.start_comment(w, cx));
+        w.render_frame(cx);
+        w.input("Posting in the background", cx);
+        w.press("cmd-enter", cx);
+        assert!(feature.read(cx).busy());
+        // While it posts, the user opens a long comment in the reader.
+        feature.update(cx, |f, cx| f.scroll_row_end(1, cx));
+        w.render_frame(cx);
+        w.click("git-long-C_1", cx);
+        w.render_frame(cx);
+        assert!(feature.read(cx).reader().is_some());
+    })
+    .unwrap();
+    until(cx, window, |_, cx| {
+        let f = feature.read(cx);
+        !f.busy()
+            && !f.inspect().loading
+            && f.inspect()
+                .details
+                .as_ref()
+                .is_some_and(|d| d.comments.len() == 2)
+    })
+    .await;
+    assert_eq!(writes(&dir).len(), 1);
+    cx.update(|cx| {
+        assert!(
+            feature.read(cx).reader().is_some(),
+            "the refresh after a post must not close what the user is reading"
+        )
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_collapsing_a_thread_closes_its_reply_and_cmd_s_posts_nothing(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let mut pr = pr_fixture(1);
+    pr["reviewThreads"]["nodes"][0]["isResolved"] = json!(true);
+    let (_gh, dir, window, feature) = open_pr(cx, pr).await;
+    let press = press_in(window);
+    press(cx, &["home", "down", "down", "r"]);
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.input("Hidden reply", cx);
+        w.click("git-thread-collapse-T_0", cx);
+        w.render_frame(cx);
+        assert!(w.find("git-thread-collapsed-T_0").visible());
+        assert_eq!(feature.read(cx).inspect().editing, None);
+        w.press("cmd-s", cx);
+        w.press("cmd-enter", cx);
+        assert!(!feature.read(cx).busy());
+        // From Local drafts, the collapsed thread's reply opens pinned, where it can be seen.
+        w.click("git-local-drafts", cx);
+        w.render_frame(cx);
+        w.click(("git-local-draft", 0usize), cx);
+        w.render_frame(cx);
+        w.click("git-local-drafts", cx);
+        w.render_frame(cx);
+        assert!(w.find("git-composer").visible());
+        assert_eq!(
+            feature.read(cx).draft_text(cx).as_deref(),
+            Some("Hidden reply")
+        );
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(writes(&dir).is_empty());
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_letter_keys_return_to_an_open_editor_that_lost_focus(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_gh, dir, window, feature) = open_pr(cx, pr_fixture(1)).await;
+    cx.update_window(window, |_, w, cx| {
+        // Opening the description without changing it leaves no draft behind.
+        feature.update(cx, |f, cx| f.start_description(w, cx));
+        w.render_frame(cx);
+        w.press("escape", cx);
+        w.render_frame(cx);
+        assert!(w.try_find("git-local-drafts").is_none());
+        assert!(w.try_find("git-description-resume").is_none());
+        feature.update(cx, |f, cx| f.start_comment(w, cx));
+        w.render_frame(cx);
+        w.input("Hi", cx);
+        // The field scrolls out of the list (or is clicked away from): focus falls to the pane.
+        for key in ["e", "r", "c", "enter"] {
+            feature.update(cx, |f, cx| f.focus_pane(w, cx));
+            w.press(key, cx);
+            assert_eq!(
+                feature.read(cx).inspect().editing.as_deref(),
+                Some("Comment"),
+                "{key} returns to the open comment"
+            );
+        }
+        w.input(" there", cx);
+        assert_eq!(feature.read(cx).draft_text(cx).as_deref(), Some("Hi there"));
+    })
+    .unwrap();
+    assert!(writes(&dir).is_empty());
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn git_thread_keeps_written_order_and_sits_under_its_question(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    // As on PR #75: the question's review was submitted after the author replied, so GitHub's
+    // createdAt (and list) order puts the reply first.
+    let mut pr = pr_fixture(0);
+    let node = |id: &str, n: u64, author: &str, at: &str, review: &str, body: &str| {
+        json!({"id":id,"body":body,"author":{"login":author},"createdAt":at,
+            "url":format!("https://github.com/acme/api/pull/7#discussion_r{n}"),
+            "pullRequestReview":{"id":review}})
+    };
+    pr["reviews"]["nodes"] = json!([
+        {"id":"R_reply","body":"","state":"COMMENTED","author":{"login":"author"},"url":"","createdAt":"2026-10-27T09:00:00Z"},
+        {"id":"R_bot","body":"Changes recommended","state":"COMMENTED","author":{"login":"copilot"},"url":"","createdAt":"2026-10-27T10:00:00Z"},
+    ]);
+    pr["reviewThreads"]["nodes"] = json!([{
+        "id":"T_q","path":"src/login.rs","line":3,"isResolved":false,"isOutdated":false,
+        "viewerCanReply":true,"viewerCanResolve":true,"viewerCanUnresolve":false,
+        "comments":{"nodes":[
+            node("TC_reply", 9, "author", "2026-10-27T09:00:00Z", "R_reply", "Fixed."),
+            node("TC_q", 5, "copilot", "2026-10-27T10:00:00Z", "R_bot", "Is this atomic?"),
+        ],"pageInfo":{"hasNextPage":false,"endCursor":null}},
+    }]);
+    let (_gh, _dir, _window, feature) = open_pr(cx, pr).await;
+    cx.update(|cx| {
+        let f = feature.read(cx);
+        let s = f.inspect();
+        let thread = &s.details.as_ref().unwrap().threads[0];
+        assert_eq!(thread.comments[0].id, "TC_q", "the question comes first");
+        assert_eq!(
+            s.rows,
+            [
+                "header",
+                "comment:C_1",
+                "review:R_bot",
+                "thread:T_q",
+                "composer"
+            ],
+            "under the review that asked; the reply's empty review says nothing"
+        );
+    });
 }

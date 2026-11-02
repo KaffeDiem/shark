@@ -1,6 +1,7 @@
 use crate::state::{Repo, Workspace, WsRepo};
 mod changes;
 mod copy;
+pub mod history;
 use copy::{copy_included, untracked_fingerprint};
 #[cfg(test)]
 mod tests;
@@ -44,10 +45,18 @@ pub fn cmd_bounded(dir: &Path, prog: &str, args: &[&str], secs: u64) -> Result<S
     } else {
         prog.into()
     });
-    // GIT_TERMINAL_PROMPT doesn't reach ssh, which asks for host keys and passphrases on
-    // /dev/tty itself. Only when the user hasn't picked their own ssh command.
-    if prog == "git"
-        && std::env::var_os("GIT_SSH_COMMAND").is_none()
+    if prog == "git" {
+        no_ssh_prompt(&mut c, dir);
+    }
+    c.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GH_PROMPT_DISABLED", "1");
+    crate::proc::wait_bounded(c, dir, prog, args, secs, false)
+}
+
+/// GIT_TERMINAL_PROMPT doesn't reach ssh, which asks for host keys and passphrases on
+/// /dev/tty itself. Only when the user hasn't picked their own ssh command.
+fn no_ssh_prompt(c: &mut Command, dir: &Path) {
+    if std::env::var_os("GIT_SSH_COMMAND").is_none()
         && std::env::var_os("GIT_SSH").is_none()
         && git(dir, &["config", "core.sshCommand"]).is_err()
     {
@@ -56,9 +65,6 @@ pub fn cmd_bounded(dir: &Path, prog: &str, args: &[&str], secs: u64) -> Result<S
             "ssh -o BatchMode=yes -o ConnectTimeout=15",
         );
     }
-    c.env("GIT_TERMINAL_PROMPT", "0")
-        .env("GH_PROMPT_DISABLED", "1");
-    crate::proc::wait_bounded(c, dir, prog, args, secs, false)
 }
 
 /// Runs git, returning trimmed stdout, or stderr as the error on non-zero exit.
@@ -69,6 +75,19 @@ pub fn git(dir: &Path, args: &[&str]) -> Result<String, String> {
 /// Runs git, returning stdout untouched (no trim, any bytes), or stderr as the error.
 pub fn git_bytes(dir: &Path, args: &[&str]) -> Result<Vec<u8>, String> {
     finish_bytes("git", args, run(dir, "git", args)?)
+}
+
+/// Like `git_bytes`, but a hung process is killed after `secs`.
+pub fn git_bytes_bounded(dir: &Path, args: &[&str], secs: u64) -> Result<Vec<u8>, String> {
+    // A partial clone may fetch missing objects here.
+    let mut c = Command::new("git");
+    no_ssh_prompt(&mut c, dir);
+    c.env("GIT_TERMINAL_PROMPT", "0");
+    finish_bytes(
+        "git",
+        args,
+        crate::proc::wait_output(c, dir, "git", args, secs, false)?,
+    )
 }
 
 /// Commits with a fixed identity; `extra` is the rest of the `commit` args. Returns git's output.

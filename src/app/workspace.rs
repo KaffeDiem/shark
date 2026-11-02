@@ -116,12 +116,14 @@ impl Shark {
             window,
             move |this, _, ev: &SyncEvent, window, cx| this.sync_event(&name, ev, window, cx),
         ));
-        self._subs.push(cx.observe(&sync, |s, sync, cx| {
-            if s.active_sync() == Some(&sync) {
-                s.configure_differ(cx);
-                s.differ.update(cx, |_, cx| cx.notify());
-            }
-        }));
+        self._subs
+            .push(cx.observe_in(&sync, window, |s, sync, w, cx| {
+                if s.active_sync() == Some(&sync) {
+                    s.configure_differ(cx);
+                    s.configure_git(w, cx);
+                    s.differ.update(cx, |_, cx| cx.notify());
+                }
+            }));
         self.syncs.insert(ws.name.clone(), sync);
     }
 
@@ -911,8 +913,9 @@ impl Shark {
         if let Some(sync) = self.syncs.get(&ws.name) {
             sync.update(cx, |g, cx| g.set_workspace(ws.clone(), cx));
         }
-        if let Some(git) = self.git_features.get(&ws.name) {
-            git.update(cx, |g, cx| g.set_workspace(ws.clone(), window, cx));
+        if let Some(git) = self.git_features.get(&ws.name).cloned() {
+            let git_ws = self.effective_workspace(ws.clone(), cx);
+            git.update(cx, |g, cx| g.set_workspace(git_ws, window, cx));
         }
         self.refresh_diff_if_active(&ws.name, cx);
         window.push_notification(

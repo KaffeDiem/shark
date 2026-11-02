@@ -3,21 +3,39 @@ use super::*;
 use differ::{DifferEvent, WorkspaceSnapshot};
 
 impl Shark {
-    fn differ_workspace(&self, cx: &App) -> Option<WorkspaceSnapshot> {
-        let mut workspace = self.active_ws()?.clone();
-        let mut prs = HashMap::new();
-        if let Some(sync) = self.active_sync() {
+    /// `workspace` with GitSync's effective comparison bases, as Diff and Git use them.
+    pub(super) fn effective_workspace(&self, mut workspace: Workspace, cx: &App) -> Workspace {
+        if let Some(sync) = self.syncs.get(&workspace.name) {
             let sync = sync.read(cx);
             for repo in &mut workspace.repos {
                 if let Some(base) = sync.diff_base(&repo.name) {
                     repo.base = base;
                 }
+            }
+        }
+        workspace
+    }
+
+    fn differ_workspace(&self, cx: &App) -> Option<WorkspaceSnapshot> {
+        let workspace = self.effective_workspace(self.active_ws()?.clone(), cx);
+        let mut prs = HashMap::new();
+        if let Some(sync) = self.active_sync() {
+            let sync = sync.read(cx);
+            for repo in &workspace.repos {
                 if let Some(pr) = sync.pr_for(&repo.name) {
                     prs.insert(repo.name.clone(), pr);
                 }
             }
         }
         Some(WorkspaceSnapshot { workspace, prs })
+    }
+
+    /// A moved comparison base reaches the retained Git entity, which resets only its history.
+    pub(super) fn configure_git(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let (Some(ws), Some(git)) = (self.active_ws(), self.active_git_feature()) {
+            let ws = self.effective_workspace(ws.clone(), cx);
+            git.update(cx, |g, cx| g.set_workspace(ws, window, cx));
+        }
     }
 
     pub(super) fn configure_differ(&self, cx: &mut Context<Self>) {

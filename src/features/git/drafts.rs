@@ -14,8 +14,21 @@ pub(super) struct DescriptionDraft {
     pub(super) body: String,
 }
 
+impl DescriptionDraft {
+    /// Whether it says anything GitHub's version doesn't.
+    pub(super) fn changed(&self) -> bool {
+        self.title != self.original_title || self.body != self.original_body
+    }
+}
+
+/// An opened but unchanged description is not a draft: it is never written to disk.
+fn unchanged(d: &Option<DescriptionDraft>) -> bool {
+    !d.as_ref().is_some_and(DescriptionDraft::changed)
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub(super) struct Draft {
+    #[serde(default, skip_serializing_if = "unchanged")]
     pub(super) description: Option<DescriptionDraft>,
     pub(super) note: String,
     pub(super) replies: HashMap<String, String>,
@@ -32,7 +45,7 @@ impl Draft {
     /// Whether this draft holds text for `kind`.
     pub(super) fn has(&self, kind: &Editing) -> bool {
         match kind {
-            Editing::Description => self.description.is_some(),
+            Editing::Description => self.description.as_ref().is_some_and(|d| d.changed()),
             Editing::Comment => !self.note.is_empty(),
             Editing::Reply(id) => self.replies.get(id).is_some_and(|body| !body.is_empty()),
         }
