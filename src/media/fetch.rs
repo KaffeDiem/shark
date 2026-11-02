@@ -176,6 +176,8 @@ fn download(url: &str, out: &Path, dir: &Path) -> Result<String, String> {
     let mut args = vec![
         // Must come first: ignores ~/.curlrc, which could add credentials or headers.
         "-q",
+        // Brackets and braces in a document's URL are literal, not ranges or sets.
+        "--globoff",
         "--silent",
         "--show-error",
         "--fail",

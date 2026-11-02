@@ -13,6 +13,7 @@ use gpui_kit::component::{ActiveTheme, Icon, Sizable as _, h_flex, v_flex};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
@@ -136,32 +137,27 @@ pub(crate) fn blocks(source: &str, chunk: bool) -> Vec<Block> {
 }
 
 /// [`blocks`], with a details body given the whole document's reference definitions.
-fn split(source: &str, chunk: bool, doc_refs: Option<&str>) -> Vec<Block> {
+fn split(source: &str, chunk: bool, doc_refs: Option<&Refs>) -> Vec<Block> {
     let source = strip_comments(source);
     let lines: Vec<&str> = source.split_inclusive('\n').collect();
-    // Link reference definitions apply document-wide; each block gets a copy (they render
-    // nothing), so `[text][1]` still resolves after a split.
-    let mut refs = doc_refs.unwrap_or_default().to_string();
-    let mut in_fence: Option<(u8, usize)> = None;
-    for line in lines.iter().filter(|_| doc_refs.is_none()) {
-        match (in_fence, fence(line)) {
-            (Some((ch, len)), _) if closes(line, ch, len) => in_fence = None,
-            (Some(_), _) => {}
-            (None, Some((ch, len, _))) => in_fence = Some((ch, len)),
-            (None, None) if reference(line) => {
-                refs.push_str(line.trim_end());
-                refs.push('\n');
-            }
-            _ => {}
+    // Link reference definitions apply document-wide; each block gets a copy of those it uses
+    // (they render nothing), so `[text][1]` still resolves after a split.
+    let own;
+    let refs = match doc_refs {
+        Some(refs) => refs,
+        None => {
+            own = definitions(&lines);
+            &own
         }
-    }
+    };
     let mut out = vec![];
     let mut text = String::new();
     let flush = |text: &mut String, out: &mut Vec<Block>| {
         if !text.trim().is_empty() {
             let mut block = std::mem::take(text);
-            if !refs.is_empty() {
-                block = format!("{}\n\n{refs}", block.trim_end());
+            let used = used_refs(&block, refs);
+            if !used.is_empty() {
+                block = format!("{}\n\n{used}", block.trim_end());
             }
             out.push(Block::Text(block));
         }
@@ -195,12 +191,21 @@ fn split(source: &str, chunk: bool, doc_refs: Option<&str>) -> Vec<Block> {
             }
             continue;
         }
+        // A fence inside a list or quote is code too: no media, details or alerts in it.
+        if let Some((ch, len, _)) = code_fence(line) {
+            let end = (i + 1..lines.len())
+                .find(|&j| code_closes(lines[j], ch, len))
+                .map_or(lines.len(), |j| j + 1);
+            text.push_str(&lines[i..end].concat());
+            i = end;
+            continue;
+        }
         if let Some((summary, open, body, used, tail)) = details(&lines[i..]) {
             flush(&mut text, &mut out);
             out.push(Block::Details {
                 summary,
                 open,
-                body: split(&body, chunk, Some(&refs)),
+                body: split(&body, chunk, Some(refs)),
             });
             text.push_str(&tail);
             i += used;
@@ -227,8 +232,9 @@ fn split(source: &str, chunk: bool, doc_refs: Option<&str>) -> Vec<Block> {
                 }
                 i += 1;
             }
-            if !body.trim().is_empty() && !refs.is_empty() {
-                body = format!("{}\n\n{refs}", body.trim_end());
+            let used = used_refs(&body, refs);
+            if !used.is_empty() {
+                body = format!("{}\n\n{used}", body.trim_end());
             }
             out.push(Block::Alert { kind, body });
             continue;
@@ -273,6 +279,90 @@ fn split(source: &str, chunk: bool, doc_refs: Option<&str>) -> Vec<Block> {
     out
 }
 
+/// Link reference definition lines by [`label_key`].
+type Refs = HashMap<String, String>;
+
+/// A reference label as CommonMark matches it: whitespace collapsed, case folded.
+fn label_key(label: &str) -> String {
+    label
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase()
+}
+
+/// The link reference definitions outside code; the first for a label wins.
+fn definitions(lines: &[&str]) -> Refs {
+    let mut refs = Refs::new();
+    let mut in_fence = None;
+    for line in lines {
+        match (in_fence, code_fence(line)) {
+            (Some((ch, len)), _) if code_closes(line, ch, len) => in_fence = None,
+            (Some(_), _) => {}
+            (None, Some((ch, len, _))) => in_fence = Some((ch, len)),
+            (None, None) => {
+                if let Some(label) = reference(line) {
+                    let def = line.trim_end().to_string();
+                    refs.entry(label_key(label)).or_insert(def);
+                }
+            }
+        }
+    }
+    refs
+}
+
+/// The definitions `md` uses (`[label]`, `[text][label]`, `[label][]`) and doesn't have
+/// itself, one per line. Copying only these keeps a split document linear in size.
+fn used_refs(md: &str, refs: &Refs) -> String {
+    let mut out = String::new();
+    if refs.is_empty() {
+        return out;
+    }
+    let mut seen: HashSet<String> = md.lines().filter_map(reference).map(label_key).collect();
+    let mut rest = md;
+    while let Some(open) = rest.find('[') {
+        rest = &rest[open + 1..];
+        let Some(end) = rest.find(['[', ']']) else {
+            break;
+        };
+        if rest.as_bytes()[end] == b']' {
+            let key = label_key(&rest[..end]);
+            if let Some(def) = refs.get(&key)
+                && seen.insert(key)
+            {
+                out.push_str(def);
+                out.push('\n');
+            }
+        }
+        rest = &rest[end..];
+    }
+    out
+}
+
+/// Whether `line` is indented code: 4+ columns after a blank line or continuing indented
+/// code, unless it continues a list item. `state` is (indented, in a list), carried between
+/// calls; call it for lines outside fences and HTML blocks.
+fn indented_code(line: &str, after_blank: bool, state: &mut (bool, bool)) -> bool {
+    let (indented, in_list) = state;
+    let blank = line.trim().is_empty();
+    let mut width = 0;
+    for c in line.chars() {
+        match c {
+            ' ' => width += 1,
+            '\t' => width += 4 - width % 4,
+            _ => break,
+        }
+    }
+    let wide = width >= 4;
+    if !blank && !wide {
+        *in_list = list_marker(line.trim_start()).is_some();
+    }
+    if !blank {
+        *indented = wide && !*in_list && (after_blank || *indented);
+    }
+    *indented
+}
+
 /// `source` without HTML comments outside code. Bots keep state in comments (often huge
 /// base64), so this runs before splitting. As on GitHub, a `<!--` opening a line (an HTML
 /// block) hides everything up to `-->` or the end; elsewhere it is inline and must close
@@ -286,9 +376,12 @@ fn strip_comments(source: &str) -> Cow<'_, str> {
     let mut rest = source;
     // Whether `rest` resumes a line after a comment, so nothing in it opens a line.
     let mut mid = false;
+    let (mut after_blank, mut indented) = (true, (false, false));
     while !rest.is_empty() {
         let line = &rest[..rest.find('\n').map_or(rest.len(), |n| n + 1)];
+        let code = in_fence.is_none() && !mid && indented_code(line, after_blank, &mut indented);
         match (in_fence, code_fence(line)) {
+            _ if code => {}
             (Some((ch, len)), _) => {
                 if code_closes(line, ch, len) {
                     in_fence = None;
@@ -327,6 +420,7 @@ fn strip_comments(source: &str) -> Cow<'_, str> {
         out.push_str(line);
         rest = &rest[line.len()..];
         mid = false;
+        after_blank = line.trim().is_empty();
     }
     Cow::Owned(out)
 }
@@ -777,31 +871,13 @@ fn enrich(md: &str, web: Option<&str>) -> String {
     let links = web.zip(origin.as_deref());
     let mut out = String::with_capacity(md.len());
     let (mut in_fence, mut html, mut after_blank) = (None, None::<&str>, true);
-    // Indented code (4+ columns after a blank line), unless it continues a list item.
-    let (mut indented, mut in_list) = (false, false);
+    let mut indented = (false, false);
     for line in md.split_inclusive('\n') {
         let blank = line.trim().is_empty();
-        if in_fence.is_none() && html.is_none() {
-            let mut width = 0;
-            for c in line.chars() {
-                match c {
-                    ' ' => width += 1,
-                    '\t' => width += 4 - width % 4,
-                    _ => break,
-                }
-            }
-            let wide = width >= 4;
-            if !blank && !wide {
-                in_list = list_marker(line.trim_start()).is_some();
-            }
-            if !blank {
-                indented = wide && !in_list && (after_blank || indented);
-            }
-            if indented {
-                out.push_str(line);
-                after_blank = blank;
-                continue;
-            }
+        if in_fence.is_none() && html.is_none() && indented_code(line, after_blank, &mut indented) {
+            out.push_str(line);
+            after_blank = blank;
+            continue;
         }
         // Code and HTML blocks pass through unchanged.
         let ends = |end: &str| {
@@ -840,7 +916,7 @@ fn enrich(md: &str, web: Option<&str>) -> String {
                     html = (!done).then_some(end);
                     out.push_str(line);
                 }
-                None if reference(line) => out.push_str(line),
+                None if reference(line).is_some() => out.push_str(line),
                 None => enrich_line(line, links, &mut out),
             },
         }
@@ -1050,14 +1126,14 @@ fn continues(line: &str) -> bool {
         })
 }
 
-/// `[label]: destination`, but not a footnote, which renders visibly.
-fn reference(line: &str) -> bool {
+/// The label of `[label]: destination`, but not of a footnote, which renders visibly.
+fn reference(line: &str) -> Option<&str> {
     let t = line.trim_start_matches(' ');
-    line.len() - t.len() <= 3
-        && t.starts_with('[')
-        && !t.starts_with("[^")
-        && t.split_once("]:")
-            .is_some_and(|(l, d)| l.len() > 1 && !d.trim().is_empty())
+    if line.len() - t.len() > 3 || !t.starts_with('[') || t.starts_with("[^") {
+        return None;
+    }
+    let (l, d) = t.split_once("]:")?;
+    (l.len() > 1 && !d.trim().is_empty()).then(|| &l[1..])
 }
 
 /// An `https` URL to an image, video or GitHub attachment.
@@ -2156,6 +2232,77 @@ mod tests {
         // Nothing is appended to an empty alert.
         assert!(
             matches!(&blocks("> [!NOTE]\n\n[1]: https://x.test\n", true)[0], Block::Alert { body, .. } if body.is_empty())
+        );
+    }
+
+    #[::core::prelude::v1::test]
+    fn blocks_get_only_the_references_they_use() {
+        let src = format!(
+            "A uses [one].\n\n{}\n\n<details>\n\nB uses [Two\n Words][] and [x][THREE].\n\
+             </details>\n\n[one]: https://u1\n[two words]: https://u2\n[three]: https://u3\n\
+             [unused]: https://u4\n",
+            "word ".repeat(600)
+        );
+        let b = blocks(&src, true);
+        assert!(text(&b[0]).starts_with("A uses [one]."));
+        assert!(text(&b[0]).ends_with("word\n\n[one]: https://u1\n"));
+        let body = b
+            .iter()
+            .find_map(|b| match b {
+                Block::Details { body, .. } => Some(text(&body[0])),
+                _ => None,
+            })
+            .unwrap();
+        assert!(
+            body.ends_with("\n\n[two words]: https://u2\n[three]: https://u3\n"),
+            "{body:?}"
+        );
+        assert!(!body.contains("u1") && !body.contains("u4"));
+        // The block holding the definitions gets no second copy.
+        let last = text(b.last().unwrap());
+        assert_eq!(last.matches("https://u2").count(), 1, "{last:?}");
+
+        // Thousands of definitions grow the output linearly, not per block.
+        let n = 2000;
+        let mut doc: String = (0..n)
+            .map(|i| format!("Paragraph {i} cites [r{i}] {}\n\n", "word ".repeat(20)))
+            .collect();
+        doc.extend((0..n).map(|i| format!("[r{i}]: https://x.test/{i}\n")));
+        let parts = blocks(&doc, true);
+        assert!(parts.len() > 50);
+        let total: usize = parts.iter().map(|b| text(b).len()).sum();
+        assert!(total < 3 * doc.len(), "{total} vs {}", doc.len());
+    }
+
+    #[::core::prelude::v1::test]
+    fn fences_in_lists_stay_code() {
+        let src = "- example:\n\n  ```md\n  ![sample](https://example.test/a.png)\n  <details>\n\
+                   \x20 > [!NOTE]\n  > x\n  ```\n![real](https://example.test/b.png)\n";
+        let b = blocks(src, true);
+        assert!(text(&b[0]).contains("  ![sample](https://example.test/a.png)\n  <details>"));
+        assert!(text(&b[0]).contains("  > [!NOTE]\n  > x\n  ```\n"));
+        assert_eq!(b[1], media("https://example.test/b.png", "real"));
+        assert_eq!(b.len(), 2, "{b:?}");
+    }
+
+    #[::core::prelude::v1::test]
+    fn comments_in_indented_code_are_kept() {
+        for same in [
+            "Example:\n\n    <!-- marker -->\n",
+            "\t<!-- x\n",
+            "a\n\n    one\n\n    <!-- two -->\n",
+        ] {
+            assert_eq!(strip_comments(same), same);
+        }
+        assert_eq!(
+            text(&blocks("Example:\n\n    <!-- marker -->\n", true)[0]),
+            "Example:\n\n    <!-- marker -->\n"
+        );
+        // A paragraph or list continuation is not code.
+        assert_eq!(strip_comments("text\n    <!-- c -->\n"), "text\n    \n");
+        assert_eq!(
+            strip_comments("- item\n\n    <!-- c -->\n"),
+            "- item\n\n    \n"
         );
     }
 

@@ -315,8 +315,13 @@ impl Commits {
         self.content = Some(Content::Loading);
         let generation = self.content_generation;
         cx.notify();
-        let media = media::kind(&file.path)
-            .filter(|_| file.special().is_none() && file.mode_only().is_none());
+        // Diff needs both sides comparable; Before/After only the side they show.
+        let plain = |b: &Option<Blob>| b.as_ref().is_some_and(|b| !b.symlink() && !b.submodule());
+        let media = media::kind(&file.path).filter(|_| match view {
+            FileView::Diff => file.special().is_none() && file.mode_only().is_none(),
+            FileView::Before => plain(&file.old),
+            FileView::After => plain(&file.new),
+        });
         if let Some(kind) = media {
             let side = |b: &Option<Blob>| {
                 b.as_ref().map(|b| Side {
@@ -857,11 +862,15 @@ impl Commits {
                                     .small()
                                     .ghost()
                                     .selected(self.source)
-                                    .on_click(cx.listener(|s, _, _, cx| {
+                                    .on_click(cx.listener(|s, _, w, cx| {
                                         if let Some(doc) = &s.doc {
                                             doc.update(cx, |d, cx| d.stop(cx));
                                         }
                                         s.source = true;
+                                        // A cached editor isn't refocused by render_file.
+                                        if let Some(e) = &s.editor {
+                                            e.read(cx).focus_handle(cx).focus(w, cx);
+                                        }
                                         cx.notify();
                                     })),
                             )
@@ -1252,6 +1261,9 @@ impl Commits {
     pub(crate) fn set_source(&mut self, source: bool, cx: &mut Context<Self>) {
         self.source = source;
         cx.notify();
+    }
+    pub(crate) fn source_focused(&self, w: &Window, cx: &App) -> bool {
+        (self.editor.as_ref()).is_some_and(|e| e.read(cx).focus_handle(cx).is_focused(w))
     }
     pub(crate) fn step_for_test(&mut self, older: bool, cx: &mut Context<Self>) {
         self.step(older, cx);

@@ -2523,6 +2523,23 @@ async fn git_commit_files_read_each_side_of_the_commit(cx: &mut TestAppContext) 
     })
     .unwrap();
     cx.update(|cx| commits.update(cx, |c, cx| c.set_source(false, cx)));
+    // Back to a cached Source editor: keys reach it by focus, so it must take focus again.
+    for id in ["git-file-source", "git-file-preview", "git-file-source"] {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.click(id, cx);
+        })
+        .unwrap();
+    }
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(
+            commits.read(cx).source_focused(w, cx),
+            "Source refocuses its editor"
+        );
+    })
+    .unwrap();
+    cx.update(|cx| commits.update(cx, |c, cx| c.set_source(false, cx)));
 
     open(cx, ix("docs/readme.md"), FileView::Diff);
     until(cx, window, |_, cx| {
