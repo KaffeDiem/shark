@@ -3,11 +3,82 @@
 Git follows the Diff artifact lifecycle: it starts closed, opens once per workspace,
 participates in the saved tab order, and supports closing, reordering, shortcuts,
 pane navigation, the command palette, and the View menu. `cmd-shift-g` opens it.
-Arrow keys, Page Up/Down and Home/End scroll the conversation; Vim mode also supports
-j/k, Ctrl-D/U, gg and G outside text inputs. Saving from Home never posts a hidden
-Git draft.
+Saving from Home never posts a hidden Git draft.
 The existing workspace Git controls still own push, PR creation, readiness, merge,
 and archive.
+
+## Conversation layout
+
+One centered 680px column, read like a Linear issue:
+
+- The toolbar holds the repository picker (only with more than one repo), Conversation /
+  Commits, "Local drafts (N)" (only while drafts exist) and Refresh.
+- The header is the title, a meta line (state, `#number`, `@author opened 3d ago`,
+  `base ← head`, open in GitHub) and the description.
+- **Activity** is one timeline in creation order: conversation comments, reviews and
+  review threads. A thread follows the review it was submitted with (its first comment's
+  `review_id`); a thread without a known review sits at its first comment's time. A review
+  without a body is a one-line event ("@x approved · 2d ago"); empty "commented" reviews
+  that own no thread (GitHub records one per web reply) are left out. Times are relative,
+  with the exact local time in a tooltip.
+- A comment is a card: avatar initial, name, `bot` chip, review state, time, and hover-only
+  copy and GitHub actions in a fixed slot. Previews come from `document::preview` (HTML
+  comments stripped, never cut inside a fence); "Show more" opens the full reader only when
+  the preview was cut.
+- Comments inside a thread keep the order they were written in (their `discussion_r<id>`).
+  GitHub lists them by `createdAt`, which a review comment takes from its review's
+  submission, so a late-submitted question would otherwise sort below its replies.
+- A review thread is one chat card: `path:line` (opens the file in Diff), Outdated, Resolve
+  or Reopen, the last four lines of its diff hunk, its comments, and "Leave a reply…",
+  which opens the reply editor inside the card.
+- Resolved threads and hidden (minimized) comments are single rows ("Resolved by @x ·
+  path:line · first line") until opened; an opened resolved thread collapses again from
+  its header.
+- The comment composer is the last item: "Leave a comment…" opens it in place.
+
+## Editing in place
+
+Clicking the title or description (not a link, a button or a drag that selects text)
+swaps in the editor at the same place and size: a wrapping title field and an auto-growing
+Markdown area, focused where you clicked. Title and body are one draft
+(`DescriptionDraft`). Enter in the title moves to the description. `cmd-enter` or `cmd-s`
+saves or posts the open editor; `esc` closes it and keeps the local draft. A closed
+description draft shows "Unsaved draft" in the meta line, and a comment or reply draft
+shows its first line in place of "Leave a…"; clicking resumes it. One editor is open at a
+time; drafts stay keyed per PR and thread. Drafts opened from Local drafts, or whose PR or
+thread is not shown, open in an editor pinned below the conversation that names its PR.
+
+Opening the description without changing it leaves no draft: an unchanged description
+is never written to disk or counted. Collapsing a resolved thread closes its reply editor
+(keeping the draft); an editor whose item is not drawn is pinned below, never hidden.
+Refreshes keep the cursor and scroll position on the same item (by comment, review or
+thread id) and keep the reader open while its message exists; another PR starts at the top.
+
+A write disables only the editor being sent; other editors can be opened and typed in
+meanwhile, but GitHub writes stay one at a time and are never retried.
+
+## Keyboard
+
+The conversation has an item cursor: the header, each timeline item and the composer.
+It shows (`list_active` plus a `primary` ring, or a `primary` card border) after keyboard
+navigation while the pane has focus.
+
+| Key | Does |
+|---|---|
+| `↑`/`↓` (Vim `k`/`j`) | Move the cursor and scroll it into view |
+| `home`/`end` (Vim `gg`/`G`) | First / last item |
+| `pageup`/`pagedown` (Vim `ctrl-u`/`ctrl-d`) | Scroll |
+| `enter` | Header: edit the description. Thread: reply, or expand if resolved. Hidden comment: expand. Comment: open in the reader. Composer: write |
+| `e` | Edit the description |
+| `r` | Reply to the cursor's thread |
+| `c` | Write a comment |
+| `cmd-enter`, `cmd-s` | Save or post the open editor |
+| `esc` | Close the editor (keeping the draft) or the reader |
+
+Single keys are bound under `GitFeature && !Input`, so they never fire while typing. With
+an editor open whose field lost focus (clicked away, or scrolled out of the list), `e`,
+`r`, `c` and `enter` return to that editor instead of starting another. The
+palette has "Edit pull request description" and "Comment on pull request".
 
 ## Review workflows
 
@@ -90,8 +161,8 @@ Markdown renderer, which does not load remote or repository-relative images.
   extension; the response's content type decides what they are. Failed, private or
   unsupported resources keep their link and an Open in browser action. Videos never
   autoplay, and one plays at a time.
-- Conversation rows keep a bounded compact preview. Every message has a Reader action
-  (Read full text for long ones) that opens the complete message as a virtualized list
+- Conversation rows keep a bounded compact preview. A cut preview has "Show more", and
+  Enter on a comment opens it, in the reader: the complete message as a virtualized list
   of blocks, with Source switching to the read-only editor. The open message is one
   `Reader` (its document plus the optional source editor) in `src/features/git/mod.rs`.
 
@@ -125,10 +196,10 @@ workspace serializes snapshots, including discards; typing never waits on its di
 I/O. Changes made during a write become its next snapshot. Retry uses the same
 worker, and quit/archive wait for pending local saves as well as remote writes.
 
-Reads and GitHub writes run outside the UI thread. Conversation rows use the house
-variable-height virtual list; Markdown is created when a row is rendered and
-kept in a bounded cache. Long bodies use a UTF-8-safe formatted preview;
-Read full text opens the complete message in a virtualized rich reader; its Source
+Reads and GitHub writes run outside the UI thread. Conversation items use the house
+variable-height virtual list; Markdown is created when an item is rendered and
+kept in a bounded cache. Long bodies use a formatted preview;
+Show more opens the complete message in a virtualized rich reader; its Source
 button shows the Markdown in the house read-only editor, with wrapping, search and
 copy. The complete source remains in descriptions, comments
 and editable drafts. Rapid repository switches coalesce into one pending read. Navigation cannot redirect an in-flight write to a different repository. Closing a tab keeps
@@ -183,7 +254,7 @@ Local measurements (development build, this machine; not universal latency guara
 | Actual compiled read-only GitHub load + discovery, PR #60 | 1.23 seconds |
 | 65 KB inline-heavy Markdown preview | 3–4 ms settled redraw; 11–18 ms parsed and rendered |
 | Complete 65 KB source in read-only editor | 13–19 ms open; 1.4–1.6 ms redraw; exact clipboard copy verified |
-| Native Metal rendering | 800/1440 px, dark/light, with and without composer |
+| Native Metal rendering | 800/1440 px, dark/light: overview, description editing, activity, inline reply, comment composer, local drafts, reader, states |
 
 Run the opt-in live read test explicitly (it never mutates the PR):
 

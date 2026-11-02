@@ -274,6 +274,22 @@ impl Shark {
         Some(git)
     }
 
+    /// Shows the Git tab and runs `f` on its conversation (palette rows for its keys).
+    pub(super) fn with_git(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        f: impl FnOnce(&mut git_feature::GitFeature, &mut Window, &mut Context<git_feature::GitFeature>),
+    ) {
+        self.show(Tab::Feature(Feature::Git), window, cx);
+        if let Some(git) = self.active_git_feature().cloned() {
+            git.update(cx, |g, cx| {
+                g.set_view(git_feature::GitView::Conversation, window, cx);
+                f(g, window, cx)
+            });
+        }
+    }
+
     pub(super) fn open_git_file(
         &mut self,
         path: &str,

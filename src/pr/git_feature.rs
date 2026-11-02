@@ -61,6 +61,14 @@ pub struct Comment {
     pub author: String,
     pub url: String,
     pub created_at: String,
+    /// The author is a GitHub App or bot account.
+    pub bot: bool,
+    /// Hidden on GitHub (outdated, resolved, spam…); shown collapsed.
+    pub minimized: bool,
+    /// Review comments only: the diff context GitHub shows above a thread.
+    pub diff_hunk: Option<String>,
+    /// Review comments only: the review the comment was submitted with.
+    pub review_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -79,6 +87,9 @@ pub struct Thread {
     pub can_reply: bool,
     pub can_resolve: bool,
     pub can_unresolve: bool,
+    /// The line in the original diff; outdated threads have no current `line`.
+    pub original_line: Option<u64>,
+    pub resolved_by: Option<String>,
     pub comments: Vec<Comment>,
 }
 
@@ -91,6 +102,7 @@ pub struct Details {
     pub url: String,
     pub state: String,
     pub author: String,
+    pub created_at: String,
     pub head: String,
     /// The head commit when read, for resolving relative assets; `None` when GitHub omits it.
     pub head_sha: Option<String>,
@@ -103,11 +115,12 @@ pub struct Details {
     pub threads: Vec<Thread>,
 }
 
-const INFO: &str = "id number url title body state isDraft author{login} headRefName headRefOid baseRefName viewerCanUpdate locked";
-const COMMENT: &str = "id body author{login} url createdAt";
+const INFO: &str = "id number url title body state isDraft createdAt author{login} headRefName headRefOid baseRefName viewerCanUpdate locked";
+const COMMENT: &str = "id body author{__typename login} url createdAt isMinimized";
+const REVIEW_COMMENT: &str =
+    "id body author{__typename login} url createdAt isMinimized diffHunk pullRequestReview{id}";
 const PAGE: &str = "pageInfo{hasNextPage endCursor}";
-const THREAD: &str =
-    "id path line isResolved isOutdated viewerCanReply viewerCanResolve viewerCanUnresolve";
+const THREAD: &str = "id path line originalLine isResolved isOutdated viewerCanReply viewerCanResolve viewerCanUnresolve resolvedBy{login}";
 
 /// Reads are bounded as a whole, including pagination, as well as per subprocess.
 struct Client<'a> {
@@ -251,6 +264,10 @@ fn comment_from(value: &Value) -> Result<Comment, String> {
         author: author(value),
         url: string(value, "url")?.into(),
         created_at: string(value, "createdAt")?.into(),
+        bot: value["author"]["__typename"].as_str() == Some("Bot"),
+        minimized: value["isMinimized"].as_bool().unwrap_or(false),
+        diff_hunk: value["diffHunk"].as_str().map(Into::into),
+        review_id: value["pullRequestReview"]["id"].as_str().map(Into::into),
     })
 }
 
@@ -273,6 +290,7 @@ fn details_from(target: &Target, value: &Value) -> Result<Details, String> {
         url: url.into(),
         state: string(value, "state")?.into(),
         author: author(value),
+        created_at: value["createdAt"].as_str().unwrap_or_default().into(),
         head: string(value, "headRefName")?.into(),
         head_sha: value["headRefOid"]
             .as_str()
@@ -340,8 +358,14 @@ fn pages(
 }
 
 /// Every comment of the node `id`, following pagination from its `first` page.
-fn comments(client: &Client, id: &str, kind: &str, first: &Value) -> Result<Vec<Comment>, String> {
-    pages(client, id, kind, "comments", COMMENT, first.clone())?
+fn comments(
+    client: &Client,
+    id: &str,
+    kind: &str,
+    fields: &str,
+    first: &Value,
+) -> Result<Vec<Comment>, String> {
+    pages(client, id, kind, "comments", fields, first.clone())?
         .iter()
         .map(comment_from)
         .collect()
@@ -350,10 +374,16 @@ fn comments(client: &Client, id: &str, kind: &str, first: &Value) -> Result<Vec<
 pub fn load(wt: &Path, target: &Target) -> Result<Details, String> {
     let client = Client::new(wt, target);
     let review_fields = format!("{COMMENT} state");
-    let thread_fields = format!("{THREAD} comments(first:100){{nodes{{{COMMENT}}}{PAGE}}}");
+    let thread_fields = format!("{THREAD} comments(first:100){{nodes{{{REVIEW_COMMENT}}}{PAGE}}}");
     let value = client.pr(&format!("{INFO} comments(first:100){{nodes{{{COMMENT}}}{PAGE}}} reviews(first:100){{nodes{{{review_fields}}}{PAGE}}} reviewThreads(first:100){{nodes{{{thread_fields}}}{PAGE}}}"))?;
     let mut details = details_from(target, &value)?;
-    details.comments = comments(&client, &details.id, "PullRequest", &value["comments"])?;
+    details.comments = comments(
+        &client,
+        &details.id,
+        "PullRequest",
+        COMMENT,
+        &value["comments"],
+    )?;
     details.reviews = pages(
         &client,
         &details.id,
@@ -379,7 +409,17 @@ pub fn load(wt: &Path, target: &Target) -> Result<Details, String> {
         value["reviewThreads"].clone(),
     )? {
         let id = string(&value, "id")?.to_string();
-        let comments = comments(&client, &id, "PullRequestReviewThread", &value["comments"])?;
+        let mut comments = comments(
+            &client,
+            &id,
+            "PullRequestReviewThread",
+            REVIEW_COMMENT,
+            &value["comments"],
+        )?;
+        // GitHub lists a thread by `createdAt`, which a review comment takes from when its
+        // review was submitted: a question from a review submitted late sorts below the
+        // replies to it. Its URL's `discussion_r<id>` keeps the order it was written in.
+        comments.sort_by_key(|c| discussion_id(&c.url));
         details.threads.push(Thread {
             id,
             path: string(&value, "path")?.into(),
@@ -389,10 +429,20 @@ pub fn load(wt: &Path, target: &Target) -> Result<Details, String> {
             can_reply: boolean(&value, "viewerCanReply")?,
             can_resolve: boolean(&value, "viewerCanResolve")?,
             can_unresolve: boolean(&value, "viewerCanUnresolve")?,
+            original_line: value["originalLine"].as_u64(),
+            resolved_by: value["resolvedBy"]["login"].as_str().map(Into::into),
             comments,
         });
     }
     Ok(details)
+}
+
+/// The number in a review comment URL's `#discussion_r<n>`; comments without one keep
+/// their place at the front.
+fn discussion_id(url: &str) -> u64 {
+    url.rsplit_once("#discussion_r")
+        .and_then(|(_, n)| n.parse().ok())
+        .unwrap_or(0)
 }
 
 fn fresh(client: &Client, previous: &Details) -> Result<Details, String> {

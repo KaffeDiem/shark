@@ -168,6 +168,9 @@ actions!(
     ]
 );
 
+// The Git conversation (src/features/git/mod.rs): `e`, `r` and `c` on the cursor.
+actions!(shark, [EditDescription, ReplyToThread, CommentOnPr]);
+
 // Editor and diff review: cmd-p, and `c` / `shift-c` in the diff.
 actions!(
     shark,
@@ -390,6 +393,12 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("escape", CancelEdit, Some(DIFF)),
         KeyBinding::new("escape", CancelEdit, Some("GitFeature")),
         KeyBinding::new("enter", Confirm, Some("GitCommits && !Input")),
+        // The conversation's cursor: enter acts on it, e edits the description, r replies to
+        // the cursor's thread, c writes a comment. Never while typing.
+        KeyBinding::new("enter", Confirm, Some("GitFeature && !Input")),
+        KeyBinding::new("e", EditDescription, Some("GitFeature && !Input")),
+        KeyBinding::new("r", ReplyToThread, Some("GitFeature && !Input")),
+        KeyBinding::new("c", CommentOnPr, Some("GitFeature && !Input")),
         KeyBinding::new("c", AddComment, Some(DIFF)),
         // Plan mode; in the composer shift-tab is caught before the input outdents.
         KeyBinding::new(
@@ -604,5 +613,8 @@ mod tests {
             assert!(hit("enter", c, &Confirm), "enter in {c}");
         }
         assert!(hit("left", "Sidebar", &CollapseDir) && hit("right", "FileTree", &ExpandDir));
+        assert!(hit("enter", "GitFeature", &Confirm) && hit("e", "GitFeature", &EditDescription));
+        assert!(hit("r", "GitFeature", &ReplyToThread) && hit("c", "GitFeature", &CommentOnPr));
+        assert!(hit("c", "DiffPane", &AddComment) && hit("r", "DiffPane", &ResolveThread));
     }
 }

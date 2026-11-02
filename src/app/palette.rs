@@ -347,6 +347,20 @@ pub(super) const COMMANDS: &[Row] = &[
         "pull request description comments review resolve tab",
     ),
     Row(
+        "Edit pull request description",
+        IconName::Pencil,
+        Some(&EditDescription),
+        "git pr title description edit",
+        Some(|s, w, cx| s.with_git(w, cx, git_feature::GitFeature::start_description)),
+    ),
+    Row(
+        "Comment on pull request",
+        IconName::MessageSquarePlus,
+        Some(&CommentOnPr),
+        "git pr comment conversation reply",
+        Some(|s, w, cx| s.with_git(w, cx, git_feature::GitFeature::start_comment)),
+    ),
+    Row(
         "Open file in editor",
         IconName::FilePen,
         Some(&OpenFile),
