@@ -278,11 +278,11 @@ async fn moving_to_a_file_clears_the_line_cursor(cx: &mut TestAppContext) {
     fs::remove_dir_all(&home).ok();
 }
 
-/// A jump to a thread unfolds its viewed file; one on a file left the diff (an orphan) goes
-/// nowhere, and `]c` skips it instead of scrolling to the top.
+/// A jump to a thread unfolds its viewed file; one on a file left the diff (an orphan) selects
+/// no line but is the thread the keys act on, and `]c` reaches it last.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn jumping_to_threads_unfolds_files_and_skips_orphans(cx: &mut TestAppContext) {
+async fn jumping_to_threads_unfolds_files_and_reaches_orphans(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (home, window, shark, api) = fixture(cx, "jp", &[]).await;
     fs::write(api.join("f"), "a\nb\n").unwrap();
@@ -314,22 +314,27 @@ async fn jumping_to_threads_unfolds_files_and_skips_orphans(cx: &mut TestAppCont
     });
     assert!(!folded(cx));
     assert_eq!(selected(cx, &shark).as_deref(), Some("api/f"));
+    let at = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).differ.read(cx).thread_at(cx));
     on(cx, &|s, w, cx| {
         s.differ.update(cx, |d, cx| d.jump_to_comment(2, w, cx))
     });
-    assert_eq!(
-        selected(cx, &shark).as_deref(),
-        Some("api/f"),
-        "orphan: no jump"
-    );
-    // The cursor is on thread 1: `]c` cycles 3, 1, 3 and never lands on the orphan.
-    for want in [3, 1, 3] {
+    assert_eq!(selected(cx, &shark), None, "orphan: no line to select");
+    assert_eq!(at(cx), Some(2), "but it is the thread at the cursor");
+    // From the orphan, `]c` wraps to 1, then 3, then the orphan again, last.
+    for want in [1, 3, 2] {
         on(cx, &|s, w, cx| {
             s.differ.update(cx, |d, cx| d.thread_jump(true, w, cx))
         });
-        let at = cx.update(|cx| shark.read(cx).differ.read(cx).thread_at(cx));
-        assert_eq!(at, Some(want), "]c");
+        assert_eq!(at(cx), Some(want), "]c");
     }
+    // `x` there deletes it, as on any thread; the cursor then names none.
+    on(cx, &|s, w, cx| {
+        s.differ.update(cx, |d, cx| {
+            d.at_cursor(crate::features::differ::Differ::delete_thread, w, cx)
+        })
+    });
+    cx.update(|cx| assert_eq!(shark.read(cx).differ.read(cx).ws_comments().len(), 2));
+    assert_eq!(at(cx), None);
     fs::remove_dir_all(&home).ok();
 }
 

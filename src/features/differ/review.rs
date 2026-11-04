@@ -239,8 +239,9 @@ pub(crate) struct Review {
     pub(crate) sheet: Option<review_send::Sheet>,
     pub(crate) share: Option<review_share::Share>,
     /// The thread last jumped to, and the lines selected for it: while they stay selected it
-    /// is the thread there, though another one starts on the same line.
-    jumped: Option<(u64, DiffLineRange)>,
+    /// is the thread there, though another one starts on the same line. `None` lines for a
+    /// thread without a row (under its file header, or its file left the diff).
+    jumped: Option<(u64, Option<DiffLineRange>)>,
 }
 
 impl Review {
@@ -331,6 +332,7 @@ impl Differ {
             d.set_selected_lines(sel, cx);
         });
         self.review.view = Some((t, c));
+        self.review.jumped = None; // the cursor left the jumped thread
         cx.notify();
     }
 
@@ -578,16 +580,29 @@ impl Differ {
             return None;
         }
         let theme = cx.theme();
-        let title = div()
+        let removable: Vec<u64> = (ids.iter().copied())
+            .filter(|&id| self.comment(id).is_some_and(|c| c.status != Status::Queued))
+            .collect();
+        let title = h_flex()
+            .gap_2()
             .text_xs()
             .text_color(theme.muted_foreground)
-            .child("Threads on files no longer in the diff");
+            .child("Threads on files no longer in the diff · ]c reaches them")
+            .child(div().flex_1())
+            .when(!removable.is_empty(), |d| {
+                d.child(
+                    Button::new("orphans-remove")
+                        .ghost()
+                        .xsmall()
+                        .label(format!("Remove all {}", removable.len()))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.edit_comments(cx, |l| l.retain(|c| !removable.contains(&c.id)))
+                        })),
+                )
+            });
         let cards: Vec<AnyElement> = (ids.iter())
             .map(|&id| {
                 let c = self.comment(id).map(|c| c.path.clone()).unwrap_or_default();
-                let pending = self
-                    .comment(id)
-                    .is_some_and(|c| c.status == Status::Pending);
                 let editing = (self.review.composer.as_ref()).is_some_and(|c| c.draft.id == id);
                 let button = |name: &'static str, label: &'static str| {
                     Button::new((name, id as usize))
@@ -603,18 +618,17 @@ impl Differ {
                         true => self.render_composer(cx),
                         false => self.render_thread(id, cx),
                     })
-                    .when(pending && !editing, |d| {
+                    // Queued ones say why they stay (`unqueued`).
+                    .when(!editing, |d| {
                         d.child(
                             h_flex()
                                 .gap_2()
                                 .justify_end()
                                 .child(button("orphan-edit", "Edit").on_click(
-                                    cx.listener(move |this, _, w, cx| this.edit_comment(id, w, cx)),
+                                    cx.listener(move |this, _, w, cx| this.edit_thread(id, w, cx)),
                                 ))
                                 .child(button("orphan-delete", "Delete").on_click(cx.listener(
-                                    move |this, _, _, cx| {
-                                        this.edit_comments(cx, |l| l.retain(|c| c.id != id))
-                                    },
+                                    move |this, _, w, cx| this.delete_thread(id, w, cx),
                                 ))),
                         )
                     })
@@ -802,12 +816,22 @@ impl Differ {
         cx.notify();
     }
 
+    /// cmd-shift-enter: the draft straight to the shown chat, skipping the sheet (the other
+    /// pending threads stay for a later send).
+    pub(crate) fn send_composer_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if let Some(id) = self.submit_composer(window, cx) {
+            self.send_review(&[id], "", false, window, cx);
+        }
+    }
+
     /// cmd-enter: adds the draft to the review (Pending), or saves the edited thread. Empty
-    /// text removes it.
-    pub(crate) fn submit_composer(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(comp) = self.review.composer.take() else {
-            return;
-        };
+    /// text removes it. The thread's id, when one is left.
+    pub(crate) fn submit_composer(
+        &mut self,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<u64> {
+        let comp = self.review.composer.take()?;
         let text = comp.input.read(cx).value().trim().to_string();
         let suggestion = (comp.suggest.as_ref())
             .map(|s| s.read(cx).value().trim_end().to_string())
@@ -815,13 +839,12 @@ impl Differ {
         let order: HashMap<String, usize> = (self.diff_files.iter().enumerate())
             .map(|(i, f)| (f.path().to_string(), i))
             .collect();
-        let Some(ws) = self.workspace_name().map(str::to_string) else {
-            return;
-        };
+        let ws = self.workspace_name()?.to_string();
         let id = match comp.draft.id {
             0 => self.review.store.new_id(&ws),
             id => id,
         };
+        let kept = !text.is_empty();
         self.edit_comments(cx, |list| {
             let old = list.iter().position(|c| c.id == id).map(|i| list.remove(i));
             if !text.is_empty() {
@@ -841,6 +864,7 @@ impl Differ {
             }
         });
         self.focus_diff(window, cx);
+        kept.then_some(id)
     }
 
     /// Esc: drops the draft (an edited thread stays as it was).
@@ -856,16 +880,20 @@ impl Differ {
 
     /// The shown thread under the line cursor (or the selection's last line).
     pub(crate) fn thread_at(&self, cx: &App) -> Option<u64> {
-        let r = self.diff.read(cx).selected_lines()?;
+        let r = self.diff.read(cx).selected_lines();
+        let jumped = (self.review.jumped.as_ref()).filter(|(_, sel)| *sel == r);
+        let Some(r) = r else {
+            // `]c` landed on a thread without a row: it is the one, until the cursor moves.
+            return jumped
+                .map(|(id, _)| *id)
+                .filter(|&id| self.comment(id).is_some());
+        };
         let at = DiffLinePosition::new(r.path().clone(), r.end_side(), r.end());
         let here: Vec<u64> = (self.ws_comments().iter())
             .filter(|c| c.shown() && c.covers(&at))
             .map(|c| c.id)
             .collect();
-        (self.review.jumped.as_ref())
-            .filter(|(id, sel)| *sel == r && here.contains(id))
-            .map(|(id, _)| *id)
-            .or(here.first().copied())
+        (jumped.map(|(id, _)| *id).filter(|id| here.contains(id))).or(here.first().copied())
     }
 
     /// Thread `id`, unless it waits in a chat's queued review card (that card would send it
@@ -1052,32 +1080,35 @@ impl Differ {
         self.diff.update(cx, |d, cx| d.set_selected_lines(sel, cx));
     }
 
-    /// Puts the line cursor on comment `id`.
+    /// Puts the line cursor on comment `id`. A thread without a row (under its file header,
+    /// or its file left the diff and it shows below) is still the one `e`/`x`/`r` act on,
+    /// with no line selected, until the cursor moves.
     pub(crate) fn jump_to_comment(&mut self, id: u64, window: &mut Window, cx: &mut Context<Self>) {
         let Some(c) = self.comment(id).cloned() else {
             return;
         };
-        // Orphans have no row to go to; they show below the diff.
-        if !self.diff_files.iter().any(|f| *f.path() == c.path) {
-            return notify_err(
-                window,
-                cx,
-                "Its file is no longer in the diff: see the threads below it",
-            );
-        }
         self.drop_mouse_selection(window, cx);
-        // A viewed file is folded: its line has no row.
-        self.diff.update(cx, |d, cx| {
-            if d.is_file_collapsed(&c.path) {
-                d.set_file_collapsed(&c.path, false, cx)
-            }
-        });
-        self.reveal(&Spot::Line(c.anchor()), 0., cx);
+        let in_diff = self.change_ix(id).is_some();
+        let on_line = in_diff && self.on_its_line(&c);
+        if in_diff {
+            // A viewed file is folded: its line has no row.
+            self.diff.update(cx, |d, cx| {
+                if d.is_file_collapsed(&c.path) {
+                    d.set_file_collapsed(&c.path, false, cx)
+                }
+            });
+            let spot = match on_line {
+                true => Spot::Line(c.anchor()),
+                false => Spot::File(c.path.clone().into()),
+            };
+            self.reveal(&spot, 0., cx);
+        }
         // `find` lands on the closest row; the thread's own line is what `e`/`x` read.
-        let sel = DiffLineRange::new(c.path.clone(), side(c.end.0), c.end.1, c.end.1);
-        self.diff
-            .update(cx, |d, cx| d.set_selected_lines(Some(sel), cx));
-        self.review.jumped = self.diff.read(cx).selected_lines().map(|s| (id, s));
+        let sel =
+            on_line.then(|| DiffLineRange::new(c.path.clone(), side(c.end.0), c.end.1, c.end.1));
+        self.diff.update(cx, |d, cx| d.set_selected_lines(sel, cx));
+        self.review.jumped = Some((id, self.diff.read(cx).selected_lines()));
+        cx.notify();
     }
 
     /// `]c` / `[c`: the next (previous) thread, wrapping; with none, the next change.
@@ -1087,23 +1118,34 @@ impl Differ {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // Top to bottom as the diff shows them; one row's by id. Orphans (their file left the
-        // diff) have no row, so they are skipped.
+        // Top to bottom as the diff shows them; one row's by id. A thread under its file
+        // header sits at the header; orphans (their file left the diff) come last.
         let rows = self.diff_rows(cx);
         let row = |l: DiffLinePosition| find(&rows, &Spot::Line(l));
         let mut threads: Vec<(usize, u64)> = (self.ws_comments().iter())
-            .filter(|c| c.shown() && self.diff_files.iter().any(|f| *f.path() == c.path))
-            .map(|c| (row(c.anchor()), c.id))
+            .filter(|c| c.shown())
+            .map(|c| {
+                let r = match (self.change_ix(c.id).is_some(), self.on_its_line(c)) {
+                    (true, true) => row(c.anchor()),
+                    (true, false) => find(&rows, &Spot::File(c.path.clone().into())),
+                    (false, _) => usize::MAX,
+                };
+                (r, c.id)
+            })
             .collect();
         if threads.is_empty() {
             return self.diff_change(forward, window, cx);
         }
         threads.sort();
-        let here = self.thread_at(cx).unwrap_or(0);
-        let at = (self.diff.read(cx).selected_lines()).map(|r| {
-            let l = DiffLinePosition::new(r.path().clone(), r.end_side(), r.end());
-            (row(l), here)
-        });
+        let here = self.thread_at(cx);
+        let at = match self.diff.read(cx).selected_lines() {
+            Some(r) => {
+                let l = DiffLinePosition::new(r.path().clone(), r.end_side(), r.end());
+                Some((row(l), here.unwrap_or(0)))
+            }
+            // On a jumped thread without a row: the next one after it.
+            None => here.and_then(|id| threads.iter().find(|t| t.1 == id).copied()),
+        };
         let next = match (forward, at) {
             (_, None) => threads.first(),
             (true, Some(at)) => threads.iter().find(|&&t| t > at).or(threads.first()),
@@ -1232,6 +1274,7 @@ impl Differ {
                     this.submit_composer(w, cx);
                 }
             }))
+            .on_action(cx.listener(|this, _: &SendNow, w, cx| this.send_composer_now(w, cx)))
             .capture_action(cx.listener(|this, _: &Escape, w, cx| {
                 cx.stop_propagation();
                 this.cancel_composer(w, cx);
@@ -1302,7 +1345,7 @@ impl Differ {
                             .text_color(theme.muted_foreground)
                             .child(match editing {
                                 true => "Empty text deletes the thread",
-                                false => "Stays pending until you send the review",
+                                false => "⌘↵ keeps it for ⇧C's review · ⌘⇧↵ sends it now",
                             }),
                     )
                     .child(
@@ -1311,9 +1354,22 @@ impl Differ {
                             .xsmall()
                             .flex_shrink_1()
                             .min_w_0()
-                            .label("Esc")
+                            .label("Cancel esc")
                             .on_click(cx.listener(|this, _, w, cx| this.cancel_composer(w, cx))),
                     )
+                    .when(!editing, |d| {
+                        d.child(
+                            Button::new("composer-send")
+                                .outline()
+                                .xsmall()
+                                .flex_shrink_1()
+                                .min_w_0()
+                                .label("Send now ⌘⇧↵")
+                                .on_click(
+                                    cx.listener(|this, _, w, cx| this.send_composer_now(w, cx)),
+                                ),
+                        )
+                    })
                     .child(
                         Button::new("composer-add")
                             .primary()
@@ -1325,7 +1381,9 @@ impl Differ {
                             } else {
                                 "Add to review ⌘↵"
                             })
-                            .on_click(cx.listener(|this, _, w, cx| this.submit_composer(w, cx))),
+                            .on_click(cx.listener(|this, _, w, cx| {
+                                this.submit_composer(w, cx);
+                            })),
                     ),
             )
             .test_support()
@@ -1385,11 +1443,11 @@ impl Differ {
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, e: &MouseDownEvent, w, cx| {
+                    // Stopped here, the diff never took the focus: the keys after the menu
+                    // closes are its, not the last text box's.
                     cx.stop_propagation();
-                    // Selects it like `]c`; a thread whose file left the diff has no line to select.
-                    if this.change_ix(id).is_some() {
-                        this.jump_to_comment(id, w, cx);
-                    }
+                    this.focus_diff(w, cx);
+                    this.jump_to_comment(id, w, cx); // selects it like `]c`
                     let entries = this.thread_menu(id, cx);
                     this.show_menu(e.position, entries, w, cx);
                 }),
