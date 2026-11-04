@@ -14,7 +14,7 @@ use crate::{
     ExpandDir, NextFile, NextHunk, NextThread, OpenFile, PageDown, PageUp, PlayMedia, PrevFile,
     PrevHunk, PrevThread, RefreshDiff, ReopenThread, RequeueOutdated, ResolveAddressed,
     ResolveThread, SaveFile, SelectFirst, SelectLast, SelectNext, SelectPrev, SendComments,
-    SubmitForm, SuggestChange, ToggleDiffMode, ToggleRow, ToggleViewed, ViewChange, git,
+    SendNow, SubmitForm, SuggestChange, ToggleDiffMode, ToggleRow, ToggleViewed, ViewChange, git,
 };
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
@@ -43,6 +43,7 @@ mod review_store;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod test_support;
 pub(crate) use diff::Viewed;
+pub(crate) use review_send::Target;
 
 #[derive(Clone)]
 pub(crate) struct Preferences {

@@ -43,9 +43,7 @@ use gpui_kit::component::{ActiveTheme, Icon, Selectable as _, WindowExt as _, h_
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 pub(crate) use links::{copy_button, link_roots, markdown};
-#[cfg(all(test, feature = "test-support"))]
-pub(crate) use model::model_entries;
-pub(crate) use model::{effort_label, model_label};
+pub(crate) use model::{effort_label, model_entries, model_label};
 use planmode::{ENTER_PLAN, NEEDS_APPROVAL, PLAN_SHOWN};
 pub(crate) use review::{ReviewCard, ReviewItem, parse_reports};
 use review::{card_of, hidden_reply, hide_reports, may_report, review_title, split_notes};

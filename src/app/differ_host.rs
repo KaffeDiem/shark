@@ -1,5 +1,6 @@
 //! Workspace-qualified integration with Differ. Destructive coordination stays in the host.
 use super::*;
+use crate::state::ChatMeta;
 use differ::{DifferEvent, WorkspaceSnapshot};
 
 impl Shark {
@@ -247,22 +248,47 @@ impl Shark {
                 if self.active.as_ref() != Some(&request.workspace)
                     || !self.differ.read(cx).review_request_valid(request)
                 {
-                    return;
+                    return notify_err(window, cx, "The diff changed; open the sheet again");
                 }
-                let Some(chat) = self
-                    .active_chat()
-                    .filter(|chat| chat.read(cx).meta.id == request.chat)
-                    .cloned()
-                else {
+                let Some(ws) = self.active_ws().cloned() else {
                     return;
                 };
+                // A new chat is a tab like cmd-t's, but the diff stays on screen.
+                let meta = match &request.target {
+                    differ::Target::Chat(id) => ws.chats.iter().find(|m| &m.id == id).cloned(),
+                    differ::Target::New(pick) => {
+                        let meta = ChatMeta {
+                            model: pick.model.clone(),
+                            effort: pick.effort.clone(),
+                            ..self.state.new_chat(&ws, ws.next_chat_id())
+                        };
+                        self.active_ws_mut().unwrap().push_chat(meta.clone());
+                        let _ = self.state.save();
+                        self.configure_differ(cx); // the next sheet lists it
+                        Some(meta)
+                    }
+                };
+                let Some(meta) = meta else {
+                    return notify_err(window, cx, "That chat was closed");
+                };
+                let ws = self.active_ws().cloned().unwrap();
+                let chat = self.ensure_chat(&ws, &meta, window, cx);
                 if !chat.update(cx, |c, cx| c.send_review(request.card.clone(), cx)) {
+                    // A new chat shows its refusal; the next send's "This chat" is it, so
+                    // no second one is made.
+                    if matches!(request.target, differ::Target::New(_))
+                        && let Some(ix) = ws.chats.iter().position(|m| m.id == meta.id)
+                    {
+                        self.select_chat(ix, window, cx);
+                    }
                     return notify_err(window, cx, "Review not sent; the chat says why");
                 }
+                let queued = chat.read(cx).queued() > 0;
                 // GPUI delivers Chat events after this update. Queue first, so even an immediate
                 // ReviewSent acknowledgement observes the accepted comments.
-                self.differ
-                    .update(cx, |d, cx| d.review_accepted(request, window, cx));
+                self.differ.update(cx, |d, cx| {
+                    d.review_accepted(request, &meta.id, queued, window, cx)
+                });
             }
             _ => {}
         }

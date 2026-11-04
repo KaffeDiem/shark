@@ -5187,6 +5187,207 @@ async fn split_ratio_and_inline_edit(cx: &mut TestAppContext) {
 }
 
 /// The review queue end to end: compose (c), suggest, edit (e) and delete (x) threads, the
+/// Where a review goes: cmd-shift-enter in the composer sends the draft to the shown chat
+/// without the sheet; the sheet's target rows send to a new chat on the picked model, or to
+/// another open chat, while the diff stays on screen.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn review_targets(cx: &mut TestAppContext) {
+    use review::Status;
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos(&home, &["api"]),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.create_workspace(
+            "rt".into(),
+            git::on_branch(&repos, "rt"),
+            vec![],
+            None,
+            w,
+            cx,
+        )
+    });
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.is_some()
+    })
+    .await;
+    let api = home.join("shark/workspaces/rt/api");
+    fs::write(api.join("f"), "a\nb\nc\n").unwrap();
+    on(cx, &|s, w, cx| s.show(Tab::Feature(Feature::Diff), w, cx));
+    cx.update(|cx| assert_eq!(shark.read(cx).differ.read(cx).diff_files().len(), 1));
+    let press = press_in(window);
+    let comments = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            (shark.read(cx).differ.read(cx).ws_comments().iter())
+                .map(|c| (c.id, c.status.clone(), c.chat.clone()))
+                .collect::<Vec<_>>()
+        })
+    };
+    let typing = |cx: &mut TestAppContext, t: &str| {
+        cx.update_window(window, |_, w, cx| w.input(t, cx)).unwrap();
+        cx.run_until_parked();
+    };
+    let chats = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let ws = shark.read(cx).active_ws().unwrap();
+            (
+                ws.chats.iter().map(|c| c.id.clone()).collect::<Vec<_>>(),
+                ws.active_chat,
+            )
+        })
+    };
+    let first = cx.update(|cx| shark.read(cx).active_chat().cloned().unwrap());
+    let first_id = cx.update(|cx| first.read(cx).meta.id.clone());
+
+    // cmd-shift-enter: one chord sends the draft to the shown chat; no sheet, no pending.
+    press(cx, &["down", "c"]);
+    typing(cx, "quick nit");
+    press(cx, &["cmd-shift-enter"]);
+    cx.update(|cx| {
+        let d = shark.read(cx).differ.read(cx);
+        assert!(d.review().composer.is_none() && d.review().sheet.is_none());
+    });
+    assert_eq!(
+        comments(cx),
+        [(1, Status::Sent { turn: 1 }, Some(first_id.clone()))]
+    );
+    assert!(cx.update(|cx| first.read(cx).sent_texts()[0].contains("quick nit")));
+
+    // Two more pending, then the sheet (the bar's button, with the composer still open): it
+    // opens on "This chat" and the draft being typed is in it too.
+    press(cx, &["down", "c"]);
+    typing(cx, "second");
+    press(cx, &["cmd-enter", "down", "c"]);
+    typing(cx, "third");
+    on(cx, &|s, w, cx| {
+        s.differ.update(cx, |d, cx| d.open_sheet(w, cx))
+    });
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        let sheet = s.differ.read(cx).review().sheet.as_ref().unwrap();
+        assert_eq!(sheet.rows, [(2, true), (3, true)]);
+        assert_eq!(sheet.targets.len(), 2, "this chat, new chat");
+        assert_eq!(sheet.target, 0);
+        assert_eq!(
+            sheet.pick.model,
+            s.active_chat().unwrap().read(cx).meta.model
+        );
+    });
+    // tab: New chat; a model picked into the sheet; cmd-enter makes the chat, the diff stays.
+    press(cx, &["tab"]);
+    on(cx, &|s, _, cx| {
+        s.differ.update(cx, |d, _| {
+            let sheet = d.review_mut().sheet.as_mut().unwrap();
+            assert!(sheet.targets[sheet.target].0.is_none());
+            sheet.pick.model = Some("haiku".into());
+            sheet.pick.effort = Some("low".into());
+        })
+    });
+    press(cx, &["cmd-enter"]);
+    let (ids, active) = chats(cx);
+    assert_eq!(
+        (ids.len(), active),
+        (2, 0),
+        "a second chat; the first stays selected"
+    );
+    let new_id = ids[1].clone();
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.tab, Tab::Feature(Feature::Diff));
+        let meta = &s.active_ws().unwrap().chats[1];
+        assert_eq!(
+            (
+                meta.model.as_deref(),
+                meta.effort.as_deref(),
+                meta.title.as_str()
+            ),
+            (Some("haiku"), Some("low"), "Review · 2 comments")
+        );
+        assert!(s.differ.read(cx).review().sheet.is_none());
+    });
+    assert_eq!(
+        (comments(cx)[1].1.clone(), comments(cx)[1].2.clone()),
+        (Status::Sent { turn: 1 }, Some(new_id.clone()))
+    );
+    assert_eq!(
+        cx.update(|cx| first.read(cx).sent_texts().len()),
+        1,
+        "the first chat got nothing"
+    );
+
+    let other = cx.update(|cx| shark.read(cx).chats.get(&new_id).cloned().unwrap());
+    let said = |t: &str| {
+        [
+            serde_json::json!({"type": "assistant", "message": {"content": [{"type": "text", "text": t}]}, "parent_tool_use_id": null}).to_string(),
+            serde_json::json!({"type": "result", "is_error": false, "result": t, "total_cost_usd": 0, "duration_ms": 1}).to_string(),
+        ]
+    };
+    let reply = |cx: &mut TestAppContext, t: &str| {
+        let lines = said(t);
+        cx.update(|cx| {
+            other.update(cx, |c, cx| {
+                let lines: Vec<&str> = lines.iter().map(|l| l.as_str()).collect();
+                crate::chat::ui_tests::play(c, &lines, cx)
+            })
+        });
+        cx.run_until_parked();
+    };
+    reply(cx, "Working."); // its first turn ends, so the next review goes out at once
+
+    // Another thread to the other (unshown) chat: it is listed by title after New chat, and
+    // its report lands on the thread.
+    press(cx, &["c"]);
+    typing(cx, "fourth");
+    press(cx, &["cmd-enter", "shift-c"]);
+    cx.update(|cx| {
+        let sheet = shark
+            .read(cx)
+            .differ
+            .read(cx)
+            .review()
+            .sheet
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            sheet
+                .targets
+                .iter()
+                .map(|t| t.1.as_str())
+                .collect::<Vec<_>>(),
+            ["This chat", "New chat", "Review · 2 comments"]
+        );
+    });
+    press(cx, &["tab", "tab", "cmd-enter"]);
+    assert_eq!(comments(cx)[3].2, Some(new_id.clone()));
+    assert_eq!(chats(cx).1, 0, "still on the first chat");
+    assert!(
+        matches!(comments(cx)[3].1, Status::Sent { .. }),
+        "{:?}",
+        comments(cx)[3]
+    );
+    reply(cx, "[c4] addressed: Done.");
+    assert!(
+        matches!(comments(cx)[3].1, Status::Addressed { .. }),
+        "{:?}",
+        comments(cx)[3]
+    );
+    assert!(
+        matches!(comments(cx)[0].1, Status::Sent { .. }),
+        "the first chat's thread is untouched"
+    );
+}
+
 /// send sheet (shift-c) sending only what is ticked, agent reports and changed lines judging
 /// the threads, resolve / reopen / re-queue, a review queued behind a busy turn and removed
 /// from its chat card, orphaned threads, and sharing to GitHub through a fake gh.

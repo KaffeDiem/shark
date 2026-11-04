@@ -40,7 +40,7 @@ Shark opens on Home (`cmd-0`). Type what you want to build and press `enter` to 
 
 1. Choose **Add repo** in `cmd-k`. `cmd-n`, tick the repos, and name the branch. `enter` creates the workspace.
 2. `shift-tab` for plan mode. Revise the plan in the chat, then `a` in the plan pane to build.
-3. `cmd-shift-d`, or **Differ** in the Features rail, opens the Diff artifact with its changed-files tree. `c` on a diff line leaves a comment, and `shift-c` sends the review to the agent.
+3. `cmd-shift-d`, or **Differ** in the Features rail, opens the Diff artifact with its changed-files tree. `c` on a diff line leaves a comment (`cmd-shift-enter` sends it right away), and `shift-c` sends the review to this chat, a new chat on a model you pick, or another open chat.
 4. Create or update PRs (`cmd-k` or the git menu) opens linked PRs. The git button (top right) takes it from there.
 
 ## Learn more

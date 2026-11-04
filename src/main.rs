@@ -197,7 +197,9 @@ actions!(
         SuggestChange,
         ToggleRow,
         ResolveAddressed,
-        RequeueOutdated
+        RequeueOutdated,
+        SendNow,
+        CycleTarget
     ]
 );
 
@@ -422,6 +424,8 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("[ c", PrevThread, Some(DIFF)),
         // The composer takes cmd-enter and escape from its textarea itself.
         KeyBinding::new("cmd-shift-s", SuggestChange, Some("ReviewComposer")),
+        KeyBinding::new("cmd-shift-enter", SendNow, Some("ReviewComposer")),
+        KeyBinding::new("tab", CycleTarget, Some("ReviewSheet")),
         KeyBinding::new("space", ToggleRow, Some("ReviewSheet")),
         KeyBinding::new("enter", Confirm, Some("ReviewSheet")),
         KeyBinding::new("escape", CancelEdit, Some("ReviewSheet")),
