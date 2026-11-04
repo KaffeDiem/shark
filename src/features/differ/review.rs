@@ -249,6 +249,7 @@ impl Review {
     pub(crate) fn at_file(&mut self, path: &str) {
         let s = Spot::File(path.to_string().into());
         self.view = Some((s.clone(), s));
+        self.jumped = None; // the cursor left the jumped thread
     }
 }
 
@@ -425,6 +426,7 @@ impl Differ {
 
     /// The mouse scrolled: the view model no longer matches the screen.
     pub(crate) fn lose_view(&mut self) {
+        self.review.jumped = None;
         self.review.view = None;
     }
 
@@ -595,7 +597,13 @@ impl Differ {
                         .ghost()
                         .xsmall()
                         .label(format!("Remove all {}", removable.len()))
-                        .on_click(cx.listener(move |this, _, _, cx| {
+                        .on_click(cx.listener(move |this, _, w, cx| {
+                            // A composer on one of them would add it back (`keep_draft`).
+                            if (this.review.composer.as_ref())
+                                .is_some_and(|c| removable.contains(&c.draft.id))
+                            {
+                                this.cancel_composer(w, cx);
+                            }
                             this.edit_comments(cx, |l| l.retain(|c| !removable.contains(&c.id)))
                         })),
                 )
@@ -819,8 +827,13 @@ impl Differ {
     /// cmd-shift-enter: the draft straight to the shown chat, skipping the sheet (the other
     /// pending threads stay for a later send).
     pub(crate) fn send_composer_now(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(id) = self.submit_composer(window, cx) {
-            self.send_review(&[id], "", false, window, cx);
+        let Some(id) = self.submit_composer(window, cx) else {
+            return;
+        };
+        // An edited thread with the same words is still where it was.
+        match self.comment(id).map(|c| c.status == Status::Pending) {
+            Some(true) => self.send_review(&[id], "", false, window, cx),
+            _ => notify_err(window, cx, "Nothing new to send: the agent has this thread"),
         }
     }
 
@@ -1428,6 +1441,8 @@ impl Differ {
             (false, false) => "",
         };
         let mono = theme.mono_font_family.clone();
+        // No line to select for it: the card itself shows `]c` landed here.
+        let picked = !self.on_its_line(&c) && self.thread_at(cx) == Some(id);
         v_flex()
             .id(("thread-card", id as usize))
             .min_w_0()
@@ -1439,6 +1454,7 @@ impl Differ {
             .gap_1p5()
             .border_l_2()
             .border_color(color)
+            .when(picked, |d| d.bg(theme.list_active))
             .text_sm()
             .on_mouse_down(
                 MouseButton::Right,

@@ -327,6 +327,14 @@ async fn jumping_to_threads_unfolds_files_and_reaches_orphans(cx: &mut TestAppCo
         });
         assert_eq!(at(cx), Some(want), "]c");
     }
+    // Moving to a file in the tree leaves the orphan: `x` would act on nothing.
+    on(cx, &|s, _, cx| {
+        s.differ.update(cx, |d, cx| d.goto_file(0, cx))
+    });
+    assert_eq!(at(cx), None, "the tree jump left the orphan");
+    on(cx, &|s, w, cx| {
+        s.differ.update(cx, |d, cx| d.jump_to_comment(2, w, cx))
+    });
     // `x` there deletes it, as on any thread; the cursor then names none.
     on(cx, &|s, w, cx| {
         s.differ.update(cx, |d, cx| {
