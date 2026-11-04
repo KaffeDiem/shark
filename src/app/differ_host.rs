@@ -274,6 +274,13 @@ impl Shark {
                 let ws = self.active_ws().cloned().unwrap();
                 let chat = self.ensure_chat(&ws, &meta, window, cx);
                 if !chat.update(cx, |c, cx| c.send_review(request.card.clone(), cx)) {
+                    // A new chat shows its refusal; the next send's "This chat" is it, so
+                    // no second one is made.
+                    if matches!(request.target, differ::Target::New(_))
+                        && let Some(ix) = ws.chats.iter().position(|m| m.id == meta.id)
+                    {
+                        self.select_chat(ix, window, cx);
+                    }
                     return notify_err(window, cx, "Review not sent; the chat says why");
                 }
                 let queued = chat.read(cx).queued() > 0;

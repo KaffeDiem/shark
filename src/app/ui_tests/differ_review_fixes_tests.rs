@@ -335,6 +335,21 @@ async fn jumping_to_threads_unfolds_files_and_reaches_orphans(cx: &mut TestAppCo
     on(cx, &|s, w, cx| {
         s.differ.update(cx, |d, cx| d.jump_to_comment(2, w, cx))
     });
+    // Resolved there, it is hidden and no longer the thread at the cursor.
+    on(cx, &|s, _, cx| {
+        s.differ.update(cx, |d, cx| {
+            d.set_status(&[2], review::Status::Sent { turn: 1 }, cx);
+            d.resolve_thread(cx);
+        })
+    });
+    assert_eq!(at(cx), None, "resolved: hidden");
+    on(cx, &|s, _, cx| {
+        s.differ
+            .update(cx, |d, cx| d.set_status(&[2], review::Status::Pending, cx))
+    });
+    on(cx, &|s, w, cx| {
+        s.differ.update(cx, |d, cx| d.jump_to_comment(2, w, cx))
+    });
     // `x` there deletes it, as on any thread; the cursor then names none.
     on(cx, &|s, w, cx| {
         s.differ.update(cx, |d, cx| {

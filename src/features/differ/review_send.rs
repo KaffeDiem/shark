@@ -423,6 +423,13 @@ impl Differ {
             .shadow_lg()
             .text_sm()
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
+            // cmd-/ anywhere in the sheet (the note too) picks the new chat's model, not the
+            // shown chat's.
+            .on_action(cx.listener(|this, _: &PickModel, w, cx| {
+                if this.review.sheet.as_ref().is_some_and(|s| s.targets[s.target].0.is_none()) {
+                    this.sheet_model_menu(w, cx)
+                }
+            }))
             // In the note: cmd-enter sends and Esc closes, as everywhere in the sheet.
             .capture_action(cx.listener(|this, a: &Enter, w, cx| {
                 if a.secondary {
@@ -475,11 +482,6 @@ impl Differ {
                     .on_action(cx.listener(|this, _: &CancelEdit, w, cx| this.close_sheet(w, cx)))
                     .on_action(cx.listener(|this, _: &SubmitForm, w, cx| this.sheet_send(w, cx)))
                     .on_action(cx.listener(|this, _: &CycleTarget, _, cx| this.sheet_cycle_target(cx)))
-                    .on_action(cx.listener(|this, _: &PickModel, w, cx| {
-                        if this.review.sheet.as_ref().is_some_and(|s| s.targets[s.target].0.is_none()) {
-                            this.sheet_model_menu(w, cx)
-                        }
-                    }))
                     .children(rows),
             )
             .child(

@@ -238,6 +238,8 @@ pub(crate) struct Review {
     pub(crate) composer: Option<Composer>,
     pub(crate) sheet: Option<review_send::Sheet>,
     pub(crate) share: Option<review_share::Share>,
+    /// The list below the diff, so `]c` brings the orphan it lands on into view.
+    orphan_scroll: ScrollHandle,
     /// The thread last jumped to, and the lines selected for it: while they stay selected it
     /// is the thread there, though another one starts on the same line. `None` lines for a
     /// thread without a row (under its file header, or its file left the diff).
@@ -332,8 +334,11 @@ impl Differ {
             };
             d.set_selected_lines(sel, cx);
         });
+        // A refresh restoring the same spot keeps the jumped thread; a move drops it.
+        if self.review.view.as_ref().is_none_or(|v| v.1 != c) {
+            self.review.jumped = None;
+        }
         self.review.view = Some((t, c));
-        self.review.jumped = None; // the cursor left the jumped thread
         cx.notify();
     }
 
@@ -646,6 +651,7 @@ impl Differ {
         Some(
             v_flex()
                 .id("orphan-threads")
+                .track_scroll(&self.review.orphan_scroll)
                 .flex_none()
                 .max_h(px(240.))
                 .overflow_y_scroll()
@@ -899,7 +905,7 @@ impl Differ {
             // `]c` landed on a thread without a row: it is the one, until the cursor moves.
             return jumped
                 .map(|(id, _)| *id)
-                .filter(|&id| self.comment(id).is_some());
+                .filter(|&id| self.comment(id).is_some_and(Comment::shown));
         };
         let at = DiffLinePosition::new(r.path().clone(), r.end_side(), r.end());
         let here: Vec<u64> = (self.ws_comments().iter())
@@ -1115,6 +1121,11 @@ impl Differ {
                 false => Spot::File(c.path.clone().into()),
             };
             self.reveal(&spot, 0., cx);
+        } else if let Some(ix) = (self.ws_comments().iter())
+            .filter(|c| c.shown() && self.change_ix(c.id).is_none())
+            .position(|c| c.id == id)
+        {
+            self.review.orphan_scroll.scroll_to_item(ix + 1); // after the title
         }
         // `find` lands on the closest row; the thread's own line is what `e`/`x` read.
         let sel =
