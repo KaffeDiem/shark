@@ -343,7 +343,6 @@ mod tests {
         let done = |is_error| Ev::Result {
             is_error,
             text: String::new(),
-            cost: 0.,
             secs: 0,
         };
         let turn = |text: &str| vec![Ev::User("go".into()), Ev::Text(text.into()), done(false)];

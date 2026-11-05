@@ -1,10 +1,8 @@
 //! One agent conversation (a chat tab): transcript blocks, composer, and the claude process.
-pub(crate) mod activity;
-#[cfg(test)]
-mod activity_tests;
 mod completion;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod completion_pixels;
+mod critters;
 mod links;
 mod model;
 mod planmode;
@@ -39,7 +37,9 @@ use gpui_kit::component::shimmer::ShimmerText;
 use gpui_kit::component::spinner::Spinner;
 use gpui_kit::component::text::{TextView, TextViewState, TextViewStyle};
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, Icon, Selectable as _, WindowExt as _, h_flex, v_flex};
+use gpui_kit::component::{
+    ActiveTheme, Icon, Selectable as _, ThemeColor, WindowExt as _, h_flex, v_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 pub(crate) use links::{copy_button, link_roots, markdown};
@@ -122,10 +122,7 @@ pub struct Chat {
     pub busy: bool,
     /// Background tasks (subagents, shells) still running; the turn can end before they do.
     pub background: Vec<agent::Task>,
-    task_pokemon: HashMap<String, String>,
-    activity_roster: Vec<activity::Pokemon>,
-    activity_portraits:
-        std::collections::BTreeMap<activity::Appearance, std::sync::Arc<RenderImage>>,
+    critters: HashMap<String, usize>,
     hop: usize,
     hopping: Option<Task<()>>,
     /// When the running turn started.
@@ -177,8 +174,6 @@ pub struct Chat {
     unread: VecDeque<usize>,
     /// The turn was interrupted; its result reads "interrupted".
     cut: bool,
-    /// `total_cost_usd` of the last result: claude reports a running total, shown per turn.
-    cost_total: f64,
     /// SIGTERM fallback for an interrupt claude doesn't act on.
     stopping: Option<Task<()>>,
     /// Applying stored history: nothing is emitted to the app.
@@ -241,16 +236,6 @@ pub(crate) fn read_events<T: 'static>(
             }
         }
     })
-}
-
-/// A turn's cost from claude's running `total` (updated here); a lower total is a fresh
-/// process's, shown as it is.
-fn turn_cost(total: &mut f64, cost: f64) -> f64 {
-    let turn = if cost >= *total { cost - *total } else { cost };
-    if cost > 0. {
-        *total = cost; // codex and failures report none
-    }
-    turn
 }
 
 /// "48s", "2m 5s".
@@ -320,9 +305,7 @@ impl Chat {
             sel: 0,
             busy: false,
             background: vec![],
-            task_pokemon: HashMap::new(),
-            activity_roster: vec![],
-            activity_portraits: std::collections::BTreeMap::new(),
+            critters: HashMap::new(),
             hop: 0,
             hopping: None,
             started: None,
@@ -357,7 +340,6 @@ impl Chat {
             prs_at: None,
             unread: VecDeque::new(),
             cut: false,
-            cost_total: 0.,
             stopping: None,
             replaying: false,
             queue: vec![],
@@ -409,7 +391,7 @@ impl Chat {
         let kept = (
             self.busy,
             std::mem::take(&mut self.background),
-            std::mem::take(&mut self.task_pokemon),
+            std::mem::take(&mut self.critters),
             self.hop,
             self.hopping.take(),
             self.started,
@@ -417,7 +399,6 @@ impl Chat {
             self.meta.session_id.clone(),
         );
         (self.busy, self.cut, self.replaying) = (false, false, true);
-        self.cost_total = 0.;
         for ev in evs {
             // A turn that never got its result was cut off by quitting (or a crash).
             if matches!(ev, Ev::Init { .. }) && self.busy {
@@ -433,7 +414,7 @@ impl Chat {
         (
             self.busy,
             self.background,
-            self.task_pokemon,
+            self.critters,
             self.hop,
             self.hopping,
             self.started,
@@ -1013,9 +994,8 @@ impl Chat {
             Ev::Result {
                 is_error,
                 text,
-                cost,
                 secs,
-            } => self.on_result(is_error, text, cost, secs, cx),
+            } => self.on_result(is_error, text, secs, cx),
             Ev::Exited(msg) => {
                 self.drop_process(cx);
                 if self.busy {
@@ -1222,14 +1202,7 @@ impl Chat {
         }
     }
 
-    fn on_result(
-        &mut self,
-        is_error: bool,
-        text: String,
-        cost: f64,
-        secs: u64,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_result(&mut self, is_error: bool, text: String, secs: u64, cx: &mut Context<Self>) {
         self.busy = false;
         if !self.replaying {
             self.stopping = None; // a live interrupt's fallback outlives history
@@ -1240,13 +1213,12 @@ impl Chat {
         // every resume would fail the same way. (Replay restores the session after.)
         let gone = is_error && text.starts_with(agent::SESSION_GONE);
         let took = duration(secs);
-        let cost = turn_cost(&mut self.cost_total, cost);
         self.blocks.push(Block::Info(if cut {
-            format!("interrupted · {took} · ${cost:.2}")
+            format!("interrupted · {took}")
         } else if is_error {
             format!("error: {text}")
         } else {
-            format!("done · {took} · ${cost:.2}")
+            format!("done · {took}")
         }));
         if gone {
             self.meta.session_id = None;
@@ -2013,29 +1985,11 @@ impl Render for Chat {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
-
-    #[test]
-    fn turn_cost_is_the_delta_of_the_running_total() {
-        let mut total = 0.;
-        assert_eq!(turn_cost(&mut total, 0.5), 0.5);
-        assert_eq!(turn_cost(&mut total, 0.75), 0.25);
-        // A fresh process reports a lower total: shown as it is.
-        assert_eq!(turn_cost(&mut total, 0.25), 0.25);
-        // codex and failures report none: the total stays.
-        assert_eq!(turn_cost(&mut total, 0.), 0.);
-        assert_eq!(total, 0.25);
-    }
-}
-
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod ui_tests {
     use super::*;
     use crate::models::effort_of;
-    use activity::HOP_INTERVAL;
+    use critters::HOP_INTERVAL;
     use planmode::{APPROVED, BUILD_FRESH};
 
     /// Feeds recorded protocol lines to the chat as its process would.
@@ -2051,66 +2005,6 @@ pub(crate) mod ui_tests {
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
     use gpui_kit::InputEvent as _;
     use gpui_kit::test::TestWindowExt as _;
-
-    pub(crate) fn set_activity_tasks(
-        c: &mut Chat,
-        tasks: Vec<agent::Task>,
-        cx: &mut Context<Chat>,
-    ) {
-        c.apply(Ev::Background(tasks), cx);
-    }
-
-    pub(crate) fn activity_snapshot(c: &Chat) -> (Vec<(String, activity::Appearance, bool)>, bool) {
-        (
-            c.background
-                .iter()
-                .filter_map(|t| {
-                    activity::assigned(t, &c.task_pokemon, &c.activity_roster).map(|p| {
-                        (
-                            t.id.clone(),
-                            p.appearance.clone(),
-                            c.activity_portraits.contains_key(&p.appearance),
-                        )
-                    })
-                })
-                .collect(),
-            c.hopping.is_some(),
-        )
-    }
-
-    pub(crate) fn seed_activity_pokemon(c: &mut Chat, cx: &mut Context<Chat>) {
-        let roster: Vec<_> = [
-            (1, "Bulbasaur"),
-            (4, "Charmander"),
-            (7, "Squirtle"),
-            (25, "Pikachu"),
-        ]
-        .into_iter()
-        .map(|(id, name)| activity::Pokemon {
-            id: format!("caught-{id}"),
-            name: name.into(),
-            appearance: (id, false, None),
-        })
-        .collect();
-        c.sync_activity_roster(&roster, cx);
-        for pokemon in roster {
-            let image = if let Some(dir) = std::env::var_os("SHARK_POKEMON_PREVIEW_SPRITES") {
-                let path = PathBuf::from(dir).join(format!("{}.gif", pokemon.appearance.0));
-                let asset =
-                    crate::pokemon::sprites::cached(&path).expect("validated preview Pokémon");
-                crate::ui::pokemon_images::render_capped(asset, std::time::Duration::MAX)
-            } else {
-                std::sync::Arc::new(RenderImage::new(vec![image::Frame::new(
-                    image::RgbaImage::from_pixel(
-                        16,
-                        16,
-                        image::Rgba([80, 160, (pokemon.appearance.0 * 8) as u8, 255]),
-                    ),
-                )]))
-            };
-            c.set_activity_portrait(pokemon.appearance, image, cx);
-        }
-    }
 
     /// Real-renderer smoke check, also exporting the parade for visual inspection.
     pub(crate) fn render_activity_pixels(cx: &mut HeadlessAppContext) {
@@ -2189,7 +2083,6 @@ pub(crate) mod ui_tests {
                             .collect(),
                         cx,
                     );
-                    seed_activity_pokemon(c, cx);
                 });
             });
             cx.run_until_parked();
@@ -2206,7 +2099,7 @@ pub(crate) mod ui_tests {
                 cx.update_window(window, |_, w, cx| {
                     w.render_frame(cx);
                     if state == "hover" {
-                        w.hover(("background-pokemon", 0usize), cx);
+                        w.hover(("background-critter", 0usize), cx);
                     }
                     if state == "static" {
                         w.pointer_move(point(px(450.), px(0.)), None, cx);
@@ -2247,7 +2140,7 @@ pub(crate) mod ui_tests {
                 if state == "static-next" {
                     assert!(
                         still.as_ref().unwrap() == &shot,
-                        "reduced motion keeps portraits still"
+                        "reduced motion keeps the critters still"
                     );
                 }
                 if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
@@ -2278,7 +2171,6 @@ pub(crate) mod ui_tests {
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
                 c.apply(Ev::Background(tasks()), cx);
-                seed_activity_pokemon(c, cx);
                 assert!(!c.busy && c.working());
                 assert!(c.hopping.is_some());
                 assert_eq!(c.list.item_count(), c.rows.len() + 1);
@@ -2291,8 +2183,8 @@ pub(crate) mod ui_tests {
                 assert_eq!(w.find("activity").bounds().size.height, px(24.));
                 (0usize..4)
                     .map(|i| {
-                        let slot = w.find(("background-pokemon", i)).bounds();
-                        assert_eq!(slot.size, size(px(20.), px(20.)));
+                        let slot = w.find(("background-critter", i)).bounds();
+                        assert_eq!(slot.size, size(px(12.), px(12.)));
                         slot
                     })
                     .collect::<Vec<_>>()
@@ -2311,15 +2203,15 @@ pub(crate) mod ui_tests {
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
                 assert_eq!(c.hop, 1);
-                let assignments = c.task_pokemon.clone();
+                let critters = c.critters.clone();
                 c.load_history(vec![Ev::Background(vec![]), Ev::Exited(String::new())], cx);
                 assert_eq!(c.background, tasks());
-                assert_eq!(c.task_pokemon, assignments);
+                assert_eq!(c.critters, critters);
                 assert_eq!(c.hop, 1);
                 assert!(c.hopping.is_some());
                 c.apply(Ev::Background(vec![]), cx);
                 assert!(!c.working());
-                assert!(c.hopping.is_none() && c.task_pokemon.is_empty());
+                assert!(c.hopping.is_none() && c.critters.is_empty());
                 assert_eq!(c.list.item_count(), c.rows.len() + 1);
             })
         });
@@ -2351,7 +2243,7 @@ pub(crate) mod ui_tests {
                     "a changed motion preference stops the timer"
                 );
                 c.apply(Ev::Exited(String::new()), cx);
-                assert!(!c.working() && c.task_pokemon.is_empty());
+                assert!(!c.working() && c.critters.is_empty());
             })
         });
     }
@@ -2537,54 +2429,6 @@ exec cat >/dev/null
         let _ = std::fs::remove_file(ws.dir());
     }
 
-    /// claude's `total_cost_usd` runs across turns (and resumes): each turn shows its share, in
-    /// replayed history too, and a lower total counts as a reset.
-    #[gpui_kit::test]
-    fn turn_cost_is_the_running_totals_delta(cx: &mut TestAppContext) {
-        cx.update(gpui_kit::init);
-        let ws = Workspace {
-            name: format!("cost-test-{}", std::process::id()),
-            ..Default::default()
-        };
-        let meta = ChatMeta {
-            id: ws.name.clone(),
-            ..Default::default()
-        };
-        let (_, chat) = cx
-            .update(|cx| {
-                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
-                    cx.new(|cx| Chat::new(ws.clone(), meta, false, w, cx))
-                })
-            })
-            .unwrap();
-        let result = |cost| Ev::Result {
-            is_error: false,
-            text: String::new(),
-            cost,
-            secs: 1,
-        };
-        let infos = |cx: &mut TestAppContext| {
-            cx.update(|cx| {
-                (chat.read(cx).blocks.iter())
-                    .filter_map(|b| match b {
-                        Block::Info(t) => t.rsplit_once('$').map(|(_, c)| c.to_string()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-        };
-        cx.update(|cx| {
-            chat.update(cx, |c, cx| {
-                c.load_history(vec![result(1.5), result(1.75)], cx);
-                c.apply(result(2.0), cx); // a live turn goes on from the history's total
-                c.apply(result(0.5), cx); // a new process starts over
-                c.apply(result(0.), cx); // codex: no price
-                c.apply(result(0.75), cx);
-            })
-        });
-        assert_eq!(infos(cx), ["1.50", "0.25", "0.25", "0.50", "0.00", "0.25"]);
-    }
-
     /// cmd-shift-enter asks the draft on the side: the answer streams into the card, the chat
     /// never sees it, and enter puts the answer into the composer.
     #[gpui_kit::test]
@@ -2640,7 +2484,6 @@ exec cat >/dev/null
         let result = || Ev::Result {
             is_error: false,
             text: String::new(),
-            cost: 0.,
             secs: 0,
         };
         cx.update(|cx| {
@@ -2693,7 +2536,6 @@ exec cat >/dev/null
                     Ev::Result {
                         is_error: true,
                         text: "No conversation found".into(),
-                        cost: 0.,
                         secs: 0,
                     },
                     cx,
@@ -2796,7 +2638,6 @@ exec cat >/dev/null
                         Ev::Result {
                             is_error: false,
                             text: String::new(),
-                            cost: 0.,
                             secs: 0,
                         },
                         cx,
@@ -3039,7 +2880,6 @@ exec cat >/dev/null
                     Ev::Result {
                         is_error: false,
                         text: String::new(),
-                        cost: 0.,
                         secs: 0,
                     },
                     cx,
@@ -3166,7 +3006,6 @@ exec cat >/dev/null
                 let result = Ev::Result {
                     is_error: false,
                     text: String::new(),
-                    cost: 0.,
                     secs: 1,
                 };
                 c.apply(result, cx);
@@ -3444,7 +3283,6 @@ exec cat >/dev/null
                     Ev::Result {
                         is_error: true,
                         text,
-                        cost: 0.,
                         secs: 0,
                     },
                     cx,
@@ -3523,14 +3361,13 @@ exec cat >/dev/null
                 let result = Ev::Result {
                     is_error: true,
                     text: String::new(),
-                    cost: 0.,
                     secs: 3,
                 };
                 c.apply(result, cx);
                 let Some(Block::Info(t)) = c.blocks.last() else {
                     panic!()
                 };
-                assert_eq!(t, "interrupted · 3s · $0.00");
+                assert_eq!(t, "interrupted · 3s");
             })
         });
         assert_eq!(emitted.get(), 1, "only the live TurnDone");
@@ -3652,7 +3489,6 @@ exec cat >/dev/null
         let result = |is_error| Ev::Result {
             is_error,
             text: String::new(),
-            cost: 0.,
             secs: 1,
         };
 

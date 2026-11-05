@@ -1,5 +1,4 @@
 use super::*;
-use objc2_foundation::{NSDate, NSISO8601DateFormatter, NSTimeZone};
 
 #[test]
 #[ignore = "read-only installed CLIs, no inference"]
@@ -183,6 +182,45 @@ fn snapshot_coalesces_and_keeps_only_temporary_failure_results() {
     assert!(s.allowances.is_empty());
     assert!(s.fetched_at.is_none());
     assert!(!s.outdated);
+}
+
+#[test]
+fn limiting_skips_expired_and_invalid_rows() {
+    let row = |label: &str, remaining, resets_at| Allowance {
+        label: label.into(),
+        remaining,
+        resets_at,
+        window: None,
+    };
+    let mut s = Snapshot::default();
+    assert!(s.limiting(100.).is_none());
+    s.allowances = vec![
+        row("expired", Some(0.), Some(50.)),
+        row("invalid", Some(150.), Some(500.)),
+        row("nan", Some(f64::NAN), None),
+        row("unknown", None, None),
+        row("5 hours", Some(80.), None),
+        row("Weekly", Some(30.), Some(500.)),
+    ];
+    assert_eq!(s.limiting(100.).unwrap().label, "Weekly");
+    s.allowances.pop();
+    assert_eq!(s.limiting(100.).unwrap().label, "5 hours");
+}
+
+#[test]
+fn pace_is_the_share_of_the_window_still_to_come() {
+    let row = |resets_at, window| Allowance {
+        label: "Weekly".into(),
+        remaining: Some(30.),
+        resets_at,
+        window,
+    };
+    assert_eq!(row(Some(150.), Some(100.)).pace(100.), Some(50.));
+    assert_eq!(row(Some(100.), Some(100.)).pace(150.), Some(0.));
+    assert_eq!(row(Some(500.), Some(100.)).pace(100.), Some(100.));
+    assert_eq!(row(None, Some(100.)).pace(100.), None);
+    assert_eq!(row(Some(150.), None).pace(100.), None);
+    assert_eq!(row(Some(150.), Some(0.)).pace(100.), None);
 }
 
 struct Fake {
@@ -380,155 +418,6 @@ fn fake_errors_missing_cli_and_timeout_cleanup() {
     );
     assert_eq!(fake.requests().len(), 1);
     fake.reaped();
-}
-
-fn midnight(day: i64) -> f64 {
-    let utc = day as f64 * 86400.;
-    let local = utc
-        - NSTimeZone::localTimeZone()
-            .secondsFromGMTForDate(&NSDate::dateWithTimeIntervalSince1970(utc)) as f64;
-    assert_eq!(
-        (activity::local_day(local - 1.), activity::local_day(local)),
-        (day - 1, day)
-    );
-    local
-}
-
-/// A log whose `@A` is noon on `day`, `@B` the last second of it and `@C` the next midnight.
-fn log(provider: Provider, day: i64) -> String {
-    let iso = |s: f64| {
-        NSISO8601DateFormatter::new()
-            .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(s))
-            .to_string()
-    };
-    let next = midnight(day + 1);
-    match provider {
-        Provider::Claude => include_str!("fixtures/claude-log.jsonl"),
-        Provider::Codex => include_str!("fixtures/codex-log.jsonl"),
-    }
-    .replace("@A", &iso(midnight(day) + 12. * HOUR))
-    .replace("@B", &iso(next - 1.))
-    .replace("@C", &iso(next))
-}
-
-fn heatmap(
-    provider: Provider,
-    root: &std::path::Path,
-    cache: &mut logs::Cache,
-    now: f64,
-) -> activity::Daily {
-    let dir = root.join(match provider {
-        Provider::Claude => "projects",
-        Provider::Codex => "sessions",
-    });
-    logs::scan(provider, &logs::Roots::new(vec![dir]), cache, now).heatmap()
-}
-
-#[test]
-fn heatmap_deduplicates_skips_noise_splits_at_local_midnight_and_excludes_cache_reads() {
-    let day = activity::local_day(now()) - 5;
-    // Claude: 2+100+50 once despite the repeat (the later line's output_tokens is the real one,
-    // counted on the first line's day), plus 1+9 before midnight; cache reads excluded.
-    // Codex: 100-40+10 once despite the repeated total, plus 200-50+20; 10-20 saturates.
-    for (provider, expected) in [(Provider::Claude, [162, 1000]), (Provider::Codex, [240, 5])] {
-        let root = std::env::temp_dir().join(format!(
-            "shark-heatmap-{}-{}",
-            std::process::id(),
-            provider as usize
-        ));
-        let _ = std::fs::remove_dir_all(&root);
-        let dir = root.join(match provider {
-            Provider::Claude => "projects/p",
-            Provider::Codex => "sessions/2026",
-        });
-        std::fs::create_dir_all(&dir).unwrap();
-        std::fs::write(dir.join("a.jsonl"), log(provider, day)).unwrap();
-        let daily = heatmap(provider, &root, &mut Default::default(), now());
-        let i = (day - daily.first_day) as usize;
-        assert_eq!(daily.tokens[i..i + 2], expected, "{}", provider.name());
-        assert_eq!(
-            daily.tokens.iter().sum::<u64>(),
-            expected.iter().sum::<u64>()
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-}
-
-#[test]
-fn heatmap_windows_skips_stale_files_and_reuses_cache() {
-    let root = std::env::temp_dir().join(format!("shark-activity-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    let (now, today) = (now(), activity::local_day(now()));
-    let write = |path: std::path::PathBuf, text: &str| {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, text).unwrap();
-        path
-    };
-    let session = write(
-        root.join("projects/p/s.jsonl"),
-        &log(Provider::Claude, today - 1),
-    );
-    // Subagent logs count; a line from before the window does not.
-    let agent = log(Provider::Claude, today - 1).replace(r#""msg_"#, r#""agent_"#)
-        + &log(Provider::Claude, today - 200).replace(r#""msg_"#, r#""old_"#);
-    write(root.join("projects/p/s/subagents/agent-1.jsonl"), &agent);
-    let stale = write(
-        root.join("projects/q/old.jsonl"),
-        &log(Provider::Claude, today - 1).replace(r#""msg_"#, r#""stale_"#),
-    );
-    std::fs::File::options()
-        .write(true)
-        .open(&stale)
-        .unwrap()
-        .set_modified(UNIX_EPOCH + Duration::from_secs(86400))
-        .unwrap();
-    let codex_dir = |day| root.join(format!("sessions/{day}"));
-    write(
-        codex_dir(today).join("rollout-a.jsonl"),
-        &log(Provider::Codex, today - 1),
-    );
-    // A session started before the window and resumed inside it still counts.
-    write(
-        codex_dir(today - 140).join("rollout-b.jsonl"),
-        &log(Provider::Codex, today - 1).replace(r#""s1""#, r#""s2""#),
-    );
-
-    let mut caches = [logs::Cache::default(), logs::Cache::default()];
-    let mut scan = |p: Provider| heatmap(p, &root, &mut caches[p as usize], now);
-    let daily = scan(Provider::Claude);
-    assert_eq!(daily.first_day, today - 139);
-    assert_eq!(daily.tokens.len(), activity::DAYS);
-    assert_eq!(daily.tokens[138..], [324, 2000]);
-    assert_eq!(daily.tokens[..138].iter().sum::<u64>(), 0);
-    assert_eq!(scan(Provider::Codex).tokens[138..], [480, 10]);
-
-    // Same length and mtime: the cached result stands even though the bytes changed.
-    let mtime = std::fs::metadata(&session).unwrap().modified().unwrap();
-    std::fs::write(
-        &session,
-        log(Provider::Claude, today - 1).replace("1000", "3000"),
-    )
-    .unwrap();
-    let file = std::fs::File::options().write(true).open(&session).unwrap();
-    file.set_modified(mtime).unwrap();
-    assert_eq!(scan(Provider::Claude).tokens[139], 2000);
-    file.set_modified(mtime + Duration::from_secs(1)).unwrap();
-    assert_eq!(scan(Provider::Claude).tokens[139], 4000);
-    std::fs::remove_dir_all(&root).unwrap();
-}
-
-#[test]
-fn heatmap_extreme_counts_saturate() {
-    let entry = |id: &str| logs::Entry {
-        id: id.into(),
-        date: now(),
-        input: u64::MAX,
-        output: 1,
-        cache_write: 1,
-        ..Default::default()
-    };
-    let report = logs::Report::from_entries(vec![entry("a"), entry("b")], now());
-    assert_eq!(report.heatmap().tokens.last(), Some(&u64::MAX));
 }
 
 #[test]

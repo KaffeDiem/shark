@@ -331,7 +331,6 @@ pub fn parse(v: &Value) -> Vec<Ev> {
             let result = |is_error, text| Ev::Result {
                 is_error,
                 text,
-                cost: 0.0, // a subscription has no per-turn price
                 secs,
             };
             match turn["status"].as_str() {
@@ -361,7 +360,6 @@ pub fn parse(v: &Value) -> Vec<Ev> {
             vec![Ev::Result {
                 is_error: true,
                 text: format!("{SESSION_GONE} ({})", s(&v["error"]["message"])),
-                cost: 0.0,
                 secs: 0,
             }]
         }
@@ -374,7 +372,6 @@ pub fn parse(v: &Value) -> Vec<Ev> {
             vec![Ev::Result {
                 is_error: true,
                 text: s(&v["error"]["message"]),
-                cost: 0.0,
                 secs: 0,
             }]
         }
@@ -561,7 +558,6 @@ mod tests {
         let done = |is_error: bool, text: &str, secs| Ev::Result {
             is_error,
             text: text.into(),
-            cost: 0.0,
             secs,
         };
         assert_eq!(
@@ -869,7 +865,6 @@ done
                 Ev::Result {
                     is_error: false,
                     text: String::new(),
-                    cost: 0.0,
                     secs: 2,
                 },
             ]

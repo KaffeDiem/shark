@@ -245,10 +245,6 @@ pub(crate) fn render_pixels() {
         super::super::usage::render_pixels(&mut cx);
         return;
     }
-    if std::env::var_os("SHARK_RENDER_POKEMON_ONLY").is_some() {
-        super::pokemon_tests::render_pixels(&mut cx);
-        return;
-    }
     crate::chat::ui_tests::render_activity_pixels(&mut cx);
     if std::env::var_os("SHARK_RENDER_ACTIVITY_ONLY").is_some() {
         return;

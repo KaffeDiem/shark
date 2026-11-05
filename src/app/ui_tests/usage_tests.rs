@@ -1,5 +1,5 @@
 use super::*;
-use crate::usage::{Allowance, Failure, Status};
+use crate::usage::{Allowance, Failure, Provider, Status};
 use gpui_kit::test::TestEventExt;
 
 fn sample() -> Vec<Allowance> {
@@ -136,15 +136,14 @@ async fn usage_independent_states_refresh_and_focus(cx: &mut TestAppContext) {
 async fn usage_footer_availability_and_click(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
-    let mut state = State::default();
-    state.pokemon_disabled = true;
+    let state = State::default();
     let (window, shark) = boot(cx, state, WindowOptions::default());
     let on = on_app(window, shark.clone());
     for rail in [false, true] {
         for available in ["loading", "both", "cached", "none"] {
             on(cx, &|s, _, cx| {
                 s.rail = rail;
-                s.usage = vec![crate::usage::Snapshot::default(); s.usage_providers.len()];
+                s.usage = vec![crate::usage::Snapshot::default(); Provider::ALL.len()];
                 for snapshot in &mut s.usage {
                     if available == "loading" {
                         snapshot.begin();
@@ -165,7 +164,7 @@ async fn usage_footer_availability_and_click(cx: &mut TestAppContext) {
             cx.update_window(window, |_, w, cx| {
                 w.render_frame(cx);
                 assert!(w.find("show-usage").visible());
-                assert!(w.try_find("pokemon-footer").is_none());
+                assert!(w.find("usage-footer-quotas").visible());
                 assert!(w.try_find("usage-trigger-claude").is_none());
                 assert!(w.try_find("usage-trigger-codex").is_none());
                 w.click("show-usage", cx);
@@ -286,7 +285,6 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         for width in [800., 1440.] {
             let mut state = State::default();
             state.appearance.mode = mode;
-            state.pokemon_disabled = true;
             state.save().unwrap();
             let (window, shark) = cx
                 .update(|cx| {
@@ -340,16 +338,6 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                         )
                                     }));
                                 }
-                                let today = crate::usage::activity::local_day(crate::usage::now());
-                                s.usage_activity[0] = crate::usage::activity::Daily {
-                                    first_day: today - 139,
-                                    tokens: (0..140u64)
-                                        .map(|i| match i * 7919 % 11 {
-                                            0..=2 => 0,
-                                            n => n * n * 40_000 + i * 9_000,
-                                        })
-                                        .collect(),
-                                };
                                 s.show_usage(w, cx);
                                 s.usage[0].finish(Ok(sample()));
                                 s.usage[1].finish(Ok(vec![Allowance {
@@ -429,7 +417,7 @@ async fn live_usage_panel(cx: &mut TestAppContext) {
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
             s.usage_live = true;
-            s.usage = vec![crate::usage::Snapshot::default(); s.usage_providers.len()];
+            s.usage = vec![crate::usage::Snapshot::default(); Provider::ALL.len()];
             s.usage_queries = vec![0; 2];
             s.usage_poll = None;
             s.usage_due = None;
@@ -458,7 +446,7 @@ async fn live_usage_panel(cx: &mut TestAppContext) {
             w.render_frame(cx);
             let s = shark.read(cx);
             assert_eq!(s.usage_queries, [round; 2]);
-            for (provider, snapshot) in crate::usage::Provider::ALL.into_iter().zip(&s.usage) {
+            for (provider, snapshot) in Provider::ALL.into_iter().zip(&s.usage) {
                 assert_eq!(
                     snapshot.status,
                     Status::Ready,
@@ -473,14 +461,11 @@ async fn live_usage_panel(cx: &mut TestAppContext) {
                         .any(|row| row.remaining.is_some() && row.resets_at.is_some())
                 );
                 assert!(
-                    w.try_find(format!("usage-trigger-{}", provider.source().id()))
+                    w.try_find(format!("usage-trigger-{}", provider.id()))
                         .is_none()
                 );
                 if s.usage_panel.is_some() {
-                    assert!(
-                        w.find(format!("usage-{}-0", provider.source().id()))
-                            .visible()
-                    );
+                    assert!(w.find(format!("usage-{}-0", provider.id())).visible());
                 }
             }
             eprintln!("live panel round {round}: both providers rendered real allowances");

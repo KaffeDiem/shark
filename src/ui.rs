@@ -1,5 +1,4 @@
 //! Shared UI styling and dialogs used by the host and workspace features.
-pub(crate) mod pokemon_images;
 use crate::state::Mode;
 use crate::{PageDown, PageUp, SelectFirst, SelectLast, SelectNext, SelectPrev};
 use gpui_kit::assets::IconName;
