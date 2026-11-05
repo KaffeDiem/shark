@@ -113,5 +113,4 @@ fn status(snapshot: &Snapshot) -> Option<&'static str> {
 }
 
 #[cfg(test)]
-#[path = "footer_usage_tests.rs"]
 mod tests;

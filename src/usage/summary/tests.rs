@@ -24,7 +24,6 @@ fn now() -> NaiveDate {
 fn recap(l: &UsageLedger, scope: Scope, offset: i32) -> Recap {
     Recap::make(
         l,
-        &[],
         Period::containing(scope, now(), 0).shifted(offset),
         now(),
     )
@@ -184,56 +183,6 @@ fn streak_stays_in_period() {
     );
     assert_eq!(recap(&l, Scope::Week, 0).best_streak, 3);
     assert_eq!(recap(&l, Scope::Month, 0).best_streak, 6)
-}
-#[test]
-fn graduations_exclude_released_outside() {
-    let graduates = [
-        Graduation {
-            id: "this-week".into(),
-            date: date(2026, 9, 17),
-            released: false,
-        },
-        Graduation {
-            id: "monday".into(),
-            date: date(2026, 9, 14),
-            released: false,
-        },
-        Graduation {
-            id: "let-go".into(),
-            date: date(2026, 9, 16),
-            released: true,
-        },
-        Graduation {
-            id: "last-week".into(),
-            date: date(2026, 9, 13),
-            released: false,
-        },
-    ];
-    let l = ledger(date(2026, 9, 1), &[]);
-    let week = Recap::make(
-        &l,
-        &graduates,
-        Period::containing(Scope::Week, now(), 0),
-        now(),
-    );
-    assert_eq!(
-        week.graduated
-            .iter()
-            .map(|g| g.id.as_str())
-            .collect::<Vec<_>>(),
-        ["this-week", "monday"]
-    );
-    assert_eq!(
-        Recap::make(
-            &l,
-            &graduates,
-            Period::containing(Scope::Month, now(), 0),
-            now()
-        )
-        .graduated
-        .len(),
-        3
-    )
 }
 #[test]
 fn navigation_stops_before_coverage() {

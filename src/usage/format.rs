@@ -1,4 +1,4 @@
-//! Display text shared by the companion and its usage surfaces.
+//! Display text for token counts and costs.
 pub fn compact(value: u64) -> String {
     if value < 1_000 {
         return value.to_string();
@@ -44,16 +44,5 @@ pub fn grouped(value: u64, separator: char) -> String {
     result
 }
 
-pub fn progress_detail(used: u64, total: u64) -> String {
-    let used = used.min(total);
-    let percent = if total == 0 {
-        0
-    } else {
-        (used as u128 * 100 / total as u128) as u64
-    };
-    format!("{} / {} · {percent}%", compact(used), compact(total))
-}
-
 #[cfg(test)]
-#[path = "tests/format_extra.rs"]
 mod tests;

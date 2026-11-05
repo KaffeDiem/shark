@@ -1,5 +1,6 @@
 //! Short-lived, prompt-free account queries. No chat state or snapshots go to disk.
 pub mod activity;
+pub mod format;
 pub mod logs;
 pub mod pace;
 pub mod providers;

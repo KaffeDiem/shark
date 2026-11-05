@@ -1,11 +1,10 @@
-//! Extensible boundary between coding tools and Shark's usage/companion UI.
+//! Extensible boundary between coding tools and Shark's usage UI.
 //!
 //! Implement [`UsageProvider`] and register it in [`Registry`] for another tool. IDs are
 //! stable persistence keys, independent of labels and list order. A provider owns its
 //! incremental cache; callers run its blocking methods on a background executor.
 //! The built-ins deliberately retain Shark's proven CLI account-query protocols.
-use super::{Allowance, Failure, Provider, Snapshot, Status, activity::Daily};
-use std::collections::BTreeMap;
+use super::{Allowance, Failure, Provider, activity::Daily};
 use std::sync::{Mutex, OnceLock};
 
 pub trait UsageProvider: Send + Sync {
@@ -29,23 +28,19 @@ pub trait UsageProvider: Send + Sync {
     fn configure_scan_roots(&self, _raw: &str) -> bool {
         false
     }
-    /// Full companion accounting, kept distinct from the existing navigation heatmap.
+    /// Full usage accounting, kept distinct from the existing navigation heatmap.
     fn observations(&self, now: f64) -> Observation {
         let activity = self.activity(now);
         Observation {
-            companion: super::logs::Report::from_daily(activity.clone()),
+            report: super::logs::Report::from_daily(activity.clone()),
             activity,
         }
-    }
-    /// Override for providers whose official quota windows use different labels or lengths.
-    fn candy_windows(&self, snapshot: &Snapshot) -> Vec<CandyWindow> {
-        eligible_candy_windows(self.id(), snapshot)
     }
 }
 
 pub struct Observation {
     pub activity: Daily,
-    pub companion: super::logs::Report,
+    pub report: super::logs::Report,
 }
 
 /// A registered source and its process-local UI slot. Persistence always uses `id`,
@@ -77,65 +72,6 @@ impl From<Provider> for ProviderHandle {
             .expect("built-in usage provider registered")
     }
 }
-
-/// A normalized headline quota window. Model-specific or monetary caps do not earn candy.
-#[derive(Debug)]
-pub struct CandyWindow {
-    pub key: String,
-    pub name: String,
-    pub epoch: Option<String>,
-    pub utilization: f64,
-    pub weekly: bool,
-}
-
-pub fn eligible_candy_windows(provider_id: &str, snapshot: &Snapshot) -> Vec<CandyWindow> {
-    if snapshot.status != Status::Ready || snapshot.outdated {
-        return vec![];
-    }
-    let mut windows = BTreeMap::new();
-    for row in &snapshot.allowances {
-        let weekly = match (row.label.as_str(), row.window) {
-            ("5 hours", Some(seconds)) if seconds == 18_000. => false,
-            ("Weekly", Some(seconds)) if seconds == 604_800. => true,
-            _ => continue,
-        };
-        let Some(remaining) = row
-            .remaining
-            .filter(|n| n.is_finite() && (0. ..=100.).contains(n))
-        else {
-            continue;
-        };
-        let key = format!(
-            "{provider_id}:{}",
-            if weekly { "weekly" } else { "session" }
-        );
-        let provider = builtins()
-            .get(provider_id)
-            .map_or(provider_id, |p| p.name());
-        windows.entry(key.clone()).or_insert_with(|| CandyWindow {
-            key,
-            name: format!(
-                "{provider} {}",
-                if weekly {
-                    "weekly limit"
-                } else {
-                    "5-hour limit"
-                }
-            ),
-            epoch: row
-                .resets_at
-                .filter(|n| n.is_finite() && *n >= 0.)
-                .map(|n| format!("{n:020.0}")),
-            utilization: 100. - remaining.clamp(0., 100.),
-            weekly,
-        });
-    }
-    windows.into_values().collect()
-}
-
-#[cfg(test)]
-#[path = "provider_candy_tests.rs"]
-mod candy_tests;
 
 #[derive(Default)]
 pub struct Registry {
@@ -197,7 +133,7 @@ struct Scanner {
 struct LocalProvider {
     provider: Provider,
     scanner: Mutex<Scanner>,
-    companion_roots: Mutex<String>,
+    report_roots: Mutex<String>,
 }
 
 impl UsageProvider for LocalProvider {
@@ -223,10 +159,7 @@ impl UsageProvider for LocalProvider {
         true
     }
     fn configure_scan_roots(&self, raw: &str) -> bool {
-        let mut roots = self
-            .companion_roots
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut roots = self.report_roots.lock().unwrap_or_else(|e| e.into_inner());
         let raw = raw.trim();
         if *roots == raw {
             return false;
@@ -234,10 +167,10 @@ impl UsageProvider for LocalProvider {
         *roots = raw.to_owned();
         true
     }
-    /// One pass over the logs feeds both the companion report and the heatmap.
+    /// One pass over the logs feeds both the usage report and the heatmap.
     fn observations(&self, now: f64) -> Observation {
         let raw = self
-            .companion_roots
+            .report_roots
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
@@ -260,10 +193,10 @@ impl UsageProvider for LocalProvider {
                 &scanner.roots.insert((now, roots)).1
             }
         };
-        let companion = super::logs::scan(self.provider, roots, &mut scanner.cache, now);
+        let report = super::logs::scan(self.provider, roots, &mut scanner.cache, now);
         Observation {
-            activity: companion.heatmap(),
-            companion,
+            activity: report.heatmap(),
+            report,
         }
     }
 }
@@ -283,7 +216,7 @@ pub fn builtins() -> &'static Registry {
                         roots: None,
                         cache: Default::default(),
                     }),
-                    companion_roots: Mutex::default(),
+                    report_roots: Mutex::default(),
                 })
                 .expect("unique built-in provider ID");
         }
@@ -338,7 +271,7 @@ mod tests {
         let mut registry = Registry::default();
         registry.register(FutureTool("tool")).unwrap();
         assert!(registry.register(FutureTool("tool")).is_err());
-        for id in ["", "Tool", "tool name", "../tool", "pokémon"] {
+        for id in ["", "Tool", "tool name", "../tool", "tööl"] {
             assert!(registry.register(FutureTool(id)).is_err());
         }
         assert_eq!(registry.iter().count(), 1);

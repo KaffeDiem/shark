@@ -31,10 +31,10 @@ async fn cost_coverage_survives_store_and_native_usage(cx: &mut TestAppContext) 
                 let report = Report::from_entries(vec![entry(model, now)], now);
                 s.complete_usage_activity(
                     provider.into(),
-                    s.pokemon_ui.generation,
+                    s.usage_generation,
                     Observation {
                         activity: report.daily.clone(),
-                        companion: report,
+                        report,
                     },
                     cx,
                 )
@@ -101,10 +101,10 @@ async fn native_cost_states_have_accessible_labels_and_layout(cx: &mut TestAppCo
                 };
                 s.complete_usage_activity(
                     Provider::Claude.into(),
-                    s.pokemon_ui.generation,
+                    s.usage_generation,
                     Observation {
                         activity: report.daily.clone(),
-                        companion: report,
+                        report,
                     },
                     cx,
                 );
@@ -141,10 +141,10 @@ async fn failed_local_usage_scan_preserves_prior_report_and_recovers(cx: &mut Te
             );
             s.complete_usage_activity(
                 Provider::Claude.into(),
-                s.pokemon_ui.generation,
+                s.usage_generation,
                 Observation {
                     activity: report.daily.clone(),
-                    companion: report,
+                    report,
                 },
                 cx,
             );
@@ -155,10 +155,10 @@ async fn failed_local_usage_scan_preserves_prior_report_and_recovers(cx: &mut Te
             };
             s.complete_usage_activity(
                 Provider::Claude.into(),
-                s.pokemon_ui.generation,
+                s.usage_generation,
                 Observation {
                     activity: Daily::default(),
-                    companion: failed,
+                    report: failed,
                 },
                 cx,
             );
@@ -173,10 +173,10 @@ async fn failed_local_usage_scan_preserves_prior_report_and_recovers(cx: &mut Te
             let report = Report::from_entries(vec![entry("gpt-5.5", now)], now);
             s.complete_usage_activity(
                 Provider::Claude.into(),
-                s.pokemon_ui.generation,
+                s.usage_generation,
                 Observation {
                     activity: report.daily.clone(),
-                    companion: report,
+                    report,
                 },
                 cx,
             );
@@ -190,10 +190,10 @@ async fn failed_local_usage_scan_preserves_prior_report_and_recovers(cx: &mut Te
 fn apply_report(s: &mut Shark, provider: Provider, report: Report, cx: &mut Context<Shark>) {
     s.complete_usage_activity(
         provider.into(),
-        s.pokemon_ui.generation,
+        s.usage_generation,
         Observation {
             activity: report.daily.clone(),
-            companion: report,
+            report,
         },
         cx,
     )
@@ -223,14 +223,14 @@ async fn stale_source_report_cannot_pollute_another_sources_ledger_refresh(
         shark.update(cx, |s, cx| {
             apply_report(s, Provider::Claude, report(100), cx);
             apply_report(s, Provider::Codex, report(100), cx);
-            let old = s.pokemon_ui.generation;
+            let old = s.usage_generation;
             s.set_usage_roots("claude", "/tmp/shark-recap-stale-fixture", cx);
             s.complete_usage_activity(
                 Provider::Claude.into(),
                 old,
                 Observation {
                     activity: report(10000).daily,
-                    companion: report(10000),
+                    report: report(10000),
                 },
                 cx,
             );

@@ -589,7 +589,7 @@ async fn native_legend_wraps_for_future_sources_with_long_names(cx: &mut TestApp
                 s.usage = vec![Default::default(); count];
                 s.usage_activity = vec![Default::default(); count];
                 s.usage_queries = vec![0; count];
-                s.pokemon_ui.scanning = vec![false; count];
+                s.usage_scanning = vec![false; count];
                 let now = Local
                     .from_local_datetime(&date("2026-08-24").and_hms_opt(12, 0, 0).unwrap())
                     .earliest()

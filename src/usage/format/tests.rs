@@ -1,5 +1,4 @@
-use crate::pokemon::format::*;
-use crate::pokemon::{Balance, Companion};
+use super::*;
 #[test]
 fn compact_promotes_rounded_units() {
     for (value, expected) in [
@@ -30,15 +29,4 @@ fn compact_examples() {
     ] {
         assert_eq!(compact(value), expected)
     }
-}
-#[test]
-fn scaled_first_egg_hatch_point() {
-    let mut companion = Companion::default();
-    companion.growth_difficulty = 0.1;
-    assert_eq!(companion.progress().1, 500000);
-    assert_eq!(
-        Companion::default().progress().1,
-        Balance::EGG_HATCH_THRESHOLD
-    );
-    assert_eq!(compact(companion.progress().1), "500K");
 }

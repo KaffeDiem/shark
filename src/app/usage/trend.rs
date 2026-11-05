@@ -1,6 +1,6 @@
 //! The month chart used by the native Usage popover. Future days are layout, never ledger data.
 use super::*;
-use crate::pokemon::format::compact;
+use crate::usage::format::compact;
 use crate::usage::summary::{Day, ProviderSeries, dates};
 use chrono::{Datelike, Local, Months, NaiveDate, TimeZone};
 use objc2_foundation::{NSCalendar, NSLocale, NSString};

@@ -22,18 +22,10 @@ pub struct State {
     /// Vim keys in the file editor.
     #[serde(default)]
     pub vim: bool,
-    /// Hide the Pokémon companion and pause its growth without deleting its collection.
-    #[serde(default)]
-    pub pokemon_disabled: bool,
-    #[serde(default, deserialize_with = "or_default")]
-    pub pokemon_animation_quality: crate::pokemon::animation::Quality,
-    /// Locally persisted PokeTokenBar progress and provider usage checkpoints.
-    #[serde(default, deserialize_with = "or_default")]
-    pub pokemon: crate::pokemon::Companion,
     /// Additional token log roots, keyed by the provider's stable ID.
     #[serde(default, deserialize_with = "or_default")]
     pub usage_roots: BTreeMap<String, String>,
-    /// Numeric local-day history for usage recaps, independent of companion growth.
+    /// Numeric local-day history for usage recaps, kept per local day.
     #[serde(default)]
     pub usage_ledger: crate::usage::summary::UsageLedger,
     /// The file editor's code size in logical px (cmd-=/cmd--); None is
@@ -554,25 +546,12 @@ fn tolerant_lists<'de, D: serde::Deserializer<'de>>(
         .collect())
 }
 
-/// A bad value in a field added with the Pokémon companion must not fail the whole `State`
-/// parse, which would reset workspaces and chats.
+/// A bad value in an optional field must not fail the whole `State` parse, which would reset
+/// workspaces and chats.
 fn or_default<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned + Default>(
     d: D,
 ) -> Result<T, D::Error> {
     Ok(serde_json::from_value(Value::deserialize(d)?).unwrap_or_default())
-}
-
-/// The stored `pokemon` value exists but `or_default` had to discard it.
-fn pokemon_unreadable(bytes: &[u8]) -> bool {
-    #[derive(Deserialize)]
-    struct Raw {
-        #[serde(default)]
-        pokemon: Option<Value>,
-    }
-    serde_json::from_slice::<Raw>(bytes)
-        .ok()
-        .and_then(|raw| raw.pokemon)
-        .is_some_and(|v| serde_json::from_value::<crate::pokemon::Companion>(v).is_err())
 }
 
 /// The first unused `state.json.bak-N`; numbered so a later backup never replaces an earlier one.
@@ -625,20 +604,6 @@ pub(crate) fn write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 }
 
 impl State {
-    pub(crate) fn pokemon_snapshots() -> crate::pokemon::storage::Snapshots {
-        Self::pokemon_snapshots_at(&state_file())
-    }
-
-    fn pokemon_snapshots_at(path: &Path) -> crate::pokemon::storage::Snapshots {
-        crate::pokemon::storage::Snapshots::new(
-            path.parent()
-                .unwrap_or_else(|| Path::new("."))
-                .join(".snapshots")
-                .join(path.file_name().unwrap_or_default())
-                .join("pokemon"),
-        )
-    }
-
     pub fn load() -> State {
         Self::load_at(&state_file())
     }
@@ -669,24 +634,6 @@ impl State {
                 ..State::default()
             }
         });
-        // `or_default` reset an unreadable collection: keep the original file and recover from the
-        // latest snapshot so the next save doesn't overwrite it.
-        let pokemon_lost =
-            state.corrupt_backup.is_none() && !state.read_only && pokemon_unreadable(&bytes);
-        if pokemon_lost {
-            let bak = backup_path(path);
-            eprintln!(
-                "state.json pokemon unreadable, copied to {}: {:?}",
-                bak.display(),
-                fs::copy(path, &bak)
-            );
-        }
-        if state.corrupt_backup.is_some() || pokemon_lost {
-            if let Some(pokemon) = Self::pokemon_snapshots_at(path).latest() {
-                state.pokemon = pokemon;
-            }
-        }
-        state.pokemon.sanitize();
         let (model, effort) = (state.new_model(), state.last_effort.clone());
         for ws in &mut state.workspaces {
             ws.migrate();
@@ -816,17 +763,6 @@ impl State {
                 .and_then(|bytes| write(path, &bytes))
         };
         *self.save_error.borrow_mut() = result.as_ref().err().map(ToString::to_string);
-        if result.is_ok()
-            && (self.pokemon.lifetime_tokens > 0
-                || self.pokemon.active.is_some()
-                || !self.pokemon.collection.is_empty())
-        {
-            if let Err(error) = Self::pokemon_snapshots_at(path)
-                .maybe_create(&self.pokemon, crate::usage::now() as u64)
-            {
-                eprintln!("Pokémon snapshot could not be written: {error}");
-            }
-        }
         result
     }
 }
@@ -836,79 +772,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn bad_pokemon_value_keeps_workspaces_and_recovers_from_snapshot() {
+    fn bad_usage_roots_value_keeps_the_rest_of_state() {
         let dir = std::env::temp_dir().join(format!(
-            "shark-pokemon-badfield-{}-{}",
+            "shark-badfield-{}-{}",
             std::process::id(),
-            crate::pokemon::seed()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join("state.json");
         let mut state = State::default();
-        state.pokemon.lifetime_tokens = 4_242;
         state.last_repos = vec!["kept".into()];
         state.save_at(&path).unwrap();
         let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        value["pokemon"] = serde_json::json!({ "lifetime_tokens": "garbage" });
         value["usage_roots"] = serde_json::json!("garbage");
         fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
         let loaded = State::load_at(&path);
         assert_eq!(loaded.last_repos, ["kept"]);
         assert!(loaded.corrupt_backup.is_none());
         assert!(loaded.usage_roots.is_empty());
-        assert_eq!(loaded.pokemon.lifetime_tokens, 4_242);
-        assert!(path.with_extension("json.bak-0").exists());
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn pokemon_recovers_from_snapshot_when_state_is_corrupt() {
-        let dir = std::env::temp_dir().join(format!(
-            "shark-pokemon-recovery-{}-{}",
-            std::process::id(),
-            crate::pokemon::seed()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("state.json");
-        let mut state = State::default();
-        state.pokemon.lifetime_tokens = 77_777;
-        state.pokemon.inventory.candies = 5;
-        state.save_at(&path).unwrap();
-        assert_eq!(State::pokemon_snapshots_at(&path).list().len(), 1);
-        fs::write(&path, "{ corrupted").unwrap();
-        let recovered = State::load_at(&path);
-        assert_eq!(recovered.pokemon.lifetime_tokens, 77_777);
-        assert_eq!(recovered.pokemon.inventory.candies, 5);
-        assert_eq!(
-            fs::read_to_string(recovered.corrupt_backup.unwrap()).unwrap(),
-            "{ corrupted"
-        );
-        fs::remove_dir_all(dir).unwrap();
-    }
-
-    #[test]
-    fn pokemon_state_load_sanitizes_extreme_values() {
-        let dir = std::env::temp_dir().join(format!(
-            "shark-pokemon-sanitize-{}-{}",
-            std::process::id(),
-            crate::pokemon::seed()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("state.json");
-        let mut state = State::default();
-        state.pokemon.lifetime_tokens = u64::MAX;
-        state.pokemon.spent_tokens = u64::MAX;
-        fs::write(&path, serde_json::to_vec(&state).unwrap()).unwrap();
-        let mut loaded = State::load_at(&path);
-        assert_eq!(loaded.pokemon.lifetime_tokens, 1_000_000_000_000_000);
-        assert_eq!(loaded.pokemon.spent_tokens, 1_000_000_000_000_000);
-        loaded
-            .pokemon
-            .observe_usage("claude", "2026-08-03", 10, true);
-        loaded
-            .pokemon
-            .observe_usage("claude", "2026-08-03", 1010, true);
-        assert_eq!(loaded.pokemon.balance(), 1000);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1043,8 +927,6 @@ mod tests {
         fs::write(&path, "{ first").unwrap();
         let st = State::load_at(&path);
         let first = st.corrupt_backup.clone().unwrap();
-        assert!(st.pokemon.collection.is_empty());
-        assert!(st.pokemon.active.is_none());
         assert!(!st.read_only && !path.exists());
         assert_eq!(baks().len(), 1);
         st.save_at(&path).unwrap();

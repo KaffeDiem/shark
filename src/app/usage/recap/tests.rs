@@ -1,6 +1,5 @@
 use super::*;
 use crate::app::ui_tests::{UI_LOCK, boot, test_home};
-use crate::pokemon::{Balance, Companion, EvoLine, EvoNode, Rarity};
 use crate::usage::summary::UsageLedger;
 use chrono::{Local, TimeZone};
 use core::prelude::v1::test;
@@ -27,39 +26,6 @@ fn ledger() -> UsageLedger {
         ]),
     }
 }
-fn mon(species: u16, name: &str, form: Option<&str>, id: &str) -> Mon {
-    let mut p = Companion::default();
-    p.egg_tokens = Balance::EGG_HATCH_THRESHOLD;
-    let base = if species == 413 { 412 } else { species };
-    p.hatch(EvoLine {
-        base_id: base,
-        tree: EvoNode {
-            species_id: base,
-            children: if species == 413 {
-                vec![EvoNode {
-                    species_id: 413,
-                    children: vec![],
-                }]
-            } else {
-                vec![]
-            },
-        },
-        rarity: Rarity::Common,
-        names: BTreeMap::from([(species, BTreeMap::from([("en".into(), name.into())]))]),
-    });
-    let mut mon = p.active.take().unwrap();
-    if species == 413 {
-        mon.path = vec![412, 413];
-        mon.stage = 1;
-    }
-    mon.shiny = false;
-    mon.ditto_disguise = None;
-    mon.form = form.map(|f| forms::Form(f.into()));
-    mon.profile.as_mut().unwrap().instance_id = id.into();
-    mon.graduated = true;
-    mon.caught_at = (now() - 86400.) as u64;
-    mon
-}
 fn open(s: &mut Shark, w: &mut Window, cx: &mut Context<Shark>) {
     s.show_usage(w, cx);
     s.usage_panel.as_mut().unwrap().reference_time = Some(now());
@@ -79,7 +45,7 @@ fn accessible_meter_descriptions_distinguish_zero_from_unrecorded() {
     observed.tokens_by_day.retain(|key, _| key == "2026-09-17");
     for scope in Scope::ALL {
         let period = Period::containing(scope, date("2026-09-18"), 0);
-        let recap = Recap::make(&observed, &[], period, date("2026-09-18"));
+        let recap = Recap::make(&observed, period, date("2026-09-18"));
         let used = recap
             .buckets
             .iter()
@@ -119,7 +85,7 @@ async fn native_recap_card_renders_every_scope_and_preserves_layout(cx: &mut Tes
             assert!(card.left() >= panel.left() && card.right() <= panel.right());
             assert!(w.find("usage-recap-period").visible());
             assert!(w.find("usage-recap-total").visible());
-            assert_eq!(shark.read(cx).recap_content().0.buckets.len(), count);
+            assert_eq!(shark.read(cx).recap_content().buckets.len(), count);
             if scope == Scope::Month {
                 assert!(
                     w.find("usage-recap-tick-2026-09-15").bounds().size.height <= px(12.),
@@ -129,7 +95,7 @@ async fn native_recap_card_renders_every_scope_and_preserves_layout(cx: &mut Tes
             }
             let meters = w.find("usage-recap-meters").bounds();
             assert!(meters.right() <= card.right());
-            for meter in &shark.read(cx).recap_content().0.buckets {
+            for meter in &shark.read(cx).recap_content().buckets {
                 let bar = w.find(format!("usage-recap-meter-{}", meter.date));
                 assert!(bar.bounds().left() >= meters.left() - px(0.5));
                 assert!(bar.bounds().right() <= meters.right() + px(0.5));
@@ -139,47 +105,6 @@ async fn native_recap_card_renders_every_scope_and_preserves_layout(cx: &mut Tes
     })
     .unwrap();
 }
-#[gpui_kit::test]
-#[allow(clippy::await_holding_lock)]
-async fn native_graduate_strip_keeps_forms_and_current_companion_identity(cx: &mut TestAppContext) {
-    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    test_home();
-    let mut state = State::default();
-    let unown = mon(201, "Unown", Some("q"), "unown-q");
-    let wormadam = mon(413, "Wormadam", Some("sandy"), "wormadam-sandy");
-    assert_eq!(graduate_name(&unown), "Unown [Q]");
-    assert_eq!(graduate_name(&wormadam), "Wormadam");
-    let mut active = mon(25, "Pikachu", None, "active");
-    active.graduated = false;
-    state.pokemon.active = Some(active);
-    state.pokemon.collection = vec![unown, wormadam];
-    state.pokemon.representative = Some(201);
-    let (window, shark) = boot(cx, state, WindowOptions::default());
-    cx.update_window(window, |_, w, cx| {
-        shark.update(cx, |s, cx| open(s, w, cx));
-        w.render_frame(cx);
-        assert_eq!(
-            w.find("usage-recap-graduate-unown-q").label().as_deref(),
-            Some("Unown [Q]")
-        );
-        assert_eq!(
-            w.find("usage-recap-graduate-wormadam-sandy")
-                .label()
-                .as_deref(),
-            Some("Wormadam")
-        );
-        for id in [
-            "usage-recap-sprite-201-false-q",
-            "usage-recap-sprite-413-false-sandy",
-            "usage-recap-sprite-25-false-default",
-        ] {
-            assert!(w.find(id).visible());
-        }
-        assert_eq!(shark.read(cx).state.pokemon.representative, Some(201));
-    })
-    .unwrap();
-}
-
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn recap_controls_navigate_whole_periods_and_escape_returns_to_usage(
@@ -205,13 +130,13 @@ async fn recap_controls_navigate_whole_periods_and_escape_returns_to_usage(
             Some((Scope::Month, -1))
         );
         assert_eq!(
-            shark.read(cx).recap_content().0.period.start,
+            shark.read(cx).recap_content().period.start,
             date("2026-08-01")
         );
         w.click("usage-recap-next", cx);
         w.render_frame(cx);
         assert_eq!(
-            shark.read(cx).recap_content().0.period.start,
+            shark.read(cx).recap_content().period.start,
             date("2026-09-01")
         );
         w.click("usage-recap-scope-Year", cx);

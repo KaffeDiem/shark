@@ -38,7 +38,7 @@ fn sources(s: &mut Shark, count: usize) {
     s.usage_activity = vec![Default::default(); count];
     s.usage_queries = vec![0; count];
     s.usage_reports = vec![Report::default(); count];
-    s.pokemon_ui.scanning = vec![false; count];
+    s.usage_scanning = vec![false; count];
 }
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -153,7 +153,7 @@ async fn even_a_long_future_source_name_cannot_expand_one_tab_past_content(
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
     let (window, shark) = boot(cx, State::default(), WindowOptions::default());
-    cx.update_window(window,|_,w,cx|{shark.update(cx,|s,cx|{let mut registry=Registry::default();registry.register(Tool{id:"long-name".into(),name:"Future source with a deliberately exceptionally long descriptive coding-tool name".into()}).unwrap();let registry=Box::leak(Box::new(registry));s.usage_providers=registry.handles().collect();s.usage.truncate(1);s.usage_activity.truncate(1);s.usage_reports.truncate(1);s.usage_queries.truncate(1);s.pokemon_ui.scanning.truncate(1);s.show_usage(w,cx);});w.render_frame(cx);assert!(w.find("usage-provider-tab-long-name").bounds().size.width<=w.find("usage-provider-tabs").bounds().size.width);assert!(w.find("usage-provider-tab-long-name").bounds().size.height<=px(28.));}).unwrap();
+    cx.update_window(window,|_,w,cx|{shark.update(cx,|s,cx|{let mut registry=Registry::default();registry.register(Tool{id:"long-name".into(),name:"Future source with a deliberately exceptionally long descriptive coding-tool name".into()}).unwrap();let registry=Box::leak(Box::new(registry));s.usage_providers=registry.handles().collect();s.usage.truncate(1);s.usage_activity.truncate(1);s.usage_reports.truncate(1);s.usage_queries.truncate(1);s.usage_scanning.truncate(1);s.show_usage(w,cx);});w.render_frame(cx);assert!(w.find("usage-provider-tab-long-name").bounds().size.width<=w.find("usage-provider-tabs").bounds().size.width);assert!(w.find("usage-provider-tab-long-name").bounds().size.height<=px(28.));}).unwrap();
 }
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]

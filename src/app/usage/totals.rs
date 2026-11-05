@@ -1,5 +1,5 @@
 use super::*;
-use crate::pokemon::format::compact;
+use crate::usage::format::compact;
 use crate::usage::summary::combined::Summary;
 impl Shark {
     pub(super) fn shows_usage_cost(&self, summary: &Summary) -> bool {

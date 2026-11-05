@@ -6864,7 +6864,6 @@ dependencies = [
  "anyhow",
  "async-channel",
  "chrono",
- "gif 0.14.2",
  "globset",
  "gpui-kit",
  "ignore",

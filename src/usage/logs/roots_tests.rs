@@ -6,7 +6,10 @@ impl Temp {
         let p = std::env::temp_dir().join(format!(
             "shark-roots-{}-{}",
             std::process::id(),
-            crate::pokemon::seed()
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
         ));
         fs::create_dir_all(&p).unwrap();
         Self(p.canonicalize().unwrap())
@@ -335,7 +338,7 @@ fn location_registry_covers_supported_tools_without_credential_variables() {
 }
 
 #[test]
-fn companion_scanners_share_registered_environment_lookup() {
+fn scanners_share_registered_environment_lookup() {
     for source in [
         include_str!("../logs.rs"),
         include_str!("../providers.rs"),

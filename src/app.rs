@@ -50,7 +50,6 @@ pub(crate) mod menus;
 mod new_workspace;
 mod palette;
 mod picker;
-mod pokemon;
 mod reorder;
 mod repo_settings;
 mod run;
@@ -144,7 +143,8 @@ pub struct Shark {
     menu: Option<(Entity<menu::Menu>, Subscription)>,
     app_switcher: Option<app_switcher::AppSwitcher>,
     usage_panel: Option<usage::Panel>,
-    pokemon_ui: pokemon::CompanionUi,
+    usage_scanning: Vec<bool>,
+    usage_generation: u64,
     usage_providers: Vec<crate::usage::providers::ProviderHandle>,
     usage: Vec<crate::usage::Snapshot>,
     /// Daily tokens from the agents' local logs, rescanned with each usage refresh.
@@ -196,8 +196,6 @@ impl Shark {
             s.restore_last_open(window, cx);
             s.check_deps(cx);
             s.usage_polling(window, cx);
-            s.pokemon_window_activity(window, cx);
-            s.load_pokemon(cx);
             let msg = match (backup, read_only) {
                 (Some(bak), _) => Some(format!(
                     "Couldn't read state.json; moved it to {}",
@@ -243,7 +241,6 @@ impl Shark {
             }),
             cx.observe_window_activation(window, |s, w, cx| {
                 s.attn.window_active = w.is_window_active();
-                s.pokemon_window_activity(w, cx);
                 s.usage_polling(w, cx);
                 if !s.attn.window_active {
                     s.close_app_switcher(false, w, cx);
@@ -277,8 +274,6 @@ impl Shark {
             );
         }
         let provider_count = usage_providers.len();
-        let mut pokemon_ui = pokemon::CompanionUi::default();
-        pokemon_ui.scanning = vec![false; provider_count];
         Shark {
             state,
             sel: SideRow::Ws(0),
@@ -318,7 +313,8 @@ impl Shark {
             menu: None,
             app_switcher: None,
             usage_panel: None,
-            pokemon_ui,
+            usage_scanning: vec![false; provider_count],
+            usage_generation: 0,
             usage_providers,
             usage: vec![Default::default(); provider_count],
             usage_activity: vec![Default::default(); provider_count],
@@ -983,7 +979,6 @@ impl Shark {
 
 impl Render for Shark {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.sync_chat_pokemon(cx);
         self.prune_reorder(cx);
         // Toasts clear the toolbar, Features rail, and visible Files controls.
         let mut side = if self.right_rail_shown() {
@@ -1035,7 +1030,6 @@ impl Render for Shark {
             .on_action(cx.listener(|this, _: &StopAgent, _, cx| this.stop(cx)))
             .on_action(cx.listener(|this, _: &FocusQueue, w, cx| this.focus_queue(w, cx)))
             .on_action(cx.listener(|this, _: &ShowUsage, w, cx| this.show_usage(w, cx)))
-            .on_action(cx.listener(|this, _: &ShowPokemon, w, cx| this.show_pokemon(w, cx)))
             .on_action(cx.listener(|this, _: &ShowChat, w, cx| this.show(Tab::Chat, w, cx)))
             .on_action(cx.listener(|this, _: &NewChat, w, cx| this.new_chat(w, cx)))
             .on_action(cx.listener(|this, _: &CloseChat, w, cx| this.close_chat(w, cx)))

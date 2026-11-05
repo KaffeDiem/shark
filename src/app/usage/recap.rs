@@ -1,27 +1,12 @@
 //! A native, coverage-aware usage recap. It shares the persisted ledger with the month chart.
 use super::*;
-use crate::pokemon::format::{compact, grouped};
-use crate::pokemon::{Mon, forms};
-use crate::usage::summary::{Graduation, Meter, Period, Recap, Scope, local_date};
+use crate::usage::format::{compact, grouped};
+use crate::usage::summary::{Meter, Period, Recap, Scope, local_date};
 use chrono::{Datelike, Days};
 use gpui_kit::component::{Disableable as _, Selectable as _};
 use objc2_foundation::NSCalendar;
 use trend::DateText;
 
-fn mon_id(mon: &Mon) -> String {
-    mon.profile
-        .as_ref()
-        .map(|p| p.instance_id.clone())
-        .unwrap_or_else(|| format!("{}-{}-{}", mon.line.base_id, mon.caught_at, mon.nature))
-}
-pub(super) fn graduate_name(mon: &Mon) -> String {
-    forms::display_name(
-        &mon.line.name(mon.species_id()),
-        mon.species_id(),
-        mon.form.as_ref(),
-        None,
-    )
-}
 pub(super) fn scope_name(scope: Scope) -> &'static str {
     match scope {
         Scope::Week => "Week",
@@ -82,7 +67,7 @@ fn bucket_tick(meter: &Meter, scope: Scope) -> String {
 }
 
 impl Shark {
-    fn recap_content(&self) -> (Recap, Vec<&Mon>) {
+    fn recap_content(&self) -> Recap {
         let now = self.usage_view_now();
         let today = local_date(now);
         let (scope, offset) = self
@@ -92,61 +77,23 @@ impl Shark {
             .unwrap_or((Scope::Week, 0));
         let first = (NSCalendar::currentCalendar().firstWeekday() as u32 + 5) % 7;
         let period = Period::containing(scope, today, first).shifted(offset);
-        let graduates: Vec<_> = self
-            .state
-            .pokemon
-            .collection
-            .iter()
-            .filter(|m| m.graduated)
-            .map(|m| Graduation {
-                id: mon_id(m),
-                date: local_date(m.caught_at as f64),
-                released: m.released,
-            })
-            .collect();
-        let recap = Recap::make(&self.state.usage_ledger, &graduates, period, today);
-        let mons = recap
-            .graduated
-            .iter()
-            .take(4)
-            .filter_map(|g| {
-                self.state
-                    .pokemon
-                    .collection
-                    .iter()
-                    .find(|mon| mon_id(mon) == g.id)
-            })
-            .collect();
-        (recap, mons)
-    }
-    pub(in crate::app) fn warm_usage_recap(&mut self, cx: &mut Context<Self>) {
-        if self.state.pokemon_disabled {
-            return;
-        }
-        let (_, graduates) = self.recap_content();
-        let mut mons: Vec<_> = graduates.into_iter().cloned().collect();
-        if let Some(active) = &self.state.pokemon.active {
-            mons.insert(0, active.clone());
-        }
-        self.load_recap_mons(&mons, cx);
+        Recap::make(&self.state.usage_ledger, period, today)
     }
     pub(super) fn open_usage_recap(&mut self, cx: &mut Context<Self>) {
         if let Some(panel) = self.usage_panel.as_mut() {
             panel.recap = Some((Scope::Week, 0));
             panel.hovered_day = None;
         }
-        self.warm_usage_recap(cx);
         cx.notify();
     }
     fn set_recap_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
         if let Some(panel) = self.usage_panel.as_mut() {
             panel.recap = Some((scope, 0));
         }
-        self.warm_usage_recap(cx);
         cx.notify();
     }
     fn shift_recap(&mut self, delta: i32, cx: &mut Context<Self>) {
-        let (recap, _) = self.recap_content();
+        let recap = self.recap_content();
         if delta < 0 && !recap.can_go_back {
             return;
         }
@@ -155,11 +102,10 @@ impl Shark {
                 panel.recap = Some((scope, offset.saturating_add(delta).min(0)));
             }
         }
-        self.warm_usage_recap(cx);
         cx.notify();
     }
     pub(super) fn render_usage_recap(&self, cx: &Context<Self>) -> AnyElement {
-        let (recap, graduates) = self.recap_content();
+        let recap = self.recap_content();
         let scope = recap.period.scope;
         let offset = self
             .usage_panel
@@ -342,49 +288,11 @@ impl Shark {
                                     .map_or_else(|| "—".into(), |(_, n)| compact(n)),
                                 recap.best_streak
                             ))
-                            .child(if self.state.pokemon_disabled {
-                                format!("Active days: {}/{}", recap.active_days, recap.counted_days)
-                            } else {
-                                format!(
-                                    "Active days: {}/{} · Graduates: {}",
-                                    recap.active_days,
-                                    recap.counted_days,
-                                    recap.graduated.len()
-                                )
-                            }),
+                            .child(format!(
+                                "Active days: {}/{}",
+                                recap.active_days, recap.counted_days
+                            )),
                     )
-                    .when(!self.state.pokemon_disabled, |d| {
-                        d.child(
-                            div()
-                                .id("usage-recap-graduates")
-                                .flex()
-                                .flex_wrap()
-                                .gap_1()
-                                .items_center()
-                                .when_some(self.state.pokemon.active.as_ref(), |d, mon| {
-                                    d.child(self.render_recap_mon(mon, 20.))
-                                })
-                                .when(graduates.is_empty(), |d| {
-                                    d.child(div().text_xs().child("No graduates in this period"))
-                                })
-                                .children(graduates.into_iter().map(|mon| {
-                                    let name = graduate_name(mon);
-                                    h_flex()
-                                        .id(format!("usage-recap-graduate-{}", mon_id(mon)))
-                                        .gap_1()
-                                        .items_center()
-                                        .max_w(px(135.))
-                                        .child(self.render_recap_mon(mon, 20.))
-                                        .child(
-                                            div().text_size(px(9.)).truncate().child(name.clone()),
-                                        )
-                                        .role(Role::Label)
-                                        .aria_label(name)
-                                        .test_support()
-                                }))
-                                .test_support(),
-                        )
-                    })
                     .test_support(),
             )
             .when_some(recap.best_day, |d, (date, n)| {

@@ -136,8 +136,7 @@ async fn usage_independent_states_refresh_and_focus(cx: &mut TestAppContext) {
 async fn usage_footer_availability_and_click(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
-    let mut state = State::default();
-    state.pokemon_disabled = true;
+    let state = State::default();
     let (window, shark) = boot(cx, state, WindowOptions::default());
     let on = on_app(window, shark.clone());
     for rail in [false, true] {
@@ -165,7 +164,7 @@ async fn usage_footer_availability_and_click(cx: &mut TestAppContext) {
             cx.update_window(window, |_, w, cx| {
                 w.render_frame(cx);
                 assert!(w.find("show-usage").visible());
-                assert!(w.try_find("pokemon-footer").is_none());
+                assert!(w.find("usage-footer-quotas").visible());
                 assert!(w.try_find("usage-trigger-claude").is_none());
                 assert!(w.try_find("usage-trigger-codex").is_none());
                 w.click("show-usage", cx);
@@ -286,7 +285,6 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         for width in [800., 1440.] {
             let mut state = State::default();
             state.appearance.mode = mode;
-            state.pokemon_disabled = true;
             state.save().unwrap();
             let (window, shark) = cx
                 .update(|cx| {

@@ -265,12 +265,6 @@ pub struct Meter {
     pub current: bool,
     pub has_data: bool,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct Graduation {
-    pub id: String,
-    pub date: NaiveDate,
-    pub released: bool,
-}
 #[derive(Clone, Debug)]
 pub struct Recap {
     pub period: Period,
@@ -282,7 +276,6 @@ pub struct Recap {
     pub active_days: usize,
     pub counted_days: usize,
     pub best_streak: usize,
-    pub graduated: Vec<Graduation>,
     pub can_go_back: bool,
 }
 impl Recap {
@@ -291,12 +284,7 @@ impl Recap {
             .filter(|n| *n > 0)
             .map(|p| (self.total as f64 - p as f64) / p as f64)
     }
-    pub fn make(
-        ledger: &UsageLedger,
-        graduated: &[Graduation],
-        period: Period,
-        today: NaiveDate,
-    ) -> Self {
+    pub fn make(ledger: &UsageLedger, period: Period, today: NaiveDate) -> Self {
         let known = |d| ledger.tokens(d) > 0 || ledger.covers(d);
         let elapsed: Vec<_> = dates(period.start, period.end)
             .filter(|d| *d <= today)
@@ -348,12 +336,6 @@ impl Recap {
                 .map(|d| ledger.tokens(*d))
                 .fold(0, u64::saturating_add)
         });
-        let mut graduated: Vec<_> = graduated
-            .iter()
-            .filter(|g| !g.released && g.date >= period.start && g.date < period.end)
-            .cloned()
-            .collect();
-        graduated.sort_by(|a, b| b.date.cmp(&a.date));
         Self {
             period,
             buckets,
@@ -371,7 +353,6 @@ impl Recap {
             active_days: elapsed.iter().filter(|d| ledger.tokens(**d) > 0).count(),
             counted_days: elapsed.iter().filter(|d| known(**d)).count(),
             best_streak,
-            graduated,
             can_go_back: previous_days.last().is_some_and(|d| ledger.covers(*d)),
         }
     }

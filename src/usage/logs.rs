@@ -112,7 +112,7 @@ impl Bucket {
             return if compact { "$—" } else { "Unavailable" }.into();
         }
         if compact {
-            crate::pokemon::format::compact_cost(self.cost)
+            crate::usage::format::compact_cost(self.cost)
         } else {
             format!("${:.2}", self.cost)
         }
@@ -164,6 +164,7 @@ impl Report {
             error: None,
         }
     }
+    #[cfg(test)]
     pub fn today(&self) -> u64 {
         self.daily.tokens.last().copied().unwrap_or(0)
     }

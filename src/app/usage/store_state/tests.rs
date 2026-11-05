@@ -1,6 +1,5 @@
 use super::*;
 use crate::app::ui_tests::{UI_LOCK, boot, test_home};
-use crate::usage::logs::Report;
 use core::prelude::v1::test;
 use gpui_kit::test::TestWindowExt;
 fn quota(label: &str, remaining: f64, span: f64) -> Allowance {
@@ -10,82 +9,6 @@ fn quota(label: &str, remaining: f64, span: f64) -> Allowance {
         resets_at: None,
         window: Some(span),
     }
-}
-fn today(tokens: u64) -> Report {
-    Report::from_daily(Daily {
-        first_day: activity::local_day(crate::usage::now()),
-        tokens: vec![tokens],
-    })
-}
-// Shark warnings use official quotas regardless of local activity; footer no-activity coverage
-// lives in pokemon::footer_usage tests, adapting upstream
-// Adaptation: user requested both provider quotas remain visible regardless of local activity.
-#[gpui_kit::test]
-#[allow(clippy::await_holding_lock)]
-async fn observed_headline_warning_is_independent_of_local_activity(cx: &mut TestAppContext) {
-    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    test_home();
-    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
-    cx.update_window(window, |_, _, cx| {
-        shark.update(cx, |s, _| {
-            s.usage[0].finish(Ok(vec![quota("5 hours", 4., 18000.)]));
-            s.usage[1].finish(Ok(vec![quota("5 hours", 60., 18000.)]));
-            s.usage_reports[0] = today(0);
-            s.usage_reports[1] = today(500000);
-            assert!(s.observed_headline_warning());
-            s.usage_reports[0] = today(100000);
-            s.usage_reports[0].daily.first_day -= 1;
-            assert!(s.observed_headline_warning());
-        })
-    })
-    .unwrap();
-}
-#[gpui_kit::test]
-#[allow(clippy::await_holding_lock)]
-async fn monetary_and_model_caps_never_drive_companion_token_warning(cx: &mut TestAppContext) {
-    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    test_home();
-    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
-    cx.update_window(window, |_, _, cx| {
-        shark.update(cx, |s, _| {
-            s.usage_reports[1] = today(10000);
-            s.usage[1].finish(Ok(vec![
-                quota("5 hours", 70., 18000.),
-                quota("Individual spend", 1., 604800.),
-                quota("Model · Weekly", 0., 604800.),
-            ]));
-            assert!(!s.observed_headline_warning());
-        })
-    })
-    .unwrap();
-}
-#[gpui_kit::test]
-#[allow(clippy::await_holding_lock)]
-async fn observed_critical_warning_uses_official_headline_windows_and_fixed_shark_thresholds(
-    cx: &mut TestAppContext,
-) {
-    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    test_home();
-    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
-    cx.update_window(window, |_, _, cx| {
-        shark.update(cx, |s, _| {
-            s.usage[0].finish(Ok(vec![quota("5 hours", 4., 18000.)]));
-            assert!(s.observed_headline_warning());
-            s.usage[0].finish(Ok(vec![quota("5 hours", 50., 18000.)]));
-            assert!(!s.observed_headline_warning());
-            s.usage[1].finish(Ok(vec![
-                quota("5 hours", 90., 18000.),
-                quota("Weekly", 3., 604800.),
-            ]));
-            assert!(s.observed_headline_warning());
-            s.usage[1].finish(Err(Failure::Temporary));
-            assert!(
-                !s.observed_headline_warning(),
-                "outdated data cannot assert a current exhausted quota"
-            );
-        })
-    })
-    .unwrap();
 }
 #[test]
 fn scoped_registry_ids_remain_unique_and_stable() {
@@ -114,7 +37,7 @@ async fn native_snapshots_distinguish_no_result_fresh_and_failed_refresh(cx: &mu
             assert!(s.usage[0].checked_at.is_none());
             s.complete_usage_query(
                 Provider::Claude.into(),
-                s.pokemon_ui.generation,
+                s.usage_generation,
                 Ok(vec![quota("5 hours", 50., 18000.)]),
                 cx,
             );
@@ -122,7 +45,7 @@ async fn native_snapshots_distinguish_no_result_fresh_and_failed_refresh(cx: &mu
             assert!(!s.usage[0].outdated);
             s.complete_usage_query(
                 Provider::Claude.into(),
-                s.pokemon_ui.generation,
+                s.usage_generation,
                 Err(Failure::Temporary),
                 cx,
             );
@@ -148,7 +71,7 @@ async fn repeated_refreshes_share_queries_but_configuration_refresh_is_not_lost(
                 s.refresh_usage(cx);
             }
             assert_eq!(s.usage_queries, before);
-            let generation = s.pokemon_ui.generation;
+            let generation = s.usage_generation;
             s.set_usage_roots("claude", "/tmp/shark-refresh-fixture", cx);
             s.complete_usage_query(
                 Provider::Claude.into(),
@@ -245,30 +168,6 @@ async fn native_pace_marker_only_extends_two_points_above_and_below_track(cx: &m
         assert_eq!(track.size.height, px(4.));
         assert_eq!(marker.size.height, track.size.height + px(4.));
         assert_eq!(track.top() - marker.top(), px(2.));
-    })
-    .unwrap();
-}
-
-#[gpui_kit::test]
-#[allow(clippy::await_holding_lock)]
-async fn expired_allowances_do_not_raise_the_headline_warning(cx: &mut TestAppContext) {
-    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    test_home();
-    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
-    cx.update_window(window, |_, _, cx| {
-        shark.update(cx, |s, _| {
-            let expired = Allowance {
-                resets_at: Some(crate::usage::now() - 60.),
-                ..quota("5 hours", 2., 18000.)
-            };
-            s.usage[0].finish(Ok(vec![expired.clone()]));
-            assert!(!s.observed_headline_warning());
-            s.usage[0].finish(Ok(vec![Allowance {
-                resets_at: Some(crate::usage::now() + 600.),
-                ..expired
-            }]));
-            assert!(s.observed_headline_warning());
-        })
     })
     .unwrap();
 }

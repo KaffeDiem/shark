@@ -1,5 +1,5 @@
 use super::*;
-use crate::pokemon::format::compact_cost;
+use crate::usage::format::compact_cost;
 fn e(model: &str) -> Entry {
     Entry {
         id: model.into(),
@@ -373,7 +373,7 @@ fn fixture_codex_cost_audit() {
 
 #[test]
 fn grouped_and_cost_edges() {
-    use crate::pokemon::format::grouped;
+    use crate::usage::format::grouped;
     assert_eq!(grouped(253412890, ','), "253,412,890");
     assert_eq!(grouped(253412890, '.'), "253.412.890");
     assert_eq!(compact_cost(9.54), "$9.5");

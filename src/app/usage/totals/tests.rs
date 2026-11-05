@@ -42,7 +42,7 @@ fn open(s: &mut Shark, w: &mut Window, cx: &mut Context<Shark>, report: Report) 
     s.usage_panel.as_mut().unwrap().reference_time = Some(at(18));
     cx.notify();
 }
-// Adaptation: Shark's native Usage view owns historical accounting; Pokémon Home remains the companion view.
+// Adaptation: Shark's native Usage view owns historical accounting.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn quiet_today_keeps_month_history_and_zero_today_visible(cx: &mut TestAppContext) {
@@ -188,7 +188,7 @@ async fn native_summary_and_chart_omit_money_for_non_cost_sources(cx: &mut TestA
             s.usage.truncate(1);
             s.usage_activity.truncate(1);
             s.usage_queries.truncate(1);
-            s.pokemon_ui.scanning.truncate(1);
+            s.usage_scanning.truncate(1);
             s.usage_reports = vec![history(false)];
             s.show_usage(w, cx);
             s.usage_panel.as_mut().unwrap().details = true;
