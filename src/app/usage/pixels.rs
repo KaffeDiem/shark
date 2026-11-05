@@ -1,45 +1,7 @@
 use super::*;
 use crate::app::ui_tests::{UI_LOCK, test_home};
-use crate::usage::logs::{Entry, Report};
-use crate::usage::summary::{Scope, UsageLedger};
-use chrono::{Local, NaiveDate, TimeZone};
 use gpui_kit::test::TestWindowExt;
-use std::collections::BTreeMap;
 
-fn now() -> f64 {
-    Local
-        .from_local_datetime(
-            &NaiveDate::from_ymd_opt(2026, 8, 24)
-                .unwrap()
-                .and_hms_opt(12, 0, 0)
-                .unwrap(),
-        )
-        .earliest()
-        .unwrap()
-        .timestamp() as f64
-}
-fn report(multiplier: u64) -> Report {
-    Report::from_entries(
-        (1..=24)
-            .map(|day| Entry {
-                id: format!("fixture-{day}"),
-                date: Local
-                    .from_local_datetime(
-                        &NaiveDate::from_ymd_opt(2026, 8, day)
-                            .unwrap()
-                            .and_hms_opt(12, 0, 0)
-                            .unwrap(),
-                    )
-                    .earliest()
-                    .unwrap()
-                    .timestamp() as f64,
-                input: day as u64 * 1000 * multiplier,
-                ..Default::default()
-            })
-            .collect(),
-        now(),
-    )
-}
 fn crop(image: &image::RgbaImage, bounds: Bounds<Pixels>, width: f32) -> image::RgbaImage {
     let scale = image.width() as f32 / width;
     let left = (f32::from(bounds.left()) * scale).round().max(0.) as u32;
@@ -56,31 +18,10 @@ fn save(image: &image::RgbaImage, name: &str) {
     }
 }
 
-fn quiet_report() -> Report {
-    let at = |day| {
-        Local
-            .from_local_datetime(
-                &NaiveDate::from_ymd_opt(2026, 9, day)
-                    .unwrap()
-                    .and_hms_opt(12, 0, 0)
-                    .unwrap(),
-            )
-            .earliest()
-            .unwrap()
-            .timestamp() as f64
-    };
-    Report::from_entries(
-        [(17, 4_800_000), (1, 13_100_000)]
-            .into_iter()
-            .map(|(day, input)| Entry {
-                id: format!("quiet-{day}"),
-                date: at(day),
-                input,
-                ..Default::default()
-            })
-            .collect(),
-        at(18),
-    )
+/// Where the tick's centre lies on a bar `width` wide for `percent` left at an even pace.
+fn tick_center(percent: f64, width: f32) -> f32 {
+    let left = (percent.clamp(0., 100.) / 100.) as f32 * width - 2.25;
+    left.clamp(0., (width - 4.5).max(0.)) + 2.25
 }
 fn validate_marker(component: &image::RgbaImage, percent: Option<f64>, ink: [u8; 3], scale: f32) {
     let hits: Vec<_> = component
@@ -99,7 +40,7 @@ fn validate_marker(component: &image::RgbaImage, percent: Option<f64>, ink: [u8;
     let center =
         hits.iter().map(|(x, _)| *x as f64 + 0.5).sum::<f64>() / hits.len() as f64 / scale as f64;
     let width = component.width() as f32 / scale;
-    let expected = marker_left(percent, width) + 2.25;
+    let expected = tick_center(percent, width);
     assert!(
         (center - expected as f64).abs() <= 1.5,
         "pace{percent}:paintedcenter{center} expected{expected}"
@@ -121,7 +62,7 @@ fn validate_marker(component: &image::RgbaImage, percent: Option<f64>, ink: [u8;
     );
 }
 
-// Native host-language artifacts; exact chart crop equality and painted pace geometry are verified.
+// Native renders of the footer and the panel, with the painted pace tick checked against its geometry.
 pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
@@ -150,18 +91,10 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     )
                 })
                 .unwrap();
-            let mut single = None;
             for page in [
-                "single",
-                "idle",
-                "stacked",
-                "hover",
-                "Week",
-                "Month",
-                "Year",
-                "quiet-history",
-                "quiet-empty",
-                "quiet-known",
+                "footer",
+                "footer-rail",
+                "panel",
                 "pace-none",
                 "pace0",
                 "pace25",
@@ -171,42 +104,33 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 let bounds = cx
                     .update_window(window, |_, w, cx| {
                         shark.update(cx, |s, cx| {
-                            s.show_usage(w, cx);
-                            s.usage_panel.as_mut().unwrap().reference_time = Some(now());
-                            s.usage_panel.as_mut().unwrap().details = true;
-                            s.usage_reports[0] = report(1);
-                            s.usage_reports[1] = if page == "single" {
-                                Report::default()
-                            } else if page == "idle" {
-                                report(0)
+                            s.rail = page == "footer-rail";
+                            s.usage[0].finish(Ok(vec![
+                                Allowance {
+                                    label: "5 hours".into(),
+                                    remaining: Some(42.),
+                                    resets_at: Some(crate::usage::now() + 9000.),
+                                    window: Some(18000.),
+                                },
+                                Allowance {
+                                    label: "Weekly".into(),
+                                    remaining: Some(8.),
+                                    resets_at: Some(crate::usage::now() + 302400.),
+                                    window: Some(604800.),
+                                },
+                            ]));
+                            s.usage[1].finish(Ok(vec![Allowance {
+                                label: "5 hours".into(),
+                                remaining: Some(68.),
+                                resets_at: Some(crate::usage::now() + 9000.),
+                                window: Some(18000.),
+                            }]));
+                            if page.starts_with("footer") {
+                                s.close_usage(w, cx);
                             } else {
-                                report(2)
-                            };
-                            for snapshot in &mut s.usage {
-                                snapshot.finish(Ok(vec![]));
-                            }
-                            if page.starts_with("quiet-") {
-                                let report = quiet_report();
-                                let date = Local
-                                    .from_local_datetime(
-                                        &NaiveDate::from_ymd_opt(2026, 9, 18)
-                                            .unwrap()
-                                            .and_hms_opt(12, 0, 0)
-                                            .unwrap(),
-                                    )
-                                    .earliest()
-                                    .unwrap()
-                                    .timestamp() as f64;
-                                s.usage_reports[0] = if page == "quiet-empty" {
-                                    Report::from_entries(vec![], date)
-                                } else {
-                                    report
-                                };
-                                s.usage_reports[1] = Report::default();
-                                s.usage_panel.as_mut().unwrap().reference_time = Some(date);
+                                s.show_usage(w, cx);
                             }
                             if page.starts_with("pace") {
-                                s.usage_reports = vec![Report::default(); s.usage_providers.len()];
                                 let percent = page
                                     .strip_prefix("pace")
                                     .and_then(|value| value.parse::<f64>().ok());
@@ -218,35 +142,11 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                     window: Some(18000.),
                                 }]));
                             }
-                            if ["Week", "Month", "Year"].contains(&page) {
-                                s.state.usage_ledger = UsageLedger {
-                                    covered_since: Some("2026-01-01".into()),
-                                    tokens_by_day: BTreeMap::from([
-                                        ("2026-08-23".into(), 2500000),
-                                        ("2026-08-24".into(), 4000000),
-                                        ("2026-08-17".into(), 1500000),
-                                    ]),
-                                };
-                                s.open_usage_recap(cx);
-                                s.usage_panel.as_mut().unwrap().recap = Some((
-                                    match page {
-                                        "Month" => Scope::Month,
-                                        "Year" => Scope::Year,
-                                        _ => Scope::Week,
-                                    },
-                                    0,
-                                ));
-                            }
                             cx.notify();
                         });
                         w.render_frame(cx);
                         w.refresh();
                         w.render_frame(cx);
-                        if page == "hover" {
-                            w.hover("usage-trend-day-2026-08-23", cx);
-                            w.render_frame(cx);
-                            assert!(w.find("usage-trend-tooltip").visible());
-                        }
                         if page.starts_with("pace") {
                             let bar = w.find("usage-bar-claude-0").bounds();
                             Bounds::new(
@@ -254,12 +154,10 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 size(bar.size.width, px(8.)),
                             )
                         } else {
-                            w.find(if ["Week", "Month", "Year"].contains(&page) {
-                                "usage-recap-card"
-                            } else if page.starts_with("quiet-") {
-                                "usage-combined-totals"
+                            w.find(if page.starts_with("footer") {
+                                "usage-footer"
                             } else {
-                                "usage-trend"
+                                "usage-panel"
                             })
                             .bounds()
                         }
@@ -290,22 +188,8 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     );
                 }
                 assert!(component.width() > 0 && component.height() > 0);
-                if page == "single" {
-                    single = Some(component.clone());
-                }
-                if page == "idle" {
-                    assert_eq!(
-                        single.as_ref().unwrap(),
-                        &component,
-                        "single-active and idle-provider chart pixels must be identical ({label})"
-                    );
-                }
-                save(&screenshot, &format!("usage-{page}-{label}.png"));
-                save(&component, &format!("usage-{page}-component-{label}.png"));
             }
         }
     }
-    println!(
-        "Usage real Metal renders:30passed; single/idle chart RGBA crops identical in dark+light; recap Week/Month/Year rendered"
-    );
+    println!("Usage real Metal renders:16 passed; footer, panel and pace ticks in dark+light");
 }

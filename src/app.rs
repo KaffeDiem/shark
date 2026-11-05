@@ -143,13 +143,7 @@ pub struct Shark {
     menu: Option<(Entity<menu::Menu>, Subscription)>,
     app_switcher: Option<app_switcher::AppSwitcher>,
     usage_panel: Option<usage::Panel>,
-    usage_scanning: Vec<bool>,
-    usage_generation: u64,
-    usage_providers: Vec<crate::usage::providers::ProviderHandle>,
     usage: Vec<crate::usage::Snapshot>,
-    /// Daily tokens from the agents' local logs, rescanned with each usage refresh.
-    usage_activity: Vec<crate::usage::activity::Daily>,
-    usage_reports: Vec<crate::usage::logs::Report>,
     #[cfg(test)]
     usage_queries: Vec<usize>,
     #[cfg(test)]
@@ -263,17 +257,6 @@ impl Shark {
         _subs.push(cx.subscribe_in(&differ, window, |s, _, event, w, cx| {
             s.differ_event(event, w, cx)
         }));
-        let usage_providers: Vec<_> = crate::usage::providers::builtins().handles().collect();
-        for provider in &usage_providers {
-            provider.source().configure_scan_roots(
-                state
-                    .usage_roots
-                    .get(provider.id())
-                    .map(String::as_str)
-                    .unwrap_or(""),
-            );
-        }
-        let provider_count = usage_providers.len();
         Shark {
             state,
             sel: SideRow::Ws(0),
@@ -313,16 +296,9 @@ impl Shark {
             menu: None,
             app_switcher: None,
             usage_panel: None,
-            usage_scanning: vec![false; provider_count],
-            usage_generation: 0,
-            usage_providers,
-            usage: vec![Default::default(); provider_count],
-            usage_activity: vec![Default::default(); provider_count],
-            usage_reports: (0..provider_count)
-                .map(|_| crate::usage::logs::Report::from_daily(Default::default()))
-                .collect(),
+            usage: vec![Default::default(); crate::usage::Provider::ALL.len()],
             #[cfg(test)]
-            usage_queries: vec![0; provider_count],
+            usage_queries: vec![0; crate::usage::Provider::ALL.len()],
             #[cfg(test)]
             usage_live: false,
             usage_at: Default::default(),

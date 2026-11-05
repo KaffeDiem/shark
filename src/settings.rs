@@ -1,7 +1,5 @@
 //! Settings dialog (cmd-,): general (stay awake, Vim mode), appearance (mode, light and dark
-//! theme, fonts), the git button's agent prompts and token-source folders. Preferences apply
-//! immediately; a folder list is saved when its field loses focus (or the dialog closes), so a
-//! partially typed path never starts a scan.
+//! theme, fonts) and the git button's agent prompts. Preferences apply immediately.
 use crate::SwitchField;
 use crate::app::Shark;
 use crate::prompts::{self, PROMPTS};
@@ -32,7 +30,7 @@ pub fn open(state: &State, window: &mut Window, cx: &mut Context<Shark>) {
     focus.focus(window, cx);
 }
 
-/// About dialog (Shark > About Shark): version, author, repo link, and licenses.
+/// About dialog (Shark > About Shark): version, author, repo link, and license.
 pub fn about(window: &mut Window, cx: &mut App) {
     window.open_dialog(cx, |d, _, cx| {
         let theme = cx.theme();
@@ -64,10 +62,6 @@ pub fn about(window: &mut Window, cx: &mut App) {
                 .child(section(theme, "Shark · GPL-3.0"))
                 .child("Copyright Kasper Munch Jensen. Shark is free software distributed under the GNU General Public License, version 3.")
                 .child(link("license-shark", "Read Shark’s full license", "https://github.com/KaffeDiem/shark/blob/master/LICENSE"))
-                .child(section(theme, "PokeTokenBar · MIT"))
-                .child("Shark’s usage log accounting is adapted from PokeTokenBar by chattymin and contributors.")
-                .child(link("license-poketokenbar", "PokeTokenBar source", "https://github.com/chattymin/PokeTokenBar"))
-                .child(div().text_xs().child(include_str!("../licenses/PokeTokenBar-MIT.txt")))
                 .test_support(),
         )
     });
@@ -112,7 +106,6 @@ pub struct Settings {
     ui_font: Choice,
     mono_font: Choice,
     prompts: Vec<Entity<TextareaState>>,
-    roots: Vec<(String, String, Entity<TextareaState>)>,
     _subs: Vec<Subscription>,
 }
 
@@ -216,46 +209,6 @@ impl Settings {
             })
             .collect();
 
-        let roots = crate::usage::providers::builtins()
-            .handles()
-            .filter(|provider| provider.source().supports_custom_roots())
-            .enumerate()
-            .map(|(index, provider)| {
-                let value = state
-                    .usage_roots
-                    .get(provider.id())
-                    .cloned()
-                    .unwrap_or_default();
-                let input = cx.new(|cx| {
-                    TextareaState::new(window, cx)
-                        .auto_grow(2, 6)
-                        .default_value(value)
-                });
-                subs.push(
-                    cx.subscribe_in(&input, window, move |this, _, ev, _, cx| match ev {
-                        InputEvent::Blur => this.save_roots(index, cx),
-                        _ => cx.notify(),
-                    }),
-                );
-                (
-                    provider.id().to_string(),
-                    provider.name().to_string(),
-                    input,
-                )
-            })
-            .collect::<Vec<_>>();
-        // Closing the dialog may not blur the field first; don't lose what was typed.
-        let pending = roots
-            .iter()
-            .map(|(id, _, input): &(String, String, Entity<TextareaState>)| {
-                (id.clone(), input.clone())
-            })
-            .collect::<Vec<_>>();
-        subs.push(cx.on_release(move |this, cx| {
-            for (id, input) in &pending {
-                Self::commit_roots(&this.shark, id, input, cx);
-            }
-        }));
         Settings {
             shark,
             tab: 0,
@@ -265,7 +218,6 @@ impl Settings {
             ui_font,
             mono_font,
             prompts,
-            roots,
             _subs: subs,
         }
     }
@@ -422,51 +374,6 @@ impl Settings {
             ))
     }
 
-    fn commit_roots(
-        shark: &WeakEntity<Shark>,
-        id: &str,
-        input: &Entity<TextareaState>,
-        cx: &mut App,
-    ) {
-        let raw = input.read(cx).value().to_string();
-        shark
-            .update(cx, |shark, cx| shark.set_usage_roots(id, &raw, cx))
-            .ok();
-    }
-
-    pub(crate) fn save_roots(&mut self, index: usize, cx: &mut Context<Self>) {
-        let (id, _, input) = &self.roots[index];
-        Self::commit_roots(&self.shark, id, input, cx);
-        cx.notify();
-    }
-
-    #[cfg(test)]
-    pub(crate) fn roots_input(&self, id: &str) -> Entity<TextareaState> {
-        self.roots
-            .iter()
-            .find(|(key, _, _)| key == id)
-            .unwrap()
-            .2
-            .clone()
-    }
-
-    fn render_roots(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let home = crate::state::home();
-        v_flex().w_full().min_w_0().gap_4()
-            .child("Shark finds the standard log folders automatically. Add folders for other local installations here; each tool keeps its own list.")
-            .child(div().text_sm().text_color(theme.muted_foreground)
-                .child("Use one path per line or separate paths with commas. ~ and directory wildcards are supported. Changes are saved when you leave the field; clear a list to use only the standard folders."))
-            .children(self.roots.iter().map(|(_, name, input)| {
-                let ignored = ignored_roots(&input.read(cx).value(), &home);
-                v_flex().w_full().min_w_0().gap_2()
-                    .child(div().text_sm().font_weight(FontWeight::SEMIBOLD).child(name.clone()))
-                    .child(Textarea::new(input))
-                    .when(!ignored.is_empty(), |d| d.child(div().text_xs().text_color(theme.muted_foreground)
-                        .child(format!("Ignored (not an absolute path, or too broad): {}", ignored.join(", ")))))
-            }))
-    }
-
     fn render_appearance(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let saved = self.saved_appearance(cx);
         let mode = saved.mode;
@@ -613,22 +520,7 @@ const PAGES: &[(IconName, (&str, &str))] = &[
             "Sent to the agent by the git button; {repos} and {branch} are filled in when the step runs",
         ),
     ),
-    (
-        IconName::Folder,
-        ("Token sources", "Extra local log folders for usage totals"),
-    ),
 ];
-
-/// Entries of a folder list that the scan drops: relative paths and bare `/` or `~`.
-pub(crate) fn ignored_roots(raw: &str, home: &std::path::Path) -> Vec<String> {
-    raw.split([',', '\n', '\r'])
-        .map(str::trim)
-        .filter(|part| {
-            !part.is_empty() && crate::usage::logs::roots::parse_paths(part, home).is_empty()
-        })
-        .map(String::from)
-        .collect()
-}
 
 /// A tiny mock of the app in a theme's colors: sidebar, text lines and a primary button.
 fn preview(theme: &Theme, s: &Swatch, on: bool) -> Div {
@@ -691,8 +583,7 @@ impl Render for Settings {
         let body = match self.tab {
             0 => self.render_general(cx).into_any_element(),
             1 => self.render_appearance(cx).into_any_element(),
-            2 => self.render_prompts(cx).into_any_element(),
-            _ => self.render_roots(cx).into_any_element(),
+            _ => self.render_prompts(cx).into_any_element(),
         };
         let (title, desc) = PAGES[self.tab].1;
         let theme = cx.theme();

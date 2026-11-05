@@ -22,12 +22,6 @@ pub struct State {
     /// Vim keys in the file editor.
     #[serde(default)]
     pub vim: bool,
-    /// Additional token log roots, keyed by the provider's stable ID.
-    #[serde(default, deserialize_with = "or_default")]
-    pub usage_roots: BTreeMap<String, String>,
-    /// Numeric local-day history for usage recaps, kept per local day.
-    #[serde(default)]
-    pub usage_ledger: crate::usage::summary::UsageLedger,
     /// The file editor's code size in logical px (cmd-=/cmd--); None is
     /// `editor::FONT_SIZE`.
     #[serde(default)]
@@ -546,14 +540,6 @@ fn tolerant_lists<'de, D: serde::Deserializer<'de>>(
         .collect())
 }
 
-/// A bad value in an optional field must not fail the whole `State` parse, which would reset
-/// workspaces and chats.
-fn or_default<'de, D: serde::Deserializer<'de>, T: serde::de::DeserializeOwned + Default>(
-    d: D,
-) -> Result<T, D::Error> {
-    Ok(serde_json::from_value(Value::deserialize(d)?).unwrap_or_default())
-}
-
 /// The first unused `state.json.bak-N`; numbered so a later backup never replaces an earlier one.
 fn backup_path(path: &Path) -> PathBuf {
     (0..)
@@ -770,31 +756,6 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn bad_usage_roots_value_keeps_the_rest_of_state() {
-        let dir = std::env::temp_dir().join(format!(
-            "shark-badfield-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("state.json");
-        let mut state = State::default();
-        state.last_repos = vec!["kept".into()];
-        state.save_at(&path).unwrap();
-        let mut value: Value = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
-        value["usage_roots"] = serde_json::json!("garbage");
-        fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-        let loaded = State::load_at(&path);
-        assert_eq!(loaded.last_repos, ["kept"]);
-        assert!(loaded.corrupt_backup.is_none());
-        assert!(loaded.usage_roots.is_empty());
-        fs::remove_dir_all(dir).unwrap();
-    }
 
     #[test]
     fn tests_never_touch_the_real_home() {
