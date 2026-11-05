@@ -1,6 +1,6 @@
 use super::*;
 use crate::app::ui_tests::{UI_LOCK, boot, test_home};
-use crate::usage::logs::{Bucket, CostCoverage, Entry, Report};
+use crate::usage::logs::{Bucket, Entry, Report};
 use crate::usage::providers::{Registry, UsageProvider};
 use core::prelude::v1::test;
 use gpui_kit::test::TestWindowExt;
@@ -13,11 +13,6 @@ fn day(text: &str, tokens: u64) -> Day {
         date: date(text),
         bucket: Bucket {
             input: tokens,
-            cost: 7.,
-            coverage: CostCoverage {
-                estimated: true,
-                ..Default::default()
-            },
             ..Default::default()
         },
     }
@@ -27,7 +22,6 @@ fn provider(id: &str, values: &[(&str, u64)]) -> ProviderSeries {
         id: id.into(),
         name: id.into(),
         days: Some(values.iter().map(|(d, n)| day(d, *n)).collect()),
-        reports_cost: true,
     }
 }
 fn labels(today: &str) -> Vec<String> {
@@ -321,19 +315,11 @@ fn registered_sources_have_distinct_palette_slots() {
     assert_eq!(slots.len(), registry.len());
 }
 #[test]
-fn caption_is_combined_today_and_cost() {
+fn caption_is_combined_today() {
     let days = vec![day("2026-08-23", 4_000_000), day("2026-08-24", 2_500_000)];
     let labels = DateText::new("MdE");
     assert_eq!(
-        readout(&days, date("2026-08-24"), true, &labels),
-        format!(
-            "{} 2.5M {}",
-            labels.stamp(date("2026-08-24")),
-            days[1].bucket.cost_text(true)
-        )
-    );
-    assert_eq!(
-        readout(&days, date("2026-08-24"), false, &labels),
+        readout(&days, date("2026-08-24"), &labels),
         format!("{} 2.5M", labels.stamp(date("2026-08-24")))
     );
 }
@@ -348,16 +334,14 @@ fn tooltip_names_day_total_and_used_provider_split() {
     ];
     ps[0].name = "Claude Code".into();
     ps[1].name = "Codex".into();
-    ps[1].reports_cost = false;
     let total = vec![day("2026-08-23", 4_000_000), day("2026-08-24", 2_000_000)];
     let labels = DateText::new("MdE");
-    let text = hover_text(date("2026-08-23"), &total, &ordered(&ps), true, &labels).unwrap();
+    let text = hover_text(date("2026-08-23"), &total, &ordered(&ps), &labels).unwrap();
     assert!(text.contains("4M tokens"));
-    assert!(text.contains("Claude Code · 3M · $"));
+    assert!(text.contains("Claude Code · 3M"));
     assert!(text.ends_with("Codex · 1M"));
-    let quiet = hover_text(date("2026-08-24"), &total, &ordered(&ps), false, &labels).unwrap();
+    let quiet = hover_text(date("2026-08-24"), &total, &ordered(&ps), &labels).unwrap();
     assert!(!quiet.contains("Codex"));
-    assert!(!quiet.contains('$'));
 }
 #[test]
 fn single_provider_tooltip_has_no_duplicate_breakdown() {
@@ -366,7 +350,6 @@ fn single_provider_tooltip_has_no_duplicate_breakdown() {
         date("2026-08-24"),
         &[day("2026-08-24", 1000)],
         &ordered(&ps),
-        true,
         &DateText::new("MdE"),
     )
     .unwrap();
@@ -386,8 +369,6 @@ fn report(values: &[(&str, u64)], now: f64) -> Report {
                     .unwrap()
                     .timestamp() as f64,
                 input: *n,
-                explicit_cost: Some(8888.88),
-                cost_is_estimate: Some(true),
                 ..Default::default()
             })
             .collect(),

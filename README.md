@@ -24,7 +24,7 @@
 
 ## Credits
 
-Usage log scanning and pricing are adapted from [PokeTokenBar](https://github.com/chattymin/PokeTokenBar) (MIT).
+Usage log scanning is adapted from [PokeTokenBar](https://github.com/chattymin/PokeTokenBar) (MIT).
 
 ## Install
 ```sh

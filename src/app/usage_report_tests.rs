@@ -1,6 +1,6 @@
 use super::*;
 use crate::app::ui_tests::{UI_LOCK, boot, test_home};
-use crate::usage::logs::{CostCoverage, Entry, Report};
+use crate::usage::logs::{Entry, Report};
 use crate::usage::providers::Observation;
 use core::prelude::v1::test;
 use gpui_kit::test::TestWindowExt;
@@ -13,112 +13,6 @@ fn entry(model: &str, now: f64) -> Entry {
         output: 100,
         cache_read: 500,
         ..Default::default()
-    }
-}
-#[gpui_kit::test]
-#[allow(clippy::await_holding_lock)]
-async fn cost_coverage_survives_store_and_native_usage(cx: &mut TestAppContext) {
-    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    test_home();
-    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
-    let now = crate::usage::now();
-    cx.update_window(window, |_, w, cx| {
-        shark.update(cx, |s, cx| {
-            for (provider, model) in [
-                (Provider::Claude, "gpt-5.5"),
-                (Provider::Codex, "new-model"),
-            ] {
-                let report = Report::from_entries(vec![entry(model, now)], now);
-                s.complete_usage_activity(
-                    provider.into(),
-                    s.usage_generation,
-                    Observation {
-                        activity: report.daily.clone(),
-                        report,
-                    },
-                    cx,
-                )
-            }
-            let combined = crate::usage::summary::combine_series(
-                s.usage_reports.iter().map(|r| r.month_daily(now)),
-            );
-            let today = combined.last().unwrap();
-            assert_eq!(today.bucket.total(), 3200);
-            assert_eq!(
-                today.bucket.coverage,
-                CostCoverage {
-                    estimated: true,
-                    unknown: true,
-                    reported: false
-                }
-            );
-            assert_eq!(
-                s.state
-                    .usage_ledger
-                    .tokens(crate::usage::summary::local_date(now)),
-                3200
-            );
-            s.show_usage(w, cx);
-            s.usage_panel.as_mut().unwrap().details = true
-        });
-        w.render_frame(cx);
-        let priced = w.find("usage-cost-claude");
-        assert!(priced.visible());
-        assert!(priced.label().unwrap().contains("$0.01"));
-        assert!(!priced.label().unwrap().contains('≈'));
-        assert!(!priced.label().unwrap().contains('+'));
-        assert!(
-            w.find("usage-cost-codex")
-                .label()
-                .unwrap()
-                .contains("Unavailable")
-        );
-    })
-    .unwrap();
-}
-// Shark retains its interface language; pure cost localization tests cover all upstream languages.
-#[gpui_kit::test]
-#[allow(clippy::await_holding_lock)]
-async fn native_cost_states_have_accessible_labels_and_layout(cx: &mut TestAppContext) {
-    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-    test_home();
-    let (window, shark) = boot(cx, State::default(), WindowOptions::default());
-    let now = crate::usage::now();
-    for (reported, estimated, unknown, label) in [
-        (false, true, false, "includes estimates"),
-        (true, false, false, "reported"),
-        (false, false, true, "Unavailable"),
-        (false, true, true, "partial coverage"),
-    ] {
-        cx.update_window(window, |_, w, cx| {
-            shark.update(cx, |s, cx| {
-                let mut report = Report::from_entries(vec![entry("gpt-5.5", now)], now);
-                report.totals.cost = if reported { 0. } else { 12.5 };
-                report.totals.coverage = CostCoverage {
-                    reported,
-                    estimated,
-                    unknown,
-                };
-                s.complete_usage_activity(
-                    Provider::Claude.into(),
-                    s.usage_generation,
-                    Observation {
-                        activity: report.daily.clone(),
-                        report,
-                    },
-                    cx,
-                );
-                s.show_usage(w, cx);
-                s.usage_panel.as_mut().unwrap().details = true
-            });
-            w.render_frame(cx);
-            let node = w.find("usage-cost-claude");
-            assert!(node.visible());
-            assert!(node.label().unwrap().contains(label));
-            assert!(node.bounds().size.width > px(100.));
-            assert!(node.bounds().size.height > px(8.));
-        })
-        .unwrap();
     }
 }
 #[gpui_kit::test]

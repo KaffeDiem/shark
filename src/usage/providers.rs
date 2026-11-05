@@ -10,10 +10,6 @@ use std::sync::{Mutex, OnceLock};
 pub trait UsageProvider: Send + Sync {
     fn id(&self) -> &str;
     fn name(&self) -> &str;
-    /// False for tools whose local monetary totals must not be presented as usage costs.
-    fn reports_cost(&self) -> bool {
-        true
-    }
 
     /// Official remaining allowance, never inferred from token consumption.
     /// Providers without quota reporting return `Failure::Unsupported`.

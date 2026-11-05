@@ -155,7 +155,7 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
   - Expanded, each call is its own 28px row, indented 22px to line up with the summary text, and each opens to its output.
   - Skills (`Skill`) and subagents (`Agent`/`Task`) are never grouped: they get their own row with a `BookOpen` / `Bot` icon, because they say *what* the agent is doing. Add a tool to `standalone()` only if it carries that kind of intent.
   - Tool paths are shown relative to the workspace (`api/src/a.rs`).
-  - A turn ends with an info line: "done · 48s · $0.12", or "interrupted · 12s · $0.03" after `ctrl-c`. A turn cut off by quitting gets "interrupted" on replay.
+  - A turn ends with an info line: "done · 48s", or "interrupted · 12s" after `ctrl-c`. A turn cut off by quitting gets "interrupted" on replay.
 - **Composer completions** (`@` files, `/` skills; `src/complete.rs`):
   - The menu opens upward from the composer, at its width, over the transcript, on the menu surface (`menu::chrome`). It shows 8 rows of 32px (`menu::ROW_H`) and scrolls to more, with a `faint` key-hint footer.
   - Each row has an icon: a file's or folder's colored icon (see Icons), else a 14px `File` / `Folder` / `SquareSlash`; the name in `foreground`, the folder or description in `text_xs` `muted_foreground` (truncated), and on the right the repo (`FolderGit2` + name) when the workspace has more than one repo, or a command's argument hint in `faint`.

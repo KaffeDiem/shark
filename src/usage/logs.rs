@@ -1,5 +1,4 @@
 //! Inclusive local token accounting, separate from Shark's cache-excluding activity heatmap.
-//! Pricing is an estimate from PokeTokenBar's pinned table, never a subscription invoice.
 use super::{
     Provider,
     activity::{DAYS, Daily, local_day},
@@ -10,8 +9,6 @@ use std::collections::{BTreeMap, BTreeSet};
 pub mod cache;
 pub mod claude;
 pub mod codex;
-pub mod cost;
-pub mod pricing;
 pub mod roots;
 pub mod timing;
 pub use cache::Cache;
@@ -26,9 +23,6 @@ pub struct Entry {
     pub output: u64,
     pub cache_write: u64,
     pub cache_read: u64,
-    pub explicit_cost: Option<f64>,
-    pub cost_is_estimate: Option<bool>,
-    pub cost_unavailable: Option<bool>,
     pub session_ids: BTreeSet<String>,
 }
 impl Entry {
@@ -39,30 +33,12 @@ impl Entry {
             .saturating_add(self.cache_read)
     }
 }
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub struct CostCoverage {
-    pub reported: bool,
-    pub estimated: bool,
-    pub unknown: bool,
-}
-impl CostCoverage {
-    pub fn merge(&mut self, other: Self) {
-        self.reported |= other.reported;
-        self.estimated |= other.estimated;
-        self.unknown |= other.unknown;
-    }
-    pub fn has_known(self) -> bool {
-        self.reported || self.estimated
-    }
-}
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Bucket {
     pub input: u64,
     pub output: u64,
     pub cache_write: u64,
     pub cache_read: u64,
-    pub cost: f64,
-    pub coverage: CostCoverage,
 }
 impl Bucket {
     pub fn total(&self) -> u64 {
@@ -76,46 +52,12 @@ impl Bucket {
         self.output = self.output.saturating_add(e.output);
         self.cache_write = self.cache_write.saturating_add(e.cache_write);
         self.cache_read = self.cache_read.saturating_add(e.cache_read);
-        if e.total() == 0 {
-            return;
-        }
-        if let Some(cost) = e.explicit_cost.filter(|c| c.is_finite() && *c >= 0.) {
-            self.cost = (self.cost + cost).min(f64::MAX);
-            if e.cost_is_estimate == Some(true) {
-                self.coverage.estimated = true
-            } else {
-                self.coverage.reported = true
-            }
-        } else if e.cost_unavailable != Some(true) {
-            if let Some(cost) =
-                pricing::estimate(&e.model, e.input, e.output, e.cache_write, e.cache_read)
-            {
-                self.cost = (self.cost + cost).min(f64::MAX);
-                self.coverage.estimated = true
-            } else {
-                self.coverage.unknown = true;
-            }
-        } else {
-            self.coverage.unknown = true
-        }
     }
     pub fn merge(&mut self, b: &Self) {
         self.input = self.input.saturating_add(b.input);
         self.output = self.output.saturating_add(b.output);
         self.cache_write = self.cache_write.saturating_add(b.cache_write);
         self.cache_read = self.cache_read.saturating_add(b.cache_read);
-        self.cost = (self.cost + b.cost).min(f64::MAX);
-        self.coverage.merge(b.coverage);
-    }
-    pub fn cost_text(&self, compact: bool) -> String {
-        if self.coverage.unknown && !self.coverage.has_known() {
-            return if compact { "$—" } else { "Unavailable" }.into();
-        }
-        if compact {
-            crate::usage::format::compact_cost(self.cost)
-        } else {
-            format!("${:.2}", self.cost)
-        }
     }
 }
 #[derive(Clone, Debug, Default)]
@@ -133,10 +75,6 @@ impl Report {
             daily,
             totals: Bucket {
                 input: total,
-                coverage: CostCoverage {
-                    unknown: total > 0,
-                    ..Default::default()
-                },
                 ..Default::default()
             },
             ..Self::default()

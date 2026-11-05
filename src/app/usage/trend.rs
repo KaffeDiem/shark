@@ -152,43 +152,23 @@ pub(super) fn color_slot(id: &str, registry: &[String], palette_count: usize) ->
 fn color(id: &str, registry: &[String]) -> Hsla {
     gpui_kit::rgb(PALETTE[color_slot(id, registry, PALETTE.len())]).into()
 }
-pub(super) fn readout(
-    series: &[Day],
-    today: NaiveDate,
-    shows_cost: bool,
-    labels: &DateText,
-) -> String {
+pub(super) fn readout(series: &[Day], today: NaiveDate, labels: &DateText) -> String {
     let Some(day) = series.iter().find(|d| d.date == today) else {
         return String::new();
     };
-    format!(
-        "{} {}{}",
-        labels.stamp(today),
-        compact(day.bucket.total()),
-        if shows_cost {
-            format!(" {}", day.bucket.cost_text(true))
-        } else {
-            String::new()
-        }
-    )
+    format!("{} {}", labels.stamp(today), compact(day.bucket.total()))
 }
 pub(super) fn hover_text(
     date: NaiveDate,
     series: &[Day],
     stack: &[&ProviderSeries],
-    shows_cost: bool,
     labels: &DateText,
 ) -> Option<String> {
     let day = series.iter().find(|d| d.date == date)?;
     let mut text = format!(
-        "{} · {} tokens{}",
+        "{} · {} tokens",
         labels.stamp(date),
-        compact(day.bucket.total()),
-        if shows_cost {
-            format!(" · {}", day.bucket.cost_text(false))
-        } else {
-            String::new()
-        }
+        compact(day.bucket.total())
     );
     if stack.len() > 1 {
         for p in stack {
@@ -198,16 +178,7 @@ pub(super) fn hover_text(
                 .and_then(|ds| ds.iter().find(|d| d.date == date))
                 .filter(|d| d.bucket.total() > 0)
             {
-                text.push_str(&format!(
-                    "\n{} · {}{}",
-                    p.name,
-                    compact(day.bucket.total()),
-                    if shows_cost && p.reports_cost {
-                        format!(" · {}", day.bucket.cost_text(false))
-                    } else {
-                        String::new()
-                    }
-                ));
+                text.push_str(&format!("\n{} · {}", p.name, compact(day.bucket.total())));
             }
         }
     }
@@ -221,7 +192,6 @@ impl Shark {
         providers: &[ProviderSeries],
         registry: &[String],
         today: NaiveDate,
-        shows_cost: bool,
         cx: &Context<Self>,
     ) -> AnyElement {
         let columns = columns(series, today);
@@ -233,9 +203,9 @@ impl Shark {
         let stack = ordered(providers);
         let stacked = stack.len() > 1;
         let labels = DateText::new("MdE");
-        let caption = readout(series, today, shows_cost, &labels);
+        let caption = readout(series, today, &labels);
         let hovered = self.usage_panel.as_ref().and_then(|p| p.hovered_day);
-        let tip = hovered.and_then(|date| hover_text(date, series, &stack, shows_cost, &labels));
+        let tip = hovered.and_then(|date| hover_text(date, series, &stack, &labels));
         let bars = h_flex()
             .id("usage-trend-bars")
             .h(px(TRACK))
@@ -249,7 +219,7 @@ impl Shark {
                 } else {
                     vec![]
                 };
-                let label = hover_text(date, series, &stack, shows_cost, &labels)
+                let label = hover_text(date, series, &stack, &labels)
                     .unwrap_or_else(|| format!("{}, 0 tokens", labels.stamp(date)));
                 div()
                     .id(format!("usage-trend-day-{date}"))

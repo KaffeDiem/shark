@@ -61,10 +61,6 @@ impl Report {
                     date,
                     bucket: Bucket {
                         input: *n,
-                        coverage: super::logs::CostCoverage {
-                            unknown: *n > 0,
-                            ..Default::default()
-                        },
                         ..Default::default()
                     },
                 })
@@ -364,7 +360,6 @@ pub struct ProviderSeries {
     pub id: String,
     pub name: String,
     pub days: Option<Vec<Day>>,
-    pub reports_cost: bool,
 }
 #[cfg(test)]
 mod combined_tests;

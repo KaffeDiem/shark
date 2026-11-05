@@ -38,7 +38,6 @@ struct Blob {
     offset: Option<u64>,
     append_guard: Option<(u64, u64)>,
     entries: Vec<Entry>,
-    ledger: BTreeMap<String, f64>,
     rollout: Option<codex::Rollout>,
 }
 #[derive(Clone, Debug)]
@@ -182,11 +181,7 @@ impl Cache {
                 included
                     .iter()
                     .filter_map(|p| self.snapshot.blobs.get(p))
-                    .flat_map(|b| {
-                        let mut e = b.entries.clone();
-                        claude::apply_ledger(&mut e, &b.ledger);
-                        e
-                    })
+                    .flat_map(|b| b.entries.clone())
                     .collect(),
             )
         } else {
@@ -295,17 +290,11 @@ impl Cache {
                 vec![]
             };
             entries.extend(parsed.entries);
-            let ledger = if parsed.ledger.is_empty() && offset > 0 {
-                old.map(|b| b.ledger.clone()).unwrap_or_default()
-            } else {
-                parsed.ledger
-            };
             Blob {
                 stamp: stamp.clone(),
                 offset: Some(parsed.offset),
                 append_guard: next_guard,
                 entries: dedup_claude(entries),
-                ledger,
                 rollout: None,
             }
         };

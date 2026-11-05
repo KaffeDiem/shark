@@ -23,11 +23,7 @@ fn report(rows: &[(f64, u64)]) -> Report {
 }
 fn combine(reports: &[(&str, Report)]) -> Summary {
     Summary::from_sources(
-        reports.iter().map(|(id, r)| Source {
-            id,
-            report: r,
-            reports_cost: true,
-        }),
+        reports.iter().map(|(id, r)| Source { id, report: r }),
         now(),
     )
 }
@@ -133,7 +129,6 @@ fn recent_use_crosses_calendar_boundary() {
         [Source {
             id: "codex",
             report: &r,
-            reports_cost: true,
         }],
         monday,
     );
@@ -163,9 +158,8 @@ fn older_than_week_without_current_period_hidden() {
             [Source {
                 id: "codex",
                 report: &r,
-                reports_cost: true
             }],
-            day
+            day,
         )
         .providers
         .is_empty()
@@ -224,7 +218,6 @@ fn midnight_preserves_active_usage_and_periods() {
         [Source {
             id: "claude",
             report: &r,
-            reports_cost: true,
         }],
         now,
     );

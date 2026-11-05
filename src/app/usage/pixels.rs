@@ -34,8 +34,6 @@ fn report(multiplier: u64) -> Report {
                     .unwrap()
                     .timestamp() as f64,
                 input: day as u64 * 1000 * multiplier,
-                explicit_cost: Some(0.3),
-                cost_is_estimate: Some(true),
                 ..Default::default()
             })
             .collect(),
@@ -58,7 +56,7 @@ fn save(image: &image::RgbaImage, name: &str) {
     }
 }
 
-fn quiet_report(unavailable: bool) -> Report {
+fn quiet_report() -> Report {
     let at = |day| {
         Local
             .from_local_datetime(
@@ -72,14 +70,12 @@ fn quiet_report(unavailable: bool) -> Report {
             .timestamp() as f64
     };
     Report::from_entries(
-        [(17, 4_800_000, 31.64), (1, 13_100_000, 89.66)]
+        [(17, 4_800_000), (1, 13_100_000)]
             .into_iter()
-            .map(|(day, input, cost)| Entry {
+            .map(|(day, input)| Entry {
                 id: format!("quiet-{day}"),
                 date: at(day),
                 input,
-                explicit_cost: (!unavailable).then_some(cost),
-                cost_unavailable: unavailable.then_some(true),
                 ..Default::default()
             })
             .collect(),
@@ -166,7 +162,6 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 "quiet-history",
                 "quiet-empty",
                 "quiet-known",
-                "quiet-unavailable",
                 "pace-none",
                 "pace0",
                 "pace25",
@@ -191,7 +186,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 snapshot.finish(Ok(vec![]));
                             }
                             if page.starts_with("quiet-") {
-                                let report = quiet_report(page == "quiet-unavailable");
+                                let report = quiet_report();
                                 let date = Local
                                     .from_local_datetime(
                                         &NaiveDate::from_ymd_opt(2026, 9, 18)
@@ -311,6 +306,6 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         }
     }
     println!(
-        "Usage real Metal renders:32passed; single/idle chart RGBA crops identical in dark+light; recap Week/Month/Year rendered"
+        "Usage real Metal renders:30passed; single/idle chart RGBA crops identical in dark+light; recap Week/Month/Year rendered"
     );
 }

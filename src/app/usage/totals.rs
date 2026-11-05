@@ -2,15 +2,7 @@ use super::*;
 use crate::usage::format::compact;
 use crate::usage::summary::combined::Summary;
 impl Shark {
-    pub(super) fn shows_usage_cost(&self, summary: &Summary) -> bool {
-        summary.providers.iter().any(|active| {
-            self.usage_providers
-                .iter()
-                .any(|provider| provider.id() == active.id && provider.source().reports_cost())
-        })
-    }
     pub(super) fn render_usage_totals(&self, summary: &Summary, cx: &Context<Self>) -> AnyElement {
-        let shows_cost = self.shows_usage_cost(summary);
         h_flex()
             .id("usage-combined-totals")
             .gap_2()
@@ -23,15 +15,7 @@ impl Shark {
                 ]
                 .into_iter()
                 .map(|(id, label, title, bucket)| {
-                    let text = format!(
-                        "{title}: {} tokens{}",
-                        compact(bucket.total()),
-                        if shows_cost {
-                            format!(" · {}", bucket.cost_text(false))
-                        } else {
-                            String::new()
-                        }
-                    );
+                    let text = format!("{title}: {} tokens", compact(bucket.total()));
                     v_flex()
                         .id(id)
                         .flex_1()
@@ -42,11 +26,6 @@ impl Shark {
                         .bg(cx.theme().muted)
                         .role(Role::Label)
                         .aria_label(text)
-                        .aria_description(if shows_cost {
-                            bucket.cost_explanation()
-                        } else {
-                            ""
-                        })
                         .child(
                             div()
                                 .text_xs()
@@ -65,15 +44,6 @@ impl Shark {
                                 .text_color(cx.theme().muted_foreground)
                                 .child("tokens"),
                         )
-                        .when(shows_cost, |d| {
-                            d.child(
-                                div()
-                                    .text_xs()
-                                    .truncate()
-                                    .text_color(cx.theme().muted_foreground)
-                                    .child(bucket.cost_text(false)),
-                            )
-                        })
                         .test_support()
                 }),
             )

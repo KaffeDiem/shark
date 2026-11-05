@@ -234,9 +234,7 @@ fn month_series_matches_scalar() {
     assert_eq!(
         series.iter().map(|d| d.bucket.total()).sum::<u64>(),
         month.total()
-    );
-    let cost = series.iter().map(|d| d.bucket.cost).sum::<f64>();
-    assert!((cost - month.cost).abs() < 1e-9)
+    )
 }
 #[test]
 fn last_usage_excludes_synthetic() {
@@ -276,27 +274,6 @@ fn month_series_stops_today() {
     assert_eq!(series.last().unwrap().date, now)
 }
 #[test]
-fn monthly_cost_coverage_matches() {
-    let now = date(2026, 7, 10);
-    let r = report(vec![entry(date(2026, 7, 5), 5000)], now);
-    let series = r.month_daily(entry(now, 0).date);
-    let period = r.period(date(2026, 7, 1), date(2026, 7, 11));
-    assert_eq!(
-        series.iter().map(|d| d.bucket.cost).sum::<f64>(),
-        period.cost
-    );
-    assert!(period.coverage.estimated);
-    assert!(
-        series
-            .iter()
-            .find(|d| d.bucket.total() > 0)
-            .unwrap()
-            .bucket
-            .coverage
-            .estimated
-    )
-}
-#[test]
 fn absent_report_is_not_observed_zero() {
     assert!(
         Report::default()
@@ -326,8 +303,7 @@ fn daily_only_future_provider_is_summarized() {
         [80, 40]
     );
     let b = r.period(now().pred_opt().unwrap(), now().succ_opt().unwrap());
-    assert_eq!(b.total(), 120);
-    assert!(b.coverage.unknown)
+    assert_eq!(b.total(), 120)
 }
 #[test]
 fn cross_month_file_mtime_scan_preserves_but_filters_entries() {
@@ -391,12 +367,10 @@ fn cross_month_file_mtime_scan_preserves_but_filters_entries() {
 }
 
 #[test]
-fn daily_only_report_totals_have_unknown_price() {
+fn daily_only_report_totals() {
     let r = Report::from_daily(crate::usage::activity::Daily {
         first_day: 1,
         tokens: vec![80, 40],
     });
-    assert_eq!(r.totals.total(), 120);
-    assert!(r.totals.coverage.unknown);
-    assert_eq!(r.totals.cost_text(false), "Unavailable");
+    assert_eq!(r.totals.total(), 120)
 }

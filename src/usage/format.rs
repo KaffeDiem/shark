@@ -1,4 +1,4 @@
-//! Display text for token counts and costs.
+//! Display text for token counts.
 pub fn compact(value: u64) -> String {
     if value < 1_000 {
         return value.to_string();
@@ -17,18 +17,6 @@ fn trim(value: f64, digits: usize) -> String {
         .trim_end_matches('0')
         .trim_end_matches('.')
         .to_string()
-}
-pub fn compact_cost(value: f64) -> String {
-    let tenths = format!("{value:.1}");
-    if tenths.parse::<f64>().is_ok_and(|n| n < 100.) {
-        return format!("${tenths}");
-    }
-    let whole = format!("{value:.0}");
-    if whole.parse::<f64>().is_ok_and(|n| n < 10_000.) {
-        format!("${whole}")
-    } else {
-        format!("${:.1}K", value / 1000.)
-    }
 }
 
 /// Groups digits with the given separator; independent of the machine's locale.

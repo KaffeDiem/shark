@@ -23,8 +23,6 @@ fn fill_usage(s: &mut Shark) {
                 model: "fixture".into(),
                 input: 100,
                 cache_read: 200,
-                explicit_cost: Some(1.25),
-                cost_is_estimate: Some(true),
                 ..Default::default()
             }],
             now,
@@ -117,6 +115,20 @@ async fn footer_quota_readout_shares_one_line_and_names_each_quota(cx: &mut Test
                     );
                 }
                 assert!(w.find("usage-footer-quotas").visible());
+                assert_eq!(w.try_find("usage-footer-pace-claude").is_some(), !rail);
+                if !rail {
+                    // The row fills the button, so the readout leads instead of centring (button padding is p_1).
+                    let button = w.find("show-usage").bounds();
+                    let dot = w.find("usage-footer-pace-claude").bounds();
+                    assert!(
+                        (dot.left() - button.left()).abs() <= px(4. + 3.),
+                        "first quota must lead the button: {dot:?} in {button:?}"
+                    );
+                    assert!(
+                        claude.left() - button.left() <= px(4. + 6. + 3. + 3.),
+                        "quota text must start at the leading edge: {claude:?} in {button:?}"
+                    );
+                }
                 let label = w.find("show-usage").label().unwrap_or_default().to_owned();
                 assert!(
                     label.ends_with(". Open usage"),
@@ -323,8 +335,6 @@ async fn usage_accounting_scrolls_without_horizontal_clipping(cx: &mut TestAppCo
                         model: "fixture".into(),
                         input: 100,
                         cache_read: 200,
-                        explicit_cost: Some(1.25),
-                        cost_is_estimate: Some(true),
                         ..Default::default()
                     }],
                     crate::usage::now(),
@@ -353,7 +363,7 @@ async fn usage_accounting_scrolls_without_horizontal_clipping(cx: &mut TestAppCo
         w.render_frame(cx);
         assert!(
             w.find("usage-accounting-codex").visible(),
-            "second provider's cache/cost breakdown must be reachable"
+            "second provider's cache breakdown must be reachable"
         );
     })
     .unwrap();

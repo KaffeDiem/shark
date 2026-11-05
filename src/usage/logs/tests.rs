@@ -8,8 +8,7 @@ use std::{
 mod cache;
 mod claude;
 mod codex;
-mod cost;
-mod pricing;
+mod totals;
 struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
@@ -80,9 +79,6 @@ fn daily_buckets(r: &Report) -> std::collections::BTreeMap<i64, Bucket> {
             .add(e)
     }
     days
-}
-fn close(a: f64, b: f64) {
-    assert!((a - b).abs() < 1e-10, "{a} != {b}")
 }
 fn epoch(day: u8) -> f64 {
     crate::usage::timestamp(&json!(format!("2026-09-{day:02}T12:00:00Z"))).unwrap()

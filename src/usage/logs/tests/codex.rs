@@ -87,14 +87,12 @@ fn total_only_matches_cumulative() {
             event(1., Some(v(100, 10)), [0, 0, 0, 0, 0, 110]),
         ],
     )]);
-    assert_eq!(totals(&e), [110]);
-    assert_eq!(e[0].cost_unavailable, Some(true))
+    assert_eq!(totals(&e), [110])
 }
 #[test]
 fn total_only_without_cumulative() {
     let e = resolve(vec![rollout("a", &[event(1., None, [0, 0, 0, 0, 0, 110])])]);
-    assert_eq!(totals(&e), [110]);
-    assert!(bucket(&e).coverage.unknown)
+    assert_eq!(totals(&e), [110])
 }
 #[test]
 fn total_only_cumulative_grew() {
@@ -106,14 +104,7 @@ fn total_only_cumulative_grew() {
             event(2., Some(v(300, 30)), [0, 0, 0, 0, 0, 220]),
         ],
     )]);
-    assert_eq!(totals(&e), [110, 220]);
-    assert!(
-        e.iter()
-            .find(|e| e.total() == 220)
-            .unwrap()
-            .cost_unavailable
-            .unwrap()
-    )
+    assert_eq!(totals(&e), [110, 220])
 }
 #[test]
 fn session_change_resets_rerecord() {

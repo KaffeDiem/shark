@@ -163,7 +163,6 @@ pub fn parse_reader(mut reader: impl std::io::BufRead, path: &Path) -> std::io::
             input,
             output,
             cache_read: read,
-            cost_unavailable: total_only.then_some(true),
             ..Entry::default()
         };
         r.events.push(Event {
@@ -229,8 +228,7 @@ fn owned(r: &Rollout, replay: usize, mut history: Vec<Event>) -> Resolved {
                 && s.last.0[5] > 0
                 && prior.is_some_and(|p| s.cumulative.0[5] > p.0[5])
             {
-                e.input = s.last.0[5];
-                e.cost_unavailable = Some(true)
+                e.input = s.last.0[5]
             }
             if let Some(owner) = &owner {
                 e.id = format!("codex|{owner}|{epoch}|{}", s.fingerprint())

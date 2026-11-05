@@ -1,14 +1,10 @@
 use super::{Entry, dedup_claude, token};
 use serde_json::Value;
-use std::{collections::BTreeMap, path::Path};
+use std::path::Path;
 #[derive(Clone, Debug, Default)]
 pub struct Parsed {
     pub entries: Vec<Entry>,
-    pub ledger: BTreeMap<String, f64>,
     pub offset: u64,
-}
-fn model_key(s: &str) -> &str {
-    s.split('[').next().unwrap_or(s)
 }
 pub fn session(path: &Path) -> String {
     if path
@@ -49,29 +45,12 @@ pub fn parse_reader(
         if terminated {
             result.offset = at
         }
-        if !super::mentions(&line, &[b"\"usage\"", b"cost-state"]) {
+        if !super::mentions(&line, &[b"\"usage\""]) {
             continue;
         }
         let Ok(v) = serde_json::from_slice::<Value>(&line) else {
             continue;
         };
-        if v["type"] == "cost-state" {
-            if let Some(models) = v["modelUsage"].as_object() {
-                let mut ledger = BTreeMap::new();
-                for (name, raw) in models {
-                    if let Some(cost) = raw["costUSD"]
-                        .as_f64()
-                        .filter(|c| c.is_finite() && *c >= 0.)
-                    {
-                        *ledger.entry(model_key(name).to_owned()).or_insert(0.) += cost;
-                    }
-                }
-                if !ledger.is_empty() {
-                    result.ledger = ledger
-                }
-            }
-            continue;
-        }
         let m = &v["message"];
         let u = &m["usage"];
         if v["type"] != "assistant" || !u.is_object() {
@@ -103,30 +82,4 @@ pub fn parse_reader(
     }
     result.entries = dedup_claude(result.entries);
     Ok(result)
-}
-pub fn apply_ledger(entries: &mut [Entry], ledger: &BTreeMap<String, f64>) {
-    for e in entries.iter_mut() {
-        e.explicit_cost = None;
-        e.cost_is_estimate = None
-    }
-    for (model, cost) in ledger {
-        let indices: Vec<_> = entries
-            .iter()
-            .enumerate()
-            .filter(|(_, e)| e.total() > 0 && model_key(&e.model) == model)
-            .map(|(i, _)| i)
-            .collect();
-        let total: f64 = indices.iter().map(|i| entries[*i].total() as f64).sum();
-        let mut remaining = *cost;
-        for (n, i) in indices.iter().enumerate() {
-            let share = if n + 1 == indices.len() {
-                remaining
-            } else {
-                cost * entries[*i].total() as f64 / total
-            };
-            entries[*i].explicit_cost = Some(share.max(0.));
-            entries[*i].cost_is_estimate = Some(false);
-            remaining -= share;
-        }
-    }
 }

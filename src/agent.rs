@@ -55,7 +55,6 @@ pub enum Ev {
     Result {
         is_error: bool,
         text: String,
-        cost: f64,
         secs: u64,
     },
     /// Backgrounded tasks (subagents, shells) still running after the turn's result.
@@ -456,7 +455,6 @@ pub(crate) fn parse_record(v: Value) -> Vec<Ev> {
             } else {
                 text_of(&v["errors"])
             },
-            cost: v["total_cost_usd"].as_f64().unwrap_or(0.0),
             secs: v["duration_ms"].as_u64().unwrap_or(0) / 1000,
         }],
         _ => vec![],
@@ -587,13 +585,11 @@ not json"#;
                 Ev::Result {
                     is_error: false,
                     text: "hello".into(),
-                    cost: 0.5,
                     secs: 48
                 },
                 Ev::Result {
                     is_error: true,
                     text: "Invalid API key".into(),
-                    cost: 0.0,
                     secs: 0
                 },
             ]
@@ -633,7 +629,6 @@ not json"#;
         let done = Ev::Result {
             is_error: false,
             text: String::new(),
-            cost: 0.0,
             secs: 0,
         };
         let evs: Vec<Ev> = turn.into_iter().chain([done]).collect();

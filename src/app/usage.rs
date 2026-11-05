@@ -312,6 +312,7 @@ impl Shark {
                 h_flex()
                     .id("usage-footer-quotas")
                     .min_w_0()
+                    .when(!self.rail, |d| d.w_full())
                     .overflow_hidden()
                     .items_center()
                     .gap(px(3.))
@@ -343,7 +344,8 @@ impl Shark {
                                                 .size(px(6.))
                                                 .flex_none()
                                                 .rounded_full()
-                                                .bg(color),
+                                                .bg(color)
+                                                .test_support(),
                                         )
                                     })
                                     .child(
@@ -378,7 +380,6 @@ impl Shark {
                 .map(|provider| crate::usage::summary::combined::Source {
                     id: provider.id(),
                     report: &self.usage_reports[provider.index()],
-                    reports_cost: provider.source().reports_cost(),
                 }),
             now,
         )
@@ -504,7 +505,6 @@ impl Shark {
                         id: p.id().into(),
                         name: p.name().into(),
                         days: Some(self.usage_reports[p.index()].month_daily(now)),
-                        reports_cost: p.source().reports_cost(),
                     })
                     .collect();
                 let registry: Vec<_> = self
@@ -512,13 +512,11 @@ impl Shark {
                     .iter()
                     .map(|p| p.id().to_owned())
                     .collect();
-                let shows_cost = self.shows_usage_cost(&summary);
                 d.child(self.render_month_trend(
                     &summary.month_daily,
                     &series,
                     &registry,
                     crate::usage::summary::local_date(now),
-                    shows_cost,
                     cx,
                 ))
             })
@@ -790,14 +788,6 @@ fn accounting(
     cx: &App,
 ) -> AnyElement {
     let bucket = &report.totals;
-    let coverage = bucket.coverage;
-    let note = match (coverage.reported, coverage.estimated, coverage.unknown) {
-        (_, _, true) if coverage.reported || coverage.estimated => " · partial coverage",
-        (_, _, true) => "",
-        (_, true, false) => " · includes estimates",
-        (true, false, false) => " · reported",
-        _ => "",
-    };
     v_flex()
         .id(format!("usage-accounting-{}", provider.id()))
         .gap_1()
@@ -817,15 +807,6 @@ fn accounting(
             tokens(bucket.cache_write),
             tokens(bucket.cache_read)
         ))
-        .when(provider.source().reports_cost(), |d| {
-            d.child(
-                div()
-                    .id(format!("usage-cost-{}", provider.id()))
-                    .aria_label(format!("Token cost: {}{note}", bucket.cost_text(false)))
-                    .child(format!("Token cost: {}{note}", bucket.cost_text(false)))
-                    .test_support(),
-            )
-        })
         .test_support()
         .into_any_element()
 }
@@ -1243,5 +1224,5 @@ mod lifecycle_tests {
 }
 
 #[cfg(all(test, feature = "test-support"))]
-#[path = "usage_cost_tests.rs"]
-mod cost_tests;
+#[path = "usage_report_tests.rs"]
+mod report_tests;

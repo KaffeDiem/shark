@@ -174,8 +174,6 @@ pub struct Chat {
     unread: VecDeque<usize>,
     /// The turn was interrupted; its result reads "interrupted".
     cut: bool,
-    /// `total_cost_usd` of the last result: claude reports a running total, shown per turn.
-    cost_total: f64,
     /// SIGTERM fallback for an interrupt claude doesn't act on.
     stopping: Option<Task<()>>,
     /// Applying stored history: nothing is emitted to the app.
@@ -238,16 +236,6 @@ pub(crate) fn read_events<T: 'static>(
             }
         }
     })
-}
-
-/// A turn's cost from claude's running `total` (updated here); a lower total is a fresh
-/// process's, shown as it is.
-fn turn_cost(total: &mut f64, cost: f64) -> f64 {
-    let turn = if cost >= *total { cost - *total } else { cost };
-    if cost > 0. {
-        *total = cost; // codex and failures report none
-    }
-    turn
 }
 
 /// "48s", "2m 5s".
@@ -352,7 +340,6 @@ impl Chat {
             prs_at: None,
             unread: VecDeque::new(),
             cut: false,
-            cost_total: 0.,
             stopping: None,
             replaying: false,
             queue: vec![],
@@ -412,7 +399,6 @@ impl Chat {
             self.meta.session_id.clone(),
         );
         (self.busy, self.cut, self.replaying) = (false, false, true);
-        self.cost_total = 0.;
         for ev in evs {
             // A turn that never got its result was cut off by quitting (or a crash).
             if matches!(ev, Ev::Init { .. }) && self.busy {
@@ -1008,9 +994,8 @@ impl Chat {
             Ev::Result {
                 is_error,
                 text,
-                cost,
                 secs,
-            } => self.on_result(is_error, text, cost, secs, cx),
+            } => self.on_result(is_error, text, secs, cx),
             Ev::Exited(msg) => {
                 self.drop_process(cx);
                 if self.busy {
@@ -1217,14 +1202,7 @@ impl Chat {
         }
     }
 
-    fn on_result(
-        &mut self,
-        is_error: bool,
-        text: String,
-        cost: f64,
-        secs: u64,
-        cx: &mut Context<Self>,
-    ) {
+    fn on_result(&mut self, is_error: bool, text: String, secs: u64, cx: &mut Context<Self>) {
         self.busy = false;
         if !self.replaying {
             self.stopping = None; // a live interrupt's fallback outlives history
@@ -1235,13 +1213,12 @@ impl Chat {
         // every resume would fail the same way. (Replay restores the session after.)
         let gone = is_error && text.starts_with(agent::SESSION_GONE);
         let took = duration(secs);
-        let cost = turn_cost(&mut self.cost_total, cost);
         self.blocks.push(Block::Info(if cut {
-            format!("interrupted · {took} · ${cost:.2}")
+            format!("interrupted · {took}")
         } else if is_error {
             format!("error: {text}")
         } else {
-            format!("done · {took} · ${cost:.2}")
+            format!("done · {took}")
         }));
         if gone {
             self.meta.session_id = None;
@@ -2008,24 +1985,6 @@ impl Render for Chat {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
-
-    #[test]
-    fn turn_cost_is_the_delta_of_the_running_total() {
-        let mut total = 0.;
-        assert_eq!(turn_cost(&mut total, 0.5), 0.5);
-        assert_eq!(turn_cost(&mut total, 0.75), 0.25);
-        // A fresh process reports a lower total: shown as it is.
-        assert_eq!(turn_cost(&mut total, 0.25), 0.25);
-        // codex and failures report none: the total stays.
-        assert_eq!(turn_cost(&mut total, 0.), 0.);
-        assert_eq!(total, 0.25);
-    }
-}
-
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod ui_tests {
     use super::*;
@@ -2470,54 +2429,6 @@ exec cat >/dev/null
         let _ = std::fs::remove_file(ws.dir());
     }
 
-    /// claude's `total_cost_usd` runs across turns (and resumes): each turn shows its share, in
-    /// replayed history too, and a lower total counts as a reset.
-    #[gpui_kit::test]
-    fn turn_cost_is_the_running_totals_delta(cx: &mut TestAppContext) {
-        cx.update(gpui_kit::init);
-        let ws = Workspace {
-            name: format!("cost-test-{}", std::process::id()),
-            ..Default::default()
-        };
-        let meta = ChatMeta {
-            id: ws.name.clone(),
-            ..Default::default()
-        };
-        let (_, chat) = cx
-            .update(|cx| {
-                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
-                    cx.new(|cx| Chat::new(ws.clone(), meta, false, w, cx))
-                })
-            })
-            .unwrap();
-        let result = |cost| Ev::Result {
-            is_error: false,
-            text: String::new(),
-            cost,
-            secs: 1,
-        };
-        let infos = |cx: &mut TestAppContext| {
-            cx.update(|cx| {
-                (chat.read(cx).blocks.iter())
-                    .filter_map(|b| match b {
-                        Block::Info(t) => t.rsplit_once('$').map(|(_, c)| c.to_string()),
-                        _ => None,
-                    })
-                    .collect::<Vec<_>>()
-            })
-        };
-        cx.update(|cx| {
-            chat.update(cx, |c, cx| {
-                c.load_history(vec![result(1.5), result(1.75)], cx);
-                c.apply(result(2.0), cx); // a live turn goes on from the history's total
-                c.apply(result(0.5), cx); // a new process starts over
-                c.apply(result(0.), cx); // codex: no price
-                c.apply(result(0.75), cx);
-            })
-        });
-        assert_eq!(infos(cx), ["1.50", "0.25", "0.25", "0.50", "0.00", "0.25"]);
-    }
-
     /// cmd-shift-enter asks the draft on the side: the answer streams into the card, the chat
     /// never sees it, and enter puts the answer into the composer.
     #[gpui_kit::test]
@@ -2573,7 +2484,6 @@ exec cat >/dev/null
         let result = || Ev::Result {
             is_error: false,
             text: String::new(),
-            cost: 0.,
             secs: 0,
         };
         cx.update(|cx| {
@@ -2626,7 +2536,6 @@ exec cat >/dev/null
                     Ev::Result {
                         is_error: true,
                         text: "No conversation found".into(),
-                        cost: 0.,
                         secs: 0,
                     },
                     cx,
@@ -2729,7 +2638,6 @@ exec cat >/dev/null
                         Ev::Result {
                             is_error: false,
                             text: String::new(),
-                            cost: 0.,
                             secs: 0,
                         },
                         cx,
@@ -2972,7 +2880,6 @@ exec cat >/dev/null
                     Ev::Result {
                         is_error: false,
                         text: String::new(),
-                        cost: 0.,
                         secs: 0,
                     },
                     cx,
@@ -3099,7 +3006,6 @@ exec cat >/dev/null
                 let result = Ev::Result {
                     is_error: false,
                     text: String::new(),
-                    cost: 0.,
                     secs: 1,
                 };
                 c.apply(result, cx);
@@ -3377,7 +3283,6 @@ exec cat >/dev/null
                     Ev::Result {
                         is_error: true,
                         text,
-                        cost: 0.,
                         secs: 0,
                     },
                     cx,
@@ -3456,14 +3361,13 @@ exec cat >/dev/null
                 let result = Ev::Result {
                     is_error: true,
                     text: String::new(),
-                    cost: 0.,
                     secs: 3,
                 };
                 c.apply(result, cx);
                 let Some(Block::Info(t)) = c.blocks.last() else {
                     panic!()
                 };
-                assert_eq!(t, "interrupted · 3s · $0.00");
+                assert_eq!(t, "interrupted · 3s");
             })
         });
         assert_eq!(emitted.get(), 1, "only the live TurnDone");
@@ -3585,7 +3489,6 @@ exec cat >/dev/null
         let result = |is_error| Ev::Result {
             is_error,
             text: String::new(),
-            cost: 0.,
             secs: 1,
         };
 

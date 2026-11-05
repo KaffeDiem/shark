@@ -4066,7 +4066,6 @@ async fn home_ask_shark(cx: &mut TestAppContext) {
             crate::agent::Ev::Result {
                 is_error: false,
                 text: String::new(),
-                cost: 0.,
                 secs: 0,
             },
             cx,
@@ -4108,7 +4107,6 @@ async fn home_ask_shark(cx: &mut TestAppContext) {
             crate::agent::Ev::Result {
                 is_error: true,
                 text: msg.into(),
-                cost: 0.,
                 secs: 0,
             },
             cx,

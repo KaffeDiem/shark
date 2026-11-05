@@ -23,7 +23,6 @@ impl BurnTier {
 pub struct Source<'a> {
     pub id: &'a str,
     pub report: &'a Report,
-    pub reports_cost: bool,
 }
 #[derive(Clone, Debug)]
 pub struct ProviderSummary {
@@ -55,7 +54,7 @@ impl Summary {
         let mut out = Self::default();
         for source in sources {
             let r = source.report;
-            let mut p = ProviderSummary {
+            let p = ProviderSummary {
                 id: source.id.into(),
                 today: r.period(today, tomorrow),
                 week: r.period(week, tomorrow),
@@ -64,16 +63,6 @@ impl Summary {
                 last_usage: r.last_usage(),
                 month_daily: r.month_daily(now),
             };
-            if !source.reports_cost {
-                for b in [&mut p.today, &mut p.week, &mut p.month] {
-                    b.cost = 0.;
-                    b.coverage = Default::default()
-                }
-                for day in &mut p.month_daily {
-                    day.bucket.cost = 0.;
-                    day.bucket.coverage = Default::default()
-                }
-            }
             if p.today.total() == 0
                 && p.week.total() == 0
                 && p.month.total() == 0
