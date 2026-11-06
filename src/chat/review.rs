@@ -85,13 +85,24 @@ pub(super) fn may_report(text: &str) -> bool {
     })
 }
 
-/// A message as it went on the wire, split into the `[shark]` workspace notes put before it
-/// (`repos_changed`) and the text itself.
+/// Ends the context notes before a message. They may hold blank lines, so a blank line can't.
+pub(super) const NOTES_END: &str = "\n[/shark]\n\n";
+
+/// A message as it went on the wire, split into the `[shark]` context notes put before it
+/// (`pending_context`) and the text itself. Older messages end their notes with a blank line.
 pub(super) fn split_notes(wire: &str) -> (&str, &str) {
-    match wire.split_once("\n\n") {
+    let split = wire.split_once(NOTES_END).or(wire.split_once("\n\n"));
+    match split {
         Some((notes, text)) if notes.starts_with("[shark] ") => (notes, text),
         _ => ("", wire),
     }
+}
+
+/// The rows context notes show as: their `[shark]` lines, without what a note goes on to quote.
+pub(super) fn info_notes(notes: &str) -> impl Iterator<Item = Block> {
+    (notes.lines())
+        .filter(|l| l.starts_with("[shark] "))
+        .map(|l| Block::Info(l.into()))
 }
 
 /// A review's prompt (review.rs `prompt`) back as its card, for a replayed transcript: each
@@ -152,7 +163,7 @@ impl Chat {
         // As the queue sends it, so claude's echo matches the card.
         card.prompt = card.prompt.trim().to_string();
         let card = Rc::new(card);
-        if self.busy || self.hold {
+        if self.busy || self.held().is_some() {
             let q = Queued {
                 review: Some(card.clone()),
                 ..Queued::new(card.prompt.clone().into())

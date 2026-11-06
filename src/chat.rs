@@ -17,7 +17,7 @@ use crate::agent::{self, Agent, Ev};
 use crate::complete::{self, Item};
 use crate::models::EFFORT;
 use crate::plan::{self, PlanPane};
-use crate::state::{ChatMeta, Workspace};
+use crate::state::{ChatMeta, REPO_CONTEXT, Workspace, context_record};
 use crate::ui::{hint, plural};
 use crate::vim::{self, Vim};
 use crate::*;
@@ -45,8 +45,11 @@ use gpui_kit::*;
 pub(crate) use links::{copy_button, link_roots, markdown};
 pub(crate) use model::{effort_label, model_entries, model_label};
 use planmode::{ENTER_PLAN, NEEDS_APPROVAL, PLAN_SHOWN};
+use review::{
+    NOTES_END, card_of, hidden_reply, hide_reports, info_notes, may_report, review_title,
+    split_notes,
+};
 pub(crate) use review::{ReviewCard, ReviewItem, parse_reports};
-use review::{card_of, hidden_reply, hide_reports, may_report, review_title, split_notes};
 use serde_json::Value;
 use side::Side;
 use std::collections::{HashMap, VecDeque};
@@ -99,6 +102,8 @@ pub enum ChatEvent {
     GitReviewsSent(Vec<String>),
     /// The agent started or stopped waiting on answers to its questions (`Chat::asking`).
     Asking,
+    /// `refuse_unready` said no: the app offers Attach repository.
+    NeedsRepo,
     /// A review card's "Review changes" row: show the diff.
     ShowChanges,
     /// A review card's comment link: show that comment in the diff.
@@ -129,10 +134,14 @@ pub struct Chat {
     pub started: Option<Instant>,
     /// Set while a git step runs in these worktrees; sends wait for it.
     pub hold: bool,
+    /// Set while the agent has an attachment operation (`Workspace::attaching`). Its own field:
+    /// a git step ending must not release it, nor it a git step.
+    pub attach_hold: bool,
     /// Set while the workspace's worktrees are being removed; sends are refused.
     pub archiving: bool,
-    /// Told to the agent with the next message (a repo joined the workspace mid-session).
-    note: Option<String>,
+    /// What `ChatMeta::delivered` becomes once the agent echoes the message at a block: a message
+    /// it never read leaves the context pending.
+    told: Vec<(usize, std::collections::BTreeMap<String, u64>)>,
     agent: Option<Agent>,
     pub(crate) composer: Entity<TextareaState>,
     /// The reply of the turn that ended last, and that turn's number (see `turns`).
@@ -213,7 +222,7 @@ const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 impl EventEmitter<ChatEvent> for Chat {}
 
 /// A tab title from a message: its first line, cut at a word near 40 characters.
-fn title_of(text: &str) -> String {
+pub(crate) fn title_of(text: &str) -> String {
     let line = text.trim().lines().next().unwrap_or_default();
     if line.chars().count() <= 40 {
         return line.to_string();
@@ -249,11 +258,14 @@ pub(crate) fn duration(secs: u64) -> String {
 impl Chat {
     pub fn new(
         ws: Workspace,
-        meta: ChatMeta,
+        mut meta: ChatMeta,
         vim_on: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Every chat passes here, new, reopened or restored: none starts out of Plan mode
+        // without a repository. Not `ready`: a later attachment leaves a chat's mode alone.
+        meta.plan |= ws.repos.is_empty();
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 10)
@@ -290,6 +302,7 @@ impl Chat {
             }
         });
         let ws_name = ws.name.clone();
+        let attach_hold = !ws.attaching.is_empty();
         let prs = ws
             .repos
             .iter()
@@ -310,8 +323,9 @@ impl Chat {
             hopping: None,
             started: None,
             hold: false,
+            attach_hold,
             archiving: false,
-            note: None,
+            told: vec![],
             agent: None,
             composer,
             last_reply: String::new(),
@@ -424,6 +438,7 @@ impl Chat {
         let n = self.blocks.len();
         self.blocks.extend(live);
         self.unread = unread.into_iter().map(|i| i + n).collect();
+        self.told.iter_mut().for_each(|(bi, _)| *bi += n);
         self.rows = self.build_rows();
         self.list.reset(self.rows.len() + 1); // + the activity footer
         self.list.set_follow_mode(FollowMode::Tail);
@@ -445,6 +460,21 @@ impl Chat {
     /// Whether anything is still going on: a turn, or tasks it left running in the background.
     pub fn working(&self) -> bool {
         self.busy || !self.background.is_empty()
+    }
+
+    /// Nothing is running or about to: no turn, background task or question, and no message sent
+    /// into a turn that ended before reading it, which starts one of its own.
+    pub fn idle(&self) -> bool {
+        !self.working() && !self.asking() && !self.steered
+    }
+
+    /// Why sends wait, if they do. Every path that sends asks this, through `send_block` at least.
+    fn held(&self) -> Option<&'static str> {
+        match (self.hold, self.attach_hold) {
+            (true, _) => Some("a git step is running"),
+            (_, true) => Some("a repository is being attached"),
+            _ => None,
+        }
     }
 
     pub fn queued(&self) -> usize {
@@ -570,9 +600,9 @@ impl Chat {
             self.drain(cx);
         }
         let busy = self.busy;
-        let sent = !self.hold && (!busy || now) && self.send_text(text, now, cx);
-        self.steered |= sent && busy;
-        if !sent && (self.busy || self.hold) {
+        let held = self.held().is_some();
+        let sent = !held && (!busy || now) && self.send_text(text, now, cx);
+        if !sent && (self.busy || held) {
             self.qsel = self.queue_draft(content);
         } else if !sent {
             return; // spawn or write failed; the error is in the transcript, keep the draft
@@ -588,6 +618,14 @@ impl Chat {
             self.drain(cx); // an edit that went straight out lets the rest follow
         }
         cx.notify();
+    }
+
+    /// Feeds `ev` to the chat as its process would.
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn play(&mut self, ev: Ev, cx: &mut Context<Self>) {
+        // Injected events replace the reader: a real exit at cleanup trips the test scheduler.
+        self.reader = None;
+        self.apply(ev, cx);
     }
 
     /// What went out, oldest first: messages, and reviews as their prompt.
@@ -616,9 +654,9 @@ impl Chat {
             )));
             self.finish_draft(window, cx);
         }
-        // The agent didn't start (refusals keep `hold`/`archiving` set): a new chat's first
-        // message, e.g. from New workspace, goes back to the composer instead of being lost.
-        let failed = !sent && self.agent.is_none() && !self.hold && !self.archiving;
+        // It didn't go out (refusals keep a hold or `archiving` set): a new chat's first message,
+        // e.g. from Home, goes back to the composer instead of being lost.
+        let failed = !sent && !self.busy && self.held().is_none() && !self.archiving;
         if failed && draft.is_empty() && self.meta.session_id.is_none() {
             self.composer
                 .update(cx, |c, cx| c.set_value(text, window, cx));
@@ -643,16 +681,14 @@ impl Chat {
         if text.is_empty() || (self.busy && !steer) {
             return false;
         }
-        if self.hold {
-            self.push(
-                Block::Info("a git step is running; send again when it finishes".into()),
-                cx,
-            );
+        if let Some(why) = self.held() {
+            let msg = format!("{why}; send again when it finishes");
+            self.push(Block::Info(msg), cx);
             return false;
         }
         if self.archiving {
             self.push(
-                Block::Info("this workspace is being archived; nothing was sent".into()),
+                Block::Info("this agent is being deleted; nothing was sent".into()),
                 cx,
             );
             return false;
@@ -665,6 +701,16 @@ impl Chat {
             self.set_background(vec![], cx); // its reader is replaced below, so its Exited never arrives
         }
         if self.agent.is_none() {
+            // A session starting now reads the repos from the root docs, and has nothing else.
+            if self.meta.session_id.is_none() {
+                let mut context = self.ws.context();
+                context.retain(|k, _| k.starts_with(REPO_CONTEXT));
+                let known = context_record(&context);
+                if self.meta.delivered != known {
+                    self.meta.delivered = known;
+                    cx.emit(ChatEvent::Meta);
+                }
+            }
             match agent::spawn(&self.ws, &self.meta) {
                 Ok((mut a, rx)) => {
                     if self.meta.plan
@@ -688,15 +734,25 @@ impl Chat {
                 }
             }
         }
-        let wire = match &self.note {
-            Some(n) => format!("{n}\n\n{text}"),
-            None => text.clone(),
+        // A `/command` must stay the whole message, and a steer lands mid-turn: the context waits
+        // for the next normal message.
+        let notes = match self.busy || text.trim_start().starts_with('/') {
+            true => vec![],
+            false => self.pending_context(),
+        };
+        let wire = match notes.is_empty() {
+            true => text.clone(),
+            false => format!("{}{NOTES_END}{text}", notes.join("\n")),
         };
         if let Err(e) = self.agent.as_mut().unwrap().send(&wire) {
             self.push(Block::Info(format!("send failed: {e}")), cx);
             return false;
         }
-        self.note = None;
+        if !notes.is_empty() {
+            self.blocks.extend(info_notes(&notes.join("\n")));
+            self.told
+                .push((self.blocks.len(), context_record(&self.ws.context())));
+        }
         let ids = review.as_ref().map(|r| r.ids());
         self.sent(text, review, cx);
         if let Some(ids) = ids {
@@ -730,24 +786,42 @@ impl Chat {
             .count()
     }
 
-    /// A repo joined the workspace: refresh `@` files, show it, and tell the agent next turn
-    /// (its CLAUDE.md was read at session start).
-    pub fn repos_changed(&mut self, ws: &Workspace, note: String, cx: &mut Context<Self>) {
-        self.ws.repos = ws.repos.clone();
-        self.push(Block::Info(note.clone()), cx);
-        self.note = Some(match self.note.take() {
-            Some(old) => format!("{old}\n{note}"),
-            None => note,
-        });
-        self.reindex(cx);
-        self.prs_at = None; // the next `#` lists the new repo's PRs
+    /// The agent's repos, branches, issues or attachment changed. Session and Plan mode stay;
+    /// the agent hears of it with its next normal turn (`pending_context`). Ending the attachment
+    /// hold sends what waited for it, unless a git step still holds it.
+    pub fn workspace_changed(&mut self, ws: &Workspace, cx: &mut Context<Self>) {
+        let grew = ws.repos.len() != self.ws.repos.len();
+        let released = self.attach_hold && ws.attaching.is_empty();
+        self.ws = ws.clone();
+        self.attach_hold = !ws.attaching.is_empty();
+        if grew {
+            self.reindex(cx);
+            self.prs_at = None; // the next `#` lists the new repo's PRs
+        }
+        if released {
+            self.drain(cx);
+        }
+        cx.notify();
+    }
+
+    /// The notes of `Workspace::context` this chat's session hasn't received, for its next
+    /// normal message. Derived from what is saved, so it needs no event: chats closed, not yet
+    /// loaded or from before a restart catch up the same way.
+    pub(crate) fn pending_context(&self) -> Vec<String> {
+        (self.ws.context().into_iter())
+            .filter(|(k, note)| self.meta.delivered.get(k) != Some(&note.fingerprint))
+            .map(|(_, note)| note.text)
+            .collect()
     }
 
     fn sent(&mut self, text: String, review: Option<Rc<ReviewCard>>, cx: &mut Context<Self>) {
-        let queued = self.busy;
-        if !queued {
+        // codex runs `/compact` as a request of its own, with no user message to echo.
+        let echoed = !(self.codex() && text.trim() == "/compact");
+        let queued = self.busy && echoed;
+        if !self.busy {
             self.started = Some(Instant::now());
         }
+        self.steered |= queued;
         self.busy = true;
         if self.meta.title.is_empty() {
             self.meta.title = match &review {
@@ -759,7 +833,9 @@ impl Chat {
         // Jump to the end so push follows the new message and the reply.
         self.sel = self.rows.len().saturating_sub(1);
         self.list.set_follow_mode(FollowMode::Tail);
-        self.unread.push_back(self.blocks.len());
+        if echoed {
+            self.unread.push_back(self.blocks.len());
+        }
         self.push(
             match review {
                 Some(r) => Block::Review(r, queued),
@@ -838,6 +914,7 @@ impl Chat {
         self.stopping = None;
         self.cut = false;
         self.steered = false;
+        self.told.clear(); // never echoed now: that context stays pending
         self.interrupt();
         self.drop_unread(cx);
     }
@@ -964,7 +1041,7 @@ impl Chat {
             } => self.on_init(session_id, &model, &permission_mode, &mcp, cx),
             Ev::Background(tasks) => self.set_background(tasks, cx),
             Ev::Interrupted => self.cut = true,
-            Ev::User(text) => self.on_echo(text),
+            Ev::User(text) => self.on_echo(text, cx),
             Ev::Notice(text) => self.blocks.push(Block::Info(text)),
             Ev::TextDelta(s) => self.on_text(s, cx),
             Ev::Text(full) => self.on_full_text(full, cx),
@@ -1047,9 +1124,9 @@ impl Chat {
     }
 
     /// claude's echo: the oldest message it hadn't read is now part of the turn.
-    /// `ends_with`: a workspace `note` may have been put before the text on the wire.
+    /// `ends_with`: context notes may have been put before the text on the wire.
     /// Not just the oldest: one the CLI refused (a failed codex turn/start) is never echoed.
-    fn on_echo(&mut self, text: String) {
+    fn on_echo(&mut self, text: String, cx: &mut Context<Self>) {
         let read = (self.unread.iter())
             .position(|&bi| (self.blocks[bi].message()).is_some_and(|(t, _)| text.ends_with(t)));
         match read {
@@ -1059,16 +1136,20 @@ impl Chat {
                     *queued = false;
                 }
                 self.remeasure(bi);
-                // codex reads a steer into the running turn, with no new init after.
-                if self.unread.is_empty() {
-                    self.steered = false;
+                if let Some(i) = self.told.iter().position(|(b, _)| *b == bi) {
+                    self.meta.delivered = self.told.remove(i).1;
+                    cx.emit(ChatEvent::Meta);
                 }
+                // codex reads a steer into the running turn, with no new init after.
+                self.steered = self
+                    .unread
+                    .iter()
+                    .any(|&bi| matches!(self.blocks[bi].message(), Some((_, true))));
             }
             None => {
                 // A replayed message carries the workspace notes sent with it.
                 let (notes, text) = split_notes(&text);
-                self.blocks
-                    .extend(notes.lines().map(|n| Block::Info(n.into())));
+                self.blocks.extend(info_notes(notes));
                 self.blocks.push(match card_of(text) {
                     Some(card) => Block::Review(Rc::new(card), false),
                     None => Block::User(text.into(), false),
@@ -1209,6 +1290,18 @@ impl Chat {
             self.drop_asked(cx);
         }
         let cut = std::mem::take(&mut self.cut);
+        // codex refused what was sent, or the turn it joined is over: what it hasn't read won't
+        // start a turn of its own. It stays unread in case an echo comes, but nothing waits on it.
+        if self.codex() && (is_error || cut) {
+            for &bi in &self.unread {
+                if let Some(Block::User(_, queued) | Block::Review(_, queued)) =
+                    self.blocks.get_mut(bi)
+                {
+                    *queued = false;
+                }
+            }
+            self.steered = false;
+        }
         // A pruned or deleted session: claude says so in the result and exits, and
         // every resume would fail the same way. (Replay restores the session after.)
         let gone = is_error && text.starts_with(agent::SESSION_GONE);
@@ -1590,6 +1683,7 @@ impl Chat {
             theme.secondary,
             theme.muted_foreground,
         );
+        let held = self.held().is_some();
         // The editor's Vim pill, on `muted`: the card is already `secondary`.
         let vim_pill = self.vim_on.then(|| {
             div()
@@ -1792,13 +1886,13 @@ impl Chat {
                                     .overflow_hidden()
                                     .justify_end()
                                     .gap_3()
-                                    .when(self.busy || self.hold, |d| {
+                                    .when(self.busy || held, |d| {
                                         d.child(match self.editing {
                                             Some(_) => hint("enter", "save"),
                                             None => hint("enter", "queue"),
                                         })
                                     })
-                                    .when(self.busy && !self.hold, |d| {
+                                    .when(self.busy && !held, |d| {
                                         d.child(hint("cmd-enter", "send now"))
                                     })
                                     .when(self.busy, |d| d.child(hint("ctrl-c", "interrupt"))),
@@ -2575,6 +2669,12 @@ exec cat >/dev/null
         fake_claude();
         let ws = Workspace {
             name: format!("plan-test-{}", std::process::id()),
+            repos: vec![crate::state::WsRepo {
+                name: "api".into(),
+                src: root.clone(),
+                base: "main".into(),
+                branch: None,
+            }],
             ..Default::default()
         };
         let meta = ChatMeta {
@@ -3200,6 +3300,120 @@ exec cat >/dev/null
         });
     }
 
+    /// Context notes may hold blank lines, and what they quote stays out of the rows and the
+    /// user's bubble.
+    #[gpui_kit::test]
+    fn replay_keeps_multi_paragraph_notes_out_of_the_message(cx: &mut TestAppContext) {
+        let chat = open_chat("note-paragraphs", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.replaying = true;
+                let wire = format!(
+                    "[shark] Issue ENG-1 changed:\nFirst paragraph.\n\nSecond.{NOTES_END}fix it"
+                );
+                c.apply(Ev::User(wire), cx);
+                c.replaying = false;
+                assert!(matches!(&c.blocks[0], Block::Info(t) if t.ends_with("changed:")));
+                assert!(matches!(&c.blocks[1], Block::User(t, _) if t == "fix it"));
+                assert_eq!(c.blocks.len(), 2);
+            })
+        });
+    }
+
+    /// A message the agent never read leaves its context pending: only an echo records it.
+    #[gpui_kit::test]
+    fn context_stays_pending_until_the_agent_reads_it(cx: &mut TestAppContext) {
+        let chat = open_chat("context-echo", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.ws.repos.push(crate::state::WsRepo {
+                    name: "api".into(),
+                    src: "/src/api".into(),
+                    base: "main".into(),
+                    branch: None,
+                });
+                let record = context_record(&c.ws.context());
+                let unread = |c: &mut Chat, record: &std::collections::BTreeMap<_, _>| {
+                    c.blocks.push(Block::User("hi".into(), false));
+                    c.unread.push_back(c.blocks.len() - 1);
+                    c.told.push((c.blocks.len() - 1, record.clone()));
+                };
+                unread(c, &record);
+                c.apply(Ev::Exited("claude exited".into()), cx);
+                assert!(c.told.is_empty() && c.meta.delivered.is_empty());
+                assert_eq!(c.pending_context().len(), 1);
+                unread(c, &record);
+                c.apply(Ev::User("[shark] x\n[/shark]\n\nhi".into()), cx);
+                assert_eq!(c.meta.delivered, record);
+                assert!(c.pending_context().is_empty());
+            })
+        });
+    }
+
+    /// While an attachment holds a chat, every way of sending stops at the same gate and nothing
+    /// is lost; a git hold ending doesn't change that. Plan mode and the plan stay as they are.
+    #[gpui_kit::test]
+    fn attach_hold_stops_every_way_of_sending(cx: &mut TestAppContext) {
+        let chat = open_chat("attach-hold", cx);
+        let window = cx.windows()[0];
+        let act = |cx: &mut TestAppContext,
+                   f: &dyn Fn(&mut Chat, &mut Window, &mut Context<Chat>)| {
+            cx.update_window(window, |_, w, cx| chat.update(cx, |c, cx| f(c, w, cx)))
+                .unwrap();
+        };
+        act(cx, &|c, w, cx| {
+            c.attach_hold = true;
+            c.ws.repos.push(crate::state::WsRepo {
+                name: "api".into(),
+                src: "/src/api".into(),
+                base: "main".into(),
+                branch: None,
+            });
+            c.ws.attaching.push(crate::state::Attachment::fresh(
+                &crate::state::Repo {
+                    name: "web".into(),
+                    path: "/src/web".into(),
+                },
+                "b",
+                "",
+            ));
+            c.meta.plan = true;
+            c.plan
+                .update(cx, |p, cx| p.add("p1".into(), "# Plan".into(), cx));
+            assert!(!c.send_text("direct".into(), false, cx), "the gate itself");
+            assert!(!c.ask("host prompt", w, cx), "ask");
+            c.approve_plan(w, cx);
+            assert!(!c.build_plan("# Plan", w, cx), "build");
+            c.set_plan_mode(false, cx);
+            assert!(c.meta.plan, "attachment never leaves Plan mode");
+            assert_eq!(c.plan.read(cx).approved, None, "or approves");
+            // Composer, git prompt and review: they queue.
+            c.composer.update(cx, |t, cx| t.set_value("typed", w, cx));
+            c.send(false, w, cx);
+            c.composer.update(cx, |t, cx| t.set_value("now!", w, cx));
+            c.send(true, w, cx);
+            assert!(c.enqueue("git prompt", vec![], cx));
+            let card = ReviewCard {
+                prompt: "R".into(),
+                items: vec![],
+                changes: String::new(),
+            };
+            assert!(c.send_review(card, cx));
+            assert_eq!(c.queued(), 4);
+            c.qsel = 1;
+            c.steer(w, cx);
+            c.drain(cx);
+            assert_eq!(c.queued(), 4, "steering and draining wait");
+            assert!(c.sent_texts().is_empty());
+            assert!(c.agent.is_none(), "no provider started");
+            // A git step coming and going leaves it alone.
+            c.hold = true;
+            c.hold = false;
+            c.drain(cx);
+            assert_eq!(c.queued(), 4);
+        });
+    }
+
     /// A codex turn as the chat sees it: a message sent mid-turn joins the running turn with no
     /// new init, and once read nothing stays unread or steered. One codex refuses is never
     /// echoed, and doesn't hold up the next.
@@ -3242,6 +3456,70 @@ exec cat >/dev/null
                     [("first", false), ("second", false), ("refused", false), ("next", false)],
                     "read in place, none twice"
                 );
+            })
+        });
+    }
+
+    /// Entries codex will never echo don't keep a chat from going idle: `/compact` isn't recorded,
+    /// a refused message doesn't outlive the turn it was refused in, and a steer read later isn't
+    /// held up by either. An attachment waiting on `idle` would hold the turn that clears them.
+    #[gpui_kit::test]
+    fn stale_codex_messages_leave_the_chat_idle(cx: &mut TestAppContext) {
+        let chat = open_chat("codex-stale", cx);
+        let done = || Ev::Result {
+            is_error: false,
+            text: String::new(),
+            secs: 1,
+        };
+        let refused = || Ev::Result {
+            is_error: true,
+            text: "bad input".into(),
+            secs: 0,
+        };
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.meta.model = Some("codex:gpt-6-astra".into());
+                c.agent_model = c.meta.model.clone();
+                c.sent("/compact".into(), None, cx);
+                assert!(c.unread.is_empty(), "never echoed");
+                c.apply(done(), cx);
+                c.sent("refused".into(), None, cx);
+                c.apply(refused(), cx);
+                assert_eq!(c.unread.len(), 1);
+
+                // A steer read with those around, as the reviewer's case had it.
+                c.sent("turn".into(), None, cx);
+                c.apply(Ev::User("turn".into()), cx);
+                c.sent("/compact".into(), None, cx);
+                assert!(!c.steered, "no steer to read");
+                c.sent("steer".into(), None, cx);
+                assert!(c.steered);
+                c.apply(Ev::User("steer".into()), cx);
+                assert!(!c.steered, "the stale entry doesn't hold it");
+                c.apply(done(), cx);
+                assert!(c.idle());
+
+                // A steer refused, then one in an interrupted turn: nothing starts a turn for them.
+                c.sent("turn".into(), None, cx);
+                c.apply(Ev::User("turn".into()), cx);
+                c.sent("steer 2".into(), None, cx);
+                c.apply(refused(), cx);
+                assert!(c.idle(), "refused");
+                c.sent("turn".into(), None, cx);
+                c.apply(Ev::User("turn".into()), cx);
+                c.sent("steer 3".into(), None, cx);
+                c.apply(Ev::Interrupted, cx);
+                c.apply(done(), cx);
+                assert!(c.idle(), "interrupted");
+
+                // A steer left unread by a turn that ended well does start its own: still waits.
+                c.sent("turn".into(), None, cx);
+                c.apply(Ev::User("turn".into()), cx);
+                c.sent("steer 4".into(), None, cx);
+                c.apply(done(), cx);
+                assert!(!c.idle());
+                c.apply(Ev::User("steer 4".into()), cx);
+                assert!(c.idle());
             })
         });
     }

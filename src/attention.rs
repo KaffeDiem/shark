@@ -131,7 +131,9 @@ fn poll(cx: &mut Context<Shark>) -> Task<()> {
             cx.background_executor().timer(TICK).await;
             let Ok(next) = this.update(cx, |s, cx| {
                 s.refresh_attention(cx);
+                // With no repos there's nothing to check.
                 let names: Vec<String> = (s.state.workspaces.iter())
+                    .filter(|w| !w.repos.is_empty())
                     .map(|w| w.name.clone())
                     .filter(|n| !s.busy(n, cx))
                     .collect();
@@ -196,6 +198,9 @@ impl Shark {
         if self.asking_chat(name, cx) {
             return Some(crate::transcript::QUESTION.into());
         }
+        if let Some(label) = self.attach_needs(name) {
+            return Some(label);
+        }
         if self.busy(name, cx) {
             return None;
         }
@@ -231,7 +236,7 @@ impl Shark {
             }
         }
         if !shown || !self.attn.window_active {
-            notify(name, "The agent finished its turn");
+            notify(&self.ws_title(name), "The agent finished its turn");
         }
         self.refresh_attention(cx);
     }
@@ -260,7 +265,7 @@ impl Shark {
                 && prev != &needs
                 && !on_screen
             {
-                notify(name, l);
+                notify(&self.ws_title(name), l);
             }
         }
         set_badge(count);
@@ -286,7 +291,7 @@ impl Shark {
         });
         match hit {
             Some(ix) => self.open_workspace(ix, window, cx),
-            None => window.push_notification("No other workspace needs you", cx),
+            None => window.push_notification("No other agent needs you", cx),
         }
     }
 }

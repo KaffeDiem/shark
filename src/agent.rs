@@ -497,6 +497,11 @@ mod tests {
     /// Quitting stops what `start` registered, and a reaped process leaves the registry.
     #[test]
     fn stop_all_signals_registered_children() {
+        // `start` writes its log under the shared test home, which `test_home` wipes.
+        #[cfg(feature = "test-support")]
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
         let (agent, rx) = start(cmd, &std::env::temp_dir(), "stop-all-test", None, None).unwrap();

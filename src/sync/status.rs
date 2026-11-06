@@ -1075,7 +1075,7 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
         .iter()
         .any(|r| r.pr().is_some_and(|p| p.state == PrState::Merged))
     {
-        return act("Merged · archive", Kind::Archive, vec![], false);
+        return act("Merged · delete agent", Kind::Archive, vec![], false);
     }
     act("No changes", Kind::None, vec![], false)
 }
@@ -1155,7 +1155,7 @@ pub fn step_args(kind: &Kind, r: &Repo) -> Result<Option<Vec<String>>, String> {
             }
             if p.base != short(&r.base) {
                 return Err(format!(
-                    "PR targets `{}`, but this workspace targets `{}`; retarget the PR before merging",
+                    "PR targets `{}`, but this agent targets `{}`; retarget the PR before merging",
                     p.base,
                     short(&r.base)
                 ));

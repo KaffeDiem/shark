@@ -102,7 +102,7 @@ impl Shark {
     /// cmd-p: the picker over every tracked and untracked file of the open workspace.
     pub(super) fn open_any_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ws) = self.active_ws() else {
-            return notify_err(window, cx, "Open a workspace first");
+            return notify_err(window, cx, "Open an agent first");
         };
         let repos = ws.repo_paths();
         let shark = cx.entity().downgrade();

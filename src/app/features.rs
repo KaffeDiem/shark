@@ -282,7 +282,11 @@ impl Shark {
         f: impl FnOnce(&mut git_feature::GitFeature, &mut Window, &mut Context<git_feature::GitFeature>),
     ) {
         self.show(Tab::Feature(Feature::Git), window, cx);
-        if let Some(git) = self.active_git_feature().cloned() {
+        if let Some(git) = self
+            .active_git_feature()
+            .cloned()
+            .filter(|_| !self.no_repos())
+        {
             git.update(cx, |g, cx| {
                 g.set_view(git_feature::GitView::Conversation, window, cx);
                 f(g, window, cx)
@@ -314,6 +318,8 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         match feature {
+            // The offer shows instead of them: focus on a handle not in the tree loses every key.
+            _ if self.no_repos() => self.content_focus.focus(window, cx),
             Feature::Diff => self.differ.update(cx, |d, cx| d.activate(window, cx)),
             Feature::Git => {
                 if let Some(git) = self.ensure_git_feature(window, cx) {
@@ -353,6 +359,7 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         match feature {
+            _ if self.no_repos() => self.content_focus.focus(window, cx),
             Feature::Diff => self.differ.update(cx, |d, cx| d.focus(target, window, cx)),
             Feature::Git => {
                 if let Some(git) = self.active_git_feature().cloned() {
@@ -364,6 +371,7 @@ impl Shark {
 
     pub(super) fn render_feature_controls(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
         match self.tab {
+            _ if self.no_repos() => None,
             Tab::Feature(Feature::Diff) => Some(
                 self.differ
                     .update(cx, |d, cx| d.render_diff_controls(cx).into_any_element()),
@@ -372,7 +380,56 @@ impl Shark {
         }
     }
 
-    pub(super) fn render_feature(&self, feature: Feature) -> AnyElement {
+    /// The open agent has no repository, so Diff and Git have nothing to show.
+    pub(super) fn no_repos(&self) -> bool {
+        self.active_ws().is_some_and(|w| w.repos.is_empty())
+    }
+
+    /// Diff and Git of an agent with no repository: the offer instead of Git actions.
+    fn render_attach_offer(&self, feature: Feature, cx: &mut Context<Self>) -> AnyElement {
+        let theme = cx.theme();
+        v_flex()
+            .id("attach-offer")
+            .flex_1()
+            .min_h_0()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .child(
+                Icon::new(IconName::FolderGit2)
+                    .with_size(px(32.))
+                    .text_color(faint(theme)),
+            )
+            .child(div().text_base().child("No repository attached"))
+            .child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child(format!(
+                        "{} works on an attached repository",
+                        feature.metadata().title
+                    )),
+            )
+            .child(self.attach_button("attach-repository", cx).primary())
+            .test_support()
+            .into_any_element()
+    }
+
+    /// Attach repository, for the open agent.
+    pub(super) fn attach_button(&self, id: &'static str, cx: &mut Context<Self>) -> Button {
+        Button::new(id)
+            .label("Attach repository")
+            .on_click(cx.listener(|s, _, w, cx| {
+                if let Some(name) = s.active.clone() {
+                    s.attach_repository(name, w, cx);
+                }
+            }))
+    }
+
+    pub(super) fn render_feature(&self, feature: Feature, cx: &mut Context<Self>) -> AnyElement {
+        if self.no_repos() {
+            return self.render_attach_offer(feature, cx);
+        }
         let content = match feature {
             Feature::Diff => self.differ.clone().into_any_element(),
             Feature::Git => self

@@ -12,13 +12,17 @@ impl Shark {
             false => self.active.as_ref(),
         };
         let Some(ws) = name.and_then(|n| self.ws(n)).cloned() else {
-            return notify_err(window, cx, "Open a workspace first");
+            return notify_err(window, cx, "Open an agent first");
         };
         if self.archiving.contains(&ws.name) {
-            return notify_err(window, cx, format!("{} is being archived", ws.name));
+            return notify_err(
+                window,
+                cx,
+                format!("{} is being deleted", ws.display_title()),
+            );
         }
         if self.runs.remove(&ws.name).is_some() {
-            window.push_notification(format!("Stopped {}'s run scripts", ws.name), cx);
+            window.push_notification(format!("Stopped {}'s run scripts", ws.display_title()), cx);
             return cx.notify();
         }
         let jobs = scripts::jobs(&self.state, &ws, Phase::Run, None);
@@ -60,7 +64,7 @@ impl Shark {
                     };
                     let (exited, all) = run.reap();
                     for e in exited {
-                        let msg = format!("{name}: run script exited: {e}");
+                        let msg = format!("{}: run script exited: {e}", s.ws_title(&name));
                         window.push_notification(Notification::warning(msg), cx);
                     }
                     if all {
@@ -136,9 +140,10 @@ impl Shark {
             }))
     }
 
-    /// Setup scripts for a new workspace, or only `repo`'s for one just added, in the background.
-    /// `then`'s prompt is sent to its chat once they succeed, so the agent never works on a
-    /// half-set-up worktree; if they fail or the chat is busy, it waits in the composer.
+    /// Setup scripts for a new workspace, or only `repo`'s for one just attached, in the background;
+    /// how the latter went decides its attachment (`setup_finished`). `then`'s prompt is sent to
+    /// its chat once they succeed, so the agent never works on a half-set-up worktree; if they
+    /// fail or the chat is busy, it waits in the composer.
     /// False when there's nothing to run (and `then` wasn't taken).
     pub(super) fn run_setup(
         &mut self,
@@ -153,7 +158,9 @@ impl Shark {
             return false;
         }
         let name = ws.name.clone();
-        window.push_notification(format!("Running setup scripts in {name}…"), cx);
+        let title = ws.display_title().to_string();
+        let attached = repo.map(String::from);
+        window.push_notification(format!("Running setup scripts in {title}…"), cx);
         // Archiving waits for it: the worktree mustn't go while setup writes to it.
         self.setting_up.push(name.clone());
         cx.spawn_in(window, async move |this, cx| {
@@ -166,12 +173,16 @@ impl Shark {
                     s.setting_up.remove(i);
                 }
                 let ok = result.is_ok();
-                match result {
+                match result.clone() {
                     Ok(()) => window.push_notification(
-                        Notification::success(format!("Setup done in {name}")),
+                        Notification::success(format!("Setup done in {title}")),
                         cx,
                     ),
                     Err(e) => script_failed(&name, e, window, cx),
+                }
+                match attached {
+                    Some(repo) => s.setup_finished(&name, &repo, result, window, cx),
+                    None => s.advance_attachment(&name, window, cx),
                 }
                 if let Some((p, chat)) = then {
                     chat.update(cx, |c, cx| {
@@ -197,12 +208,16 @@ impl Shark {
 
     pub(super) fn show_script_log(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(name) = self.active.clone() else {
-            return notify_err(window, cx, "Open a workspace first");
+            return notify_err(window, cx, "Open an agent first");
         };
-        let log = scripts::log_path(&name);
+        self.show_log_of(&name, window, cx);
+    }
+
+    pub(super) fn show_log_of(&self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        let log = scripts::log_path(name);
         match log.exists() {
             true => cx.open_with_system(&log),
-            false => notify_err(window, cx, "No script has run in this workspace yet"),
+            false => notify_err(window, cx, "No script has run in this agent yet"),
         }
     }
 }

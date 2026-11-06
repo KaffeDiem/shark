@@ -191,7 +191,7 @@ impl Differ {
         cx: &mut Context<Self>,
     ) {
         let Some(id) = (self.active_ws()).and_then(|ws| ws.chats.get(ws.active_chat)) else {
-            return notify_err(window, cx, "Open a workspace first");
+            return notify_err(window, cx, "Open an agent first");
         };
         let target = Target::Chat(id.id.clone());
         self.send_review_to(target, ids, note, publish, window, cx);
@@ -208,7 +208,7 @@ impl Differ {
         cx: &mut Context<Self>,
     ) {
         let Some(ws) = self.active_ws() else {
-            return notify_err(window, cx, "Open a workspace first");
+            return notify_err(window, cx, "Open an agent first");
         };
         let workspace = ws.name.clone();
         self.reanchor_comments(); // the lines as the agent will read them

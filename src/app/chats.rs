@@ -1,4 +1,4 @@
-//! Chat tabs of the open workspace, and the agent status in the header.
+//! Chat tabs of the open agent, and the agent status in the header.
 use super::*;
 use std::time::Duration;
 
@@ -103,6 +103,9 @@ impl Shark {
         // Opened mid-archive (its row is still listed): sends stay refused.
         let archiving = self.archiving.contains(&ws.name);
         let vim = self.state.vim;
+        // Current, whatever the caller cloned: a chat opened mid-attachment inherits its hold.
+        let ws = self.ws(&ws.name).unwrap_or(ws).clone();
+        let ws = &ws;
         let chat = cx.new(|cx| {
             let mut c = Chat::new(ws.clone(), meta.clone(), vim, window, cx);
             c.archiving = archiving;
@@ -110,20 +113,24 @@ impl Shark {
         });
         let (id, name) = (meta.id.clone(), ws.name.clone());
         // Busy also flips without a ChatEvent (background tasks, turns the CLI starts itself).
-        self._subs.push(cx.observe(&chat, |this, chat, cx| {
-            this.update_awake(cx);
-            // Home's "Approve a plan": approving notifies the chat.
-            if !this.state.approved_plan && chat.read(cx).plan.read(cx).approved.is_some() {
-                this.state.mark(|s| &mut s.approved_plan);
-            }
-            cx.notify()
-        }));
+        let workspace = name.clone();
+        self._subs
+            .push(cx.observe_in(&chat, window, move |this, chat, window, cx| {
+                this.update_awake(cx);
+                // Home's "Approve a plan": approving notifies the chat.
+                if !this.state.approved_plan && chat.read(cx).plan.read(cx).approved.is_some() {
+                    this.state.mark(|s| &mut s.approved_plan);
+                }
+                this.advance_attachment(&workspace, window, cx);
+                cx.notify()
+            }));
         self._subs.push(cx.subscribe_in(
             &chat,
             window,
             move |this, chat, ev: &ChatEvent, window, cx| {
                 match ev {
                     ChatEvent::Meta => this.save_meta(chat, cx),
+                    ChatEvent::NeedsRepo => this.offer_attach(&name, window, cx),
                     ChatEvent::GitReviewsSent(_) => {} // GitSync records these.
                     ChatEvent::Picked => {
                         this.record_interaction(&name, cx);
@@ -193,15 +200,19 @@ impl Shark {
         chat
     }
 
+    /// The first message of a still untitled agent titles it too.
     fn save_meta(&mut self, chat: &Entity<Chat>, cx: &mut Context<Self>) {
         let meta = chat.read(cx).meta.clone();
-        let slot = (self.state.workspaces.iter_mut())
-            .flat_map(|w| w.chats.iter_mut())
-            .find(|c| c.id == meta.id);
-        if let Some(slot) = slot
-            && *slot != meta
-        {
-            *slot = meta;
+        let ws =
+            (self.state.workspaces.iter_mut()).find(|w| w.chats.iter().any(|c| c.id == meta.id));
+        let Some(ws) = ws else { return };
+        let untitled = ws.title == crate::state::NEW_AGENT && !meta.title.is_empty();
+        if untitled {
+            ws.title = meta.title.clone();
+        }
+        let slot = ws.chats.iter_mut().find(|c| c.id == meta.id);
+        let changed = slot.filter(|s| **s != meta).map(|s| *s = meta).is_some();
+        if untitled || changed {
             let _ = self.state.save();
         }
     }
@@ -335,7 +346,7 @@ impl Shark {
     pub(super) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let fast = self.active_chat().and_then(|c| c.read(cx).meta.fast);
         let Some(id) = self.active_ws().map(Workspace::next_chat_id) else {
-            return notify_err(window, cx, "Open a workspace first");
+            return notify_err(window, cx, "Open an agent first");
         };
         let meta = ChatMeta {
             fast,
@@ -452,6 +463,7 @@ impl Shark {
             sync.update(cx, |g, cx| g.remove_chat(&chat, cx)); // the last ref; dropping stops claude
         }
         self.refresh_attention(cx); // an unread or asking tab no longer counts
+        self.advance_attachment(workspace, window, cx); // a closed chat can't report going idle
         if self.active.as_deref() == Some(workspace) && shown {
             if self.tab == Tab::Chat && !self.home_shown() {
                 match at {
@@ -477,10 +489,10 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         let Some(ws) = self.active_ws_mut() else {
-            return notify_err(window, cx, "Open a workspace first");
+            return notify_err(window, cx, "Open an agent first");
         };
         let Some(ix) = pick.or(ws.closed.len().checked_sub(1)) else {
-            return notify_err(window, cx, "No closed chats in this workspace");
+            return notify_err(window, cx, "No closed chats in this agent");
         };
         let meta = ws.closed.remove(ix);
         let at = ws.push_chat(meta);
@@ -491,10 +503,10 @@ impl Shark {
 
     pub(super) fn pick_closed_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ws) = self.active_ws() else {
-            return notify_err(window, cx, "Open a workspace first");
+            return notify_err(window, cx, "Open an agent first");
         };
         if ws.closed.is_empty() {
-            return notify_err(window, cx, "No closed chats in this workspace");
+            return notify_err(window, cx, "No closed chats in this agent");
         }
         // Newest first.
         let n = ws.closed.len();
@@ -521,11 +533,11 @@ impl Shark {
         );
     }
 
-    /// The shown workspace's chat, or a toast saying to open a workspace.
+    /// The shown agent's chat, or a toast saying to open one.
     pub(super) fn chat_or_err(&self, window: &mut Window, cx: &mut App) -> Option<Entity<Chat>> {
         let chat = self.active_chat().cloned();
         if chat.is_none() {
-            notify_err(window, cx, "Open a workspace first");
+            notify_err(window, cx, "Open an agent first");
         }
         chat
     }
@@ -653,7 +665,7 @@ impl Shark {
     /// The no-menu fast path, so confirm the switch in a toast.
     pub(super) fn set_model(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
         let (Some(chat), Some(m)) = (self.active_chat().cloned(), MODELS.get(ix)) else {
-            return notify_err(window, cx, "Open a workspace first");
+            return notify_err(window, cx, "Open an agent first");
         };
         chat.update(cx, |c, cx| c.set_model(m, cx));
         let m = crate::chat::model_label(m);
@@ -925,7 +937,7 @@ impl Shark {
             })
             .id("chat-tabs")
             .role(Role::TabList)
-            .aria_label("Workspace tabs")
+            .aria_label("Agent tabs")
             .test_support()
             .min_w_0()
             .gap_1()

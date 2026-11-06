@@ -1,6 +1,6 @@
-//! Home (cmd-0): a prompt to start the next workspace or ask Shark, setup, every workspace by
-//! what it needs from you, and appearance. It is what shows while no workspace is open, and
-//! over the open one while `Home::on`.
+//! Home (cmd-0): a prompt to start the next agent or ask Shark, setup, every agent by what it
+//! needs from you, and appearance. It is what shows while no agent is open, and over the open
+//! one while `Home::on`.
 use super::ask::Ask;
 use super::*;
 use crate::state::Appearance;
@@ -8,7 +8,7 @@ use crate::sync::PrState;
 use crate::ui::{card, close_button, mode_pills};
 use std::time::SystemTime;
 
-const BUILD: &str = "Describe the change; enter picks repos and a branch";
+const BUILD: &str = "Describe the work; enter starts an agent";
 const ASK: &str = "Ask how to do something in Shark";
 const RELEASES: &str = "https://github.com/KaffeDiem/shark/releases/tag/v";
 
@@ -150,9 +150,17 @@ pub(super) struct HomeRow {
 }
 
 impl Shark {
-    /// A new workspace on the repos of the last one.
+    /// cmd-n: an agent with an empty conversation.
+    pub(super) fn new_empty_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_agent(None, None, window, cx)
+    }
+
+    /// The branch and PR dialog on the repos of the last one, with Home's typed prompt as the
+    /// first message.
     pub(super) fn new_workspace_default(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_workspace(self.state.last_repos.clone(), None, window, cx)
+        let typed = self.home.prompt.read(cx).value().trim().to_string();
+        let first = (self.home_shown() && !self.home.asking && !typed.is_empty()).then_some(typed);
+        self.new_workspace(self.state.last_repos.clone(), first, window, cx)
     }
 
     /// Home is on screen: asked for, or nothing else to show.
@@ -380,15 +388,7 @@ impl Shark {
             }
             return;
         }
-        if self.state.repos.is_empty() {
-            window.push_notification(
-                "Add a repo first: each workspace gets its own worktree of it",
-                cx,
-            );
-            return self.add_repo(window, cx);
-        }
-        let first = (!text.is_empty()).then_some(text);
-        self.new_workspace(self.state.last_repos.clone(), first, window, cx);
+        self.new_agent((!text.is_empty()).then_some(text), None, window, cx);
     }
 
     /// A workspace was created with `first` as its first message: clear the prompt if it
@@ -430,7 +430,7 @@ impl Shark {
                 !self.deps.is_empty() && self.deps.iter().all(|d| d.ok),
             ),
             ("Add a repo", !st.repos.is_empty()),
-            ("Create a workspace", !st.workspaces.is_empty()),
+            ("Create an agent", !st.workspaces.is_empty()),
             ("Approve a plan", st.approved_plan),
             ("Open a PR", pr),
         ]
@@ -451,7 +451,7 @@ impl Shark {
     pub(super) fn try_plan_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.home_rows(cx);
         let Some(r) = self.home_cursor(&rows) else {
-            return notify_err(window, cx, "Create a workspace first (cmd-n)");
+            return notify_err(window, cx, "Create an agent first (cmd-n)");
         };
         let ix = rows[r].ix;
         // Leaving the open workspace asks about unsaved edits first; plan mode comes after.
@@ -536,7 +536,7 @@ impl Shark {
                             Button::new("back-to-workspace")
                                 .ghost()
                                 .xsmall()
-                                .label("Back to workspace")
+                                .label("Back to agent")
                                 .on_click(cx.listener(|this, _, w, cx| this.leave_home(w, cx))),
                         )
                         .child(
@@ -583,13 +583,8 @@ impl Shark {
             .focus_handle(cx)
             .is_focused(window);
         let (title, enter, other) = match self.home.asking {
-            true => ("Ask Shark", "ask", "new workspace"),
-            false if self.state.repos.is_empty() => (
-                "What do you want to build?",
-                "add a repo first",
-                "ask Shark",
-            ),
-            false => ("What do you want to build?", "pick repos", "ask Shark"),
+            true => ("Ask Shark", "ask", "new agent"),
+            false => ("What do you want to build?", "start agent", "ask Shark"),
         };
         v_flex()
             .gap_2()
@@ -615,7 +610,17 @@ impl Shark {
                     .text_xs()
                     .text_color(theme.muted_foreground)
                     .child(crate::ui::hint("enter", enter))
-                    .child(crate::ui::hint("tab", other)),
+                    .child(crate::ui::hint("tab", other))
+                    .child(div().flex_1())
+                    .when(!self.home.asking, |d| {
+                        d.child(
+                            Button::new("home-linear-issue")
+                                .ghost()
+                                .xsmall()
+                                .label("Start from Linear issue")
+                                .on_click(cx.listener(|s, _, w, cx| s.start_from_issue(w, cx))),
+                        )
+                    }),
             )
             .into_any_element()
     }
@@ -701,7 +706,7 @@ impl Shark {
             .children(items.iter().enumerate().map(|(i, (label, done))| {
                 let (btn, keys, go): (_, _, Go) = match i {
                     1 => ("Add repo", "cmd-k", Shark::add_repo),
-                    2 => ("New workspace", "cmd-n", Shark::new_workspace_default),
+                    2 => ("New agent", "cmd-n", Shark::new_empty_agent),
                     3 => ("Use plan mode", "shift-tab", Shark::try_plan_mode),
                     _ => ("Create PRs", "cmd-k", Shark::toggle_palette),
                 };
@@ -809,27 +814,19 @@ impl Shark {
                     .text_color(faint(theme))
                     .child(crate::ui::hint("enter", "open"))
                     .child(crate::ui::hint("i", "prompt"))
-                    .child(crate::ui::hint("cmd-backspace", "archive"))
+                    .child(crate::ui::hint("cmd-backspace", "delete"))
                     .child(div().child("right-click for more")),
             )
             .into_any_element()
     }
 
-    /// The list with no workspaces: add a repo, then start one.
+    /// The list with no agents: start one; a repo can come later.
     fn render_empty(&self, list: Stateful<Div>, cx: &Context<Self>) -> AnyElement {
         let theme = cx.theme();
-        let no_repos = self.state.repos.is_empty();
         let add = Button::new("home-add-repo").label("Add repo");
-        let add = add
-            .when(no_repos, |b| b.primary())
-            .on_click(cx.listener(|s, _, w, cx| s.add_repo(w, cx)));
-        let new = Button::new("home-new-ws").label("New workspace");
-        let new = key_button(
-            new.when(!no_repos, |b| b.primary()),
-            "cmd-n",
-            Shark::new_workspace_default,
-            cx,
-        );
+        let add = add.on_click(cx.listener(|s, _, w, cx| s.add_repo(w, cx)));
+        let new = Button::new("home-new-ws").label("New agent").primary();
+        let new = key_button(new, "cmd-n", Shark::new_empty_agent, cx);
         list.py_8()
             .items_center()
             .gap_3()
@@ -842,21 +839,15 @@ impl Shark {
                 div()
                     .text_base()
                     .text_color(theme.foreground)
-                    .child("No workspaces yet"),
+                    .child("No agents yet"),
             )
             .child(
                 div()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child(match no_repos {
-                        true => "Add a git repo, then start a workspace on a new branch",
-                        false => "A workspace is a branch with a worktree of each repo",
-                    }),
+                    .child("An agent plans first; attach a repository when it's time to build"),
             )
-            .child(match no_repos {
-                true => h_flex().gap_4().child(add).child(new),
-                false => h_flex().gap_4().child(new).child(add),
-            })
+            .child(h_flex().gap_4().child(new).child(add))
             .into_any_element()
     }
 
@@ -886,6 +877,11 @@ impl Shark {
             n => format!("{n} chats"),
         };
         let name = w.name.clone();
+        let title = w.display_title().to_string();
+        let on = match w.repos.is_empty() {
+            true => "No repository".to_string(),
+            false => format!("{} · {names}", w.branch),
+        };
         let ws = w.clone();
         h_flex()
             .id(("home-ws", ix))
@@ -932,7 +928,7 @@ impl Shark {
                                     .min_w_0()
                                     .truncate()
                                     .font_weight(FontWeight::MEDIUM)
-                                    .child(name),
+                                    .child(title),
                             )
                             .when(merged, |d| {
                                 d.child(
@@ -974,14 +970,10 @@ impl Shark {
                             .text_xs()
                             .text_color(theme.muted_foreground)
                             .child(Icon::new(IconName::GitBranch).with_size(px(12.)))
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .truncate()
-                                    .child(format!("{} · {names} · {chats}", w.branch)),
-                            ),
+                            .child(div().min_w_0().truncate().child(format!("{on} · {chats}"))),
                     )
                     .children(match repos {
+                        None if w.repos.is_empty() => vec![],
                         None => vec![div().text_xs().text_color(faint(theme)).child("checking…")],
                         Some(repos) => (repos.iter())
                             .map(|r| {

@@ -1,4 +1,4 @@
-//! Repo settings (click a repo in the sidebar): new workspace, default model, setup, run and
+//! Repo settings (click a repo in the sidebar): new agent, default model, setup, run and
 //! archive scripts, removal. Every change saves at once, as in Settings.
 use super::*;
 use crate::chat::{effort_label, model_label};
@@ -263,13 +263,16 @@ impl RepoSettingsView {
                 // A workspace being created or getting a repo isn't in `workspaces` yet.
                 (s.state.workspaces.iter())
                     .filter(|w| w.repos.iter().any(|r| r.name == name))
-                    .map(|w| w.name.clone())
+                    .map(|w| w.display_title().to_string())
                     .chain(s.creating.iter().chain(&s.adding_repos).cloned())
                     .collect()
             })
             .unwrap_or_default();
         if !used.is_empty() {
-            let msg = format!("{name} is in {}; archive those first", used.join(", "));
+            let msg = format!(
+                "{name} is in {}; delete those agents first",
+                used.join(", ")
+            );
             return notify_err(window, cx, msg);
         }
         confirm(
@@ -475,7 +478,7 @@ impl Render for RepoSettingsView {
                     .primary()
                     .small()
                     .icon(IconName::Plus)
-                    .label("New workspace")
+                    .label("New agent")
                     .on_click(cx.listener(|this, _, w, cx| this.new_workspace(w, cx))),
             );
         v_flex()
@@ -492,7 +495,7 @@ impl Render for RepoSettingsView {
                             theme,
                             false,
                             "Default model",
-                            "New chats in workspaces with this repo",
+                            "New chats in agents with this repo",
                             Select::new(&self.model).small(),
                         ))
                         .child(row(

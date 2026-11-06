@@ -505,7 +505,7 @@ impl Shark {
                         return notify_err(
                             window,
                             cx,
-                            "The workspace or edits changed; try the action again",
+                            "The agent or edits changed; try the action again",
                         );
                     }
                     // Closing may still be canceled by the final storage check.
@@ -1072,7 +1072,7 @@ fn restore_file(ws: &Workspace, path: &str) -> Result<(PathBuf, String), String>
         .iter()
         .any(|r| std::ffi::OsStr::new(&r.name) == repo)
     {
-        return Err("repository is not in this workspace".into());
+        return Err("repository is not in this agent".into());
     }
     let read = || -> Result<_, std::io::Error> {
         let root = ws.dir().join(repo).canonicalize()?;

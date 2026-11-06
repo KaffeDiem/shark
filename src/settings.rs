@@ -1,7 +1,9 @@
 //! Settings dialog (cmd-,): general (stay awake, Vim mode), appearance (mode, light and dark
-//! theme, fonts) and the git button's agent prompts. Preferences apply immediately.
+//! theme, fonts), the git button's agent prompts and the Linear connection. Preferences apply
+//! immediately.
 use crate::SwitchField;
 use crate::app::Shark;
+use crate::app::linear_connection::LinearPage;
 use crate::prompts::{self, PROMPTS};
 use crate::state::{Appearance, State};
 use crate::theme::{THEMES, theme_configs};
@@ -20,8 +22,18 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 
 pub fn open(state: &State, window: &mut Window, cx: &mut Context<Shark>) {
+    open_page(state, 0, window, cx)
+}
+
+/// Settings on its Linear page, the last.
+pub fn open_linear(state: &State, window: &mut Window, cx: &mut Context<Shark>) {
+    open_page(state, PAGES.len() - 1, window, cx)
+}
+
+fn open_page(state: &State, tab: usize, window: &mut Window, cx: &mut Context<Shark>) {
     let shark = cx.entity().downgrade();
     let view = cx.new(|cx| Settings::new(shark, state, window, cx));
+    view.update(cx, |v, _| v.tab = tab);
     let focus = view.read(cx).focus.clone();
     window.open_dialog(cx, move |d, _, _| {
         // No dialog title: the page list and the page title say where you are.
@@ -106,6 +118,7 @@ pub struct Settings {
     ui_font: Choice,
     mono_font: Choice,
     prompts: Vec<Entity<TextareaState>>,
+    linear: Entity<LinearPage>,
     _subs: Vec<Subscription>,
 }
 
@@ -209,15 +222,18 @@ impl Settings {
             })
             .collect();
 
+        let focus = cx.focus_handle();
+        let linear = cx.new(|cx| LinearPage::new(shark.clone(), focus.clone(), window, cx));
         Settings {
             shark,
             tab: 0,
-            focus: cx.focus_handle(),
+            focus,
             light: swatches("Light"),
             dark: swatches("Dark"),
             ui_font,
             mono_font,
             prompts,
+            linear,
             _subs: subs,
         }
     }
@@ -520,6 +536,10 @@ const PAGES: &[(IconName, (&str, &str))] = &[
             "Sent to the agent by the git button; {repos} and {branch} are filled in when the step runs",
         ),
     ),
+    (
+        IconName::Link,
+        ("Linear", "Read-only access to your Linear issues"),
+    ),
 ];
 
 /// A tiny mock of the app in a theme's colors: sidebar, text lines and a primary button.
@@ -562,7 +582,7 @@ fn preview(theme: &Theme, s: &Swatch, on: bool) -> Div {
 }
 
 /// A separated row with the label on top and a full-width control beneath.
-fn stacked(
+pub(crate) fn stacked(
     theme: &Theme,
     label: &'static str,
     desc: &'static str,
@@ -583,7 +603,8 @@ impl Render for Settings {
         let body = match self.tab {
             0 => self.render_general(cx).into_any_element(),
             1 => self.render_appearance(cx).into_any_element(),
-            _ => self.render_prompts(cx).into_any_element(),
+            2 => self.render_prompts(cx).into_any_element(),
+            _ => self.linear.clone().into_any_element(),
         };
         let (title, desc) = PAGES[self.tab].1;
         let theme = cx.theme();

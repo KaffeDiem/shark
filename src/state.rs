@@ -26,7 +26,7 @@ pub struct State {
     /// `editor::FONT_SIZE`.
     #[serde(default)]
     pub editor_font_size: Option<f32>,
-    /// Repo names picked for the last new workspace; the next dialog starts with them.
+    /// Repo names picked for the last agent made in the dialog; the next one starts with them.
     #[serde(default)]
     pub last_repos: Vec<String>,
     /// Applications opened through Shark, most recent first, shared by all workspaces.
@@ -47,6 +47,9 @@ pub struct State {
     /// Keep the Mac from idle-sleeping while an agent works (`Shark::update_awake`).
     #[serde(default)]
     pub stay_awake: bool,
+    /// Who Linear is connected as; the credential itself is in the Keychain.
+    #[serde(default)]
+    pub linear: Option<crate::app::linear_connection::Connection>,
     /// Where `load` moved an unreadable state.json, for the launch notice.
     #[serde(skip)]
     pub corrupt_backup: Option<PathBuf>,
@@ -183,9 +186,25 @@ pub struct Workspace {
     /// Last explicit user interaction, in Unix milliseconds; background work never updates it.
     #[serde(default)]
     pub last_interacted_at: Option<u64>,
+    /// Immutable identity: the directory, the first chat's id, every per-workspace key.
     pub name: String,
+    /// What the user sees and edits; empty shows `name` (`display_title`).
+    #[serde(default)]
+    pub title: String,
+    /// With no repos: a placeholder equal to `name`, which nothing shows. The first repo replaces
+    /// it with its branch (`default_branch` is what the dialog offers), and later repos inherit it.
     pub branch: String,
     pub repos: Vec<WsRepo>,
+    /// The attachment operation under way, in the order it runs. Saved before Git changes anything;
+    /// while it holds anything, the agent's chats and Git steps wait.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attaching: Vec<Attachment>,
+    /// The Linear issues attached to it.
+    #[serde(default)]
+    pub linear: crate::linear::Attachments,
+    /// `linear`'s snapshots as `linear::read_snapshots` has them; their file owns them.
+    #[serde(skip)]
+    pub issues: Vec<crate::linear::Snapshot>,
     /// Pre-tabs single chat; `migrate` moves it into `chats`.
     #[serde(default, skip_serializing)]
     pub session_id: Option<String>,
@@ -244,8 +263,12 @@ impl Default for Workspace {
         Self {
             last_interacted_at: None,
             name: String::new(),
+            title: String::new(),
             branch: String::new(),
             repos: Vec::new(),
+            attaching: Vec::new(),
+            linear: Default::default(),
+            issues: Vec::new(),
             session_id: None,
             model: None,
             chats: Vec::new(),
@@ -284,6 +307,67 @@ pub struct ChatMeta {
     /// codex's Fast service tier, once toggled; `None` follows codex's own config.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fast: Option<bool>,
+    /// What this chat's session has been told of `Workspace::context`, by source, as text
+    /// fingerprints. Anything else goes out with its next normal message.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub delivered: BTreeMap<String, u64>,
+}
+
+/// A repository on its way into an agent. The stage says how far it got, so a restart can
+/// reconcile it (`app::attach`).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct Attachment {
+    pub repo: String,
+    pub src: PathBuf,
+    pub branch: String,
+    /// What a fresh branch starts on; empty is the repo's default.
+    #[serde(default)]
+    pub base: String,
+    /// A new branch, so an existing one of that name is refused. Otherwise a branch the user
+    /// picked to check out.
+    pub fresh: bool,
+    pub stage: AttachStage,
+    /// Why it stopped: the setup failure, or what a restart found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachStage {
+    /// Nothing exists yet: it waits for idle or its turn, and can be cancelled.
+    Queued,
+    /// Git may have started; a restart looks at what is there.
+    Creating,
+    /// In `Workspace::repos`; its setup scripts are running.
+    Setup,
+    /// Kept with its worktree until the user retries or continues.
+    SetupFailed,
+    /// After an interruption, resources that can't be told apart from someone else's.
+    Uncertain,
+}
+
+impl Attachment {
+    /// Fresh on `branch`, waiting its turn.
+    pub fn fresh(r: &Repo, branch: &str, base: &str) -> Self {
+        Attachment {
+            repo: r.name.clone(),
+            src: r.path.clone(),
+            branch: branch.into(),
+            base: base.into(),
+            fresh: true,
+            stage: AttachStage::Queued,
+            error: None,
+        }
+    }
+
+    /// It stopped and waits for the user.
+    pub fn stuck(&self) -> bool {
+        matches!(
+            self.stage,
+            AttachStage::SetupFailed | AttachStage::Uncertain
+        )
+    }
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -330,9 +414,113 @@ pub fn workspaces_dir() -> PathBuf {
     home().join("shark/workspaces")
 }
 
+/// The title of an agent nothing has been said to yet; its first message replaces it.
+pub const NEW_AGENT: &str = "New agent";
+
+/// The key prefix of a repository in `Workspace::context`. A session reads these from the root
+/// CLAUDE.md or AGENTS.md when it starts, so it starts with them delivered.
+pub const REPO_CONTEXT: &str = "repo:";
+
+/// The key prefix of a Linear issue in `Workspace::context`, before its UUID. Unlike repositories
+/// these are in no root doc, so every session gets them with its first normal turn.
+pub const ISSUE_CONTEXT: &str = "issue:";
+
+/// One entry of `Workspace::context`.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ContextNote {
+    pub text: String,
+    /// Of what the source says, which may be less than `text`: only a change here sends it again.
+    pub fingerprint: u64,
+}
+
+/// `Workspace::context` as a chat records it (`ChatMeta::delivered`).
+pub fn context_record(context: &BTreeMap<String, ContextNote>) -> BTreeMap<String, u64> {
+    (context.iter())
+        .map(|(k, note)| (k.clone(), note.fingerprint))
+        .collect()
+}
+
+/// A new agent's identity, safe as a directory and as a branch: `agent-<hex>`, counting up from
+/// `seed` past whatever is `taken`.
+pub fn agent_name(seed: u64, taken: impl Fn(&str) -> bool) -> String {
+    (seed..)
+        .map(|n| format!("agent-{n:x}"))
+        .find(|n| !taken(n))
+        .expect("u64 outlasts the agents")
+}
+
 impl Workspace {
     pub fn dir(&self) -> PathBuf {
         workspaces_dir().join(&self.name)
+    }
+
+    /// What to call it on screen.
+    pub fn display_title(&self) -> &str {
+        match self.title.is_empty() {
+            true => &self.name,
+            false => &self.title,
+        }
+    }
+
+    /// Whether it has a repository to build in; plan mode can't end without one. An attachment
+    /// counts until it is done: set up, or continued past a failed setup.
+    pub fn ready(&self) -> bool {
+        !self.repos.is_empty() && self.attaching.is_empty()
+    }
+
+    /// The primary attached issue, as last retrieved.
+    pub fn primary_issue(&self) -> Option<&crate::linear::Snapshot> {
+        self.linear.primary()?.of(&self.issues)
+    }
+
+    /// The branch the next repository attaches on: the one the agent is on, or for the first,
+    /// `<primary issue or title>-<suffix>`.
+    pub fn default_branch(&self) -> String {
+        if !self.repos.is_empty() {
+            return self.branch.clone();
+        }
+        let source = match self.primary_issue() {
+            Some(issue) => &issue.identifier,
+            None if self.title == NEW_AGENT => "",
+            None => self.display_title(),
+        };
+        let mut slug = String::new();
+        for w in (source.split(|c: char| !c.is_ascii_alphanumeric())).filter(|w| !w.is_empty()) {
+            if slug.len() + w.len() > 40 {
+                break;
+            }
+            slug += &w.to_ascii_lowercase();
+            slug.push('-');
+        }
+        match slug.is_empty() {
+            true => self.name.clone(),
+            false => slug + self.name.strip_prefix("agent-").unwrap_or(&self.name),
+        }
+    }
+
+    /// What every chat of the agent should know, one entry per source, each a `[shark]` note:
+    /// `repo:<name>` for each repository, `issue:<uuid>` for each attached issue. A chat gets what
+    /// it hasn't received (`ChatMeta::delivered`) with its next normal message.
+    pub fn context(&self) -> BTreeMap<String, ContextNote> {
+        (self.repos.iter())
+            .map(|r| {
+                let rules = crate::git::rules_file(&self.dir().join(&r.name))
+                    .map_or(String::new(), |f| format!(" Read {}/{f} for its rules.", r.name));
+                let text = format!(
+                    "[shark] Repo `{0}` is attached: `{0}/` is a git worktree of {1} on branch `{2}` (base `{3}`), and the root CLAUDE.md and AGENTS.md list it.{rules}",
+                    r.name,
+                    r.src.display(),
+                    self.branch_of(r),
+                    r.base
+                );
+                let fingerprint = crate::files::fingerprint(&text);
+                (
+                    format!("{REPO_CONTEXT}{}", r.name),
+                    ContextNote { text, fingerprint },
+                )
+            })
+            .chain(crate::linear::context_notes(&self.linear, &self.issues))
+            .collect()
     }
 
     /// Its repos as (name, worktree path).
@@ -624,6 +812,10 @@ impl State {
         for ws in &mut state.workspaces {
             ws.migrate();
             ws.fill_models(&model, effort.as_ref());
+            if ws.linear.primary().is_some() {
+                // Unreadable shows as missing snapshots; `put_snapshot` still won't overwrite it.
+                ws.issues = crate::linear::read_snapshots(&ws.name).unwrap_or_default();
+            }
         }
         state
     }
@@ -935,6 +1127,131 @@ mod tests {
     }
 
     /// A pre-tabs workspace keeps its session, model and transcript as its first chat.
+    /// Files from before attachments load, and a recorded one survives a round trip.
+    #[test]
+    fn issue_attachments_default_and_round_trip_without_their_text() {
+        let old = r#"{"name":"a","branch":"b","repos":[]}"#;
+        let mut ws: Workspace = serde_json::from_str(old).unwrap();
+        assert_eq!(ws.linear.primary(), None);
+        let snapshot = crate::linear::Snapshot {
+            org: "o".into(),
+            id: "i".into(),
+            identifier: "ENG-1".into(),
+            description: "secret plans".into(),
+            ..Default::default()
+        };
+        ws.linear.attach((&snapshot).into());
+        ws.issues.push(snapshot.clone());
+        let out = serde_json::to_string(&ws).unwrap();
+        assert!(
+            !out.contains("secret plans") && !out.contains("ENG-1"),
+            "{out}"
+        );
+        let back: Workspace = serde_json::from_str(&out).unwrap();
+        assert_eq!(back.linear, ws.linear);
+        assert!(back.issues.is_empty(), "their file owns them");
+    }
+
+    #[test]
+    fn the_primary_issue_names_a_first_branch_and_context_holds_each_issue() {
+        let issue = |id: &str, n: u32| crate::linear::Snapshot {
+            org: "o".into(),
+            id: id.into(),
+            identifier: format!("ENG-{n}"),
+            title: "Hostile: title".into(),
+            ..Default::default()
+        };
+        let (one, two) = (issue("uuid-1", 1), issue("uuid-2", 2));
+        let mut ws = Workspace {
+            name: "agent-19a2b".into(),
+            title: "Some title".into(),
+            ..Default::default()
+        };
+        assert_eq!(ws.default_branch(), "some-title-19a2b");
+        ws.linear.attach((&one).into());
+        ws.linear.attach((&two).into());
+        ws.issues = vec![one, two.clone()];
+        assert_eq!(ws.default_branch(), "eng-1-19a2b");
+        ws.linear.make_primary(&(&two).into());
+        assert_eq!(ws.default_branch(), "eng-2-19a2b");
+        ws.title = NEW_AGENT.into();
+        assert_eq!(ws.default_branch(), "eng-2-19a2b");
+        let context = ws.context();
+        let keys: Vec<&String> = context.keys().collect();
+        assert_eq!(keys, ["issue:uuid-1", "issue:uuid-2"]);
+        assert!(context.values().all(|n| n.text.starts_with("[shark] ")));
+        ws.branch = "chosen".into();
+        ws.repos.push(WsRepo {
+            name: "api".into(),
+            src: "/src/api".into(),
+            base: "main".into(),
+            branch: None,
+        });
+        assert_eq!(ws.default_branch(), "chosen", "an existing branch stays");
+    }
+
+    #[test]
+    fn attachments_and_delivered_context_default_and_round_trip() {
+        let json = r#"{"name":"feat","branch":"b","repos":[],"chats":[{"id":"feat"}]}"#;
+        let mut ws: Workspace = serde_json::from_str(json).unwrap();
+        assert!(ws.attaching.is_empty() && ws.chats[0].delivered.is_empty());
+        let out = serde_json::to_string(&ws).unwrap();
+        assert!(
+            !out.contains("attaching") && !out.contains("delivered"),
+            "{out}"
+        );
+        ws.attaching.push(Attachment {
+            stage: AttachStage::SetupFailed,
+            error: Some("exit 3".into()),
+            ..Attachment::fresh(
+                &Repo {
+                    name: "api".into(),
+                    path: "/src/api".into(),
+                },
+                "b",
+                "origin/dev",
+            )
+        });
+        ws.chats[0].delivered.insert("repo:api".into(), 7);
+        let back: Workspace = serde_json::from_str(&serde_json::to_string(&ws).unwrap()).unwrap();
+        assert_eq!(back.attaching, ws.attaching);
+        assert_eq!(back.chats, ws.chats);
+    }
+
+    /// A default branch is the title's words plus the agent's suffix; an untitled agent has only
+    /// its identity. Readiness needs a repo and no attachment left.
+    #[test]
+    fn default_branch_and_readiness() {
+        let mut ws = Workspace {
+            name: "agent-19a2b".into(),
+            title: NEW_AGENT.into(),
+            branch: "agent-19a2b".into(),
+            ..Default::default()
+        };
+        assert_eq!(ws.default_branch(), "agent-19a2b");
+        ws.title = "Fix: the Login page — properly, please, before the long weekend!".into();
+        assert_eq!(
+            ws.default_branch(),
+            "fix-the-login-page-properly-please-19a2b"
+        );
+        assert!(!ws.ready());
+        ws.repos.push(WsRepo {
+            name: "api".into(),
+            src: "/src/api".into(),
+            base: "main".into(),
+            branch: None,
+        });
+        ws.branch = "chosen".into();
+        assert_eq!(ws.default_branch(), "chosen", "later repos inherit it");
+        assert!(ws.ready());
+        let r = Repo {
+            name: "web".into(),
+            path: "/src/web".into(),
+        };
+        ws.attaching.push(Attachment::fresh(&r, "chosen", ""));
+        assert!(!ws.ready());
+    }
+
     #[test]
     fn migrates_single_chat() {
         let json = r#"{"name":"feat","branch":"b","repos":[],"session_id":"s1","model":"opus"}"#;
@@ -950,6 +1267,7 @@ mod tests {
                 effort: None,
                 plan: false,
                 fast: None,
+                delivered: Default::default(),
             }]
         );
         assert_eq!(ws.next_chat_id(), "feat~2");
@@ -1073,6 +1391,28 @@ mod tests {
             repos: vec![],
             ..Default::default()
         }
+    }
+
+    /// A workspace saved before titles shows its name and saves back loadable.
+    #[test]
+    fn old_state_has_no_title() {
+        let old =
+            r#"{"repos":[],"workspaces":[{"name":"kd-login","branch":"kd/login","repos":[]}]}"#;
+        let st: State = serde_json::from_str(old).unwrap();
+        let ws = &st.workspaces[0];
+        assert_eq!((ws.title.as_str(), ws.display_title()), ("", "kd-login"));
+        let back: State = serde_json::from_str(&serde_json::to_string(&st).unwrap()).unwrap();
+        assert_eq!(back.workspaces[0].display_title(), "kd-login");
+    }
+
+    /// A generated name that's taken counts up; it stays a valid directory and branch name.
+    #[test]
+    fn agent_names_skip_taken_ones() {
+        assert_eq!(agent_name(255, |_| false), "agent-ff");
+        assert_eq!(
+            agent_name(255, |n| ["agent-ff", "agent-100"].contains(&n)),
+            "agent-101"
+        );
     }
 
     #[test]

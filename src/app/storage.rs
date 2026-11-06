@@ -24,11 +24,11 @@ impl Shark {
             .as_ref()
             .filter(|_| only.is_none())
         {
-            errors.push(format!("Workspace state and settings: {e}"));
+            errors.push(format!("Agent state and settings: {e}"));
         }
         for (ws, e) in self.differ.read(cx).storage_errors() {
             if keep(&ws) {
-                errors.push(format!("Comments in {ws}: {e}"));
+                errors.push(format!("Comments in {}: {e}", self.ws_title(&ws)));
             }
         }
         for chat in self.chats.values() {
@@ -47,7 +47,7 @@ impl Shark {
         }
         for (ws, git) in &self.git_features {
             if let (true, Some(e)) = (keep(ws), git.read(cx).storage_error()) {
-                errors.push(format!("Git drafts in {ws}: {e}"));
+                errors.push(format!("Git drafts in {}: {e}", self.ws_title(ws)));
             }
         }
         errors.sort();
@@ -77,7 +77,7 @@ impl Shark {
     ) -> bool {
         if !self.creating.is_empty() || !self.adding_repos.is_empty() || !self.archiving.is_empty()
         {
-            window.push_notification("Wait for workspace changes to finish before closing", cx);
+            window.push_notification("Wait for agent changes to finish before closing", cx);
             return false;
         }
         if self.git_features.values().any(|g| g.read(cx).busy()) {

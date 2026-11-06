@@ -696,7 +696,7 @@ impl Differ {
     /// edited instead.
     pub(crate) fn comment_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if self.workspace.is_none() {
-            return notify_err(window, cx, "Open a workspace first");
+            return notify_err(window, cx, "Open an agent first");
         }
         let Some(range) = self.picked_lines(cx) else {
             let keys = if self.preferences.vim {

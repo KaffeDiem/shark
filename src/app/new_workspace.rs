@@ -1,4 +1,4 @@
-//! The New workspace dialog: a branch name and a filterable repo or branch picker.
+//! The branch and PR dialog: a branch name and a filterable repo or branch picker.
 use super::*;
 use gpui_kit::base::Selectable as _;
 use std::time::{Duration, Instant};
@@ -24,6 +24,11 @@ pub(super) struct NewWorkspaceForm {
     from: Vec<Option<String>>,
     /// "Insert workspace below…": the workspace to stack on the new one once it exists.
     insert: Option<String>,
+    /// Attach repository: the agent the repos join, instead of a new one. The branch field starts
+    /// on its default branch, alt-enter picks a repo's base, and the last row adds a local repo.
+    attach: Option<String>,
+    /// Per repo: the base a new branch starts on unless `from` says otherwise; `None` until read.
+    defaults: Vec<Option<String>>,
     refreshed_at: Vec<[Option<Instant>; 2]>,
     loading: Vec<[bool; 2]>,
     errors: Vec<[Option<String>; 2]>,
@@ -62,12 +67,17 @@ impl NewWorkspaceForm {
         first: Option<String>,
         from: &[(String, String)],
         insert: Option<String>,
+        attach: Option<(String, String)>,
         shark: WeakEntity<Shark>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
-        let branch =
-            cx.new(|cx| InputState::new(window, cx).placeholder("branch, e.g. you/eng-123-login"));
+        let (attach, fresh) = attach.unzip();
+        let branch = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("branch, e.g. you/eng-123-login")
+                .default_value(fresh.unwrap_or_default())
+        });
         // Branch names can't contain spaces; turn them into dashes as you type.
         let _sub = cx.subscribe_in(&branch, window, |_, input, ev: &InputEvent, window, cx| {
             if let InputEvent::Change = ev {
@@ -87,14 +97,19 @@ impl NewWorkspaceForm {
         let srcs: Vec<PathBuf> = repos.iter().map(|r| r.path.clone()).collect();
         cx.spawn(async move |this, cx| {
             let lists = (cx.background_executor())
-                .spawn(async move { crate::proc::par_map(&srcs, |s| git::branches(s).ok()) })
+                .spawn(async move {
+                    crate::proc::par_map(&srcs, |s| {
+                        (git::branches(s).ok(), git::resolve_base(s, ""))
+                    })
+                })
                 .await;
             this.update(cx, |f, cx| {
-                for (slot, l) in f.branches.iter_mut().zip(lists) {
+                for (i, (l, base)) in lists.into_iter().enumerate() {
                     // A fetched list may have landed first.
-                    if slot.is_none() {
-                        *slot = l;
+                    if f.branches[i].is_none() {
+                        f.branches[i] = l;
                     }
+                    f.defaults[i] = Some(base);
                 }
                 cx.notify();
             })
@@ -112,6 +127,8 @@ impl NewWorkspaceForm {
         NewWorkspaceForm {
             from,
             insert,
+            attach,
+            defaults: vec![None; n],
             branch,
             first,
             picker: cx.new(|cx| CommandState::new(window, cx)),
@@ -155,7 +172,10 @@ impl NewWorkspaceForm {
 
     fn source_repo(&self, cx: &App) -> Option<usize> {
         match self.mode.slot() {
-            None => self.picker.read(cx).selected_index().map(|i| i.row),
+            // Not the add-a-local-repo row, which is no repo.
+            None => (self.picker.read(cx).selected_index())
+                .map(|i| i.row)
+                .filter(|r| *r < self.repos.len()),
             Some((ix, _)) => Some(ix),
         }
     }
@@ -166,6 +186,9 @@ impl NewWorkspaceForm {
     }
 
     fn pick_pr(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
+        if self.attach.is_some() {
+            return;
+        }
         if self.prs[ix].is_none() {
             let repo = &self.repos[ix];
             self.prs[ix] = Some(complete::cached_repo_prs(&repo.name, &repo.path, true));
@@ -301,7 +324,8 @@ impl NewWorkspaceForm {
                 else {
                     return;
                 };
-                if !b.origin {
+                // A base needn't be on GitHub, a parent to stack on must.
+                if !b.origin && self.attach.is_none() {
                     let msg = format!("`{}` isn't on GitHub yet; push it first", b.name);
                     return notify_err(window, cx, msg);
                 }
@@ -345,6 +369,7 @@ impl NewWorkspaceForm {
             self.from[ix] = None;
         }
         let ix = match self.mode {
+            Mode::Repos if row == self.repos.len() => return self.add_local(window, cx),
             Mode::Repos => {
                 self.toggle(row, cx);
                 return self.picker.update(cx, |p, cx| p.set_query("", window, cx));
@@ -407,18 +432,91 @@ impl NewWorkspaceForm {
         if let Some(b) = &self.own[ix] {
             return b.clone();
         }
+        let exists = self.typed_exists(ix, cx);
+        if self.attach.is_some() {
+            let base = self.from[ix].as_ref().or(self.defaults[ix].as_ref());
+            return match (exists, base) {
+                (true, _) => "exists · pick another name".into(),
+                (false, Some(base)) => format!("new · from {base}"),
+                (false, None) => "new".into(),
+            };
+        }
         if let Some(p) = &self.from[ix] {
             return format!("new · on {p}");
         }
+        if exists { "existing" } else { "new" }.into()
+    }
+
+    /// Repo `ix` has a branch of the typed name, here or on origin.
+    fn typed_exists(&self, ix: usize, cx: &App) -> bool {
         let typed = self.branch.read(cx).value();
         let typed = typed.trim();
-        let exists = (self.branches[ix].as_ref())
-            .is_some_and(|l| !typed.is_empty() && l.iter().any(|b| b.name == typed));
-        if exists { "existing" } else { "new" }.into()
+        (self.branches[ix].as_ref())
+            .is_some_and(|l| !typed.is_empty() && l.iter().any(|b| b.name == typed))
+    }
+
+    /// Attach repository's last row: a folder picker, then this dialog again with it ticked.
+    fn add_local(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(name) = self.attach.clone() else {
+            return;
+        };
+        let picked = (self.repos.iter().zip(&self.picked))
+            .filter(|(_, p)| **p)
+            .map(|(r, _)| r.name.clone())
+            .collect();
+        window.close_dialog(cx);
+        self.shark
+            .update(cx, |s, cx| s.attach_local_repo(name, picked, window, cx))
+            .ok();
+    }
+
+    /// Attach repository's Attach: queues the ticked repos. A branch name collision is told here;
+    /// the operation checks again, as branches can appear while it waits.
+    fn submit_attach(&mut self, name: String, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let typed = self.branch.read(cx).value().trim().to_string();
+        let ticked: Vec<usize> = (0..self.repos.len()).filter(|i| self.picked[*i]).collect();
+        if ticked.is_empty() {
+            notify_err(
+                window,
+                cx,
+                "Pick at least one repo (space or enter ticks it)",
+            );
+            self.picker.update(cx, |p, cx| p.focus(window, cx));
+            return false;
+        }
+        let fresh = || ticked.iter().filter(|i| self.own[**i].is_none());
+        let taken = fresh().find(|i| self.typed_exists(**i, cx));
+        if typed.is_empty() && fresh().next().is_some() {
+            notify_err(window, cx, "Name the branch first");
+        } else if let Some(i) = taken {
+            let repo = &self.repos[*i].name;
+            let msg = format!("{repo}: branch `{typed}` already exists; pick another name");
+            notify_err(window, cx, msg);
+        } else {
+            let picks = (ticked.iter())
+                .map(|i| crate::state::Attachment {
+                    fresh: self.own[*i].is_none(),
+                    ..crate::state::Attachment::fresh(
+                        &self.repos[*i],
+                        self.own[*i].as_ref().unwrap_or(&typed),
+                        self.from[*i].as_deref().unwrap_or_default(),
+                    )
+                })
+                .collect();
+            self.shark
+                .update(cx, |s, cx| s.queue_attachment(name, picks, window, cx))
+                .ok();
+            return true;
+        }
+        self.branch.update(cx, |i, cx| i.focus(window, cx));
+        false
     }
 
     /// Returns whether the form was valid (and the dialog may close).
     pub(super) fn submit(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        if let Some(name) = self.attach.clone() {
+            return self.submit_attach(name, window, cx);
+        }
         let primary = self.primary(cx);
         let typed = self.branch.read(cx).value().trim().to_string();
         let picked: Vec<(Repo, Option<String>)> = (self.repos.iter())
@@ -486,6 +584,7 @@ impl Render for NewWorkspaceForm {
         let theme = cx.theme();
         let (muted, faint) = (theme.muted_foreground, faint(theme));
         let in_branch = self.branch.read(cx).focus_handle(cx).is_focused(window);
+        let attaching = self.attach.is_some();
         let entity = cx.entity().downgrade();
         let items: Vec<CommandItem> = match self.mode {
             // A checkbox on every row, so it reads as multi-select before anything is ticked.
@@ -527,25 +626,35 @@ impl Render for NewWorkspaceForm {
                                         })
                                         .test_support(),
                                 )
-                                .child(
-                                    Button::new(("repo-prs", i))
-                                        .ghost()
-                                        .xsmall()
-                                        .label("Open PRs")
-                                        .tooltip("Open pull requests (cmd-p)")
-                                        .on_click(move |_, window, cx| {
-                                            cx.stop_propagation();
-                                            pr_entity
-                                                .update(cx, |f, cx| f.pick_pr(i, window, cx))
-                                                .ok();
-                                        }),
-                                )
+                                .when(!attaching, |d| {
+                                    d.child(
+                                        Button::new(("repo-prs", i))
+                                            .ghost()
+                                            .xsmall()
+                                            .label("Open PRs")
+                                            .tooltip("Open pull requests (cmd-p)")
+                                            .on_click(move |_, window, cx| {
+                                                cx.stop_propagation();
+                                                pr_entity
+                                                    .update(cx, |f, cx| f.pick_pr(i, window, cx))
+                                                    .ok();
+                                            }),
+                                    )
+                                })
                         })
                 })
+                .chain(attaching.then(|| {
+                    CommandItem::new()
+                        .label("Add a local repository…")
+                        .icon(IconName::FolderPlus)
+                }))
                 .collect(),
             Mode::Branches(ix) => {
                 let list = self.branches[ix].clone().unwrap_or_default();
-                let new = CommandItem::new().label("New branch (workspace name)");
+                let new = CommandItem::new().label(match attaching {
+                    true => "New branch",
+                    false => "New branch (agent name)",
+                });
                 (std::iter::once(new))
                     .chain(list.into_iter().enumerate().map(|(i, b)| {
                         let tag = match &b.checked_out {
@@ -716,7 +825,8 @@ impl Render for NewWorkspaceForm {
             .child(Input::new(&self.branch))
             .child({
                 // As `create_workspace` names it.
-                let name = self.primary(cx).unwrap_or_default().replace('/', "-");
+                let name = (self.attach.clone())
+                    .unwrap_or_else(|| self.primary(cx).unwrap_or_default().replace('/', "-"));
                 let dir = workspaces_dir().join(if name.is_empty() { "<name>" } else { &name });
                 div()
                     .text_xs()
@@ -725,6 +835,8 @@ impl Render for NewWorkspaceForm {
                     .child(format!("Worktrees go in {}", super::menus::tilde(&dir)))
             })
             .children(self.insert.as_ref().map(|child| {
+                let shark = self.shark.upgrade();
+                let child = shark.map_or(child.clone(), |s| s.read(cx).ws_title(child));
                 div().text_xs().text_color(muted).child(format!(
                     "Inserted below `{child}`: {child} will be stacked on it"
                 ))
@@ -752,19 +864,21 @@ impl Render for NewWorkspaceForm {
                                         }
                                     })),
                             )
-                            .child(
-                                Button::new("source-prs")
-                                    .ghost()
-                                    .xsmall()
-                                    .label("Pull requests")
-                                    .selected(matches!(self.mode, Mode::Prs(_)))
-                                    .tooltip("Pull requests (cmd-p)")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        if let Some(ix) = this.source_repo(cx) {
-                                            this.pick_pr(ix, window, cx);
-                                        }
-                                    })),
-                            )
+                            .when(!attaching, |d| {
+                                d.child(
+                                    Button::new("source-prs")
+                                        .ghost()
+                                        .xsmall()
+                                        .label("Pull requests")
+                                        .selected(matches!(self.mode, Mode::Prs(_)))
+                                        .tooltip("Pull requests (cmd-p)")
+                                        .on_click(cx.listener(|this, _, window, cx| {
+                                            if let Some(ix) = this.source_repo(cx) {
+                                                this.pick_pr(ix, window, cx);
+                                            }
+                                        })),
+                                )
+                            })
                             .child(
                                 Button::new("refresh-sources")
                                     .ghost()
@@ -806,26 +920,42 @@ impl Render for NewWorkspaceForm {
                     .map(|d| match (self.mode, in_branch) {
                         (Mode::Branches(_), _) => d
                             .child(hint(vec![kbd("enter")], "check out"))
-                            .child(hint(vec![kbd("alt-enter")], "branch from it"))
+                            .child(hint(
+                                vec![kbd("alt-enter")],
+                                match attaching {
+                                    true => "use as base",
+                                    false => "branch from it",
+                                },
+                            ))
                             .child(hint(vec![kbd("tab")], "back")),
                         (Mode::Prs(_), _) => d
                             .child(hint(vec![kbd("enter")], "review"))
                             .child(hint(vec![kbd("alt-enter")], "branch from it"))
                             .child(hint(vec![kbd("tab")], "back")),
-                        (Mode::Repos, true) => d
-                            .child(hint(vec![kbd("tab")], "switch field"))
-                            .child(hint(vec![kbd("enter")], "create")),
+                        (Mode::Repos, true) => {
+                            d.child(hint(vec![kbd("tab")], "switch field")).child(hint(
+                                vec![kbd("enter")],
+                                if attaching { "attach" } else { "create" },
+                            ))
+                        }
                         (Mode::Repos, false) => d
                             .child(hint(vec![kbd("tab")], "switch field"))
                             .child(hint(vec![kbd("space")], "tick repo"))
-                            .child(hint(vec![kbd("cmd-b")], "branch"))
-                            .child(hint(vec![kbd("cmd-p")], "PR")),
+                            .child(hint(
+                                vec![kbd("cmd-b")],
+                                if attaching {
+                                    "branch or base"
+                                } else {
+                                    "branch"
+                                },
+                            ))
+                            .when(!attaching, |d| d.child(hint(vec![kbd("cmd-p")], "PR"))),
                     })
                     .child(div().flex_1())
                     .child(
                         Button::new("create")
                             .primary()
-                            .label("Create")
+                            .label(if attaching { "Attach" } else { "Create" })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 if this.submit(window, cx) {
                                     window.close_dialog(cx);

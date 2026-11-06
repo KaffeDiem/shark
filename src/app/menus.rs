@@ -92,7 +92,7 @@ pub(super) fn path_submenu(
 /// Right-click menu of a sidebar workspace. Shows where everything lives on disk,
 /// and keeps the destructive items last. Shortcuts live in the palette, not here (Apple HIG).
 pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<Entry> {
-    let paths: Vec<(String, PathBuf)> = std::iter::once(("Workspace folder".into(), ws.dir()))
+    let paths: Vec<(String, PathBuf)> = std::iter::once(("Agent folder".into(), ws.dir()))
         .chain(ws.repo_paths())
         .collect();
     let mut entries = vec![];
@@ -100,12 +100,17 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
         // By name: the list can change under an open menu (a background auto-archive).
         entries.push(menu::item(
             IconName::MessageSquare,
-            "Open workspace",
+            "Open agent",
             on_ws(cx, &ws.name, |s, n, w, cx| {
                 s.open_workspace_named(&n, w, cx)
             }),
         ));
     }
+    entries.push(menu::item(
+        IconName::Pencil,
+        "Rename agent…",
+        on_ws(cx, &ws.name, |s, n, w, cx| s.rename_agent(n, w, cx)),
+    ));
     entries.push(move_submenu(this, &ws.name, cx));
     let missing: Vec<Entry> = (this.state.repos.iter())
         .filter(|r| !ws.repos.iter().any(|w| w.name == r.name))
@@ -115,13 +120,18 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
                 IconName::FolderGit2,
                 r.name.clone(),
                 on_shark(cx, move |s, w, cx| {
-                    s.add_repo_to_workspace(name.clone(), repo.clone(), w, cx)
+                    s.attach_form(name.clone(), vec![repo.name.clone()], w, cx)
                 }),
             )
         })
         .collect();
-    if !missing.is_empty() {
-        entries.push(menu::sub(IconName::FolderPlus, "Add repo", missing));
+    // With no repos, the branch rows below offer it.
+    if !missing.is_empty() && !ws.repos.is_empty() {
+        entries.push(menu::sub(
+            IconName::FolderPlus,
+            "Attach repository",
+            missing,
+        ));
     }
     entries.extend([
         Entry::Sep,
@@ -144,12 +154,12 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
         Entry::Sep,
         menu::item(
             IconName::Archive,
-            "Archive",
+            "Delete agent…",
             on_ws(cx, &ws.name, |s, n, w, cx| s.archive_ws(n, false, w, cx)),
         ),
         menu::item(
             IconName::ArchiveX,
-            "Force archive…",
+            "Force delete agent…",
             on_ws(cx, &ws.name, |s, n, w, cx| s.archive_ws(n, true, w, cx)),
         ),
     ]);
@@ -252,7 +262,7 @@ fn stack_rows(
                     let label = format!("#{} · {:?}", p.number, p.state).to_lowercase();
                     (IconName::GitMerge, label, Some(p.url.clone()))
                 }
-                (None, None) if n.ws.is_some() => (IconName::GitBranch, "workspace".into(), None),
+                (None, None) if n.ws.is_some() => (IconName::GitBranch, "agent".into(), None),
                 (None, None) => (IconName::GitBranch, String::new(), None),
             };
             let hint = match prefix {
@@ -284,6 +294,13 @@ fn stack_rows(
 /// insert below, copy and change base, then what's on GitHub. Shared by the sidebar's and the
 /// header's menus.
 pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<Entry> {
+    if ws.repos.is_empty() {
+        return vec![menu::item(
+            IconName::FolderPlus,
+            "Attach repository…",
+            on_ws(cx, &ws.name, |s, n, w, cx| s.attach_repository(n, w, cx)),
+        )];
+    }
     let sync = this.syncs.get(&ws.name).map(|s| s.read(cx));
     let branches = sync.map(|s| s.branches()).unwrap_or_default();
     // Not opened yet, so not probed: the branches the workspace put them on.
@@ -434,7 +451,7 @@ fn stack_actions(
     out.push(
         menu::item(
             IconName::Layers,
-            "New workspace on top…",
+            "New agent on top…",
             on_ws(cx, &name, |s, n, w, cx| s.stack_from(n, false, w, cx)),
         )
         .hint(ws.branch.clone()),
@@ -446,7 +463,7 @@ fn stack_actions(
     out.push(
         menu::item(
             IconName::ListPlus,
-            "Insert workspace below…",
+            "Insert agent below…",
             on_ws(cx, &name, |s, n, w, cx| s.stack_from(n, true, w, cx)),
         )
         .hint(below),
@@ -526,7 +543,7 @@ pub(super) fn repo_menu(this: &Shark, repo: &Repo, cx: &Context<Shark>) -> Vec<E
         ),
         menu::item(
             IconName::Plus,
-            "New workspace…",
+            "New agent from this repo…",
             on_shark(cx, move |s, w, cx| {
                 s.new_workspace(picked.clone(), None, w, cx)
             }),
@@ -547,15 +564,15 @@ pub(super) fn repo_menu(this: &Shark, repo: &Repo, cx: &Context<Shark>) -> Vec<E
             let (ws, repo) = (w.name.clone(), repo.clone());
             menu::item(
                 IconName::MessageSquare,
-                w.name.clone(),
+                w.display_title().to_string(),
                 on_shark(cx, move |s, win, cx| {
-                    s.add_repo_to_workspace(ws.clone(), repo.clone(), win, cx)
+                    s.attach_form(ws.clone(), vec![repo.name.clone()], win, cx)
                 }),
             )
         })
         .collect();
     if !rows.is_empty() {
-        entries.insert(2, menu::sub(IconName::FolderPlus, "Add to workspace", rows));
+        entries.insert(2, menu::sub(IconName::FolderPlus, "Attach to agent", rows));
     }
     entries.extend(open_in_entries(None, &[(name, path.clone())], cx));
     entries.push(

@@ -30,7 +30,7 @@ impl Shark {
             s.scroll.scroll_to_item(s.selected);
         } else {
             let Some(target) = self.target(window) else {
-                return notify_err(window, cx, "Open a workspace first");
+                return notify_err(window, cx, "Open an agent first");
             };
             let mut apps = palette::available_apps(Some(&target));
             apps.sort_by_key(|app| {
@@ -41,11 +41,7 @@ impl Shark {
                     .unwrap_or(usize::MAX)
             });
             if apps.is_empty() {
-                return notify_err(
-                    window,
-                    cx,
-                    "No applications available to open this workspace",
-                );
+                return notify_err(window, cx, "No applications available to open this agent");
             }
             let previous_focus = window.focused(cx);
             let focus = cx.focus_handle();
@@ -140,7 +136,7 @@ impl Shark {
         if open {
             match self.ws(&s.workspace).cloned() {
                 Some(ws) => self.open_in_workspace(s.apps[s.selected], &ws, window, cx),
-                None => notify_err(window, cx, "The selected workspace is no longer available"),
+                None => notify_err(window, cx, "The selected agent is no longer available"),
             }
         }
         cx.notify();
@@ -164,7 +160,7 @@ impl Shark {
         let panel = menu::chrome(theme)
             .id("app-switcher")
             .role(Role::Dialog)
-            .aria_label("Open workspace in application")
+            .aria_label("Open agent in application")
             .w(width)
             .p(px(20.))
             .gap_3()

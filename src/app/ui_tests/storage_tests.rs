@@ -37,7 +37,8 @@ async fn workspace_operations_finish_before_closing(cx: &mut TestAppContext) {
     .await;
     assert_eq!(State::load().workspaces.len(), 1);
     on(cx, &|s, w, cx| {
-        s.add_repo_to_workspace("closing".into(), repos[1].clone(), w, cx);
+        let web = crate::state::Attachment::fresh(&repos[1], "closing", "");
+        s.queue_attachment("closing".into(), vec![web], w, cx);
         assert!(!s.adding_repos.is_empty());
         assert!(
             !s.close_window(w, cx),

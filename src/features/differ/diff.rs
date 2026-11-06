@@ -802,9 +802,9 @@ impl Differ {
                         "All changes"
                     })
                     .tooltip(if self.preferences.uncommitted_only {
-                        "HEAD → working tree: staged, unstaged, and untracked changes. Click for all changes: workspace base → working tree.".to_string()
+                        "HEAD → working tree: staged, unstaged, and untracked changes. Click for all changes: agent base → working tree.".to_string()
                     } else {
-                        format!("Workspace base ({base}) → working tree: committed and uncommitted changes. Click for uncommitted changes: HEAD → working tree.")
+                        format!("Agent base ({base}) → working tree: committed and uncommitted changes. Click for uncommitted changes: HEAD → working tree.")
                     })
                     .on_click(cx.listener(|this, _, w, cx| this.toggle_uncommitted(w, cx))),
             )

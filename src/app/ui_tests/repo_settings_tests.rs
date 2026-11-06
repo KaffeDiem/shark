@@ -91,6 +91,7 @@ async fn repo_settings_scripts_and_model(cx: &mut TestAppContext) {
     }
 
     on(cx, &|s, w, cx| s.archive_ws("scripts".into(), false, w, cx));
+    press_in(window)(cx, &["enter"]);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).state.workspaces.is_empty()
     })

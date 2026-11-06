@@ -2585,8 +2585,8 @@ impl GitFeature {
         if self.workspace.repos.get(self.selected).is_none() {
             (
                 "git-empty-repositories",
-                "No repositories in this workspace",
-                "Add a repository to the workspace to view its pull request.",
+                "No repositories in this agent",
+                "Attach a repository to view its pull request.",
                 IconName::FolderGit2,
             )
         } else if self.loading {
@@ -2608,7 +2608,7 @@ impl GitFeature {
                 "git-unloaded",
                 "Pull request not loaded",
                 if self.archiving {
-                    "This workspace is being archived."
+                    "This agent is being deleted."
                 } else {
                     "Load this branch’s pull request to read its description and review activity."
                 },

@@ -676,6 +676,16 @@ mod tests {
     #[cfg(feature = "test-support")]
     #[gpui_kit::test]
     fn review_wrapped_choices_keep_submit_inside_viewport(cx: &mut TestAppContext) {
+        // With no repository the chat would share its width with the plan pane.
+        let ws = Workspace {
+            repos: vec![crate::state::WsRepo {
+                name: "api".into(),
+                src: Default::default(),
+                base: "main".into(),
+                branch: None,
+            }],
+            ..Default::default()
+        };
         use gpui_kit::test::{TestEventExt, TestQueryExt, TestWindowExt};
 
         crate::state::TEST_HOME
@@ -699,13 +709,7 @@ mod tests {
                             cx,
                             |w, cx| {
                                 cx.new(|cx| {
-                                    Chat::new(
-                                        Workspace::default(),
-                                        ChatMeta::default(),
-                                        false,
-                                        w,
-                                        cx,
-                                    )
+                                    Chat::new(ws.clone(), ChatMeta::default(), false, w, cx)
                                 })
                             },
                         )

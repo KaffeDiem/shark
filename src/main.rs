@@ -15,6 +15,7 @@ mod features;
 mod file_icon;
 mod files;
 mod git;
+mod linear;
 mod lsp;
 mod media;
 mod menu;
@@ -47,6 +48,7 @@ actions!(
     [
         TogglePalette,
         NewWorkspace,
+        NewWorkspaceFromBranch,
         ArchiveWorkspace,
         ForceArchiveWorkspace,
         AddRepo,
@@ -369,6 +371,9 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("cmd-r", RunScripts, None),
         KeyBinding::new("ctrl-tab", SwitchField, Some("Settings")),
         KeyBinding::new("ctrl-shift-tab", SwitchField, Some("Settings")),
+        // Enter is for the focused control. The dialog's OK would close Settings first, hiding a
+        // rejected key's message.
+        KeyBinding::new("enter", NoAction, Some("LinearPage")),
         KeyBinding::new("cmd-/", PickModel, None),
         KeyBinding::new("cmd-shift-f", ToggleFastMode, None),
         KeyBinding::new("cmd-shift-.", RaiseEffort, None),

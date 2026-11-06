@@ -1,6 +1,7 @@
-//! Creating, opening, growing and archiving workspaces.
+//! Creating, opening, growing and deleting agents (`Workspace` in the code).
 use super::new_workspace::NewWorkspaceForm;
 use super::*;
+use crate::state::AttachStage;
 
 impl Shark {
     pub(crate) fn open_workspace(
@@ -33,7 +34,7 @@ impl Shark {
         then: impl FnOnce(&mut Shark, &mut Window, &mut Context<Shark>) + 'static,
     ) {
         if self.archiving.contains(name) || self.ws(name).is_none() {
-            return notify_err(window, cx, "The selected workspace is no longer available");
+            return notify_err(window, cx, "The selected agent is no longer available");
         }
         if self.active.as_deref() == Some(name) {
             if self.home.on {
@@ -54,7 +55,7 @@ impl Shark {
                 .position(|w| w.name == name)
                 .filter(|_| !s.archiving.contains(&name))
             else {
-                return notify_err(window, cx, "The selected workspace is no longer available");
+                return notify_err(window, cx, "The selected agent is no longer available");
             };
             s.open_workspace_now(ix, window, cx);
             s.record_interaction(&name, cx);
@@ -116,13 +117,15 @@ impl Shark {
             window,
             move |this, _, ev: &SyncEvent, window, cx| this.sync_event(&name, ev, window, cx),
         ));
+        let name = ws.name.clone();
         self._subs
-            .push(cx.observe_in(&sync, window, |s, sync, w, cx| {
+            .push(cx.observe_in(&sync, window, move |s, sync, w, cx| {
                 if s.active_sync() == Some(&sync) {
                     s.configure_differ(cx);
                     s.configure_git(w, cx);
                     s.differ.update(cx, |_, cx| cx.notify());
                 }
+                s.advance_attachment(&name, w, cx); // a git step may be what it waited for
             }));
         self.syncs.insert(ws.name.clone(), sync);
     }
@@ -149,7 +152,7 @@ impl Shark {
                 cx.notify();
             }
             SyncEvent::DeleteRemote(on) => self.set_delete_remote(*on, cx),
-            SyncEvent::Archive => self.remove_workspace(name, false, window, cx),
+            SyncEvent::Archive => self.archive_ws(name.to_string(), false, window, cx),
             SyncEvent::PrsCreated => self.state.mark(|s| &mut s.opened_pr),
             SyncEvent::PrBaseAdopted(moves) => {
                 if let Some(ws) = self.ws_mut(name) {
@@ -173,7 +176,7 @@ impl Shark {
     }
 
     /// Refreshes the diff when `name` is the open workspace.
-    fn refresh_diff_if_active(&mut self, name: &str, cx: &mut Context<Self>) {
+    pub(super) fn refresh_diff_if_active(&mut self, name: &str, cx: &mut Context<Self>) {
         if self.active.as_deref() == Some(name) {
             self.refresh_diff(cx);
         }
@@ -196,21 +199,144 @@ impl Shark {
         .detach();
     }
 
-    /// From the folder picker or folders dropped on the sidebar.
+    /// From the folder picker or folders dropped on the sidebar. Returns the repos it added.
     pub(super) fn add_repo_paths(
         &mut self,
         paths: &[PathBuf],
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) {
+    ) -> Vec<Repo> {
+        let mut added = vec![];
         for p in paths {
             match git::add_repo(p, &self.state.repos) {
-                Ok(r) => self.state.repos.push(r),
+                Ok(r) => added.push(r),
                 Err(e) => notify_err(window, cx, e),
             }
         }
+        self.state.repos.extend(added.iter().cloned());
         let _ = self.state.save();
         cx.notify();
+        added
+    }
+
+    /// New agent: an empty conversation, no dialog, no repository. `first`, when set, titles it
+    /// and goes out as its first message. `issue`, a title and a snapshot, is attached before that
+    /// and gives the title instead. Unsaved edits are asked about before anything exists, so
+    /// cancelling leaves nothing behind.
+    pub(super) fn new_agent(
+        &mut self,
+        first: Option<String>,
+        issue: Option<(String, Snapshot)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let editors = self.file_tabs.iter().map(|t| t.editor.clone()).collect();
+        self.confirm_editors(editors, true, false, window, cx, move |s, window, cx| {
+            s.create_agent(first, issue, window, cx)
+        });
+    }
+
+    /// Saved before any provider starts: a failed save leaves neither agent nor directory. A
+    /// failed first send leaves the agent, with the message back in its composer (`Chat::ask`).
+    fn create_agent(
+        &mut self,
+        first: Option<String>,
+        issue: Option<(String, Snapshot)>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        // Nothing is saved this run, so the agent would be gone on restart.
+        if self.state.read_only {
+            return notify_err(
+                window,
+                cx,
+                "Can't create agents: state.json couldn't be read",
+            );
+        }
+        let name = crate::state::agent_name(interaction::now_ms(), |n| {
+            self.creating.contains(n)
+                || self.ws(n).is_some()
+                || workspaces_dir().join(n).exists()
+                || crate::transcript::transcript_path(n).exists()
+        });
+        let title = match (&issue, first.as_deref()) {
+            (Some((title, _)), _) => title.clone(),
+            (None, Some(first)) => crate::chat::title_of(first),
+            (None, None) => crate::state::NEW_AGENT.into(),
+        };
+        let dir = workspaces_dir().join(&name);
+        let mut ws = match git::create_empty_workspace(&dir, &name, &title) {
+            Ok(ws) => ws,
+            Err(e) => return notify_err(window, cx, e),
+        };
+        if let Some((_, snapshot)) = issue {
+            // ponytail: one small write on the UI thread, like the agent's other first writes.
+            if let Err(e) = crate::linear::put_snapshot(&name, &snapshot) {
+                let _ = git::remove_workspace(&ws, &dir, false);
+                return notify_err(window, cx, format!("Couldn't save the issue: {e}"));
+            }
+            ws.linear.attach((&snapshot).into());
+            ws.issues.push(snapshot);
+        }
+        let (model, effort) = self.state.defaults_for(&ws);
+        ws.fill_models(&model, effort.as_ref());
+        self.state.workspaces.push(ws.clone());
+        if let Err(e) = self.state.save() {
+            self.state.workspaces.pop();
+            let _ = git::remove_workspace(&ws, &dir, false);
+            crate::linear::delete_snapshots(&name);
+            return notify_err(window, cx, format!("Couldn't save the new agent: {e}"));
+        }
+        self.open_workspace_now(self.state.workspaces.len() - 1, window, cx);
+        self.record_interaction(&name, cx);
+        let Some(first) = first else { return };
+        self.home_prompt_used(Some(&first), window, cx);
+        if let Some(chat) = self.active_chat().cloned() {
+            chat.update(cx, |c, cx| c.ask(&first, window, cx));
+        }
+    }
+
+    /// `name`'s title, for messages; `name` itself once it's gone.
+    pub(crate) fn ws_title(&self, name: &str) -> String {
+        self.ws(name).map_or(name, Workspace::display_title).into()
+    }
+
+    /// "Rename agent…": a field with the title.
+    pub(super) fn rename_agent(
+        &mut self,
+        name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let title = self.ws_title(&name);
+        let input = cx.new(|cx| InputState::new(window, cx).default_value(title));
+        let (field, shark) = (input.clone(), cx.entity().downgrade());
+        window.open_dialog(cx, move |d, _, _| {
+            let (input, shark, name) = (input.clone(), shark.clone(), name.clone());
+            crate::ui::dialog(d)
+                .title("Rename agent")
+                .w(px(440.))
+                .child(Input::new(&input))
+                .on_ok(move |_, _, cx| {
+                    let title = input.read(cx).value().trim().to_string();
+                    shark.update(cx, |s, cx| s.set_title(&name, title, cx)).ok();
+                    true
+                })
+        });
+        field.update(cx, |i, cx| {
+            i.focus(window, cx);
+            i.select_all(window, cx);
+        });
+    }
+
+    /// Only the title changes: identity is `name`, so directories, transcripts and branches
+    /// stay. An empty title changes nothing.
+    pub(super) fn set_title(&mut self, name: &str, title: String, cx: &mut Context<Self>) {
+        if let Some(ws) = self.ws_mut(name).filter(|_| !title.is_empty()) {
+            ws.title = title;
+            let _ = self.state.save();
+            cx.notify();
+        }
     }
 
     /// `picked` repos start ticked: the last-used ones, or the repo clicked in the sidebar.
@@ -225,8 +351,8 @@ impl Shark {
         self.new_workspace_from(picked, first, vec![], None, window, cx)
     }
 
-    /// The New workspace dialog with `from` `(repo, parent)` prefilled; `insert` names the
-    /// workspace to stack on the new one.
+    /// The branch and PR dialog with `from` `(repo, parent)` prefilled; `insert` names the
+    /// workspace to stack on the new one. It checks out repos, so it needs one registered.
     pub(super) fn new_workspace_from(
         &mut self,
         picked: Vec<String>,
@@ -242,7 +368,9 @@ impl Shark {
         let shark = cx.entity().downgrade();
         let repos = self.state.repos.clone();
         let form = cx.new(|cx| {
-            NewWorkspaceForm::new(repos, &picked, first, &from, insert, shark, window, cx)
+            NewWorkspaceForm::new(
+                repos, &picked, first, &from, insert, None, shark, window, cx,
+            )
         });
         let input = form.read(cx).branch.clone();
         window.open_dialog(cx, move |d, _, _| {
@@ -250,7 +378,7 @@ impl Shark {
             // Dialog binds enter to Confirm, which runs on_ok and closes when it returns true.
             // In the repo picker, the Command list takes enter first (it ticks a repo).
             crate::ui::dialog(d)
-                .title("New workspace")
+                .title("New agent from branch or PR")
                 .w(px(640.))
                 .child(form.clone())
                 .on_ok(move |_, window, cx| f.update(cx, |f, cx| f.submit(window, cx)))
@@ -304,11 +432,11 @@ impl Shark {
             return notify_err(
                 window,
                 cx,
-                "Can't create workspaces: state.json couldn't be read",
+                "Can't create agents: state.json couldn't be read",
             );
         }
         if self.creating.contains(&name) || self.state.workspaces.iter().any(|w| w.name == name) {
-            return notify_err(window, cx, format!("workspace `{name}` already exists"));
+            return notify_err(window, cx, format!("agent `{name}` already exists"));
         }
         self.creating.insert(name.clone());
         self.state.last_repos = repos.iter().map(|(r, _)| r.name.clone()).collect();
@@ -356,7 +484,8 @@ impl Shark {
                                 window,
                                 cx,
                                 format!(
-                                    "Created, but `{child}` stays where it was; pushing failed: {e}"
+                                    "Created, but `{}` stays where it was; pushing failed: {e}",
+                                    s.ws_title(child)
                                 ),
                             ),
                             _ => {}
@@ -444,106 +573,34 @@ impl Shark {
         }
     }
 
-    /// "Add repo to workspace…": a menu of the repos the target workspace doesn't have yet.
+    /// "Attach repository…" on the target agent.
     pub(super) fn pick_repo_for_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.with_target(window, cx, |s, ws, window, cx| {
-            let missing: Vec<Repo> = (s.state.repos.iter())
-                .filter(|r| !ws.repos.iter().any(|w| w.name == r.name))
-                .cloned()
-                .collect();
-            if missing.is_empty() {
-                return notify_err(
-                    window,
-                    cx,
-                    format!(
-                        "{} has every repo; add another first (Add repo in cmd-k)",
-                        ws.name
-                    ),
-                );
-            }
-            let items = missing
-                .iter()
-                .map(|r| {
-                    CommandItem::new()
-                        .label(r.name.clone())
-                        .icon(IconName::FolderGit2)
-                        .keywords([r.path.to_string_lossy().to_string()])
-                })
-                .collect();
-            let name = ws.name.clone();
-            open_menu(
-                cx.entity().downgrade(),
-                "Add a repo to this workspace…",
-                items,
-                0,
-                move |s, row, window, cx| {
-                    s.add_repo_to_workspace(name.clone(), missing[row].clone(), window, cx)
-                },
-                window,
-                cx,
-            );
+            s.attach_repository(ws.name, window, cx)
         })
     }
 
-    pub(super) fn add_repo_to_workspace(
-        &mut self,
-        name: String,
-        repo: Repo,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if self.archiving.contains(&name) {
-            return notify_err(window, cx, format!("{name} is being archived"));
-        }
-        let Some(ws) = self.ws(&name).cloned() else {
-            return;
-        };
-        if !self.adding_repos.insert(name.clone()) {
-            return notify_err(
-                window,
-                cx,
-                format!("{name}: a repository addition is already in progress"),
-            );
-        }
-        window.push_notification(format!("Adding {} to {name}…", repo.name), cx);
-        cx.spawn_in(window, async move |this, cx| {
-            let dir = ws.dir();
-            let result = cx
-                .background_executor()
-                .spawn(async move { git::add_to_workspace(&ws, &dir, &repo) })
-                .await;
-            this.update_in(cx, |s, window, cx| {
-                s.adding_repos.remove(&name);
-                match result {
-                    Ok(ws) => s.repo_added(ws, window, cx),
-                    Err(e) => notify_err(window, cx, e),
-                }
+    /// `refuse_unready` said no. A toast because it can come from anywhere, Zen and the plan
+    /// pane too; it names `name` because another agent may be open by the time it's clicked.
+    pub(super) fn offer_attach(&self, name: &str, window: &mut Window, cx: &mut Context<Self>) {
+        struct AttachOffer;
+        let (shark, name) = (cx.entity().downgrade(), name.to_string());
+        let toast = Notification::warning("Building needs a repository")
+            .id::<AttachOffer>()
+            .action(move |_, _, cx| {
+                let (shark, name) = (shark.clone(), name.clone());
+                Button::new("attach-offer")
+                    .primary()
+                    .label("Attach repository")
+                    .on_click(cx.listener(move |toast, _, w, cx| {
+                        toast.dismiss(w, cx);
+                        shark
+                            .update(cx, |s, cx| s.attach_repository(name.clone(), w, cx))
+                            .ok();
+                    }))
             })
-            .ok();
-        })
-        .detach();
-    }
-
-    /// Every chat of an opened workspace that has (or had) a conversation gets `note` and the
-    /// new repo list; one never started reads the new root CLAUDE.md at its session start.
-    fn tell_chats(
-        &mut self,
-        ws: &Workspace,
-        note: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        if !self.syncs.contains_key(&ws.name) {
-            return;
-        }
-        let metas: Vec<ChatMeta> = (ws.chats.iter())
-            .filter(|m| self.chats.contains_key(&m.id) || m.session_id.is_some())
-            .cloned()
-            .collect();
-        for m in metas {
-            let chat = self.ensure_chat(ws, &m, window, cx);
-            chat.update(cx, |c, cx| c.repos_changed(ws, note.clone(), cx));
-        }
+            .autohide(true);
+        window.push_notification(toast, cx);
     }
 
     /// "New workspace on top…": the New workspace dialog with this workspace's repos ticked,
@@ -559,6 +616,9 @@ impl Shark {
         let Some(ws) = self.ws(&name).cloned() else {
             return;
         };
+        if ws.repos.is_empty() {
+            return notify_err(window, cx, NO_REPO);
+        }
         // A review checkout's base is a `refs/shark/…` ref, not a branch to stack on.
         let from: Vec<(String, String)> = (ws.repos.iter())
             .filter(|r| r.base.starts_with("origin/"))
@@ -649,6 +709,9 @@ impl Shark {
         let Some(ws) = self.ws(&name).cloned() else {
             return;
         };
+        if ws.repos.is_empty() {
+            return notify_err(window, cx, NO_REPO);
+        }
         let repos: Vec<String> = ws.repos.iter().map(|r| r.name.clone()).collect();
         if repos.len() < 2 {
             return self.pick_base(name, repos, window, cx);
@@ -781,8 +844,8 @@ impl Shark {
         );
     }
 
-    /// Records the new bases (`(repo, old, new)`), retargets open PRs on GitHub, tells the
-    /// chats, and with `rebase` asks the agent to move the commits.
+    /// Records the new bases (`(repo, old, new)`), retargets open PRs on GitHub, and with `rebase`
+    /// asks the agent to move the commits. The chats hear of it with their next normal turn.
     pub(super) fn set_base(
         &mut self,
         name: &str,
@@ -791,10 +854,13 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.ws(name).is_some_and(|w| !w.attaching.is_empty()) {
+            return notify_err(window, cx, "Wait for the repository attachment to finish");
+        }
         let sync = self.syncs.get(name).cloned();
         if rebase {
             let Some(sync) = &sync else {
-                return notify_err(window, cx, "Open the workspace to rebase it");
+                return notify_err(window, cx, "Open the agent to rebase it");
             };
             if let Some(e) = sync.read(cx).blocked(true, cx) {
                 return notify_err(window, cx, e);
@@ -816,7 +882,7 @@ impl Shark {
             .map(|(r, o, n)| format!("`{r}` now targets `{n}` (was `{o}`)"))
             .collect::<Vec<_>>()
             .join(", ");
-        self.tell_chats(&ws, format!("[shark] New base: {changed}."), window, cx);
+        self.publish_workspace(name, cx);
         if let Some(sync) = &sync {
             let prs: Vec<(PathBuf, String, String)> = (moves.iter())
                 .filter_map(|(r, _, n)| {
@@ -878,54 +944,6 @@ impl Shark {
         });
     }
 
-    /// Saves the new repo list and tells the chat, the git button and the diff.
-    fn repo_added(&mut self, ws: Workspace, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(slot) = self.ws_mut(&ws.name) else {
-            return;
-        };
-        // Only the repos change; session, model and viewed may have moved on meanwhile.
-        // Merge rather than replace: another add may have finished since this one started.
-        let Some(r) = ws.repos.last().cloned() else {
-            return;
-        };
-        let raced = slot.repos.len() + 1 != ws.repos.len();
-        if !slot.repos.iter().any(|w| w.name == r.name) {
-            slot.repos.push(r.clone());
-        }
-        let ws = slot.clone();
-        self.record_interaction(&ws.name, cx);
-        let _ = self.state.save();
-        if raced {
-            git::write_claude_md(&ws);
-        }
-        let rules = match git::rules_file(&ws.dir().join(&r.name)) {
-            Some(f) => format!(" Read {}/{f} for its rules.", r.name),
-            None => String::new(),
-        };
-        let note = format!(
-            "[shark] Repo `{0}` joined this workspace: `{0}/` is a git worktree of {1} on branch `{2}` (base `{3}`), and the root CLAUDE.md and AGENTS.md now list it.{rules}",
-            r.name,
-            r.src.display(),
-            ws.branch_of(&r),
-            r.base
-        );
-        self.tell_chats(&ws, note, window, cx);
-        if let Some(sync) = self.syncs.get(&ws.name) {
-            sync.update(cx, |g, cx| g.set_workspace(ws.clone(), cx));
-        }
-        if let Some(git) = self.git_features.get(&ws.name).cloned() {
-            let git_ws = self.effective_workspace(ws.clone(), cx);
-            git.update(cx, |g, cx| g.set_workspace(git_ws, window, cx));
-        }
-        self.refresh_diff_if_active(&ws.name, cx);
-        window.push_notification(
-            Notification::success(format!("Added {} to {}", r.name, ws.name)),
-            cx,
-        );
-        self.run_setup(&ws, Some(&r.name), None, window, cx);
-        cx.notify();
-    }
-
     /// Row actions hit the workspace under the sidebar cursor when the sidebar is focused, else
     /// the highlighted Home row while Home shows, else the open one.
     pub(super) fn target(&self, window: &Window) -> Option<Workspace> {
@@ -947,7 +965,7 @@ impl Shark {
     ) {
         match self.target(window) {
             Some(ws) => f(self, ws, window, cx),
-            None => notify_err(window, cx, "Open a workspace first"),
+            None => notify_err(window, cx, "Open an agent first"),
         }
     }
 
@@ -964,28 +982,44 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        // An agent waiting on answers is mid-turn too: it would go on in a removed worktree.
-        if self.running_chats(&name, cx) > 0 || self.asking_chat(&name, cx) {
-            // ctrl-c stops the shown chat's agent only.
-            let msg = match self.active.as_deref() == Some(name.as_str()) {
-                true => "An agent is running; stop it first (ctrl-c in each running chat)".into(),
-                false => {
-                    format!("An agent in {name} is running; open it and stop it first (ctrl-c)")
-                }
-            };
+        let title = self.ws_title(&name);
+        if let Some(msg) = self.chats_at_work(&name, cx) {
             return notify_err(window, cx, msg);
         }
-        if !force {
-            return self.remove_workspace(&name, false, window, cx);
-        }
+        let (heading, body) = match force {
+            true => (
+                format!("Force delete {title}?"),
+                "Removes its conversations, plans, repository and Linear attachments and worktrees, including uncommitted changes. Branches are kept. Nothing changes in Linear.",
+            ),
+            false => (
+                format!("Delete {title}?"),
+                "Removes its conversations, plans, repository and Linear attachments and worktrees. Uncommitted changes stop this. Merged branches are deleted; other branches are kept. Nothing changes in Linear.",
+            ),
+        };
         confirm(
-            format!("Force-archive {name}?"),
-            "Removes its worktrees including uncommitted changes. Branches are kept.",
-            "Archive",
-            move |s, window, cx| s.remove_workspace(&name, true, window, cx),
+            heading,
+            body,
+            "Delete",
+            move |s, window, cx| s.remove_workspace(&name, force, window, cx),
             window,
             cx,
         );
+    }
+
+    /// What to say while a chat of `name` works in its worktrees. An agent waiting on answers is
+    /// mid-turn too: it would go on in a removed worktree.
+    fn chats_at_work(&self, name: &str, cx: &App) -> Option<String> {
+        if self.started_chats(name).iter().all(|c| c.read(cx).idle()) {
+            return None;
+        }
+        // ctrl-c stops the shown chat's agent only.
+        Some(match self.active.as_deref() == Some(name) {
+            true => "A chat is running; stop it first (ctrl-c in each running chat)".into(),
+            false => format!(
+                "A chat in {} is running; open it and stop it first (ctrl-c)",
+                self.ws_title(name)
+            ),
+        })
     }
 
     pub(super) fn remove_workspace(
@@ -1021,7 +1055,7 @@ impl Shark {
                 return notify_err(
                     window,
                     cx,
-                    "Wait for the Git operation to finish before archiving",
+                    "Wait for the Git operation to finish before deleting",
                 );
             }
             git.update(cx, |g, cx| g.retry_save(cx));
@@ -1029,11 +1063,11 @@ impl Shark {
                 return notify_err(
                     window,
                     cx,
-                    "Wait for Git drafts to finish saving before archiving",
+                    "Wait for Git drafts to finish saving before deleting",
                 );
             }
             if git.read(cx).storage_error().is_some() {
-                return notify_err(window, cx, "Save Git drafts before archiving (Retry save)");
+                return notify_err(window, cx, "Save Git drafts before deleting (Retry save)");
             }
         }
         if self.active.as_deref() == Some(name)
@@ -1044,29 +1078,48 @@ impl Shark {
                     .edit_snapshot()
                     .is_some_and(|e| e.saving))
         {
-            return notify_err(window, cx, "Wait for file saves before archiving");
+            return notify_err(window, cx, "Wait for file saves before deleting");
         }
-        if self.adding_repos.contains(name) {
+        // A failed setup's repo goes with the agent; what recovery couldn't identify isn't ours to.
+        if self.adding_repos.contains(name)
+            || (self.ws(name)).is_some_and(|w| {
+                w.attaching
+                    .iter()
+                    .any(|a| a.stage != AttachStage::SetupFailed)
+            })
+        {
             return notify_err(
                 window,
                 cx,
-                "Wait for the repository addition before archiving",
+                "Finish or cancel the repository attachment before deleting",
             );
         }
         if self.setting_up.iter().any(|n| n == name) {
-            return notify_err(window, cx, "Wait for setup scripts before archiving");
+            return notify_err(window, cx, "Wait for setup scripts before deleting");
         }
         self.retry_saves(cx);
         if !self.unsaved_data(Some(name), cx).is_empty() {
             return notify_err(
                 window,
                 cx,
-                "Unsaved comments or answers: Retry save before archiving this workspace",
+                "Unsaved comments or answers: Retry save before deleting this agent",
             );
         }
         let Some(ws) = self.ws(name).cloned() else {
             return;
         };
+        // Asked again in the update that sets `archiving`: the dialogs on the way here stay open
+        // for as long as the user likes, and a message queued behind a Git step can go out meanwhile.
+        if let Some(msg) = self.chats_at_work(name, cx) {
+            return notify_err(window, cx, msg);
+        }
+        if self.syncs.get(name).is_some_and(|g| g.read(cx).running()) {
+            return notify_err(
+                window,
+                cx,
+                "Wait for the Git operation to finish before deleting",
+            );
+        }
         // The merge step and the menu can both ask while a removal runs.
         if !self.archiving.insert(ws.name.clone()) {
             return;
@@ -1092,7 +1145,7 @@ impl Shark {
         let run = self.runs.remove(name);
         let jobs = crate::scripts::jobs(&self.state, &ws, crate::scripts::Phase::Archive, None);
         // `worktree remove` deletes node_modules, target and the like: seconds, off the UI thread.
-        window.push_notification(format!("Archiving {name}…"), cx);
+        window.push_notification(format!("Deleting {}…", ws.display_title()), cx);
         cx.spawn_in(window, async move |this, cx| {
             let dir = ws.dir();
             let name = ws.name.clone();
@@ -1111,7 +1164,7 @@ impl Shark {
                     if scripts.is_some() && !force {
                         return (
                             scripts,
-                            Err("Archive script failed; workspace kept.".into()),
+                            Err("Archive script failed; agent kept.".into()),
                             None,
                         );
                     }
@@ -1149,6 +1202,7 @@ impl Shark {
         self.syncs.remove(name);
         self.parked_sessions.remove(name);
         self.git_features.remove(name);
+        self.attach_results.remove(name);
         self.attn.forget(name);
         self.differ.update(cx, |d, _| d.forget_workspace(name));
     }
@@ -1168,9 +1222,12 @@ impl Shark {
         }
         match result {
             Ok(deleted) => {
+                let title = self.ws_title(name);
+                let repoless = self.ws(name).is_some_and(|w| w.repos.is_empty());
                 let before = self.cursors(cx);
                 self.forget_workspace_views(name, cx);
                 self.state.remove_workspace(name);
+                crate::linear::delete_snapshots(name);
                 let _ = std::fs::remove_file(crate::scripts::log_path(name));
                 let _ = self.state.save();
                 if self.active.as_deref() == Some(name) {
@@ -1183,11 +1240,12 @@ impl Shark {
                 }
                 self.restore_cursors(name, before, cx);
                 let branch = match deleted.is_empty() {
-                    true => "branch kept".to_string(),
-                    false => format!("merged branch deleted in {}", deleted.join(", ")),
+                    true if repoless => String::new(),
+                    true => " (branch kept)".to_string(),
+                    false => format!(" (merged branch deleted in {})", deleted.join(", ")),
                 };
                 window.push_notification(
-                    Notification::success(format!("Archived {name} ({branch})")),
+                    Notification::success(format!("Deleted {title}{branch}")),
                     cx,
                 );
             }
@@ -1198,13 +1256,16 @@ impl Shark {
                 notify_err(
                     window,
                     cx,
-                    format!("{e}\nUse Force archive workspace in cmd-k to discard them."),
+                    format!("{e}\nUse Force delete agent in cmd-k to discard them."),
                 )
             }
         }
         cx.notify();
     }
 }
+
+/// A git action on an agent with nothing to act on.
+pub(super) const NO_REPO: &str = "No repository attached; attach one first";
 
 /// `(repo, old base, new base)` for the repos of the workspace inserted below that sit on
 /// the parent branch the new workspace stacks on.

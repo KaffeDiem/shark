@@ -62,7 +62,7 @@ pub fn create_linked_prs(
     for r in &ws.repos {
         if crate::git::review_pr_url(&dir.join(&r.name), ws.branch_of(r)).is_some() {
             return Err(format!(
-                "{} is a local PR review checkout; create a regular workspace to publish changes",
+                "{} is a local PR review checkout; create a regular agent to publish changes",
                 r.name
             ));
         }
@@ -94,7 +94,7 @@ pub fn create_linked_prs(
         if !crate::git::has_ref(&wt, &r.base) {
             let b = crate::sync::short(&r.base);
             return Err(format!(
-                "{}: its base `{b}` isn't on GitHub; push it first (from its workspace), or Change base…",
+                "{}: its base `{b}` isn't on GitHub; push it first (from its agent), or Change base…",
                 r.name
             ));
         }
