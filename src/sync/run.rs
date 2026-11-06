@@ -356,6 +356,27 @@ pub(super) fn execute(
                 Kind::Pull | Kind::Push | Kind::ForcePush => ("git", 120),
                 _ => ("gh", 60),
             };
+            let azure = r
+                .pr()
+                .filter(|p| crate::azure::parse_pr_url(&p.url).is_some());
+            if let (Some(p), "gh") = (azure, prog) {
+                let body = match a.kind {
+                    Kind::Reopen => serde_json::json!({"status": "active"}),
+                    Kind::Ready => serde_json::json!({"isDraft": false}),
+                    _ => {
+                        return Err(format!(
+                            "`gh {}` has no Azure DevOps equivalent",
+                            args[..2].join(" ")
+                        ));
+                    }
+                };
+                crate::azure::update(wt, &p.url, body)?;
+                let done = match a.kind {
+                    Kind::Reopen => "reopened",
+                    _ => "ready for review",
+                };
+                return Ok(Some(format!("#{} {done}", p.number)));
+            }
             cmd_bounded(wt, prog, &argv(&args), secs).map_err(|e| match a.kind {
                 Kind::Pull if diverged(&e) => {
                     format!("{e}\nThe branches diverged; use “Sync with remote”.")
@@ -392,6 +413,11 @@ pub(super) fn execute(
             let Some(mut args) = planned(r)? else {
                 return Ok(None);
             };
+            let p = r.open_pr().expect("planned a merge");
+            if crate::azure::parse_pr_url(&p.url).is_some() {
+                crate::azure::merge(wt, &p.url, &p.head, delete_remote)?;
+                return Ok(Some(format!("merged #{}", p.number)));
+            }
             args.push(merge_method(wt)?.into());
             // Run from the linked worktree, gh deletes only the remote branch: it skips the
             // local one that is checked out here (archive deletes that).
@@ -426,6 +452,7 @@ impl From<&Pr> for crate::git::PullRequest {
             number: p.number,
             url: p.url.clone(),
             base: p.base.clone(),
+            head: String::new(),
         }
     }
 }

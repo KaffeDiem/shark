@@ -9,7 +9,7 @@ pub use run::check_in_background;
 #[cfg(test)]
 pub(crate) use status::parse_prs;
 pub use status::{
-    Kind, Pr, PrState, Repo, ago, branch_prs, github_url, origin_repo, pick_pr, short,
+    Checks, Kind, Pr, PrState, Repo, ago, branch_prs, github_url, origin_repo, pick_pr, short,
 };
 
 use crate::app::menus::{each_or_all, pr_entry};

@@ -17,6 +17,9 @@ pub struct Target {
 
 impl Target {
     pub fn from_url(url: &str) -> Result<Self, String> {
+        if let Some((remote, number)) = crate::azure::parse_pr_url(url) {
+            return Ok(Self::azure(&remote, number));
+        }
         let parts: Vec<_> = url
             .strip_prefix("https://")
             .unwrap_or("")
@@ -47,6 +50,9 @@ impl Target {
     }
 
     pub fn url(&self) -> String {
+        if let Some(remote) = self.remote() {
+            return remote.pr_url(self.number);
+        }
         format!(
             "https://{}/{}/{}/pull/{}",
             self.host, self.owner, self.repo, self.number
@@ -234,7 +240,10 @@ pub fn discover(wt: &Path, branch: &str) -> Result<Option<Target>, String> {
     if let Some(url) = crate::git::review_pr_url(wt, branch) {
         return Target::from_url(&url).map(Some);
     }
-    crate::sync::origin_repo(wt).ok_or("Origin is not a GitHub repository")?;
+    if let Some(remote) = crate::azure::Remote::of(wt) {
+        return crate::azure::discover(wt, &remote, branch);
+    }
+    crate::sync::origin_repo(wt).ok_or("Origin is not a GitHub or Azure DevOps repository")?;
     let prs = crate::sync::branch_prs(wt, branch, "url,state,isCrossRepository,updatedAt", 30)?;
     crate::sync::pick_pr(&prs.iter().collect::<Vec<_>>())
         .map(|p| Target::from_url(string(p, "url")?))
@@ -372,6 +381,9 @@ fn comments(
 }
 
 pub fn load(wt: &Path, target: &Target) -> Result<Details, String> {
+    if target.remote().is_some() {
+        return crate::azure::load(wt, target);
+    }
     let client = Client::new(wt, target);
     let review_fields = format!("{COMMENT} state");
     let thread_fields = format!("{THREAD} comments(first:100){{nodes{{{REVIEW_COMMENT}}}{PAGE}}}");
@@ -482,6 +494,9 @@ pub fn save_description(
     if title.trim().is_empty() {
         return Err("A pull request title cannot be empty".into());
     }
+    if previous.target.remote().is_some() {
+        return crate::azure::save_description(wt, previous, title, body);
+    }
     let client = Client::new(wt, &previous.target);
     let current = fresh(&client, previous)?;
     if !current.can_update {
@@ -502,6 +517,9 @@ pub fn save_description(
 pub fn comment(wt: &Path, previous: &Details, body: &str) -> Result<(), String> {
     if body.trim().is_empty() {
         return Err("Write a comment before posting".into());
+    }
+    if previous.target.remote().is_some() {
+        return crate::azure::comment(wt, previous, body);
     }
     let client = Client::new(wt, &previous.target);
     let current = fresh(&client, previous)?;
@@ -536,6 +554,9 @@ pub fn reply(wt: &Path, previous: &Details, thread_id: &str, body: &str) -> Resu
     if body.trim().is_empty() {
         return Err("Write a reply before posting".into());
     }
+    if previous.target.remote().is_some() {
+        return crate::azure::reply(wt, previous, thread_id, body);
+    }
     let client = Client::new(wt, &previous.target);
     let value = fresh_thread(&client, previous, thread_id)?;
     if !boolean(&value, "viewerCanReply")? {
@@ -555,6 +576,9 @@ pub fn resolve(
     thread_id: &str,
     resolved: bool,
 ) -> Result<(), String> {
+    if previous.target.remote().is_some() {
+        return crate::azure::resolve(wt, previous, thread_id, resolved);
+    }
     let client = Client::new(wt, &previous.target);
     let value = fresh_thread(&client, previous, thread_id)?;
     if boolean(&value, "isResolved")? == resolved {

@@ -2,6 +2,7 @@ mod agent;
 mod app;
 mod apps;
 mod attention;
+mod azure;
 mod chat;
 mod checkbox;
 mod codex;

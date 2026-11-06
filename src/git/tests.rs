@@ -463,6 +463,7 @@ fn pr_checkout_uses_exact_tip_base_and_rolls_back() {
         number: 7,
         url: "https://github.com/o/upstream/pull/7".into(),
         base: "release".into(),
+        head: String::new(),
     };
     let picked = [(repo.clone(), "pr/7".into())];
     let prs = [(repo.name.clone(), pr.clone())];
@@ -495,6 +496,7 @@ fn pr_checkout_uses_exact_tip_base_and_rolls_back() {
             number: 404,
             url: "https://github.com/o/upstream/pull/404".into(),
             base: "release".into(),
+            head: String::new(),
         },
     )];
     let failed = root.join("ws/missing");
@@ -578,6 +580,7 @@ fn review_base_refresh_follows_target_and_preserves_worktree() {
         number: 7,
         url: "https://github.com/o/upstream/pull/7".into(),
         base: "release".into(),
+        head: String::new(),
     };
     let dir = root.join("ws/review");
     let ws = create_workspace_with_prs(
@@ -1456,6 +1459,7 @@ fn pr_remote_matches_origin_case_insensitively() {
         number: 3,
         url: url.into(),
         base: "main".into(),
+        head: String::new(),
     };
     let same = pr("https://github.com/owner/repo/pull/3");
     assert_eq!(pr_remote(&repo.path, &same).unwrap(), "origin");

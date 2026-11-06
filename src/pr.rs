@@ -116,6 +116,12 @@ pub fn create_linked_prs(
             &["push", "-u", "origin", &format!("refs/heads/{branch}")],
             120,
         )?;
+        if let Some(remote) = crate::azure::Remote::of(&wt) {
+            let base = crate::sync::short(&r.base);
+            let url = crate::azure::find_or_create_pr(&wt, &remote, branch, base, new)?;
+            prs.push((r.name.clone(), url));
+            continue;
+        }
         // Same `--repo` as polling, so a fork's upstream never answers for origin.
         let origin = crate::sync::origin_repo(&wt);
         let repo_flag = |a| with_repo(a, origin.as_deref());
@@ -160,6 +166,11 @@ fn link_prs(dir: &Path, prs: &[(String, String)]) -> Option<String> {
         for (r, url) in prs {
             let wt = dir.join(r);
             let link = || {
+                if crate::azure::parse_pr_url(url).is_some() {
+                    let body = link_body(&crate::azure::description(&wt, url)?, prs, url);
+                    crate::azure::update(&wt, url, serde_json::json!({"description": body}))?;
+                    return Ok(String::new());
+                }
                 let body = cmd_bounded(
                     &wt,
                     "gh",
@@ -207,6 +218,14 @@ pub fn link_body(body: &str, prs: &[(String, String)], own: &str) -> String {
     out
 }
 
+/// Points the PR at `url` to merge into `base`.
+pub fn retarget(wt: &Path, url: &str, base: &str) -> Result<(), String> {
+    match crate::azure::parse_pr_url(url) {
+        Some(_) => crate::azure::retarget(wt, url, base),
+        None => cmd_bounded(wt, "gh", &["pr", "edit", url, "--base", base], 30).map(|_| ()),
+    }
+}
+
 pub(crate) use crate::proc::gh;
 
 /// Runs gh to post something; an error is gh's last word, not the command line (which carries
@@ -218,7 +237,7 @@ pub(crate) fn gh_post(wt: &Path, args: &[&str], secs: u64) -> Result<String, Str
 }
 
 /// `e` without `cmd`, its last line; a timeout may still have posted.
-fn gh_error(e: &str, cmd: &str) -> String {
+pub(crate) fn gh_error(e: &str, cmd: &str) -> String {
     let why = e.strip_prefix(cmd).unwrap_or(e);
     let why = why
         .lines()

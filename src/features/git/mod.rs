@@ -1,4 +1,5 @@
-//! The Git artifact: GitHub conversations, with drafts pinned to their exact PR.
+//! The Git artifact: GitHub and Azure DevOps conversations, with drafts pinned to their exact
+//! PR, and on Azure DevOps the work items (PBIs and their tasks) the branch is for.
 pub(crate) mod commits;
 pub(crate) mod document;
 mod drafts;
@@ -73,6 +74,8 @@ pub(crate) struct GitFeature {
     workspace: Workspace,
     selected: usize,
     details: Option<api::Details>,
+    /// Azure DevOps only; a failure here doesn't hide the PR.
+    work_items: Result<Vec<crate::azure::WorkItem>, String>,
     loading: bool,
     loaded: bool,
     error: Option<String>,
@@ -118,6 +121,7 @@ impl GitFeature {
             workspace,
             selected: 0,
             details: None,
+            work_items: Ok(vec![]),
             loading: false,
             loaded: false,
             error: None,
@@ -290,6 +294,7 @@ impl GitFeature {
         self.generation += 1;
         self.loaded = false;
         self.details = None;
+        self.work_items = Ok(vec![]);
         self.error = None;
         self.refreshed = None;
         self.rebuild_rows();
@@ -336,9 +341,13 @@ impl GitFeature {
             let result = cx
                 .background_executor()
                 .spawn(async move {
-                    api::discover(&wt, &branch)?
+                    let details = api::discover(&wt, &branch)?
                         .map(|target| api::load(&wt, &target))
-                        .transpose()
+                        .transpose()?;
+                    let pr = (details.as_ref())
+                        .filter(|d| d.target.remote().is_some())
+                        .map(|d| d.target.number);
+                    Ok::<_, String>((details, crate::azure::work_items(&wt, &branch, pr)))
                 })
                 .await;
             this.update_in(cx, |s, window, cx| {
@@ -353,7 +362,8 @@ impl GitFeature {
                 }
                 s.loaded = true;
                 match result {
-                    Ok(details) => {
+                    Ok((details, work_items)) => {
+                        s.work_items = work_items;
                         let target_changed = s.details.as_ref().map(|d| &d.target)
                             != details.as_ref().map(|d| &d.target);
                         if target_changed {
@@ -1222,7 +1232,7 @@ impl GitFeature {
                         Button::new("git-editor-save")
                             .loading(sending)
                             .label(if sending { "Saving…" } else { label })
-                            .tooltip(format!("{label} on GitHub (cmd-enter)"))
+                            .tooltip(format!("{label} on {} (cmd-enter)", self.host()))
                             .primary()
                             .small()
                             .disabled(
@@ -1313,7 +1323,7 @@ impl GitFeature {
                         .font_weight(FontWeight::MEDIUM)
                         .child(match &c.kind {
                             Editing::Description => "Edit PR description",
-                            Editing::Comment => "Comment on GitHub",
+                            Editing::Comment => "Comment on the PR",
                             Editing::Reply(_) => "Reply to review thread",
                         }),
                 )
@@ -1371,6 +1381,7 @@ impl GitFeature {
         } else {
             state_label(&d.state)
         };
+        let work_items = self.work_items_view(cx);
         let target = d.target.url();
         let can_edit = d.can_update || self.has_draft(&target, &Editing::Description);
         let (title, body, url, number, author, created, branches) = (
@@ -1402,7 +1413,7 @@ impl GitFeature {
             .child(
                 h_flex()
                     .gap_1()
-                    .child(format!("@{author} opened"))
+                    .child(format!("{} opened", self.display_name(&author)))
                     .when(!created.is_empty(), |d| {
                         d.child(time_label("git-pr-created", &created))
                     }),
@@ -1434,7 +1445,7 @@ impl GitFeature {
             .child(
                 Button::new("git-open-pr")
                     .icon(IconName::ExternalLink)
-                    .tooltip("Open in GitHub")
+                    .tooltip(format!("Open in {}", self.host()))
                     .ghost()
                     .xsmall()
                     .on_click(move |_, _, cx| cx.open_url(&url)),
@@ -1553,6 +1564,7 @@ impl GitFeature {
                     .text_color(muted)
                     .child("Activity"),
             )
+            .when_some(work_items, |d, w| d.child(div().pt_6().child(w)))
             .into_any_element()
     }
 
@@ -1590,7 +1602,7 @@ impl GitFeature {
                             .font_weight(FontWeight::MEDIUM)
                             .text_color(fg)
                             .truncate()
-                            .child(display_name(&c.author)),
+                            .child(self.display_name(&c.author)),
                     )
                     .when(c.bot, |d| {
                         d.child(
@@ -1632,7 +1644,7 @@ impl GitFeature {
                                 .child(
                                     Button::new(SharedString::from(format!("git-link-{}", c.id)))
                                         .icon(IconName::ExternalLink)
-                                        .tooltip("Open on GitHub")
+                                        .tooltip(format!("Open in {}", self.host()))
                                         .ghost()
                                         .xsmall()
                                         .on_click(move |_, _, cx| cx.open_url(&url)),
@@ -1698,7 +1710,7 @@ impl GitFeature {
                 &c.id,
                 Icon::new(IconName::EyeOff),
                 (
-                    format!("Hidden comment by {}", display_name(&c.author)),
+                    format!("Hidden comment by {}", self.display_name(&c.author)),
                     String::new(),
                 ),
                 ring,
@@ -1759,7 +1771,7 @@ impl GitFeature {
                     div()
                         .text_color(theme.foreground)
                         .font_weight(FontWeight::MEDIUM)
-                        .child(display_name(&r.comment.author)),
+                        .child(self.display_name(&r.comment.author)),
                 )
                 .child(verb)
                 .child("·")
@@ -1784,7 +1796,11 @@ impl GitFeature {
         let target = d.target.url();
         let place = format!(
             "{}{}",
-            t.path,
+            if t.path.is_empty() {
+                "Conversation"
+            } else {
+                &t.path
+            },
             t.line
                 .or(t.original_line)
                 .map(|l| format!(":{l}"))
@@ -1846,7 +1862,10 @@ impl GitFeature {
                         .cursor_pointer()
                         .hover(|d| d.bg(theme.secondary_hover))
                         .child(Icon::new(IconName::EyeOff).with_size(px(14.)))
-                        .child(format!("Hidden comment by {}", display_name(&c.author)))
+                        .child(format!(
+                            "Hidden comment by {}",
+                            self.display_name(&c.author)
+                        ))
                         .on_click(cx.listener(move |s, _, _, cx| s.toggle_expanded(&id, cx)))
                         .into_any_element()
                 } else {
@@ -1957,10 +1976,12 @@ impl GitFeature {
                             .ghost()
                             .small()
                             .on_click(cx.listener(move |_, _, _, cx| {
-                                cx.emit(GitFeatureEvent::OpenFile {
-                                    repo: repo.clone(),
-                                    path: path.clone(),
-                                })
+                                if !path.is_empty() {
+                                    cx.emit(GitFeatureEvent::OpenFile {
+                                        repo: repo.clone(),
+                                        path: path.clone(),
+                                    })
+                                }
                             })),
                     )
                     .when(t.outdated, |d| {
@@ -2445,14 +2466,6 @@ fn avatar(name: &str, bot: bool, theme: &gpui_kit::component::Theme) -> Div {
         })
 }
 
-fn display_name(author: &str) -> String {
-    if author.is_empty() {
-        "Deleted user".into()
-    } else {
-        format!("@{author}")
-    }
-}
-
 fn review_icon(state: &str) -> IconName {
     match state {
         "APPROVED" => IconName::Check,
@@ -2479,6 +2492,148 @@ fn repo_context(workspace: &Workspace, selected: usize) -> Option<RepoContext> {
         wt: workspace.dir().join(&repo.name),
         base: repo.base.clone(),
     })
+}
+
+impl GitFeature {
+    /// Where the shown PR lives, for labels.
+    fn host(&self) -> &'static str {
+        match self.details.as_ref().and_then(|d| d.target.remote()) {
+            Some(_) => "Azure DevOps",
+            None => "GitHub",
+        }
+    }
+
+    /// GitHub logins read as `@login`; Azure DevOps gives display names.
+    fn display_name(&self, author: &str) -> String {
+        match (
+            author.is_empty(),
+            self.details.as_ref().and_then(|d| d.target.remote()),
+        ) {
+            (true, _) => "Deleted user".into(),
+            (false, Some(_)) => author.to_string(),
+            (false, None) => format!("@{author}"),
+        }
+    }
+}
+
+impl GitFeature {
+    /// The branch's PBIs, each with its tasks: state, who has it, and a link.
+    fn work_items_view(&self, cx: &App) -> Option<AnyElement> {
+        let theme = cx.theme();
+        let muted = theme.muted_foreground;
+        let items = match &self.work_items {
+            Ok(items) if items.is_empty() => return None,
+            Ok(items) => items,
+            Err(e) => {
+                return Some(
+                    div()
+                        .id("git-work-items-error")
+                        .test_support()
+                        .text_sm()
+                        .text_color(muted)
+                        .child(format!("Work items unavailable: {e}"))
+                        .into_any_element(),
+                );
+            }
+        };
+        let line = |w: &crate::azure::WorkItem, top: bool| {
+            let url = w.url.clone();
+            let who = match w.assigned.is_empty() {
+                true => "Unassigned".to_string(),
+                false => w.assigned.clone(),
+            };
+            h_flex()
+                .gap_2()
+                .min_w_0()
+                .text_size(px(if top { 14. } else { 13. }))
+                .child(
+                    Icon::new(match () {
+                        _ if top => IconName::ClipboardList,
+                        _ if w.done() => IconName::CircleCheck,
+                        _ => IconName::Circle,
+                    })
+                    .with_size(px(14.))
+                    .flex_none()
+                    .text_color(if !top && w.done() {
+                        theme.success_foreground
+                    } else {
+                        muted
+                    }),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .text_color(muted)
+                        .child(format!("{} {}", w.kind, w.id)),
+                )
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .when(top, |d| d.font_weight(FontWeight::MEDIUM))
+                        .child(w.title.clone()),
+                )
+                .child(
+                    div()
+                        .flex_none()
+                        .px_2()
+                        .rounded(theme.radius)
+                        .bg(theme.muted)
+                        .text_xs()
+                        .text_color(if w.done() {
+                            theme.success_foreground
+                        } else {
+                            theme.foreground
+                        })
+                        .child(w.state.clone()),
+                )
+                .child(div().flex_none().text_xs().text_color(muted).child(who))
+                .child(
+                    Button::new(SharedString::from(format!("git-work-item-{}", w.id)))
+                        .icon(IconName::ExternalLink)
+                        .tooltip("Open in Azure DevOps")
+                        .ghost()
+                        .xsmall()
+                        .on_click(move |_, _, cx| cx.open_url(&url)),
+                )
+        };
+        Some(
+            v_flex()
+                .id("git-work-items")
+                .test_support()
+                .w_full()
+                .gap_3()
+                .text_left()
+                .child(div().text_xs().text_color(muted).child("Work items"))
+                .children(items.iter().map(|w| {
+                    let done = w.children.iter().filter(|c| c.done()).count();
+                    v_flex()
+                        .gap_1()
+                        .p_3()
+                        .rounded(theme.radius_lg)
+                        .border_1()
+                        .border_color(theme.border)
+                        .bg(theme.secondary)
+                        .child(line(w, true))
+                        .when(!w.children.is_empty(), |d| {
+                            d.child(
+                                div()
+                                    .pl_6()
+                                    .text_xs()
+                                    .text_color(muted)
+                                    .child(format!("{done} of {} done", w.children.len())),
+                            )
+                        })
+                        .children(
+                            w.children
+                                .iter()
+                                .map(|c| div().pl_6().child(line(c, false))),
+                        )
+                }))
+                .into_any_element(),
+        )
+    }
 }
 
 fn state_label(state: &str) -> &str {
@@ -2593,14 +2748,14 @@ impl GitFeature {
             (
                 "git-loading",
                 "Loading pull request…",
-                "Fetching the description and review activity from GitHub.",
+                "Fetching the description and review activity.",
                 IconName::GitPullRequest,
             )
         } else if self.error.is_some() {
             (
                 "git-load-error",
                 "Could not load the pull request",
-                "Check the connection and GitHub access, then try again.",
+                "Check the connection and your gh or az login, then try again.",
                 IconName::TriangleAlert,
             )
         } else if !self.loaded {
@@ -2625,6 +2780,7 @@ impl GitFeature {
     }
 
     fn placeholder(&self, cx: &mut Context<Self>) -> AnyElement {
+        let work_items = self.work_items_view(cx);
         let theme = cx.theme();
         let muted = theme.muted_foreground;
         let disabled = self.posting || self.archiving;
@@ -2705,6 +2861,9 @@ impl GitFeature {
                         )
                     }),
             )
+            .when_some(work_items, |d, w| {
+                d.child(div().w_full().max_w(px(680.)).mx_auto().pt_8().child(w))
+            })
             .into_any_element()
     }
 
