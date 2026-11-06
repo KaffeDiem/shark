@@ -1,15 +1,20 @@
 //! Shared UI styling and dialogs used by the host and workspace features.
 #[cfg(test)]
 use core::prelude::v1::test;
+#[cfg(all(test, feature = "test-support"))]
+mod dialog_tests;
 mod links;
+mod toolbar;
+#[cfg(all(test, feature = "test-support"))]
+pub(crate) mod toolbar_pixels;
 use crate::models::{MODELS, effort_label, effort_of, efforts, model_label};
 use crate::state::{ChatMeta, Mode};
 use crate::{PageDown, PageUp, SelectFirst, SelectLast, SelectNext, SelectPrev};
 use gpui_kit::assets::IconName;
-use gpui_kit::base::{ResizeHandleRenderer, ResizeHandleState};
+use gpui_kit::base::{ResizeHandleRenderer, ResizeHandleState, StyledExt as _};
 use gpui_kit::component::button::{Button, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
-use gpui_kit::component::dialog::{Dialog, DialogEntrance};
+use gpui_kit::component::dialog::{AlertDialog, Dialog, DialogEntrance};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::resizable::resize_handle_appearance;
@@ -20,6 +25,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 pub(crate) use links::{copy_button, link_roots, markdown};
 use std::{rc::Rc, sync::Arc};
+pub(crate) use toolbar::toolbar;
 
 /// Inter disambiguation (ss02 + cv05/cv08/zero): serifed I, tailed l, slashed 0 for paths and hashes.
 /// Dialogs render outside this view's tree, so they apply it again.
@@ -31,11 +37,22 @@ pub(crate) fn inter_features() -> FontFeatures {
     ))
 }
 
-/// Every `open_dialog` starts here: dialogs render outside the view's tree (see `inter_features`),
-/// and none of them animates in.
+/// Dialogs share menu typography and rounded surfaces; native fading respects reduced motion.
 pub(crate) fn dialog(d: Dialog) -> Dialog {
     d.font_features(inter_features())
-        .entrance(DialogEntrance::None)
+        .entrance(DialogEntrance::Fade)
+        .rounded(px(14.))
+        .p(px(20.))
+        .text_size(px(14.))
+}
+
+/// Confirmations use the same spacing without changing their dismissal or action rules.
+pub(crate) fn alert_dialog(d: AlertDialog) -> AlertDialog {
+    d.font_features(inter_features())
+        .entrance(DialogEntrance::Fade)
+        .rounded(px(14.))
+        .p(px(20.))
+        .text_size(px(14.))
 }
 
 /// Hint text below the muted level; gpui-kit has no token for it. Never use it for content.
@@ -89,8 +106,7 @@ pub(crate) fn confirm<T: 'static>(
     let (target, ok) = (cx.entity().downgrade(), Rc::new(ok));
     window.open_alert_dialog(cx, move |d, _, _| {
         let (target, ok) = (target.clone(), ok.clone());
-        d.font_features(inter_features())
-            .entrance(DialogEntrance::None)
+        alert_dialog(d)
             .title(title.clone())
             .description(description)
             .ok_text(ok_text)
@@ -239,13 +255,12 @@ pub(crate) fn tab_close(button: Button, theme: &Theme) -> Div {
         )
 }
 
-/// An icon control in the window chrome.
+/// An icon control in the window chrome; the caller applies `toolbar` after its handlers.
 pub(crate) fn side_toggle(id: &'static str, icon: IconName, tip: &'static str) -> Button {
     Button::new(id)
         .ghost()
         .icon(icon)
-        .w(px(32.))
-        .h(px(28.))
+        .size(px(32.))
         .accessibility_label(tip)
         .tooltip(tip)
 }
@@ -547,13 +562,23 @@ mod model_menu_tests {
     }
 }
 
-/// The cmd-k bar look: a bare 640px dialog near the top, on the menus' `popover` surface with
-/// their 4px inset, holding a borderless `Command`.
+/// Command palettes retain the native search, virtualization and keyboard behavior.
+pub(crate) fn command(state: &Entity<CommandState>, window: &Window) -> Command {
+    // Native rows add .75rem vertical padding; the inherited line height supplies the rest.
+    Command::new(state)
+        .bordered(false)
+        .rounded(px(12.))
+        .text_size(px(14.))
+        .line_height(px(36.) - window.rem_size() * 0.75)
+}
+
+/// The cmd-k surface shares click menus' radius, inset, colors and shadow.
 pub(crate) fn menu_dialog(d: Dialog, cx: &App) -> Dialog {
+    let surface = crate::menu::chrome(cx.theme()).style().clone();
     crate::ui::dialog(d)
         .w(px(640.))
-        .p(px(4.))
-        .bg(cx.theme().popover)
+        .refine_style(&surface)
+        .border_0()
         .margin_top(px(96.))
         .close_button(false)
 }
@@ -616,9 +641,9 @@ pub(crate) fn open_headed<T: 'static>(
             })
             .collect(),
     );
-    let command = move |state: &Entity<CommandState>| {
+    let command = move |state: &Entity<CommandState>, window: &Window| {
         groups.iter().fold(
-            Command::new(state).bordered(false).placeholder(placeholder),
+            crate::ui::command(state, window).placeholder(placeholder),
             |c, (heading, items)| {
                 let g = CommandGroup::new().items(items.clone());
                 c.group(match heading {
@@ -631,17 +656,17 @@ pub(crate) fn open_headed<T: 'static>(
     let palette = cx.new(|cx| CommandState::new(window, cx));
     // The menu only learns its items when it renders; install them now so the
     // highlight can start on `selected`. The dialog's renders keep it.
-    RenderOnce::render(command(&palette), window, cx);
+    RenderOnce::render(command(&palette, window), window, cx);
     let section = starts.iter().rposition(|&s| s <= selected).unwrap_or(0);
     let at = IndexPath::new(selected - starts[section]).section(section);
     palette.update(cx, |p, cx| p.set_selected_index(Some(at), window, cx));
     let on_pick = Rc::new(on_pick);
     let state = palette.clone();
-    window.open_dialog(cx, move |d, _, cx| {
+    window.open_dialog(cx, move |d, window, cx| {
         let (target, on_pick, starts) = (target.clone(), on_pick.clone(), starts.clone());
         menu_dialog(d, cx)
             .children(header.as_ref().map(|h| h(cx)))
-            .child(command(&state).on_confirm(move |ix, window, cx| {
+            .child(command(&state, window).on_confirm(move |ix, window, cx| {
                 window.close_dialog(cx);
                 let row = starts[ix.section] + ix.row;
                 target.update(cx, |s, cx| on_pick(s, row, window, cx)).ok();

@@ -835,14 +835,17 @@ impl Render for IssuePicker {
             cx.entity().downgrade(),
         );
         let command = (groups.iter())
-            .fold(Command::new(&self.state), |c, (heading, rows)| {
-                let items = rows.iter().map(|r| self.item(r, &attached));
-                let group = CommandGroup::new().items(items);
-                c.group(match heading {
-                    Some(h) => group.label(*h),
-                    None => group,
-                })
-            })
+            .fold(
+                crate::ui::command(&self.state, window),
+                |c, (heading, rows)| {
+                    let items = rows.iter().map(|r| self.item(r, &attached));
+                    let group = CommandGroup::new().items(items);
+                    c.group(match heading {
+                        Some(h) => group.label(*h),
+                        None => group,
+                    })
+                },
+            )
             .bordered(false)
             .filterable(false)
             .max_h(px(380.))
@@ -1102,7 +1105,7 @@ impl IssueDetails {
 }
 
 impl Render for IssueDetails {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some((snapshot, primary, id)) = self.issue(cx) else {
             return div().into_any_element();
         };
@@ -1136,7 +1139,7 @@ impl Render for IssueDetails {
                 }
             });
         let this = cx.entity().downgrade();
-        let actions = Command::new(&self.state)
+        let actions = crate::ui::command(&self.state, window)
             .bordered(false)
             .searchable(false)
             .items(items.collect::<Vec<_>>())
@@ -1429,7 +1432,11 @@ impl Shark {
         });
         let state = details.read(cx).state.clone();
         // Installs `searchable`, which `focus` goes by.
-        RenderOnce::render(Command::new(&state).searchable(false), window, cx);
+        RenderOnce::render(
+            crate::ui::command(&state, window).searchable(false),
+            window,
+            cx,
+        );
         window.open_dialog(cx, move |d, _, cx| {
             menu_dialog(d, cx).child(details.clone())
         });
@@ -1574,14 +1581,15 @@ impl Shark {
                 "{n} disconnected issue{}: from another Linear organization, or Linear isn't connected. Opens Settings.",
                 plural(n),
             );
-            Self::chip("issues-disconnected", icon, "Disconnected".into(), theme)
-                .aria_label(tip.clone())
-                .cursor_pointer()
-                .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+            Button::new("issues-disconnected")
+                .flex_none()
+                .icon(icon)
+                .accessibility_label(tip.clone())
+                .tooltip(tip)
                 .on_click(cx.listener(|s, _, w, cx| {
                     crate::settings::open_linear(&s.state, w, cx)
                 }))
-                .test_support()
+                .map(|b| crate::ui::toolbar("issues-disconnected", b))
                 .into_any_element()
         })
     }
@@ -1616,15 +1624,14 @@ impl Shark {
                 let (name, r) = (ws.name.clone(), r.clone());
                 let id = SharedString::from(format!("issue-chip-{}", r.issue));
                 let aria = format!("{label}: {tip}");
-                Self::chip(id, icon, label, theme)
+                Self::chip(id.clone(), icon, label)
                     .when(is_primary, |c| c.child(star))
-                    .aria_label(aria)
-                    .cursor_pointer()
-                    .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+                    .accessibility_label(aria)
+                    .tooltip(tip)
                     .on_click(cx.listener(move |s, _, w, cx| {
                         s.issue_details(name.clone(), r.clone(), w, cx)
                     }))
-                    .test_support()
+                    .map(|b| crate::ui::toolbar(id, b))
                     .into_any_element()
             })
             .collect()

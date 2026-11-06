@@ -454,14 +454,14 @@ impl Settings {
                         false,
                         "Interface font",
                         "Sidebar, transcript and menus",
-                        Select::new(&self.ui_font).small().menu_max_h(px(320.)),
+                        Select::new(&self.ui_font).menu_max_h(px(320.)),
                     ))
                     .child(row(
                         theme,
                         true,
                         "Code font",
                         "Code, diffs and tool output",
-                        Select::new(&self.mono_font).small().menu_max_h(px(320.)),
+                        Select::new(&self.mono_font).menu_max_h(px(320.)),
                     ))
                     .child(
                         div()

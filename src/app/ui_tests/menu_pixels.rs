@@ -65,6 +65,11 @@ fn entries(case: &str) -> Vec<Entry> {
 }
 
 pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
+    let reduce_motion = cx.update(|cx| {
+        let previous = cx.reduce_motion();
+        cx.set_reduce_motion(true);
+        previous
+    });
     for (mode, mode_name) in [
         (crate::state::Mode::Dark, "dark"),
         (crate::state::Mode::Light, "light"),
@@ -170,4 +175,5 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     }
     println!("menu previews: 12 rendered (both themes; shared production model entries)");
     crate::chat::completion_pixels::render_pixels(cx);
+    cx.update(|cx| cx.set_reduce_motion(reduce_motion));
 }

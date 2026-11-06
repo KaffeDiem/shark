@@ -735,7 +735,8 @@ impl Shark {
                                     })
                                     .on_click(
                                         cx.listener(|s, _, w, cx| s.navigate_history(false, w, cx)),
-                                    ),
+                                    )
+                                    .map(|b| crate::ui::toolbar("nav-back", b)),
                             )
                             .child(
                                 Button::new("nav-forward")
@@ -750,7 +751,8 @@ impl Shark {
                                     })
                                     .on_click(
                                         cx.listener(|s, _, w, cx| s.navigate_history(true, w, cx)),
-                                    ),
+                                    )
+                                    .map(|b| crate::ui::toolbar("nav-forward", b)),
                             ),
                     )
                     .child(match crate::file_icon::file_icon(&name, theme.is_dark()) {
@@ -906,7 +908,8 @@ impl Shark {
                                         .tooltip(tooltip)
                                         .on_click(cx.listener(|s, _, w, cx| {
                                             s.choose_or_restart_language(w, cx)
-                                        })),
+                                        }))
+                                        .map(|b| crate::ui::toolbar("language-status", b)),
                                 ),
                         )
                     })

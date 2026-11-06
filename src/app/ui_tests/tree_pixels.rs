@@ -169,7 +169,7 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 b.left() >= island.left() && b.right() <= island.right(),
                                 "{label}, {width}, rail={rail}: {id} {b:?} outside {island:?}"
                             );
-                            assert_eq!(b.size.height, px(28.), "{id}");
+                            assert_eq!(b.size.height, px(32.), "{id}");
                             assert_eq!(b.top(), scope.top(), "one row: {id}");
                         }
                         assert!(
@@ -180,16 +180,16 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         if chip.visible() {
                             let b = chip.bounds();
                             assert!(b.size.width <= px(280.));
-                            assert_eq!(b.size.height, px(22.));
+                            assert_eq!(b.size.height, px(32.));
                             assert!(b.left() >= island.left() && b.right() <= scope.left());
-                            assert_eq!(b.top() + px(11.), scope.top() + px(14.));
+                            assert_eq!(b.center().y, scope.center().y);
                         } else {
                             assert!(
                                 w.find("attach-more").visible(),
                                 "hidden branch stays reachable"
                             );
                         }
-                        assert_eq!(layout.size, size(px(28.), px(28.)));
+                        assert_eq!(layout.size, size(px(32.), px(32.)));
                         assert_eq!(scope.right() + px(8.), layout.left());
                         assert_eq!(layout.right() + px(8.), toggle.left());
                         assert_eq!(toggle.right() + px(8.), sync.left());

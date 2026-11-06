@@ -303,3 +303,45 @@ fn replacement_child_scroll_stays_inside_window(cx: &mut TestAppContext) {
     })
     .unwrap();
 }
+
+#[gpui_kit::test]
+fn linear_spacing_and_pointer_actions_in_both_themes(cx: &mut TestAppContext) {
+    for mode in [crate::state::Mode::Dark, crate::state::Mode::Light] {
+        for reduce_motion in [false, true] {
+            let (window, fixture, menu) = fixture(cx, 1000., 400., 20., false);
+            cx.update(|cx| {
+                crate::theme::apply(
+                    &crate::state::Appearance {
+                        mode,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+                cx.set_reduce_motion(reduce_motion);
+            });
+            cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                let first = w.find(0usize).bounds();
+                let checked = w.find(3usize).bounds();
+                let label = w.find(("menu-label", 0usize)).bounds();
+                let icon = w.find(("menu-icon", 0usize)).bounds();
+                assert_eq!(first.size.height, px(36.));
+                assert_eq!(label.left(), icon.right() + px(10.));
+                assert_eq!(label.left(), w.find(("menu-label", 3usize)).bounds().left());
+                assert_eq!(w.find(2usize).bounds().top(), first.bottom() + px(13.));
+                w.hover(3usize, cx);
+                assert_eq!(menu.read(cx).sel, Some(3));
+                assert_eq!(
+                    checked,
+                    w.find(3usize).bounds(),
+                    "highlight must not move the target"
+                );
+                w.click(0usize, cx);
+                assert_eq!(fixture.read(cx).calls.get(), 1);
+                assert!(fixture.read(cx).focus.is_focused(w));
+                w.remove_window();
+            })
+            .unwrap();
+        }
+    }
+}

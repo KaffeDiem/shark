@@ -969,7 +969,7 @@ impl Render for NewWorkspaceForm {
                 "Filter pull requests…".into(),
             ),
         };
-        let picker = Command::new(&self.picker)
+        let picker = crate::ui::command(&self.picker, window)
             .items(items)
             .placeholder(placeholder)
             .bordered(!attaching)

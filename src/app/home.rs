@@ -476,6 +476,7 @@ impl Shark {
         side_row(theme)
             .text_color(theme.sidebar_foreground)
             .id("home-row")
+            .when(!rail, |d| d.h(px(32.)).mb_0())
             .when(rail, super::sidebar::rail_button)
             .map(|d| cursor_row(d, self.home_shown(), false, false, theme))
             .when(self.home_shown(), |d| d.font_weight(FontWeight::MEDIUM))

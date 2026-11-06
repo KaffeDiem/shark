@@ -277,7 +277,8 @@ impl Shark {
                             .accessibility_label("Refresh usage")
                             .tooltip("Refresh usage")
                             .icon(IconName::RefreshCw)
-                            .on_click(cx.listener(|s, _, _, cx| s.refresh_usage(cx))),
+                            .on_click(cx.listener(|s, _, _, cx| s.refresh_usage(cx)))
+                            .map(|b| crate::ui::toolbar("refresh-usage", b)),
                     ),
             )
             .children(

@@ -60,7 +60,7 @@ fn rel(item: &Item) -> String {
 }
 
 impl Render for FilePicker {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let dark = cx.theme().is_dark();
         let items = (self.hits.iter()).map(|&i| {
             let label: SharedString = rel(&self.files[i]).into();
@@ -70,7 +70,7 @@ impl Render for FilePicker {
             }
         });
         let (q, pick) = (cx.entity().downgrade(), cx.entity().downgrade());
-        Command::new(&self.state)
+        crate::ui::command(&self.state, window)
             .items(items.collect::<Vec<_>>())
             .filterable(false)
             .placeholder("Open file…")

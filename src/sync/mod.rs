@@ -15,16 +15,17 @@ use crate::menu::each_or_all;
 use crate::menu::{self, Entry};
 use crate::pr;
 use crate::state::Workspace;
+use crate::ui::notify_err;
 use crate::ui::open_menu;
-use crate::ui::{inter_features, notify_err};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::async_util::{Receiver, Sender, unbounded};
 use gpui_kit::component::button::{Button, ButtonRounded, ButtonVariant, ButtonVariants as _};
 use gpui_kit::component::command::CommandItem;
-use gpui_kit::component::dialog::DialogEntrance;
 use gpui_kit::component::notification::Notification;
 use gpui_kit::component::tooltip::Tooltip;
-use gpui_kit::component::{ActiveTheme, Disableable as _, Icon, Sizable as _, WindowExt, h_flex};
+use gpui_kit::component::{
+    ActiveTheme, Disableable as _, Icon, Selectable as _, Sizable as _, WindowExt, h_flex,
+};
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 use run::{
@@ -688,8 +689,7 @@ impl GitSync {
         let sync = cx.entity().downgrade();
         window.open_alert_dialog(cx, move |d, _, _| {
             let (sync, a) = (sync.clone(), a.clone());
-            d.font_features(inter_features())
-                .entrance(DialogEntrance::None)
+            crate::ui::alert_dialog(d)
                 .title(title.clone())
                 .description(body.clone())
                 .ok_text(ok)
@@ -1235,7 +1235,7 @@ impl Render for GitSync {
             _ => theme.border,
         };
         // One split button: the chevron trails inside it, behind a hairline.
-        let radius = theme.radius;
+        let radius = px(16.);
         let split = h_flex()
             .child(
                 // A div, not Button::tooltip: that takes fixed text, and this is built on hover so
@@ -1256,15 +1256,22 @@ impl Render for GitSync {
                             .w_full()
                             .min_w_0()
                             .small()
-                            .h(px(28.))
+                            .h(px(32.))
                             .px(px(10.))
                             .icon(icon)
                             .label(label)
                             .rounded(ButtonRounded::None)
                             .rounded_l(radius)
+                            .rounded_tr(px(0.))
+                            .rounded_br(px(0.))
+                            .border_r_0()
                             .map(variant)
                             .disabled(!clickable || blocked)
-                            .on_click(cx.listener(|s, _, window, cx| s.primary(window, cx))),
+                            .on_click(cx.listener(|s, _, window, cx| s.primary(window, cx)))
+                            .map(|b| match passive {
+                                true => crate::ui::toolbar("git-next", b).into_any_element(),
+                                false => b.into_any_element(),
+                            }),
                     ),
             )
             .child(
@@ -1274,14 +1281,22 @@ impl Render for GitSync {
                     .child(
                         Button::new("git-menu")
                             .small()
-                            .h(px(28.))
+                            .h(px(32.))
                             .px(px(6.))
                             .icon(IconName::ChevronDown)
                             .rounded(ButtonRounded::None)
                             .rounded_r(radius)
+                            .rounded_tl(px(0.))
+                            .rounded_bl(px(0.))
+                            .border_l_0()
                             .map(variant)
+                            .open(self.menu.is_some())
                             .tooltip("Git menu")
-                            .on_click(cx.listener(|s, _, window, cx| s.open_menu(window, cx))),
+                            .on_click(cx.listener(|s, _, window, cx| s.open_menu(window, cx)))
+                            .map(|b| match passive {
+                                true => crate::ui::toolbar("git-menu", b).into_any_element(),
+                                false => b.into_any_element(),
+                            }),
                     )
                     .child(
                         div()

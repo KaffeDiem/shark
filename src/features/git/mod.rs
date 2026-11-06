@@ -2520,6 +2520,7 @@ impl GitFeature {
                         .selected(i == self.selected)
                         .disabled(disabled)
                         .on_click(cx.listener(move |s, _, w, cx| s.select_repo(i, w, cx)))
+                        .map(|b| crate::ui::toolbar(format!("git-repo-{i}"), b))
                 }))
                 .child(div().w(px(8.)))
             })
@@ -2534,7 +2535,8 @@ impl GitFeature {
                         s.show_drafts = false;
                         s.set_view(GitView::Conversation, w, cx);
                         cx.notify();
-                    })),
+                    }))
+                    .map(|b| crate::ui::toolbar("git-view-conversation", b)),
             )
             .child(
                 Button::new("git-view-commits")
@@ -2543,7 +2545,8 @@ impl GitFeature {
                     .small()
                     .ghost()
                     .selected(commits_view)
-                    .on_click(cx.listener(|s, _, w, cx| s.set_view(GitView::Commits, w, cx))),
+                    .on_click(cx.listener(|s, _, w, cx| s.set_view(GitView::Commits, w, cx)))
+                    .map(|b| crate::ui::toolbar("git-view-commits", b)),
             )
             .child(div().flex_1())
             .when(!commits_view, |r| {
@@ -2560,22 +2563,25 @@ impl GitFeature {
                                 s.reader = None;
                                 s.focus.focus(w, cx);
                                 cx.notify();
-                            })),
+                            }))
+                            .map(|b| crate::ui::toolbar("git-local-drafts", b)),
                     )
                 })
                 .child(
                     Button::new("git-refresh")
                         .icon(IconName::RefreshCw)
                         .loading(self.loading)
-                        .label(if self.loading {
+                        .accessibility_label(if self.loading {
                             "Refreshing…"
                         } else {
                             "Refresh"
                         })
+                        .tooltip("Refresh pull request")
                         .small()
                         .ghost()
                         .disabled(disabled || self.loading || repo.is_none())
-                        .on_click(cx.listener(|s, _, w, cx| s.refresh(w, cx))),
+                        .on_click(cx.listener(|s, _, w, cx| s.refresh(w, cx)))
+                        .map(|b| crate::ui::toolbar("git-refresh", b)),
                 )
             })
             .into_any_element()

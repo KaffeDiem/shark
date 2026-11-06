@@ -511,14 +511,14 @@ impl Render for RepoSettingsView {
                             false,
                             "Default model",
                             "New chats in agents with this repo",
-                            Select::new(&self.model).small(),
+                            Select::new(&self.model),
                         ))
                         .child(row(
                             theme,
                             true,
                             "Thinking",
                             "Their thinking level",
-                            Select::new(&self.effort).small(),
+                            Select::new(&self.effort),
                         )),
                 ),
             )

@@ -399,7 +399,7 @@ impl WorkspacePicker {
         let names = self.hits.clone();
         let shark = self.shark.clone();
         let empty = self.workspaces.is_empty();
-        Command::new(&self.state)
+        crate::ui::command(&self.state, window)
             .items(items)
             .filterable(false)
             .bordered(false)

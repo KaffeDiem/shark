@@ -2072,8 +2072,8 @@ async fn titlebar_controls(cx: &mut TestAppContext) {
                 for id in ["show-tree", "hide-tree", "tools-diff"] {
                     assert!(w.try_find(id).is_none(), "no expandable Features pane");
                 }
-                assert_eq!(toggle.origin, point(px(80.), px(8.)));
-                assert_eq!(toggle.size, size(px(32.), px(28.)));
+                assert_eq!(toggle.origin, point(px(80.), px(6.)));
+                assert_eq!(toggle.size, size(px(32.), px(32.)));
                 let titlebar = w.find("workspace-titlebar").bounds();
                 assert_eq!(titlebar.top(), px(0.));
                 assert_eq!(titlebar.size.height, px(44.));
@@ -4747,8 +4747,8 @@ async fn side_rails_and_toggles(cx: &mut TestAppContext) {
         assert!(bounds(cx, id).is_none(), "absent on Chat: {id}");
     }
     let left = bounds(cx, "toggle-sidebar").unwrap();
-    assert_eq!(left.size, size(px(32.), px(28.)));
-    assert_eq!(left.top(), px(8.));
+    assert_eq!(left.size, size(px(32.), px(32.)));
+    assert_eq!(left.top(), px(6.));
     assert_eq!(left.left(), px(80.));
     let diff_button = bounds(cx, "feature-differ").unwrap();
     assert_eq!(right.center().x, diff_button.center().x);

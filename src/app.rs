@@ -598,7 +598,7 @@ impl Shark {
         })
     }
 
-    fn render_sidebar_toggle(&self, cx: &Context<Self>) -> Button {
+    fn render_sidebar_toggle(&self, cx: &Context<Self>) -> impl IntoElement {
         side_toggle(
             "toggle-sidebar",
             if self.rail {
@@ -608,20 +608,20 @@ impl Shark {
             },
             "Toggle sidebar (cmd-b)",
         )
-        .text_color(cx.theme().sidebar_foreground)
         .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
+        .map(|b| toolbar("toggle-sidebar", b))
     }
 
-    fn render_commands(&self, cx: &Context<Self>) -> Button {
+    fn render_commands(&self, cx: &Context<Self>) -> impl IntoElement {
         side_toggle("commands", IconName::Command, "Commands (cmd-k)")
-            .text_color(cx.theme().sidebar_foreground)
             .on_click(cx.listener(|this, _, window, cx| this.toggle_palette(window, cx)))
+            .map(|b| toolbar("commands", b))
     }
 
-    fn render_new_workspace(&self, cx: &Context<Self>) -> Button {
+    fn render_new_workspace(&self, cx: &Context<Self>) -> impl IntoElement {
         side_toggle("new-workspace", IconName::SquarePen, "New agent (cmd-n)")
-            .text_color(cx.theme().sidebar_foreground)
             .on_click(cx.listener(|this, _, window, cx| this.new_empty_agent(window, cx)))
+            .map(|b| toolbar("new-workspace", b))
     }
 
     fn draggable_chrome(&self, id: &'static str, d: Stateful<Div>) -> impl IntoElement {
@@ -698,7 +698,8 @@ impl Shark {
                                 .tooltip("New chat (cmd-t)")
                                 .on_click(
                                     cx.listener(|this, _, window, cx| this.new_chat(window, cx)),
-                                ),
+                                )
+                                .map(|b| toolbar("new-chat", b)),
                         )
                     }),
             )
@@ -752,7 +753,7 @@ impl Shark {
                             d.child(
                                 div()
                                     .min_w_0()
-                                    .flex_shrink_0()
+                                    .flex_shrink_1()
                                     .when(has_controls, |d| d.max_w(relative(0.4)))
                                     .child(sync),
                             )

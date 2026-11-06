@@ -1322,6 +1322,17 @@ async fn empty_views_go_live_once_a_repo_attaches(cx: &mut TestAppContext) {
     assert!(!shown(cx, "attach-repository"));
     assert!(shown(cx, "repo-chip-api"));
     assert!(shown(cx, "header-attach"), "more can join");
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        let repo = w.find("repo-chip-api");
+        assert_eq!(repo.role(), Some(Role::Button));
+        for id in ["repo-chip-api", "run", "header-attach"] {
+            let bounds = w.find(id).bounds();
+            assert_eq!(bounds.size.height, px(32.), "{id} is a toolbar button");
+            assert_eq!(bounds.center().y, repo.bounds().center().y, "{id} aligns");
+        }
+    })
+    .unwrap();
     assert!(
         !shown(cx, "branch"),
         "branch actions live in the repository chip"
@@ -1342,6 +1353,20 @@ async fn empty_views_go_live_once_a_repo_attaches(cx: &mut TestAppContext) {
         .unwrap();
         cx.run_until_parked();
         cx.update(|cx| assert!(shark.read(cx).menu.is_some()));
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            let button = w.find("repo-chip-api").bounds();
+            let menu = w.find("menu-parent").bounds();
+            assert!(
+                (menu.top() - button.bottom() - px(4.)).abs() <= px(0.5),
+                "{key} anchor"
+            );
+            assert!(
+                (menu.left() - button.left()).abs() <= px(1.),
+                "{key} anchor"
+            );
+        })
+        .unwrap();
         press_in(window)(cx, &["escape"]);
     }
     // A different checkout does not inherit the attached branch's base in its description.
@@ -1495,6 +1520,31 @@ async fn failures_stay_reachable_under_overflow(cx: &mut TestAppContext) {
         "behind the failures"
     );
     assert!(shows(cx, window, "attach-more"));
+    for key in ["enter", "space"] {
+        cx.update_window(window, |_, w, cx| {
+            for id in ["attach-chip-repository-00", "attach-more"] {
+                let button = w.find(id);
+                assert_eq!(button.role(), Some(Role::Button));
+                assert_eq!(button.bounds().size.height, px(32.));
+            }
+            for _ in 0..100 {
+                w.render_frame(cx);
+                if w.find("attach-chip-repository-00").focused() == Some(true) {
+                    break;
+                }
+                w.focus_next(cx);
+            }
+            assert_eq!(w.find("attach-chip-repository-00").focused(), Some(true));
+            w.press(key, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(
+            shows(cx, window, "attach-panel"),
+            "{key} opens failure actions"
+        );
+        press_in(window)(cx, &["escape"]);
+    }
     // `+N`: the hidden ones, the last of them a failure the header can't show.
     cx.update_window(window, |_, w, cx| w.click("attach-more", cx))
         .unwrap();
@@ -2402,6 +2452,8 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             })
             .unwrap();
             cx.run_until_parked();
+            // Capture settled dialogs even when boot reinitializes motion preferences.
+            cx.update(|cx| cx.set_reduce_motion(true));
             // The branch lists load in the background; the base list is one click on.
             for frame in 0..6 {
                 cx.update_window(window, |_, w, cx| {

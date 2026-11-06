@@ -112,7 +112,7 @@ struct AttachPanel {
 }
 
 impl Render for AttachPanel {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(shark) = self.shark.upgrade() else {
             return div().into_any_element();
         };
@@ -195,7 +195,7 @@ impl Render for AttachPanel {
             .map(|(icon, label, _)| CommandItem::new().label(*label).icon(*icon))
             .collect();
         let (name, repo, target) = (self.name.clone(), self.repo.clone(), self.shark.clone());
-        let command = Command::new(&self.picker)
+        let command = crate::ui::command(&self.picker, window)
             .bordered(false)
             .placeholder("Repository attachment…")
             .items(items)
@@ -223,7 +223,7 @@ pub(super) struct Fit {
 /// About what the Attach button's label takes.
 const LABEL: Pixels = px(60.);
 /// What `+N` needs at the end of the row.
-const MORE: Pixels = px(56.);
+const MORE: Pixels = px(72.);
 
 impl Fit {
     /// After a frame with `clipped` of `chips` past the row's end. The label goes first and comes
@@ -298,6 +298,7 @@ impl RenderOnce for AttachRow {
                         })
                         .ok();
                 })
+                .map(|b| crate::ui::toolbar("header-attach", b))
         };
         let more = (shown < count).then(|| {
             let (shark, name) = (self.shark.clone(), self.name.clone());
@@ -306,23 +307,33 @@ impl RenderOnce for AttachRow {
                 false => Icon::new(IconName::Ellipsis),
             };
             let hidden = count - shown;
-            Shark::chip("attach-more", icon, format!("+{hidden}"), cx.theme())
+            Shark::chip("attach-more", icon, format!("+{hidden}"))
+                .w(MORE - px(4.))
+                .px(px(6.))
                 .absolute()
                 .left(was.more_at)
                 .cursor_pointer()
-                .aria_label(format!("Show {hidden} more"))
-                .tooltip(move |w, cx| Tooltip::new(format!("Show {hidden} more")).build(w, cx))
+                .accessibility_label(format!("Show {hidden} more"))
+                .tooltip(format!("Show {hidden} more"))
                 .on_click(move |_, w, cx| {
                     let name = name.clone();
                     shark
                         .update(cx, |s, cx| s.attachment_list(name, shown, w, cx))
                         .ok();
                 })
-                .test_support()
+                .map(|b| crate::ui::toolbar("attach-more", b))
         });
         h_flex()
             .flex_shrink_1()
-            .min_w_0()
+            // Reserve the status indicator too, so it cannot squeeze out the overflow button.
+            .min_w(
+                (if count > 0 { MORE + px(36.) } else { px(32.) })
+                    + if self.disconnected.is_some() {
+                        px(36.)
+                    } else {
+                        px(0.)
+                    },
+            )
             .gap_1()
             .child(
                 h_flex()
@@ -371,6 +382,8 @@ impl RenderOnce for AttachRow {
                 div().relative().flex_none().child(attach).child(
                     canvas(move |b, _, _| at.set(b), |_, _, _, _| {})
                         .absolute()
+                        .top_0()
+                        .left_0()
                         .size_full(),
                 ),
             )
@@ -1450,24 +1463,13 @@ impl Shark {
         );
     }
 
-    /// A chip in the header's attachment row.
-    pub(super) fn chip(
-        id: impl Into<ElementId>,
-        icon: impl Into<Icon>,
-        label: String,
-        theme: &Theme,
-    ) -> Stateful<Div> {
-        h_flex()
-            .id(id)
+    /// Attachment controls share the toolbar's button styling after callbacks are installed.
+    pub(super) fn chip(id: impl Into<ElementId>, icon: impl Into<Icon>, label: String) -> Button {
+        Button::new(id)
+            .ghost()
             .flex_none()
-            .h(px(22.))
-            .px_1p5()
-            .gap_1()
-            .rounded(theme.radius)
-            .bg(theme.muted)
-            .text_xs()
-            .child(icon.into().with_size(px(12.)))
-            .child(label)
+            .icon(icon.into())
+            .label(label)
     }
 
     /// The header's attachments: a chip per repository, what needs the user first, then one per
@@ -1489,34 +1491,28 @@ impl Shark {
                 let ready = r.standing == Standing::Ready;
                 let (n, repo) = (name.clone(), r.repo.clone());
                 if !ready {
-                    return Self::chip(
-                        SharedString::from(format!("attach-chip-{}", r.repo)),
-                        r.standing.mark(cx.theme()),
-                        r.repo.clone(),
-                        cx.theme(),
-                    )
-                    .aria_label(format!("{}: {}", r.repo, r.state))
-                    .tooltip(move |w, cx| Tooltip::new(r.tip.clone()).build(w, cx))
-                    .cursor_pointer()
-                    .on_click(cx.listener(move |s, _, w, cx| {
-                        s.attachment_menu(n.clone(), repo.clone(), w, cx)
-                    }))
-                    .test_support()
-                    .into_any_element();
+                    let id = SharedString::from(format!("attach-chip-{}", r.repo));
+                    return Self::chip(id.clone(), r.standing.mark(cx.theme()), r.repo.clone())
+                        .accessibility_label(format!("{}: {}", r.repo, r.state))
+                        .tooltip(r.tip.clone())
+                        .cursor_pointer()
+                        .on_click(cx.listener(move |s, _, w, cx| {
+                            s.attachment_menu(n.clone(), repo.clone(), w, cx)
+                        }))
+                        .map(|b| crate::ui::toolbar(id, b))
+                        .into_any_element();
                 }
                 let attached = ws.repos.iter().find(|repo| repo.name == r.repo).unwrap();
                 let branch = menus::repo_branch(self, ws, attached, cx)
                     .unwrap_or_else(|| "Detached HEAD".into());
                 let tip = self.repository_tip(ws, attached, &branch, cx);
                 let (right_name, right_repo) = (name.clone(), r.repo.clone());
-                Button::new(SharedString::from(format!("repo-chip-{}", r.repo)))
+                let id = SharedString::from(format!("repo-chip-{}", r.repo));
+                let at = Rc::new(Cell::<Bounds<Pixels>>::default());
+                let click_at = at.clone();
+                let button = Button::new(id.clone())
                     .ghost()
-                    .xsmall()
-                    .h(px(22.))
                     .max_w(px(280.))
-                    .px_1p5()
-                    .rounded(cx.theme().radius)
-                    .bg(cx.theme().muted)
                     .icon(r.standing.mark(cx.theme()))
                     .label(format!("{} · {branch}", r.repo))
                     .dropdown_caret(true)
@@ -1526,8 +1522,10 @@ impl Shark {
                         tip.split_once('\n').unwrap().1
                     ))
                     .tooltip(tip)
-                    .on_click(cx.listener(move |s, e: &ClickEvent, w, cx| {
-                        s.repository_menu(n.clone(), repo.clone(), Some(e.position()), w, cx)
+                    .on_click(cx.listener(move |s, _, w, cx| {
+                        let b = click_at.get();
+                        let pos = point(b.left(), b.bottom() + px(4.));
+                        s.repository_menu(n.clone(), repo.clone(), Some(pos), w, cx)
                     }))
                     .on_mouse_down(
                         MouseButton::Right,
@@ -1540,6 +1538,18 @@ impl Shark {
                                 cx,
                             )
                         }),
+                    )
+                    .map(|b| crate::ui::toolbar(id, b));
+                div()
+                    .relative()
+                    .flex_none()
+                    .child(button)
+                    .child(
+                        canvas(move |b, _, _| at.set(b), |_, _, _, _| {})
+                            .absolute()
+                            .top_0()
+                            .left_0()
+                            .size_full(),
                     )
                     .into_any_element()
             })

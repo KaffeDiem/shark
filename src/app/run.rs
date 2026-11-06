@@ -2,6 +2,7 @@
 //! worktree is made (`create_workspace_on`, `repo_added`), archive before removal (`workspace.rs`).
 use super::*;
 use crate::scripts::{self, Phase, Running};
+use gpui_kit::component::Selectable as _;
 
 impl Shark {
     /// cmd-r: the active workspace's run scripts, in order; again stops them. On Home, the
@@ -85,7 +86,7 @@ impl Shark {
         self.runs.contains_key(ws)
     }
 
-    /// Header button, a filled square (`secondary`, unlike the git button's variants): run/stop
+    /// Header control: run/stop
     /// the active workspace; while running, its port in green beside it.
     /// Right-click: the same toggle, and the script output.
     pub(super) fn render_run(&self, cx: &Context<Self>) -> impl IntoElement {
@@ -103,7 +104,7 @@ impl Shark {
         let button = Button::new("run")
             .secondary()
             .small()
-            .size(px(28.))
+            .size(px(32.))
             .flex_none()
             .accessibility_label(tip.clone())
             .tooltip(tip)
@@ -131,7 +132,7 @@ impl Shark {
         h_flex()
             .flex_none()
             .gap_1p5()
-            .child(button)
+            .child(crate::ui::toolbar("run", button.selected(port.is_some())))
             .children(port.map(|p| {
                 div()
                     .text_xs()

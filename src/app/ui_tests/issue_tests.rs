@@ -1084,7 +1084,7 @@ async fn attach_and_the_palette_follow_linear_in_use(cx: &mut TestAppContext) {
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         let row = |w: &Window, ix: usize| w.find(("menu-label", ix)).bounds();
-        assert_eq!(row(w, 1).top() - row(w, 0).top(), px(32.));
+        assert_eq!(row(w, 1).top() - row(w, 0).top(), px(36.));
         assert!(w.try_find(("menu-label", 2usize)).is_none(), "two rows");
         let (button, menu) = (
             w.find("header-attach").bounds(),
@@ -1092,7 +1092,10 @@ async fn attach_and_the_palette_follow_linear_in_use(cx: &mut TestAppContext) {
         );
         let off = (menu.right() - button.right()).abs();
         assert!(off <= px(1.), "hangs from the button, {off} off");
-        assert!(menu.top() >= button.bottom());
+        assert!(
+            (menu.top() - button.bottom() - px(4.)).abs() <= px(0.5),
+            "the popup is anchored to the button, not its measuring canvas's static position"
+        );
     })
     .unwrap();
     press(cx, &["enter"]);
@@ -1176,9 +1179,32 @@ async fn disconnected_issues_share_one_mark(cx: &mut TestAppContext) {
     let width = cx
         .update_window(window, |_, w, cx| {
             w.render_frame(cx);
-            w.find("issue-chip-uuid-1").bounds().size.width
+            let chip = w.find("issue-chip-uuid-1");
+            assert_eq!(chip.role(), Some(Role::Button));
+            assert_eq!(chip.bounds().size.height, px(32.));
+            chip.bounds().size.width
         })
         .unwrap();
+    for key in ["enter", "space"] {
+        cx.update_window(window, |_, w, cx| {
+            for _ in 0..100 {
+                w.render_frame(cx);
+                if w.find("issue-chip-uuid-1").focused() == Some(true) {
+                    break;
+                }
+                w.focus_next(cx);
+            }
+            assert_eq!(w.find("issue-chip-uuid-1").focused(), Some(true));
+            w.press(key, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        assert!(
+            shows(cx, window, "issue-details"),
+            "{key} opens issue details"
+        );
+        press_in(window)(cx, &["escape"]);
+    }
 
     shark.update(cx, |s, cx| {
         s.state.linear = None;
@@ -1187,6 +1213,9 @@ async fn disconnected_issues_share_one_mark(cx: &mut TestAppContext) {
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         assert_eq!(w.find_all("issues-disconnected").len(), 1);
+        let disconnected = w.find("issues-disconnected");
+        assert_eq!(disconnected.role(), Some(Role::Button));
+        assert_eq!(disconnected.bounds().size.height, px(32.));
         let chip = w.find("issue-chip-uuid-1");
         assert_eq!(chip.bounds().size.width, width, "the chip didn't grow");
         assert!(chip.label().unwrap().contains("(disconnected)"));
@@ -1195,6 +1224,83 @@ async fn disconnected_issues_share_one_mark(cx: &mut TestAppContext) {
     .unwrap();
     cx.run_until_parked();
     assert!(shows(cx, window, "linear-sign-in"));
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn disconnected_overflow_controls_remain_reachable(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let (window, shark, _) = connected(cx, &home, &[]);
+    let name = ws_of(cx, &shark).name;
+    shark.update(cx, |s, cx| {
+        (1..=20).for_each(|n| attach_directly(s, &name, n));
+        s.rail = true;
+        s.state.linear = None;
+        cx.notify();
+    });
+    for mode in [crate::state::Mode::Dark, crate::state::Mode::Light] {
+        for width in [420., 800.] {
+            cx.update_window(window, |_, w, cx| {
+                crate::theme::apply(
+                    &crate::state::Appearance {
+                        mode,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+                w.resize(size(px(width), px(700.)));
+            })
+            .unwrap();
+            for _ in 0..4 {
+                cx.update_window(window, |_, w, cx| w.render_frame(cx))
+                    .unwrap();
+                cx.run_until_parked();
+            }
+            cx.update_window(window, |_, w, cx| {
+                let island = w.find("content-island").bounds();
+                let more = w.find("attach-more");
+                let status = w.find("issues-disconnected");
+                let attach = w.find("header-attach");
+                assert!(status.label().unwrap().contains("20 disconnected issues"));
+                assert_eq!(status.bounds().size, size(px(32.), px(32.)));
+                for button in [&more, &status, &attach] {
+                    assert!(button.visible());
+                    assert_eq!(button.role(), Some(Role::Button));
+                    assert!(button.bounds().left() >= island.left());
+                    assert!(button.bounds().right() <= island.right());
+                }
+                assert!(more.bounds().right() <= status.bounds().left());
+                assert!(status.bounds().right() <= attach.bounds().left());
+                w.click("attach-more", cx);
+            })
+            .unwrap();
+            cx.run_until_parked();
+            assert!(
+                dialog_open(cx, window),
+                "overflow stays clickable at {width}"
+            );
+            press_in(window)(cx, &["escape"]);
+            cx.update_window(window, |_, w, cx| w.click("issues-disconnected", cx))
+                .unwrap();
+            cx.run_until_parked();
+            assert!(
+                shows(cx, window, "linear-sign-in"),
+                "status still opens Settings"
+            );
+            press_in(window)(cx, &["escape"]);
+            cx.update_window(window, |_, w, cx| w.click("header-attach", cx))
+                .unwrap();
+            cx.run_until_parked();
+            assert!(
+                shows(cx, window, "menu-parent"),
+                "Attach stays clickable at {width}"
+            );
+            press_in(window)(cx, &["escape"]);
+        }
+    }
 }
 
 /// Show attachments: repositories and issues in their groups, with their status, then the offers.
@@ -2075,6 +2181,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         })
         .unwrap();
         let shot = |cx: &mut gpui_kit::HeadlessAppContext, case: &str| {
+            cx.update(|cx| cx.set_reduce_motion(true));
             cx.run_until_parked();
             cx.update_window(window, |_, w, cx| w.render_frame(cx))
                 .unwrap();
@@ -2169,6 +2276,16 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         cx.update_window(window, |_, w, cx| w.click("header-attach", cx))
             .unwrap();
         shot(cx, "attach-menu");
+        cx.update_window(window, |_, w, _| {
+            let button = w.find("header-attach").bounds();
+            let menu = w.find("menu-parent").bounds();
+            assert!(
+                (menu.top() - button.bottom() - px(4.)).abs() <= px(0.5),
+                "{label}"
+            );
+            assert!((menu.right() - button.right()).abs() <= px(1.), "{label}");
+        })
+        .unwrap();
         keys(cx, &["escape"]);
         cx.update_window(window, |_, w, cx| {
             shark.update(cx, |s, cx| s.attachment_list(name.clone(), 0, w, cx));
