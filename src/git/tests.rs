@@ -221,7 +221,7 @@ fn skills_link_into_the_root_and_archive_with_it() {
         n
     };
 
-    link_skills(&ws, &dir, true);
+    reconcile_skills(&ws, &dir, true);
     assert_eq!(names(), ["deploy", "lint", "web-deploy"]);
     assert!(links.join("deploy/SKILL.md").exists());
     assert_eq!(
@@ -232,7 +232,7 @@ fn skills_link_into_the_root_and_archive_with_it() {
     // A skill gone from its repo loses its link; a link the user made keeps its place.
     fs::remove_dir_all(dir.join("web/.claude/skills/lint")).unwrap();
     std::os::unix::fs::symlink(&root, links.join("mine")).unwrap();
-    link_skills(&ws, &dir, true);
+    reconcile_skills(&ws, &dir, true);
     assert_eq!(names(), ["deploy", "mine", "web-deploy"]);
     fs::remove_file(links.join("mine")).unwrap();
 
@@ -251,9 +251,9 @@ fn skills_link_into_the_root_and_archive_with_it() {
     assert!(err.contains(".agents"), "{err}");
     fs::remove_dir(links.join("real")).unwrap();
 
-    link_skills(&ws, &dir, false);
+    reconcile_skills(&ws, &dir, false);
     assert!(!dir.join(".agents").exists());
-    link_skills(&ws, &dir, true);
+    reconcile_skills(&ws, &dir, true);
     remove_workspace(&ws, &dir, false).unwrap();
     assert!(!dir.exists());
 }
@@ -282,7 +282,7 @@ fn skills_preserve_user_links_and_avoid_name_collisions() {
         fs::create_dir_all(dir.join(path)).unwrap();
         fs::write(dir.join(path).join("SKILL.md"), "hi").unwrap();
     }
-    link_skills(&ws, &dir, true);
+    reconcile_skills(&ws, &dir, true);
     let links = dir.join(SKILL_LINKS);
     let before = owned_skill_links(&dir).unwrap();
     assert_eq!(
@@ -294,7 +294,7 @@ fn skills_preserve_user_links_and_avoid_name_collisions() {
         before["web-deploy-2"],
         Path::new("../../web/.agents/skills/deploy")
     );
-    link_skills(&ws, &dir, true);
+    reconcile_skills(&ws, &dir, true);
     assert_eq!(
         owned_skill_links(&dir).unwrap(),
         before,
@@ -307,31 +307,73 @@ fn skills_preserve_user_links_and_avoid_name_collisions() {
     // Replacing one of our links relinquishes ownership too.
     fs::remove_file(links.join("deploy")).unwrap();
     std::os::unix::fs::symlink(&dir, links.join("deploy")).unwrap();
-    link_skills(&ws, &dir, true);
+    reconcile_skills(&ws, &dir, true);
     assert_eq!(fs::read_link(links.join("custom")).unwrap(), user);
     assert_eq!(fs::read_link(links.join("deploy")).unwrap(), dir);
     assert!(
         !only_skill_links(&dir),
         "ordinary archive must preserve user links"
     );
-    link_skills(&ws, &dir, false);
+    reconcile_skills(&ws, &dir, false);
     assert_eq!(fs::read_dir(&links).unwrap().count(), 2);
     assert_eq!(fs::read_link(links.join("custom")).unwrap(), user);
     assert_eq!(fs::read_link(links.join("deploy")).unwrap(), dir);
 
     // Old unrecorded links stay user-owned without duplicating the same target.
     std::os::unix::fs::symlink("../../api/.agents/skills/deploy", links.join("old")).unwrap();
-    link_skills(&ws, &dir, true);
+    reconcile_skills(&ws, &dir, true);
     assert!(
         !owned_skill_links(&dir)
             .unwrap()
             .values()
             .any(|p| p == Path::new("../../api/.agents/skills/deploy"))
     );
-    link_skills(&ws, &dir, false);
+    reconcile_skills(&ws, &dir, false);
     assert!(fs::read_link(links.join("old")).is_ok());
     assert!(!only_skill_links(&dir));
     fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn waiting_skill_refresh_observes_disabled_preference() {
+    let _ui = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let dir = std::env::temp_dir().join(format!("shark-skill-refresh-{}", std::process::id()));
+    let skill = dir.join("api/.agents/skills/deploy");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(skill.join("SKILL.md"), "hi").unwrap();
+    let ws = Workspace {
+        repos: vec![WsRepo {
+            name: "api".into(),
+            src: dir.join("api"),
+            base: "HEAD".into(),
+            branch: None,
+        }],
+        ..Default::default()
+    };
+    reconcile_skills(&ws, &dir, true);
+    let mut preference = REPO_SKILLS.lock().unwrap_or_else(|e| e.into_inner());
+    let previous = *preference;
+    let (started, waiting) = std::sync::mpsc::channel();
+    let refresh_dir = dir.clone();
+    let refresh_ws = ws.clone();
+    let refresh = std::thread::spawn(move || {
+        started.send(()).unwrap();
+        link_skills(&refresh_ws, &refresh_dir);
+    });
+    waiting.recv().unwrap();
+    *preference = false;
+    reconcile_skills(&ws, &dir, false);
+    drop(preference);
+    let result = refresh.join();
+    set_repo_skills(previous);
+    result.unwrap();
+    assert!(
+        !dir.join(SKILL_LINKS).exists(),
+        "a queued refresh recreated disabled skills"
+    );
+    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -354,7 +396,7 @@ fn skills_never_follow_user_directory_symlinks() {
         fs::create_dir_all(&user_links).unwrap();
         std::os::unix::fs::symlink("../../custom", user_links.join("mine")).unwrap();
         for on in [true, false] {
-            link_skills(&ws, &dir, on);
+            reconcile_skills(&ws, &dir, on);
             assert_eq!(
                 fs::read_link(user_links.join("mine")).unwrap(),
                 Path::new("../../custom")

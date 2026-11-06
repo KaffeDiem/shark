@@ -98,7 +98,61 @@ fn editor_tokens(
     encoding: Encoding,
     types: usize,
 ) -> Result<SemanticTokens> {
-    let lines = Lines::new(text);
+    let mut chars = text.chars().peekable();
+    let mut source = Position::default();
+    let mut editor = Position::default();
+    // Token endpoints are ordered, so each character is consumed at most once.
+    let mut position = |target: Position| -> Result<Position> {
+        ensure!(source <= target, "overlapping semantic tokens");
+        while source < target {
+            let Some(&c) = chars.peek() else { break };
+            let crlf = c == '\r' && chars.clone().nth(1) == Some('\n');
+            let newline = c == '\n' || (c == '\r' && (encoding != Encoding::Editor || crlf));
+            if newline && source.line == target.line {
+                break; // LSP columns past the line end clamp to the line end.
+            }
+            let width = match encoding {
+                Encoding::Utf8 => c.len_utf8() as u32,
+                Encoding::Utf16 => c.len_utf16() as u32,
+                Encoding::Utf32 | Encoding::Editor => 1,
+            };
+            if !newline && source.line == target.line {
+                ensure!(
+                    width <= target.character - source.character,
+                    "position splits a Unicode character"
+                );
+            }
+            chars.next();
+            if newline {
+                source.line = source
+                    .line
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("token line overflow"))?;
+                source.character = 0;
+            } else {
+                source.character = source
+                    .character
+                    .checked_add(width)
+                    .ok_or_else(|| anyhow::anyhow!("token column overflow"))?;
+            }
+            if c == '\n' || (c == '\r' && chars.peek() == Some(&'\n')) {
+                if c == '\r' {
+                    chars.next();
+                }
+                editor.line = editor
+                    .line
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("editor line overflow"))?;
+                editor.character = 0;
+            } else {
+                editor.character = editor
+                    .character
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("editor column overflow"))?;
+            }
+        }
+        Ok(editor)
+    };
     let mut server = Position::default();
     let mut previous = Position::default();
     let mut previous_end = Position::default();
@@ -122,11 +176,10 @@ fn editor_tokens(
         if token.token_type as usize >= types || token.length == 0 {
             continue;
         }
-        let range = lines.convert_range(
-            Range::new(server, Position::new(server.line, end)),
-            encoding,
-            Encoding::Editor,
-        )?;
+        let range = Range::new(
+            position(server)?,
+            position(Position::new(server.line, end))?,
+        );
         ensure!(
             range.start.line == range.end.line && range.start >= previous_end,
             "overlapping semantic tokens"
@@ -192,6 +245,78 @@ mod tests {
         ] {
             assert!(editor_tokens(tokens(data), text, Encoding::Utf16, 1).is_err());
         }
+    }
+
+    #[test]
+    fn semantic_token_cursor_matches_document_coordinates() {
+        let text = "😀 café\r\nbare\rreturn\n";
+        let lines = Lines::new(text);
+        for encoding in [
+            Encoding::Utf8,
+            Encoding::Utf16,
+            Encoding::Utf32,
+            Encoding::Editor,
+        ] {
+            for line in 0..5 {
+                for column in 0..16 {
+                    let input = tokens(json!([line, column, 1, 0, 0]));
+                    let range =
+                        Range::new(Position::new(line, column), Position::new(line, column + 1));
+                    let expected = lines.convert_range(range, encoding, Encoding::Editor);
+                    let actual = editor_tokens(input, text, encoding, 1);
+                    match expected {
+                        Err(_) => assert!(actual.is_err()),
+                        Ok(range) if range.start == range.end => {
+                            assert!(actual.unwrap().data.is_empty())
+                        }
+                        Ok(range) => assert_eq!(
+                            actual.unwrap(),
+                            tokens(json!([
+                                range.start.line,
+                                range.start.character,
+                                range.end.character - range.start.character,
+                                0,
+                                0
+                            ]))
+                        ),
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn semantic_tokens_scan_long_lines_and_clamp_endpoints() {
+        let text = "😀x ".repeat(20_000);
+        for (encoding, width) in [
+            (Encoding::Utf8, 6),
+            (Encoding::Utf16, 4),
+            (Encoding::Utf32, 3),
+        ] {
+            let input = SemanticTokens {
+                result_id: None,
+                data: (0..20_000)
+                    .map(|i| SemanticToken {
+                        delta_line: 0,
+                        delta_start: if i == 0 { 0 } else { width },
+                        length: width - 1,
+                        token_type: 0,
+                        token_modifiers_bitset: 0,
+                    })
+                    .collect(),
+            };
+            let output = editor_tokens(input, &text, encoding, 1).unwrap();
+            assert_eq!(output.data.len(), 20_000);
+            for (i, token) in output.data.iter().enumerate() {
+                assert_eq!(token.delta_start, if i == 0 { 0 } else { 3 });
+                assert_eq!(token.length, 2);
+            }
+        }
+        let input = tokens(json!([0, 0, 99, 0, 0, 1, 0, 99, 0, 0, 10, 0, 1, 0, 0]));
+        assert_eq!(
+            editor_tokens(input, "a\r\nb", Encoding::Utf16, 1).unwrap(),
+            tokens(json!([0, 0, 1, 0, 0, 1, 0, 1, 0, 0]))
+        );
     }
 
     #[test]

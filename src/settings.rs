@@ -259,7 +259,7 @@ impl Settings {
             s.no_repo_skills = !on;
             crate::git::set_repo_skills(on);
             for ws in &s.workspaces {
-                crate::git::link_skills(ws, &ws.dir(), on);
+                crate::git::link_skills(ws, &ws.dir());
             }
         });
         cx.notify();

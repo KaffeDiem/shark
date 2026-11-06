@@ -12,7 +12,7 @@ use std::{
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
     process::{Command, Output},
-    sync::atomic::{AtomicBool, Ordering},
+    sync::Mutex,
 };
 
 pub fn run(dir: &Path, prog: &str, args: &[&str]) -> Result<Output, String> {
@@ -872,19 +872,19 @@ fn write_root_docs(ws: &Workspace, dir: &Path) -> Result<(), String> {
     fs::write(dir.join(claude), claude_md(ws, dir))
         .and_then(|()| fs::write(dir.join(agents), agents_md(ws, dir)))
         .map_err(|e| e.to_string())?;
-    link_skills(ws, dir, repo_skills());
+    link_skills(ws, dir);
     Ok(())
 }
 
 /// Whether agents get the repos' skills: `State::no_repo_skills`, here for the spawn paths.
-static REPO_SKILLS: AtomicBool = AtomicBool::new(true);
+static REPO_SKILLS: Mutex<bool> = Mutex::new(true);
 
 pub fn repo_skills() -> bool {
-    REPO_SKILLS.load(Ordering::Relaxed)
+    *REPO_SKILLS.lock().unwrap_or_else(|e| e.into_inner())
 }
 
 pub fn set_repo_skills(on: bool) {
-    REPO_SKILLS.store(on, Ordering::Relaxed);
+    *REPO_SKILLS.lock().unwrap_or_else(|e| e.into_inner()) = on;
 }
 
 /// `--add-dir` for each repo: claude loads a repo's `.claude/skills` and `.claude/commands` at
@@ -938,7 +938,13 @@ fn owned_skill_links(dir: &Path) -> Option<BTreeMap<String, PathBuf>> {
 
 /// Link repo skills into Codex's root. Only recorded, unchanged links belong to Shark;
 /// pre-existing links (including ones from older Shark versions) stay user-owned.
-pub fn link_skills(ws: &Workspace, dir: &Path, on: bool) {
+pub fn link_skills(ws: &Workspace, dir: &Path) {
+    // Keep the current preference and filesystem reconciliation under the same lock.
+    let on = REPO_SKILLS.lock().unwrap_or_else(|e| e.into_inner());
+    reconcile_skills(ws, dir, *on);
+}
+
+fn reconcile_skills(ws: &Workspace, dir: &Path, on: bool) {
     if !skill_dirs_owned(dir) {
         return;
     }

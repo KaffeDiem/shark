@@ -418,6 +418,13 @@ impl Differ {
         let Some((top, cur)) = self.review.view.clone() else {
             return false;
         };
+        self.diff.update(cx, |d, cx| {
+            for spot in [&top, &cur] {
+                if let Spot::Line(line) = spot {
+                    d.scroll_to_line(line.clone(), cx);
+                }
+            }
+        });
         let rows = self.diff_rows(cx);
         let (t, c) = (find(&rows, &top), find(&rows, &cur));
         self.apply_view(&rows, t, c, cx);
@@ -1900,6 +1907,22 @@ mod tests {
             assert!(!visible.iter().any(|r| r.spot == line(50)));
             d.diff_move(1, None, window, cx);
             assert_eq!(d.diff.read(cx).selected_lines().unwrap().start(), 11);
+
+            // Adding or removing another file resets folds but must preserve both saved lines.
+            for add in [true, false] {
+                if add {
+                    d.diff_files.push(DiffFile::unchanged("api/other", "other"));
+                } else {
+                    d.diff_files.pop();
+                }
+                d.review.view = Some((line(10), line(50)));
+                d.diff
+                    .update(cx, |state, cx| state.set_files(d.diff_files.clone(), cx));
+                assert!(!d.diff_rows(cx).iter().any(|r| r.spot == line(10)));
+                assert!(d.restore_view(cx));
+                assert_eq!(d.review.view, Some((line(10), line(50))));
+                assert_eq!(d.diff.read(cx).selected_lines().unwrap().start(), 50);
+            }
 
             let mut comment =
                 Comment::from_range(&DiffLineRange::new("api/f", DiffSide::Modified, 10, 10));
