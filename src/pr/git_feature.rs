@@ -1,4 +1,5 @@
 //! PR conversations addressed by immutable repository/number, never a mutable branch name.
+use super::Target;
 use serde::Deserialize;
 use serde_json::Value;
 use std::{
@@ -6,53 +7,6 @@ use std::{
     path::Path,
     time::{Duration, Instant},
 };
-
-#[derive(Clone, Debug, Eq, PartialEq, Hash)]
-pub struct Target {
-    pub host: String,
-    pub owner: String,
-    pub repo: String,
-    pub number: u64,
-}
-
-impl Target {
-    pub fn from_url(url: &str) -> Result<Self, String> {
-        let parts: Vec<_> = url
-            .strip_prefix("https://")
-            .unwrap_or("")
-            .trim_end_matches('/')
-            .split('/')
-            .collect();
-        let valid = |s: &str| {
-            !s.is_empty()
-                && s != "."
-                && s != ".."
-                && s.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
-        };
-        if parts.len() != 5 || parts[3] != "pull" || !parts[..3].iter().all(|s| valid(s)) {
-            return Err("Invalid GitHub pull request URL".into());
-        }
-        let number = parts[4]
-            .parse::<u64>()
-            .ok()
-            .filter(|n| *n > 0)
-            .ok_or("Invalid pull request number")?;
-        Ok(Self {
-            host: parts[0].to_ascii_lowercase(),
-            owner: parts[1].into(),
-            repo: parts[2].into(),
-            number,
-        })
-    }
-
-    pub fn url(&self) -> String {
-        format!(
-            "https://{}/{}/{}/pull/{}",
-            self.host, self.owner, self.repo, self.number
-        )
-    }
-}
 
 #[derive(Clone, Debug)]
 pub struct Comment {
@@ -234,9 +188,9 @@ pub fn discover(wt: &Path, branch: &str) -> Result<Option<Target>, String> {
     if let Some(url) = crate::git::review_pr_url(wt, branch) {
         return Target::from_url(&url).map(Some);
     }
-    crate::sync::origin_repo(wt).ok_or("Origin is not a GitHub repository")?;
-    let prs = crate::sync::branch_prs(wt, branch, "url,state,isCrossRepository,updatedAt", 30)?;
-    crate::sync::pick_pr(&prs.iter().collect::<Vec<_>>())
+    super::origin_repo(wt).ok_or("Origin is not a GitHub repository")?;
+    let prs = super::branch_prs(wt, branch, "url,state,isCrossRepository,updatedAt", 30)?;
+    super::pick_pr(&prs.iter().collect::<Vec<_>>())
         .map(|p| Target::from_url(string(p, "url")?))
         .transpose()
 }

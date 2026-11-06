@@ -1,5 +1,10 @@
-//! Markdown and link handling for chat text.
+//! Shared Markdown presentation and workspace-relative links.
 use super::*;
+use crate::state::Workspace;
+use gpui_kit::component::ActiveTheme as _;
+use gpui_kit::component::clipboard::Clipboard;
+use gpui_kit::component::text::{TextView, TextViewState, TextViewStyle};
+use std::path::PathBuf;
 
 /// A copy button whose icon turns into a check for 2s. Until `group` is hovered it is
 /// invisible but laid out, so showing it never moves anything.

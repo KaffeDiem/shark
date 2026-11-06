@@ -1125,7 +1125,7 @@ fn per_repo_branch_edges() {
     );
     // A repo added later gets the workspace branch, and CLAUDE.md now tells them apart.
     let cli = init_repo(&root, "cli");
-    sws = add_to_workspace(&sws, &s, &cli).unwrap();
+    sws = add_to_workspace(&sws, &s, &cli, &sws.branch, None).unwrap();
     assert_eq!(
         git(&s.join("cli"), &["branch", "--show-current"]).unwrap(),
         "s"
@@ -1249,7 +1249,7 @@ fn branch_reuse_add_repo_and_blockers() {
     remove_workspace(&uws, &u, true).unwrap();
 
     // A third repo joins on the same branch; CLAUDE.md lists it.
-    let ws = add_to_workspace(&ws, &dir, &repos[1]).unwrap();
+    let ws = add_to_workspace(&ws, &dir, &repos[1], &ws.branch, None).unwrap();
     assert_eq!(
         git(&dir.join("web"), &["branch", "--show-current"]).unwrap(),
         "remote-only"
@@ -1260,7 +1260,7 @@ fn branch_reuse_add_repo_and_blockers() {
             .contains("@web/CLAUDE.md")
     );
     assert!(
-        add_to_workspace(&ws, &dir, &repos[1]).is_err(),
+        add_to_workspace(&ws, &dir, &repos[1], &ws.branch, None).is_err(),
         "already in it"
     );
 
@@ -1488,4 +1488,204 @@ fn git_bytes_keeps_whitespace_and_git_trims() {
             .starts_with("git rev-parse nope")
     );
     fs::remove_dir_all(&dir).ok();
+}
+
+/// An empty agent gets its directory and docs; an existing path is left alone.
+#[test]
+fn empty_workspace_says_no_repositories_are_attached() {
+    let root = std::env::temp_dir().join(format!("shark-empty-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let dir = root.join("agent-1");
+    let ws = create_empty_workspace(&dir, "agent-1", "Plan it").unwrap();
+    assert_eq!(
+        (ws.branch.as_str(), ws.title.as_str()),
+        ("agent-1", "Plan it")
+    );
+    assert!(ws.repos.is_empty() && ws.chats[0].plan);
+    assert_eq!(ws.chats[0].id, "agent-1");
+    for doc in ROOT_DOCS {
+        let text = fs::read_to_string(dir.join(doc)).unwrap();
+        assert!(text.contains("No repositories are attached"), "{text}");
+        assert!(!text.contains("worktree"), "{text}");
+    }
+    fs::write(dir.join("keep"), "x").unwrap();
+    assert!(create_empty_workspace(&dir, "agent-1", "").is_err());
+    assert_eq!(fs::read_to_string(dir.join("keep")).unwrap(), "x");
+    // Nothing of a repo to clean up, and no worktree stops it.
+    fs::remove_file(dir.join("keep")).unwrap();
+    remove_workspace(&ws, &dir, false).unwrap();
+    assert!(!dir.exists());
+    fs::remove_dir_all(&root).unwrap();
+}
+
+fn tmp(tag: &str) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("shark-{tag}-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    root
+}
+
+fn empty_agent(root: &Path, name: &str) -> (Workspace, PathBuf) {
+    let dir = root.join("ws").join(name);
+    (create_empty_workspace(&dir, name, name).unwrap(), dir)
+}
+
+/// The fresh path takes the branch and base it's given, and the first repo's branch becomes the
+/// agent's; a later repo on another records it as its own.
+#[test]
+fn fresh_attach_takes_branch_and_base() {
+    let root = tmp("fresh-attach");
+    let (api, web) = (init_repo(&root, "api"), init_repo(&root, "web"));
+    let (ws, dir) = empty_agent(&root, "agent-1");
+    git(&web.path, &["branch", "develop"]).unwrap();
+    let ws = add_to_workspace(&ws, &dir, &api, "login-1", Some("")).unwrap();
+    assert_eq!(ws.branch, "login-1");
+    assert_eq!(ws.repos[0].branch, None);
+    assert_eq!(ws.repos[0].base, "main");
+    let ws = add_to_workspace(&ws, &dir, &web, "mine", Some("develop")).unwrap();
+    assert_eq!(ws.branch, "login-1");
+    assert_eq!(ws.repos[1].branch.as_deref(), Some("mine"));
+    assert_eq!(ws.repos[1].base, "develop");
+    assert_eq!(
+        git(&dir.join("web"), &["branch", "--show-current"]).unwrap(),
+        "mine"
+    );
+    let _ = fs::remove_dir_all(root);
+}
+
+/// Before anything is made, the fresh path refuses a branch that exists locally, one only origin
+/// has, one checked out, a missing base and a bad name; the explicit path still takes an existing
+/// branch.
+#[test]
+fn fresh_attach_refuses_existing_branches() {
+    let root = tmp("fresh-refuse");
+    let api = init_repo(&root, "api");
+    let origin = root.join("origin.git");
+    git(&root, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
+    git(
+        &api.path,
+        &["remote", "add", "origin", &origin.to_string_lossy()],
+    )
+    .unwrap();
+    git(
+        &api.path,
+        &["push", "-q", "origin", "main:main", "main:remote-only"],
+    )
+    .unwrap();
+    git(&api.path, &["branch", "local-only"]).unwrap();
+    // Fetch may also create origin/HEAD; snapshot refs after the fixture is refreshed.
+    git(&api.path, &["fetch", "--quiet", "--prune", "origin"]).unwrap();
+    let (ws, dir) = empty_agent(&root, "agent-1");
+    let refs = |p: &Path| git(p, &["for-each-ref", "--format=%(refname)"]).unwrap();
+    let before = refs(&api.path);
+    for (branch, base) in [
+        ("local-only", ""),
+        ("remote-only", ""),
+        ("main", ""),
+        ("new", "no-such-base"),
+        ("bad..name", ""),
+    ] {
+        let e = add_to_workspace(&ws, &dir, &api, branch, Some(base)).err();
+        assert!(e.is_some(), "{branch} {base}");
+        assert!(!dir.join("api").exists(), "{branch} {base}");
+        assert_eq!(refs(&api.path), before, "{branch} {base}");
+    }
+    let e = add_to_workspace(&ws, &dir, &api, "remote-only", Some(""))
+        .err()
+        .unwrap();
+    assert!(e.message.contains("already exists"), "{e:?}");
+    let ws = add_to_workspace(&ws, &dir, &api, "remote-only", None).unwrap();
+    assert_eq!(ws.branch, "remote-only", "the explicit path keeps working");
+    let _ = fs::remove_dir_all(root);
+}
+
+/// A failure after the worktree exists undoes what the operation made and nothing else: another
+/// repo's worktree with its work, and a branch it didn't make, stay.
+#[test]
+fn fresh_attach_rolls_back_only_what_it_made() {
+    let root = tmp("fresh-rollback");
+    let (api, web) = (init_repo(&root, "api"), init_repo(&root, "web"));
+    let (ws, dir) = empty_agent(&root, "agent-1");
+    let ws = add_to_workspace(&ws, &dir, &api, "b", Some("")).unwrap();
+    fs::write(dir.join("api/work.txt"), "unsaved").unwrap();
+    git(&web.path, &["branch", "theirs"]).unwrap();
+    // The root docs can't be written.
+    fs::remove_file(dir.join("AGENTS.md")).unwrap();
+    fs::create_dir(dir.join("AGENTS.md")).unwrap();
+    let e = add_to_workspace(&ws, &dir, &web, "b", Some(""))
+        .err()
+        .unwrap();
+    assert!(!e.message.is_empty() && !e.preserved);
+    assert!(!dir.join("web").exists(), "its worktree went");
+    assert!(!has_ref(&web.path, "refs/heads/b"), "its branch went");
+    assert!(has_ref(&web.path, "refs/heads/theirs"));
+    assert_eq!(
+        fs::read_to_string(dir.join("api/work.txt")).unwrap(),
+        "unsaved"
+    );
+    assert!(has_ref(&api.path, "refs/heads/b"));
+    let _ = fs::remove_dir_all(root);
+}
+
+/// What an interrupted attachment left, told apart: nothing, a worktree on its branch, or
+/// something that may be someone else's. An existing branch it never owned is no trace.
+#[cfg(feature = "test-support")]
+#[test]
+fn find_attachment_tells_states_apart() {
+    let _turn = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let root = tmp("find-attachment");
+    let api = init_repo(&root, "api");
+    let name = format!("find-{}", std::process::id());
+    let dir = crate::state::workspaces_dir().join(&name);
+    let _ = fs::remove_dir_all(&dir);
+    let ws = create_empty_workspace(&dir, &name, &name).unwrap();
+    let a = Attachment::fresh(&api, "feat", "");
+    assert!(matches!(find_attachment(&ws, &a), Found::Nothing));
+
+    git(&api.path, &["branch", "feat"]).unwrap();
+    assert!(
+        matches!(find_attachment(&ws, &a), Found::Unclear(_)),
+        "ours?"
+    );
+    let picked = Attachment {
+        fresh: false,
+        ..a.clone()
+    };
+    assert!(matches!(find_attachment(&ws, &picked), Found::Nothing));
+    git(&api.path, &["branch", "-D", "feat"]).unwrap();
+
+    fs::create_dir(dir.join("api")).unwrap();
+    assert!(matches!(find_attachment(&ws, &a), Found::Unclear(_)));
+    fs::remove_dir(dir.join("api")).unwrap();
+
+    // On its branch but not whole: the included files or the checkout may be missing, as a `git
+    // worktree add` killed mid-checkout leaves it, locked `initializing`.
+    let wt = dir.join("api").to_string_lossy().into_owned();
+    git(&api.path, &["worktree", "add", "-q", "-b", "feat", &wt]).unwrap();
+    assert!(matches!(find_attachment(&ws, &a), Found::Unclear(_)));
+    let lock = ["worktree", "lock", "--reason", "initializing", &wt];
+    git(&api.path, &lock).unwrap();
+    assert!(matches!(find_attachment(&ws, &a), Found::Unclear(_)));
+    git(&api.path, &["worktree", "unlock", &wt]).unwrap();
+    git(&api.path, &["worktree", "remove", &wt]).unwrap();
+    git(&api.path, &["branch", "-D", "feat"]).unwrap();
+
+    add_to_workspace(&ws, &dir, &api, "feat", Some("")).unwrap();
+    // The default was main when creation finished; recovery must not take the source's new HEAD.
+    git(&api.path, &["checkout", "-q", "-b", "source-moved"]).unwrap();
+    let Found::Worktree(found) = find_attachment(&ws, &a) else {
+        panic!("the finished worktree");
+    };
+    assert_eq!((found.name.as_str(), found.base.as_str()), ("api", "main"));
+    let other = Attachment::fresh(&api, "other", "");
+    assert!(matches!(find_attachment(&ws, &other), Found::Unclear(_)));
+    // Git keeps the source's registration even if the directory now contains another repository.
+    let foreign = init_repo(&root, "foreign");
+    git(&foreign.path, &["branch", "-m", "feat"]).unwrap();
+    fs::remove_file(dir.join("api/.git")).unwrap();
+    fs::rename(foreign.path.join(".git"), dir.join("api/.git")).unwrap();
+    assert!(matches!(find_attachment(&ws, &a), Found::Unclear(_)));
+    let _ = fs::remove_dir_all(dir);
+    let _ = fs::remove_dir_all(root);
 }

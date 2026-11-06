@@ -3,82 +3,6 @@ use super::*;
 use crate::apps::{self, Kind, OpenApp};
 use crate::ui::app_icon;
 
-/// The cmd-k bar look: a bare 640px dialog near the top, on the menus' `popover` surface with
-/// their 4px inset, holding a borderless `Command`.
-pub(super) fn menu_dialog(d: Dialog, cx: &App) -> Dialog {
-    crate::ui::dialog(d)
-        .w(px(640.))
-        .p(px(4.))
-        .bg(cx.theme().popover)
-        .margin_top(px(96.))
-        .close_button(false)
-}
-
-/// Opens a cmd-k style menu over `target`; `on_pick` gets the confirmed row.
-pub(crate) fn open_menu<T: 'static>(
-    target: WeakEntity<T>,
-    placeholder: &'static str,
-    items: Vec<CommandItem>,
-    selected: usize,
-    on_pick: impl Fn(&mut T, usize, &mut Window, &mut Context<T>) + 'static,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let groups = vec![(None, items)];
-    open_grouped(target, placeholder, groups, selected, on_pick, window, cx)
-}
-
-/// [`open_menu`] with headed groups; `selected` and the picked row count down through all
-/// the groups, as if they were one list.
-pub(crate) fn open_grouped<T: 'static>(
-    target: WeakEntity<T>,
-    placeholder: &'static str,
-    groups: Vec<(Option<&'static str>, Vec<CommandItem>)>,
-    selected: usize,
-    on_pick: impl Fn(&mut T, usize, &mut Window, &mut Context<T>) + 'static,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let starts: Rc<Vec<usize>> = Rc::new(
-        (groups.iter())
-            .scan(0, |n, (_, items)| {
-                *n += items.len();
-                Some(*n - items.len())
-            })
-            .collect(),
-    );
-    let command = move |state: &Entity<CommandState>| {
-        groups.iter().fold(
-            Command::new(state).bordered(false).placeholder(placeholder),
-            |c, (heading, items)| {
-                let g = CommandGroup::new().items(items.clone());
-                c.group(match heading {
-                    Some(h) => g.label(*h),
-                    None => g,
-                })
-            },
-        )
-    };
-    let palette = cx.new(|cx| CommandState::new(window, cx));
-    // The menu only learns its items when it renders; install them now so the
-    // highlight can start on `selected`. The dialog's renders keep it.
-    RenderOnce::render(command(&palette), window, cx);
-    let section = starts.iter().rposition(|&s| s <= selected).unwrap_or(0);
-    let at = IndexPath::new(selected - starts[section]).section(section);
-    palette.update(cx, |p, cx| p.set_selected_index(Some(at), window, cx));
-    let on_pick = Rc::new(on_pick);
-    let state = palette.clone();
-    window.open_dialog(cx, move |d, _, cx| {
-        let (target, on_pick, starts) = (target.clone(), on_pick.clone(), starts.clone());
-        menu_dialog(d, cx).child(command(&state).on_confirm(move |ix, window, cx| {
-            window.close_dialog(cx);
-            let row = starts[ix.section] + ix.row;
-            target.update(cx, |s, cx| on_pick(s, row, window, cx)).ok();
-        }))
-    });
-    palette.update(cx, |p, cx| p.focus(window, cx));
-}
-
 type Cmd = fn(&mut Shark, &mut Window, &mut Context<Shark>);
 
 /// A palette row: label, icon, the action whose shortcut it shows, extra search words, and
@@ -115,29 +39,70 @@ impl Row {
 /// Grouped the way people reach for them; `GROUPS` names each group by its first row.
 pub(super) const COMMANDS: &[Row] = &[
     Row::key(
-        "New workspace…",
+        "New agent",
         IconName::Plus,
         &NewWorkspace,
-        "create branch",
+        "create start chat",
     ),
     Row::key(
-        "Open workspace…",
+        "New agent from branch or PR…",
+        IconName::GitBranch,
+        &NewWorkspaceFromBranch,
+        "create branch checkout pull request worktree repo review",
+    ),
+    Row::key(
+        "Open agent…",
         IconName::Search,
         &OpenWorkspacePicker,
         "switch recent repository",
     ),
     Row::key(
-        "Open next workspace needing attention",
+        "Open next agent needing attention",
         IconName::CircleAlert,
         &NextAttention,
         "jump waiting",
     ),
     Row::key("Add repo…", IconName::FolderPlus, &AddRepo, "folder git"),
     Row::key(
-        "Add repo to workspace…",
+        "Attach repository…",
         IconName::FolderPlus,
         &AddRepoToWorkspace,
-        "",
+        "add repo folder git",
+    ),
+    Row(
+        "Start from Linear issue…",
+        IconName::Plus,
+        None,
+        "new agent create ticket plan",
+        Some(|s, w, cx| s.start_from_issue(w, cx)),
+    ),
+    Row(
+        "Attach Linear issue…",
+        IconName::Link,
+        None,
+        "add ticket context",
+        Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.attach_linear_issue(ws.name, w, cx))),
+    ),
+    Row(
+        "Show Linear issue…",
+        IconName::Tag,
+        None,
+        "ticket details refresh primary remove snapshot",
+        Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.pick_issue(ws.name, w, cx))),
+    ),
+    Row(
+        "Show attachments",
+        IconName::Paperclip,
+        None,
+        "list repositories repos issues chips more overflow",
+        Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.attachment_list(ws.name, 0, w, cx))),
+    ),
+    Row(
+        "Rename agent…",
+        IconName::Pencil,
+        None,
+        "title",
+        Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.rename_agent(ws.name, w, cx))),
     ),
     Row::key(
         "Run or stop run scripts",
@@ -153,24 +118,24 @@ pub(super) const COMMANDS: &[Row] = &[
         Some(|s, w, cx| s.show_script_log(w, cx)),
     ),
     Row::key(
-        "Archive workspace",
+        "Delete agent",
         IconName::Archive,
         &ArchiveWorkspace,
-        "remove close",
+        "remove close archive",
     ),
     Row::key(
-        "Force archive workspace…",
+        "Force delete agent…",
         IconName::ArchiveX,
         &ForceArchiveWorkspace,
-        "discard changes delete",
+        "discard changes remove archive",
     ),
     Row::key(
         "Reveal in Finder",
         IconName::FolderOpen,
         &RevealInFinder,
-        "workspace folder",
+        "agent folder",
     ),
-    Row::key("Copy workspace path", IconName::Copy, &CopyPath, "folder"),
+    Row::key("Copy agent path", IconName::Copy, &CopyPath, "folder"),
     Row::key("Copy branch name", IconName::GitBranch, &CopyBranch, ""),
     Row::key("Show chat", IconName::MessageSquare, &ShowChat, "tab"),
     Row::key("New chat", IconName::Plus, &NewChat, "tab"),
@@ -522,14 +487,14 @@ pub(super) const COMMANDS: &[Row] = &[
         Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.change_base(ws.name, w, cx))),
     ),
     Row(
-        "New workspace on top…",
+        "New agent on top…",
         IconName::Layers,
         None,
         "stack stacked branch from child pr",
         Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.stack_from(ws.name, false, w, cx))),
     ),
     Row(
-        "Insert workspace below…",
+        "Insert agent below…",
         IconName::ListPlus,
         None,
         "stack stacked between parent in-between pr",
@@ -599,7 +564,7 @@ pub(super) const COMMANDS: &[Row] = &[
     ),
     Row::key("New section", IconName::FolderPlus, &NewSection, "group"),
     Row::key(
-        "Move workspace to section…",
+        "Move agent to section…",
         IconName::FolderInput,
         &MoveToSection,
         "group",
@@ -622,7 +587,7 @@ pub(super) const COMMANDS: &[Row] = &[
         "Delete section",
         IconName::Trash,
         &DeleteSection,
-        "group remove workspaces stay",
+        "group remove agents stay",
     ),
     Row(
         "Go to Home",
@@ -757,15 +722,26 @@ pub(super) const COMMANDS: &[Row] = &[
     ),
 ];
 
-/// Rows that act on a workspace; left out while there's none to act on.
+/// Rows that act on an agent; left out while there's none to act on.
 const NEED_WORKSPACE: &[&str] = &[
     "Show Git",
-    "Add repo to workspace…",
+    "Attach repository…",
+    "Attach Linear issue…",
+    "Show Linear issue…",
+    "Show attachments",
+    "Rename agent…",
     "Run or stop run scripts",
     "Show script output",
-    "Archive workspace",
-    "Force archive workspace…",
+    "Delete agent",
+    "Force delete agent…",
     "Reveal in Finder",
+];
+
+/// Rows about Linear; left out while nobody uses it (`linear_in_use`).
+const NEED_LINEAR: &[&str] = &[
+    "Start from Linear issue…",
+    "Attach Linear issue…",
+    "Show Linear issue…",
 ];
 
 /// Rows that only a Claude chat can do; a Codex chat's palette leaves them out.
@@ -774,7 +750,7 @@ const CODEX_ONLY: &[&str] = &["Toggle fast mode", "Thinking: Ultra"];
 
 /// The palette's headings, each with the label of the row it starts at.
 const GROUPS: &[(&str, &str)] = &[
-    ("Workspace", "New workspace…"),
+    ("Agent", "New agent"),
     ("Chat", "Show chat"),
     ("Plan", "Toggle plan mode"),
     ("Files and diff", "Open file…"),
@@ -802,7 +778,7 @@ fn shortcut(action: &dyn Action, window: &Window) -> Option<Keystroke> {
 }
 
 /// Each command with a shortcut from where `window` is focused, as (label, keystroke) like
-/// ("New workspace…", "cmd-n"): the live keymap for Home and Ask Shark.
+/// ("New agent", "cmd-n"): the live keymap for Home and Ask Shark.
 pub(crate) fn keymap_summary(window: &Window) -> Vec<(String, String)> {
     (COMMANDS.iter())
         .filter_map(|Row(label, _, action, ..)| {
@@ -902,7 +878,7 @@ impl Shark {
             _ => (IconName::FolderGit2, "Open which repo?", "No repo"),
         };
         match &targets[..] {
-            [] => notify_err(window, cx, format!("{none} in {}", ws.name)),
+            [] => notify_err(window, cx, format!("{none} in {}", ws.display_title())),
             [(_, path)] => self.launch_app(app, path),
             _ => {
                 let items = (targets.iter())
@@ -929,12 +905,14 @@ impl Shark {
         let target = self.target(window);
         let no_target = target.is_none();
         let mut apps = available_apps(target.as_ref());
+        let no_linear = !self.linear_in_use();
         for (ix, Row(label, icon, action, words, _)) in COMMANDS.iter().enumerate() {
             if let Some((heading, _)) = GROUPS.iter().find(|(_, first)| first == label) {
                 groups.push((Some(heading), vec![]));
             }
             if (if codex { CLAUDE_ONLY } else { CODEX_ONLY }).contains(label)
                 || (no_target && NEED_WORKSPACE.contains(label))
+                || (no_linear && NEED_LINEAR.contains(label))
                 || (*label == "Show or hide diff files"
                     && (self.tab != Tab::Feature(Feature::Diff) || self.home_shown()))
             {
@@ -948,7 +926,7 @@ impl Shark {
             if *label == "Reveal in Finder" {
                 for app in apps.drain(..) {
                     rows.push(Pick::App(app));
-                    group.push(app_item(app).keywords(["app", "open", "workspace"]));
+                    group.push(app_item(app).keywords(["app", "open", "agent"]));
                 }
             }
         }
@@ -956,14 +934,16 @@ impl Shark {
             let key = (shown.iter().position(|&s| s == ix))
                 .filter(|&n| n < 9)
                 .and_then(|n| shortcut(&OpenWorkspace(n), window));
-            let name = &self.state.workspaces[ix].name;
-            row_item(format!("Open {name}"), IconName::GitBranch, key).keywords([
-                "go",
-                "switch",
-                "workspace",
+            let ws = &self.state.workspaces[ix];
+            let open = format!("Open {}", ws.display_title());
+            row_item(open, IconName::GitBranch, key).keywords([
+                "go".to_string(),
+                "switch".to_string(),
+                "agent".to_string(),
+                ws.name.clone(),
             ])
         });
-        groups.push((Some("Open workspace"), workspaces.collect()));
+        groups.push((Some("Open agent"), workspaces.collect()));
         open_grouped(
             cx.entity().downgrade(),
             "Type a command or search…",
@@ -995,7 +975,8 @@ mod tests {
                 "{heading}: no row {first}"
             );
         }
-        for label in CLAUDE_ONLY.iter().chain(CODEX_ONLY).chain(NEED_WORKSPACE) {
+        let gated = [CLAUDE_ONLY, CODEX_ONLY, NEED_WORKSPACE, NEED_LINEAR];
+        for label in gated.into_iter().flatten() {
             assert!(COMMANDS.iter().any(|r| r.0 == *label), "no row {label}");
         }
     }
@@ -1011,7 +992,7 @@ mod tests {
             })
             .collect();
         let models: Vec<_> = (MODELS.iter().enumerate())
-            .map(|(i, m)| (crate::chat::model_label(m), i))
+            .map(|(i, m)| (crate::models::model_label(m), i))
             .collect();
         assert_eq!(
             rows.iter()

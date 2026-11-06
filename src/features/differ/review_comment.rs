@@ -351,7 +351,7 @@ pub(crate) fn posted_as(url: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::chat::parse_reports;
+    use crate::review_protocol::parse_reports;
 
     #[::core::prelude::v1::test]
     fn prompt_lists_places_ids_and_suggestions() {

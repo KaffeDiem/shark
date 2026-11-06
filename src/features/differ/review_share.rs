@@ -73,9 +73,10 @@ fn post(
     mut inline: Option<(Anchor, String)>,
     fallback: String,
 ) -> Result<String, String> {
+    let target = pr.target()?;
     let mut head = pr.head.clone();
     if let Some((anchor, _)) = inline.as_ref().filter(|(a, _)| a.left) {
-        let verified = crate::pr::verify_original_anchor(wt, pr.number, revision, anchor);
+        let verified = crate::pr::verify_original_anchor(wt, &target, revision, anchor);
         if let Some((captured, _)) = &verified {
             head = captured.clone();
         }
@@ -85,8 +86,8 @@ fn post(
     }
     let inline = inline.as_ref().map(|(a, t)| (a, t.as_str()));
     match review {
-        true => crate::pr::publish_review(wt, pr.number, &head, &body, inline),
-        false => crate::pr::publish_note(wt, pr.number, &body),
+        true => crate::pr::publish_review(wt, &target, &head, &body, inline),
+        false => crate::pr::publish_note(wt, &target, &body),
     }
 }
 

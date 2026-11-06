@@ -257,6 +257,15 @@ print(json.dumps({'data':{'repository':{'pullRequest':json.loads((p/'pr.json').r
             ],
         )
         .unwrap();
+        crate::git::git(
+            &f.root,
+            &[
+                "config",
+                "remote.upstream.url",
+                "git@github.com:upstream/repo.git",
+            ],
+        )
+        .unwrap();
         f.write("list.json", &json!([]));
         assert_eq!(discover(&f.root, "feature").unwrap(), None);
         f.write("list.json", &json!([

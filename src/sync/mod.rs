@@ -8,16 +8,14 @@ mod status;
 pub use run::check_in_background;
 #[cfg(test)]
 pub(crate) use status::parse_prs;
-pub use status::{
-    Kind, Pr, PrState, Repo, ago, branch_prs, github_url, origin_repo, pick_pr, short,
-};
+pub use status::{Kind, Pr, PrState, Repo, ago};
 
-use crate::app::menus::{each_or_all, pr_entry};
-use crate::app::open_menu;
 use crate::chat::Chat;
+use crate::menu::each_or_all;
 use crate::menu::{self, Entry};
 use crate::pr;
 use crate::state::Workspace;
+use crate::ui::open_menu;
 use crate::ui::{inter_features, notify_err};
 use gpui_kit::assets::IconName;
 use gpui_kit::base::async_util::{Receiver, Sender, unbounded};
@@ -412,16 +410,41 @@ impl GitSync {
         cx.notify();
     }
 
-    /// Why a step can't start now: one is running, or (`idle`) the agent is.
+    /// Why a step can't start now: one is running, a repository is attaching, or (`idle`) the
+    /// agent is.
     pub fn blocked(&self, idle: bool, cx: &App) -> Option<String> {
         if let Some(r) = &self.running {
             return Some(format!("Still running: {r}"));
+        }
+        if !self.ws.attaching.is_empty() {
+            return Some("Wait for the repository attachment to finish".into());
         }
         (idle && self.busy(cx)).then(|| "Agent is running; wait for it or stop it (ctrl-c)".into())
     }
 
     fn busy(&self, cx: &App) -> bool {
         self.chats.iter().any(|c| c.read(cx).working())
+    }
+
+    /// Plays a git step starting or ending, as `exec` does around one.
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn play_step(&mut self, step: Option<&str>, cx: &mut Context<Self>) {
+        self.running = step.map(String::from);
+        self.set_hold(step.is_some(), cx);
+        for c in self.chats.clone() {
+            c.update(cx, |c, cx| c.drain(cx));
+        }
+        cx.notify();
+    }
+
+    /// A git step is running in these worktrees.
+    pub fn running(&self) -> bool {
+        self.running.is_some()
+    }
+
+    /// The attachment operation moved on; unlike `set_workspace`, no repo changed.
+    pub fn set_attaching(&mut self, attaching: Vec<crate::state::Attachment>) {
+        self.ws.attaching = attaching;
     }
 
     fn set_hold(&self, hold: bool, cx: &mut App) {
@@ -521,6 +544,23 @@ impl GitSync {
         self.action = Some(next_action(&self.repos, &self.reviewed));
     }
 
+    /// "Open pull request" for each repo with one, or `None` before any PR.
+    pub(crate) fn pr_entry(&self) -> Option<Entry> {
+        let prs = self
+            .pr_urls()
+            .into_iter()
+            .map(|(repo, url)| (repo, String::new(), url))
+            .collect();
+        each_or_all(
+            IconName::GitPullRequest,
+            "Open pull request",
+            prs,
+            |urls, _, cx| {
+                urls.iter().for_each(|url| cx.open_url(url));
+            },
+        )
+    }
+
     /// `(repo, PR URL)` per repo with a PR.
     pub fn pr_urls(&self) -> Vec<(String, String)> {
         self.repos
@@ -601,7 +641,7 @@ impl GitSync {
                 return notify_err(window, cx, "Open a chat to queue this step");
             };
             if !chat.update(cx, |c, cx| c.enqueue(prompt, a.reviews, cx)) {
-                return notify_err(window, cx, "This workspace is being archived");
+                return notify_err(window, cx, "This agent is being deleted");
             }
             return;
         }
@@ -1031,7 +1071,7 @@ impl GitSync {
                     "Create draft PRs",
                     every,
                 ),
-                pr_entry(self),
+                self.pr_entry(),
                 kind(
                     IconName::GitMerge,
                     Kind::Merge,

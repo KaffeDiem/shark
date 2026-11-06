@@ -188,7 +188,7 @@ impl Commits {
                     let list = history::commits(&repo.wt, &repo.base)?;
                     let web = crate::git::git(&repo.wt, &["config", "--get", "remote.origin.url"])
                         .ok()
-                        .and_then(|u| crate::sync::github_url(&u));
+                        .and_then(|u| crate::pr::github_url(&u));
                     Ok::<_, String>((list, web))
                 })
                 .await;

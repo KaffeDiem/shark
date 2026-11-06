@@ -1,4 +1,5 @@
-use crate::state::{Repo, Workspace, WsRepo};
+use crate::proc::{finish, finish_bytes};
+use crate::state::{Attachment, Repo, Workspace, WsRepo};
 mod changes;
 mod copy;
 pub mod history;
@@ -21,22 +22,6 @@ pub fn run(dir: &Path, prog: &str, args: &[&str]) -> Result<Output, String> {
         .args(args)
         .output()
         .map_err(|e| crate::proc::spawn_err(dir, prog, e))
-}
-
-pub(crate) fn finish(prog: &str, args: &[&str], out: Output) -> Result<String, String> {
-    finish_bytes(prog, args, out).map(|b| String::from_utf8_lossy(&b).trim().to_string())
-}
-
-fn finish_bytes(prog: &str, args: &[&str], out: Output) -> Result<Vec<u8>, String> {
-    if out.status.success() {
-        Ok(out.stdout)
-    } else {
-        Err(format!(
-            "{prog} {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
-    }
 }
 
 /// Like `git`, for any `prog` making network calls: never prompts for credentials, and is killed
@@ -253,32 +238,159 @@ pub fn create_workspace_with_prs(
     result
 }
 
+/// An agent with no repositories yet: its directory, root docs and first chat, in Plan mode.
+/// Nothing is left behind on failure.
+pub fn create_empty_workspace(dir: &Path, name: &str, title: &str) -> Result<Workspace, String> {
+    fs::create_dir_all(dir.parent().ok_or("Workspace has no parent")?)
+        .map_err(|e| e.to_string())?;
+    fs::create_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
+    let mut ws = Workspace {
+        name: name.into(),
+        title: title.into(),
+        branch: name.into(),
+        ..Default::default()
+    };
+    ws.migrate();
+    ws.chats[0].plan = true;
+    if let Err(e) = write_root_docs(&ws, dir) {
+        let _ = fs::remove_dir_all(dir);
+        return Err(e);
+    }
+    Ok(ws)
+}
+
 /// Every repo on `branch`, for `create_workspace`.
 #[cfg(test)]
 pub fn on_branch(repos: &[Repo], branch: &str) -> Vec<(Repo, String)> {
     repos.iter().map(|r| (r.clone(), branch.into())).collect()
 }
 
-/// Adds one more repo to an existing workspace on its branch and rewrites the root CLAUDE.md.
+/// A refused attachment can leave owned resources that rollback could not safely delete.
+#[derive(Debug)]
+pub struct AttachError {
+    pub message: String,
+    pub preserved: bool,
+}
+
+impl From<String> for AttachError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            preserved: false,
+        }
+    }
+}
+
+/// Adds one more repo to an existing workspace on `branch` and rewrites the root CLAUDE.md; the
+/// first repo's branch becomes the workspace's. With `fresh`, the base (empty: the repo's default)
+/// of a branch that must be new; without, an existing branch is used as `plan_worktree` does.
 /// Blocking: it fetches.
-pub fn add_to_workspace(ws: &Workspace, dir: &Path, r: &Repo) -> Result<Workspace, String> {
+pub fn add_to_workspace(
+    ws: &Workspace,
+    dir: &Path,
+    r: &Repo,
+    branch: &str,
+    fresh: Option<&str>,
+) -> Result<Workspace, AttachError> {
     if ws.repos.iter().any(|w| w.name == r.name) {
-        return Err(format!("{} is already in {}", r.name, ws.name));
+        return Err(format!("{} is already in {}", r.name, ws.display_title()).into());
     }
     if dir.join(&r.name).exists() {
-        return Err(format!("{} already exists", dir.join(&r.name).display()));
+        return Err(format!("{} already exists", dir.join(&r.name).display()).into());
     }
-    let plan = plan_worktree(&ws.branch, r, None)?;
+    let plan = match fresh {
+        Some(base) => plan_fresh(branch, r, base)?,
+        None => plan_worktree(branch, r, None)?,
+    };
+    let before = ws;
     let mut ws = ws.clone();
+    if ws.repos.is_empty() {
+        ws.branch = branch.into();
+    }
     let mut owned = OwnedWorktree::default();
-    let added = add_worktree(dir, &ws.branch, r, &plan, &mut owned).and_then(|wr| {
-        ws.repos.push(wr);
+    let added = add_worktree(dir, branch, r, &plan, &mut owned).and_then(|wr| {
+        ws.repos.push(WsRepo {
+            branch: (branch != ws.branch).then(|| branch.into()),
+            ..wr
+        });
         write_root_docs(&ws, dir)
     });
     if let Err(e) = added {
-        return Err(rollback_error(e, undo_worktree(dir, &ws.branch, r, &owned)));
+        let _ = write_root_docs(before, dir); // one of the two may have gone out
+        let remaining = undo_worktree(dir, branch, r, &owned);
+        return Err(AttachError {
+            preserved: !remaining.is_empty(),
+            message: rollback_error(e, remaining),
+        });
     }
     Ok(ws)
+}
+
+/// What an interrupted attachment left behind.
+pub enum Found {
+    Nothing,
+    /// The worktree, on its branch: the work finished.
+    Worktree(WsRepo),
+    /// Something that can't be told from someone else's; says what.
+    Unclear(String),
+}
+
+/// Looks at `a`'s source repo, branch and path. Reads only.
+pub fn find_attachment(ws: &Workspace, a: &Attachment) -> Found {
+    let wt = ws.dir().join(&a.repo);
+    let Ok(wts) = worktree_list(&a.src) else {
+        return Found::Unclear(format!("{} can't be read", a.src.display()));
+    };
+    // The root docs list it only once it is whole: a `git worktree add` killed mid-checkout, or a
+    // crash before the included files were copied, looks like a worktree on its branch.
+    let [_, last] = ROOT_DOCS;
+    let base = fs::read_to_string(ws.dir().join(last)).ok().and_then(|d| {
+        let prefix = listed(&a.repo);
+        let line = d.lines().find(|line| line.starts_with(&prefix))?;
+        let (_, base) = line.rsplit_once(" (base `")?;
+        Some(base.rsplit_once('`')?.0.to_string())
+    });
+    let here = fs::canonicalize(&wt).ok();
+    let on_branch =
+        holder(&wts, &a.branch).is_some_and(|p| here.is_some() && fs::canonicalize(p).ok() == here);
+    if let Some(base) = base.filter(|_| on_branch) {
+        // A replaced .git can leave the source's worktree registration pointing at another repo.
+        let common = |dir: &Path| {
+            git(
+                dir,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )
+            .ok()
+            .and_then(|p| fs::canonicalize(p).ok())
+        };
+        let source = common(&a.src);
+        if source.is_some()
+            && common(&wt) == source
+            && git(&wt, &["symbolic-ref", "HEAD"])
+                .is_ok_and(|b| b == format!("refs/heads/{}", a.branch))
+        {
+            return Found::Worktree(WsRepo {
+                name: a.repo.clone(),
+                src: a.src.clone(),
+                base,
+                branch: None,
+            });
+        }
+    }
+    let branch = a.fresh && has_ref(&a.src, &format!("refs/heads/{}", a.branch));
+    match (wt.exists(), branch) {
+        (false, false) => Found::Nothing,
+        (false, true) => Found::Unclear(format!(
+            "branch `{}` exists in {} with no worktree",
+            a.branch,
+            a.src.display()
+        )),
+        (true, _) => Found::Unclear(format!(
+            "{} exists but isn't a finished worktree on `{}`",
+            wt.display(),
+            a.branch
+        )),
+    }
 }
 
 /// A branch of a source repo, as the New workspace dialog lists it.
@@ -465,10 +577,7 @@ fn plan_worktree(branch: &str, r: &Repo, parent: Option<&str>) -> Result<Plan, S
         }
         return plan_stacked(r, p);
     }
-    let base = Some(default_base(&r.path))
-        .filter(|b| !b.is_empty())
-        .or_else(|| git(&r.path, &["rev-parse", "--abbrev-ref", "HEAD"]).ok())
-        .unwrap_or_else(|| "HEAD".into());
+    let base = resolve_base(&r.path, "");
     let from = match (has_local, has_remote) {
         (true, true) => {
             // Behind origin with nothing of its own: catch up first. Nothing has it checked out
@@ -488,7 +597,7 @@ fn plan_worktree(branch: &str, r: &Repo, parent: Option<&str>) -> Result<Plan, S
             if fetched && git(&r.path, &["merge-base", "--is-ancestor", &local, &base]).is_ok() =>
         {
             return Err(format!(
-                "{}: a local branch `{branch}` exists that origin doesn't have and is already merged into {base} (left from an archived workspace?). Pick another name, or rename it: git -C {} branch -m {branch} {branch}-old",
+                "{}: a local branch `{branch}` exists that origin doesn't have and is already merged into {base} (left from a deleted agent?). Pick another name, or rename it: git -C {} branch -m {branch} {branch}-old",
                 r.name,
                 r.path.display()
             ));
@@ -498,6 +607,47 @@ fn plan_worktree(branch: &str, r: &Repo, parent: Option<&str>) -> Result<Plan, S
         (false, false) => Some(base.clone()),
     };
     Ok(Plan::new(base, from))
+}
+
+/// `base` as a ref: origin's when origin has it. Empty is the repo's default.
+pub fn resolve_base(src: &Path, base: &str) -> String {
+    let base = base.trim();
+    if base.is_empty() {
+        return Some(default_base(src))
+            .filter(|b| !b.is_empty())
+            .or_else(|| git(src, &["rev-parse", "--abbrev-ref", "HEAD"]).ok())
+            .unwrap_or_else(|| "HEAD".into());
+    }
+    match has_ref(src, &format!("refs/remotes/origin/{base}")) {
+        true => format!("origin/{base}"),
+        false => base.into(),
+    }
+}
+
+/// `plan_worktree` for a branch that must be new: `branch` existing here or on origin is refused
+/// before anything is made. Fetches, so it blocks.
+fn plan_fresh(branch: &str, r: &Repo, base: &str) -> Result<Plan, String> {
+    git(&r.path, &["check-ref-format", "--branch", branch])
+        .map_err(|_| format!("`{branch}` isn't a valid branch name"))?;
+    let _ = git(&r.path, &["worktree", "prune"]);
+    // Best effort, as in `plan_worktree`; offline, the last fetch's refs are checked.
+    let args = ["fetch", "--quiet", "--prune", "origin"];
+    let _ = cmd_bounded(&r.path, "git", &args, 30);
+    if has_ref(&r.path, &format!("refs/heads/{branch}"))
+        || has_ref(&r.path, &format!("refs/remotes/origin/{branch}"))
+    {
+        return Err(format!(
+            "{}: branch `{branch}` already exists; pick another name",
+            r.name
+        ));
+    }
+    let base = resolve_base(&r.path, base);
+    git(
+        &r.path,
+        &["rev-parse", "--verify", &format!("{base}^{{commit}}")],
+    )
+    .map_err(|_| format!("{}: base `{base}` not found", r.name))?;
+    Ok(Plan::new(base.clone(), Some(base)))
 }
 
 /// A new branch stacked on `p`: it starts on `origin/<p>`, which is also its base.
@@ -520,7 +670,7 @@ fn parent_start(r: &Repo, p: &str) -> Result<String, String> {
     ) {
         (true, _) => Ok(format!("origin/{p}")),
         (false, true) => Err(format!(
-            "{}: `{p}` isn't on GitHub yet; push it first (from its workspace)",
+            "{}: `{p}` isn't on GitHub yet; push it first (from its agent)",
             r.name
         )),
         (false, false) => Err(format!(
@@ -552,7 +702,7 @@ fn pr_remote(src: &Path, pr: &PullRequest) -> Result<String, String> {
             "Pull request base is missing; refresh pull requests and select it again".into(),
         );
     }
-    let t = crate::pr::git_feature::Target::from_url(&pr.url)
+    let t = crate::pr::Target::from_url(&pr.url)
         .ok()
         .filter(|t| t.number == pr.number)
         .ok_or("Invalid pull request URL")?;
@@ -1115,7 +1265,18 @@ fn agents_md(ws: &Workspace, dir: &Path) -> String {
     s
 }
 
+/// How the root docs start `repo`'s line.
+fn listed(repo: &str) -> String {
+    format!("- `{repo}/`: worktree of ")
+}
+
 fn header(ws: &Workspace) -> String {
+    if ws.repos.is_empty() {
+        return format!(
+            "# Workspace `{}`\n\nNo repositories are attached. This directory is NOT a git repo and holds no code: discuss and plan here. Building starts once the user attaches a repository.\n\n",
+            ws.name
+        );
+    }
     let first = ws
         .repos
         .first()
@@ -1136,11 +1297,11 @@ fn header(ws: &Workspace) -> String {
         };
         // A PR URL names the GitHub repo, which needn't match the folder.
         let gh = (git(&r.src, &["remote", "get-url", "origin"]).ok())
-            .and_then(|o| crate::sync::github_url(&o))
+            .and_then(|o| crate::pr::github_url(&o))
             .map_or(String::new(), |u| format!(", GitHub {u}"));
         s += &format!(
-            "- `{}/`: worktree of {}{on} (base `{}`{gh})\n",
-            r.name,
+            "{}{}{on} (base `{}`{gh})\n",
+            listed(&r.name),
             r.src.display(),
             r.base
         );
@@ -1352,4 +1513,9 @@ pub fn combined_diff(ws: &Workspace, dir: &Path, uncommitted_only: bool) -> Resu
         out += &String::from_utf8_lossy(&o.stdout);
     }
     Ok(out)
+}
+
+/// `origin/main` → `main`, for labels.
+pub fn short(base: &str) -> &str {
+    base.strip_prefix("origin/").unwrap_or(base)
 }

@@ -3,7 +3,6 @@ mod completion;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod completion_pixels;
 mod critters;
-mod links;
 mod model;
 mod planmode;
 mod question;
@@ -16,8 +15,11 @@ use self::queue::Queued;
 use crate::agent::{self, Agent, Ev};
 use crate::complete::{self, Item};
 use crate::models::EFFORT;
+use crate::models::{effort_label, model_label};
 use crate::plan::{self, PlanPane};
-use crate::state::{ChatMeta, Workspace};
+use crate::review_protocol::{ReviewCard, card_of, hidden_reply, hide_reports, may_report};
+use crate::state::{ChatMeta, REPO_CONTEXT, Workspace, context_record};
+use crate::ui::{copy_button, link_roots, markdown, model_entries};
 use crate::ui::{hint, plural};
 use crate::vim::{self, Vim};
 use crate::*;
@@ -35,18 +37,15 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::shimmer::ShimmerText;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::text::{TextView, TextViewState, TextViewStyle};
+use gpui_kit::component::text::TextViewState;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme, Icon, Selectable as _, ThemeColor, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-pub(crate) use links::{copy_button, link_roots, markdown};
-pub(crate) use model::{effort_label, model_entries, model_label};
 use planmode::{ENTER_PLAN, NEEDS_APPROVAL, PLAN_SHOWN};
-pub(crate) use review::{ReviewCard, ReviewItem, parse_reports};
-use review::{card_of, hidden_reply, hide_reports, may_report, review_title, split_notes};
+use review::{NOTES_END, info_notes, review_title, split_notes};
 use serde_json::Value;
 use side::Side;
 use std::collections::{HashMap, VecDeque};
@@ -99,6 +98,8 @@ pub enum ChatEvent {
     GitReviewsSent(Vec<String>),
     /// The agent started or stopped waiting on answers to its questions (`Chat::asking`).
     Asking,
+    /// `refuse_unready` said no: the app offers Attach repository.
+    NeedsRepo,
     /// A review card's "Review changes" row: show the diff.
     ShowChanges,
     /// A review card's comment link: show that comment in the diff.
@@ -129,10 +130,14 @@ pub struct Chat {
     pub started: Option<Instant>,
     /// Set while a git step runs in these worktrees; sends wait for it.
     pub hold: bool,
+    /// Set while the agent has an attachment operation (`Workspace::attaching`). Its own field:
+    /// a git step ending must not release it, nor it a git step.
+    pub attach_hold: bool,
     /// Set while the workspace's worktrees are being removed; sends are refused.
     pub archiving: bool,
-    /// Told to the agent with the next message (a repo joined the workspace mid-session).
-    note: Option<String>,
+    /// What `ChatMeta::delivered` becomes once the agent echoes the message at a block: a message
+    /// it never read leaves the context pending.
+    told: Vec<(usize, std::collections::BTreeMap<String, u64>, String)>,
     agent: Option<Agent>,
     pub(crate) composer: Entity<TextareaState>,
     /// The reply of the turn that ended last, and that turn's number (see `turns`).
@@ -215,7 +220,7 @@ const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
 impl EventEmitter<ChatEvent> for Chat {}
 
 /// A tab title from a message: its first line, cut at a word near 40 characters.
-fn title_of(text: &str) -> String {
+pub(crate) fn title_of(text: &str) -> String {
     let line = text.trim().lines().next().unwrap_or_default();
     if line.chars().count() <= 40 {
         return line.to_string();
@@ -251,11 +256,14 @@ pub(crate) fn duration(secs: u64) -> String {
 impl Chat {
     pub fn new(
         ws: Workspace,
-        meta: ChatMeta,
+        mut meta: ChatMeta,
         vim_on: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> Self {
+        // Every chat passes here, new, reopened or restored: none starts out of Plan mode
+        // without a repository. Not `ready`: a later attachment leaves a chat's mode alone.
+        meta.plan |= ws.repos.is_empty();
         let composer = cx.new(|cx| {
             TextareaState::new(window, cx)
                 .auto_grow(1, 10)
@@ -292,6 +300,7 @@ impl Chat {
             }
         });
         let ws_name = ws.name.clone();
+        let attach_hold = !ws.attaching.is_empty();
         let prs = ws
             .repos
             .iter()
@@ -312,8 +321,9 @@ impl Chat {
             hopping: None,
             started: None,
             hold: false,
+            attach_hold,
             archiving: false,
-            note: None,
+            told: vec![],
             agent: None,
             composer,
             last_reply: String::new(),
@@ -390,6 +400,7 @@ impl Chat {
         }
         let live = std::mem::take(&mut self.blocks);
         let unread = std::mem::take(&mut self.unread);
+        let told = std::mem::take(&mut self.told);
         // state.json's session (it may have been reset), or the live process's
         let kept = (
             self.busy,
@@ -399,6 +410,7 @@ impl Chat {
             self.hopping.take(),
             self.started,
             self.cut,
+            self.steered,
             self.meta.session_id.clone(),
         );
         (self.busy, self.cut, self.replaying) = (false, false, true);
@@ -422,11 +434,16 @@ impl Chat {
             self.hopping,
             self.started,
             self.cut,
+            self.steered,
             self.meta.session_id,
         ) = kept;
         let n = self.blocks.len();
         self.blocks.extend(live);
         self.unread = unread.into_iter().map(|i| i + n).collect();
+        self.told = told
+            .into_iter()
+            .map(|(bi, record, wire)| (bi + n, record, wire))
+            .collect();
         self.rows = self.build_rows();
         self.list.reset(self.rows.len() + 1); // + the activity footer
         self.list.set_follow_mode(FollowMode::Tail);
@@ -448,6 +465,36 @@ impl Chat {
     /// Whether anything is still going on: a turn, or tasks it left running in the background.
     pub fn working(&self) -> bool {
         self.busy || !self.background.is_empty()
+    }
+
+    /// Nothing is running or about to: no turn, background task or question, and no message sent
+    /// into a turn that ended before reading it, which starts one of its own.
+    pub fn idle(&self) -> bool {
+        !self.working() && !self.asking() && !self.steered
+    }
+
+    /// Why sends wait, if they do, and what to do about it. Every path that sends asks this,
+    /// through `send_block` at least.
+    pub fn held(&self) -> Option<String> {
+        use crate::state::AttachStage::*;
+        if self.hold {
+            return Some("a git step is running".into());
+        }
+        if !self.attach_hold {
+            return None;
+        }
+        let list = &self.ws.attaching;
+        let Some(a) = list.iter().find(|a| a.stuck()).or(list.first()) else {
+            return Some("a repository is being attached".into());
+        };
+        let repo = &a.repo;
+        let chip = "its chip in the header (or Attach repository… in cmd-k)";
+        Some(match a.stage {
+            SetupFailed => format!("setup of {repo} failed; open {chip} to retry or continue"),
+            Uncertain => format!("Shark can't tell how {repo} ended up; open {chip} to check"),
+            Queued => format!("{repo} is queued to attach; {chip} says what it waits for"),
+            Creating | Setup => format!("{repo} is being attached; {chip} shows how far it got"),
+        })
     }
 
     pub fn queued(&self) -> usize {
@@ -573,9 +620,9 @@ impl Chat {
             self.drain(cx);
         }
         let busy = self.busy;
-        let sent = !self.hold && (!busy || now) && self.send_text(text, now, cx);
-        self.steered |= sent && busy;
-        if !sent && (self.busy || self.hold) {
+        let held = self.held().is_some();
+        let sent = !held && (!busy || now) && self.send_text(text, now, cx);
+        if !sent && (self.busy || held) {
             self.qsel = self.queue_draft(content);
         } else if !sent {
             return; // spawn or write failed; the error is in the transcript, keep the draft
@@ -593,6 +640,14 @@ impl Chat {
         cx.notify();
     }
 
+    /// Feeds `ev` to the chat as its process would.
+    #[cfg(all(test, feature = "test-support"))]
+    pub(crate) fn play(&mut self, ev: Ev, cx: &mut Context<Self>) {
+        // Injected events replace the reader: a real exit at cleanup trips the test scheduler.
+        self.reader = None;
+        self.apply(ev, cx);
+    }
+
     /// What went out, oldest first: messages, and reviews as their prompt.
     #[cfg(all(test, feature = "test-support"))]
     pub(crate) fn sent_texts(&self) -> Vec<String> {
@@ -604,6 +659,7 @@ impl Chat {
     /// Sends a host-written prompt together with any draft instructions.
     pub fn ask(&mut self, prompt: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let mut draft = self.composer.read(cx).value().trim().to_string();
+        let had_draft = !draft.is_empty();
         // The same prompt put back below after a failed start: retrying must not send it twice.
         if draft == prompt.trim() {
             draft.clear();
@@ -613,15 +669,15 @@ impl Chat {
             false => format!("{prompt}\n\nAlso: {draft}"),
         };
         let sent = self.send_text(text.clone(), false, cx);
-        if sent && !draft.is_empty() {
+        if sent && had_draft {
             cx.emit(ChatEvent::GitReviewsSent(std::mem::take(
                 &mut self.editing_git_reviews,
             )));
             self.finish_draft(window, cx);
         }
-        // The agent didn't start (refusals keep `hold`/`archiving` set): a new chat's first
-        // message, e.g. from New workspace, goes back to the composer instead of being lost.
-        let failed = !sent && self.agent.is_none() && !self.hold && !self.archiving;
+        // It didn't go out (refusals keep a hold or `archiving` set): a new chat's first message,
+        // e.g. from Home, goes back to the composer instead of being lost.
+        let failed = !sent && !self.busy && self.held().is_none() && !self.archiving;
         if failed && draft.is_empty() && self.meta.session_id.is_none() {
             self.composer
                 .update(cx, |c, cx| c.set_value(text, window, cx));
@@ -646,16 +702,14 @@ impl Chat {
         if text.is_empty() || (self.busy && !steer) {
             return false;
         }
-        if self.hold {
-            self.push(
-                Block::Info("a git step is running; send again when it finishes".into()),
-                cx,
-            );
+        if let Some(why) = self.held() {
+            let msg = format!("{why}; send again when it finishes");
+            self.push(Block::Info(msg), cx);
             return false;
         }
         if self.archiving {
             self.push(
-                Block::Info("this workspace is being archived; nothing was sent".into()),
+                Block::Info("this agent is being deleted; nothing was sent".into()),
                 cx,
             );
             return false;
@@ -670,6 +724,16 @@ impl Chat {
             self.set_background(vec![], cx); // its reader is replaced below, so its Exited never arrives
         }
         if self.agent.is_none() {
+            // A session starting now reads the repos from the root docs, and has nothing else.
+            if self.meta.session_id.is_none() {
+                let mut context = self.ws.context();
+                context.retain(|k, _| k.starts_with(REPO_CONTEXT));
+                let known = context_record(&context);
+                if self.meta.delivered != known {
+                    self.meta.delivered = known;
+                    cx.emit(ChatEvent::Meta);
+                }
+            }
             match agent::spawn(&self.ws, &self.meta) {
                 Ok((mut a, rx)) => {
                     if self.meta.plan
@@ -694,15 +758,25 @@ impl Chat {
                 }
             }
         }
-        let wire = match &self.note {
-            Some(n) => format!("{n}\n\n{text}"),
-            None => text.clone(),
+        // A `/command` must stay the whole message, and a steer lands mid-turn: the context waits
+        // for the next normal message.
+        let notes = match self.busy || text.trim_start().starts_with('/') {
+            true => vec![],
+            false => self.pending_context(),
+        };
+        let wire = match notes.is_empty() {
+            true => text.clone(),
+            false => format!("{}{NOTES_END}{text}", notes.join("\n")),
         };
         if let Err(e) = self.agent.as_mut().unwrap().send(&wire) {
             self.push(Block::Info(format!("send failed: {e}")), cx);
             return false;
         }
-        self.note = None;
+        if !notes.is_empty() {
+            self.blocks.extend(info_notes(&notes.join("\n")));
+            self.told
+                .push((self.blocks.len(), context_record(&self.ws.context()), wire));
+        }
         let ids = review.as_ref().map(|r| r.ids());
         self.sent(text, review, cx);
         if let Some(ids) = ids {
@@ -736,24 +810,42 @@ impl Chat {
             .count()
     }
 
-    /// A repo joined the workspace: refresh `@` files, show it, and tell the agent next turn
-    /// (its CLAUDE.md was read at session start).
-    pub fn repos_changed(&mut self, ws: &Workspace, note: String, cx: &mut Context<Self>) {
-        self.ws.repos = ws.repos.clone();
-        self.push(Block::Info(note.clone()), cx);
-        self.note = Some(match self.note.take() {
-            Some(old) => format!("{old}\n{note}"),
-            None => note,
-        });
-        self.reindex(cx);
-        self.prs_at = None; // the next `#` lists the new repo's PRs
+    /// The agent's repos, branches, issues or attachment changed. Session and Plan mode stay;
+    /// the agent hears of it with its next normal turn (`pending_context`). Ending the attachment
+    /// hold sends what waited for it, unless a git step still holds it.
+    pub fn workspace_changed(&mut self, ws: &Workspace, cx: &mut Context<Self>) {
+        let grew = ws.repos.len() != self.ws.repos.len();
+        let released = self.attach_hold && ws.attaching.is_empty();
+        self.ws = ws.clone();
+        self.attach_hold = !ws.attaching.is_empty();
+        if grew {
+            self.reindex(cx);
+            self.prs_at = None; // the next `#` lists the new repo's PRs
+        }
+        if released {
+            self.drain(cx);
+        }
+        cx.notify();
+    }
+
+    /// The notes of `Workspace::context` this chat's session hasn't received, for its next
+    /// normal message. Derived from what is saved, so it needs no event: chats closed, not yet
+    /// loaded or from before a restart catch up the same way.
+    pub(crate) fn pending_context(&self) -> Vec<String> {
+        (self.ws.context().into_iter())
+            .filter(|(k, note)| self.meta.delivered.get(k) != Some(&note.fingerprint))
+            .map(|(_, note)| note.text)
+            .collect()
     }
 
     fn sent(&mut self, text: String, review: Option<Rc<ReviewCard>>, cx: &mut Context<Self>) {
-        let queued = self.busy;
-        if !queued {
+        // codex runs `/compact` as a request of its own, with no user message to echo.
+        let echoed = !(self.active_codex() && text.trim() == "/compact");
+        let queued = self.busy && echoed;
+        if !self.busy {
             self.started = Some(Instant::now());
         }
+        self.steered |= queued;
         self.busy = true;
         if self.meta.title.is_empty() {
             self.meta.title = match &review {
@@ -765,7 +857,9 @@ impl Chat {
         // Jump to the end so push follows the new message and the reply.
         self.sel = self.rows.len().saturating_sub(1);
         self.list.set_follow_mode(FollowMode::Tail);
-        self.unread.push_back(self.blocks.len());
+        if echoed {
+            self.unread.push_back(self.blocks.len());
+        }
         self.push(
             match review {
                 Some(r) => Block::Review(r, queued),
@@ -844,6 +938,7 @@ impl Chat {
         self.stopping = None;
         self.cut = false;
         self.steered = false;
+        self.told.clear(); // never echoed now: that context stays pending
         self.interrupt();
         self.drop_unread(cx);
     }
@@ -970,12 +1065,17 @@ impl Chat {
             } => self.on_init(session_id, &model, &permission_mode, &mcp, cx),
             Ev::Background(tasks) => self.set_background(tasks, cx),
             Ev::Interrupted => self.cut = true,
-            Ev::User(text) => self.on_echo(text),
+            Ev::User(text) => self.on_echo(text, cx),
             Ev::Notice(text) => self.blocks.push(Block::Info(text)),
             Ev::TextDelta(s) => self.on_text(s, cx),
             Ev::Text(full) => self.on_full_text(full, cx),
             Ev::ToolUse { id, name, input } => self.on_tool_use(id, name, input),
             Ev::ToolResult { id, text, is_error } => self.on_tool_result(id, text, is_error),
+            Ev::Questions(request) => {
+                if !self.replaying {
+                    self.show_asked(request, cx);
+                }
+            }
             Ev::Permission {
                 request_id,
                 tool,
@@ -1030,8 +1130,7 @@ impl Chat {
     ) {
         // A process of the backend the chat just switched away from: its session
         // can't be resumed by the new one.
-        let stale =
-            !self.replaying && codex::is_codex(self.agent_model.as_deref()) != self.meta.is_codex();
+        let stale = !self.replaying && self.active_codex() != self.meta.is_codex();
         if !stale && self.meta.session_id.as_ref() != Some(&id) {
             self.meta.session_id = Some(id);
             if !self.replaying {
@@ -1053,11 +1152,15 @@ impl Chat {
     }
 
     /// claude's echo: the oldest message it hadn't read is now part of the turn.
-    /// `ends_with`: a workspace `note` may have been put before the text on the wire.
     /// Not just the oldest: one the CLI refused (a failed codex turn/start) is never echoed.
-    fn on_echo(&mut self, text: String) {
-        let read = (self.unread.iter())
-            .position(|&bi| (self.blocks[bi].message()).is_some_and(|(t, _)| text.ends_with(t)));
+    fn on_echo(&mut self, text: String, cx: &mut Context<Self>) {
+        let read =
+            self.unread
+                .iter()
+                .position(|&bi| match self.told.iter().find(|(b, ..)| *b == bi) {
+                    Some((_, _, wire)) => wire == &text,
+                    None => self.blocks[bi].message().is_some_and(|(t, _)| t == text),
+                });
         match read {
             Some(k) => {
                 let bi = self.unread.remove(k).unwrap();
@@ -1065,16 +1168,20 @@ impl Chat {
                     *queued = false;
                 }
                 self.remeasure(bi);
-                // codex reads a steer into the running turn, with no new init after.
-                if self.unread.is_empty() {
-                    self.steered = false;
+                if let Some(i) = self.told.iter().position(|(b, ..)| *b == bi) {
+                    self.meta.delivered = self.told.remove(i).1;
+                    cx.emit(ChatEvent::Meta);
                 }
+                // codex reads a steer into the running turn, with no new init after.
+                self.steered = self
+                    .unread
+                    .iter()
+                    .any(|&bi| matches!(self.blocks[bi].message(), Some((_, true))));
             }
             None => {
                 // A replayed message carries the workspace notes sent with it.
                 let (notes, text) = split_notes(&text);
-                self.blocks
-                    .extend(notes.lines().map(|n| Block::Info(n.into())));
+                self.blocks.extend(info_notes(notes));
                 self.blocks.push(match card_of(text) {
                     Some(card) => Block::Review(Rc::new(card), false),
                     None => Block::User(text.into(), false),
@@ -1138,7 +1245,7 @@ impl Chat {
         let call = Call {
             summary: match name.as_str() {
                 PLAN_TOOL => plan::title(input["plan"].as_str().unwrap_or_default()),
-                ASK_TOOL => question::asked_summary(&input),
+                ASK_TOOL => crate::transcript::asked_summary(&input),
                 _ => summarize(&input, &self.ws.dir().to_string_lossy()),
             },
             input: full_input(&input),
@@ -1166,7 +1273,7 @@ impl Chat {
         });
         if let Some((bi, c)) = call {
             if c.name == ASK_TOOL
-                && let Some(answer) = question::answered(&text)
+                && let Some(answer) = crate::transcript::answered(&text)
             {
                 c.summary = answer.to_string();
             }
@@ -1184,11 +1291,6 @@ impl Chat {
         input: Value,
         cx: &mut Context<Self>,
     ) {
-        // Questions wait for the user's answers in a card; the turn holds meanwhile.
-        // (Replayed history has none: a request is only ever live.)
-        if tool == ASK_TOOL && !self.replaying {
-            return self.show_asked(request_id, tool_use_id, input, cx);
-        }
         // Plan mode's approval happens in the plan pane, after the turn: the agent is
         // told the plan was shown, and the turn ends instead of waiting on a person.
         let reason = match tool.as_str() {
@@ -1220,6 +1322,13 @@ impl Chat {
             self.drop_asked(cx);
         }
         let cut = std::mem::take(&mut self.cut);
+        // Codex won't start a turn for unread messages after refusal/interruption. Retiring them
+        // also keeps a later retry of the same text from acknowledging the refused message.
+        if self.active_codex() && (is_error || cut) {
+            self.drop_unread(cx);
+            self.told.clear();
+            self.steered = false;
+        }
         // A pruned or deleted session: claude says so in the result and exits, and
         // every resume would fail the same way. (Replay restores the session after.)
         let gone = is_error && text.starts_with(agent::SESSION_GONE);
@@ -1341,7 +1450,7 @@ impl Chat {
                                         )
                                     }
                                     (ASK_TOOL, _) => (c.result.as_deref())
-                                        .and_then(question::answered)
+                                        .and_then(crate::transcript::answered)
                                         .unwrap_or(&c.summary)
                                         .to_string(),
                                     _ => c.summary.clone(),
@@ -1601,6 +1710,7 @@ impl Chat {
             theme.secondary,
             theme.muted_foreground,
         );
+        let held = self.held().is_some();
         // The editor's Vim pill, on `muted`: the card is already `secondary`.
         let vim_pill = self.vim_on.then(|| {
             div()
@@ -1803,13 +1913,13 @@ impl Chat {
                                     .overflow_hidden()
                                     .justify_end()
                                     .gap_3()
-                                    .when(self.busy || self.hold, |d| {
+                                    .when(self.busy || held, |d| {
                                         d.child(match self.editing {
                                             Some(_) => hint("enter", "save"),
                                             None => hint("enter", "queue"),
                                         })
                                     })
-                                    .when(self.busy && !self.hold, |d| {
+                                    .when(self.busy && !held, |d| {
                                         d.child(hint("cmd-enter", "send now"))
                                     })
                                     .when(self.busy, |d| d.child(hint("ctrl-c", "interrupt"))),
@@ -2390,7 +2500,7 @@ exec cat >>"$0.stdin"
                 unsafe { std::env::set_var("SHARK_CLAUDE", &self.0) };
             }
         }
-        let _restore = Restore(fake);
+        let _restore = Restore(fake.clone());
         // SAFETY: as above.
         unsafe { std::env::set_var("SHARK_CLAUDE", "/nonexistent") };
         let root = std::env::temp_dir().join(format!("shark-noclaude-{}", std::process::id()));
@@ -2437,6 +2547,17 @@ exec cat >>"$0.stdin"
                 assert_eq!(c.composer.read(cx).value().as_ref(), "build the thing");
             })
         });
+        // A successful retry consumes the restored draft without sending it twice.
+        unsafe { std::env::set_var("SHARK_CLAUDE", &fake) };
+        cx.update_window(window, |_, w, cx| {
+            chat.update(cx, |c, cx| {
+                assert!(c.ask("build the thing", w, cx));
+                assert_eq!(c.sent_texts(), ["build the thing"]);
+                assert!(c.composer.read(cx).value().is_empty());
+                c.reader = None;
+            });
+        })
+        .unwrap();
         let _ = std::fs::remove_file(ws.dir());
     }
 
@@ -2586,6 +2707,12 @@ exec cat >>"$0.stdin"
         fake_claude();
         let ws = Workspace {
             name: format!("plan-test-{}", std::process::id()),
+            repos: vec![crate::state::WsRepo {
+                name: "api".into(),
+                src: root.clone(),
+                base: "main".into(),
+                branch: None,
+            }],
             ..Default::default()
         };
         let meta = ChatMeta {
@@ -2813,15 +2940,12 @@ exec cat >>"$0.stdin"
                     c.busy = true;
                     c.agent_model = c.meta.model.clone(); // a codex process asks
                     c.apply(
-                        Ev::Permission {
-                            request_id: id.into(),
-                            tool: ASK_TOOL.into(),
-                            tool_use_id: format!("call-{id}"),
-                            input: serde_json::json!({"questions": [
+                        Ev::Questions(agent::Questions::new(
+                            id.into(), format!("call-{id}"), serde_json::json!({"questions": [
                                 {"id": "db", "header": "DB", "question": "Which DB?", "isOther": true, "options": [{"label": "Postgres", "description": "SQL"}, {"label": "Redis", "description": "KV"}]},
                                 {"id": "tests", "header": "Tests", "question": "Which tests?", "isOther": true, "options": [{"label": "Unit", "description": ""}, {"label": "E2E", "description": ""}]},
-                            ]}),
-                        },
+                            ]}), true,
+                        )),
                         cx,
                     );
                 })
@@ -3122,6 +3246,137 @@ exec cat >>"$0.stdin"
         });
     }
 
+    /// A model pick affects the successor, while compact and failed steers keep the live backend's semantics.
+    #[gpui_kit::test]
+    fn busy_backend_switch_keeps_live_compact_and_result_semantics(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt;
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root =
+            std::env::temp_dir().join(format!("shark-backend-switch-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fake = root.join("agent");
+        std::fs::write(&fake, r#"#!/bin/sh
+: > "$0.in"
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$0.in"
+    case "$line" in
+        *'"thread/resume"'*) printf '%s\n' '{"id":"resume","result":{"thread":{"id":"th1"},"model":"m1"}}';;
+        *'"thread/start"'*) printf '%s\n' '{"id":"start","result":{"thread":{"id":"th1"},"model":"m1"}}';;
+    esac
+done
+"#).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        struct Restore([Option<std::ffi::OsString>; 2]);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, old) in ["SHARK_CLAUDE", "SHARK_CODEX"].into_iter().zip(&self.0) {
+                    // SAFETY: all provider-spawning tests hold UI_LOCK.
+                    unsafe {
+                        match old {
+                            Some(old) => std::env::set_var(key, old),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _restore = Restore([
+            std::env::var_os("SHARK_CLAUDE"),
+            std::env::var_os("SHARK_CODEX"),
+        ]);
+        for key in ["SHARK_CLAUDE", "SHARK_CODEX"] {
+            // SAFETY: as above.
+            unsafe { std::env::set_var(key, &fake) };
+        }
+        for (running, selected, is_codex) in [
+            ("codex:gpt-6.1-sol", "opus", true),
+            ("opus", "codex:gpt-6.1-sol", false),
+        ] {
+            let chat = open_chat(
+                if is_codex {
+                    "switch-from-codex"
+                } else {
+                    "switch-from-claude"
+                },
+                cx,
+            );
+            chat.update(cx, |c, cx| {
+                std::fs::create_dir_all(c.ws.dir()).unwrap();
+                c.meta.model = Some(running.into());
+                assert!(c.send_text("first".into(), false, cx));
+                c.apply(Ev::User("first".into()), cx);
+                c.set_model(selected, cx);
+                assert_eq!(c.agent.as_ref().unwrap().is_codex(), is_codex);
+                assert_eq!(c.active_codex(), is_codex);
+                assert!(c.send_text("/compact".into(), true, cx));
+                assert_eq!(c.unread.len(), usize::from(!is_codex));
+                assert_eq!(c.steered, !is_codex);
+                let compact_seen = || {
+                    std::fs::read_to_string(fake.with_extension("in"))
+                        .unwrap_or_default()
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                        .any(|v| {
+                            if is_codex {
+                                v["method"] == "thread/compact/start"
+                            } else {
+                                v["type"] == "user" && v["message"]["content"] == "/compact"
+                            }
+                        })
+                };
+                for _ in 0..1000 {
+                    if compact_seen() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                assert!(
+                    compact_seen(),
+                    "compact must reach the process that is still running"
+                );
+                // Keep transport events out of the manually driven result assertions.
+                c.reader = None;
+                c.unread.clear();
+                c.steered = false;
+                for interrupted in [false, true] {
+                    c.busy = true;
+                    let wire = "pending".to_string();
+                    c.told.push((
+                        c.blocks.len(),
+                        [("issue:one".into(), 1)].into_iter().collect(),
+                        wire.clone(),
+                    ));
+                    c.sent(wire, None, cx);
+                    if interrupted {
+                        c.apply(Ev::Interrupted, cx);
+                    }
+                    c.apply(
+                        Ev::Result {
+                            is_error: !interrupted,
+                            text: "refused".into(),
+                            secs: 0,
+                        },
+                        cx,
+                    );
+                    assert_eq!(
+                        c.unread.is_empty(),
+                        is_codex,
+                        "interrupted={interrupted}, running={running}"
+                    );
+                    assert_eq!(c.told.is_empty(), is_codex);
+                    assert_eq!(c.steered, !is_codex);
+                    c.unread.clear();
+                    c.told.clear();
+                    c.steered = false;
+                }
+                c.drop_process(cx);
+                std::fs::remove_dir_all(c.ws.dir()).unwrap();
+            });
+        }
+    }
+
     /// Thinking levels: `high` until picked, stepping stops at the ends, and a level the model
     /// lacks becomes its highest. A claude level change restarts the process at the next send;
     /// codex's doesn't.
@@ -3190,9 +3445,11 @@ exec cat >>"$0.stdin"
                     base: "HEAD".into(),
                     branch: None,
                 });
-                c.repos_changed(&ws, "added api".into(), cx);
+                c.workspace_changed(&ws, cx);
                 assert!(c.send_text("steer".into(), true, cx));
                 assert!(c.agent_skills.is_empty(), "never restart an active turn");
+                c.apply(Ev::User("first".into()), cx);
+                c.apply(Ev::User("steer".into()), cx);
                 c.apply(
                     Ev::Result {
                         is_error: false,
@@ -3295,6 +3552,293 @@ exec cat >>"$0.stdin"
         });
     }
 
+    /// Context notes may hold blank lines, and what they quote stays out of the rows and the
+    /// user's bubble.
+    #[gpui_kit::test]
+    fn replay_keeps_multi_paragraph_notes_out_of_the_message(cx: &mut TestAppContext) {
+        let chat = open_chat("note-paragraphs", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.replaying = true;
+                let wire = format!(
+                    "[shark] Issue ENG-1 changed:\nFirst paragraph.\n\nSecond.{NOTES_END}fix it"
+                );
+                c.apply(Ev::User(wire), cx);
+                c.replaying = false;
+                assert!(matches!(&c.blocks[0], Block::Info(t) if t.ends_with("changed:")));
+                assert!(matches!(&c.blocks[1], Block::User(t, _) if t == "fix it"));
+                assert_eq!(c.blocks.len(), 2);
+            })
+        });
+    }
+
+    /// A message the agent never read leaves its context pending: only an echo records it.
+    #[gpui_kit::test]
+    fn context_stays_pending_until_the_agent_reads_it(cx: &mut TestAppContext) {
+        let chat = open_chat("context-echo", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.ws.repos.push(crate::state::WsRepo {
+                    name: "api".into(),
+                    src: "/src/api".into(),
+                    base: "main".into(),
+                    branch: None,
+                });
+                let record = context_record(&c.ws.context());
+                let unread = |c: &mut Chat, record: &std::collections::BTreeMap<_, _>| {
+                    c.blocks.push(Block::User("hi".into(), false));
+                    c.unread.push_back(c.blocks.len() - 1);
+                    c.told.push((
+                        c.blocks.len() - 1,
+                        record.clone(),
+                        "[shark] x\n[/shark]\n\nhi".into(),
+                    ));
+                };
+                unread(c, &record);
+                c.apply(Ev::Exited("claude exited".into()), cx);
+                assert!(c.told.is_empty() && c.meta.delivered.is_empty());
+                assert_eq!(c.pending_context().len(), 1);
+                unread(c, &record);
+                c.apply(Ev::User("[shark] x\n[/shark]\n\nhi".into()), cx);
+                assert_eq!(c.meta.delivered, record);
+                assert!(c.pending_context().is_empty());
+            })
+        });
+    }
+
+    /// The real Codex transport carries repo and issue notes, leaves compact requests alone,
+    /// and acknowledges context only when its app-server echoes the user message.
+    #[gpui_kit::test]
+    fn codex_delivers_attachment_context_on_normal_turns(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt;
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let chat = open_chat("codex-context", cx);
+        let root = std::env::temp_dir().join(format!("shark-codex-context-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fake = root.join("codex");
+        std::fs::write(&fake, r#"#!/bin/sh
+: > "$0.in"
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$0.in"
+    case "$line" in
+        *'"thread/resume"'*) printf '%s\n' '{"id":"resume","result":{"thread":{"id":"th1"},"model":"m1"}}';;
+        *'"thread/start"'*) printf '%s\n' '{"id":"start","result":{"thread":{"id":"th1"},"model":"m1"}}';;
+    esac
+done
+"#).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: tests that spawn providers hold UI_LOCK.
+                unsafe {
+                    match &self.0 {
+                        Some(old) => std::env::set_var("SHARK_CODEX", old),
+                        None => std::env::remove_var("SHARK_CODEX"),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("SHARK_CODEX"));
+        // SAFETY: as above.
+        unsafe { std::env::set_var("SHARK_CODEX", &fake) };
+        let request = |n: usize| {
+            for _ in 0..1000 {
+                let log = std::fs::read_to_string(fake.with_extension("in")).unwrap_or_default();
+                let turns: Vec<Value> = log
+                    .lines()
+                    .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                    .filter(|v| {
+                        matches!(
+                            v["method"].as_str(),
+                            Some("turn/start" | "thread/compact/start")
+                        )
+                    })
+                    .collect();
+                if let Some(turn) = turns.get(n) {
+                    return turn.clone();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            panic!("Codex request {n} was not received");
+        };
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                std::fs::create_dir_all(c.ws.dir()).unwrap();
+                c.meta.model = Some("codex:gpt-6.1-sol".into());
+                c.ws.repos.push(crate::state::WsRepo { name: "api".into(), src: "/src/api".into(), base: "main".into(), branch: None });
+                let issue = crate::linear::Snapshot { org: "org".into(), id: "one".into(), identifier: "ENG-1".into(), title: "Fix login".into(), description: "Use the existing session".into(), ..Default::default() };
+                c.ws.linear.attach((&issue).into());
+                c.ws.issues.push(issue);
+                assert!(c.send_text("/compact".into(), false, cx));
+                assert_eq!(request(0)["method"], "thread/compact/start");
+                assert_eq!(c.pending_context().len(), 2);
+                c.play(Ev::Result { is_error: false, text: String::new(), secs: 0 }, cx);
+                assert!(c.send_text("build it".into(), false, cx));
+                let wire = request(1)["params"]["input"][0]["text"].as_str().unwrap().to_string();
+                assert!(wire.contains("Repo `api`") && wire.contains("Linear issue ENG-1"), "{wire}");
+                assert!(wire.ends_with("build it"));
+                assert_eq!(c.pending_context().len(), 2, "not yet echoed");
+                let echo = serde_json::json!({"method":"item/started", "params":{"item":{"type":"userMessage", "id":"u1", "content":[{"type":"text", "text":wire}]}}});
+                play(c, &[&echo.to_string()], cx);
+                assert!(c.pending_context().is_empty());
+                c.play(Ev::Result { is_error: false, text: String::new(), secs: 0 }, cx);
+                assert!(c.send_text("next".into(), false, cx));
+                assert_eq!(request(2)["params"]["input"][0]["text"], "next");
+                c.drop_process(cx);
+                let _ = std::fs::remove_dir_all(c.ws.dir());
+            })
+        });
+    }
+
+    /// A refused message cannot claim another message's echo, even with the same user text
+    /// after its context changed.
+    #[gpui_kit::test]
+    fn echoes_match_the_exact_message_and_context(cx: &mut TestAppContext) {
+        let chat = open_chat("exact-echo", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.sent("it".into(), None, cx);
+                c.busy = false; // refused without an echo
+                c.sent("fix it".into(), None, cx);
+                c.apply(Ev::User("fix it".into()), cx);
+                assert_eq!(c.unread.iter().copied().collect::<Vec<_>>(), [0]);
+
+                let old = [("issue:one".into(), 1)].into_iter().collect();
+                let new: std::collections::BTreeMap<String, u64> =
+                    [("issue:one".into(), 2)].into_iter().collect();
+                for (record, wire) in [
+                    (old, format!("[shark] Old context{NOTES_END}retry")),
+                    (new.clone(), format!("[shark] New context{NOTES_END}retry")),
+                ] {
+                    c.busy = false;
+                    c.told.push((c.blocks.len(), record, wire));
+                    c.sent("retry".into(), None, cx);
+                }
+                c.apply(Ev::User(format!("[shark] New context{NOTES_END}retry")), cx);
+                assert_eq!(c.meta.delivered, new);
+                assert_eq!(
+                    c.told.len(),
+                    1,
+                    "the refused context was never acknowledged"
+                );
+                assert_eq!(c.unread.len(), 2, "only the matching message was read");
+            })
+        });
+    }
+
+    /// History can finish loading between a turn ending and a pending steer being read.
+    #[gpui_kit::test]
+    fn history_preserves_pending_steers_and_context(cx: &mut TestAppContext) {
+        let chat = open_chat("history-steer", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.sent("first".into(), None, cx);
+                c.apply(Ev::User("first".into()), cx);
+                let wire = format!("[shark] Context{NOTES_END}steer");
+                let record = [("issue:one".into(), 1)].into_iter().collect();
+                c.told.push((c.blocks.len(), record, wire.clone()));
+                c.sent("steer".into(), None, cx);
+                c.apply(
+                    Ev::Result {
+                        is_error: false,
+                        text: String::new(),
+                        secs: 1,
+                    },
+                    cx,
+                );
+                assert!(!c.idle());
+                c.load_history(
+                    vec![
+                        Ev::User("history".into()),
+                        Ev::Init {
+                            session_id: "old".into(),
+                            model: "m".into(),
+                            permission_mode: "plan".into(),
+                            mcp: vec![],
+                        },
+                        Ev::Exited("old process exited".into()),
+                    ],
+                    cx,
+                );
+                assert!(
+                    !c.idle(),
+                    "attachments and deletion must still wait for the steer"
+                );
+                assert_eq!(c.told.len(), 1);
+                c.apply(Ev::User(wire), cx);
+                assert_eq!(c.meta.delivered.get("issue:one"), Some(&1));
+                assert!(c.idle());
+            })
+        });
+    }
+
+    /// While an attachment holds a chat, every way of sending stops at the same gate and nothing
+    /// is lost; a git hold ending doesn't change that. Plan mode and the plan stay as they are.
+    #[gpui_kit::test]
+    fn attach_hold_stops_every_way_of_sending(cx: &mut TestAppContext) {
+        let chat = open_chat("attach-hold", cx);
+        let window = cx.windows()[0];
+        let act = |cx: &mut TestAppContext,
+                   f: &dyn Fn(&mut Chat, &mut Window, &mut Context<Chat>)| {
+            cx.update_window(window, |_, w, cx| chat.update(cx, |c, cx| f(c, w, cx)))
+                .unwrap();
+        };
+        act(cx, &|c, w, cx| {
+            c.attach_hold = true;
+            c.ws.repos.push(crate::state::WsRepo {
+                name: "api".into(),
+                src: "/src/api".into(),
+                base: "main".into(),
+                branch: None,
+            });
+            c.ws.attaching.push(crate::state::Attachment::fresh(
+                &crate::state::Repo {
+                    name: "web".into(),
+                    path: "/src/web".into(),
+                },
+                "b",
+                "",
+            ));
+            c.meta.plan = true;
+            c.plan
+                .update(cx, |p, cx| p.add("p1".into(), "# Plan".into(), cx));
+            assert!(!c.send_text("direct".into(), false, cx), "the gate itself");
+            assert!(!c.ask("host prompt", w, cx), "ask");
+            c.approve_plan(w, cx);
+            assert!(!c.build_plan("# Plan", w, cx), "build");
+            c.set_plan_mode(false, cx);
+            assert!(c.meta.plan, "attachment never leaves Plan mode");
+            assert_eq!(c.plan.read(cx).approved, None, "or approves");
+            // Composer, git prompt and review: they queue.
+            c.composer.update(cx, |t, cx| t.set_value("typed", w, cx));
+            c.send(false, w, cx);
+            c.composer.update(cx, |t, cx| t.set_value("now!", w, cx));
+            c.send(true, w, cx);
+            assert!(c.enqueue("git prompt", vec![], cx));
+            let card = ReviewCard {
+                prompt: "R".into(),
+                items: vec![],
+                changes: String::new(),
+            };
+            assert!(c.send_review(card, cx));
+            assert_eq!(c.queued(), 4);
+            c.qsel = 1;
+            c.steer(w, cx);
+            c.drain(cx);
+            assert_eq!(c.queued(), 4, "steering and draining wait");
+            assert!(c.sent_texts().is_empty());
+            assert!(c.agent.is_none(), "no provider started");
+            // A git step coming and going leaves it alone.
+            c.hold = true;
+            c.hold = false;
+            c.drain(cx);
+            assert_eq!(c.queued(), 4);
+        });
+    }
+
     /// A codex turn as the chat sees it: a message sent mid-turn joins the running turn with no
     /// new init, and once read nothing stays unread or steered. One codex refuses is never
     /// echoed, and doesn't hold up the next.
@@ -3337,6 +3881,80 @@ exec cat >>"$0.stdin"
                     [("first", false), ("second", false), ("refused", false), ("next", false)],
                     "read in place, none twice"
                 );
+            })
+        });
+    }
+
+    /// Entries codex will never echo don't keep a chat from going idle: `/compact` isn't recorded,
+    /// a refused message doesn't outlive the turn it was refused in, and a steer read later isn't
+    /// held up by either. An attachment waiting on `idle` would hold the turn that clears them.
+    #[gpui_kit::test]
+    fn stale_codex_messages_leave_the_chat_idle(cx: &mut TestAppContext) {
+        let chat = open_chat("codex-stale", cx);
+        let done = || Ev::Result {
+            is_error: false,
+            text: String::new(),
+            secs: 1,
+        };
+        let refused = || Ev::Result {
+            is_error: true,
+            text: "bad input".into(),
+            secs: 0,
+        };
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.meta.model = Some("codex:gpt-6-astra".into());
+                c.agent_model = c.meta.model.clone();
+                c.sent("/compact".into(), None, cx);
+                assert!(c.unread.is_empty(), "never echoed");
+                c.apply(done(), cx);
+                c.sent("refused".into(), None, cx);
+                c.apply(refused(), cx);
+                assert!(c.unread.is_empty());
+
+                // A steer read with those around, as the reviewer's case had it.
+                c.sent("turn".into(), None, cx);
+                c.apply(Ev::User("turn".into()), cx);
+                c.sent("/compact".into(), None, cx);
+                assert!(!c.steered, "no steer to read");
+                c.sent("steer".into(), None, cx);
+                assert!(c.steered);
+                c.apply(Ev::User("steer".into()), cx);
+                assert!(!c.steered, "the stale entry doesn't hold it");
+                c.apply(done(), cx);
+                assert!(c.idle());
+
+                // Retrying refused text as a steer must read the retry, not the stale entry.
+                c.sent("again".into(), None, cx);
+                c.apply(refused(), cx);
+                c.sent("turn".into(), None, cx);
+                c.apply(Ev::User("turn".into()), cx);
+                c.sent("again".into(), None, cx);
+                c.apply(Ev::User("again".into()), cx);
+                c.apply(done(), cx);
+                assert!(c.idle() && c.unread.is_empty());
+
+                // A steer refused, then one in an interrupted turn: nothing starts a turn for them.
+                c.sent("turn".into(), None, cx);
+                c.apply(Ev::User("turn".into()), cx);
+                c.sent("steer 2".into(), None, cx);
+                c.apply(refused(), cx);
+                assert!(c.idle(), "refused");
+                c.sent("turn".into(), None, cx);
+                c.apply(Ev::User("turn".into()), cx);
+                c.sent("steer 3".into(), None, cx);
+                c.apply(Ev::Interrupted, cx);
+                c.apply(done(), cx);
+                assert!(c.idle(), "interrupted");
+
+                // A steer left unread by a turn that ended well does start its own: still waits.
+                c.sent("turn".into(), None, cx);
+                c.apply(Ev::User("turn".into()), cx);
+                c.sent("steer 4".into(), None, cx);
+                c.apply(done(), cx);
+                assert!(!c.idle());
+                c.apply(Ev::User("steer 4".into()), cx);
+                assert!(c.idle());
             })
         });
     }

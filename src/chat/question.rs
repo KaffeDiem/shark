@@ -2,25 +2,18 @@
 //! answered in a card above the composer while the turn waits. The card is gpui-component's
 //! questionnaire: number keys pick, ↑/↓ move, enter goes on, the last question submits.
 use super::*;
+use crate::agent::{ANSWER_IN_CHAT, Answer, Questions};
+use crate::transcript::{answer_pairs, answer_result};
 use gpui_kit::component::Size;
 use gpui_kit::component::input::InputState;
 use gpui_kit::component::questionnaire::*;
+#[cfg(test)]
 use serde_json::json;
 use std::cell::Cell;
 
-/// Told to the agent when the user closes the card (or sends a message instead).
-pub(crate) const ANSWER_IN_CHAT: &str = "The user closed these questions to answer in the chat \
-    instead. End your turn now without assuming any answers; their reply comes next.";
-
 /// The agent's questions, waiting on the user. The turn holds until they're answered.
 pub(super) struct Asked {
-    request_id: String,
-    tool_use_id: String,
-    input: Value,
-    qs: Vec<Q>,
-    /// The asking process is codex's. Not `Chat::codex`: a model picked meanwhile only
-    /// applies from the next message.
-    codex: bool,
+    request: Questions,
     /// Built on the first render, which has the window its inputs need.
     form: Option<Entity<QuestionnaireState>>,
     scroll: ScrollHandle,
@@ -28,155 +21,11 @@ pub(super) struct Asked {
     _subs: Vec<Subscription>,
 }
 
-pub(super) struct Q {
-    /// codex's; claude keys answers by the question's text.
-    id: String,
-    header: String,
-    text: String,
-    /// Label and description.
-    options: Vec<(String, String)>,
-    multi: bool,
-    /// A free-text answer is allowed: always for claude, `isOther` for codex.
-    other: bool,
-    secret: bool,
-}
-
 /// The user's own text for an answer: trimmed, unless it's a secret (spaces may belong to it).
 /// Blank is no answer.
 fn note_of(text: &str, secret: bool) -> Option<String> {
     let t = if secret { text } else { text.trim() };
     (!text.trim().is_empty()).then(|| t.to_string())
-}
-
-/// What the user answered to one question: the labels picked and any text of their own.
-type Answer = (Vec<String>, Option<String>);
-
-/// The questions in a tool input, claude's or codex's.
-pub(super) fn questions(input: &Value) -> Vec<Q> {
-    let s = |v: &Value| v.as_str().unwrap_or_default().to_string();
-    (input["questions"].as_array().into_iter().flatten())
-        .map(|q| {
-            let options: Vec<(String, String)> = (q["options"].as_array().into_iter().flatten())
-                .map(|o| (s(&o["label"]), s(&o["description"])))
-                .collect();
-            Q {
-                id: s(&q["id"]),
-                header: s(&q["header"]),
-                text: s(&q["question"]),
-                multi: q["multiSelect"].as_bool().unwrap_or(false),
-                other: q["isOther"].as_bool().unwrap_or(true) || options.is_empty(),
-                secret: q["isSecret"].as_bool().unwrap_or(false),
-                options,
-            }
-        })
-        .collect()
-}
-
-/// The questions answered, each with its picks and the user's own text joined with ", ".
-fn given<'a>(
-    qs: &'a [Q],
-    answers: &'a [Answer],
-) -> impl Iterator<Item = (&'a Q, &'a Answer, String)> {
-    (qs.iter().zip(answers))
-        .filter(|(_, a)| !a.0.is_empty() || a.1.is_some())
-        .map(|(q, a)| {
-            (
-                q,
-                a,
-                a.0.iter()
-                    .map(String::as_str)
-                    .chain(a.1.as_deref())
-                    .collect::<Vec<_>>()
-                    .join(", "),
-            )
-        })
-}
-
-/// What the agent gets back. claude: its input plus `answers` by question text. codex:
-/// `answers` by question id, its own TUI's way (`None of the above` and a `user_note:` for
-/// text of the user's own).
-pub(super) fn reply(input: &Value, qs: &[Q], answers: &[Answer], codex: bool) -> Value {
-    if codex {
-        let by_id: serde_json::Map<String, Value> = given(qs, answers)
-            .map(|(q, (labels, note), _)| {
-                let mut list = labels.clone();
-                if let Some(n) = note {
-                    if list.is_empty() {
-                        list.push("None of the above".into());
-                    }
-                    list.push(format!("user_note: {n}"));
-                }
-                (q.id.clone(), json!({ "answers": list }))
-            })
-            .collect();
-        return json!({ "answers": by_id });
-    }
-    let by_text: serde_json::Map<String, Value> = given(qs, answers)
-        .map(|(q, _, all)| (q.text.clone(), all.into()))
-        .collect();
-    let mut updated = input.clone();
-    updated["answers"] = by_text.into();
-    updated
-}
-
-/// `"Which DB?"="Postgres", …`: the answers as claude's tool result words them.
-fn pairs(qs: &[Q], answers: &[Answer]) -> String {
-    let pairs: Vec<String> = given(qs, answers)
-        // Only the agent gets a secret; the row shows that one was given.
-        .map(|(q, _, all)| {
-            format!(
-                "\"{}\"=\"{}\"",
-                q.text,
-                if q.secret { "••••" } else { &all }
-            )
-        })
-        .collect();
-    match pairs.is_empty() {
-        true => "No answers".into(),
-        false => pairs.join(", "),
-    }
-}
-
-/// The wordings a tool result gives answers in: codex's (which we write) and claude's own,
-/// each as the text before and after the answers.
-const RESULTS: [(&str, &str); 2] = [
-    (
-        "Your questions have been answered: ",
-        ". You can now continue",
-    ),
-    ("The user answered: ", ". Read the answers carefully"),
-];
-
-/// The tool result recorded for codex's answers, in claude's words.
-fn answer_result(summary: &str) -> String {
-    let (prefix, ending) = RESULTS[0];
-    format!("{prefix}{summary}{ending}")
-}
-
-/// A question row's summary from claude's tool result, when it holds the answers.
-pub(super) fn answered(result: &str) -> Option<&str> {
-    // A clipped result has no reliable protocol suffix; keep all retained answer text.
-    let truncated = result.rsplit_once("\n… truncated, ").is_some_and(|(_, n)| {
-        n.strip_suffix(" chars total")
-            .is_some_and(|n| n.parse::<u64>().is_ok())
-    });
-    for (prefix, ending) in RESULTS {
-        if let Some(r) = result.strip_prefix(prefix) {
-            return Some(
-                r.rsplit_once(ending)
-                    .filter(|_| !truncated)
-                    .map_or(r, |(answer, _)| answer),
-            );
-        }
-    }
-    (result == ANSWER_IN_CHAT).then_some("Answered in the chat")
-}
-
-/// The questions as the row's summary until they're answered.
-pub(super) fn asked_summary(input: &Value) -> String {
-    let qs = questions(input);
-    let texts: Vec<&str> = qs.iter().map(|q| q.text.as_str()).collect();
-    texts.join(" · ")
 }
 
 impl Asked {
@@ -188,22 +37,11 @@ impl Asked {
 impl Chat {
     /// The agent asked: show the card. A question still open is closed first, so its request
     /// gets an answer too.
-    pub(super) fn show_asked(
-        &mut self,
-        request_id: String,
-        tool_use_id: String,
-        input: Value,
-        cx: &mut Context<Self>,
-    ) {
+    pub(super) fn show_asked(&mut self, request: Questions, cx: &mut Context<Self>) {
         self.dismiss_asked(cx);
-        let qs = questions(&input);
-        let empty = qs.is_empty();
+        let empty = request.questions.is_empty();
         self.asked = Some(Asked {
-            request_id,
-            tool_use_id,
-            input,
-            qs,
-            codex: codex::is_codex(self.agent_model.as_deref()),
+            request,
             form: None,
             scroll: ScrollHandle::new(),
             revealed: Cell::new(None),
@@ -240,7 +78,7 @@ impl Chat {
             return;
         }
         let mut others = vec![];
-        let items: Vec<QuestionnaireItemDefinition> = (asked.qs.iter().enumerate())
+        let items: Vec<QuestionnaireItemDefinition> = (asked.request.questions.iter().enumerate())
             .map(|(i, q)| {
                 // Indices, not labels: the form refuses two items or choices with one name.
                 let choices = (q.options.iter().enumerate()).map(|(j, (label, desc))| {
@@ -322,26 +160,30 @@ impl Chat {
         let Some(asked) = self.asked.take() else {
             return;
         };
-        let answers: Vec<Answer> = (0..asked.qs.len())
+        let answers: Vec<Answer> = (0..asked.request.questions.len())
             .map(|i| {
                 let Some(a) = sub.answer(&i.to_string()) else {
                     return (vec![], None);
                 };
                 let labels = (a.choices().iter())
-                    .filter_map(|j| asked.qs[i].options.get(j.parse::<usize>().ok()?))
+                    .filter_map(|j| {
+                        asked.request.questions[i]
+                            .options
+                            .get(j.parse::<usize>().ok()?)
+                    })
                     .map(|(l, _)| l.clone())
                     .collect();
                 (
                     labels,
-                    a.freeform().and_then(|t| note_of(t, asked.qs[i].secret)),
+                    a.freeform()
+                        .and_then(|t| note_of(t, asked.request.questions[i].secret)),
                 )
             })
             .collect();
-        let (reply, summary) = (
-            reply(&asked.input, &asked.qs, &answers, asked.codex),
-            pairs(&asked.qs, &answers),
-        );
-        let res = (self.agent.as_mut()).map_or(Ok(()), |a| a.allow(&asked.request_id, reply));
+        let summary = answer_pairs(&asked.request.questions, &answers);
+        let res = (self.agent.as_mut()).map_or(Ok(()), |a| {
+            a.answer_questions(&asked.request, Some(&answers))
+        });
         let result = answer_result(&summary);
         self.answered(asked, result, res, cx);
         self.focus_composer(window, cx);
@@ -353,17 +195,10 @@ impl Chat {
         let Some(asked) = self.asked.take() else {
             return;
         };
-        let res = match (asked.codex, self.agent.as_mut()) {
-            (_, None) => Ok(()),
-            (true, Some(a)) => {
-                let note = json!({"answers": [format!("user_note: {ANSWER_IN_CHAT}")]});
-                let by_id: serde_json::Map<String, Value> = (asked.qs.iter())
-                    .map(|q| (q.id.clone(), note.clone()))
-                    .collect();
-                a.allow(&asked.request_id, json!({ "answers": by_id }))
-            }
-            (false, Some(a)) => a.deny(&asked.request_id, ANSWER_IN_CHAT),
-        };
+        let res = self
+            .agent
+            .as_mut()
+            .map_or(Ok(()), |a| a.answer_questions(&asked.request, None));
         self.answered(asked, ANSWER_IN_CHAT.into(), res, cx);
     }
 
@@ -378,8 +213,8 @@ impl Chat {
     ) {
         if let Err(e) = res {
             self.push(Block::Info(format!("answering the agent failed: {e}")), cx);
-        } else if asked.codex {
-            self.record_codex_answer(asked.tool_use_id, asked.input, result, cx);
+        } else if asked.request.record_history {
+            self.record_answer(asked.request, result, cx);
         }
         cx.emit(ChatEvent::Asking);
         cx.notify();
@@ -387,22 +222,12 @@ impl Chat {
 
     /// Replays codex's question and its answer as a tool call and result, and saves them to
     /// history: codex's own log has no such call.
-    fn record_codex_answer(
-        &mut self,
-        id: String,
-        input: Value,
-        result: String,
-        cx: &mut Context<Self>,
-    ) {
-        let records = [
-            json!({"type":"assistant", "shark_completed_answer":true, "message":{"content":[{"type":"tool_use", "id":id, "name":ASK_TOOL, "input":input}]}}),
-            json!({"type":"user", "shark_completed_answer":true, "message":{"content":[{"type":"tool_result", "tool_use_id":id, "content":result, "is_error":false}]}}),
-        ].map(|v| crate::transcript::compact(&v.to_string()).into_owned());
+    fn record_answer(&mut self, request: Questions, result: String, cx: &mut Context<Self>) {
+        let id = request.tool_use_id.clone();
+        let (records, events) = crate::transcript::completed_answer(request, result);
         if !self.completed_answers.contains_key(&id) {
-            for record in &records {
-                for event in agent::parse(record) {
-                    self.apply(event, cx);
-                }
+            for event in events {
+                self.apply(event, cx);
             }
             self.completed_answers.insert(id, records);
         }
@@ -444,8 +269,8 @@ impl Chat {
             asked.focused(window, cx),
             form.read(cx).current_ix().unwrap_or(0),
         );
-        let last = at + 1 == asked.qs.len();
-        let q = &asked.qs[at.min(asked.qs.len() - 1)];
+        let last = at + 1 == asked.request.questions.len();
+        let q = &asked.request.questions[at.min(asked.request.questions.len() - 1)];
         let max_height = window.viewport_size().height * 0.5;
         let answer = form
             .read(cx)
@@ -460,7 +285,7 @@ impl Chat {
         let viewport = window.viewport_size();
         let target = answer.map(|(item, choice)| (item, choice, viewport.width, viewport.height));
         let reveal = asked.revealed.replace(target) != target;
-        let items: Vec<_> = (asked.qs.iter().enumerate())
+        let items: Vec<_> = (asked.request.questions.iter().enumerate())
             .map(|(i, q)| {
                 let name = i.to_string();
                 let choices: Vec<_> = (0..q.options.len())
@@ -507,7 +332,7 @@ impl Chat {
                 false => format!("The agent asks · {}", q.header),
             })
             .child(div().flex_1())
-            .when(asked.qs.len() > 1, |d| {
+            .when(asked.request.questions.len() > 1, |d| {
                 d.child(QuestionnaireProgress::new(form).with_size(Size::XSmall))
             })
             .child(
@@ -651,14 +476,14 @@ mod tests {
                     .unwrap();
                 cx.update_window(window, |_, w, cx| {
                     chat.update(cx, |c, cx| {
-                        c.show_asked("wrap".into(), "wrap".into(), json!({"questions": [{
+                        c.show_asked(Questions::new("wrap".into(), "wrap".into(), json!({"questions": [{
                             "question": "What should the first release aim to deliver?",
                             "multiSelect": multi,
                             "options": [
                                 {"label": "Core IDE editing (Recommended)", "description": "Definition and back/forward, completion, hover, diagnostics, references, rename, formatting, and quick fixes."},
                                 {"label": "Navigation first", "description": "Short description."}
                             ]
-                        }]}), cx);
+                        }]}), false), cx);
                         cx.notify();
                     });
                     w.render_frame(cx);
@@ -676,6 +501,16 @@ mod tests {
     #[cfg(feature = "test-support")]
     #[gpui_kit::test]
     fn review_wrapped_choices_keep_submit_inside_viewport(cx: &mut TestAppContext) {
+        // With no repository the chat would share its width with the plan pane.
+        let ws = Workspace {
+            repos: vec![crate::state::WsRepo {
+                name: "api".into(),
+                src: Default::default(),
+                base: "main".into(),
+                branch: None,
+            }],
+            ..Default::default()
+        };
         use gpui_kit::test::{TestEventExt, TestQueryExt, TestWindowExt};
 
         crate::state::TEST_HOME
@@ -699,13 +534,7 @@ mod tests {
                             cx,
                             |w, cx| {
                                 cx.new(|cx| {
-                                    Chat::new(
-                                        Workspace::default(),
-                                        ChatMeta::default(),
-                                        false,
-                                        w,
-                                        cx,
-                                    )
+                                    Chat::new(ws.clone(), ChatMeta::default(), false, w, cx)
                                 })
                             },
                         )
@@ -713,7 +542,7 @@ mod tests {
                     .unwrap();
                 cx.update_window(window, |_, w, cx| {
                     chat.update(cx, |c, cx| {
-                        c.show_asked("review-wrap".into(), "review-wrap".into(), json!({"questions": [{
+                        c.show_asked(Questions::new("review-wrap".into(), "review-wrap".into(), json!({"questions": [{
                             "question": "What should the first release aim to deliver?",
                             "multiSelect": multi,
                             "options": [
@@ -722,7 +551,7 @@ mod tests {
                                 {"label": "Review", "description": "Review comments, side by side diffs, inline editing, staging changes, resolving conflicts, and sharing feedback with the agent."},
                                 {"label": "Collaboration", "description": "Shared workspaces, team settings, project templates, permissions, remote sessions, and notifications about important changes."}
                             ]
-                        }]}), cx);
+                        }]}), false), cx);
                         cx.notify();
                     });
                     w.render_frame(cx);
@@ -886,10 +715,10 @@ mod tests {
             .unwrap();
         cx.run_until_parked();
         let input = json!({"questions":[{"id":"secret","question":"Token?","isSecret":true}]});
-        let qs = questions(&input);
-        let summary = pairs(&qs, &[(vec![], Some("NEVER_STORE_THIS_SECRET".into()))]);
+        let qs = agent::questions(&input);
+        let summary = answer_pairs(&qs, &[(vec![], Some("NEVER_STORE_THIS_SECRET".into()))]);
         chat.update(cx, |c, cx| {
-            let asked = Asked { request_id:"rpc".into(), tool_use_id:"question-1".into(), input, qs, codex:true, form:None, scroll:ScrollHandle::new(), revealed:Cell::new(None), _subs:vec![] };
+            let asked = Asked { request: Questions::new("rpc".into(), "question-1".into(), input, true), form:None, scroll:ScrollHandle::new(), revealed:Cell::new(None), _subs:vec![] };
             c.answered(asked, answer_result(&summary), Ok(()), cx);
             assert!(c.history_save_error.is_some());
             assert_eq!(c.completed_answers.len(), 1);
@@ -935,11 +764,7 @@ mod tests {
             let input = json!({"questions":[]});
             c.answered(
                 Asked {
-                    request_id: "rpc2".into(),
-                    tool_use_id: "question-2".into(),
-                    input,
-                    qs: vec![],
-                    codex: true,
+                    request: Questions::new("rpc2".into(), "question-2".into(), input, true),
                     form: None,
                     scroll: ScrollHandle::new(),
                     revealed: Cell::new(None),
@@ -1034,8 +859,11 @@ mod tests {
                 cx.update_window(window, |_, w, cx| {
                     chat.update(cx, |c, cx| {
                         let asked = c.asked.as_ref().unwrap();
-                        assert_eq!(asked.qs.len(), 1);
-                        assert!(!asked.qs[0].secret, "this live question is public");
+                        assert_eq!(asked.request.questions.len(), 1);
+                        assert!(
+                            !asked.request.questions[0].secret,
+                            "this live question is public"
+                        );
                         c.build_asked(w, cx);
                         c.asked_form().unwrap().update(cx, |form, cx| {
                             form.set_answer(
@@ -1135,95 +963,6 @@ mod tests {
         fs::remove_dir_all(ws.dir()).unwrap();
     }
 
-    #[test]
-    fn answers_go_back_in_each_agents_shape() {
-        let input = json!({"questions": [
-            {"question": "Which DB?", "header": "DB", "multiSelect": false, "options": [{"label": "Postgres", "description": "SQL"}, {"label": "Redis", "description": ""}]},
-            {"question": "Which tests?", "header": "Tests", "multiSelect": true, "options": [{"label": "Unit", "description": ""}, {"label": "E2E", "description": ""}]},
-            {"question": "Name?", "header": "Name", "multiSelect": false, "options": [{"label": "a", "description": ""}, {"label": "b", "description": ""}]},
-        ]});
-        let qs = questions(&input);
-        assert_eq!(
-            (qs.len(), qs[1].multi, qs[0].other),
-            (3, true, true),
-            "claude always takes text"
-        );
-        assert_eq!(qs[0].options[0], ("Postgres".into(), "SQL".into()));
-        let answers: Vec<Answer> = vec![
-            (vec!["Postgres".into()], None),
-            (vec!["Unit".into(), "E2E".into()], Some("smoke".into())),
-            (vec![], None), // skipped
-        ];
-        let r = reply(&input, &qs, &answers, false);
-        assert_eq!(
-            r["questions"], input["questions"],
-            "claude needs its questions back"
-        );
-        assert_eq!(
-            r["answers"],
-            json!({"Which DB?": "Postgres", "Which tests?": "Unit, E2E, smoke"})
-        );
-        assert_eq!(
-            pairs(&qs, &answers),
-            r#""Which DB?"="Postgres", "Which tests?"="Unit, E2E, smoke""#
-        );
-
-        let input = json!({"questions": [
-            {"id": "file", "header": "File", "question": "Which file?", "isOther": true, "isSecret": false, "options": [{"label": "a.txt", "description": ""}]},
-            {"id": "ok", "header": "Run", "question": "Run it?", "isOther": false, "isSecret": true, "options": [{"label": "Accept", "description": ""}]},
-        ]});
-        let qs = questions(&input);
-        assert_eq!(
-            (qs[0].other, qs[1].other, qs[1].secret),
-            (true, false, true)
-        );
-        let answers: Vec<Answer> = vec![
-            (vec![], Some("b.txt".into())),
-            (vec!["Accept".into()], None),
-        ];
-        assert_eq!(
-            pairs(&qs, &answers),
-            r#""Which file?"="b.txt", "Run it?"="••••""#
-        );
-        assert_eq!(
-            reply(&input, &qs, &answers, true),
-            json!({"answers": {
-                "file": {"answers": ["None of the above", "user_note: b.txt"]},
-                "ok": {"answers": ["Accept"]},
-            }})
-        );
-    }
-
-    #[test]
-    fn answer_summaries_keep_protocol_words_inside_user_text() {
-        for (prefix, ending) in RESULTS {
-            let summary = format!(r#""Instructions?"="Stop{ending} after tests""#);
-            let result = format!("{prefix}{summary}{ending}");
-            assert_eq!(answered(&result), Some(summary.as_str()));
-        }
-    }
-
-    #[test]
-    fn clipped_answer_summaries_keep_protocol_words_inside_user_text() {
-        for (prefix, ending) in RESULTS {
-            let summary = format!(
-                r#""Instructions?"="Stop{ending} after {}""#,
-                "x".repeat(crate::transcript::MAX_OUTPUT)
-            );
-            let result = format!("{prefix}{summary}{ending}");
-            let record = json!({"type":"user", "message":{"content":[{"type":"tool_result", "tool_use_id":"q", "content":result}]}}).to_string();
-            let events = agent::parse(&crate::transcript::compact(&record));
-            let [Ev::ToolResult { text, .. }] = events.as_slice() else {
-                panic!()
-            };
-            assert!(text.contains("… truncated,"));
-            assert_eq!(
-                answered(text).unwrap().len(),
-                text.strip_prefix(prefix).unwrap().len()
-            );
-        }
-    }
-
     /// The real CLIs, through Shark's own spawn, parse and reply: each asks and uses the answer
     /// it gets back (a pick, the user's own text), or ends its turn when told the user answers
     /// in the chat. Costs a few cents of the logged-in plans, so it runs only on request:
@@ -1274,33 +1013,16 @@ mod tests {
             let (mut seen, mut text) = (vec![], String::new());
             while let Ok(ev) = rx.recv_blocking() {
                 match ev {
-                    Ev::Permission {
-                        request_id,
-                        tool,
-                        input,
-                        ..
-                    } if tool == ASK_TOOL => {
-                        let qs = questions(&input);
-                        seen.extend(qs.iter().map(|q| q.text.clone()));
-                        let codex = model.starts_with("codex:");
-                        match &answer {
-                            Some(ans) => {
-                                let r = reply(&input, &qs, &vec![ans.clone(); qs.len()], codex);
-                                eprintln!("{model} asked {seen:?}, replying {r}");
-                                a.allow(&request_id, r).unwrap();
-                            }
-                            // As `dismiss_asked` answers.
-                            None if codex => {
-                                let note =
-                                    json!({"answers": [format!("user_note: {ANSWER_IN_CHAT}")]});
-                                let by_id: serde_json::Map<String, Value> =
-                                    qs.iter().map(|q| (q.id.clone(), note.clone())).collect();
-                                a.allow(&request_id, json!({ "answers": by_id })).unwrap();
-                            }
-                            None => a.deny(&request_id, ANSWER_IN_CHAT).unwrap(),
-                        }
+                    Ev::Questions(request) => {
+                        seen.extend(request.questions.iter().map(|q| q.text.clone()));
+                        let answers = answer
+                            .as_ref()
+                            .map(|ans| vec![ans.clone(); request.questions.len()]);
+                        a.answer_questions(&request, answers.as_deref()).unwrap();
                     }
-                    Ev::ToolResult { text: t, .. } if seen.len() == 1 && answered(&t).is_some() => {
+                    Ev::ToolResult { text: t, .. }
+                        if seen.len() == 1 && crate::transcript::answered(&t).is_some() =>
+                    {
                         eprintln!("{model} tool result: {t}");
                     }
                     Ev::Text(t) => text.push_str(&t),
@@ -1344,19 +1066,5 @@ mod tests {
                 "{model} assumed: {text}"
             );
         }
-    }
-
-    #[test]
-    fn rows_summarize_claudes_results() {
-        let r = r#"Your questions have been answered: "Which DB?"="Postgres". You can now continue with these answers in mind."#;
-        assert_eq!(answered(r), Some(r#""Which DB?"="Postgres""#));
-        let r = r#"The user answered: "Name?"="bob". Read the answers carefully — they may request clarification"#;
-        assert_eq!(answered(r), Some(r#""Name?"="bob""#));
-        assert_eq!(answered(ANSWER_IN_CHAT), Some("Answered in the chat"));
-        assert_eq!(answered("(interrupted)"), None);
-        assert_eq!(
-            asked_summary(&json!({"questions": [{"question": "A?"}, {"question": "B?"}]})),
-            "A? · B?"
-        );
     }
 }

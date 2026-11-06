@@ -28,6 +28,96 @@ pub struct Task {
     pub description: String,
 }
 
+/// Told to the agent when the user closes the card (or sends a message instead).
+pub(crate) const ANSWER_IN_CHAT: &str = "The user closed these questions to answer in the chat \
+    instead. End your turn now without assuming any answers; their reply comes next.";
+
+#[derive(Debug, PartialEq)]
+pub struct Question {
+    /// codex's; claude keys answers by the question's text.
+    pub(crate) id: String,
+    pub header: String,
+    pub text: String,
+    /// Label and description.
+    pub options: Vec<(String, String)>,
+    pub multi: bool,
+    /// A free-text answer is allowed: always for claude, `isOther` for codex.
+    pub other: bool,
+    pub secret: bool,
+}
+
+/// A live question request, normalized before it reaches the questionnaire UI.
+#[derive(Debug, PartialEq)]
+pub struct Questions {
+    pub request_id: String,
+    pub tool_use_id: String,
+    pub questions: Vec<Question>,
+    pub(crate) input: Value,
+    /// The transport has no tool result for these answers, so Shark must record one.
+    pub record_history: bool,
+}
+
+impl Questions {
+    pub(crate) fn new(
+        request_id: String,
+        tool_use_id: String,
+        input: Value,
+        record_history: bool,
+    ) -> Self {
+        Self {
+            request_id,
+            tool_use_id,
+            questions: questions(&input),
+            input,
+            record_history,
+        }
+    }
+}
+
+/// Picked labels and optional free text for one question.
+pub type Answer = (Vec<String>, Option<String>);
+
+/// The questions in a tool input, claude's or codex's.
+pub(crate) fn questions(input: &Value) -> Vec<Question> {
+    let s = |v: &Value| v.as_str().unwrap_or_default().to_string();
+    (input["questions"].as_array().into_iter().flatten())
+        .map(|q| {
+            let options: Vec<(String, String)> = (q["options"].as_array().into_iter().flatten())
+                .map(|o| (s(&o["label"]), s(&o["description"])))
+                .collect();
+            Question {
+                id: s(&q["id"]),
+                header: s(&q["header"]),
+                text: s(&q["question"]),
+                multi: q["multiSelect"].as_bool().unwrap_or(false),
+                other: q["isOther"].as_bool().unwrap_or(true) || options.is_empty(),
+                secret: q["isSecret"].as_bool().unwrap_or(false),
+                options,
+            }
+        })
+        .collect()
+}
+
+/// The questions answered, each with its picks and the user's own text joined with ", ".
+pub(crate) fn given<'a>(
+    qs: &'a [Question],
+    answers: &'a [Answer],
+) -> impl Iterator<Item = (&'a Question, &'a Answer, String)> {
+    (qs.iter().zip(answers))
+        .filter(|(_, a)| !a.0.is_empty() || a.1.is_some())
+        .map(|(q, a)| {
+            (
+                q,
+                a,
+                a.0.iter()
+                    .map(String::as_str)
+                    .chain(a.1.as_deref())
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            )
+        })
+}
+
 #[derive(Debug, PartialEq)]
 pub enum Ev {
     /// The session as the CLI reports it at the start of each turn.
@@ -69,6 +159,8 @@ pub enum Ev {
         tool_use_id: String,
         input: Value,
     },
+    /// Questions awaiting answers, live only.
+    Questions(Questions),
     /// A plan codex's plan mode proposed. claude's come as an ExitPlanMode `Permission`.
     Plan {
         id: String,
@@ -88,6 +180,16 @@ pub struct Agent {
     stdin: Arc<Mutex<ChildStdin>>,
     /// Set for a `codex app-server` process.
     codex: Option<Arc<Mutex<codex::State>>>,
+}
+
+/// Claude resumes its tool with the original input plus answers keyed by question text.
+fn question_reply(request: &Questions, answers: &[Answer]) -> Value {
+    let by_text: serde_json::Map<String, Value> = given(&request.questions, answers)
+        .map(|(q, _, all)| (q.text.clone(), all.into()))
+        .collect();
+    let mut input = request.input.clone();
+    input["answers"] = by_text.into();
+    input
 }
 
 /// Pids of the running agent processes, with their `exited` flags. Quitting stops them: macOS
@@ -253,7 +355,12 @@ pub(crate) fn start(
                 continue;
             }
             let evs = parse(&line);
-            if (evs.iter()).any(|e| !matches!(e, Ev::TextDelta(_) | Ev::Permission { .. })) {
+            if (evs.iter()).any(|e| {
+                !matches!(
+                    e,
+                    Ev::TextDelta(_) | Ev::Permission { .. } | Ev::Questions(_)
+                )
+            }) {
                 append(&transcript, &compact(&line)); // deltas are redundant with the full assistant message
             }
             for ev in evs {
@@ -276,6 +383,29 @@ pub(crate) fn start(
 }
 
 impl Agent {
+    /// The running process's backend, independent of the next selected model.
+    pub fn is_codex(&self) -> bool {
+        self.codex.is_some()
+    }
+
+    /// Answers or dismisses a normalized request in this process's wire format.
+    pub fn answer_questions(
+        &mut self,
+        request: &Questions,
+        answers: Option<&[Answer]>,
+    ) -> std::io::Result<()> {
+        if self.is_codex() {
+            return self.allow(
+                &request.request_id,
+                codex::question_reply(&request.questions, answers),
+            );
+        }
+        let Some(answers) = answers else {
+            return self.deny(&request.request_id, ANSWER_IN_CHAT);
+        };
+        self.allow(&request.request_id, question_reply(request, answers))
+    }
+
     pub fn send(&mut self, text: &str) -> std::io::Result<()> {
         if let Some(st) = &self.codex {
             return codex::send(st, &self.stdin, text);
@@ -444,6 +574,17 @@ pub(crate) fn parse_record(v: Value) -> Vec<Ev> {
                 _ => None,
             })
             .collect(),
+        "control_request"
+            if v["request"]["subtype"] == "can_use_tool"
+                && v["request"]["tool_name"] == "AskUserQuestion" =>
+        {
+            vec![Ev::Questions(Questions::new(
+                s(&v["request_id"]),
+                s(&v["request"]["tool_use_id"]),
+                v["request"]["input"].clone(),
+                false,
+            ))]
+        }
         "control_request" if v["request"]["subtype"] == "can_use_tool" => vec![Ev::Permission {
             request_id: s(&v["request_id"]),
             tool: s(&v["request"]["tool_name"]),
@@ -499,6 +640,11 @@ mod tests {
     /// Quitting stops what `start` registered, and a reaped process leaves the registry.
     #[test]
     fn stop_all_signals_registered_children() {
+        // `start` writes its log under the shared test home, which `test_home` wipes.
+        #[cfg(feature = "test-support")]
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
         let (agent, rx) = start(cmd, &std::env::temp_dir(), "stop-all-test", None, None).unwrap();
@@ -596,6 +742,86 @@ not json"#;
                 },
             ]
         );
+    }
+
+    #[test]
+    fn answers_go_back_in_each_agents_shape() {
+        let input = json!({"questions": [
+            {"question": "Which DB?", "header": "DB", "multiSelect": false, "options": [{"label": "Postgres", "description": "SQL"}, {"label": "Redis", "description": ""}]},
+            {"question": "Which tests?", "header": "Tests", "multiSelect": true, "options": [{"label": "Unit", "description": ""}, {"label": "E2E", "description": ""}]},
+            {"question": "Name?", "header": "Name", "multiSelect": false, "options": [{"label": "a", "description": ""}, {"label": "b", "description": ""}]},
+        ]});
+        let qs = questions(&input);
+        assert_eq!(
+            (qs.len(), qs[1].multi, qs[0].other),
+            (3, true, true),
+            "claude always takes text"
+        );
+        assert_eq!(qs[0].options[0], ("Postgres".into(), "SQL".into()));
+        let answers: Vec<Answer> = vec![
+            (vec!["Postgres".into()], None),
+            (vec!["Unit".into(), "E2E".into()], Some("smoke".into())),
+            (vec![], None), // skipped
+        ];
+        let request = Questions::new("r".into(), "q".into(), input.clone(), false);
+        let r = question_reply(&request, &answers);
+        assert_eq!(
+            r["questions"], input["questions"],
+            "claude needs its questions back"
+        );
+        assert_eq!(
+            r["answers"],
+            json!({"Which DB?": "Postgres", "Which tests?": "Unit, E2E, smoke"})
+        );
+        assert_eq!(
+            crate::transcript::answer_pairs(&qs, &answers),
+            r#""Which DB?"="Postgres", "Which tests?"="Unit, E2E, smoke""#
+        );
+
+        let input = json!({"questions": [
+            {"id": "file", "header": "File", "question": "Which file?", "isOther": true, "isSecret": false, "options": [{"label": "a.txt", "description": ""}]},
+            {"id": "ok", "header": "Run", "question": "Run it?", "isOther": false, "isSecret": true, "options": [{"label": "Accept", "description": ""}]},
+        ]});
+        let qs = questions(&input);
+        assert_eq!(
+            (qs[0].other, qs[1].other, qs[1].secret),
+            (true, false, true)
+        );
+        let answers: Vec<Answer> = vec![
+            (vec![], Some("b.txt".into())),
+            (vec!["Accept".into()], None),
+        ];
+        assert_eq!(
+            crate::transcript::answer_pairs(&qs, &answers),
+            r#""Which file?"="b.txt", "Run it?"="••••""#
+        );
+        assert_eq!(
+            codex::question_reply(&qs, Some(&answers)),
+            json!({"answers": {
+                "file": {"answers": ["None of the above", "user_note: b.txt"]},
+                "ok": {"answers": ["Accept"]},
+            }})
+        );
+        assert_eq!(
+            codex::question_reply(&qs, None),
+            json!({"answers": {
+                "file": {"answers": [format!("user_note: {ANSWER_IN_CHAT}")]},
+                "ok": {"answers": [format!("user_note: {ANSWER_IN_CHAT}")]},
+            }})
+        );
+    }
+
+    #[test]
+    fn questions_are_normalized_before_the_ui() {
+        let evs = parse(
+            r#"{"type":"control_request","request_id":"r","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"q","input":{"questions":[{"question":"Which?","options":[]}]}}}"#,
+        );
+        let [Ev::Questions(request)] = evs.as_slice() else {
+            panic!("{evs:?}")
+        };
+        assert_eq!(request.questions[0].text, "Which?");
+        assert!(request.questions[0].other);
+        assert!(!request.record_history);
     }
 
     #[test]

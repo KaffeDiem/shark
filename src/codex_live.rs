@@ -197,7 +197,12 @@ fn is_exit(e: &Ev) -> bool {
 /// Live events as the transcript should replay them.
 fn stored(evs: &[Ev]) -> Vec<&Ev> {
     evs.iter()
-        .filter(|e| !matches!(e, Ev::TextDelta(_) | Ev::Permission { .. } | Ev::Exited(_)))
+        .filter(|e| {
+            !matches!(
+                e,
+                Ev::TextDelta(_) | Ev::Permission { .. } | Ev::Questions(_) | Ev::Exited(_)
+            )
+        })
         .collect()
 }
 

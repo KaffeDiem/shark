@@ -313,7 +313,7 @@ impl Shark {
         let at = rows.iter().position(|r| *r == self.sel).unwrap_or(0);
         let to = nav.to(at, rows.len(), 0);
         self.sel = rows[to];
-        // Child 0 of the scrolled list is the Workspaces header.
+        // Child 0 of the scrolled list is the Agents header.
         self.sidebar_scroll.scroll_to_item(to + 1);
         cx.notify();
     }
@@ -432,10 +432,7 @@ impl Shark {
             self.sel = SideRow::Section(if j > i { j - 1 } else { j });
         }
         self.fix_sel();
-        window.push_notification(
-            format!("Deleted section {} (its workspaces stay)", s.name),
-            cx,
-        );
+        window.push_notification(format!("Deleted section {} (its agents stay)", s.name), cx);
         cx.notify();
     }
 
@@ -715,7 +712,7 @@ impl Shark {
                 self.reorder_source(
                     d,
                     reorder::Item::Workspace(w.name.clone()),
-                    w.name.clone().into(),
+                    w.display_title().to_string().into(),
                 )
             })
             .child(match nth {
@@ -731,7 +728,7 @@ impl Shark {
                             div()
                                 .truncate()
                                 .when(active, |d| d.font_weight(FontWeight::MEDIUM))
-                                .child(w.name.clone()),
+                                .child(w.display_title().to_string()),
                         )
                         .child(
                             div()
@@ -747,6 +744,9 @@ impl Shark {
                                         .map(|r| r.name.as_str())
                                         .collect::<Vec<_>>()
                                         .join(" · ");
+                                    if repos.is_empty() {
+                                        repos = "No repository".into();
+                                    }
                                     if self.running(&w.name) {
                                         repos = format!("Scripts running · {repos}");
                                     }
@@ -761,7 +761,7 @@ impl Shark {
                 )
             })
             .when(rail, |d| {
-                let name: SharedString = w.name.clone().into();
+                let name: SharedString = w.display_title().to_string().into();
                 d.tooltip(move |w, cx| Tooltip::new(name.clone()).build(w, cx))
             })
             // Holding cmd in the rail names every workspace beside its cmd-N key.
@@ -783,7 +783,7 @@ impl Shark {
                                 .text_color(theme.popover_foreground)
                                 .text_sm()
                                 .shadow_md()
-                                .child(w.name.clone()),
+                                .child(w.display_title().to_string()),
                         ),
                     )),
                 )
@@ -941,8 +941,8 @@ impl Shark {
                 let mut entries = vec![
                     menu::item(
                         IconName::Plus,
-                        "New workspace…",
-                        on_shark(cx, |s, w, cx| s.new_workspace_default(w, cx)),
+                        "New agent",
+                        on_shark(cx, |s, w, cx| s.new_empty_agent(w, cx)),
                     ),
                     menu::item(
                         IconName::FolderPlus,
@@ -966,7 +966,7 @@ impl Shark {
             .group("ws-header")
             .justify_between()
             .items_end()
-            .child(header("Workspaces"))
+            .child(header("Agents"))
             .when(!rail, |d| {
                 d.child(
                     div()
@@ -987,7 +987,7 @@ impl Shark {
                 )
             })
             .on_mouse_down(MouseButton::Right, new_section_menu(false));
-        // Like the Workspaces header: the + shows on hover; right-click offers the same.
+        // Like the Agents header: the + shows on hover; right-click offers the same.
         let repo_header = h_flex()
             .id("repo-header")
             .group("repo-header")
@@ -1035,9 +1035,9 @@ impl Shark {
             .id("sidebar")
             // Folders dragged in from Finder are added as repos.
             .drag_over::<ExternalPaths>(move |d, _, _, _| d.bg(accent))
-            .on_drop(
-                cx.listener(|this, p: &ExternalPaths, w, cx| this.add_repo_paths(p.paths(), w, cx)),
-            )
+            .on_drop(cx.listener(|this, p: &ExternalPaths, w, cx| {
+                this.add_repo_paths(p.paths(), w, cx);
+            }))
             .key_context("Sidebar")
             .track_focus(&self.sidebar_focus)
             // The rail clears the traffic lights (x 9..61), so the content island never sits under them.
@@ -1116,12 +1116,7 @@ impl Shark {
                     .children(items)
                     .when(
                         self.state.workspaces.is_empty() && self.state.sections.is_empty(),
-                        |d| {
-                            d.child(hint(match self.state.repos.is_empty() {
-                                true => "Add a repo first",
-                                false => "cmd-n to create",
-                            }))
-                        },
+                        |d| d.child(hint("cmd-n to create")),
                     )
                     .child(repo_header)
                     .children(repos)

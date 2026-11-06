@@ -197,7 +197,7 @@ impl DraftStore {
     }
 }
 
-fn store_path(workspace: &str) -> PathBuf {
+pub(crate) fn store_path(workspace: &str) -> PathBuf {
     crate::state::support_dir()
         .join("git-drafts")
         .join(format!("{workspace}.json"))

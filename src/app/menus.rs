@@ -1,6 +1,7 @@
 //! Right-click menus and the path helpers they share.
 use super::*;
 use crate::apps::{self, Kind};
+use crate::menu::each_or_all;
 
 /// `/Users/me/x` → `~/x`: paths in menus are read, so keep them short.
 pub(super) fn tilde(path: &Path) -> String {
@@ -92,7 +93,7 @@ pub(super) fn path_submenu(
 /// Right-click menu of a sidebar workspace. Shows where everything lives on disk,
 /// and keeps the destructive items last. Shortcuts live in the palette, not here (Apple HIG).
 pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<Entry> {
-    let paths: Vec<(String, PathBuf)> = std::iter::once(("Workspace folder".into(), ws.dir()))
+    let paths: Vec<(String, PathBuf)> = std::iter::once(("Agent folder".into(), ws.dir()))
         .chain(ws.repo_paths())
         .collect();
     let mut entries = vec![];
@@ -100,12 +101,17 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
         // By name: the list can change under an open menu (a background auto-archive).
         entries.push(menu::item(
             IconName::MessageSquare,
-            "Open workspace",
+            "Open agent",
             on_ws(cx, &ws.name, |s, n, w, cx| {
                 s.open_workspace_named(&n, w, cx)
             }),
         ));
     }
+    entries.push(menu::item(
+        IconName::Pencil,
+        "Rename agent…",
+        on_ws(cx, &ws.name, |s, n, w, cx| s.rename_agent(n, w, cx)),
+    ));
     entries.push(move_submenu(this, &ws.name, cx));
     let missing: Vec<Entry> = (this.state.repos.iter())
         .filter(|r| !ws.repos.iter().any(|w| w.name == r.name))
@@ -115,13 +121,18 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
                 IconName::FolderGit2,
                 r.name.clone(),
                 on_shark(cx, move |s, w, cx| {
-                    s.add_repo_to_workspace(name.clone(), repo.clone(), w, cx)
+                    s.attach_form(name.clone(), vec![repo.name.clone()], w, cx)
                 }),
             )
         })
         .collect();
-    if !missing.is_empty() {
-        entries.push(menu::sub(IconName::FolderPlus, "Add repo", missing));
+    // With no repos, the branch rows below offer it.
+    if !missing.is_empty() && !ws.repos.is_empty() {
+        entries.push(menu::sub(
+            IconName::FolderPlus,
+            "Attach repository",
+            missing,
+        ));
     }
     entries.extend([
         Entry::Sep,
@@ -144,12 +155,12 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
         Entry::Sep,
         menu::item(
             IconName::Archive,
-            "Archive",
+            "Delete agent…",
             on_ws(cx, &ws.name, |s, n, w, cx| s.archive_ws(n, false, w, cx)),
         ),
         menu::item(
             IconName::ArchiveX,
-            "Force archive…",
+            "Force delete agent…",
             on_ws(cx, &ws.name, |s, n, w, cx| s.archive_ws(n, true, w, cx)),
         ),
     ]);
@@ -212,7 +223,7 @@ pub(super) fn branch_label(this: &Shark, ws: &Workspace, cx: &App) -> String {
         false => parents,
         true => (ws.repos.iter())
             .filter(|r| r.base.starts_with("origin/"))
-            .map(|r| crate::sync::short(&r.base))
+            .map(|r| crate::git::short(&r.base))
             .collect(),
     };
     crate::stack::title(&ws.branch, &bases)
@@ -252,7 +263,7 @@ fn stack_rows(
                     let label = format!("#{} · {:?}", p.number, p.state).to_lowercase();
                     (IconName::GitMerge, label, Some(p.url.clone()))
                 }
-                (None, None) if n.ws.is_some() => (IconName::GitBranch, "workspace".into(), None),
+                (None, None) if n.ws.is_some() => (IconName::GitBranch, "agent".into(), None),
                 (None, None) => (IconName::GitBranch, String::new(), None),
             };
             let hint = match prefix {
@@ -284,6 +295,13 @@ fn stack_rows(
 /// insert below, copy and change base, then what's on GitHub. Shared by the sidebar's and the
 /// header's menus.
 pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<Entry> {
+    if ws.repos.is_empty() {
+        return vec![menu::item(
+            IconName::FolderPlus,
+            "Attach repository…",
+            on_ws(cx, &ws.name, |s, n, w, cx| s.attach_repository(n, w, cx)),
+        )];
+    }
     let sync = this.syncs.get(&ws.name).map(|s| s.read(cx));
     let branches = sync.map(|s| s.branches()).unwrap_or_default();
     // Not opened yet, so not probed: the branches the workspace put them on.
@@ -362,7 +380,7 @@ pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) 
     );
     let github: Vec<Entry> = [
         each_or_all(IconName::Github, "Open branch on GitHub", links, open_urls),
-        sync.and_then(pr_entry),
+        sync.and_then(|sync| sync.pr_entry()),
     ]
     .into_iter()
     .flatten()
@@ -434,7 +452,7 @@ fn stack_actions(
     out.push(
         menu::item(
             IconName::Layers,
-            "New workspace on top…",
+            "New agent on top…",
             on_ws(cx, &name, |s, n, w, cx| s.stack_from(n, false, w, cx)),
         )
         .hint(ws.branch.clone()),
@@ -446,25 +464,12 @@ fn stack_actions(
     out.push(
         menu::item(
             IconName::ListPlus,
-            "Insert workspace below…",
+            "Insert agent below…",
             on_ws(cx, &name, |s, n, w, cx| s.stack_from(n, true, w, cx)),
         )
         .hint(below),
     );
     out
-}
-
-/// "Open pull request" for each repo with one, or `None` before any PR.
-pub(crate) fn pr_entry(sync: &crate::sync::GitSync) -> Option<Entry> {
-    let prs = (sync.pr_urls().into_iter())
-        .map(|(repo, url)| (repo, String::new(), url))
-        .collect();
-    each_or_all(
-        IconName::GitPullRequest,
-        "Open pull request",
-        prs,
-        open_urls,
-    )
 }
 
 fn open_urls(urls: &[String], _: &mut Window, cx: &mut App) {
@@ -483,35 +488,6 @@ pub(super) fn base_hint(ws: &Workspace) -> String {
     }
 }
 
-/// `label` for `rows` of `(label, hint, value)`, usually one per repo: a single row is one
-/// item, hinted with its label; several make a submenu ending in "All". `f` gets the values.
-pub(crate) fn each_or_all(
-    icon: IconName,
-    label: &'static str,
-    mut rows: Vec<(String, String, String)>,
-    f: impl Fn(&[String], &mut Window, &mut App) + 'static,
-) -> Option<Entry> {
-    let f = Rc::new(f);
-    if rows.len() < 2 {
-        let (hint, _, v) = rows.pop()?;
-        let item = menu::item(icon, label, move |w, cx| f(std::slice::from_ref(&v), w, cx));
-        return Some(item.hint(hint));
-    }
-    let all: Vec<String> = rows.iter().map(|r| r.2.clone()).collect();
-    let mut entries: Vec<Entry> = (rows.into_iter())
-        .map(|(name, hint, v)| {
-            let f = f.clone();
-            let run = move |w: &mut Window, cx: &mut App| f(std::slice::from_ref(&v), w, cx);
-            menu::item(IconName::FolderGit2, name, run).hint(hint)
-        })
-        .collect();
-    entries.extend([
-        Entry::Sep,
-        menu::item(None, "All", move |w, cx| f(&all, w, cx)),
-    ]);
-    Some(menu::sub(icon, label, entries))
-}
-
 /// Right-click menu of a sidebar repo row.
 pub(super) fn repo_menu(this: &Shark, repo: &Repo, cx: &Context<Shark>) -> Vec<Entry> {
     let (name, path) = (repo.name.clone(), repo.path.clone());
@@ -526,7 +502,7 @@ pub(super) fn repo_menu(this: &Shark, repo: &Repo, cx: &Context<Shark>) -> Vec<E
         ),
         menu::item(
             IconName::Plus,
-            "New workspace…",
+            "New agent from this repo…",
             on_shark(cx, move |s, w, cx| {
                 s.new_workspace(picked.clone(), None, w, cx)
             }),
@@ -547,15 +523,15 @@ pub(super) fn repo_menu(this: &Shark, repo: &Repo, cx: &Context<Shark>) -> Vec<E
             let (ws, repo) = (w.name.clone(), repo.clone());
             menu::item(
                 IconName::MessageSquare,
-                w.name.clone(),
+                w.display_title().to_string(),
                 on_shark(cx, move |s, win, cx| {
-                    s.add_repo_to_workspace(ws.clone(), repo.clone(), win, cx)
+                    s.attach_form(ws.clone(), vec![repo.name.clone()], win, cx)
                 }),
             )
         })
         .collect();
     if !rows.is_empty() {
-        entries.insert(2, menu::sub(IconName::FolderPlus, "Add to workspace", rows));
+        entries.insert(2, menu::sub(IconName::FolderPlus, "Attach to agent", rows));
     }
     entries.extend(open_in_entries(None, &[(name, path.clone())], cx));
     entries.push(
@@ -586,35 +562,4 @@ pub(super) fn on_ws(
 ) -> impl Fn(&mut Window, &mut App) + 'static {
     let name = name.to_string();
     on_shark(cx, move |s, w, cx| f(s, name.clone(), w, cx))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
-
-    #[test]
-    fn each_or_all_collapses_one_row() {
-        let row = |n: &str| (n.to_string(), String::new(), n.to_string());
-        let f: fn(&[String], &mut Window, &mut App) = |_, _, _| {};
-        assert!(each_or_all(IconName::Github, "Open", vec![], f).is_none());
-        match each_or_all(IconName::Github, "Open", vec![row("api")], f) {
-            Some(Entry::Item { label, hint, .. }) => {
-                assert_eq!((&*label, hint.as_deref()), ("Open", Some("api")))
-            }
-            _ => panic!("one row is one item"),
-        }
-        match each_or_all(IconName::Github, "Open", vec![row("api"), row("web")], f) {
-            Some(Entry::Sub { entries, .. }) => {
-                let labels: Vec<_> = (entries.iter())
-                    .map(|e| match e {
-                        Entry::Item { label, .. } => label.to_string(),
-                        _ => "-".into(),
-                    })
-                    .collect();
-                assert_eq!(labels, ["api", "web", "-", "All"]);
-            }
-            _ => panic!("several rows are a submenu"),
-        }
-    }
 }

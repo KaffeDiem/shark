@@ -23,6 +23,7 @@ pub(super) struct WorkspacePicker {
 #[derive(PartialEq)]
 pub(super) struct PickerWorkspace {
     name: String,
+    title: String,
     repos: Vec<(String, (String, IconName, Option<crate::prs::PrStatus>))>,
     last_interacted_at: Option<u64>,
     running: usize,
@@ -33,6 +34,7 @@ impl PickerWorkspace {
     fn new(ws: &Workspace, repos: Option<&[SyncRepo]>, running: usize, attention: Attn) -> Self {
         Self {
             name: ws.name.clone(),
+            title: ws.display_title().to_string(),
             repos: ws
                 .repos
                 .iter()
@@ -81,7 +83,8 @@ fn rank(workspaces: &[PickerWorkspace], query: &str) -> Vec<String> {
         .iter()
         .enumerate()
         .filter_map(|(order, ws)| {
-            let score = std::iter::once(ws.name.as_str())
+            let score = [ws.title.as_str(), ws.name.as_str()]
+                .into_iter()
                 .chain(ws.repos.iter().map(|(name, _)| name.as_str()))
                 .filter_map(|name| crate::complete::score(&q, &search_key(name), 0))
                 .max()?;
@@ -277,8 +280,9 @@ impl WorkspacePicker {
                 } else {
                     time
                 };
+                let title = ws.title.clone();
                 let label = format!(
-                    "{name}, {}, {time}, {exact}, {}",
+                    "{title}, {}, {time}, {exact}, {}",
                     activity.as_deref().unwrap_or("Idle"),
                     rows.iter()
                         .map(|(name, (status, ..))| format!("{name}: {status}"))
@@ -327,7 +331,7 @@ impl WorkspacePicker {
                                         .min_w_0()
                                         .truncate()
                                         .font_weight(FontWeight::MEDIUM)
-                                        .child(name.clone()),
+                                        .child(title.clone()),
                                 )
                                 .child(
                                     div()
@@ -399,7 +403,7 @@ impl WorkspacePicker {
             .items(items)
             .filterable(false)
             .bordered(false)
-            .placeholder("Open workspace…")
+            .placeholder("Open agent…")
             .max_h(
                 (window.viewport_size().height - px(200.))
                     .max(px(48.))
@@ -416,9 +420,9 @@ impl WorkspacePicker {
                     .p_4()
                     .text_color(cx.theme().muted_foreground)
                     .child(if empty {
-                        "No workspaces yet"
+                        "No agents yet"
                     } else {
-                        "No matching workspaces"
+                        "No matching agents"
                     })
             })
             .footer(|_, _, cx| {
@@ -562,6 +566,30 @@ mod tests {
             rank(&[ws("ab", "cd", None)], "bc").is_empty(),
             "never match across name/repo boundaries"
         );
+    }
+
+    #[test]
+    fn renamed_agents_rank_by_title_and_keep_their_identity_at_scale() {
+        for count in [100, 1000] {
+            let workspaces: Vec<_> = (0..count)
+                .map(|i| {
+                    let mut agent = ws(&format!("agent-{i:06}"), "api", Some(i));
+                    agent.title = "Investigate connection failures".into();
+                    agent
+                })
+                .collect();
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                let hits = rank(&workspaces, "connection failures");
+                assert_eq!(hits.len(), count as usize);
+                assert_eq!(hits[0], format!("agent-{:06}", count - 1));
+            }
+            eprintln!(
+                "rank {count} renamed agents: {:?} per query",
+                start.elapsed() / 20
+            );
+            assert_eq!(rank(&workspaces, "agent-000000")[0], "agent-000000");
+        }
     }
 
     #[test]

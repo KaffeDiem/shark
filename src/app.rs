@@ -3,6 +3,7 @@ use crate::attention::Attn;
 use crate::chat::{Chat, ChatEvent};
 use crate::checkbox::Checkbox;
 use crate::editor::{EditorEvent, FileEditor};
+use crate::linear::Snapshot;
 use crate::menu::{self, Entry};
 use crate::models::MODELS;
 use crate::state::{ChatMeta, Repo, Section, State, TabId, Workspace, move_item, workspaces_dir};
@@ -12,7 +13,6 @@ use gpui_kit::assets::IconName;
 use gpui_kit::base::InteractiveElementExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
-use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::hover_card::HoverCard;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
@@ -36,6 +36,7 @@ use std::rc::Rc;
 
 mod app_switcher;
 mod ask;
+mod attach;
 mod chats;
 mod differ_host;
 mod editor_pane;
@@ -46,6 +47,8 @@ mod intelligence;
 #[cfg(all(test, feature = "test-support"))]
 mod intelligence_tests;
 mod interaction;
+pub(crate) mod linear_connection;
+mod linear_issues;
 pub(crate) mod menus;
 mod new_workspace;
 mod palette;
@@ -66,8 +69,6 @@ use crate::ui::*;
 use differ::Differ;
 use differ::Viewed;
 use menus::{on_shark, tilde, ws_menu};
-use palette::menu_dialog;
-pub(crate) use palette::open_menu;
 use sidebar::{Naming, SideRow, move_submenu};
 
 #[derive(PartialEq, Clone, Copy, Debug)]
@@ -119,7 +120,10 @@ pub struct Shark {
     /// Workspaces whose worktrees are being removed in the background.
     pub(crate) archiving: HashSet<String>,
     creating: HashSet<String>,
+    /// Agents with a repository being created right now (`Workspace::attaching` has the rest).
     adding_repos: HashSet<String>,
+    /// Per agent, how the attachment operation has gone.
+    attach_results: HashMap<String, attach::Results>,
     /// Workspaces with setup scripts running, once per run (a repo added during the first).
     setting_up: Vec<String>,
     /// Sidebar shrunk to icons by the user.
@@ -161,6 +165,7 @@ pub struct Shark {
     /// When the last dependency check started.
     deps_at: Option<std::time::Instant>,
     pub(crate) home: home::Home,
+    linear: linear_connection::Linear,
     /// Running run scripts by workspace (cmd-r); dropping one stops them.
     runs: HashMap<String, crate::scripts::Running>,
     _subs: Vec<Subscription>,
@@ -188,6 +193,7 @@ impl Shark {
         let home = home::Home::new(window, cx);
         let differ = cx.new(|cx| Differ::new(differ::Preferences::from(&state), window, cx));
         cx.defer_in(window, move |s, window, cx| {
+            s.reconcile_attachments(window, cx);
             s.restore_last_open(window, cx);
             s.check_deps(cx);
             s.usage_polling(window, cx);
@@ -280,6 +286,7 @@ impl Shark {
             archiving: HashSet::new(),
             creating: HashSet::new(),
             adding_repos: HashSet::new(),
+            attach_results: HashMap::new(),
             setting_up: vec![],
             rail: false,
             zen: false,
@@ -310,6 +317,7 @@ impl Shark {
             branch_at: Default::default(),
             deps: vec![],
             deps_check: None,
+            linear: Default::default(),
             deps_at: None,
             home,
             runs: HashMap::new(),
@@ -361,7 +369,7 @@ impl Shark {
     /// "Branch menu…": the header's branch menu, hanging from the button, from the keyboard.
     fn open_branch_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ws) = self.active_ws() else {
-            return notify_err(window, cx, "Open a workspace first");
+            return notify_err(window, cx, "Open an agent first");
         };
         let entries = menus::branch_entries(self, ws, cx);
         let b = self.branch_at.get();
@@ -402,15 +410,16 @@ impl Shark {
         f: impl FnOnce(&mut GitSync, &mut Window, &mut Context<GitSync>),
     ) {
         match self.active_sync().cloned() {
+            _ if self.no_repos() => notify_err(window, cx, workspace::NO_REPO),
             Some(sync) => sync.update(cx, |g, cx| f(g, window, cx)),
-            None => notify_err(window, cx, "Open a workspace first"),
+            None => notify_err(window, cx, "Open an agent first"),
         }
     }
 
     fn show(&mut self, tab: Tab, window: &mut Window, cx: &mut Context<Self>) {
         if let Tab::Feature(feature) = tab {
             if self.active_ws().is_none() {
-                return notify_err(window, cx, "Open a workspace first");
+                return notify_err(window, cx, "Open an agent first");
             }
             let ws = self.active_ws_mut().unwrap();
             let closed = feature.closed_mut(ws);
@@ -469,7 +478,7 @@ impl Shark {
             return cx.notify();
         }
         if self.home_shown() {
-            return notify_err(window, cx, "Open a workspace first");
+            return notify_err(window, cx, "Open an agent first");
         }
         // Out of the hidden sidebar or rail, into the content; a field already in the content
         // (a side question) keeps the focus.
@@ -625,13 +634,9 @@ impl Shark {
     }
 
     fn render_new_workspace(&self, cx: &Context<Self>) -> Button {
-        side_toggle(
-            "new-workspace",
-            IconName::SquarePen,
-            "New workspace (cmd-n)",
-        )
-        .text_color(cx.theme().sidebar_foreground)
-        .on_click(cx.listener(|this, _, window, cx| this.new_workspace_default(window, cx)))
+        side_toggle("new-workspace", IconName::SquarePen, "New agent (cmd-n)")
+            .text_color(cx.theme().sidebar_foreground)
+            .on_click(cx.listener(|this, _, window, cx| this.new_empty_agent(window, cx)))
     }
 
     fn draggable_chrome(&self, id: &'static str, d: Stateful<Div>) -> impl IntoElement {
@@ -730,6 +735,8 @@ impl Shark {
         }
         let controls = self.render_feature_controls(cx);
         let has_controls = controls.is_some();
+        let no_repos = self.no_repos();
+        let attachments = self.render_attachments(cx);
         let theme = cx.theme();
         v_flex()
             .flex_1()
@@ -744,13 +751,16 @@ impl Shark {
                     .border_b_1()
                     .border_color(theme.border)
                     .child(self.render_run(cx))
-                    .child(
-                        div()
-                            .flex_shrink_1()
-                            .min_w(px(28.))
-                            .overflow_hidden()
-                            .child(self.render_branch(cx)),
-                    )
+                    .child(attachments)
+                    .when(!no_repos, |d| {
+                        d.child(
+                            div()
+                                .flex_shrink_1()
+                                .min_w(px(28.))
+                                .overflow_hidden()
+                                .child(self.render_branch(cx)),
+                        )
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -760,15 +770,18 @@ impl Shark {
                             .map(|d| self.draggable_chrome("workspace-toolbar-empty", d)),
                     )
                     .children(controls)
-                    .when_some(self.active_sync().cloned(), |d, sync| {
-                        d.child(
-                            div()
-                                .min_w_0()
-                                .flex_shrink_0()
-                                .when(has_controls, |d| d.max_w(relative(0.4)))
-                                .child(sync),
-                        )
-                    }),
+                    .when_some(
+                        self.active_sync().cloned().filter(|_| !no_repos),
+                        |d, sync| {
+                            d.child(
+                                div()
+                                    .min_w_0()
+                                    .flex_shrink_0()
+                                    .when(has_controls, |d| d.max_w(relative(0.4)))
+                                    .child(sync),
+                            )
+                        },
+                    ),
             )
             .child(self.render_tab(cx))
             .into_any_element()
@@ -786,7 +799,7 @@ impl Shark {
                         .map(|chat| chat.clone().cached(StyleRefinement::default().size_full())),
                 )
                 .into_any_element(),
-            Tab::Feature(feature) => self.render_feature(feature),
+            Tab::Feature(feature) => self.render_feature(feature, cx),
             Tab::File => h_flex()
                 .flex_1()
                 .min_h_0()
@@ -984,9 +997,10 @@ impl Render for Shark {
             .text_color(theme.foreground)
             .font_features(inter_features())
             .on_action(cx.listener(|this, _: &TogglePalette, w, cx| this.toggle_palette(w, cx)))
-            .on_action(
-                cx.listener(|this, _: &NewWorkspace, w, cx| this.new_workspace_default(w, cx)),
-            )
+            .on_action(cx.listener(|this, _: &NewWorkspace, w, cx| this.new_empty_agent(w, cx)))
+            .on_action(cx.listener(|this, _: &NewWorkspaceFromBranch, w, cx| {
+                this.new_workspace_default(w, cx)
+            }))
             .on_action(cx.listener(|this, _: &ArchiveWorkspace, w, cx| this.archive(false, w, cx)))
             .on_action(
                 cx.listener(|this, _: &ForceArchiveWorkspace, w, cx| this.archive(true, w, cx)),
@@ -1074,7 +1088,10 @@ impl Render for Shark {
                 })
             }))
             .on_action(cx.listener(|this, _: &CopyBranch, w, cx| {
-                this.with_target(w, cx, |_, ws, w, cx| copy(ws.branch.clone(), w, cx))
+                this.with_target(w, cx, |_, ws, w, cx| match ws.repos.is_empty() {
+                    true => notify_err(w, cx, workspace::NO_REPO),
+                    false => copy(ws.branch.clone(), w, cx),
+                })
             }))
             .on_action(cx.listener(|this, a: &SetModel, w, cx| this.set_model(a.0, w, cx)))
             .on_action(cx.listener(|this, _: &NextAttention, w, cx| this.next_attention(w, cx)))

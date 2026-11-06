@@ -11,6 +11,17 @@ Feature implementations live in `src/features/differ/` and `src/features/git/`.
 dialogs and clipboard helpers live in `src/ui.rs`. Features import their
 dependencies explicitly and do not depend on the `app` module.
 
+Shared contracts live below their consumers: `review_protocol` owns review cards and
+addressed-comment reports; `models` owns model labels and effort rules; `ui` owns
+Markdown/link rendering and shared model/command menus. Feature-specific acceptance,
+rendering state and delivery remain with the feature. Review line geometry comes from
+the validated `DiffFile` patch model; narrowing to GitHub's context is review policy.
+
+`pr` owns GitHub target identity and discovery. Publication and anchor verification take
+an explicit `Target` captured from the discovered PR URL, including host and repository;
+the working directory is not the publication target. GitSync consumes this shared policy
+and owns its header/menu workflow.
+
 ## Adding a feature
 
 1. Add its concrete variant to `Feature` in `src/features/mod.rs`, then add metadata
@@ -70,6 +81,16 @@ Only acceptance queues the comments and starts optional publication. The host
 updates the queue synchronously before GPUI delivers Chat's acknowledgement events.
 Chat has no dependency on Differ. Publication completion updates the captured
 workspace even if its tab is hidden or another workspace is active.
+
+Plan storage retains save errors and protects files that failed to load. Retry, quit,
+archive and chat-close guards include plan errors, including plans in inactive chats.
+The stored plan and transcript formats remain unchanged.
+
+The host discovers and caches language sessions; `FileEditor` owns detach, discovery
+state and attachment transitions. It exposes read access and concrete operations rather
+than mutable lifecycle fields. Agent adapters likewise own question normalization and
+reply encoding; Chat uses the running backend for live events and the selected model
+for the next process. Transcript record construction stays in `transcript`.
 
 ## Validation
 

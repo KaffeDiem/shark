@@ -9,7 +9,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::{fs, path::PathBuf, time::Duration};
 
+mod agent_tests;
 mod app_switcher_tests;
+mod attach_tests;
 mod audit_tests;
 mod base_adoption_tests;
 pub(crate) mod chrome_tests;
@@ -19,6 +21,7 @@ mod editor_pane_tests;
 mod file_changes_tests;
 mod git_tests;
 mod home_tests;
+mod issue_tests;
 mod menu_pixels;
 mod mixed_tab_tests;
 mod navigation_pixels;
@@ -97,6 +100,15 @@ pub(super) fn boot(
         crate::menubar::init(cx);
     });
     open(cx, options)
+}
+
+/// Opens the branch and PR dialog, which has no key of its own.
+fn branch_dialog(cx: &mut TestAppContext, window: AnyWindowHandle) {
+    cx.update_window(window, |_, w, cx| {
+        w.dispatch_action(Box::new(NewWorkspaceFromBranch), cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
 }
 
 /// Every menu-bar item without an `os_action` has a handler from the current focus `at`.
@@ -334,8 +346,9 @@ async fn vim_setting_and_palette_target(cx: &mut TestAppContext) {
     }
     assert_ne!(name(cx), open);
     press(cx, &["cmd-k"]);
-    cx.update_window(window, |_, w, cx| w.input("archive workspace", cx))
+    cx.update_window(window, |_, w, cx| w.input("delete agent", cx))
         .unwrap();
+    press(cx, &["enter"]);
     press(cx, &["enter"]);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).state.workspaces.len() == 1
@@ -413,7 +426,8 @@ async fn pull_request_picker(cx: &mut TestAppContext) {
         })
         .unwrap()
     };
-    press(cx, &["cmd-n", "tab", "cmd-p"]);
+    branch_dialog(cx, window);
+    press(cx, &["tab", "cmd-p"]);
     cx.wait_for(window, Duration::from_secs(10), |w, _| {
         w.try_find("source-status").is_none() && w.try_find(("source-pr", 0usize)).is_some()
     })
@@ -479,7 +493,7 @@ async fn pull_request_picker(cx: &mut TestAppContext) {
         )
     });
     // An explicit name creates another review branch without resetting the first one.
-    press(cx, &["cmd-n"]);
+    branch_dialog(cx, window);
     input(cx, "second-review");
     press(cx, &["tab", "cmd-p"]);
     input(cx, "7");
@@ -563,7 +577,7 @@ async fn branch_picker(cx: &mut TestAppContext) {
     let count = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.workspaces.len());
 
     // The row label says new or existing as the name is typed.
-    press(cx, &["cmd-n"]);
+    branch_dialog(cx, window);
     assert_eq!(gets(cx, 0).as_deref(), Some("new"));
     input(cx, "shared");
     assert_eq!(
@@ -592,7 +606,7 @@ async fn branch_picker(cx: &mut TestAppContext) {
     );
 
     // Picking, then the first row puts the new branch back. Clicking the label lists too.
-    press(cx, &["cmd-n"]);
+    branch_dialog(cx, window);
     input(cx, "y1");
     press(cx, &["tab"]);
     branches_of(cx, "web", "shared");
@@ -630,7 +644,8 @@ async fn branch_picker(cx: &mut TestAppContext) {
     assert_eq!(on("y1", "web"), "y1");
 
     // Without a name, every ticked repo needs a branch: one is not enough.
-    press(cx, &["cmd-n", "tab"]);
+    branch_dialog(cx, window);
+    press(cx, &["tab"]);
     branches_of(cx, "api", "kd/a");
     press(cx, &["enter"]);
     press(cx, &["cmd-enter"]);
@@ -690,7 +705,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         cx.update_window(window, |_, w, cx| w.dispatch_action(a.boxed_clone(), cx))
             .unwrap()
     };
-    press(cx, &["cmd-n"]);
+    branch_dialog(cx, window);
     cx.update_window(window, |_, w, cx| w.input("ui x", cx))
         .unwrap();
     press(cx, &["enter"]);
@@ -1055,7 +1070,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
 
     // Repo picker: tab to the filter, enter ticks the match, space unticks the
     // highlighted (top) row, cmd-enter creates from the picker.
-    press(cx, &["cmd-n"]);
+    branch_dialog(cx, window);
     cx.run_until_parked();
     cx.update_window(window, |_, w, cx| w.input("kb", cx))
         .unwrap();
@@ -1113,6 +1128,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     cx.update(|cx| assert_eq!(shark.read(cx).state.workspaces.len(), 1));
     press(cx, &["ctrl-w", "h"]);
     run(cx, &ArchiveWorkspace);
+    press(cx, &["enter"]);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).state.workspaces.is_empty()
     })
@@ -1137,7 +1153,9 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     let cli = home.join("src/cli");
     init_repo(&cli);
     let dropped = [cli, home.join("src/api")];
-    on(cx, &|s, w, cx| s.add_repo_paths(&dropped, w, cx));
+    on(cx, &|s, w, cx| {
+        s.add_repo_paths(&dropped, w, cx);
+    });
     cx.update(|cx| {
         let names: Vec<_> = shark
             .read(cx)
@@ -1158,7 +1176,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     )
     .unwrap();
     git::git(&api, &["push", "-q", "origin", "main:remote-only"]).unwrap();
-    press(cx, &["cmd-n"]);
+    branch_dialog(cx, window);
     cx.run_until_parked();
     cx.update_window(window, |_, w, cx| w.input("new-x", cx))
         .unwrap();
@@ -1416,7 +1434,8 @@ async fn add_repo_and_restore(cx: &mut TestAppContext) {
     // A second tab hears about the repo too.
     on(cx, &|s, w, cx| {
         s.new_chat(w, cx);
-        s.add_repo_to_workspace("grow".into(), repos[1].clone(), w, cx)
+        let web = crate::state::Attachment::fresh(&repos[1], "grow", "");
+        s.queue_attachment("grow".into(), vec![web], w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).state.workspaces[0].repos.len() == 2
@@ -2075,14 +2094,12 @@ async fn titlebar_controls(cx: &mut TestAppContext) {
                     assert!(create.right() <= w.find("sidebar").bounds().right());
                     assert_eq!(create.center().y, w.find("home-row").bounds().center().y);
                 }
-                w.click("new-workspace", cx);
                 assert!(
-                    w.has_active_dialog(cx),
-                    "create opens New workspace, rail={rail}, width={width}, tab={:?}, tools={}",
+                    w.is_action_available(&NewWorkspace, cx),
+                    "New agent, rail={rail}, width={width}, tab={:?}, tools={}",
                     shark.read(cx).tab,
                     shark.read(cx).tree_shown(cx)
                 );
-                w.close_dialog(cx);
             })
             .unwrap();
             cx.run_until_parked();
@@ -3272,7 +3289,7 @@ async fn open_in_apps(cx: &mut TestAppContext) {
         })
     };
     let s = |v: &[&str]| v.iter().map(|x| x.to_string()).collect::<Vec<_>>();
-    let all = s(&["Workspace folder", "ios", "web"]);
+    let all = s(&["Agent folder", "ios", "web"]);
     assert_eq!(
         menu_of(cx, "both"),
         [
@@ -3291,7 +3308,7 @@ async fn open_in_apps(cx: &mut TestAppContext) {
         shark.update(cx, |s, cx| {
             let ws = s.ws(ws).unwrap().clone();
             (ws_menu(s, &ws, cx).into_iter()).find_map(|e| match e {
-                Entry::Sub { label, entries, .. } if label == "Add repo" => Some(
+                Entry::Sub { label, entries, .. } if label == "Attach repository" => Some(
                     (entries.iter())
                         .filter_map(|r| match r {
                             Entry::Item { label, .. } => Some(label.to_string()),
@@ -3472,10 +3489,7 @@ async fn open_in_apps(cx: &mut TestAppContext) {
     press(cx, &["cmd-o", "cmd-n"]);
     on(cx, &|s, w, cx| {
         assert!(s.app_switcher.is_some(), "unrelated commands stay blocked");
-        assert!(
-            !w.has_active_dialog(cx),
-            "Cmd+N cannot open a workspace dialog"
-        );
+        assert!(!w.has_active_dialog(cx), "Cmd+N cannot start an agent");
     });
     press(cx, &["cmd-escape"]);
     modifiers(cx, false);
@@ -3887,12 +3901,12 @@ async fn home_navigation(cx: &mut TestAppContext) {
     cx.update(|cx| assert!(shark.read(cx).home.asking));
     press(cx, &["tab"]);
     cx.update(|cx| assert!(!shark.read(cx).home.asking));
-    // enter opens the New workspace dialog with the text as the first message.
+    // The branch dialog opens over a typed prompt, which becomes the first message.
     cx.update_window(window, |_, w, cx| w.input("add a login page", cx))
         .unwrap();
-    press(cx, &["enter"]);
+    branch_dialog(cx, window);
     cx.update_window(window, |_, w, cx| {
-        assert!(w.has_active_dialog(cx), "enter opens New workspace");
+        assert!(w.has_active_dialog(cx), "the dialog opens");
         w.close_dialog(cx);
     })
     .unwrap();
@@ -4046,10 +4060,7 @@ async fn home_ask_shark(cx: &mut TestAppContext) {
         args.contains("--model haiku") && args.contains("# Shortcuts"),
         "{args}"
     );
-    assert!(
-        args.contains("cmd-n: New workspace…"),
-        "the live keymap: {args}"
-    );
+    assert!(args.contains("cmd-n: New agent"), "the live keymap: {args}");
     let on = on_app(window, shark.clone());
     on(cx, &|s, _, cx| {
         let ask = s.home.ask.as_ref().unwrap();
@@ -4146,7 +4157,7 @@ async fn home_prompt_and_chat_keys(cx: &mut TestAppContext) {
     };
     cx.update_window(window, |_, w, cx| w.input("add a login page", cx))
         .unwrap();
-    press(cx, &["enter"]);
+    branch_dialog(cx, window);
     cx.update_window(window, |_, w, cx| w.close_dialog(cx))
         .unwrap();
     assert_eq!(text(cx), "add a login page", "cancelled: kept");
@@ -5747,7 +5758,7 @@ async fn review_queue(cx: &mut TestAppContext) {
     let argv = fs::read_to_string(&log).unwrap();
     assert!(
         argv.starts_with(
-            "pr|comment|7|--body|**api/f** · working copy · 1\n\n```\nA\n```\n\nrename vars"
+            "pr|comment|https://github.com/o/api/pull/7|--body|**api/f** · working copy · 1\n\n```\nA\n```\n\nrename vars"
         ),
         "{argv}"
     );
@@ -5801,7 +5812,7 @@ async fn review_queue(cx: &mut TestAppContext) {
     .await;
     let argv = fs::read_to_string(&log).unwrap();
     assert!(
-        argv.starts_with("api|--method|POST|repos/{owner}/{repo}/pulls/7/reviews|-f|event=COMMENT|-f|commit_id=h|-f|body=**api/f**"),
+        argv.starts_with("api|--hostname|github.com|--method|POST|repos/o/api/pulls/7/reviews|-f|event=COMMENT|-f|commit_id=h|-f|body=**api/f**"),
         "{argv}"
     );
     assert!(matches!(comments(cx)[0].2, Status::Sent { .. }));
@@ -5830,7 +5841,7 @@ async fn review_queue(cx: &mut TestAppContext) {
     .await;
     let argv = fs::read_to_string(&log).unwrap();
     assert!(
-        argv.starts_with("api|--method|POST|repos/{owner}/{repo}/pulls/7/reviews|-f|event=COMMENT|-f|commit_id=h|-f|body=api/f:3|-f|comments[][path]=f|-F|comments[][line]=3|-f|comments[][side]=RIGHT|-f|comments[][body]=third line|"),
+        argv.starts_with("api|--hostname|github.com|--method|POST|repos/o/api/pulls/7/reviews|-f|event=COMMENT|-f|commit_id=h|-f|body=api/f:3|-f|comments[][path]=f|-F|comments[][line]=3|-f|comments[][side]=RIGHT|-f|comments[][body]=third line|"),
         "{argv}"
     );
     assert!(github(cx, 2).is_some_and(|u| u.ends_with("#pullrequestreview-5")));
@@ -8329,7 +8340,7 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
 
     // alt-enter on a branch: api's new branch starts on `logic` and targets it; web, unticked,
     // isn't in the workspace.
-    press(cx, &["cmd-n"]);
+    branch_dialog(cx, window);
     input(cx, "ui");
     press(cx, &["tab", "cmd-b"]);
     cx.wait_for(window, Duration::from_secs(10), |w, _| {
@@ -8557,7 +8568,7 @@ async fn branch_from_refusals_and_mixed_repos(cx: &mut TestAppContext) {
         })
         .unwrap()
     };
-    press(cx, &["cmd-n"]);
+    branch_dialog(cx, window);
     input(cx, "mixed");
     press(cx, &["tab", "cmd-b"]);
     cx.wait_for(window, Duration::from_secs(10), |w, _| {

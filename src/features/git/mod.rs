@@ -2,6 +2,7 @@
 pub(crate) mod commits;
 pub(crate) mod document;
 mod drafts;
+pub(crate) use drafts::store_path as drafts_path;
 mod mermaid;
 use crate::media::{Lru, Playing};
 use crate::pr::git_feature as api;
@@ -1618,7 +1619,7 @@ impl GitFeature {
                     ))
                     .child(div().flex_1())
                     // Hover actions sit in a fixed slot, so showing them moves nothing.
-                    .child(crate::chat::copy_button(
+                    .child(crate::ui::copy_button(
                         SharedString::from(format!("git-copy-{}", c.id)),
                         c.body.clone(),
                         "git-row",
@@ -2585,8 +2586,8 @@ impl GitFeature {
         if self.workspace.repos.get(self.selected).is_none() {
             (
                 "git-empty-repositories",
-                "No repositories in this workspace",
-                "Add a repository to the workspace to view its pull request.",
+                "No repositories in this agent",
+                "Attach a repository to view its pull request.",
                 IconName::FolderGit2,
             )
         } else if self.loading {
@@ -2608,7 +2609,7 @@ impl GitFeature {
                 "git-unloaded",
                 "Pull request not loaded",
                 if self.archiving {
-                    "This workspace is being archived."
+                    "This agent is being deleted."
                 } else {
                     "Load this branch’s pull request to read its description and review activity."
                 },
@@ -3074,7 +3075,8 @@ pub(crate) struct TestState<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use api::{Comment, Details, Review, Target, Thread};
+    use crate::pr::Target;
+    use api::{Comment, Details, Review, Thread};
 
     fn comment(id: &str, at: &str, review: Option<&str>) -> Comment {
         Comment {

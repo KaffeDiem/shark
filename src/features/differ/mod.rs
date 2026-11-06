@@ -16,6 +16,8 @@ use crate::{
     ResolveThread, SaveFile, SelectFirst, SelectLast, SelectNext, SelectPrev, SendComments,
     SendNow, SubmitForm, SuggestChange, ToggleDiffMode, ToggleRow, ToggleViewed, ViewChange, git,
 };
+#[cfg(test)]
+use core::prelude::v1::test;
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::dialog::Dialog;

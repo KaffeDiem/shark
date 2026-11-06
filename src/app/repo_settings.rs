@@ -1,8 +1,8 @@
-//! Repo settings (click a repo in the sidebar): new workspace, default model, setup, run and
+//! Repo settings (click a repo in the sidebar): new agent, default model, setup, run and
 //! archive scripts, removal. Every change saves at once, as in Settings.
 use super::*;
-use crate::chat::{effort_label, model_label};
 use crate::models::efforts;
+use crate::models::{effort_label, model_label};
 use crate::scripts::Phase;
 use crate::state::RepoSettings;
 use crate::ui::{card, row, section};
@@ -255,28 +255,46 @@ impl RepoSettingsView {
             .ok();
     }
 
-    fn remove_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn can_remove(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let name = self.repo.name.clone();
         let used: Vec<String> = (self.shark.upgrade())
             .map(|s| {
                 let s = s.read(cx);
-                // A workspace being created or getting a repo isn't in `workspaces` yet.
+                // Queued attachments still need this repo's setup scripts and defaults.
                 (s.state.workspaces.iter())
-                    .filter(|w| w.repos.iter().any(|r| r.name == name))
-                    .map(|w| w.name.clone())
+                    .filter(|w| {
+                        w.repos.iter().any(|r| r.name == name)
+                            || w.attaching.iter().any(|a| a.repo == name)
+                    })
+                    .map(|w| w.display_title().to_string())
                     .chain(s.creating.iter().chain(&s.adding_repos).cloned())
                     .collect()
             })
             .unwrap_or_default();
         if !used.is_empty() {
-            let msg = format!("{name} is in {}; archive those first", used.join(", "));
-            return notify_err(window, cx, msg);
+            let msg = format!(
+                "{name} is in {}; finish or cancel its attachments, or delete those agents first",
+                used.join(", ")
+            );
+            notify_err(window, cx, msg);
+            return false;
         }
+        true
+    }
+
+    fn remove_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_remove(window, cx) {
+            return;
+        }
+        let name = self.repo.name.clone();
         confirm(
             format!("Remove {name} from Shark?"),
             "Its folder stays where it is; its scripts and defaults here are forgotten.",
             "Remove",
             move |this: &mut Self, window, cx| {
+                if !this.can_remove(window, cx) {
+                    return;
+                }
                 let name = this.repo.name.clone();
                 window.close_dialog(cx);
                 (this.shark)
@@ -475,7 +493,7 @@ impl Render for RepoSettingsView {
                     .primary()
                     .small()
                     .icon(IconName::Plus)
-                    .label("New workspace")
+                    .label("New agent")
                     .on_click(cx.listener(|this, _, w, cx| this.new_workspace(w, cx))),
             );
         v_flex()
@@ -492,7 +510,7 @@ impl Render for RepoSettingsView {
                             theme,
                             false,
                             "Default model",
-                            "New chats in workspaces with this repo",
+                            "New chats in agents with this repo",
                             Select::new(&self.model).small(),
                         ))
                         .child(row(

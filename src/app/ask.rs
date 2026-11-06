@@ -150,7 +150,7 @@ impl Shark {
                         .group("home-answer")
                         .text_size(px(14.))
                         .line_height(relative(1.5))
-                        .child(crate::chat::markdown(&ask.answer, "home-answer", vec![]))
+                        .child(crate::ui::markdown(&ask.answer, "home-answer", vec![]))
                         .when_some(ask.error.clone(), |d, e| {
                             d.child(div().text_xs().text_color(theme.danger_foreground).child(e))
                         }),
