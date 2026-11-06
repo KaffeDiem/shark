@@ -581,6 +581,36 @@ async fn a_cached_query_sends_nothing(cx: &mut TestAppContext) {
     assert_eq!(searches().len(), 2);
 }
 
+#[gpui_kit::test]
+#[ignore = "manual performance measurement; run with --ignored --nocapture"]
+#[allow(clippy::await_holding_lock)]
+async fn benchmark_cached_issue_picker(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let (window, shark, _) = connected(cx, &home, &[]);
+    open_picker(cx, window, &shark);
+    type_in(cx, window, "login");
+    settle(cx);
+    press_in(window)(cx, &["backspace"]);
+    settle(cx);
+    let before = sent().len();
+    let start = Instant::now();
+    for _ in 0..100 {
+        type_in(cx, window, "n");
+        assert!(shows(cx, window, "issue-row-ENG-5"));
+        press_in(window)(cx, &["backspace"]);
+        assert!(shows(cx, window, "issue-row-ENG-5"));
+    }
+    println!(
+        "issue picker: 200 cached query transitions with 20 rows and headless frames in {:?}; {} additional requests",
+        start.elapsed(),
+        sent().len() - before,
+    );
+    assert_eq!(sent().len(), before);
+}
+
 /// Live search stays under Linear's limit by itself: past the budget the next query waits.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -826,6 +856,30 @@ fn connect_now(cx: &mut TestAppContext, shark: &Entity<Shark>) {
         cx.notify();
     });
     cx.run_until_parked();
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn reconnecting_the_same_identity_clears_cached_results_and_marks(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let (window, shark, _) = connected(cx, &home, &[]);
+    open_picker(cx, window, &shark);
+    type_in(cx, window, "older");
+    settle(cx);
+    press_in(window)(cx, &["cmd-enter"]);
+    assert!(shows(cx, window, "issue-attach-marked"));
+
+    connect_now(cx, &shark);
+    assert_eq!(
+        searches(),
+        ["older", "older"],
+        "the replacement is asked again"
+    );
+    assert!(!shows(cx, window, "issue-attach-marked"));
+    assert_eq!(field(cx, window), "older");
 }
 
 /// Not connected, the reason replaces the rows and `enter` goes to Settings over the picker,

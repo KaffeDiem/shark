@@ -712,23 +712,32 @@ impl Shark {
         .detach();
     }
 
-    /// Creation failed and rolled back what it made: the next repo goes on, and this one stays in
-    /// the header until dismissed.
+    /// Creation failed: keep anything rollback couldn't safely delete in recovery; an ordinary
+    /// refusal ends here. Either way the next repo goes on and the error is reported.
     fn repo_refused(
         &mut self,
         name: &str,
         repo: &str,
-        e: String,
+        e: git::AttachError,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         if let Some(ws) = self.ws_mut(name) {
-            ws.attaching.retain(|a| a.repo != repo);
+            if e.preserved {
+                if let Some(a) = ws.attaching.iter_mut().find(|a| a.repo == repo) {
+                    a.stage = AttachStage::Uncertain;
+                    a.error = Some(e.message.clone());
+                }
+            } else {
+                ws.attaching.retain(|a| a.repo != repo);
+            }
         }
         let _ = self.state.save();
         let results = self.attach_results.entry(name.into()).or_default();
-        results.failed.push((repo.into(), e.clone()));
-        results.untold.push((repo.into(), e));
+        if !e.preserved {
+            results.failed.push((repo.into(), e.message.clone()));
+        }
+        results.untold.push((repo.into(), e.message));
         self.attach_settled(name, window, cx);
     }
 
@@ -910,14 +919,18 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         let Some(ws) = self.ws_mut(name) else { return };
-        let what = (ws.attaching.iter().find(|a| a.repo == repo))
-            .and_then(|a| a.error.clone())
-            .unwrap_or_default();
+        let Some(a) = ws
+            .attaching
+            .iter()
+            .find(|a| a.repo == repo && a.stage == AttachStage::Uncertain)
+        else {
+            return;
+        };
+        let what = a.error.clone().unwrap_or_default();
         ws.attaching.retain(|a| a.repo != repo);
-        // With its worktree gone it can't stay listed: `ready` would pass on nothing.
-        let (dir, had) = (ws.dir(), ws.repos.len());
-        ws.repos
-            .retain(|r| r.name != repo || dir.join(&r.name).exists());
+        // An unverified worktree can't stay listed as ready; its files stay on disk.
+        let had = ws.repos.len();
+        ws.repos.retain(|r| r.name != repo);
         let dropped = ws.repos.len() != had;
         let ws = ws.clone();
         if dropped {
@@ -960,31 +973,30 @@ impl Shark {
             if a.stage == AttachStage::Queued {
                 continue;
             }
-            if ws.repos.iter().any(|r| r.name == a.repo) {
-                if !ws.dir().join(&a.repo).exists() {
+            let recorded = ws.repos.iter().any(|r| r.name == a.repo);
+            match git::find_attachment(&ws, &a) {
+                Found::Nothing if !recorded => continue,
+                Found::Nothing => {
                     a.stage = AttachStage::Uncertain;
                     a.error = Some(format!("the worktree of `{}` is gone", a.repo));
                     ws.attaching.push(a);
                     continue;
                 }
-            } else {
-                match git::find_attachment(&ws, &a) {
-                    Found::Nothing => continue,
-                    Found::Unclear(why) => {
-                        a.stage = AttachStage::Uncertain;
-                        a.error = Some(why);
-                        ws.attaching.push(a);
-                        continue;
-                    }
-                    Found::Worktree(mut wr) => {
-                        if ws.repos.is_empty() {
-                            ws.branch = a.branch.clone();
-                        }
-                        wr.branch = (a.branch != ws.branch).then(|| a.branch.clone());
-                        ws.repos.push(wr);
-                        git::write_claude_md(&ws);
-                    }
+                Found::Unclear(why) => {
+                    a.stage = AttachStage::Uncertain;
+                    a.error = Some(why);
+                    ws.attaching.push(a);
+                    continue;
                 }
+                Found::Worktree(mut wr) if !recorded => {
+                    if ws.repos.is_empty() {
+                        ws.branch = a.branch.clone();
+                    }
+                    wr.branch = (a.branch != ws.branch).then(|| a.branch.clone());
+                    ws.repos.push(wr);
+                    git::write_claude_md(&ws);
+                }
+                Found::Worktree(_) => {}
             }
             if a.stage == AttachStage::SetupFailed {
                 ws.attaching.push(a);

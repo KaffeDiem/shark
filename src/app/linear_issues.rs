@@ -311,6 +311,8 @@ pub(super) struct IssuePicker {
     agent: Option<String>,
     /// Why nothing can be asked of Linear; the row to Settings replaces the others.
     blocked: Option<Blocked>,
+    /// Lists, cached results and marks belong to this connection.
+    connection: (Option<super::linear_connection::Connection>, Option<u64>),
     query: String,
     lists: Option<Lists>,
     /// Every answer by query, for the picker's lifetime: asking again sends nothing.
@@ -641,11 +643,32 @@ impl IssuePicker {
         let Some(shark) = self.shark.upgrade() else {
             return;
         };
-        let now = shark.read(cx).linear_blocked();
-        if now == self.blocked {
+        let s = shark.read(cx);
+        let now = s.linear_blocked();
+        let connection = (s.state.linear.clone(), s.linear_connection_epoch());
+        let changed = connection != self.connection;
+        if now == self.blocked && !changed {
             return;
         }
-        if std::mem::replace(&mut self.blocked, now).is_some() && self.blocked.is_none() {
+        if changed {
+            self.connection = connection;
+            self.lists = None;
+            self.cache.clear();
+            self.shown.clear();
+            self.marks.clear();
+            self.cursor = None;
+            self.failure = None;
+            self.wait = None;
+            self.pending = false;
+            self.flying = false;
+            self.fetching = false;
+            self._debounce = Task::ready(());
+            self._flight = Task::ready(());
+            self._wait = Task::ready(());
+            self._fetch = Task::ready(());
+        }
+        let unblocked = std::mem::replace(&mut self.blocked, now).is_some();
+        if (unblocked || changed) && self.blocked.is_none() && self.connection.1.is_some() {
             if (self.settings.take()).is_some_and(|f| f.upgrade().is_some()) {
                 window.close_dialog(cx);
             }
@@ -1170,11 +1193,13 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         let blocked = self.linear_blocked();
+        let connection = (self.state.linear.clone(), self.linear_connection_epoch());
         let shark = cx.entity();
         let picker = cx.new(|cx| IssuePicker {
             state: cx.new(|cx| CommandState::new(window, cx)),
             agent,
             blocked,
+            connection,
             query: String::new(),
             lists: None,
             cache: HashMap::new(),

@@ -261,6 +261,66 @@ async fn switching_organizations_replaces_the_session(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
+async fn a_stale_keychain_read_cannot_borrow_the_replacement_session(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, shark) = setup(cx, None);
+    use_key(cx, &shark, KEY);
+    let epoch = cx.read(|cx| shark.read(cx).linear.epoch);
+    use_key(cx, &shark, OTHER);
+    let opened = shark.update(cx, |s, cx| {
+        s.linear_open(epoch, Ok(Some(Credential::key(KEY))), cx)
+    });
+    assert!(matches!(opened, Err(Error::Failed(e)) if e == CHANGED));
+    assert_eq!(credential(cx, &shark).await, Ok(Credential::key(OTHER)));
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_queued_request_cannot_use_a_replaced_credential(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, shark) = setup(cx, None);
+    use_key(cx, &shark, KEY);
+    let request = shark.update(cx, |s, cx| {
+        s.linear_request(|_, _| panic!("the stale request must not be sent"), cx)
+    });
+    shark.update(cx, |s, _| s.linear.epoch += 1);
+    assert_eq!(request.await, Err::<(), _>(Error::Failed(CHANGED.into())));
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_response_from_a_replaced_connection_is_discarded(cx: &mut TestAppContext) {
+    thread_local! {
+        static REPLACE: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+    }
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (_, shark) = setup(cx, None);
+    use_key(cx, &shark, KEY);
+    let (mut app, changed) = (cx.to_async(), shark.clone());
+    REPLACE.with(|replace| {
+        *replace.borrow_mut() = Some(Box::new(move || {
+            changed.update(&mut app, |s, cx| {
+                s.linear.epoch += 1;
+                s.linear.session = Some(Live::new(Credential::key(OTHER), cx));
+            });
+        }));
+    });
+    let request = shark.update(cx, |s, cx| {
+        s.linear_request(
+            |_, _| {
+                REPLACE.with(|replace| replace.borrow_mut().take().unwrap()());
+                Ok("old issue")
+            },
+            cx,
+        )
+    });
+    assert_eq!(request.await, Err(Error::Failed(CHANGED.into())));
+    assert_eq!(credential(cx, &shark).await, Ok(Credential::key(OTHER)));
+    assert_eq!(attention(cx, &shark), "");
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
 async fn disconnect_deletes_the_credential_and_the_metadata(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (_, shark) = setup(cx, None);

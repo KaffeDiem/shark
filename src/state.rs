@@ -1412,6 +1412,50 @@ mod tests {
         assert_eq!(back.chats, ws.chats);
     }
 
+    /// Reproducible desktop workload: 20 issues with 32 KiB descriptions, 100 context updates.
+    /// Run with `cargo test context_fingerprint_workload -- --ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn context_fingerprint_workload() {
+        let mut ws = Workspace {
+            name: "context-workload".into(),
+            ..Default::default()
+        };
+        for i in 0..20 {
+            let issue = crate::linear::Snapshot {
+                org: "org".into(),
+                id: format!("issue-{i}"),
+                identifier: format!("ENG-{i}"),
+                description: "A description with <tags> and [shark] notes.\n".repeat(800),
+                ..Default::default()
+            };
+            ws.linear.attach((&issue).into());
+            ws.issues.push(issue);
+        }
+        let expected = context_record(&ws.context());
+        let started = std::time::Instant::now();
+        for _ in 0..100 {
+            assert_eq!(
+                context_record(&std::hint::black_box(&ws).context()),
+                expected
+            );
+        }
+        eprintln!(
+            "100 context updates, 20 issues / {} KiB descriptions: {:?}",
+            ws.issues.iter().map(|s| s.description.len()).sum::<usize>() / 1024,
+            started.elapsed()
+        );
+        ws.issues[0].description.push_str("Changed");
+        let changed = context_record(&ws.context());
+        assert_eq!(
+            expected
+                .iter()
+                .filter(|(key, value)| changed.get(*key) != Some(*value))
+                .count(),
+            1
+        );
+    }
+
     /// A default branch is the title's words plus the agent's suffix; an untitled agent has only
     /// its identity. Readiness needs a repo and no attachment left.
     #[test]

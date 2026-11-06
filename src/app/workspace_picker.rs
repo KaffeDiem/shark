@@ -569,6 +569,30 @@ mod tests {
     }
 
     #[test]
+    fn renamed_agents_rank_by_title_and_keep_their_identity_at_scale() {
+        for count in [100, 1000] {
+            let workspaces: Vec<_> = (0..count)
+                .map(|i| {
+                    let mut agent = ws(&format!("agent-{i:06}"), "api", Some(i));
+                    agent.title = "Investigate connection failures".into();
+                    agent
+                })
+                .collect();
+            let start = std::time::Instant::now();
+            for _ in 0..20 {
+                let hits = rank(&workspaces, "connection failures");
+                assert_eq!(hits.len(), count as usize);
+                assert_eq!(hits[0], format!("agent-{:06}", count - 1));
+            }
+            eprintln!(
+                "rank {count} renamed agents: {:?} per query",
+                start.elapsed() / 20
+            );
+            assert_eq!(rank(&workspaces, "agent-000000")[0], "agent-000000");
+        }
+    }
+
+    #[test]
     fn spaced_queries_match_words_in_workspace_and_repo_names() {
         let workspaces = vec![
             ws("eng-130-rate-limits", "web", Some(3)),

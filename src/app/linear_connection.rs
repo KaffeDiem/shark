@@ -26,6 +26,7 @@ const NOT_FOUND: &str = "OSStatus -25300";
 const NOT_READ: &str = "Keychain access wasn't granted, so Shark can't use Linear. Try again and allow access when macOS asks, or reconnect.";
 const REJECTED: &str = "Linear rejected the credential. Reconnect to use it.";
 const BAD_KEY: &str = "Linear didn't accept this key. Check it and try again.";
+const CHANGED: &str = "The Linear connection changed. Try again.";
 /// What leaving a workspace means, for its confirmations.
 const LEAVING: &str = "Attached issues stay readable but can't refresh. Nothing changes in Linear.";
 /// Settings > Account > Security & Access, per https://linear.app/docs/api-and-webhooks.
@@ -229,29 +230,30 @@ impl Shark {
                         .map_err(|e| Error::Failed(e.to_string()))??
                 }
             };
-            let asked = live.clone();
             let fresh = (cx.background_executor())
-                .spawn(async move { asked.fresh(http) })
+                .spawn(async move { live.fresh(http) })
                 .await;
-            if matches!(fresh, Err(Error::Unauthorized)) {
-                let _ = this.update(cx, |s, cx| {
-                    // A replaced session's failure says nothing about the new one.
-                    if s.linear
-                        .session
-                        .as_ref()
-                        .is_some_and(|l| Arc::ptr_eq(l, &live))
-                    {
-                        s.linear_rejected(cx);
-                    }
-                });
-            }
-            fresh
+            this.update(cx, |s, cx| {
+                if s.linear.epoch != epoch {
+                    return Err(Error::Failed(CHANGED.into()));
+                }
+                if matches!(fresh, Err(Error::Unauthorized)) {
+                    s.linear_rejected(cx);
+                }
+                fresh
+            })
+            .map_err(|e| Error::Failed(e.to_string()))?
         })
     }
 
     /// The connected organization's UUID. A snapshot from any other reads as disconnected.
     pub(crate) fn linear_org_id(&self) -> Option<&str> {
         self.state.linear.as_ref().map(|c| c.org_id.as_str())
+    }
+
+    /// None while the Keychain is changing; pickers resume once the replacement is ready.
+    pub(super) fn linear_connection_epoch(&self) -> Option<u64> {
+        (!matches!(self.linear.op, Op::Saving)).then_some(self.linear.epoch)
     }
 
     /// Linear refused the connection's credential: the page shows reconnect. For any request
@@ -286,14 +288,16 @@ impl Shark {
             let result = (cx.background_executor())
                 .spawn(async move { call(http, &credential) })
                 .await;
-            if matches!(result, Err(Error::Unauthorized)) {
-                let _ = this.update(cx, |s, cx| {
-                    if s.linear.epoch == epoch {
-                        s.linear_rejected(cx);
-                    }
-                });
-            }
-            result
+            this.update(cx, |s, cx| {
+                if s.linear.epoch != epoch {
+                    return Err(Error::Failed(CHANGED.into()));
+                }
+                if matches!(result, Err(Error::Unauthorized)) {
+                    s.linear_rejected(cx);
+                }
+                result
+            })
+            .map_err(|e| Error::Failed(e.to_string()))?
         })
     }
 
@@ -305,13 +309,11 @@ impl Shark {
         stored: anyhow::Result<Option<Credential>>,
         cx: &mut Context<Self>,
     ) -> Result<Arc<Live>, Error> {
+        if epoch != self.linear.epoch || self.state.linear.is_none() {
+            return Err(Error::Failed(CHANGED.into()));
+        }
         if let Some(live) = &self.linear.session {
             return Ok(live.clone());
-        }
-        if epoch != self.linear.epoch || self.state.linear.is_none() {
-            return Err(Error::Failed(
-                "The Linear connection changed. Try again.".into(),
-            ));
         }
         let failure = match stored {
             Ok(Some(credential)) => {
@@ -549,6 +551,7 @@ impl Shark {
         http: &'static Http<'static>,
         cx: &mut Context<Self>,
     ) {
+        self.linear.epoch += 1;
         self.state.linear = Some(connection);
         self.linear.http = http;
         self.linear.session = Some(Live::new(Credential::key(key), cx));

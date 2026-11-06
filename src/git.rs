@@ -278,6 +278,22 @@ pub fn on_branch(repos: &[Repo], branch: &str) -> Vec<(Repo, String)> {
     repos.iter().map(|r| (r.clone(), branch.into())).collect()
 }
 
+/// A refused attachment can leave owned resources that rollback could not safely delete.
+#[derive(Debug)]
+pub struct AttachError {
+    pub message: String,
+    pub preserved: bool,
+}
+
+impl From<String> for AttachError {
+    fn from(message: String) -> Self {
+        Self {
+            message,
+            preserved: false,
+        }
+    }
+}
+
 /// Adds one more repo to an existing workspace on `branch` and rewrites the root CLAUDE.md; the
 /// first repo's branch becomes the workspace's. With `fresh`, the base (empty: the repo's default)
 /// of a branch that must be new; without, an existing branch is used as `plan_worktree` does.
@@ -288,12 +304,12 @@ pub fn add_to_workspace(
     r: &Repo,
     branch: &str,
     fresh: Option<&str>,
-) -> Result<Workspace, String> {
+) -> Result<Workspace, AttachError> {
     if ws.repos.iter().any(|w| w.name == r.name) {
-        return Err(format!("{} is already in {}", r.name, ws.display_title()));
+        return Err(format!("{} is already in {}", r.name, ws.display_title()).into());
     }
     if dir.join(&r.name).exists() {
-        return Err(format!("{} already exists", dir.join(&r.name).display()));
+        return Err(format!("{} already exists", dir.join(&r.name).display()).into());
     }
     let plan = match fresh {
         Some(base) => plan_fresh(branch, r, base)?,
@@ -314,7 +330,11 @@ pub fn add_to_workspace(
     });
     if let Err(e) = added {
         let _ = write_root_docs(before, dir); // one of the two may have gone out
-        return Err(rollback_error(e, undo_worktree(dir, branch, r, &owned)));
+        let remaining = undo_worktree(dir, branch, r, &owned);
+        return Err(AttachError {
+            preserved: !remaining.is_empty(),
+            message: rollback_error(e, remaining),
+        });
     }
     Ok(ws)
 }
@@ -337,17 +357,38 @@ pub fn find_attachment(ws: &Workspace, a: &Attachment) -> Found {
     // The root docs list it only once it is whole: a `git worktree add` killed mid-checkout, or a
     // crash before the included files were copied, looks like a worktree on its branch.
     let [_, last] = ROOT_DOCS;
-    let whole = fs::read_to_string(ws.dir().join(last)).is_ok_and(|d| d.contains(&listed(&a.repo)));
+    let base = fs::read_to_string(ws.dir().join(last)).ok().and_then(|d| {
+        let prefix = listed(&a.repo);
+        let line = d.lines().find(|line| line.starts_with(&prefix))?;
+        let (_, base) = line.rsplit_once(" (base `")?;
+        Some(base.rsplit_once('`')?.0.to_string())
+    });
     let here = fs::canonicalize(&wt).ok();
     let on_branch =
         holder(&wts, &a.branch).is_some_and(|p| here.is_some() && fs::canonicalize(p).ok() == here);
-    if whole && on_branch {
-        return Found::Worktree(WsRepo {
-            name: a.repo.clone(),
-            src: a.src.clone(),
-            base: resolve_base(&a.src, &a.base),
-            branch: None,
-        });
+    if let Some(base) = base.filter(|_| on_branch) {
+        // A replaced .git can leave the source's worktree registration pointing at another repo.
+        let common = |dir: &Path| {
+            git(
+                dir,
+                &["rev-parse", "--path-format=absolute", "--git-common-dir"],
+            )
+            .ok()
+            .and_then(|p| fs::canonicalize(p).ok())
+        };
+        let source = common(&a.src);
+        if source.is_some()
+            && common(&wt) == source
+            && git(&wt, &["symbolic-ref", "HEAD"])
+                .is_ok_and(|b| b == format!("refs/heads/{}", a.branch))
+        {
+            return Found::Worktree(WsRepo {
+                name: a.repo.clone(),
+                src: a.src.clone(),
+                base,
+                branch: None,
+            });
+        }
     }
     let branch = a.fresh && has_ref(&a.src, &format!("refs/heads/{}", a.branch));
     match (wt.exists(), branch) {

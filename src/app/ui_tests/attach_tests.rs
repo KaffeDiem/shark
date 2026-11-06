@@ -243,6 +243,47 @@ async fn collisions_leave_everything_alone(cx: &mut TestAppContext) {
     assert!(ws_of(cx, &shark).attaching.is_empty());
 }
 
+/// A failed inclusion scan leaves an owned worktree that rollback cannot prove safe to remove.
+/// Its intent must survive the failure and a restart so the user can recover it.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn failed_rollback_keeps_attachment_recoverable(cx: &mut TestAppContext) {
+    guards!(quiet, _turn, _claude);
+    let home = test_home();
+    let (window, shark, repos) = agent(cx, &home, &["api"], &[]);
+    fs::create_dir(repos[0].path.join(".worktreeinclude")).unwrap();
+    let name = ws_of(cx, &shark).name;
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.queue_attachment(name.clone(), vec![fresh(&repos[0], "b")], w, cx)
+    });
+    settled(cx, window, &shark).await;
+    let ws = ws_of(cx, &shark);
+    assert!(ws.repos.is_empty());
+    assert_eq!(ws.attaching[0].stage, AttachStage::Uncertain);
+    assert!(
+        ws.attaching[0]
+            .error
+            .as_ref()
+            .unwrap()
+            .contains("Preserved resources")
+    );
+    assert!(ws.dir().join("api/.git").exists());
+    assert!(git::has_ref(&repos[0].path, "refs/heads/b"));
+    assert_eq!(State::load().workspaces[0].attaching, ws.attaching);
+    let chat = chat_of(cx, &shark);
+    cx.update(|cx| assert!(chat.read(cx).attach_hold));
+
+    let (window2, shark2) = open(cx, WindowOptions::default());
+    cx.run_until_parked();
+    cx.update(|cx| {
+        let ws = shark2.read(cx).ws(&name).unwrap();
+        assert_eq!(ws.attaching[0].stage, AttachStage::Uncertain);
+        assert!(ws.dir().join("api/.git").exists());
+    });
+    cx.update_window(window2, |_, w, _| w.remove_window())
+        .unwrap();
+}
+
 /// Three repos run in order; the one that can't attach is reported, the others attach, and the
 /// hold ends with the operation.
 #[gpui_kit::test]
@@ -873,6 +914,26 @@ async fn restart_reconciles_every_stage(cx: &mut TestAppContext) {
     let foreign = interrupted("foreign", api, Creating, false, false);
     fs::create_dir(foreign.dir().join("api")).unwrap();
     fs::write(foreign.dir().join("api/mine.txt"), "keep").unwrap();
+    let switched = interrupted("switched", api, Setup, true, true);
+    git::git(
+        &switched.dir().join("api"),
+        &["checkout", "-q", "-b", "switched-other"],
+    )
+    .unwrap();
+    let replaced = interrupted("replaced", api, Setup, true, true);
+    let replaced_path = replaced.dir().join("api");
+    git::git(
+        &api.path,
+        &[
+            "worktree",
+            "remove",
+            "--force",
+            &replaced_path.to_string_lossy(),
+        ],
+    )
+    .unwrap();
+    fs::create_dir(&replaced_path).unwrap();
+    fs::write(replaced_path.join("mine.txt"), "keep").unwrap();
     let mut failed = interrupted("failed", web, SetupFailed, true, true);
     failed.attaching[0].error = Some("exit 3".into());
     let workspaces = vec![
@@ -886,6 +947,8 @@ async fn restart_reconciles_every_stage(cx: &mut TestAppContext) {
         gone,
         branch_only,
         foreign,
+        switched,
+        replaced,
     ];
     let setup = vec![format!("touch {}", marker.display())];
     let (window, shark) = boot(
@@ -938,6 +1001,12 @@ async fn restart_reconciles_every_stage(cx: &mut TestAppContext) {
     assert_eq!(attempt(cx, "gone"), (1, Some(Uncertain), false));
     assert_eq!(attempt(cx, "branch-only"), (0, Some(Uncertain), false));
     assert_eq!(attempt(cx, "foreign"), (0, Some(Uncertain), false));
+    assert_eq!(attempt(cx, "switched"), (1, Some(Uncertain), false));
+    assert_eq!(attempt(cx, "replaced"), (1, Some(Uncertain), false));
+    assert_eq!(
+        fs::read_to_string(replaced_path.join("mine.txt")).unwrap(),
+        "keep"
+    );
     assert_eq!(needs(cx, "foreign"), Attn::Needs("Recover api".into()));
     assert!(git::has_ref(&api.path, "refs/heads/branch-only-branch"));
     let saved = State::load();
@@ -1001,6 +1070,28 @@ async fn restart_reconciles_every_stage(cx: &mut TestAppContext) {
     assert!(saved.repos.is_empty());
     let chat = chat_of(cx, &shark);
     cx.update(|cx| assert!(!chat.read(cx).ws.ready()));
+
+    // Stopping tracking a changed identity also drops its stale repo metadata, but no files.
+    for name in ["switched", "replaced"] {
+        on(cx, &|s, w, cx| {
+            s.open_workspace_named(name, w, cx);
+            s.attachment_menu(name.into(), "api".into(), w, cx);
+        });
+        press_in(window)(cx, &["down", "enter"]);
+        assert_eq!(attempt(cx, name), (0, None, false));
+    }
+    assert_eq!(
+        fs::read_to_string(replaced_path.join("mine.txt")).unwrap(),
+        "keep"
+    );
+    assert_eq!(
+        git::git(
+            &workspaces_dir().join("switched/api"),
+            &["branch", "--show-current"]
+        )
+        .unwrap(),
+        "switched-other",
+    );
 }
 
 /// A claude that keeps what it is sent, one JSON line per message, next to itself.
@@ -1612,7 +1703,7 @@ async fn the_base_button_picks_a_base(cx: &mut TestAppContext) {
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api"], &[]);
     let src = &repos[0].path;
-    git::git(src, &["branch", "develop"]).unwrap();
+    git::git(src, &["branch", "zz-base"]).unwrap();
     git::git(src, &["update-ref", "refs/remotes/origin/main", "main"]).unwrap();
     let on = on_app(window, shark.clone());
     let name = ws_of(cx, &shark).name;
@@ -1630,21 +1721,26 @@ async fn the_base_button_picks_a_base(cx: &mut TestAppContext) {
     assert!(shows(cx, window, "base-default"), "marked Default");
     let list = git::branches(src).unwrap();
     let main = list.iter().position(|b| b.name == "main").unwrap();
-    let develop = list.iter().position(|b| b.name == "develop").unwrap();
+    let custom = list.iter().position(|b| b.name == "zz-base").unwrap();
     // It starts on the current base, the default.
-    for _ in 0..develop.saturating_sub(main) {
+    for _ in 0..custom.saturating_sub(main) {
         press(cx, &["down"]);
     }
-    for _ in 0..main.saturating_sub(develop) {
+    for _ in 0..main.saturating_sub(custom) {
         press(cx, &["up"]);
     }
     press(cx, &["enter"]);
     assert!(shows(cx, window, "attach-summary"), "back on the repos");
+    // Reopening the base list keeps our choice, even though the default sorts before it.
+    assert!(main < custom);
+    click(cx, "attach-change");
+    click(cx, "source-other");
+    press(cx, &["enter"]);
     press(cx, &["enter"]);
     settled(cx, window, &shark).await;
     let ws = ws_of(cx, &shark);
-    assert_eq!(ws.repos[0].base, "develop");
-    assert_eq!(ws.branch, ws.name, "still the new branch, not develop");
+    assert_eq!(ws.repos[0].base, "zz-base");
+    assert_eq!(ws.branch, ws.name, "still the new branch, not zz-base");
 }
 
 fn summary(cx: &mut TestAppContext, window: AnyWindowHandle) -> String {

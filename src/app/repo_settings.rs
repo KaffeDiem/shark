@@ -255,14 +255,17 @@ impl RepoSettingsView {
             .ok();
     }
 
-    fn remove_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn can_remove(&self, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let name = self.repo.name.clone();
         let used: Vec<String> = (self.shark.upgrade())
             .map(|s| {
                 let s = s.read(cx);
-                // A workspace being created or getting a repo isn't in `workspaces` yet.
+                // Queued attachments still need this repo's setup scripts and defaults.
                 (s.state.workspaces.iter())
-                    .filter(|w| w.repos.iter().any(|r| r.name == name))
+                    .filter(|w| {
+                        w.repos.iter().any(|r| r.name == name)
+                            || w.attaching.iter().any(|a| a.repo == name)
+                    })
                     .map(|w| w.display_title().to_string())
                     .chain(s.creating.iter().chain(&s.adding_repos).cloned())
                     .collect()
@@ -270,16 +273,28 @@ impl RepoSettingsView {
             .unwrap_or_default();
         if !used.is_empty() {
             let msg = format!(
-                "{name} is in {}; delete those agents first",
+                "{name} is in {}; finish or cancel its attachments, or delete those agents first",
                 used.join(", ")
             );
-            return notify_err(window, cx, msg);
+            notify_err(window, cx, msg);
+            return false;
         }
+        true
+    }
+
+    fn remove_repo(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.can_remove(window, cx) {
+            return;
+        }
+        let name = self.repo.name.clone();
         confirm(
             format!("Remove {name} from Shark?"),
             "Its folder stays where it is; its scripts and defaults here are forgotten.",
             "Remove",
             move |this: &mut Self, window, cx| {
+                if !this.can_remove(window, cx) {
+                    return;
+                }
                 let name = this.repo.name.clone();
                 window.close_dialog(cx);
                 (this.shark)

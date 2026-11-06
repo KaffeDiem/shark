@@ -1,6 +1,75 @@
 use super::*;
 use crate::state::RepoSettings;
 
+/// A queued attachment must keep its setup configuration, including while removal is open.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn pending_attachment_prevents_removing_its_repo(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    for confirm_already_open in [false, true] {
+        let home = test_home();
+        let (window, shark, repos) =
+            attach_tests::agent(cx, &home, &["api"], &[("api", "echo setup")]);
+        let on = on_app(window, shark.clone());
+        on(cx, &|s, w, cx| {
+            super::super::repo_settings::open(s, repos[0].clone(), w, cx);
+        });
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.scroll(
+                "repo-new-workspace",
+                ScrollDelta::Pixels(point(px(0.), px(-1000.))),
+                cx,
+            );
+        })
+        .unwrap();
+        if confirm_already_open {
+            cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                w.click("remove-repo", cx);
+            })
+            .unwrap();
+        }
+        on(cx, &|s, w, cx| {
+            let name = s.active.clone().unwrap();
+            s.setting_up.push(name.clone());
+            s.queue_attachment(
+                name,
+                vec![crate::state::Attachment::fresh(
+                    &repos[0], "pending", "main",
+                )],
+                w,
+                cx,
+            );
+            assert_eq!(
+                s.active_ws().unwrap().attaching[0].stage,
+                crate::state::AttachStage::Queued
+            );
+        });
+        if !confirm_already_open {
+            cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                w.click("remove-repo", cx);
+            })
+            .unwrap();
+        }
+        press_in(window)(cx, &["enter"]);
+        cx.read(|cx| {
+            let s = shark.read(cx);
+            assert_eq!(
+                s.state.repos.len(),
+                1,
+                "confirmation open: {confirm_already_open}"
+            );
+            assert_eq!(s.state.repo_settings["api"].setup, ["echo setup"]);
+        });
+        cx.update_window(window, |_, w, _| w.remove_window())
+            .unwrap();
+    }
+}
+
 /// A repo row opens its settings; its default model, setup, run (cmd-r) and archive scripts
 /// apply to workspaces with it.
 #[gpui_kit::test]

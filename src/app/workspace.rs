@@ -209,11 +209,13 @@ impl Shark {
         let mut added = vec![];
         for p in paths {
             match git::add_repo(p, &self.state.repos) {
-                Ok(r) => added.push(r),
+                Ok(r) => {
+                    self.state.repos.push(r.clone());
+                    added.push(r);
+                }
                 Err(e) => notify_err(window, cx, e),
             }
         }
-        self.state.repos.extend(added.iter().cloned());
         let _ = self.state.save();
         cx.notify();
         added

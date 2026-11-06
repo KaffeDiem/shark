@@ -772,6 +772,9 @@ done
     #[cfg(feature = "test-support")] // shares the UI tests' home
     /// Runs the chat's process against a fake `codex app-server` until it exits or a turn ends.
     fn run_fake(session_id: Option<&str>, tag: &str, plan: bool) -> Vec<Ev> {
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         static FAKE_PATH: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         FAKE_PATH.get_or_init(|| {
             let dir = std::env::temp_dir().join(format!("shark-fake-codex-{}", std::process::id()));
@@ -801,9 +804,6 @@ done
             effort: Some("xhigh".into()),
             ..Default::default()
         };
-        let _turn = crate::app::ui_tests::UI_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
         std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
         let _ = std::fs::remove_file(ws.dir());
         std::os::unix::fs::symlink(&root, ws.dir()).unwrap();

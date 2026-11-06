@@ -141,7 +141,7 @@ pub struct Chat {
     pub archiving: bool,
     /// What `ChatMeta::delivered` becomes once the agent echoes the message at a block: a message
     /// it never read leaves the context pending.
-    told: Vec<(usize, std::collections::BTreeMap<String, u64>)>,
+    told: Vec<(usize, std::collections::BTreeMap<String, u64>, String)>,
     agent: Option<Agent>,
     pub(crate) composer: Entity<TextareaState>,
     /// The reply of the turn that ended last, and that turn's number (see `turns`).
@@ -401,6 +401,7 @@ impl Chat {
         }
         let live = std::mem::take(&mut self.blocks);
         let unread = std::mem::take(&mut self.unread);
+        let told = std::mem::take(&mut self.told);
         // state.json's session (it may have been reset), or the live process's
         let kept = (
             self.busy,
@@ -410,6 +411,7 @@ impl Chat {
             self.hopping.take(),
             self.started,
             self.cut,
+            self.steered,
             self.meta.session_id.clone(),
         );
         (self.busy, self.cut, self.replaying) = (false, false, true);
@@ -433,12 +435,16 @@ impl Chat {
             self.hopping,
             self.started,
             self.cut,
+            self.steered,
             self.meta.session_id,
         ) = kept;
         let n = self.blocks.len();
         self.blocks.extend(live);
         self.unread = unread.into_iter().map(|i| i + n).collect();
-        self.told.iter_mut().for_each(|(bi, _)| *bi += n);
+        self.told = told
+            .into_iter()
+            .map(|(bi, record, wire)| (bi + n, record, wire))
+            .collect();
         self.rows = self.build_rows();
         self.list.reset(self.rows.len() + 1); // + the activity footer
         self.list.set_follow_mode(FollowMode::Tail);
@@ -654,6 +660,7 @@ impl Chat {
     /// Sends a host-written prompt together with any draft instructions.
     pub fn ask(&mut self, prompt: &str, window: &mut Window, cx: &mut Context<Self>) -> bool {
         let mut draft = self.composer.read(cx).value().trim().to_string();
+        let had_draft = !draft.is_empty();
         // The same prompt put back below after a failed start: retrying must not send it twice.
         if draft == prompt.trim() {
             draft.clear();
@@ -663,7 +670,7 @@ impl Chat {
             false => format!("{prompt}\n\nAlso: {draft}"),
         };
         let sent = self.send_text(text.clone(), false, cx);
-        if sent && !draft.is_empty() {
+        if sent && had_draft {
             cx.emit(ChatEvent::GitReviewsSent(std::mem::take(
                 &mut self.editing_git_reviews,
             )));
@@ -766,7 +773,7 @@ impl Chat {
         if !notes.is_empty() {
             self.blocks.extend(info_notes(&notes.join("\n")));
             self.told
-                .push((self.blocks.len(), context_record(&self.ws.context())));
+                .push((self.blocks.len(), context_record(&self.ws.context()), wire));
         }
         let ids = review.as_ref().map(|r| r.ids());
         self.sent(text, review, cx);
@@ -1139,11 +1146,15 @@ impl Chat {
     }
 
     /// claude's echo: the oldest message it hadn't read is now part of the turn.
-    /// `ends_with`: context notes may have been put before the text on the wire.
     /// Not just the oldest: one the CLI refused (a failed codex turn/start) is never echoed.
     fn on_echo(&mut self, text: String, cx: &mut Context<Self>) {
-        let read = (self.unread.iter())
-            .position(|&bi| (self.blocks[bi].message()).is_some_and(|(t, _)| text.ends_with(t)));
+        let read =
+            self.unread
+                .iter()
+                .position(|&bi| match self.told.iter().find(|(b, ..)| *b == bi) {
+                    Some((_, _, wire)) => wire == &text,
+                    None => self.blocks[bi].message().is_some_and(|(t, _)| t == text),
+                });
         match read {
             Some(k) => {
                 let bi = self.unread.remove(k).unwrap();
@@ -1151,7 +1162,7 @@ impl Chat {
                     *queued = false;
                 }
                 self.remeasure(bi);
-                if let Some(i) = self.told.iter().position(|(b, _)| *b == bi) {
+                if let Some(i) = self.told.iter().position(|(b, ..)| *b == bi) {
                     self.meta.delivered = self.told.remove(i).1;
                     cx.emit(ChatEvent::Meta);
                 }
@@ -1305,16 +1316,11 @@ impl Chat {
             self.drop_asked(cx);
         }
         let cut = std::mem::take(&mut self.cut);
-        // codex refused what was sent, or the turn it joined is over: what it hasn't read won't
-        // start a turn of its own. It stays unread in case an echo comes, but nothing waits on it.
+        // Codex won't start a turn for unread messages after refusal/interruption. Retiring them
+        // also keeps a later retry of the same text from acknowledging the refused message.
         if self.codex() && (is_error || cut) {
-            for &bi in &self.unread {
-                if let Some(Block::User(_, queued) | Block::Review(_, queued)) =
-                    self.blocks.get_mut(bi)
-                {
-                    *queued = false;
-                }
-            }
+            self.drop_unread(cx);
+            self.told.clear();
             self.steered = false;
         }
         // A pruned or deleted session: claude says so in the result and exits, and
@@ -2488,7 +2494,7 @@ exec cat >/dev/null
                 unsafe { std::env::set_var("SHARK_CLAUDE", &self.0) };
             }
         }
-        let _restore = Restore(fake);
+        let _restore = Restore(fake.clone());
         // SAFETY: as above.
         unsafe { std::env::set_var("SHARK_CLAUDE", "/nonexistent") };
         let root = std::env::temp_dir().join(format!("shark-noclaude-{}", std::process::id()));
@@ -2535,6 +2541,17 @@ exec cat >/dev/null
                 assert_eq!(c.composer.read(cx).value().as_ref(), "build the thing");
             })
         });
+        // A successful retry consumes the restored draft without sending it twice.
+        unsafe { std::env::set_var("SHARK_CLAUDE", &fake) };
+        cx.update_window(window, |_, w, cx| {
+            chat.update(cx, |c, cx| {
+                assert!(c.ask("build the thing", w, cx));
+                assert_eq!(c.sent_texts(), ["build the thing"]);
+                assert!(c.composer.read(cx).value().is_empty());
+                c.reader = None;
+            });
+        })
+        .unwrap();
         let _ = std::fs::remove_file(ws.dir());
     }
 
@@ -3351,7 +3368,11 @@ exec cat >/dev/null
                 let unread = |c: &mut Chat, record: &std::collections::BTreeMap<_, _>| {
                     c.blocks.push(Block::User("hi".into(), false));
                     c.unread.push_back(c.blocks.len() - 1);
-                    c.told.push((c.blocks.len() - 1, record.clone()));
+                    c.told.push((
+                        c.blocks.len() - 1,
+                        record.clone(),
+                        "[shark] x\n[/shark]\n\nhi".into(),
+                    ));
                 };
                 unread(c, &record);
                 c.apply(Ev::Exited("claude exited".into()), cx);
@@ -3361,6 +3382,175 @@ exec cat >/dev/null
                 c.apply(Ev::User("[shark] x\n[/shark]\n\nhi".into()), cx);
                 assert_eq!(c.meta.delivered, record);
                 assert!(c.pending_context().is_empty());
+            })
+        });
+    }
+
+    /// The real Codex transport carries repo and issue notes, leaves compact requests alone,
+    /// and acknowledges context only when its app-server echoes the user message.
+    #[gpui_kit::test]
+    fn codex_delivers_attachment_context_on_normal_turns(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt;
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let chat = open_chat("codex-context", cx);
+        let root = std::env::temp_dir().join(format!("shark-codex-context-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fake = root.join("codex");
+        std::fs::write(&fake, r#"#!/bin/sh
+: > "$0.in"
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$0.in"
+    case "$line" in
+        *'"thread/resume"'*) printf '%s\n' '{"id":"resume","result":{"thread":{"id":"th1"},"model":"m1"}}';;
+        *'"thread/start"'*) printf '%s\n' '{"id":"start","result":{"thread":{"id":"th1"},"model":"m1"}}';;
+    esac
+done
+"#).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        struct Restore(Option<std::ffi::OsString>);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                // SAFETY: tests that spawn providers hold UI_LOCK.
+                unsafe {
+                    match &self.0 {
+                        Some(old) => std::env::set_var("SHARK_CODEX", old),
+                        None => std::env::remove_var("SHARK_CODEX"),
+                    }
+                }
+            }
+        }
+        let _restore = Restore(std::env::var_os("SHARK_CODEX"));
+        // SAFETY: as above.
+        unsafe { std::env::set_var("SHARK_CODEX", &fake) };
+        let request = |n: usize| {
+            for _ in 0..1000 {
+                let log = std::fs::read_to_string(fake.with_extension("in")).unwrap_or_default();
+                let turns: Vec<Value> = log
+                    .lines()
+                    .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                    .filter(|v| {
+                        matches!(
+                            v["method"].as_str(),
+                            Some("turn/start" | "thread/compact/start")
+                        )
+                    })
+                    .collect();
+                if let Some(turn) = turns.get(n) {
+                    return turn.clone();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            panic!("Codex request {n} was not received");
+        };
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                std::fs::create_dir_all(c.ws.dir()).unwrap();
+                c.meta.model = Some("codex:gpt-6.1-sol".into());
+                c.ws.repos.push(crate::state::WsRepo { name: "api".into(), src: "/src/api".into(), base: "main".into(), branch: None });
+                let issue = crate::linear::Snapshot { org: "org".into(), id: "one".into(), identifier: "ENG-1".into(), title: "Fix login".into(), description: "Use the existing session".into(), ..Default::default() };
+                c.ws.linear.attach((&issue).into());
+                c.ws.issues.push(issue);
+                assert!(c.send_text("/compact".into(), false, cx));
+                assert_eq!(request(0)["method"], "thread/compact/start");
+                assert_eq!(c.pending_context().len(), 2);
+                c.play(Ev::Result { is_error: false, text: String::new(), secs: 0 }, cx);
+                assert!(c.send_text("build it".into(), false, cx));
+                let wire = request(1)["params"]["input"][0]["text"].as_str().unwrap().to_string();
+                assert!(wire.contains("Repo `api`") && wire.contains("Linear issue ENG-1"), "{wire}");
+                assert!(wire.ends_with("build it"));
+                assert_eq!(c.pending_context().len(), 2, "not yet echoed");
+                let echo = serde_json::json!({"method":"item/started", "params":{"item":{"type":"userMessage", "id":"u1", "content":[{"type":"text", "text":wire}]}}});
+                play(c, &[&echo.to_string()], cx);
+                assert!(c.pending_context().is_empty());
+                c.play(Ev::Result { is_error: false, text: String::new(), secs: 0 }, cx);
+                assert!(c.send_text("next".into(), false, cx));
+                assert_eq!(request(2)["params"]["input"][0]["text"], "next");
+                c.drop_process(cx);
+                let _ = std::fs::remove_dir_all(c.ws.dir());
+            })
+        });
+    }
+
+    /// A refused message cannot claim another message's echo, even with the same user text
+    /// after its context changed.
+    #[gpui_kit::test]
+    fn echoes_match_the_exact_message_and_context(cx: &mut TestAppContext) {
+        let chat = open_chat("exact-echo", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.sent("it".into(), None, cx);
+                c.busy = false; // refused without an echo
+                c.sent("fix it".into(), None, cx);
+                c.apply(Ev::User("fix it".into()), cx);
+                assert_eq!(c.unread.iter().copied().collect::<Vec<_>>(), [0]);
+
+                let old = [("issue:one".into(), 1)].into_iter().collect();
+                let new: std::collections::BTreeMap<String, u64> =
+                    [("issue:one".into(), 2)].into_iter().collect();
+                for (record, wire) in [
+                    (old, format!("[shark] Old context{NOTES_END}retry")),
+                    (new.clone(), format!("[shark] New context{NOTES_END}retry")),
+                ] {
+                    c.busy = false;
+                    c.told.push((c.blocks.len(), record, wire));
+                    c.sent("retry".into(), None, cx);
+                }
+                c.apply(Ev::User(format!("[shark] New context{NOTES_END}retry")), cx);
+                assert_eq!(c.meta.delivered, new);
+                assert_eq!(
+                    c.told.len(),
+                    1,
+                    "the refused context was never acknowledged"
+                );
+                assert_eq!(c.unread.len(), 2, "only the matching message was read");
+            })
+        });
+    }
+
+    /// History can finish loading between a turn ending and a pending steer being read.
+    #[gpui_kit::test]
+    fn history_preserves_pending_steers_and_context(cx: &mut TestAppContext) {
+        let chat = open_chat("history-steer", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.sent("first".into(), None, cx);
+                c.apply(Ev::User("first".into()), cx);
+                let wire = format!("[shark] Context{NOTES_END}steer");
+                let record = [("issue:one".into(), 1)].into_iter().collect();
+                c.told.push((c.blocks.len(), record, wire.clone()));
+                c.sent("steer".into(), None, cx);
+                c.apply(
+                    Ev::Result {
+                        is_error: false,
+                        text: String::new(),
+                        secs: 1,
+                    },
+                    cx,
+                );
+                assert!(!c.idle());
+                c.load_history(
+                    vec![
+                        Ev::User("history".into()),
+                        Ev::Init {
+                            session_id: "old".into(),
+                            model: "m".into(),
+                            permission_mode: "plan".into(),
+                            mcp: vec![],
+                        },
+                        Ev::Exited("old process exited".into()),
+                    ],
+                    cx,
+                );
+                assert!(
+                    !c.idle(),
+                    "attachments and deletion must still wait for the steer"
+                );
+                assert_eq!(c.told.len(), 1);
+                c.apply(Ev::User(wire), cx);
+                assert_eq!(c.meta.delivered.get("issue:one"), Some(&1));
+                assert!(c.idle());
             })
         });
     }
@@ -3500,7 +3690,7 @@ exec cat >/dev/null
                 c.apply(done(), cx);
                 c.sent("refused".into(), None, cx);
                 c.apply(refused(), cx);
-                assert_eq!(c.unread.len(), 1);
+                assert!(c.unread.is_empty());
 
                 // A steer read with those around, as the reviewer's case had it.
                 c.sent("turn".into(), None, cx);
@@ -3513,6 +3703,16 @@ exec cat >/dev/null
                 assert!(!c.steered, "the stale entry doesn't hold it");
                 c.apply(done(), cx);
                 assert!(c.idle());
+
+                // Retrying refused text as a steer must read the retry, not the stale entry.
+                c.sent("again".into(), None, cx);
+                c.apply(refused(), cx);
+                c.sent("turn".into(), None, cx);
+                c.apply(Ev::User("turn".into()), cx);
+                c.sent("again".into(), None, cx);
+                c.apply(Ev::User("again".into()), cx);
+                c.apply(done(), cx);
+                assert!(c.idle() && c.unread.is_empty());
 
                 // A steer refused, then one in an interrupted turn: nothing starts a turn for them.
                 c.sent("turn".into(), None, cx);

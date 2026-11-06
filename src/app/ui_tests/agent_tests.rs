@@ -21,6 +21,26 @@ fn toasts(cx: &mut TestAppContext, window: AnyWindowHandle) -> usize {
         .unwrap()
 }
 
+/// Duplicate folders and names in one picker result are checked against earlier additions.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn adding_repository_paths_rejects_duplicates_within_the_batch(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let first = home.join("src/api");
+    let same_name = home.join("other/api");
+    init_repo(&first);
+    init_repo(&same_name);
+    let (window, shark) = empty_app(cx);
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        let added = s.add_repo_paths(&[first.clone(), first.clone(), same_name.clone()], w, cx);
+        assert_eq!(added.len(), 1);
+        assert_eq!(s.state.repos.len(), 1);
+        assert_eq!(s.state.repos[0].path, first.canonicalize().unwrap());
+    });
+    assert_eq!(State::load().repos.len(), 1);
+}
+
 /// An agent with no repository, its chat holding a plan.
 async fn planned_agent(
     cx: &mut TestAppContext,

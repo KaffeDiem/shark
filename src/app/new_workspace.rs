@@ -230,8 +230,10 @@ impl NewWorkspaceForm {
 
     /// The base list, on the base repo `ix` has now.
     fn pick_base(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let at = (self.branches[ix].iter().flatten())
-            .position(|b| self.from[ix].as_ref() == Some(&b.name) || self.is_default(ix, &b.name));
+        let at = (self.branches[ix].iter().flatten()).position(|b| match &self.from[ix] {
+            Some(base) => base == &b.name,
+            None => self.is_default(ix, &b.name),
+        });
         self.show(Mode::Bases(ix), 0, window, cx);
         self.select_after_refresh(at.map(IndexPath::new), window, cx);
         self.refresh(false, window, cx);

@@ -1376,7 +1376,7 @@ fn fresh_attach_refuses_existing_branches() {
     let e = add_to_workspace(&ws, &dir, &api, "remote-only", Some(""))
         .err()
         .unwrap();
-    assert!(e.contains("already exists"), "{e}");
+    assert!(e.message.contains("already exists"), "{e:?}");
     let ws = add_to_workspace(&ws, &dir, &api, "remote-only", None).unwrap();
     assert_eq!(ws.branch, "remote-only", "the explicit path keeps working");
     let _ = fs::remove_dir_all(root);
@@ -1398,7 +1398,7 @@ fn fresh_attach_rolls_back_only_what_it_made() {
     let e = add_to_workspace(&ws, &dir, &web, "b", Some(""))
         .err()
         .unwrap();
-    assert!(!e.is_empty());
+    assert!(!e.message.is_empty() && !e.preserved);
     assert!(!dir.join("web").exists(), "its worktree went");
     assert!(!has_ref(&web.path, "refs/heads/b"), "its branch went");
     assert!(has_ref(&web.path, "refs/heads/theirs"));
@@ -1456,12 +1456,20 @@ fn find_attachment_tells_states_apart() {
     git(&api.path, &["branch", "-D", "feat"]).unwrap();
 
     add_to_workspace(&ws, &dir, &api, "feat", Some("")).unwrap();
+    // The default was main when creation finished; recovery must not take the source's new HEAD.
+    git(&api.path, &["checkout", "-q", "-b", "source-moved"]).unwrap();
     let Found::Worktree(found) = find_attachment(&ws, &a) else {
         panic!("the finished worktree");
     };
     assert_eq!((found.name.as_str(), found.base.as_str()), ("api", "main"));
     let other = Attachment::fresh(&api, "other", "");
     assert!(matches!(find_attachment(&ws, &other), Found::Unclear(_)));
+    // Git keeps the source's registration even if the directory now contains another repository.
+    let foreign = init_repo(&root, "foreign");
+    git(&foreign.path, &["branch", "-m", "feat"]).unwrap();
+    fs::remove_file(dir.join("api/.git")).unwrap();
+    fs::rename(foreign.path.join(".git"), dir.join("api/.git")).unwrap();
+    assert!(matches!(find_attachment(&ws, &a), Found::Unclear(_)));
     let _ = fs::remove_dir_all(dir);
     let _ = fs::remove_dir_all(root);
 }
