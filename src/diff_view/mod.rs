@@ -55,7 +55,7 @@ mod syntax;
 
 pub use document::{DiffFile, DiffFileStatus, DiffLinePosition, DiffLineRange, DiffSide};
 pub(crate) use parser::hunk_header;
-pub(crate) use rows::CONTEXT_LINES;
+pub(crate) use rows::{CONTEXT_LINES, DisplayRow};
 pub use state::{DiffEvent, DiffState};
 
 use std::{collections::HashMap, rc::Rc, sync::Arc};
@@ -79,7 +79,7 @@ use gpui_kit::component::{
     v_flex,
 };
 use presentation::FilePresentation;
-use rows::{DisplayRow, EXPANSION_LINES};
+use rows::EXPANSION_LINES;
 use selection::{CodeText, SelectionLayer};
 use state::{FoldExpansion, LayoutKey, REVEAL_MAX_ROWS, SelectedLines};
 

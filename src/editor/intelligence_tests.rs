@@ -14,6 +14,21 @@ fn fake_client(root: &std::path::Path, log: &std::path::Path) -> Client {
     Client::start(fake_server(log), root, json!({})).unwrap()
 }
 
+struct PendingDefinition(async_channel::Receiver<Vec<lsp_types::LocationLink>>);
+
+impl gpui_kit::base::input::DefinitionProvider for PendingDefinition {
+    fn definitions(
+        &self,
+        _: &gpui_kit::base::input::Rope,
+        _: usize,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Vec<lsp_types::LocationLink>>> {
+        let response = self.0.clone();
+        cx.spawn(async move |_| Ok(response.recv().await?))
+    }
+}
+
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn semantic_highlighting_opens_refreshes_edits_and_restarts(cx: &mut TestAppContext) {
@@ -78,6 +93,23 @@ async fn semantic_highlighting_opens_refreshes_edits_and_restarts(cx: &mut TestA
                 json!(["type", "constant", "function"])
             );
         });
+        let (definition, response) = async_channel::unbounded();
+        let navigated = std::rc::Rc::new(std::cell::Cell::new(false));
+        cx.update_window(window, |_, w, cx| {
+            focus(&editor, w, cx);
+            editor.read(cx).input.clone().update(cx, |i, _| {
+                i.lsp_mut().definition_provider =
+                    Some(std::rc::Rc::new(PendingDefinition(response)));
+                let navigated = navigated.clone();
+                i.lsp_mut().show_document = Some(std::rc::Rc::new(move |_, _, _| {
+                    navigated.set(true);
+                    true
+                }));
+            });
+            w.dispatch_action(Box::new(gpui_kit::base::input::GoToDefinition), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
         let before = requests().len();
         cx.update(|cx| {
             session.update(cx, |_, cx| {
@@ -92,6 +124,16 @@ async fn semantic_highlighting_opens_refreshes_edits_and_restarts(cx: &mut TestA
             requests().len() > before
         })
         .await;
+        definition
+            .try_send(vec![lsp_types::LocationLink {
+                origin_selection_range: None,
+                target_uri: crate::lsp::document::file_uri(&file).unwrap(),
+                target_range: Default::default(),
+                target_selection_range: Default::default(),
+            }])
+            .unwrap();
+        cx.run_until_parked();
+        assert!(navigated.get(), "semantic refresh cancelled navigation");
         let before = requests().len();
         let edited = "// 😀\nlet value: String = \"unsaved\"\n";
         cx.update_window(window, |_, w, cx| {

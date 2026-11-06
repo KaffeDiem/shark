@@ -243,6 +243,9 @@ fn skills_link_into_the_root_and_archive_with_it() {
         commit(&wt, &["-qm", "skills"]);
     }
     archive_preflight(&ws, &dir, false).unwrap();
+    std::os::unix::fs::symlink(&root, links.join("mine")).unwrap();
+    assert!(archive_preflight(&ws, &dir, false).is_err());
+    fs::remove_file(links.join("mine")).unwrap();
     fs::create_dir(links.join("real")).unwrap();
     let err = archive_preflight(&ws, &dir, false).unwrap_err();
     assert!(err.contains(".agents"), "{err}");
@@ -253,6 +256,114 @@ fn skills_link_into_the_root_and_archive_with_it() {
     link_skills(&ws, &dir, true);
     remove_workspace(&ws, &dir, false).unwrap();
     assert!(!dir.exists());
+}
+
+#[test]
+fn skills_preserve_user_links_and_avoid_name_collisions() {
+    let dir = std::env::temp_dir().join(format!("shark-skill-ownership-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    let ws = Workspace {
+        repos: ["api", "web"]
+            .into_iter()
+            .map(|name| WsRepo {
+                name: name.into(),
+                src: dir.join(name),
+                base: "HEAD".into(),
+                branch: None,
+            })
+            .collect(),
+        ..Default::default()
+    };
+    for path in [
+        "api/.agents/skills/deploy",
+        "api/.agents/skills/web-deploy",
+        "web/.agents/skills/deploy",
+    ] {
+        fs::create_dir_all(dir.join(path)).unwrap();
+        fs::write(dir.join(path).join("SKILL.md"), "hi").unwrap();
+    }
+    link_skills(&ws, &dir, true);
+    let links = dir.join(SKILL_LINKS);
+    let before = owned_skill_links(&dir).unwrap();
+    assert_eq!(
+        before.len(),
+        3,
+        "a fallback name cannot replace another skill"
+    );
+    assert_eq!(
+        before["web-deploy-2"],
+        Path::new("../../web/.agents/skills/deploy")
+    );
+    link_skills(&ws, &dir, true);
+    assert_eq!(
+        owned_skill_links(&dir).unwrap(),
+        before,
+        "stable on refresh"
+    );
+    assert!(only_skill_links(&dir));
+
+    let user = Path::new("../../my-skills/custom");
+    std::os::unix::fs::symlink(user, links.join("custom")).unwrap();
+    // Replacing one of our links relinquishes ownership too.
+    fs::remove_file(links.join("deploy")).unwrap();
+    std::os::unix::fs::symlink(&dir, links.join("deploy")).unwrap();
+    link_skills(&ws, &dir, true);
+    assert_eq!(fs::read_link(links.join("custom")).unwrap(), user);
+    assert_eq!(fs::read_link(links.join("deploy")).unwrap(), dir);
+    assert!(
+        !only_skill_links(&dir),
+        "ordinary archive must preserve user links"
+    );
+    link_skills(&ws, &dir, false);
+    assert_eq!(fs::read_dir(&links).unwrap().count(), 2);
+    assert_eq!(fs::read_link(links.join("custom")).unwrap(), user);
+    assert_eq!(fs::read_link(links.join("deploy")).unwrap(), dir);
+
+    // Old unrecorded links stay user-owned without duplicating the same target.
+    std::os::unix::fs::symlink("../../api/.agents/skills/deploy", links.join("old")).unwrap();
+    link_skills(&ws, &dir, true);
+    assert!(
+        !owned_skill_links(&dir)
+            .unwrap()
+            .values()
+            .any(|p| p == Path::new("../../api/.agents/skills/deploy"))
+    );
+    link_skills(&ws, &dir, false);
+    assert!(fs::read_link(links.join("old")).is_ok());
+    assert!(!only_skill_links(&dir));
+    fs::remove_dir_all(&dir).unwrap();
+}
+
+#[test]
+fn skills_never_follow_user_directory_symlinks() {
+    let root = std::env::temp_dir().join(format!("shark-skill-dirs-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let ws = Workspace::default();
+    for name in [AGENTS_DIR, SKILL_LINKS] {
+        let dir = root.join(name.replace('/', "-"));
+        let external = dir.join("external");
+        fs::create_dir_all(&external).unwrap();
+        let link = dir.join(name);
+        fs::create_dir_all(link.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&external, &link).unwrap();
+        let user_links = if name == AGENTS_DIR {
+            external.join("skills")
+        } else {
+            external.clone()
+        };
+        fs::create_dir_all(&user_links).unwrap();
+        std::os::unix::fs::symlink("../../custom", user_links.join("mine")).unwrap();
+        for on in [true, false] {
+            link_skills(&ws, &dir, on);
+            assert_eq!(
+                fs::read_link(user_links.join("mine")).unwrap(),
+                Path::new("../../custom")
+            );
+            assert_eq!(fs::read_link(&link).unwrap(), external);
+            assert!(!only_skill_links(&dir));
+        }
+    }
+    fs::remove_dir_all(root).unwrap();
 }
 
 #[test]

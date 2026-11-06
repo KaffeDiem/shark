@@ -150,8 +150,8 @@ pub struct Chat {
     /// respawns it on the next send.
     agent_model: Option<String>,
     agent_effort: &'static str,
-    /// Whether the running claude got the repos' skills (`git::claude_skill_args`).
-    agent_skills: bool,
+    /// Repo directories passed to the running Claude (`git::claude_skill_args`).
+    agent_skills: Vec<String>,
     /// Virtualized: only visible rows render, which matters while a spinner redraws every frame.
     list: ListState,
     pub focus: FocusHandle,
@@ -325,7 +325,7 @@ impl Chat {
             model_at: Default::default(),
             agent_model: None,
             agent_effort: EFFORT,
-            agent_skills: true,
+            agent_skills: Vec::new(),
             list: ListState::new(1, ListAlignment::Top, px(400.)), // the activity footer
             focus: cx.focus_handle(),
             reader: None,
@@ -661,10 +661,10 @@ impl Chat {
             return false;
         }
         // Never mid-turn: a steer would kill the turn it means to steer.
+        let skills = crate::git::claude_skill_args(&self.ws);
         let stale = self.agent_model != self.meta.model
             || (!self.codex()
-                && (self.agent_effort != self.effort()
-                    || self.agent_skills != crate::git::repo_skills()));
+                && (self.agent_effort != self.effort() || self.agent_skills != skills));
         if self.agent.is_some() && stale && !self.busy && !self.steered {
             self.agent = None; // drop stops it; the respawn resumes the same session on the new model/level
             self.set_background(vec![], cx); // its reader is replaced below, so its Exited never arrives
@@ -681,7 +681,7 @@ impl Chat {
                     self.agent = Some(a);
                     self.agent_model = self.meta.model.clone();
                     self.agent_effort = self.effort();
-                    self.agent_skills = crate::git::repo_skills();
+                    self.agent_skills = skills;
                     self.reader = Some(read_events(rx, Self::apply, cx));
                 }
                 Err(e) => {
@@ -3165,6 +3165,48 @@ exec cat >>"$0.stdin"
                 c.agent_model = c.meta.model.clone();
                 c.agent_effort = "high";
                 assert_ne!(c.agent_effort, c.effort());
+            })
+        });
+    }
+
+    #[gpui_kit::test]
+    fn added_repo_skills_restart_claude_only_on_idle_send(cx: &mut TestAppContext) {
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fake_claude();
+        let chat = open_chat("added-repo-skills", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                let dir = c.ws.dir();
+                std::fs::create_dir_all(&dir).unwrap();
+                assert!(c.send_text("first".into(), false, cx));
+                assert!(c.agent_skills.is_empty());
+                let mut ws = c.ws.clone();
+                std::fs::create_dir_all(dir.join("api")).unwrap();
+                ws.repos.push(crate::state::WsRepo {
+                    name: "api".into(),
+                    src: dir.join("api"),
+                    base: "HEAD".into(),
+                    branch: None,
+                });
+                c.repos_changed(&ws, "added api".into(), cx);
+                assert!(c.send_text("steer".into(), true, cx));
+                assert!(c.agent_skills.is_empty(), "never restart an active turn");
+                c.apply(
+                    Ev::Result {
+                        is_error: false,
+                        text: String::new(),
+                        secs: 0,
+                    },
+                    cx,
+                );
+                assert!(c.send_text("next".into(), false, cx));
+                assert_eq!(c.agent_skills, crate::git::claude_skill_args(&ws));
+                assert_eq!(c.agent_skills.len(), 2, "restarted with the added repo");
+                c.reader = None;
+                c.agent = None;
+                std::fs::remove_dir_all(dir).unwrap();
             })
         });
     }

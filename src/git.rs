@@ -904,45 +904,124 @@ const AGENTS_DIR: &str = ".agents";
 /// Where codex looks at the workspace root.
 const SKILL_LINKS: &str = ".agents/skills";
 
-/// Links each repo's skills into the root, or removes the links: codex has no `--add-dir` and
-/// only looks from its cwd upward. It doesn't read `.claude/skills`, so those count too. A name
-/// a second repo shares becomes `<repo>-<skill>`, as a link can't rename what codex lists.
-/// Anything but our own links stays; a failure only leaves them stale.
+const SKILL_OWNERS: &str = ".shark-skills.json";
+
+// Never follow a user's directory symlink while managing workspace-owned files.
+fn skill_dirs_owned(dir: &Path) -> bool {
+    [AGENTS_DIR, SKILL_LINKS]
+        .iter()
+        .all(|p| match fs::symlink_metadata(dir.join(p)) {
+            Ok(m) => m.is_dir(),
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        })
+}
+
+fn owned_skill_links(dir: &Path) -> Option<BTreeMap<String, PathBuf>> {
+    let path = dir.join(AGENTS_DIR).join(SKILL_OWNERS);
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(BTreeMap::new()),
+        Ok(m) if m.is_file() => {
+            let links: BTreeMap<String, PathBuf> =
+                serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+            links
+                .keys()
+                .all(|name| {
+                    let mut parts = Path::new(name).components();
+                    matches!(parts.next(), Some(std::path::Component::Normal(_)))
+                        && parts.next().is_none()
+                })
+                .then_some(links)
+        }
+        _ => None,
+    }
+}
+
+/// Link repo skills into Codex's root. Only recorded, unchanged links belong to Shark;
+/// pre-existing links (including ones from older Shark versions) stay user-owned.
 pub fn link_skills(ws: &Workspace, dir: &Path, on: bool) {
+    if !skill_dirs_owned(dir) {
+        return;
+    }
+    let Some(mut owned) = owned_skill_links(dir) else {
+        return;
+    };
     let links = dir.join(SKILL_LINKS);
+    owned.retain(|name, target| fs::read_link(links.join(name)).is_ok_and(|t| &t == target));
+    let mut used = HashSet::new();
+    let mut user_targets = HashSet::new();
+    match fs::read_dir(&links) {
+        Ok(entries) => {
+            for entry in entries {
+                let Ok(entry) = entry else { return };
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !owned.contains_key(&name) {
+                    used.insert(name);
+                    if let Ok(target) = fs::read_link(entry.path()) {
+                        user_targets.insert(target);
+                    }
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return,
+    }
     let mut want = BTreeMap::new();
     for r in ws.repos.iter().filter(|_| on) {
         let mut own = HashSet::new();
         for src in [SKILL_LINKS, ".claude/skills"] {
             let found = fs::read_dir(dir.join(&r.name).join(src));
-            for e in found.into_iter().flatten().flatten() {
+            let mut found: Vec<_> = found.into_iter().flatten().flatten().collect();
+            found.sort_by_key(|e| e.file_name());
+            for e in found {
                 let skill = e.file_name().to_string_lossy().into_owned();
                 if !e.path().join("SKILL.md").exists() || !own.insert(skill.clone()) {
                     continue;
                 }
                 let target = Path::new("../..").join(&r.name).join(src).join(&skill);
-                let link = match want.contains_key(&skill) {
-                    true => format!("{}-{skill}", r.name),
-                    false => skill,
-                };
-                want.insert(link, target);
+                if user_targets.contains(&target) {
+                    continue;
+                }
+                let mut name = skill.clone();
+                if used.contains(&name) {
+                    name = format!("{}-{skill}", r.name);
+                }
+                let base = name.clone();
+                let mut suffix = 2;
+                while used.contains(&name) {
+                    name = format!("{base}-{suffix}");
+                    suffix += 1;
+                }
+                used.insert(name.clone());
+                want.insert(name, target);
             }
         }
     }
-    for e in fs::read_dir(&links).into_iter().flatten().flatten() {
-        let name = e.file_name().to_string_lossy().into_owned();
-        if fs::read_link(e.path())
-            .is_ok_and(|t| t.starts_with("../..") && want.get(&name) != Some(&t))
-        {
-            let _ = fs::remove_file(e.path());
+    owned.retain(|name, target| {
+        want.get(name) == Some(target) || fs::remove_file(links.join(name)).is_err()
+    });
+    let manifest = dir.join(AGENTS_DIR).join(SKILL_OWNERS);
+    if want.is_empty() && owned.is_empty() {
+        let _ = fs::remove_file(manifest);
+        let _ = fs::remove_dir(&links).and_then(|()| fs::remove_dir(dir.join(AGENTS_DIR)));
+        return;
+    }
+    if fs::create_dir_all(&links).is_err() {
+        return;
+    }
+    // Record before creating links: a failed write must never leave untracked owned links.
+    for (name, target) in &want {
+        if !owned.contains_key(name) {
+            owned.insert(name.clone(), target.clone());
         }
     }
-    if want.is_empty() {
-        let _ = fs::remove_dir(&links).and_then(|()| fs::remove_dir(dir.join(AGENTS_DIR)));
-    } else if fs::create_dir_all(&links).is_ok() {
-        for (name, target) in want {
-            let _ = std::os::unix::fs::symlink(target, links.join(name));
-        }
+    let Ok(bytes) = serde_json::to_vec(&owned) else {
+        return;
+    };
+    if crate::state::write(&manifest, &bytes).is_err() {
+        return;
+    }
+    for (name, target) in want {
+        let _ = std::os::unix::fs::symlink(target, links.join(name));
     }
 }
 
@@ -978,13 +1057,25 @@ fn shark_owned(dir: &Path, name: &str) -> bool {
 }
 
 fn only_skill_links(dir: &Path) -> bool {
+    if !skill_dirs_owned(dir) {
+        return false;
+    }
+    let Some(owned) = owned_skill_links(dir) else {
+        return false;
+    };
     let links = dir.join(SKILL_LINKS);
-    fs::read_dir(dir.join(AGENTS_DIR))
-        .is_ok_and(|mut es| es.all(|e| e.is_ok_and(|e| e.file_name() == "skills")))
-        && (!links.exists()
-            || fs::read_dir(&links).is_ok_and(|mut es| {
-                es.all(|e| e.is_ok_and(|e| e.file_type().is_ok_and(|t| t.is_symlink())))
-            }))
+    fs::read_dir(dir.join(AGENTS_DIR)).is_ok_and(|mut es| {
+        es.all(|e| e.is_ok_and(|e| e.file_name() == "skills" || e.file_name() == SKILL_OWNERS))
+    }) && (!links.exists()
+        || fs::read_dir(&links).is_ok_and(|mut es| {
+            es.all(|e| {
+                e.is_ok_and(|e| {
+                    owned
+                        .get(&e.file_name().to_string_lossy().into_owned())
+                        .is_some_and(|target| fs::read_link(e.path()).is_ok_and(|t| &t == target))
+                })
+            })
+        }))
 }
 
 fn claude_md(ws: &Workspace, dir: &Path) -> String {

@@ -111,12 +111,18 @@ impl Drop for Language {
 
 impl FileEditor {
     /// The buffer changed: language responses and diagnostics for the old text are stale.
-    pub(crate) fn language_changed(&mut self) {
+    pub(crate) fn language_changed(&mut self, cx: &mut Context<Self>) {
         document::document_changed();
         if let Some(language) = &mut self.intelligence {
             language.edits.fetch_add(1, Ordering::AcqRel);
             language.diagnostics = Default::default();
         }
+        self.input.update(cx, |i, _| {
+            // Only text edits invalidate positions and pending navigation.
+            if i.lsp().semantic_tokens_provider.is_some() {
+                EditorMode::reset_language_features(i);
+            }
+        });
     }
     pub(crate) fn language_status(&self, cx: &App) -> Option<(crate::lsp::Status, Option<String>)> {
         if let Some(error) = &self.lsp_error {
@@ -379,8 +385,6 @@ impl FileEditor {
     fn refresh_semantic_tokens(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.input.update(cx, |i, cx| {
             if i.lsp().semantic_tokens_provider.is_some() {
-                // Cached positions belong to the previous text until the new response arrives.
-                EditorMode::reset_language_features(i);
                 EditorMode::refresh_language_features(i, window, cx);
                 cx.notify();
             }
