@@ -22,6 +22,8 @@ use std::{
     time::Duration,
 };
 
+mod semantic;
+
 /// Data-carrying items resolved before the menu shows; the rest are presented unresolved.
 const EAGER_RESOLVE: usize = 16;
 

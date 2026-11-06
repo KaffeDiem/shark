@@ -5,6 +5,7 @@ use crate::lsp::{
     document::{self, Encoding, Lines, Snapshot, file_uri, same_file},
     providers::Provider,
 };
+use gpui_kit::base::input::EditorMode;
 use lsp_types::{PublishDiagnosticsParams, Uri};
 use serde::Deserialize as _;
 use serde_json::json;
@@ -197,6 +198,15 @@ impl FileEditor {
                     }
                     if let SessionEvent::Notification {
                         method,
+                        companion: false,
+                        ..
+                    } = event
+                        && method == "workspace/semanticTokens/refresh"
+                    {
+                        e.refresh_semantic_tokens(window, cx);
+                    }
+                    if let SessionEvent::Notification {
+                        method,
                         params,
                         companion,
                     } = event
@@ -269,6 +279,7 @@ impl FileEditor {
         if opening {
             self.install_providers(client.clone(), companion.clone(), window, cx);
         }
+        self.refresh_semantic_tokens(window, cx);
         let Some(language) = &mut self.intelligence else {
             return;
         };
@@ -365,6 +376,17 @@ impl FileEditor {
         });
     }
 
+    fn refresh_semantic_tokens(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |i, cx| {
+            if i.lsp().semantic_tokens_provider.is_some() {
+                // Cached positions belong to the previous text until the new response arrives.
+                EditorMode::reset_language_features(i);
+                EditorMode::refresh_language_features(i, window, cx);
+                cx.notify();
+            }
+        });
+    }
+
     /// Gives the editor's completion, hover, definition and code-action providers to `client`
     /// (and `companion`), and forwards their events.
     fn install_providers(
@@ -396,6 +418,7 @@ impl FileEditor {
             lsp.completion_provider = Some(main.clone());
             lsp.hover_provider = Some(main.clone());
             lsp.definition_provider = Some(main.clone());
+            lsp.semantic_tokens_provider = main.semantic_options().map(|_| main.clone() as _);
             lsp.code_action_providers = vec![main.clone()];
             if let Some(ruff) = ruff {
                 lsp.code_action_providers.push(ruff);

@@ -729,6 +729,8 @@ fn go(project: &Project) -> Result<Launch> {
     let expected = fs::read_to_string(resources.join("gopls.sha256"))?;
     install::verify(&binary, expected.trim())?;
     let mut result = launch(project, binary, &[]);
+    result.initialization_options = json!({"semanticTokens": true});
+    result.settings = json!({"gopls":{"semanticTokens": true}});
     result.env.push(("GOTOOLCHAIN".into(), selected));
     Ok(result)
 }
