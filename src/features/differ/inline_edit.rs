@@ -363,6 +363,7 @@ impl Differ {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.close_markdown(cx);
         let Some(ws) = self.active_ws() else {
             return;
         };

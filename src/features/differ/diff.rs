@@ -157,6 +157,7 @@ impl Differ {
             self.edit_disk(&abs, bytes, cx);
         }
         if let Some(error) = self.reconcile_edit(&data) {
+            self.close_markdown(cx);
             self.diff_error = Some(error);
             cx.notify();
             return;
@@ -181,10 +182,12 @@ impl Differ {
                 .eq(data.files.iter().map(|f| f.path()))
         {
             if status_changed {
+                self.close_markdown(cx);
                 cx.notify();
             }
             return;
         }
+        self.close_markdown(cx);
         self.splice_edit(&mut data, cx);
         // With the same files, only those that changed are replaced, so the others keep their
         // folds, annotations and selection and the view stays put.
@@ -455,6 +458,7 @@ impl Differ {
                 dirty,
                 cx.entity().downgrade(),
             )])
+            .chain(self.markdown_button(file, cx))
             .collect()
     }
 
@@ -516,6 +520,7 @@ impl Differ {
 
     /// Makes file `ix` the one last moved to and scrolls the diff to it.
     pub(crate) fn goto_file(&mut self, ix: usize, cx: &mut Context<Self>) {
+        self.close_markdown(cx);
         self.diff_file = ix;
         let path = self.diff_files[ix].path().to_string();
         self.review.at_file(&path);
@@ -622,6 +627,9 @@ impl Differ {
     }
 
     pub(crate) fn render_diff(&self, _window: &Window, cx: &mut Context<Self>) -> AnyElement {
+        if self.markdown.is_some() {
+            return self.render_markdown(cx);
+        }
         let viewed = self.viewed_now.clone();
         let shark = cx.entity().downgrade();
         let placeholder = self.diff_placeholder(cx);
@@ -1509,6 +1517,31 @@ mod tests {
             });
             assert_eq!(selected, Some(select.clone()));
             assert_eq!(text, "two\n");
+        });
+    }
+
+    #[gpui_kit::test]
+    fn markdown_preview_survives_unchanged_refresh_but_leaves_when_the_patch_changes(
+        cx: &mut TestAppContext,
+    ) {
+        use crate::diff_view::DiffSide;
+        cx.update(|cx| {
+            gpui_kit::component::init(cx);
+            crate::diff_view::init(cx);
+        });
+        let (differ, cx) = cx.add_window_view(|w, cx| {
+            Differ::new(Preferences::from(&crate::state::State::default()), w, cx)
+        });
+        let patch = "diff --git a/a.md b/a.md\n--- a/a.md\n+++ b/a.md\n@@ -1 +1 @@\n-# Before\n+# After\n\
+                     diff --git a/b.txt b/b.txt\n--- a/b.txt\n+++ b/b.txt\n@@ -1 +1 @@\n-old\n+new\n";
+        differ.update(cx, |d, cx| {
+            d.apply_diff(data(patch, [1, 2]), cx);
+            d.open_markdown("a.md", DiffSide::Modified, cx);
+            assert!(d.markdown.is_some());
+            d.apply_diff(data(patch, [1, 2]), cx);
+            assert!(d.markdown.is_some());
+            d.apply_diff(data(&patch.replace("# After", "# Updated"), [3, 4]), cx);
+            assert!(d.markdown.is_none());
         });
     }
 }

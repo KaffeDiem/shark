@@ -1042,6 +1042,7 @@ impl GitFeature {
         Some(DocContext {
             repo: self.workspace.dir().join(&repo.name),
             rev: d.head_sha.clone(),
+            working_tree: false,
             dir: String::new(),
             web: Some(format!(
                 "https://{}/{}/{}",

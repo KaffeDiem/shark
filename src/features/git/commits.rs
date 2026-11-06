@@ -83,13 +83,6 @@ fn when(date: &str) -> String {
     date.replacen('T', " ", 1).chars().take(16).collect()
 }
 
-fn markdown(path: &str) -> bool {
-    let lower = path.to_ascii_lowercase();
-    [".md", ".markdown", ".mdx", ".mdown"]
-        .iter()
-        .any(|e| lower.ends_with(e))
-}
-
 fn status_label(f: &FileChange) -> &'static str {
     match f.status {
         'A' => "Added",
@@ -380,7 +373,7 @@ impl Commits {
                     }
                     Ok(Loaded::Note(n)) => Content::Note(n),
                     Ok(Loaded::Text(text)) => Content::Text {
-                        markdown: markdown(&file.path),
+                        markdown: super::document::is_markdown(&file.path),
                         text,
                     },
                     Err(e) => Content::Failed(e),
@@ -409,6 +402,7 @@ impl Commits {
         Some(DocContext {
             repo: repo.wt.clone(),
             rev,
+            working_tree: false,
             dir: file
                 .path
                 .rsplit_once('/')

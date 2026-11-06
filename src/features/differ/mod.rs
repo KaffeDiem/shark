@@ -34,6 +34,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 mod diff;
 mod inline_edit;
+mod markdown;
 use crate::media;
 mod review;
 mod review_comment;
@@ -170,6 +171,7 @@ pub(crate) struct Differ {
     review: review::Review,
     media: Vec<(SharedString, Entity<media::MediaView>)>,
     media_cache: Entity<media::Lru>,
+    markdown: Option<markdown::Preview>,
     media_width: Rc<std::cell::Cell<Pixels>>,
     menu: Option<(Entity<menu::Menu>, Subscription)>,
     _subscriptions: Vec<Subscription>,
@@ -248,6 +250,7 @@ impl Differ {
             review: Default::default(),
             media: vec![],
             media_cache: media::Lru::new(cx),
+            markdown: None,
             media_width: Rc::default(),
             menu: None,
             _subscriptions: subscriptions,
@@ -291,6 +294,7 @@ impl Differ {
             self.review.sheet = None;
             self.close_share(window, cx);
             self.media.clear();
+            self.close_markdown(cx);
             self.menu = None;
             self.diff.update(cx, |d, cx| d.set_files([], cx));
         }
@@ -512,13 +516,14 @@ impl Differ {
         window: &Window,
         cx: &App,
     ) -> Option<SharedString> {
-        path.or_else(|| {
-            self.diff
-                .read(cx)
-                .selected_lines()
-                .map(|r| r.path().clone())
-        })
-        .or_else(|| self.cursor_path(window, cx))
+        path.or_else(|| self.markdown.as_ref().map(|p| p.path.clone()))
+            .or_else(|| {
+                self.diff
+                    .read(cx)
+                    .selected_lines()
+                    .map(|r| r.path().clone())
+            })
+            .or_else(|| self.cursor_path(window, cx))
     }
 
     /// Whether the diff has `path`; true while it is still loading, which says nothing yet.

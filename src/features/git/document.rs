@@ -1,6 +1,6 @@
 //! Rich Git documents: Markdown in the house style, closed Mermaid fences as diagrams, and
-//! standalone images or videos. Relative assets come from the document's captured revision,
-//! never the working tree. A document is a list of blocks, so long ones are virtualized.
+//! standalone images or videos. Relative assets use the captured revision, or the working
+//! tree for a Diff after-preview. Long documents are virtualized as lists of blocks.
 //! GitHub's extensions are handled here: HTML comments are dropped, `<details>` folds,
 //! `> [!NOTE]` alerts, `suggestion` fences, `:emoji:` and `@user`/`#123`/SHA links.
 use super::mermaid::{self, Diagram};
@@ -17,13 +17,22 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 
+pub(crate) fn is_markdown(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    [".md", ".markdown", ".mdx", ".mdown"]
+        .iter()
+        .any(|e| lower.ends_with(e))
+}
+
 /// Where a document's relative links point.
 #[derive(Clone, Debug, PartialEq)]
 pub(crate) struct DocContext {
-    /// The repository worktree, read only through Git objects.
+    /// The repository worktree containing the document and its assets.
     pub(crate) repo: PathBuf,
     /// The commit relative assets resolve against; `None` when unknown.
     pub(crate) rev: Option<String>,
+    /// Resolve relative assets and links in the working tree instead of a Git revision.
+    pub(crate) working_tree: bool,
     /// The document's directory inside the repository (`""` for the root).
     pub(crate) dir: String,
     /// `https://github.com/owner/repo`, for opening what can't be shown here.
@@ -1281,6 +1290,33 @@ fn resolve(url: &str, ctx: Option<&DocContext>) -> Result<MediaFile, String> {
     let ctx = ctx.ok_or("relative links need a repository")?;
     let path = repo_path(&ctx.dir, url).ok_or("the link leaves the repository")?;
     let kind = media::kind(&path).ok_or("not an image or video")?;
+    if ctx.working_tree {
+        let root = ctx.repo.canonicalize().map_err(|e| e.to_string())?;
+        let abs = root.join(&path).canonicalize().map_err(|e| e.to_string())?;
+        if !abs.starts_with(&root) {
+            return Err("the link leaves the repository".into());
+        }
+        let sha = crate::git::git(
+            &ctx.repo,
+            &[
+                "hash-object",
+                &format!("--path={path}"),
+                "--",
+                &abs.to_string_lossy(),
+            ],
+        )?;
+        return Ok(MediaFile {
+            // Working media paths include a repo prefix, removed by media::prepare.
+            path: format!("working/{path}").into(),
+            kind,
+            old: None,
+            new: Some(Side {
+                sha,
+                repo: ctx.repo.clone(),
+                source: Source::Working(abs),
+            }),
+        });
+    }
     let rev = ctx
         .rev
         .as_deref()
@@ -1387,6 +1423,12 @@ fn link_url(url: &str, ctx: Option<&DocContext>) -> Option<String> {
     }
     if url.starts_with("www.") {
         return Some(format!("https://{url}"));
+    }
+    if let Some(ctx) = ctx.filter(|ctx| ctx.working_tree) {
+        let path = repo_path(&ctx.dir, url)?;
+        return url::Url::from_file_path(ctx.repo.join(path))
+            .ok()
+            .map(Into::into);
     }
     let mut link = web_link(url, ctx)?;
     if let Some((_, frag)) = url.split_once('#') {
@@ -2524,6 +2566,7 @@ mod tests {
         let ctx = DocContext {
             repo: "/r".into(),
             rev: Some("abc".into()),
+            working_tree: false,
             dir: "docs".into(),
             web: Some("https://github.com/o/r".into()),
         };
@@ -2545,6 +2588,15 @@ mod tests {
         );
         assert_eq!(link_url("#usage", Some(&ctx)), None);
         assert_eq!(link_url("docs/a.md", None), None);
+        let working = DocContext {
+            working_tree: true,
+            ..ctx.clone()
+        };
+        assert_eq!(
+            link_url("a%20b.md", Some(&working)).as_deref(),
+            Some("file:///r/docs/a%20b.md")
+        );
+        assert_eq!(link_url("../../outside.md", Some(&working)), None);
         assert_eq!(
             attr("<img alt='x y' src=a.png>", "src").as_deref(),
             Some("a.png")
@@ -2553,5 +2605,60 @@ mod tests {
             attr("<img data-src=\"no\" src=\"yes\">", "src").as_deref(),
             Some("yes")
         );
+    }
+
+    #[::core::prelude::v1::test]
+    fn markdown_assets_use_the_selected_revision_or_working_tree() {
+        use crate::git::git;
+        use std::fs;
+        let temp = std::env::temp_dir().join(format!(
+            "shark-markdown-assets-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repo = temp.join("repo");
+        fs::create_dir_all(repo.join("docs")).unwrap();
+        git(&repo, &["init", "-q"]).unwrap();
+        fs::write(repo.join("docs/image.png"), b"before").unwrap();
+        git(&repo, &["add", "."]).unwrap();
+        git(
+            &repo,
+            &[
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.com",
+                "commit",
+                "-qm",
+                "base",
+            ],
+        )
+        .unwrap();
+        let mut ctx = DocContext {
+            repo: repo.clone(),
+            rev: Some(git(&repo, &["rev-parse", "HEAD"]).unwrap()),
+            working_tree: false,
+            dir: "docs".into(),
+            web: None,
+        };
+        fs::write(repo.join("docs/image.png"), b"after").unwrap();
+        let before = resolve("image.png", Some(&ctx)).unwrap().new.unwrap();
+        assert_eq!(before.source, Source::Blob);
+        assert_eq!(
+            crate::git::history::blob(&repo, &before.sha).unwrap(),
+            b"before"
+        );
+        ctx.working_tree = true;
+        let after = resolve("image.png", Some(&ctx)).unwrap().new.unwrap();
+        assert!(matches!(after.source, Source::Working(_)));
+        assert_ne!(after.sha, before.sha);
+        fs::write(temp.join("outside.png"), b"outside").unwrap();
+        std::os::unix::fs::symlink(temp.join("outside.png"), repo.join("docs/escape.png")).unwrap();
+        assert!(resolve("escape.png", Some(&ctx)).is_err());
+        assert!(resolve("../../outside.png", Some(&ctx)).is_err());
+        fs::remove_dir_all(temp).unwrap();
     }
 }
