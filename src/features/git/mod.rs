@@ -2,6 +2,7 @@
 pub(crate) mod commits;
 pub(crate) mod document;
 mod drafts;
+pub(crate) use drafts::store_path as drafts_path;
 mod mermaid;
 use crate::media::{Lru, Playing};
 use crate::pr::git_feature as api;

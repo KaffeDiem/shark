@@ -770,6 +770,7 @@ fn errors_never_quote_a_credential() {
 
 #[test]
 fn snapshots_never_hold_credentials() {
+    let _turn = home_turn();
     let agent = format!("test-agent-{}", random().unwrap());
     let http = |_: &Req| ok(ISSUE_JSON);
     let live = oauth(now() as u64 + 3600);
@@ -857,6 +858,131 @@ fn snapshot_reads_old_json_with_defaults() {
     assert_eq!((s.project, s.retrieved_at), (None, 0));
 }
 
+/// What's stored in chats: `content`'s hash from before `state_type` and `priority` existed.
+#[test]
+fn display_only_fields_leave_the_fingerprint_alone() {
+    let before = r#"{"org":"o","id":"i","identifier":"ENG-1","url":"u","title":"Fix","description":"d","status":"Todo","team":"Eng","team_key":"ENG","project":null,"assignee":null,"updated_at":"","retrieved_at":0}"#;
+    let old: Snapshot = serde_json::from_str(before).unwrap();
+    assert_eq!(content(&old), crate::files::fingerprint(before));
+    let refreshed = Snapshot {
+        state_type: "started".into(),
+        priority: 1,
+        updated_at: "2026-11-06T10:00:00.000Z".into(),
+        retrieved_at: 1_788_000_000,
+        ..old.clone()
+    };
+    assert_eq!(content(&refreshed), content(&old), "not redelivered");
+    let changed = Snapshot {
+        status: "In Progress".into(),
+        ..refreshed.clone()
+    };
+    assert_ne!(
+        content(&changed),
+        content(&old),
+        "the status is in the note"
+    );
+
+    // Kept on disk all the same, and an old file still loads.
+    let back: Snapshot = serde_json::from_slice(&serde_json::to_vec(&refreshed).unwrap()).unwrap();
+    assert_eq!(back, refreshed);
+    assert_eq!((old.state_type.as_str(), old.priority), ("", 0));
+}
+
+const NODE: &str = r#"{"id":"i1","identifier":"ENG-1","url":"u","title":"t","priority":2.0,
+    "updatedAt":"2026-11-01T10:00:00.000Z","state":{"name":"Merged","type":"completed"},
+    "team":{"key":"ENG","name":"Engineering"},"assignee":{"name":"Ann Lee"}}"#;
+
+fn other_node() -> Value {
+    let mut n: Value = serde_json::from_str(NODE).unwrap();
+    n["id"] = "i2".into();
+    n["identifier"] = "ENG-2".into();
+    n["assignee"] = Value::Null;
+    n
+}
+
+#[test]
+fn lists_take_one_read_and_recent_leaves_out_what_is_assigned() {
+    let http = |req: &Req| {
+        let v: Value = serde_json::from_slice(&req.body).unwrap();
+        let q = v["query"].as_str().unwrap();
+        assert!(
+            q.contains("assignedIssues(") && q.contains("orderBy: updatedAt"),
+            "{q}"
+        );
+        assert_eq!(v["variables"]["first"], 20);
+        let node: Value = serde_json::from_str(NODE).unwrap();
+        ok(&json!({"data":{
+            "viewer":{"assignedIssues":{"nodes":[node.clone()]}},
+            "issues":{"nodes":[node, other_node()]}}})
+        .to_string())
+    };
+    let l = lists(&http, &key()).unwrap();
+    assert_eq!(l.assigned[0].priority, 2, "Linear's priority is a Float");
+    assert_eq!(l.assigned[0].state_type, "completed");
+    assert_eq!(l.assigned[0].status, "Merged");
+    assert_eq!(l.assigned[0].assignee.as_deref(), Some("Ann Lee"));
+    assert_eq!(l.assigned[0].updated_at, "2026-11-01T10:00:00.000Z");
+    assert_eq!(l.recent.len(), 1);
+    assert_eq!(l.recent[0].identifier, "ENG-2");
+}
+
+fn is_search(req: &Req) -> bool {
+    fake::body(req).contains("searchIssues")
+}
+
+fn search_answer() -> Result<Resp, Error> {
+    let nodes = [serde_json::from_str::<Value>(NODE).unwrap(), other_node()];
+    ok(&json!({"data":{"searchIssues":{"nodes":nodes,
+        "pageInfo":{"hasNextPage":false,"endCursor":null}}}})
+    .to_string())
+}
+
+#[test]
+fn an_identifier_shaped_term_searches_too() {
+    // `gpt-4` names nothing: the search stands.
+    let http = |req: &Req| match is_search(req) {
+        true => search_answer(),
+        false => ok(r#"{"errors":[{"message":"Entity not found: Issue"}]}"#),
+    };
+    let found = find(&http, &key(), "gpt-4").unwrap();
+    assert_eq!(found.hits.len(), 2);
+
+    // `ENG-123` does: it comes first, and only once.
+    let named = |req: &Req| match is_search(req) {
+        true => search_answer(),
+        false => ok(ISSUE_JSON),
+    };
+    let found = find(&named, &key(), "eng-123").unwrap();
+    assert_eq!(found.hits[0].identifier, "ENG-123");
+    assert_eq!(found.hits.len(), 3);
+
+    // A limit isn't "names nothing".
+    let limited = |_: &Req| reply(429, "retry-after: 9\n", "{}");
+    let e = find(&limited, &key(), "gpt-4").unwrap_err();
+    assert!(matches!(e, Error::RateLimited { .. }), "{e:?}");
+}
+
+#[test]
+fn a_url_only_names_an_issue() {
+    let http = |req: &Req| {
+        assert!(!is_search(req), "a URL isn't a search term");
+        ok(ISSUE_JSON)
+    };
+    let url = "https://linear.app/acme/issue/ENG-123/fix";
+    let found = find(&http, &key(), url).unwrap();
+    assert_eq!(found.hits.len(), 1);
+    let elsewhere = "https://linear.app/other/issue/ENG-123/fix";
+    assert_eq!(find(&http, &key(), elsewhere), Err(Error::WrongOrg));
+}
+
+/// Snapshots live under the shared test home, which `test_home` wipes.
+fn home_turn() -> Option<MutexGuard<'static, ()>> {
+    #[cfg(feature = "test-support")]
+    return Some((crate::app::ui_tests::UI_LOCK.lock()).unwrap_or_else(|e| e.into_inner()));
+    #[cfg(not(feature = "test-support"))]
+    None
+}
+
 fn snapshot(id: &str, title: &str) -> Snapshot {
     Snapshot {
         org: "o".into(),
@@ -869,6 +995,7 @@ fn snapshot(id: &str, title: &str) -> Snapshot {
 
 #[test]
 fn snapshots_live_in_one_private_file_per_agent() {
+    let _turn = home_turn();
     use std::os::unix::fs::PermissionsExt;
     let agent = format!("test-agent-{}", random().unwrap());
     assert_eq!(read_snapshots(&agent).unwrap(), vec![]);
@@ -905,6 +1032,7 @@ fn sign_in_needs_a_client_id() {
 
 #[test]
 fn removing_a_snapshot_leaves_the_others() {
+    let _turn = home_turn();
     let agent = format!("test-agent-{}", random().unwrap());
     put_snapshot(&agent, &snapshot("1", "one")).unwrap();
     put_snapshot(&agent, &snapshot("2", "two")).unwrap();
@@ -915,6 +1043,7 @@ fn removing_a_snapshot_leaves_the_others() {
 
 #[test]
 fn an_unreadable_file_is_not_overwritten() {
+    let _turn = home_turn();
     let agent = format!("test-agent-{}", random().unwrap());
     let path = snapshots_path(&agent);
     state::write(&path, b"not json").unwrap();

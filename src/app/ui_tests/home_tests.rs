@@ -316,6 +316,33 @@ async fn cancelled_open_still_sets_up_the_new_workspace(cx: &mut TestAppContext)
 }
 
 /// Palette rows with no handler of their own dispatch their action, as its key would.
+/// The keyboard's way to what `+N` lists, with nothing pending or failed to bring it up.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn palette_shows_attachments_with_nothing_pending(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (home, window, shark) = one_workspace(cx).await;
+    let press = press_in(window);
+    cx.update(|cx| {
+        let s = shark.read(cx);
+        assert!(s.state.workspaces[0].attaching.is_empty());
+        assert!(!s.state.workspaces[0].repos.is_empty());
+    });
+    press(cx, &["cmd-k"]);
+    cx.update_window(window, |_, w, cx| w.input("Show attachments", cx))
+        .unwrap();
+    press(cx, &["enter"]);
+    press(cx, &["enter"]);
+    cx.update_window(window, |_, w, _| {
+        assert!(
+            w.find("attach-panel").visible(),
+            "the list's first row, the repo"
+        )
+    })
+    .unwrap();
+    fs::remove_dir_all(&home).ok();
+}
+
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn palette_rows_dispatch_their_actions(cx: &mut TestAppContext) {

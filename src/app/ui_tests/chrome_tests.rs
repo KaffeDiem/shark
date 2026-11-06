@@ -245,6 +245,10 @@ pub(crate) fn render_pixels() {
         super::super::usage::render_pixels(&mut cx);
         return;
     }
+    if std::env::var_os("SHARK_RENDER_LINEAR_ONLY").is_some() {
+        super::super::linear_connection::tests::render_pixels(&mut cx);
+        return;
+    }
     crate::chat::ui_tests::render_activity_pixels(&mut cx);
     if std::env::var_os("SHARK_RENDER_ACTIVITY_ONLY").is_some() {
         return;
@@ -391,6 +395,9 @@ pub(crate) fn render_pixels() {
     super::tree_pixels::render_pixels(&mut cx);
     super::tree_pixels::render_artifact_pixels(&mut cx);
     super::git_tests::render_pixels(&mut cx);
+    super::attach_tests::render_pixels(&mut cx);
+    super::issue_tests::render_pixels(&mut cx);
+    super::super::linear_connection::tests::render_pixels(&mut cx);
 }
 
 /// Render the real Shark overlay, including scrolling the last app into a narrow window.

@@ -12,8 +12,350 @@ use git::Found;
 #[derive(Default)]
 pub(super) struct Results {
     attached: Vec<String>,
-    failed: Vec<(String, String)>,
+    pub(super) failed: Vec<(String, String)>,
     untold: Vec<(String, String)>,
+}
+
+/// How a repo stands, in the order the header lists them: what needs the user comes first.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Standing {
+    Failed,
+    Waiting,
+    Running,
+    Queued,
+    Ready,
+}
+
+impl Standing {
+    /// The status mark, the one colored thing on a chip.
+    fn mark(self, theme: &Theme) -> Icon {
+        let (icon, color) = match self {
+            Standing::Failed => (IconName::CircleX, theme.danger_foreground),
+            Standing::Waiting => (IconName::CircleAlert, theme.warning_foreground),
+            Standing::Running => (IconName::RefreshCw, theme.warning_foreground),
+            Standing::Queued => (IconName::Clock, theme.muted_foreground),
+            Standing::Ready => (IconName::CircleCheck, theme.success_foreground),
+        };
+        Icon::new(icon).text_color(color)
+    }
+}
+
+/// A repo as the header shows it.
+struct RepoRow {
+    repo: String,
+    standing: Standing,
+    state: &'static str,
+    tip: String,
+}
+
+/// A step of an attachment, as its panel marks it.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(super) enum Step {
+    Done,
+    Current,
+    Pending,
+    Failed,
+}
+
+type Act = fn(&mut Shark, &str, &str, &mut Window, &mut Context<Shark>);
+
+/// The last lines of `repo`'s part of an agent's script log. Repos share the log, and the next
+/// repo's setup runs right after a failure, so its plain tail can be someone else's.
+pub(super) fn setup_tail(log: &str, repo: &str) -> String {
+    let Some(start) = log.rfind(&format!("$ {repo}: ")) else {
+        return String::new();
+    };
+    let part = &log[start..];
+    let part = &part[..part.find("\n\n$ ").unwrap_or(part.len())];
+    let lines: Vec<&str> = part.lines().collect();
+    lines[lines.len().saturating_sub(8)..].join("\n")
+}
+
+/// The end of `name`'s script log: a dev server's output can make it long.
+fn log_end(name: &str) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let mut bytes = vec![];
+    if let Ok(mut f) = std::fs::File::open(scripts::log_path(name)) {
+        let len = f.metadata().map_or(0, |m| m.len());
+        let _ = f.seek(SeekFrom::Start(len.saturating_sub(65536)));
+        let _ = f.read_to_end(&mut bytes);
+    }
+    String::from_utf8_lossy(&bytes).into_owned()
+}
+
+/// What a chip opens: where `repo`'s attachment is and what can be done about it. Not
+/// `open_headed`: its rows are fixed when it opens, and a panel left open on a running setup must
+/// offer Retry once the setup fails.
+struct AttachPanel {
+    name: String,
+    repo: String,
+    shark: WeakEntity<Shark>,
+    picker: Entity<CommandState>,
+    /// The failed setup's log lines, read when the failure first shows.
+    log: Option<String>,
+    _updates: Subscription,
+}
+
+impl Render for AttachPanel {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(shark) = self.shark.upgrade() else {
+            return div().into_any_element();
+        };
+        let s = shark.read(cx);
+        let summary = s.attach_summary(&self.name, &self.repo);
+        let steps = s.attach_steps(&self.name, &self.repo, cx);
+        let actions = s.attach_actions(&self.name, &self.repo);
+        if steps[2].1 == Step::Failed && self.log.is_none() {
+            self.log = Some(setup_tail(&log_end(&self.name), &self.repo));
+        }
+        let theme = cx.theme();
+        let (muted, danger) = (theme.muted_foreground, theme.danger_foreground);
+        let rows = steps
+            .into_iter()
+            .enumerate()
+            .map(|(i, (label, step, detail))| {
+                let icon = |name: IconName, color| {
+                    let icon = Icon::new(name).text_color(color);
+                    icon.with_size(px(14.)).into_any_element()
+                };
+                let mark = match step {
+                    Step::Done => icon(IconName::Check, theme.success_foreground),
+                    Step::Current => Spinner::new().with_size(px(14.)).into_any_element(),
+                    Step::Pending => icon(IconName::Circle, muted),
+                    Step::Failed => icon(IconName::X, danger),
+                };
+                let log = (self.log.as_ref())
+                    .filter(|l| step == Step::Failed && i == 2 && !l.is_empty())
+                    .map(|log| {
+                        v_flex()
+                            .mt_1()
+                            .p_2()
+                            .rounded(theme.radius)
+                            .bg(theme.muted)
+                            .font_family(theme.mono_font_family.clone())
+                            .text_size(theme.mono_font_size)
+                            .text_color(muted)
+                            .children(log.lines().map(|l| div().truncate().child(l.to_string())))
+                    });
+                v_flex()
+                    .id(("attach-step", i))
+                    .aria_label(format!("{label}: {step:?}"))
+                    .test_support()
+                    .gap_0p5()
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(div().flex_none().size(px(14.)).child(mark))
+                            .child(label),
+                    )
+                    .child(
+                        v_flex()
+                            .pl(px(22.))
+                            .gap_0p5()
+                            .text_xs()
+                            .text_color(if step == Step::Failed { danger } else { muted })
+                            .children(detail)
+                            .children(log),
+                    )
+            });
+        let header = v_flex()
+            .id("attach-panel")
+            .test_support()
+            .px_3()
+            .py_2()
+            .gap_2()
+            .text_sm()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .child(
+                        div()
+                            .font_weight(FontWeight::MEDIUM)
+                            .child(self.repo.clone()),
+                    )
+                    .children(summary.map(|s| div().text_xs().text_color(muted).child(s))),
+            )
+            .children(rows);
+        let items: Vec<CommandItem> = (actions.iter())
+            .map(|(icon, label, _)| CommandItem::new().label(*label).icon(*icon))
+            .collect();
+        let (name, repo, target) = (self.name.clone(), self.repo.clone(), self.shark.clone());
+        let command = Command::new(&self.picker)
+            .bordered(false)
+            .placeholder("Repository attachment…")
+            .items(items)
+            .on_confirm(move |ix, window, cx| {
+                window.close_dialog(cx);
+                let act = actions[ix.row].2;
+                target
+                    .update(cx, |s, cx| act(s, &name, &repo, window, cx))
+                    .ok();
+            });
+        v_flex().child(header).child(command).into_any_element()
+    }
+}
+
+/// How the header's chips fit, as last measured. `hidden` didn't fit, and `+N` goes `more_at` into
+/// the row; `tight` is set once the Attach buttons gave up their labels for them: at this window
+/// width and chip count.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub(super) struct Fit {
+    pub(super) hidden: usize,
+    more_at: Pixels,
+    tight: Option<(Pixels, usize)>,
+}
+
+/// About what the Attach buttons' labels take.
+const LABELS: Pixels = px(220.);
+/// What `+N` needs at the end of the row.
+const MORE: Pixels = px(56.);
+
+impl Fit {
+    /// After a frame with `clipped` of `chips` past the row's end. The labels go first and come
+    /// back only once they would fit again, so the row doesn't flip between the two.
+    pub(super) fn next(self, clipped: usize, chips: usize, width: Pixels) -> Self {
+        match self.tight {
+            None if clipped > 0 => Fit {
+                hidden: 0,
+                tight: Some((width, chips)),
+                ..self
+            },
+            Some((at, n)) if chips < n || width > at + LABELS => Fit::default(),
+            tight => Fit {
+                hidden: clipped,
+                tight,
+                ..self
+            },
+        }
+    }
+}
+
+/// The header's chips and actions. Lays every chip out, hiding what doesn't fit, so that what is
+/// measured doesn't depend on what is shown; `render_attachments` built them.
+// ponytail: `+N` sits by the last chip shown, so up to a chip's width stays empty before the
+// buttons; closing that means laying chips out by measured widths instead.
+#[derive(IntoElement)]
+struct AttachRow {
+    name: String,
+    chips: Vec<AnyElement>,
+    /// The first this many chips are failures.
+    failed: usize,
+    shark: WeakEntity<Shark>,
+}
+
+impl RenderOnce for AttachRow {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
+        let key = SharedString::from(format!("attach-fit-{}", self.name));
+        let fit = window.use_keyed_state(key, cx, |_, _| Fit::default());
+        let was = *fit.read(cx);
+        let count = self.chips.len();
+        let shown = count - was.hidden.min(count);
+        let compact = was.tight.is_some();
+        let action =
+            |id,
+             icon,
+             label: &'static str,
+             open: fn(&mut Shark, String, &mut Window, &mut Context<Shark>)| {
+                let (shark, name) = (self.shark.clone(), self.name.clone());
+                Button::new(id)
+                    .icon(icon)
+                    .ghost()
+                    .xsmall()
+                    .flex_none()
+                    .map(|b| match compact {
+                        true => b.tooltip(label),
+                        false => b.label(label),
+                    })
+                    .on_click(move |_, w, cx| {
+                        shark.update(cx, |s, cx| open(s, name.clone(), w, cx)).ok();
+                    })
+            };
+        let attach = action(
+            "header-attach",
+            IconName::FolderPlus,
+            "Attach repository",
+            |s, n, w, cx| s.attach_repository(n, w, cx),
+        );
+        let issue = action(
+            "header-attach-issue",
+            IconName::TagPlus,
+            "Attach Linear issue",
+            |s, n, w, cx| s.attach_linear_issue(n, w, cx),
+        );
+        let more = (shown < count).then(|| {
+            let (shark, name) = (self.shark.clone(), self.name.clone());
+            let icon = match shown < self.failed {
+                true => Standing::Failed.mark(cx.theme()),
+                false => Icon::new(IconName::Ellipsis),
+            };
+            let hidden = count - shown;
+            Shark::chip("attach-more", icon, format!("+{hidden}"), cx.theme())
+                .absolute()
+                .left(was.more_at)
+                .cursor_pointer()
+                .aria_label(format!("Show {hidden} more"))
+                .tooltip(move |w, cx| Tooltip::new(format!("Show {hidden} more")).build(w, cx))
+                .on_click(move |_, w, cx| {
+                    let name = name.clone();
+                    shark
+                        .update(cx, |s, cx| s.attachment_list(name, shown, w, cx))
+                        .ok();
+                })
+                .test_support()
+        });
+        h_flex()
+            // Chips have `+N`; the branch button beside them has nothing to fall back on.
+            .map(|mut d| {
+                d.style().flex_shrink = Some(8.);
+                d
+            })
+            .min_w_0()
+            .gap_1()
+            .child(
+                h_flex()
+                    .relative()
+                    .flex_shrink_1()
+                    .min_w_0()
+                    .overflow_hidden()
+                    .gap_1()
+                    // The first child, so the measuring below gets the row's own bounds.
+                    .child(canvas(|_, _, _| {}, |_, _, _, _| {}).absolute().size_full())
+                    .children(self.chips.into_iter().enumerate().map(|(i, chip)| {
+                        div()
+                            .flex_none()
+                            .when(i >= shown, |d| d.invisible())
+                            .child(chip)
+                    }))
+                    .children(more)
+                    .on_children_prepainted(move |bounds, window, cx| {
+                        let Some((row, rest)) = bounds.split_first() else {
+                            return;
+                        };
+                        let chips = &rest[..count];
+                        let end = row.right() + px(0.5);
+                        let over = chips.iter().any(|c| c.right() > end);
+                        let edge = if over { end - MORE } else { end };
+                        let clipped = chips.iter().filter(|c| c.right() > edge).count();
+                        let last = chips[..count - clipped].last();
+                        let next = Fit {
+                            more_at: last.map_or(px(0.), |c| c.right() - row.left() + px(4.)),
+                            ..was.next(clipped, count, window.viewport_size().width)
+                        };
+                        if next != was {
+                            // Too late for this frame: the next one is drawn with it.
+                            let fit = fit.clone();
+                            cx.defer(move |cx| {
+                                fit.update(cx, |f, cx| {
+                                    *f = next;
+                                    cx.notify();
+                                })
+                            });
+                        }
+                    }),
+            )
+            .child(attach)
+            .child(issue)
+    }
 }
 
 /// What the end of an operation says, if anything, and whether it all went well. `new` failed
@@ -50,7 +392,8 @@ impl Shark {
     }
 
     /// The dialog with the repos `name` doesn't have yet, `picked` ticked; nothing happens until
-    /// it is confirmed.
+    /// it is confirmed. With an operation under way or a failure to deal with, those come first,
+    /// so that everything on the header's chips can be reached from cmd-k.
     pub(super) fn attach_form(
         &mut self,
         name: String,
@@ -59,10 +402,27 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         let Some(ws) = self.ws(&name) else { return };
-        if let Some(a) = ws.attaching.first() {
-            let repo = a.repo.clone();
-            return self.attachment_menu(name, repo, window, cx);
+        let failed = (self.attach_results.get(&name)).is_some_and(|r| !r.failed.is_empty());
+        match (ws.attaching.as_slice(), failed) {
+            ([], false) => {}
+            ([], true) if !picked.is_empty() => {}
+            ([a], false) => {
+                let repo = a.repo.clone();
+                return self.attachment_menu(name, repo, window, cx);
+            }
+            _ => return self.attachment_list(name, 0, window, cx),
         }
+        self.attach_dialog(name, picked, window, cx)
+    }
+
+    pub(super) fn attach_dialog(
+        &mut self,
+        name: String,
+        picked: Vec<String>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ws) = self.ws(&name) else { return };
         let missing: Vec<Repo> = (self.state.repos.iter())
             .filter(|r| !ws.repos.iter().any(|w| w.name == r.name))
             .cloned()
@@ -152,6 +512,19 @@ impl Shark {
         self.attach_results.remove(&name);
         self.publish_workspace(&name, cx);
         self.advance_attachment(&name, window, cx);
+        let queued: Vec<&str> = (self.ws(&name).into_iter())
+            .flat_map(|w| &w.attaching)
+            .filter(|a| a.stage == AttachStage::Queued)
+            .map(|a| a.repo.as_str())
+            .collect();
+        if !queued.is_empty() {
+            let msg = format!(
+                "{} queued: waiting for {}…",
+                queued.join(", "),
+                self.attach_waits(&name, cx)
+            );
+            window.push_notification(msg, cx);
+        }
     }
 
     /// Hands the saved agent to its loaded chats and Git button. Chats that aren't loaded need
@@ -178,6 +551,34 @@ impl Shark {
             && !self.setting_up.iter().any(|n| n == name)
             && self.syncs.get(name).is_none_or(|g| !g.read(cx).running())
             && self.started_chats(name).iter().all(|c| c.read(cx).idle())
+    }
+
+    /// What `attach_idle` is waiting on, in words.
+    pub(super) fn attach_waits(&self, name: &str, cx: &App) -> String {
+        let chats = self.started_chats(name);
+        let chats = |test: &dyn Fn(&Chat) -> bool, what: &str| {
+            let n = chats.iter().filter(|c| test(c.read(cx))).count();
+            (n > 0).then(|| format!("{n} chat{} {what}", if n == 1 { "" } else { "s" }))
+        };
+        let moving = (self.ws(name).into_iter())
+            .flat_map(|w| &w.attaching)
+            .find(|a| matches!(a.stage, AttachStage::Creating | AttachStage::Setup));
+        let setup = self.setting_up.iter().any(|n| n == name);
+        let git = self.syncs.get(name).is_some_and(|g| g.read(cx).running());
+        let why: Vec<String> = [
+            moving.map(|a| a.repo.clone()),
+            (moving.is_none() && setup).then(|| "setup scripts".into()),
+            git.then(|| "a Git step".into()),
+            chats(&|c| !c.idle() && !c.asking(), "running"),
+            chats(&Chat::asking, "asking you something"),
+        ]
+        .into_iter()
+        .flatten()
+        .collect();
+        match why.is_empty() {
+            true => "its turn".into(),
+            false => why.join(", "),
+        }
     }
 
     /// Starts the next queued repo if the agent is idle. The check and the start are this one
@@ -398,11 +799,30 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.cancel_queued(name, None, window, cx)
+    }
+
+    /// Takes `repo`, or without one all, back from the queue. Once started it can't be.
+    pub(super) fn cancel_queued(
+        &mut self,
+        name: &str,
+        repo: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let Some(ws) = self.ws_mut(name) else { return };
-        ws.attaching.retain(|a| a.stage != AttachStage::Queued);
+        let had = ws.attaching.len();
+        (ws.attaching)
+            .retain(|a| a.stage != AttachStage::Queued || repo.is_some_and(|r| r != a.repo));
+        if ws.attaching.len() == had {
+            return notify_err(window, cx, "It has started, so it can't be cancelled");
+        }
         // Unsaved, a restart clears the queued entries too: nothing exists for them.
         let _ = self.state.save();
-        window.push_notification("Attachment cancelled", cx);
+        let done = repo.map_or("Attachment cancelled".into(), |r| {
+            format!("{r}: attachment cancelled")
+        });
+        window.push_notification(done, cx);
         self.attach_settled(name, window, cx);
     }
 
@@ -555,38 +975,97 @@ impl Shark {
         }
     }
 
-    /// What can be done about `repo` right now, as a keyboard menu.
-    pub(super) fn attachment_menu(
-        &mut self,
-        name: String,
-        repo: String,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        type Act = fn(&mut Shark, &str, &str, &mut Window, &mut Context<Shark>);
+    /// The branch and base `repo` gets or got, for its panel.
+    fn attach_summary(&self, name: &str, repo: &str) -> Option<String> {
+        let ws = self.ws(name)?;
+        if let Some(a) = ws.attaching.iter().find(|a| a.repo == repo) {
+            return Some(match (a.fresh, a.base.as_str()) {
+                (false, _) => a.branch.clone(),
+                (true, "") => format!("{} from the default branch", a.branch),
+                (true, base) => format!("{} from {base}", a.branch),
+            });
+        }
+        let r = ws.repos.iter().find(|r| r.name == repo)?;
+        Some(format!("{} from {}", ws.branch_of(r), r.base))
+    }
+
+    /// Where `repo` is, step by step, with what the current step waits for or the failed one's
+    /// error.
+    pub(super) fn attach_steps(
+        &self,
+        name: &str,
+        repo: &str,
+        cx: &App,
+    ) -> [(&'static str, Step, Option<String>); 3] {
+        use Step::*;
+        let a = (self.ws(name).into_iter())
+            .flat_map(|w| &w.attaching)
+            .find(|a| a.repo == repo);
+        let refused = (self.attach_results.get(name).into_iter())
+            .flat_map(|r| &r.failed)
+            .find(|(r, _)| r == repo)
+            .map(|(_, e)| e.clone());
+        let steps = match (a.map(|a| a.stage), &refused) {
+            (Some(AttachStage::Queued), _) => [Current, Pending, Pending],
+            (Some(AttachStage::Creating), _) => [Done, Current, Pending],
+            (Some(AttachStage::Setup), _) => [Done, Done, Current],
+            (Some(AttachStage::SetupFailed), _) => [Done, Done, Failed],
+            (Some(AttachStage::Uncertain), _) | (None, Some(_)) => [Done, Failed, Pending],
+            (None, None) => [Done, Done, Done],
+        };
+        let error = a.and_then(|a| a.error.clone()).or(refused);
+        let detail = |i: usize| match steps[i] {
+            Failed => error.clone(),
+            Current if i == 0 => Some(self.attach_waits(name, cx)),
+            _ => None,
+        };
+        [
+            ("Waiting for idle", steps[0], detail(0)),
+            ("Creating worktree", steps[1], detail(1)),
+            ("Running setup", steps[2], detail(2)),
+        ]
+    }
+
+    /// What can be done about `repo` right now. Dismissing a failed setup only closes the panel:
+    /// the chats go on waiting for Retry or Continue anyway.
+    pub(super) fn attach_actions(
+        &self,
+        name: &str,
+        repo: &str,
+    ) -> Vec<(IconName, &'static str, Act)> {
         let log: Act = |s, n, _, w, cx| s.show_log_of(n, w, cx);
-        let stage = (self.ws(&name).into_iter())
+        let close: Act = |_, _, _, _, _| {};
+        let ws = self.ws(name);
+        let stage = (ws.into_iter())
             .flat_map(|w| &w.attaching)
             .find(|a| a.repo == repo)
             .map(|a| a.stage);
-        let actions: Vec<(IconName, &str, Act)> = match stage {
+        match stage {
             Some(AttachStage::Queued) => {
-                vec![(IconName::X, "Cancel attachment", |s, n, _, w, cx| {
-                    s.cancel_attachment(n, w, cx)
-                })]
+                let cancel: Act = |s, n, r, w, cx| s.cancel_queued(n, Some(r), w, cx);
+                let all: Act = |s, n, _, w, cx| s.cancel_attachment(n, w, cx);
+                let queued = (ws.into_iter())
+                    .flat_map(|w| &w.attaching)
+                    .filter(|a| a.stage == AttachStage::Queued);
+                let mut rows = vec![(IconName::X, "Cancel attachment", cancel)];
+                rows.extend((queued.count() > 1).then_some((
+                    IconName::X,
+                    "Cancel all queued",
+                    all,
+                )));
+                rows
             }
-            Some(AttachStage::Creating) => vec![],
-            Some(AttachStage::Setup) => vec![(IconName::ScrollText, "Show setup log", log)],
+            Some(AttachStage::Creating) => vec![(IconName::X, "Close", close)],
+            Some(AttachStage::Setup) => vec![(IconName::ExternalLink, "Open setup log", log)],
             Some(AttachStage::SetupFailed) => vec![
-                (IconName::ScrollText, "Show setup log", log),
-                (IconName::RefreshCw, "Retry setup", |s, n, r, w, cx| {
+                (IconName::ExternalLink, "Open setup log", log),
+                (IconName::RefreshCw, "Retry", |s, n, r, w, cx| {
                     s.retry_setup(n, r, w, cx)
                 }),
-                (
-                    IconName::Check,
-                    "Continue without successful setup",
-                    |s, n, r, w, cx| s.attach_done(n, r, w, cx),
-                ),
+                (IconName::Check, "Continue anyway", |s, n, r, w, cx| {
+                    s.attach_done(n, r, w, cx)
+                }),
+                (IconName::X, "Dismiss", close),
             ],
             Some(AttachStage::Uncertain) => vec![
                 (IconName::RefreshCw, "Check again", |s, n, _, w, cx| {
@@ -598,26 +1077,131 @@ impl Shark {
                     |s, n, r, w, cx| s.forget_attachment(n, r, w, cx),
                 ),
             ],
-            None => vec![(IconName::X, "Dismiss", |s, n, r, _, cx| {
-                if let Some(results) = s.attach_results.get_mut(n) {
-                    results.failed.retain(|(x, _)| x != r);
-                }
-                s.refresh_attention(cx);
-                cx.notify();
-            })],
-        };
-        if actions.is_empty() {
-            return window.push_notification(format!("{repo} is being created"), cx);
+            None if (self.attach_results.get(name).into_iter())
+                .flat_map(|r| &r.failed)
+                .any(|(r, _)| r == repo) =>
+            {
+                let dismiss: Act = |s, n, r, _, cx| {
+                    if let Some(results) = s.attach_results.get_mut(n) {
+                        results.failed.retain(|(x, _)| x != r);
+                    }
+                    s.refresh_attention(cx);
+                    cx.notify();
+                };
+                // ponytail: a refused attachment keeps no branch or base, so Retry goes through
+                // the dialog; keep the `Attachment` in `Results` to retry it as it was.
+                let retry: Act =
+                    |s, n, r, w, cx| s.attach_form(n.to_string(), vec![r.to_string()], w, cx);
+                let idle = ws.is_some_and(|w| w.attaching.is_empty());
+                let mut rows = vec![(IconName::X, "Dismiss", dismiss)];
+                rows.extend(idle.then_some((IconName::RefreshCw, "Retry…", retry)));
+                rows
+            }
+            None => vec![(IconName::X, "Close", close)],
         }
-        let items = (actions.iter())
-            .map(|(icon, label, _)| CommandItem::new().label(*label).icon(*icon))
+    }
+
+    /// Opens `repo`'s panel: its steps, and what can be done about it, as a keyboard menu.
+    pub(super) fn attachment_menu(
+        &mut self,
+        name: String,
+        repo: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let shark = cx.entity();
+        let panel = cx.new(|cx| AttachPanel {
+            name,
+            repo,
+            shark: shark.downgrade(),
+            picker: cx.new(|cx| CommandState::new(window, cx)),
+            log: None,
+            _updates: cx.observe(&shark, |_, _, cx| cx.notify()),
+        });
+        let picker = panel.read(cx).picker.clone();
+        window.open_dialog(cx, move |d, _, cx| menu_dialog(d, cx).child(panel.clone()));
+        picker.update(cx, |p, cx| p.focus(window, cx));
+    }
+
+    /// Every repo the header shows, what needs the user first.
+    fn repo_rows(&self, ws: &Workspace) -> Vec<RepoRow> {
+        let pending = (ws.attaching.iter()).map(|a| {
+            let (standing, state) = match a.stage {
+                AttachStage::Queued => (Standing::Queued, "queued"),
+                AttachStage::Creating => (Standing::Running, "creating its worktree"),
+                AttachStage::Setup => (Standing::Running, "running setup"),
+                AttachStage::SetupFailed => (Standing::Failed, "setup failed"),
+                AttachStage::Uncertain => (Standing::Waiting, "check what happened"),
+            };
+            let tip = (a.error.clone()).unwrap_or_else(|| format!("{}: {state}", a.repo));
+            (a.repo.clone(), standing, state, tip)
+        });
+        let refused = (self.attach_results.get(&ws.name).into_iter())
+            .flat_map(|r| &r.failed)
+            .map(|(r, e)| (r.clone(), Standing::Failed, "couldn't attach", e.clone()));
+        let settled = (ws.repos.iter())
+            .filter(|r| !ws.attaching.iter().any(|a| a.repo == r.name))
+            .map(|r| {
+                let tip = format!("{} on {}", r.name, ws.branch_of(r));
+                (r.name.clone(), Standing::Ready, "ready", tip)
+            });
+        let mut rows: Vec<RepoRow> = (pending.chain(refused).chain(settled))
+            .map(|(repo, standing, state, tip)| RepoRow {
+                repo,
+                standing,
+                state,
+                tip,
+            })
             .collect();
+        rows.sort_by_key(|r| r.standing);
+        rows
+    }
+
+    /// What the header shows from chip `from` on, each row opening what its chip opens; all of it
+    /// and Attach repository, when that's possible, for cmd-k.
+    pub(super) fn attachment_list(
+        &mut self,
+        name: String,
+        from: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        enum Pick {
+            Repo(String),
+            Issue(crate::linear::IssueRef),
+            Attach,
+        }
+        let Some(ws) = self.ws(&name) else { return };
+        let theme = cx.theme();
+        let repos = self.repo_rows(ws).into_iter().map(|r| {
+            let label = format!("{} · {}", r.repo, r.state);
+            let item = CommandItem::new().label(label).icon(r.standing.mark(theme));
+            (item, Pick::Repo(r.repo))
+        });
+        let issues = ws.linear.ordered().map(|r| {
+            let label = r
+                .of(&ws.issues)
+                .map_or("Linear issue", |s| s.identifier.as_str());
+            let item = CommandItem::new()
+                .label(label.to_string())
+                .icon(IconName::Tag);
+            (item, Pick::Issue(r.clone()))
+        });
+        let attach = (from == 0 && ws.attaching.is_empty()).then(|| {
+            let item = CommandItem::new().label("Attach repository…");
+            (item.icon(IconName::FolderPlus), Pick::Attach)
+        });
+        let (items, picks): (Vec<_>, Vec<_>) = repos.chain(issues).skip(from).chain(attach).unzip();
         open_menu(
             cx.entity().downgrade(),
-            "Repository attachment…",
+            "Attachments…",
             items,
             0,
-            move |s, row, w, cx| actions[row].2(s, &name, &repo, w, cx),
+            move |s, row, w, cx| match &picks[row] {
+                Pick::Repo(repo) => s.attachment_menu(name.clone(), repo.clone(), w, cx),
+                Pick::Issue(r) => s.issue_details(name.clone(), r.clone(), w, cx),
+                Pick::Attach => s.attach_dialog(name.clone(), vec![], w, cx),
+            },
             window,
             cx,
         );
@@ -626,7 +1210,7 @@ impl Shark {
     /// A chip in the header's attachment row.
     pub(super) fn chip(
         id: impl Into<ElementId>,
-        icon: IconName,
+        icon: impl Into<Icon>,
         label: String,
         theme: &Theme,
     ) -> Stateful<Div> {
@@ -639,110 +1223,53 @@ impl Shark {
             .rounded(theme.radius)
             .bg(theme.muted)
             .text_xs()
-            .child(Icon::new(icon).with_size(px(12.)))
+            .child(icon.into().with_size(px(12.)))
             .child(label)
     }
 
-    /// The header's attachments: a chip per repository, then one per attachment under way or
-    /// failed, then one per Linear issue, then Attach repository and Attach Linear issue.
-    // ponytail: past what fits, chips clip; the Attach buttons stay and the sidebar lists the
-    // repositories, Show Linear issue the issues.
+    /// The header's attachments: a chip per repository, what needs the user first, then one per
+    /// Linear issue, then Attach repository and Attach Linear issue. `+N` lists what doesn't fit;
+    /// Show attachments in cmd-k lists all of it, and Attach repository does whenever an
+    /// attachment needs anything.
     pub(super) fn render_attachments(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(ws) = self.active_ws() else {
             return div().into_any_element();
         };
         let name = ws.name.clone();
-        let theme = cx.theme();
-        let settled = (ws.repos.iter())
-            .filter(|r| !ws.attaching.iter().any(|a| a.repo == r.name))
+        let rows = self.repo_rows(ws);
+        let failed = rows
+            .iter()
+            .filter(|r| r.standing == Standing::Failed)
+            .count();
+        let mut chips: Vec<AnyElement> = (rows.into_iter())
             .map(|r| {
+                let ready = r.standing == Standing::Ready;
+                let kind = if ready { "repo" } else { "attach" };
+                let (n, repo, tip) = (name.clone(), r.repo.clone(), r.tip);
                 Self::chip(
-                    SharedString::from(format!("repo-chip-{}", r.name)),
-                    IconName::FolderGit2,
-                    r.name.clone(),
-                    theme,
+                    SharedString::from(format!("{kind}-chip-{}", r.repo)),
+                    r.standing.mark(cx.theme()),
+                    r.repo.clone(),
+                    cx.theme(),
                 )
-                .tooltip({
-                    let tip = format!("{} on {}", r.name, ws.branch_of(r));
-                    move |w, cx| Tooltip::new(tip.clone()).build(w, cx)
+                .aria_label(format!("{}: {}", r.repo, r.state))
+                .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+                .when(!ready, |d| {
+                    d.cursor_pointer().on_click(cx.listener(move |s, _, w, cx| {
+                        s.attachment_menu(n.clone(), repo.clone(), w, cx)
+                    }))
                 })
                 .test_support()
                 .into_any_element()
             })
-            .collect::<Vec<_>>();
-        let failed = self.attach_results.get(&name).into_iter();
-        let failed = failed.flat_map(|r| {
-            r.failed
-                .iter()
-                .map(|(r, e)| (r.clone(), "failed", Some(e.clone())))
-        });
-        let pending = (ws.attaching.iter())
-            .map(|a| {
-                let state = match a.stage {
-                    AttachStage::Queued => "waiting",
-                    AttachStage::Creating => "creating",
-                    AttachStage::Setup => "setting up",
-                    AttachStage::SetupFailed => "setup failed",
-                    AttachStage::Uncertain => "needs recovery",
-                };
-                (a.repo.clone(), state, a.error.clone())
-            })
-            .chain(failed)
-            .map(|(repo, state, error)| {
-                let tip = error.unwrap_or_else(|| format!("{repo}: {state}"));
-                let warn = matches!(state, "setup failed" | "needs recovery" | "failed");
-                let (n, r) = (name.clone(), repo.clone());
-                Self::chip(
-                    SharedString::from(format!("attach-chip-{repo}")),
-                    if warn {
-                        IconName::TriangleAlert
-                    } else {
-                        IconName::Clock
-                    },
-                    format!("{repo} · {state}"),
-                    cx.theme(),
-                )
-                .when(warn, |d| d.text_color(cx.theme().warning_foreground))
-                .cursor_pointer()
-                .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
-                .on_click(
-                    cx.listener(move |s, _, w, cx| s.attachment_menu(n.clone(), r.clone(), w, cx)),
-                )
-                .test_support()
-                .into_any_element()
-            })
-            .collect::<Vec<_>>();
-        let issues = self.issue_chips(ws, cx);
-        h_flex()
-            .flex_shrink_1()
-            .min_w_0()
-            .gap_1()
-            .child(
-                h_flex()
-                    .flex_shrink_1()
-                    .min_w_0()
-                    .overflow_hidden()
-                    .gap_1()
-                    .children(settled)
-                    .children(pending)
-                    .children(issues),
-            )
-            .child(
-                self.attach_button("header-attach", cx)
-                    .ghost()
-                    .xsmall()
-                    .flex_none(),
-            )
-            .child(
-                Button::new("header-attach-issue")
-                    .label("Attach Linear issue")
-                    .ghost()
-                    .xsmall()
-                    .flex_none()
-                    .on_click(
-                        cx.listener(move |s, _, w, cx| s.attach_linear_issue(name.clone(), w, cx)),
-                    ),
-            )
-            .into_any_element()
+            .collect();
+        chips.extend(self.issue_chips(ws, cx));
+        AttachRow {
+            name,
+            chips,
+            failed,
+            shark: cx.entity().downgrade(),
+        }
+        .into_any_element()
     }
 }

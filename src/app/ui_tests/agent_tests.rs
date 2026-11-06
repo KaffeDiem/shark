@@ -1,5 +1,5 @@
 use super::*;
-use crate::state::{ChatMeta, NEW_AGENT, TabId};
+use crate::state::{ChatMeta, NEW_AGENT, SEA_NAMES, TabId};
 
 /// The app on no repos at all, on a claude that never answers; the guard holds it.
 fn empty_app(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Shark>) {
@@ -56,7 +56,7 @@ async fn home_prompt_starts_an_agent_without_repos(cx: &mut TestAppContext) {
     })
     .unwrap();
     let ws = active_ws(cx, &shark);
-    assert!(ws.name.starts_with("agent-"), "{}", ws.name);
+    assert!(SEA_NAMES.contains(&ws.name.as_str()), "{}", ws.name);
     assert_eq!(ws.title, "sketch a login page");
     assert_eq!(ws.branch, ws.name);
     assert!(ws.repos.is_empty() && !ws.ready());
@@ -106,10 +106,16 @@ async fn new_agent_is_empty_until_the_first_message(cx: &mut TestAppContext) {
     cx.run_until_parked();
     cx.update(|cx| assert_eq!(shark.read(cx).state.workspaces.len(), 2, "the + button too"));
     let ws = active_ws(cx, &shark);
-    assert_eq!(ws.display_title(), NEW_AGENT);
+    let shown = ws.display_title().into_owned();
+    assert_eq!(shown.to_lowercase(), ws.name);
+    assert_ne!(shown, ws.name, "capitalised");
     assert!(ws.repos.is_empty());
     let chat = active_chat(cx, &shark);
     cx.update(|cx| assert!(chat.read(cx).sent_texts().is_empty()));
+
+    // OK in the rename dialog, with the field as it opened.
+    shark.update(cx, |s, cx| s.set_title(&ws.name, shown.clone(), cx));
+    assert_eq!(active_ws(cx, &shark).title, NEW_AGENT, "still untitled");
 
     cx.update_window(window, |_, w, cx| {
         chat.update(cx, |c, cx| c.ask("plan the rollout\nin detail", w, cx));
@@ -118,6 +124,44 @@ async fn new_agent_is_empty_until_the_first_message(cx: &mut TestAppContext) {
     cx.run_until_parked();
     assert_eq!(active_ws(cx, &shark).title, "plan the rollout");
     assert_eq!(State::load().workspaces[1].title, "plan the rollout");
+
+    // The name as a title, once it is one, is the user's: a later save doesn't undo it.
+    shark.update(cx, |s, cx| s.set_title(&ws.name, shown.clone(), cx));
+    chat.update(cx, |_, cx| cx.emit(crate::chat::ChatEvent::Meta));
+    cx.run_until_parked();
+    assert_eq!(active_ws(cx, &shark).title, shown);
+}
+
+/// An agent saved with the old name and the literal placeholder is still titled by a message.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn first_message_titles_an_old_untitled_agent(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let name = "agent-19a2b";
+    let dir = home.join("shark/workspaces").join(name);
+    let ws = git::create_empty_workspace(&dir, name, NEW_AGENT).unwrap();
+    let state = State {
+        workspaces: vec![ws],
+        ..Default::default()
+    };
+    let (window, shark) = boot(cx, state, WindowOptions::default());
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        shark.update(cx, |s, cx| s.open_workspace_now(0, w, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(active_ws(cx, &shark).display_title(), NEW_AGENT);
+    let chat = active_chat(cx, &shark);
+    cx.update_window(window, |_, w, cx| {
+        chat.update(cx, |c, cx| c.ask("plan the rollout", w, cx));
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert_eq!(active_ws(cx, &shark).title, "plan the rollout");
 }
 
 /// The first message can't go out: the agent stays, saved, with the message in its composer.

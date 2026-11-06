@@ -2,6 +2,7 @@ use crate::scripts::Phase;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
@@ -188,7 +189,7 @@ pub struct Workspace {
     pub last_interacted_at: Option<u64>,
     /// Immutable identity: the directory, the first chat's id, every per-workspace key.
     pub name: String,
-    /// What the user sees and edits; empty shows `name` (`display_title`).
+    /// What the user sees and edits; empty or `NEW_AGENT` shows `name` (`display_title`).
     #[serde(default)]
     pub title: String,
     /// With no repos: a placeholder equal to `name`, which nothing shows. The first repo replaces
@@ -414,7 +415,8 @@ pub fn workspaces_dir() -> PathBuf {
     home().join("shark/workspaces")
 }
 
-/// The title of an agent nothing has been said to yet; its first message replaces it.
+/// The saved title of an agent nothing has been said to yet; its first message replaces it. Only
+/// this means untitled: a user may title an agent after its name.
 pub const NEW_AGENT: &str = "New agent";
 
 /// The key prefix of a repository in `Workspace::context`. A session reads these from the root
@@ -440,13 +442,198 @@ pub fn context_record(context: &BTreeMap<String, ContextNote>) -> BTreeMap<Strin
         .collect()
 }
 
-/// A new agent's identity, safe as a directory and as a branch: `agent-<hex>`, counting up from
-/// `seed` past whatever is `taken`.
+/// What new agents are called, each safe as a directory and as a branch.
+pub const SEA_NAMES: &[&str] = &[
+    "albacore",
+    "amberjack",
+    "anchovy",
+    "anemone",
+    "angelfish",
+    "anglerfish",
+    "barnacle",
+    "barracuda",
+    "basslet",
+    "beluga",
+    "bigeye",
+    "blenny",
+    "blue-tang",
+    "blue-whale",
+    "bluefin",
+    "bluefish",
+    "boarfish",
+    "bonito",
+    "boxfish",
+    "bream",
+    "brill",
+    "butterflyfish",
+    "capelin",
+    "cardinalfish",
+    "clam",
+    "clownfish",
+    "cobia",
+    "cod",
+    "coelacanth",
+    "conch",
+    "conger",
+    "coral",
+    "cowfish",
+    "crab",
+    "croaker",
+    "cuttlefish",
+    "damselfish",
+    "dolphin",
+    "dorado",
+    "dory",
+    "dragonet",
+    "dugong",
+    "eel",
+    "filefish",
+    "flounder",
+    "flyingfish",
+    "frogfish",
+    "garibaldi",
+    "goby",
+    "grouper",
+    "gurnard",
+    "haddock",
+    "hake",
+    "halibut",
+    "hammerhead",
+    "hawkfish",
+    "herring",
+    "hoki",
+    "humpback",
+    "jawfish",
+    "jellyfish",
+    "john-dory",
+    "kingfish",
+    "krill",
+    "lanternfish",
+    "limpet",
+    "ling",
+    "lingcod",
+    "lionfish",
+    "lobster",
+    "lumpfish",
+    "mackerel",
+    "mahi-mahi",
+    "mako",
+    "manatee",
+    "mandarinfish",
+    "manta",
+    "marlin",
+    "menhaden",
+    "monkfish",
+    "moonfish",
+    "moray",
+    "mullet",
+    "mussel",
+    "narwhal",
+    "nautilus",
+    "needlefish",
+    "oarfish",
+    "octopus",
+    "opah",
+    "orca",
+    "otter",
+    "oyster",
+    "parrotfish",
+    "pilchard",
+    "pilotfish",
+    "pipefish",
+    "plaice",
+    "pollock",
+    "pomfret",
+    "pompano",
+    "porcupinefish",
+    "porgy",
+    "porpoise",
+    "prawn",
+    "pufferfish",
+    "quillback",
+    "razorfish",
+    "redfish",
+    "reef-shark",
+    "remora",
+    "rockfish",
+    "sablefish",
+    "sailfish",
+    "salmon",
+    "sardine",
+    "sawfish",
+    "scallop",
+    "scorpionfish",
+    "sculpin",
+    "sea-bass",
+    "sea-lion",
+    "sea-otter",
+    "sea-robin",
+    "sea-turtle",
+    "seadragon",
+    "seahorse",
+    "seal",
+    "shad",
+    "shrimp",
+    "skate",
+    "smelt",
+    "snapper",
+    "snook",
+    "sole",
+    "spadefish",
+    "spearfish",
+    "sponge",
+    "sprat",
+    "squid",
+    "squirrelfish",
+    "starfish",
+    "stingray",
+    "stonefish",
+    "sturgeon",
+    "sunfish",
+    "surgeonfish",
+    "swordfish",
+    "tang",
+    "tarpon",
+    "tautog",
+    "tiger-shark",
+    "tilefish",
+    "toadfish",
+    "trevally",
+    "triggerfish",
+    "tripletail",
+    "trumpetfish",
+    "tuna",
+    "turbot",
+    "turtle",
+    "urchin",
+    "wahoo",
+    "walrus",
+    "whale-shark",
+    "whiting",
+    "wolffish",
+    "wrasse",
+    "wreckfish",
+    "yellowfin",
+    "yellowtail",
+    "zebra-shark",
+];
+
+/// A new agent's identity: a random entry of `SEA_NAMES` that isn't `taken`, or with all of them
+/// gone, a numbered one (`marlin-2`). `seed` stands in if the system has no randomness to give.
 pub fn agent_name(seed: u64, taken: impl Fn(&str) -> bool) -> String {
-    (seed..)
-        .map(|n| format!("agent-{n:x}"))
-        .find(|n| !taken(n))
-        .expect("u64 outlasts the agents")
+    let pick = getrandom::u64().unwrap_or(seed) as usize;
+    (1..)
+        .find_map(|n| {
+            let free: Vec<String> = (SEA_NAMES.iter())
+                .map(|name| match n {
+                    1 => name.to_string(),
+                    n => format!("{name}-{n}"),
+                })
+                .filter(|name| !taken(name))
+                .collect();
+            (!free.is_empty()).then(|| free[pick % free.len()].clone())
+        })
+        .expect("numbers outlast the agents")
 }
 
 impl Workspace {
@@ -454,11 +641,17 @@ impl Workspace {
         workspaces_dir().join(&self.name)
     }
 
-    /// What to call it on screen.
-    pub fn display_title(&self) -> &str {
-        match self.title.is_empty() {
-            true => &self.name,
-            false => &self.title,
+    /// What to call it on screen. Untitled, that's its name capitalised, but an `agent-<hex>` from
+    /// before `SEA_NAMES` stays "New agent".
+    pub fn display_title(&self) -> Cow<'_, str> {
+        match self.title.as_str() {
+            "" => self.name.as_str().into(),
+            NEW_AGENT if !self.name.starts_with("agent-") => {
+                let mut c = self.name.chars();
+                let first = c.next().into_iter().flat_map(char::to_uppercase);
+                first.chain(c).collect::<String>().into()
+            }
+            title => title.into(),
         }
     }
 
@@ -474,15 +667,16 @@ impl Workspace {
     }
 
     /// The branch the next repository attaches on: the one the agent is on, or for the first,
-    /// `<primary issue or title>-<suffix>`.
+    /// `<primary issue or title>-<name>`, less the `agent-` of an old name.
     pub fn default_branch(&self) -> String {
         if !self.repos.is_empty() {
             return self.branch.clone();
         }
+        let title = self.display_title();
         let source = match self.primary_issue() {
             Some(issue) => &issue.identifier,
             None if self.title == NEW_AGENT => "",
-            None => self.display_title(),
+            None => &title,
         };
         let mut slug = String::new();
         for w in (source.split(|c: char| !c.is_ascii_alphanumeric())).filter(|w| !w.is_empty()) {
@@ -1400,19 +1594,70 @@ mod tests {
             r#"{"repos":[],"workspaces":[{"name":"kd-login","branch":"kd/login","repos":[]}]}"#;
         let st: State = serde_json::from_str(old).unwrap();
         let ws = &st.workspaces[0];
-        assert_eq!((ws.title.as_str(), ws.display_title()), ("", "kd-login"));
+        assert_eq!((ws.title.as_str(), &*ws.display_title()), ("", "kd-login"));
         let back: State = serde_json::from_str(&serde_json::to_string(&st).unwrap()).unwrap();
         assert_eq!(back.workspaces[0].display_title(), "kd-login");
     }
 
-    /// A generated name that's taken counts up; it stays a valid directory and branch name.
+    /// A generated name comes from the table and skips what's taken; with the table used up, it
+    /// counts up.
     #[test]
     fn agent_names_skip_taken_ones() {
-        assert_eq!(agent_name(255, |_| false), "agent-ff");
+        assert!(SEA_NAMES.contains(&agent_name(0, |_| false).as_str()));
+        assert_eq!(agent_name(0, |n| n != "marlin"), "marlin");
+        assert_eq!(agent_name(0, |n| n != "marlin-2"), "marlin-2");
+        let bare = |n: &str| SEA_NAMES.contains(&n);
+        let numbered = agent_name(0, bare);
+        assert!(bare(numbered.strip_suffix("-2").unwrap()), "{numbered}");
+        let next = agent_name(0, |n| bare(n) || n.ends_with("-2"));
+        assert!(bare(next.strip_suffix("-3").unwrap()), "{next}");
+    }
+
+    #[test]
+    fn sea_names_are_unique_directories_and_branches() {
+        assert!(SEA_NAMES.len() >= 150);
         assert_eq!(
-            agent_name(255, |n| ["agent-ff", "agent-100"].contains(&n)),
-            "agent-101"
+            SEA_NAMES.iter().collect::<HashSet<_>>().len(),
+            SEA_NAMES.len()
         );
+        for name in SEA_NAMES {
+            let letters = |w: &str| !w.is_empty() && w.chars().all(|c| c.is_ascii_lowercase());
+            assert!(name.split('-').all(letters), "{name}");
+            assert!(!name.starts_with("agent-"), "{name}");
+            let args = ["check-ref-format", "--branch", name];
+            crate::git::git(&std::env::temp_dir(), &args).unwrap();
+        }
+    }
+
+    #[test]
+    fn untitled_agents_show_and_branch_on_their_name() {
+        let mut ws = Workspace {
+            name: "marlin".into(),
+            title: NEW_AGENT.into(),
+            ..Default::default()
+        };
+        assert_eq!(ws.display_title(), "Marlin");
+        assert_eq!(ws.default_branch(), "marlin");
+        ws.name = "mahi-mahi-2".into();
+        assert_eq!(ws.display_title(), "Mahi-mahi-2");
+        assert_eq!(ws.default_branch(), "mahi-mahi-2");
+        ws.title = "Fix login".into();
+        assert_eq!(ws.display_title(), "Fix login");
+        assert_eq!(ws.default_branch(), "fix-login-mahi-mahi-2");
+    }
+
+    /// An `agent-<hex>` saved before `SEA_NAMES` looks and branches as it did.
+    #[test]
+    fn old_agent_names_stay_as_they_were() {
+        let mut ws = Workspace {
+            name: "agent-19a2b".into(),
+            title: NEW_AGENT.into(),
+            ..Default::default()
+        };
+        assert_eq!(ws.display_title(), NEW_AGENT);
+        assert_eq!(ws.default_branch(), "agent-19a2b");
+        ws.title = "Fix login".into();
+        assert_eq!(ws.default_branch(), "fix-login-19a2b");
     }
 
     #[test]

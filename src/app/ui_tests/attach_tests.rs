@@ -1,3 +1,4 @@
+use super::super::attach::{Fit, setup_tail};
 use super::*;
 use crate::agent::{Ev, Task};
 use crate::attention::Attn;
@@ -97,8 +98,7 @@ async fn branches_and_bases_of_first_and_later_repos(cx: &mut TestAppContext) {
     on(cx, &|s, _, cx| {
         s.set_title(&name, "Fix: the Login page!".into(), cx)
     });
-    let suffix = name.strip_prefix("agent-").unwrap();
-    let branch = format!("fix-the-login-page-{suffix}");
+    let branch = format!("fix-the-login-page-{name}");
     assert_eq!(ws_of(cx, &shark).default_branch(), branch);
 
     let first = fresh(&repos[0], &branch);
@@ -1250,4 +1250,593 @@ async fn empty_views_go_live_once_a_repo_attaches(cx: &mut TestAppContext) {
         docs.contains("`api/`") && !docs.contains("No repositories"),
         "{docs}"
     );
+}
+
+/// Draws until a measured header has settled: each change shows on the next frame.
+fn header_settled(cx: &mut TestAppContext, window: AnyWindowHandle) {
+    for _ in 0..4 {
+        cx.update_window(window, |_, w, cx| w.render_frame(cx))
+            .unwrap();
+        cx.run_until_parked();
+    }
+}
+
+fn shows(cx: &mut TestAppContext, window: AnyWindowHandle, id: impl Into<ElementId>) -> bool {
+    let id = id.into();
+    cx.update_window(window, move |_, w, cx| {
+        w.render_frame(cx);
+        w.try_find(id).is_some_and(|e| e.visible())
+    })
+    .unwrap()
+}
+
+/// Cancelling a chip takes back that repo alone; the others stay queued, and what has started
+/// stays out of reach. Cancel all queued is a row of its own.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn cancelling_one_keeps_the_rest_queued(cx: &mut TestAppContext) {
+    guards!(quiet, _turn, _claude);
+    let home = test_home();
+    let (window, shark, repos) = agent(cx, &home, &["api", "web", "docs", "cli"], &[]);
+    let on = on_app(window, shark.clone());
+    let name = ws_of(cx, &shark).name;
+    let chat = chat_of(cx, &shark);
+    cx.update(|cx| chat.update(cx, |c, _| c.busy = true));
+    on(cx, &|s, w, cx| {
+        let picks = repos.iter().map(|r| fresh(r, "b")).collect();
+        s.queue_attachment(name.clone(), picks, w, cx)
+    });
+    let notices = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, w, cx| w.notifications(cx).len())
+            .unwrap()
+    };
+    assert_eq!(notices(cx), 1, "told it is queued");
+    on(cx, &|s, w, cx| {
+        s.attachment_menu(name.clone(), "web".into(), w, cx)
+    });
+    press_in(window)(cx, &["enter"]);
+    let left = |cx: &mut TestAppContext| -> Vec<String> {
+        (ws_of(cx, &shark).attaching.iter())
+            .map(|a| a.repo.clone())
+            .collect()
+    };
+    assert_eq!(left(cx), ["api", "docs", "cli"]);
+    assert_eq!(State::load().workspaces[0].attaching.len(), 3);
+    cx.update(|cx| assert!(chat.read(cx).attach_hold, "the rest still hold"));
+
+    on(cx, &|s, w, cx| {
+        s.attachment_menu(name.clone(), "api".into(), w, cx)
+    });
+    press_in(window)(cx, &["down", "enter"]);
+    assert!(left(cx).is_empty(), "the second row takes them all");
+    cx.update(|cx| assert!(!chat.read(cx).attach_hold));
+    cx.update(|cx| chat.update(cx, |c, _| c.busy = false));
+
+    // Creating: the panel has nothing to cancel, and a call from a stale row changes nothing.
+    on(cx, &|s, w, cx| {
+        let picks = vec![fresh(&repos[0], "b"), fresh(&repos[1], "b")];
+        s.queue_attachment(name.clone(), picks, w, cx);
+        s.cancel_queued(&name, Some("api"), w, cx);
+        assert_eq!(s.ws(&name).unwrap().attaching.len(), 2);
+        assert_eq!(s.attach_actions(&name, "api")[0].1, "Close");
+        s.cancel_queued(&name, Some("web"), w, cx);
+    });
+    settled(cx, window, &shark).await;
+    let ws = ws_of(cx, &shark);
+    assert_eq!(ws.repos.len(), 1);
+    assert!(ws.dir().join("api").exists() && !ws.dir().join("web").exists());
+}
+
+/// Failures come first and what doesn't fit is behind `+N` and cmd-k, so every failure can be
+/// reached and dealt with, not only the first.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn failures_stay_reachable_under_overflow(cx: &mut TestAppContext) {
+    guards!(quiet, _turn, _claude);
+    let home = test_home();
+    let (window, shark, _) = agent(cx, &home, &["api"], &[]);
+    let on = on_app(window, shark.clone());
+    let name = ws_of(cx, &shark).name;
+    let failed: Vec<String> = (0..40).map(|i| format!("repository-{i:02}")).collect();
+    on(cx, &|s, _, _| {
+        let results = s.attach_results.entry(name.clone()).or_default();
+        results.failed = (failed.iter())
+            .map(|r| (r.clone(), "branch exists".into()))
+            .collect();
+        s.ws_mut(&name).unwrap().repos.push(crate::state::WsRepo {
+            name: "settled".into(),
+            src: "/src/settled".into(),
+            base: "main".into(),
+            branch: None,
+        });
+    });
+    cx.update_window(window, |_, w, _| w.resize(size(px(900.), px(600.))))
+        .unwrap();
+    header_settled(cx, window);
+    assert!(shows(cx, window, "attach-chip-repository-00"), "first");
+    assert!(!shows(cx, window, "attach-chip-repository-39"), "clipped");
+    assert!(
+        !shows(cx, window, "repo-chip-settled"),
+        "behind the failures"
+    );
+    assert!(shows(cx, window, "attach-more"));
+    // `+N`: the hidden ones, the last of them a failure the header can't show.
+    cx.update_window(window, |_, w, cx| w.click("attach-more", cx))
+        .unwrap();
+    cx.run_until_parked();
+    let on_row = |cx: &mut TestAppContext, row: usize| {
+        for _ in 0..row {
+            press_in(window)(cx, &["down"]);
+        }
+        press_in(window)(cx, &["enter"]);
+    };
+    let hidden = 41
+        - (0..40)
+            .take_while(|i| {
+                let id = SharedString::from(format!("attach-chip-repository-{i:02}"));
+                shows(cx, window, id)
+            })
+            .count();
+    on_row(cx, hidden - 2); // the settled repo is the last row
+    assert!(shows(cx, window, "attach-panel"));
+    press_in(window)(cx, &["enter"]);
+    assert_eq!(
+        cx.update(|cx| shark.read(cx).attach_results[&name].failed.len()),
+        39,
+        "dismissed from the list"
+    );
+    let gone = cx.update(|cx| {
+        let failed = &shark.read(cx).attach_results[&name].failed;
+        !failed.iter().any(|(r, _)| r == "repository-39")
+    });
+    assert!(gone, "the clipped one");
+
+    // cmd-k's Attach repository: everything, from the keyboard, then the dialog as its last row.
+    on(cx, &|s, _, cx| {
+        let results = s.attach_results.get_mut(&name).unwrap();
+        results.failed.truncate(2);
+        cx.notify();
+    });
+    let form = |cx: &mut TestAppContext| shows(cx, window, ("repo-pick", 0usize));
+    on(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
+    assert!(!form(cx), "not the dialog: failures come first");
+    on_row(cx, 1);
+    press_in(window)(cx, &["enter"]);
+    assert_eq!(
+        cx.update(|cx| shark.read(cx).attach_needs(&name)).unwrap(),
+        "Couldn't attach repository-00"
+    );
+    on(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
+    on_row(cx, 0);
+    press_in(window)(cx, &["enter"]);
+    cx.update(|cx| assert_eq!(shark.read(cx).attach_needs(&name), None));
+    on(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
+    assert!(form(cx), "nothing left in the way");
+}
+
+/// The Attach buttons give up their labels before chips get hidden, and take them back only with
+/// room to spare: nothing flips from frame to frame.
+#[test]
+fn chips_get_the_room_first() {
+    let wide = px(1000.);
+    let fit = Fit::default().next(0, 3, wide);
+    assert_eq!(fit, Fit::default());
+    let tight = fit.next(2, 3, wide);
+    assert_eq!(tight.hidden, 0, "labels go first");
+    assert_eq!(
+        tight.next(0, 3, wide),
+        tight,
+        "stays, though it all fits now"
+    );
+    let hidden = tight.next(1, 3, wide);
+    assert_eq!(hidden.hidden, 1);
+    assert_eq!(hidden.next(1, 3, wide), hidden);
+    assert_eq!(hidden.next(0, 3, wide + px(10.)).hidden, 0, "room again");
+    assert_eq!(hidden.next(0, 2, wide), Fit::default(), "a chip went");
+    assert_eq!(hidden.next(0, 3, wide + px(400.)), Fit::default());
+}
+
+/// Each stage marks its steps: what's done, what's on, what's left, and only what failed is red.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn the_panel_marks_each_step(cx: &mut TestAppContext) {
+    use super::super::attach::Step::*;
+    guards!(quiet, _turn, _claude);
+    let home = test_home();
+    let (window, shark, repos) = agent(cx, &home, &["api", "web"], &[]);
+    let name = ws_of(cx, &shark).name;
+    let chat = chat_of(cx, &shark);
+    cx.update(|cx| chat.update(cx, |c, _| c.busy = true));
+    let on = on_app(window, shark.clone());
+    for (stage, error, marks, detail) in [
+        (
+            Some(AttachStage::Queued),
+            None,
+            [Current, Pending, Pending],
+            [Some("1 chat running"), None, None],
+        ),
+        (
+            Some(AttachStage::Creating),
+            None,
+            [Done, Current, Pending],
+            [None; 3],
+        ),
+        (
+            Some(AttachStage::Setup),
+            None,
+            [Done, Done, Current],
+            [None; 3],
+        ),
+        (
+            Some(AttachStage::SetupFailed),
+            Some("api: `x` failed"),
+            [Done, Done, Failed],
+            [None, None, Some("api: `x` failed")],
+        ),
+        (
+            Some(AttachStage::Uncertain),
+            Some("it isn't ours"),
+            [Done, Failed, Pending],
+            [None, Some("it isn't ours"), None],
+        ),
+        (
+            None,
+            Some("branch exists"),
+            [Done, Failed, Pending],
+            [None, Some("branch exists"), None],
+        ),
+        (None, None, [Done, Done, Done], [None; 3]),
+    ] {
+        on(cx, &|s, _, _| {
+            let ws = s.ws_mut(&name).unwrap();
+            ws.attaching = (stage.iter())
+                .map(|st| Attachment {
+                    stage: *st,
+                    error: error.map(String::from),
+                    ..fresh(&repos[0], "b")
+                })
+                .collect();
+            let results = s.attach_results.entry(name.clone()).or_default();
+            results.failed = (error.iter())
+                .filter(|_| stage.is_none())
+                .map(|e| ("api".to_string(), e.to_string()))
+                .collect();
+        });
+        let steps = cx.update(|cx| shark.read(cx).attach_steps(&name, "api", cx));
+        assert_eq!(steps.each_ref().map(|s| s.1), marks, "{stage:?}");
+        assert_eq!(
+            steps.each_ref().map(|s| s.2.as_deref()),
+            detail,
+            "{stage:?}"
+        );
+        assert_eq!(
+            steps.map(|s| s.0),
+            ["Waiting for idle", "Creating worktree", "Running setup"]
+        );
+    }
+}
+
+/// The log is shared between repos and setup goes on after a failure: the panel shows the failed
+/// repo's own last lines.
+#[test]
+fn the_tail_is_the_failed_repos() {
+    let log = "\n$ api: one\nold\n\n$ api: two\nline a\nline b\n\n$ web: three\nweb says\n";
+    assert_eq!(setup_tail(log, "api"), "$ api: two\nline a\nline b");
+    assert_eq!(setup_tail(log, "web"), "$ web: three\nweb says");
+    assert_eq!(setup_tail(log, "my-api"), "");
+    let long = format!("$ api: one\n{}", "x\n".repeat(20));
+    assert_eq!(setup_tail(&long, "api").lines().count(), 8);
+}
+
+/// A panel left open follows the attachment: opened while it starts, it offers Retry once setup
+/// has failed, and the retry works.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn an_open_panel_follows_the_failure(cx: &mut TestAppContext) {
+    guards!(quiet, _turn, _claude);
+    let home = test_home();
+    let (window, shark, repos) = agent(cx, &home, &["api"], &[("api", "echo broken; exit 3")]);
+    let on = on_app(window, shark.clone());
+    let name = ws_of(cx, &shark).name;
+    on(cx, &|s, w, cx| {
+        s.queue_attachment(name.clone(), vec![fresh(&repos[0], "b")], w, cx);
+        s.attachment_menu(name.clone(), "api".into(), w, cx);
+    });
+    settled(cx, window, &shark).await;
+    assert_eq!(stage(cx, &shark), AttachStage::SetupFailed);
+    assert!(shows(cx, window, ("attach-step", 2usize)));
+    on(cx, &|s, _, _| {
+        s.state.repo_settings.get_mut("api").unwrap().setup = vec!["true".into()];
+    });
+    press_in(window)(cx, &["down", "enter"]);
+    settled(cx, window, &shark).await;
+    assert!(ws_of(cx, &shark).ready(), "Retry was on the open panel");
+    on(cx, &|s, w, cx| {
+        s.attachment_menu(name.clone(), "api".into(), w, cx)
+    });
+    press_in(window)(cx, &["escape"]);
+    cx.update_window(window, |_, w, cx| assert!(!w.has_active_dialog(cx)))
+        .unwrap();
+}
+
+/// The hold says what it waits on and what to do, naming the repo: a failure waits on the user,
+/// not on an attachment that is under way.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn the_hold_says_what_it_waits_on(cx: &mut TestAppContext) {
+    guards!(quiet, _turn, _claude);
+    let home = test_home();
+    let (_, shark, repos) = agent(cx, &home, &["api", "web"], &[]);
+    let chat = chat_of(cx, &shark);
+    let mut ws = ws_of(cx, &shark);
+    let held = |cx: &mut TestAppContext, ws: &Workspace| {
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                c.workspace_changed(ws, cx);
+                c.held()
+            })
+        })
+    };
+    assert_eq!(held(cx, &ws), None);
+    for (stage, words) in [
+        (AttachStage::Queued, "api is queued"),
+        (AttachStage::Creating, "api is being attached"),
+        (AttachStage::Setup, "api is being attached"),
+        (AttachStage::SetupFailed, "setup of api failed"),
+        (AttachStage::Uncertain, "can't tell how api ended up"),
+    ] {
+        let a = Attachment {
+            stage,
+            ..fresh(&repos[0], "b")
+        };
+        ws.attaching = vec![a];
+        let why = held(cx, &ws).unwrap();
+        assert!(why.contains(words) && why.contains("chip"), "{why}");
+    }
+    // Who needs the user is named over who is merely waiting its turn.
+    ws.attaching.insert(0, fresh(&repos[1], "b"));
+    ws.attaching[1].stage = AttachStage::SetupFailed;
+    assert!(held(cx, &ws).unwrap().contains("setup of api failed"));
+    // A git step still comes first; it clears by itself.
+    cx.update(|cx| chat.update(cx, |c, _| c.hold = true));
+    assert_eq!(held(cx, &ws).unwrap(), "a git step is running");
+}
+
+/// The dialog's base button lists bases: enter takes one as the base, not as a branch to check
+/// out, the default branch is marked, and the row says what will be made.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn the_base_button_picks_a_base(cx: &mut TestAppContext) {
+    guards!(quiet, _turn, _claude);
+    let home = test_home();
+    let (window, shark, repos) = agent(cx, &home, &["api"], &[]);
+    let src = &repos[0].path;
+    git::git(src, &["branch", "develop"]).unwrap();
+    git::git(src, &["update-ref", "refs/remotes/origin/main", "main"]).unwrap();
+    let on = on_app(window, shark.clone());
+    let name = ws_of(cx, &shark).name;
+    let press = press_in(window);
+    on(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
+    assert!(shows(cx, window, ("repo-base", 0usize)), "visible");
+    assert!(!shows(cx, window, "base-default"));
+    cx.update_window(window, |_, w, cx| w.click(("repo-base", 0usize), cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(shows(cx, window, "base-default"), "marked Default");
+    let list = git::branches(src).unwrap();
+    let main = list.iter().position(|b| b.name == "main").unwrap();
+    let develop = list.iter().position(|b| b.name == "develop").unwrap();
+    // It starts on the current base, the default.
+    for _ in 0..develop.saturating_sub(main) {
+        press(cx, &["down"]);
+    }
+    for _ in 0..main.saturating_sub(develop) {
+        press(cx, &["up"]);
+    }
+    press(cx, &["enter"]);
+    assert!(
+        shows(cx, window, ("repo-base", 0usize)),
+        "back on the repos"
+    );
+    press(cx, &["cmd-enter"]);
+    settled(cx, window, &shark).await;
+    let ws = ws_of(cx, &shark);
+    assert_eq!(ws.repos[0].base, "develop");
+    assert_eq!(ws.branch, ws.name, "still the new branch, not develop");
+}
+
+/// Real pixels, both themes: chips in each state, overflow, the confirm step and the panel.
+pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api", "web"]);
+    let api = &repos[0].path;
+    git::git(api, &["branch", "develop"]).unwrap();
+    git::git(api, &["branch", "release/2.4"]).unwrap();
+    git::git(api, &["remote", "add", "origin", api.to_str().unwrap()]).unwrap();
+    git::git(api, &["fetch", "-q", "origin"]).unwrap();
+    let (src, name) = (&repos[0], "attach-preview");
+    let stage = |repo: &str, stage, error: Option<&str>| Attachment {
+        repo: repo.into(),
+        stage,
+        error: error.map(String::from),
+        base: "develop".into(),
+        ..Attachment::fresh(src, "you/eng-123-login", "")
+    };
+    let log = crate::scripts::log_path(name);
+    fs::create_dir_all(log.parent().unwrap()).unwrap();
+    fs::write(
+        log,
+        "\n$ payments: npm ci\nnpm warn deprecated inflight@1.0.6\nnpm error code ERESOLVE\n\
+         npm error ERESOLVE could not resolve\nnpm error While resolving: react-dom@19.1.0\n\
+         npm error Found: react@18.3.1\nnpm error A complete log of this run can be found in: \
+         /Users/you/.npm/_logs/2026-11-06T10_12_44_121Z-debug-0.log\n\n$ search: make setup\nok\n",
+    )
+    .unwrap();
+    for (mode, label) in [
+        (crate::state::Mode::Dark, "dark"),
+        (crate::state::Mode::Light, "light"),
+    ] {
+        for (case, width) in [
+            ("header", 1280.),
+            ("chips", 1280.),
+            ("overflow", 860.),
+            ("confirm", 1000.),
+            ("bases", 1000.),
+            ("queued", 1000.),
+            ("running", 1000.),
+            ("failed", 1000.),
+        ] {
+            let mut state = State {
+                repos: repos.clone(),
+                ..Default::default()
+            };
+            state.appearance.mode = mode;
+            state.save().unwrap();
+            let (window, shark) = cx
+                .update(|cx| {
+                    gpui_kit::open_window(
+                        WindowOptions {
+                            window_bounds: Some(WindowBounds::Windowed(Bounds::new(
+                                point(px(0.), px(0.)),
+                                size(px(width), px(640.)),
+                            ))),
+                            focus: false,
+                            show: false,
+                            ..Default::default()
+                        },
+                        cx,
+                        |w, cx| cx.new(|cx| Shark::new(w, cx)),
+                    )
+                })
+                .unwrap();
+            cx.update_window(window, |_, w, cx| {
+                shark.update(cx, |s, cx| {
+                    s.home.on = false;
+                    s.active = Some(name.into());
+                    s.tab = Tab::Chat;
+                    let settled = |r: &str| crate::state::WsRepo {
+                        name: r.into(),
+                        src: src.path.clone(),
+                        base: "main".into(),
+                        branch: None,
+                    };
+                    let mut ws = Workspace {
+                        name: name.into(),
+                        branch: "you/eng-123-login".into(),
+                        chats: ["attach-preview-1", "attach-preview-2"]
+                            .map(|id| ChatMeta {
+                                id: id.into(),
+                                ..Default::default()
+                            })
+                            .into(),
+                        repos: ["payments", "ledger", "docs-site", "mobile-app"]
+                            .map(settled)
+                            .into(),
+                        attaching: vec![
+                            stage("search", AttachStage::Queued, None),
+                            stage(
+                                "payments",
+                                AttachStage::SetupFailed,
+                                Some("payments: `npm ci` failed (exit status: 1)"),
+                            ),
+                            stage("ledger", AttachStage::Setup, None),
+                            stage("docs-site", AttachStage::Creating, None),
+                            stage(
+                                "mobile-app",
+                                AttachStage::Uncertain,
+                                Some("branch `b` exists and isn't Shark's"),
+                            ),
+                        ],
+                        ..Default::default()
+                    };
+                    ws.repos.push(settled("notes"));
+                    let id = |n: &str| crate::linear::Snapshot {
+                        org: "acme".into(),
+                        id: format!("uuid-{n}"),
+                        identifier: n.into(),
+                        title: "Sign-in loops on expired tokens".into(),
+                        ..Default::default()
+                    };
+                    ws.issues = vec![id("ENG-123"), id("ENG-124")];
+                    for s in &ws.issues {
+                        ws.linear.attach(s.into());
+                    }
+                    ws.normalize_tabs();
+                    s.state.workspaces = vec![ws.clone()];
+                    if case == "queued" {
+                        for meta in &ws.chats {
+                            let chat = s.ensure_chat(&ws, meta, w, cx);
+                            chat.update(cx, |c, _| c.busy = true);
+                        }
+                    }
+                    let results = s.attach_results.entry(name.into()).or_default();
+                    results.failed = vec![(
+                        "billing".into(),
+                        "billing: branch `you/eng-123-login` already exists; pick another name"
+                            .into(),
+                    )];
+                    if case == "header" {
+                        results.failed.clear();
+                    }
+                    let ws = s.ws_mut(name).unwrap();
+                    match case {
+                        "overflow" | "chips" => {}
+                        "header" => {
+                            ws.attaching = vec![];
+                            ws.repos.truncate(2);
+                            ws.linear.remove(&(&ws.issues[1]).into());
+                        }
+                        "queued" => ws.attaching.truncate(1),
+                        _ => ws.attaching = vec![],
+                    }
+                    match case {
+                        "running" => ws.attaching = vec![stage("ledger", AttachStage::Setup, None)],
+                        "failed" => {
+                            ws.attaching = vec![stage(
+                                "payments",
+                                AttachStage::SetupFailed,
+                                Some("payments: `npm ci` failed (exit status: 1)"),
+                            )]
+                        }
+                        _ => {}
+                    }
+                    let open = ["queued", "running", "failed"];
+                    if let Some(at) = open.iter().position(|c| *c == case) {
+                        let repo = ["search", "ledger", "payments"][at];
+                        s.attachment_menu(name.into(), repo.into(), w, cx);
+                    }
+                    if matches!(case, "confirm" | "bases") {
+                        s.attach_results.clear();
+                        s.attach_dialog(name.into(), vec!["api".into()], w, cx);
+                    }
+                    cx.notify();
+                })
+            })
+            .unwrap();
+            cx.run_until_parked();
+            // The branch lists load in the background; the base list is one click on.
+            for frame in 0..6 {
+                cx.update_window(window, |_, w, cx| {
+                    w.render_frame(cx);
+                    if case == "bases" && frame == 2 {
+                        w.click(("repo-base", 0usize), cx);
+                    }
+                })
+                .unwrap();
+                cx.run_until_parked();
+            }
+            let screenshot = cx.capture_screenshot(window).expect("real attach renderer");
+            if let Some(dir) = std::env::var_os("SHARK_RENDER_DIR") {
+                let dir = PathBuf::from(dir);
+                fs::create_dir_all(&dir).unwrap();
+                screenshot
+                    .save(dir.join(format!("attach-{case}-{label}.png")))
+                    .unwrap();
+            }
+            cx.update_window(window, |_, w, _| w.remove_window())
+                .unwrap();
+        }
+    }
+    println!("attachment previews: 16 rendered (both themes)");
 }

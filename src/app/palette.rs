@@ -194,6 +194,13 @@ pub(super) const COMMANDS: &[Row] = &[
         Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.pick_issue(ws.name, w, cx))),
     ),
     Row(
+        "Show attachments",
+        IconName::Paperclip,
+        None,
+        "list repositories repos issues chips more overflow",
+        Some(|s, w, cx| s.with_target(w, cx, |s, ws, w, cx| s.attachment_list(ws.name, 0, w, cx))),
+    ),
+    Row(
         "Rename agent…",
         IconName::Pencil,
         None,
@@ -824,6 +831,7 @@ const NEED_WORKSPACE: &[&str] = &[
     "Attach repository…",
     "Attach Linear issue…",
     "Show Linear issue…",
+    "Show attachments",
     "Rename agent…",
     "Run or stop run scripts",
     "Show script output",

@@ -44,8 +44,8 @@ const VIEWER: &str = "query Viewer {
 const ISSUE: &str = "query Issue($id: String!) {
   organization { id urlKey }
   issue(id: $id) {
-    id identifier url title description updatedAt
-    state { name }
+    id identifier url title description priority updatedAt
+    state { name type }
     team { key name }
     project { name }
     assignee { name }
@@ -53,9 +53,25 @@ const ISSUE: &str = "query Issue($id: String!) {
 }";
 const SEARCH: &str = "query Search($term: String!, $first: Int!, $after: String) {
   searchIssues(term: $term, first: $first, after: $after) {
-    nodes { id identifier url title state { name } team { key name } }
+    nodes {
+      id identifier url title priority updatedAt
+      state { name type } team { key name } assignee { name }
+    }
     pageInfo { hasNextPage endCursor }
   }
+}";
+const LISTS: &str = "query Lists($first: Int!) {
+  viewer {
+    assignedIssues(
+      first: $first, orderBy: updatedAt,
+      filter: { state: { type: { nin: [\"completed\", \"canceled\", \"duplicate\"] } } }
+    ) { nodes { ...Row } }
+  }
+  issues(first: $first, orderBy: updatedAt) { nodes { ...Row } }
+}
+fragment Row on Issue {
+  id identifier url title priority updatedAt
+  state { name type } team { key name } assignee { name }
 }";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -808,6 +824,13 @@ struct Team {
 }
 
 #[derive(Deserialize)]
+struct Workflow {
+    name: String,
+    #[serde(rename = "type", default)]
+    kind: String,
+}
+
+#[derive(Deserialize)]
 struct Org {
     id: String,
     #[serde(default)]
@@ -845,7 +868,65 @@ pub struct Hit {
     pub url: String,
     pub title: String,
     pub status: String,
+    /// Linear's `state.type`, which custom states keep.
+    pub state_type: String,
+    /// 0 none, 1 urgent, 2 high, 3 medium, 4 low.
+    pub priority: u8,
     pub team: String,
+    pub assignee: Option<String>,
+    /// Linear's `updatedAt`.
+    pub updated_at: String,
+}
+
+/// An issue in a list. Linear types `priority` as a Float.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct Node {
+    id: String,
+    identifier: String,
+    url: String,
+    title: String,
+    #[serde(default)]
+    priority: f64,
+    #[serde(default)]
+    updated_at: String,
+    state: Workflow,
+    team: Team,
+    assignee: Option<Named>,
+}
+
+impl From<Node> for Hit {
+    fn from(n: Node) -> Self {
+        Self {
+            id: n.id,
+            identifier: n.identifier,
+            url: n.url,
+            title: n.title,
+            status: n.state.name,
+            state_type: n.state.kind,
+            priority: n.priority as u8,
+            team: n.team.name,
+            assignee: n.assignee.map(|a| a.name),
+            updated_at: n.updated_at,
+        }
+    }
+}
+
+impl From<&Snapshot> for Hit {
+    fn from(s: &Snapshot) -> Self {
+        Self {
+            id: s.id.clone(),
+            identifier: s.identifier.clone(),
+            url: s.url.clone(),
+            title: s.title.clone(),
+            status: s.status.clone(),
+            state_type: s.state_type.clone(),
+            priority: s.priority,
+            team: s.team.clone(),
+            assignee: s.assignee.clone(),
+            updated_at: s.updated_at.clone(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
@@ -855,18 +936,63 @@ pub struct Page {
     pub next: Option<String>,
 }
 
-/// One page of matches. An explicit-submit action only: Linear allows 30 searches a minute.
-/// Blocking.
-pub fn search(http: &Http, c: &Credential, term: &str, after: Option<&str>) -> Result<Page, Error> {
+/// What the picker shows before anything is typed.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Lists {
+    pub assigned: Vec<Hit>,
+    /// Recently updated, without what's in `assigned`.
+    pub recent: Vec<Hit>,
+}
+
+/// One read for both of them. Blocking.
+pub fn lists(http: &Http, c: &Credential) -> Result<Lists, Error> {
     #[derive(Deserialize)]
-    struct Node {
-        id: String,
-        identifier: String,
-        url: String,
-        title: String,
-        state: Named,
-        team: Team,
+    struct Nodes {
+        nodes: Vec<Node>,
     }
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct Viewer {
+        assigned_issues: Nodes,
+    }
+    #[derive(Deserialize)]
+    struct Data {
+        viewer: Viewer,
+        issues: Nodes,
+    }
+    let d: Data = decode(gql(http, c, LISTS, json!({ "first": PAGE }))?)?;
+    let hits = |n: Nodes| n.nodes.into_iter().map(Hit::from).collect::<Vec<_>>();
+    let assigned = hits(d.viewer.assigned_issues);
+    let mut recent = hits(d.issues);
+    recent.retain(|r| !assigned.iter().any(|a| a.id == r.id));
+    Ok(Lists { assigned, recent })
+}
+
+/// What a typed query finds. A URL only names an issue. A term shaped like an identifier may name
+/// one, first, and searches anyway: `gpt-4` is usually not an issue. Blocking.
+pub fn find(http: &Http, c: &Credential, query: &str) -> Result<Page, Error> {
+    let named = match parse_issue(query) {
+        Some(url) if url.org.is_some() => {
+            let hits = vec![(&get_issue(http, c, &url)?).into()];
+            return Ok(Page { hits, next: None });
+        }
+        Some(id) => match get_issue(http, c, &id) {
+            Err(e @ (Error::RateLimited { .. } | Error::Unauthorized)) => return Err(e),
+            found => found.ok(),
+        },
+        None => None,
+    };
+    let mut page = search(http, c, query, None)?;
+    if let Some(s) = named {
+        page.hits.retain(|h| h.id != s.id);
+        page.hits.insert(0, (&s).into());
+    }
+    Ok(page)
+}
+
+/// One page of matches. `searchIssues` allows 30 requests a minute (its schema description; the
+/// rate limiting page doesn't list it), which `IssuePicker` keeps to. Blocking.
+pub fn search(http: &Http, c: &Credential, term: &str, after: Option<&str>) -> Result<Page, Error> {
     #[derive(Deserialize)]
     #[serde(rename_all = "camelCase")]
     struct PageInfo {
@@ -890,16 +1016,8 @@ pub fn search(http: &Http, c: &Credential, term: &str, after: Option<&str>) -> R
     }
     let variables = json!({ "term": term, "first": PAGE, "after": after });
     let results = decode::<Data>(gql(http, c, SEARCH, variables)?)?.search_issues;
-    let hit = |n: Node| Hit {
-        id: n.id,
-        identifier: n.identifier,
-        url: n.url,
-        title: n.title,
-        status: n.state.name,
-        team: n.team.name,
-    };
     Ok(Page {
-        hits: results.nodes.into_iter().map(hit).collect(),
+        hits: results.nodes.into_iter().map(Hit::from).collect(),
         next: (results.page_info.end_cursor).filter(|_| results.page_info.has_next_page),
     })
 }
@@ -925,6 +1043,17 @@ pub struct Snapshot {
     pub updated_at: String,
     /// Unix seconds.
     pub retrieved_at: u64,
+    /// Linear's `state.type`. Display only: `content` leaves it out, and left empty it must not
+    /// serialize, or old fingerprints change.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub state_type: String,
+    /// As `Hit::priority`, and display only like `state_type`.
+    #[serde(skip_serializing_if = "no_priority")]
+    pub priority: u8,
+}
+
+fn no_priority(p: &u8) -> bool {
+    *p == 0
 }
 
 /// A snapshot and the workspace slug it came from. `id` is a UUID or an identifier.
@@ -937,8 +1066,10 @@ fn fetch(http: &Http, c: &Credential, id: &str) -> Result<(Snapshot, String), Er
         url: String,
         title: String,
         description: Option<String>,
+        #[serde(default)]
+        priority: f64,
         updated_at: String,
-        state: Named,
+        state: Workflow,
         team: Team,
         project: Option<Named>,
         assignee: Option<Named>,
@@ -957,6 +1088,8 @@ fn fetch(http: &Http, c: &Credential, id: &str) -> Result<(Snapshot, String), Er
         title: d.issue.title,
         description: d.issue.description.unwrap_or_default(),
         status: d.issue.state.name,
+        state_type: d.issue.state.kind,
+        priority: d.issue.priority as u8,
         team: d.issue.team.name,
         team_key: d.issue.team.key,
         project: d.issue.project.map(|p| p.name),
@@ -1145,11 +1278,14 @@ fn render(s: &Snapshot, primary: bool) -> String {
 }
 
 /// What an issue says, for `ContextNote::fingerprint`: not when it was read or last touched, which
-/// a refresh that found nothing new changes, and not whether it is primary.
+/// a refresh that found nothing new changes, not whether it is primary, and not what only Shark's
+/// own UI reads. These bytes must stay what they were: chats keep the hash they were sent.
 fn content(s: &Snapshot) -> u64 {
     let read = Snapshot {
         updated_at: String::new(),
         retrieved_at: 0,
+        state_type: String::new(),
+        priority: 0,
         ..s.clone()
     };
     crate::files::fingerprint(serde_json::to_vec(&read).unwrap_or_default())
@@ -1181,9 +1317,13 @@ pub(crate) mod fake {
     use super::*;
 
     pub(crate) fn resp(status: u16, body: &str) -> Result<Resp, Error> {
+        with_headers(status, "", body)
+    }
+
+    pub(crate) fn with_headers(status: u16, headers: &str, body: &str) -> Result<Resp, Error> {
         Ok(Resp {
             status,
-            headers: String::new(),
+            headers: headers.to_string(),
             body: body.as_bytes().to_vec(),
         })
     }

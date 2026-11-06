@@ -298,7 +298,8 @@ impl Shark {
 
     /// `name`'s title, for messages; `name` itself once it's gone.
     pub(crate) fn ws_title(&self, name: &str) -> String {
-        self.ws(name).map_or(name, Workspace::display_title).into()
+        self.ws(name)
+            .map_or(name.into(), |w| w.display_title().into())
     }
 
     /// "Rename agent…": a field with the title.
@@ -330,9 +331,10 @@ impl Shark {
     }
 
     /// Only the title changes: identity is `name`, so directories, transcripts and branches
-    /// stay. An empty title changes nothing.
+    /// stay. An empty title changes nothing, nor does one left as shown: untitled stays untitled.
     pub(super) fn set_title(&mut self, name: &str, title: String, cx: &mut Context<Self>) {
-        if let Some(ws) = self.ws_mut(name).filter(|_| !title.is_empty()) {
+        let edited = |w: &&mut Workspace| !title.is_empty() && title != w.display_title();
+        if let Some(ws) = self.ws_mut(name).filter(edited) {
             ws.title = title;
             let _ = self.state.save();
             cx.notify();
@@ -1229,6 +1231,8 @@ impl Shark {
                 self.state.remove_workspace(name);
                 crate::linear::delete_snapshots(name);
                 let _ = std::fs::remove_file(crate::scripts::log_path(name));
+                // Names come back around, and a later agent must not find these.
+                let _ = std::fs::remove_file(crate::features::git::drafts_path(name));
                 let _ = self.state.save();
                 if self.active.as_deref() == Some(name) {
                     self.active = None;

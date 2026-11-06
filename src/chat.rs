@@ -468,13 +468,28 @@ impl Chat {
         !self.working() && !self.asking() && !self.steered
     }
 
-    /// Why sends wait, if they do. Every path that sends asks this, through `send_block` at least.
-    fn held(&self) -> Option<&'static str> {
-        match (self.hold, self.attach_hold) {
-            (true, _) => Some("a git step is running"),
-            (_, true) => Some("a repository is being attached"),
-            _ => None,
+    /// Why sends wait, if they do, and what to do about it. Every path that sends asks this,
+    /// through `send_block` at least.
+    pub fn held(&self) -> Option<String> {
+        use crate::state::AttachStage::*;
+        if self.hold {
+            return Some("a git step is running".into());
         }
+        if !self.attach_hold {
+            return None;
+        }
+        let list = &self.ws.attaching;
+        let Some(a) = list.iter().find(|a| a.stuck()).or(list.first()) else {
+            return Some("a repository is being attached".into());
+        };
+        let repo = &a.repo;
+        let chip = "its chip in the header (or Attach repository… in cmd-k)";
+        Some(match a.stage {
+            SetupFailed => format!("setup of {repo} failed; open {chip} to retry or continue"),
+            Uncertain => format!("Shark can't tell how {repo} ended up; open {chip} to check"),
+            Queued => format!("{repo} is queued to attach; {chip} says what it waits for"),
+            Creating | Setup => format!("{repo} is being attached; {chip} shows how far it got"),
+        })
     }
 
     pub fn queued(&self) -> usize {
