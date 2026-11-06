@@ -9,6 +9,9 @@ documents = {}
 waiting = []
 ignore_shutdown = False
 exit_needs_eof = False
+semantic_tokens = None
+semantic_waiting = []
+hold_semantic = False
 
 
 def send(value):
@@ -36,7 +39,26 @@ with open(log_path, "a") as log:
         method = message.get("method")
         params = message.get("params", {})
         if method == "initialize":
-            respond(message, dict(capabilities=dict(positionEncoding="utf-16", textDocumentSync=dict(openClose=True, change=1, save=dict(includeText=True)), completionProvider=dict(resolveProvider=True))))
+            capabilities = dict(positionEncoding="utf-16", textDocumentSync=dict(openClose=True, change=1, save=dict(includeText=True)), completionProvider=dict(resolveProvider=True))
+            options = params.get("initializationOptions") or {}
+            if "semanticTokensProvider" in options:
+                capabilities["semanticTokensProvider"] = options["semanticTokensProvider"]
+            respond(message, dict(capabilities=capabilities))
+        elif method == "test/setSemanticTokens":
+            semantic_tokens = params.get("tokens")
+            hold_semantic = params.get("hold", False)
+            respond(message, None)
+        elif method in ("textDocument/semanticTokens/full", "textDocument/semanticTokens/range"):
+            assert params["textDocument"]["uri"] in documents
+            if hold_semantic:
+                semantic_waiting.append((message, semantic_tokens))
+            else:
+                respond(message, semantic_tokens)
+        elif method == "test/releaseSemanticTokens":
+            for pending, tokens in semantic_waiting:
+                respond(pending, tokens)
+            semantic_waiting.clear()
+            respond(message, None)
         elif method == "workspace/didChangeConfiguration":
             send(dict(id="config", method="workspace/configuration", params=dict(items=[dict(section="python.analysis"), {}])))
         elif method == "textDocument/didOpen":

@@ -77,6 +77,8 @@ pub(super) fn swift(project: &Project) -> Result<Launch> {
     let program = run(&project.root, "/usr/bin/xcrun", &["--find", "sourcekit-lsp"], 15)
         .context("Install/select Xcode or a Swift toolchain with SourceKit-LSP (xcode-select --switch /Applications/Xcode.app)")?;
     let mut result = launch(project, program.into(), &[]);
+    // Ask SourceKit for syntax as well as type-aware colors.
+    result.initialization_options = json!({"reportSyntacticHighlightInSemanticTokens": true});
     let bsp = project.root.join("buildServer.json");
     if project.root.join("Package.swift").is_file() {
         if bsp.exists() {
@@ -207,7 +209,7 @@ pub(super) fn swift(project: &Project) -> Result<Launch> {
     }
     // Background indexing waits on SweetPad's prepare, which builds every target first and
     // holds diagnostics back. SweetPad's builds still write the index sourcekit-lsp reads.
-    result.initialization_options = json!({"backgroundIndexing": false});
+    result.initialization_options["backgroundIndexing"] = false.into();
     Ok(result)
 }
 

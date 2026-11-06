@@ -14,6 +14,177 @@ fn fake_client(root: &std::path::Path, log: &std::path::Path) -> Client {
     Client::start(fake_server(log), root, json!({})).unwrap()
 }
 
+struct PendingDefinition(async_channel::Receiver<Vec<lsp_types::LocationLink>>);
+
+impl gpui_kit::base::input::DefinitionProvider for PendingDefinition {
+    fn definitions(
+        &self,
+        _: &gpui_kit::base::input::Rope,
+        _: usize,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Vec<lsp_types::LocationLink>>> {
+        let response = self.0.clone();
+        cx.spawn(async move |_| Ok(response.recv().await?))
+    }
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn semantic_highlighting_opens_refreshes_edits_and_restarts(cx: &mut TestAppContext) {
+    let _turn = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for full in [false, true] {
+        let initial = "// 😀\nlet value: Int = 1\n";
+        let (dir, file, window, editor) =
+            ui_tests::open_editor("a.swift", "semantic", initial, cx).await;
+        let log = dir.join("semantic.jsonl");
+        let client = fake_client(&dir, &log);
+        block_on(
+            client.initialize_with_options(json!({"semanticTokensProvider":{
+                "legend":{"tokenTypes":["class","enumMember","method"],"tokenModifiers":[]},
+                "range":!full,"full":full
+            }})),
+        )
+        .unwrap();
+        // The deterministic UI scheduler cannot be woken by the peer's OS thread.
+        // Hold responses so edits/restarts exercise cancellation instead.
+        block_on(client.request("test/setSemanticTokens", json!({"hold":true}))).unwrap();
+        let project = Project {
+            root: dir.clone(),
+            worktree: dir.clone(),
+            backend: Backend::Swift,
+            toolchain: String::new(),
+            rust_toolchain: None,
+            interpreter: None,
+        };
+        let session = cx.update(|cx| cx.new(|_| Session::with_client(project, client.clone())));
+        cx.update_window(window, |_, w, cx| {
+            editor.update(cx, |e, cx| e.attach_language(session.clone(), w, cx));
+        })
+        .unwrap();
+        let method = if full {
+            "textDocument/semanticTokens/full"
+        } else {
+            "textDocument/semanticTokens/range"
+        };
+        let requests = || {
+            logged(&log)
+                .into_iter()
+                .filter(|v| v["method"] == method)
+                .collect::<Vec<_>>()
+        };
+        cx.wait_for(window, Duration::from_secs(10), |_, _| {
+            !requests().is_empty()
+        })
+        .await;
+        cx.update(|cx| {
+            let provider = editor
+                .read(cx)
+                .input
+                .read(cx)
+                .lsp()
+                .semantic_tokens_provider
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(provider.legend().token_types).unwrap(),
+                json!(["type", "constant", "function"])
+            );
+        });
+        let (definition, response) = async_channel::unbounded();
+        let navigated = std::rc::Rc::new(std::cell::Cell::new(false));
+        cx.update_window(window, |_, w, cx| {
+            focus(&editor, w, cx);
+            editor.read(cx).input.clone().update(cx, |i, _| {
+                i.lsp_mut().definition_provider =
+                    Some(std::rc::Rc::new(PendingDefinition(response)));
+                let navigated = navigated.clone();
+                i.lsp_mut().show_document = Some(std::rc::Rc::new(move |_, _, _| {
+                    navigated.set(true);
+                    true
+                }));
+            });
+            w.dispatch_action(Box::new(gpui_kit::base::input::GoToDefinition), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let before = requests().len();
+        cx.update(|cx| {
+            session.update(cx, |_, cx| {
+                cx.emit(crate::lsp::SessionEvent::Notification {
+                    method: "workspace/semanticTokens/refresh".into(),
+                    params: Value::Null,
+                    companion: false,
+                })
+            })
+        });
+        cx.wait_for(window, Duration::from_secs(10), |_, _| {
+            requests().len() > before
+        })
+        .await;
+        definition
+            .try_send(vec![lsp_types::LocationLink {
+                origin_selection_range: None,
+                target_uri: crate::lsp::document::file_uri(&file).unwrap(),
+                target_range: Default::default(),
+                target_selection_range: Default::default(),
+            }])
+            .unwrap();
+        cx.run_until_parked();
+        assert!(navigated.get(), "semantic refresh cancelled navigation");
+        let before = requests().len();
+        let edited = "// 😀\nlet value: String = \"unsaved\"\n";
+        cx.update_window(window, |_, w, cx| {
+            editor.update(cx, |e, cx| e.replace_language_text(edited.into(), w, cx));
+        })
+        .unwrap();
+        cx.wait_for(window, Duration::from_secs(10), |_, _| {
+            requests().len() > before
+        })
+        .await;
+        let messages = logged(&log);
+        let change = messages
+            .iter()
+            .rposition(|v| v["method"] == "textDocument/didChange")
+            .unwrap();
+        let tokens = messages
+            .iter()
+            .rposition(|v| v["method"] == method)
+            .unwrap();
+        assert!(change < tokens);
+        assert_eq!(
+            messages[change]["params"]["contentChanges"][0]["text"],
+            edited
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), initial);
+        assert!(messages.iter().any(|v| v["method"] == "$/cancelRequest"));
+        cx.update(|cx| {
+            session.update(cx, |s, cx| {
+                s.client = None;
+                s.generation += 1;
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(
+                editor
+                    .read(cx)
+                    .input
+                    .read(cx)
+                    .lsp()
+                    .semantic_tokens_provider
+                    .is_none()
+            )
+        });
+        block_on(client.request("test/releaseSemanticTokens", Value::Null)).unwrap();
+        client.shutdown();
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn language_replacements_preserve_selection_scroll_and_one_vim_undo(cx: &mut TestAppContext) {

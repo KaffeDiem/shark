@@ -10,7 +10,9 @@ use super::review_comment::{Comment, Status, judge, lines_now, posted_as, side, 
 use super::review_store::CommentStore;
 use super::*;
 use crate::chat::parse_reports;
-use crate::diff_view::{DiffAnnotation, DiffLinePosition, DiffLineRange, DiffSide};
+use crate::diff_view::{
+    CONTEXT_LINES, DiffAnnotation, DiffLinePosition, DiffLineRange, DiffSide, DisplayRow,
+};
 use gpui_kit::component::input::{Enter, Escape, Textarea, TextareaState};
 use std::cell::Cell;
 
@@ -57,6 +59,31 @@ pub(crate) fn parse_hunks(chunk: &str) -> Vec<Hunk> {
     hunks
 }
 
+/// The hunks git prints at its default context, for GitHub inline comments.
+/// Local review uses the displayed rows, including expanded context.
+pub(crate) fn narrow_hunks(hunks: Vec<Hunk>) -> Vec<Hunk> {
+    let mut out = vec![];
+    for hunk in hunks {
+        let mut keep = vec![false; hunk.len()];
+        for (i, _) in hunk.iter().enumerate().filter(|(_, l)| l.0 != b' ') {
+            let end = (i + CONTEXT_LINES + 1).min(hunk.len());
+            keep[i.saturating_sub(CONTEXT_LINES)..end].fill(true);
+        }
+        let mut run = vec![];
+        for (line, keep) in hunk.into_iter().zip(keep) {
+            if keep {
+                run.push(line);
+            } else if !run.is_empty() {
+                out.push(std::mem::take(&mut run));
+            }
+        }
+        if !run.is_empty() {
+            out.push(run);
+        }
+    }
+    out
+}
+
 /// A row the cursor can sit on: a file header or a source line.
 #[derive(Clone, Debug, PartialEq)]
 enum Spot {
@@ -83,69 +110,43 @@ struct Row {
     h: f32,
 }
 
-/// The diff's rows in display order, like `DiffState` projects them: unified mode lists a
-/// change's removed lines before its added ones, split mode pairs them. Collapsed (viewed)
-/// files are a header only.
-// ponytail: rebuilt per key, ~1ms per 50k patch lines; cache per refresh if it shows up.
-fn rows(files: &[(SharedString, &[Hunk], bool)], split: bool) -> Vec<Row> {
+/// The displayed code rows, including opened context but skipping folds themselves.
+fn rows(diff: &DiffState) -> Vec<Row> {
     let mut out = vec![];
-    for (path, hunks, collapsed) in files {
+    let mut gap = 0.;
+    for row in diff.rows().iter() {
+        let file = &diff.files()[row.file()];
+        let (spot, old, changed, h) = match row {
+            DisplayRow::File(_) => (Spot::File(file.path().clone()), None, false, 2.),
+            DisplayRow::Code {
+                original,
+                modified,
+                changed,
+                ..
+            } => {
+                let position = modified
+                    .map(|i| file.position(DiffSide::Modified, i))
+                    .or_else(|| original.map(|i| file.position(DiffSide::Original, i)))
+                    .unwrap();
+                let old = original.map(|i| file.line_number(DiffSide::Original, i));
+                (Spot::Line(position), old, *changed, 1.)
+            }
+            DisplayRow::Hunk { .. } | DisplayRow::Fold { .. } => {
+                gap += 1.;
+                continue;
+            }
+            DisplayRow::Notice(_) => continue,
+        };
         out.push(Row {
-            spot: Spot::File(path.clone()),
-            old: None,
-            changed: false,
-            h: 2.,
+            spot,
+            old,
+            changed,
+            h: h + gap,
         });
-        if *collapsed {
-            continue;
-        }
-        let line =
-            |old: bool, n: usize| Spot::Line(DiffLinePosition::new(path.clone(), side(old), n));
-        for hunk in hunks.iter() {
-            let first = out.len();
-            let mut i = 0;
-            while i < hunk.len() {
-                if hunk[i].0 == b' ' {
-                    out.push(Row {
-                        spot: line(false, hunk[i].2),
-                        old: Some(hunk[i].1),
-                        changed: false,
-                        h: 1.,
-                    });
-                    i += 1;
-                    continue;
-                }
-                let end = (i..hunk.len())
-                    .find(|&j| hunk[j].0 == b' ')
-                    .unwrap_or(hunk.len());
-                let (dels, adds): (Vec<usize>, Vec<usize>) =
-                    (i..end).partition(|&j| hunk[j].0 == b'-');
-                let spots: Vec<(Spot, Option<usize>)> = match split {
-                    false => (dels.iter().map(|&j| (line(true, hunk[j].1), None)))
-                        .chain(adds.iter().map(|&j| (line(false, hunk[j].2), None)))
-                        .collect(),
-                    true => (0..dels.len().max(adds.len()))
-                        .map(|k| {
-                            let old = dels.get(k).map(|&j| hunk[j].1);
-                            match adds.get(k) {
-                                Some(&j) => (line(false, hunk[j].2), old),
-                                None => (line(true, hunk[dels[k]].1), None),
-                            }
-                        })
-                        .collect(),
-                };
-                out.extend(spots.into_iter().map(|(spot, old)| Row {
-                    spot,
-                    old,
-                    changed: true,
-                    h: 1.,
-                }));
-                i = end;
-            }
-            if let Some(r) = out.get_mut(first) {
-                r.h += 1.; // the hunk separator above it
-            }
-        }
+        gap = 0.;
+    }
+    if let Some(last) = out.last_mut() {
+        last.h += gap;
     }
     out
 }
@@ -231,6 +232,7 @@ pub(crate) struct Composer {
 pub(crate) struct Review {
     /// Top row and cursor of the keyboard view; `None` once the mouse scrolled.
     view: Option<(Spot, Spot)>,
+    /// Default-context hunks for GitHub inline eligibility.
     pub(crate) hunks: HashMap<SharedString, Vec<Hunk>>,
     /// The diff pane as last painted.
     viewport: Rc<Cell<Bounds<Pixels>>>,
@@ -298,14 +300,7 @@ fn textarea(
 
 impl Differ {
     fn diff_rows(&self, cx: &App) -> Vec<Row> {
-        let d = self.diff.read(cx);
-        let files: Vec<(SharedString, &[Hunk], bool)> = (self.diff_files.iter())
-            .map(|f| {
-                let hunks = self.review.hunks.get(f.path()).map_or(&[][..], |h| &h[..]);
-                (f.path().clone(), hunks, d.is_file_collapsed(f.path()))
-            })
-            .collect();
-        rows(&files, d.mode() == DiffMode::Split)
+        rows(self.diff.read(cx))
     }
 
     /// Scrolls `top` to the top of the diff and shows the cursor as the selected line.
@@ -423,6 +418,13 @@ impl Differ {
         let Some((top, cur)) = self.review.view.clone() else {
             return false;
         };
+        self.diff.update(cx, |d, cx| {
+            for spot in [&top, &cur] {
+                if let Spot::Line(line) = spot {
+                    d.scroll_to_line(line.clone(), cx);
+                }
+            }
+        });
         let rows = self.diff_rows(cx);
         let (t, c) = (find(&rows, &top), find(&rows, &cur));
         self.apply_view(&rows, t, c, cx);
@@ -528,25 +530,26 @@ impl Differ {
         })
     }
 
-    /// Whether the diff shows the thread's line (in a hunk, on its side).
+    /// Whether the current diff contains the thread's line, including folded context.
     pub(crate) fn on_its_line(&self, c: &Comment) -> bool {
-        self.hunk_of(c, c.end.1).is_some()
+        let now = (c.path.split_once('/')).and_then(|(repo, _)| self.diff_revs.get(repo));
+        if c.end.0 && now.is_some_and(|r| !r.is_empty() && !c.rev.is_empty() && *r != c.rev) {
+            return false;
+        }
+        self.diff_files
+            .iter()
+            .any(|file| *file.path() == c.path && file.line_index(side(c.end.0), c.end.1).is_some())
     }
 
     /// Whether one hunk of the diff shows all the thread's lines, as GitHub wants an inline
     /// comment's.
     pub(crate) fn in_one_hunk(&self, c: &Comment) -> bool {
         let h = self.hunk_of(c, c.end.1);
-        h.is_some() && self.hunk_of(c, c.start.1) == h
+        self.on_its_line(c) && h.is_some() && self.hunk_of(c, c.start.1) == h
     }
 
-    /// The hunk of the diff showing line `line` of the comment's side. Old-side numbers count
-    /// in the commit the comment was made against, so another compare commit shows none.
+    /// The default-context hunk containing the line, for GitHub inline eligibility.
     fn hunk_of(&self, c: &Comment, line: usize) -> Option<usize> {
-        let now = (c.path.split_once('/')).and_then(|(repo, _)| self.diff_revs.get(repo));
-        if c.end.0 && now.is_some_and(|r| !r.is_empty() && !c.rev.is_empty() && *r != c.rev) {
-            return None;
-        }
         (self.review.hunks.get(c.path.as_str()))?
             .iter()
             .position(|h| {
@@ -1091,6 +1094,10 @@ impl Differ {
     /// annotated there), keeping the selected lines.
     fn reveal(&mut self, spot: &Spot, below: f32, cx: &mut Context<Self>) {
         let sel = self.diff.read(cx).selected_lines();
+        if let Spot::Line(line) = spot {
+            self.diff
+                .update(cx, |d, cx| d.scroll_to_line(line.clone(), cx));
+        }
         let rows = self.diff_rows(cx);
         let cur = find(&rows, spot);
         let top = (self.review.view.as_ref()).map_or(cur, |(t, _)| find(&rows, t));
@@ -1842,8 +1849,9 @@ impl Differ {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use core::prelude::v1::test;
 
-    const PATCH: &str = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,4 +1,4 @@ fn x\n a\n-b\n-c\n+B\n d\n\\ No newline at end of file\n@@ -10 +10,2 @@\n x\n+y\n";
+    const PATCH: &str = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,4 +1,3 @@ fn x\n a\n-b\n-c\n+B\n d\n@@ -10 +10,2 @@\n x\n+y\n\\ No newline at end of file\n";
 
     fn spots(rows: &[Row]) -> Vec<String> {
         rows.iter()
@@ -1854,17 +1862,123 @@ mod tests {
             .collect()
     }
 
-    #[::core::prelude::v1::test]
-    fn rows_follow_the_diff_layout() {
+    #[gpui_kit::test]
+    fn expanded_context_keeps_local_comments_and_navigation(cx: &mut TestAppContext) {
+        cx.update(|cx| {
+            gpui_kit::component::init(cx);
+            crate::diff_view::init(cx);
+        });
+        let (differ, cx) = cx.add_window_view(|window, cx| {
+            Differ::new(
+                Preferences::from(&crate::state::State::default()),
+                window,
+                cx,
+            )
+        });
+        let body = (1..=60)
+            .map(|n| {
+                if n == 30 {
+                    "-line 30\n+changed 30\n".to_string()
+                } else {
+                    format!(" line {n}\n")
+                }
+            })
+            .collect::<String>();
+        let patch = format!(
+            "diff --git a/api/f b/api/f\n--- a/api/f\n+++ b/api/f\n@@ -1,60 +1,60 @@\n{body}"
+        );
+        differ.update_in(cx, |d, window, cx| {
+            d.diff_files = DiffFile::parse(&patch).unwrap();
+            d.review
+                .hunks
+                .insert("api/f".into(), narrow_hunks(parse_hunks(&patch)));
+            d.diff
+                .update(cx, |state, cx| state.set_files(d.diff_files.clone(), cx));
+            let line = |n| Spot::Line(DiffLinePosition::new("api/f", DiffSide::Modified, n));
+            assert!(!d.diff_rows(cx).iter().any(|r| r.spot == line(10)));
+            d.review.at_file("api/f");
+            d.diff_move(1, None, window, cx);
+            assert_eq!(d.diff.read(cx).selected_lines().unwrap().start(), 27);
+
+            // Opening a context comment reveals its line before finding the keyboard row.
+            d.reveal(&line(10), 0., cx);
+            let visible = d.diff_rows(cx);
+            assert!(visible.iter().any(|r| r.spot == line(10)));
+            assert!(!visible.iter().any(|r| r.spot == line(50)));
+            d.diff_move(1, None, window, cx);
+            assert_eq!(d.diff.read(cx).selected_lines().unwrap().start(), 11);
+
+            // Adding or removing another file resets folds but must preserve both saved lines.
+            for add in [true, false] {
+                if add {
+                    d.diff_files.push(DiffFile::unchanged("api/other", "other"));
+                } else {
+                    d.diff_files.pop();
+                }
+                d.review.view = Some((line(10), line(50)));
+                d.diff
+                    .update(cx, |state, cx| state.set_files(d.diff_files.clone(), cx));
+                assert!(!d.diff_rows(cx).iter().any(|r| r.spot == line(10)));
+                assert!(d.restore_view(cx));
+                assert_eq!(d.review.view, Some((line(10), line(50))));
+                assert_eq!(d.diff.read(cx).selected_lines().unwrap().start(), 50);
+            }
+
+            let mut comment =
+                Comment::from_range(&DiffLineRange::new("api/f", DiffSide::Modified, 10, 10));
+            assert!(
+                d.on_its_line(&comment),
+                "context comments stay attached to their source line"
+            );
+            assert!(
+                !d.in_one_hunk(&comment),
+                "expanded context is not a GitHub anchor"
+            );
+            comment.start.1 = 30;
+            comment.end.1 = 30;
+            assert!(d.in_one_hunk(&comment));
+            comment.start.0 = true;
+            comment.end.0 = true;
+            comment.rev = "old-base".into();
+            d.diff_revs.insert("api".into(), "new-base".into());
+            assert!(!d.on_its_line(&comment));
+            assert!(!d.in_one_hunk(&comment));
+        });
+    }
+
+    #[gpui_kit::test]
+    fn rows_follow_the_diff_layout(cx: &mut TestAppContext) {
+        // Whole-file context narrows to git's default hunks; 7 lines apart stay separate.
+        let line = |k: u8, n: usize| (k, n, n);
+        let hunk = |changes: &[usize]| -> Hunk {
+            (1..=30)
+                .map(|n| line(if changes.contains(&n) { b'+' } else { b' ' }, n))
+                .collect()
+        };
+        let spans = |hunks: Vec<Hunk>| -> Vec<(usize, usize)> {
+            let span = |h: &Hunk| (h[0].2, h[h.len() - 1].2);
+            hunks.iter().map(span).collect()
+        };
+        assert_eq!(spans(narrow_hunks(vec![hunk(&[10])])), [(7, 13)]);
+        assert_eq!(spans(narrow_hunks(vec![hunk(&[10, 17])])), [(7, 20)]);
+        assert_eq!(
+            spans(narrow_hunks(vec![hunk(&[10, 18])])),
+            [(7, 13), (15, 21)]
+        );
+        assert_eq!(
+            spans(narrow_hunks(vec![hunk(&[1, 30])])),
+            [(1, 4), (27, 30)]
+        );
+
         let hunks = parse_hunks(PATCH);
         assert_eq!(hunks.len(), 2);
         assert_eq!(hunks[0][3], (b'+', 0, 2));
         assert_eq!(hunks[1], [(b' ', 10, 10), (b'+', 0, 11)]);
-        let files = [
-            ("r/f".into(), &hunks[..], false),
-            ("r/g".into(), &[][..], false),
-        ];
-        let unified = rows(&files, false);
+        let patch = PATCH.replace("a/f", "a/r/f").replace("b/f", "b/r/f");
+        let mut files = DiffFile::parse(&patch).unwrap();
+        files.push(DiffFile::unchanged("r/g", ""));
+        let state = cx.new(|cx| DiffState::new(files, cx));
+        let unified = state.read_with(cx, |d, _| rows(d));
         assert_eq!(
             spots(&unified),
             [
@@ -1879,9 +1993,11 @@ mod tests {
                 "F r/g"
             ]
         );
-        let split = rows(&files, true);
+        state.update(cx, |d, cx| d.set_mode(DiffMode::Split, cx));
+        let split = state.read_with(cx, |d, _| rows(d));
         assert_eq!(spots(&split)[2..4], ["Modified 2", "Original 3"]);
-        assert_eq!(rows(&[("r/f".into(), &hunks[..], true)], false).len(), 1);
+        state.update(cx, |d, cx| d.set_file_collapsed("r/f", true, cx));
+        assert_eq!(state.read_with(cx, |d, _| rows(d).len()), 2);
 
         // A refresh that dropped the line lands on the closest one above it.
         let gone = Spot::Line(DiffLinePosition::new("r/f", DiffSide::Modified, 7));

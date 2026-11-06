@@ -337,7 +337,8 @@ impl Client {
                     "applyEdit":true,"workspaceFolders":true,"configuration":true,
                     "workspaceEdit":{"documentChanges":true,"failureHandling":"transactional"},
                     "didChangeWatchedFiles":{"dynamicRegistration":true,"relativePatternSupport":true},
-                    "diagnostics":{"refreshSupport":true}
+                    "diagnostics":{"refreshSupport":true},
+                    "semanticTokens":{"refreshSupport":true}
                 },
                 "window":{"workDoneProgress":true,"showDocument":{"support":true}},
                 "textDocument":{
@@ -349,6 +350,13 @@ impl Client {
                     "documentSymbol":{"hierarchicalDocumentSymbolSupport":true},
                     "publishDiagnostics":{"versionSupport":true,"relatedInformation":true},
                     "diagnostic":{"relatedDocumentSupport":true},
+                    "semanticTokens":{
+                        "requests":{"range":true,"full":true},
+                        "tokenTypes":["namespace","type","class","enum","interface","struct","typeParameter","parameter","variable","property","enumMember","event","function","method","macro","keyword","modifier","comment","string","number","regexp","operator","decorator"],
+                        "tokenModifiers":[],"formats":["relative"],
+                        "overlappingTokenSupport":false,"multilineTokenSupport":false,
+                        "augmentsSyntaxTokens":true
+                    },
                     "codeAction":{"codeActionLiteralSupport":{"codeActionKind":{"valueSet":["","quickfix","refactor","source.organizeImports","source.fixAll"]}}},
                     "rename":{"prepareSupport":true}
                 }

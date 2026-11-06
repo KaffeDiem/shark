@@ -124,7 +124,7 @@ impl FileEditor {
             |this: &mut Self, _, ev: &InputEvent, window, cx| {
                 if matches!(ev, InputEvent::Change) && this.loaded {
                     this.lsp_request = None;
-                    this.language_changed();
+                    this.language_changed(cx);
                     this.dirty = true;
                     this.snippet_changed(window, cx);
                     this.sync_language(window, cx);
@@ -295,7 +295,7 @@ impl FileEditor {
                     (None, _) => e.conflict = e.loaded,
                     (Some(text), Some(fp)) => {
                         e.snippets.resolve = None;
-                        e.language_changed();
+                        e.language_changed(cx);
                         e.disk = fp;
                         e.dirty = false;
                         e.conflict = false;

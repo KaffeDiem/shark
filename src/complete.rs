@@ -226,7 +226,7 @@ pub fn cached_commands(ws: &str) -> Vec<Item> {
 
 /// Asks `claude` for its commands (skills, plugin skills, built-ins) with the stream-json
 /// `initialize` control request. Takes about a second, costs no tokens, starts no session.
-pub fn probe_commands(ws: &str, dir: &Path) -> Option<Vec<Item>> {
+pub fn probe_commands(ws: &str, dir: &Path, skills: &[String]) -> Option<Vec<Item>> {
     let mut child = Command::new("claude")
         .args([
             "-p",
@@ -236,6 +236,7 @@ pub fn probe_commands(ws: &str, dir: &Path) -> Option<Vec<Item>> {
             "stream-json",
             "--verbose",
         ])
+        .args(skills)
         .current_dir(dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -608,7 +609,7 @@ mod tests {
     #[test]
     #[ignore]
     fn live_probe() {
-        let cmds = probe_commands("live-probe-test", &std::env::temp_dir()).expect("probe");
+        let cmds = probe_commands("live-probe-test", &std::env::temp_dir(), &[]).expect("probe");
         let _ = fs::remove_file(cache_path("live-probe-test"));
         assert!(
             cmds.iter().any(|c| c.insert == "/compact"),

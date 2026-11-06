@@ -150,6 +150,8 @@ pub struct Chat {
     /// respawns it on the next send.
     agent_model: Option<String>,
     agent_effort: &'static str,
+    /// Repo directories passed to the running Claude (`git::claude_skill_args`).
+    agent_skills: Vec<String>,
     /// Virtualized: only visible rows render, which matters while a spinner redraws every frame.
     list: ListState,
     pub focus: FocusHandle,
@@ -323,6 +325,7 @@ impl Chat {
             model_at: Default::default(),
             agent_model: None,
             agent_effort: EFFORT,
+            agent_skills: Vec::new(),
             list: ListState::new(1, ListAlignment::Top, px(400.)), // the activity footer
             focus: cx.focus_handle(),
             reader: None,
@@ -658,8 +661,10 @@ impl Chat {
             return false;
         }
         // Never mid-turn: a steer would kill the turn it means to steer.
+        let skills = crate::git::claude_skill_args(&self.ws);
         let stale = self.agent_model != self.meta.model
-            || (!self.codex() && self.agent_effort != self.effort());
+            || (!self.codex()
+                && (self.agent_effort != self.effort() || self.agent_skills != skills));
         if self.agent.is_some() && stale && !self.busy && !self.steered {
             self.agent = None; // drop stops it; the respawn resumes the same session on the new model/level
             self.set_background(vec![], cx); // its reader is replaced below, so its Exited never arrives
@@ -676,6 +681,7 @@ impl Chat {
                     self.agent = Some(a);
                     self.agent_model = self.meta.model.clone();
                     self.agent_effort = self.effort();
+                    self.agent_skills = skills;
                     self.reader = Some(read_events(rx, Self::apply, cx));
                 }
                 Err(e) => {
@@ -1189,13 +1195,18 @@ impl Chat {
             PLAN_TOOL => {
                 let text = input["plan"].as_str().unwrap_or_default().to_string();
                 self.show_plan(tool_use_id, text, cx);
-                PLAN_SHOWN
+                Some(PLAN_SHOWN)
             }
-            "EnterPlanMode" => ENTER_PLAN,
-            _ => NEEDS_APPROVAL,
+            "EnterPlanMode" => Some(ENTER_PLAN),
+            // Plan mode asks for these too, and planning needs the web.
+            "WebSearch" | "WebFetch" => None,
+            _ => Some(NEEDS_APPROVAL),
         };
         if let Some(a) = &mut self.agent
-            && let Err(e) = a.deny(&request_id, reason)
+            && let Err(e) = match reason {
+                Some(reason) => a.deny(&request_id, reason),
+                None => a.allow(&request_id, input),
+            }
         {
             self.blocks
                 .push(Block::Info(format!("answering the agent failed: {e}")));
@@ -2248,7 +2259,7 @@ pub(crate) mod ui_tests {
         });
     }
 
-    /// A claude stand-in that swallows stdin. Side questions and Ask Shark (both
+    /// A claude stand-in that keeps stdin next to it. Side questions and Ask Shark (both
     /// `--no-session-persistence`) get a canned answer, and their args are written next to it.
     const FAKE: &str = r#"#!/bin/sh
 case "$*" in *--no-session-persistence*)
@@ -2258,7 +2269,7 @@ case "$*" in *--no-session-persistence*)
   echo '{"type":"assistant","message":{"content":[{"type":"text","text":"Forty-two"}]},"parent_tool_use_id":null}'
   echo '{"type":"result","is_error":false,"result":"Forty-two","total_cost_usd":0,"duration_ms":1}'
 esac
-exec cat >/dev/null
+exec cat >>"$0.stdin"
 "#;
 
     /// Installs the script once for the whole test run: tests run in parallel, and one must
@@ -2645,6 +2656,48 @@ exec cat >/dev/null
                 })
             })
         };
+        // The web runs with its input as asked; other tools stay refused.
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                for (id, tool) in [
+                    ("web-1", "WebSearch"),
+                    ("web-2", "WebFetch"),
+                    ("bash-1", "Bash"),
+                ] {
+                    let input = serde_json::json!({"query": id});
+                    let (request_id, tool, tool_use_id) = (id.into(), tool.into(), id.into());
+                    c.apply(
+                        Ev::Permission {
+                            request_id,
+                            tool,
+                            tool_use_id,
+                            input,
+                        },
+                        cx,
+                    );
+                }
+            })
+        });
+        let replied = |id: &str| {
+            let needle = format!(r#""request_id":"{id}""#);
+            let stdin = fake_claude().with_extension("stdin");
+            // A cold first run starts the fake slowly.
+            for _ in 0..6000 {
+                let sent = std::fs::read_to_string(&stdin).unwrap_or_default();
+                if let Some(line) = sent.lines().find(|l| l.contains(&needle)) {
+                    return serde_json::from_str::<Value>(line).unwrap()["response"]["response"]
+                        .clone();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("no reply to {id}");
+        };
+        for id in ["web-1", "web-2"] {
+            let r = replied(id);
+            assert_eq!(r["behavior"], "allow", "{r}");
+            assert_eq!(r["updatedInput"]["query"], id, "{r}");
+        }
+        assert_eq!(replied("bash-1")["message"], NEEDS_APPROVAL);
         submit(cx, "t1", "# Cache\n\nUse a map.\n");
         submit(cx, "t2", "# Cache\n\nUse an LRU map.\n");
         act(cx, &|_, _| {});
@@ -3112,6 +3165,48 @@ exec cat >/dev/null
                 c.agent_model = c.meta.model.clone();
                 c.agent_effort = "high";
                 assert_ne!(c.agent_effort, c.effort());
+            })
+        });
+    }
+
+    #[gpui_kit::test]
+    fn added_repo_skills_restart_claude_only_on_idle_send(cx: &mut TestAppContext) {
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        fake_claude();
+        let chat = open_chat("added-repo-skills", cx);
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                let dir = c.ws.dir();
+                std::fs::create_dir_all(&dir).unwrap();
+                assert!(c.send_text("first".into(), false, cx));
+                assert!(c.agent_skills.is_empty());
+                let mut ws = c.ws.clone();
+                std::fs::create_dir_all(dir.join("api")).unwrap();
+                ws.repos.push(crate::state::WsRepo {
+                    name: "api".into(),
+                    src: dir.join("api"),
+                    base: "HEAD".into(),
+                    branch: None,
+                });
+                c.repos_changed(&ws, "added api".into(), cx);
+                assert!(c.send_text("steer".into(), true, cx));
+                assert!(c.agent_skills.is_empty(), "never restart an active turn");
+                c.apply(
+                    Ev::Result {
+                        is_error: false,
+                        text: String::new(),
+                        secs: 0,
+                    },
+                    cx,
+                );
+                assert!(c.send_text("next".into(), false, cx));
+                assert_eq!(c.agent_skills, crate::git::claude_skill_args(&ws));
+                assert_eq!(c.agent_skills.len(), 2, "restarted with the added repo");
+                c.reader = None;
+                c.agent = None;
+                std::fs::remove_dir_all(dir).unwrap();
             })
         });
     }

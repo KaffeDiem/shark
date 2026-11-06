@@ -702,6 +702,54 @@ async fn closing_shows_the_strip_neighbor(cx: &mut TestAppContext) {
     );
 }
 
+/// A middle click closes the tab under the pointer, of any kind, and keeps the shown one.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn middle_click_closes_the_tab_under_the_pointer(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let (window, shark) = boot(cx, fixture(&home), WindowOptions::default());
+    let on = on_app(window, shark.clone());
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).file_tabs.len() == 2
+    })
+    .await;
+    on(cx, &|s, w, cx| s.select_chat(0, w, cx));
+    let strip = |cx: &mut TestAppContext| {
+        cx.update(|cx| {
+            let s = shark.read(cx);
+            s.visible_tab_ids(s.active_ws().unwrap(), cx)
+        })
+    };
+    let click = |cx: &mut TestAppContext, id: &TabId, button| {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            let at = w.find(element(id)).bounds().center();
+            w.pointer_move(at, None, cx);
+            w.pointer_down(at, button, cx);
+            w.pointer_up(at, button, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    let chat = TabId::Chat("mixed".into());
+    let mut left = strip(cx);
+    for id in [
+        TabId::File("api/a.txt".into()),
+        TabId::Diff,
+        TabId::Git,
+        TabId::File("api/b.txt".into()),
+    ] {
+        click(cx, &id, MouseButton::Middle);
+        left.retain(|t| *t != id);
+        assert_eq!(strip(cx), left);
+        assert_eq!(cx.update(|cx| shark.read(cx).tab), Tab::Chat);
+    }
+    // Other aux buttons don't close. Not Right: its menu covers the tab before the release.
+    click(cx, &chat, MouseButton::Navigate(NavigationDirection::Back));
+    assert_eq!(strip(cx), [chat]);
+}
+
 /// Closing the only chat puts its fresh replacement in the same slot, and shows it.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]

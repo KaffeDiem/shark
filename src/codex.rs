@@ -58,6 +58,8 @@ pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receive
     if !ws.dir().join("AGENTS.md").exists() {
         crate::git::write_claude_md(ws); // a workspace from before codex chats
     }
+    // Also catches skills a pull brought in since the links were last written.
+    crate::git::link_skills(ws, &ws.dir());
     let (agent, rx) = agent::start(
         cmd,
         &ws.dir(),

@@ -170,6 +170,7 @@ impl Shark {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut state = State::load();
         crate::prompts::set_overrides(&state.prompts);
+        crate::git::set_repo_skills(!state.no_repo_skills);
         crate::theme::apply(&state.appearance, cx);
         if let Some(size) = state.editor_font_size {
             cx.set_global(crate::editor::CodeFont(editor_pane::clamp_font_size(size)));
