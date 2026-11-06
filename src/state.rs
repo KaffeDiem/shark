@@ -50,7 +50,7 @@ pub struct State {
     pub stay_awake: bool,
     /// Who Linear is connected as; the credential itself is in the Keychain.
     #[serde(default)]
-    pub linear: Option<crate::app::linear_connection::Connection>,
+    pub linear: Option<crate::linear::Connection>,
     /// Keep the repos' skills from the agents (`git::claude_skill_args`, `git::link_skills`).
     #[serde(default)]
     pub no_repo_skills: bool,

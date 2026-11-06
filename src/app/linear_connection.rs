@@ -2,7 +2,7 @@
 //! for. Ordinary settings hold only `Connection`. The credential stays in the Keychain, and
 //! nothing reads it until a feature asks, because a read can prompt on macOS.
 use super::Shark;
-use crate::linear::{self, Credential, Error, Flow, Http, Identity, Session};
+use crate::linear::{self, Connection, Credential, Error, Flow, Http, Identity, Method, Session};
 use crate::settings::stacked;
 use crate::ui::{card, confirm, notify_err};
 #[cfg(all(test, feature = "test-support"))]
@@ -17,7 +17,6 @@ use gpui_kit::component::{
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -31,24 +30,6 @@ const CHANGED: &str = "The Linear connection changed. Try again.";
 const LEAVING: &str = "Attached issues stay readable but can't refresh. Nothing changes in Linear.";
 /// Settings > Account > Security & Access, per https://linear.app/docs/api-and-webhooks.
 const KEY_PAGE: &str = "https://linear.app/settings/account/security";
-
-#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
-pub enum Method {
-    #[default]
-    OAuth,
-    ApiKey,
-}
-
-/// What `state.json` keeps of the connection. Never the credential.
-#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
-pub struct Connection {
-    /// Organization UUID.
-    pub org_id: String,
-    pub org: String,
-    pub user: String,
-    pub method: Method,
-}
 
 /// The Keychain calls. The test platform's stubs can't fail, so tests swap these.
 #[derive(Clone, Copy)]

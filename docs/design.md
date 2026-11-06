@@ -246,7 +246,7 @@ Run `python3 docs/contrast.py '<fg>' '<bg>' …` for every new pair. Also: no pu
 | Markdown | `TextView` + `TextViewState::markdown` |
 | Primary action | `Button::new(..).primary()`, at most one per view |
 | Row action button | `Button::new(..).ghost().xsmall()` with an icon only, shown on the row |
-| Copy button | `chat::copy_button` (gpui-kit `Clipboard`: `Copy` turns into `Check` for 2s) in content, `Clipboard` itself in a header. Rendered markdown goes through `chat::markdown` for code-block copy |
+| Copy button | `ui::copy_button` (gpui-kit `Clipboard`: `Copy` turns into `Check` for 2s) in content, `Clipboard` itself in a header. Rendered markdown goes through `ui::markdown` for code-block copy |
 
 ## Copy buttons
 - **Never move anything.** A hover-revealed button is `invisible()` until its group is hovered, so its slot is always laid out. Showing it, and the check after a copy, changes no size.

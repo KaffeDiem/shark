@@ -25,7 +25,7 @@ impl Chat {
             return;
         }
         self.meta.plan = on;
-        if self.busy && self.codex() {
+        if self.busy && self.active_codex() {
             self.push(
                 Block::Info("codex switches plan mode from the next message".into()),
                 cx,

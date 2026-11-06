@@ -384,6 +384,7 @@ struct DocumentInner {
     line_number_digits: usize,
     /// The patch body in order; each side's lines map back into it.
     patch_lines: Vec<PatchLine>,
+    patch_hunks: Vec<Range<usize>>,
     patch_ixs: [Vec<usize>; 2],
 }
 
@@ -437,7 +438,8 @@ impl DiffFile {
             .clone()
             .or_else(|| original.path.clone())
             .unwrap_or_default();
-        let (patch_lines, patch_ixs) = patch_order(&pairs, &hunks, &original, &modified);
+        let (patch_lines, patch_ixs, patch_hunks) =
+            patch_order(&pairs, &hunks, &original, &modified);
         Self {
             inner: Arc::new(DocumentInner {
                 path,
@@ -453,6 +455,7 @@ impl DiffFile {
                 line_number_digits: widest.max(1).ilog10() as usize + 1,
                 patch_lines,
                 patch_ixs,
+                patch_hunks,
             }),
         }
     }
@@ -576,6 +579,13 @@ impl DiffFile {
         self.inner.line_number_digits
     }
 
+    /// Validated patch lines grouped by their original hunk boundaries.
+    pub(crate) fn patch_hunks(&self) -> impl Iterator<Item = &[PatchLine]> {
+        self.inner
+            .patch_hunks
+            .iter()
+            .map(|range| &self.inner.patch_lines[range.clone()])
+    }
     pub(crate) fn patch_lines(&self) -> &[PatchLine] {
         &self.inner.patch_lines
     }
@@ -621,7 +631,7 @@ fn patch_order(
     hunks: &[Hunk],
     original: &FileSide,
     modified: &FileSide,
-) -> (Vec<PatchLine>, [Vec<usize>; 2]) {
+) -> (Vec<PatchLine>, [Vec<usize>; 2], Vec<Range<usize>>) {
     let mut lines = Vec::with_capacity(pairs.len());
     let mut ixs = [vec![0; original.lines.len()], vec![0; modified.lines.len()]];
     let ranges = if hunks.is_empty() {
@@ -629,7 +639,9 @@ fn patch_order(
     } else {
         hunks.iter().map(Hunk::pairs).collect()
     };
+    let mut patch_hunks = Vec::with_capacity(hunks.len());
     for range in ranges {
+        let start = lines.len();
         let mut ix = range.start;
         while ix < range.end {
             let pair = pairs[ix];
@@ -648,6 +660,9 @@ fn patch_order(
             );
             ix = end;
         }
+        if !hunks.is_empty() {
+            patch_hunks.push(start..lines.len());
+        }
     }
     for (patch_ix, line) in lines.iter().enumerate() {
         if let Some(ix) = line.original {
@@ -657,7 +672,7 @@ fn patch_order(
             ixs[1][ix] = patch_ix;
         }
     }
-    (lines, ixs)
+    (lines, ixs, patch_hunks)
 }
 
 /// Builds the display form of one source line from its range in `source`.

@@ -438,7 +438,19 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         if let Some(chat) = self.chats.get(id) {
-            chat.update(cx, |c, cx| c.retry_history(cx));
+            chat.update(cx, |c, cx| {
+                c.retry_history(cx);
+                c.plan.update(cx, |p, cx| p.retry_save(cx));
+            });
+            let plan_error = chat
+                .read(cx)
+                .plan
+                .read(cx)
+                .storage_error()
+                .map(str::to_owned);
+            if let Some(error) = plan_error {
+                return notify_err(window, cx, error);
+            }
             if chat.read(cx).history_save_error.is_some() {
                 return notify_err(
                     window,
@@ -695,7 +707,7 @@ impl Shark {
             return notify_err(window, cx, "Open an agent first");
         };
         chat.update(cx, |c, cx| c.set_model(m, cx));
-        let m = crate::chat::model_label(m);
+        let m = crate::models::model_label(m);
         window.push_notification(format!("Model: {m} (from the next message)"), cx);
     }
 
@@ -718,7 +730,7 @@ impl Shark {
     }
 
     fn effort_toast(&self, chat: &Entity<Chat>, window: &mut Window, cx: &mut Context<Self>) {
-        let l = crate::chat::effort_label(chat.read(cx).effort());
+        let l = crate::models::effort_label(chat.read(cx).effort());
         window.push_notification(format!("Thinking: {l} (from the next message)"), cx);
     }
 

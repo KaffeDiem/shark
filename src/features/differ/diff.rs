@@ -73,7 +73,7 @@ impl DiffData {
                 let file = parse_chunk(chunk)?;
                 hunks.insert(
                     file.path().clone(),
-                    review::narrow_hunks(review::parse_hunks(chunk)),
+                    review::narrow_hunks(review::hunks(&file)),
                 );
                 media.extend(media::MediaFile::parse(file.path(), chunk, &ws_dir));
                 Some((file, review_comment::chunk_fingerprint(chunk)))

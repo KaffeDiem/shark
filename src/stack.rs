@@ -30,7 +30,7 @@ pub fn chain(
     local: &[(String, String, String)],
     prs: &[Pr],
 ) -> (Vec<Node>, usize) {
-    let trunk_name = crate::sync::short(trunk);
+    let trunk_name = crate::git::short(trunk);
     let own: Vec<&Pr> = prs.iter().filter(|p| !p.is_cross_repository).collect();
     let node = |b: &str| Node {
         branch: b.to_string(),

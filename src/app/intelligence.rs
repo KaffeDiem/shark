@@ -267,7 +267,7 @@ impl Shark {
         let session = self
             .editor
             .as_ref()
-            .and_then(|e| e.read(cx).intelligence.as_ref().map(|l| l.session.clone()));
+            .and_then(|e| e.read(cx).language().map(|l| l.session.clone()));
         let Some(session) = session else {
             return self.restart_language(window, cx);
         };
@@ -312,11 +312,7 @@ impl Shark {
         let Some(editor) = self.editor.clone() else {
             return;
         };
-        let session = editor
-            .read(cx)
-            .intelligence
-            .as_ref()
-            .map(|l| l.session.clone());
+        let session = editor.read(cx).language().map(|l| l.session.clone());
         let project = session.as_ref().map(|s| s.read(cx).project.clone());
         let editors = if let Some(session) = session {
             self.language_sessions
@@ -326,8 +322,7 @@ impl Shark {
                 .filter(|tab| {
                     tab.editor
                         .read(cx)
-                        .intelligence
-                        .as_ref()
+                        .language()
                         .is_some_and(|language| language.session == session)
                 })
                 .map(|tab| tab.editor.clone())
@@ -342,17 +337,14 @@ impl Shark {
         // Retry discovers current environments and regroups every document that shared the server.
         for editor in editors {
             editor.update(cx, |e, cx| {
-                e.intelligence = None;
-                e.lsp_setup = None;
-                e.lsp_request = None;
-                e.lsp_error = None;
-                e.clear_language_view(cx);
+                let follow = e.external.then(|| anchor.clone()).flatten();
+                e.detach_language(follow, cx);
             });
             if !editor.read(cx).external {
                 self.start_language(&editor, window, cx);
-            } else if let Some(anchor) = &anchor {
-                editor.update(cx, |e, _| e.reattach_to = Some(anchor.clone()));
-            } else if let Some(project) = project.clone() {
+            } else if anchor.is_none()
+                && let Some(project) = project.clone()
+            {
                 let session = cx.new(|cx| Session::new(project, window, cx));
                 self.register_session(session.clone(), window, cx);
                 editor.update(cx, |e, cx| e.attach_language(session, window, cx));
@@ -418,7 +410,7 @@ impl Shark {
         if e.external && matches!(action, Format) {
             return notify_err(window, cx, "Dependency sources are read-only");
         }
-        let Some(language) = &e.intelligence else {
+        let Some(language) = e.language() else {
             return notify_err(window, cx, "Language tools are not ready");
         };
         let Some(client) = (match action {
@@ -513,7 +505,7 @@ impl Shark {
                 }
             });
         });
-        request_editor.update(cx, |e, _| e.lsp_request = Some(task));
+        request_editor.update(cx, |e, _| e.track_language_request(task));
     }
 
     /// The keyboard Go to definition: the editor's own Command-click request at the cursor.
@@ -566,7 +558,7 @@ impl Shark {
                     return;
                 }
                 let Some(editor) = weak.upgrade() else { return };
-                match project {
+                let error = match project {
                     Ok(Some(project)) => {
                         let session = match s.language_sessions.get(&project.session_key()) {
                             Some((session, _)) => session.clone(),
@@ -579,32 +571,25 @@ impl Shark {
                         // Dependency sources Retry detached from this editor follow it.
                         let followers: Vec<_> = (s.file_tabs.iter())
                             .map(|t| t.editor.clone())
-                            .filter(|f| f.read(cx).reattach_to.as_ref() == Some(&weak))
+                            .filter(|f| f.read(cx).follows_language(&weak))
                             .chain([editor.clone()])
                             .collect();
                         for follower in followers {
-                            follower.update(cx, |e, cx| {
-                                e.reattach_to = None;
-                                e.attach_language(session.clone(), window, cx)
-                            });
+                            follower
+                                .update(cx, |e, cx| e.attach_language(session.clone(), window, cx));
                         }
+                        None
                     }
-                    Ok(None) => {}
-                    Err(error) => editor.update(cx, |e, cx| {
-                        e.lsp_error = Some(format!("{error:#}"));
-                        cx.notify();
-                    }),
-                }
-                editor.update(cx, |e, _| e.discovering = false);
+                    Ok(None) => None,
+                    Err(error) => Some(format!("{error:#}")),
+                };
+                editor.update(cx, |e, cx| e.finish_language_discovery(error, cx));
                 // A session kept only for this file's discovery may have no user now.
                 s.prune_language_sessions(cx);
                 cx.notify();
             });
         });
-        editor.update(cx, |e, _| {
-            e.lsp_setup = Some(task);
-            e.discovering = true;
-        });
+        editor.update(cx, |e, cx| e.begin_language_discovery(task, cx));
     }
 
     /// Keeps `session` for its project's editors, routing its server requests and messages.
@@ -646,11 +631,11 @@ impl Shark {
         self.language_sessions.retain(|_, (session, _)| {
             tabs.iter().any(|t| {
                 let e = t.editor.read(cx);
-                match &e.intelligence {
+                match e.language() {
                     Some(l) => l.session == *session,
                     // A file still discovering (say, just restored) may be about to join it.
                     None => {
-                        e.discovering
+                        e.discovering_language()
                             && e.absolute_path()
                                 .starts_with(&session.read(cx).project.worktree)
                     }
@@ -682,7 +667,7 @@ impl Shark {
                 if editor.read(cx).input.read(cx).value().as_ref() != snapshot.text.as_ref() {
                     return notify_err(window, cx, "The document changed; request the edit again");
                 }
-                let Some(language) = &editor.read(cx).intelligence else {
+                let Some(language) = editor.read(cx).language() else {
                     return;
                 };
                 let root = language.session.read(cx).project.worktree.clone();
@@ -814,7 +799,7 @@ impl Shark {
             path: editor.absolute_path().to_owned(),
             selection: editor.input.read(cx).selected_range(),
             scroll: editor.input.read(cx).scroll_offset(),
-            session: (editor.intelligence.as_ref()).map(|l| l.session.downgrade()),
+            session: (editor.language()).map(|l| l.session.downgrade()),
         })
     }
 
@@ -863,7 +848,7 @@ impl Shark {
         };
         let e = editor.read(cx);
         if e.outline.is_empty() {
-            let message = match e.intelligence {
+            let message = match e.language() {
                 Some(_) => "No symbols in this file",
                 None if e.external => "No language tools for this dependency source",
                 None => "Language tools are not ready",
@@ -981,7 +966,7 @@ impl Shark {
             (None, Some(reply)) => Some(reply.session.clone()),
             (None, None) => origin
                 .as_ref()
-                .and_then(|e| (e.read(cx).intelligence.as_ref()).map(|l| l.session.downgrade())),
+                .and_then(|e| (e.read(cx).language()).map(|l| l.session.downgrade())),
         };
         let open_paths: Vec<_> = self
             .file_tabs
@@ -1197,7 +1182,7 @@ impl Shark {
                 OpenDoc {
                     path: e.absolute_path().to_owned(),
                     text: e.input.read(cx).text().clone(),
-                    snapshot: e.intelligence.as_ref().map(|l| l.snapshot.clone()),
+                    snapshot: e.language().map(|l| l.snapshot.clone()),
                     blocked: e.conflict || e.saving || e.external,
                     fingerprint: e.disk_fingerprint(),
                 }
@@ -1243,11 +1228,7 @@ impl Shark {
                                     && !e.saving
                                     && !e.external
                                     && e.input.read(cx).value().as_ref() == edit.before
-                                    && e.intelligence.as_ref().map(|l| l
-                                        .snapshot
-                                        .lock()
-                                        .unwrap()
-                                        .version)
+                                    && e.language().map(|l| l.snapshot.lock().unwrap().version)
                                         == edit.version,
                                 "{} changed; request the edit again",
                                 edit.relative

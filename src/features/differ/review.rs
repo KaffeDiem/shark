@@ -9,54 +9,38 @@
 use super::review_comment::{Comment, Status, judge, lines_now, posted_as, side, slice};
 use super::review_store::CommentStore;
 use super::*;
-use crate::chat::parse_reports;
 use crate::diff_view::{
     CONTEXT_LINES, DiffAnnotation, DiffLinePosition, DiffLineRange, DiffSide, DisplayRow,
 };
+use crate::review_protocol::parse_reports;
 use gpui_kit::component::input::{Enter, Escape, Textarea, TextareaState};
 use std::cell::Cell;
 
 /// One hunk's patch lines: kind (`b' '`, `b'-'`, `b'+'`), old and new one-based line numbers.
 pub(crate) type Hunk = Vec<(u8, usize, usize)>;
 
-/// Hunks of one file's patch chunk, so the cursor knows the rows the diff draws.
-pub(crate) fn parse_hunks(chunk: &str) -> Vec<Hunk> {
-    let mut hunks: Vec<Hunk> = vec![];
-    let (mut old, mut new, mut inside) = (0, 0, false);
-    for line in chunk.lines() {
-        if let Some(rest) = line.strip_prefix("@@ -") {
-            let start = |s: &str| s.split(',').next()?.parse::<usize>().ok();
-            let mut parts = rest.split(' ');
-            let o = parts.next().and_then(start);
-            let n = parts.next().and_then(|s| start(s.strip_prefix('+')?));
-            inside = o.is_some() && n.is_some();
-            (old, new) = (o.unwrap_or(0), n.unwrap_or(0));
-            if inside {
-                hunks.push(vec![]);
-            }
-            continue;
-        }
-        let Some(h) = hunks.last_mut().filter(|_| inside) else {
-            continue;
-        };
-        match line.as_bytes().first() {
-            Some(b' ') | None => {
-                h.push((b' ', old, new));
-                (old, new) = (old + 1, new + 1);
-            }
-            Some(b'-') => {
-                h.push((b'-', old, 0));
-                old += 1;
-            }
-            Some(b'+') => {
-                h.push((b'+', 0, new));
-                new += 1;
-            }
-            Some(b'\\') => {}
-            _ => inside = false,
-        }
-    }
-    hunks
+/// Geometry from the same validated patch model used for display.
+pub(crate) fn hunks(file: &DiffFile) -> Vec<Hunk> {
+    file.patch_hunks()
+        .map(|hunk| {
+            hunk.iter()
+                .map(|line| {
+                    let old = line
+                        .line(DiffSide::Original)
+                        .map(|ix| file.line_number(DiffSide::Original, ix));
+                    let new = line
+                        .line(DiffSide::Modified)
+                        .map(|ix| file.line_number(DiffSide::Modified, ix));
+                    let kind = match (old, new) {
+                        (Some(_), Some(_)) => b' ',
+                        (Some(_), None) => b'-',
+                        _ => b'+',
+                    };
+                    (kind, old.unwrap_or(0), new.unwrap_or(0))
+                })
+                .collect()
+        })
+        .collect()
 }
 
 /// The hunks git prints at its default context, for GitHub inline comments.
@@ -1853,6 +1837,59 @@ mod tests {
 
     const PATCH: &str = "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -1,4 +1,3 @@ fn x\n a\n-b\n-c\n+B\n d\n@@ -10 +10,2 @@\n x\n+y\n\\ No newline at end of file\n";
 
+    #[test]
+    fn geometry_preserves_empty_sides_and_unterminated_lines() {
+        let file = |body: &str| {
+            DiffFile::parse(&format!("diff --git a/f b/f\n--- a/f\n+++ b/f\n{body}"))
+                .unwrap()
+                .remove(0)
+        };
+        assert_eq!(
+            hunks(&file("@@ -0,0 +1,2 @@\n+a\n+b\n")),
+            [vec![(b'+', 0, 1), (b'+', 0, 2)]]
+        );
+        assert_eq!(
+            hunks(&file("@@ -1,2 +0,0 @@\n-a\n-b\n")),
+            [vec![(b'-', 1, 0), (b'-', 2, 0)]]
+        );
+        assert_eq!(
+            hunks(&file(
+                "@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b\n\\ No newline at end of file\n"
+            )),
+            [vec![(b'-', 1, 0), (b'+', 0, 1)]]
+        );
+        assert!(hunks(&file("@@ -0,0 +0,0 @@\n")).iter().all(Vec::is_empty));
+        assert!(hunks(&DiffFile::unchanged("f", "parse failure\n")).is_empty());
+    }
+
+    #[test]
+    fn expanded_geometry_is_narrowed_only_for_remote_inline_policy() {
+        let patch = |expanded: bool| {
+            let (first, last) = if expanded { (1, 20) } else { (7, 13) };
+            let body: String = (first..=last)
+                .map(|line| {
+                    if line == 10 {
+                        "-old\n+new\n".into()
+                    } else {
+                        format!(" line {line}\n")
+                    }
+                })
+                .collect();
+            let count = last - first + 1;
+            format!(
+                "diff --git a/f b/f\n--- a/f\n+++ b/f\n@@ -{first},{count} +{first},{count} @@\n{body}"
+            )
+        };
+        let expanded = hunks(&DiffFile::parse(&patch(true)).unwrap()[0]);
+        let remote = hunks(&DiffFile::parse(&patch(false)).unwrap()[0]);
+        assert_eq!(expanded[0].len(), 21);
+        assert_eq!(narrow_hunks(expanded), remote);
+        for bad in ["@@ -1,2 +1,2 @@\n-a\n+b\n", "@@ -1 +1 @@\n-a\n+b\n+c\n"] {
+            let source = format!("diff --git a/f b/f\n--- a/f\n+++ b/f\n{bad}");
+            assert!(DiffFile::parse(&source).is_err());
+        }
+    }
+
     fn spots(rows: &[Row]) -> Vec<String> {
         rows.iter()
             .map(|r| match &r.spot {
@@ -1891,7 +1928,7 @@ mod tests {
             d.diff_files = DiffFile::parse(&patch).unwrap();
             d.review
                 .hunks
-                .insert("api/f".into(), narrow_hunks(parse_hunks(&patch)));
+                .insert("api/f".into(), narrow_hunks(hunks(&d.diff_files[0])));
             d.diff
                 .update(cx, |state, cx| state.set_files(d.diff_files.clone(), cx));
             let line = |n| Spot::Line(DiffLinePosition::new("api/f", DiffSide::Modified, n));
@@ -1970,7 +2007,7 @@ mod tests {
             [(1, 4), (27, 30)]
         );
 
-        let hunks = parse_hunks(PATCH);
+        let hunks = hunks(&DiffFile::parse(PATCH).unwrap()[0]);
         assert_eq!(hunks.len(), 2);
         assert_eq!(hunks[0][3], (b'+', 0, 2));
         assert_eq!(hunks[1], [(b' ', 10, 10), (b'+', 0, 11)]);

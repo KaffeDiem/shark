@@ -1,6 +1,7 @@
 //! Right-click menus and the path helpers they share.
 use super::*;
 use crate::apps::{self, Kind};
+use crate::menu::each_or_all;
 
 /// `/Users/me/x` → `~/x`: paths in menus are read, so keep them short.
 pub(super) fn tilde(path: &Path) -> String {
@@ -222,7 +223,7 @@ pub(super) fn branch_label(this: &Shark, ws: &Workspace, cx: &App) -> String {
         false => parents,
         true => (ws.repos.iter())
             .filter(|r| r.base.starts_with("origin/"))
-            .map(|r| crate::sync::short(&r.base))
+            .map(|r| crate::git::short(&r.base))
             .collect(),
     };
     crate::stack::title(&ws.branch, &bases)
@@ -379,7 +380,7 @@ pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) 
     );
     let github: Vec<Entry> = [
         each_or_all(IconName::Github, "Open branch on GitHub", links, open_urls),
-        sync.and_then(pr_entry),
+        sync.and_then(|sync| sync.pr_entry()),
     ]
     .into_iter()
     .flatten()
@@ -471,19 +472,6 @@ fn stack_actions(
     out
 }
 
-/// "Open pull request" for each repo with one, or `None` before any PR.
-pub(crate) fn pr_entry(sync: &crate::sync::GitSync) -> Option<Entry> {
-    let prs = (sync.pr_urls().into_iter())
-        .map(|(repo, url)| (repo, String::new(), url))
-        .collect();
-    each_or_all(
-        IconName::GitPullRequest,
-        "Open pull request",
-        prs,
-        open_urls,
-    )
-}
-
 fn open_urls(urls: &[String], _: &mut Window, cx: &mut App) {
     urls.iter().for_each(|u| cx.open_url(u))
 }
@@ -498,35 +486,6 @@ pub(super) fn base_hint(ws: &Workspace) -> String {
         [] => String::new(),
         _ => "per repo".into(),
     }
-}
-
-/// `label` for `rows` of `(label, hint, value)`, usually one per repo: a single row is one
-/// item, hinted with its label; several make a submenu ending in "All". `f` gets the values.
-pub(crate) fn each_or_all(
-    icon: IconName,
-    label: &'static str,
-    mut rows: Vec<(String, String, String)>,
-    f: impl Fn(&[String], &mut Window, &mut App) + 'static,
-) -> Option<Entry> {
-    let f = Rc::new(f);
-    if rows.len() < 2 {
-        let (hint, _, v) = rows.pop()?;
-        let item = menu::item(icon, label, move |w, cx| f(std::slice::from_ref(&v), w, cx));
-        return Some(item.hint(hint));
-    }
-    let all: Vec<String> = rows.iter().map(|r| r.2.clone()).collect();
-    let mut entries: Vec<Entry> = (rows.into_iter())
-        .map(|(name, hint, v)| {
-            let f = f.clone();
-            let run = move |w: &mut Window, cx: &mut App| f(std::slice::from_ref(&v), w, cx);
-            menu::item(IconName::FolderGit2, name, run).hint(hint)
-        })
-        .collect();
-    entries.extend([
-        Entry::Sep,
-        menu::item(None, "All", move |w, cx| f(&all, w, cx)),
-    ]);
-    Some(menu::sub(icon, label, entries))
 }
 
 /// Right-click menu of a sidebar repo row.
@@ -603,35 +562,4 @@ pub(super) fn on_ws(
 ) -> impl Fn(&mut Window, &mut App) + 'static {
     let name = name.to_string();
     on_shark(cx, move |s, w, cx| f(s, name.clone(), w, cx))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
-
-    #[test]
-    fn each_or_all_collapses_one_row() {
-        let row = |n: &str| (n.to_string(), String::new(), n.to_string());
-        let f: fn(&[String], &mut Window, &mut App) = |_, _, _| {};
-        assert!(each_or_all(IconName::Github, "Open", vec![], f).is_none());
-        match each_or_all(IconName::Github, "Open", vec![row("api")], f) {
-            Some(Entry::Item { label, hint, .. }) => {
-                assert_eq!((&*label, hint.as_deref()), ("Open", Some("api")))
-            }
-            _ => panic!("one row is one item"),
-        }
-        match each_or_all(IconName::Github, "Open", vec![row("api"), row("web")], f) {
-            Some(Entry::Sub { entries, .. }) => {
-                let labels: Vec<_> = (entries.iter())
-                    .map(|e| match e {
-                        Entry::Item { label, .. } => label.to_string(),
-                        _ => "-".into(),
-                    })
-                    .collect();
-                assert_eq!(labels, ["api", "web", "-", "All"]);
-            }
-            _ => panic!("several rows are a submenu"),
-        }
-    }
 }

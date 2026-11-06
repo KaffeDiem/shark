@@ -627,7 +627,7 @@ impl Shark {
         let from: Vec<(String, String)> = (ws.repos.iter())
             .filter(|r| r.base.starts_with("origin/"))
             .map(|r| match insert {
-                true => (r.name.clone(), sync::short(&r.base).to_string()),
+                true => (r.name.clone(), crate::git::short(&r.base).to_string()),
                 false => (r.name.clone(), ws.branch_of(r).to_string()),
             })
             .collect();
@@ -891,7 +891,7 @@ impl Shark {
             let prs: Vec<(PathBuf, String, String)> = (moves.iter())
                 .filter_map(|(r, _, n)| {
                     let url = sync.read(cx).pr_for(r)?.0.url;
-                    let b = crate::sync::short(n).to_string();
+                    let b = crate::git::short(n).to_string();
                     Some((ws.dir().join(r), url, b))
                 })
                 .collect();
@@ -1120,7 +1120,7 @@ impl Shark {
             return notify_err(
                 window,
                 cx,
-                "Unsaved comments or answers: Retry save before deleting this agent",
+                "Unsaved data: Retry save before deleting this agent",
             );
         }
         let Some(ws) = self.ws(name).cloned() else {

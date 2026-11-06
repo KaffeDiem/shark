@@ -44,7 +44,7 @@ fn entries(case: &str) -> Vec<Entry> {
             action(IconName::Github, "Merge PRs…"),
             action(IconName::GitBranch, "Delete remote branches after merge").checked(true),
         ],
-        "models" => crate::chat::model_entries(&ChatMeta::default(), |_, _| {}, |_, _| {}).0,
+        "models" => crate::ui::model_entries(&ChatMeta::default(), |_, _| {}, |_, _| {}).0,
         _ => vec![
             menu::sub(
                 IconName::FolderOpen,

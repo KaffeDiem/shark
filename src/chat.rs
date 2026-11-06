@@ -3,7 +3,6 @@ mod completion;
 #[cfg(all(test, feature = "test-support"))]
 pub(crate) mod completion_pixels;
 mod critters;
-mod links;
 mod model;
 mod planmode;
 mod question;
@@ -16,8 +15,11 @@ use self::queue::Queued;
 use crate::agent::{self, Agent, Ev};
 use crate::complete::{self, Item};
 use crate::models::EFFORT;
+use crate::models::{effort_label, model_label};
 use crate::plan::{self, PlanPane};
+use crate::review_protocol::{ReviewCard, card_of, hidden_reply, hide_reports, may_report};
 use crate::state::{ChatMeta, REPO_CONTEXT, Workspace, context_record};
+use crate::ui::{copy_button, link_roots, markdown, model_entries};
 use crate::ui::{hint, plural};
 use crate::vim::{self, Vim};
 use crate::*;
@@ -35,21 +37,15 @@ use gpui_kit::component::notification::Notification;
 use gpui_kit::component::scroll::ScrollableElement;
 use gpui_kit::component::shimmer::ShimmerText;
 use gpui_kit::component::spinner::Spinner;
-use gpui_kit::component::text::{TextView, TextViewState, TextViewStyle};
+use gpui_kit::component::text::TextViewState;
 use gpui_kit::component::tooltip::Tooltip;
 use gpui_kit::component::{
     ActiveTheme, Icon, Selectable as _, ThemeColor, WindowExt as _, h_flex, v_flex,
 };
 use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
-pub(crate) use links::{copy_button, link_roots, markdown};
-pub(crate) use model::{effort_label, model_entries, model_label};
 use planmode::{ENTER_PLAN, NEEDS_APPROVAL, PLAN_SHOWN};
-use review::{
-    NOTES_END, card_of, hidden_reply, hide_reports, info_notes, may_report, review_title,
-    split_notes,
-};
-pub(crate) use review::{ReviewCard, ReviewItem, parse_reports};
+use review::{NOTES_END, info_notes, review_title, split_notes};
 use serde_json::Value;
 use side::Side;
 use std::collections::{HashMap, VecDeque};
@@ -844,7 +840,7 @@ impl Chat {
 
     fn sent(&mut self, text: String, review: Option<Rc<ReviewCard>>, cx: &mut Context<Self>) {
         // codex runs `/compact` as a request of its own, with no user message to echo.
-        let echoed = !(self.codex() && text.trim() == "/compact");
+        let echoed = !(self.active_codex() && text.trim() == "/compact");
         let queued = self.busy && echoed;
         if !self.busy {
             self.started = Some(Instant::now());
@@ -1075,6 +1071,11 @@ impl Chat {
             Ev::Text(full) => self.on_full_text(full, cx),
             Ev::ToolUse { id, name, input } => self.on_tool_use(id, name, input),
             Ev::ToolResult { id, text, is_error } => self.on_tool_result(id, text, is_error),
+            Ev::Questions(request) => {
+                if !self.replaying {
+                    self.show_asked(request, cx);
+                }
+            }
             Ev::Permission {
                 request_id,
                 tool,
@@ -1129,8 +1130,7 @@ impl Chat {
     ) {
         // A process of the backend the chat just switched away from: its session
         // can't be resumed by the new one.
-        let stale =
-            !self.replaying && codex::is_codex(self.agent_model.as_deref()) != self.meta.is_codex();
+        let stale = !self.replaying && self.active_codex() != self.meta.is_codex();
         if !stale && self.meta.session_id.as_ref() != Some(&id) {
             self.meta.session_id = Some(id);
             if !self.replaying {
@@ -1245,7 +1245,7 @@ impl Chat {
         let call = Call {
             summary: match name.as_str() {
                 PLAN_TOOL => plan::title(input["plan"].as_str().unwrap_or_default()),
-                ASK_TOOL => question::asked_summary(&input),
+                ASK_TOOL => crate::transcript::asked_summary(&input),
                 _ => summarize(&input, &self.ws.dir().to_string_lossy()),
             },
             input: full_input(&input),
@@ -1273,7 +1273,7 @@ impl Chat {
         });
         if let Some((bi, c)) = call {
             if c.name == ASK_TOOL
-                && let Some(answer) = question::answered(&text)
+                && let Some(answer) = crate::transcript::answered(&text)
             {
                 c.summary = answer.to_string();
             }
@@ -1291,11 +1291,6 @@ impl Chat {
         input: Value,
         cx: &mut Context<Self>,
     ) {
-        // Questions wait for the user's answers in a card; the turn holds meanwhile.
-        // (Replayed history has none: a request is only ever live.)
-        if tool == ASK_TOOL && !self.replaying {
-            return self.show_asked(request_id, tool_use_id, input, cx);
-        }
         // Plan mode's approval happens in the plan pane, after the turn: the agent is
         // told the plan was shown, and the turn ends instead of waiting on a person.
         let reason = match tool.as_str() {
@@ -1329,7 +1324,7 @@ impl Chat {
         let cut = std::mem::take(&mut self.cut);
         // Codex won't start a turn for unread messages after refusal/interruption. Retiring them
         // also keeps a later retry of the same text from acknowledging the refused message.
-        if self.codex() && (is_error || cut) {
+        if self.active_codex() && (is_error || cut) {
             self.drop_unread(cx);
             self.told.clear();
             self.steered = false;
@@ -1455,7 +1450,7 @@ impl Chat {
                                         )
                                     }
                                     (ASK_TOOL, _) => (c.result.as_deref())
-                                        .and_then(question::answered)
+                                        .and_then(crate::transcript::answered)
                                         .unwrap_or(&c.summary)
                                         .to_string(),
                                     _ => c.summary.clone(),
@@ -2945,15 +2940,12 @@ exec cat >>"$0.stdin"
                     c.busy = true;
                     c.agent_model = c.meta.model.clone(); // a codex process asks
                     c.apply(
-                        Ev::Permission {
-                            request_id: id.into(),
-                            tool: ASK_TOOL.into(),
-                            tool_use_id: format!("call-{id}"),
-                            input: serde_json::json!({"questions": [
+                        Ev::Questions(agent::Questions::new(
+                            id.into(), format!("call-{id}"), serde_json::json!({"questions": [
                                 {"id": "db", "header": "DB", "question": "Which DB?", "isOther": true, "options": [{"label": "Postgres", "description": "SQL"}, {"label": "Redis", "description": "KV"}]},
                                 {"id": "tests", "header": "Tests", "question": "Which tests?", "isOther": true, "options": [{"label": "Unit", "description": ""}, {"label": "E2E", "description": ""}]},
-                            ]}),
-                        },
+                            ]}), true,
+                        )),
                         cx,
                     );
                 })
@@ -3252,6 +3244,137 @@ exec cat >>"$0.stdin"
                 assert_eq!(c.meta.session_id, None);
             })
         });
+    }
+
+    /// A model pick affects the successor, while compact and failed steers keep the live backend's semantics.
+    #[gpui_kit::test]
+    fn busy_backend_switch_keeps_live_compact_and_result_semantics(cx: &mut TestAppContext) {
+        use std::os::unix::fs::PermissionsExt;
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let root =
+            std::env::temp_dir().join(format!("shark-backend-switch-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let fake = root.join("agent");
+        std::fs::write(&fake, r#"#!/bin/sh
+: > "$0.in"
+while IFS= read -r line; do
+    printf '%s\n' "$line" >> "$0.in"
+    case "$line" in
+        *'"thread/resume"'*) printf '%s\n' '{"id":"resume","result":{"thread":{"id":"th1"},"model":"m1"}}';;
+        *'"thread/start"'*) printf '%s\n' '{"id":"start","result":{"thread":{"id":"th1"},"model":"m1"}}';;
+    esac
+done
+"#).unwrap();
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+        struct Restore([Option<std::ffi::OsString>; 2]);
+        impl Drop for Restore {
+            fn drop(&mut self) {
+                for (key, old) in ["SHARK_CLAUDE", "SHARK_CODEX"].into_iter().zip(&self.0) {
+                    // SAFETY: all provider-spawning tests hold UI_LOCK.
+                    unsafe {
+                        match old {
+                            Some(old) => std::env::set_var(key, old),
+                            None => std::env::remove_var(key),
+                        }
+                    }
+                }
+            }
+        }
+        let _restore = Restore([
+            std::env::var_os("SHARK_CLAUDE"),
+            std::env::var_os("SHARK_CODEX"),
+        ]);
+        for key in ["SHARK_CLAUDE", "SHARK_CODEX"] {
+            // SAFETY: as above.
+            unsafe { std::env::set_var(key, &fake) };
+        }
+        for (running, selected, is_codex) in [
+            ("codex:gpt-6.1-sol", "opus", true),
+            ("opus", "codex:gpt-6.1-sol", false),
+        ] {
+            let chat = open_chat(
+                if is_codex {
+                    "switch-from-codex"
+                } else {
+                    "switch-from-claude"
+                },
+                cx,
+            );
+            chat.update(cx, |c, cx| {
+                std::fs::create_dir_all(c.ws.dir()).unwrap();
+                c.meta.model = Some(running.into());
+                assert!(c.send_text("first".into(), false, cx));
+                c.apply(Ev::User("first".into()), cx);
+                c.set_model(selected, cx);
+                assert_eq!(c.agent.as_ref().unwrap().is_codex(), is_codex);
+                assert_eq!(c.active_codex(), is_codex);
+                assert!(c.send_text("/compact".into(), true, cx));
+                assert_eq!(c.unread.len(), usize::from(!is_codex));
+                assert_eq!(c.steered, !is_codex);
+                let compact_seen = || {
+                    std::fs::read_to_string(fake.with_extension("in"))
+                        .unwrap_or_default()
+                        .lines()
+                        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+                        .any(|v| {
+                            if is_codex {
+                                v["method"] == "thread/compact/start"
+                            } else {
+                                v["type"] == "user" && v["message"]["content"] == "/compact"
+                            }
+                        })
+                };
+                for _ in 0..1000 {
+                    if compact_seen() {
+                        break;
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                assert!(
+                    compact_seen(),
+                    "compact must reach the process that is still running"
+                );
+                // Keep transport events out of the manually driven result assertions.
+                c.reader = None;
+                c.unread.clear();
+                c.steered = false;
+                for interrupted in [false, true] {
+                    c.busy = true;
+                    let wire = "pending".to_string();
+                    c.told.push((
+                        c.blocks.len(),
+                        [("issue:one".into(), 1)].into_iter().collect(),
+                        wire.clone(),
+                    ));
+                    c.sent(wire, None, cx);
+                    if interrupted {
+                        c.apply(Ev::Interrupted, cx);
+                    }
+                    c.apply(
+                        Ev::Result {
+                            is_error: !interrupted,
+                            text: "refused".into(),
+                            secs: 0,
+                        },
+                        cx,
+                    );
+                    assert_eq!(
+                        c.unread.is_empty(),
+                        is_codex,
+                        "interrupted={interrupted}, running={running}"
+                    );
+                    assert_eq!(c.told.is_empty(), is_codex);
+                    assert_eq!(c.steered, !is_codex);
+                    c.unread.clear();
+                    c.told.clear();
+                    c.steered = false;
+                }
+                c.drop_process(cx);
+                std::fs::remove_dir_all(c.ws.dir()).unwrap();
+            });
+        }
     }
 
     /// Thinking levels: `high` until picked, stepping stops at the ends, and a level the model

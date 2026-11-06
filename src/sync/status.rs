@@ -1,6 +1,9 @@
 //! Pure git/GitHub state per repo and the step it calls for. No gpui here, so it is unit tested.
 pub use crate::git::Op;
-use crate::git::{cmd_bounded, git, run};
+use crate::git::{cmd_bounded, git, run, short};
+#[cfg(test)]
+use crate::pr::own;
+use crate::pr::{branch_prs, github_url, origin_repo, pick_pr};
 use crate::prompts;
 use crate::prs::PrStatus;
 use serde_json::Value;
@@ -82,6 +85,15 @@ pub struct Pr {
 }
 
 impl Pr {
+    /// Remote identity captured by discovery, independent of gh's working-directory default.
+    pub fn target(&self) -> Result<crate::pr::Target, String> {
+        let target = crate::pr::Target::from_url(&self.url)?;
+        if target.number != self.number {
+            return Err("GitHub pull request URL and number disagree".into());
+        }
+        Ok(target)
+    }
+
     /// `head` is the PR's head, or a merged PR contains it.
     pub fn has(&self, head: &str) -> bool {
         self.head == head || (!head.is_empty() && self.contains_head == head)
@@ -355,46 +367,12 @@ fn checks(rollup: &Value) -> Checks {
     }
 }
 
-/// `branch`'s PRs of any state in origin's repo (`--repo`, so a fork's upstream never answers),
-/// as `gh pr list --json fields` gives them; same-named fork branches are left out.
-pub fn branch_prs(wt: &Path, branch: &str, fields: &str, secs: u64) -> Result<Vec<Value>, String> {
-    let origin = origin_repo(wt);
-    let args = crate::pr::with_repo(
-        vec![
-            "pr", "list", "--head", branch, "--state", "all", "--json", fields, "--limit", "100",
-        ],
-        origin.as_deref(),
-    );
-    let json = cmd_bounded(wt, "gh", &args, secs)?;
-    let list: Vec<Value> = serde_json::from_str(&json).map_err(|e| format!("gh: {e}"))?;
-    Ok(own(&list).into_iter().cloned().collect())
-}
-
 /// Picks this branch's PR from `gh pr list --head … --state all`: the open one, else the newest.
 /// Fork PRs whose branch happens to have the same name are ignored.
 #[cfg(test)]
 pub fn parse_prs(json: &str) -> Option<Pr> {
     let list: Vec<Value> = serde_json::from_str(json).ok()?;
     Some(parse_pr(pick_pr(&own(&list))?))
-}
-
-/// The PRs from this repo itself; a fork's PR on a same-named branch isn't about it.
-pub fn own(list: &[Value]) -> Vec<&Value> {
-    list.iter()
-        .filter(|p| p["isCrossRepository"] != true)
-        .collect()
-}
-
-/// The open PR, else the most recently updated; also how the Git tab picks, so both agree.
-pub fn pick_pr<'a>(own: &[&'a Value]) -> Option<&'a Value> {
-    own.iter()
-        .copied()
-        .find(|p| p["state"] == "OPEN")
-        .or_else(|| {
-            own.iter()
-                .copied()
-                .max_by_key(|p| p["updatedAt"].as_str().unwrap_or("").to_string())
-        })
 }
 
 fn parse_pr(pick: &Value) -> Pr {
@@ -440,14 +418,6 @@ pub fn fetch_parent(wt: &Path, parent: &str) -> Result<Option<Pr>, String> {
     let remote = format!("refs/remotes/origin/{parent}");
     let tip = crate::git::ref_oid(wt, &remote);
     Ok(pr.filter(|p| p.state == PrState::Open || tip.as_ref().is_none_or(|t| *t == p.head)))
-}
-
-/// Origin's GitHub URL, for `gh --repo`: gh may default to a fork's upstream, but branch
-/// ownership belongs to origin.
-pub fn origin_repo(wt: &Path) -> Option<String> {
-    git(wt, &["config", "--get", "remote.origin.url"])
-        .ok()
-        .and_then(|url| github_url(&url))
 }
 
 /// `Ok(None)` means the branch has no PR. Unlike `gh pr view`, "none" isn't an error exit,
@@ -649,11 +619,6 @@ pub fn restack_prompt(repos: &[&Repo], onto: impl Fn(&Repo) -> String) -> String
     };
     let pairs = repos.iter().map(|r| (&*r.name, &*r.branch));
     prompts::render_each("restack", pairs, fill)
-}
-
-/// `origin/main` → `main`, for labels.
-pub fn short(base: &str) -> &str {
-    base.strip_prefix("origin/").unwrap_or(base)
 }
 
 impl Repo {
@@ -1185,19 +1150,6 @@ pub fn step_args(kind: &Kind, r: &Repo) -> Result<Option<Vec<String>>, String> {
     }
 }
 
-/// The web URL of a GitHub remote, from its https, scp-style or ssh form.
-pub fn github_url(remote: &str) -> Option<String> {
-    let path = [
-        "https://github.com/",
-        "git@github.com:",
-        "ssh://git@github.com/",
-    ]
-    .iter()
-    .find_map(|p| remote.strip_prefix(p))?;
-    let path = path.trim_end_matches('/').trim_end_matches(".git");
-    Some(format!("https://github.com/{path}"))
-}
-
 /// `8s ago`, `2m ago`, `3h ago`, `2d ago`.
 pub fn ago(d: std::time::Duration) -> String {
     match d.as_secs() {
@@ -1256,24 +1208,23 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn github_urls() {
-        for r in [
-            "https://github.com/o/r.git",
-            "https://github.com/o/r",
-            "git@github.com:o/r.git",
-            "ssh://git@github.com/o/r.git",
-        ] {
-            assert_eq!(
-                super::github_url(r).as_deref(),
-                Some("https://github.com/o/r"),
-                "{r}"
-            );
-        }
-        assert_eq!(super::github_url("git@gitlab.com:o/r.git"), None);
-    }
-
     use super::*;
+
+    #[test]
+    fn publication_target_comes_from_discovered_url() {
+        let mut found = pr("CLEAN", Checks::Passing);
+        for url in [
+            "https://github.com/fork/repo/pull/1",
+            "https://github.example/original/repo/pull/1",
+        ] {
+            found.url = url.into();
+            assert_eq!(found.target().unwrap().url(), url);
+        }
+        found.number = 2;
+        assert!(found.target().unwrap_err().contains("disagree"));
+        found.url = "invalid".into();
+        assert!(found.target().is_err());
+    }
 
     #[test]
     fn parses_porcelain_v2() {

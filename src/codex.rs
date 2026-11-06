@@ -201,6 +201,34 @@ pub fn deny(stdin: &Mutex<ChildStdin>, request_id: &str) -> std::io::Result<()> 
     reply(stdin, request_id, json!({"decision": "decline"}))
 }
 
+/// Codex keys answers by question id and uses its TUI's free-text convention.
+pub(crate) fn question_reply(qs: &[agent::Question], answers: Option<&[agent::Answer]>) -> Value {
+    let by_id: serde_json::Map<String, Value> = match answers {
+        Some(answers) => agent::given(qs, answers)
+            .map(|(q, (labels, note), _)| {
+                let mut list = labels.clone();
+                if let Some(n) = note {
+                    if list.is_empty() {
+                        list.push("None of the above".into());
+                    }
+                    list.push(format!("user_note: {n}"));
+                }
+                (q.id.clone(), json!({ "answers": list }))
+            })
+            .collect(),
+        None => qs
+            .iter()
+            .map(|q| {
+                (
+                    q.id.clone(),
+                    json!({"answers": [format!("user_note: {}", agent::ANSWER_IN_CHAT)]}),
+                )
+            })
+            .collect(),
+    };
+    json!({ "answers": by_id })
+}
+
 pub fn reply(stdin: &Mutex<ChildStdin>, request_id: &str, result: Value) -> std::io::Result<()> {
     let id: Value = serde_json::from_str(request_id).unwrap_or(request_id.into());
     agent::write(stdin, &json!({"id": id, "result": result}))
@@ -341,14 +369,12 @@ pub fn parse(v: &Value) -> Vec<Ev> {
                 _ => vec![result(false, String::new())],
             }
         }
-        // Its questions take claude's AskUserQuestion shape where they share fields, plus
-        // `id` and `isOther`; the chat reads both.
-        (Some(USER_INPUT), _) => vec![Ev::Permission {
-            request_id: v["id"].to_string(),
-            tool: "AskUserQuestion".into(),
-            tool_use_id: s(&p["itemId"]),
-            input: json!({"questions": p["questions"]}),
-        }],
+        (Some(USER_INPUT), _) => vec![Ev::Questions(agent::Questions::new(
+            v["id"].to_string(),
+            s(&p["itemId"]),
+            json!({"questions": p["questions"]}),
+            true,
+        ))],
         (Some(method), _) if APPROVALS.contains(&method) => vec![Ev::Permission {
             request_id: v["id"].to_string(),
             tool: method.into(),
@@ -622,13 +648,13 @@ mod tests {
                     name: "ExitPlanMode".into(),
                     input: json!({"plan": ""}),
                 },
-                // Plan mode's question, for the chat to show and answer.
-                Ev::Permission {
-                    request_id: "0".into(),
-                    tool: "AskUserQuestion".into(),
-                    tool_use_id: "call_1".into(),
-                    input: json!({"questions": [{"id": "filename", "header": "Filename", "question": "Which file?", "isOther": true, "isSecret": false, "options": [{"label": "hello.txt", "description": ""}]}]}),
-                },
+                // Plan mode's question, normalized for the card.
+                Ev::Questions(agent::Questions::new(
+                    "0".into(),
+                    "call_1".into(),
+                    json!({"questions": [{"id": "filename", "header": "Filename", "question": "Which file?", "isOther": true, "isSecret": false, "options": [{"label": "hello.txt", "description": ""}]}]}),
+                    true,
+                )),
                 Ev::ToolResult {
                     id: "t6-plan".into(),
                     text: String::new(),
@@ -822,8 +848,8 @@ done
                     }
             );
             // The chat's answer to plan mode's question.
-            if let Ev::Permission { request_id, .. } = &ev {
-                a.allow(request_id, json!({"answers": {"q1": {"answers": ["A"]}}}))
+            if let Ev::Questions(request) = &ev {
+                a.answer_questions(request, Some(&[(vec!["A".into()], None)]))
                     .unwrap();
             }
             evs.push(ev);
@@ -893,8 +919,8 @@ done
     fn plans_a_turn() {
         let evs = run_fake(None, "plan", true);
         assert!(
-            matches!(&evs[..], [Ev::Init { .. }, Ev::Permission { tool, .. }, Ev::ToolUse { name, .. }, Ev::ToolResult { .. }, Ev::Plan { id, text }, Ev::Result { is_error: false, .. }]
-                if tool == "AskUserQuestion" && name == "ExitPlanMode" && id == "t2-plan" && text == "# P"),
+            matches!(&evs[..], [Ev::Init { .. }, Ev::Questions(_), Ev::ToolUse { name, .. }, Ev::ToolResult { .. }, Ev::Plan { id, text }, Ev::Result { is_error: false, .. }]
+                if name == "ExitPlanMode" && id == "t2-plan" && text == "# P"),
             "{evs:?}"
         );
     }

@@ -18,6 +18,24 @@ use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 use url::{Url, form_urlencoded};
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub enum Method {
+    #[default]
+    OAuth,
+    ApiKey,
+}
+
+/// What `state.json` keeps of the connection. Never the credential.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct Connection {
+    /// Organization UUID.
+    pub org_id: String,
+    pub org: String,
+    pub user: String,
+    pub method: Method,
+}
+
 // ponytail: empty until the Linear app is registered; `begin` reports NotConfigured until then.
 const CLIENT_ID: &str = "";
 const AUTHORIZE: &str = "https://linear.app/oauth/authorize";

@@ -968,3 +968,60 @@ mod tests {
 
 #[cfg(all(test, feature = "test-support"))]
 mod interaction_tests;
+
+/// `label` for `rows` of `(label, hint, value)`, usually one per repo: a single row is one
+/// item, hinted with its label; several make a submenu ending in "All". `f` gets the values.
+pub(crate) fn each_or_all(
+    icon: IconName,
+    label: &'static str,
+    mut rows: Vec<(String, String, String)>,
+    f: impl Fn(&[String], &mut Window, &mut App) + 'static,
+) -> Option<Entry> {
+    let f = Rc::new(f);
+    if rows.len() < 2 {
+        let (hint, _, v) = rows.pop()?;
+        let item = item(icon, label, move |w, cx| f(std::slice::from_ref(&v), w, cx));
+        return Some(item.hint(hint));
+    }
+    let all: Vec<String> = rows.iter().map(|r| r.2.clone()).collect();
+    let mut entries: Vec<Entry> = (rows.into_iter())
+        .map(|(name, hint, v)| {
+            let f = f.clone();
+            let run = move |w: &mut Window, cx: &mut App| f(std::slice::from_ref(&v), w, cx);
+            item(IconName::FolderGit2, name, run).hint(hint)
+        })
+        .collect();
+    entries.extend([Entry::Sep, item(None, "All", move |w, cx| f(&all, w, cx))]);
+    Some(sub(icon, label, entries))
+}
+
+#[cfg(test)]
+mod each_or_all_tests {
+    use super::*;
+    use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+
+    #[test]
+    fn each_or_all_collapses_one_row() {
+        let row = |n: &str| (n.to_string(), String::new(), n.to_string());
+        let f: fn(&[String], &mut Window, &mut App) = |_, _, _| {};
+        assert!(each_or_all(IconName::Github, "Open", vec![], f).is_none());
+        match each_or_all(IconName::Github, "Open", vec![row("api")], f) {
+            Some(Entry::Item { label, hint, .. }) => {
+                assert_eq!((&*label, hint.as_deref()), ("Open", Some("api")))
+            }
+            _ => panic!("one row is one item"),
+        }
+        match each_or_all(IconName::Github, "Open", vec![row("api"), row("web")], f) {
+            Some(Entry::Sub { entries, .. }) => {
+                let labels: Vec<_> = (entries.iter())
+                    .map(|e| match e {
+                        Entry::Item { label, .. } => label.to_string(),
+                        _ => "-".into(),
+                    })
+                    .collect();
+                assert_eq!(labels, ["api", "web", "-", "All"]);
+            }
+            _ => panic!("several rows are a submenu"),
+        }
+    }
+}

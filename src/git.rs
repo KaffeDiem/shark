@@ -1,3 +1,4 @@
+use crate::proc::{finish, finish_bytes};
 use crate::state::{Attachment, Repo, Workspace, WsRepo};
 mod changes;
 mod copy;
@@ -21,22 +22,6 @@ pub fn run(dir: &Path, prog: &str, args: &[&str]) -> Result<Output, String> {
         .args(args)
         .output()
         .map_err(|e| crate::proc::spawn_err(dir, prog, e))
-}
-
-pub(crate) fn finish(prog: &str, args: &[&str], out: Output) -> Result<String, String> {
-    finish_bytes(prog, args, out).map(|b| String::from_utf8_lossy(&b).trim().to_string())
-}
-
-fn finish_bytes(prog: &str, args: &[&str], out: Output) -> Result<Vec<u8>, String> {
-    if out.status.success() {
-        Ok(out.stdout)
-    } else {
-        Err(format!(
-            "{prog} {}: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&out.stderr).trim()
-        ))
-    }
 }
 
 /// Like `git`, for any `prog` making network calls: never prompts for credentials, and is killed
@@ -717,7 +702,7 @@ fn pr_remote(src: &Path, pr: &PullRequest) -> Result<String, String> {
             "Pull request base is missing; refresh pull requests and select it again".into(),
         );
     }
-    let t = crate::pr::git_feature::Target::from_url(&pr.url)
+    let t = crate::pr::Target::from_url(&pr.url)
         .ok()
         .filter(|t| t.number == pr.number)
         .ok_or("Invalid pull request URL")?;
@@ -1312,7 +1297,7 @@ fn header(ws: &Workspace) -> String {
         };
         // A PR URL names the GitHub repo, which needn't match the folder.
         let gh = (git(&r.src, &["remote", "get-url", "origin"]).ok())
-            .and_then(|o| crate::sync::github_url(&o))
+            .and_then(|o| crate::pr::github_url(&o))
             .map_or(String::new(), |u| format!(", GitHub {u}"));
         s += &format!(
             "{}{}{on} (base `{}`{gh})\n",
@@ -1528,4 +1513,9 @@ pub fn combined_diff(ws: &Workspace, dir: &Path, uncommitted_only: bool) -> Resu
         out += &String::from_utf8_lossy(&o.stdout);
     }
     Ok(out)
+}
+
+/// `origin/main` → `main`, for labels.
+pub fn short(base: &str) -> &str {
+    base.strip_prefix("origin/").unwrap_or(base)
 }

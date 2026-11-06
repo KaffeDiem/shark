@@ -27,6 +27,7 @@ mod pr;
 mod proc;
 mod prompts;
 mod prs;
+mod review_protocol;
 mod scripts;
 mod settings;
 mod stack;

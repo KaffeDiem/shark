@@ -1,10 +1,10 @@
 //! Linear issues on an agent: attaching one, its details, and starting an agent from one. An
 //! attachment is reference material: it starts no turn and waits for nothing, and chats hear of
 //! it through `Workspace::context`. Nothing here writes to Linear.
-use super::palette::menu_dialog;
 use super::*;
 use crate::linear::{self, Credential, Error, Hit, Http, IssueRef, Lists, Page, Target};
 use crate::sync::ago;
+use crate::ui::menu_dialog;
 use crate::usage::now;
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::input::{Enter, Textarea, TextareaState};
@@ -312,7 +312,7 @@ pub(super) struct IssuePicker {
     /// Why nothing can be asked of Linear; the row to Settings replaces the others.
     blocked: Option<Blocked>,
     /// Lists, cached results and marks belong to this connection.
-    connection: (Option<super::linear_connection::Connection>, Option<u64>),
+    connection: (Option<crate::linear::Connection>, Option<u64>),
     query: String,
     lists: Option<Lists>,
     /// Every answer by query, for the picker's lifetime: asking again sends nothing.
@@ -995,7 +995,7 @@ fn issue_summary(
                     .overflow_y_scroll()
                     .text_size(px(14.))
                     .line_height(relative(1.5))
-                    .child(crate::chat::markdown(
+                    .child(crate::ui::markdown(
                         description,
                         "issue-description",
                         vec![],

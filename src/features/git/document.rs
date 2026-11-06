@@ -1397,7 +1397,7 @@ fn link_url(url: &str, ctx: Option<&DocContext>) -> Option<String> {
 
 /// Markdown in the house style, with links resolved against the document.
 fn markdown(state: &Entity<TextViewState>, ctx: Option<DocContext>) -> impl IntoElement {
-    crate::chat::markdown(state, "git-row", vec![]).on_link_click(move |url, event, _, cx| {
+    crate::ui::markdown(state, "git-row", vec![]).on_link_click(move |url, event, _, cx| {
         if (event.standard_click() || event.is_middle_click())
             && let Some(target) = link_url(url, ctx.as_ref())
         {
@@ -1728,7 +1728,7 @@ impl RichDoc {
                             .child(Icon::new(IconName::TriangleAlert).with_size(px(12.)))
                             .child(format!("Mermaid diagram not rendered: {e}")),
                     )
-                    .child(crate::chat::markdown(source, "git-row", vec![]))
+                    .child(crate::ui::markdown(source, "git-row", vec![]))
                     .into_any_element(),
                 Some(_) => loading(cx).into_any_element(),
                 None => {

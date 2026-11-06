@@ -297,9 +297,7 @@ impl Differ {
         if let Some(e) = &mut self.editing
             && let Some(f) = data.files.iter_mut().find(|f| *f.path() == e.path)
         {
-            let hunks = data
-                .hunks
-                .insert(e.path.clone(), review::parse_hunks(&e.patch));
+            let hunks = data.hunks.insert(e.path.clone(), review::hunks(&e.file));
             e.orig = (
                 std::mem::replace(f, e.file.clone()),
                 hunks.unwrap_or_default(),
@@ -533,7 +531,7 @@ impl Differ {
         let (file, caret) = (e.file.clone(), e.caret());
         self.review
             .hunks
-            .insert(e.path.clone(), review::parse_hunks(&e.patch));
+            .insert(e.path.clone(), review::hunks(&e.file));
         self.put_file(file, cx);
         self.diff.update(cx, |d, cx| d.show_line(caret, cx));
         cx.notify();
@@ -864,7 +862,12 @@ mod tests {
         assert_eq!(first_change("same\n", "same\n"), 0);
 
         // Every line is there to edit: far from the change, and with no change at all.
-        let rows = |p: &str| review::parse_hunks(p).iter().flatten().count();
+        let rows = |p: &str| {
+            review::hunks(&DiffFile::parse(p).unwrap()[0])
+                .iter()
+                .flatten()
+                .count()
+        };
         let long: String = (1..=20).map(|i| format!("{i}\n")).collect();
         assert_eq!(
             rows(&patch("api/f", &long, &long.replace("20\n", "x\n"), false)),
@@ -878,7 +881,7 @@ mod tests {
         // An empty or emptied file keeps a working line to edit.
         for (base, added) in [("", true), ("", false), ("a\nb\n", false)] {
             let p = patch("api/f", base, "", added);
-            let hunks = review::parse_hunks(&p);
+            let hunks = review::hunks(&DiffFile::parse(&p).unwrap()[0]);
             assert!(
                 hunks.iter().flatten().any(|r| r.0 != b'-' && r.2 == 1),
                 "{p}"

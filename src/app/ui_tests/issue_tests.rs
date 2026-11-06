@@ -2,9 +2,9 @@
 use super::attach_tests::{agent, chat_of, recording_claude, result, wire, ws_of};
 use super::*;
 use crate::agent::Ev;
-use crate::app::linear_connection::{Connection, Method};
 use crate::chat::Chat;
 use crate::linear::{self, IssueRef, Req, Resp, fake};
+use crate::linear::{Connection, Method};
 use gpui_kit::test::TestQueryExt as _;
 use serde_json::{Value, json};
 use std::cell::RefCell;

@@ -146,7 +146,7 @@ fn server_messages(log: &Path) -> Vec<serde_json::Value> {
 }
 
 fn session_of(editor: &Entity<FileEditor>, cx: &App) -> Option<Entity<crate::lsp::Session>> {
-    (editor.read(cx).intelligence.as_ref()).map(|l| l.session.clone())
+    (editor.read(cx).language()).map(|l| l.session.clone())
 }
 
 async fn open_tab(
@@ -161,7 +161,7 @@ async fn open_tab(
     .unwrap();
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         (shark.read(cx).editor.as_ref())
-            .is_some_and(|e| e.read(cx).path == path && e.read(cx).intelligence.is_some())
+            .is_some_and(|e| e.read(cx).path == path && e.read(cx).language().is_some())
     })
     .await;
     cx.update(|cx| shark.read(cx).editor.clone().unwrap())
@@ -1014,12 +1014,9 @@ async fn retry_rediscovers_shared_editors_without_losing_unsaved_text(cx: &mut T
             s.editor = Some(first.clone());
             let tabs = s.active_ws().unwrap().tab_order.clone();
             s.restart_language(w, cx);
-            assert!(first.read(cx).intelligence.is_none());
-            assert!(second.read(cx).intelligence.is_none());
-            assert_eq!(
-                third_editor.read(cx).intelligence.as_ref().unwrap().session,
-                unrelated
-            );
+            assert!(first.read(cx).language().is_none());
+            assert!(second.read(cx).language().is_none());
+            assert_eq!(third_editor.read(cx).language().unwrap().session, unrelated);
             assert!(!s.language_sessions.contains_key(&shared_key));
             assert!(s.language_sessions.contains_key(&unrelated_key));
             assert_eq!(text(&first, cx), "unsaved answer\n");
@@ -1110,7 +1107,7 @@ async fn language_sessions_are_shared_and_outlive_their_tabs(cx: &mut TestAppCon
     .unwrap();
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         (shark.read(cx).editor.as_ref())
-            .is_some_and(|e| e.read(cx).path == "api/e.txt" && e.read(cx).intelligence.is_some())
+            .is_some_and(|e| e.read(cx).path == "api/e.txt" && e.read(cx).language().is_some())
     })
     .await;
     cx.update(|cx| {
@@ -1161,7 +1158,7 @@ async fn language_keys_send_rename_definition_and_buffer_formatting(cx: &mut Tes
     .unwrap();
     let editor = open_tab(cx, window, &shark, "api/c.txt").await;
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        let language = editor.read(cx).intelligence.as_ref().unwrap();
+        let language = editor.read(cx).language().unwrap();
         language.snapshot.lock().unwrap().text.as_ref() == text
     })
     .await;
@@ -1270,9 +1267,9 @@ async fn closing_a_tab_keeps_servers_of_files_still_discovering(cx: &mut TestApp
         .unwrap();
     let p = open_tab(cx, window, &shark, "api/pending/p.txt").await;
     cx.update(|cx| {
-        p.update(cx, |e, _| {
-            e.intelligence = None;
-            e.discovering = true;
+        p.update(cx, |e, cx| {
+            e.detach_language(None, cx);
+            e.begin_language_discovery(Task::ready(()), cx);
         })
     });
     let close = |cx: &mut TestAppContext, editor: Entity<FileEditor>| {
@@ -1286,7 +1283,7 @@ async fn closing_a_tab_keeps_servers_of_files_still_discovering(cx: &mut TestApp
     close(cx, a);
     assert!(weak.upgrade().is_some(), "p.txt may still attach to it");
     // A file whose discovery found no server (README, Cargo.toml) does not hold one.
-    cx.update(|cx| p.update(cx, |e, _| e.discovering = false));
+    cx.update(|cx| p.update(cx, |e, cx| e.finish_language_discovery(None, cx)));
     cx.update_window(window, |_, _, cx| {
         shark.update(cx, |s, cx| s.prune_language_sessions(cx))
     })
@@ -1526,7 +1523,7 @@ async fn retry_reattaches_dependency_sources_and_format_refuses_them(cx: &mut Te
             shark.update(cx, |s, cx| {
                 s.editor = Some(a.clone());
                 s.restart_language(w, cx);
-                assert!(dep.read(cx).intelligence.is_none());
+                assert!(dep.read(cx).language().is_none());
                 // Test discovery finds whichever registered session covers the worktree.
                 let fresh = cx.new(|_| fresh);
                 s.register_session(fresh.clone(), w, cx);

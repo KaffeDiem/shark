@@ -220,6 +220,86 @@ pub(crate) fn append(path: &Option<PathBuf>, line: &str) {
     }
 }
 
+/// `"Which DB?"="Postgres", …`: the answers as claude's tool result words them.
+pub(crate) fn answer_pairs(
+    qs: &[crate::agent::Question],
+    answers: &[crate::agent::Answer],
+) -> String {
+    let pairs: Vec<String> = crate::agent::given(qs, answers)
+        // Only the agent gets a secret; the row shows that one was given.
+        .map(|(q, _, all)| {
+            format!(
+                "\"{}\"=\"{}\"",
+                q.text,
+                if q.secret { "••••" } else { &all }
+            )
+        })
+        .collect();
+    match pairs.is_empty() {
+        true => "No answers".into(),
+        false => pairs.join(", "),
+    }
+}
+
+/// The wordings a tool result gives answers in: codex's (which we write) and claude's own,
+/// each as the text before and after the answers.
+const RESULTS: [(&str, &str); 2] = [
+    (
+        "Your questions have been answered: ",
+        ". You can now continue",
+    ),
+    ("The user answered: ", ". Read the answers carefully"),
+];
+
+/// The tool result recorded for codex's answers, in claude's words.
+pub(crate) fn answer_result(summary: &str) -> String {
+    let (prefix, ending) = RESULTS[0];
+    format!("{prefix}{summary}{ending}")
+}
+
+/// A question row's summary from claude's tool result, when it holds the answers.
+pub(crate) fn answered(result: &str) -> Option<&str> {
+    // A clipped result has no reliable protocol suffix; keep all retained answer text.
+    let truncated = result.rsplit_once("\n… truncated, ").is_some_and(|(_, n)| {
+        n.strip_suffix(" chars total")
+            .is_some_and(|n| n.parse::<u64>().is_ok())
+    });
+    for (prefix, ending) in RESULTS {
+        if let Some(r) = result.strip_prefix(prefix) {
+            return Some(
+                r.rsplit_once(ending)
+                    .filter(|_| !truncated)
+                    .map_or(r, |(answer, _)| answer),
+            );
+        }
+    }
+    (result == crate::agent::ANSWER_IN_CHAT).then_some("Answered in the chat")
+}
+
+/// The questions as the row's summary until they're answered.
+pub(crate) fn asked_summary(input: &Value) -> String {
+    let qs = crate::agent::questions(input);
+    let texts: Vec<&str> = qs.iter().map(|q| q.text.as_str()).collect();
+    texts.join(" · ")
+}
+
+/// Completed answers keep their existing Claude-shaped history records for replay.
+pub(crate) fn completed_answer(
+    request: crate::agent::Questions,
+    result: String,
+) -> ([String; 2], Vec<Ev>) {
+    let (id, input) = (request.tool_use_id, request.input);
+    let records = [
+        serde_json::json!({"type":"assistant", "shark_completed_answer":true, "message":{"content":[{"type":"tool_use", "id":id, "name":"AskUserQuestion", "input":input}]}}),
+        serde_json::json!({"type":"user", "shark_completed_answer":true, "message":{"content":[{"type":"tool_result", "tool_use_id":id, "content":result, "is_error":false}]}}),
+    ].map(|v| compact(&v.to_string()).into_owned());
+    let events = records
+        .iter()
+        .flat_map(|record| crate::agent::parse(record))
+        .collect();
+    (records, events)
+}
+
 pub(crate) fn append_answer(path: &Path, id: &str, records: &[String; 2]) -> std::io::Result<()> {
     append_records(path, &[&records[0], &records[1]], Some(id))
 }
@@ -286,6 +366,53 @@ mod tests {
 
     const USER_TURN: &str = r#"{"type": "user", "message": {"role": "user", "content": "read a.txt"}, "parent_tool_use_id": null}"#;
     const SHORT_RESULT: &str = r#"{"type": "user", "message": {"role": "user", "content": [{"tool_use_id": "toolu_1", "type": "tool_result", "content": "1\thello\n2\t"}]}, "parent_tool_use_id": null}"#;
+
+    #[test]
+    fn rows_summarize_claudes_results() {
+        let r = r#"Your questions have been answered: "Which DB?"="Postgres". You can now continue with these answers in mind."#;
+        assert_eq!(answered(r), Some(r#""Which DB?"="Postgres""#));
+        let r = r#"The user answered: "Name?"="bob". Read the answers carefully — they may request clarification"#;
+        assert_eq!(answered(r), Some(r#""Name?"="bob""#));
+        assert_eq!(
+            answered(crate::agent::ANSWER_IN_CHAT),
+            Some("Answered in the chat")
+        );
+        assert_eq!(answered("(interrupted)"), None);
+        assert_eq!(
+            asked_summary(&json!({"questions": [{"question": "A?"}, {"question": "B?"}]})),
+            "A? · B?"
+        );
+    }
+
+    #[test]
+    fn answer_summaries_keep_protocol_words_inside_user_text() {
+        for (prefix, ending) in RESULTS {
+            let summary = format!(r#""Instructions?"="Stop{ending} after tests""#);
+            let result = format!("{prefix}{summary}{ending}");
+            assert_eq!(answered(&result), Some(summary.as_str()));
+        }
+    }
+
+    #[test]
+    fn clipped_answer_summaries_keep_protocol_words_inside_user_text() {
+        for (prefix, ending) in RESULTS {
+            let summary = format!(
+                r#""Instructions?"="Stop{ending} after {}""#,
+                "x".repeat(crate::transcript::MAX_OUTPUT)
+            );
+            let result = format!("{prefix}{summary}{ending}");
+            let record = json!({"type":"user", "message":{"content":[{"type":"tool_result", "tool_use_id":"q", "content":result}]}}).to_string();
+            let events = crate::agent::parse(&crate::transcript::compact(&record));
+            let [Ev::ToolResult { text, .. }] = events.as_slice() else {
+                panic!()
+            };
+            assert!(text.contains("… truncated,"));
+            assert_eq!(
+                answered(text).unwrap().len(),
+                text.strip_prefix(prefix).unwrap().len()
+            );
+        }
+    }
 
     #[test]
     fn forget_removes_transcript_and_log() {

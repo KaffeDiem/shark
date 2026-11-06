@@ -5758,7 +5758,7 @@ async fn review_queue(cx: &mut TestAppContext) {
     let argv = fs::read_to_string(&log).unwrap();
     assert!(
         argv.starts_with(
-            "pr|comment|7|--body|**api/f** · working copy · 1\n\n```\nA\n```\n\nrename vars"
+            "pr|comment|https://github.com/o/api/pull/7|--body|**api/f** · working copy · 1\n\n```\nA\n```\n\nrename vars"
         ),
         "{argv}"
     );
@@ -5812,7 +5812,7 @@ async fn review_queue(cx: &mut TestAppContext) {
     .await;
     let argv = fs::read_to_string(&log).unwrap();
     assert!(
-        argv.starts_with("api|--method|POST|repos/{owner}/{repo}/pulls/7/reviews|-f|event=COMMENT|-f|commit_id=h|-f|body=**api/f**"),
+        argv.starts_with("api|--hostname|github.com|--method|POST|repos/o/api/pulls/7/reviews|-f|event=COMMENT|-f|commit_id=h|-f|body=**api/f**"),
         "{argv}"
     );
     assert!(matches!(comments(cx)[0].2, Status::Sent { .. }));
@@ -5841,7 +5841,7 @@ async fn review_queue(cx: &mut TestAppContext) {
     .await;
     let argv = fs::read_to_string(&log).unwrap();
     assert!(
-        argv.starts_with("api|--method|POST|repos/{owner}/{repo}/pulls/7/reviews|-f|event=COMMENT|-f|commit_id=h|-f|body=api/f:3|-f|comments[][path]=f|-F|comments[][line]=3|-f|comments[][side]=RIGHT|-f|comments[][body]=third line|"),
+        argv.starts_with("api|--hostname|github.com|--method|POST|repos/o/api/pulls/7/reviews|-f|event=COMMENT|-f|commit_id=h|-f|body=api/f:3|-f|comments[][path]=f|-F|comments[][line]=3|-f|comments[][side]=RIGHT|-f|comments[][body]=third line|"),
         "{argv}"
     );
     assert!(github(cx, 2).is_some_and(|u| u.ends_with("#pullrequestreview-5")));

@@ -490,8 +490,7 @@ async fn git_feature_large_review_virtualizes_and_releases(cx: &mut TestAppConte
     let home = test_home();
     let state = fixture(&home);
     let (_gh, dir) = fake_github(&home, &state, 1000);
-    let target =
-        crate::pr::git_feature::Target::from_url("https://github.com/acme/api/pull/7").unwrap();
+    let target = crate::pr::Target::from_url("https://github.com/acme/api/pull/7").unwrap();
     let details = crate::pr::git_feature::load(&dir, &target).unwrap();
     let (window, shark) = boot(cx, state, WindowOptions::default());
     press_in(window)(cx, &["cmd-shift-g"]);
@@ -912,8 +911,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     let home = test_home();
     let (fixture, _, _) = history_fixture(&home);
     let (_gh, dir) = fake_github(&home, &fixture, 2);
-    let target =
-        crate::pr::git_feature::Target::from_url("https://github.com/acme/api/pull/7").unwrap();
+    let target = crate::pr::Target::from_url("https://github.com/acme/api/pull/7").unwrap();
     let mut details = crate::pr::git_feature::load(&dir, &target).unwrap();
     details.title =
         "Keep sign-in sessions reliable when reconnecting after a network interruption".into();

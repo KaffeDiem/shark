@@ -44,6 +44,9 @@ impl Shark {
             if let (true, Some(e)) = (mine, &chat.history_save_error) {
                 errors.push(format!("Completed answers in {}: {e}", chat.meta.id));
             }
+            if let (true, Some(e)) = (mine, chat.plan.read(cx).storage_error()) {
+                errors.push(format!("Plans in {}: {e}", chat.meta.id));
+            }
         }
         for (ws, git) in &self.git_features {
             if let (true, Some(e)) = (keep(ws), git.read(cx).storage_error()) {
@@ -61,7 +64,10 @@ impl Shark {
         }
         self.differ.update(cx, |d, _| d.retry_saves());
         for chat in self.chats.values() {
-            chat.update(cx, |c, cx| c.retry_history(cx));
+            chat.update(cx, |c, cx| {
+                c.retry_history(cx);
+                c.plan.update(cx, |p, cx| p.retry_save(cx));
+            });
         }
         for git in self.git_features.values() {
             git.update(cx, |g, cx| g.retry_save(cx));

@@ -700,12 +700,9 @@ async fn attachment_starts_when_the_last_work_ends(cx: &mut TestAppContext) {
     wait(cx, 1);
 
     // A pending question: the turn holds, and answering it finishes the turn.
-    let asked = Ev::Permission {
-        request_id: "r".into(),
-        tool: "AskUserQuestion".into(),
-        tool_use_id: "u".into(),
-        input: serde_json::json!({"questions": [{"question": "Which?", "options": [{"label": "A"}]}]}),
-    };
+    let asked = crate::agent::parse(
+        r#"{"type":"control_request","request_id":"r","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"u","input":{"questions":[{"question":"Which?","options":[{"label":"A"}]}]}}}"#,
+    ).pop().unwrap();
     cx.update(|cx| {
         chat.update(cx, |c, cx| {
             c.busy = true;

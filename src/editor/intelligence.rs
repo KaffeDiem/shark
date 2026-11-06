@@ -110,6 +110,54 @@ impl Drop for Language {
 }
 
 impl FileEditor {
+    pub(crate) fn language(&self) -> Option<&Language> {
+        self.intelligence.as_ref()
+    }
+
+    /// Retry cancels this document's work and clears every view of its old session.
+    pub(crate) fn detach_language(
+        &mut self,
+        reattach_to: Option<WeakEntity<FileEditor>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.intelligence = None;
+        self.lsp_setup = None;
+        self.lsp_request = None;
+        self.lsp_error = None;
+        self.discovering = false;
+        self.reattach_to = reattach_to;
+        self.clear_language_view(cx);
+    }
+
+    pub(crate) fn begin_language_discovery(&mut self, task: Task<()>, cx: &mut Context<Self>) {
+        self.lsp_setup = Some(task);
+        self.discovering = true;
+        self.lsp_error = None;
+        cx.notify();
+    }
+
+    pub(crate) fn finish_language_discovery(
+        &mut self,
+        error: Option<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.discovering = false;
+        self.lsp_error = error;
+        cx.notify();
+    }
+
+    pub(crate) fn discovering_language(&self) -> bool {
+        self.discovering
+    }
+
+    pub(crate) fn follows_language(&self, editor: &WeakEntity<FileEditor>) -> bool {
+        self.reattach_to.as_ref() == Some(editor)
+    }
+
+    pub(crate) fn track_language_request(&mut self, task: Task<()>) {
+        self.lsp_request = Some(task);
+    }
+
     /// The buffer changed: language responses and diagnostics for the old text are stale.
     pub(crate) fn language_changed(&mut self, cx: &mut Context<Self>) {
         document::document_changed();
@@ -141,7 +189,7 @@ impl FileEditor {
     }
 
     /// Clears the outline, crumbs, providers and diagnostics a language session left in the view.
-    pub(crate) fn clear_language_view(&mut self, cx: &mut Context<Self>) {
+    fn clear_language_view(&mut self, cx: &mut Context<Self>) {
         self.outline.clear();
         self.crumbs.clear();
         self.input.update(cx, |i, cx| {
@@ -184,6 +232,7 @@ impl FileEditor {
         let Some(uri) = file_uri(&self.abs) else {
             return;
         };
+        self.reattach_to = None;
         let subs = vec![
             cx.observe_in(&session, window, |e, session, w, cx| {
                 if e.intelligence.as_ref().is_some_and(|l| {

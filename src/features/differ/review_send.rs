@@ -3,9 +3,11 @@
 use super::review_comment::{Comment, Status, prompt};
 use super::review_share::{github_body, unposted_by_repo};
 use super::*;
-use crate::chat::{ReviewCard, ReviewItem, effort_label, model_entries, model_label};
 use crate::models::effort_of;
+use crate::models::{effort_label, model_label};
+use crate::review_protocol::{ReviewCard, ReviewItem};
 use crate::state::ChatMeta;
+use crate::ui::model_entries;
 use crate::ui::plural;
 use crate::{CycleTarget, PickModel};
 use gpui_kit::component::Disableable as _;

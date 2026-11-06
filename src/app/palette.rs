@@ -3,109 +3,6 @@ use super::*;
 use crate::apps::{self, Kind, OpenApp};
 use crate::ui::app_icon;
 
-/// The cmd-k bar look: a bare 640px dialog near the top, on the menus' `popover` surface with
-/// their 4px inset, holding a borderless `Command`.
-pub(super) fn menu_dialog(d: Dialog, cx: &App) -> Dialog {
-    crate::ui::dialog(d)
-        .w(px(640.))
-        .p(px(4.))
-        .bg(cx.theme().popover)
-        .margin_top(px(96.))
-        .close_button(false)
-}
-
-/// Opens a cmd-k style menu over `target`; `on_pick` gets the confirmed row.
-pub(crate) fn open_menu<T: 'static>(
-    target: WeakEntity<T>,
-    placeholder: &'static str,
-    items: Vec<CommandItem>,
-    selected: usize,
-    on_pick: impl Fn(&mut T, usize, &mut Window, &mut Context<T>) + 'static,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let groups = vec![(None, items)];
-    open_grouped(target, placeholder, groups, selected, on_pick, window, cx)
-}
-
-/// [`open_menu`] with headed groups; `selected` and the picked row count down through all
-/// the groups, as if they were one list.
-pub(crate) fn open_grouped<T: 'static>(
-    target: WeakEntity<T>,
-    placeholder: &'static str,
-    groups: Vec<(Option<&'static str>, Vec<CommandItem>)>,
-    selected: usize,
-    on_pick: impl Fn(&mut T, usize, &mut Window, &mut Context<T>) + 'static,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let none: Option<fn(&App) -> AnyElement> = None;
-    open_headed(
-        target,
-        placeholder,
-        groups,
-        selected,
-        none,
-        on_pick,
-        window,
-        cx,
-    )
-}
-
-/// [`open_grouped`] under `header`, for a menu about something it shows.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn open_headed<T: 'static>(
-    target: WeakEntity<T>,
-    placeholder: &'static str,
-    groups: Vec<(Option<&'static str>, Vec<CommandItem>)>,
-    selected: usize,
-    header: Option<impl Fn(&App) -> AnyElement + 'static>,
-    on_pick: impl Fn(&mut T, usize, &mut Window, &mut Context<T>) + 'static,
-    window: &mut Window,
-    cx: &mut App,
-) {
-    let starts: Rc<Vec<usize>> = Rc::new(
-        (groups.iter())
-            .scan(0, |n, (_, items)| {
-                *n += items.len();
-                Some(*n - items.len())
-            })
-            .collect(),
-    );
-    let command = move |state: &Entity<CommandState>| {
-        groups.iter().fold(
-            Command::new(state).bordered(false).placeholder(placeholder),
-            |c, (heading, items)| {
-                let g = CommandGroup::new().items(items.clone());
-                c.group(match heading {
-                    Some(h) => g.label(*h),
-                    None => g,
-                })
-            },
-        )
-    };
-    let palette = cx.new(|cx| CommandState::new(window, cx));
-    // The menu only learns its items when it renders; install them now so the
-    // highlight can start on `selected`. The dialog's renders keep it.
-    RenderOnce::render(command(&palette), window, cx);
-    let section = starts.iter().rposition(|&s| s <= selected).unwrap_or(0);
-    let at = IndexPath::new(selected - starts[section]).section(section);
-    palette.update(cx, |p, cx| p.set_selected_index(Some(at), window, cx));
-    let on_pick = Rc::new(on_pick);
-    let state = palette.clone();
-    window.open_dialog(cx, move |d, _, cx| {
-        let (target, on_pick, starts) = (target.clone(), on_pick.clone(), starts.clone());
-        menu_dialog(d, cx)
-            .children(header.as_ref().map(|h| h(cx)))
-            .child(command(&state).on_confirm(move |ix, window, cx| {
-                window.close_dialog(cx);
-                let row = starts[ix.section] + ix.row;
-                target.update(cx, |s, cx| on_pick(s, row, window, cx)).ok();
-            }))
-    });
-    palette.update(cx, |p, cx| p.focus(window, cx));
-}
-
 type Cmd = fn(&mut Shark, &mut Window, &mut Context<Shark>);
 
 /// A palette row: label, icon, the action whose shortcut it shows, extra search words, and
@@ -1095,7 +992,7 @@ mod tests {
             })
             .collect();
         let models: Vec<_> = (MODELS.iter().enumerate())
-            .map(|(i, m)| (crate::chat::model_label(m), i))
+            .map(|(i, m)| (crate::models::model_label(m), i))
             .collect();
         assert_eq!(
             rows.iter()

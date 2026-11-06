@@ -3,10 +3,10 @@
 //! is saved before Git changes anything, so a restart can tell what happened).
 use super::interaction::now_ms;
 use super::new_workspace::{AttachTo, NewWorkspaceForm};
-use super::palette::{menu_dialog, open_grouped};
 use super::*;
 use crate::scripts::{self, Phase};
 use crate::state::{AttachStage, Attachment};
+use crate::ui::{menu_dialog, open_grouped};
 use git::Found;
 use std::cell::Cell;
 use std::time::Duration;

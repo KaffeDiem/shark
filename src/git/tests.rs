@@ -1572,6 +1572,8 @@ fn fresh_attach_refuses_existing_branches() {
     )
     .unwrap();
     git(&api.path, &["branch", "local-only"]).unwrap();
+    // Fetch may also create origin/HEAD; snapshot refs after the fixture is refreshed.
+    git(&api.path, &["fetch", "--quiet", "--prune", "origin"]).unwrap();
     let (ws, dir) = empty_agent(&root, "agent-1");
     let refs = |p: &Path| git(p, &["for-each-ref", "--format=%(refname)"]).unwrap();
     let before = refs(&api.path);

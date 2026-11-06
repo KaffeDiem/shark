@@ -1,8 +1,8 @@
 //! Repo settings (click a repo in the sidebar): new agent, default model, setup, run and
 //! archive scripts, removal. Every change saves at once, as in Settings.
 use super::*;
-use crate::chat::{effort_label, model_label};
 use crate::models::efforts;
+use crate::models::{effort_label, model_label};
 use crate::scripts::Phase;
 use crate::state::RepoSettings;
 use crate::ui::{card, row, section};

@@ -13,7 +13,6 @@ use gpui_kit::assets::IconName;
 use gpui_kit::base::InteractiveElementExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
-use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::hover_card::HoverCard;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
@@ -70,8 +69,6 @@ use crate::ui::*;
 use differ::Differ;
 use differ::Viewed;
 use menus::{on_shark, tilde, ws_menu};
-use palette::menu_dialog;
-pub(crate) use palette::open_menu;
 use sidebar::{Naming, SideRow, move_submenu};
 
 #[derive(PartialEq, Clone, Copy, Debug)]

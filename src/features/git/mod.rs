@@ -1619,7 +1619,7 @@ impl GitFeature {
                     ))
                     .child(div().flex_1())
                     // Hover actions sit in a fixed slot, so showing them moves nothing.
-                    .child(crate::chat::copy_button(
+                    .child(crate::ui::copy_button(
                         SharedString::from(format!("git-copy-{}", c.id)),
                         c.body.clone(),
                         "git-row",
@@ -3075,7 +3075,8 @@ pub(crate) struct TestState<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use api::{Comment, Details, Review, Target, Thread};
+    use crate::pr::Target;
+    use api::{Comment, Details, Review, Thread};
 
     fn comment(id: &str, at: &str, review: Option<&str>) -> Comment {
         Comment {

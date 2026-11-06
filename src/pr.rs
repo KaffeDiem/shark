@@ -1,10 +1,62 @@
-//! Coordinated PRs: one per repo with commits, each body linking all the others.
+//! GitHub PR identity, discovery, review publication, and coordinated creation.
 use crate::git::{cmd_bounded, dirty, git};
 use crate::state::Workspace;
 use std::path::Path;
 
+mod discovery;
 pub mod git_feature;
 mod review;
+#[cfg(test)]
+pub(crate) use discovery::own;
+pub use discovery::{branch_prs, github_url, origin_repo, pick_pr};
+
+/// A PR addressed independently of a checkout's ambient GitHub repository.
+#[derive(Clone, Debug, Eq, PartialEq, Hash)]
+pub struct Target {
+    pub host: String,
+    pub owner: String,
+    pub repo: String,
+    pub number: u64,
+}
+
+impl Target {
+    pub fn from_url(url: &str) -> Result<Self, String> {
+        let parts: Vec<_> = url
+            .strip_prefix("https://")
+            .unwrap_or("")
+            .trim_end_matches('/')
+            .split('/')
+            .collect();
+        let valid = |s: &str| {
+            !s.is_empty()
+                && s != "."
+                && s != ".."
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        };
+        if parts.len() != 5 || parts[3] != "pull" || !parts[..3].iter().all(|s| valid(s)) {
+            return Err("Invalid GitHub pull request URL".into());
+        }
+        let number = parts[4]
+            .parse::<u64>()
+            .ok()
+            .filter(|n| *n > 0)
+            .ok_or("Invalid pull request number")?;
+        Ok(Self {
+            host: parts[0].to_ascii_lowercase(),
+            owner: parts[1].into(),
+            repo: parts[2].into(),
+            number,
+        })
+    }
+
+    pub fn url(&self) -> String {
+        format!(
+            "https://{}/{}/{}/pull/{}",
+            self.host, self.owner, self.repo, self.number
+        )
+    }
+}
 
 pub use review::{Anchor, publish_note, publish_review, verify_original_anchor};
 
@@ -92,7 +144,7 @@ pub fn create_linked_prs(
         }
         // A stacked branch's PR merges into its parent, which must be on GitHub.
         if !crate::git::has_ref(&wt, &r.base) {
-            let b = crate::sync::short(&r.base);
+            let b = crate::git::short(&r.base);
             return Err(format!(
                 "{}: its base `{b}` isn't on GitHub; push it first (from its agent), or Change base…",
                 r.name
@@ -117,7 +169,7 @@ pub fn create_linked_prs(
             120,
         )?;
         // Same `--repo` as polling, so a fork's upstream never answers for origin.
-        let origin = crate::sync::origin_repo(&wt);
+        let origin = origin_repo(&wt);
         let repo_flag = |a| with_repo(a, origin.as_deref());
         // Only an open PR from this repo is reused; `gh pr view <branch>` would also return a
         // merged one, and new commits after a merge need a new PR.
@@ -141,7 +193,7 @@ pub fn create_linked_prs(
         let url = match open.is_empty() {
             false => open,
             true => {
-                let base = crate::sync::short(&r.base);
+                let base = crate::git::short(&r.base);
                 let out = cmd_bounded(&wt, "gh", &repo_flag(new.args(branch, base)), 60)?;
                 last_line(&out)
             }
