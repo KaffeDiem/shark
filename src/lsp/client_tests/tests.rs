@@ -77,6 +77,13 @@ fn lifecycle_orders_unsaved_text_requests_configuration_and_diagnostics() {
         initialize["params"]["capabilities"]["workspace"]["diagnostics"]["refreshSupport"],
         true
     );
+    let semantic = &initialize["params"]["capabilities"]["textDocument"]["semanticTokens"];
+    assert_eq!(semantic["requests"], json!({"range":true,"full":true}));
+    assert_eq!(semantic["augmentsSyntaxTokens"], true);
+    assert_eq!(
+        initialize["params"]["capabilities"]["workspace"]["semanticTokens"]["refreshSupport"],
+        true
+    );
     let uri = "file:///tmp/example.py";
     peer.client
         .notify(

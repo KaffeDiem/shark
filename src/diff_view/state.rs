@@ -4,6 +4,7 @@ use std::{
     ops::Range,
     rc::Rc,
     sync::Arc,
+    time::{Duration, Instant},
 };
 
 use gpui_kit::base::{
@@ -146,6 +147,7 @@ pub struct DiffState {
     mode: DiffMode,
     context_lines: Option<usize>,
     expanded: Vec<Vec<Range<usize>>>,
+    reveal: Option<Reveal>,
     collapsed: HashSet<SharedString>,
     file_rows: Vec<FileRows>,
     header_rows: Vec<usize>,
@@ -184,6 +186,18 @@ pub struct DiffState {
     preparing: Option<usize>,
     _presentation: Task<()>,
     _selection_subscription: Subscription,
+}
+
+/// How long the lines of an opened fold take to appear.
+const REVEAL_DURATION: Duration = Duration::from_millis(160);
+/// The most rows that slide open. Rows still closed have no height, so the list lays out all of
+/// them each frame; a longer fold fades in at full height.
+pub(crate) const REVEAL_MAX_ROWS: usize = 64;
+
+/// The code rows of a fold being opened.
+struct Reveal {
+    rows: Range<usize>,
+    started: Instant,
 }
 
 /// Longest line, in bytes, compared for inline changes and given syntax emphasis.
@@ -277,6 +291,7 @@ impl DiffState {
             files,
             mode: DiffMode::Unified,
             context_lines: Some(CONTEXT_LINES),
+            reveal: None,
             collapsed: HashSet::new(),
             file_rows: Vec::new(),
             header_rows: Vec::new(),
@@ -701,10 +716,44 @@ impl DiffState {
             FoldExpansion::Down => pairs.start..(pairs.start + lines).min(pairs.end),
         };
         if let Some(expanded) = self.expanded.get_mut(file) {
-            expanded.push(revealed);
+            expanded.push(revealed.clone());
             self.rebuild_at_anchor();
+            if !cx.reduce_motion() {
+                self.start_reveal(file, revealed);
+            }
             cx.notify();
         }
+    }
+
+    /// Animates the rows just opened; a fold holds unchanged pairs, one row each.
+    fn start_reveal(&mut self, file: usize, pairs: Range<usize>) {
+        let first = (self.files[file].pairs().get(pairs.start))
+            .and_then(|pair| self.file_rows[file].modified[pair.modified()?]);
+        self.reveal = first.map(|first| Reveal {
+            rows: first..first + pairs.len(),
+            started: Instant::now(),
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn reveal_rows(&self) -> Option<Range<usize>> {
+        self.reveal.as_ref().map(|reveal| reveal.rows.clone())
+    }
+
+    /// The rows being opened and how far along they are, asking for the next frame until done.
+    pub(crate) fn reveal_frame(&mut self, window: &Window) -> Option<(Range<usize>, f32)> {
+        let reveal = self.reveal.as_ref()?;
+        let rows = reveal.rows.clone();
+        let t = reveal.started.elapsed().as_secs_f32() / REVEAL_DURATION.as_secs_f32();
+        if rows.len() <= REVEAL_MAX_ROWS {
+            self.list.remeasure_items(rows.clone());
+        }
+        if t >= 1. {
+            self.reveal = None;
+            return None;
+        }
+        window.request_animation_frame();
+        Some((rows, 1. - (1. - t).powi(3)))
     }
 
     /// Toggles a file from its header.
@@ -1107,6 +1156,7 @@ impl DiffState {
     /// measured heights of unchanged rows survive disclosure changes. Returns the old rows
     /// replaced.
     fn rebuild(&mut self, reset: bool) -> Range<usize> {
+        self.reveal = None;
         let rows = project_rows(
             &self.files,
             &self.collapsed,

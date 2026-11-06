@@ -1,6 +1,6 @@
-//! Settings dialog (cmd-,): general (stay awake, Vim mode), appearance (mode, light and dark
-//! theme, fonts), the git button's agent prompts and the Linear connection. Preferences apply
-//! immediately.
+//! Settings dialog (cmd-,): general (stay awake, Vim mode, repo skills), appearance (mode, light
+//! and dark theme, fonts), the git button's agent prompts and the Linear connection. Preferences
+//! apply immediately.
 use crate::SwitchField;
 use crate::app::Shark;
 use crate::app::linear_connection::LinearPage;
@@ -270,6 +270,17 @@ impl Settings {
         cx.notify();
     }
 
+    pub(crate) fn set_repo_skills(&mut self, on: bool, cx: &mut Context<Self>) {
+        self.with_state(cx, |s| {
+            s.no_repo_skills = !on;
+            crate::git::set_repo_skills(on);
+            for ws in &s.workspaces {
+                crate::git::link_skills(ws, &ws.dir());
+            }
+        });
+        cx.notify();
+    }
+
     /// `None`, blank or the default text drops the override.
     pub(crate) fn set_prompt(&mut self, i: usize, text: Option<String>, cx: &mut Context<Self>) {
         let p = &PROMPTS[i];
@@ -354,10 +365,10 @@ impl Settings {
     }
 
     fn render_general(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let (awake, vim) = (self.shark.upgrade())
+        let (awake, vim, no_skills) = (self.shark.upgrade())
             .map(|s| {
                 let state = &s.read(cx).state;
-                (state.stay_awake, state.vim)
+                (state.stay_awake, state.vim, state.no_repo_skills)
             })
             .unwrap_or_default();
         let this = cx.entity().downgrade();
@@ -383,8 +394,20 @@ impl Settings {
                 "Vim mode",
                 "Vim keys in the file editor, the composer and lists (ctrl-cmd-v)",
                 Switch::new("vim").checked(vim).on_click({
+                    let this = this.clone();
                     move |&v, _, cx| {
                         this.update(cx, |s, cx| s.set_vim(v, cx)).ok();
+                    }
+                }),
+            ))
+            .child(row(
+                theme,
+                true,
+                "Skills from repos",
+                "Agents can use the skills in each repo of a workspace",
+                Switch::new("repo-skills").checked(!no_skills).on_click({
+                    move |&v, _, cx| {
+                        this.update(cx, |s, cx| s.set_repo_skills(v, cx)).ok();
                     }
                 }),
             ))

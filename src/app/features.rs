@@ -172,6 +172,7 @@ impl Shark {
             .pl_2p5()
             .pr_1()
             .on_click(cx.listener(move |s, _, w, cx| s.show(Tab::Feature(feature), w, cx)))
+            .on_aux_click(Self::close_on_middle_click(feature.tab_id(), cx))
             .child(chats::ctrl_chip(ctrl_held, ix).unwrap_or_else(|| {
                 Icon::new(meta.tab_icon)
                     .with_size(px(14.))

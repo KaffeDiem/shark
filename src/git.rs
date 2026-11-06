@@ -7,10 +7,12 @@ use copy::{copy_included, untracked_fingerprint};
 mod tests;
 pub use changes::{discard_file, uncommitted_files};
 use std::{
+    collections::{BTreeMap, HashSet},
     fs,
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
     process::{Command, Output},
+    sync::Mutex,
 };
 
 pub fn run(dir: &Path, prog: &str, args: &[&str]) -> Result<Output, String> {
@@ -1034,14 +1036,177 @@ fn write_root_docs(ws: &Workspace, dir: &Path) -> Result<(), String> {
     let [claude, agents] = ROOT_DOCS;
     fs::write(dir.join(claude), claude_md(ws, dir))
         .and_then(|()| fs::write(dir.join(agents), agents_md(ws, dir)))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    link_skills(ws, dir);
+    Ok(())
 }
 
-/// What Shark itself leaves in a workspace root: its docs, Finder litter, and the `.context`
-/// folder of attachments.
-fn root_owned() -> [&'static str; 4] {
+/// Whether agents get the repos' skills: `State::no_repo_skills`, here for the spawn paths.
+static REPO_SKILLS: Mutex<bool> = Mutex::new(true);
+
+pub fn repo_skills() -> bool {
+    *REPO_SKILLS.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+pub fn set_repo_skills(on: bool) {
+    *REPO_SKILLS.lock().unwrap_or_else(|e| e.into_inner()) = on;
+}
+
+/// `--add-dir` for each repo: claude loads a repo's `.claude/skills` and `.claude/commands` at
+/// start only from its own cwd upward or from these. A clash shows as `/repo:skill`.
+pub fn claude_skill_args(ws: &Workspace) -> Vec<String> {
+    if !repo_skills() {
+        return vec![];
+    }
+    (ws.repos.iter())
+        .map(|r| ws.dir().join(&r.name))
+        .filter(|p| p.exists())
+        .flat_map(|p| ["--add-dir".into(), p.to_string_lossy().into_owned()])
+        .collect()
+}
+
+const AGENTS_DIR: &str = ".agents";
+/// Where codex looks at the workspace root.
+const SKILL_LINKS: &str = ".agents/skills";
+
+const SKILL_OWNERS: &str = ".shark-skills.json";
+
+// Never follow a user's directory symlink while managing workspace-owned files.
+fn skill_dirs_owned(dir: &Path) -> bool {
+    [AGENTS_DIR, SKILL_LINKS]
+        .iter()
+        .all(|p| match fs::symlink_metadata(dir.join(p)) {
+            Ok(m) => m.is_dir(),
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        })
+}
+
+fn owned_skill_links(dir: &Path) -> Option<BTreeMap<String, PathBuf>> {
+    let path = dir.join(AGENTS_DIR).join(SKILL_OWNERS);
+    match fs::symlink_metadata(&path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(BTreeMap::new()),
+        Ok(m) if m.is_file() => {
+            let links: BTreeMap<String, PathBuf> =
+                serde_json::from_slice(&fs::read(path).ok()?).ok()?;
+            links
+                .keys()
+                .all(|name| {
+                    let mut parts = Path::new(name).components();
+                    matches!(parts.next(), Some(std::path::Component::Normal(_)))
+                        && parts.next().is_none()
+                })
+                .then_some(links)
+        }
+        _ => None,
+    }
+}
+
+/// Link repo skills into Codex's root. Only recorded, unchanged links belong to Shark;
+/// pre-existing links (including ones from older Shark versions) stay user-owned.
+pub fn link_skills(ws: &Workspace, dir: &Path) {
+    // Keep the current preference and filesystem reconciliation under the same lock.
+    let on = REPO_SKILLS.lock().unwrap_or_else(|e| e.into_inner());
+    reconcile_skills(ws, dir, *on);
+}
+
+fn reconcile_skills(ws: &Workspace, dir: &Path, on: bool) {
+    if !skill_dirs_owned(dir) {
+        return;
+    }
+    let Some(mut owned) = owned_skill_links(dir) else {
+        return;
+    };
+    let links = dir.join(SKILL_LINKS);
+    owned.retain(|name, target| fs::read_link(links.join(name)).is_ok_and(|t| &t == target));
+    let mut used = HashSet::new();
+    let mut user_targets = HashSet::new();
+    match fs::read_dir(&links) {
+        Ok(entries) => {
+            for entry in entries {
+                let Ok(entry) = entry else { return };
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if !owned.contains_key(&name) {
+                    used.insert(name);
+                    if let Ok(target) = fs::read_link(entry.path()) {
+                        user_targets.insert(target);
+                    }
+                }
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return,
+    }
+    let mut want = BTreeMap::new();
+    for r in ws.repos.iter().filter(|_| on) {
+        let mut own = HashSet::new();
+        for src in [SKILL_LINKS, ".claude/skills"] {
+            let found = fs::read_dir(dir.join(&r.name).join(src));
+            let mut found: Vec<_> = found.into_iter().flatten().flatten().collect();
+            found.sort_by_key(|e| e.file_name());
+            for e in found {
+                let skill = e.file_name().to_string_lossy().into_owned();
+                if !e.path().join("SKILL.md").exists() || !own.insert(skill.clone()) {
+                    continue;
+                }
+                let target = Path::new("../..").join(&r.name).join(src).join(&skill);
+                if user_targets.contains(&target) {
+                    continue;
+                }
+                let mut name = skill.clone();
+                if used.contains(&name) {
+                    name = format!("{}-{skill}", r.name);
+                }
+                let base = name.clone();
+                let mut suffix = 2;
+                while used.contains(&name) {
+                    name = format!("{base}-{suffix}");
+                    suffix += 1;
+                }
+                used.insert(name.clone());
+                want.insert(name, target);
+            }
+        }
+    }
+    owned.retain(|name, target| {
+        want.get(name) == Some(target) || fs::remove_file(links.join(name)).is_err()
+    });
+    let manifest = dir.join(AGENTS_DIR).join(SKILL_OWNERS);
+    if want.is_empty() && owned.is_empty() {
+        let _ = fs::remove_file(manifest);
+        let _ = fs::remove_dir(&links).and_then(|()| fs::remove_dir(dir.join(AGENTS_DIR)));
+        return;
+    }
+    if fs::create_dir_all(&links).is_err() {
+        return;
+    }
+    // Record before creating links: a failed write must never leave untracked owned links.
+    for (name, target) in &want {
+        if !owned.contains_key(name) {
+            owned.insert(name.clone(), target.clone());
+        }
+    }
+    let Ok(bytes) = serde_json::to_vec(&owned) else {
+        return;
+    };
+    if crate::state::write(&manifest, &bytes).is_err() {
+        return;
+    }
+    for (name, target) in want {
+        let _ = std::os::unix::fs::symlink(target, links.join(name));
+    }
+}
+
+/// What Shark itself leaves in a workspace root: its docs, Finder litter, the `.context` folder
+/// of attachments and the skill links.
+fn root_owned() -> [&'static str; 5] {
     let [claude, agents] = ROOT_DOCS;
-    [claude, agents, ".DS_Store", attachments_parts().0]
+    [
+        claude,
+        agents,
+        ".DS_Store",
+        attachments_parts().0,
+        AGENTS_DIR,
+    ]
 }
 
 fn attachments_parts() -> (&'static str, &'static str) {
@@ -1051,13 +1216,37 @@ fn attachments_parts() -> (&'static str, &'static str) {
 }
 
 /// Whether `name` in the root is Shark's, not the user's: `.context` only counts while it
-/// holds nothing but attachments (unreadable, or a file, is unexpected: refuse before removing).
+/// holds nothing but attachments and `.agents` nothing but skill links (unreadable, or a file,
+/// is unexpected: refuse before removing).
 fn shark_owned(dir: &Path, name: &str) -> bool {
     let (context, attachments) = attachments_parts();
     root_owned().contains(&name)
         && (name != context
             || fs::read_dir(dir.join(name))
                 .is_ok_and(|mut es| es.all(|e| e.is_ok_and(|e| e.file_name() == attachments))))
+        && (name != AGENTS_DIR || only_skill_links(dir))
+}
+
+fn only_skill_links(dir: &Path) -> bool {
+    if !skill_dirs_owned(dir) {
+        return false;
+    }
+    let Some(owned) = owned_skill_links(dir) else {
+        return false;
+    };
+    let links = dir.join(SKILL_LINKS);
+    fs::read_dir(dir.join(AGENTS_DIR)).is_ok_and(|mut es| {
+        es.all(|e| e.is_ok_and(|e| e.file_name() == "skills" || e.file_name() == SKILL_OWNERS))
+    }) && (!links.exists()
+        || fs::read_dir(&links).is_ok_and(|mut es| {
+            es.all(|e| {
+                e.is_ok_and(|e| {
+                    owned
+                        .get(&e.file_name().to_string_lossy().into_owned())
+                        .is_some_and(|target| fs::read_link(e.path()).is_ok_and(|t| &t == target))
+                })
+            })
+        }))
 }
 
 fn claude_md(ws: &Workspace, dir: &Path) -> String {
@@ -1315,6 +1504,9 @@ pub fn combined_diff(ws: &Workspace, dir: &Path, uncommitted_only: bool) -> Resu
             "--full-index",
             // Rename headers carry no --src/--dst prefix, so a renamed file would lose its repo.
             "--no-renames",
+            // Whole files, so the diff can open the lines between changes. Viewed fingerprints
+            // hash the blob and the review narrows its hunks back (`review::narrow_hunks`).
+            "--unified=1000000",
             &src,
             &dst,
         ];

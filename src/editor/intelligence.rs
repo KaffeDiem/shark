@@ -5,6 +5,7 @@ use crate::lsp::{
     document::{self, Encoding, Lines, Snapshot, file_uri, same_file},
     providers::Provider,
 };
+use gpui_kit::base::input::EditorMode;
 use lsp_types::{PublishDiagnosticsParams, Uri};
 use serde::Deserialize as _;
 use serde_json::json;
@@ -110,12 +111,18 @@ impl Drop for Language {
 
 impl FileEditor {
     /// The buffer changed: language responses and diagnostics for the old text are stale.
-    pub(crate) fn language_changed(&mut self) {
+    pub(crate) fn language_changed(&mut self, cx: &mut Context<Self>) {
         document::document_changed();
         if let Some(language) = &mut self.intelligence {
             language.edits.fetch_add(1, Ordering::AcqRel);
             language.diagnostics = Default::default();
         }
+        self.input.update(cx, |i, _| {
+            // Only text edits invalidate positions and pending navigation.
+            if i.lsp().semantic_tokens_provider.is_some() {
+                EditorMode::reset_language_features(i);
+            }
+        });
     }
     pub(crate) fn language_status(&self, cx: &App) -> Option<(crate::lsp::Status, Option<String>)> {
         if let Some(error) = &self.lsp_error {
@@ -197,6 +204,15 @@ impl FileEditor {
                     }
                     if let SessionEvent::Notification {
                         method,
+                        companion: false,
+                        ..
+                    } = event
+                        && method == "workspace/semanticTokens/refresh"
+                    {
+                        e.refresh_semantic_tokens(window, cx);
+                    }
+                    if let SessionEvent::Notification {
+                        method,
                         params,
                         companion,
                     } = event
@@ -269,6 +285,7 @@ impl FileEditor {
         if opening {
             self.install_providers(client.clone(), companion.clone(), window, cx);
         }
+        self.refresh_semantic_tokens(window, cx);
         let Some(language) = &mut self.intelligence else {
             return;
         };
@@ -365,6 +382,15 @@ impl FileEditor {
         });
     }
 
+    fn refresh_semantic_tokens(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.input.update(cx, |i, cx| {
+            if i.lsp().semantic_tokens_provider.is_some() {
+                EditorMode::refresh_language_features(i, window, cx);
+                cx.notify();
+            }
+        });
+    }
+
     /// Gives the editor's completion, hover, definition and code-action providers to `client`
     /// (and `companion`), and forwards their events.
     fn install_providers(
@@ -396,6 +422,7 @@ impl FileEditor {
             lsp.completion_provider = Some(main.clone());
             lsp.hover_provider = Some(main.clone());
             lsp.definition_provider = Some(main.clone());
+            lsp.semantic_tokens_provider = main.semantic_options().map(|_| main.clone() as _);
             lsp.code_action_providers = vec![main.clone()];
             if let Some(ruff) = ruff {
                 lsp.code_action_providers.push(ruff);

@@ -71,7 +71,10 @@ impl DiffData {
             .into_iter()
             .filter_map(|chunk| {
                 let file = parse_chunk(chunk)?;
-                hunks.insert(file.path().clone(), review::parse_hunks(chunk));
+                hunks.insert(
+                    file.path().clone(),
+                    review::narrow_hunks(review::parse_hunks(chunk)),
+                );
                 media.extend(media::MediaFile::parse(file.path(), chunk, &ws_dir));
                 Some((file, review_comment::chunk_fingerprint(chunk)))
             })

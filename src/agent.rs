@@ -111,6 +111,7 @@ pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receive
     if chat.is_codex() {
         return codex::spawn(ws, chat);
     }
+    let skills = crate::git::claude_skill_args(ws);
     let resume = chat.session_id.iter().flat_map(|id| ["--resume", id]);
     // Tools that need a person (ExitPlanMode, AskUserQuestion) ask us instead of failing.
     let prompts = ["--permission-prompt-tool", "stdio"];
@@ -118,7 +119,8 @@ pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receive
         &ws.dir(),
         chat.model(),
         &chat.id,
-        prompts.into_iter().chain(effort(chat)).chain(resume),
+        (prompts.into_iter().chain(effort(chat)).chain(resume))
+            .chain(skills.iter().map(String::as_str)),
         Some(transcript_path(&chat.id)),
     )
 }

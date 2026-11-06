@@ -432,10 +432,11 @@ impl Chat {
             return;
         }
         let (name, dir) = (self.ws.name.clone(), self.ws.dir());
+        let skills = crate::git::claude_skill_args(&self.ws);
         self.probing = Some(cx.spawn(async move |this, cx| {
             let cmds = cx
                 .background_executor()
-                .spawn(async move { complete::probe_commands(&name, &dir) })
+                .spawn(async move { complete::probe_commands(&name, &dir, &skills) })
                 .await;
             this.update(cx, |c, cx| {
                 c.probing = None;
