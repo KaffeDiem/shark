@@ -19,14 +19,48 @@ pub(super) struct FileTab {
 struct Header {
     dirty: bool,
     conflict: bool,
-    vim: &'static str,
-    pending: String,
-    status: Option<(String, Option<String>)>,
+    vim_on: bool,
+    vim: String,
+    status: Option<(crate::lsp::Status, Option<String>)>,
     activity: Option<crate::lsp::Work>,
-    crumbs: Vec<String>,
+    crumbs: Vec<(usize, String)>,
+}
+
+impl Header {
+    fn of(e: &FileEditor, cx: &App) -> Self {
+        Self {
+            dirty: e.dirty,
+            conflict: e.conflict,
+            vim_on: e.vim_on,
+            vim: e.vim.label(),
+            status: e.language_status(cx),
+            activity: e.language_activity(cx),
+            crumbs: (e.crumbs.iter())
+                .map(|&i| (i, e.outline[i].name.clone()))
+                .collect(),
+        }
+    }
 }
 
 impl Shark {
+    /// The index of the file tab showing `path`.
+    pub(super) fn file_tab_ix(&self, path: &str, cx: &App) -> Option<usize> {
+        (self.file_tabs.iter()).position(|t| t.editor.read(cx).path == path)
+    }
+
+    /// `path` is edited in the diff with unsaved or in-flight changes.
+    pub(super) fn diff_edit_busy(&self, path: &str, cx: &App) -> bool {
+        self.differ.read(cx).has_unsaved_edit(path)
+    }
+
+    /// `path` has unsaved or in-flight changes in a file tab.
+    pub(super) fn editor_busy(&self, path: &str, cx: &App) -> bool {
+        self.file_tabs.iter().any(|t| {
+            let e = t.editor.read(cx);
+            e.path == path && (e.dirty || e.saving)
+        })
+    }
+
     /// Opens `repo/rel/path`, replacing the selected file after confirming unsaved edits.
     pub(super) fn open_path(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
         self.open_path_in_tab(path, false, window, cx);
@@ -49,16 +83,10 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         let Some(ws) = self.active_ws() else { return };
-        if let Some(ix) = self
-            .file_tabs
-            .iter()
-            .position(|t| t.editor.read(cx).path == path)
-        {
+        if let Some(ix) = self.file_tab_ix(&path, cx) {
             return self.select_file(ix, window, cx);
         }
-        if (self.differ.read(cx).edit_snapshot())
-            .is_some_and(|e| e.path.as_str() == path && (e.dirty || e.saving))
-        {
+        if self.diff_edit_busy(&path, cx) {
             return notify_err(window, cx, format!("{path} has unsaved edits in the diff"));
         }
         let workspace = ws.name.clone();
@@ -81,19 +109,11 @@ impl Shark {
                 if s.active.as_ref() != Some(&workspace) {
                     return;
                 }
-                if s.differ
-                    .read(cx)
-                    .edit_snapshot()
-                    .is_some_and(|e| e.path.as_str() == path && (e.dirty || e.saving))
-                {
+                if s.diff_edit_busy(&path, cx) {
                     return notify_err(window, cx, format!("{path} has unsaved edits in the diff"));
                 }
                 // Restoration may have opened the target while the discard dialog was up.
-                let tab = match s
-                    .file_tabs
-                    .iter()
-                    .position(|t| t.editor.read(cx).path == path)
-                {
+                let tab = match s.file_tab_ix(&path, cx) {
                     Some(ix) => s.file_tabs.remove(ix),
                     None => s.make_file_tab(path.clone(), abs, None, window, cx),
                 };
@@ -117,9 +137,7 @@ impl Shark {
                 let _ = s.state.save();
                 s.editor = Some(editor);
                 s.show(Tab::File, window, cx);
-                if let Some(name) = s.active.clone() {
-                    s.record_interaction(&name, cx);
-                }
+                s.record_active_interaction(cx);
             },
         );
     }
@@ -161,18 +179,7 @@ impl Shark {
                 let Some(tab) = s.file_tabs.iter_mut().find(|t| t.editor == editor) else {
                     return;
                 };
-                let e = editor.read(cx);
-                let header = Header {
-                    dirty: e.dirty,
-                    conflict: e.conflict,
-                    vim: e.vim.status(),
-                    pending: e.vim.pending().to_string(),
-                    status: e.language_status(cx),
-                    activity: e.language_activity(cx),
-                    crumbs: (e.crumbs.iter())
-                        .map(|&i| e.outline[i].name.clone())
-                        .collect(),
-                };
+                let header = Header::of(editor.read(cx), cx);
                 if header != tab.header {
                     // A hidden file shows only its unsaved dot, in the tab strip.
                     let shown =
@@ -196,7 +203,10 @@ impl Shark {
         let Some(ws) = self.active_ws() else { return };
         let order: Vec<_> = ws.file_tabs().cloned().collect();
         self.file_tabs
-            .sort_by_key(|t| order.iter().position(|p| *p == t.editor.read(cx).path));
+            // Unlisted (external) files go last, as the strip draws them.
+            .sort_by_key(|t| {
+                (order.iter().position(|p| *p == t.editor.read(cx).path)).unwrap_or(usize::MAX)
+            });
     }
 
     /// Restore disk contents in the background without selecting or focusing a file.
@@ -231,7 +241,7 @@ impl Shark {
                         .unwrap()
                         .tab_order
                         .contains(&TabId::File(path.clone()))
-                        || s.file_tabs.iter().any(|t| t.editor.read(cx).path == path)
+                        || s.file_tab_ix(&path, cx).is_some()
                     {
                         continue;
                     }
@@ -267,19 +277,12 @@ impl Shark {
             return;
         };
         let path = tab.editor.read(cx).path.clone();
-        if self
-            .differ
-            .read(cx)
-            .edit_snapshot()
-            .is_some_and(|e| e.path.as_str() == path && (e.dirty || e.saving))
-        {
+        if self.diff_edit_busy(&path, cx) {
             return notify_err(window, cx, format!("{path} has unsaved edits in the diff"));
         }
         self.editor = Some(tab.editor.clone());
         self.show(Tab::File, window, cx);
-        if let Some(name) = self.active.clone() {
-            self.record_interaction(&name, cx);
-        }
+        self.record_active_interaction(cx);
     }
 
     pub(super) fn close_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -306,20 +309,23 @@ impl Shark {
                     return;
                 };
                 let path = editor.read(cx).path.clone();
+                let shown = s.editor.as_ref() == Some(&editor);
+                let at = s
+                    .active_tab_index(cx)
+                    .filter(|_| shown && s.tab == Tab::File);
                 s.active_ws_mut().unwrap().close_tab(&TabId::File(path));
                 let _ = s.state.save();
                 s.file_tabs.remove(ix);
                 s.prune_language_sessions(cx);
                 if s.file_tabs.is_empty() {
                     s.editor = None;
-                    if s.tab == Tab::File {
-                        s.show(s.file_fallback(), window, cx);
-                    }
-                } else if s.editor.as_ref() == Some(&editor) {
+                } else if shown {
                     s.editor = Some(s.file_tabs[ix.min(s.file_tabs.len() - 1)].editor.clone());
-                    if s.tab == Tab::File {
-                        s.show(Tab::File, window, cx);
-                    }
+                }
+                if let Some(at) = at.filter(|_| !s.home_shown()) {
+                    s.select_neighbor(at, window, cx);
+                } else if s.tab == Tab::File && s.editor.is_none() {
+                    s.show(s.file_fallback(), window, cx);
                 }
                 cx.notify();
             },
@@ -327,7 +333,10 @@ impl Shark {
     }
 
     pub(super) fn file_fallback(&self) -> Tab {
-        if self.active_ws().is_some_and(|ws| ws.diff_closed) {
+        if self
+            .active_ws()
+            .is_some_and(|ws| !Feature::Diff.is_open(ws))
+        {
             Tab::Chat
         } else {
             Tab::Feature(Feature::Diff)
@@ -657,20 +666,17 @@ impl Shark {
             Some((d, n)) => (format!("{d}/"), n.to_string()),
             None => (String::new(), path.clone()),
         };
-        let vim = e.vim_on.then(|| {
-            let p = e.vim.pending();
-            match p.is_empty() {
-                true => e.vim.status().to_string(),
-                false => format!("{} {p}", e.vim.status()),
-            }
-        });
-        let (dirty, conflict) = (e.dirty, e.conflict);
-        let language_status = e.language_status(cx);
-        let activity = e.language_activity(cx);
-        let crumbs: Vec<_> = (e.crumbs.iter())
-            .map(|&i| (i, e.outline[i].name.clone()))
-            .collect();
-        let vim_on = e.vim_on;
+        let h = Header::of(e, cx);
+        let vim = h.vim_on.then(|| h.vim.clone());
+        let Header {
+            dirty,
+            conflict,
+            vim_on,
+            status: language_status,
+            activity,
+            crumbs,
+            ..
+        } = h;
         // Each folder of a workspace file lists its entries; a dependency outside the
         // workspace shows its path as plain text.
         let folders: Vec<(String, String)> = match e.external {
@@ -684,8 +690,7 @@ impl Shark {
                 .collect(),
         };
         // `g t` works in Vim's Normal mode, where it types nothing.
-        let normal =
-            e.vim_on && e.vim.mode == crate::vim::Mode::Normal && e.vim.pending().is_empty();
+        let normal = e.vim_on && e.vim.idle();
         v_flex()
             .id("file-editor-pane")
             .test_support()
@@ -874,10 +879,11 @@ impl Shark {
                     .when_some(language_status.clone(), |d, (status, detail)| {
                         let busy = activity.as_ref();
                         // "Indexing 42%"; the server's message (crate, file count) is in the tooltip.
-                        let label = busy.map_or(status, |w| match w.percentage {
-                            Some(p) => format!("{} {p}%", w.title),
-                            None => w.title.clone(),
-                        });
+                        let label =
+                            busy.map_or(status.label().to_string(), |w| match w.percentage {
+                                Some(p) => format!("{} {p}%", w.title),
+                                None => w.title.clone(),
+                            });
                         let tooltip = (busy.and_then(|w| w.message.clone()))
                             .or(detail)
                             .unwrap_or_else(|| "Restart language tools".into());
@@ -939,7 +945,7 @@ impl Shark {
                         )
                     })
                     .child(
-                        crate::settings::close_button("close-file", "Close file (cmd-w)")
+                        crate::ui::close_button("close-file", "Close file (cmd-w)")
                             .on_click(cx.listener(|this, _, w, cx| this.close_file(w, cx))),
                     ),
             )
@@ -961,7 +967,9 @@ impl Shark {
             })
             .when_some(
                 language_status.and_then(|(status, detail)| {
-                    (status == "Setup needed").then_some(detail).flatten()
+                    (status == crate::lsp::Status::SetupNeeded)
+                        .then_some(detail)
+                        .flatten()
                 }),
                 |d, detail| {
                     let deps = [crate::deps::Dep {

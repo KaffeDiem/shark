@@ -18,7 +18,7 @@
 <table>
 <tr><td width="50%" valign="top"><b>Multi-repo workspaces</b><br>One task gets one git worktree per repo on a shared branch, and a single agent works across all of them.<br><br><img src="docs/images/multi-repo.png" alt="The new-workspace dialog with several repos ticked"></td><td width="50%" valign="top"><b>Review the diff like a PR</b><br>Comment on lines across every repo, send the comments to the agent as one review, and track each until it is addressed.<br><br><img src="docs/images/review.png" alt="Send review listing the pending comment threads and the prompt preview"></td></tr>
 <tr><td width="50%" valign="top"><b>Version-controlled plans</b><br>In plan mode each plan revision is saved and diffed against the last one. Press <code>a</code> to approve and build.<br><br><img src="docs/images/plan-versions.png" alt="The plan pane showing a revised plan with added and removed words marked"></td><td width="50%" valign="top"><b>One git button</b><br>It shows the next step for every repo: commit, push, fix checks, address review, merge.<br><br><img src="docs/images/git-menu.png" alt="The git button and its menu with the next step for each repo"></td></tr>
-<tr><td width="50%" valign="top"><b>Stacked PRs</b><br>Start from another branch or PR. When the parent merges, Shark retargets the PR and rebases.<br><br><img src="docs/images/stack.png" alt="The branch menu showing a three-PR stack, its current workspace, and actions to rebase or insert a workspace"></td><td width="50%" valign="top"><b>Claude and Codex</b><br>Model and thinking level per chat, with usage rings for what is left of your plan.<br><br><img src="docs/images/usage.png" alt="The usage panel with Claude and Codex allowances and a calendar of tokens per day"></td></tr>
+<tr><td width="50%" valign="top"><b>Stacked PRs</b><br>Start from another branch or PR. When the parent merges, Shark retargets the PR and rebases.<br><br><img src="docs/images/stack.png" alt="The branch menu showing a three-PR stack, its current workspace, and actions to rebase or insert a workspace"></td><td width="50%" valign="top"><b>Claude and Codex</b><br>Model and thinking level per chat, with the quota left on your plan and when it resets.<br><br><img src="docs/images/usage.png" alt="The usage panel with Claude and Codex quota bars and reset times"></td></tr>
 <tr><td colspan="2" valign="top"><b>Native and keyboard-first</b><br>GPUI on Metal, not Electron. Everything is in <code>cmd-k</code>, with an optional Vim mode.<br><br><img src="docs/images/palette.png" alt="The cmd-k command palette"></td></tr>
 </table>
 
@@ -34,7 +34,7 @@ Setup: `brew install azure-cli`, `az extension add --name azure-devops`, `az log
 brew tap KaffeDiem/shark https://github.com/KaffeDiem/shark
 brew install --cask KaffeDiem/shark/shark
 ```
-Or [Download Shark 0.1.17](https://github.com/KaffeDiem/shark/releases/download/v0.1.17/Shark-0.1.17.dmg) (Apple Silicon), open it and drag Shark to Applications. The app isn't notarized: on first launch, open it, then allow it in System Settings → Privacy & Security → Open Anyway, or run `xattr -dr com.apple.quarantine /Applications/Shark.app`.
+Or [Download Shark 0.1.26](https://github.com/KaffeDiem/shark/releases/download/v0.1.26/Shark-0.1.26.dmg) (Apple Silicon), open it and drag Shark to Applications. The app isn't notarized: on first launch, open it, then allow it in System Settings → Privacy & Security → Open Anyway, or run `xattr -dr com.apple.quarantine /Applications/Shark.app`.
 
 Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH. For Codex models, also `codex` (logged in with `codex login`).
 
@@ -43,7 +43,7 @@ Shark opens on Home (`cmd-0`). Type what you want to build and press `enter` to 
 
 1. Choose **Add repo** in `cmd-k`. `cmd-n`, tick the repos, and name the branch. `enter` creates the workspace.
 2. `shift-tab` for plan mode. Revise the plan in the chat, then `a` in the plan pane to build.
-3. `cmd-shift-d`, or **Differ** in the Features rail, opens the Diff artifact with its changed-files tree. `c` on a diff line leaves a comment, and `shift-c` sends the review to the agent.
+3. `cmd-shift-d`, or **Differ** in the Features rail, opens the Diff artifact with its changed-files tree. `c` on a diff line leaves a comment (`cmd-shift-enter` sends it right away), and `shift-c` sends the review to this chat, a new chat on a model you pick, or another open chat.
 4. Create or update PRs (`cmd-k` or the git menu) opens linked PRs. The git button (top right) takes it from there.
 
 ## Learn more

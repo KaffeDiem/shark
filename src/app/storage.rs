@@ -13,22 +13,40 @@ impl Shark {
         cx.notify();
     }
 
-    pub(super) fn unsaved_data(&self, cx: &App) -> Vec<String> {
+    /// Data that failed to save, as user-facing lines; `only` limits it to one workspace's.
+    pub(super) fn unsaved_data(&self, only: Option<&str>, cx: &App) -> Vec<String> {
         let mut errors = Vec::new();
-        if let Some(e) = self.state.save_error.borrow().as_ref() {
+        let keep = |ws: &str| only.is_none_or(|o| o == ws);
+        if let Some(e) = self
+            .state
+            .save_error
+            .borrow()
+            .as_ref()
+            .filter(|_| only.is_none())
+        {
             errors.push(format!("Workspace state and settings: {e}"));
         }
         for (ws, e) in self.differ.read(cx).storage_errors() {
-            errors.push(format!("Comments in {ws}: {e}"));
+            if keep(&ws) {
+                errors.push(format!("Comments in {ws}: {e}"));
+            }
         }
         for chat in self.chats.values() {
             let chat = chat.read(cx);
-            if let Some(e) = &chat.history_save_error {
+            let mine = only.is_none_or(|o| {
+                (self.ws(o)).is_some_and(|w| {
+                    w.chats
+                        .iter()
+                        .chain(&w.closed)
+                        .any(|m| m.id == chat.meta.id)
+                })
+            });
+            if let (true, Some(e)) = (mine, &chat.history_save_error) {
                 errors.push(format!("Completed answers in {}: {e}", chat.meta.id));
             }
         }
         for (ws, git) in &self.git_features {
-            if let Some(e) = git.read(cx).storage_error() {
+            if let (true, Some(e)) = (keep(ws), git.read(cx).storage_error()) {
                 errors.push(format!("Git drafts in {ws}: {e}"));
             }
         }
@@ -67,7 +85,7 @@ impl Shark {
             return false;
         }
         self.retry_saves(cx);
-        if self.unsaved_data(cx).is_empty() {
+        if self.unsaved_data(None, cx).is_empty() {
             if self
                 .git_features
                 .values()
@@ -84,8 +102,9 @@ impl Shark {
                 return d;
             };
             owner.update(cx, |s, cx| {
-                d.title("Unsaved data")
-                    .child(div().child(s.unsaved_data(cx).join("\n")))
+                crate::ui::dialog(d)
+                    .title("Unsaved data")
+                    .child(div().child(s.unsaved_data(None, cx).join("\n")))
                     .footer(
                         h_flex()
                             .gap_2()

@@ -64,18 +64,9 @@ impl Render for FilePicker {
         let dark = cx.theme().is_dark();
         let items = (self.hits.iter()).map(|&i| {
             let label: SharedString = rel(&self.files[i]).into();
-            let item = CommandItem::new().label(label.clone());
             match crate::file_icon::file_icon(&self.files[i].label, dark) {
-                None => item.icon(IconName::File),
-                // As `app_item` in the palette: a custom row for an image icon.
-                Some(icon) => item.child(move |_, _| {
-                    h_flex()
-                        .flex_1()
-                        .gap_2()
-                        .items_center()
-                        .child(img(icon.clone()).size_4().flex_none())
-                        .child(div().flex_1().min_w_0().truncate().child(label.clone()))
-                }),
+                None => CommandItem::new().label(label).icon(IconName::File),
+                Some(icon) => image_item(label, icon),
             }
         });
         let (q, pick) = (cx.entity().downgrade(), cx.entity().downgrade());
@@ -113,9 +104,7 @@ impl Shark {
         let Some(ws) = self.active_ws() else {
             return notify_err(window, cx, "Open a workspace first");
         };
-        let repos: Vec<_> = (ws.repos.iter())
-            .map(|r| (r.name.clone(), ws.dir().join(&r.name)))
-            .collect();
+        let repos = ws.repo_paths();
         let shark = cx.entity().downgrade();
         let picker = cx.new(|cx| FilePicker::new(repos, shark, window, cx));
         let state = picker.read(cx).state.clone();

@@ -3,8 +3,8 @@ use std::{cell::RefCell, rc::Rc};
 use gpui_kit::{AppContext, Empty, ListOffset, TestAppContext, px, size};
 
 use super::{
-    DiffEvent, DiffFile, DiffLinePosition, DiffLineRange, DiffMode, DiffSide, DiffState,
-    document::fixture, state::DisplayRow,
+    DiffFile, DiffLinePosition, DiffLineRange, DiffMode, DiffSide, DiffState, document::fixture,
+    rows::DisplayRow,
 };
 
 fn document(original: &str, modified: &str) -> DiffFile {
@@ -153,7 +153,6 @@ fn context_disclosures_reveal_source_ranges_without_retargeting_selection(cx: &m
                 .any(|row| matches!(row, DisplayRow::Fold { .. }))
         );
         state.collapse_unchanged(cx);
-        assert_eq!(state.context_lines(), Some(1));
         assert_eq!(
             state.selected_lines(),
             Some(DiffLineRange::new("review.txt", DiffSide::Modified, 14, 16))
@@ -318,18 +317,9 @@ fn change_navigation_wraps_groups_and_unchanged_documents_stay_in_place(cx: &mut
 }
 
 #[gpui_kit::test]
-fn controlled_selection_stays_silent_and_coherent_changes_notify(cx: &mut TestAppContext) {
+fn coherent_changes_notify_once(cx: &mut TestAppContext) {
     let state = cx.new(|cx| DiffState::new([document("old\n", "new\n")], cx));
-    let events = Rc::new(RefCell::new(Vec::new()));
     let notifications = Rc::new(RefCell::new(0));
-    let _events = cx.update(|cx| {
-        let events = events.clone();
-        cx.subscribe(&state, move |_, event: &DiffEvent, _| {
-            if let DiffEvent::SelectionChanged(range) = event {
-                events.borrow_mut().push(range.clone());
-            }
-        })
-    });
     let _notifications = cx.update(|cx| {
         let notifications = notifications.clone();
         cx.observe(&state, move |_, _| *notifications.borrow_mut() += 1)
@@ -338,24 +328,19 @@ fn controlled_selection_stays_silent_and_coherent_changes_notify(cx: &mut TestAp
     state.update(cx, |state, cx| {
         state.set_selected_lines(Some(range.clone()), cx)
     });
-    assert!(events.borrow().is_empty());
     assert_eq!(*notifications.borrow(), 1);
     state.update(cx, |state, cx| state.set_selected_lines(Some(range), cx));
     assert_eq!(*notifications.borrow(), 1);
     state.update(cx, |state, cx| state.set_mode(DiffMode::Split, cx));
-    assert!(events.borrow().is_empty());
     assert_eq!(*notifications.borrow(), 2);
     state.update(cx, |state, cx| state.set_mode(DiffMode::Split, cx));
     assert_eq!(*notifications.borrow(), 2);
     state.update(cx, |state, cx| state.set_selected_lines(None, cx));
-    assert!(events.borrow().is_empty());
     assert_eq!(*notifications.borrow(), 3);
 }
 
 #[gpui_kit::test]
-fn user_line_selection_extends_on_one_side_and_replacement_resets_silently(
-    cx: &mut TestAppContext,
-) {
+fn user_line_selection_extends_on_one_side_and_replacement_resets(cx: &mut TestAppContext) {
     // This fixture needs a Window for focus and selection cleanup, but never
     // renders Component content. Rendered pointer/key paths live in Kit tests.
     let window = cx.open_window(size(px(640.), px(480.)), |_, _| Empty);
@@ -367,15 +352,6 @@ fn user_line_selection_extends_on_one_side_and_replacement_resets_silently(
             )],
             cx,
         )
-    });
-    let events = Rc::new(RefCell::new(Vec::new()));
-    let _subscription = cx.update(|cx| {
-        let events = events.clone();
-        cx.subscribe(&state, move |_, event: &DiffEvent, _| {
-            if let DiffEvent::SelectionChanged(range) = event {
-                events.borrow_mut().push(range.clone());
-            }
-        })
     });
     cx.update_window(window.into(), |_, window, cx| {
         state.update(cx, |state, cx| {
@@ -455,21 +431,6 @@ fn user_line_selection_extends_on_one_side_and_replacement_resets_silently(
         });
     })
     .unwrap();
-    assert_eq!(
-        events.borrow().as_slice(),
-        &[
-            Some(DiffLineRange::new("review.txt", DiffSide::Original, 2, 2)),
-            Some(DiffLineRange::new("review.txt", DiffSide::Original, 2, 3)),
-            Some(DiffLineRange::new("review.txt", DiffSide::Original, 2, 2)),
-            Some(
-                DiffLineRange::new("review.txt", DiffSide::Original, 2, 3)
-                    .with_end_side(DiffSide::Modified)
-            ),
-            Some(DiffLineRange::new("review.txt", DiffSide::Original, 1, 1)),
-            Some(DiffLineRange::new("review.txt", DiffSide::Modified, 3, 3)),
-            Some(DiffLineRange::new("review.txt", DiffSide::Modified, 1, 3)),
-        ]
-    );
     cx.update_window(window.into(), |_, window, cx| {
         state.update(cx, |state, cx| {
             state.keyboard_select(1, true, window, cx);
@@ -485,7 +446,6 @@ fn user_line_selection_extends_on_one_side_and_replacement_resets_silently(
         });
     })
     .unwrap();
-    assert_eq!(events.borrow().len(), 8);
 }
 
 #[gpui_kit::test]

@@ -14,6 +14,177 @@ fn fake_client(root: &std::path::Path, log: &std::path::Path) -> Client {
     Client::start(fake_server(log), root, json!({})).unwrap()
 }
 
+struct PendingDefinition(async_channel::Receiver<Vec<lsp_types::LocationLink>>);
+
+impl gpui_kit::base::input::DefinitionProvider for PendingDefinition {
+    fn definitions(
+        &self,
+        _: &gpui_kit::base::input::Rope,
+        _: usize,
+        _: &mut Window,
+        cx: &mut App,
+    ) -> Task<anyhow::Result<Vec<lsp_types::LocationLink>>> {
+        let response = self.0.clone();
+        cx.spawn(async move |_| Ok(response.recv().await?))
+    }
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn semantic_highlighting_opens_refreshes_edits_and_restarts(cx: &mut TestAppContext) {
+    let _turn = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    for full in [false, true] {
+        let initial = "// 😀\nlet value: Int = 1\n";
+        let (dir, file, window, editor) =
+            ui_tests::open_editor("a.swift", "semantic", initial, cx).await;
+        let log = dir.join("semantic.jsonl");
+        let client = fake_client(&dir, &log);
+        block_on(
+            client.initialize_with_options(json!({"semanticTokensProvider":{
+                "legend":{"tokenTypes":["class","enumMember","method"],"tokenModifiers":[]},
+                "range":!full,"full":full
+            }})),
+        )
+        .unwrap();
+        // The deterministic UI scheduler cannot be woken by the peer's OS thread.
+        // Hold responses so edits/restarts exercise cancellation instead.
+        block_on(client.request("test/setSemanticTokens", json!({"hold":true}))).unwrap();
+        let project = Project {
+            root: dir.clone(),
+            worktree: dir.clone(),
+            backend: Backend::Swift,
+            toolchain: String::new(),
+            rust_toolchain: None,
+            interpreter: None,
+        };
+        let session = cx.update(|cx| cx.new(|_| Session::with_client(project, client.clone())));
+        cx.update_window(window, |_, w, cx| {
+            editor.update(cx, |e, cx| e.attach_language(session.clone(), w, cx));
+        })
+        .unwrap();
+        let method = if full {
+            "textDocument/semanticTokens/full"
+        } else {
+            "textDocument/semanticTokens/range"
+        };
+        let requests = || {
+            logged(&log)
+                .into_iter()
+                .filter(|v| v["method"] == method)
+                .collect::<Vec<_>>()
+        };
+        cx.wait_for(window, Duration::from_secs(10), |_, _| {
+            !requests().is_empty()
+        })
+        .await;
+        cx.update(|cx| {
+            let provider = editor
+                .read(cx)
+                .input
+                .read(cx)
+                .lsp()
+                .semantic_tokens_provider
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                serde_json::to_value(provider.legend().token_types).unwrap(),
+                json!(["type", "constant", "function"])
+            );
+        });
+        let (definition, response) = async_channel::unbounded();
+        let navigated = std::rc::Rc::new(std::cell::Cell::new(false));
+        cx.update_window(window, |_, w, cx| {
+            focus(&editor, w, cx);
+            editor.read(cx).input.clone().update(cx, |i, _| {
+                i.lsp_mut().definition_provider =
+                    Some(std::rc::Rc::new(PendingDefinition(response)));
+                let navigated = navigated.clone();
+                i.lsp_mut().show_document = Some(std::rc::Rc::new(move |_, _, _| {
+                    navigated.set(true);
+                    true
+                }));
+            });
+            w.dispatch_action(Box::new(gpui_kit::base::input::GoToDefinition), cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        let before = requests().len();
+        cx.update(|cx| {
+            session.update(cx, |_, cx| {
+                cx.emit(crate::lsp::SessionEvent::Notification {
+                    method: "workspace/semanticTokens/refresh".into(),
+                    params: Value::Null,
+                    companion: false,
+                })
+            })
+        });
+        cx.wait_for(window, Duration::from_secs(10), |_, _| {
+            requests().len() > before
+        })
+        .await;
+        definition
+            .try_send(vec![lsp_types::LocationLink {
+                origin_selection_range: None,
+                target_uri: crate::lsp::document::file_uri(&file).unwrap(),
+                target_range: Default::default(),
+                target_selection_range: Default::default(),
+            }])
+            .unwrap();
+        cx.run_until_parked();
+        assert!(navigated.get(), "semantic refresh cancelled navigation");
+        let before = requests().len();
+        let edited = "// 😀\nlet value: String = \"unsaved\"\n";
+        cx.update_window(window, |_, w, cx| {
+            editor.update(cx, |e, cx| e.replace_language_text(edited.into(), w, cx));
+        })
+        .unwrap();
+        cx.wait_for(window, Duration::from_secs(10), |_, _| {
+            requests().len() > before
+        })
+        .await;
+        let messages = logged(&log);
+        let change = messages
+            .iter()
+            .rposition(|v| v["method"] == "textDocument/didChange")
+            .unwrap();
+        let tokens = messages
+            .iter()
+            .rposition(|v| v["method"] == method)
+            .unwrap();
+        assert!(change < tokens);
+        assert_eq!(
+            messages[change]["params"]["contentChanges"][0]["text"],
+            edited
+        );
+        assert_eq!(fs::read_to_string(&file).unwrap(), initial);
+        assert!(messages.iter().any(|v| v["method"] == "$/cancelRequest"));
+        cx.update(|cx| {
+            session.update(cx, |s, cx| {
+                s.client = None;
+                s.generation += 1;
+                cx.notify();
+            })
+        });
+        cx.run_until_parked();
+        cx.update(|cx| {
+            assert!(
+                editor
+                    .read(cx)
+                    .input
+                    .read(cx)
+                    .lsp()
+                    .semantic_tokens_provider
+                    .is_none()
+            )
+        });
+        block_on(client.request("test/releaseSemanticTokens", Value::Null)).unwrap();
+        client.shutdown();
+        let _ = fs::remove_dir_all(dir);
+    }
+}
+
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn language_replacements_preserve_selection_scroll_and_one_vim_undo(cx: &mut TestAppContext) {
@@ -86,7 +257,6 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
     let project = Project {
         root: dir.clone(),
         worktree: dir.clone(),
-        language_id: "python",
         backend: Backend::Pyrefly,
         toolchain: String::new(),
         rust_toolchain: None,
@@ -135,7 +305,7 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
     });
     cx.update(|cx| {
         session.update(cx, |s, cx| {
-            s.status = "Preparing index".into();
+            s.status = crate::lsp::Status::Preparing;
             cx.notify();
         })
     });
@@ -248,7 +418,7 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
         session.update(cx, |s, cx| {
             s.client = Some(restarted.clone());
             s.generation += 1;
-            s.status = "Ready".into();
+            s.status = crate::lsp::Status::Ready;
             cx.notify();
         })
     });
@@ -261,7 +431,7 @@ async fn fake_server_syncs_unicode_rapid_edits_save_reload_status_and_restart(
     cx.update(|cx| {
         let e = editor.read(cx);
         assert!(e.lsp_error.is_none());
-        assert_eq!(e.language_status(cx).unwrap().0, "Ready");
+        assert_eq!(e.language_status(cx).unwrap().0, crate::lsp::Status::Ready);
     });
     assert_eq!(
         block_on(restarted.request(
@@ -322,7 +492,6 @@ async fn diagnostics_from_both_servers_remain_searchable_in_document_order(
     let project = Project {
         root: dir.clone(),
         worktree: dir.clone(),
-        language_id: "python",
         backend: Backend::Pyrefly,
         toolchain: String::new(),
         rust_toolchain: None,
@@ -355,6 +524,12 @@ async fn diagnostics_from_both_servers_remain_searchable_in_document_order(
     .await;
     let uri = url::Url::from_file_path(&file).unwrap().to_string();
     for (is_companion, lines) in [(false, vec![2, 1]), (true, vec![0])] {
+        // The companion re-serializes the URI (`a` as `%61`); it is still this document.
+        let uri = if is_companion {
+            uri.replace("a.py", "%61.py")
+        } else {
+            uri.clone()
+        };
         cx.update(|cx| {
             session.update(cx, |_, cx| {
                 let diagnostics: Vec<_> = lines.iter().map(|line| json!({
@@ -382,6 +557,20 @@ async fn diagnostics_from_both_servers_remain_searchable_in_document_order(
     let _ = fs::remove_dir_all(dir);
 }
 
+#[test]
+fn publish_diagnostics_uris_match_by_decoded_path() {
+    use crate::lsp::document::{file_uri, same_file};
+    // Our own URI for a Next.js route file must be representable at all (`[id]`).
+    let ours = file_uri(std::path::Path::new("/p/app/(shop)/[id]/page.tsx")).unwrap();
+    assert!(same_file(
+        "file:///p/app/%28shop%29/%5Bid%5D/page.tsx",
+        &ours
+    ));
+    assert!(same_file(ours.as_str(), &ours));
+    assert!(!same_file("file:///p/app/(shop)/[id]/other.tsx", &ours));
+    assert!(!same_file("untitled:page.tsx", &ours));
+}
+
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn completion_acceptance_applies_autoimport_snippet_mirrors_and_undo(
@@ -402,7 +591,6 @@ async fn completion_acceptance_applies_autoimport_snippet_mirrors_and_undo(
     let project = Project {
         root: dir.clone(),
         worktree: dir.clone(),
-        language_id: "python",
         backend: Backend::Pyrefly,
         toolchain: String::new(),
         interpreter: None,
@@ -536,7 +724,6 @@ async fn accepting_an_unresolved_completion_adds_its_import_as_a_second_undo_ste
     let project = Project {
         root: dir.clone(),
         worktree: dir.clone(),
-        language_id: "python",
         backend: Backend::Pyrefly,
         toolchain: String::new(),
         interpreter: None,
@@ -653,7 +840,6 @@ async fn snippet_completion_inside_an_active_field_starts_its_own_tabstops(
     let project = Project {
         root: dir.clone(),
         worktree: dir.clone(),
-        language_id: "python",
         backend: Backend::Pyrefly,
         toolchain: String::new(),
         interpreter: None,

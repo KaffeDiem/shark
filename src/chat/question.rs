@@ -41,6 +41,13 @@ pub(super) struct Q {
     secret: bool,
 }
 
+/// The user's own text for an answer: trimmed, unless it's a secret (spaces may belong to it).
+/// Blank is no answer.
+fn note_of(text: &str, secret: bool) -> Option<String> {
+    let t = if secret { text } else { text.trim() };
+    (!text.trim().is_empty()).then(|| t.to_string())
+}
+
 /// What the user answered to one question: the labels picked and any text of their own.
 type Answer = (Vec<String>, Option<String>);
 
@@ -130,6 +137,22 @@ fn pairs(qs: &[Q], answers: &[Answer]) -> String {
     }
 }
 
+/// The wordings a tool result gives answers in: codex's (which we write) and claude's own,
+/// each as the text before and after the answers.
+const RESULTS: [(&str, &str); 2] = [
+    (
+        "Your questions have been answered: ",
+        ". You can now continue",
+    ),
+    ("The user answered: ", ". Read the answers carefully"),
+];
+
+/// The tool result recorded for codex's answers, in claude's words.
+fn answer_result(summary: &str) -> String {
+    let (prefix, ending) = RESULTS[0];
+    format!("{prefix}{summary}{ending}")
+}
+
 /// A question row's summary from claude's tool result, when it holds the answers.
 pub(super) fn answered(result: &str) -> Option<&str> {
     // A clipped result has no reliable protocol suffix; keep all retained answer text.
@@ -137,19 +160,14 @@ pub(super) fn answered(result: &str) -> Option<&str> {
         n.strip_suffix(" chars total")
             .is_some_and(|n| n.parse::<u64>().is_ok())
     });
-    if let Some(r) = result.strip_prefix("Your questions have been answered: ") {
-        return Some(
-            r.rsplit_once(". You can now continue")
-                .filter(|_| !truncated)
-                .map_or(r, |(answer, _)| answer),
-        );
-    }
-    if let Some(r) = result.strip_prefix("The user answered: ") {
-        return Some(
-            r.rsplit_once(". Read the answers carefully")
-                .filter(|_| !truncated)
-                .map_or(r, |(answer, _)| answer),
-        );
+    for (prefix, ending) in RESULTS {
+        if let Some(r) = result.strip_prefix(prefix) {
+            return Some(
+                r.rsplit_once(ending)
+                    .filter(|_| !truncated)
+                    .map_or(r, |(answer, _)| answer),
+            );
+        }
     }
     (result == ANSWER_IN_CHAT).then_some("Answered in the chat")
 }
@@ -313,8 +331,10 @@ impl Chat {
                     .filter_map(|j| asked.qs[i].options.get(j.parse::<usize>().ok()?))
                     .map(|(l, _)| l.clone())
                     .collect();
-                let note = a.freeform().map(|t| t.trim().to_string());
-                (labels, note.filter(|t| !t.is_empty()))
+                (
+                    labels,
+                    a.freeform().and_then(|t| note_of(t, asked.qs[i].secret)),
+                )
             })
             .collect();
         let (reply, summary) = (
@@ -322,7 +342,8 @@ impl Chat {
             pairs(&asked.qs, &answers),
         );
         let res = (self.agent.as_mut()).map_or(Ok(()), |a| a.allow(&asked.request_id, reply));
-        self.answered(asked, summary, res, cx);
+        let result = answer_result(&summary);
+        self.answered(asked, result, res, cx);
         self.focus_composer(window, cx);
     }
 
@@ -343,50 +364,57 @@ impl Chat {
             }
             (false, Some(a)) => a.deny(&asked.request_id, ANSWER_IN_CHAT),
         };
-        self.answered(asked, "Answered in the chat".into(), res, cx);
+        self.answered(asked, ANSWER_IN_CHAT.into(), res, cx);
     }
 
     /// After a reply went out: codex's questions get a row of their own (claude's call has one).
+    /// `result` is what the tool call's result reads.
     fn answered(
         &mut self,
         asked: Asked,
-        summary: String,
+        result: String,
         res: std::io::Result<()>,
         cx: &mut Context<Self>,
     ) {
         if let Err(e) = res {
             self.push(Block::Info(format!("answering the agent failed: {e}")), cx);
         } else if asked.codex {
-            let id = asked.tool_use_id;
-            let result = if summary == "Answered in the chat" {
-                ANSWER_IN_CHAT.to_string()
-            } else {
-                format!("Your questions have been answered: {summary}. You can now continue")
-            };
-            let records = [
-                json!({"type":"assistant", "shark_completed_answer":true, "message":{"content":[{"type":"tool_use", "id":id, "name":"AskUserQuestion", "input":asked.input}]}}),
-                json!({"type":"user", "shark_completed_answer":true, "message":{"content":[{"type":"tool_result", "tool_use_id":id, "content":result, "is_error":false}]}}),
-            ].map(|v| agent::compact(&v.to_string()).into_owned());
-            if !self.completed_answers.contains_key(&id) {
-                for record in &records {
-                    for event in agent::parse(record) {
-                        self.apply(event, cx);
-                    }
-                }
-                self.completed_answers.insert(id, records);
-            }
-            self.retry_history(cx);
+            self.record_codex_answer(asked.tool_use_id, asked.input, result, cx);
         }
         cx.emit(ChatEvent::Asking);
         cx.notify();
     }
 
+    /// Replays codex's question and its answer as a tool call and result, and saves them to
+    /// history: codex's own log has no such call.
+    fn record_codex_answer(
+        &mut self,
+        id: String,
+        input: Value,
+        result: String,
+        cx: &mut Context<Self>,
+    ) {
+        let records = [
+            json!({"type":"assistant", "shark_completed_answer":true, "message":{"content":[{"type":"tool_use", "id":id, "name":ASK_TOOL, "input":input}]}}),
+            json!({"type":"user", "shark_completed_answer":true, "message":{"content":[{"type":"tool_result", "tool_use_id":id, "content":result, "is_error":false}]}}),
+        ].map(|v| crate::transcript::compact(&v.to_string()).into_owned());
+        if !self.completed_answers.contains_key(&id) {
+            for record in &records {
+                for event in agent::parse(record) {
+                    self.apply(event, cx);
+                }
+            }
+            self.completed_answers.insert(id, records);
+        }
+        self.retry_history(cx);
+    }
+
     pub(crate) fn retry_history(&mut self, cx: &mut Context<Self>) {
-        let path = agent::transcript_path(&self.meta.id);
+        let path = crate::transcript::transcript_path(&self.meta.id);
         let mut failure = None;
         // shortcut: retries stay at EOF; add sequence metadata if replay must restore their original order.
         self.completed_answers.retain(|id, records| {
-            match agent::append_answer(&path, id, records) {
+            match crate::transcript::append_answer(&path, id, records) {
                 Ok(()) => false,
                 Err(e) => {
                     failure = Some(e.to_string());
@@ -512,19 +540,9 @@ impl Chat {
             .child(hint("enter", if last { "send" } else { "next" }))
             .child(hint("escape", "answer in chat"));
         Some(
-            v_flex()
+            side::aside_card(theme, focused)
                 .id("asked")
-                .w_full()
-                .max_w(px(712.))
                 .max_h(max_height)
-                .mx_auto()
-                .mb_2()
-                .p_3()
-                .gap_2()
-                .rounded(theme.radius_lg)
-                .border_1()
-                .border_color(if focused { theme.primary } else { theme.border })
-                .bg(theme.muted)
                 // A key reveals the focused answer again after the user wheels away from it.
                 .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
                     if ev.keystroke.modifiers.number_of_modifiers() == 0
@@ -584,6 +602,14 @@ impl Chat {
 mod tests {
     use super::*;
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
+
+    #[test]
+    fn secret_answers_keep_their_spaces() {
+        assert_eq!(note_of("  pw ", true).as_deref(), Some("  pw "));
+        assert_eq!(note_of("  pw ", false).as_deref(), Some("pw"));
+        assert_eq!(note_of("   ", true), None);
+        assert_eq!(note_of("", false), None);
+    }
 
     #[cfg(feature = "test-support")]
     #[gpui_kit::test]
@@ -838,7 +864,7 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         cx.update(gpui_kit::init);
         let id = format!("answer-retry-{}", std::process::id());
-        let path = agent::transcript_path(&id);
+        let path = crate::transcript::transcript_path(&id);
         fs::create_dir_all(&path).unwrap(); // force a storage failure
         let (_, chat) = cx
             .update(|cx| {
@@ -864,7 +890,7 @@ mod tests {
         let summary = pairs(&qs, &[(vec![], Some("NEVER_STORE_THIS_SECRET".into()))]);
         chat.update(cx, |c, cx| {
             let asked = Asked { request_id:"rpc".into(), tool_use_id:"question-1".into(), input, qs, codex:true, form:None, scroll:ScrollHandle::new(), revealed:Cell::new(None), _subs:vec![] };
-            c.answered(asked, summary, Ok(()), cx);
+            c.answered(asked, answer_result(&summary), Ok(()), cx);
             assert!(c.history_save_error.is_some());
             assert_eq!(c.completed_answers.len(), 1);
             assert!(c.blocks.iter().any(|b| matches!(b, Block::Info(s) if s == "Answer sent, but could not save it to history")));
@@ -881,7 +907,7 @@ mod tests {
         assert!(stored.lines().all(|line| {
             serde_json::from_str::<Value>(line).unwrap()["shark_completed_answer"] == true
         }));
-        let history = agent::read_history(&path, fs::metadata(&path).unwrap().len());
+        let history = crate::transcript::read_history(&path, fs::metadata(&path).unwrap().len());
         chat.update(cx, |c, cx| {
             let live = c
                 .blocks
@@ -919,7 +945,7 @@ mod tests {
                     revealed: Cell::new(None),
                     _subs: vec![],
                 },
-                "Answered in the chat".into(),
+                ANSWER_IN_CHAT.into(),
                 Ok(()),
                 cx,
             );
@@ -959,7 +985,7 @@ mod tests {
             plan: true,
             ..Default::default()
         };
-        let path = agent::transcript_path(&meta.id);
+        let path = crate::transcript::transcript_path(&meta.id);
         fs::create_dir_all(&path).unwrap();
         let (window, chat) = cx
             .update(|cx| {
@@ -1053,7 +1079,7 @@ mod tests {
             "service must use the real answer without echoing it"
         );
         assert!(
-            !fs::read_to_string(agent::transcript_path(&wire.id))
+            !fs::read_to_string(crate::transcript::transcript_path(&wire.id))
                 .unwrap()
                 .contains(SENTINEL)
         );
@@ -1074,13 +1100,13 @@ mod tests {
             2,
             "retry must store the answer exactly once"
         );
-        let history = agent::read_history(&path, u64::MAX);
+        let history = crate::transcript::read_history(&path, u64::MAX);
         chat.update(cx, |c, cx| {
             let live = c
                 .blocks
                 .iter()
                 .find_map(|b| match b {
-                    Block::Tool(t) if t.name == "AskUserQuestion" => {
+                    Block::Tool(t) if t.name == ASK_TOOL => {
                         Some((t.input.clone(), t.result.clone(), t.summary.clone()))
                     }
                     _ => None,
@@ -1104,12 +1130,8 @@ mod tests {
             );
         });
         fs::remove_file(path).unwrap();
-        fs::remove_file(agent::transcript_path(&wire.id)).unwrap();
-        let _ = fs::remove_file(
-            crate::state::support_dir()
-                .join("logs")
-                .join(format!("{}.stderr.log", wire.id)),
-        );
+        fs::remove_file(crate::transcript::transcript_path(&wire.id)).unwrap();
+        let _ = fs::remove_file(crate::transcript::log_path(&wire.id));
         fs::remove_dir_all(ws.dir()).unwrap();
     }
 
@@ -1174,13 +1196,7 @@ mod tests {
 
     #[test]
     fn answer_summaries_keep_protocol_words_inside_user_text() {
-        for (prefix, ending) in [
-            (
-                "Your questions have been answered: ",
-                ". You can now continue",
-            ),
-            ("The user answered: ", ". Read the answers carefully"),
-        ] {
+        for (prefix, ending) in RESULTS {
             let summary = format!(r#""Instructions?"="Stop{ending} after tests""#);
             let result = format!("{prefix}{summary}{ending}");
             assert_eq!(answered(&result), Some(summary.as_str()));
@@ -1189,20 +1205,14 @@ mod tests {
 
     #[test]
     fn clipped_answer_summaries_keep_protocol_words_inside_user_text() {
-        for (prefix, ending) in [
-            (
-                "Your questions have been answered: ",
-                ". You can now continue",
-            ),
-            ("The user answered: ", ". Read the answers carefully"),
-        ] {
+        for (prefix, ending) in RESULTS {
             let summary = format!(
                 r#""Instructions?"="Stop{ending} after {}""#,
-                "x".repeat(agent::MAX_OUTPUT)
+                "x".repeat(crate::transcript::MAX_OUTPUT)
             );
             let result = format!("{prefix}{summary}{ending}");
             let record = json!({"type":"user", "message":{"content":[{"type":"tool_result", "tool_use_id":"q", "content":result}]}}).to_string();
-            let events = agent::parse(&agent::compact(&record));
+            let events = agent::parse(&crate::transcript::compact(&record));
             let [Ev::ToolResult { text, .. }] = events.as_slice() else {
                 panic!()
             };
@@ -1269,7 +1279,7 @@ mod tests {
                         tool,
                         input,
                         ..
-                    } if tool == "AskUserQuestion" => {
+                    } if tool == ASK_TOOL => {
                         let qs = questions(&input);
                         seen.extend(qs.iter().map(|q| q.text.clone()));
                         let codex = model.starts_with("codex:");
@@ -1307,7 +1317,7 @@ mod tests {
             }
             drop(a);
             let _ = std::fs::remove_file(ws.dir());
-            let _ = std::fs::remove_file(agent::transcript_path(&meta.id));
+            let _ = std::fs::remove_file(crate::transcript::transcript_path(&meta.id));
             (seen, text)
         };
         let prompt = "Use your tool for asking the user questions (AskUserQuestion, or \

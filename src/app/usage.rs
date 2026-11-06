@@ -1,15 +1,22 @@
 //! Account usage belongs to the window, independent of the selected workspace.
 use super::*;
-use crate::usage::activity::{self, Daily};
-use crate::usage::{Allowance, Failure, Provider, Snapshot, Status, countdown};
-use gpui_kit::component::plot::shape::{Arc, ArcData};
-use std::f32::consts::TAU;
+use crate::usage::{Allowance, Failure, Provider, Snapshot, Status};
+use gpui_kit::component::FocusTrapElement as _;
+use objc2_foundation::{NSDate, NSDateFormatter, NSDateFormatterStyle, NSTimeZone};
 use std::time::Duration;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(300);
+#[cfg(all(test, feature = "test-support"))]
+mod pixels;
+#[cfg(test)]
+mod store_state;
+#[cfg(all(test, feature = "test-support"))]
+pub(in crate::app) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
+    pixels::render_pixels(cx);
+}
 
 pub(super) struct Panel {
-    focus: FocusHandle,
+    pub(super) focus: FocusHandle,
     previous_focus: Option<FocusHandle>,
     _keys: Subscription,
 }
@@ -18,6 +25,7 @@ impl Shark {
     pub(super) fn show_usage(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if let Some(panel) = &self.usage_panel {
             panel.focus.focus(window, cx);
+            cx.notify();
             return;
         }
         let previous_focus = window.focused(cx);
@@ -33,13 +41,6 @@ impl Shark {
                 match ev.keystroke.key.as_str() {
                     "escape" => s.close_usage(w, cx),
                     "enter" | "space" if panel.focus.is_focused(w) => s.refresh_usage(cx),
-                    "tab" => {
-                        if panel.focus.is_focused(w) {
-                            w.focus_next(cx);
-                        } else {
-                            panel.focus.focus(w, cx);
-                        }
-                    }
                     _ => return,
                 }
                 cx.stop_propagation();
@@ -59,58 +60,45 @@ impl Shark {
         let Some(panel) = self.usage_panel.take() else {
             return;
         };
-        if let Some(focus) = panel.previous_focus {
-            focus.focus(window, cx);
-        } else {
-            self.focus_fallback(window, cx);
-        }
+        self.restore_focus(panel.previous_focus, window, cx);
         cx.notify();
     }
 
     pub(super) fn refresh_usage(&mut self, cx: &mut Context<Self>) {
         for provider in Provider::ALL {
-            if !self.usage[provider.index()].begin() {
-                continue;
-            }
+            let query = self.usage[provider.index()].begin();
             // Headless tests complete snapshots explicitly; never query the user's account.
             #[cfg(test)]
             {
-                self.usage_queries[provider.index()] += 1;
+                if query {
+                    self.usage_queries[provider.index()] += 1;
+                }
                 if !self.usage_live {
                     continue;
                 }
             }
-            cx.spawn(async move |this, cx| {
-                let result = cx
-                    .background_executor()
-                    .spawn(async move { crate::usage::query(provider) })
-                    .await;
-                this.update(cx, |s, cx| {
-                    s.usage[provider.index()].finish(result);
-                    cx.notify();
+            if query {
+                cx.spawn(async move |this, cx| {
+                    let result = cx
+                        .background_executor()
+                        .spawn(async move { crate::usage::query(provider) })
+                        .await;
+                    this.update(cx, |s, cx| s.complete_usage_query(provider, result, cx))
+                        .ok();
                 })
-                .ok();
-            })
-            .detach();
-            let cache = self.activity_cache.clone();
-            cx.spawn(async move |this, cx| {
-                let daily = cx
-                    .background_executor()
-                    .spawn(async move {
-                        let mut cache = cache[provider.index()]
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner());
-                        crate::usage::activity::scan(provider, &mut cache, crate::usage::now())
-                    })
-                    .await;
-                this.update(cx, |s, cx| {
-                    s.usage_activity[provider.index()] = daily;
-                    cx.notify();
-                })
-                .ok();
-            })
-            .detach();
+                .detach();
+            }
         }
+        cx.notify();
+    }
+
+    fn complete_usage_query(
+        &mut self,
+        provider: Provider,
+        result: Result<Vec<Allowance>, Failure>,
+        cx: &mut Context<Self>,
+    ) {
+        self.usage[provider.index()].finish(result);
         cx.notify();
     }
 
@@ -139,13 +127,6 @@ impl Shark {
 
     pub(super) fn render_usage_footer(&self, cx: &Context<Self>) -> impl IntoElement {
         let at = self.usage_at.clone();
-        let providers: Vec<_> = Provider::ALL
-            .into_iter()
-            .filter(|p| !self.usage[p.index()].allowances.is_empty())
-            .collect();
-        let fallback = providers.is_empty();
-        let theme = cx.theme();
-        let hover = side_hover(theme);
         div()
             .id("usage-footer")
             .relative()
@@ -154,78 +135,7 @@ impl Shark {
             .child(
                 v_flex()
                     .when(self.rail, |d| d.items_center().gap_1())
-                    .when(fallback, |d| {
-                        d.child(
-                            Button::new("show-usage")
-                                .ghost()
-                                .small()
-                                .icon(IconName::ChartBar)
-                                .when(!self.rail, |b| b.label("Usage"))
-                                .accessibility_label("Show usage")
-                                .tooltip("Show account usage")
-                                .on_click(cx.listener(|s, _, w, cx| s.show_usage(w, cx))),
-                        )
-                    })
-                    .children(providers.into_iter().map(|provider| {
-                        let snapshot = &self.usage[provider.index()];
-                        let now = crate::usage::now();
-                        let limiting = snapshot.limiting();
-                        let remaining = limiting.and_then(|row| row.remaining);
-                        let pace = limiting.and_then(|row| row.pace(now));
-                        let description = ring_description(provider, snapshot);
-                        let left = left_label(limiting, now);
-                        let ring = ring(
-                            remaining.unwrap_or(0.),
-                            pace,
-                            fill_color(remaining, snapshot.outdated, theme),
-                            theme.sidebar,
-                            theme,
-                        );
-                        // Expanded: a side row (ring, name, what's left). Rail: the ring over its name.
-                        let trigger = if self.rail {
-                            v_flex()
-                                .w(px(56.))
-                                .py_1p5()
-                                .gap_1()
-                                .items_center()
-                                .rounded(theme.radius)
-                                .text_xs()
-                                .text_color(theme.sidebar_foreground)
-                                .child(ring)
-                                .child(provider.name())
-                        } else {
-                            side_row(theme)
-                                .mx_0()
-                                .text_color(theme.sidebar_foreground)
-                                .child(ring)
-                                .child(div().flex_1().child(provider.name()))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .when_some(
-                                            label_color(remaining, snapshot.outdated, theme),
-                                            |d, c| d.text_color(c),
-                                        )
-                                        .child(left),
-                                )
-                        };
-                        let (snapshot, daily) = (
-                            snapshot.clone(),
-                            self.usage_activity[provider.index()].clone(),
-                        );
-                        HoverCard::new(format!("usage-card-{}", provider.name()))
-                            .anchor(Anchor::BottomLeft)
-                            .trigger(
-                                trigger
-                                    .id(format!("usage-trigger-{}", provider.name()))
-                                    .role(Role::Button)
-                                    .aria_label(description)
-                                    .hover(move |d| d.bg(hover))
-                                    .on_click(cx.listener(|s, _, w, cx| s.show_usage(w, cx)))
-                                    .test_support(),
-                            )
-                            .content(move |_, _, cx| card(provider, &snapshot, &daily, cx))
-                    })),
+                    .child(self.render_usage_quota_button(cx)),
             )
             .child(
                 canvas(
@@ -242,6 +152,96 @@ impl Shark {
                 .size_full(),
             )
             .test_support()
+    }
+
+    fn render_usage_quota_button(&self, cx: &Context<Self>) -> AnyElement {
+        let now = crate::usage::now();
+        let theme = cx.theme();
+        let quotas: Vec<_> = Provider::ALL
+            .into_iter()
+            .map(|provider| {
+                let snapshot = &self.usage[provider.index()];
+                let limiting = snapshot.limiting(now);
+                let remaining = limiting.and_then(|row| row.remaining);
+                let text = match remaining {
+                    Some(n) => format!("{}%", n.ceil()),
+                    None if snapshot.checked_at.is_none() => "…".into(),
+                    None => "—".into(),
+                };
+                let dot = quota_color(
+                    remaining,
+                    limiting.and_then(|row| row.pace(now)),
+                    snapshot.outdated,
+                    theme,
+                );
+                (provider, text, dot)
+            })
+            .collect();
+        let quota = Provider::ALL
+            .into_iter()
+            .map(|provider| quota_details(provider, &self.usage[provider.index()], now))
+            .collect::<Vec<_>>()
+            .join(" · ");
+        Button::new("show-usage")
+            .ghost()
+            .h_auto()
+            .p_1()
+            .when(self.rail, |b| b.px_0())
+            .w_full()
+            .accessibility_label(format!("{quota}. Open usage"))
+            .tooltip(quota)
+            .on_click(cx.listener(|s, _, w, cx| s.show_usage(w, cx)))
+            .child(
+                h_flex()
+                    .id("usage-footer-quotas")
+                    .min_w_0()
+                    .when(!self.rail, |d| d.w_full())
+                    .when(self.rail, |d| d.justify_center())
+                    .overflow_hidden()
+                    .items_center()
+                    .gap(px(3.))
+                    .text_size(px(if self.rail { 9. } else { 12. }))
+                    .whitespace_nowrap()
+                    .children(quotas.into_iter().enumerate().map(
+                        |(index, (provider, text, dot))| {
+                            let id = provider.id();
+                            h_flex()
+                                .flex_none()
+                                .gap(px(if self.rail { 2. } else { 3. }))
+                                .when(index > 0 && !self.rail, |d| {
+                                    d.child(div().text_color(theme.sidebar_foreground).child("·"))
+                                })
+                                .when(!self.rail, |d| {
+                                    // The hue stays out of the text so light themes keep sidebar contrast.
+                                    d.items_center().child(
+                                        div()
+                                            .id(format!("usage-footer-pace-{id}"))
+                                            .size(px(6.))
+                                            .flex_none()
+                                            .rounded_full()
+                                            .bg(dot)
+                                            .test_support(),
+                                    )
+                                })
+                                .child(
+                                    div()
+                                        .id(format!("usage-footer-quota-{id}"))
+                                        .text_color(theme.sidebar_foreground)
+                                        .child(if self.rail {
+                                            text
+                                        } else {
+                                            format!("{} {text}", provider.name())
+                                        })
+                                        .test_support(),
+                                )
+                        },
+                    ))
+                    .when(!self.rail, |d| {
+                        d.child(div().text_color(theme.sidebar_foreground).child("left"))
+                    })
+                    .test_support(),
+            )
+            .into_any_element()
     }
 
     pub(super) fn render_usage(&self, window: &Window, cx: &Context<Self>) -> Option<AnyElement> {
@@ -274,16 +274,17 @@ impl Shark {
                         Button::new("refresh-usage")
                             .ghost()
                             .xsmall()
-                            .label("Refresh")
+                            .accessibility_label("Refresh usage")
+                            .tooltip("Refresh usage")
                             .icon(IconName::RefreshCw)
                             .on_click(cx.listener(|s, _, _, cx| s.refresh_usage(cx))),
                     ),
             )
-            .children(Provider::ALL.map(|provider| {
-                let i = provider.index();
-                section(provider, &self.usage[i], &self.usage_activity[i], cx)
-            }))
-            .test_support();
+            .children(
+                Provider::ALL.map(|provider| section(provider, &self.usage[provider.index()], cx)),
+            )
+            .test_support()
+            .focus_trap("usage-panel", &panel.focus);
         Some(
             deferred(
                 anchored().position(point(px(0.), px(0.))).child(
@@ -304,14 +305,12 @@ impl Shark {
                         .child(content),
                 ),
             )
-            .with_priority(100)
             .into_any_element(),
         )
     }
 }
 
-/// The calendar is here too, so its daily values are reachable without a pointer.
-fn section(provider: Provider, snapshot: &Snapshot, daily: &Daily, cx: &App) -> impl IntoElement {
+fn section(provider: Provider, snapshot: &Snapshot, cx: &App) -> impl IntoElement {
     let theme = cx.theme();
     let status = match snapshot.status {
         Status::Idle => Some("Not checked"),
@@ -324,8 +323,18 @@ fn section(provider: Provider, snapshot: &Snapshot, daily: &Daily, cx: &App) -> 
         Status::Failed(error) => Some(error.message()),
     };
     v_flex()
-        .id(format!("usage-{}", provider.name()))
+        .id(format!("usage-{}", provider.id()))
+        .role(Role::Group)
+        .aria_label(provider.name().to_owned())
+        .aria_description(snapshot.checked_at.map_or_else(
+            || "Last checked: never".into(),
+            |at| format!("Last checked: {}", local_time(at)),
+        ))
         .gap_2()
+        .p_3()
+        .border_1()
+        .border_color(theme.border)
+        .rounded_lg()
         .child(
             div()
                 .font_weight(FontWeight::SEMIBOLD)
@@ -333,7 +342,7 @@ fn section(provider: Provider, snapshot: &Snapshot, daily: &Daily, cx: &App) -> 
         )
         .children(status.map(|text| {
             div()
-                .id(format!("usage-status-{}", provider.name()))
+                .id(format!("usage-status-{}", provider.id()))
                 .text_xs()
                 .text_color(theme.muted_foreground)
                 .child(text)
@@ -350,16 +359,16 @@ fn section(provider: Provider, snapshot: &Snapshot, daily: &Daily, cx: &App) -> 
                     }
                 },
             );
-            let pace = row.pace(crate::usage::now());
-            let mut reset = row.resets_at.map_or_else(
-                || "Reset time unknown".into(),
-                |at| format!("Resets {}", crate::usage::local_time(at)),
-            );
+            let now = crate::usage::now();
+            let pace = row.pace(now);
+            let mut reset = resets(row.resets_at);
             if let Some(p) = pace {
-                reset.push_str(&format!(" · Even pace: {}% left", p.round()));
+                reset.push_str(&even_pace(p));
             }
             v_flex()
-                .id(format!("usage-{}-{ix}", provider.name()))
+                .id(format!("usage-{}-{ix}", provider.id()))
+                .role(Role::Group)
+                .aria_description(reset.clone())
                 .gap_1()
                 .child(
                     h_flex()
@@ -375,33 +384,25 @@ fn section(provider: Provider, snapshot: &Snapshot, daily: &Daily, cx: &App) -> 
                         .h(px(4.))
                         .rounded_full()
                         .bg(theme.muted)
-                        .id(format!("usage-bar-{}-{ix}", provider.name()))
+                        .id(format!("usage-bar-{}-{ix}", provider.id()))
                         .role(Role::ProgressIndicator)
                         .aria_label(format!("{}: {remaining}", row.label))
                         .when_some(row.remaining, |d, n| {
                             d.child(
                                 div()
+                                    .id(format!("usage-fill-{}-{ix}", provider.id()))
                                     .h_full()
-                                    .w(relative(n as f32 / 100.))
+                                    .w(relative(n.clamp(0., 100.) as f32 / 100.))
                                     .rounded_full()
-                                    .bg(fill_color(Some(n), snapshot.outdated, theme)),
+                                    .bg(quota_color(Some(n), pace, snapshot.outdated, theme))
+                                    .test_support(),
                             )
                         })
                         .when_some(pace, |d, p| {
                             // A 1.5px line, knocked out of the bar by 1.5px of panel background.
-                            d.child(
-                                div()
-                                    .absolute()
-                                    .top(px(-3.))
-                                    .left(relative(p as f32 / 100.))
-                                    .ml(px(-2.25))
-                                    .w(px(4.5))
-                                    .h(px(10.))
-                                    .border_x(px(1.5))
-                                    .border_color(theme.popover)
-                                    .bg(theme.popover_foreground),
-                            )
-                        }),
+                            d.child(quota_marker(provider, ix, p, theme))
+                        })
+                        .test_support(),
                 )
                 .child(
                     div()
@@ -411,15 +412,10 @@ fn section(provider: Provider, snapshot: &Snapshot, daily: &Daily, cx: &App) -> 
                 )
                 .test_support()
         }))
-        .child(
-            div()
-                .text_xs()
-                .child(heatmap(provider, daily, crate::usage::now(), theme)),
-        )
         .child(div().text_xs().text_color(theme.muted_foreground).child(
             snapshot.checked_at.map_or_else(
                 || "Last checked: never".into(),
-                |at| format!("Last checked: {}", crate::usage::local_time(at)),
+                |at| format!("Last checked: {}", local_time(at)),
             ),
         ))
         .when(snapshot.outdated, |d| {
@@ -427,463 +423,210 @@ fn section(provider: Provider, snapshot: &Snapshot, daily: &Daily, cx: &App) -> 
                 div()
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(format!("Previous result: {}", crate::usage::local_time(at)))
+                    .child(format!("Previous result: {}", local_time(at)))
             }))
         })
         .test_support()
 }
 
-/// What's left: `sidebar_foreground` like the rest of the navigation, `warning` / `danger`
-/// fills when low. Never `primary`, which is reserved for focus, running agents and the
-/// primary button.
-fn fill_color(remaining: Option<f64>, outdated: bool, theme: &Theme) -> Hsla {
-    match remaining {
-        _ if outdated => faint(theme),
-        Some(n) if n <= 5. => theme.danger,
-        Some(n) if n <= 20. => theme.warning,
-        _ => theme.sidebar_foreground,
-    }
+fn marker_left(remaining: f64, width: f32) -> f32 {
+    ((remaining.clamp(0., 100.) / 100.) as f32 * width - 2.25).clamp(0., (width - 4.5).max(0.))
 }
-
-/// The footer label's text: the brighter `*_foreground` at `fill_color`'s thresholds.
-fn label_color(remaining: Option<f64>, outdated: bool, theme: &Theme) -> Option<Hsla> {
-    match remaining {
-        _ if outdated => None,
-        Some(n) if n <= 5. => Some(theme.danger_foreground),
-        Some(n) if n <= 20. => Some(theme.warning_foreground),
-        _ => None,
-    }
-}
-
-/// "62% left · 5h"; when low, the reset instead: "18% left · resets 3d".
-fn left_label(row: Option<&Allowance>, now: f64) -> String {
-    let Some((row, n)) = row.and_then(|row| Some((row, row.remaining?))) else {
-        return "Unknown".into();
-    };
-    match row.resets_at {
-        Some(at) if n <= 20. => format!("{}% left · resets {}", n.ceil(), countdown(at - now)),
-        _ => format!("{}% left · {}", n.ceil(), short_window(&row.label)),
-    }
-}
-
-/// "5 hours" → "5h", "Weekly" → "week", "gpt-5 · Weekly" → "gpt-5 week", "Fable" as is.
-fn short_window(label: &str) -> String {
-    label
-        .split(" · ")
-        .map(short_part)
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
-fn short_part(label: &str) -> String {
-    match label.split_once(' ') {
-        _ if label == "Weekly" => "week".into(),
-        Some((n, "hour" | "hours")) => format!("{n}h"),
-        Some((n, "days")) => format!("{n}d"),
-        Some((n, "minutes")) => format!("{n}m"),
-        _ if label.chars().count() > 10 => {
-            format!("{}…", label.chars().take(9).collect::<String>())
-        }
-        _ => label.into(),
-    }
-}
-
-/// A 16px ring of what's left, clockwise from the top, on a track tinted like the fill so an
-/// empty red ring still reads as red. A tick crossing it, knocked out of the band in the row
-/// background `bg`, marks what would be left at an even pace: an arc past the tick is ahead
-/// of the limit.
-fn ring(left: f64, pace: Option<f64>, fill: Hsla, bg: Hsla, theme: &Theme) -> impl IntoElement {
-    let (track, tick) = (fill.opacity(0.25), theme.sidebar_foreground);
-    let (left, pace) = (left as f32, pace.map(|p| p as f32));
-    canvas(
-        |_, _, _| {},
-        move |b, _, w, _| {
-            let band = Arc::new().inner_radius(4.).outer_radius(7.5);
-            band.paint(&ArcData::new(&(), 0, 100., 0., TAU), track, &b, w);
-            if left > 0. {
-                let end = left / 100. * TAU;
-                band.paint(&ArcData::new(&(), 1, left, 0., end), fill, &b, w);
-            }
-            if let Some(p) = pace {
-                let (sin, cos) = (p / 100. * TAU).sin_cos();
-                let at = |r: f32| b.center() + point(px(r * sin), px(-r * cos));
-                // The knockout stays within the band, so a hovered row's background can't show it.
-                for (width, from, to, color) in [(4.5, 4., 7.5, bg), (1.5, 2.5, 8., tick)] {
-                    let mut line = PathBuilder::stroke(px(width));
-                    line.move_to(at(from));
-                    line.line_to(at(to));
-                    if let Ok(path) = line.build() {
-                        w.paint_path(path, color);
-                    }
-                }
-            }
-        },
-    )
-    .size(px(16.))
-    .flex_none()
-}
-
-/// One allowance: "5 hours · 62% left · resets in 2h 14m (Thu 11:00 PM) · even pace 40%".
-fn limit_line(row: &Allowance, now: f64) -> String {
-    let mut text = format!(
-        "{} · {}",
-        row.label,
-        row.remaining.map_or_else(
-            || "Remaining unknown".into(),
-            |n| format!("{}% left", n.ceil())
-        )
-    );
-    if let Some(at) = row.resets_at {
-        text.push_str(&format!(
-            " · resets in {} ({})",
-            countdown(at - now),
-            crate::usage::short_time(at)
-        ));
-    }
-    if let Some(p) = row.pace(now) {
-        text.push_str(&format!(" · even pace {}%", p.round()));
-    }
-    text
-}
-
-fn ring_description(provider: Provider, snapshot: &Snapshot) -> String {
-    let mut text = match snapshot.limiting() {
-        Some(row) => format!(
-            "{} · {} · {}% remaining · {}",
-            provider.name(),
-            row.label,
-            row.remaining.unwrap().ceil(),
-            row.resets_at.map_or_else(
-                || "Reset time unknown".into(),
-                |at| format!("Resets {}", crate::usage::local_time(at))
+fn quota_marker(provider: Provider, index: usize, remaining: f64, theme: &Theme) -> AnyElement {
+    let background = theme.popover;
+    let ink = theme.popover_foreground;
+    div()
+        .id(format!("usage-marker-{}-{index}", provider.id()))
+        .role(Role::Label)
+        .aria_label(format!(
+            "Even pace: {:.1}% remaining",
+            remaining.clamp(0., 100.)
+        ))
+        .absolute()
+        .top(px(-2.))
+        .left_0()
+        .w_full()
+        .h(px(8.))
+        .child(
+            canvas(
+                |_, _, _| (),
+                move |bounds, _, window, _| {
+                    let left =
+                        bounds.left() + px(marker_left(remaining, f32::from(bounds.size.width)));
+                    window.paint_quad(fill(
+                        Bounds::new(point(left, bounds.top()), size(px(4.5), bounds.size.height)),
+                        background,
+                    ));
+                    window.paint_quad(fill(
+                        Bounds::new(
+                            point(left + px(1.5), bounds.top()),
+                            size(px(1.5), bounds.size.height),
+                        ),
+                        ink,
+                    ));
+                },
             )
-        ),
-        None => format!("{} · Remaining unknown", provider.name()),
-    };
-    if let Some(p) = snapshot
-        .limiting()
-        .and_then(|row| row.pace(crate::usage::now()))
-    {
-        text.push_str(&format!(" · Even pace: {}% left", p.round()));
-    }
-    text.push_str(&status_note(snapshot));
-    text
+            .size_full(),
+        )
+        .test_support()
+        .into_any_element()
 }
 
-fn status_note(snapshot: &Snapshot) -> String {
-    let mut text = String::new();
-    if snapshot
+/// The dot and bar colour: what is left, and for what is left, how far it trails an even burn.
+fn quota_color(remaining: Option<f64>, even: Option<f64>, outdated: bool, theme: &Theme) -> Hsla {
+    let Some(n) = remaining.filter(|_| !outdated) else {
+        return faint(theme);
+    };
+    match even {
+        _ if n <= 5. => theme.danger,
+        _ if n <= 20. => theme.warning,
+        Some(even) if even - n > 25. => theme.danger,
+        Some(even) if even - n > 10. => theme.warning,
+        _ => theme.success,
+    }
+}
+
+/// "Claude · 5 hours · 42% left · Even pace: 50% left" per allowance, then a status word.
+fn quota_details(provider: Provider, snapshot: &Snapshot, now: f64) -> String {
+    let name = provider.name();
+    let mut parts: Vec<String> = snapshot
         .allowances
         .iter()
-        .any(|row| row.remaining.is_none())
-    {
-        text.push_str(" · Some allowances unknown");
+        .filter(|row| row.resets_at.is_none_or(|at| at > now))
+        .map(|row| {
+            let mut text = match row.remaining {
+                Some(n) => format!("{name} · {} · {}% left", row.label, n.ceil()),
+                None => format!("{name} · {} · left unknown", row.label),
+            };
+            if let Some(p) = row.pace(now) {
+                text.push_str(&even_pace(p));
+            }
+            text
+        })
+        .collect();
+    if parts.is_empty() {
+        parts.push(format!("{name} · left unknown"));
     }
-    if snapshot.outdated {
-        text.push_str(" · Outdated");
+    match snapshot.status {
+        _ if snapshot.outdated => parts.push("Outdated".into()),
+        Status::Loading => parts.push("Checking…".into()),
+        Status::Failed(_) => parts.push("Unavailable".into()),
+        Status::Idle | Status::Ready => {}
     }
-    if snapshot.status == Status::Loading {
-        text.push_str(" · Checking…");
-    }
-    if let Some(at) = snapshot.checked_at {
-        text.push_str(&format!(" · Last checked {}", crate::usage::local_time(at)));
-    }
-    text
+    parts.join(" · ")
 }
 
-const CELL: f32 = 11.;
-const GAP: f32 = 3.;
-const WEEKS: i64 = 20;
-
-/// Heatmap level 0–4: 0 for no tokens, else the quartile of non-zero days (GitHub's cut).
-fn levels(tokens: &[u64]) -> impl Fn(u64) -> usize {
-    let mut busy: Vec<u64> = tokens.iter().copied().filter(|n| *n > 0).collect();
-    busy.sort_unstable();
-    // Cut below the maximum so the busiest day always reaches level 4.
-    let top = busy.len().saturating_sub(1);
-    let cut = |q: usize| busy[..top].get(top * q / 4).copied().unwrap_or(0);
-    let cuts = [cut(1), cut(2), cut(3)];
-    move |n| match n {
-        0 => 0,
-        n => 1 + cuts.iter().filter(|c| n > **c).count(),
-    }
+/// "Resets Oct 28, 2026 at 11:00 PM", or that it's unknown.
+fn resets(at: Option<f64>) -> String {
+    at.map_or_else(
+        || "Reset time unknown".into(),
+        |at| format!("Resets {}", local_time(at)),
+    )
 }
 
-fn level_color(level: usize, theme: &Theme) -> Hsla {
-    match level {
-        0 => theme.muted,
-        n => theme.foreground.opacity([0.25, 0.45, 0.7, 1.][n - 1]),
-    }
+/// " · Even pace: 40% left", to append to a reset line.
+fn even_pace(p: f64) -> String {
+    format!(" · Even pace: {}% left", p.round())
 }
 
-fn cell(level: usize, theme: &Theme) -> Div {
-    div()
-        .size(px(CELL))
-        .flex_none()
-        .rounded(px(2.))
-        .bg(level_color(level, theme))
-}
-
-/// The footer hover card: each allowance, then a GitHub-style calendar of daily tokens.
-fn card(
-    provider: Provider,
-    snapshot: &Snapshot,
-    daily: &Daily,
-    cx: &App,
-) -> impl IntoElement + use<> {
-    let theme = cx.theme();
-    let now = crate::usage::now();
-    let muted = theme.muted_foreground;
-    v_flex()
-        .id(format!("usage-card-{}", provider.name()))
-        .w(px(304.))
-        .gap_2()
-        .text_xs()
-        .child(
-            div()
-                .font_weight(FontWeight::SEMIBOLD)
-                .child(provider.name()),
-        )
-        .children(
-            snapshot
-                .allowances
-                .iter()
-                .map(|row| div().text_color(muted).child(limit_line(row, now))),
-        )
-        .children(
-            Some(status_note(snapshot).trim_start_matches(" · ").to_string())
-                .filter(|t| !t.is_empty())
-                .map(|t| div().text_color(muted).child(t)),
-        )
-        .child(heatmap(provider, daily, now, theme))
-        .test_support()
-}
-
-fn heatmap(provider: Provider, daily: &Daily, now: f64, theme: &Theme) -> AnyElement {
-    let today = activity::local_day(now);
-    // Columns run Monday to Sunday; the last one holds today.
-    let first = today - (today + 3).rem_euclid(7) - (WEEKS - 1) * 7;
-    let at = |day: i64| {
-        usize::try_from(day - daily.first_day)
-            .ok()
-            .and_then(|i| daily.tokens.get(i).copied())
-            .unwrap_or(0)
-    };
-    let shown: Vec<u64> = (first..=today).map(at).collect();
-    let total: u64 = shown.iter().sum();
-    let empty = match () {
-        _ if daily.tokens.is_empty() => Some("Reading local logs…"),
-        _ if total == 0 => Some("No local activity found"),
-        _ => None,
-    };
-    if let Some(text) = empty {
-        return div()
-            .text_color(faint(theme))
-            .child(text)
-            .into_any_element();
-    }
-    let level = levels(&shown);
-    let busiest = (first..=today).max_by_key(|d| (at(*d), -d)).unwrap();
-    let step = CELL + GAP;
-    let gutter = 28.;
-    // Each month over the column holding its 1st; the first column's only if it has room.
-    let mut months: Vec<(i64, i64)> = vec![(0, first)];
-    for day in first + 1..=today {
-        if activity::civil(day).2 == 1 {
-            months.push(((day - first) / 7, day));
-        }
-    }
-    if months.get(1).is_some_and(|(week, _)| *week < 3) {
-        months.remove(0);
-    }
-    let (long, month) = (activity::day_labels("EEEMMMd"), activity::day_labels("MMM"));
-    v_flex()
-        .gap_2()
-        .child(format!(
-            "{} tokens in {WEEKS} weeks · busiest {}",
-            crate::usage::tokens(total),
-            long(busiest)
-        ))
-        .child(
-            v_flex()
-                .id(SharedString::from(format!(
-                    "usage-heatmap-{}",
-                    provider.name()
-                )))
-                .role(Role::Group)
-                .aria_label(format!("{} tokens per day", provider.name()))
-                .gap(px(GAP))
-                .text_color(theme.muted_foreground)
-                .child(div().relative().h(px(16.)).children(months.into_iter().map(
-                    |(week, day)| {
-                        div()
-                            .absolute()
-                            .left(px(gutter + week as f32 * step))
-                            .child(month(day))
-                    },
-                )))
-                .children((0..7i64).map(|row| {
-                    h_flex()
-                        .gap(px(GAP))
-                        .h(px(CELL))
-                        .child(
-                            div()
-                                .w(px(gutter - GAP))
-                                .line_height(px(CELL))
-                                .when(row % 2 == 0 && row < 6, |d| {
-                                    d.child(["Mon", "Wed", "Fri"][row as usize / 2])
-                                }),
-                        )
-                        .children((0..WEEKS).map(|week| {
-                            let day = first + week * 7 + row;
-                            if day > today {
-                                return div().size(px(CELL)).flex_none().into_any_element();
-                            }
-                            let n = at(day);
-                            let tip = format!(
-                                "{} · {}",
-                                long(day),
-                                match n {
-                                    0 => "No activity".into(),
-                                    n => format!("{} tokens", crate::usage::tokens(n)),
-                                }
-                            );
-                            cell(level(n), theme)
-                                .id(SharedString::from(format!(
-                                    "usage-day-{}-{day}",
-                                    provider.name()
-                                )))
-                                .role(Role::Label)
-                                .aria_label(tip.clone())
-                                .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
-                                .into_any_element()
-                        }))
-                })),
-        )
-        .child(
-            h_flex()
-                .justify_end()
-                .gap(px(GAP))
-                .text_color(theme.muted_foreground)
-                .child(div().mr_1().child("Less"))
-                .children((0..5).map(|n| cell(n, theme)))
-                .child(div().ml_1().child("More")),
-        )
-        .into_any_element()
+fn local_time(seconds: f64) -> String {
+    let formatter = NSDateFormatter::new();
+    formatter.setDateStyle(NSDateFormatterStyle::MediumStyle);
+    formatter.setTimeStyle(NSDateFormatterStyle::ShortStyle);
+    formatter.setTimeZone(Some(&NSTimeZone::localTimeZone()));
+    formatter
+        .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(seconds))
+        .to_string()
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{
-        Allowance, Failure, Provider, Snapshot, Theme, fill_color, label_color, left_label, levels,
-        limit_line, ring_description,
-    };
-    use gpui_kit::rgb;
+    use super::{Allowance, Provider, Snapshot, Status, local_time};
 
     #[test]
-    fn usage_ring_thresholds_and_unknown_stale_labels() {
-        let mut theme = Theme::default();
-        theme.warning = rgb(0x654321).into();
-        theme.danger = rgb(0xff0000).into();
-        theme.sidebar_foreground = rgb(0x888888).into();
-        for (remaining, expected) in [
-            (Some(21.), theme.sidebar_foreground),
-            (Some(20.), theme.warning),
-            (Some(5.1), theme.warning),
-            (Some(5.), theme.danger),
-            (Some(0.), theme.danger),
-            (None, theme.sidebar_foreground),
-        ] {
-            assert_eq!(fill_color(remaining, false, &theme), expected);
-            assert_eq!(
-                fill_color(remaining, true, &theme),
-                crate::ui::faint(&theme)
-            );
-        }
-        let mut snapshot = Snapshot::default();
-        snapshot.finish(Ok(vec![
-            crate::usage::Allowance {
-                label: "Weekly".into(),
-                remaining: Some(0.),
-                resets_at: Some(0.),
-                window: None,
-            },
-            crate::usage::Allowance {
-                label: "Model".into(),
-                remaining: None,
-                resets_at: None,
-                window: None,
-            },
-        ]));
-        snapshot.finish(Err(Failure::Temporary));
-        snapshot.begin();
-        let text = ring_description(Provider::Claude, &snapshot);
-        for part in [
-            "Claude",
-            "Weekly",
-            "0% remaining",
-            "Resets",
-            "Some allowances unknown",
-            "Outdated",
-            "Checking",
-            "Last checked",
-        ] {
-            assert!(text.contains(part), "{text} should contain {part}");
-        }
-        snapshot.allowances.remove(0);
-        assert!(ring_description(Provider::Claude, &snapshot).contains("Remaining unknown"));
+    fn reset_and_pace_text() {
+        assert_eq!(super::resets(None), "Reset time unknown");
+        assert!(super::resets(Some(0.)).starts_with("Resets "));
+        assert_eq!(super::even_pace(39.6), " · Even pace: 40% left");
+        assert!(!local_time(1e9).is_empty());
+    }
 
-        let row = |label: &str, remaining: f64| Allowance {
-            label: label.into(),
-            remaining: Some(remaining),
-            resets_at: Some(1000. + 2. * 3600. + 14. * 60.),
-            window: Some(5. * 3600.),
-        };
-        for (label, remaining, expected) in [
-            ("5 hours", 61.2, "62% left · 5h"),
-            ("Weekly", 21., "21% left · week"),
-            (
-                "gpt-5.5-codex-max · Weekly",
-                50.,
-                "50% left · gpt-5.5-c… week",
-            ),
-            ("Fable", 30., "30% left · Fable"),
-            ("5 hours", 4., "4% left · resets 2h 14m"),
-        ] {
-            assert_eq!(left_label(Some(&row(label, remaining)), 1000.), expected);
-        }
-        let mut weekly = row("Weekly", 18.);
-        weekly.resets_at = Some(1000. + 3. * 86400. + 60.);
-        assert_eq!(left_label(Some(&weekly), 1000.), "18% left · resets 3d");
-        assert_eq!(left_label(None, 0.), "Unknown");
-        assert_eq!(label_color(Some(21.), false, &theme), None);
+    #[test]
+    fn details_join_allowances_and_name_the_status() {
+        let mut snapshot = Snapshot::default();
         assert_eq!(
-            label_color(Some(20.), false, &theme),
-            Some(theme.warning_foreground)
+            super::quota_details(Provider::Claude, &snapshot, 0.),
+            "Claude · left unknown"
         );
+        snapshot.allowances.push(Allowance {
+            label: "5 hours".into(),
+            remaining: Some(41.2),
+            resets_at: Some(9000.),
+            window: Some(18000.),
+        });
+        snapshot.status = Status::Ready;
         assert_eq!(
-            label_color(Some(5.), false, &theme),
-            Some(theme.danger_foreground)
+            super::quota_details(Provider::Claude, &snapshot, 0.),
+            "Claude · 5 hours · 42% left · Even pace: 50% left"
         );
-        let line = limit_line(&row("5 hours", 61.2), 1000. + 3600.);
-        assert!(
-            line.starts_with("5 hours · 62% left · resets in 1h 14m ("),
-            "{line}"
-        );
-        assert!(line.ends_with(") · even pace 25%"), "{line}");
-        snapshot.finish(Ok(vec![row("5 hours", 61.234)]));
-        let text = ring_description(Provider::Claude, &snapshot);
-        assert!(text.contains("· 62% remaining ·"), "{text}");
-        assert_eq!(crate::usage::countdown(59.), "1m");
-        assert_eq!(crate::usage::tokens(412_345), "412k");
-        assert_eq!(crate::usage::tokens(38_200_000), "38.2M");
-        assert_eq!(crate::usage::tokens(999_999), "1.0M");
-        let level = levels(&[0, 1, 2, 3, 4, 5, 6, 7, 8]);
-        assert_eq!(
-            [0, 1, 2, 3, 4, 5, 6, 7, 8].map(&level),
-            [0, 1, 1, 2, 2, 3, 3, 4, 4]
-        );
-        assert_eq!([0, 5, 9].map(levels(&[0, 5, 9])), [0, 1, 4]);
-        assert_eq!(levels(&[7])(7), 4);
+        snapshot.outdated = true;
+        assert!(super::quota_details(Provider::Claude, &snapshot, 0.).ends_with(" · Outdated"));
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod lifecycle_tests {
+    use super::*;
+    use crate::app::ui_tests::{UI_LOCK, boot, test_home};
+    use core::prelude::v1::test;
+    use gpui_kit::test::TestWindowExt;
+
+    #[gpui_kit::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn quota_colors_follow_remaining_then_even_pace(cx: &mut TestAppContext) {
+        let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        test_home();
+        let (window, shark) = boot(cx, State::default(), WindowOptions::default());
+        cx.update_window(window, |_, w, cx| {
+            let theme = cx.theme();
+            assert_eq!(quota_color(Some(50.), Some(55.), true, theme), faint(theme));
+            assert_eq!(quota_color(None, Some(55.), false, theme), faint(theme));
+            assert_eq!(quota_color(Some(5.), Some(5.), false, theme), theme.danger);
+            assert_eq!(quota_color(Some(20.), None, false, theme), theme.warning);
+            assert_eq!(
+                quota_color(Some(50.), Some(76.), false, theme),
+                theme.danger
+            );
+            assert_eq!(
+                quota_color(Some(50.), Some(75.), false, theme),
+                theme.warning
+            );
+            assert_eq!(
+                quota_color(Some(50.), Some(61.), false, theme),
+                theme.warning
+            );
+            assert_eq!(
+                quota_color(Some(50.), Some(60.), false, theme),
+                theme.success
+            );
+            assert_eq!(quota_color(Some(50.), None, false, theme), theme.success);
+            shark.update(cx, |s, cx| {
+                s.usage[0].finish(Ok(vec![Allowance {
+                    label: "5 hours".into(),
+                    remaining: Some(20.),
+                    resets_at: None,
+                    window: Some(18000.),
+                }]));
+                s.show_usage(w, cx);
+            });
+            w.render_frame(cx);
+            let bar = w.find("usage-bar-claude-0").bounds();
+            let fill = w.find("usage-fill-claude-0").bounds();
+            assert!(
+                (fill.size.width / bar.size.width - 0.2).abs() < 0.01,
+                "bar fills remaining 20%, consistently with its label"
+            );
+        })
+        .unwrap();
     }
 }

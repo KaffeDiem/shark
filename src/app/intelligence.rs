@@ -1,23 +1,23 @@
 //! Location-aware navigation and atomic preflight for language-server edits.
 use super::*;
-use crate::editor::LanguageEvent;
 use crate::lsp::{
     Session, SessionEvent, client,
-    document::{self, Encoding, Snapshot},
+    document::{self, Encoding, Snapshot, uri_path},
+    providers::ProviderEvent,
     tools,
 };
-use gpui_kit::base::input::RopeExt as _;
+use gpui_kit::base::input::{Rope, RopeExt as _};
 use lsp_types::{LocationLink, Uri, WorkspaceEdit};
 use serde_json::{Value, json};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone)]
 pub(super) struct Visit {
     pub(super) path: PathBuf,
-    selection: std::ops::Range<usize>,
-    scroll: Point<Pixels>,
+    pub(super) selection: std::ops::Range<usize>,
+    pub(super) scroll: Point<Pixels>,
     /// The editor's session: an external source has none of its own to rediscover.
-    session: Option<WeakEntity<Session>>,
+    pub(super) session: Option<WeakEntity<Session>>,
 }
 
 #[derive(Default)]
@@ -26,13 +26,68 @@ pub(super) struct History {
     pub(super) forward: Vec<Visit>,
     request: u64,
     /// The Back/Forward still loading: its direction, the entries it steps over, its request.
-    pending: Option<(bool, usize, u64)>,
+    pub(super) pending: Option<(bool, usize, u64)>,
 }
 
 impl History {
     fn steps(&self, request: u64) -> usize {
         self.pending.filter(|p| p.2 == request).map_or(1, |p| p.1)
     }
+
+    /// The Forward stack, or Back.
+    pub(super) fn stack(&mut self, forward: bool) -> &mut Vec<Visit> {
+        if forward {
+            &mut self.forward
+        } else {
+            &mut self.back
+        }
+    }
+
+    /// A jump: `old` becomes the Back target and Forward is dropped.
+    pub(super) fn push(&mut self, old: Visit) {
+        self.back.push(old);
+        self.forward.clear();
+    }
+
+    /// Drops the entry a Back/Forward could not open. True when an earlier one remains to try,
+    /// with the retry's remaining steps recorded.
+    pub(super) fn prune(&mut self, forward: bool, steps: usize, request: u64) -> bool {
+        let from = self.stack(forward);
+        let Some(ix) = from.len().checked_sub(steps) else {
+            return false;
+        };
+        from.remove(ix);
+        if ix > 0 {
+            self.pending = Some((forward, steps - 1, request));
+        }
+        ix > 0
+    }
+
+    /// A Back/Forward landed: the target and the entries quick repeated presses stepped over
+    /// leave their stack; `old` and those entries go on the opposite one.
+    pub(super) fn step(&mut self, forward: bool, steps: usize, old: Option<Visit>) {
+        let from = self.stack(forward);
+        let passed = from.split_off(from.len().saturating_sub(steps));
+        let to = self.stack(!forward);
+        if let Some(old) = old {
+            to.push(old);
+        }
+        to.extend(passed.into_iter().skip(1).rev());
+    }
+}
+
+/// A Back/Forward target and its direction.
+pub(super) struct Step {
+    visit: Visit,
+    forward: bool,
+}
+
+/// A server's `window/showDocument` request: answered once the file shows.
+pub(super) struct ShowReply {
+    reply: client::Reply,
+    focus: bool,
+    /// The server's session, which an external file it opens attaches to.
+    session: WeakEntity<Session>,
 }
 
 pub(super) enum LanguageAction {
@@ -89,13 +144,118 @@ fn signature_label(result: &Value) -> String {
         .join("\n")
 }
 
-struct Staged {
-    path: PathBuf,
-    existing_path: Option<PathBuf>,
-    relative: String,
-    before: String,
-    after: String,
-    version: Option<i32>,
+/// An open editor's state when an edit was requested.
+pub(super) struct OpenDoc {
+    pub(super) path: PathBuf,
+    pub(super) text: Rope,
+    pub(super) snapshot: Option<Arc<Mutex<Snapshot>>>,
+    /// A conflict, save or read-only source: no edit may land.
+    pub(super) blocked: bool,
+    pub(super) fingerprint: u64,
+}
+
+#[derive(Debug)]
+pub(super) struct Staged {
+    pub(super) path: PathBuf,
+    pub(super) existing_path: Option<PathBuf>,
+    pub(super) relative: String,
+    pub(super) before: String,
+    pub(super) after: String,
+    pub(super) version: Option<i32>,
+}
+
+/// The version of `snapshot` if the server holds exactly `text`.
+fn synced_version(snapshot: &Mutex<Snapshot>, text: &str) -> Option<i32> {
+    let s = snapshot.lock().unwrap();
+    (s.text.as_ref() == text).then_some(s.version)
+}
+
+/// Checks `edit` against the worktree, the open documents and the disk, and computes each
+/// document's new text. Nothing is changed.
+pub(super) fn stage_edits(
+    edit: WorkspaceEdit,
+    encoding: Encoding,
+    root: PathBuf,
+    directory: PathBuf,
+    guard: Option<document::EditGuard>,
+    open: &[OpenDoc],
+) -> anyhow::Result<Vec<Staged>> {
+    anyhow::ensure!(
+        guard.as_ref().is_none_or(|g| g.is_current()),
+        "Documents changed after the language request; try again"
+    );
+    let root = root.canonicalize()?;
+    let directory = directory.canonicalize()?;
+    let mut seen = HashSet::new();
+    document::workspace_edits(edit)?
+        .into_iter()
+        .map(|(uri, expected, edits)| {
+            let path = uri_path(uri.as_str())?.canonicalize()?;
+            anyhow::ensure!(
+                path.starts_with(&root),
+                "Edit leaves the current worktree: {}",
+                path.display()
+            );
+            anyhow::ensure!(
+                seen.insert(path.clone()),
+                "Duplicate document in workspace edit"
+            );
+            let relative = path.strip_prefix(&directory)?.to_string_lossy().to_string();
+            let aliases: Vec<_> = open
+                .iter()
+                .filter(|d| d.path.canonicalize().is_ok_and(|p| p == path))
+                .collect();
+            anyhow::ensure!(
+                aliases.len() <= 1,
+                "Close duplicate aliases of {} before editing",
+                path.display()
+            );
+            let existing = aliases.first().copied();
+            anyhow::ensure!(
+                guard.is_some() || expected.is_some(),
+                "Unversioned server edits require a fresh editor request"
+            );
+            let disk = read_source(&path)?;
+            if let Some(guard) = &guard {
+                // An open document is also guarded by its disk fingerprint below,
+                // so a ctime-only change (an xattr write) cannot reject its edit.
+                ensure_disk_before_request(&path, guard.started, existing.is_none())?;
+            }
+            let (before, version) = match existing {
+                Some(doc) => {
+                    anyhow::ensure!(
+                        !doc.blocked,
+                        "Resolve the save or disk conflict in {relative} first"
+                    );
+                    anyhow::ensure!(
+                        crate::files::fingerprint(disk.as_bytes()) == doc.fingerprint,
+                        "{relative} changed on disk; reload before applying edits"
+                    );
+                    let text = doc.text.to_string();
+                    let version = (doc.snapshot.as_ref()).and_then(|s| synced_version(s, &text));
+                    (text, version)
+                }
+                None => (disk, None),
+            };
+            anyhow::ensure!(
+                expected.is_none() || expected == version,
+                "Stale version for {relative}"
+            );
+            let snapshot = Snapshot {
+                text: Arc::from(before.as_str()),
+                version: version.unwrap_or(0),
+            };
+            let after = document::apply_edits(&snapshot, expected, &edits, encoding)?;
+            Ok(Staged {
+                path,
+                existing_path: existing.map(|d| d.path.clone()),
+                relative,
+                before,
+                after,
+                version,
+            })
+        })
+        .collect()
 }
 
 impl Shark {
@@ -186,16 +346,7 @@ impl Shark {
                 e.lsp_setup = None;
                 e.lsp_request = None;
                 e.lsp_error = None;
-                e.outline.clear();
-                e.crumbs.clear();
-                e.input.update(cx, |input, cx| {
-                    *input.lsp_mut() = Default::default();
-                    if let Some(diagnostics) = input.diagnostics_mut() {
-                        diagnostics.clear();
-                    }
-                    cx.notify();
-                });
-                cx.notify();
+                e.clear_language_view(cx);
             });
             if !editor.read(cx).external {
                 self.start_language(&editor, window, cx);
@@ -234,7 +385,8 @@ impl Shark {
             let input = input.clone();
             let weak = weak.clone();
             let editor = editor.clone();
-            d.title("Rename symbol")
+            crate::ui::dialog(d)
+                .title("Rename symbol")
                 .child(Input::new(&input))
                 .on_ok(move |_, window, cx| {
                     let name = input.read(cx).value().to_string();
@@ -286,20 +438,9 @@ impl Shark {
         let editor = editor.downgrade();
         let task = cx.spawn_in(window, async move |this, cx| {
             let response = async {
-                let mut snapshot = snapshots.lock().unwrap().clone();
-                for _ in 0..100 {
-                    if snapshot.text.as_ref() == text {
-                        break;
-                    }
-                    let tick = std::time::Duration::from_millis(10);
-                    cx.background_executor().timer(tick).await;
-                    snapshot = snapshots.lock().unwrap().clone();
-                }
-                anyhow::ensure!(
-                    snapshot.text.as_ref() == text,
-                    "Document synchronization is pending; try again"
-                );
-                let encoding = Encoding::from(client.encoding());
+                let snapshot =
+                    document::synchronized(&snapshots, &text, cx.background_executor()).await?;
+                let encoding = client.encoding();
                 let position = document::position(&text, cursor, encoding)?;
                 let (method, params) = language_request(&action, &uri, &text, position);
                 if matches!(action, Rename(_)) && wants_prepare_rename(&client) {
@@ -332,14 +473,15 @@ impl Shark {
                     return window.push_notification("No result at this position", cx);
                 }
                 match action {
-                    Format => match serde_json::from_value::<Vec<lsp_types::TextEdit>>(result) {
-                        Ok(edits) => {
-                            let changes = std::collections::HashMap::from([(uri, edits)]);
-                            let edit = WorkspaceEdit {
-                                changes: Some(changes),
-                                ..Default::default()
-                            };
-                            s.apply_workspace_edit(
+                    Format | Rename(_) => {
+                        // Format's plain edits take Rename's workspace-edit path.
+                        let result = if matches!(action, Format) {
+                            json!({"changes": {uri.as_str(): result}})
+                        } else {
+                            result
+                        };
+                        match serde_json::from_value(result) {
+                            Ok(edit) => s.apply_workspace_edit(
                                 edit,
                                 encoding,
                                 root,
@@ -347,22 +489,10 @@ impl Shark {
                                 None,
                                 window,
                                 cx,
-                            )
+                            ),
+                            Err(error) => notify_err(window, cx, error.to_string()),
                         }
-                        Err(error) => notify_err(window, cx, error.to_string()),
-                    },
-                    Rename(_) => match serde_json::from_value(result) {
-                        Ok(edit) => s.apply_workspace_edit(
-                            edit,
-                            encoding,
-                            root,
-                            Some(guard),
-                            None,
-                            window,
-                            cx,
-                        ),
-                        Err(error) => notify_err(window, cx, error.to_string()),
-                    },
+                    }
                     References => {
                         match serde_json::from_value::<Vec<lsp_types::Location>>(result) {
                             Ok(locations) => {
@@ -532,18 +662,18 @@ impl Shark {
     pub(super) fn language_event(
         &mut self,
         editor: &Entity<FileEditor>,
-        event: &LanguageEvent,
+        event: &ProviderEvent,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
         match event {
-            LanguageEvent::Navigate(locations, encoding, new_tab) => {
+            ProviderEvent::Navigate(locations, encoding, new_tab) => {
                 if self.editor.as_ref() != Some(editor) || self.tab != Tab::File {
                     return;
                 }
                 self.pick_locations(locations.clone(), *encoding, *new_tab, window, cx)
             }
-            LanguageEvent::Apply {
+            ProviderEvent::Apply {
                 edit,
                 snapshot,
                 encoding,
@@ -586,7 +716,7 @@ impl Shark {
                         };
                         self.apply_workspace_edit(
                             edit,
-                            client.encoding().into(),
+                            client.encoding(),
                             session.project.worktree.clone(),
                             None,
                             Some(reply),
@@ -601,14 +731,13 @@ impl Shark {
             }
             client::Event::ShowDocument { params, reply } => {
                 let parsed = serde_json::from_value::<lsp_types::ShowDocumentParams>(params);
-                match parsed.map(|p| (uri_path(&p.uri), p)) {
+                match parsed.map(|p| (uri_path(p.uri.as_str()), p)) {
                     Ok((Ok(path), p)) => {
                         let encoding = session
                             .read(cx)
                             .client
                             .as_ref()
-                            .map(|c| c.encoding().into())
-                            .unwrap_or(Encoding::Utf16);
+                            .map_or(Encoding::Utf16, |c| c.encoding());
                         let range = p.selection.map(|range| (range, encoding));
                         // Without focus it opens in a background tab; success waits for the open.
                         let focus = p.take_focus != Some(false);
@@ -618,7 +747,11 @@ impl Shark {
                             None,
                             focus,
                             !focus,
-                            Some((reply, focus, session.downgrade())),
+                            Some(ShowReply {
+                                reply,
+                                focus,
+                                session: session.downgrade(),
+                            }),
                             window,
                             cx,
                         );
@@ -651,7 +784,7 @@ impl Shark {
             .map(|l| {
                 CommandItem::new().label(format!(
                     "{}:{}:{}",
-                    uri_path(&l.target_uri)
+                    uri_path(l.target_uri.as_str())
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|_| l.target_uri.to_string()),
                     l.target_selection_range.start.line + 1,
@@ -691,20 +824,23 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let nav = &self.navigation;
+        let nav = &mut self.navigation;
         // A press before the previous one landed steps past its target instead of repeating it.
         let steps = match nav.pending {
             Some((f, steps, request)) if f == forward && request == nav.request => steps + 1,
             _ => 1,
         };
-        let from = if forward { &nav.forward } else { &nav.back };
+        let from = nav.stack(forward);
         let Some(target) = (from.len().checked_sub(steps)).map(|ix| from[ix].clone()) else {
             return;
         };
         self.open_source(
             target.path.clone(),
             None,
-            Some((target, forward)),
+            Some(Step {
+                visit: target,
+                forward,
+            }),
             false,
             false,
             None,
@@ -761,8 +897,7 @@ impl Shark {
         };
         self.navigation.request += 1;
         if let Some(old) = self.visit(cx) {
-            self.navigation.back.push(old);
-            self.navigation.forward.clear();
+            self.navigation.push(old);
         }
         editor.update(cx, |e, cx| {
             e.input.update(cx, |i, cx| {
@@ -784,7 +919,7 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        match uri_path(&location.target_uri) {
+        match uri_path(location.target_uri.as_str()) {
             Ok(path) => self.open_source(
                 path,
                 Some((location.target_selection_range, encoding)),
@@ -824,10 +959,10 @@ impl Shark {
         &mut self,
         path: PathBuf,
         range: Option<(lsp_types::Range, Encoding)>,
-        visit: Option<(Visit, bool)>,
+        visit: Option<Step>,
         history: bool,
         new_tab: bool,
-        reply: Option<(client::Reply, bool, WeakEntity<Session>)>,
+        reply: Option<ShowReply>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -842,8 +977,8 @@ impl Shark {
         let origin_tab = self.tab;
         // Dependency sources have no project of their own; they use the server that found them.
         let session = match (&visit, &reply) {
-            (Some((v, _)), _) => v.session.clone(),
-            (None, Some((_, _, session))) => Some(session.clone()),
+            (Some(step), _) => step.visit.session.clone(),
+            (None, Some(reply)) => Some(reply.session.clone()),
             (None, None) => origin
                 .as_ref()
                 .and_then(|e| (e.read(cx).intelligence.as_ref()).map(|l| l.session.downgrade())),
@@ -900,20 +1035,10 @@ impl Shark {
                         // A deleted file leaves history: Back goes on to the entry before it.
                         let gone = (error.downcast_ref::<std::io::Error>())
                             .is_some_and(|e| e.kind() == std::io::ErrorKind::NotFound);
-                        if let Some((_, forward)) = visit.as_ref().filter(|_| gone) {
-                            let nav = &mut s.navigation;
-                            let from = if *forward {
-                                &mut nav.forward
-                            } else {
-                                &mut nav.back
-                            };
-                            if let Some(ix) = from.len().checked_sub(steps) {
-                                from.remove(ix);
-                                if ix > 0 {
-                                    nav.pending = Some((*forward, steps - 1, request));
-                                    return s.navigate_history(*forward, window, cx);
-                                }
-                            }
+                        if let Some(step) = visit.as_ref().filter(|_| gone)
+                            && s.navigation.prune(step.forward, steps, request)
+                        {
+                            return s.navigate_history(step.forward, window, cx);
                         }
                         return notify_err(window, cx, error.to_string());
                     }
@@ -921,10 +1046,7 @@ impl Shark {
                 let existing =
                     s.find_tab(existing_path.as_deref(), &original, relative.as_deref(), cx);
                 if let Some(relative) = &relative
-                    && s.differ
-                        .read(cx)
-                        .edit_snapshot()
-                        .is_some_and(|e| e.path.as_str() == relative && (e.dirty || e.saving))
+                    && s.diff_edit_busy(relative, cx)
                 {
                     return notify_err(window, cx, "The target has unsaved edits in the diff");
                 }
@@ -954,7 +1076,8 @@ impl Shark {
                             );
                         }
                     },
-                    None => visit.as_ref().map(|(v, _)| {
+                    None => visit.as_ref().map(|step| {
+                        let v = &step.visit;
                         source.floor_char_boundary(v.selection.start.min(source.len()))
                             ..source.floor_char_boundary(v.selection.end.min(source.len()))
                     }),
@@ -1018,23 +1141,12 @@ impl Shark {
                         editor
                     }
                 };
-                if let Some((_, forward)) = &visit {
-                    let (from, to) = if *forward {
-                        (&mut s.navigation.forward, &mut s.navigation.back)
-                    } else {
-                        (&mut s.navigation.back, &mut s.navigation.forward)
-                    };
-                    // The target, then the entries quick repeated presses stepped over.
-                    let passed = from.split_off(from.len().saturating_sub(steps));
-                    if let Some(old) = old {
-                        to.push(old);
-                    }
-                    to.extend(passed.into_iter().skip(1).rev());
+                if let Some(step) = &visit {
+                    s.navigation.step(step.forward, steps, old);
                 } else if let Some(old) = old {
-                    s.navigation.back.push(old);
-                    s.navigation.forward.clear();
+                    s.navigation.push(old);
                 }
-                let focus = reply.as_ref().is_none_or(|(_, focus, _)| *focus);
+                let focus = reply.as_ref().is_none_or(|r| r.focus);
                 if focus {
                     s.editor = Some(editor.clone());
                     s.show(Tab::File, window, cx);
@@ -1044,16 +1156,16 @@ impl Shark {
                         if let Some(selected) = selected {
                             i.set_selected_range(selected, cx);
                         }
-                        if let Some((visit, _)) = visit {
-                            i.set_scroll_offset(visit.scroll, cx);
+                        if let Some(step) = visit {
+                            i.set_scroll_offset(step.visit.scroll, cx);
                         }
                         if focus {
                             i.focus(window, cx);
                         }
                     })
                 });
-                if let Some((reply, ..)) = reply {
-                    reply.respond(json!({"success":true}));
+                if let Some(reply) = reply {
+                    reply.reply.respond(json!({"success":true}));
                 }
                 let _ = s.state.save();
                 cx.notify();
@@ -1082,13 +1194,13 @@ impl Shark {
             .iter()
             .map(|tab| {
                 let e = tab.editor.read(cx);
-                (
-                    e.absolute_path().to_owned(),
-                    e.input.read(cx).text().clone(),
-                    e.intelligence.as_ref().map(|l| l.snapshot.clone()),
-                    e.conflict || e.saving || e.external,
-                    e.disk_fingerprint(),
-                )
+                OpenDoc {
+                    path: e.absolute_path().to_owned(),
+                    text: e.input.read(cx).text().clone(),
+                    snapshot: e.intelligence.as_ref().map(|l| l.snapshot.clone()),
+                    blocked: e.conflict || e.saving || e.external,
+                    fingerprint: e.disk_fingerprint(),
+                }
             })
             .collect();
         cx.spawn_in(window, async move |this, cx| {
@@ -1096,85 +1208,7 @@ impl Shark {
             let staged = cx
                 .background_executor()
                 .spawn(async move {
-                    anyhow::ensure!(
-                        preflight_guard.as_ref().is_none_or(|g| g.is_current()),
-                        "Documents changed after the language request; try again"
-                    );
-                    let root = root.canonicalize()?;
-                    let directory = directory.canonicalize()?;
-                    let mut seen = HashSet::new();
-                    document::workspace_edits(edit)?
-                        .into_iter()
-                        .map(|(uri, expected, edits)| {
-                            let path = uri_path(&uri)?.canonicalize()?;
-                            anyhow::ensure!(
-                                path.starts_with(&root),
-                                "Edit leaves the current worktree: {}",
-                                path.display()
-                            );
-                            anyhow::ensure!(
-                                seen.insert(path.clone()),
-                                "Duplicate document in workspace edit"
-                            );
-                            let relative =
-                                path.strip_prefix(&directory)?.to_string_lossy().to_string();
-                            let aliases: Vec<_> = open
-                                .iter()
-                                .filter(|(p, _, _, _, _)| p.canonicalize().is_ok_and(|p| p == path))
-                                .collect();
-                            anyhow::ensure!(
-                                aliases.len() <= 1,
-                                "Close duplicate aliases of {} before editing",
-                                path.display()
-                            );
-                            let existing = aliases.first().copied();
-                            anyhow::ensure!(
-                                preflight_guard.is_some() || expected.is_some(),
-                                "Unversioned server edits require a fresh editor request"
-                            );
-                            let disk = read_source(&path)?;
-                            if let Some(guard) = &preflight_guard {
-                                ensure_disk_before_request(&path, guard.started)?;
-                            }
-                            let (before, version) = match existing {
-                                Some((_, text, snapshot, blocked, fingerprint)) => {
-                                    anyhow::ensure!(
-                                        !blocked,
-                                        "Resolve the save or disk conflict in {relative} first"
-                                    );
-                                    anyhow::ensure!(
-                                        crate::files::fingerprint(disk.as_bytes()) == *fingerprint,
-                                        "{relative} changed on disk; reload before applying edits"
-                                    );
-                                    let text = text.to_string();
-                                    let version = snapshot.as_ref().and_then(|s| {
-                                        let s = s.lock().unwrap();
-                                        (s.text.as_ref() == text).then_some(s.version)
-                                    });
-                                    (text, version)
-                                }
-                                None => (disk, None),
-                            };
-                            anyhow::ensure!(
-                                expected.is_none() || expected == version,
-                                "Stale version for {relative}"
-                            );
-                            let snapshot = Snapshot {
-                                text: Arc::from(before.as_str()),
-                                version: version.unwrap_or(0),
-                            };
-                            let after =
-                                document::apply_edits(&snapshot, expected, &edits, encoding)?;
-                            Ok(Staged {
-                                path,
-                                existing_path: existing.map(|(path, ..)| path.clone()),
-                                relative,
-                                before,
-                                after,
-                                version,
-                            })
-                        })
-                        .collect::<anyhow::Result<Vec<_>>>()
+                    stage_edits(edit, encoding, root, directory, preflight_guard, &open)
                 })
                 .await;
             let _ = this.update_in(cx, |s, window, cx| {
@@ -1274,12 +1308,6 @@ impl Shark {
     }
 }
 
-fn uri_path(uri: &Uri) -> anyhow::Result<PathBuf> {
-    url::Url::parse(uri.as_str())?
-        .to_file_path()
-        .map_err(|_| anyhow::anyhow!("Only local file locations are supported"))
-}
-
 /// FormattingOptions matching `text`'s own indentation: tabs when most indented lines start
 /// with one, else its most common indent step (4 when nothing is indented). Servers such as
 /// tsserver reindent the whole file to these options.
@@ -1332,7 +1360,13 @@ pub(super) fn read_source(path: &Path) -> anyhow::Result<String> {
     Ok(String::from_utf8(bytes)?)
 }
 
-fn ensure_disk_before_request(path: &Path, started: std::time::SystemTime) -> anyhow::Result<()> {
+/// `check_ctime` also rejects changes that left the mtime alone (a replacement preserving it), at
+/// the cost of rejecting metadata-only changes such as xattr writes.
+fn ensure_disk_before_request(
+    path: &Path,
+    started: std::time::SystemTime,
+    check_ctime: bool,
+) -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
     let metadata = path.metadata()?;
     let changed = std::time::UNIX_EPOCH
@@ -1341,7 +1375,7 @@ fn ensure_disk_before_request(path: &Path, started: std::time::SystemTime) -> an
             metadata.ctime_nsec().try_into()?,
         );
     anyhow::ensure!(
-        metadata.modified()? <= started && changed <= started,
+        metadata.modified()? <= started && (!check_ctime || changed <= started),
         "{} changed on disk after the language request; try again",
         path.display()
     );

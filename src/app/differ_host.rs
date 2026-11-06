@@ -1,23 +1,42 @@
 //! Workspace-qualified integration with Differ. Destructive coordination stays in the host.
 use super::*;
+use crate::state::ChatMeta;
 use differ::{DifferEvent, WorkspaceSnapshot};
 
 impl Shark {
-    fn differ_workspace(&self, cx: &App) -> Option<WorkspaceSnapshot> {
-        let mut workspace = self.active_ws()?.clone();
-        let mut prs = HashMap::new();
-        if let Some(sync) = self.active_sync() {
+    /// `workspace` with GitSync's effective comparison bases, as Diff and Git use them.
+    pub(super) fn effective_workspace(&self, mut workspace: Workspace, cx: &App) -> Workspace {
+        if let Some(sync) = self.syncs.get(&workspace.name) {
             let sync = sync.read(cx);
             for repo in &mut workspace.repos {
                 if let Some(base) = sync.diff_base(&repo.name) {
                     repo.base = base;
                 }
+            }
+        }
+        workspace
+    }
+
+    fn differ_workspace(&self, cx: &App) -> Option<WorkspaceSnapshot> {
+        let workspace = self.effective_workspace(self.active_ws()?.clone(), cx);
+        let mut prs = HashMap::new();
+        if let Some(sync) = self.active_sync() {
+            let sync = sync.read(cx);
+            for repo in &workspace.repos {
                 if let Some(pr) = sync.pr_for(&repo.name) {
                     prs.insert(repo.name.clone(), pr);
                 }
             }
         }
         Some(WorkspaceSnapshot { workspace, prs })
+    }
+
+    /// A moved comparison base reaches the retained Git entity, which resets only its history.
+    pub(super) fn configure_git(&self, window: &mut Window, cx: &mut Context<Self>) {
+        if let (Some(ws), Some(git)) = (self.active_ws(), self.active_git_feature()) {
+            let ws = self.effective_workspace(ws.clone(), cx);
+            git.update(cx, |g, cx| g.set_workspace(ws, window, cx));
+        }
     }
 
     pub(super) fn configure_differ(&self, cx: &mut Context<Self>) {
@@ -134,12 +153,7 @@ impl Shark {
                 new_tab,
                 existing_only,
             } if self.active.as_ref() == Some(workspace) => {
-                if *existing_only
-                    && !self
-                        .file_tabs
-                        .iter()
-                        .any(|t| t.editor.read(cx).path == *path)
-                {
+                if *existing_only && self.file_tab_ix(path, cx).is_none() {
                     return notify_err(
                         window,
                         cx,
@@ -175,14 +189,12 @@ impl Shark {
                 {
                     return self.show(Tab::Feature(Feature::Diff), window, cx);
                 }
+                // begin_edit would find nothing after the switch and do nothing.
+                if !self.differ.read(cx).in_diff(&path) {
+                    return notify_err(window, cx, format!("{path} is not in the current diff"));
+                }
 
-                let conflict = |s: &Shark, cx: &App| {
-                    s.file_tabs.iter().any(|t| {
-                        let e = t.editor.read(cx);
-                        e.path == path && (e.dirty || e.saving)
-                    })
-                };
-                if conflict(self, cx) {
+                if self.editor_busy(&path, cx) {
                     return notify_err(
                         window,
                         cx,
@@ -193,10 +205,7 @@ impl Shark {
                     if s.active.as_ref() != Some(&workspace) {
                         return;
                     }
-                    if s.file_tabs.iter().any(|t| {
-                        let e = t.editor.read(cx);
-                        e.path == path && (e.dirty || e.saving)
-                    }) {
+                    if s.editor_busy(&path, cx) {
                         return notify_err(
                             w,
                             cx,
@@ -239,22 +248,47 @@ impl Shark {
                 if self.active.as_ref() != Some(&request.workspace)
                     || !self.differ.read(cx).review_request_valid(request)
                 {
-                    return;
+                    return notify_err(window, cx, "The diff changed; open the sheet again");
                 }
-                let Some(chat) = self
-                    .active_chat()
-                    .filter(|chat| chat.read(cx).meta.id == request.chat)
-                    .cloned()
-                else {
+                let Some(ws) = self.active_ws().cloned() else {
                     return;
                 };
+                // A new chat is a tab like cmd-t's, but the diff stays on screen.
+                let meta = match &request.target {
+                    differ::Target::Chat(id) => ws.chats.iter().find(|m| &m.id == id).cloned(),
+                    differ::Target::New(pick) => {
+                        let meta = ChatMeta {
+                            model: pick.model.clone(),
+                            effort: pick.effort.clone(),
+                            ..self.state.new_chat(&ws, ws.next_chat_id())
+                        };
+                        self.active_ws_mut().unwrap().push_chat(meta.clone());
+                        let _ = self.state.save();
+                        self.configure_differ(cx); // the next sheet lists it
+                        Some(meta)
+                    }
+                };
+                let Some(meta) = meta else {
+                    return notify_err(window, cx, "That chat was closed");
+                };
+                let ws = self.active_ws().cloned().unwrap();
+                let chat = self.ensure_chat(&ws, &meta, window, cx);
                 if !chat.update(cx, |c, cx| c.send_review(request.card.clone(), cx)) {
+                    // A new chat shows its refusal; the next send's "This chat" is it, so
+                    // no second one is made.
+                    if matches!(request.target, differ::Target::New(_))
+                        && let Some(ix) = ws.chats.iter().position(|m| m.id == meta.id)
+                    {
+                        self.select_chat(ix, window, cx);
+                    }
                     return notify_err(window, cx, "Review not sent; the chat says why");
                 }
+                let queued = chat.read(cx).queued() > 0;
                 // GPUI delivers Chat events after this update. Queue first, so even an immediate
                 // ReviewSent acknowledgement observes the accepted comments.
-                self.differ
-                    .update(cx, |d, cx| d.review_accepted(request, window, cx));
+                self.differ.update(cx, |d, cx| {
+                    d.review_accepted(request, &meta.id, queued, window, cx)
+                });
             }
             _ => {}
         }

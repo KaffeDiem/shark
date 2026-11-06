@@ -86,7 +86,7 @@ async fn qa_discard_pending_does_not_delete_another_workspaces_comments(cx: &mut
     on_app(window, shark.clone())(cx, &|s, w, cx| {
         s.differ.update(cx, |d, cx| {
             for workspace in ["boundary-a", "boundary-b"] {
-                d.review_mut().edit(workspace, |comments| {
+                d.review_mut().store.edit(workspace, |comments| {
                     comments.push(
                         serde_json::from_value(serde_json::json!({
                             "id": 1, "path": "api/shared.rs", "start": [false, 1],

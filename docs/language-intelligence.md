@@ -16,7 +16,9 @@ percentage arrives. Setup needed shows the problem with a Retry button; Retry
 rediscovers the project. Error and warning `window/showMessage` notices from a server
 appear as notifications.
 
-A project's files share one server. The server outlives the replacement of its only
+A project's files share one server. Only fields that select the toolchain key it
+(go.mod's `go`/`toolchain` lines, pyproject.toml's `requires-python` and checker
+tables), so editing a dependency does not start a second server. The server outlives the replacement of its only
 tab (tree clicks, same-tab definitions, Back) and stops when the last file using it
 closes. Switching workspaces parks the outgoing workspace's servers for five minutes;
 returning within that window resumes them warm.
@@ -118,8 +120,10 @@ and [CLI BSP implementation](https://github.com/sweetpad-dev/sweetpad/blob/cli-v
 URLs, SHA-256 hashes, and executable paths. Installation downloads over HTTPS to
 unique staging directories, verifies the archive checksum and paths, extracts,
 checks the executable path, and atomically renames the completed version.
-Existing version directories are retained. Cached verified versions can be reused
-offline; failed stages are removed. No npm install scripts or project
+Existing version directories are retained, except a complete one whose recorded
+hash differs from the manifest's: it is replaced once the new download verifies and
+restored if the swap fails. Cached verified versions can be reused offline; failed
+stages are removed. No npm install scripts or project
 configuration migration commands run.
 
 | Tool | Pin | Provenance |
@@ -201,3 +205,6 @@ latency and performance under a busy indexer are not measured.
   document. Unversioned unsolicited server edits are rejected. This can require
   retrying an action; it prevents an older response from interpreting ranges
   against newer unsaved contents.
+- **Closed files in multi-file edits:** a file that is not open is rejected when its
+  mtime or ctime is newer than the request, so an xattr write between the request and
+  the edit rejects it. Open files rely on the mtime and their disk fingerprint.

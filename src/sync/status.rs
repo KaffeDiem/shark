@@ -1,22 +1,17 @@
 //! Pure git/GitHub state per repo and the step it calls for. No gpui here, so it is unit tested.
+pub use crate::git::Op;
 use crate::git::{cmd_bounded, git, run};
 use crate::prompts;
+use crate::prs::PrStatus;
 use serde_json::Value;
 use std::path::Path;
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub enum Op {
-    Merge,
-    Rebase,
-    CherryPick,
-    Revert,
-    Bisect,
-}
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Local {
     /// This branch is an isolated checkout for reviewing somebody else's PR.
     pub review: bool,
+    /// Review checkouts: the PR head last fetched (`refs/shark/pull/N/head`); empty if unknown.
+    pub review_head: String,
     /// `None` when HEAD is detached (also mid-rebase).
     pub branch: Option<String>,
     pub head: String,
@@ -91,6 +86,26 @@ impl Pr {
     pub fn has(&self, head: &str) -> bool {
         self.head == head || (!head.is_empty() && self.contains_head == head)
     }
+
+    /// GitHub hasn't computed mergeability yet.
+    pub fn merge_unknown(&self) -> bool {
+        matches!(self.merge_state.as_str(), "UNKNOWN" | "")
+    }
+
+    /// The base has moved on since the head was cut.
+    pub fn behind(&self) -> bool {
+        self.merge_state == "BEHIND"
+    }
+
+    /// Lifecycle label of the PR (not its checks).
+    pub fn status(&self) -> PrStatus {
+        match self.state {
+            PrState::Merged => PrStatus::Merged,
+            PrState::Closed => PrStatus::Closed,
+            PrState::Open if self.draft => PrStatus::Draft,
+            PrState::Open => PrStatus::Open,
+        }
+    }
 }
 
 /// Parses `git status --porcelain=v2 --branch -z`.
@@ -142,6 +157,7 @@ pub fn probe(
             "status",
             "--porcelain=v2",
             "--branch",
+            "--untracked-files=normal",
             "-z",
         ],
     )?;
@@ -150,58 +166,54 @@ pub fn probe(
     }
     let mut l = parse_status(&out.stdout);
     l.review = crate::git::review_pr_url(wt, branch).is_some();
-    // Per-worktree state files; --git-path resolves them inside .git/worktrees/<name>/.
-    const OPS: [(&str, Op); 6] = [
-        ("rebase-merge", Op::Rebase),
-        ("rebase-apply", Op::Rebase),
-        ("MERGE_HEAD", Op::Merge),
-        ("CHERRY_PICK_HEAD", Op::CherryPick),
-        ("REVERT_HEAD", Op::Revert),
-        ("BISECT_LOG", Op::Bisect),
-    ];
-    let mut args = vec!["rev-parse", "--path-format=absolute"];
-    OPS.iter().for_each(|(f, _)| args.extend(["--git-path", f]));
-    let paths = git(wt, &args)?;
-    l.op = paths
-        .lines()
-        .zip(OPS)
-        .find(|(p, _)| Path::new(p).exists())
-        .map(|(_, (_, op))| op);
+    // A review checkout's saved base is `refs/shark/pull/N/base`.
+    let pr_number = base
+        .strip_prefix("refs/shark/pull/")
+        .and_then(|b| b.strip_suffix("/base")?.parse().ok());
+    if let Some(n) = pr_number {
+        let head = crate::git::review_ref(n, "head");
+        l.review_head = crate::git::ref_oid(wt, &head).unwrap_or_default();
+    }
+    l.op = crate::git::op_in_progress(wt)?;
     l.origin = git(wt, &["remote", "get-url", "origin"]).ok();
-    l.trunk = (prev.map(|p| p.trunk.clone()).filter(|t| !t.is_empty()))
-        .unwrap_or_else(|| crate::git::default_base(wt));
+    l.trunk = trunk_of(wt, prev);
     let remote = format!("refs/remotes/origin/{branch}");
-    if let Ok(oid) = git(wt, &["rev-parse", "--verify", "--quiet", &remote]) {
+    if let Some(oid) = crate::git::ref_oid(wt, &remote) {
         if let Some(p) =
             prev.filter(|p| p.remote.is_some() && (&p.head, &p.remote_head) == (&l.head, &oid))
         {
             (l.remote, l.rewritten, l.remote_head) = (p.remote, p.rewritten, oid);
-            return base_counts(wt, base, l)
-                .map(|l| parent_tip(wt, branch, base, l, allow_parent_update));
+        } else {
+            l.remote_head = oid;
+            let range = format!("HEAD...{remote}");
+            let ab = counts(&git(wt, &["rev-list", "--left-right", "--count", &range])?);
+            if ab.0 > 0 && ab.1 > 0 {
+                let theirs = git(
+                    wt,
+                    &[
+                        "rev-list",
+                        "--count",
+                        "--cherry-pick",
+                        "--right-only",
+                        &range,
+                    ],
+                )?;
+                // Patch equality is symmetric; only the side with the newer tip did the rewriting.
+                let time = |r: &str| git(wt, &["log", "-1", "--format=%ct", r]).unwrap_or_default();
+                let newer = time("HEAD").parse::<u64>().unwrap_or(0)
+                    > time(&remote).parse().unwrap_or(u64::MAX);
+                l.rewritten = theirs == "0" && newer;
+            }
+            l.remote = Some(ab);
         }
-        l.remote_head = oid;
-        let range = format!("HEAD...{remote}");
-        let ab = counts(&git(wt, &["rev-list", "--left-right", "--count", &range])?);
-        if ab.0 > 0 && ab.1 > 0 {
-            let theirs = git(
-                wt,
-                &[
-                    "rev-list",
-                    "--count",
-                    "--cherry-pick",
-                    "--right-only",
-                    &range,
-                ],
-            )?;
-            // Patch equality is symmetric; only the side with the newer tip did the rewriting.
-            let time = |r: &str| git(wt, &["log", "-1", "--format=%ct", r]).unwrap_or_default();
-            let newer = time("HEAD").parse::<u64>().unwrap_or(0)
-                > time(&remote).parse().unwrap_or(u64::MAX);
-            l.rewritten = theirs == "0" && newer;
-        }
-        l.remote = Some(ab);
     }
     base_counts(wt, base, l).map(|l| parent_tip(wt, branch, base, l, allow_parent_update))
+}
+
+/// The trunk the last probe found, else the repo's default branch.
+pub fn trunk_of(wt: &Path, prev: Option<&Local>) -> String {
+    (prev.map(|p| p.trunk.clone()).filter(|t| !t.is_empty()))
+        .unwrap_or_else(|| crate::git::default_base(wt))
 }
 
 /// Reads the parent tip, and moves it to the base's tip once HEAD has all of the base (the
@@ -221,15 +233,7 @@ fn parent_tip(
         return l;
     }
     // Only the real base: a fallback (a pruned parent) says nothing about the boundary.
-    let Ok(tip) = git(
-        wt,
-        &[
-            "rev-parse",
-            "--verify",
-            "--quiet",
-            &format!("{base}^{{commit}}"),
-        ],
-    ) else {
+    let Some(tip) = crate::git::ref_oid(wt, &format!("{base}^{{commit}}")) else {
         return l;
     };
     let ancestor = |a: &str, b: &str| {
@@ -311,10 +315,17 @@ fn checks(rollup: &Value) -> Checks {
             .unwrap_or("")
             .to_string()
     };
-    // A re-run leaves the old run in the rollup; only the newest per name counts.
+    // A re-run leaves the old run in the rollup; only the newest per workflow and name counts
+    // (two workflows may both have a `build`).
+    let key = |c: &Value| {
+        (
+            c["workflowName"].as_str().unwrap_or("").to_string(),
+            name(c),
+        )
+    };
     let mut latest: Vec<&Value> = vec![];
     for c in items {
-        match latest.iter().position(|l| name(l) == name(c)) {
+        match latest.iter().position(|l| key(l) == key(c)) {
             Some(i) if started(latest[i]) <= started(c) => latest[i] = c,
             Some(_) => {}
             None => latest.push(c),
@@ -344,19 +355,46 @@ fn checks(rollup: &Value) -> Checks {
     }
 }
 
+/// `branch`'s PRs of any state in origin's repo (`--repo`, so a fork's upstream never answers),
+/// as `gh pr list --json fields` gives them; same-named fork branches are left out.
+pub fn branch_prs(wt: &Path, branch: &str, fields: &str, secs: u64) -> Result<Vec<Value>, String> {
+    let origin = origin_repo(wt);
+    let args = crate::pr::with_repo(
+        vec![
+            "pr", "list", "--head", branch, "--state", "all", "--json", fields, "--limit", "100",
+        ],
+        origin.as_deref(),
+    );
+    let json = cmd_bounded(wt, "gh", &args, secs)?;
+    let list: Vec<Value> = serde_json::from_str(&json).map_err(|e| format!("gh: {e}"))?;
+    Ok(own(&list).into_iter().cloned().collect())
+}
+
 /// Picks this branch's PR from `gh pr list --head … --state all`: the open one, else the newest.
 /// Fork PRs whose branch happens to have the same name are ignored.
+#[cfg(test)]
 pub fn parse_prs(json: &str) -> Option<Pr> {
     let list: Vec<Value> = serde_json::from_str(json).ok()?;
-    let own: Vec<&Value> = list
-        .iter()
+    Some(parse_pr(pick_pr(&own(&list))?))
+}
+
+/// The PRs from this repo itself; a fork's PR on a same-named branch isn't about it.
+pub fn own(list: &[Value]) -> Vec<&Value> {
+    list.iter()
         .filter(|p| p["isCrossRepository"] != true)
-        .collect();
-    let pick = own.iter().find(|p| p["state"] == "OPEN").or_else(|| {
-        own.iter()
-            .max_by_key(|p| p["updatedAt"].as_str().unwrap_or("").to_string())
-    })?;
-    Some(parse_pr(pick))
+        .collect()
+}
+
+/// The open PR, else the most recently updated; also how the Git tab picks, so both agree.
+pub fn pick_pr<'a>(own: &[&'a Value]) -> Option<&'a Value> {
+    own.iter()
+        .copied()
+        .find(|p| p["state"] == "OPEN")
+        .or_else(|| {
+            own.iter()
+                .copied()
+                .max_by_key(|p| p["updatedAt"].as_str().unwrap_or("").to_string())
+        })
 }
 
 fn parse_pr(pick: &Value) -> Pr {
@@ -400,8 +438,16 @@ fn parse_pr(pick: &Value) -> Pr {
 pub fn fetch_parent(wt: &Path, parent: &str) -> Result<Option<Pr>, String> {
     let pr = fetch_pr(wt, parent, "")?;
     let remote = format!("refs/remotes/origin/{parent}");
-    let tip = git(wt, &["rev-parse", "--verify", "--quiet", &remote]).ok();
+    let tip = crate::git::ref_oid(wt, &remote);
     Ok(pr.filter(|p| p.state == PrState::Open || tip.as_ref().is_none_or(|t| *t == p.head)))
+}
+
+/// Origin's GitHub URL, for `gh --repo`: gh may default to a fork's upstream, but branch
+/// ownership belongs to origin.
+pub fn origin_repo(wt: &Path) -> Option<String> {
+    git(wt, &["config", "--get", "remote.origin.url"])
+        .ok()
+        .and_then(|url| github_url(&url))
 }
 
 /// `Ok(None)` means the branch has no PR. Unlike `gh pr view`, "none" isn't an error exit,
@@ -420,21 +466,10 @@ pub fn fetch_pr(wt: &Path, branch: &str, head: &str) -> Result<Option<Pr>, Strin
         };
         return Ok(holding_head(wt, pr, head));
     }
-    // gh may default to a fork's upstream; branch ownership belongs to origin.
-    let origin = git(wt, &["config", "--get", "remote.origin.url"])
-        .ok()
-        .and_then(|url| github_url(&url));
-    let mut args = vec![
-        "pr", "list", "--head", branch, "--state", "all", "--json", PR_FIELDS,
-    ];
-    if let Some(origin) = &origin {
-        args.extend(["--repo", origin]);
-    }
+    let origin = origin_repo(wt);
     let own = if review.is_none() || origin.is_some() {
-        let result = cmd_bounded(wt, "gh", &args, 20).and_then(|json| {
-            serde_json::from_str::<Vec<Value>>(&json).map_err(|e| format!("gh: {e}"))?;
-            Ok(parse_prs(&json))
-        });
+        let result = branch_prs(wt, branch, PR_FIELDS, 20)
+            .map(|list| pick_pr(&list.iter().collect::<Vec<_>>()).map(parse_pr));
         match result {
             Ok(pr) => pr,
             // A private fork can be inaccessible while the original review is still readable.
@@ -445,25 +480,10 @@ pub fn fetch_pr(wt: &Path, branch: &str, head: &str) -> Result<Option<Pr>, Strin
         None
     };
     if let Some(url) = &review {
-        if let Some(pr) = own.as_ref().filter(|p| {
-            p.state == PrState::Open
-                && p.url != *url
-                && p.number != 0
-                && !p.base.is_empty()
-                && origin
-                    .as_ref()
-                    .is_some_and(|o| p.url == format!("{o}/pull/{}", p.number))
-                && !p.head.is_empty()
-                // Publishing establishes ownership even if GitHub has since advanced or rewritten it.
-                && ((git(wt, &["config", "--get", &format!("branch.{branch}.remote")]).as_deref()
-                    == Ok("origin")
-                    && git(wt, &["config", "--get", &format!("branch.{branch}.merge")]).as_deref()
-                        == Ok(format!("refs/heads/{branch}").as_str()))
-                    || git(
-                        wt,
-                        &["merge-base", "--is-ancestor", "--", &p.head, &format!("refs/heads/{branch}")],
-                    ).is_ok())
-        }) {
+        if let Some(pr) = own
+            .as_ref()
+            .filter(|p| published_review(wt, branch, url, origin.as_deref(), p))
+        {
             git(
                 wt,
                 &["check-ref-format", &format!("refs/heads/{}", pr.base)],
@@ -480,7 +500,7 @@ pub fn fetch_pr(wt: &Path, branch: &str, head: &str) -> Result<Option<Pr>, Strin
                 ],
             )?;
         } else {
-            let json = cmd_bounded(wt, "gh", &["pr", "view", &url, "--json", PR_FIELDS], 20)?;
+            let json = cmd_bounded(wt, "gh", &["pr", "view", url, "--json", PR_FIELDS], 20)?;
             let value = serde_json::from_str(&json).map_err(|e| format!("gh: {e}"))?;
             return Ok(Some(Pr {
                 review_checkout: true,
@@ -497,18 +517,44 @@ fn holding_head(wt: &Path, mut pr: Option<Pr>, head: &str) -> Option<Pr> {
         .as_mut()
         .filter(|p| p.state == PrState::Merged && !head.is_empty() && p.head != head)
     {
-        // A head pushed on GitHub (Update branch) and auto-deleted right after the merge
-        // may never have reached a fetch here; the PR ref keeps it.
-        let have = format!("{}^{{commit}}", p.head);
-        if git(wt, &["cat-file", "-e", &have]).is_err() {
-            let pull = format!("refs/pull/{}/head", p.number);
-            let _ = cmd_bounded(wt, "git", &["fetch", "--quiet", "origin", &pull], 20);
-        }
-        if git(wt, &["merge-base", "--is-ancestor", head, &p.head]).is_ok() {
-            p.contains_head = head.to_string();
-        }
+        mark_contains_head(wt, p, head);
     }
     pr
+}
+
+/// Whether `p`, an open PR of this repo, is the review checkout `branch`'s own published work
+/// (`url` is the reviewed PR): its identity may be dropped.
+fn published_review(wt: &Path, branch: &str, url: &str, origin: Option<&str>, p: &Pr) -> bool {
+    p.state == PrState::Open
+        && p.url != url
+        && p.number != 0
+        && !p.base.is_empty()
+        && origin.is_some_and(|o| p.url == format!("{o}/pull/{}", p.number))
+        && !p.head.is_empty()
+        // Publishing establishes ownership even if GitHub has since advanced or rewritten it.
+        && ((git(wt, &["config", "--get", &format!("branch.{branch}.remote")]).as_deref()
+            == Ok("origin")
+            && git(wt, &["config", "--get", &format!("branch.{branch}.merge")]).as_deref()
+                == Ok(format!("refs/heads/{branch}").as_str()))
+            || git(
+                wt,
+                &["merge-base", "--is-ancestor", "--", &p.head, &format!("refs/heads/{branch}")],
+            )
+            .is_ok())
+}
+
+/// Sets `p.contains_head` to `head` when the merged PR's head holds it.
+fn mark_contains_head(wt: &Path, p: &mut Pr, head: &str) {
+    // A head pushed on GitHub (Update branch) and auto-deleted right after the merge
+    // may never have reached a fetch here; the PR ref keeps it.
+    let have = format!("{}^{{commit}}", p.head);
+    if git(wt, &["cat-file", "-e", &have]).is_err() {
+        let pull = format!("refs/pull/{}/head", p.number);
+        let _ = cmd_bounded(wt, "git", &["fetch", "--quiet", "origin", &pull], 20);
+    }
+    if git(wt, &["merge-base", "--is-ancestor", head, &p.head]).is_ok() {
+        p.contains_head = head.to_string();
+    }
 }
 
 /// Everything known about one repo of a workspace.
@@ -551,6 +597,28 @@ impl Repo {
         self.pr().filter(|p| p.state == PrState::Open)
     }
 
+    /// A reviewed PR got new commits on GitHub since its head was fetched, whatever the local
+    /// state. Whether "Fetch updates" can run is `review_fetchable`.
+    pub fn review_head_moved(&self) -> bool {
+        let local = self.local.as_ref().map_or("", |l| l.review_head.as_str());
+        self.is_review()
+            && self
+                .open_pr()
+                .is_some_and(|p| !p.head.is_empty() && !local.is_empty() && p.head != local)
+    }
+
+    /// `review_head_moved`, and `git::update_review_branch` would not refuse: clean tree
+    /// (untracked counts), no operation in progress, on the review branch at the fetched head.
+    pub fn review_fetchable(&self) -> bool {
+        self.review_head_moved()
+            && self.local.as_ref().is_ok_and(|l| {
+                l.changed == 0
+                    && l.op.is_none()
+                    && l.branch.as_deref() == Some(&self.branch)
+                    && l.head == l.review_head
+            })
+    }
+
     /// The branch it is stacked on: its base is `origin/<parent>` and not the trunk.
     pub fn stacked(&self) -> Option<&str> {
         let trunk = self.local.as_ref().map(|l| l.trunk.as_str()).ok()?;
@@ -584,6 +652,18 @@ pub fn restack_line(r: &Repo, onto: &str) -> String {
         _ => format!("`$(git merge-base HEAD {})`", r.base),
     };
     format!("{}: onto `{onto}`, after {after}", r.name)
+}
+
+/// The `restack` prompt for `repos`, each onto `onto(repo)`.
+pub fn restack_prompt(repos: &[&Repo], onto: impl Fn(&Repo) -> String) -> String {
+    let fill = |names: &[String]| {
+        (repos.iter().filter(|r| names.contains(&r.name)))
+            .map(|r| restack_line(r, &onto(r)))
+            .collect::<Vec<_>>()
+            .join("; ")
+    };
+    let pairs = repos.iter().map(|r| (&*r.name, &*r.branch));
+    prompts::render_each("restack", pairs, fill)
 }
 
 /// `origin/main` → `main`, for labels.
@@ -652,13 +732,11 @@ impl Repo {
             Some(Ok(Some(p))) => parts.push(format!(
                 "PR #{} {}",
                 p.number,
-                match (&p.state, &p.checks) {
-                    (PrState::Merged, _) => "merged",
-                    (PrState::Closed, _) => "closed",
+                match (p.status(), &p.checks) {
+                    (s @ (PrStatus::Merged | PrStatus::Closed), _) => s.label(),
                     (_, Checks::Failing(_)) => "checks failing",
                     (_, Checks::Pending) => "checks running",
-                    _ if p.draft => "draft",
-                    _ => "open",
+                    (s, _) => s.label(),
                 }
             )),
             Some(Err(_)) => parts.push(format!("{} unavailable", self.host())),
@@ -690,6 +768,8 @@ pub enum Kind {
     Merge,
     Archive,
     OpenPr,
+    /// A reviewed PR got new commits: move its review branch to them.
+    FetchReview,
     /// Nothing to run; the label is a status.
     None,
 }
@@ -698,6 +778,11 @@ impl Kind {
     /// Direct writes must not race an agent; agent prompts go through the chat queue.
     pub fn needs_idle(&self) -> bool {
         !matches!(self, Kind::Agent(_) | Kind::OpenPr | Kind::None)
+    }
+
+    /// Opens PRs, as a new one or a draft.
+    pub fn creates_pr(&self) -> bool {
+        matches!(self, Kind::CreatePr | Kind::CreateDraftPr)
     }
 }
 
@@ -728,14 +813,40 @@ pub fn among<'a>(repos: &'a [Repo], rs: &'a [String]) -> impl Iterator<Item = &'
     repos.iter().filter(|r| rs.contains(&r.name))
 }
 
+/// `r` is among `rs`; an empty scope means every repo.
+pub fn in_scope(rs: &[String], r: &Repo) -> bool {
+    rs.is_empty() || rs.contains(&r.name)
+}
+
 /// The single most useful next step for the whole workspace. Local problems come before
 /// remote ones, and within the PR phase actionable steps beat passive waits, so a
 /// "checks running" in one repo can't hide a "ready for review" in another. `handled`: review
 /// IDs already sent to the agent.
 pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
+    let label = |verb: &str, rs: &[String]| match repos.len() {
+        1 => verb.to_string(),
+        _ => format!("{verb} · {}", rs.join(", ")),
+    };
     if repos.iter().any(Repo::is_review) {
+        let moved: Vec<String> = (repos.iter())
+            .filter(|r| r.review_fetchable())
+            .map(|r| r.name.clone())
+            .collect();
+        if !moved.is_empty() {
+            let verb = label("Fetch updates", &moved);
+            return act(verb, Kind::FetchReview, moved, true);
+        }
         let normal: Vec<_> = repos.iter().filter(|r| !r.is_review()).cloned().collect();
         if normal.is_empty() {
+            // Moved but not fetchable: a hint, not a step, since the click couldn't succeed.
+            let blocked: Vec<String> = (repos.iter())
+                .filter(|r| r.review_head_moved())
+                .map(|r| r.name.clone())
+                .collect();
+            if !blocked.is_empty() {
+                let verb = "PR updated · commit or discard local changes to fetch";
+                return act(verb, Kind::OpenPr, blocked, false);
+            }
             return act(
                 "Review PR",
                 Kind::OpenPr,
@@ -757,22 +868,8 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
             .collect()
     };
     // The `restack` prompt for `rs`, each onto its own base.
-    let restack = |rs: &[String]| {
-        let fill = |rs: &[String]| {
-            (among(repos, rs).map(|r| restack_line(r, &r.base)))
-                .collect::<Vec<_>>()
-                .join("; ")
-        };
-        prompts::render_each(
-            "restack",
-            among(repos, rs).map(|r| (&*r.name, &*r.branch)),
-            fill,
-        )
-    };
-    let label = |verb: &str, rs: &[String]| match repos.len() {
-        1 => verb.to_string(),
-        _ => format!("{verb} · {}", rs.join(", ")),
-    };
+    let restack =
+        |rs: &[String]| restack_prompt(&among(repos, rs).collect::<Vec<_>>(), |r| r.base.clone());
     let with_base = |rs: &[String]| {
         among(repos, rs)
             .map(|r| format!("{} (base `{}`)", r.name, r.base))
@@ -936,7 +1033,7 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
         })
         .or_else(|| {
             // GitHub's Update branch merges the parent in; a stack rebases instead.
-            let behind = current(&|p| p.merge_state == "BEHIND");
+            let behind = current(&|p| p.behind());
             let (stacked, rs): (Vec<String>, Vec<String>) = (behind.into_iter()).partition(|n| {
                 among(repos, std::slice::from_ref(n)).any(|r| r.stacked().is_some())
             });
@@ -973,26 +1070,28 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
             false => act("Checking PR…", Kind::None, vec![], false),
         };
     }
-    let passive = |l: &str| act(l, Kind::OpenPr, vec![], false);
+    // A wait opens the PRs it waits on in the browser; `rs` are those repos.
+    let passive = |l: &str, rs: Vec<String>| act(l, Kind::OpenPr, rs, false);
     // GitHub computes mergeability lazily, and lags a push by a few seconds.
-    if !prs(&|p, l| p.head != l.head || matches!(p.merge_state.as_str(), "UNKNOWN" | "")).is_empty()
-    {
-        return passive("Checking PR…");
+    let rs = prs(&|p, l| p.head != l.head || p.merge_unknown());
+    if !rs.is_empty() {
+        return passive("Checking PR…", rs);
     }
-    if !prs(&|p, _| p.checks == Checks::Pending).is_empty() {
-        return passive("Checks running");
+    let rs = prs(&|p, _| p.checks == Checks::Pending);
+    if !rs.is_empty() {
+        return passive("Checks running", rs);
     }
-    if !prs(&|p, _| p.review == "CHANGES_REQUESTED").is_empty() {
-        return passive("Awaiting re-review");
+    let rs = prs(&|p, _| p.review == "CHANGES_REQUESTED");
+    if !rs.is_empty() {
+        return passive("Awaiting re-review", rs);
     }
-    if !prs(&|p, _| p.merge_state == "BLOCKED").is_empty() {
-        let review =
-            !prs(&|p, _| p.merge_state == "BLOCKED" && p.review == "REVIEW_REQUIRED").is_empty();
-        return passive(if review {
-            "Awaiting review"
-        } else {
-            "Merge blocked"
-        });
+    let blocked = prs(&|p, _| p.merge_state == "BLOCKED");
+    if !blocked.is_empty() {
+        let rs = prs(&|p, _| p.merge_state == "BLOCKED" && p.review == "REVIEW_REQUIRED");
+        return match rs.is_empty() {
+            true => passive("Merge blocked", blocked),
+            false => passive("Awaiting review", rs),
+        };
     }
     // A child merges after its parent; GitHub would otherwise merge it into the parent branch.
     let waiting = |r: &Repo| r.parent_is(PrState::Open).is_some();
@@ -1002,7 +1101,8 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
     }
     if let Some(r) = repos.iter().find(|r| r.open_pr().is_some() && waiting(r)) {
         let p = r.parent.as_ref().map_or(0, |p| p.number);
-        return passive(&format!("Waiting on parent PR #{p}"));
+        let rs = names(&|r, _| r.open_pr().is_some() && waiting(r));
+        return passive(&format!("Waiting on parent PR #{p}"), rs);
     }
     if repos
         .iter()
@@ -1016,11 +1116,8 @@ pub fn next_action(repos: &[Repo], handled: &[String]) -> Action {
 /// Whether to ask GitHub again soon: its answer is about to change.
 pub fn pr_settling(repos: &[Repo]) -> bool {
     repos.iter().any(|r| {
-        r.open_pr().is_some_and(|p| {
-            p.checks == Checks::Pending
-                || matches!(p.merge_state.as_str(), "UNKNOWN" | "")
-                || head_moved(r, p)
-        })
+        r.open_pr()
+            .is_some_and(|p| p.checks == Checks::Pending || p.merge_unknown() || head_moved(r, p))
     })
 }
 
@@ -1038,8 +1135,8 @@ pub fn pr_head_moved(repos: &[Repo]) -> bool {
 }
 
 /// The command one repo's part of a mechanical step runs: `git` args for Pull, Push and
-/// ForcePush, `gh` args for Merge (minus the merge method). `Ok(None)` when the repo has nothing
-/// to do. Menu steps skip the next-step check, so these guards are what keeps them from moving
+/// ForcePush, `gh` args for Merge (minus the merge method), Reopen, UpdateBranch and Ready.
+/// `Ok(None)` when the repo has nothing to do. Menu steps skip the next-step check, so these guards are what keeps them from moving
 /// the wrong commit.
 pub fn step_args(kind: &Kind, r: &Repo) -> Result<Option<Vec<String>>, String> {
     if r.is_review() {
@@ -1105,6 +1202,18 @@ pub fn step_args(kind: &Kind, r: &Repo) -> Result<Option<Vec<String>>, String> {
             }
             args(&["pr", "merge", &p.url, "--match-head-commit", &p.head])
         }
+        Kind::Reopen => match r.pr().filter(|p| p.state == PrState::Closed) {
+            Some(p) => args(&["pr", "reopen", &p.url]),
+            None => Ok(None),
+        },
+        Kind::UpdateBranch => match r.open_pr().filter(|p| p.behind()) {
+            Some(p) => args(&["pr", "update-branch", &p.url]),
+            None => Ok(None),
+        },
+        Kind::Ready => match r.open_pr().filter(|p| p.draft) {
+            Some(p) => args(&["pr", "ready", &p.url]),
+            None => Ok(None),
+        },
         _ => Ok(None),
     }
 }
@@ -1158,6 +1267,7 @@ mod tests {
             Kind::Ready,
             Kind::Merge,
             Kind::Archive,
+            Kind::FetchReview,
         ] {
             assert!(kind.needs_idle(), "{kind:?}");
         }
@@ -1238,6 +1348,83 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
     }
 
     #[test]
+    fn same_named_checks_of_two_workflows_do_not_hide_each_other() {
+        let rollup: Value = serde_json::from_str(
+            r#"[{"name":"build","workflowName":"ci","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-01-01"},
+                {"name":"build","workflowName":"release","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-01-02"}]"#,
+        )
+        .unwrap();
+        assert_eq!(checks(&rollup), Checks::Failing(vec!["build".into()]));
+        // The same workflow's re-run still replaces its older run.
+        let rerun: Value = serde_json::from_str(
+            r#"[{"name":"build","workflowName":"ci","status":"COMPLETED","conclusion":"FAILURE","startedAt":"2026-01-01"},
+                {"name":"build","workflowName":"ci","status":"COMPLETED","conclusion":"SUCCESS","startedAt":"2026-01-02"}]"#,
+        )
+        .unwrap();
+        assert_eq!(checks(&rerun), Checks::Passing);
+    }
+
+    #[test]
+    fn button_and_git_tab_pick_the_same_pr() {
+        // gh lists newest created first; the one updated last is not the first.
+        let list: Vec<Value> = serde_json::from_str(
+            r#"[{"url":"new","state":"CLOSED","updatedAt":"2026-01-01"},
+                {"url":"old","state":"MERGED","updatedAt":"2026-03-01"}]"#,
+        )
+        .unwrap();
+        let own: Vec<&Value> = list.iter().collect();
+        assert_eq!(pick_pr(&own).unwrap()["url"], "old");
+        assert_eq!(
+            parse_prs(&serde_json::to_string(&list).unwrap())
+                .unwrap()
+                .url,
+            "old"
+        );
+        let mut open = list.clone();
+        open.push(serde_json::json!({"url":"open","state":"OPEN"}));
+        let own: Vec<&Value> = open.iter().collect();
+        assert_eq!(pick_pr(&own).unwrap()["url"], "open");
+    }
+
+    #[test]
+    fn waits_open_only_the_prs_they_wait_on() {
+        let waiting = |p: Pr| repo("web", clean(1), Some(p));
+        let done = repo("api", clean(1), Some(pr("CLEAN", Checks::Passing)));
+        let api_pending = repo("api", clean(1), Some(pr("CLEAN", Checks::Pending)));
+        let a = next(&[api_pending, waiting(pr("CLEAN", Checks::Passing))]);
+        assert_eq!(
+            (a.label.as_str(), &a.kind),
+            ("Checks running", &Kind::OpenPr)
+        );
+        assert_eq!(a.repos, ["api"]);
+        let a = next(&[done.clone(), waiting(pr("BLOCKED", Checks::Passing))]);
+        assert_eq!(
+            (a.label.as_str(), a.repos),
+            ("Merge blocked", vec!["web".to_string()])
+        );
+        let review = Pr {
+            review: "REVIEW_REQUIRED".into(),
+            ..pr("BLOCKED", Checks::Passing)
+        };
+        let a = next(&[done.clone(), waiting(review)]);
+        assert_eq!(
+            (a.label.as_str(), a.repos),
+            ("Awaiting review", vec!["web".to_string()])
+        );
+        let changes = Pr {
+            review: "CHANGES_REQUESTED".into(),
+            change_requests: vec!["r1".into()],
+            ..pr("CLEAN", Checks::Passing)
+        };
+        // The agent has seen r1; what is left is waiting for the reviewer.
+        let a = next_action(&[done, waiting(changes)], &["r1".into()]);
+        assert_eq!(
+            (a.label.as_str(), a.repos),
+            ("Awaiting re-review", vec!["web".to_string()])
+        );
+    }
+
+    #[test]
     fn picks_own_open_pr() {
         let json = r#"[{"url":"u1","number":1,"state":"CLOSED","updatedAt":"2026-01-02"},
                        {"url":"u3","number":3,"state":"OPEN","isCrossRepository":true},
@@ -1279,6 +1466,101 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
         let action = next_action(&[review, normal], &[]);
         assert_eq!(action.kind, Kind::CreatePr);
         assert_eq!(action.repos, ["work"]);
+    }
+
+    /// A review checkout whose PR head is `remote` on GitHub and `fetched` locally.
+    fn reviewed(name: &str, fetched: &str, remote: &str, l: impl FnOnce(&mut Local)) -> Repo {
+        let mut local = Local {
+            review: true,
+            review_head: fetched.into(),
+            head: fetched.into(),
+            ..clean(1)
+        };
+        l(&mut local);
+        let p = Pr {
+            head: remote.into(),
+            review_checkout: true,
+            ..pr("CLEAN", Checks::Passing)
+        };
+        repo(name, local, Some(p))
+    }
+
+    #[test]
+    fn fetch_updates_when_review_head_moved() {
+        let a = next(&[reviewed("api", "old", "new", |_| {})]);
+        assert_eq!(a.label, "Fetch updates");
+        assert_eq!(a.kind, Kind::FetchReview);
+        assert_eq!(a.repos, ["api"]);
+        assert!(a.attention);
+        assert!(super::super::run::needs_you(&a));
+    }
+
+    #[test]
+    fn fetch_updates_names_repo_in_multi_repo() {
+        let repos = [
+            reviewed("api", "old", "new", |_| {}),
+            reviewed("web", "same", "same", |_| {}),
+        ];
+        let a = next(&repos);
+        assert_eq!(a.label, "Fetch updates · api");
+        assert_eq!(a.repos, ["api"]);
+    }
+
+    #[test]
+    fn fetch_updates_quiet_when_equal_unknown_or_not_open() {
+        for (fetched, remote) in [("h", "h"), ("", "new")] {
+            let a = next(&[reviewed("api", fetched, remote, |_| {})]);
+            assert_eq!(a.label, "Review PR", "{fetched:?} vs {remote:?}");
+        }
+        for state in [PrState::Closed, PrState::Merged] {
+            let mut r = reviewed("api", "old", "new", |_| {});
+            if let Some(Ok(Some(p))) = &mut r.pr {
+                p.state = state;
+            }
+            assert_ne!(next(&[r]).kind, Kind::FetchReview, "{state:?}");
+        }
+    }
+
+    #[test]
+    fn fetch_updates_blocked_by_local_state_is_a_hint() {
+        let cases = [
+            reviewed("api", "old", "new", |l| l.head = "local".into()),
+            reviewed("api", "old", "new", |l| l.changed = 2),
+            reviewed("api", "old", "new", |l| l.branch = Some("other".into())),
+            reviewed("api", "old", "new", |l| l.branch = None),
+            reviewed("api", "old", "new", |l| l.op = Some(Op::Rebase)),
+        ];
+        for r in cases {
+            assert!(r.review_head_moved() && !r.review_fetchable());
+            let a = next(&[r]);
+            assert_eq!(
+                a.label,
+                "PR updated · commit or discard local changes to fetch"
+            );
+            assert_eq!(a.kind, Kind::OpenPr);
+            assert_eq!(a.repos, ["api"]);
+            assert!(!a.attention);
+            assert!(!super::super::run::needs_you(&a));
+        }
+    }
+
+    #[test]
+    fn fetch_updates_outranks_normal_repo_in_mixed_workspace() {
+        let work = repo("work", clean(2), None);
+        assert_eq!(next(std::slice::from_ref(&work)).kind, Kind::CreatePr);
+        let a = next(&[reviewed("review", "old", "new", |_| {}), work]);
+        assert_eq!(a.kind, Kind::FetchReview);
+        assert_eq!(a.repos, ["review"]);
+    }
+
+    #[test]
+    fn blocked_fetch_updates_does_not_outrank_normal_repo() {
+        let work = repo("work", clean(2), None);
+        let blocked = reviewed("review", "old", "new", |l| l.changed = 1);
+        let a = next(&[blocked, work]);
+        assert_eq!(a.kind, Kind::CreatePr);
+        assert_eq!(a.repos, ["work"]);
+        assert!(!a.label.contains("Fetch"));
     }
 
     fn repo(name: &str, l: Local, pr: Option<Pr>) -> Repo {

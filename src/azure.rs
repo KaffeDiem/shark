@@ -436,11 +436,7 @@ fn text_comments(t: &Value) -> Vec<&Value> {
 }
 
 /// For `#` completion and the new-workspace PR list, as `gh pr list --json` gives them.
-pub fn list_prs(
-    src: &Path,
-    remote: &Remote,
-    open: bool,
-) -> Result<Vec<crate::complete::Pr>, String> {
+pub fn list_prs(src: &Path, remote: &Remote, open: bool) -> Result<Vec<crate::prs::Pr>, String> {
     let (status, top) = if open {
         ("active", "1000")
     } else {
@@ -467,11 +463,11 @@ pub fn list_prs(
         .map(|p| {
             let n = p["pullRequestId"].as_u64().unwrap_or(0);
             let updated = p["closedDate"].as_str().unwrap_or(str(p, "creationDate"));
-            crate::complete::Pr {
+            crate::prs::Pr {
                 repo: String::new(),
                 number: n,
                 title: str(p, "title").into(),
-                author: Some(crate::complete::Author {
+                author: Some(crate::prs::Author {
                     login: str(&p["createdBy"], "displayName").into(),
                 }),
                 head_ref_name: branch_name(str(p, "sourceRefName")).into(),
@@ -744,6 +740,10 @@ pub fn load(wt: &Path, target: &Target) -> Result<Details, String> {
                 author: str(r, "displayName").into(),
                 url: String::new(),
                 created_at: String::new(),
+                bot: false,
+                minimized: false,
+                diff_hunk: None,
+                review_id: None,
             },
             state: vote_label(r["vote"].as_i64().unwrap_or(0)).into(),
         })
@@ -767,6 +767,8 @@ pub fn load(wt: &Path, target: &Target) -> Result<Details, String> {
             can_reply: true,
             can_resolve: true,
             can_unresolve: true,
+            original_line: line,
+            resolved_by: None,
             comments: comments
                 .iter()
                 .map(|c| Comment {
@@ -775,6 +777,10 @@ pub fn load(wt: &Path, target: &Target) -> Result<Details, String> {
                     author: str(&c["author"], "displayName").into(),
                     url: format!("{}?discussionId={tid}", d.url),
                     created_at: timestamp(str(c, "publishedDate")),
+                    bot: false,
+                    minimized: false,
+                    diff_hunk: None,
+                    review_id: None,
                 })
                 .collect(),
         });
@@ -801,7 +807,11 @@ fn details_from(target: &Target, pr: &Value) -> Result<Details, String> {
         }
         .into(),
         author: str(&pr["createdBy"], "displayName").into(),
+        created_at: timestamp(str(pr, "creationDate")),
         head: branch_name(str(pr, "sourceRefName")).into(),
+        head_sha: pr["lastMergeSourceCommit"]["commitId"]
+            .as_str()
+            .map(String::from),
         base: branch_name(str(pr, "targetRefName")).into(),
         draft: pr["isDraft"].as_bool().unwrap_or(false),
         // ponytail: az can't ask for permissions up front; a refused write says so instead.

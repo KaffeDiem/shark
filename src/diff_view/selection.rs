@@ -20,6 +20,7 @@ use gpui_kit::{
 
 use super::{
     DiffFile, DiffSide,
+    document::SourceLine,
     state::{decode_key, encode_key},
 };
 
@@ -33,6 +34,21 @@ pub(crate) struct CodeRun {
     /// `bounds` clipped to the column, so text scrolled out of it isn't hit.
     visible: Bounds<Pixels>,
     document: DiffFile,
+}
+
+impl CodeRun {
+    fn line(&self) -> &SourceLine {
+        &self.document.lines(self.side)[self.line_ix]
+    }
+    /// The selection key of a display offset within this run's line.
+    fn key(&self, display_offset: usize) -> u64 {
+        let line = self.line();
+        encode_key(
+            self.file,
+            self.side,
+            line.source().start + line.source_offset(display_offset),
+        )
+    }
 }
 
 #[derive(Default)]
@@ -78,7 +94,7 @@ impl SelectionGeometry {
     pub fn key_at(&self, point: Point<Pixels>, side: Option<DiffSide>) -> Option<u64> {
         if let Some((count, position, cursor)) = self.multi_click.get() {
             let run = self.run_at(position, None)?;
-            let line = &run.document.lines(run.side)[run.line_ix];
+            let line = run.line();
             let ix = run.display_range.start
                 + run
                     .layout
@@ -91,23 +107,13 @@ impl SelectionGeometry {
             };
             self.multi_click
                 .set((!cursor).then_some((count, position, true)));
-            return Some(encode_key(
-                run.file,
-                run.side,
-                line.source().start
-                    + line.source_offset(if cursor { range.end } else { range.start }),
-            ));
+            return Some(run.key(if cursor { range.end } else { range.start }));
         }
         let point = point + self.bounds.origin + self.scroll_offset;
         let run = self.run_at(point, side)?;
         let ix =
             run.display_range.start + run.layout.index_for_position(point).unwrap_or_else(|ix| ix);
-        let line = &run.document.lines(run.side)[run.line_ix];
-        Some(encode_key(
-            run.file,
-            run.side,
-            line.source().start + line.source_offset(ix),
-        ))
+        Some(run.key(ix))
     }
 
     fn run_at(&self, point: Point<Pixels>, side: Option<DiffSide>) -> Option<&CodeRun> {
@@ -534,16 +540,9 @@ impl Element for SelectionLayer {
             .runs
             .iter()
             .map(|run| {
-                let text = run.document.lines(run.side)[run.line_ix].chunk_text(&run.display_range);
-                TextSelectionRun::new(text, run.layout.clone(), run.visible).with_document_order(
-                    encode_key(
-                        run.file,
-                        run.side,
-                        run.document.lines(run.side)[run.line_ix].source().start
-                            + run.document.lines(run.side)[run.line_ix]
-                                .source_offset(run.display_range.start),
-                    ),
-                )
+                let text = run.line().chunk_text(&run.display_range);
+                TextSelectionRun::new(text, run.layout.clone(), run.visible)
+                    .with_document_order(run.key(run.display_range.start))
             })
             .collect::<Vec<_>>();
         self.selection.update_runs(&runs, cx);

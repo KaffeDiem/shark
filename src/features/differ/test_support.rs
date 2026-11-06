@@ -9,6 +9,8 @@ pub(crate) mod inline_edit {
 }
 pub(crate) mod review {
     pub(crate) use super::super::review::*;
+    pub(crate) use super::super::review_comment::*;
+    pub(crate) use super::super::review_store::*;
 }
 
 impl Differ {
@@ -17,6 +19,9 @@ impl Differ {
     }
     pub(crate) fn diff(&self) -> &Entity<DiffState> {
         &self.diff
+    }
+    pub(crate) fn diff_revs(&self) -> &HashMap<String, String> {
+        &self.diff_revs
     }
     pub(crate) fn diff_error(&self) -> &Option<String> {
         &self.diff_error

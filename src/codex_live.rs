@@ -14,7 +14,7 @@ use std::{
 const MODEL: &str = "codex:gpt-6.1-sol";
 const TURN: u64 = 600; // secs a turn may take
 
-/// Two temp repos in a workspace linked into `workspaces_dir()`; removed on drop.
+/// Two temp repos (api, web) in a workspace linked into `workspaces_dir()`; removed on drop.
 struct Env {
     root: PathBuf,
     ws: Workspace,
@@ -25,11 +25,16 @@ impl Env {
         let root = std::env::temp_dir().join(format!("shark-cxlive-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&root);
         let mut repos = vec![];
-        for name in ["api", "web"] {
+        for (name, lang) in [("api", "Python"), ("web", "TypeScript")] {
             let p = root.join("src").join(name);
             fs::create_dir_all(&p).unwrap();
             git::git(&p, &["init", "-q", "-b", "main"]).unwrap();
             fs::write(p.join("README.md"), format!("{name}\n")).unwrap();
+            fs::write(
+                p.join("CLAUDE.md"),
+                format!("The {name} repo is written in {lang}.\n"),
+            )
+            .unwrap();
             git::git(&p, &["add", "."]).unwrap();
             git::git(
                 &p,
@@ -81,15 +86,14 @@ impl Env {
 }
 
 fn transcript(ws: &Workspace) -> PathBuf {
-    agent::transcript_path(&ws.chats[0].id)
+    crate::transcript::transcript_path(&ws.chats[0].id)
 }
 
 impl Drop for Env {
     fn drop(&mut self) {
         let _ = fs::remove_file(crate::state::workspaces_dir().join(&self.ws.name));
         let _ = fs::remove_file(transcript(&self.ws));
-        let log = format!("{}.stderr.log", self.ws.chats[0].id);
-        let _ = fs::remove_file(crate::state::support_dir().join("logs").join(log));
+        let _ = fs::remove_file(crate::transcript::log_path(&self.ws.chats[0].id));
         let _ = fs::remove_dir_all(&self.root);
     }
 }
@@ -225,7 +229,7 @@ fn check_replay(env: &Env, live: &[Ev]) {
         .filter(|k| k.starts_with("hook/") || k.contains("tokenUsage") || k.contains("reasoning"))
         .collect();
     eprintln!("noise stored: {noise:?}");
-    let replay = agent::read_history(&path, u64::MAX);
+    let replay = crate::transcript::read_history(&path, u64::MAX);
     let want = stored(live);
     let got: Vec<&Ev> = replay.iter().collect();
     if got != want {
@@ -246,16 +250,6 @@ fn check_replay(env: &Env, live: &[Ev]) {
         }
     }
     assert_eq!(got, want, "transcript replay differs from live events");
-}
-
-fn git_out(dir: &PathBuf, args: &[&str]) -> String {
-    let o = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(args)
-        .output()
-        .unwrap();
-    String::from_utf8_lossy(&o.stdout).into_owned()
 }
 
 /// 1 + 6: an edit and a commit in one repo of the workspace, then the transcript's replay.
@@ -298,8 +292,8 @@ fn codex_live_edit_commit() {
         "{:?}",
         r.evs.last()
     );
-    let log = git_out(&env.repo("api"), &["log", "--format=%s", "-n", "3"]);
-    let tree = git_out(&env.repo("api"), &["ls-tree", "--name-only", "HEAD"]);
+    let log = git::git(&env.repo("api"), &["log", "--format=%s", "-n", "3"]).unwrap_or_default();
+    let tree = git::git(&env.repo("api"), &["ls-tree", "--name-only", "HEAD"]).unwrap_or_default();
     eprintln!("api log: {log:?} tree: {tree:?}");
     assert!(
         tree.lines().any(|l| l == "hello.txt"),
@@ -637,4 +631,43 @@ fn codex_live_sub_agent() {
     );
     r.close();
     check_replay(&env, &r.evs);
+}
+
+/// Each repo's instructions reach the agent through the workspace's root docs.
+fn repo_languages(tag: &str, model: &str, how: &str) {
+    let env = Env::new(tag, model);
+    let mut r = env.spawn(None);
+    r.agent
+        .send(&format!(
+            "{how}: which language is each repo written in? One line."
+        ))
+        .unwrap();
+    assert!(r.until(TURN, |e| is_result(e) || is_exit(e)), "no Result");
+    let text = r.text();
+    assert!(
+        text.contains("Python") && text.contains("TypeScript"),
+        "imports not loaded: {text}"
+    );
+}
+
+/// Against the real claude CLI, which has the repos' files imported. A few cents.
+#[test]
+#[ignore]
+fn claude_live_repo_languages() {
+    repo_languages(
+        "claude-docs",
+        crate::models::MODELS[0],
+        "Without using any tools",
+    );
+}
+
+/// codex follows AGENTS.md's pointers to read them.
+#[test]
+#[ignore]
+fn codex_live_repo_languages() {
+    repo_languages(
+        "docs",
+        MODEL,
+        "Reading only what your instructions point you to",
+    );
 }

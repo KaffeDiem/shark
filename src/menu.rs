@@ -99,6 +99,24 @@ pub(crate) fn open(
     open_at(entries, pos, Anchor::TopLeft, window, cx)
 }
 
+/// A menu its owner keeps open, with the subscription that clears it on dismiss.
+pub(crate) type Held = Option<(Entity<Menu>, Subscription)>;
+
+/// Keep `m` in `this`'s `slot` until it dismisses itself, then clear the slot.
+pub(crate) fn hold<T: 'static>(
+    this: &mut T,
+    m: Entity<Menu>,
+    slot: fn(&mut T) -> &mut Held,
+    cx: &mut Context<T>,
+) {
+    let sub = cx.subscribe(&m, move |this, _, _: &DismissEvent, cx| {
+        *slot(this) = None;
+        cx.notify();
+    });
+    *slot(this) = Some((m, sub));
+    cx.notify();
+}
+
 /// [`open`] with the menu's `corner` at `pos`: a dropdown at the window's right edge hangs
 /// from its button's right end (`Anchor::TopRight`).
 pub(crate) fn open_at(

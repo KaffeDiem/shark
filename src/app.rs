@@ -1,9 +1,10 @@
 //! Root view: sidebar of repos and workspaces, Chat/Diff tabs, palette and dialogs.
 use crate::attention::Attn;
-use crate::chat::{Chat, ChatEvent, MODELS};
+use crate::chat::{Chat, ChatEvent};
 use crate::checkbox::Checkbox;
 use crate::editor::{EditorEvent, FileEditor};
 use crate::menu::{self, Entry};
+use crate::models::MODELS;
 use crate::state::{ChatMeta, Repo, Section, State, TabId, Workspace, move_item, workspaces_dir};
 use crate::sync::{GitSync, SyncEvent};
 use crate::*;
@@ -11,7 +12,7 @@ use gpui_kit::assets::IconName;
 use gpui_kit::base::InteractiveElementExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
-use gpui_kit::component::dialog::{Dialog, DialogEntrance};
+use gpui_kit::component::dialog::Dialog;
 use gpui_kit::component::hover_card::HoverCard;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
@@ -34,6 +35,7 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 mod app_switcher;
+mod ask;
 mod chats;
 mod differ_host;
 mod editor_pane;
@@ -45,9 +47,12 @@ mod intelligence;
 mod intelligence_tests;
 mod interaction;
 pub(crate) mod menus;
+mod new_workspace;
 mod palette;
 mod picker;
 mod reorder;
+mod repo_settings;
+mod run;
 mod sidebar;
 mod storage;
 #[cfg(all(test, feature = "test-support"))]
@@ -60,7 +65,7 @@ use crate::features::{Feature, FeatureFocus, differ, git as git_feature};
 use crate::ui::*;
 use differ::Differ;
 use differ::Viewed;
-use menus::{on_shark, open_in_entries, tilde, ws_menu};
+use menus::{on_shark, tilde, ws_menu};
 use palette::menu_dialog;
 pub(crate) use palette::open_menu;
 use sidebar::{Naming, SideRow, move_submenu};
@@ -95,6 +100,10 @@ pub struct Shark {
     chats: HashMap<String, Entity<Chat>>,
     /// `caffeinate` while agents work and `stay_awake` is on.
     awake: Option<std::process::Child>,
+    /// When ⌘Q last warned that agents are at work, and the watch on the held key; see
+    /// `quit_or_warn`.
+    quit_warned: Option<std::time::Instant>,
+    quit_hold: Task<()>,
     /// Chats whose turn ended while another chat was shown.
     unread: HashSet<String>,
     tab: Tab,
@@ -111,6 +120,8 @@ pub struct Shark {
     pub(crate) archiving: HashSet<String>,
     creating: HashSet<String>,
     adding_repos: HashSet<String>,
+    /// Workspaces with setup scripts running, once per run (a repo added during the first).
+    setting_up: Vec<String>,
     /// Sidebar shrunk to icons by the user.
     rail: bool,
     /// Zen mode (cmd-.): only the shown tab's content; see `zen_shown`.
@@ -132,12 +143,9 @@ pub struct Shark {
     menu: Option<(Entity<menu::Menu>, Subscription)>,
     app_switcher: Option<app_switcher::AppSwitcher>,
     usage_panel: Option<usage::Panel>,
-    usage: [crate::usage::Snapshot; 2],
-    /// Daily tokens from the agents' local logs, rescanned with each usage refresh.
-    usage_activity: [crate::usage::activity::Daily; 2],
-    activity_cache: std::sync::Arc<[std::sync::Mutex<crate::usage::activity::Cache>; 2]>,
+    usage: Vec<crate::usage::Snapshot>,
     #[cfg(test)]
-    usage_queries: [usize; 2],
+    usage_queries: Vec<usize>,
     #[cfg(test)]
     usage_live: bool,
     usage_at: Rc<std::cell::Cell<Bounds<Pixels>>>,
@@ -153,6 +161,8 @@ pub struct Shark {
     /// When the last dependency check started.
     deps_at: Option<std::time::Instant>,
     pub(crate) home: home::Home,
+    /// Running run scripts by workspace (cmd-r); dropping one stops them.
+    runs: HashMap<String, crate::scripts::Running>,
     _subs: Vec<Subscription>,
 }
 
@@ -160,7 +170,8 @@ impl Shark {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let mut state = State::load();
         crate::prompts::set_overrides(&state.prompts);
-        crate::settings::apply(&state.appearance, cx);
+        crate::git::set_repo_skills(!state.no_repo_skills);
+        crate::theme::apply(&state.appearance, cx);
         if let Some(size) = state.editor_font_size {
             cx.set_global(crate::editor::CodeFont(editor_pane::clamp_font_size(size)));
         }
@@ -220,7 +231,7 @@ impl Shark {
             cx.on_focus_lost(window, |s, w, cx| s.focus_fallback(w, cx)),
             cx.observe_window_appearance(window, |s, _, cx| {
                 if s.state.appearance.mode == crate::state::Mode::System {
-                    crate::settings::apply(&s.state.appearance, cx)
+                    crate::theme::apply(&s.state.appearance, cx)
                 }
             }),
             cx.observe_window_activation(window, |s, w, cx| {
@@ -237,6 +248,12 @@ impl Shark {
                 }
             }),
         ];
+        // Dev servers started by cmd-r don't outlive Shark.
+        _subs.push(cx.on_app_quit(|s, _| {
+            crate::scripts::Running::stop_all(s.runs.drain().map(|(_, r)| r), 2);
+            crate::scripts::wait_stopping(None);
+            async {}
+        }));
         _subs.push(cx.observe(&differ, |_, _, cx| cx.notify()));
         _subs.push(cx.subscribe_in(&differ, window, |s, _, event, w, cx| {
             s.differ_event(event, w, cx)
@@ -248,6 +265,8 @@ impl Shark {
             active: None,
             chats: HashMap::new(),
             awake: None,
+            quit_warned: None,
+            quit_hold: Task::ready(()),
             unread: HashSet::new(),
             tab: Tab::Chat,
             differ,
@@ -261,6 +280,7 @@ impl Shark {
             archiving: HashSet::new(),
             creating: HashSet::new(),
             adding_repos: HashSet::new(),
+            setting_up: vec![],
             rail: false,
             zen: false,
             editor: None,
@@ -277,11 +297,9 @@ impl Shark {
             menu: None,
             app_switcher: None,
             usage_panel: None,
-            usage: Default::default(),
-            usage_activity: Default::default(),
-            activity_cache: Default::default(),
+            usage: vec![Default::default(); crate::usage::Provider::ALL.len()],
             #[cfg(test)]
-            usage_queries: [0; 2],
+            usage_queries: vec![0; crate::usage::Provider::ALL.len()],
             #[cfg(test)]
             usage_live: false,
             usage_at: Default::default(),
@@ -294,6 +312,7 @@ impl Shark {
             deps_check: None,
             deps_at: None,
             home,
+            runs: HashMap::new(),
             _subs,
         }
     }
@@ -324,13 +343,19 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let m = menu::open(entries, pos, window, cx);
-        let sub = cx.subscribe(&m, |this, _, _: &DismissEvent, cx| {
-            this.menu = None;
-            cx.notify();
-        });
-        self.menu = Some((m, sub));
-        cx.notify();
+        self.show_menu_at(entries, pos, Anchor::TopLeft, window, cx);
+    }
+
+    fn show_menu_at(
+        &mut self,
+        entries: Vec<Entry>,
+        pos: Point<Pixels>,
+        anchor: Anchor,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let m = menu::open_at(entries, pos, anchor, window, cx);
+        menu::hold(self, m, |s| &mut s.menu, cx);
     }
 
     /// "Branch menu…": the header's branch menu, hanging from the button, from the keyboard.
@@ -340,19 +365,8 @@ impl Shark {
         };
         let entries = menus::branch_entries(self, ws, cx);
         let b = self.branch_at.get();
-        let m = menu::open_at(
-            entries,
-            point(b.right(), b.bottom() + px(4.)),
-            Anchor::TopRight,
-            window,
-            cx,
-        );
-        let sub = cx.subscribe(&m, |this, _, _: &DismissEvent, cx| {
-            this.menu = None;
-            cx.notify();
-        });
-        self.menu = Some((m, sub));
-        cx.notify();
+        let pos = point(b.right(), b.bottom() + px(4.));
+        self.show_menu_at(entries, pos, Anchor::TopRight, window, cx);
     }
 
     fn ws(&self, name: &str) -> Option<&Workspace> {
@@ -399,10 +413,7 @@ impl Shark {
                 return notify_err(window, cx, "Open a workspace first");
             }
             let ws = self.active_ws_mut().unwrap();
-            let closed = match feature {
-                Feature::Diff => &mut ws.diff_closed,
-                Feature::Git => &mut ws.git_closed,
-            };
+            let closed = feature.closed_mut(ws);
             if *closed {
                 *closed = false;
                 ws.open_tab(feature.tab_id());
@@ -411,13 +422,18 @@ impl Shark {
             self.feature_sel = Feature::ALL.iter().position(|f| *f == feature).unwrap();
         }
         self.tab = tab;
+        // Turns that ended under Home are seen now.
+        if let (true, Some(name)) = (self.home.on, &self.active) {
+            self.attn.opened(name);
+        }
         self.home.on = false;
         self.remember_open();
         self.reveal_tab(cx);
         self.configure_differ(cx);
         match tab {
             Tab::Chat => {
-                if let Some(chat) = self.active_chat() {
+                if let Some(chat) = self.active_chat().cloned() {
+                    self.unread.remove(&chat.read(cx).meta.id);
                     let focus = chat.read(cx).focus.clone();
                     focus.focus(window, cx);
                 }
@@ -615,9 +631,7 @@ impl Shark {
             "New workspace (cmd-n)",
         )
         .text_color(cx.theme().sidebar_foreground)
-        .on_click(cx.listener(|this, _, window, cx| {
-            this.new_workspace(this.state.last_repos.clone(), None, window, cx)
-        }))
+        .on_click(cx.listener(|this, _, window, cx| this.new_workspace_default(window, cx)))
     }
 
     fn draggable_chrome(&self, id: &'static str, d: Stateful<Div>) -> impl IntoElement {
@@ -729,6 +743,7 @@ impl Shark {
                     .gap(px(8.))
                     .border_b_1()
                     .border_color(theme.border)
+                    .child(self.render_run(cx))
                     .child(
                         div()
                             .flex_shrink_1()
@@ -771,7 +786,7 @@ impl Shark {
                         .map(|chat| chat.clone().cached(StyleRefinement::default().size_full())),
                 )
                 .into_any_element(),
-            Tab::Feature(feature) => self.render_feature(feature, cx),
+            Tab::Feature(feature) => self.render_feature(feature),
             Tab::File => h_flex()
                 .flex_1()
                 .min_h_0()
@@ -916,7 +931,7 @@ impl Shark {
     }
 
     fn render_unsaved(&self, cx: &Context<Self>) -> Option<impl IntoElement + use<>> {
-        let unsaved = self.unsaved_data(cx);
+        let unsaved = self.unsaved_data(None, cx);
         (!unsaved.is_empty()).then(|| {
             h_flex()
                 .id("unsaved-data")
@@ -969,9 +984,9 @@ impl Render for Shark {
             .text_color(theme.foreground)
             .font_features(inter_features())
             .on_action(cx.listener(|this, _: &TogglePalette, w, cx| this.toggle_palette(w, cx)))
-            .on_action(cx.listener(|this, _: &NewWorkspace, w, cx| {
-                this.new_workspace(this.state.last_repos.clone(), None, w, cx)
-            }))
+            .on_action(
+                cx.listener(|this, _: &NewWorkspace, w, cx| this.new_workspace_default(w, cx)),
+            )
             .on_action(cx.listener(|this, _: &ArchiveWorkspace, w, cx| this.archive(false, w, cx)))
             .on_action(
                 cx.listener(|this, _: &ForceArchiveWorkspace, w, cx| this.archive(true, w, cx)),
@@ -1051,15 +1066,15 @@ impl Render for Shark {
                 }),
             )
             .on_action(cx.listener(|this, _: &RevealInFinder, w, cx| {
-                this.with_target(w, cx, |ws, _, cx| cx.reveal_path(&ws.dir()))
+                this.with_target(w, cx, |_, ws, _, cx| cx.reveal_path(&ws.dir()))
             }))
             .on_action(cx.listener(|this, _: &CopyPath, w, cx| {
-                this.with_target(w, cx, |ws, w, cx| {
+                this.with_target(w, cx, |_, ws, w, cx| {
                     copy(ws.dir().display().to_string(), w, cx)
                 })
             }))
             .on_action(cx.listener(|this, _: &CopyBranch, w, cx| {
-                this.with_target(w, cx, |ws, w, cx| copy(ws.branch.clone(), w, cx))
+                this.with_target(w, cx, |_, ws, w, cx| copy(ws.branch.clone(), w, cx))
             }))
             .on_action(cx.listener(|this, a: &SetModel, w, cx| this.set_model(a.0, w, cx)))
             .on_action(cx.listener(|this, _: &NextAttention, w, cx| this.next_attention(w, cx)))
@@ -1122,7 +1137,9 @@ impl Render for Shark {
             // `o` in the diff and the tree.
             .on_action(cx.listener(|this, _: &OpenFile, w, cx| this.open_cursor_file(w, cx)))
             .on_action(cx.listener(|this, _: &OpenAnyFile, w, cx| this.open_any_file(w, cx)))
+            .on_action(cx.listener(|this, _: &RunScripts, w, cx| this.toggle_run(w, cx)))
             .on_action(cx.listener(|this, _: &OpenSettings, w, cx| {
+                this.close_usage(w, cx);
                 crate::settings::open(&this.state, w, cx)
             }))
             .children(self.menu.as_ref().map(|(m, _)| menu::layer(m.clone())))

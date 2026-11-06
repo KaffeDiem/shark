@@ -40,6 +40,17 @@ def exercise(language, command):
         process, send = peer.process, peer.send
         lifecycle_deadline = time.monotonic() + 120
         diagnostic_messages = []
+        semantic_capabilities = {
+            "requests": {"range": True, "full": True},
+            "tokenTypes": ["namespace", "type", "class", "enum", "interface", "struct", "typeParameter", "parameter", "variable", "property", "enumMember", "event", "function", "method", "macro", "keyword", "modifier", "comment", "string", "number", "regexp", "operator", "decorator"],
+            "tokenModifiers": [], "formats": ["relative"],
+            "overlappingTokenSupport": False, "multilineTokenSupport": False,
+            "augmentsSyntaxTokens": True,
+        }
+        init_options = json.loads(os.environ.get("SHARK_LSP_SMOKE_INIT", "null"))
+        if language in ("swift", "go"):
+            init_options = init_options or {}
+            init_options.setdefault("reportSyntacticHighlightInSemanticTokens" if language == "swift" else "semanticTokens", True)
 
         def response(ident):
             deadline = min(time.monotonic() + 60, lifecycle_deadline)
@@ -58,7 +69,7 @@ def exercise(language, command):
                     raise TimeoutError("server response timed out")
 
         try:
-            send("initialize", {"processId": os.getpid(), "rootUri": root.as_uri(), "workspaceFolders": [{"uri": root.as_uri(), "name": root.name}], "initializationOptions": json.loads(os.environ.get("SHARK_LSP_SMOKE_INIT", "null")), "capabilities": {"general": {"positionEncodings": ["utf-16"]}, "textDocument": {"completion": {"completionItem": {"snippetSupport": False}}, "diagnostic": {}, "publishDiagnostics": {"versionSupport": True}}, "workspace": {"configuration": True}}}, 1)
+            send("initialize", {"processId": os.getpid(), "rootUri": root.as_uri(), "workspaceFolders": [{"uri": root.as_uri(), "name": root.name}], "initializationOptions": init_options, "capabilities": {"general": {"positionEncodings": ["utf-16"]}, "textDocument": {"semanticTokens": semantic_capabilities, "completion": {"completionItem": {"snippetSupport": False}}, "diagnostic": {}, "publishDiagnostics": {"versionSupport": True}}, "workspace": {"configuration": True}}}, 1)
             initialized = response(1)
             send("initialized", {})
             send("textDocument/didOpen", {"textDocument": {"uri": uri, "languageId": "python" if language == "ruff" else language, "version": 1, "text": initial}})
@@ -103,6 +114,18 @@ def exercise(language, command):
                     send("textDocument/hover", params, 100 + attempt)
                     response(100 + attempt)
                 assert diagnostic_messages, "server did not publish diagnostics"
+            semantic = initialized["capabilities"].get("semanticTokensProvider")
+            if semantic and (semantic.get("full") or semantic.get("range")):
+                token_params = {"textDocument": {"uri": uri}}
+                method = "textDocument/semanticTokens/full"
+                if not semantic.get("full"):
+                    method = "textDocument/semanticTokens/range"
+                    token_params["range"] = {"start": {"line": 0, "character": 0}, "end": {"line": len(edited.splitlines()), "character": 0}}
+                send(method, token_params, 35)
+                tokens = response(35)
+                assert tokens and tokens["data"], "server returned no semantic highlighting"
+                assert len(tokens["data"]) % 5 == 0
+                assert all(t < len(semantic["legend"]["tokenTypes"]) for t in tokens["data"][3::5])
             send("textDocument/didClose", {"textDocument": {"uri": uri}})
             send("shutdown", None, 40)
             response(40)
@@ -112,6 +135,8 @@ def exercise(language, command):
             assert process.returncode == 0, process.returncode
             assert source.read_text() == initial, "smoke test unexpectedly changed the file on disk"
             features = "formatting/diagnostics" if language == "ruff" else "completion/definition/diagnostics"
+            if semantic and (semantic.get("full") or semantic.get("range")):
+                features += "/semantic highlighting"
             print(language + ": initialize/open/unsaved edit/" + features + "/close/shutdown passed")
         except Exception:
             sys.stderr.write(peer.stderr_tail())

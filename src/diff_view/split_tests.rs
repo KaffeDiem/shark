@@ -8,7 +8,7 @@ use gpui_kit::{
 
 use super::{
     Diff, DiffEvent, DiffLinePosition, DiffMode, DiffSide, DiffState, document::fixture,
-    state::DisplayRow,
+    rows::DisplayRow,
 };
 
 fn lines(word: &str, count: usize) -> String {
@@ -40,8 +40,8 @@ fn split_ratio_is_clamped_and_silent_when_set(cx: &mut TestAppContext) {
         assert!((state.split_ratio() - 0.6).abs() < 1e-4);
         state.drag_divider(px(400.), px(400.), cx);
         assert_eq!(state.split_ratio(), 0.8);
-        state.end_divider_drag(cx);
-        state.end_divider_drag(cx);
+        state.end_gesture(cx);
+        state.end_gesture(cx);
         // Without a drag, pointer moves leave the ratio alone.
         state.drag_divider(px(0.), px(400.), cx);
         assert_eq!(state.split_ratio(), 0.8);
@@ -432,4 +432,53 @@ fn showing_a_line_in_view_keeps_the_scroll(cx: &mut TestAppContext) {
             assert_eq!((scrolled.item_ix, scrolled.offset_in_item), (1, px(15.)));
         })
     });
+}
+
+/// A unified host whose add-annotation button records the ranges it is clicked with.
+struct Annotating {
+    state: Entity<DiffState>,
+    added: Rc<RefCell<Vec<super::DiffLineRange>>>,
+}
+
+impl Render for Annotating {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let added = self.added.clone();
+        div().w(px(400.)).h(px(340.)).child(
+            Diff::new(&self.state)
+                .size_full()
+                .on_add_annotation(move |range, _, _| added.borrow_mut().push(range.clone())),
+        )
+    }
+}
+
+#[gpui_kit::test]
+fn an_old_side_selection_of_an_unchanged_unified_row_gets_the_add_button(cx: &mut TestAppContext) {
+    cx.update(super::test_init);
+    let state = cx.new(|cx| DiffState::new([two_hunks()], cx));
+    let added = Rc::new(RefCell::new(Vec::new()));
+    let (_, cx) = cx.add_window_view({
+        let (state, added) = (state.clone(), added.clone());
+        move |_, _| Annotating { state, added }
+    });
+    for _ in 0..3 {
+        draw(cx);
+    }
+    let buttons = |cx: &mut VisualTestContext| {
+        (0..60usize)
+            .flat_map(|ix| find(cx, ("add-annotation", ix)))
+            .collect::<Vec<_>>()
+    };
+    assert!(buttons(cx).is_empty());
+    // Line 9 is context: one unified row for both sides, drawn as the modified side.
+    let range = super::DiffLineRange::new("split.txt", DiffSide::Original, 9, 9);
+    cx.update(|_, cx| {
+        state.update(cx, |state, cx| {
+            state.set_selected_lines(Some(range.clone()), cx)
+        })
+    });
+    draw(cx);
+    let buttons = buttons(cx);
+    assert_eq!(buttons.len(), 1, "{buttons:?}");
+    cx.simulate_click(buttons[0].center(), Modifiers::default());
+    assert_eq!(added.borrow().as_slice(), [range]);
 }

@@ -6,7 +6,7 @@ use lsp_types::{
 };
 use std::collections::{HashMap, HashSet};
 use std::sync::{
-    Arc,
+    Arc, Mutex,
     atomic::{AtomicU64, Ordering},
 };
 use std::time::SystemTime;
@@ -112,12 +112,7 @@ impl<'a> Lines<'a> {
             byte <= text.len() && text.is_char_boundary(byte),
             "invalid byte offset"
         );
-        ensure!(
-            !(byte > 0
-                && text.as_bytes().get(byte - 1) == Some(&b'\r')
-                && text.as_bytes().get(byte) == Some(&b'\n')),
-            "position splits CRLF"
-        );
+        ensure!(!splits_crlf(text, byte), "position splits CRLF");
         let starts = self.starts(encoding);
         let line = starts.partition_point(|&s| s <= byte) - 1;
         Ok(Position::new(
@@ -158,15 +153,26 @@ impl<'a> Lines<'a> {
         Ok(start + line.len())
     }
 
-    pub fn convert_range(&self, range: Range, from: Encoding, to: Encoding) -> Result<Range> {
-        let start = self.offset(range.start, from)?;
-        let end = self.offset(range.end, from)?;
+    /// Byte offsets of a range's ends, which must not be reversed.
+    pub fn span(&self, range: Range, encoding: Encoding) -> Result<(usize, usize)> {
+        let start = self.offset(range.start, encoding)?;
+        let end = self.offset(range.end, encoding)?;
         ensure!(start <= end, "reversed edit range");
+        Ok((start, end))
+    }
+
+    pub fn convert_range(&self, range: Range, from: Encoding, to: Encoding) -> Result<Range> {
+        let (start, end) = self.span(range, from)?;
         Ok(Range::new(
             self.position(start, to)?,
             self.position(end, to)?,
         ))
     }
+}
+
+/// Whether `at` falls between the CR and LF of a CRLF pair.
+fn splits_crlf(s: &str, at: usize) -> bool {
+    at > 0 && s.as_bytes().get(at - 1) == Some(&b'\r') && s.as_bytes().get(at) == Some(&b'\n')
 }
 
 /// One-off conversions; use [`Lines`] for more than one position in the same text.
@@ -199,12 +205,7 @@ pub fn incremental_change(
     while !old.is_char_boundary(start) || !new.is_char_boundary(start) {
         start -= 1;
     }
-    if start > 0
-        && (old.as_bytes().get(start - 1) == Some(&b'\r')
-            && old.as_bytes().get(start) == Some(&b'\n')
-            || new.as_bytes().get(start - 1) == Some(&b'\r')
-                && new.as_bytes().get(start) == Some(&b'\n'))
-    {
+    if splits_crlf(old, start) || splits_crlf(new, start) {
         start -= 1;
     }
     let suffix = old[start..]
@@ -218,13 +219,7 @@ pub fn incremental_change(
         old_end += 1;
         new_end += 1;
     }
-    if old_end > 0
-        && (old.as_bytes().get(old_end - 1) == Some(&b'\r')
-            && old.as_bytes().get(old_end) == Some(&b'\n')
-            || new_end > 0
-                && new.as_bytes().get(new_end - 1) == Some(&b'\r')
-                && new.as_bytes().get(new_end) == Some(&b'\n'))
-    {
+    if old_end > 0 && (splits_crlf(old, old_end) || splits_crlf(new, new_end)) {
         old_end += 1;
         new_end += 1;
     }
@@ -253,9 +248,7 @@ pub fn apply_edits(
     let mut replacements = edits
         .iter()
         .map(|e| {
-            let start = lines.offset(e.range.start, encoding)?;
-            let end = lines.offset(e.range.end, encoding)?;
-            ensure!(start <= end, "reversed edit range");
+            let (start, end) = lines.span(e.range, encoding)?;
             Ok((start, end, &e.new_text))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -326,6 +319,49 @@ pub fn workspace_edits(edit: WorkspaceEdit) -> Result<Vec<DocumentEdits>> {
         );
     }
     Ok(result)
+}
+
+/// `path` as a `Uri`. `url` leaves `[ ] ^ |` raw, which `Uri` rejects: Next.js `[id]` routes
+/// would otherwise get no language intelligence.
+pub fn file_uri(path: &std::path::Path) -> Option<Uri> {
+    let url = url::Url::from_file_path(path).ok()?;
+    let encoded = url
+        .as_str()
+        .replace('[', "%5B")
+        .replace(']', "%5D")
+        .replace('^', "%5E")
+        .replace('|', "%7C");
+    encoded.parse().ok()
+}
+
+/// The local path `uri` names.
+pub fn uri_path(uri: &str) -> Result<std::path::PathBuf> {
+    url::Url::parse(uri)?
+        .to_file_path()
+        .map_err(|_| anyhow::anyhow!("Only local file locations are supported"))
+}
+
+/// Whether `uri` names the same file as `ours`. Servers re-serialize URIs (`%28` for `(`,
+/// drive-letter case), so compare decoded paths, not strings.
+pub fn same_file(uri: &str, ours: &Uri) -> bool {
+    let path = |u: &str| url::Url::parse(u).ok()?.to_file_path().ok();
+    uri == ours.as_str() || path(uri).is_some_and(|p| Some(p) == path(ours.as_str()))
+}
+
+/// Waits for `snapshot` to hold exactly `text`; an earlier flush can land first.
+pub async fn synchronized(
+    snapshot: &Mutex<Snapshot>,
+    text: &str,
+    executor: &gpui_kit::BackgroundExecutor,
+) -> Result<Snapshot> {
+    for _ in 0..100 {
+        let current = snapshot.lock().unwrap().clone();
+        if current.text.as_ref() == text {
+            return Ok(current);
+        }
+        executor.timer(std::time::Duration::from_millis(10)).await;
+    }
+    bail!("Document synchronization is pending; try again")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -508,6 +544,19 @@ mod tests {
             version: 4,
         }
     }
+    #[test]
+    fn crlf_split_and_reversed_spans_are_detected() {
+        assert!(splits_crlf("a\r\nb", 2));
+        assert!(!splits_crlf("a\r\nb", 0) && !splits_crlf("a\r\nb", 3) && !splits_crlf("\n", 0));
+        let lines = Lines::new("ab\ncd");
+        let (p, q) = (Position::new(0, 1), Position::new(1, 1));
+        assert_eq!(
+            lines.span(Range::new(p, q), Encoding::Utf8).unwrap(),
+            (1, 4)
+        );
+        assert!(lines.span(Range::new(q, p), Encoding::Utf8).is_err());
+    }
+
     #[test]
     fn unicode_and_crlf_positions_roundtrip() {
         let text = "é😀z\r\n中文\n";

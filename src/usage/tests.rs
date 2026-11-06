@@ -29,9 +29,7 @@ fn live_usage() {
                 provider.name(),
                 row.label,
                 row.remaining,
-                row.resets_at
-                    .map(local_time)
-                    .unwrap_or_else(|| "unknown".into())
+                row.resets_at.map_or("unknown".into(), |t| t.to_string())
             );
         }
     }
@@ -158,7 +156,6 @@ fn foundation_parses_offsets_fractional_and_whole_seconds() {
     assert!(
         (timestamp(&json!("2026-10-28T10:50:00.404499+00:00")).unwrap() - z - 0.404).abs() < 0.002
     );
-    assert!(!local_time(z).is_empty());
 }
 
 #[test]
@@ -188,38 +185,42 @@ fn snapshot_coalesces_and_keeps_only_temporary_failure_results() {
 }
 
 #[test]
-fn limiting_allowance_uses_tightest_known_remaining_even_after_reset() {
+fn limiting_skips_expired_and_invalid_rows() {
+    let row = |label: &str, remaining, resets_at| Allowance {
+        label: label.into(),
+        remaining,
+        resets_at,
+        window: None,
+    };
     let mut s = Snapshot::default();
-    assert!(s.limiting().is_none());
-    s.finish(Ok(vec![
-        Allowance {
-            label: "5 hours".into(),
-            remaining: Some(80.),
-            resets_at: None,
-            window: None,
-        },
-        Allowance {
-            label: "Weekly".into(),
-            remaining: Some(0.),
-            resets_at: Some(0.),
-            window: None,
-        },
-        Allowance {
-            label: "Model".into(),
-            remaining: None,
-            resets_at: None,
-            window: None,
-        },
-    ]));
-    assert_eq!(s.limiting().unwrap().label, "Weekly");
-    assert_eq!(s.limiting().unwrap().remaining, Some(0.));
-    s.allowances.remove(1);
-    assert_eq!(s.limiting().unwrap().remaining, Some(80.));
-    s.allowances.remove(0);
-    assert!(
-        s.limiting().is_none(),
-        "unknown never implies a full allowance"
-    );
+    assert!(s.limiting(100.).is_none());
+    s.allowances = vec![
+        row("expired", Some(0.), Some(50.)),
+        row("invalid", Some(150.), Some(500.)),
+        row("nan", Some(f64::NAN), None),
+        row("unknown", None, None),
+        row("5 hours", Some(80.), None),
+        row("Weekly", Some(30.), Some(500.)),
+    ];
+    assert_eq!(s.limiting(100.).unwrap().label, "Weekly");
+    s.allowances.pop();
+    assert_eq!(s.limiting(100.).unwrap().label, "5 hours");
+}
+
+#[test]
+fn pace_is_the_share_of_the_window_still_to_come() {
+    let row = |resets_at, window| Allowance {
+        label: "Weekly".into(),
+        remaining: Some(30.),
+        resets_at,
+        window,
+    };
+    assert_eq!(row(Some(150.), Some(100.)).pace(100.), Some(50.));
+    assert_eq!(row(Some(100.), Some(100.)).pace(150.), Some(0.));
+    assert_eq!(row(Some(500.), Some(100.)).pace(100.), Some(100.));
+    assert_eq!(row(None, Some(100.)).pace(100.), None);
+    assert_eq!(row(Some(150.), None).pace(100.), None);
+    assert_eq!(row(Some(150.), Some(0.)).pace(100.), None);
 }
 
 struct Fake {
@@ -420,157 +421,86 @@ fn fake_errors_missing_cli_and_timeout_cleanup() {
 }
 
 #[test]
-fn pace_is_the_share_of_the_window_still_to_come() {
-    let row = |resets_at, window| Allowance {
-        label: "Weekly".into(),
-        remaining: Some(30.),
-        resets_at,
-        window,
-    };
-    assert_eq!(row(Some(150.), Some(100.)).pace(100.), Some(50.));
-    assert_eq!(row(Some(100.), Some(100.)).pace(150.), Some(0.));
-    assert_eq!(row(Some(500.), Some(100.)).pace(100.), Some(100.));
-    assert_eq!(row(None, Some(100.)).pace(100.), None);
-    assert_eq!(row(Some(150.), None).pace(100.), None);
-    assert_eq!(row(Some(150.), Some(0.)).pace(100.), None);
-}
-
-fn midnight(day: i64) -> f64 {
-    let utc = day as f64 * 86400.;
-    let local = utc
-        - NSTimeZone::localTimeZone()
-            .secondsFromGMTForDate(&NSDate::dateWithTimeIntervalSince1970(utc)) as f64;
+fn failures_read_message_fields_and_401_as_a_word() {
+    let kind = |v: Value| failure(&message(&v));
+    // Ids, durations and timestamps around a transient error say nothing about auth.
     assert_eq!(
-        (activity::local_day(local - 1.), activity::local_day(local)),
-        (day - 1, day)
+        kind(
+            json!({"type":"result","is_error":true,"result":"overloaded","session_id":"s-401-login","duration_ms":1401,"timestamp":"2025-10-04T01:40:12Z"})
+        ),
+        Failure::Temporary
     );
-    local
-}
-
-/// A log whose `@A` is noon on `day`, `@B` the last second of it and `@C` the next midnight.
-fn log(provider: Provider, day: i64) -> String {
-    let iso = |s: f64| {
-        NSISO8601DateFormatter::new()
-            .stringFromDate(&NSDate::dateWithTimeIntervalSince1970(s))
-            .to_string()
-    };
-    let next = midnight(day + 1);
-    match provider {
-        Provider::Claude => include_str!("fixtures/claude-log.jsonl"),
-        Provider::Codex => include_str!("fixtures/codex-log.jsonl"),
-    }
-    .replace("@A", &iso(midnight(day) + 12. * HOUR))
-    .replace("@B", &iso(next - 1.))
-    .replace("@C", &iso(next))
+    assert_eq!(failure("took 1401ms"), Failure::Temporary);
+    assert_eq!(failure("HTTP 401: nope"), Failure::SignIn);
+    assert_eq!(kind(json!({"code":401,"message":"nope"})), Failure::SignIn);
+    assert_eq!(kind(json!({"errors":["Invalid API key"]})), Failure::SignIn);
+    assert_eq!(kind(json!({"code":-32601})), Failure::Unsupported);
 }
 
 #[test]
-fn activity_logs_deduplicate_skip_noise_and_split_at_local_midnight() {
-    let day = activity::local_day(now()) - 5;
-    // Claude: 2+100+30 once despite the repeat, plus 1+9 before midnight; cache reads excluded.
-    // Codex: 100-40+10 once despite the repeated total, plus 200-50+20; 10-20 saturates.
-    for (provider, expected) in [
-        (Provider::Claude, [(day, 142), (day + 1, 1000)]),
-        (Provider::Codex, [(day, 240), (day + 1, 5)]),
+fn window_label_is_singular_for_one() {
+    for (mins, label) in [
+        (1440, "1 day"),
+        (2880, "2 days"),
+        (60, "1 hour"),
+        (10080, "Weekly"),
     ] {
-        let mut days = activity::parse(
-            provider,
-            log(provider, day).as_bytes(),
-            &mut Default::default(),
-        );
-        days.sort();
-        assert_eq!(days, expected, "{}", provider.name());
+        assert_eq!(window_label(&json!(mins)), label);
     }
 }
 
 #[test]
-fn civil_dates_ignore_the_locale() {
-    assert_eq!(activity::civil(20390), (2025, 10, 29));
-    assert_eq!(activity::civil(0), (1970, 1, 1));
-    assert_eq!(activity::civil(-1), (1969, 12, 31));
-    assert_eq!(activity::civil(11016), (2000, 2, 29));
-}
-
-#[test]
-fn activity_scan_windows_skips_stale_files_and_reuses_cache() {
-    let root = std::env::temp_dir().join(format!("shark-activity-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
-    let (now, today) = (now(), activity::local_day(now()));
-    let write = |path: std::path::PathBuf, text: &str| {
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(&path, text).unwrap();
-        path
+fn exchange_reads_each_providers_protocol_from_pipes() {
+    let reply = |provider, lines: &[String]| {
+        let mut sent = vec![];
+        let out = std::io::Cursor::new(lines.join("\n") + "\n");
+        let result = exchange(provider, &mut sent, out);
+        let sent: Vec<Value> = String::from_utf8(sent)
+            .unwrap()
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        (result, sent)
     };
-    let session = write(
-        root.join("projects/p/s.jsonl"),
-        &log(Provider::Claude, today - 1),
+    let (rows, sent) = reply(
+        Provider::Claude,
+        &[
+            json!({"type":"control_response","response":{"request_id":"wrong","subtype":"success","response":{}}}).to_string(),
+            fixture(Provider::Claude).to_string(),
+        ],
     );
-    // Subagent logs count; a line from before the window does not.
-    let agent = log(Provider::Claude, today - 1).replace(r#""msg_"#, r#""agent_"#)
-        + &log(Provider::Claude, today - 200).replace(r#""msg_"#, r#""old_"#);
-    write(root.join("projects/p/s/subagents/agent-1.jsonl"), &agent);
-    let stale = write(
-        root.join("projects/q/old.jsonl"),
-        &log(Provider::Claude, today - 1),
+    assert_eq!(rows.unwrap().len(), 3);
+    assert_eq!(sent[0]["request"]["subtype"], "get_usage");
+    assert_eq!(sent.len(), 1);
+
+    // A usage answer before the handshake finishes is ignored.
+    let usage = fixture(Provider::Codex).to_string();
+    let (rows, sent) = reply(
+        Provider::Codex,
+        &[
+            usage.clone(),
+            json!({"id":"init","result":{}}).to_string(),
+            usage,
+        ],
     );
-    std::fs::File::options()
-        .write(true)
-        .open(&stale)
-        .unwrap()
-        .set_modified(UNIX_EPOCH + Duration::from_secs(86400))
-        .unwrap();
-    let codex_dir = |day| {
-        let (y, m, d) = activity::civil(day);
-        root.join(format!("sessions/{y:04}/{m:02}/{d:02}"))
-    };
-    write(
-        codex_dir(today).join("rollout-a.jsonl"),
-        &log(Provider::Codex, today - 1),
-    );
-    // A session started before the window and resumed inside it still counts.
-    write(
-        codex_dir(today - 140).join("rollout-b.jsonl"),
-        &log(Provider::Codex, today - 1),
+    assert_eq!(rows.unwrap()[0].remaining, Some(68.));
+    let methods: Vec<_> = sent.iter().map(|v| v["method"].as_str().unwrap()).collect();
+    assert_eq!(
+        methods,
+        ["initialize", "initialized", "account/rateLimits/read"]
     );
 
-    let mut caches = [activity::Cache::default(), activity::Cache::default()];
-    let mut scan = |p: Provider| activity::scan_in(p, &root, &mut caches[p.index()], now);
-    let daily = scan(Provider::Claude);
-    assert_eq!(daily.first_day, today - 139);
-    assert_eq!(daily.tokens.len(), activity::DAYS);
-    assert_eq!(daily.tokens[138..], [284, 2000]);
-    assert_eq!(daily.tokens[..138].iter().sum::<u64>(), 0);
-    assert_eq!(scan(Provider::Codex).tokens[138..], [480, 10]);
-
-    // Same length and mtime: the cached result stands even though the bytes changed.
-    let mtime = std::fs::metadata(&session).unwrap().modified().unwrap();
-    std::fs::write(
-        &session,
-        log(Provider::Claude, today - 1).replace("1000", "3000"),
-    )
-    .unwrap();
-    let file = std::fs::File::options().write(true).open(&session).unwrap();
-    file.set_modified(mtime).unwrap();
-    assert_eq!(scan(Provider::Claude).tokens[139], 2000);
-    file.set_modified(mtime + Duration::from_secs(1)).unwrap();
-    assert_eq!(scan(Provider::Claude).tokens[139], 4000);
-    std::fs::remove_dir_all(&root).unwrap();
-}
-
-#[test]
-#[ignore = "reads the real local logs"]
-fn live_activity() {
-    for provider in Provider::ALL {
-        let mut cache = activity::Cache::default();
-        for _ in 0..2 {
-            let started = std::time::Instant::now();
-            let daily = activity::scan(provider, &mut cache, now());
-            eprintln!(
-                "{}: {:?}, last 3 days {:?}",
-                provider.name(),
-                started.elapsed(),
-                &daily.tokens[activity::DAYS - 3..]
-            );
-        }
-    }
+    let (rows, _) = reply(
+        Provider::Codex,
+        &[json!({"id":"init","error":{"message":"not logged in"}}).to_string()],
+    );
+    assert_eq!(rows, Err(Failure::SignIn));
+    assert_eq!(
+        exchange(Provider::Claude, Vec::new(), std::io::empty()),
+        Err(Failure::Temporary)
+    );
+    assert_eq!(
+        exchange(Provider::Claude, Vec::new(), &b"{}"[..]),
+        Err(Failure::Unsupported)
+    );
 }

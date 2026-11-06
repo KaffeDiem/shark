@@ -1,7 +1,7 @@
 //! Recent-first workspace navigation. PR refreshes repaint rows without reranking them.
 use super::interaction::now_ms;
 use super::*;
-use crate::sync::{PrState, Repo as SyncRepo};
+use crate::sync::Repo as SyncRepo;
 use std::cmp::Reverse;
 
 pub(super) struct WorkspacePicker {
@@ -23,10 +23,7 @@ pub(super) struct WorkspacePicker {
 #[derive(PartialEq)]
 pub(super) struct PickerWorkspace {
     name: String,
-    repos: Vec<(
-        String,
-        (String, IconName, Option<crate::complete::PrStatus>),
-    )>,
+    repos: Vec<(String, (String, IconName, Option<crate::prs::PrStatus>))>,
     last_interacted_at: Option<u64>,
     running: usize,
     attention: Attn,
@@ -101,21 +98,21 @@ fn rank(workspaces: &[PickerWorkspace], query: &str) -> Vec<String> {
 }
 
 /// Lifecycle is separate from the next Git action: failing checks must not hide Draft.
-fn status(repo: Option<&SyncRepo>) -> (String, IconName, Option<crate::complete::PrStatus>) {
-    use crate::complete::PrStatus;
+fn status(repo: Option<&SyncRepo>) -> (String, IconName, Option<crate::prs::PrStatus>) {
     match repo.and_then(|r| r.pr.as_ref()) {
         None => ("Not checked".into(), IconName::Clock, None),
         Some(Err(_)) => ("Status unavailable".into(), IconName::CircleAlert, None),
         Some(Ok(None)) => ("No PR".into(), IconName::GitBranch, None),
         Some(Ok(Some(pr))) => {
-            let (label, state) = match pr.state {
-                PrState::Merged => ("Merged", PrStatus::Merged),
-                PrState::Closed => ("Closed", PrStatus::Closed),
-                PrState::Open if pr.draft => ("Draft", PrStatus::Draft),
-                PrState::Open => ("Open", PrStatus::Open),
-            };
+            let state = pr.status();
+            let label = state.label();
             (
-                format!("{label} #{}", pr.number),
+                format!(
+                    "{}{} #{}",
+                    label[..1].to_uppercase(),
+                    &label[1..],
+                    pr.number
+                ),
                 IconName::GitPullRequest,
                 Some(state),
             )
@@ -145,7 +142,7 @@ fn interaction_time(at: Option<u64>, now: u64) -> (String, String) {
 
 impl WorkspacePicker {
     pub(super) fn snapshot(s: &Shark, cx: &App) -> Vec<PickerWorkspace> {
-        s.sidebar_order()
+        s.ws_order(true)
             .into_iter()
             .map(|ix| &s.state.workspaces[ix])
             .filter(|ws| !s.archiving.contains(&ws.name))
@@ -206,41 +203,16 @@ impl WorkspacePicker {
                 .entry(sync.entity_id())
                 .or_insert_with(|| cx.observe(sync, |p, _, cx| p.refresh(cx)));
         }
-        let s = shark.read(cx);
-        let live: HashMap<_, _> = s
-            .state
-            .workspaces
-            .iter()
-            .filter(|ws| !s.archiving.contains(&ws.name))
-            .map(|ws| (ws.name.as_str(), ws))
-            .collect();
-        let known: HashSet<_> = self.workspaces.iter().map(|ws| ws.name.as_str()).collect();
+        let fresh = Self::snapshot(shark.read(cx), cx);
+        let live: HashSet<_> = fresh.iter().map(|ws| ws.name.clone()).collect();
+        let known: HashSet<_> = self.workspaces.iter().map(|ws| ws.name.clone()).collect();
+        let (kept, added): (Vec<_>, Vec<_>) =
+            fresh.into_iter().partition(|ws| known.contains(&ws.name));
+        let mut kept: HashMap<_, _> = kept.into_iter().map(|ws| (ws.name.clone(), ws)).collect();
         let mut workspaces: Vec<_> = self
             .workspaces
             .iter()
-            .filter_map(|ws| live.get(ws.name.as_str()))
-            .map(|ws| {
-                PickerWorkspace::new(
-                    ws,
-                    s.overview_repos(&ws.name, cx),
-                    s.running_chats(&ws.name, cx),
-                    s.attention_of(&ws.name, cx),
-                )
-            })
-            .collect();
-        let added: Vec<_> = s
-            .sidebar_order()
-            .into_iter()
-            .map(|ix| &s.state.workspaces[ix])
-            .filter(|ws| live.contains_key(ws.name.as_str()) && !known.contains(ws.name.as_str()))
-            .map(|ws| {
-                PickerWorkspace::new(
-                    ws,
-                    s.overview_repos(&ws.name, cx),
-                    s.running_chats(&ws.name, cx),
-                    s.attention_of(&ws.name, cx),
-                )
-            })
+            .filter_map(|ws| kept.remove(&ws.name))
             .collect();
         let selected = self
             .select
@@ -248,7 +220,7 @@ impl WorkspacePicker {
             .and_then(|ix| self.hits.get(ix))
             .cloned();
         let old_len = self.hits.len();
-        self.hits.retain(|name| live.contains_key(name.as_str()));
+        self.hits.retain(|name| live.contains(name));
         let removed = self.hits.len() != old_len;
         let added_hits = rank(&added, &self.query);
         let changed_hits = removed || !added_hits.is_empty();

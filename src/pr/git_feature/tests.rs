@@ -265,6 +265,18 @@ print(json.dumps({'data':{'repository':{'pullRequest':json.loads((p/'pr.json').r
             {"url":target().url(),"state":"OPEN","isCrossRepository":false}
         ]));
         assert_eq!(discover(&f.root, "feature").unwrap(), Some(target()));
+        // With none open it is the button's pick: the last updated, not the newest created.
+        f.write("list.json", &json!([
+            {"url":"https://github.com/owner/repo/pull/13","state":"CLOSED","isCrossRepository":false,"updatedAt":"2026-01-01T00:00:00Z"},
+            {"url":target().url(),"state":"MERGED","isCrossRepository":false,"updatedAt":"2026-02-01T00:00:00Z"}
+        ]));
+        assert_eq!(discover(&f.root, "feature").unwrap(), Some(target()));
+        f.write(
+            "list.json",
+            &json!([
+                {"url":target().url(),"state":"OPEN","isCrossRepository":false}
+            ]),
+        );
         assert!(
             f.calls()[0]
                 .windows(2)

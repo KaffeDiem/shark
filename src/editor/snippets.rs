@@ -6,17 +6,17 @@ use std::ops::Range;
 
 #[derive(Default)]
 pub(super) struct Snippets {
-    active: Option<Session>,
+    pub(super) active: Option<Session>,
     accepted: Option<(i32, u64)>,
     /// Resolves the last accepted item's imports; a newer acceptance, undo, reload or closing
     /// cancels it.
     pub(super) resolve: Option<Task<()>>,
 }
 
-struct Session {
-    text: String,
-    stops: Vec<Stop>,
-    index: u32,
+pub(super) struct Session {
+    pub(super) text: String,
+    pub(super) stops: Vec<Stop>,
+    pub(super) index: u32,
 }
 
 impl FileEditor {
@@ -137,7 +137,7 @@ impl FileEditor {
         let Some(client) = self.intelligence.as_ref().and_then(|l| l.client.clone()) else {
             return;
         };
-        let encoding = client.encoding().into();
+        let encoding = client.encoding();
         let alive = self.intelligence.as_ref().map(|l| l.alive.clone());
         self.snippets.resolve = Some(cx.spawn_in(window, async move |this, cx| {
             let Ok(response) = client.request("completionItem/resolve", item).await else {
@@ -182,28 +182,12 @@ impl FileEditor {
         self.replace_language_text(text, window, cx);
         // The rewrite keeps only the main caret; put it back in every mirrored field.
         if let Some(Some(fields)) = fields {
-            self.input.update(cx, |i, cx| {
-                for (n, range) in fields.into_iter().enumerate() {
-                    if n == 0 {
-                        i.set_selected_range(range, cx);
-                    } else {
-                        i.add_selection(range, cx);
-                    }
-                }
-            });
+            self.select_ranges(fields, cx);
         }
     }
 
-    fn select_snippet(&self, cx: &mut Context<Self>) {
-        let Some(session) = &self.snippets.active else {
-            return;
-        };
-        let ranges: Vec<Range<usize>> = session
-            .stops
-            .iter()
-            .filter(|s| s.index == session.index)
-            .map(|s| s.start..s.end)
-            .collect();
+    /// The first range becomes the main selection; the rest are added as mirrors.
+    fn select_ranges(&self, ranges: Vec<Range<usize>>, cx: &mut Context<Self>) {
         self.input.update(cx, |i, cx| {
             for (n, range) in ranges.into_iter().enumerate() {
                 if n == 0 {
@@ -215,6 +199,14 @@ impl FileEditor {
         });
     }
 
+    fn select_snippet(&self, cx: &mut Context<Self>) {
+        let Some(session) = &self.snippets.active else {
+            return;
+        };
+        let ranges = session.field().map(|s| s.start..s.end).collect();
+        self.select_ranges(ranges, cx);
+    }
+
     pub(super) fn snippet_key(&mut self, ks: &Keystroke, cx: &mut Context<Self>) -> bool {
         let Some(session) = self.snippets.active.as_mut() else {
             return false;
@@ -223,7 +215,7 @@ impl FileEditor {
             self.snippets.active = None;
             return false;
         }
-        if self.vim_on && self.vim.mode != vim::Mode::Insert {
+        if self.vim_on && !self.vim.typing() {
             self.snippets.active = None;
             return false;
         }
@@ -235,12 +227,7 @@ impl FileEditor {
             return false;
         }
         let selected = self.input.read(cx).selected_range();
-        if !session
-            .stops
-            .iter()
-            .filter(|s| s.index == session.index)
-            .any(|s| selected.start >= s.start && selected.end <= s.end)
-        {
+        if !(session.field()).any(|s| selected.start >= s.start && selected.end <= s.end) {
             self.snippets.active = None;
             return false;
         }
@@ -273,6 +260,11 @@ impl FileEditor {
 }
 
 impl Session {
+    /// The stops (mirrors) of the current tabstop.
+    fn field(&self) -> impl Iterator<Item = &Stop> {
+        self.stops.iter().filter(|s| s.index == self.index)
+    }
+
     /// Moves every stop by `delta` for an edit that ends at or before `at`, returning the
     /// selections to restore: the caret's offsets within its field, in each mirror. `None` when
     /// a stop starts before `at`, so its position is unknown.
@@ -286,8 +278,8 @@ impl Session {
         if self.stops.iter().any(|s| s.start < at) {
             return None;
         }
-        let field = (self.stops.iter())
-            .find(|s| s.index == self.index && s.start <= selected.start && selected.end <= s.end)
+        let field = (self.field())
+            .find(|s| s.start <= selected.start && selected.end <= s.end)
             .map(|s| (selected.start - s.start, selected.end - s.start, s.start));
         for stop in &mut self.stops {
             stop.start = stop.start.checked_add_signed(delta)?;
@@ -298,10 +290,7 @@ impl Session {
             return Some(vec![]);
         };
         let primary = primary.checked_add_signed(delta)?;
-        let mut active: Vec<_> = (self.stops.iter())
-            .filter(|s| s.index == self.index)
-            .map(|s| s.start)
-            .collect();
+        let mut active: Vec<_> = self.field().map(|s| s.start).collect();
         // The caret's own field first, so it stays the main selection.
         active.sort_by_key(|&start| start != primary);
         Some(active.into_iter().map(|s| s + from..s + to).collect())
@@ -309,12 +298,7 @@ impl Session {
 
     /// GPUI edits all mirrored selections together; unchanged gaps prove this is still our snippet.
     fn changed(&mut self, new: &str) -> bool {
-        let mut active: Vec<_> = self
-            .stops
-            .iter()
-            .filter(|s| s.index == self.index)
-            .cloned()
-            .collect();
+        let mut active: Vec<_> = self.field().cloned().collect();
         active.sort_by_key(|s| s.start);
         if active.is_empty() {
             return false;

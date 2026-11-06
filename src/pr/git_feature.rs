@@ -67,6 +67,14 @@ pub struct Comment {
     pub author: String,
     pub url: String,
     pub created_at: String,
+    /// The author is a GitHub App or bot account.
+    pub bot: bool,
+    /// Hidden on GitHub (outdated, resolved, spam…); shown collapsed.
+    pub minimized: bool,
+    /// Review comments only: the diff context GitHub shows above a thread.
+    pub diff_hunk: Option<String>,
+    /// Review comments only: the review the comment was submitted with.
+    pub review_id: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -85,6 +93,9 @@ pub struct Thread {
     pub can_reply: bool,
     pub can_resolve: bool,
     pub can_unresolve: bool,
+    /// The line in the original diff; outdated threads have no current `line`.
+    pub original_line: Option<u64>,
+    pub resolved_by: Option<String>,
     pub comments: Vec<Comment>,
 }
 
@@ -97,7 +108,10 @@ pub struct Details {
     pub url: String,
     pub state: String,
     pub author: String,
+    pub created_at: String,
     pub head: String,
+    /// The head commit when read, for resolving relative assets; `None` when GitHub omits it.
+    pub head_sha: Option<String>,
     pub base: String,
     pub draft: bool,
     pub can_update: bool,
@@ -107,11 +121,12 @@ pub struct Details {
     pub threads: Vec<Thread>,
 }
 
-const INFO: &str = "id number url title body state isDraft author{login} headRefName baseRefName viewerCanUpdate locked";
-const COMMENT: &str = "id body author{login} url createdAt";
+const INFO: &str = "id number url title body state isDraft createdAt author{login} headRefName headRefOid baseRefName viewerCanUpdate locked";
+const COMMENT: &str = "id body author{__typename login} url createdAt isMinimized";
+const REVIEW_COMMENT: &str =
+    "id body author{__typename login} url createdAt isMinimized diffHunk pullRequestReview{id}";
 const PAGE: &str = "pageInfo{hasNextPage endCursor}";
-const THREAD: &str =
-    "id path line isResolved isOutdated viewerCanReply viewerCanResolve viewerCanUnresolve";
+const THREAD: &str = "id path line originalLine isResolved isOutdated viewerCanReply viewerCanResolve viewerCanUnresolve resolvedBy{login}";
 
 /// Reads are bounded as a whole, including pagination, as well as per subprocess.
 struct Client<'a> {
@@ -148,9 +163,7 @@ impl<'a> Client<'a> {
             args.extend(["-f".into(), format!("{key}={value}")]);
         }
         let refs: Vec<_> = args.iter().map(String::as_str).collect();
-        let gh = super::gh();
-        let out = crate::git::cmd_bounded(self.wt, &gh, &refs, remaining.min(30)).map_err(|e| {
-            let error = super::gh_error(&e, &format!("{gh} {}: ", refs.join(" ")));
+        let out = super::gh_post(self.wt, &refs, remaining.min(30)).map_err(|error| {
             if mutation && error.contains("timed out") {
                 "GitHub timed out; the change may have been saved. Refresh and check before retrying.".into()
             } else { error }
@@ -227,38 +240,12 @@ pub fn discover(wt: &Path, branch: &str) -> Result<Option<Target>, String> {
     if let Some(url) = crate::git::review_pr_url(wt, branch) {
         return Target::from_url(&url).map(Some);
     }
-    let origin = crate::git::git(wt, &["config", "--get", "remote.origin.url"])?;
-    if let Some(remote) = crate::azure::Remote::parse(&origin) {
+    if let Some(remote) = crate::azure::Remote::of(wt) {
         return crate::azure::discover(wt, &remote, branch);
     }
-    let origin = crate::sync::github_url(&origin)
-        .ok_or("Origin is not a GitHub or Azure DevOps repository")?;
-    let gh = super::gh();
-    let args = [
-        "pr",
-        "list",
-        "--repo",
-        &origin,
-        "--head",
-        branch,
-        "--state",
-        "all",
-        "--json",
-        "url,state,isCrossRepository",
-        "--limit",
-        "100",
-    ];
-    let out = crate::git::cmd_bounded(wt, &gh, &args, 30)
-        .map_err(|e| super::gh_error(&e, &format!("{gh} {}: ", args.join(" "))))?;
-    let prs: Vec<Value> =
-        serde_json::from_str(&out).map_err(|e| format!("Invalid GitHub response: {e}"))?;
-    let own: Vec<_> = prs
-        .iter()
-        .filter(|p| p["isCrossRepository"].as_bool() == Some(false))
-        .collect();
-    own.iter()
-        .find(|p| p["state"] == "OPEN")
-        .or_else(|| own.first())
+    crate::sync::origin_repo(wt).ok_or("Origin is not a GitHub or Azure DevOps repository")?;
+    let prs = crate::sync::branch_prs(wt, branch, "url,state,isCrossRepository,updatedAt", 30)?;
+    crate::sync::pick_pr(&prs.iter().collect::<Vec<_>>())
         .map(|p| Target::from_url(string(p, "url")?))
         .transpose()
 }
@@ -286,6 +273,10 @@ fn comment_from(value: &Value) -> Result<Comment, String> {
         author: author(value),
         url: string(value, "url")?.into(),
         created_at: string(value, "createdAt")?.into(),
+        bot: value["author"]["__typename"].as_str() == Some("Bot"),
+        minimized: value["isMinimized"].as_bool().unwrap_or(false),
+        diff_hunk: value["diffHunk"].as_str().map(Into::into),
+        review_id: value["pullRequestReview"]["id"].as_str().map(Into::into),
     })
 }
 
@@ -308,7 +299,12 @@ fn details_from(target: &Target, value: &Value) -> Result<Details, String> {
         url: url.into(),
         state: string(value, "state")?.into(),
         author: author(value),
+        created_at: value["createdAt"].as_str().unwrap_or_default().into(),
         head: string(value, "headRefName")?.into(),
+        head_sha: value["headRefOid"]
+            .as_str()
+            .filter(|s| !s.is_empty() && s.bytes().all(|b| b.is_ascii_hexdigit()))
+            .map(Into::into),
         base: string(value, "baseRefName")?.into(),
         draft: boolean(value, "isDraft")?,
         can_update: boolean(value, "viewerCanUpdate")?,
@@ -370,26 +366,36 @@ fn pages(
     Ok(out)
 }
 
+/// Every comment of the node `id`, following pagination from its `first` page.
+fn comments(
+    client: &Client,
+    id: &str,
+    kind: &str,
+    fields: &str,
+    first: &Value,
+) -> Result<Vec<Comment>, String> {
+    pages(client, id, kind, "comments", fields, first.clone())?
+        .iter()
+        .map(comment_from)
+        .collect()
+}
+
 pub fn load(wt: &Path, target: &Target) -> Result<Details, String> {
     if target.remote().is_some() {
         return crate::azure::load(wt, target);
     }
     let client = Client::new(wt, target);
     let review_fields = format!("{COMMENT} state");
-    let thread_fields = format!("{THREAD} comments(first:100){{nodes{{{COMMENT}}}{PAGE}}}");
+    let thread_fields = format!("{THREAD} comments(first:100){{nodes{{{REVIEW_COMMENT}}}{PAGE}}}");
     let value = client.pr(&format!("{INFO} comments(first:100){{nodes{{{COMMENT}}}{PAGE}}} reviews(first:100){{nodes{{{review_fields}}}{PAGE}}} reviewThreads(first:100){{nodes{{{thread_fields}}}{PAGE}}}"))?;
     let mut details = details_from(target, &value)?;
-    details.comments = pages(
+    details.comments = comments(
         &client,
         &details.id,
         "PullRequest",
-        "comments",
         COMMENT,
-        value["comments"].clone(),
-    )?
-    .iter()
-    .map(comment_from)
-    .collect::<Result<_, _>>()?;
+        &value["comments"],
+    )?;
     details.reviews = pages(
         &client,
         &details.id,
@@ -415,17 +421,17 @@ pub fn load(wt: &Path, target: &Target) -> Result<Details, String> {
         value["reviewThreads"].clone(),
     )? {
         let id = string(&value, "id")?.to_string();
-        let comments = pages(
+        let mut comments = comments(
             &client,
             &id,
             "PullRequestReviewThread",
-            "comments",
-            COMMENT,
-            value["comments"].clone(),
-        )?
-        .iter()
-        .map(comment_from)
-        .collect::<Result<_, _>>()?;
+            REVIEW_COMMENT,
+            &value["comments"],
+        )?;
+        // GitHub lists a thread by `createdAt`, which a review comment takes from when its
+        // review was submitted: a question from a review submitted late sorts below the
+        // replies to it. Its URL's `discussion_r<id>` keeps the order it was written in.
+        comments.sort_by_key(|c| discussion_id(&c.url));
         details.threads.push(Thread {
             id,
             path: string(&value, "path")?.into(),
@@ -435,10 +441,20 @@ pub fn load(wt: &Path, target: &Target) -> Result<Details, String> {
             can_reply: boolean(&value, "viewerCanReply")?,
             can_resolve: boolean(&value, "viewerCanResolve")?,
             can_unresolve: boolean(&value, "viewerCanUnresolve")?,
+            original_line: value["originalLine"].as_u64(),
+            resolved_by: value["resolvedBy"]["login"].as_str().map(Into::into),
             comments,
         });
     }
     Ok(details)
+}
+
+/// The number in a review comment URL's `#discussion_r<n>`; comments without one keep
+/// their place at the front.
+fn discussion_id(url: &str) -> u64 {
+    url.rsplit_once("#discussion_r")
+        .and_then(|(_, n)| n.parse().ok())
+        .unwrap_or(0)
 }
 
 fn fresh(client: &Client, previous: &Details) -> Result<Details, String> {
@@ -449,18 +465,21 @@ fn fresh(client: &Client, previous: &Details) -> Result<Details, String> {
     Ok(details)
 }
 
-fn mutate(client: &Client, query: &str, vars: &[(&str, &str)], field: &str) -> Result<(), String> {
+/// Runs a mutation and requires GitHub to echo a non-empty id at the JSON pointer `id_path`.
+fn mutate(
+    client: &Client,
+    query: &str,
+    vars: &[(&str, &str)],
+    id_path: &str,
+) -> Result<(), String> {
     let data = client
         .query(query, vars, true)
         .map_err(|e| format!("{e} Refresh and check before retrying."))?;
-    let result = &data[field];
-    let id = match field {
-        "updatePullRequest" => &result["pullRequest"]["id"],
-        "addComment" => &result["commentEdge"]["node"]["id"],
-        "addPullRequestReviewThreadReply" => &result["comment"]["id"],
-        _ => &result["thread"]["id"],
-    };
-    if id.as_str().is_none_or(str::is_empty) {
+    if data
+        .pointer(id_path)
+        .and_then(Value::as_str)
+        .is_none_or(str::is_empty)
+    {
         return Err("GitHub did not confirm the change. Refresh and check before retrying.".into());
     }
     Ok(())
@@ -491,7 +510,7 @@ pub fn save_description(
         &client,
         "mutation($id:ID!,$title:String!,$body:String!){updatePullRequest(input:{pullRequestId:$id,title:$title,body:$body}){pullRequest{id}}}",
         &[("id", &current.id), ("title", title), ("body", body)],
-        "updatePullRequest",
+        "/updatePullRequest/pullRequest/id",
     )
 }
 
@@ -511,7 +530,7 @@ pub fn comment(wt: &Path, previous: &Details, body: &str) -> Result<(), String> 
         &client,
         "mutation($id:ID!,$body:String!){addComment(input:{subjectId:$id,body:$body}){commentEdge{node{id}}}}",
         &[("id", &current.id), ("body", body)],
-        "addComment",
+        "/addComment/commentEdge/node/id",
     )
 }
 
@@ -547,7 +566,7 @@ pub fn reply(wt: &Path, previous: &Details, thread_id: &str, body: &str) -> Resu
         &client,
         "mutation($id:ID!,$body:String!){addPullRequestReviewThreadReply(input:{pullRequestReviewThreadId:$id,body:$body}){comment{id}}}",
         &[("id", thread_id), ("body", body)],
-        "addPullRequestReviewThreadReply",
+        "/addPullRequestReviewThreadReply/comment/id",
     )
 }
 
@@ -577,7 +596,7 @@ pub fn resolve(
         &client,
         &format!("mutation($id:ID!){{{field}(input:{{threadId:$id}}){{thread{{id isResolved}}}}}}"),
         &[("id", thread_id)],
-        field,
+        &format!("/{field}/thread/id"),
     )
 }
 

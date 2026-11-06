@@ -6,20 +6,8 @@ use gpui_kit::base::input::HighlightStyleResolver;
 use gpui_kit::{HighlightStyle, SharedString};
 use similar::{ChangeTag, TextDiff};
 
-use super::syntax::SyntaxHighlighter;
+use super::syntax::{SyntaxHighlighter, language_token};
 use super::{DiffFile, DiffSide, document::SourceLine};
-
-/// The unit inline changes are compared and emphasized in.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-#[non_exhaustive]
-pub enum DiffInlineUnit {
-    /// Words and punctuation; changed words separated only by whitespace are
-    /// emphasized as one run.
-    #[default]
-    Word,
-    /// Grapheme clusters.
-    Character,
-}
 
 /// Paired lines sharing less than this proportion of content are emphasized as
 /// whole lines only; marking nearly every character adds noise, not signal.
@@ -28,7 +16,6 @@ const MIN_INLINE_SIMILARITY: f32 = 0.25;
 /// Settings that determine prepared presentation.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct PresentationOptions {
-    pub inline_unit: Option<DiffInlineUnit>,
     pub inline_max_line_length: usize,
     pub syntax_max_line_length: usize,
 }
@@ -106,9 +93,7 @@ impl FilePresentation {
             );
             presentation.syntax[side as usize] = LineSpans::from_lines(per_line);
         }
-        if let Some(unit) = options.inline_unit {
-            presentation.inline = inline_changes(file, unit, options.inline_max_line_length);
-        }
+        presentation.inline = inline_changes(file, options.inline_max_line_length);
         presentation
     }
 
@@ -158,14 +143,13 @@ fn syntax_spans(
 ) -> Vec<Vec<(Range<u32>, u16)>> {
     let lines = file.lines(side);
     let mut per_line: Vec<Vec<(Range<u32>, u16)>> = (0..lines.len()).map(|_| Vec::new()).collect();
-    let language = match (file.language_override(), file.side_path(side)) {
-        (Some(language), _) => language.clone(),
-        (None, Some(path)) => detected_language(path),
-        (None, None) => return per_line,
+    let Some(path) = file.side_path(side) else {
+        return per_line;
     };
-    if language.as_str() == "text" || lines.is_empty() {
+    if lines.is_empty() {
         return per_line;
     }
+    let language = language_token(path);
     let highlighter = highlighters
         .entry(language.clone())
         .or_insert_with(|| SyntaxHighlighter::new(&language));
@@ -205,11 +189,7 @@ fn syntax_spans(
 }
 
 /// Compares each deleted line with the added line paired with it.
-fn inline_changes(
-    file: &DiffFile,
-    unit: DiffInlineUnit,
-    max_line_length: usize,
-) -> [LineSpans<()>; 2] {
+fn inline_changes(file: &DiffFile, max_line_length: usize) -> [LineSpans<()>; 2] {
     let mut sides: [Vec<Vec<(Range<u32>, ())>>; 2] = [
         (0..file.lines_count(DiffSide::Original))
             .map(|_| Vec::new())
@@ -229,7 +209,7 @@ fn inline_changes(
         if old.len() > max_line_length || new.len() > max_line_length || old == new {
             continue;
         }
-        let (old_runs, new_runs) = changed_runs(old, new, unit);
+        let (old_runs, new_runs) = changed_runs(old, new);
         sides[0][old_ix] = old_runs.into_iter().map(|range| (range, ())).collect();
         sides[1][new_ix] = new_runs.into_iter().map(|range| (range, ())).collect();
     }
@@ -241,15 +221,8 @@ fn inline_changes(
 }
 
 /// Byte ranges that differ between two lines, on each side.
-pub(crate) fn changed_runs(
-    old: &str,
-    new: &str,
-    unit: DiffInlineUnit,
-) -> (Vec<Range<u32>>, Vec<Range<u32>>) {
-    let diff = match unit {
-        DiffInlineUnit::Word => TextDiff::from_unicode_words(old, new),
-        DiffInlineUnit::Character => TextDiff::from_graphemes(old, new),
-    };
+pub(crate) fn changed_runs(old: &str, new: &str) -> (Vec<Range<u32>>, Vec<Range<u32>>) {
+    let diff = TextDiff::from_unicode_words(old, new);
     if diff.ratio() < MIN_INLINE_SIMILARITY {
         return (Vec::new(), Vec::new());
     }
@@ -263,11 +236,11 @@ pub(crate) fn changed_runs(
                 new_offset += len;
             }
             ChangeTag::Delete => {
-                push_run(&mut old_runs, old_offset..old_offset + len, old, unit);
+                push_run(&mut old_runs, old_offset..old_offset + len, old);
                 old_offset += len;
             }
             ChangeTag::Insert => {
-                push_run(&mut new_runs, new_offset..new_offset + len, new, unit);
+                push_run(&mut new_runs, new_offset..new_offset + len, new);
                 new_offset += len;
             }
         }
@@ -276,10 +249,10 @@ pub(crate) fn changed_runs(
 }
 
 /// Extends the previous run when only whitespace separates it from `range`.
-fn push_run(runs: &mut Vec<Range<u32>>, range: Range<usize>, text: &str, unit: DiffInlineUnit) {
+fn push_run(runs: &mut Vec<Range<u32>>, range: Range<usize>, text: &str) {
     if let Some(last) = runs.last_mut() {
         let gap = &text[last.end as usize..range.start];
-        if gap.is_empty() || unit == DiffInlineUnit::Word && gap.trim().is_empty() {
+        if gap.trim().is_empty() {
             last.end = range.end as u32;
             return;
         }
@@ -287,83 +260,26 @@ fn push_run(runs: &mut Vec<Range<u32>>, range: Range<usize>, text: &str, unit: D
     runs.push(range.start as u32..range.end as u32);
 }
 
-/// File paths may come from another platform. Only the final component
-/// determines the language; dots in a directory are not extensions.
-pub(crate) fn detected_language(path: &str) -> SharedString {
-    let name = path.rsplit(['/', '\\']).next().unwrap_or("").to_lowercase();
-    let language = match name.as_str() {
-        "makefile" | "gnumakefile" => "make",
-        "cmakelists.txt" => "cmake",
-        _ => match name.rsplit_once('.').map(|(_, extension)| extension) {
-            Some("jsx" | "mjs" | "cjs") => "javascript",
-            Some("mts" | "cts") => "typescript",
-            Some("cc" | "cxx" | "hpp" | "hxx") => "cpp",
-            Some("h") => "c",
-            Some("htm") => "html",
-            Some("gql") => "graphql",
-            Some("exs") => "elixir",
-            Some(
-                extension @ ("astro" | "sh" | "bash" | "c" | "cmake" | "cs" | "cpp" | "css"
-                | "scss" | "diff" | "ejs" | "ex" | "erb" | "go" | "graphql" | "html"
-                | "java" | "js" | "json" | "jsonc" | "kt" | "kts" | "lua" | "md"
-                | "mdx" | "php" | "php3" | "php4" | "php5" | "phtml" | "proto" | "py"
-                | "pyi" | "rb" | "rs" | "scala" | "sql" | "svelte" | "swift" | "toml"
-                | "tsx" | "ts" | "yaml" | "yml" | "zig"),
-            ) => extension,
-            _ => "text",
-        },
-    };
-    super::syntax::language_name(language)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const OPTIONS: PresentationOptions = PresentationOptions {
-        inline_unit: Some(DiffInlineUnit::Word),
         inline_max_line_length: 1000,
         syntax_max_line_length: 1000,
     };
 
     #[test]
-    fn language_detection_uses_filename() {
-        for (name, language) in [
-            ("src/main.RS", "rust"),
-            ("src/components/App.jsx", "javascript"),
-            ("C:\\src\\lib.hpp", "cpp"),
-            ("build/CMakeLists.txt", "cmake"),
-            ("build/Makefile", "make"),
-            ("directory.rs/README", "text"),
-            ("ts", "text"),
-            ("notes.unknown", "text"),
-        ] {
-            assert_eq!(detected_language(name).as_str(), language);
-        }
-        let file = DiffFile::parse("--- a/notes\n+++ b/notes\n@@ -1 +1 @@\n-a\n+b\n")
-            .unwrap()
-            .remove(0);
-        assert_eq!(file.language().as_str(), "text");
-        assert_eq!(file.with_language("rust").language().as_str(), "rust");
-    }
-
-    #[test]
     fn inline_changes_merge_words_across_whitespace_and_skip_unrelated_lines() {
-        let (old, new) = changed_runs(
-            "let total = price * count;",
-            "let total = cost * quantity;",
-            DiffInlineUnit::Word,
-        );
+        let (old, new) = changed_runs("let total = price * count;", "let total = cost * quantity;");
         assert_eq!(old, [12..17, 20..25]);
         assert_eq!(new, [12..16, 19..27]);
-        let (old, new) = changed_runs("old value here", "new value here", DiffInlineUnit::Word);
+        let (old, new) = changed_runs("old value here", "new value here");
         assert_eq!((old, new), (vec![0..3], vec![0..3]));
-        let (old, new) = changed_runs("a b c", "a x y c", DiffInlineUnit::Word);
+        let (old, new) = changed_runs("a b c", "a x y c");
         assert_eq!(new, [2..5]);
         assert!(old.is_empty() || old == [2..3]);
-        let (old, new) = changed_runs("colour", "color", DiffInlineUnit::Character);
-        assert_eq!((old, new), (vec![4..5], vec![]));
-        let (old, new) = changed_runs("alpha", "zzzzzzzzz", DiffInlineUnit::Word);
+        let (old, new) = changed_runs("alpha", "zzzzzzzzz");
         assert!(old.is_empty() && new.is_empty());
     }
 
@@ -401,22 +317,10 @@ mod tests {
         assert_eq!(ranges(DiffSide::Original, 0), [12..17]);
         assert_eq!(ranges(DiffSide::Modified, 0), [12..16]);
         assert!(ranges(DiffSide::Modified, 1).is_empty());
-        let off = PresentationOptions {
-            inline_unit: None,
-            ..OPTIONS
-        };
-        let presentation =
-            FilePresentation::prepare(&file, off, &mut SyntaxHighlighters::default());
-        assert_eq!(
-            presentation
-                .inline_changes(&file.lines(DiffSide::Original)[0], DiffSide::Original, 0)
-                .count(),
-            0
-        );
     }
 
     #[test]
-    fn syntax_is_parsed_per_hunk_and_respects_language_and_line_limit() {
+    fn syntax_is_parsed_per_hunk_and_respects_line_limit() {
         // Hunks are separated by unavailable source. Parsing their fragments
         // together would join `/* open` and `close */` into one comment.
         let file = DiffFile::parse(
@@ -451,11 +355,6 @@ mod tests {
         };
         let presentation =
             FilePresentation::prepare(&file, short, &mut SyntaxHighlighters::default());
-        assert!(names(&presentation, 0).is_empty());
-
-        let as_text = file.clone().with_language("text");
-        let presentation =
-            FilePresentation::prepare(&as_text, OPTIONS, &mut SyntaxHighlighters::default());
         assert!(names(&presentation, 0).is_empty());
     }
 }

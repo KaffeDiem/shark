@@ -24,6 +24,7 @@ pub(crate) struct OpenApp {
 }
 
 const XCODE: &str = "com.apple.dt.Xcode";
+const FINDER: &str = "com.apple.finder";
 /// Git clients register for folders but only open repos.
 const GIT: &[&str] = &[
     "com.DanPristupov.Fork",
@@ -55,9 +56,8 @@ const IDES: &[&str] = &[
     "com.panic.Nova",
     "dev.warp.Warp-Stable",
 ];
-/// Folder handlers that aren't a way to work on code; Finder is Reveal in Finder.
+/// Folder handlers that aren't a way to work on code.
 const SKIP: &[&str] = &[
-    "com.apple.finder",
     "com.apple.Notes",
     "io.github.kaffediem.shark",
     "com.anthropic.claudefordesktop",
@@ -197,7 +197,12 @@ fn discover() -> Vec<OpenApp> {
     let mut ids = handlers("public.folder", LSRolesMask::Editor);
     // Terminal, Ghostty and Fork register for `public.directory`, which `public.folder` misses.
     ids.extend(handlers("public.directory", LSRolesMask::Editor));
-    ids.extend(IDES.iter().chain([&XCODE]).map(|id| id.to_string()));
+    // Finder too: cmd-o is the one way to open a workspace somewhere.
+    ids.extend(
+        IDES.iter()
+            .chain([&XCODE, &FINDER])
+            .map(|id| id.to_string()),
+    );
     let mut apps: Vec<OpenApp> = vec![];
     for id in ids {
         if SKIP.contains(&id.as_str()) {
@@ -334,7 +339,7 @@ mod tests {
         assert!(xcode_projects(&tmp("missing")).is_empty());
     }
 
-    /// The real lookup on this Mac: Terminal ships with macOS.
+    /// The real lookup on this Mac: Terminal and Finder ship with macOS.
     #[test]
     fn discover_finds_terminal_with_its_icon() {
         let apps = discover();
@@ -348,7 +353,16 @@ mod tests {
                 .as_ref()
                 .is_some_and(|i| i.bytes.starts_with(b"\x89PNG"))
         );
-        assert!((apps.iter()).all(|a| !["Finder", "Shark", "Claude"].contains(&a.name.as_str())));
+        assert!((apps.iter()).all(|a| !["Shark", "Claude"].contains(&a.name.as_str())));
+        let finder = apps
+            .iter()
+            .find(|a| a.name == "Finder")
+            .expect("Finder listed");
+        assert_eq!(
+            finder.kind,
+            Kind::Folder,
+            "opens the workspace folder and repos"
+        );
         assert_eq!(apps[0].kind, Kind::Terminal, "terminals first");
     }
 

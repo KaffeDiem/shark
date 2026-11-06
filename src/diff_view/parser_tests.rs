@@ -144,15 +144,10 @@ fn malformed_hunks_fail_without_partial_documents() {
         let error = DiffFile::parse(patch)
             .err()
             .expect("reject malformed patch");
-        assert!(error.line() > 0);
-        assert!(!error.message().is_empty());
+        let message = error.to_string();
+        assert!(message.starts_with("patch line ") && !message.starts_with("patch line 0:"));
     }
     assert!(DiffFile::parse("").unwrap().is_empty());
-}
-
-#[test]
-fn the_hunk_separator_counts_unchanged_lines() {
-    assert_eq!(t!("Diff.HiddenLines", count = 3), "↑ 3 unchanged lines");
 }
 
 #[test]
@@ -181,4 +176,12 @@ fn files_report_git_status_and_hidden_lines() {
     let added = files[0].hunks();
     assert_eq!(added[0].hidden_lines_before(None), 0);
     let _ = DiffMode::Unified;
+}
+
+#[test]
+fn short_hunk_before_multibyte_text_is_an_error_not_a_panic() {
+    let err = DiffFile::parse("--- a/a\n+++ b/a\n@@ -1,2 +1,2 @@\n-old\né\n")
+        .err()
+        .unwrap();
+    assert!(err.to_string().contains("hunk"), "{err}");
 }

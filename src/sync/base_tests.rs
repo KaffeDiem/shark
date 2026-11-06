@@ -1,5 +1,7 @@
+use super::status::{Action, Kind};
 use super::{
-    Job, Pr, PrState, Probed, Repo, open_pr, repo_diff_base, repos_from, run_job, status, worktrees,
+    Job, Pr, PrState, Probed, Repo, open_pr, repo_diff_base, repos_from, run_job, run_step, status,
+    worktrees,
 };
 use crate::git::{git, review_pr_url};
 use crate::state::Workspace;
@@ -34,20 +36,7 @@ impl Fixture {
         git(&root, &["init", "-q", "--bare", &remote.to_string_lossy()]).unwrap();
         git(&wt, &["init", "-q", "-b", "main"]).unwrap();
         let commit = |message| {
-            git(
-                &wt,
-                &[
-                    "-c",
-                    "user.name=t",
-                    "-c",
-                    "user.email=t@t",
-                    "commit",
-                    "--allow-empty",
-                    "-qm",
-                    message,
-                ],
-            )
-            .unwrap();
+            crate::git::commit(&wt, &["--allow-empty", "-qm", message]);
             git(&wt, &["rev-parse", "HEAD"]).unwrap()
         };
         let main = commit("main");
@@ -164,6 +153,7 @@ esac
             repos: worktrees(&self.ws),
             fetch,
             pr,
+            backoff: false,
             prev: prev.to_vec(),
             stack: vec![],
         }
@@ -171,6 +161,66 @@ esac
 
     fn repos(&self, p: Probed, last: &[Repo]) -> Vec<Repo> {
         repos_from(&self.ws, p.locals, p.prs, p.parents, last)
+    }
+
+    /// A commit on `parent` that no branch holds.
+    fn loose_commit(&self, parent: &str) -> String {
+        let tree = format!("{parent}^{{tree}}");
+        let id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+        let args = ["commit-tree", "-p", parent, "-m", "pushed", &tree];
+        git(&self.wt, &[&id[..], &args].concat()).unwrap()
+    }
+
+    /// Like `loose_commit`, but the commit adds `path` (via the index, which is restored).
+    fn loose_commit_adding(&self, parent: &str, path: &str) -> String {
+        fs::write(self.wt.join(path), "from the PR\n").unwrap();
+        git(&self.wt, &["add", "-f", path]).unwrap();
+        let tree = git(&self.wt, &["write-tree"]).unwrap();
+        git(&self.wt, &["rm", "-q", "--cached", path]).unwrap();
+        fs::remove_file(self.wt.join(path)).unwrap();
+        let id = ["-c", "user.name=t", "-c", "user.email=t@t"];
+        let args = ["commit-tree", "-p", parent, "-m", "pushed", &tree];
+        git(&self.wt, &[&id[..], &args].concat()).unwrap()
+    }
+
+    /// A review checkout of PR 7 fetched at `head`, whose author has since pushed `sha`.
+    fn pr_moved_to(&self, sha: &str) {
+        let wt = &self.wt;
+        let pushed = format!("+{sha}:refs/pull/7/head");
+        git(wt, &["push", "-q", "origin", &pushed]).unwrap();
+        git(wt, &["update-ref", "refs/shark/pull/7/head", &self.head]).unwrap();
+        // Review checkouts don't push their branch; a second call finds it gone.
+        let _ = git(wt, &["push", "-q", "origin", "--delete", "feature"]);
+        let _ = git(wt, &["update-ref", "-d", "refs/remotes/origin/feature"]);
+        let mut pr = self.pr(7, "main", "OPEN");
+        pr["headRefOid"] = sha.into();
+        self.write("review.json", pr);
+    }
+
+    /// The current next step, run as the button does.
+    fn click(&self) -> (Result<String, String>, Vec<Repo>) {
+        let repos = self.repos(run_job(&self.job(false, true, &[])), &[]);
+        let a = status::next_action(&repos, &[]);
+        assert_eq!(a.kind, Kind::FetchReview, "{}", a.label);
+        let job = self.job(false, true, &repos);
+        let new_pr = crate::pr::NewPr::new("", false);
+        let r = run_step(a, &self.ws, job, &[], &[], &new_pr, false, true).map(|(_, m)| m);
+        (r, repos)
+    }
+
+    /// What the button runs, called directly for states where it is no longer offered.
+    fn update(&self) -> Result<Option<String>, String> {
+        let pr = crate::git::PullRequest {
+            number: 7,
+            url: "https://github.com/o/api/pull/7".into(),
+            base: "main".into(),
+            head: String::new(),
+        };
+        crate::git::update_review_branch(&self.wt, "feature", &pr)
+    }
+
+    fn oid(&self, rf: &str) -> String {
+        git(&self.wt, &["rev-parse", rf]).unwrap()
     }
 }
 
@@ -190,20 +240,7 @@ fn own_pr_replaces_review_identity_and_follows_retargets() {
     let f = Fixture::new("adopt");
     f.write("own.json", json!([f.pr(8, "release", "OPEN")]));
     // Work can continue locally after publishing the branch's own PR.
-    git(
-        &f.wt,
-        &[
-            "-c",
-            "user.name=t",
-            "-c",
-            "user.email=t@t",
-            "commit",
-            "--allow-empty",
-            "-qm",
-            "unpublished work",
-        ],
-    )
-    .unwrap();
+    crate::git::commit(&f.wt, &["--allow-empty", "-qm", "unpublished work"]);
     let local_head = git(&f.wt, &["rev-parse", "HEAD"]).unwrap();
     assert_ne!(local_head, f.head);
     let mut repos = f.repos(run_job(&f.job(false, true, &[])), &[]);
@@ -907,4 +944,278 @@ fn probe_error_drops_cached_own_pr_after_review_identity_appears() {
         current[0].pr().is_none(),
         "cached ordinary PR must not return after identity and local probe failure"
     );
+}
+
+#[test]
+fn fetch_updates_moves_clean_branch() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates");
+    let fast_forward = f.loose_commit(&f.head);
+    let force_pushed = f.loose_commit(&f.main);
+    for new in [fast_forward, force_pushed] {
+        f.pr_moved_to(&new);
+        let (result, _) = f.click();
+        assert!(result.unwrap().contains(&new[..7]));
+        assert_eq!(f.oid("HEAD"), new);
+        assert_eq!(f.oid("refs/shark/pull/7/head"), new);
+        assert_eq!(f.oid("refs/heads/feature"), new);
+        let repos = f.repos(run_job(&f.job(false, true, &[])), &[]);
+        assert_eq!(status::next_action(&repos, &[]).label, "Review PR");
+        // The next round starts from the old head again.
+        git(&f.wt, &["reset", "-q", "--hard", &f.head]).unwrap();
+    }
+}
+
+#[test]
+fn fetch_updates_refuses_dirty_without_fetching() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-dirty");
+    let new = f.loose_commit(&f.head);
+    f.pr_moved_to(&new);
+    fs::write(f.wt.join("notes.txt"), "mine\n").unwrap();
+    let result = f.update();
+    assert!(result.unwrap_err().contains("uncommitted"));
+    assert_eq!(f.oid("refs/shark/pull/7/head"), f.head);
+    assert_eq!(f.oid("HEAD"), f.head);
+    let notes = fs::read_to_string(f.wt.join("notes.txt")).unwrap();
+    assert_eq!(notes, "mine\n");
+}
+
+#[test]
+fn fetch_updates_refuses_local_commits() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-ahead");
+    let new = f.loose_commit(&f.head);
+    f.pr_moved_to(&new);
+    crate::git::commit(&f.wt, &["--allow-empty", "-qm", "my fixup"]);
+    let mine = f.oid("HEAD");
+    let result = f.update();
+    assert!(result.unwrap_err().contains("commits on top"));
+    assert_eq!(f.oid("refs/shark/pull/7/head"), f.head);
+    assert_eq!(f.oid("HEAD"), mine);
+}
+
+#[test]
+fn fetch_updates_refuses_to_overwrite_ignored_file() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-ignored");
+    let new = f.loose_commit_adding(&f.head, ".env");
+    f.pr_moved_to(&new);
+    fs::write(f.wt.join(".git/info/exclude"), ".env\n").unwrap();
+    fs::write(f.wt.join(".env"), "SECRET=1\n").unwrap();
+    let (result, _) = f.click();
+    let err = result.unwrap_err();
+    assert!(err.contains("overwrite ignored file `.env`"), "{err}");
+    assert_eq!(fs::read_to_string(f.wt.join(".env")).unwrap(), "SECRET=1\n");
+    assert_eq!(f.oid("HEAD"), f.head);
+    assert_eq!(f.oid("refs/shark/pull/7/head"), f.head);
+    let repos = f.repos(run_job(&f.job(false, true, &[])), &[]);
+    assert_eq!(status::next_action(&repos, &[]).kind, Kind::FetchReview);
+}
+
+#[test]
+fn fetch_updates_replaces_tracked_dir_with_file() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-dir-to-file");
+    let new = f.loose_commit_adding(&f.head, "config");
+    fs::create_dir(f.wt.join("config")).unwrap();
+    fs::write(f.wt.join("config/app.toml"), "a = 1\n").unwrap();
+    git(&f.wt, &["add", "config"]).unwrap();
+    crate::git::commit(&f.wt, &["-qm", "add config dir"]);
+    let old = f.oid("HEAD");
+    git(&f.wt, &["update-ref", "refs/shark/pull/7/head", &old]).unwrap();
+    git(
+        &f.wt,
+        &["push", "-q", "origin", &format!("+{new}:refs/pull/7/head")],
+    )
+    .unwrap();
+    assert!(f.update().unwrap().is_some());
+    assert_eq!(f.oid("HEAD"), new);
+    assert!(f.wt.join("config").is_file());
+}
+
+#[test]
+fn fetch_updates_refuses_during_merge_or_bisect() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-op");
+    let new = f.loose_commit(&f.head);
+    f.pr_moved_to(&new);
+    // A merge that changes nothing leaves the tree clean, so only the marker file gives it away.
+    for (start, end, op) in [
+        (
+            &["merge", "--no-commit", "--no-ff", "release"][..],
+            &["merge", "--abort"][..],
+            "merge",
+        ),
+        (&["bisect", "start"], &["bisect", "reset"], "bisect"),
+    ] {
+        git(&f.wt, start).unwrap();
+        assert!(!crate::git::dirty(&f.wt).unwrap());
+        let err = f.update().unwrap_err();
+        assert!(err.contains(&format!("a {op} is in progress")), "{err}");
+        assert_eq!(f.oid("HEAD"), f.head);
+        assert_eq!(f.oid("refs/shark/pull/7/head"), f.head);
+        git(&f.wt, end).unwrap();
+    }
+}
+
+#[test]
+fn fetch_updates_refuses_untracked_file_despite_config() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-untracked");
+    let new = f.loose_commit(&f.head);
+    f.pr_moved_to(&new);
+    git(&f.wt, &["config", "status.showUntrackedFiles", "no"]).unwrap();
+    fs::write(f.wt.join("notes.txt"), "mine\n").unwrap();
+    let l = status::probe(&f.wt, "feature", "origin/release", None, true).unwrap();
+    assert_eq!(l.changed, 1);
+    assert!(f.update().unwrap_err().contains("uncommitted"));
+    assert_eq!(f.oid("HEAD"), f.head);
+    assert_eq!(f.oid("refs/shark/pull/7/head"), f.head);
+}
+
+#[test]
+fn fetch_updates_checks_files_under_ignored_dir() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-ignored-dir");
+    // Commits first: the helper writes and deletes the PR's file in the work tree.
+    fs::create_dir(f.wt.join("build")).unwrap();
+    let fresh = f.loose_commit_adding(&f.head, "build/fresh.txt");
+    let out = f.loose_commit_adding(&f.head, "build/out.txt");
+    fs::write(f.wt.join(".git/info/exclude"), "build/\n").unwrap();
+    fs::write(f.wt.join("build/keep.txt"), "mine\n").unwrap();
+    fs::write(f.wt.join("build/out.txt"), "mine\n").unwrap();
+    // The PR adds a file that is not on disk, then one that is; both sit in an ignored dir.
+    f.pr_moved_to(&fresh);
+    assert!(f.update().unwrap().is_some());
+    assert!(f.wt.join("build/fresh.txt").is_file());
+    assert_eq!(
+        fs::read_to_string(f.wt.join("build/keep.txt")).unwrap(),
+        "mine\n"
+    );
+    git(&f.wt, &["reset", "-q", "--hard", &f.head]).unwrap();
+    f.pr_moved_to(&out);
+    let err = f.update().unwrap_err();
+    assert!(
+        err.contains("overwrite ignored file `build/out.txt`"),
+        "{err}"
+    );
+    assert_eq!(
+        fs::read_to_string(f.wt.join("build/out.txt")).unwrap(),
+        "mine\n"
+    );
+    assert_eq!(f.oid("HEAD"), f.head);
+}
+
+#[test]
+fn fetch_updates_ignores_same_named_tag() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-tag");
+    let new = f.loose_commit(&f.head);
+    f.pr_moved_to(&new);
+    git(&f.wt, &["tag", "feature"]).unwrap();
+    let (result, _) = f.click();
+    assert!(result.unwrap().contains(&new[..7]));
+    assert_eq!(f.oid("refs/heads/feature"), new);
+}
+
+#[test]
+fn fetch_updates_refuses_other_branch_or_detached() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-elsewhere");
+    let new = f.loose_commit(&f.head);
+    f.pr_moved_to(&new);
+    // Both at the old head, so only the branch name differs.
+    for checkout in [
+        &["checkout", "-qb", "other"][..],
+        &["checkout", "-q", "--detach"],
+    ] {
+        git(&f.wt, checkout).unwrap();
+        let result = f.update();
+        let err = result.unwrap_err();
+        assert!(err.contains("not on branch `feature`"), "{err}");
+        assert_eq!(f.oid("HEAD"), f.head);
+        assert_eq!(f.oid("refs/shark/pull/7/head"), f.head);
+        git(&f.wt, &["checkout", "-q", "feature"]).unwrap();
+    }
+}
+
+#[test]
+fn fetch_updates_refuses_staged_change() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("fetch-updates-staged");
+    let new = f.loose_commit(&f.head);
+    f.pr_moved_to(&new);
+    fs::write(f.wt.join("staged.txt"), "mine\n").unwrap();
+    git(&f.wt, &["add", "staged.txt"]).unwrap();
+    let result = f.update();
+    assert!(result.unwrap_err().contains("uncommitted"));
+    assert_eq!(f.oid("refs/shark/pull/7/head"), f.head);
+    assert_eq!(f.oid("HEAD"), f.head);
+    assert_eq!(
+        fs::read_to_string(f.wt.join("staged.txt")).unwrap(),
+        "mine\n"
+    );
+    git(&f.wt, &["diff", "--cached", "--quiet", "--exit-code"]).unwrap_err();
+}
+
+#[test]
+fn poll_never_fetches_review_head() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("poll-review-head");
+    let new = f.loose_commit(&f.head);
+    f.pr_moved_to(&new);
+    let mut pr = f.pr(7, "release", "OPEN");
+    pr["headRefOid"] = new.clone().into();
+    f.write("review.json", pr);
+    let p = run_job(&f.job(true, true, &[]));
+    assert_eq!(p.fetch_error, None);
+    assert_eq!(f.oid("refs/shark/pull/7/base"), f.release);
+    assert_eq!(f.oid("refs/shark/pull/7/head"), f.head);
+    let repos = f.repos(p, &[]);
+    assert_eq!(status::next_action(&repos, &[]).kind, Kind::FetchReview);
+}
+
+#[test]
+fn review_guard_still_blocks_other_kinds() {
+    let _lock = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new("review-guard");
+    let repos = f.repos(run_job(&f.job(false, true, &[])), &[]);
+    let a = Action {
+        label: "Pull".into(),
+        kind: Kind::Pull,
+        repos: vec![],
+        attention: false,
+        reviews: vec![],
+    };
+    let job = f.job(false, true, &repos);
+    let new_pr = crate::pr::NewPr::new("", false);
+    let err = run_step(a, &f.ws, job, &[], &[], &new_pr, false, false).unwrap_err();
+    assert!(err.contains("local PR review checkout"), "{err}");
 }
