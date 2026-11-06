@@ -7,10 +7,12 @@ use copy::{copy_included, untracked_fingerprint};
 mod tests;
 pub use changes::{discard_file, uncommitted_files};
 use std::{
+    collections::{BTreeMap, HashSet},
     fs,
     os::unix::{ffi::OsStrExt, fs::MetadataExt},
     path::{Path, PathBuf},
     process::{Command, Output},
+    sync::atomic::{AtomicBool, Ordering},
 };
 
 pub fn run(dir: &Path, prog: &str, args: &[&str]) -> Result<Output, String> {
@@ -869,14 +871,92 @@ fn write_root_docs(ws: &Workspace, dir: &Path) -> Result<(), String> {
     let [claude, agents] = ROOT_DOCS;
     fs::write(dir.join(claude), claude_md(ws, dir))
         .and_then(|()| fs::write(dir.join(agents), agents_md(ws, dir)))
-        .map_err(|e| e.to_string())
+        .map_err(|e| e.to_string())?;
+    link_skills(ws, dir, repo_skills());
+    Ok(())
 }
 
-/// What Shark itself leaves in a workspace root: its docs, Finder litter, and the `.context`
-/// folder of attachments.
-fn root_owned() -> [&'static str; 4] {
+/// Whether agents get the repos' skills: `State::no_repo_skills`, here for the spawn paths.
+static REPO_SKILLS: AtomicBool = AtomicBool::new(true);
+
+pub fn repo_skills() -> bool {
+    REPO_SKILLS.load(Ordering::Relaxed)
+}
+
+pub fn set_repo_skills(on: bool) {
+    REPO_SKILLS.store(on, Ordering::Relaxed);
+}
+
+/// `--add-dir` for each repo: claude loads a repo's `.claude/skills` and `.claude/commands` at
+/// start only from its own cwd upward or from these. A clash shows as `/repo:skill`.
+pub fn claude_skill_args(ws: &Workspace) -> Vec<String> {
+    if !repo_skills() {
+        return vec![];
+    }
+    (ws.repos.iter())
+        .map(|r| ws.dir().join(&r.name))
+        .filter(|p| p.exists())
+        .flat_map(|p| ["--add-dir".into(), p.to_string_lossy().into_owned()])
+        .collect()
+}
+
+const AGENTS_DIR: &str = ".agents";
+/// Where codex looks at the workspace root.
+const SKILL_LINKS: &str = ".agents/skills";
+
+/// Links each repo's skills into the root, or removes the links: codex has no `--add-dir` and
+/// only looks from its cwd upward. It doesn't read `.claude/skills`, so those count too. A name
+/// a second repo shares becomes `<repo>-<skill>`, as a link can't rename what codex lists.
+/// Anything but our own links stays; a failure only leaves them stale.
+pub fn link_skills(ws: &Workspace, dir: &Path, on: bool) {
+    let links = dir.join(SKILL_LINKS);
+    let mut want = BTreeMap::new();
+    for r in ws.repos.iter().filter(|_| on) {
+        let mut own = HashSet::new();
+        for src in [SKILL_LINKS, ".claude/skills"] {
+            let found = fs::read_dir(dir.join(&r.name).join(src));
+            for e in found.into_iter().flatten().flatten() {
+                let skill = e.file_name().to_string_lossy().into_owned();
+                if !e.path().join("SKILL.md").exists() || !own.insert(skill.clone()) {
+                    continue;
+                }
+                let target = Path::new("../..").join(&r.name).join(src).join(&skill);
+                let link = match want.contains_key(&skill) {
+                    true => format!("{}-{skill}", r.name),
+                    false => skill,
+                };
+                want.insert(link, target);
+            }
+        }
+    }
+    for e in fs::read_dir(&links).into_iter().flatten().flatten() {
+        let name = e.file_name().to_string_lossy().into_owned();
+        if fs::read_link(e.path())
+            .is_ok_and(|t| t.starts_with("../..") && want.get(&name) != Some(&t))
+        {
+            let _ = fs::remove_file(e.path());
+        }
+    }
+    if want.is_empty() {
+        let _ = fs::remove_dir(&links).and_then(|()| fs::remove_dir(dir.join(AGENTS_DIR)));
+    } else if fs::create_dir_all(&links).is_ok() {
+        for (name, target) in want {
+            let _ = std::os::unix::fs::symlink(target, links.join(name));
+        }
+    }
+}
+
+/// What Shark itself leaves in a workspace root: its docs, Finder litter, the `.context` folder
+/// of attachments and the skill links.
+fn root_owned() -> [&'static str; 5] {
     let [claude, agents] = ROOT_DOCS;
-    [claude, agents, ".DS_Store", attachments_parts().0]
+    [
+        claude,
+        agents,
+        ".DS_Store",
+        attachments_parts().0,
+        AGENTS_DIR,
+    ]
 }
 
 fn attachments_parts() -> (&'static str, &'static str) {
@@ -886,13 +966,25 @@ fn attachments_parts() -> (&'static str, &'static str) {
 }
 
 /// Whether `name` in the root is Shark's, not the user's: `.context` only counts while it
-/// holds nothing but attachments (unreadable, or a file, is unexpected: refuse before removing).
+/// holds nothing but attachments and `.agents` nothing but skill links (unreadable, or a file,
+/// is unexpected: refuse before removing).
 fn shark_owned(dir: &Path, name: &str) -> bool {
     let (context, attachments) = attachments_parts();
     root_owned().contains(&name)
         && (name != context
             || fs::read_dir(dir.join(name))
                 .is_ok_and(|mut es| es.all(|e| e.is_ok_and(|e| e.file_name() == attachments))))
+        && (name != AGENTS_DIR || only_skill_links(dir))
+}
+
+fn only_skill_links(dir: &Path) -> bool {
+    let links = dir.join(SKILL_LINKS);
+    fs::read_dir(dir.join(AGENTS_DIR))
+        .is_ok_and(|mut es| es.all(|e| e.is_ok_and(|e| e.file_name() == "skills")))
+        && (!links.exists()
+            || fs::read_dir(&links).is_ok_and(|mut es| {
+                es.all(|e| e.is_ok_and(|e| e.file_type().is_ok_and(|t| t.is_symlink())))
+            }))
 }
 
 fn claude_md(ws: &Workspace, dir: &Path) -> String {

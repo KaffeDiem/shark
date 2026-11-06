@@ -38,6 +38,7 @@ Open-source GPUI apps in the same space, worth reading: **Arbor** (worktrees, te
 - Event types: `system/init` (carries `session_id`), `stream_event` (text deltas), `assistant` (full content blocks), `user` (tool_result), `result`. Use `--resume <id>` to continue a session. SIGTERM, then resume, is safe.
 - Headless `-p` denies tools that need approval, so the agent needs `bypassPermissions` (or a host permission prompt).
 - **Multi-repo caveat:** with cwd = the workspace root, a repo's `CLAUDE.md` loads only after the agent touches that subdirectory, and its `.claude/settings.json`, hooks and `.mcp.json` are ignored. `--add-dir` grants file access but doesn't load CLAUDE.md unless `CLAUDE_CODE_ADDITIONAL_DIRECTORIES_CLAUDE_MD=1` is set. Shark writes a root `CLAUDE.md` that `@`-imports each repo's file. https://code.claude.com/docs/en/memory
+- **Skills in a multi-repo root (2.1.309):** nested `.claude/skills` load only once the agent touches a file there. `--add-dir` loads a directory's `.claude/skills` and `.claude/commands` at start and watches the skills; a clash gets a `/dir:skill` name. A symlink in the root's `.claude/skills` also loads, but the frontmatter `name` wins, so a renamed link can't resolve a clash. https://code.claude.com/docs/en/skills
 - Licensing: building on a user's claude.ai subscription needs Anthropic's approval for third-party products.
 
 ## Driving Codex (codex-cli 0.164.0, checked Oct 2026)
@@ -58,6 +59,7 @@ Open-source GPUI apps in the same space, worth reading: **Arbor** (worktrees, te
 - Fast mode is a service tier. `"fast"` is sent on the wire as `"priority"`; `"default"` is standard speed. `thread/start`, `thread/resume` and `turn/start` take `serviceTier`, which holds for later turns (`serviceTierForTurn` is for one turn). Omitted, `service_tier` in `config.toml` applies; the start and resume results report it. An unknown value is accepted silently. `model/list` lists each model's `serviceTiers` (all current models offer `priority`, "Fast"). The TUI's `/fast` toggles between `priority` and `default` and saves it to config; its "Toggle Fast Mode" key has no default binding. Shift+Tab cycles collaboration modes.
 - `model/list` on a Pro plan: `gpt-6.1-sol` (default), `gpt-6-astra`, `gpt-6-sol`, `gpt-6-luna`, `gpt-5.6-sol`, `gpt-5.6-terra`, `gpt-5.6-luna`.
 - A non-git workspace root is fine. `instructionSources` lists `~/.codex/AGENTS.md` and the root `AGENTS.md`. Codex has no `@` imports, so the root file points at each repo's file.
+- Skills: `.agents/skills` from the cwd up to the repo root, never below it, and no `.claude/skills`. Symlinked skill folders work, changes are picked up without a restart, and two skills with one `name` both appear. `skills/list {cwds}` on the app server shows what a directory gets. https://learn.chatgpt.com/docs/build-skills
 - Licensing: Shark only launches the user's own `codex` CLI with its own login, the same arrangement as with `claude`.
 
 ## Git worktree pitfalls

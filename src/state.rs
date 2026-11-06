@@ -47,6 +47,9 @@ pub struct State {
     /// Keep the Mac from idle-sleeping while an agent works (`Shark::update_awake`).
     #[serde(default)]
     pub stay_awake: bool,
+    /// Keep the repos' skills from the agents (`git::claude_skill_args`, `git::link_skills`).
+    #[serde(default)]
+    pub no_repo_skills: bool,
     /// Where `load` moved an unreadable state.json, for the launch notice.
     #[serde(skip)]
     pub corrupt_backup: Option<PathBuf>,

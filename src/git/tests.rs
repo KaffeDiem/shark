@@ -195,6 +195,67 @@ fn init_repo(root: &Path, name: &str) -> Repo {
 }
 
 #[test]
+fn skills_link_into_the_root_and_archive_with_it() {
+    let root = std::env::temp_dir().join(format!("shark-skills-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let (api, web) = (init_repo(&root, "api"), init_repo(&root, "web"));
+    let dir = root.join("ws/feat");
+    let ws = create_workspace(&dir, "feat", "feat", &on_branch(&[api, web], "feat")).unwrap();
+    let skill = |repo: &str, src: &str, name: &str| {
+        let p = dir.join(repo).join(src).join(name);
+        fs::create_dir_all(&p).unwrap();
+        fs::write(p.join("SKILL.md"), "hi\n").unwrap();
+    };
+    skill("api", ".agents/skills", "deploy");
+    skill("api", ".claude/skills", "deploy"); // the same repo: `.agents` wins
+    skill("web", ".claude/skills", "deploy");
+    skill("web", ".claude/skills", "lint");
+    fs::create_dir_all(dir.join("web/.agents/skills/not-a-skill")).unwrap();
+    fs::write(dir.join("web/.agents/skills/not-a-skill/README.md"), "x").unwrap();
+    let links = dir.join(".agents/skills");
+    let names = || {
+        let mut n: Vec<_> = (fs::read_dir(&links).unwrap().flatten())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        n.sort();
+        n
+    };
+
+    link_skills(&ws, &dir, true);
+    assert_eq!(names(), ["deploy", "lint", "web-deploy"]);
+    assert!(links.join("deploy/SKILL.md").exists());
+    assert_eq!(
+        fs::canonicalize(links.join("web-deploy")).unwrap(),
+        fs::canonicalize(dir.join("web/.claude/skills/deploy")).unwrap()
+    );
+
+    // A skill gone from its repo loses its link; a link the user made keeps its place.
+    fs::remove_dir_all(dir.join("web/.claude/skills/lint")).unwrap();
+    std::os::unix::fs::symlink(&root, links.join("mine")).unwrap();
+    link_skills(&ws, &dir, true);
+    assert_eq!(names(), ["deploy", "mine", "web-deploy"]);
+    fs::remove_file(links.join("mine")).unwrap();
+
+    // Links don't block an archive, but a skill of the user's in the root does.
+    for repo in ["api", "web"] {
+        let wt = dir.join(repo);
+        git(&wt, &["add", ".agents", ".claude"]).unwrap();
+        commit(&wt, &["-qm", "skills"]);
+    }
+    archive_preflight(&ws, &dir, false).unwrap();
+    fs::create_dir(links.join("real")).unwrap();
+    let err = archive_preflight(&ws, &dir, false).unwrap_err();
+    assert!(err.contains(".agents"), "{err}");
+    fs::remove_dir(links.join("real")).unwrap();
+
+    link_skills(&ws, &dir, false);
+    assert!(!dir.join(".agents").exists());
+    link_skills(&ws, &dir, true);
+    remove_workspace(&ws, &dir, false).unwrap();
+    assert!(!dir.exists());
+}
+
+#[test]
 fn pr_checkout_uses_exact_tip_base_and_rolls_back() {
     let root = std::env::temp_dir().join(format!("shark-pr-checkout-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);

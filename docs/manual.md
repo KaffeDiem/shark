@@ -81,6 +81,7 @@ Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH. For Codex
   - **Add repo to workspace…** (`cmd-k`) adds a worktree for another repo on the same branch the same way, rewrites the root `CLAUDE.md`, and the agent is told about it with the next message.
   - Gitignored files that match `.worktreeinclude` (default `.env*`) are copied into the new worktree.
   - A root `CLAUDE.md` is written that lists the repos (with each one's GitHub URL, so a PR URL maps to its folder) and `@`-imports each repo's own CLAUDE.md.
+  - **Skills from repos** (on by default, Settings > General): agents run in the workspace root, where neither CLI finds a repo's skills. Claude chats start with `--add-dir` per repo, which loads `.claude/skills` and `.claude/commands`; a skill two repos share shows as `/repo:skill`. For Codex chats, the root's `.agents/skills` holds a link to each skill in a repo's `.agents/skills` or `.claude/skills`, refreshed when a Codex chat starts; a shared name gets a `<repo>-<skill>` link, though Codex lists both under the skill's own name. Turning it off removes the links, and a running Claude chat restarts on its next message.
 - **Open in an app:** the menus and `cmd-k` list every app macOS has registered to open folders (terminals, editors, git clients such as Fork), plus JetBrains IDEs, Android Studio and others that open folders without registering for them, each with its own icon, found once at launch. Terminals and editors open the workspace folder or a repo, git clients a repo, and Xcode an `.xcworkspace`, else `.xcodeproj`, else `Package.swift` (only in a repo without a project), in a repo or two folders down; Xcode shows only where there's one. With several repos or projects, `cmd-k` asks which.
 - **Menu bar:** the Shark, File, Edit, View and Window menus run the same actions as the keys and the palette.
 - **Restart:** the open workspace and tab (Chat or Diff, or Home over it) are saved in `state.json` and reopened at launch, on the chat tab last shown. With nothing to reopen, Shark starts on Home.
@@ -136,7 +137,7 @@ Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH. For Codex
   - A finished turn (off screen, or with the window in the background) and a workspace off screen that starts needing you raise a macOS notification through `osascript` (`UNUserNotificationCenter` needs an app bundle, which `cargo run` isn't), so it's listed under Script Editor in System Settings → Notifications.
 - **Settings** (`cmd-,`; `src/settings.rs`): changes apply and save to `state.json` at once.
   - Appearance: mode (System/Light/Dark), a theme for light mode and one for dark mode (Linear, Roraima, Everest, Sequoia, Sakura; popular editor themes GitHub, One, Dracula, Catppuccin, Tokyo Night, Gruvbox, Nord, Rosé Pine, Solarized, Ayu, Kanagawa; and Graphite, Dune, Obsidian, Neon, Lagoon), interface and code font (any installed font).
-  - General: stay awake, Vim mode.
+  - General: stay awake, Vim mode, skills from repos.
   - Prompts: every prompt the git button sends to the agent (`src/prompts.rs`) can be edited; `{repos}` and `{branch}` are filled in. Only edits are saved, and "Reset to default" drops the edit.
 - **About** (Shark > About Shark): version, author, repo link, Shark's GPL-3.0 notice.
 - **PRs:**

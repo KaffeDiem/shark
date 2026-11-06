@@ -150,6 +150,8 @@ pub struct Chat {
     /// respawns it on the next send.
     agent_model: Option<String>,
     agent_effort: &'static str,
+    /// Whether the running claude got the repos' skills (`git::claude_skill_args`).
+    agent_skills: bool,
     /// Virtualized: only visible rows render, which matters while a spinner redraws every frame.
     list: ListState,
     pub focus: FocusHandle,
@@ -323,6 +325,7 @@ impl Chat {
             model_at: Default::default(),
             agent_model: None,
             agent_effort: EFFORT,
+            agent_skills: true,
             list: ListState::new(1, ListAlignment::Top, px(400.)), // the activity footer
             focus: cx.focus_handle(),
             reader: None,
@@ -659,7 +662,9 @@ impl Chat {
         }
         // Never mid-turn: a steer would kill the turn it means to steer.
         let stale = self.agent_model != self.meta.model
-            || (!self.codex() && self.agent_effort != self.effort());
+            || (!self.codex()
+                && (self.agent_effort != self.effort()
+                    || self.agent_skills != crate::git::repo_skills()));
         if self.agent.is_some() && stale && !self.busy && !self.steered {
             self.agent = None; // drop stops it; the respawn resumes the same session on the new model/level
             self.set_background(vec![], cx); // its reader is replaced below, so its Exited never arrives
@@ -676,6 +681,7 @@ impl Chat {
                     self.agent = Some(a);
                     self.agent_model = self.meta.model.clone();
                     self.agent_effort = self.effort();
+                    self.agent_skills = crate::git::repo_skills();
                     self.reader = Some(read_events(rx, Self::apply, cx));
                 }
                 Err(e) => {
