@@ -321,11 +321,7 @@ impl RenderOnce for AttachRow {
                 .test_support()
         });
         h_flex()
-            // Chips have `+N`; the branch button beside them has nothing to fall back on.
-            .map(|mut d| {
-                d.style().flex_shrink = Some(8.);
-                d
-            })
+            .flex_shrink_1()
             .min_w_0()
             .gap_1()
             .child(
@@ -1254,19 +1250,139 @@ impl Shark {
         }
     }
 
-    /// What the header shows from chip `from` on, by group: label, status mark and what the row
-    /// opens, which is what its chip opens. All of it and the Attach offers, when they're
-    /// possible, for cmd-k.
+    /// Branch actions remain reachable when the toolbar is hidden or its chips overflow.
+    pub(super) fn open_branch_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(ws) = self.active_ws() else {
+            return notify_err(window, cx, "Open an agent first");
+        };
+        let name = ws.name.clone();
+        let repos = self.repo_rows(ws);
+        match repos.len() {
+            0 => self.attach_repository(name, window, cx),
+            1 => self.repository_menu(name, repos[0].repo.clone(), None, window, cx),
+            _ => {
+                let items = repos
+                    .iter()
+                    .map(|r| {
+                        let branch = ws
+                            .repos
+                            .iter()
+                            .find(|repo| repo.name == r.repo)
+                            .filter(|_| r.standing == Standing::Ready)
+                            .map(|repo| {
+                                menus::repo_branch(self, ws, repo, cx)
+                                    .unwrap_or_else(|| "Detached HEAD".into())
+                            });
+                        CommandItem::new()
+                            .label(format!(
+                                "{} · {}",
+                                r.repo,
+                                branch.as_deref().unwrap_or(r.state)
+                            ))
+                            .icon(r.standing.mark(cx.theme()))
+                    })
+                    .collect();
+                open_menu(
+                    cx.entity().downgrade(),
+                    "Repository branch…",
+                    items,
+                    0,
+                    move |s, row, w, cx| {
+                        s.repository_menu(name.clone(), repos[row].repo.clone(), None, w, cx)
+                    },
+                    window,
+                    cx,
+                );
+            }
+        }
+    }
+
+    /// The same destination from a chip, overflow, and the keyboard picker.
+    pub(super) fn repository_menu(
+        &mut self,
+        name: String,
+        repo: String,
+        position: Option<Point<Pixels>>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(ws) = self.ws(&name) else { return };
+        let Some(row) = self.repo_rows(ws).into_iter().find(|r| r.repo == repo) else {
+            return;
+        };
+        if row.standing != Standing::Ready {
+            return self.attachment_menu(name, repo, window, cx);
+        }
+        let entries = menus::branch_entries(self, ws, Some(&repo), cx);
+        let position =
+            position.unwrap_or_else(|| point(window.viewport_size().width / 2., px(48.)));
+        self.show_menu(position, entries, window, cx);
+    }
+
+    fn repository_tip(
+        &self,
+        ws: &Workspace,
+        repo: &crate::state::WsRepo,
+        branch: &str,
+        cx: &App,
+    ) -> String {
+        let attached = ws.branch_of(repo);
+        let context = if branch == attached {
+            format!("{} ← {branch}", repo.base)
+        } else {
+            format!("Checked out: {branch}\nBase: {} ← {attached}", repo.base)
+        };
+        let mut tip = format!(
+            "{}\n{context}\nWorktree: {}",
+            repo.name,
+            ws.dir().join(&repo.name).display()
+        );
+        let probed = self
+            .syncs
+            .get(&ws.name)
+            .and_then(|sync| sync.read(cx).repos())
+            .and_then(|repos| repos.iter().find(|r| r.name == repo.name));
+        match probed {
+            None => tip.push_str("\nGit status not yet checked"),
+            Some(r) => {
+                if let Err(error) = &r.local {
+                    tip.push_str(&format!("\nGit status unavailable: {error}"));
+                }
+            }
+        }
+        if let Some(stack) = menus::stacks(self, ws, cx)
+            .iter()
+            .find(|s| s.repo == repo.name)
+        {
+            tip.push_str(&format!(
+                "\nStack: {} of {}",
+                stack.me + 1,
+                stack.nodes.len()
+            ));
+        }
+        tip
+    }
+
+    /// What the header shows from chip `from` on, grouped with the available Attach offers.
     pub(super) fn attachment_rows(
         &self,
         ws: &Workspace,
         from: usize,
-        theme: &Theme,
+        cx: &App,
     ) -> Vec<(Option<&'static str>, Vec<ListRow>)> {
+        let theme = cx.theme();
         let rows = self.repo_rows(ws);
         let past_repos = from.saturating_sub(rows.len());
         let repos = rows.into_iter().skip(from).map(|r| {
-            let label = format!("{} · {}", r.repo, r.state);
+            let branch = ws
+                .repos
+                .iter()
+                .find(|repo| repo.name == r.repo)
+                .filter(|_| r.standing == Standing::Ready)
+                .map(|repo| {
+                    menus::repo_branch(self, ws, repo, cx).unwrap_or_else(|| "Detached HEAD".into())
+                });
+            let label = format!("{} · {}", r.repo, branch.as_deref().unwrap_or(r.state));
             (label, r.standing.mark(theme), Pick::Repo(r.repo))
         });
         let issues = (ws.linear.ordered()).skip(past_repos).map(|r| {
@@ -1300,7 +1416,7 @@ impl Shark {
     ) {
         let Some(ws) = self.ws(&name) else { return };
         let mut picks = vec![];
-        let groups = (self.attachment_rows(ws, from, cx.theme()).into_iter())
+        let groups = (self.attachment_rows(ws, from, cx).into_iter())
             .map(|(heading, rows)| {
                 let items = rows.into_iter().map(|(label, icon, pick)| {
                     picks.push(pick);
@@ -1324,7 +1440,7 @@ impl Shark {
             groups,
             0,
             move |s, row, w, cx| match &picks[row] {
-                Pick::Repo(repo) => s.attachment_menu(name.clone(), repo.clone(), w, cx),
+                Pick::Repo(repo) => s.repository_menu(name.clone(), repo.clone(), None, w, cx),
                 Pick::Issue(r) => s.issue_details(name.clone(), r.clone(), w, cx),
                 Pick::Attach => s.attach_dialog(name.clone(), vec![], w, cx),
                 Pick::AttachIssue => s.attach_linear_issue(name.clone(), w, cx),
@@ -1371,23 +1487,61 @@ impl Shark {
         let mut chips: Vec<AnyElement> = (rows.into_iter())
             .map(|r| {
                 let ready = r.standing == Standing::Ready;
-                let kind = if ready { "repo" } else { "attach" };
-                let (n, repo, tip) = (name.clone(), r.repo.clone(), r.tip);
-                Self::chip(
-                    SharedString::from(format!("{kind}-chip-{}", r.repo)),
-                    r.standing.mark(cx.theme()),
-                    r.repo.clone(),
-                    cx.theme(),
-                )
-                .aria_label(format!("{}: {}", r.repo, r.state))
-                .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
-                .when(!ready, |d| {
-                    d.cursor_pointer().on_click(cx.listener(move |s, _, w, cx| {
+                let (n, repo) = (name.clone(), r.repo.clone());
+                if !ready {
+                    return Self::chip(
+                        SharedString::from(format!("attach-chip-{}", r.repo)),
+                        r.standing.mark(cx.theme()),
+                        r.repo.clone(),
+                        cx.theme(),
+                    )
+                    .aria_label(format!("{}: {}", r.repo, r.state))
+                    .tooltip(move |w, cx| Tooltip::new(r.tip.clone()).build(w, cx))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |s, _, w, cx| {
                         s.attachment_menu(n.clone(), repo.clone(), w, cx)
                     }))
-                })
-                .test_support()
-                .into_any_element()
+                    .test_support()
+                    .into_any_element();
+                }
+                let attached = ws.repos.iter().find(|repo| repo.name == r.repo).unwrap();
+                let branch = menus::repo_branch(self, ws, attached, cx)
+                    .unwrap_or_else(|| "Detached HEAD".into());
+                let tip = self.repository_tip(ws, attached, &branch, cx);
+                let (right_name, right_repo) = (name.clone(), r.repo.clone());
+                Button::new(SharedString::from(format!("repo-chip-{}", r.repo)))
+                    .ghost()
+                    .xsmall()
+                    .h(px(22.))
+                    .max_w(px(280.))
+                    .px_1p5()
+                    .rounded(cx.theme().radius)
+                    .bg(cx.theme().muted)
+                    .icon(r.standing.mark(cx.theme()))
+                    .label(format!("{} · {branch}", r.repo))
+                    .dropdown_caret(true)
+                    .accessibility_label(format!(
+                        "{}: ready · {}",
+                        r.repo,
+                        tip.split_once('\n').unwrap().1
+                    ))
+                    .tooltip(tip)
+                    .on_click(cx.listener(move |s, e: &ClickEvent, w, cx| {
+                        s.repository_menu(n.clone(), repo.clone(), Some(e.position()), w, cx)
+                    }))
+                    .on_mouse_down(
+                        MouseButton::Right,
+                        cx.listener(move |s, e: &MouseDownEvent, w, cx| {
+                            s.repository_menu(
+                                right_name.clone(),
+                                right_repo.clone(),
+                                Some(e.position),
+                                w,
+                                cx,
+                            )
+                        }),
+                    )
+                    .into_any_element()
             })
             .collect();
         chips.extend(self.issue_chips(ws, cx));

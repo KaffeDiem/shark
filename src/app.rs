@@ -13,7 +13,6 @@ use gpui_kit::assets::IconName;
 use gpui_kit::base::InteractiveElementExt as _;
 use gpui_kit::component::button::{Button, ButtonVariants as _};
 use gpui_kit::component::command::{Command, CommandGroup, CommandItem, CommandState};
-use gpui_kit::component::hover_card::HoverCard;
 use gpui_kit::component::input::{Input, InputEvent, InputState};
 use gpui_kit::component::kbd::Kbd;
 use gpui_kit::component::link::Link;
@@ -157,8 +156,6 @@ pub struct Shark {
     usage_due: Option<std::time::Instant>,
     content_focus: FocusHandle,
     interaction_save: Option<Task<()>>,
-    /// The header's branch button as last painted: "Branch menu…" hangs its menu from it.
-    branch_at: Rc<std::cell::Cell<Bounds<Pixels>>>,
     /// The latest dependency check; empty until the first one lands.
     pub(crate) deps: Vec<crate::deps::Dep>,
     deps_check: Option<Task<()>>,
@@ -314,7 +311,6 @@ impl Shark {
             usage_due: None,
             content_focus: cx.focus_handle(),
             interaction_save: None,
-            branch_at: Default::default(),
             deps: vec![],
             deps_check: None,
             linear: Default::default(),
@@ -364,17 +360,6 @@ impl Shark {
     ) {
         let m = menu::open_at(entries, pos, anchor, window, cx);
         menu::hold(self, m, |s| &mut s.menu, cx);
-    }
-
-    /// "Branch menu…": the header's branch menu, hanging from the button, from the keyboard.
-    fn open_branch_menu(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws() else {
-            return notify_err(window, cx, "Open an agent first");
-        };
-        let entries = menus::branch_entries(self, ws, cx);
-        let b = self.branch_at.get();
-        let pos = point(b.right(), b.bottom() + px(4.));
-        self.show_menu_at(entries, pos, Anchor::TopRight, window, cx);
     }
 
     fn ws(&self, name: &str) -> Option<&Workspace> {
@@ -752,15 +737,6 @@ impl Shark {
                     .border_color(theme.border)
                     .child(self.render_run(cx))
                     .child(attachments)
-                    .when(!no_repos, |d| {
-                        d.child(
-                            div()
-                                .flex_shrink_1()
-                                .min_w(px(28.))
-                                .overflow_hidden()
-                                .child(self.render_branch(cx)),
-                        )
-                    })
                     .child(
                         div()
                             .flex_1()
@@ -808,109 +784,6 @@ impl Shark {
         }
     }
 
-    /// The header's branch label, `base ← branch`, with a stack icon and the branch's place in
-    /// its stack (`2/3`) when it is part of one; hovering lists each repo's branch, linked to
-    /// GitHub once pushed, and the base it targets. Either click opens the branch menu.
-    fn render_branch(&self, cx: &Context<Self>) -> impl IntoElement {
-        let theme = cx.theme();
-        let branch = self
-            .active_ws()
-            .map(|w| w.branch.clone())
-            .unwrap_or_default();
-        let links = self
-            .active_sync()
-            .map(|s| s.read(cx).branches())
-            .unwrap_or_default();
-        let stacks = (self.active_ws())
-            .map(|w| menus::stacks(self, w, cx))
-            .unwrap_or_default();
-        let label = (self.active_ws())
-            .map(|w| menus::branch_label(self, w, cx))
-            .unwrap_or_default();
-        let place = |s: &menus::RepoStack| format!("{}/{}", s.me + 1, s.nodes.len());
-        let position = stacks.first().map(place);
-        let per_repo: Vec<(String, String)> =
-            stacks.iter().map(|s| (s.repo.clone(), place(s))).collect();
-        HoverCard::new("branch-card")
-            .anchor(Anchor::TopRight)
-            .trigger(
-                Button::new("branch")
-                    .ghost()
-                    .xsmall()
-                    .w_full()
-                    .h(px(28.))
-                    .min_w_0()
-                    .gap_1p5()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .accessibility_label(label.clone())
-                    .child(
-                        Icon::new(match position {
-                            Some(_) => IconName::Layers,
-                            None => IconName::GitBranch,
-                        })
-                        .with_size(px(12.))
-                        .flex_none(),
-                    )
-                    .child(div().min_w_0().truncate().child(label))
-                    .children(position.map(|p| div().flex_shrink_0().child(p)))
-                    .child({
-                        let at = self.branch_at.clone();
-                        canvas(move |b, _, _| at.set(b), |_, _, _, _| {})
-                            .absolute()
-                            .top_0()
-                            .left_0()
-                            .size_full()
-                    })
-                    .on_any_mouse_down(cx.listener(|this, e: &MouseDownEvent, w, cx| {
-                        if !matches!(e.button, MouseButton::Left | MouseButton::Right) {
-                            return;
-                        }
-                        let Some(ws) = this.active_ws() else { return };
-                        let entries = menus::branch_entries(this, ws, cx);
-                        this.show_menu(e.position, entries, w, cx);
-                    })),
-            )
-            .content(move |_, _, cx| {
-                let theme = cx.theme();
-                v_flex()
-                    .gap_1()
-                    .text_xs()
-                    .child(
-                        div()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("Branch {branch}")),
-                    )
-                    .children(links.iter().enumerate().map(|(ix, b)| {
-                        h_flex()
-                            .gap_1p5()
-                            .child(Icon::new(IconName::FolderGit2).with_size(px(12.)))
-                            .child(match &b.url {
-                                Some(u) => Link::new(("branch-link", ix))
-                                    .href(u.clone())
-                                    .child(b.repo.clone())
-                                    .into_any_element(),
-                                None => h_flex()
-                                    .gap_1p5()
-                                    .child(b.repo.clone())
-                                    .child(
-                                        div()
-                                            .text_color(theme.muted_foreground)
-                                            .child("not on GitHub"),
-                                    )
-                                    .into_any_element(),
-                            })
-                            .child(div().text_color(theme.muted_foreground).child(
-                                match per_repo.iter().find(|(r, _)| *r == b.repo) {
-                                    Some((_, at)) => {
-                                        format!("{} → {} · stack {at}", b.name, b.base)
-                                    }
-                                    None => format!("{} → {}", b.name, b.base),
-                                },
-                            ))
-                    }))
-            })
-    }
     /// Zen (cmd-.): the shown tab alone on the content background. Its bar keeps the traffic
     /// lights clear, drags the window and holds the tab's own controls (Diff's).
     fn render_zen(&self, cx: &mut Context<Self>) -> Div {

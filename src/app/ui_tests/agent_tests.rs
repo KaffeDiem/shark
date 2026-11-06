@@ -559,7 +559,7 @@ async fn empty_diff_and_git_offer_attaching(cx: &mut TestAppContext) {
     );
     refused(
         cx,
-        &|s, w, cx| s.change_base(ws.name.clone(), w, cx),
+        &|s, w, cx| s.change_base(ws.name.clone(), None, w, cx),
         "base",
     );
     refused(

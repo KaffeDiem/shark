@@ -150,7 +150,7 @@ pub(super) fn ws_menu(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<
         &paths,
         |p, w, cx| copy(p.display().to_string(), w, cx),
     )]);
-    entries.extend(branch_entries(this, ws, cx));
+    entries.extend(branch_entries(this, ws, None, cx));
     entries.extend([
         Entry::Sep,
         menu::item(
@@ -209,24 +209,6 @@ pub(super) fn stacks(this: &Shark, ws: &Workspace, cx: &App) -> Vec<RepoStack> {
             })
         })
         .collect()
-}
-
-/// The header's `base ← branch`: the stacked repos' parent when they share one (a backend repo
-/// on `main` next to a stacked iOS repo still reads `logic ← ui`), else the base every repo
-/// shares, else the branch alone.
-pub(super) fn branch_label(this: &Shark, ws: &Workspace, cx: &App) -> String {
-    let probed = (this.syncs.get(&ws.name))
-        .and_then(|s| s.read(cx).repos().map(<[_]>::to_vec))
-        .unwrap_or_default();
-    let parents: Vec<&str> = probed.iter().filter_map(|r| r.stacked()).collect();
-    let bases: Vec<&str> = match parents.is_empty() {
-        false => parents,
-        true => (ws.repos.iter())
-            .filter(|r| r.base.starts_with("origin/"))
-            .map(|r| crate::git::short(&r.base))
-            .collect(),
-    };
-    crate::stack::title(&ws.branch, &bases)
 }
 
 /// A stack's rows, newest on top, the workspace's own checked. A row opens its workspace,
@@ -291,10 +273,35 @@ fn stack_rows(
         .collect()
 }
 
-/// The stack rows (one repo's inline, several as a submenu each), then restack, new on top,
-/// insert below, copy and change base, then what's on GitHub. Shared by the sidebar's and the
-/// header's menus.
-pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) -> Vec<Entry> {
+/// The checked-out branch, with saved state before a successful probe; None means detached.
+pub(super) fn repo_branch(
+    this: &Shark,
+    ws: &Workspace,
+    repo: &crate::state::WsRepo,
+    cx: &App,
+) -> Option<String> {
+    let local = this
+        .syncs
+        .get(&ws.name)
+        .and_then(|s| s.read(cx).repos())
+        .and_then(|rs| rs.iter().find(|r| r.name == repo.name))
+        .and_then(|r| r.local.as_ref().ok());
+    match local {
+        Some(local) => local.branch.clone(),
+        None => Some(ws.branch_of(repo).to_string()),
+    }
+}
+
+/// Branch actions for one attached repository, or the whole workspace in its sidebar menu.
+pub(super) fn branch_entries(
+    this: &Shark,
+    ws: &Workspace,
+    repo: Option<&str>,
+    cx: &Context<Shark>,
+) -> Vec<Entry> {
+    if repo.is_some_and(|name| !ws.repos.iter().any(|r| r.name == name)) {
+        return vec![];
+    }
     if ws.repos.is_empty() {
         return vec![menu::item(
             IconName::FolderPlus,
@@ -303,28 +310,26 @@ pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) 
         )];
     }
     let sync = this.syncs.get(&ws.name).map(|s| s.read(cx));
-    let branches = sync.map(|s| s.branches()).unwrap_or_default();
-    // Not opened yet, so not probed: the branches the workspace put them on.
-    let saved = || {
-        ws.repos
-            .iter()
-            .map(|r| (r.name.clone(), ws.branch_of(r).to_string()))
-    };
-    let pairs: Vec<(String, String)> = match branches.is_empty() {
-        true => saved().collect(),
-        false => branches
-            .iter()
-            .map(|b| (b.repo.clone(), b.name.clone()))
-            .collect(),
-    };
+    let branches: Vec<_> = sync
+        .map(|s| s.branches())
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|b| repo.is_none_or(|r| r == b.repo))
+        .collect();
+    let pairs: Vec<(String, String)> = ws
+        .repos
+        .iter()
+        .filter(|r| repo.is_none_or(|name| name == r.name))
+        .filter_map(|r| Some((r.name.clone(), repo_branch(this, ws, r, cx)?)))
+        .collect();
     let mut names: Vec<String> = pairs.iter().map(|(_, b)| b.clone()).collect();
     names.sort();
     names.dedup();
-    // One name when they share a branch, else one per repo.
+    // One name when they share a branch, else one per repo. Detached HEAD has no branch to copy.
     let copies = match names.len() {
-        0 | 1 => {
-            let b = names.pop().unwrap_or_else(|| ws.branch.clone());
-            // The branch is usually the workspace's name; then the hint says nothing new.
+        0 => vec![],
+        1 => {
+            let b = names.pop().unwrap();
             let hint = if b == ws.name {
                 String::new()
             } else {
@@ -332,23 +337,45 @@ pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) 
             };
             vec![(hint, String::new(), b)]
         }
-        _ => (pairs.into_iter())
+        _ => pairs
+            .into_iter()
             .map(|(repo, b)| (repo, b.clone(), b))
             .collect(),
     };
-    let links = (branches.into_iter())
+    let mut links: Vec<(String, String, String)> = branches
+        .into_iter()
         .filter_map(|b| Some((b.repo, String::new(), b.url?)))
         .collect();
+    let drifted = repo
+        .and_then(|name| ws.repos.iter().find(|r| r.name == name))
+        .filter(|r| repo_branch(this, ws, r, cx).as_deref() != Some(ws.branch_of(r)))
+        .map(|r| ws.branch_of(r));
+    let target = repo.map(str::to_string);
     let base = menu::item(
         IconName::Target,
         "Change base…",
-        on_ws(cx, &ws.name, |s, n, w, cx| s.change_base(n, w, cx)),
+        on_ws(cx, &ws.name, move |s, n, w, cx| {
+            s.change_base(n, target.clone(), w, cx)
+        }),
     )
-    .hint(base_hint(ws));
-    let stacks = stacks(this, ws, cx);
+    .hint(match repo {
+        Some(name) => {
+            let base = &ws.repos.iter().find(|r| r.name == name).unwrap().base;
+            match drifted {
+                Some(branch) => format!("{base} ← {branch}"),
+                None => base.clone(),
+            }
+        }
+        None => base_hint(ws),
+    });
+    let stacks: Vec<_> = stacks(this, ws, cx)
+        .into_iter()
+        .filter(|s| repo.is_none_or(|name| name == s.repo))
+        .collect();
     let mut entries: Vec<Entry> = match &stacks[..] {
-        [one] => stack_rows(this, ws, one, ws.repos.len() > 1, cx),
-        many => (many.iter())
+        [one] => stack_rows(this, ws, one, repo.is_none() && ws.repos.len() > 1, cx),
+        many => many
+            .iter()
             .map(|s| {
                 let rows = stack_rows(this, ws, s, false, cx);
                 let hint = format!("{} of {}", s.me + 1, s.nodes.len());
@@ -359,7 +386,7 @@ pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) 
     if !entries.is_empty() {
         entries.push(Entry::Sep);
     }
-    entries.extend(stack_actions(ws, sync, cx));
+    entries.extend(stack_actions(ws, sync, repo, drifted, cx));
     entries.extend(
         [
             each_or_all(
@@ -378,13 +405,32 @@ pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) 
         .into_iter()
         .flatten(),
     );
-    let github: Vec<Entry> = [
-        each_or_all(IconName::Github, "Open branch on GitHub", links, open_urls),
-        sync.and_then(|sync| sync.pr_entry()),
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let branch_link = match repo.and_then(|name| ws.repos.iter().find(|r| r.name == name)) {
+        Some(r) if repo_branch(this, ws, r, cx).as_deref() != Some(ws.branch_of(r)) => {
+            links.pop().map(|(_, _, url)| {
+                menu::item(
+                    IconName::Github,
+                    format!("Open attached branch “{}” on GitHub", ws.branch_of(r)),
+                    move |_, cx| cx.open_url(&url),
+                )
+            })
+        }
+        _ => each_or_all(IconName::Github, "Open branch on GitHub", links, open_urls),
+    };
+    let pr = sync.and_then(|sync| match repo {
+        None => sync.pr_entry(),
+        Some(name) => each_or_all(
+            IconName::GitPullRequest,
+            "Open pull request",
+            sync.pr_urls()
+                .into_iter()
+                .filter(|(r, _)| r == name)
+                .map(|(r, url)| (r, String::new(), url))
+                .collect(),
+            open_urls,
+        ),
+    });
+    let github: Vec<Entry> = [branch_link, pr].into_iter().flatten().collect();
     if !github.is_empty() {
         entries.push(Entry::Sep);
         entries.extend(github);
@@ -397,9 +443,16 @@ pub(super) fn branch_entries(this: &Shark, ws: &Workspace, cx: &Context<Shark>) 
 fn stack_actions(
     ws: &Workspace,
     sync: Option<&crate::sync::GitSync>,
+    repo: Option<&str>,
+    attached_branch: Option<&str>,
     cx: &Context<Shark>,
 ) -> Vec<Entry> {
-    let repos = sync.and_then(|g| g.repos()).unwrap_or_default();
+    let repos: Vec<_> = sync
+        .and_then(|g| g.repos())
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| repo.is_none_or(|name| name == r.name))
+        .collect();
     if repos.iter().any(|r| r.is_review()) {
         return vec![];
     }
@@ -407,7 +460,11 @@ fn stack_actions(
     let merged: Vec<String> = (repos.iter().filter(|r| r.parent_merged()))
         .map(|r| r.name.clone())
         .collect();
-    let stacked: Vec<&crate::sync::Repo> = repos.iter().filter(|r| r.stacked().is_some()).collect();
+    let stacked: Vec<&crate::sync::Repo> = repos
+        .iter()
+        .copied()
+        .filter(|r| r.stacked().is_some())
+        .collect();
     let mut out = vec![];
     if let Some(onto) = (repos.iter().find(|r| r.parent_merged())).and_then(|r| r.parent.as_ref()) {
         let label = format!("Parent merged · rebase onto {}", onto.base);
@@ -424,7 +481,9 @@ fn stack_actions(
                     }
                 }),
             )
-            .hint("Agent"),
+            .hint(
+                attached_branch.map_or_else(|| "Agent".into(), |b| format!("Attached branch: {b}")),
+            ),
         );
     } else if let Some(r) = stacked.first() {
         let p = r.stacked().unwrap_or_default();
@@ -433,21 +492,27 @@ fn stack_actions(
             _ => "Rebase onto parent".to_string(),
         };
         let behind = r.local.as_ref().map_or(0, |l| l.base.1);
+        let repo = repo.map(str::to_string);
         out.push(
             menu::item(
                 IconName::GitCompareArrows,
                 label,
-                on_ws(cx, &name, |s, n, w, cx| {
+                on_ws(cx, &name, move |s, n, w, cx| {
                     if let Some(g) = s.syncs.get(&n).cloned() {
-                        g.update(cx, |g, cx| g.restack_onto_parent(w, cx));
+                        g.update(cx, |g, cx| g.restack_onto_parent(repo.as_deref(), w, cx));
                     }
                 }),
             )
-            .hint(match behind {
-                0 => "Agent".to_string(),
-                n => format!("{n} behind"),
+            .hint(match (attached_branch, behind) {
+                (Some(b), 0) => format!("Attached branch: {b}"),
+                (Some(b), n) => format!("Attached branch: {b} · {n} behind"),
+                (None, 0) => "Agent".to_string(),
+                (None, n) => format!("{n} behind"),
             }),
         );
+    }
+    if repo.is_some() {
+        return out;
     }
     out.push(
         menu::item(

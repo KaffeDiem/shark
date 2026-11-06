@@ -707,6 +707,7 @@ impl Shark {
     pub(super) fn change_base(
         &mut self,
         name: String,
+        repo: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -715,6 +716,12 @@ impl Shark {
         };
         if ws.repos.is_empty() {
             return notify_err(window, cx, NO_REPO);
+        }
+        if let Some(repo) = repo {
+            if !ws.repos.iter().any(|r| r.name == repo) {
+                return notify_err(window, cx, "Repository is no longer attached");
+            }
+            return self.pick_base(name, vec![repo], window, cx);
         }
         let repos: Vec<String> = ws.repos.iter().map(|r| r.name.clone()).collect();
         if repos.len() < 2 {

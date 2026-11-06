@@ -150,14 +150,12 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         assert!(island.right() <= features.left());
                         assert!(w.try_find("show-tree").is_none());
                         assert!(w.try_find("hide-tree").is_none());
-                        let branch = w.find("branch").bounds();
                         let scope = w.find("uncommitted-only").bounds();
                         let layout = w.find("diff-mode").bounds();
                         let toggle = w.find("files-toggle").bounds();
                         let sync = w.find("git-next").bounds();
                         let menu = w.find("git-menu").bounds();
                         for id in [
-                            "branch",
                             "uncommitted-only",
                             "diff-mode",
                             "files-toggle",
@@ -174,8 +172,23 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             assert_eq!(b.size.height, px(28.), "{id}");
                             assert_eq!(b.top(), scope.top(), "one row: {id}");
                         }
-                        assert!(branch.size.width >= px(28.), "branch icon stays visible");
-                        assert!(branch.right() <= scope.left());
+                        assert!(
+                            w.try_find("branch").is_none(),
+                            "branch lives in the repository chip"
+                        );
+                        let chip = w.find("repo-chip-shark");
+                        if chip.visible() {
+                            let b = chip.bounds();
+                            assert!(b.size.width <= px(280.));
+                            assert_eq!(b.size.height, px(22.));
+                            assert!(b.left() >= island.left() && b.right() <= scope.left());
+                            assert_eq!(b.top() + px(11.), scope.top() + px(14.));
+                        } else {
+                            assert!(
+                                w.find("attach-more").visible(),
+                                "hidden branch stays reachable"
+                            );
+                        }
                         assert_eq!(layout.size, size(px(28.), px(28.)));
                         assert_eq!(scope.right() + px(8.), layout.left());
                         assert_eq!(layout.right() + px(8.), toggle.left());

@@ -1228,17 +1228,18 @@ async fn show_attachments_lists_repositories_and_issues(cx: &mut TestAppContext)
     let rows = |cx: &mut TestAppContext, from: usize| -> Rows {
         cx.read(|cx| {
             let s = shark.read(cx);
-            let rows = s.attachment_rows(s.ws(&name).unwrap(), from, cx.theme());
+            let rows = s.attachment_rows(s.ws(&name).unwrap(), from, cx);
             (rows.into_iter())
                 .map(|(heading, rows)| (heading, rows.into_iter().map(|r| r.0).collect()))
                 .collect()
         })
     };
+    let repository = format!("api · {}", ws_of(cx, &shark).branch);
     let group = |heading, rows: &[&str]| (heading, rows.iter().map(|r| r.to_string()).collect());
     assert_eq!(
         rows(cx, 0),
         [
-            group(Some("Repositories"), &["api · ready"]),
+            group(Some("Repositories"), &[&repository]),
             group(
                 Some("Linear issues"),
                 &["ENG-1 Issue 1 · Todo · primary", "ENG-2 Issue 2 · Todo"]
@@ -1248,7 +1249,13 @@ async fn show_attachments_lists_repositories_and_issues(cx: &mut TestAppContext)
     );
     list(cx);
     press(cx, &["enter"]);
-    assert!(shows(cx, window, "attach-panel"), "the repo's details");
+    cx.update(|cx| {
+        assert!(
+            shark.read(cx).menu.is_some(),
+            "the ready repo’s branch menu"
+        )
+    });
+    assert!(!shows(cx, window, "attach-panel"));
     press(cx, &["escape"]);
     list(cx);
     press(cx, &["down", "enter"]);
@@ -1291,7 +1298,7 @@ async fn show_attachments_lists_repositories_and_issues(cx: &mut TestAppContext)
     assert_eq!(
         rows(cx, 0),
         [
-            group(Some("Repositories"), &["api · ready"]),
+            group(Some("Repositories"), &[&repository]),
             group(None, &["Attach repository…"]),
         ]
     );

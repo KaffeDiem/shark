@@ -966,18 +966,17 @@ impl GitSync {
         SyncEvent::Restack { moves, prompt }
     }
 
-    /// Asks the agent to rebase every stacked repo onto its parent's latest commits.
-    pub fn restack_onto_parent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let stacked: Vec<&Repo> = self
-            .repos
-            .iter()
-            .filter(|r| r.stacked().is_some())
-            .collect();
-        if stacked.is_empty() {
-            return notify_err(window, cx, "Not stacked: its base is the trunk");
-        }
-        let prompt = status::restack_prompt(&stacked, |r| r.base.clone());
-        self.run_kind(Kind::Agent(prompt), "Rebase onto parent", window, cx)
+    /// Asks the agent to rebase the selected stacked repos onto their parents' latest commits.
+    pub fn restack_onto_parent(
+        &mut self,
+        repo: Option<&str>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some((repos, prompt)) = restack_step(&self.repos, repo) else {
+            return notify_err(window, cx, "No stacked repository matches this action");
+        };
+        self.run_kind_in(Kind::Agent(prompt), "Rebase onto parent", repos, window, cx)
     }
 
     /// Available even before the agent has made any changes. Targets the repos the button's
@@ -1152,6 +1151,19 @@ fn open_pr(repo: &str, number: u64) -> Pr {
         comments: vec![],
         contains_head: String::new(),
     }
+}
+
+/// Keep the rebase prompt and its execution scope on the same repositories.
+fn restack_step(repos: &[Repo], repo: Option<&str>) -> Option<(Vec<String>, String)> {
+    let stacked: Vec<&Repo> = repos
+        .iter()
+        .filter(|r| repo.is_none_or(|name| name == r.name) && r.stacked().is_some())
+        .collect();
+    if stacked.is_empty() {
+        return None;
+    }
+    let prompt = status::restack_prompt(&stacked, |r| r.base.clone());
+    Some((stacked.iter().map(|r| r.name.clone()).collect(), prompt))
 }
 
 /// The repos "Commit and push" targets (the dirty ones, else all) and its prompt.
@@ -2014,6 +2026,101 @@ esac
             4,
             "even a partial fetch can add or move a base ref"
         );
+    }
+
+    #[cfg(feature = "test-support")]
+    #[gpui_kit::test]
+    fn merged_restack_keeps_other_repository_base_and_prompt_out(
+        cx: &mut gpui_kit::TestAppContext,
+    ) {
+        use super::*;
+        let _lock = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cx.update(gpui_kit::init);
+        let ws = Workspace {
+            name: "merged-scope-test".into(),
+            branch: "feature".into(),
+            repos: ["api", "web"]
+                .map(|name| crate::state::WsRepo {
+                    name: name.into(),
+                    src: "/nonexistent".into(),
+                    base: format!("origin/{name}-parent"),
+                    branch: None,
+                })
+                .into(),
+            ..Default::default()
+        };
+        let (_, sync) = cx
+            .update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| GitSync::new(ws, w, cx))
+                })
+            })
+            .unwrap();
+        cx.update(|cx| {
+            sync.update(cx, |g, _| {
+                for r in &mut g.repos {
+                    r.local = Ok(Local {
+                        trunk: "origin/main".into(),
+                        branch: Some("feature".into()),
+                        head: format!("{}-head", r.name),
+                        base: (1, 0),
+                        ..Default::default()
+                    });
+                    r.parent = Some(Pr {
+                        state: PrState::Merged,
+                        base: "main".into(),
+                        ..open_pr(&r.name, 1)
+                    });
+                }
+                let SyncEvent::Restack { moves, prompt } = g.restack_event(&["api".into()]) else {
+                    panic!("expected a restack event");
+                };
+                assert_eq!(
+                    moves,
+                    [(
+                        "api".into(),
+                        "origin/api-parent".into(),
+                        "origin/main".into()
+                    )]
+                );
+                assert!(prompt.contains("api"), "{prompt}");
+                assert!(!prompt.contains("web"), "{prompt}");
+                assert_eq!(g.repos[1].base, "origin/web-parent");
+            })
+        });
+    }
+
+    #[test]
+    fn restack_scope_matches_prompt_and_execution_targets() {
+        let repos: Vec<super::Repo> = ["api", "web"]
+            .into_iter()
+            .map(|name| super::Repo {
+                name: name.into(),
+                base: format!("origin/{name}-parent"),
+                branch: format!("{name}-work"),
+                local: Ok(Local {
+                    trunk: "origin/main".into(),
+                    branch: Some(format!("{name}-work")),
+                    review: name == "web",
+                    ..Default::default()
+                }),
+                pr: None,
+                parent: None,
+            })
+            .collect();
+        let (selected, prompt) = super::restack_step(&repos, Some("api")).unwrap();
+        assert_eq!(selected, ["api"]);
+        assert!(prompt.contains("api-parent"), "{prompt}");
+        assert!(prompt.contains("api-work"), "{prompt}");
+        assert!(!prompt.contains("web"), "{prompt}");
+        assert!(super::run::check_review_checkout(&repos, &selected).is_ok());
+        assert!(super::restack_step(&repos, Some("missing")).is_none());
+        let (all, prompt) = super::restack_step(&repos, None).unwrap();
+        assert_eq!(all, ["api", "web"]);
+        assert!(prompt.contains("api-parent") && prompt.contains("web-parent"));
+        assert!(super::run::check_review_checkout(&repos, &all).is_err());
     }
 
     #[test]

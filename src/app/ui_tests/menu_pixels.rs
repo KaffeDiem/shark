@@ -23,9 +23,6 @@ fn entries(case: &str) -> Vec<Entry> {
             action(IconName::GitBranch, "feature/menu-layout").hint("#124 · open"),
             Entry::Sep,
             action(IconName::GitBranch, "Rebase onto feature/menu-layout").hint("3 commits behind"),
-            action(IconName::Plus, "New workspace on top…"),
-            action(IconName::Plus, "Insert workspace below…")
-                .hint("between feature/menu-layout and branch-from-feature"),
             action(IconName::Copy, "Copy branch name")
                 .hint("feature/a-very-long-branch-name-that-must-yield-to-the-action"),
             action(IconName::Target, "Change base…").hint("origin/master"),

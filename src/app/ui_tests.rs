@@ -25,6 +25,7 @@ mod issue_tests;
 mod menu_pixels;
 mod mixed_tab_tests;
 mod navigation_pixels;
+mod repo_menu_tests;
 mod repo_settings_tests;
 mod storage_tests;
 mod tab_tests;
@@ -8122,7 +8123,7 @@ async fn review_followups(cx: &mut TestAppContext) {
 async fn branch_menu(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
-    let repos = repos(&home, &["api"]);
+    let repos = repos(&home, &["api", "web"]);
     let (window, shark) = boot(
         cx,
         State {
@@ -8138,15 +8139,10 @@ async fn branch_menu(cx: &mut TestAppContext) {
         },
     );
     let on = on_app(window, shark.clone());
+    let mut picked = git::on_branch(&repos, "branch-menu");
+    picked[1].1 = "web-branch".into();
     on(cx, &|s, w, cx| {
-        s.create_workspace(
-            "branch-menu".into(),
-            git::on_branch(&repos, "branch-menu"),
-            vec![],
-            None,
-            w,
-            cx,
-        )
+        s.create_workspace("branch-menu".into(), picked.clone(), vec![], None, w, cx)
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
         shark.read(cx).active.is_some()
@@ -8156,9 +8152,9 @@ async fn branch_menu(cx: &mut TestAppContext) {
         for copy in [false, true] {
             cx.update_window(window, |_, w, cx| {
                 if right {
-                    w.right_click("branch", cx);
+                    w.right_click("repo-chip-api", cx);
                 } else {
-                    w.click("branch", cx);
+                    w.click("repo-chip-api", cx);
                 }
             })
             .unwrap();
@@ -8176,6 +8172,37 @@ async fn branch_menu(cx: &mut TestAppContext) {
             cx.update(|cx| assert!(shark.read(cx).menu.is_none()));
         }
     }
+    // The second chip copies its own branch, including through the keyboard picker.
+    cx.update_window(window, |_, w, cx| w.click("repo-chip-web", cx))
+        .unwrap();
+    press_in(window)(cx, &["c", "enter"]);
+    assert_eq!(
+        cx.update(|cx| cx.read_from_clipboard().and_then(|c| c.text())),
+        Some("web-branch".into())
+    );
+    cx.update_window(window, |_, w, cx| {
+        w.dispatch_action(Box::new(crate::BranchMenu), cx)
+    })
+    .unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| w.input("web", cx))
+        .unwrap();
+    press_in(window)(cx, &["enter"]);
+    press_in(window)(cx, &["c", "enter"]);
+    assert_eq!(
+        cx.update(|cx| cx.read_from_clipboard().and_then(|c| c.text())),
+        Some("web-branch".into())
+    );
+
+    // Repo menus omit agent-wide stacking; an invalid repo cannot become an all-repo menu.
+    shark.update(cx, |s, cx| {
+        let ws = s.active_ws().unwrap();
+        let scoped = menus::branch_entries(s, ws, Some("api"), cx);
+        assert!(!scoped.iter().any(|e| matches!(e, Entry::Item { label, .. } if label == "New agent on top…" || label == "Insert agent below…")));
+        let all = menus::branch_entries(s, ws, None, cx);
+        assert!(all.iter().any(|e| matches!(e, Entry::Item { label, .. } if label == "New agent on top…")));
+        assert!(menus::branch_entries(s, ws, Some("missing"), cx).is_empty());
+    });
     fs::remove_dir_all(&home).ok();
 }
 
@@ -8213,10 +8240,24 @@ async fn change_base(cx: &mut TestAppContext) {
         "a fetched origin branch is offered"
     );
     let old = cx.update(|cx| shark.read(cx).ws("rb").unwrap().repos[0].base.clone());
-    on(cx, &|s, w, cx| {
-        let moves = [("api".into(), old.clone(), "origin/release".into())];
-        s.set_base("rb", &moves, false, w, cx)
+    let change = shark.update(cx, |s, cx| {
+        menus::branch_entries(s, s.ws("rb").unwrap(), Some("api"), cx)
+            .into_iter()
+            .find_map(|e| match e {
+                Entry::Item {
+                    label, on_click, ..
+                } if label == "Change base…" => Some(on_click),
+                _ => None,
+            })
+            .expect("repository menu offers changing its base")
     });
+    cx.update_window(window, |_, w, cx| change(w, cx)).unwrap();
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| w.input("release", cx))
+        .unwrap();
+    press_in(window)(cx, &["enter"]);
+    // Only change the target, preserving the commits and avoiding an agent turn.
+    press_in(window)(cx, &["down", "enter"]);
     cx.update(|cx| {
         let s = shark.read(cx);
         let ws = s.ws("rb").unwrap();
@@ -8320,12 +8361,11 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
             .unwrap();
         cx.run_until_parked();
     };
-    let click_branch = |cx: &mut TestAppContext| {
-        cx.update_window(window, |_, w, cx| {
-            w.render_frame(cx);
-            w.click("branch", cx)
-        })
-        .unwrap();
+    let workspace_menu = |cx: &mut TestAppContext| {
+        on(cx, &|s, w, cx| {
+            let entries = menus::branch_entries(s, s.active_ws().unwrap(), None, cx);
+            s.show_menu(point(px(100.), px(100.)), entries, w, cx);
+        });
         cx.run_until_parked();
     };
     let ws = |cx: &mut TestAppContext, name: &str| {
@@ -8375,20 +8415,23 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
         st.len() == 1 && st[0].me == 1 && st[0].nodes[0].pr.as_ref().is_some_and(|p| p.number == 1)
     })
     .await;
-    cx.update(|cx| {
-        let s = shark.read(cx);
-        assert_eq!(
-            menus::branch_label(s, s.ws("ui").unwrap(), cx),
-            "logic ← ui"
-        );
-    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        let label = w
+            .find("repo-chip-api")
+            .label()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(label.contains("ui") && label.contains("logic"), "{label}");
+    })
+    .unwrap();
 
-    // New workspace on top, from the branch menu, once ui is pushed.
+    // New workspace on top stays in the workspace menu, once ui is pushed.
     let wt = home.join("shark/workspaces/ui/api");
     g(&wt, &["commit", "-q", "--allow-empty", "-m", "ui"]);
     g(&wt, &["push", "-q", "-u", "origin", "ui"]);
     let ui_head = head("ui");
-    click_branch(cx);
+    workspace_menu(cx);
     press(cx, &["n", "enter"]);
     input(cx, "wiring");
     press(cx, &["cmd-enter"]);
@@ -8420,7 +8463,7 @@ async fn stacked_workspaces(cx: &mut TestAppContext) {
     cx.update(|cx| assert_eq!(shark.read(cx).active.as_deref(), Some("ui")));
 
     // Insert workspace below ui: based on logic, pushed, and ui moves on top of it.
-    click_branch(cx);
+    workspace_menu(cx);
     press(cx, &["i", "enter"]);
     input(cx, "models");
     press(cx, &["cmd-enter"]);
@@ -8614,14 +8657,24 @@ async fn branch_from_refusals_and_mixed_repos(cx: &mut TestAppContext) {
             && st[0].nodes[0].pr.as_ref().is_some_and(|p| p.number == 4)
     })
     .await;
-    // web on main beside the stacked api: the header names the parent.
-    cx.update(|cx| {
-        let s = shark.read(cx);
-        assert_eq!(
-            menus::branch_label(s, s.ws("mixed").unwrap(), cx),
-            "logic ← mixed"
-        );
-    });
+    // Each repository's accessible details name its own base.
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        let api = w
+            .find("repo-chip-api")
+            .label()
+            .unwrap_or_default()
+            .to_owned();
+        let web = w
+            .find("repo-chip-web")
+            .label()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(api.contains("logic"), "{api}");
+        assert!(web.contains("main"), "{web}");
+        assert!(!web.contains("logic"), "{web}");
+    })
+    .unwrap();
     fs::remove_dir_all(&home).ok();
 }
 

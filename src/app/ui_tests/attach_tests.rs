@@ -1322,7 +1322,49 @@ async fn empty_views_go_live_once_a_repo_attaches(cx: &mut TestAppContext) {
     assert!(!shown(cx, "attach-repository"));
     assert!(shown(cx, "repo-chip-api"));
     assert!(shown(cx, "header-attach"), "more can join");
-    assert!(shown(cx, "branch"));
+    assert!(
+        !shown(cx, "branch"),
+        "branch actions live in the repository chip"
+    );
+    // A real button stays reachable through focus traversal and Enter/Space.
+    for key in ["enter", "space"] {
+        cx.update_window(window, |_, w, cx| {
+            for _ in 0..100 {
+                w.render_frame(cx);
+                if w.find("repo-chip-api").focused() == Some(true) {
+                    break;
+                }
+                w.focus_next(cx);
+            }
+            assert_eq!(w.find("repo-chip-api").focused(), Some(true));
+            w.press(key, cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+        cx.update(|cx| assert!(shark.read(cx).menu.is_some()));
+        press_in(window)(cx, &["escape"]);
+    }
+    // A different checkout does not inherit the attached branch's base in its description.
+    let saved = ws_of(cx, &shark).repos[0].clone();
+    on(cx, &|s, _, cx| {
+        s.ws_mut(&name).unwrap().repos[0].branch = Some("attached-branch".into());
+        cx.notify();
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        let label = w.find("repo-chip-api").label().unwrap().to_string();
+        assert!(label.contains("Checked out: b"), "{label}");
+        assert!(
+            label.contains(&format!("Base: {} ← attached-branch", saved.base)),
+            "{label}"
+        );
+        assert!(!label.contains(&format!("{} ← b", saved.base)), "{label}");
+    })
+    .unwrap();
+    on(cx, &|s, _, cx| {
+        s.ws_mut(&name).unwrap().repos[0].branch = saved.branch.clone();
+        cx.notify();
+    });
     on(cx, &|s, w, cx| {
         assert!(s.git_features.contains_key(&name), "the view it offered");
         let sync = s.syncs[&name].read(cx);
@@ -1479,6 +1521,19 @@ async fn failures_stay_reachable_under_overflow(cx: &mut TestAppContext) {
         !failed.iter().any(|(r, _)| r == "repository-39")
     });
     assert!(gone, "the clipped one");
+
+    // A hidden ready repository opens its branch actions, not a completed setup panel.
+    on(cx, &|s, w, cx| s.attachment_list(name.clone(), 0, w, cx));
+    cx.update_window(window, |_, w, cx| w.input("settled", cx))
+        .unwrap();
+    press_in(window)(cx, &["enter"]);
+    cx.update(|cx| assert!(shark.read(cx).menu.is_some()));
+    assert!(!shows(cx, window, "attach-panel"));
+    press_in(window)(cx, &["c", "enter"]);
+    assert_eq!(
+        cx.update(|cx| cx.read_from_clipboard().and_then(|c| c.text())),
+        Some(name.clone())
+    );
 
     // cmd-k's Attach repository: everything, from the keyboard, then the dialog as its last row.
     on(cx, &|s, _, cx| {
@@ -2271,6 +2326,8 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         "header" => {
                             ws.attaching = vec![];
                             ws.repos.truncate(2);
+                            ws.repos[1].branch = Some("feature/ledger-reconciliation".into());
+                            ws.repos[1].base = "origin/develop".into();
                             ws.linear.remove(&(&ws.issues[1]).into());
                         }
                         "queued" => ws.attaching.truncate(1),
