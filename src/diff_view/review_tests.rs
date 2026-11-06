@@ -46,6 +46,28 @@ fn collapsed_files_keep_their_header_and_survive_replacement(cx: &mut TestAppCon
 }
 
 #[gpui_kit::test]
+fn opening_a_fold_reveals_its_code_rows_until_a_rebuild(cx: &mut TestAppContext) {
+    let original = (1..=60)
+        .map(|line| format!("line {line}\n"))
+        .collect::<String>();
+    let modified = original.replace("line 30\n", "changed 30\n");
+    let file = super::document::fixture::modified("long.txt", &original, &modified);
+    let state = cx.new(|cx| DiffState::new([file], cx));
+    state.update(cx, |state, cx| {
+        state.expand_fold(0, 32..60, FoldExpansion::Down, cx);
+        let rows = state.reveal_rows().unwrap();
+        assert_eq!(rows.len(), 20);
+        assert!(
+            state.rows()[rows]
+                .iter()
+                .all(|row| matches!(row, DisplayRow::Code { changed: false, .. }))
+        );
+        state.set_file_collapsed("long.txt", true, cx);
+        assert_eq!(state.reveal_rows(), None);
+    });
+}
+
+#[gpui_kit::test]
 fn folds_expand_by_direction_and_short_ranges_stay_visible(cx: &mut TestAppContext) {
     let original = (1..=60)
         .map(|line| format!("line {line}\n"))

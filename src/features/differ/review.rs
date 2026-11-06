@@ -10,7 +10,7 @@ use super::review_comment::{Comment, Status, judge, lines_now, posted_as, side, 
 use super::review_store::CommentStore;
 use super::*;
 use crate::chat::parse_reports;
-use crate::diff_view::{DiffAnnotation, DiffLinePosition, DiffLineRange, DiffSide};
+use crate::diff_view::{CONTEXT_LINES, DiffAnnotation, DiffLinePosition, DiffLineRange, DiffSide};
 use gpui_kit::component::input::{Enter, Escape, Textarea, TextareaState};
 use std::cell::Cell;
 
@@ -55,6 +55,31 @@ pub(crate) fn parse_hunks(chunk: &str) -> Vec<Hunk> {
         }
     }
     hunks
+}
+
+/// The hunks git prints at its default context, from a patch with whole files. The cursor walks
+/// these and GitHub anchors inline comments to them, so lines only a fold holds are left out.
+pub(crate) fn narrow_hunks(hunks: Vec<Hunk>) -> Vec<Hunk> {
+    let mut out = vec![];
+    for hunk in hunks {
+        let mut keep = vec![false; hunk.len()];
+        for (i, _) in hunk.iter().enumerate().filter(|(_, l)| l.0 != b' ') {
+            let end = (i + CONTEXT_LINES + 1).min(hunk.len());
+            keep[i.saturating_sub(CONTEXT_LINES)..end].fill(true);
+        }
+        let mut run = vec![];
+        for (line, keep) in hunk.into_iter().zip(keep) {
+            if keep {
+                run.push(line);
+            } else if !run.is_empty() {
+                out.push(std::mem::take(&mut run));
+            }
+        }
+        if !run.is_empty() {
+            out.push(run);
+        }
+    }
+    out
 }
 
 /// A row the cursor can sit on: a file header or a source line.
@@ -1856,6 +1881,28 @@ mod tests {
 
     #[::core::prelude::v1::test]
     fn rows_follow_the_diff_layout() {
+        // Whole-file context narrows to git's default hunks; 7 lines apart stay separate.
+        let line = |k: u8, n: usize| (k, n, n);
+        let hunk = |changes: &[usize]| -> Hunk {
+            (1..=30)
+                .map(|n| line(if changes.contains(&n) { b'+' } else { b' ' }, n))
+                .collect()
+        };
+        let spans = |hunks: Vec<Hunk>| -> Vec<(usize, usize)> {
+            let span = |h: &Hunk| (h[0].2, h[h.len() - 1].2);
+            hunks.iter().map(span).collect()
+        };
+        assert_eq!(spans(narrow_hunks(vec![hunk(&[10])])), [(7, 13)]);
+        assert_eq!(spans(narrow_hunks(vec![hunk(&[10, 17])])), [(7, 20)]);
+        assert_eq!(
+            spans(narrow_hunks(vec![hunk(&[10, 18])])),
+            [(7, 13), (15, 21)]
+        );
+        assert_eq!(
+            spans(narrow_hunks(vec![hunk(&[1, 30])])),
+            [(1, 4), (27, 30)]
+        );
+
         let hunks = parse_hunks(PATCH);
         assert_eq!(hunks.len(), 2);
         assert_eq!(hunks[0][3], (b'+', 0, 2));

@@ -1139,6 +1139,9 @@ pub fn combined_diff(ws: &Workspace, dir: &Path, uncommitted_only: bool) -> Resu
             "--full-index",
             // Rename headers carry no --src/--dst prefix, so a renamed file would lose its repo.
             "--no-renames",
+            // Whole files, so the diff can open the lines between changes. Viewed fingerprints
+            // hash the blob and the review narrows its hunks back (`review::narrow_hunks`).
+            "--unified=1000000",
             &src,
             &dst,
         ];

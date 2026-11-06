@@ -33,6 +33,7 @@
 //! - A body resize found while painting defers its `notify` (GPUI drops one made during paint).
 //! - The add-annotation button is drawn for the hovered line only, tracked in the state.
 //! - The hunk separator reads "↑ N unchanged lines".
+//! - A whole fold row is clickable, and the lines it opens slide open (`DiffState::reveal_frame`).
 
 // Upstream's style trips some of Shark's clippy lints; left as upstream wrote it.
 #![allow(
@@ -54,6 +55,7 @@ mod syntax;
 
 pub use document::{DiffFile, DiffFileStatus, DiffLinePosition, DiffLineRange, DiffSide};
 pub(crate) use parser::hunk_header;
+pub(crate) use rows::CONTEXT_LINES;
 pub use state::{DiffEvent, DiffState};
 
 use std::{collections::HashMap, rc::Rc, sync::Arc};
@@ -79,7 +81,7 @@ use gpui_kit::component::{
 use presentation::FilePresentation;
 use rows::{DisplayRow, EXPANSION_LINES};
 use selection::{CodeText, SelectionLayer};
-use state::{FoldExpansion, LayoutKey, SelectedLines};
+use state::{FoldExpansion, LayoutKey, REVEAL_MAX_ROWS, SelectedLines};
 
 // Private: bindings serve the focused code body only.
 mod actions {
@@ -426,6 +428,7 @@ fn render_diff(
         state: cx.entity(),
     });
     let rows = state.rows().clone();
+    let reveal = state.reveal_frame(window);
     let scrollbar = state.list().clone();
     let horizontal = state.horizontal_scroll().clone();
     let has_rows = !rows.is_empty();
@@ -482,7 +485,12 @@ fn render_diff(
                                     .border_color(border)
                                     .when(first, |this| this.border_t_1().rounded_t(radius))
                                     .when(last, |this| this.border_b_1().rounded_b(radius))
-                                    .child(render_row(row, code.clone(), window, cx)),
+                                    .child(reveal_row(
+                                        render_row(row, code.clone(), window, cx),
+                                        ix,
+                                        reveal.as_ref(),
+                                        row_height,
+                                    )),
                             )
                             .into_any_element()
                     })
@@ -767,6 +775,29 @@ fn measure_code_width(
     code_width(width, gutter_width, window.rem_size(), mode)
 }
 
+/// A row of a fold being opened: the rows open one after the other, pushing the lines below
+/// down. Too many to lay out each frame just fade in.
+fn reveal_row(
+    row: AnyElement,
+    ix: usize,
+    reveal: Option<&(std::ops::Range<usize>, f32)>,
+    row_height: Pixels,
+) -> AnyElement {
+    let Some((rows, progress)) = reveal.filter(|(rows, _)| rows.contains(&ix)) else {
+        return row;
+    };
+    if rows.len() > REVEAL_MAX_ROWS {
+        return div().opacity(*progress).child(row).into_any_element();
+    }
+    let open = (progress * rows.len() as f32 - (ix - rows.start) as f32).clamp(0., 1.);
+    div()
+        .h(row_height * open)
+        .overflow_hidden()
+        .opacity(open)
+        .child(row)
+        .into_any_element()
+}
+
 fn render_row(
     row: &DisplayRow,
     code: Rc<CodePresentation>,
@@ -901,17 +932,30 @@ fn render_fold(
             .w_auto()
             .text_color(cx.theme().muted_foreground)
             .on_click(move |_, _, cx| {
+                // The row around the button opens the whole fold.
+                cx.stop_propagation();
                 state.update(cx, |state, cx| {
                     state.expand_fold(file, pairs.clone(), expansion, cx)
                 })
             })
     };
+    let state = code.state.clone();
+    let all = pairs.clone();
+    let hover = cx.theme().muted.opacity(0.6);
     h_flex()
+        .id(("fold", pairs.start))
         .w_full()
         .h_6()
         .px_2()
         .gap_1()
         .bg(cx.theme().muted.opacity(0.35))
+        .cursor_pointer()
+        .hover(move |this| this.bg(hover))
+        .on_click(move |_, _, cx| {
+            state.update(cx, |state, cx| {
+                state.expand_fold(file, all.clone(), FoldExpansion::All, cx)
+            })
+        })
         .when(partial && pairs.start > hunk.start, |this| {
             this.child(
                 expand(("expand-down", pairs.start), FoldExpansion::Down)
