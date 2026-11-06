@@ -667,7 +667,7 @@ impl Render for LinearPage {
                         c.child(stacked(
                             theme,
                             "API key",
-                            "Create a personal API key in your Linear account settings",
+                            "Create a personal API key with Read access in your Linear account settings",
                             h_flex()
                                 .gap_2()
                                 .child(div().flex_1().child(Input::new(&self.key).small()))

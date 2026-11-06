@@ -605,6 +605,8 @@ impl Flow {
             ("response_type", "code"),
             ("scope", "read"),
             ("actor", "user"),
+            // Always show the consent screen, so a person can pick another workspace.
+            ("prompt", "consent"),
             ("state", &self.state),
             ("code_challenge", &challenge(&self.verifier)),
             ("code_challenge_method", "S256"),

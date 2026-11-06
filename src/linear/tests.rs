@@ -68,6 +68,7 @@ fn authorize_url_asks_for_read_as_user_with_s256() {
     assert_eq!(q["response_type"], "code");
     assert_eq!(q["scope"], "read");
     assert_eq!(q["actor"], "user");
+    assert_eq!(q["prompt"], "consent");
     assert_eq!(q["code_challenge_method"], "S256");
     assert_eq!(q["code_challenge"], challenge(&flow.verifier));
     assert_eq!(q["state"], flow.state);

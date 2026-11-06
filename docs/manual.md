@@ -50,7 +50,7 @@ An agent can start from another branch or an open PR instead of `main` (**New ag
 Shark opens on Home (`cmd-0`) when no agent is open. It shows what's missing (git, gh, claude), every agent grouped by what it needs from you (Needs you, Running, Unread, Idle), and a Get started checklist (one line once you have agents; Hide Get started in `cmd-k` removes it). Type what you want to build in its box and press `enter` to start an agent at once with that as the first message (no dialog and no repository needed; the title comes from its first line), or press `tab` to ask Shark how to do something (a one-off Haiku answer from the README, this manual and the live keymap).
 
 ## Linear
-Settings › Linear connects one Linear workspace, read-only. **Sign in with Linear** opens your browser; it needs port 48173 free and isn't available until Shark's Linear app is registered. **Use API key** takes a personal key.
+Settings › Linear connects one Linear workspace, read-only. **Sign in with Linear** opens your browser; it needs port 48173 free and isn't available until Shark's Linear app is registered. **Use API key** takes a personal key; create it with Read access, since Shark only reads.
 
 Shark checks a new credential with Linear and saves it to the Keychain before it replaces a working connection, so a bad key or a Keychain failure changes nothing. `state.json` keeps only the organization, the user and the method. Shark doesn't read the Keychain until a Linear feature needs the credential; if access isn't granted the connection stays, and Settings offers **Try again**. If Linear rejects the credential, Settings asks you to reconnect.
 
