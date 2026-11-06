@@ -375,13 +375,27 @@ async fn palette_shows_attachments_with_nothing_pending(cx: &mut TestAppContext)
         .unwrap();
     press(cx, &["enter"]);
     press(cx, &["enter"]);
-    cx.update_window(window, |_, w, _| {
+    cx.update(|cx| {
         assert!(
-            w.find("attach-panel").visible(),
-            "the list's first row, the repo"
-        )
+            shark.read(cx).menu.is_some(),
+            "the ready repo opens its branch menu"
+        );
+    });
+    cx.update_window(window, |_, w, _| {
+        assert!(w.try_find("attach-panel").is_none());
     })
     .unwrap();
+    press(cx, &["c", "enter"]);
+    let branch = cx.update(|cx| {
+        let s = shark.read(cx);
+        let ws = &s.state.workspaces[0];
+        ws.branch_of(&ws.repos[0]).to_string()
+    });
+    assert_eq!(
+        cx.update(|cx| cx.read_from_clipboard().and_then(|c| c.text())),
+        Some(branch),
+        "the ready repository's branch can be copied from Show attachments"
+    );
     fs::remove_dir_all(&home).ok();
 }
 
