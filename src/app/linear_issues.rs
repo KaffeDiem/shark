@@ -200,6 +200,57 @@ fn line_item(
     })
 }
 
+/// Why the picker can't ask Linear anything.
+#[derive(Clone, PartialEq)]
+enum Blocked {
+    NotConnected,
+    /// What `linear_needs_attention` says.
+    Attention(String),
+}
+
+impl Blocked {
+    /// What `enter` does about it, which is to go to Settings.
+    fn action(&self) -> &'static str {
+        match self {
+            Self::NotConnected => "Open Settings",
+            Self::Attention(_) => "Reconnect",
+        }
+    }
+}
+
+/// The row in place of the issues. Not `line_item`: the reason wraps, since it's all there is.
+fn blocked_item(blocked: &Blocked) -> CommandItem {
+    let action = blocked.action();
+    let (attention, text) = match blocked {
+        Blocked::NotConnected => (false, "Linear isn't connected".to_string()),
+        Blocked::Attention(why) => (true, why.clone()),
+    };
+    CommandItem::new().label(text.clone()).child(move |_, cx| {
+        let theme = cx.theme();
+        let (icon, color) = match attention {
+            true => (IconName::TriangleAlert, theme.warning_foreground),
+            false => (IconName::CircleDashed, theme.muted_foreground),
+        };
+        h_flex()
+            .id("issue-settings")
+            .test_support()
+            .flex_1()
+            .min_w_0()
+            .min_h(px(ROW_H))
+            .gap_2()
+            .aria_label(text.clone())
+            .child(Icon::new(icon).with_size(px(14.)).text_color(color))
+            .child(div().flex_1().min_w_0().child(text.clone()))
+            .child(
+                div()
+                    .flex_none()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(action),
+            )
+    })
+}
+
 /// The first load's placeholder row.
 fn skeleton_item() -> CommandItem {
     CommandItem::new().disabled(true).child(|_, _| {
@@ -218,7 +269,7 @@ fn skeleton_item() -> CommandItem {
 /// What a row of the picker does.
 #[derive(Clone)]
 enum Row {
-    Settings,
+    Settings(Blocked),
     /// Linear's rate limit counting down.
     Wait,
     /// The last failure, and Retry.
@@ -234,7 +285,7 @@ impl Row {
     /// Which row this is whatever its number, so the highlight can follow it.
     fn key(&self) -> Option<&str> {
         match self {
-            Self::Settings => Some("settings"),
+            Self::Settings(_) => Some("settings"),
             Self::Retry => Some("retry"),
             Self::More => Some("more"),
             Self::Lookup(t) => Some(&t.id),
@@ -258,8 +309,8 @@ pub(super) struct IssuePicker {
     state: Entity<CommandState>,
     /// The agent to attach to; None starts a new one.
     agent: Option<String>,
-    /// Why nothing can be asked of Linear, as the row to Settings says it.
-    blocked: Option<&'static str>,
+    /// Why nothing can be asked of Linear; the row to Settings replaces the others.
+    blocked: Option<Blocked>,
     query: String,
     lists: Option<Lists>,
     /// Every answer by query, for the picker's lifetime: asking again sends nothing.
@@ -290,6 +341,9 @@ pub(super) struct IssuePicker {
     _wait: Task<()>,
     /// Closing the dialog drops this: what it would have attached is abandoned.
     _fetch: Task<()>,
+    _connection: Subscription,
+    /// Settings over this picker, until its view is dropped with the dialog.
+    settings: Option<WeakFocusHandle>,
 }
 
 impl IssuePicker {
@@ -310,19 +364,21 @@ impl IssuePicker {
 
     /// The rows by group, none of them empty.
     fn groups(&self) -> Vec<(Option<&'static str>, Vec<Row>)> {
+        if let Some(blocked) = &self.blocked {
+            return vec![(None, vec![Row::Settings(blocked.clone())])];
+        }
         let key = self.key();
         let answer = self.cache.get(&key);
         let lookup = linear::parse_issue(&self.query).filter(|_| answer.is_none());
         // Load more's failure takes its place, where the list has scrolled to.
         let more_failed = matches!(self.failure, Some((_, Job::More)));
         let top = [
-            self.blocked.map(|_| Row::Settings),
             self.wait.map(|_| Row::Wait),
             self.failure
                 .as_ref()
                 .filter(|_| !more_failed)
                 .map(|_| Row::Retry),
-            lookup.filter(|_| self.blocked.is_none()).map(Row::Lookup),
+            lookup.map(Row::Lookup),
         ];
         let mut groups = vec![(None, top.into_iter().flatten().collect::<Vec<_>>())];
         let shown = self.cache.get(&self.shown);
@@ -342,7 +398,7 @@ impl IssuePicker {
             });
             groups.push((None, hits.chain(more).collect()));
         } else if sources.is_empty() {
-            if self.blocked.is_none() && self.wait.is_none() && self.failure.is_none() {
+            if self.wait.is_none() && self.failure.is_none() {
                 groups.push((None, vec![Row::Skeleton; 6]));
             }
         } else {
@@ -381,16 +437,7 @@ impl IssuePicker {
         let lookup_attached = |t: &Target| t.org.is_none() && attached.iter().any(|a| a.1 == t.id);
         let marked = |id: &str| self.marks.iter().any(|t| t.id == id);
         match row {
-            Row::Settings => {
-                let text = self.blocked.unwrap_or_default().to_string();
-                line_item(
-                    "issue-settings",
-                    Some(IconName::Settings),
-                    text,
-                    None,
-                    false,
-                )
-            }
+            Row::Settings(blocked) => blocked_item(blocked),
             Row::Wait => {
                 let left = self.wait.unwrap_or_default();
                 let text = format!("Linear is rate limiting searches. Resuming in {left}s");
@@ -556,9 +603,8 @@ impl IssuePicker {
     ) {
         match e {
             Error::RateLimited { retry_at } => self.pause(retry_at, window, cx),
-            Error::Unauthorized => {
-                self.blocked = Some("Linear rejected the credential. Reconnect in Settings")
-            }
+            // `linear_rejected` came first, so `connection_changed` has said it.
+            Error::Unauthorized => {}
             e if fresh => {
                 if matches!(job, Job::More) {
                     self.cursor = Some("retry".into());
@@ -589,6 +635,26 @@ impl IssuePicker {
         });
     }
 
+    /// Shark changed, perhaps through Settings over this picker. Once Linear can be asked,
+    /// Settings gives way if it's still up, and the query waiting here goes out.
+    fn connection_changed(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(shark) = self.shark.upgrade() else {
+            return;
+        };
+        let now = shark.read(cx).linear_blocked();
+        if now == self.blocked {
+            return;
+        }
+        if std::mem::replace(&mut self.blocked, now).is_some() && self.blocked.is_none() {
+            if (self.settings.take()).is_some_and(|f| f.upgrade().is_some()) {
+                window.close_dialog(cx);
+            }
+            (self.cursor, self.failure) = (None, None);
+            self.send(window, cx);
+        }
+        cx.notify();
+    }
+
     fn more(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let after = self.cache.get(&self.key()).and_then(|p| p.next.clone());
         if !self.flying && self.wait.is_none() && after.is_some() {
@@ -609,14 +675,15 @@ impl IssuePicker {
     fn pick(&mut self, at: IndexPath, window: &mut Window, cx: &mut Context<Self>) {
         let attached = self.attached(cx);
         let (target, done) = match self.row_at(at) {
-            Some(Row::Settings) => {
-                window.close_dialog(cx);
+            // Over the picker, which is there as it was when Settings closes.
+            Some(Row::Settings(_)) => {
                 let shark = self.shark.clone();
                 shark
                     .update(cx, |s, cx| {
                         crate::settings::open_linear(&s.state, window, cx)
                     })
                     .ok();
+                self.settings = window.focused(cx).map(|f| f.downgrade());
                 return;
             }
             Some(Row::Retry) => return self.retry(window, cx),
@@ -632,13 +699,15 @@ impl IssuePicker {
             }
             _ => return,
         };
-        let mut targets = self.marks.clone();
-        if !done && !targets.iter().any(|t| t.id == target.id) {
-            targets.push(target.clone());
-        }
-        match targets.is_empty() {
-            true => window.push_notification(format!("{} is already attached", target.id), cx),
-            false => self.fetch(targets, window, cx),
+        // Marks win, as on the Attach button: what the footer counts is what gets attached.
+        // ponytail: `Command` reports a click like `enter`, so clicking an unmarked row while
+        // marks exist attaches the marks without it; tell them apart to take the clicked row too.
+        match (self.marks.is_empty(), done) {
+            (false, _) => self.fetch(self.marks.clone(), window, cx),
+            (true, true) => {
+                window.push_notification(format!("{} is already attached", target.id), cx)
+            }
+            (true, false) => self.fetch(vec![target], window, cx),
         }
     }
 
@@ -723,12 +792,19 @@ impl Render for IssuePicker {
         let muted = cx.theme().muted_foreground;
         let query = self.query.trim().to_string();
         let marked = self.marks.len();
-        let verb = if self.agent.is_some() {
-            "↵ Attach · ⌘↵ Mark"
-        } else {
-            "↵ Start"
+        let (nav, close) = (("up down", "Navigate"), ("escape", "Close"));
+        let hints = match (&self.blocked, &self.agent, marked) {
+            (Some(b), ..) => vec![("enter", b.action()), close],
+            (_, None, _) => vec![nav, ("enter", "Start"), close],
+            (_, _, 0) => vec![nav, ("enter", "Attach"), ("cmd-enter", "Mark"), close],
+            _ => vec![
+                nav,
+                ("enter", "Attach marked"),
+                ("cmd-enter", "Mark"),
+                close,
+            ],
         };
-        let legend = format!("↑↓ Navigate · {verb} · Esc Close");
+        let marked = Some(marked).filter(|n| *n > 0 && self.blocked.is_none());
         let (q, select, pick, attach) = (
             cx.entity().downgrade(),
             cx.entity().downgrade(),
@@ -763,15 +839,11 @@ impl Render for IssuePicker {
             })
             .footer(move |_, _, _| {
                 let attach = attach.clone();
-                h_flex()
-                    .px_3()
-                    .py_2()
-                    .gap_2()
-                    .text_xs()
-                    .text_color(muted)
-                    .child(div().flex_1().min_w_0().truncate().child(legend.clone()))
-                    .when(marked > 0, |d| {
-                        d.child(format!("{marked} marked")).child(
+                let action = marked.map(|n| {
+                    h_flex()
+                        .gap_2()
+                        .child(format!("{n} marked"))
+                        .child(
                             Button::new("issue-attach-marked")
                                 .primary()
                                 .xsmall()
@@ -782,7 +854,9 @@ impl Render for IssuePicker {
                                         .ok();
                                 }),
                         )
-                    })
+                        .into_any_element()
+                });
+                crate::ui::key_footer(&hints, action).text_color(muted)
             })
             .on_query(move |query, window, cx| {
                 q.update(cx, |p, cx| p.typed(query, window, cx)).ok();
@@ -1073,18 +1147,30 @@ impl Render for IssueDetails {
 }
 
 impl Shark {
+    /// Whether anyone here uses Linear: connected, in whatever state, or with an issue still
+    /// attached, whose chip stays readable and whose picker offers the way back. Everything Linear
+    /// shows outside Settings hangs on this.
+    pub(super) fn linear_in_use(&self) -> bool {
+        self.state.linear.is_some()
+            || (self.state.workspaces.iter()).any(|w| w.linear.primary().is_some())
+    }
+
+    fn linear_blocked(&self) -> Option<Blocked> {
+        match (&self.state.linear, self.linear_needs_attention()) {
+            (None, _) => Some(Blocked::NotConnected),
+            (_, Some(why)) => Some(Blocked::Attention(why.to_string())),
+            _ => None,
+        }
+    }
+
     fn open_issue_picker(
         &mut self,
         agent: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let blocked = self
-            .state
-            .linear
-            .is_none()
-            .then_some("Connect Linear in Settings");
-        let shark = cx.entity().downgrade();
+        let blocked = self.linear_blocked();
+        let shark = cx.entity();
         let picker = cx.new(|cx| IssuePicker {
             state: cx.new(|cx| CommandState::new(window, cx)),
             agent,
@@ -1102,11 +1188,15 @@ impl Shark {
             wait: None,
             fetching: false,
             failure: None,
-            shark,
+            shark: shark.downgrade(),
             _debounce: Task::ready(()),
             _flight: Task::ready(()),
             _wait: Task::ready(()),
             _fetch: Task::ready(()),
+            _connection: cx.observe_in(&shark, window, |p: &mut IssuePicker, _, window, cx| {
+                p.connection_changed(window, cx)
+            }),
+            settings: None,
         });
         let state = picker.read(cx).state.clone();
         let opened = picker.clone();
@@ -1422,6 +1512,55 @@ impl Shark {
         });
     }
 
+    /// `s` belongs to no connection here, so it can't refresh.
+    fn disconnected(&self, s: &Snapshot) -> bool {
+        self.linear_org_id() != Some(s.org.as_str())
+    }
+
+    /// An issue's row in Show attachments: what its chip says, in words, and its status icon.
+    pub(super) fn issue_row(&self, ws: &Workspace, r: &IssueRef, theme: &Theme) -> (String, Icon) {
+        let Some(s) = r.of(&ws.issues) else {
+            let icon = Icon::new(IconName::TriangleAlert).text_color(theme.warning_foreground);
+            return (format!("{} · snapshot missing", issue_label(ws, r)), icon);
+        };
+        let mut label = format!("{} {} · {}", s.identifier, s.title, s.status);
+        if ws.linear.primary() == Some(r) {
+            label += " · primary";
+        }
+        if self.disconnected(s) {
+            label += " · disconnected";
+        }
+        (label, status_icon(&s.state_type, theme))
+    }
+
+    /// The header's one mark for `ws`'s disconnected issues, however many: the word on every chip
+    /// pushed them out of the row. Their tooltips and details say it for each.
+    pub(super) fn disconnected_chip(
+        &self,
+        ws: &Workspace,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        let issues = (ws.linear.ordered()).filter_map(|r| r.of(&ws.issues));
+        let n = issues.filter(|s| self.disconnected(s)).count();
+        (n > 0).then(|| {
+            let theme = cx.theme();
+            let icon = Icon::new(IconName::CircleDashed).text_color(theme.muted_foreground);
+            let tip = format!(
+                "{n} disconnected issue{}: from another Linear organization, or Linear isn't connected. Opens Settings.",
+                plural(n),
+            );
+            Self::chip("issues-disconnected", icon, "Disconnected".into(), theme)
+                .aria_label(tip.clone())
+                .cursor_pointer()
+                .tooltip(move |w, cx| Tooltip::new(tip.clone()).build(w, cx))
+                .on_click(cx.listener(|s, _, w, cx| {
+                    crate::settings::open_linear(&s.state, w, cx)
+                }))
+                .test_support()
+                .into_any_element()
+        })
+    }
+
     /// The header's issue chips, primary first: state and identifier, a star on the primary.
     pub(super) fn issue_chips(&self, ws: &Workspace, cx: &mut Context<Self>) -> Vec<AnyElement> {
         let primary = ws.linear.primary();
@@ -1429,10 +1568,9 @@ impl Shark {
             .map(|r| {
                 let theme = cx.theme();
                 let snapshot = r.of(&ws.issues);
-                let disconnected =
-                    snapshot.is_some_and(|s| self.linear_org_id() != Some(s.org.as_str()));
+                let disconnected = snapshot.is_some_and(|s| self.disconnected(s));
                 let is_primary = Some(r) == primary;
-                let mut label = issue_label(ws, r);
+                let label = issue_label(ws, r);
                 let mut tip = snapshot
                     .map_or("Snapshot missing. Open it to refresh.".into(), |s| {
                         s.title.clone()
@@ -1441,7 +1579,6 @@ impl Shark {
                     tip += " (primary)";
                 }
                 if disconnected {
-                    label += " · disconnected";
                     tip += " (disconnected)";
                 }
                 let icon = snapshot.map_or(

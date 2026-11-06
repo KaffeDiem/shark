@@ -153,8 +153,8 @@ async fn branches_and_bases_of_first_and_later_repos(cx: &mut TestAppContext) {
     assert_eq!(ws_of(cx, &shark).repos[2].branch, None, "the inherited one");
 }
 
-/// The dialog shows the branch and each repo's base before anything happens: tab reaches the
-/// list, cmd-b a repo's branches, alt-enter takes one as base, and cmd-enter confirms.
+/// The dialog shows the branch and base before anything happens: cmd-b opens Change, cmd-b again
+/// the bases, enter takes one and comes back, and enter attaches. alt-enter stays out of it.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn the_dialog_picks_branch_and_base_from_the_keyboard(cx: &mut TestAppContext) {
@@ -169,17 +169,18 @@ async fn the_dialog_picks_branch_and_base_from_the_keyboard(cx: &mut TestAppCont
     cx.update_window(window, |_, w, cx| assert!(w.has_active_dialog(cx)))
         .unwrap();
     assert!(ws_of(cx, &shark).attaching.is_empty(), "nothing yet");
-    press(cx, &["tab", "cmd-b"]);
-    cx.run_until_parked();
-    press(cx, &["down"]);
-    // develop comes after the agent's New branch row and main, in commit-date order.
-    let list = git::branches(&repos[0].path).unwrap();
-    let pick = list.iter().position(|b| b.name == "develop").unwrap();
-    for _ in 0..pick {
-        press(cx, &["down"]);
-    }
+    press(cx, &["cmd-b", "tab", "down"]);
     press(cx, &["alt-enter"]);
-    press(cx, &["cmd-enter"]);
+    assert!(
+        shows(cx, window, "source-back"),
+        "no shortcut to a base here"
+    );
+    press(cx, &["cmd-b"]);
+    cx.update_window(window, |_, w, cx| w.input("develop", cx))
+        .unwrap();
+    press(cx, &["enter"]);
+    assert_eq!(summary(cx, window), format!("{name} from develop"));
+    press(cx, &["enter"]);
     settled(cx, window, &shark).await;
     cx.update_window(window, |_, w, cx| assert!(!w.has_active_dialog(cx)))
         .unwrap();
@@ -233,10 +234,10 @@ async fn collisions_leave_everything_alone(cx: &mut TestAppContext) {
 
     // The dialog says so first, and stays open.
     on(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
-    press_in(window)(cx, &["cmd-a"]);
+    press_in(window)(cx, &["cmd-b", "cmd-a"]);
     cx.update_window(window, |_, w, cx| w.input("taken", cx))
         .unwrap();
-    press_in(window)(cx, &["enter"]);
+    press_in(window)(cx, &["enter", "enter"]);
     cx.update_window(window, |_, w, cx| assert!(w.has_active_dialog(cx)))
         .unwrap();
     assert!(ws_of(cx, &shark).attaching.is_empty());
@@ -1617,11 +1618,15 @@ async fn the_base_button_picks_a_base(cx: &mut TestAppContext) {
     let name = ws_of(cx, &shark).name;
     let press = press_in(window);
     on(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
-    assert!(shows(cx, window, ("repo-base", 0usize)), "visible");
+    assert_eq!(summary(cx, window), format!("{name} from main"), "visible");
     assert!(!shows(cx, window, "base-default"));
-    cx.update_window(window, |_, w, cx| w.click(("repo-base", 0usize), cx))
-        .unwrap();
-    cx.run_until_parked();
+    let click = |cx: &mut TestAppContext, id: &'static str| {
+        cx.update_window(window, |_, w, cx| w.click(id, cx))
+            .unwrap();
+        cx.run_until_parked();
+    };
+    click(cx, "attach-change");
+    click(cx, "source-other");
     assert!(shows(cx, window, "base-default"), "marked Default");
     let list = git::branches(src).unwrap();
     let main = list.iter().position(|b| b.name == "main").unwrap();
@@ -1634,23 +1639,405 @@ async fn the_base_button_picks_a_base(cx: &mut TestAppContext) {
         press(cx, &["up"]);
     }
     press(cx, &["enter"]);
-    assert!(
-        shows(cx, window, ("repo-base", 0usize)),
-        "back on the repos"
-    );
-    press(cx, &["cmd-enter"]);
+    assert!(shows(cx, window, "attach-summary"), "back on the repos");
+    press(cx, &["enter"]);
     settled(cx, window, &shark).await;
     let ws = ws_of(cx, &shark);
     assert_eq!(ws.repos[0].base, "develop");
     assert_eq!(ws.branch, ws.name, "still the new branch, not develop");
 }
 
+fn summary(cx: &mut TestAppContext, window: AnyWindowHandle) -> String {
+    label(cx, window, "attach-summary")
+}
+
+fn label(cx: &mut TestAppContext, window: AnyWindowHandle, id: impl Into<ElementId>) -> String {
+    let id = id.into();
+    cx.update_window(window, move |_, w, cx| {
+        w.render_frame(cx);
+        w.find(id).label().unwrap_or_default().to_string()
+    })
+    .unwrap()
+}
+
+fn is_open(cx: &mut TestAppContext, window: AnyWindowHandle) -> bool {
+    cx.update_window(window, |_, w, cx| w.has_active_dialog(cx))
+        .unwrap()
+}
+
+/// `name` attached already, so the agent has a branch for later repositories to follow.
+async fn with_branch(
+    cx: &mut TestAppContext,
+    window: AnyWindowHandle,
+    shark: &Entity<Shark>,
+    repo: &Repo,
+) {
+    let name = ws_of(cx, shark).name;
+    let first = fresh(repo, &ws_of(cx, shark).default_branch());
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.queue_attachment(name.clone(), vec![first.clone()], w, cx)
+    });
+    settled(cx, window, shark).await;
+}
+
+/// The common case is one key: nothing to tick, nothing to confirm.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn one_enter_attaches_the_highlighted_repository(cx: &mut TestAppContext) {
+    guards!(quiet, _turn, _claude);
+    let home = test_home();
+    let (window, shark, _) = agent(cx, &home, &["api", "web"], &[]);
+    let name = ws_of(cx, &shark).name;
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
+    assert_eq!(label(cx, window, "create"), "Attach 1 repository");
+    press_in(window)(cx, &["down", "enter"]);
+    settled(cx, window, &shark).await;
+    assert!(!is_open(cx, window));
+    let ws = ws_of(cx, &shark);
+    let names: Vec<&str> = ws.repos.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["web"]);
+}
+
+/// cmd-enter marks and stays; the button counts what enter would take: the marks, or the highlight
+/// with none.
+/// Space isn't a mark: the field takes typing.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn marks_count_on_the_button(cx: &mut TestAppContext) {
+    guards!(quiet, _turn, _claude);
+    let home = test_home();
+    let (window, shark, _) = agent(cx, &home, &["api", "web", "docs"], &[]);
+    let name = ws_of(cx, &shark).name;
+    let press = press_in(window);
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
+    press(cx, &["space"]);
+    assert_eq!(label(cx, window, "create"), "Attach 1 repository");
+    press(cx, &["cmd-enter"]);
+    assert!(is_open(cx, window), "marking stays open");
+    assert_eq!(label(cx, window, "create"), "Attach 1 repository");
+    press(cx, &["down"]);
+    assert_eq!(
+        label(cx, window, "create"),
+        "Attach 1 repository",
+        "marks win over the highlight"
+    );
+    press(cx, &["cmd-enter", "down", "down"]);
+    assert_eq!(
+        label(cx, window, "create"),
+        "Attach 2 repositories",
+        "Add a local repository is no target"
+    );
+    cx.update_window(window, |_, w, cx| w.click("create", cx))
+        .unwrap();
+    settled(cx, window, &shark).await;
+    assert!(!is_open(cx, window));
+    let ws = ws_of(cx, &shark);
+    let names: Vec<&str> = ws.repos.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["api", "web"]);
+}
+
+/// A later repository shows the agent's branch and can't rename it; its base stays its own.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_later_repository_follows_the_agents_branch(cx: &mut TestAppContext) {
+    guards!(quiet, _turn, _claude);
+    let home = test_home();
+    let (window, shark, repos) = agent(cx, &home, &["api", "web"], &[]);
+    with_branch(cx, window, &shark, &repos[0]).await;
+    let name = ws_of(cx, &shark).name;
+    let press = press_in(window);
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
+    assert!(shows(cx, window, "attach-follows"));
+    press(cx, &["cmd-b"]);
+    assert!(shows(cx, window, "attach-follows"), "read-only in Change");
+    press(cx, &["tab", "escape"]);
+    assert!(is_open(cx, window), "esc goes back, the dialog stays");
+    press(cx, &["enter"]);
+    settled(cx, window, &shark).await;
+    let ws = ws_of(cx, &shark);
+    assert_eq!(ws.repos[1].name, "web");
+    assert_eq!(ws.repos[1].branch, None, "the inherited one");
+}
+
+/// A taken name changes the row and offers another: tab takes it, nothing reuses the branch.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_collision_says_so_and_suggests_a_name(cx: &mut TestAppContext) {
+    guards!(quiet, _turn, _claude);
+    let home = test_home();
+    let (window, shark, repos) = agent(cx, &home, &["api"], &[]);
+    let ws = ws_of(cx, &shark);
+    let (name, branch) = (ws.name.clone(), ws.default_branch());
+    let src = &repos[0].path;
+    git::git(src, &["branch", &branch]).unwrap();
+    git::git(src, &["branch", &format!("{branch}-2")]).unwrap();
+    let tip = git::git(src, &["rev-parse", &branch]).unwrap();
+    let press = press_in(window);
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
+    assert_eq!(
+        label(cx, window, ("attach-row", 0usize)),
+        format!("api, branch {branch} already exists")
+    );
+    assert_eq!(
+        label(cx, window, ("attach-rename", 0usize)),
+        format!("Use {branch}-3"),
+        "the next free one"
+    );
+    press(cx, &["enter"]);
+    assert!(is_open(cx, window), "refused, and told");
+    assert!(ws_of(cx, &shark).attaching.is_empty());
+    press(cx, &["tab"]);
+    assert_eq!(label(cx, window, ("attach-row", 0usize)), "api");
+    assert_eq!(summary(cx, window), format!("{branch}-3 from main"));
+    press(cx, &["enter"]);
+    settled(cx, window, &shark).await;
+    let ws = ws_of(cx, &shark);
+    assert_eq!(ws.branch, format!("{branch}-3"));
+    assert_eq!(git::git(src, &["rev-parse", &branch]).unwrap(), tip);
+}
+
+/// In a later repository only the one that collides leaves the agent's branch, and it can name it.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_later_collision_is_that_repositorys_own(cx: &mut TestAppContext) {
+    guards!(quiet, _turn, _claude);
+    let home = test_home();
+    let (window, shark, repos) = agent(cx, &home, &["api", "web", "docs"], &[]);
+    with_branch(cx, window, &shark, &repos[0]).await;
+    let ws = ws_of(cx, &shark);
+    let (name, branch) = (ws.name.clone(), ws.branch.clone());
+    git::git(&repos[1].path, &["branch", &branch]).unwrap();
+    let press = press_in(window);
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
+    assert!(!shows(cx, window, "attach-follows"), "it collides");
+    press(cx, &["cmd-enter", "cmd-b", "cmd-a"]);
+    cx.update_window(window, |_, w, cx| w.input("my/web", cx))
+        .unwrap();
+    press(cx, &["enter", "down"]);
+    assert!(shows(cx, window, "attach-follows"), "docs still follows");
+    press(cx, &["cmd-enter", "enter"]);
+    settled(cx, window, &shark).await;
+    let ws = ws_of(cx, &shark);
+    let branch_of = |repo: &str| {
+        let r = ws.repos.iter().find(|r| r.name == repo).unwrap();
+        r.branch.clone()
+    };
+    assert_eq!(branch_of("web").as_deref(), Some("my/web"));
+    assert_eq!(branch_of("docs"), None);
+}
+
+/// Attached repositories stay in the list, last and out of reach; recently used come first.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn attached_rows_are_listed_and_disabled(cx: &mut TestAppContext) {
+    guards!(quiet, _turn, _claude);
+    let home = test_home();
+    let (window, shark, repos) = agent(cx, &home, &["api", "web", "docs"], &[]);
+    with_branch(cx, window, &shark, &repos[0]).await;
+    let name = ws_of(cx, &shark).name;
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, _, _| {
+        let used = |r: &str| crate::state::WsRepo {
+            name: r.into(),
+            src: "/nowhere".into(),
+            base: "main".into(),
+            branch: None,
+        };
+        s.state.workspaces.push(Workspace {
+            name: "older".into(),
+            repos: vec![used("docs")],
+            last_interacted_at: Some(1),
+            ..Default::default()
+        });
+    });
+    on(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
+    // docs was used, web never, and api is attached.
+    assert_eq!(label(cx, window, ("attach-row", 0usize)), "docs");
+    assert_eq!(label(cx, window, ("attach-row", 1usize)), "web");
+    assert_eq!(label(cx, window, ("attach-row", 2usize)), "api, attached");
+    assert!(!shows(cx, window, ("repo-pick", 2usize)));
+    cx.update_window(window, |_, w, cx| w.click(("attach-row", 2usize), cx))
+        .unwrap();
+    cx.run_until_parked();
+    assert!(is_open(cx, window), "a click does nothing");
+    let press = press_in(window);
+    press(cx, &["down", "down", "enter"]);
+    assert!(cx.did_prompt_for_paths(), "down skips it, to the last row");
+    cx.simulate_path_prompt_response(|_| None);
+}
+
+/// With nothing registered there's no list to land on: the panel, and the dialog once there's a
+/// repository. A bad folder is told and goes nowhere, and cancelling leaves nothing open.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn no_repositories_go_straight_to_the_folder_panel(cx: &mut TestAppContext) {
+    guards!(quiet, _turn, _claude);
+    let home = test_home();
+    let (window, shark, _) = agent(cx, &home, &[], &[]);
+    let name = ws_of(cx, &shark).name;
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
+    assert!(cx.did_prompt_for_paths() && !is_open(cx, window));
+    cx.simulate_path_prompt_response(|_| None);
+    cx.run_until_parked();
+    assert!(!cx.did_prompt_for_paths() && !is_open(cx, window));
+
+    on(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
+    let bad = home.join("plain");
+    fs::create_dir_all(&bad).unwrap();
+    cx.simulate_path_prompt_response(|_| Some(vec![bad.clone()]));
+    cx.run_until_parked();
+    assert!(!cx.did_prompt_for_paths() && !is_open(cx, window));
+
+    on(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
+    let good = home.join("src/api");
+    init_repo(&good);
+    cx.simulate_path_prompt_response(|_| Some(vec![good.clone()]));
+    cx.run_until_parked();
+    assert!(is_open(cx, window));
+    assert_eq!(label(cx, window, "create"), "Attach 1 repository");
+    press_in(window)(cx, &["enter"]);
+    settled(cx, window, &shark).await;
+    assert_eq!(ws_of(cx, &shark).repos[0].name, "api");
+}
+
+/// Everything attached: a title, a line and the one thing to do, then the list once it's done.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn all_attached_offers_a_local_repository(cx: &mut TestAppContext) {
+    guards!(quiet, _turn, _claude);
+    let home = test_home();
+    let (window, shark, repos) = agent(cx, &home, &["api"], &[]);
+    with_branch(cx, window, &shark, &repos[0]).await;
+    let name = ws_of(cx, &shark).name;
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
+    assert!(shows(cx, window, "attach-none"));
+    assert!(!shows(cx, window, ("attach-row", 0usize)), "no list");
+    let press = press_in(window);
+    press(cx, &["enter"]);
+    assert!(cx.did_prompt_for_paths(), "enter does it");
+    assert!(is_open(cx, window));
+    let web = home.join("src/web");
+    init_repo(&web);
+    cx.simulate_path_prompt_response(|_| Some(vec![web.clone()]));
+    cx.run_until_parked();
+    assert!(!shows(cx, window, "attach-none"));
+    assert_eq!(label(cx, window, "create"), "Attach 1 repository");
+    press(cx, &["enter"]);
+    settled(cx, window, &shark).await;
+    assert_eq!(ws_of(cx, &shark).repos[1].name, "web");
+}
+
+/// The dialog stays through the folder panel: marks, the branch, a repository's base and the
+/// filter survive a cancel and a bad folder, and the new repository arrives marked.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn add_local_comes_back_to_the_dialog_as_it_was(cx: &mut TestAppContext) {
+    guards!(quiet, _turn, _claude);
+    let home = test_home();
+    let (window, shark, repos) = agent(cx, &home, &["api", "web"], &[]);
+    git::git(&repos[1].path, &["branch", "develop"]).unwrap();
+    let name = ws_of(cx, &shark).name;
+    let press = press_in(window);
+    let input = |cx: &mut TestAppContext, text: &str| {
+        cx.update_window(window, |_, w, cx| w.input(text, cx))
+            .unwrap();
+        cx.run_until_parked();
+    };
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
+    // web on develop, the branch renamed, api marked, a filter on the last row.
+    press(cx, &["down", "cmd-b", "cmd-a"]);
+    input(cx, "my/branch");
+    press(cx, &["cmd-b"]);
+    input(cx, "develop");
+    press(cx, &["enter"]);
+    assert_eq!(summary(cx, window), "my/branch from develop");
+    press(cx, &["up"]);
+    assert_eq!(summary(cx, window), "my/branch from main");
+    press(cx, &["cmd-enter"]);
+    input(cx, "local");
+    press(cx, &["enter"]);
+    assert!(cx.did_prompt_for_paths());
+    assert!(is_open(cx, window), "open behind the panel");
+    cx.simulate_path_prompt_response(|_| None);
+    cx.run_until_parked();
+    let state = |cx: &mut TestAppContext| {
+        assert!(is_open(cx, window));
+        assert_eq!(label(cx, window, "create"), "Attach 2 repositories");
+        assert!(!shows(cx, window, ("attach-row", 0usize)), "filtered still");
+    };
+    state(cx);
+
+    // A bad folder and a duplicate: told, and back here.
+    press(cx, &["enter"]);
+    let bad = home.join("plain");
+    fs::create_dir_all(&bad).unwrap();
+    cx.simulate_path_prompt_response(|_| Some(vec![bad.clone()]));
+    cx.run_until_parked();
+    state(cx);
+    press(cx, &["enter"]);
+    let same = repos[0].path.clone();
+    cx.simulate_path_prompt_response(|_| Some(vec![same.clone()]));
+    cx.run_until_parked();
+    state(cx);
+
+    press(cx, &["enter"]);
+    let docs = home.join("src/docs");
+    init_repo(&docs);
+    cx.simulate_path_prompt_response(|_| Some(vec![docs.clone()]));
+    cx.run_until_parked();
+    assert_eq!(label(cx, window, "create"), "Attach 3 repositories");
+    cx.update_window(window, |_, w, cx| w.click("create", cx))
+        .unwrap();
+    settled(cx, window, &shark).await;
+    let ws = ws_of(cx, &shark);
+    let names: Vec<&str> = ws.repos.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["api", "web", "docs"]);
+    assert_eq!(ws.branch, "my/branch");
+    assert_eq!(ws.repos[1].base, "develop");
+}
+
+/// New workspace from branch shares the form and keeps its shell: its heading and count, ticking
+/// with space and enter, and cmd-enter to create.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn new_agent_from_branch_keeps_its_keys(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api", "web"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let press = press_in(window);
+    branch_dialog(cx, window);
+    assert!(shows(cx, window, ("repo-prs", 0usize)));
+    assert!(!shows(cx, window, "attach-summary"));
+    cx.update_window(window, |_, w, cx| w.input("kept", cx))
+        .unwrap();
+    press(cx, &["tab", "space", "down", "enter"]);
+    assert!(is_open(cx, window), "enter ticks, in the list");
+    press(cx, &["cmd-enter"]);
+    until(cx, window, {
+        let shark = shark.clone();
+        move |_, cx| shark.read(cx).ws("kept").is_some()
+    })
+    .await;
+    let ws = cx.update(|cx| shark.read(cx).ws("kept").cloned().unwrap());
+    assert_eq!(ws.repos.len(), 2);
+}
+
 /// Real pixels, both themes: chips in each state, overflow, the confirm step and the panel.
 pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
-    let repos = repos(&home, &["api", "web"]);
+    let repos = repos(&home, &["api", "web", "payments"]);
     let api = &repos[0].path;
+    git::git(&repos[1].path, &["branch", "you/eng-123-taken"]).unwrap();
     git::git(api, &["branch", "develop"]).unwrap();
     git::git(api, &["branch", "release/2.4"]).unwrap();
     git::git(api, &["remote", "add", "origin", api.to_str().unwrap()]).unwrap();
@@ -1682,7 +2069,13 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             ("chips", 1280.),
             ("overflow", 860.),
             ("confirm", 1000.),
+            ("first", 1000.),
+            ("marks", 1000.),
+            ("collision", 1000.),
+            ("change", 1000.),
+            ("change-later", 1000.),
             ("bases", 1000.),
+            ("none", 1000.),
             ("queued", 1000.),
             ("running", 1000.),
             ("failed", 1000.),
@@ -1806,9 +2199,49 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         let repo = ["search", "ledger", "payments"][at];
                         s.attachment_menu(name.into(), repo.into(), w, cx);
                     }
-                    if matches!(case, "confirm" | "bases") {
+                    let dialog = [
+                        "confirm",
+                        "first",
+                        "marks",
+                        "collision",
+                        "change",
+                        "change-later",
+                        "bases",
+                        "none",
+                    ];
+                    if dialog.contains(&case) {
+                        let ws = s.ws_mut(name).unwrap();
+                        match case {
+                            "first" | "marks" | "change" | "bases" => ws.repos.clear(),
+                            "collision" => ws.branch = "you/eng-123-taken".into(),
+                            _ => {}
+                        }
+                        // Agents that used the others lately.
+                        let used = |name: &str, repo: &str, hours: u64| {
+                            let repo = crate::state::WsRepo {
+                                name: repo.into(),
+                                src: src.path.clone(),
+                                base: "main".into(),
+                                branch: None,
+                            };
+                            let hours = hours * 3_600_000;
+                            Workspace {
+                                name: name.into(),
+                                repos: vec![repo],
+                                last_interacted_at: Some(
+                                    super::super::interaction::now_ms() - hours,
+                                ),
+                                ..Default::default()
+                            }
+                        };
+                        (s.state.workspaces).extend([used("a", "web", 2), used("b", "api", 30)]);
+                        if case == "none" {
+                            s.state.repos.retain(|r| r.name == "payments");
+                        }
                         s.attach_results.clear();
-                        s.attach_dialog(name.into(), vec!["api".into()], w, cx);
+                        // Marked from the start: a tick marked now is still animating in.
+                        let marked = (case == "marks").then(|| "web".to_string());
+                        s.attach_dialog(name.into(), marked.into_iter().collect(), w, cx);
                     }
                     cx.notify();
                 })
@@ -1819,8 +2252,12 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             for frame in 0..6 {
                 cx.update_window(window, |_, w, cx| {
                     w.render_frame(cx);
-                    if case == "bases" && frame == 2 {
-                        w.click(("repo-base", 0usize), cx);
+                    match (case, frame) {
+                        ("change" | "change-later" | "bases", 2) | ("bases", 3) => {
+                            w.press("cmd-b", cx)
+                        }
+                        ("marks", 2) => w.press("down", cx),
+                        _ => {}
                     }
                 })
                 .unwrap();
@@ -1838,5 +2275,5 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 .unwrap();
         }
     }
-    println!("attachment previews: 16 rendered (both themes)");
+    println!("attachment previews: 30 rendered (both themes)");
 }

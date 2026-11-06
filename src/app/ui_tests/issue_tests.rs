@@ -5,6 +5,7 @@ use crate::agent::Ev;
 use crate::app::linear_connection::{Connection, Method};
 use crate::chat::Chat;
 use crate::linear::{self, IssueRef, Req, Resp, fake};
+use gpui_kit::test::TestQueryExt as _;
 use serde_json::{Value, json};
 use std::cell::RefCell;
 
@@ -169,7 +170,8 @@ fn dialog_open(cx: &mut TestAppContext, window: AnyWindowHandle) -> bool {
         .unwrap()
 }
 
-fn shows(cx: &mut TestAppContext, window: AnyWindowHandle, id: &'static str) -> bool {
+fn shows(cx: &mut TestAppContext, window: AnyWindowHandle, id: impl Into<ElementId>) -> bool {
+    let id = id.into();
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         w.try_find(id).is_some()
@@ -666,8 +668,8 @@ async fn marked_rows_attach_together(cx: &mut TestAppContext) {
     );
 }
 
-/// Enter takes the highlighted row along with the marked ones. An attached row shows its check,
-/// can't be marked and isn't fetched.
+/// With marks, enter attaches the marks, as the Attach button does: what the footer counts, not
+/// the highlighted row too. An attached row shows its check, can't be marked and isn't fetched.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn attached_rows_show_a_check_and_skip_the_fetch(cx: &mut TestAppContext) {
@@ -689,7 +691,7 @@ async fn attached_rows_show_a_check_and_skip_the_fetch(cx: &mut TestAppContext) 
 
     press(cx, &["down", "cmd-enter", "down", "enter"]);
     assert!(!dialog_open(cx, window));
-    assert_eq!(ids(&ws_of(cx, &shark)), ["uuid-1", "uuid-2", "uuid-3"]);
+    assert_eq!(ids(&ws_of(cx, &shark)), ["uuid-1", "uuid-2"]);
 }
 
 /// A failed search keeps the query and the rows and offers Retry, which is the highlighted row
@@ -817,7 +819,97 @@ async fn a_rejected_credential_asks_for_a_reconnect(cx: &mut TestAppContext) {
     assert!(ids(&ws_of(cx, &shark)).is_empty());
 }
 
-/// Not connected, the picker says so and goes to Settings.
+/// Settings › Linear finished connecting, as `linear_adopt` ends.
+fn connect_now(cx: &mut TestAppContext, shark: &Entity<Shark>) {
+    shark.update(cx, |s, cx| {
+        s.linear_connected(KEY, acme(), &linear_answers, cx);
+        cx.notify();
+    });
+    cx.run_until_parked();
+}
+
+/// Not connected, the reason replaces the rows and `enter` goes to Settings over the picker,
+/// which is there as it was afterwards: closed without connecting it still says why, and
+/// connected it asks for the query that was waiting.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn the_picker_comes_back_from_settings_with_its_query(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    reset();
+    let (window, shark, _) = agent(cx, &home, &[], &[]);
+    open_picker(cx, window, &shark);
+    type_in(cx, window, "login");
+    settle(cx);
+    let press = press_in(window);
+    press(cx, &["enter"]);
+    assert!(shows(cx, window, "linear-sign-in"));
+    press(cx, &["escape"]);
+    assert!(!shows(cx, window, "linear-sign-in"));
+    assert!(shows(cx, window, "issue-settings"), "still says why");
+    assert_eq!(field(cx, window), "login");
+    assert!(sent().is_empty());
+
+    press(cx, &["enter"]);
+    assert!(shows(cx, window, "linear-sign-in"));
+    connect_now(cx, &shark);
+    assert!(!shows(cx, window, "linear-sign-in"), "Settings gave way");
+    assert!(!shows(cx, window, "issue-settings"));
+    assert_eq!(field(cx, window), "login");
+    assert_eq!(searches(), ["login"]);
+    assert!(shows(cx, window, "issue-row-ENG-1"));
+    press(cx, &["enter"]);
+    assert_eq!(ids(&ws_of(cx, &shark)), ["uuid-1"]);
+}
+
+/// Settings closed before the browser finished: only the picker is left, and it stays.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn connecting_with_settings_closed_keeps_the_picker(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    reset();
+    let (window, shark, _) = agent(cx, &home, &[], &[]);
+    open_picker(cx, window, &shark);
+    press_in(window)(cx, &["enter"]);
+    assert!(shows(cx, window, "linear-sign-in"));
+    press_in(window)(cx, &["escape"]);
+    connect_now(cx, &shark);
+    assert!(dialog_open(cx, window));
+    assert!(shows(cx, window, "issue-row-ENG-1"), "the lists came");
+}
+
+/// A connection needing attention blocks the picker up front, says why, and offers Reconnect.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn a_connection_needing_attention_offers_reconnect(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let (window, shark, _) = connected(cx, &home, &[]);
+    shark.update(cx, |s, cx| s.linear_rejected(cx));
+    open_picker(cx, window, &shark);
+    assert!(sent().is_empty(), "nothing is asked of Linear");
+    assert!(shows(cx, window, "issue-settings"));
+    let why = cx.read(|cx| shark.read(cx).linear_needs_attention().unwrap().to_string());
+    cx.update_window(window, |_, w, _| {
+        assert!(w.try_find_by_label(&why).is_some(), "{why}");
+    })
+    .unwrap();
+    press_in(window)(cx, &["enter"]);
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert_eq!(w.find("linear-sign-in").label(), Some("Reconnect"));
+    })
+    .unwrap();
+}
+
+/// Without a connection the picker points to Settings, and it needs no request to say so.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn without_a_connection_the_picker_points_to_settings(cx: &mut TestAppContext) {
@@ -835,6 +927,320 @@ async fn without_a_connection_the_picker_points_to_settings(cx: &mut TestAppCont
         "Settings on its Linear page"
     );
     assert!(sent().is_empty());
+}
+
+/// How many rows cmd-k finds for "Linear issue".
+fn palette_rows(cx: &mut TestAppContext, window: AnyWindowHandle) -> usize {
+    let press = press_in(window);
+    press(cx, &["cmd-k"]);
+    type_in(cx, window, "Linear issue");
+    let rows = cx
+        .update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            let rows = w.find_all_by_role(Role::ListBoxOption).len();
+            w.close_dialog(cx);
+            rows
+        })
+        .unwrap();
+    cx.run_until_parked();
+    rows
+}
+
+/// `s` with `n` attached, and a snapshot for it.
+fn attach_directly(s: &mut Shark, name: &str, n: u32) {
+    let snapshot = Snapshot {
+        org: "acme-uuid".into(),
+        id: format!("uuid-{n}"),
+        identifier: format!("ENG-{n}"),
+        title: format!("Issue {n}"),
+        status: "Todo".into(),
+        ..Snapshot::default()
+    };
+    let ws = s.ws_mut(name).unwrap();
+    ws.linear.attach((&snapshot).into());
+    ws.issues.push(snapshot);
+}
+
+/// Everything Linear shows hangs on `linear_in_use`.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn linear_is_in_use_once_connected_or_while_issues_are_attached(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    reset();
+    let (_, shark, _) = agent(cx, &home, &[], &[]);
+    let name = ws_of(cx, &shark).name;
+    let in_use = |cx: &mut TestAppContext| cx.read(|cx| shark.read(cx).linear_in_use());
+    assert!(!in_use(cx), "never connected");
+    connect(cx, &shark);
+    assert!(in_use(cx), "connected");
+    shark.update(cx, |s, cx| s.linear_rejected(cx));
+    assert!(in_use(cx), "needing attention");
+    shark.update(cx, |s, _| s.state.linear = None);
+    assert!(!in_use(cx), "disconnected, nothing attached");
+    shark.update(cx, |s, _| attach_directly(s, &name, 1));
+    assert!(in_use(cx), "disconnected, with an issue");
+}
+
+/// Without Linear, Attach is the repository dialog and cmd-k has no Linear rows; with it, Attach
+/// is a menu of the two dialogs, and both rows open theirs directly. Settings always has the way in.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn attach_and_the_palette_follow_linear_in_use(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    reset();
+    let (window, shark, _) = agent(cx, &home, &["api"], &[]);
+    let press = press_in(window);
+    let click_attach = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.click("header-attach", cx);
+        })
+        .unwrap();
+        cx.run_until_parked();
+    };
+    let repo_dialog = |cx: &mut TestAppContext| shows(cx, window, ("repo-pick", 0usize));
+
+    assert!(!shows(cx, window, "header-attach-issue"), "one control");
+    click_attach(cx);
+    assert!(!shows(cx, window, "menu-parent"), "no menu");
+    assert!(repo_dialog(cx));
+    press(cx, &["escape"]);
+    assert_eq!(palette_rows(cx, window), 0);
+
+    press(cx, &["cmd-,"]);
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("Linear", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(shows(cx, window, "linear-sign-in"), "the way in");
+    press(cx, &["escape"]);
+
+    connect(cx, &shark);
+    click_attach(cx);
+    assert!(shows(cx, window, "menu-parent"));
+    assert!(!dialog_open(cx, window));
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        let row = |w: &Window, ix: usize| w.find(("menu-label", ix)).bounds();
+        assert_eq!(row(w, 1).top() - row(w, 0).top(), px(32.));
+        assert!(w.try_find(("menu-label", 2usize)).is_none(), "two rows");
+        let (button, menu) = (
+            w.find("header-attach").bounds(),
+            w.find("menu-parent").bounds(),
+        );
+        let off = (menu.right() - button.right()).abs();
+        assert!(off <= px(1.), "hangs from the button, {off} off");
+        assert!(menu.top() >= button.bottom());
+    })
+    .unwrap();
+    press(cx, &["enter"]);
+    assert!(!shows(cx, window, "menu-parent"));
+    assert!(repo_dialog(cx), "keys: the first row starts highlighted");
+    press(cx, &["escape"]);
+
+    // From the keyboard alone: `tab` reaches the button, `enter` opens the menu.
+    let focus_attach = |cx: &mut TestAppContext| {
+        for _ in 0..30 {
+            press(cx, &["tab"]);
+            let on = cx.update_window(window, |_, w, cx| {
+                w.render_frame(cx);
+                w.find("header-attach").focused()
+            });
+            if on.unwrap() == Some(true) {
+                return true;
+            }
+        }
+        false
+    };
+    assert!(focus_attach(cx), "a tab stop");
+    press(cx, &["enter"]);
+    assert!(shows(cx, window, "menu-parent"));
+    press(cx, &["escape"]);
+
+    click_attach(cx);
+    press(cx, &["down", "enter"]);
+    assert!(dialog_open(cx, window));
+    assert!(!repo_dialog(cx));
+    assert!(shows(cx, window, "issue-row-ENG-1"));
+    press(cx, &["escape"]);
+
+    assert_eq!(palette_rows(cx, window), 3);
+    let name = ws_of(cx, &shark).name;
+    shark.update(cx, |s, _| s.state.linear = None);
+    assert_eq!(palette_rows(cx, window), 0);
+    shark.update(cx, |s, _| attach_directly(s, &name, 1));
+    assert_eq!(palette_rows(cx, window), 3, "a way back");
+}
+
+/// Delete agent names Linear only for an agent with issues, whatever is connected.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn delete_copy_mentions_linear_only_with_issues(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let (_, shark, _) = connected(cx, &home, &[]);
+    let name = ws_of(cx, &shark).name;
+    let copy =
+        |cx: &mut TestAppContext, force| cx.read(|cx| shark.read(cx).delete_copy(&name, force));
+    for force in [false, true] {
+        assert!(!copy(cx, force).contains("Linear"), "{force}");
+    }
+    shark.update(cx, |s, _| attach_directly(s, &name, 1));
+    for force in [false, true] {
+        let body = copy(cx, force);
+        assert!(body.contains("repository and Linear attachments"), "{body}");
+        assert!(body.ends_with("Nothing changes in Linear."), "{body}");
+    }
+}
+
+/// However many issues are disconnected the header says it once, outside the chips; each chip
+/// keeps its plain label and the state in its tooltip, and the mark leads to Settings.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn disconnected_issues_share_one_mark(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let (window, shark, _) = connected(cx, &home, &[]);
+    let name = ws_of(cx, &shark).name;
+    shark.update(cx, |s, cx| {
+        (1..=3).for_each(|n| attach_directly(s, &name, n));
+        cx.notify();
+    });
+    assert!(!shows(cx, window, "issues-disconnected"), "connected");
+    let width = cx
+        .update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.find("issue-chip-uuid-1").bounds().size.width
+        })
+        .unwrap();
+
+    shark.update(cx, |s, cx| {
+        s.state.linear = None;
+        cx.notify();
+    });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert_eq!(w.find_all("issues-disconnected").len(), 1);
+        let chip = w.find("issue-chip-uuid-1");
+        assert_eq!(chip.bounds().size.width, width, "the chip didn't grow");
+        assert!(chip.label().unwrap().contains("(disconnected)"));
+        w.click("issues-disconnected", cx);
+    })
+    .unwrap();
+    cx.run_until_parked();
+    assert!(shows(cx, window, "linear-sign-in"));
+}
+
+/// Show attachments: repositories and issues in their groups, with their status, then the offers.
+/// Every row opens its details; Linear's offer goes with Linear.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn show_attachments_lists_repositories_and_issues(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let (window, shark, _) = connected(cx, &home, &[]);
+    let name = ws_of(cx, &shark).name;
+    shark.update(cx, |s, cx| {
+        attach_directly(s, &name, 1);
+        attach_directly(s, &name, 2);
+        s.ws_mut(&name).unwrap().repos.push(crate::state::WsRepo {
+            name: "api".into(),
+            src: "/src/api".into(),
+            base: "main".into(),
+            branch: None,
+        });
+        cx.notify();
+    });
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    let list = |cx: &mut TestAppContext| {
+        on(cx, &|s, w, cx| s.attachment_list(name.clone(), 0, w, cx));
+    };
+    type Rows = Vec<(Option<&'static str>, Vec<String>)>;
+    let rows = |cx: &mut TestAppContext, from: usize| -> Rows {
+        cx.read(|cx| {
+            let s = shark.read(cx);
+            let rows = s.attachment_rows(s.ws(&name).unwrap(), from, cx.theme());
+            (rows.into_iter())
+                .map(|(heading, rows)| (heading, rows.into_iter().map(|r| r.0).collect()))
+                .collect()
+        })
+    };
+    let group = |heading, rows: &[&str]| (heading, rows.iter().map(|r| r.to_string()).collect());
+    assert_eq!(
+        rows(cx, 0),
+        [
+            group(Some("Repositories"), &["api · ready"]),
+            group(
+                Some("Linear issues"),
+                &["ENG-1 Issue 1 · Todo · primary", "ENG-2 Issue 2 · Todo"]
+            ),
+            group(None, &["Attach repository…", "Attach Linear issue…"]),
+        ]
+    );
+    list(cx);
+    press(cx, &["enter"]);
+    assert!(shows(cx, window, "attach-panel"), "the repo's details");
+    press(cx, &["escape"]);
+    list(cx);
+    press(cx, &["down", "enter"]);
+    assert!(shows(cx, window, "issue-details"), "the issue's details");
+    press(cx, &["escape"]);
+    list(cx);
+    press(cx, &["down", "down", "down", "down", "enter"]);
+    assert!(shows(cx, window, "issue-row-ENG-1"), "the issue picker");
+    press(cx, &["escape"]);
+
+    // `+N` starts past the chips shown, in either group, and offers nothing.
+    assert_eq!(
+        rows(cx, 2),
+        [group(Some("Linear issues"), &["ENG-2 Issue 2 · Todo"])]
+    );
+
+    // Disconnected, the row says so; with its snapshot gone, that.
+    shark.update(cx, |s, _| {
+        s.state.linear = None;
+        s.ws_mut(&name).unwrap().issues.remove(0);
+    });
+    assert_eq!(
+        rows(cx, 1),
+        [group(
+            Some("Linear issues"),
+            &[
+                "Linear issue · snapshot missing",
+                "ENG-2 Issue 2 · Todo · disconnected"
+            ]
+        )]
+    );
+
+    // Linear gone, nothing of it is left to offer; a repository keeps its row.
+    shark.update(cx, |s, _| {
+        let ws = s.ws_mut(&name).unwrap();
+        for r in [issue_ref(1), issue_ref(2)] {
+            ws.linear.remove(&r);
+        }
+    });
+    assert_eq!(
+        rows(cx, 0),
+        [
+            group(Some("Repositories"), &["api · ready"]),
+            group(None, &["Attach repository…"]),
+        ]
+    );
 }
 
 /// Details stay open through Refresh and Make primary, and Remove is last. A missing snapshot
@@ -1533,8 +1939,9 @@ fn pixel_answers(req: &Req) -> Result<Resp, linear::Error> {
 
 const PIXEL_DESCRIPTION: &str = "Adopt the new material across the app.\n\n## Scope\n- Navigation bars and **bottom drawers**\n- The form screens, see `FormView`\n\n```swift\nlet glass = Glass.regular\n```\n\nSee [the guidelines](https://developer.apple.com/design).";
 
-/// The picker in each of its states, details and the preview, in the real renderer. Saved to
-/// `SHARK_RENDER_DIR` for looking at.
+/// The picker in each of its states, details, the preview, the header with and without Linear,
+/// the Attach menu and Show attachments, in the real renderer. Saved to `SHARK_RENDER_DIR` for
+/// looking at.
 pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
@@ -1676,8 +2083,59 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             });
         })
         .unwrap();
-        shot(cx, "settings");
+        query(cx, "liquid");
+        shot(cx, "not-connected");
+        keys(cx, &["enter"]);
+        shot(cx, "settings-over-picker");
+        // Settings, the query, the picker.
+        keys(cx, &["escape", "escape", "escape"]);
+        shot(cx, "header-disconnected");
+        cx.update_window(window, |_, _, cx| {
+            shark.update(cx, |s, cx| {
+                s.linear_connected(KEY, acme(), &pixel_answers, cx);
+                let ws = s.ws_mut(&name).unwrap();
+                ws.repos.push(crate::state::WsRepo {
+                    name: "api".into(),
+                    src: "/src/api".into(),
+                    base: "main".into(),
+                    branch: None,
+                });
+                cx.notify();
+            });
+        })
+        .unwrap();
+        shot(cx, "header-linear");
+        cx.update_window(window, |_, w, cx| w.click("header-attach", cx))
+            .unwrap();
+        shot(cx, "attach-menu");
         keys(cx, &["escape"]);
+        cx.update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| s.attachment_list(name.clone(), 0, w, cx));
+        })
+        .unwrap();
+        shot(cx, "attachments");
+        keys(cx, &["escape"]);
+        let attached = cx.update_window(window, |_, _, cx| {
+            shark.update(cx, |s, cx| {
+                let ws = s.ws_mut(&name).unwrap();
+                let kept = (
+                    std::mem::take(&mut ws.linear),
+                    std::mem::take(&mut ws.issues),
+                );
+                s.state.linear = None;
+                cx.notify();
+                kept
+            })
+        });
+        shot(cx, "header-plain");
+        cx.update_window(window, |_, _, cx| {
+            shark.update(cx, |s, cx| {
+                let ws = s.ws_mut(&name).unwrap();
+                (ws.linear, ws.issues) = attached.unwrap();
+                cx.notify();
+            })
+        })
+        .unwrap();
         cx.update_window(window, |_, w, cx| {
             shark.update(cx, |s, cx| {
                 s.linear_connected(KEY, acme(), &pixel_answers, cx);
@@ -1706,6 +2164,16 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         cx.run_until_parked();
         keys(cx, &["enter"]);
         shot(cx, "preview");
+        keys(cx, &["escape"]);
+        // Last: nothing but a new credential clears it.
+        cx.update_window(window, |_, w, cx| {
+            shark.update(cx, |s, cx| {
+                s.linear_rejected(cx);
+                s.attach_linear_issue(name.clone(), w, cx);
+            });
+        })
+        .unwrap();
+        shot(cx, "attention");
         cx.update_window(window, |_, w, _| w.remove_window())
             .unwrap();
     }

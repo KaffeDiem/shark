@@ -612,7 +612,7 @@ impl Shark {
                     .child(crate::ui::hint("enter", enter))
                     .child(crate::ui::hint("tab", other))
                     .child(div().flex_1())
-                    .when(!self.home.asking, |d| {
+                    .when(!self.home.asking && self.linear_in_use(), |d| {
                         d.child(
                             Button::new("home-linear-issue")
                                 .ghost()

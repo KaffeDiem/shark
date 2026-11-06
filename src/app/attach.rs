@@ -1,11 +1,15 @@
 //! Attaching repositories to an agent: one operation at a time, repo by repo. It waits until
 //! nothing runs in the agent, and holds new work until it is over (`Workspace::attaching`, which
 //! is saved before Git changes anything, so a restart can tell what happened).
-use super::new_workspace::NewWorkspaceForm;
+use super::interaction::now_ms;
+use super::new_workspace::{AttachTo, NewWorkspaceForm};
+use super::palette::{menu_dialog, open_grouped};
 use super::*;
 use crate::scripts::{self, Phase};
 use crate::state::{AttachStage, Attachment};
 use git::Found;
+use std::cell::Cell;
+use std::time::Duration;
 
 /// How an agent's attachment operation has gone. `attached` and `untold` are told when it ends;
 /// `failed` stays in the header until dismissed.
@@ -56,6 +60,17 @@ pub(super) enum Step {
     Pending,
     Failed,
 }
+
+/// What a row of Show attachments opens.
+pub(super) enum Pick {
+    Repo(String),
+    Issue(crate::linear::IssueRef),
+    Attach,
+    AttachIssue,
+}
+
+/// Its label, status mark and target.
+pub(super) type ListRow = (String, Icon, Pick);
 
 type Act = fn(&mut Shark, &str, &str, &mut Window, &mut Context<Shark>);
 
@@ -196,7 +211,7 @@ impl Render for AttachPanel {
 }
 
 /// How the header's chips fit, as last measured. `hidden` didn't fit, and `+N` goes `more_at` into
-/// the row; `tight` is set once the Attach buttons gave up their labels for them: at this window
+/// the row; `tight` is set once the Attach button gave up its label for them: at this window
 /// width and chip count.
 #[derive(Clone, Copy, Default, PartialEq, Debug)]
 pub(super) struct Fit {
@@ -205,14 +220,14 @@ pub(super) struct Fit {
     tight: Option<(Pixels, usize)>,
 }
 
-/// About what the Attach buttons' labels take.
-const LABELS: Pixels = px(220.);
+/// About what the Attach button's label takes.
+const LABEL: Pixels = px(60.);
 /// What `+N` needs at the end of the row.
 const MORE: Pixels = px(56.);
 
 impl Fit {
-    /// After a frame with `clipped` of `chips` past the row's end. The labels go first and come
-    /// back only once they would fit again, so the row doesn't flip between the two.
+    /// After a frame with `clipped` of `chips` past the row's end. The label goes first and comes
+    /// back only once it would fit again, so the row doesn't flip between the two.
     pub(super) fn next(self, clipped: usize, chips: usize, width: Pixels) -> Self {
         match self.tight {
             None if clipped > 0 => Fit {
@@ -220,7 +235,7 @@ impl Fit {
                 tight: Some((width, chips)),
                 ..self
             },
-            Some((at, n)) if chips < n || width > at + LABELS => Fit::default(),
+            Some((at, n)) if chips < n || width > at + LABEL => Fit::default(),
             tight => Fit {
                 hidden: clipped,
                 tight,
@@ -230,16 +245,19 @@ impl Fit {
     }
 }
 
-/// The header's chips and actions. Lays every chip out, hiding what doesn't fit, so that what is
+/// The header's chips and Attach. Lays every chip out, hiding what doesn't fit, so that what is
 /// measured doesn't depend on what is shown; `render_attachments` built them.
 // ponytail: `+N` sits by the last chip shown, so up to a chip's width stays empty before the
-// buttons; closing that means laying chips out by measured widths instead.
+// button; closing that means laying chips out by measured widths instead.
 #[derive(IntoElement)]
 struct AttachRow {
     name: String,
     chips: Vec<AnyElement>,
     /// The first this many chips are failures.
     failed: usize,
+    /// Outside the chips: it says something about several, so it never goes under `+N`.
+    disconnected: Option<AnyElement>,
+    linear: bool,
     shark: WeakEntity<Shark>,
 }
 
@@ -251,37 +269,36 @@ impl RenderOnce for AttachRow {
         let count = self.chips.len();
         let shown = count - was.hidden.min(count);
         let compact = was.tight.is_some();
-        let action =
-            |id,
-             icon,
-             label: &'static str,
-             open: fn(&mut Shark, String, &mut Window, &mut Context<Shark>)| {
-                let (shark, name) = (self.shark.clone(), self.name.clone());
-                Button::new(id)
-                    .icon(icon)
-                    .ghost()
-                    .xsmall()
-                    .flex_none()
-                    .map(|b| match compact {
-                        true => b.tooltip(label),
-                        false => b.label(label),
-                    })
-                    .on_click(move |_, w, cx| {
-                        shark.update(cx, |s, cx| open(s, name.clone(), w, cx)).ok();
-                    })
-            };
-        let attach = action(
-            "header-attach",
-            IconName::FolderPlus,
-            "Attach repository",
-            |s, n, w, cx| s.attach_repository(n, w, cx),
-        );
-        let issue = action(
-            "header-attach-issue",
-            IconName::TagPlus,
-            "Attach Linear issue",
-            |s, n, w, cx| s.attach_linear_issue(n, w, cx),
-        );
+        let key = SharedString::from(format!("attach-at-{}", self.name));
+        let at = window.use_keyed_state(key, cx, |_, _| Rc::<Cell<Bounds<Pixels>>>::default());
+        let at = at.read(cx).clone();
+        let attach = {
+            let (shark, name, linear, at) = (
+                self.shark.clone(),
+                self.name.clone(),
+                self.linear,
+                at.clone(),
+            );
+            Button::new("header-attach")
+                .icon(IconName::Paperclip)
+                .ghost()
+                .xsmall()
+                .dropdown_caret(linear && !compact)
+                .accessibility_label("Attach")
+                .map(|b| match compact {
+                    true => b.tooltip("Attach"),
+                    false => b.label("Attach"),
+                })
+                .on_click(move |_, w, cx| {
+                    let name = name.clone();
+                    shark
+                        .update(cx, |s, cx| match linear {
+                            true => s.attach_menu(name, at.get(), w, cx),
+                            false => s.attach_repository(name, w, cx),
+                        })
+                        .ok();
+                })
+        };
         let more = (shown < count).then(|| {
             let (shark, name) = (self.shark.clone(), self.name.clone());
             let icon = match shown < self.failed {
@@ -353,8 +370,14 @@ impl RenderOnce for AttachRow {
                         }
                     }),
             )
-            .child(attach)
-            .child(issue)
+            .children(self.disconnected)
+            .child(
+                div().relative().flex_none().child(attach).child(
+                    canvas(move |b, _, _| at.set(b), |_, _, _, _| {})
+                        .absolute()
+                        .size_full(),
+                ),
+            )
     }
 }
 
@@ -391,8 +414,7 @@ impl Shark {
         self.attach_form(name, vec![], window, cx)
     }
 
-    /// The dialog with the repos `name` doesn't have yet, `picked` ticked; nothing happens until
-    /// it is confirmed. With an operation under way or a failure to deal with, those come first,
+    /// The dialog with the repos, `picked` marked; nothing happens until it is confirmed. With an operation under way or a failure to deal with, those come first,
     /// so that everything on the header's chips can be reached from cmd-k.
     pub(super) fn attach_form(
         &mut self,
@@ -422,32 +444,56 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // Nothing to list: straight to the folder panel.
+        if self.state.repos.is_empty() {
+            return self.attach_local_repo(name, None, window, cx);
+        }
         let Some(ws) = self.ws(&name) else { return };
-        let missing: Vec<Repo> = (self.state.repos.iter())
-            .filter(|r| !ws.repos.iter().any(|w| w.name == r.name))
-            .cloned()
+        let attached: Vec<String> = ws.repos.iter().map(|r| r.name.clone()).collect();
+        // A repo's last use is the last interaction with an agent that has it.
+        let last = |r: &Repo| {
+            (self.state.workspaces.iter())
+                .filter(|w| w.repos.iter().any(|x| x.name == r.name))
+                .filter_map(|w| w.last_interacted_at)
+                .max()
+        };
+        let mut repos = self.state.repos.clone();
+        repos.sort_by_key(|r| (attached.contains(&r.name), std::cmp::Reverse(last(r))));
+        let now = now_ms();
+        let used = (repos.iter())
+            .filter_map(|r| {
+                let ms = now.saturating_sub(last(r)?);
+                let ago = crate::sync::ago(Duration::from_millis(ms));
+                Some((r.name.clone(), ago))
+            })
             .collect();
-        let attach = Some((name, ws.default_branch()));
+        let attach = Some(AttachTo {
+            name,
+            branch: ws.default_branch(),
+            follows: !ws.repos.is_empty(),
+            attached,
+            used,
+        });
         let shark = cx.entity().downgrade();
         let form = cx.new(|cx| {
-            NewWorkspaceForm::new(missing, &picked, None, &[], None, attach, shark, window, cx)
+            NewWorkspaceForm::new(repos, &picked, None, &[], None, attach, shark, window, cx)
         });
-        let input = form.read(cx).branch.clone();
-        window.open_dialog(cx, move |d, _, _| {
+        let opened = form.clone();
+        window.open_dialog(cx, move |d, _, cx| {
             let f = form.clone();
-            crate::ui::dialog(d)
-                .title("Attach repository")
-                .w(px(640.))
+            menu_dialog(d, cx)
                 .child(form.clone())
                 .on_ok(move |_, window, cx| f.update(cx, |f, cx| f.submit(window, cx)))
         });
-        input.update(cx, |i, cx| i.focus(window, cx));
+        opened.update(cx, |f, cx| f.focus(window, cx));
     }
 
+    /// The folder panel. Over the dialog (`form`), what it adds arrives there, and cancelling
+    /// leaves the dialog as it was. Without one, the dialog opens on what it adds.
     pub(super) fn attach_local_repo(
         &mut self,
         name: String,
-        picked: Vec<String>,
+        form: Option<WeakEntity<NewWorkspaceForm>>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -461,26 +507,33 @@ impl Shark {
             let Ok(Ok(Some(paths))) = paths.await else {
                 return;
             };
-            this.update_in(cx, |s, window, cx| {
-                s.attach_paths(name, picked, &paths, window, cx)
+            this.update_in(cx, |s, window, cx| match form.and_then(|f| f.upgrade()) {
+                Some(form) => {
+                    let added = s.add_repo_paths(&paths, window, cx);
+                    form.update(cx, |f, cx| f.added(added, window, cx));
+                }
+                None => s.attach_paths(name, &paths, window, cx),
             })
             .ok();
         })
         .detach();
     }
 
-    /// Registers the folders and asks about attaching them to `name`.
+    /// Registers the folders and asks about attaching them to `name`. Folders it refused are told
+    /// and end here: the panel doesn't reopen on its own.
     pub(super) fn attach_paths(
         &mut self,
         name: String,
-        mut picked: Vec<String>,
         paths: &[PathBuf],
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let added = self.add_repo_paths(paths, window, cx);
-        picked.extend(added.into_iter().map(|r| r.name));
-        self.attach_form(name, picked, window, cx);
+        let picked: Vec<String> = (self.add_repo_paths(paths, window, cx).into_iter())
+            .map(|r| r.name)
+            .collect();
+        if !picked.is_empty() {
+            self.attach_form(name, picked, window, cx);
+        }
     }
 
     /// Starts an operation on `picks`: saved first, or nothing happens. From here on the agent's
@@ -1157,8 +1210,75 @@ impl Shark {
         rows
     }
 
-    /// What the header shows from chip `from` on, each row opening what its chip opens; all of it
-    /// and Attach repository, when that's possible, for cmd-k.
+    /// The header's Attach with Linear in use: which of the two dialogs, hanging from its button
+    /// `b`. They stay two: a repository is a form queued behind idle, an issue a search that works
+    /// mid-turn.
+    fn attach_menu(
+        &mut self,
+        name: String,
+        b: Bounds<Pixels>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let shark = cx.entity().downgrade();
+        let row = |icon, label, open: fn(&mut Self, String, &mut Window, &mut Context<Self>)| {
+            let (shark, name) = (shark.clone(), name.clone());
+            menu::item(icon, label, move |w, cx| {
+                shark.update(cx, |s, cx| open(s, name.clone(), w, cx)).ok();
+            })
+        };
+        let entries = vec![
+            row(IconName::FolderPlus, "Repository…", Self::attach_repository),
+            row(
+                IconName::TagPlus,
+                "Linear issue…",
+                Self::attach_linear_issue,
+            ),
+        ];
+        let pos = point(b.right(), b.bottom() + px(4.));
+        self.show_menu_at(entries, pos, Anchor::TopRight, window, cx);
+        if let Some((m, _)) = &self.menu {
+            m.update(cx, |m, _| m.select(0));
+        }
+    }
+
+    /// What the header shows from chip `from` on, by group: label, status mark and what the row
+    /// opens, which is what its chip opens. All of it and the Attach offers, when they're
+    /// possible, for cmd-k.
+    pub(super) fn attachment_rows(
+        &self,
+        ws: &Workspace,
+        from: usize,
+        theme: &Theme,
+    ) -> Vec<(Option<&'static str>, Vec<ListRow>)> {
+        let rows = self.repo_rows(ws);
+        let past_repos = from.saturating_sub(rows.len());
+        let repos = rows.into_iter().skip(from).map(|r| {
+            let label = format!("{} · {}", r.repo, r.state);
+            (label, r.standing.mark(theme), Pick::Repo(r.repo))
+        });
+        let issues = (ws.linear.ordered()).skip(past_repos).map(|r| {
+            let (label, icon) = self.issue_row(ws, r, theme);
+            (label, icon, Pick::Issue(r.clone()))
+        });
+        let muted = theme.muted_foreground;
+        let offer =
+            |label: &str, icon, pick| (label.into(), Icon::new(icon).text_color(muted), pick);
+        let repository = (from == 0 && ws.attaching.is_empty())
+            .then(|| offer("Attach repository…", IconName::FolderPlus, Pick::Attach));
+        let issue = (from == 0 && self.linear_in_use())
+            .then(|| offer("Attach Linear issue…", IconName::TagPlus, Pick::AttachIssue));
+        let groups = [
+            (Some("Repositories"), repos.collect::<Vec<_>>()),
+            (Some("Linear issues"), issues.collect()),
+            (None, repository.into_iter().chain(issue).collect()),
+        ];
+        (groups.into_iter())
+            .filter(|(_, rows)| !rows.is_empty())
+            .collect()
+    }
+
+    /// Show attachments, and `+N` from the first chip it hides.
     pub(super) fn attachment_list(
         &mut self,
         name: String,
@@ -1166,41 +1286,36 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        enum Pick {
-            Repo(String),
-            Issue(crate::linear::IssueRef),
-            Attach,
-        }
         let Some(ws) = self.ws(&name) else { return };
-        let theme = cx.theme();
-        let repos = self.repo_rows(ws).into_iter().map(|r| {
-            let label = format!("{} · {}", r.repo, r.state);
-            let item = CommandItem::new().label(label).icon(r.standing.mark(theme));
-            (item, Pick::Repo(r.repo))
-        });
-        let issues = ws.linear.ordered().map(|r| {
-            let label = r
-                .of(&ws.issues)
-                .map_or("Linear issue", |s| s.identifier.as_str());
-            let item = CommandItem::new()
-                .label(label.to_string())
-                .icon(IconName::Tag);
-            (item, Pick::Issue(r.clone()))
-        });
-        let attach = (from == 0 && ws.attaching.is_empty()).then(|| {
-            let item = CommandItem::new().label("Attach repository…");
-            (item.icon(IconName::FolderPlus), Pick::Attach)
-        });
-        let (items, picks): (Vec<_>, Vec<_>) = repos.chain(issues).skip(from).chain(attach).unzip();
-        open_menu(
+        let mut picks = vec![];
+        let groups = (self.attachment_rows(ws, from, cx.theme()).into_iter())
+            .map(|(heading, rows)| {
+                let items = rows.into_iter().map(|(label, icon, pick)| {
+                    picks.push(pick);
+                    // `Command` paints an item's own icon muted, and the mark is the status.
+                    let text = SharedString::from(label);
+                    CommandItem::new().label(text.clone()).child(move |_, _| {
+                        h_flex()
+                            .flex_1()
+                            .min_w_0()
+                            .gap_2()
+                            .child(icon.clone().size_4().flex_none())
+                            .child(div().flex_1().min_w_0().truncate().child(text.clone()))
+                    })
+                });
+                (heading, items.collect())
+            })
+            .collect();
+        open_grouped(
             cx.entity().downgrade(),
             "Attachments…",
-            items,
+            groups,
             0,
             move |s, row, w, cx| match &picks[row] {
                 Pick::Repo(repo) => s.attachment_menu(name.clone(), repo.clone(), w, cx),
                 Pick::Issue(r) => s.issue_details(name.clone(), r.clone(), w, cx),
                 Pick::Attach => s.attach_dialog(name.clone(), vec![], w, cx),
+                Pick::AttachIssue => s.attach_linear_issue(name.clone(), w, cx),
             },
             window,
             cx,
@@ -1228,9 +1343,9 @@ impl Shark {
     }
 
     /// The header's attachments: a chip per repository, what needs the user first, then one per
-    /// Linear issue, then Attach repository and Attach Linear issue. `+N` lists what doesn't fit;
-    /// Show attachments in cmd-k lists all of it, and Attach repository does whenever an
-    /// attachment needs anything.
+    /// Linear issue, then Attach, a menu of the two kinds with Linear in use and the repository
+    /// dialog without. `+N` lists what doesn't fit; Show attachments in cmd-k lists all of it, and
+    /// Attach repository does whenever an attachment needs anything.
     pub(super) fn render_attachments(&self, cx: &mut Context<Self>) -> AnyElement {
         let Some(ws) = self.active_ws() else {
             return div().into_any_element();
@@ -1268,6 +1383,8 @@ impl Shark {
             name,
             chips,
             failed,
+            disconnected: self.disconnected_chip(ws, cx),
+            linear: self.linear_in_use(),
             shark: cx.entity().downgrade(),
         }
         .into_any_element()

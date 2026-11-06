@@ -437,7 +437,7 @@ async fn new_and_reopened_chats_open_in_plan_mode(cx: &mut TestAppContext) {
     cx.update(|cx| assert!(chat.read(cx).meta.plan, "the last tab's replacement"));
 }
 
-/// With no repo registered the offer still offers something; a local repo attaches on a fresh
+/// With no repo registered the offer goes to the folder panel; a local repo attaches on a fresh
 /// branch, the root docs follow, and Plan mode and the plan stay until the user ends them.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -452,20 +452,15 @@ async fn attaching_never_ends_plan_mode(cx: &mut TestAppContext) {
     let name = active_ws(cx, &shark).name;
     let n = name.clone();
     on(cx, &|s, w, cx| s.attach_repository(n.clone(), w, cx));
-    cx.update_window(window, |_, w, cx| {
-        assert!(
-            w.has_active_dialog(cx),
-            "the dialog, with Add a local repository"
-        );
-        w.close_dialog(cx);
-    })
-    .unwrap();
+    assert!(cx.did_prompt_for_paths(), "the folder panel");
+    cx.simulate_path_prompt_response(|_| None);
+    cx.run_until_parked();
 
     let repo = home.join("src/api");
     init_repo(&repo);
     let n = name.clone();
     on(cx, &|s, w, cx| {
-        s.attach_paths(n.clone(), vec![], std::slice::from_ref(&repo), w, cx)
+        s.attach_paths(n.clone(), std::slice::from_ref(&repo), w, cx)
     });
     press_in(window)(cx, &["enter"]);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
@@ -518,11 +513,9 @@ async fn empty_diff_and_git_offer_attaching(cx: &mut TestAppContext) {
         })
         .unwrap();
         cx.run_until_parked();
-        cx.update_window(window, |_, w, cx| {
-            assert!(w.has_active_dialog(cx), "the attach menu");
-            w.close_dialog(cx);
-        })
-        .unwrap();
+        assert!(cx.did_prompt_for_paths(), "the folder panel");
+        cx.simulate_path_prompt_response(|_| None);
+        cx.run_until_parked();
     }
     let ws = active_ws(cx, &shark);
     let (label, repos) = crate::sync::check_in_background(&ws, &[], true, &[]);

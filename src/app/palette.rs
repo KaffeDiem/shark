@@ -840,6 +840,13 @@ const NEED_WORKSPACE: &[&str] = &[
     "Reveal in Finder",
 ];
 
+/// Rows about Linear; left out while nobody uses it (`linear_in_use`).
+const NEED_LINEAR: &[&str] = &[
+    "Start from Linear issue…",
+    "Attach Linear issue…",
+    "Show Linear issue…",
+];
+
 /// Rows that only a Claude chat can do; a Codex chat's palette leaves them out.
 const CLAUDE_ONLY: &[&str] = &["Ask a side question"];
 const CODEX_ONLY: &[&str] = &["Toggle fast mode", "Thinking: Ultra"];
@@ -1001,12 +1008,14 @@ impl Shark {
         let target = self.target(window);
         let no_target = target.is_none();
         let mut apps = available_apps(target.as_ref());
+        let no_linear = !self.linear_in_use();
         for (ix, Row(label, icon, action, words, _)) in COMMANDS.iter().enumerate() {
             if let Some((heading, _)) = GROUPS.iter().find(|(_, first)| first == label) {
                 groups.push((Some(heading), vec![]));
             }
             if (if codex { CLAUDE_ONLY } else { CODEX_ONLY }).contains(label)
                 || (no_target && NEED_WORKSPACE.contains(label))
+                || (no_linear && NEED_LINEAR.contains(label))
                 || (*label == "Show or hide diff files"
                     && (self.tab != Tab::Feature(Feature::Diff) || self.home_shown()))
             {
@@ -1069,7 +1078,8 @@ mod tests {
                 "{heading}: no row {first}"
             );
         }
-        for label in CLAUDE_ONLY.iter().chain(CODEX_ONLY).chain(NEED_WORKSPACE) {
+        let gated = [CLAUDE_ONLY, CODEX_ONLY, NEED_WORKSPACE, NEED_LINEAR];
+        for label in gated.into_iter().flatten() {
             assert!(COMMANDS.iter().any(|r| r.0 == *label), "no row {label}");
         }
     }

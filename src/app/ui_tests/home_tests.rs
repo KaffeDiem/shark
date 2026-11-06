@@ -315,6 +315,48 @@ async fn cancelled_open_still_sets_up_the_new_workspace(cx: &mut TestAppContext)
     fs::remove_dir_all(&home).ok();
 }
 
+/// Home offers Start from Linear issue only where Linear is in use.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn home_offers_linear_only_while_it_is_in_use(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (home, window, shark) = one_workspace(cx).await;
+    let on = on_app(window, shark.clone());
+    let offered = |cx: &mut TestAppContext| {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.try_find("home-linear-issue").is_some()
+        })
+        .unwrap()
+    };
+    on(cx, &|s, _, cx| {
+        s.home.on = true;
+        cx.notify();
+    });
+    assert!(!offered(cx), "never connected");
+    on(cx, &|s, _, cx| {
+        s.state.linear = Some(Default::default());
+        cx.notify();
+    });
+    assert!(offered(cx), "connected");
+    on(cx, &|s, _, cx| {
+        s.state.linear = None;
+        cx.notify();
+    });
+    assert!(!offered(cx), "disconnected, nothing attached");
+    on(cx, &|s, _, cx| {
+        s.state.workspaces[0]
+            .linear
+            .attach(crate::linear::IssueRef {
+                org: "acme-uuid".into(),
+                issue: "uuid-1".into(),
+            });
+        cx.notify();
+    });
+    assert!(offered(cx), "disconnected, with an issue");
+    fs::remove_dir_all(&home).ok();
+}
+
 /// Palette rows with no handler of their own dispatch their action, as its key would.
 /// The keyboard's way to what `+N` lists, with nothing pending or failed to bring it up.
 #[gpui_kit::test]

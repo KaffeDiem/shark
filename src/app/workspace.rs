@@ -988,16 +988,11 @@ impl Shark {
         if let Some(msg) = self.chats_at_work(&name, cx) {
             return notify_err(window, cx, msg);
         }
-        let (heading, body) = match force {
-            true => (
-                format!("Force delete {title}?"),
-                "Removes its conversations, plans, repository and Linear attachments and worktrees, including uncommitted changes. Branches are kept. Nothing changes in Linear.",
-            ),
-            false => (
-                format!("Delete {title}?"),
-                "Removes its conversations, plans, repository and Linear attachments and worktrees. Uncommitted changes stop this. Merged branches are deleted; other branches are kept. Nothing changes in Linear.",
-            ),
+        let heading = match force {
+            true => format!("Force delete {title}?"),
+            false => format!("Delete {title}?"),
         };
+        let body = self.delete_copy(&name, force);
         confirm(
             heading,
             body,
@@ -1006,6 +1001,25 @@ impl Shark {
             window,
             cx,
         );
+    }
+
+    /// What Delete agent says it removes. Linear comes up only for an agent with issues attached.
+    pub(super) fn delete_copy(&self, name: &str, force: bool) -> &'static str {
+        let issues = (self.ws(name)).is_some_and(|w| w.linear.primary().is_some());
+        match (force, issues) {
+            (true, true) => {
+                "Removes its conversations, plans, repository and Linear attachments and worktrees, including uncommitted changes. Branches are kept. Nothing changes in Linear."
+            }
+            (true, false) => {
+                "Removes its conversations, plans, repository attachments and worktrees, including uncommitted changes. Branches are kept."
+            }
+            (false, true) => {
+                "Removes its conversations, plans, repository and Linear attachments and worktrees. Uncommitted changes stop this. Merged branches are deleted; other branches are kept. Nothing changes in Linear."
+            }
+            (false, false) => {
+                "Removes its conversations, plans, repository attachments and worktrees. Uncommitted changes stop this. Merged branches are deleted; other branches are kept."
+            }
+        }
     }
 
     /// What to say while a chat of `name` works in its worktrees. An agent waiting on answers is

@@ -53,6 +53,18 @@ pub(crate) fn hint(keys: &str, label: &'static str) -> Div {
         .child(label)
 }
 
+/// A dialog's footer: its keys on the left, `action` (a count, a button) on the right.
+pub(crate) fn key_footer(hints: &[(&str, &'static str)], action: Option<AnyElement>) -> Div {
+    h_flex()
+        .px_3()
+        .py_2()
+        .gap_3()
+        .text_xs()
+        .children(hints.iter().map(|(keys, label)| hint(keys, label)))
+        .child(div().flex_1())
+        .children(action)
+}
+
 /// The "s" of `n` things.
 pub(crate) fn plural(n: usize) -> &'static str {
     if n == 1 { "" } else { "s" }

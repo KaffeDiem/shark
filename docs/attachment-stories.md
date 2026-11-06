@@ -44,3 +44,20 @@ Stories for connecting Linear and for attaching Linear issues and repositories t
 29. **As a** user whose access was revoked, **I want** a clear prompt to reconnect wherever I hit the problem, **so that** a healthy-looking connection doesn't mislead me.
 30. **As a** user about to disconnect or switch workspace, **I want** to know what happens to my attached issues, **so that** I don't lose access by accident.
 31. **As a** user who cancelled sign-in, **I want** that treated as my choice rather than an error, **so that** the app doesn't suggest something went wrong.
+
+## Attachment dialogs
+
+32. **As a** developer attaching context, **I want** one place to start, **so that** I don't have to choose between controls before I know what I need.
+33. **As a** developer who doesn't use Linear, **I want** no Linear controls in my way, **so that** the app only shows what applies to me.
+34. **As a** developer who wants Linear, **I want** to find it in Settings, **so that** I can turn it on when I choose to.
+35. **As a** developer who disconnected Linear, **I want** my attached issues to stay readable with a way to reconnect, **so that** I don't lose my context.
+36. **As a** developer attaching a repository, **I want** the common case to take one key, **so that** a routine step stays quick.
+37. **As a** developer moving between the two dialogs, **I want** the same keys and layout in each, **so that** I don't have to relearn them.
+38. **As a** developer attaching several repositories, **I want** to see how many I'm attaching before I confirm, **so that** I attach what I intended.
+39. **As a** developer with a usual branch and base, **I want** those details kept out of the way until I need them, **so that** the dialog stays short.
+40. **As a** developer whose branch name is taken, **I want** the problem stated plainly with a working alternative, **so that** I can continue without guessing.
+41. **As a** developer attaching a later repository, **I want** to see that it follows the agent's branch, **so that** I don't change it by accident.
+42. **As a** developer picking a repository, **I want** to see which are already attached and which I used most recently, **so that** I can find the right one quickly.
+43. **As a** new user with no repositories, **I want** to go straight to choosing a folder, **so that** I don't land on an empty list.
+44. **As a** developer adding a local repository, **I want** to come back to the dialog as I left it, even if I cancel, **so that** I don't lose my choices.
+45. **As a** developer reviewing what's attached, **I want** repositories and issues listed together, **so that** I can see the whole picture in one place.
