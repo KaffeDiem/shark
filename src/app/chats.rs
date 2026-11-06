@@ -369,6 +369,33 @@ impl Shark {
         self.close_chat_by_id(&name, &id, window, cx);
     }
 
+    /// A listener for a tab's `on_aux_click`: the middle button closes that tab, as its × does.
+    pub(super) fn close_on_middle_click(
+        id: TabId,
+        cx: &Context<Self>,
+    ) -> impl Fn(&ClickEvent, &mut Window, &mut App) + 'static {
+        cx.listener(move |this, e: &ClickEvent, w, cx| {
+            if !e.is_middle_click() {
+                return;
+            }
+            match &id {
+                TabId::Chat(id) => {
+                    if let Some(workspace) = this.active.clone() {
+                        this.close_chat_by_id(&workspace, id, w, cx);
+                    }
+                }
+                TabId::Diff => this.close_feature(Feature::Diff, w, cx),
+                TabId::Git => this.close_feature(Feature::Git, w, cx),
+                TabId::File(path) => {
+                    let tab = (this.file_tabs.iter()).find(|t| t.editor.read(cx).path == *path);
+                    if let Some(editor) = tab.map(|t| t.editor.clone()) {
+                        this.close_editor(editor, w, cx);
+                    }
+                }
+            }
+        })
+    }
+
     fn close_chat_by_id(
         &mut self,
         workspace: &str,
@@ -806,6 +833,10 @@ impl Shark {
                         .on_click(cx.listener(move |this, _, window, cx| {
                             this.select_chat(ix, window, cx);
                         }))
+                        .on_aux_click(Self::close_on_middle_click(
+                            TabId::Chat(meta.id.clone()),
+                            cx,
+                        ))
                         .on_mouse_down(
                             MouseButton::Right,
                             cx.listener(move |this, e: &MouseDownEvent, w, cx| {
@@ -858,6 +889,7 @@ impl Shark {
                     .pl_2p5()
                     .pr_1()
                     .on_click(cx.listener(move |this, _, w, cx| this.select_file(ix, w, cx)))
+                    .on_aux_click(Self::close_on_middle_click(TabId::File(path.clone()), cx))
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, e: &MouseDownEvent, w, cx| {
