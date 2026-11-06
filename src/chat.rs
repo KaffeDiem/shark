@@ -1189,13 +1189,18 @@ impl Chat {
             PLAN_TOOL => {
                 let text = input["plan"].as_str().unwrap_or_default().to_string();
                 self.show_plan(tool_use_id, text, cx);
-                PLAN_SHOWN
+                Some(PLAN_SHOWN)
             }
-            "EnterPlanMode" => ENTER_PLAN,
-            _ => NEEDS_APPROVAL,
+            "EnterPlanMode" => Some(ENTER_PLAN),
+            // Plan mode asks for these too, and planning needs the web.
+            "WebSearch" | "WebFetch" => None,
+            _ => Some(NEEDS_APPROVAL),
         };
         if let Some(a) = &mut self.agent
-            && let Err(e) = a.deny(&request_id, reason)
+            && let Err(e) = match reason {
+                Some(reason) => a.deny(&request_id, reason),
+                None => a.allow(&request_id, input),
+            }
         {
             self.blocks
                 .push(Block::Info(format!("answering the agent failed: {e}")));
@@ -2248,7 +2253,7 @@ pub(crate) mod ui_tests {
         });
     }
 
-    /// A claude stand-in that swallows stdin. Side questions and Ask Shark (both
+    /// A claude stand-in that keeps stdin next to it. Side questions and Ask Shark (both
     /// `--no-session-persistence`) get a canned answer, and their args are written next to it.
     const FAKE: &str = r#"#!/bin/sh
 case "$*" in *--no-session-persistence*)
@@ -2258,7 +2263,7 @@ case "$*" in *--no-session-persistence*)
   echo '{"type":"assistant","message":{"content":[{"type":"text","text":"Forty-two"}]},"parent_tool_use_id":null}'
   echo '{"type":"result","is_error":false,"result":"Forty-two","total_cost_usd":0,"duration_ms":1}'
 esac
-exec cat >/dev/null
+exec cat >>"$0.stdin"
 "#;
 
     /// Installs the script once for the whole test run: tests run in parallel, and one must
@@ -2645,6 +2650,48 @@ exec cat >/dev/null
                 })
             })
         };
+        // The web runs with its input as asked; other tools stay refused.
+        cx.update(|cx| {
+            chat.update(cx, |c, cx| {
+                for (id, tool) in [
+                    ("web-1", "WebSearch"),
+                    ("web-2", "WebFetch"),
+                    ("bash-1", "Bash"),
+                ] {
+                    let input = serde_json::json!({"query": id});
+                    let (request_id, tool, tool_use_id) = (id.into(), tool.into(), id.into());
+                    c.apply(
+                        Ev::Permission {
+                            request_id,
+                            tool,
+                            tool_use_id,
+                            input,
+                        },
+                        cx,
+                    );
+                }
+            })
+        });
+        let replied = |id: &str| {
+            let needle = format!(r#""request_id":"{id}""#);
+            let stdin = fake_claude().with_extension("stdin");
+            // A cold first run starts the fake slowly.
+            for _ in 0..6000 {
+                let sent = std::fs::read_to_string(&stdin).unwrap_or_default();
+                if let Some(line) = sent.lines().find(|l| l.contains(&needle)) {
+                    return serde_json::from_str::<Value>(line).unwrap()["response"]["response"]
+                        .clone();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            panic!("no reply to {id}");
+        };
+        for id in ["web-1", "web-2"] {
+            let r = replied(id);
+            assert_eq!(r["behavior"], "allow", "{r}");
+            assert_eq!(r["updatedInput"]["query"], id, "{r}");
+        }
+        assert_eq!(replied("bash-1")["message"], NEEDS_APPROVAL);
         submit(cx, "t1", "# Cache\n\nUse a map.\n");
         submit(cx, "t2", "# Cache\n\nUse an LRU map.\n");
         act(cx, &|_, _| {});
