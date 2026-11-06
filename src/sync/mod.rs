@@ -1281,7 +1281,7 @@ impl Render for GitSync {
                     .child(
                         Button::new("git-menu")
                             .small()
-                            .h(px(32.))
+                            .size(px(32.))
                             .px(px(6.))
                             .icon(IconName::ChevronDown)
                             .rounded(ButtonRounded::None)
@@ -1351,6 +1351,65 @@ mod tests {
     use super::{
         Action, Instant, Job, Kind, Local, Pr, PrState, needs_you, repos_from, run_job, status,
     };
+
+    #[cfg(feature = "test-support")]
+    #[gpui_kit::test]
+    fn git_split_button_keeps_round_caps_for_every_variant(cx: &mut gpui_kit::TestAppContext) {
+        use super::*;
+        use gpui_kit::test::TestWindowExt as _;
+
+        cx.update(gpui_kit::init);
+        for mode in [crate::state::Mode::Dark, crate::state::Mode::Light] {
+            cx.update(|cx| {
+                crate::theme::apply(
+                    &crate::state::Appearance {
+                        mode,
+                        ..Default::default()
+                    },
+                    cx,
+                );
+            });
+            let (window, sync) = cx.update(|cx| {
+                gpui_kit::open_window(WindowOptions::default(), cx, |w, cx| {
+                    cx.new(|cx| GitSync::new(Workspace::default(), w, cx))
+                })
+                .unwrap()
+            });
+            for (kind, attention) in [
+                (Kind::Agent("Commit and push".into()), false),
+                (Kind::Agent("Resolve conflicts".into()), true),
+                (Kind::OpenPr, false),
+                (Kind::None, false),
+            ] {
+                cx.update_window(window, |_, w, cx| {
+                    sync.update(cx, |s, cx| {
+                        s.action = Some(Action {
+                            label: "Commit and push".into(),
+                            kind,
+                            attention,
+                            repos: vec![],
+                            reviews: vec![],
+                        });
+                        cx.notify();
+                    });
+                    w.render_frame(cx);
+                    let action = w.find("git-next").bounds();
+                    let menu = w.find("git-menu").bounds();
+                    assert_eq!(action.size.height, px(32.));
+                    assert_eq!(
+                        menu.size,
+                        size(px(32.), px(32.)),
+                        "a narrower chevron clamps the 16px outer corners"
+                    );
+                    assert_eq!(action.right(), menu.left());
+                    assert_eq!(action.top(), menu.top());
+                })
+                .unwrap();
+            }
+            cx.update_window(window, |_, w, _| w.remove_window())
+                .unwrap();
+        }
+    }
 
     #[cfg(feature = "test-support")]
     #[gpui_kit::test]

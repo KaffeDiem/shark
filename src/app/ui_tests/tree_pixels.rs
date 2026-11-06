@@ -72,7 +72,10 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     let sync = cx.new(|cx| GitSync::new(ws.clone(), w, cx));
                     sync.update(cx, |sync, _| {
                         sync.set_merged_parent("shark", 1, "head", "main");
-                        sync.action.as_mut().unwrap().label = "Commit and push · frontend, api".into();
+                        let action = sync.action.as_mut().unwrap();
+                        action.label = "Commit and push · frontend, api".into();
+                        // Cover both the filled and attention variants of the split button.
+                        action.attention = !rail;
                     });
                     s.syncs.insert(ws.name.clone(), sync);
                     s.rail = rail;
@@ -155,6 +158,7 @@ pub(super) fn render_artifact_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         let toggle = w.find("files-toggle").bounds();
                         let sync = w.find("git-next").bounds();
                         let menu = w.find("git-menu").bounds();
+                        assert_eq!(menu.size, size(px(32.), px(32.)), "round split-button cap");
                         for id in [
                             "uncommitted-only",
                             "diff-mode",
