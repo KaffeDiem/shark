@@ -310,12 +310,6 @@ pub(super) fn branch_entries(
         )];
     }
     let sync = this.syncs.get(&ws.name).map(|s| s.read(cx));
-    let branches: Vec<_> = sync
-        .map(|s| s.branches())
-        .unwrap_or_default()
-        .into_iter()
-        .filter(|b| repo.is_none_or(|r| r == b.repo))
-        .collect();
     let pairs: Vec<(String, String)> = ws
         .repos
         .iter()
@@ -342,9 +336,12 @@ pub(super) fn branch_entries(
             .map(|(repo, b)| (repo, b.clone(), b))
             .collect(),
     };
-    let mut links: Vec<(String, String, String)> = branches
-        .into_iter()
-        .filter_map(|b| Some((b.repo, String::new(), b.url?)))
+    let mut links: Vec<(String, String, String)> = sync
+        .and_then(|s| s.repos())
+        .unwrap_or_default()
+        .iter()
+        .filter(|r| repo.is_none_or(|name| name == r.name))
+        .filter_map(|r| Some((r.name.clone(), String::new(), r.branch_url(&r.branch)?)))
         .collect();
     let drifted = repo
         .and_then(|name| ws.repos.iter().find(|r| r.name == name))

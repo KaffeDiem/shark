@@ -75,13 +75,6 @@ pub enum SyncEvent {
     PrsCreated,
 }
 
-pub struct Branch {
-    pub repo: String,
-    pub name: String,
-    pub base: String,
-    pub url: Option<String>,
-}
-
 pub struct GitSync {
     ws: Workspace,
     /// Every open chat of the workspace; git writes wait for all of them.
@@ -454,22 +447,6 @@ impl GitSync {
                 cx.notify(); // the composer footer says Enter queues now
             });
         }
-    }
-
-    /// Per repo: its checked-out branch, its base, and its own branch on GitHub (`None` until
-    /// it is pushed there).
-    pub fn branches(&self) -> Vec<Branch> {
-        self.repos
-            .iter()
-            .map(|r| Branch {
-                repo: r.name.clone(),
-                name: (r.local.as_ref().ok())
-                    .and_then(|l| l.branch.clone())
-                    .unwrap_or_else(|| r.branch.clone()),
-                base: r.base.clone(),
-                url: r.branch_url(&r.branch),
-            })
-            .collect()
     }
 
     /// The open PR target for display, or None to keep the caller's current workspace base.

@@ -1365,10 +1365,14 @@ async fn empty_views_go_live_once_a_repo_attaches(cx: &mut TestAppContext) {
         s.ws_mut(&name).unwrap().repos[0].branch = saved.branch.clone();
         cx.notify();
     });
+    until(cx, window, |_, cx| {
+        shark.read(cx).syncs[&name].read(cx).repos().is_some()
+    })
+    .await;
     on(cx, &|s, w, cx| {
         assert!(s.git_features.contains_key(&name), "the view it offered");
         let sync = s.syncs[&name].read(cx);
-        assert_eq!(sync.branches()[0].repo, "api");
+        assert_eq!(sync.repos().unwrap()[0].name, "api");
         assert!(sync.blocked(false, cx).is_none());
         let ws = s.active_ws().unwrap().clone();
         assert_eq!(s.effective_workspace(ws.clone(), cx).repos.len(), 1);

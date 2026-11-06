@@ -8258,15 +8258,22 @@ async fn change_base(cx: &mut TestAppContext) {
     press_in(window)(cx, &["enter"]);
     // Only change the target, preserving the commits and avoiding an agent turn.
     press_in(window)(cx, &["down", "enter"]);
+    until(cx, window, |_, cx| {
+        shark.read(cx).syncs["rb"].read(cx).repos().is_some()
+    })
+    .await;
     cx.update(|cx| {
         let s = shark.read(cx);
         let ws = s.ws("rb").unwrap();
         assert_eq!(ws.repos[0].base, "origin/release");
         assert_eq!(ws.repos[1].base, old, "web keeps its base");
         assert_eq!(menus::base_hint(ws), "per repo");
-        let (names, bases): (Vec<String>, Vec<String>) = (s.syncs["rb"].read(cx).branches())
-            .into_iter()
-            .map(|b| (b.name, b.base))
+        let (names, bases): (Vec<String>, Vec<String>) = s.syncs["rb"]
+            .read(cx)
+            .repos()
+            .unwrap()
+            .iter()
+            .map(|r| (r.branch.clone(), r.base.clone()))
             .unzip();
         assert_eq!(names, ["kd/x", "rb"], "each repo's own branch");
         assert_eq!(bases, ["origin/release".to_string(), old.clone()]);
