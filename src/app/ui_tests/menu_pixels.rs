@@ -47,7 +47,7 @@ fn entries(case: &str) -> Vec<Entry> {
                 IconName::FolderOpen,
                 "Open in Terminal",
                 vec![
-                    action(IconName::Folder, "Workspace folder")
+                    action(IconName::Folder, "Task folder")
                         .hint("~/shark/workspaces/branch-from-feature"),
                     Entry::Sep,
                     action(IconName::FolderGit2, "shark"),

@@ -6,7 +6,7 @@ use std::time::Duration;
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(super) enum Item {
     Tab(String, TabId),
-    Workspace(String),
+    Task(String),
     Section(usize),
     Ungrouped,
 }
@@ -174,7 +174,7 @@ impl Shark {
 
     fn reorder_items(&self, horizontal: bool, cx: &App) -> Vec<Item> {
         if horizontal {
-            self.active_ws()
+            self.active_task()
                 .map(|ws| {
                     self.visible_tab_ids(ws, cx)
                         .into_iter()
@@ -186,7 +186,7 @@ impl Shark {
             self.side_rows(false)
                 .into_iter()
                 .map(|row| match row {
-                    SideRow::Ws(i) => Item::Workspace(self.state.workspaces[i].name.clone()),
+                    SideRow::Task(i) => Item::Task(self.state.tasks[i].name.clone()),
                     SideRow::Section(i) => Item::Section(i),
                 })
                 .collect()
@@ -207,7 +207,7 @@ impl Shark {
         }
         let valid = |item: &&Item| match (&drag.source, *item) {
             (Item::Tab(ws, _), Item::Tab(other, _)) => ws == other,
-            (Item::Workspace(_), Item::Workspace(_) | Item::Section(_) | Item::Ungrouped) => true,
+            (Item::Task(_), Item::Task(_) | Item::Section(_) | Item::Ungrouped) => true,
             (Item::Section(_), Item::Section(_)) => true,
             _ => false,
         };
@@ -254,7 +254,7 @@ impl Shark {
                         .skip(start + 1)
                         .find(|(_, key)| {
                             matches!(key, Item::Section(_))
-                                || matches!(key,Item::Workspace(n) if self.section_of(n).is_none())
+                                || matches!(key,Item::Task(n) if self.section_of(n).is_none())
                         })
                         .map_or(before.len(), |(i, _)| i);
                     start..end
@@ -269,15 +269,15 @@ impl Shark {
                 };
                 order.splice(insert..insert, block);
             }
-            (Item::Workspace(source), _) => {
+            (Item::Task(source), _) => {
                 // Use the same grouping rules as the eventual drop, without saving a preview.
                 let mut preview = State {
-                    workspaces: self.state.workspaces.clone(),
+                    tasks: self.state.tasks.clone(),
                     sections: self.state.sections.clone(),
                     ..State::default()
                 };
                 match &target {
-                    Item::Workspace(to) => preview.drop_ws(source, to),
+                    Item::Task(to) => preview.drop_task(source, to),
                     Item::Section(i) => preview.move_to_section(source, Some(*i)),
                     Item::Ungrouped => preview.move_to_section(source, None),
                     _ => {}
@@ -286,20 +286,20 @@ impl Shark {
                 for (i, section) in preview.sections.iter().enumerate() {
                     order.push(Item::Section(i));
                     if !section.collapsed {
-                        order.extend(section.workspaces.iter().cloned().map(Item::Workspace));
+                        order.extend(section.tasks.iter().cloned().map(Item::Task));
                     }
                 }
                 order.extend(
                     preview
-                        .workspaces
+                        .tasks
                         .iter()
                         .filter(|ws| {
                             !preview
                                 .sections
                                 .iter()
-                                .any(|s| s.workspaces.contains(&ws.name))
+                                .any(|s| s.tasks.contains(&ws.name))
                         })
-                        .map(|ws| Item::Workspace(ws.name.clone())),
+                        .map(|ws| Item::Task(ws.name.clone())),
                 );
             }
             _ => {
@@ -351,11 +351,11 @@ impl Shark {
                 (Item::Tab(ws, from), Some(Item::Tab(other, to))) if *ws == other => {
                     self.move_tab(ws, from, &to, cx)
                 }
-                (Item::Workspace(ws), Some(Item::Workspace(to))) => self.drop_ws(ws, &to, cx),
-                (Item::Workspace(ws), Some(Item::Section(to))) => {
+                (Item::Task(ws), Some(Item::Task(to))) => self.drop_task(ws, &to, cx),
+                (Item::Task(ws), Some(Item::Section(to))) => {
                     self.move_to_section(ws, Some(to), cx)
                 }
-                (Item::Workspace(ws), Some(Item::Ungrouped)) => self.move_to_section(ws, None, cx),
+                (Item::Task(ws), Some(Item::Ungrouped)) => self.move_to_section(ws, None, cx),
                 (Item::Section(from), Some(Item::Section(to))) => self.drop_section(*from, to, cx),
                 _ => {}
             }

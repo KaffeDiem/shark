@@ -1,4 +1,4 @@
-mod agent;
+mod harness;
 mod app;
 mod apps;
 mod attention;
@@ -48,14 +48,14 @@ actions!(
     shark,
     [
         TogglePalette,
-        NewWorkspace,
-        NewWorkspaceFromBranch,
-        ArchiveWorkspace,
-        ForceArchiveWorkspace,
+        NewTask,
+        NewTaskFromBranch,
+        ArchiveTask,
+        ForceArchiveTask,
         AddRepo,
         CycleOpenApp,
-        OpenWorkspacePicker,
-        AddRepoToWorkspace,
+        OpenTaskPicker,
+        AddRepoToTask,
         StopAgent,
         FocusLeft,
         FocusRight,
@@ -106,7 +106,7 @@ actions!(
         PickBranch,
         PickPullRequest,
         BranchFromSource,
-        RefreshWorkspaceSources,
+        RefreshTaskSources,
         NextAttention,
         OpenSettings,
         RunScripts,
@@ -204,17 +204,17 @@ actions!(
     ]
 );
 
-/// Switch the open workspace to `chat::MODELS[n]` without opening the menu.
+/// Switch the open task to `chat::MODELS[n]` without opening the menu.
 #[derive(Clone, PartialEq, Debug, serde::Deserialize, Action)]
 #[action(namespace = shark, no_json)]
 pub struct SetModel(pub usize);
 
-/// Open the nth sidebar workspace (cmd-1 is the top one).
+/// Open the nth sidebar task (cmd-1 is the top one).
 #[derive(Clone, PartialEq, Debug, serde::Deserialize, Action)]
 #[action(namespace = shark, no_json)]
-pub struct OpenWorkspace(pub usize);
+pub struct OpenTask(pub usize);
 
-/// Open the nth tab of the current workspace (ctrl-1 is the leftmost one).
+/// Open the nth tab of the current task (ctrl-1 is the leftmost one).
 #[derive(Clone, PartialEq, Debug, serde::Deserialize, Action)]
 #[action(namespace = shark, no_json)]
 pub struct OpenTab(pub usize);
@@ -259,12 +259,12 @@ fn bind_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("cmd-k", TogglePalette, None),
         KeyBinding::new("cmd-shift-p", TogglePalette, None),
-        KeyBinding::new("cmd-n", NewWorkspace, None),
+        KeyBinding::new("cmd-n", NewTask, None),
         KeyBinding::new("cmd-o", CycleOpenApp, None),
-        KeyBinding::new("cmd-shift-o", OpenWorkspacePicker, Some("!FileEditor")),
+        KeyBinding::new("cmd-shift-o", OpenTaskPicker, Some("!FileEditor")),
         KeyBinding::new("cmd-0", ToggleHome, None),
-        // Home: esc goes back to the workspace (or stops an Ask Shark answer); tab switches
-        // the prompt between new workspace and Ask Shark; i/a jump from the list to it.
+        // Home: esc goes back to the task (or stops an Ask Shark answer); tab switches
+        // the prompt between new task and Ask Shark; i/a jump from the list to it.
         KeyBinding::new("escape", CancelEdit, Some("HomeView")),
         KeyBinding::new("tab", SwitchField, Some("HomePrompt")),
         KeyBinding::new(
@@ -273,8 +273,8 @@ fn bind_keys(cx: &mut App) {
             Some("Home || Transcript || Queue || PlanPane"),
         ),
         KeyBinding::new("a", FocusComposer, Some("Home || Transcript || Queue")),
-        // The workspace under the cursor, as in the row menu.
-        KeyBinding::new("cmd-backspace", ArchiveWorkspace, Some("Home || Sidebar")),
+        // The task under the cursor, as in the row menu.
+        KeyBinding::new("cmd-backspace", ArchiveTask, Some("Home || Sidebar")),
         // Not in the editor: Vim users leave insert mode with ctrl-c.
         KeyBinding::new("ctrl-c", StopAgent, Some("!FileEditor")),
         KeyBinding::new("cmd-alt-left", FocusLeft, None),
@@ -356,19 +356,19 @@ fn bind_keys(cx: &mut App) {
         KeyBinding::new("m", MoveToSection, Some("Sidebar")),
         // Inline section name in the sidebar: the Input lets escape through.
         KeyBinding::new("escape", CancelEdit, Some("SectionName")),
-        // New workspace dialog: tab hops between branch and repo filter, space ticks the
+        // New task dialog: tab hops between branch and repo filter, space ticks the
         // highlighted repo (names have no spaces), cmd-b lists its branches, cmd-enter creates
         // from either field.
-        KeyBinding::new("tab", SwitchField, Some("NewWorkspace")),
-        KeyBinding::new("shift-tab", SwitchField, Some("NewWorkspace")),
-        KeyBinding::new("space", ToggleRepo, Some("NewWorkspace > Command")),
-        KeyBinding::new("cmd-enter", SubmitForm, Some("NewWorkspace")),
-        KeyBinding::new("cmd-b", PickBranch, Some("NewWorkspace")),
-        KeyBinding::new("cmd-p", PickPullRequest, Some("NewWorkspace")),
-        KeyBinding::new("alt-enter", BranchFromSource, Some("NewWorkspace")),
-        KeyBinding::new("cmd-r", RefreshWorkspaceSources, Some("NewWorkspace")),
+        KeyBinding::new("tab", SwitchField, Some("NewTask")),
+        KeyBinding::new("shift-tab", SwitchField, Some("NewTask")),
+        KeyBinding::new("space", ToggleRepo, Some("NewTask > Command")),
+        KeyBinding::new("cmd-enter", SubmitForm, Some("NewTask")),
+        KeyBinding::new("cmd-b", PickBranch, Some("NewTask")),
+        KeyBinding::new("cmd-p", PickPullRequest, Some("NewTask")),
+        KeyBinding::new("alt-enter", BranchFromSource, Some("NewTask")),
+        KeyBinding::new("cmd-r", RefreshTaskSources, Some("NewTask")),
         KeyBinding::new("cmd-,", OpenSettings, None),
-        // Outside the New workspace dialog, whose cmd-r refreshes its lists.
+        // Outside the New task dialog, whose cmd-r refreshes its lists.
         KeyBinding::new("cmd-r", RunScripts, None),
         KeyBinding::new("ctrl-tab", SwitchField, Some("Settings")),
         KeyBinding::new("ctrl-shift-tab", SwitchField, Some("Settings")),
@@ -470,7 +470,7 @@ fn bind_keys(cx: &mut App) {
             .map(|i| KeyBinding::new(&format!("ctrl-cmd-{}", i + 1), SetModel(i), None)),
     );
     cx.bind_keys(
-        (0..9).map(|i| KeyBinding::new(&format!("cmd-{}", i + 1), OpenWorkspace(i), None)),
+        (0..9).map(|i| KeyBinding::new(&format!("cmd-{}", i + 1), OpenTask(i), None)),
     );
     cx.bind_keys((0..9).map(|i| KeyBinding::new(&format!("ctrl-{}", i + 1), OpenTab(i), None)));
     // The Diff component's scroll actions are private; bind vim keys to them by name.
@@ -542,7 +542,7 @@ fn main() {
             set_dock_icon();
             gpui_kit::init(cx);
             cx.on_app_quit(|_| async {
-                agent::stop_all();
+                harness::stop_all();
                 lsp::client::Client::terminate_all().await
             })
             .detach();

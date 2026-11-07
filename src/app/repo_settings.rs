@@ -1,4 +1,4 @@
-//! Settings › Repositories lists the repos; clicking one opens its settings: new agent, default
+//! Settings › Repositories lists the repos; clicking one opens its settings: new task, default
 //! model, setup, run and archive scripts, removal. Every change saves at once, as in Settings.
 use super::*;
 use crate::models::efforts;
@@ -97,7 +97,7 @@ impl ReposPage {
             .gap_3()
             .when(ix > 0, |d| d.border_t_1().border_color(theme.border))
             .hover(|d| d.bg(theme.secondary_hover))
-            // Drag to reorder: scripts run in this order across a workspace's repos.
+            // Drag to reorder: scripts run in this order across a task's repos.
             .on_drag(RepoDrag(ix, r.name.clone().into()), |d, _, _, cx| {
                 cx.new(|_| d.clone())
             })
@@ -371,12 +371,12 @@ impl RepoSettingsView {
         }
     }
 
-    fn new_workspace(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    fn new_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let name = self.repo.name.clone();
         // Settings may be open underneath.
         window.close_all_dialogs(cx);
         (self.shark)
-            .update(cx, |s, cx| s.new_workspace(vec![name], None, window, cx))
+            .update(cx, |s, cx| s.new_task_from_repos(vec![name], None, window, cx))
             .ok();
     }
 
@@ -386,7 +386,7 @@ impl RepoSettingsView {
             .map(|s| {
                 let s = s.read(cx);
                 // Queued attachments still need this repo's setup scripts and defaults.
-                (s.state.workspaces.iter())
+                (s.state.tasks.iter())
                     .filter(|w| {
                         w.repos.iter().any(|r| r.name == name)
                             || w.attaching.iter().any(|a| a.repo == name)
@@ -398,7 +398,7 @@ impl RepoSettingsView {
             .unwrap_or_default();
         if !used.is_empty() {
             let msg = format!(
-                "{name} is in {}; finish or cancel its attachments, or delete those agents first",
+                "{name} is in {}; finish or cancel its attachments, or delete those tasks first",
                 used.join(", ")
             );
             notify_err(window, cx, msg);
@@ -614,12 +614,12 @@ impl Render for RepoSettingsView {
                     .on_click(move |_, w, cx| copy(p2.display().to_string(), w, cx)),
             )
             .child(
-                Button::new("repo-new-workspace")
+                Button::new("repo-new-task")
                     .primary()
                     .small()
                     .icon(IconName::Plus)
-                    .label("New agent")
-                    .on_click(cx.listener(|this, _, w, cx| this.new_workspace(w, cx))),
+                    .label("New task")
+                    .on_click(cx.listener(|this, _, w, cx| this.new_task(w, cx))),
             );
         v_flex()
             .id("repo-settings")
@@ -629,13 +629,13 @@ impl Render for RepoSettingsView {
             .overflow_y_scroll()
             .child(header)
             .child(
-                v_flex().gap_1p5().child(section(theme, "Agent")).child(
+                v_flex().gap_1p5().child(section(theme, "Task")).child(
                     card(theme)
                         .child(row(
                             theme,
                             false,
                             "Default model",
-                            "New chats in agents with this repo",
+                            "New chats in tasks with this repo",
                             Select::new(&self.model),
                         ))
                         .child(row(

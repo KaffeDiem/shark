@@ -481,7 +481,7 @@ impl CodeActionProvider for Provider {
                 let guard: EditGuard = serde_json::from_value(data["sharkGuard"].clone())?;
                 ensure!(
                     guard.is_current(),
-                    "Workspace changed; request the quick fix again"
+                    "Task changed; request the quick fix again"
                 );
                 ensure!(
                     data["sharkVersion"].as_i64() == Some(snapshot.version as i64),

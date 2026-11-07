@@ -12,13 +12,13 @@ mod side;
 mod tools;
 
 use self::queue::Queued;
-use crate::agent::{self, Agent, Ev};
+use crate::harness::{self, Harness, Ev};
 use crate::complete::{self, Item};
 use crate::models::EFFORT;
 use crate::models::{effort_label, model_label};
 use crate::plan::{self, PlanPane};
 use crate::review_protocol::{ReviewCard, card_of, hidden_reply, hide_reports, may_report};
-use crate::state::{ChatMeta, REPO_CONTEXT, Workspace, context_record};
+use crate::state::{ChatMeta, REPO_CONTEXT, Task, context_record};
 use crate::ui::{copy_button, link_roots, markdown, model_entries};
 use crate::ui::{hint, plural};
 use crate::vim::{self, Vim};
@@ -114,7 +114,7 @@ pub enum ChatEvent {
 }
 
 pub struct Chat {
-    pub ws: Workspace,
+    pub ws: Task,
     pub meta: ChatMeta,
     blocks: Vec<Block>,
     /// What the list shows, derived from `blocks`; see `sync_rows`.
@@ -122,23 +122,23 @@ pub struct Chat {
     sel: usize,
     pub busy: bool,
     /// Background tasks (subagents, shells) still running; the turn can end before they do.
-    pub background: Vec<agent::Task>,
+    pub background: Vec<harness::BackgroundTask>,
     critters: HashMap<String, usize>,
     hop: usize,
-    hopping: Option<Task<()>>,
+    hopping: Option<gpui_kit::Task<()>>,
     /// When the running turn started.
     pub started: Option<Instant>,
     /// Set while a git step runs in these worktrees; sends wait for it.
     pub hold: bool,
-    /// Set while the agent has an attachment operation (`Workspace::attaching`). Its own field:
+    /// Set while the agent has an attachment operation (`Task::attaching`). Its own field:
     /// a git step ending must not release it, nor it a git step.
     pub attach_hold: bool,
-    /// Set while the workspace's worktrees are being removed; sends are refused.
+    /// Set while the task's worktrees are being removed; sends are refused.
     pub archiving: bool,
     /// What `ChatMeta::delivered` becomes once the agent echoes the message at a block: a message
     /// it never read leaves the context pending.
     told: Vec<(usize, std::collections::BTreeMap<String, u64>, String)>,
-    agent: Option<Agent>,
+    harness: Option<Harness>,
     pub(crate) composer: Entity<TextareaState>,
     /// The reply of the turn that ended last, and that turn's number (see `turns`).
     pub last_reply: String,
@@ -153,24 +153,24 @@ pub struct Chat {
     model_at: std::rc::Rc<std::cell::Cell<Bounds<Pixels>>>,
     /// Model and (claude) thinking level the running process was started with; a mismatch
     /// respawns it on the next send.
-    agent_model: Option<String>,
-    agent_effort: &'static str,
+    harness_model: Option<String>,
+    harness_effort: &'static str,
     /// Repo directories passed to the running Claude (`git::claude_skill_args`).
-    agent_skills: Vec<String>,
+    harness_skills: Vec<String>,
     /// Virtualized: only visible rows render, which matters while a spinner redraws every frame.
     list: ListState,
     pub focus: FocusHandle,
-    reader: Option<Task<()>>,
+    reader: Option<gpui_kit::Task<()>>,
     files: Vec<Item>,
     commands: Vec<Item>,
     menu: Option<Menu>,
     menu_scroll: ScrollHandle,
-    indexing: Option<Task<()>>,
-    probing: Option<Task<()>>,
+    indexing: Option<gpui_kit::Task<()>>,
+    probing: Option<gpui_kit::Task<()>>,
     /// PRs of every repo, as last listed; cached on disk per source repository.
     prs: Vec<complete::Pr>,
     pr_items: Vec<Item>,
-    fetching_prs: Option<Task<()>>,
+    fetching_prs: Option<gpui_kit::Task<()>>,
     /// Repos whose PR list hasn't landed yet in the running fetch.
     prs_left: usize,
     /// `(repo, reason)` for each repo the last fetch couldn't list.
@@ -182,7 +182,7 @@ pub struct Chat {
     /// The turn was interrupted; its result reads "interrupted".
     cut: bool,
     /// SIGTERM fallback for an interrupt claude doesn't act on.
-    stopping: Option<Task<()>>,
+    stopping: Option<gpui_kit::Task<()>>,
     /// Applying stored history: nothing is emitted to the app.
     replaying: bool,
     queue: Vec<Queued>,
@@ -235,7 +235,7 @@ pub(crate) fn read_events<T: 'static>(
     rx: gpui_kit::base::async_util::Receiver<Ev>,
     apply: fn(&mut T, Ev, &mut Context<T>),
     cx: &mut Context<T>,
-) -> Task<()> {
+) -> gpui_kit::Task<()> {
     cx.spawn(async move |this, cx| {
         while let Ok(ev) = rx.recv().await {
             if this.update(cx, |t, cx| apply(t, ev, cx)).is_err() {
@@ -255,7 +255,7 @@ pub(crate) fn duration(secs: u64) -> String {
 
 impl Chat {
     pub fn new(
-        ws: Workspace,
+        ws: Task,
         mut meta: ChatMeta,
         vim_on: bool,
         window: &mut Window,
@@ -324,7 +324,7 @@ impl Chat {
             attach_hold,
             archiving: false,
             told: vec![],
-            agent: None,
+            harness: None,
             composer,
             last_reply: String::new(),
             last_turn: 0,
@@ -333,9 +333,9 @@ impl Chat {
             vim_took: None,
             model_menu: None,
             model_at: Default::default(),
-            agent_model: None,
-            agent_effort: EFFORT,
-            agent_skills: Vec::new(),
+            harness_model: None,
+            harness_effort: EFFORT,
+            harness_skills: Vec::new(),
             list: ListState::new(1, ListAlignment::Top, px(400.)), // the activity footer
             focus: cx.focus_handle(),
             reader: None,
@@ -709,21 +709,21 @@ impl Chat {
         }
         if self.archiving {
             self.push(
-                Block::Info("this agent is being deleted; nothing was sent".into()),
+                Block::Info("this task is being deleted; nothing was sent".into()),
                 cx,
             );
             return false;
         }
         // Never mid-turn: a steer would kill the turn it means to steer.
         let skills = crate::git::claude_skill_args(&self.ws);
-        let stale = self.agent_model != self.meta.model
+        let stale = self.harness_model != self.meta.model
             || (!self.codex()
-                && (self.agent_effort != self.effort() || self.agent_skills != skills));
-        if self.agent.is_some() && stale && !self.busy && !self.steered {
-            self.agent = None; // drop stops it; the respawn resumes the same session on the new model/level
+                && (self.harness_effort != self.effort() || self.harness_skills != skills));
+        if self.harness.is_some() && stale && !self.busy && !self.steered {
+            self.harness = None; // drop stops it; the respawn resumes the same session on the new model/level
             self.set_background(vec![], cx); // its reader is replaced below, so its Exited never arrives
         }
-        if self.agent.is_none() {
+        if self.harness.is_none() {
             // A session starting now reads the repos from the root docs, and has nothing else.
             if self.meta.session_id.is_none() {
                 let mut context = self.ws.context();
@@ -734,7 +734,7 @@ impl Chat {
                     cx.emit(ChatEvent::Meta);
                 }
             }
-            match agent::spawn(&self.ws, &self.meta) {
+            match harness::spawn(&self.ws, &self.meta) {
                 Ok((mut a, rx)) => {
                     if self.meta.plan
                         && let Err(e) = a.set_plan_mode(true)
@@ -742,10 +742,10 @@ impl Chat {
                         self.push(Block::Info(format!("plan mode failed: {e}")), cx);
                         return false;
                     }
-                    self.agent = Some(a);
-                    self.agent_model = self.meta.model.clone();
-                    self.agent_effort = self.effort();
-                    self.agent_skills = skills;
+                    self.harness = Some(a);
+                    self.harness_model = self.meta.model.clone();
+                    self.harness_effort = self.effort();
+                    self.harness_skills = skills;
                     self.reader = Some(read_events(rx, Self::apply, cx));
                 }
                 Err(e) => {
@@ -768,7 +768,7 @@ impl Chat {
             true => text.clone(),
             false => format!("{}{NOTES_END}{text}", notes.join("\n")),
         };
-        if let Err(e) = self.agent.as_mut().unwrap().send(&wire) {
+        if let Err(e) = self.harness.as_mut().unwrap().send(&wire) {
             self.push(Block::Info(format!("send failed: {e}")), cx);
             return false;
         }
@@ -813,7 +813,7 @@ impl Chat {
     /// The agent's repos, branches, issues or attachment changed. Session and Plan mode stay;
     /// the agent hears of it with its next normal turn (`pending_context`). Ending the attachment
     /// hold sends what waited for it, unless a git step still holds it.
-    pub fn workspace_changed(&mut self, ws: &Workspace, cx: &mut Context<Self>) {
+    pub fn task_changed(&mut self, ws: &Task, cx: &mut Context<Self>) {
         let grew = ws.repos.len() != self.ws.repos.len();
         let released = self.attach_hold && ws.attaching.is_empty();
         self.ws = ws.clone();
@@ -828,7 +828,7 @@ impl Chat {
         cx.notify();
     }
 
-    /// The notes of `Workspace::context` this chat's session hasn't received, for its next
+    /// The notes of `Task::context` this chat's session hasn't received, for its next
     /// normal message. Derived from what is saved, so it needs no event: chats closed, not yet
     /// loaded or from before a restart catch up the same way.
     pub(crate) fn pending_context(&self) -> Vec<String> {
@@ -874,7 +874,7 @@ impl Chat {
     /// the process, since that is the only way to end them. Idle, does nothing.
     pub fn stop(&mut self, cx: &mut Context<Self>) {
         let working = self.working();
-        let Some(a) = &mut self.agent else {
+        let Some(a) = &mut self.harness else {
             return;
         };
         if !self.busy || self.stopping.is_some() {
@@ -890,7 +890,7 @@ impl Chat {
         self.stopping = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(INTERRUPT_GRACE).await;
             this.update(cx, |c, cx| {
-                if let Some(a) = &c.agent
+                if let Some(a) = &c.harness
                     && c.busy
                 {
                     // SIGTERM also ends background tasks: with some running, let the user decide.
@@ -932,7 +932,7 @@ impl Chat {
 
     /// The process is gone (or going): forget its state, end its calls, flag what it never read.
     fn drop_process(&mut self, cx: &mut Context<Self>) {
-        self.agent = None; // drop stops it
+        self.harness = None; // drop stops it
         self.drop_asked(cx);
         self.set_background(vec![], cx);
         self.stopping = None;
@@ -1179,7 +1179,7 @@ impl Chat {
                     .any(|&bi| matches!(self.blocks[bi].message(), Some((_, true))));
             }
             None => {
-                // A replayed message carries the workspace notes sent with it.
+                // A replayed message carries the task notes sent with it.
                 let (notes, text) = split_notes(&text);
                 self.blocks.extend(info_notes(notes));
                 self.blocks.push(match card_of(text) {
@@ -1304,7 +1304,7 @@ impl Chat {
             "WebSearch" | "WebFetch" => None,
             _ => Some(NEEDS_APPROVAL),
         };
-        if let Some(a) = &mut self.agent
+        if let Some(a) = &mut self.harness
             && let Err(e) = match reason {
                 Some(reason) => a.deny(&request_id, reason),
                 None => a.allow(&request_id, input),
@@ -1331,7 +1331,7 @@ impl Chat {
         }
         // A pruned or deleted session: claude says so in the result and exits, and
         // every resume would fail the same way. (Replay restores the session after.)
-        let gone = is_error && text.starts_with(agent::SESSION_GONE);
+        let gone = is_error && text.starts_with(harness::SESSION_GONE);
         let took = duration(secs);
         self.blocks.push(Block::Info(if cut {
             format!("interrupted · {took}")
@@ -2124,7 +2124,7 @@ pub(crate) mod ui_tests {
         // Injected events replace the reader, including the fake process's exit during cleanup.
         c.reader = None;
         for l in lines {
-            for ev in agent::parse(l) {
+            for ev in harness::parse(l) {
                 c.apply(ev, cx);
             }
         }
@@ -2167,7 +2167,7 @@ pub(crate) mod ui_tests {
                         cx.new(|cx| {
                             let chat = cx.new(|cx| {
                                 Chat::new(
-                                    Workspace::default(),
+                                    Task::default(),
                                     ChatMeta {
                                         id: "activity-pixels".into(),
                                         ..Default::default()
@@ -2202,7 +2202,7 @@ pub(crate) mod ui_tests {
                     c.set_background(vec![], cx);
                     c.set_background(
                         (0..4)
-                            .map(|i| agent::Task {
+                            .map(|i| harness::BackgroundTask {
                                 id: format!("agent-{i}"),
                                 kind: "local_agent".into(),
                                 description: format!("Background agent {}", i + 1),
@@ -2288,7 +2288,7 @@ pub(crate) mod ui_tests {
         let chat = open_chat("background-hop", cx);
         let tasks = || {
             (0..4)
-                .map(|i| agent::Task {
+                .map(|i| harness::BackgroundTask {
                     id: format!("live-{i}"),
                     kind: "local_agent".into(),
                     description: format!("Background agent {i}"),
@@ -2416,7 +2416,7 @@ exec cat >>"$0.stdin"
         let root = std::env::temp_dir().join(format!("shark-side-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         let fake = fake_claude();
-        let ws = Workspace {
+        let ws = Task {
             name: format!("side-proc-{}", std::process::id()),
             ..Default::default()
         };
@@ -2430,10 +2430,10 @@ exec cat >>"$0.stdin"
         let _turn = crate::app::ui_tests::UI_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
+        std::fs::create_dir_all(crate::state::tasks_dir()).unwrap();
         let _ = std::fs::remove_file(ws.dir());
         std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
-        let (mut a, rx) = agent::spawn_side(&ws, &meta).unwrap();
+        let (mut a, rx) = harness::spawn_side(&ws, &meta).unwrap();
         a.send("what is x?").unwrap();
         let mut text = String::new();
         while let Ok(ev) = rx.recv_blocking() {
@@ -2468,7 +2468,7 @@ exec cat >>"$0.stdin"
         let _turn = crate::app::ui_tests::UI_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let (mut a, rx) = agent::spawn_ask("haiku", "the docs").unwrap();
+        let (mut a, rx) = harness::spawn_ask("haiku", "the docs").unwrap();
         a.send("what is x?").unwrap();
         let mut text = String::new();
         while let Ok(ev) = rx.recv_blocking() {
@@ -2511,7 +2511,7 @@ exec cat >>"$0.stdin"
         unsafe { std::env::set_var("SHARK_CLAUDE", "/nonexistent") };
         let root = std::env::temp_dir().join(format!("shark-noclaude-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
-        let ws = Workspace {
+        let ws = Task {
             name: format!("noclaude-test-{}", std::process::id()),
             ..Default::default()
         };
@@ -2519,7 +2519,7 @@ exec cat >>"$0.stdin"
             id: ws.name.clone(),
             ..Default::default()
         };
-        std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
+        std::fs::create_dir_all(crate::state::tasks_dir()).unwrap();
         let _ = std::fs::remove_file(ws.dir());
         std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
         let (window, chat) = cx
@@ -2578,7 +2578,7 @@ exec cat >>"$0.stdin"
         let root = std::env::temp_dir().join(format!("shark-side-ui-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         fake_claude();
-        let ws = Workspace {
+        let ws = Task {
             name: format!("side-test-{}", std::process::id()),
             ..Default::default()
         };
@@ -2591,7 +2591,7 @@ exec cat >>"$0.stdin"
         let _turn = crate::app::ui_tests::UI_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
+        std::fs::create_dir_all(crate::state::tasks_dir()).unwrap();
         let _ = std::fs::remove_file(ws.dir());
         std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
         let (window, chat) = cx
@@ -2643,7 +2643,7 @@ exec cat >>"$0.stdin"
             let side = c.side.as_ref().unwrap();
             assert_eq!(side.question, "what is x?");
             assert_eq!(side.text, "Forty-two");
-            assert!(side.done && side.agent.is_none() && side.error.is_none());
+            assert!(side.done && side.harness.is_none() && side.error.is_none());
             assert!(c.blocks.is_empty(), "the chat never sees the side question");
             assert!(!c.busy);
             assert_eq!(c.composer.read(cx).value().as_ref(), "");
@@ -2711,9 +2711,9 @@ exec cat >>"$0.stdin"
         let root = std::env::temp_dir().join(format!("shark-plan-ui-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         fake_claude();
-        let ws = Workspace {
+        let ws = Task {
             name: format!("plan-test-{}", std::process::id()),
-            repos: vec![crate::state::WsRepo {
+            repos: vec![crate::state::TaskRepo {
                 name: "api".into(),
                 src: root.clone(),
                 base: "main".into(),
@@ -2728,7 +2728,7 @@ exec cat >>"$0.stdin"
         let _turn = crate::app::ui_tests::UI_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
+        std::fs::create_dir_all(crate::state::tasks_dir()).unwrap();
         let _ = std::fs::remove_file(ws.dir());
         std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
         let (window, chat) = cx
@@ -2891,7 +2891,7 @@ exec cat >>"$0.stdin"
         });
         cx.update(|cx| chat.update(cx, |c, _| c.reader = None));
         cx.run_until_parked(); // Drop the receiver before the OS thread sends the fake process's exit.
-        cx.update(|cx| chat.update(cx, |c, _| c.agent = None));
+        cx.update(|cx| chat.update(cx, |c, _| c.harness = None));
         let _ = std::fs::remove_file(super::plan::store_path(&ws.name));
         let _ = std::fs::remove_file(ws.dir());
     }
@@ -2909,7 +2909,7 @@ exec cat >>"$0.stdin"
             gpui_kit::init(cx);
             crate::bind_keys(cx);
         });
-        let ws = Workspace {
+        let ws = Task {
             name: format!("ask-test-{}", std::process::id()),
             ..Default::default()
         };
@@ -2944,9 +2944,9 @@ exec cat >>"$0.stdin"
             cx.update(|cx| {
                 chat.update(cx, |c, cx| {
                     c.busy = true;
-                    c.agent_model = c.meta.model.clone(); // a codex process asks
+                    c.harness_model = c.meta.model.clone(); // a codex process asks
                     c.apply(
-                        Ev::Questions(agent::Questions::new(
+                        Ev::Questions(harness::Questions::new(
                             id.into(), format!("call-{id}"), serde_json::json!({"questions": [
                                 {"id": "db", "header": "DB", "question": "Which DB?", "isOther": true, "options": [{"label": "Postgres", "description": "SQL"}, {"label": "Redis", "description": "KV"}]},
                                 {"id": "tests", "header": "Tests", "question": "Which tests?", "isOther": true, "options": [{"label": "Unit", "description": ""}, {"label": "E2E", "description": ""}]},
@@ -3077,7 +3077,7 @@ exec cat >>"$0.stdin"
     #[gpui_kit::test]
     fn send_scrolls_to_bottom(cx: &mut TestAppContext) {
         cx.update(gpui_kit::init);
-        let ws = Workspace {
+        let ws = Task {
             name: format!("scroll-test-{}", std::process::id()),
             branch: "b".into(),
             repos: vec![],
@@ -3149,10 +3149,10 @@ exec cat >>"$0.stdin"
         footer(cx);
     }
 
-    /// A chat on a fresh workspace resuming session `s1`.
+    /// A chat on a fresh task resuming session `s1`.
     fn open_chat(tag: &str, cx: &mut TestAppContext) -> Entity<Chat> {
         cx.update(gpui_kit::init);
-        let ws = Workspace {
+        let ws = Task {
             name: format!("{tag}-test-{}", std::process::id()),
             branch: "b".into(),
             repos: vec![],
@@ -3222,7 +3222,7 @@ exec cat >>"$0.stdin"
                                     format!("composer-toolbar-{}-{width}", std::process::id());
                                 let chat = cx.new(|cx| {
                                     let mut chat = Chat::new(
-                                        Workspace {
+                                        Task {
                                             name: fixture.clone(),
                                             ..Default::default()
                                         },
@@ -3371,10 +3371,10 @@ exec cat >>"$0.stdin"
                 c.set_model("opus", cx);
                 assert_eq!(c.meta.session_id, None);
                 // The codex process still running reports its thread: not opus's to resume.
-                c.agent_model = Some("codex:gpt-6.1-sol".into());
+                c.harness_model = Some("codex:gpt-6.1-sol".into());
                 let init =
                     r#"{"method":"turn/started","params":{"threadId":"th1","turn":{"id":"t1"}}}"#;
-                for ev in agent::parse(init) {
+                for ev in harness::parse(init) {
                     c.apply(ev, cx);
                 }
                 assert_eq!(c.meta.session_id, None);
@@ -3444,7 +3444,7 @@ done
                 assert!(c.send_text("first".into(), false, cx));
                 c.apply(Ev::User("first".into()), cx);
                 c.set_model(selected, cx);
-                assert_eq!(c.agent.as_ref().unwrap().is_codex(), is_codex);
+                assert_eq!(c.harness.as_ref().unwrap().is_codex(), is_codex);
                 assert_eq!(c.active_codex(), is_codex);
                 assert!(c.send_text("/compact".into(), true, cx));
                 assert_eq!(c.unread.len(), usize::from(!is_codex));
@@ -3553,9 +3553,9 @@ done
                 c.set_effort("ultra", cx);
                 assert_eq!(c.effort(), "max");
                 // What the send checks: claude's process is stale on another level.
-                c.agent_model = c.meta.model.clone();
-                c.agent_effort = "high";
-                assert_ne!(c.agent_effort, c.effort());
+                c.harness_model = c.meta.model.clone();
+                c.harness_effort = "high";
+                assert_ne!(c.harness_effort, c.effort());
             })
         });
     }
@@ -3572,18 +3572,18 @@ done
                 let dir = c.ws.dir();
                 std::fs::create_dir_all(&dir).unwrap();
                 assert!(c.send_text("first".into(), false, cx));
-                assert!(c.agent_skills.is_empty());
+                assert!(c.harness_skills.is_empty());
                 let mut ws = c.ws.clone();
                 std::fs::create_dir_all(dir.join("api")).unwrap();
-                ws.repos.push(crate::state::WsRepo {
+                ws.repos.push(crate::state::TaskRepo {
                     name: "api".into(),
                     src: dir.join("api"),
                     base: "HEAD".into(),
                     branch: None,
                 });
-                c.workspace_changed(&ws, cx);
+                c.task_changed(&ws, cx);
                 assert!(c.send_text("steer".into(), true, cx));
-                assert!(c.agent_skills.is_empty(), "never restart an active turn");
+                assert!(c.harness_skills.is_empty(), "never restart an active turn");
                 c.apply(Ev::User("first".into()), cx);
                 c.apply(Ev::User("steer".into()), cx);
                 c.apply(
@@ -3595,10 +3595,10 @@ done
                     cx,
                 );
                 assert!(c.send_text("next".into(), false, cx));
-                assert_eq!(c.agent_skills, crate::git::claude_skill_args(&ws));
-                assert_eq!(c.agent_skills.len(), 2, "restarted with the added repo");
+                assert_eq!(c.harness_skills, crate::git::claude_skill_args(&ws));
+                assert_eq!(c.harness_skills.len(), 2, "restarted with the added repo");
                 c.reader = None;
-                c.agent = None;
+                c.harness = None;
                 std::fs::remove_dir_all(dir).unwrap();
             })
         });
@@ -3615,7 +3615,7 @@ done
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
                 c.set_model("codex:gpt-6.1-sol", cx);
-                c.agent_model = c.meta.model.clone();
+                c.harness_model = c.meta.model.clone();
                 c.fast_by_config = true;
                 assert!(c.fast() && c.meta.fast.is_none(), "codex's config, untouched");
                 c.set_fast(false, cx);
@@ -3658,10 +3658,10 @@ done
         });
     }
 
-    /// A replayed message that went out with workspace notes shows them as Info rows, not in
+    /// A replayed message that went out with task notes shows them as Info rows, not in
     /// the user's bubble.
     #[gpui_kit::test]
-    fn replay_splits_workspace_notes_from_the_message(cx: &mut TestAppContext) {
+    fn replay_splits_task_notes_from_the_message(cx: &mut TestAppContext) {
         let chat = open_chat("note-replay", cx);
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
@@ -3714,7 +3714,7 @@ done
         let chat = open_chat("context-echo", cx);
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
-                c.ws.repos.push(crate::state::WsRepo {
+                c.ws.repos.push(crate::state::TaskRepo {
                     name: "api".into(),
                     src: "/src/api".into(),
                     base: "main".into(),
@@ -3804,7 +3804,7 @@ done
             chat.update(cx, |c, cx| {
                 std::fs::create_dir_all(c.ws.dir()).unwrap();
                 c.meta.model = Some("codex:gpt-6.1-sol".into());
-                c.ws.repos.push(crate::state::WsRepo { name: "api".into(), src: "/src/api".into(), base: "main".into(), branch: None });
+                c.ws.repos.push(crate::state::TaskRepo { name: "api".into(), src: "/src/api".into(), base: "main".into(), branch: None });
                 let issue = crate::linear::Snapshot { org: "org".into(), id: "one".into(), identifier: "ENG-1".into(), title: "Fix login".into(), description: "Use the existing session".into(), ..Default::default() };
                 c.ws.linear.attach((&issue).into());
                 c.ws.issues.push(issue);
@@ -3924,7 +3924,7 @@ done
         };
         act(cx, &|c, w, cx| {
             c.attach_hold = true;
-            c.ws.repos.push(crate::state::WsRepo {
+            c.ws.repos.push(crate::state::TaskRepo {
                 name: "api".into(),
                 src: "/src/api".into(),
                 base: "main".into(),
@@ -3966,7 +3966,7 @@ done
             c.drain(cx);
             assert_eq!(c.queued(), 4, "steering and draining wait");
             assert!(c.sent_texts().is_empty());
-            assert!(c.agent.is_none(), "no provider started");
+            assert!(c.harness.is_none(), "no provider started");
             // A git step coming and going leaves it alone.
             c.hold = true;
             c.hold = false;
@@ -3989,7 +3989,7 @@ done
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
                 c.meta.model = Some("codex:gpt-6-astra".into());
-                c.agent_model = c.meta.model.clone();
+                c.harness_model = c.meta.model.clone();
                 c.sent("first".into(), None, cx);
                 c.steered = true; // what a cmd-enter send does mid-turn
                 c.sent("second".into(), None, cx);
@@ -4040,7 +4040,7 @@ done
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
                 c.meta.model = Some("codex:gpt-6-astra".into());
-                c.agent_model = c.meta.model.clone();
+                c.harness_model = c.meta.model.clone();
                 c.sent("/compact".into(), None, cx);
                 assert!(c.unread.is_empty(), "never echoed");
                 c.apply(done(), cx);
@@ -4231,7 +4231,7 @@ done
             r#"{"type":"user","isReplay":true,"message":{"content":"<local-command-stdout>Compacted </local-command-stdout>"}}"#,
             r#"{"type":"result","subtype":"success","local_command":"compact","is_error":false,"result":"","total_cost_usd":0,"duration_ms":0}"#,
         ];
-        let evs = || lines.iter().flat_map(|l| crate::agent::parse(l));
+        let evs = || lines.iter().flat_map(|l| crate::harness::parse(l));
         let infos = |c: &Chat| {
             (c.blocks.iter())
                 .filter_map(|b| match b {
@@ -4249,7 +4249,7 @@ done
                 evs().for_each(|e| c.apply(e, cx));
                 assert!(matches!(&c.blocks[0], Block::User(_, true)), "not echoed yet");
                 let echo = r#"{"type":"user","isReplay":true,"message":{"content":"<command-message>compact</command-message>\n<command-name>/compact</command-name>\n<command-args></command-args>"}}"#;
-                crate::agent::parse(echo).into_iter().for_each(|e| c.apply(e, cx));
+                crate::harness::parse(echo).into_iter().for_each(|e| c.apply(e, cx));
                 let users: Vec<_> = (c.blocks.iter())
                     .filter(|b| matches!(b, Block::User(..)))
                     .collect();
@@ -4278,13 +4278,13 @@ done
         let root = std::env::temp_dir().join(format!("shark-queue-{}", std::process::id()));
         std::fs::create_dir_all(&root).unwrap();
         fake_claude();
-        let ws = Workspace {
+        let ws = Task {
             name: format!("queue-test-{}", std::process::id()),
             branch: "b".into(),
             repos: vec![],
             ..Default::default()
         };
-        // The UI tests reset the test home; don't let one do that under this workspace.
+        // The UI tests reset the test home; don't let one do that under this task.
         let meta = ChatMeta {
             id: ws.name.clone(),
             ..Default::default()
@@ -4292,7 +4292,7 @@ done
         let _turn = crate::app::ui_tests::UI_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        std::fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
+        std::fs::create_dir_all(crate::state::tasks_dir()).unwrap();
         std::os::unix::fs::symlink(&root, ws.dir()).unwrap();
         let (dir, transcript) = (ws.dir(), crate::transcript::transcript_path(&meta.id));
         let (window, chat) = cx
@@ -4541,7 +4541,7 @@ done
 
         cx.update(|cx| chat.update(cx, |c, _| c.reader = None));
         cx.run_until_parked(); // Drop the receiver before the OS thread sends the fake process's exit.
-        cx.update(|cx| chat.update(cx, |c, _| c.agent = None));
+        cx.update(|cx| chat.update(cx, |c, _| c.harness = None));
         let _ = std::fs::remove_file(dir);
         let _ = std::fs::remove_file(transcript);
         std::fs::remove_dir_all(root).unwrap();
@@ -4550,7 +4550,7 @@ done
     /// `@` opens the file menu; keys drive it and a pick leaves a repo-qualified chip.
     #[gpui_kit::test]
     fn dropping_a_file_attaches_it(cx: &mut TestAppContext) {
-        // Its workspace dir is under the UI tests' home, which they wipe.
+        // Its task dir is under the UI tests' home, which they wipe.
         let _turn = crate::app::ui_tests::UI_LOCK
             .lock()
             .unwrap_or_else(|e| e.into_inner());
@@ -4558,7 +4558,7 @@ done
             gpui_kit::init(cx);
             crate::bind_keys(cx);
         });
-        let ws = Workspace {
+        let ws = Task {
             name: format!("drop-test-{}", std::process::id()),
             branch: "b".into(),
             ..Default::default()
@@ -4641,13 +4641,13 @@ done
             crate::git::git(&dir, &["init", "-q"]).unwrap();
             repos.push((name.to_string(), dir));
         }
-        let repo = |n: &str| crate::state::WsRepo {
+        let repo = |n: &str| crate::state::TaskRepo {
             name: n.into(),
             src: root.join(n),
             base: "origin/main".into(),
             branch: None,
         };
-        let ws = Workspace {
+        let ws = Task {
             name: format!("at-test-{}", std::process::id()),
             branch: "b".into(),
             repos: vec![repo("api"), repo("web")],
@@ -4668,7 +4668,7 @@ done
         cx.update(|cx| {
             chat.update(cx, |c, _| {
                 c.files = complete::files(&repos);
-                c.indexing = Some(Task::ready(())); // the workspace dir doesn't exist; keep these
+                c.indexing = Some(gpui_kit::Task::ready(())); // the workspace dir doesn't exist; keep these
             })
         });
         let act = |cx: &mut TestAppContext, f: &dyn Fn(&mut Window, &mut App)| {
@@ -4758,7 +4758,7 @@ done
             gpui_kit::init(cx);
             crate::bind_keys(cx);
         });
-        let ws = Workspace {
+        let ws = Task {
             name: format!("vim-test-{}", std::process::id()),
             branch: "b".into(),
             ..Default::default()

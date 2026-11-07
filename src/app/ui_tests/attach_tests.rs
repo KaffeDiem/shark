@@ -1,6 +1,6 @@
 use super::super::attach::{Fit, setup_tail};
 use super::*;
-use crate::agent::{Ev, Task};
+use crate::harness::{Ev, BackgroundTask};
 use crate::attention::Attn;
 use crate::chat::Chat;
 use crate::state::{AttachStage, Attachment, ChatMeta, RepoSettings};
@@ -14,8 +14,8 @@ macro_rules! guards {
     };
 }
 
-pub(super) fn ws_of(cx: &mut TestAppContext, shark: &Entity<Shark>) -> Workspace {
-    cx.update(|cx| shark.read(cx).active_ws().unwrap().clone())
+pub(super) fn task_of(cx: &mut TestAppContext, shark: &Entity<Shark>) -> Task {
+    cx.update(|cx| shark.read(cx).active_task().unwrap().clone())
 }
 
 pub(super) fn chat_of(cx: &mut TestAppContext, shark: &Entity<Shark>) -> Entity<Chat> {
@@ -65,7 +65,7 @@ async fn settled(cx: &mut TestAppContext, window: AnyWindowHandle, shark: &Entit
         let s = shark.read(cx);
         s.adding_repos.is_empty()
             && s.setting_up.is_empty()
-            && (s.active_ws().unwrap().attaching.iter())
+            && (s.active_task().unwrap().attaching.iter())
                 .all(|a| a.stuck() || a.stage == AttachStage::Queued)
     })
     .await;
@@ -81,7 +81,7 @@ pub(super) fn result() -> Ev {
 }
 
 fn stage(cx: &mut TestAppContext, shark: &Entity<Shark>) -> AttachStage {
-    ws_of(cx, shark).attaching[0].stage
+    task_of(cx, shark).attaching[0].stage
 }
 
 /// A first repo takes the branch from the title; a later one inherits it, unless overridden, and
@@ -93,13 +93,13 @@ async fn branches_and_bases_of_first_and_later_repos(cx: &mut TestAppContext) {
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api", "web", "docs"], &[]);
     let on = on_app(window, shark.clone());
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     let name = ws.name.clone();
     on(cx, &|s, _, cx| {
         s.set_title(&name, "Fix: the Login page!".into(), cx)
     });
     let branch = format!("fix-the-login-page-{name}");
-    assert_eq!(ws_of(cx, &shark).default_branch(), branch);
+    assert_eq!(task_of(cx, &shark).default_branch(), branch);
 
     let first = fresh(&repos[0], &branch);
     on(cx, &|s, w, cx| {
@@ -107,14 +107,14 @@ async fn branches_and_bases_of_first_and_later_repos(cx: &mut TestAppContext) {
         // One update: idle, so it started, and it is saved, before Git has run.
         let saved = State::load();
         assert_eq!(
-            saved.workspaces[0].attaching[0].stage,
+            saved.tasks[0].attaching[0].stage,
             AttachStage::Creating
         );
         assert!(s.adding_repos.contains(&name));
         assert!(!ws.dir().join("api").exists());
     });
     settled(cx, window, &shark).await;
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     assert_eq!(ws.branch, branch);
     assert_eq!(ws.repos[0].branch, None);
     assert_eq!(ws.repos[0].base, "main");
@@ -131,7 +131,7 @@ async fn branches_and_bases_of_first_and_later_repos(cx: &mut TestAppContext) {
         s.queue_attachment(name.clone(), vec![second.clone()], w, cx)
     });
     settled(cx, window, &shark).await;
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     assert_eq!(ws.branch, branch, "the agent's stays");
     assert_eq!(ws.repos[1].branch.as_deref(), Some("my/web"));
     assert_eq!(ws.repos[1].base, "develop");
@@ -143,14 +143,14 @@ async fn branches_and_bases_of_first_and_later_repos(cx: &mut TestAppContext) {
         "{docs}"
     );
     let saved = State::load();
-    assert_eq!(saved.workspaces[0].repos.len(), 2);
-    assert!(saved.workspaces[0].attaching.is_empty());
+    assert_eq!(saved.tasks[0].repos.len(), 2);
+    assert!(saved.tasks[0].attaching.is_empty());
     let docs_repo = fresh(&repos[2], &ws.default_branch());
     on(cx, &|s, w, cx| {
         s.queue_attachment(name.clone(), vec![docs_repo.clone()], w, cx)
     });
     settled(cx, window, &shark).await;
-    assert_eq!(ws_of(cx, &shark).repos[2].branch, None, "the inherited one");
+    assert_eq!(task_of(cx, &shark).repos[2].branch, None, "the inherited one");
 }
 
 /// The dialog shows the branch and base before anything happens: cmd-b opens Change, cmd-b again
@@ -163,12 +163,12 @@ async fn the_dialog_picks_branch_and_base_from_the_keyboard(cx: &mut TestAppCont
     let (window, shark, repos) = agent(cx, &home, &["api"], &[]);
     git::git(&repos[0].path, &["branch", "develop"]).unwrap();
     let on = on_app(window, shark.clone());
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     let press = press_in(window);
     on(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
     cx.update_window(window, |_, w, cx| assert!(w.has_active_dialog(cx)))
         .unwrap();
-    assert!(ws_of(cx, &shark).attaching.is_empty(), "nothing yet");
+    assert!(task_of(cx, &shark).attaching.is_empty(), "nothing yet");
     press(cx, &["cmd-b", "tab", "down"]);
     press(cx, &["alt-enter"]);
     assert!(
@@ -184,9 +184,9 @@ async fn the_dialog_picks_branch_and_base_from_the_keyboard(cx: &mut TestAppCont
     settled(cx, window, &shark).await;
     cx.update_window(window, |_, w, cx| assert!(!w.has_active_dialog(cx)))
         .unwrap();
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     assert_eq!(ws.repos[0].base, "develop");
-    assert_eq!(ws.branch, ws.name, "New agent's default: its identity");
+    assert_eq!(ws.branch, ws.name, "New task's default: its identity");
 }
 
 /// A taken branch name stops before anything is made: told in the dialog, and again by the
@@ -201,13 +201,13 @@ async fn collisions_leave_everything_alone(cx: &mut TestAppContext) {
     git::git(&src, &["branch", "taken"]).unwrap();
     let tip = git::git(&src, &["rev-parse", "taken"]).unwrap();
     let on = on_app(window, shark.clone());
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     let name = ws.name.clone();
     on(cx, &|s, w, cx| {
         s.queue_attachment(name.clone(), vec![fresh(&repos[0], "taken")], w, cx)
     });
     settled(cx, window, &shark).await;
-    let after = ws_of(cx, &shark);
+    let after = task_of(cx, &shark);
     assert!(after.repos.is_empty() && after.attaching.is_empty());
     assert!(!ws.dir().join("api").exists());
     assert_eq!(git::git(&src, &["rev-parse", "taken"]).unwrap(), tip);
@@ -240,7 +240,7 @@ async fn collisions_leave_everything_alone(cx: &mut TestAppContext) {
     press_in(window)(cx, &["enter", "enter"]);
     cx.update_window(window, |_, w, cx| assert!(w.has_active_dialog(cx)))
         .unwrap();
-    assert!(ws_of(cx, &shark).attaching.is_empty());
+    assert!(task_of(cx, &shark).attaching.is_empty());
 }
 
 /// A failed inclusion scan leaves an owned worktree that rollback cannot prove safe to remove.
@@ -252,12 +252,12 @@ async fn failed_rollback_keeps_attachment_recoverable(cx: &mut TestAppContext) {
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api"], &[]);
     fs::create_dir(repos[0].path.join(".worktreeinclude")).unwrap();
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     on_app(window, shark.clone())(cx, &|s, w, cx| {
         s.queue_attachment(name.clone(), vec![fresh(&repos[0], "b")], w, cx)
     });
     settled(cx, window, &shark).await;
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     assert!(ws.repos.is_empty());
     assert_eq!(ws.attaching[0].stage, AttachStage::Uncertain);
     assert!(
@@ -269,14 +269,14 @@ async fn failed_rollback_keeps_attachment_recoverable(cx: &mut TestAppContext) {
     );
     assert!(ws.dir().join("api/.git").exists());
     assert!(git::has_ref(&repos[0].path, "refs/heads/b"));
-    assert_eq!(State::load().workspaces[0].attaching, ws.attaching);
+    assert_eq!(State::load().tasks[0].attaching, ws.attaching);
     let chat = chat_of(cx, &shark);
     cx.update(|cx| assert!(chat.read(cx).attach_hold));
 
     let (window2, shark2) = open(cx, WindowOptions::default());
     cx.run_until_parked();
     cx.update(|cx| {
-        let ws = shark2.read(cx).ws(&name).unwrap();
+        let ws = shark2.read(cx).task(&name).unwrap();
         assert_eq!(ws.attaching[0].stage, AttachStage::Uncertain);
         assert!(ws.dir().join("api/.git").exists());
     });
@@ -294,12 +294,12 @@ async fn several_repos_run_in_turn_and_report_partial_success(cx: &mut TestAppCo
     let (window, shark, repos) = agent(cx, &home, &["api", "web", "docs"], &[]);
     git::git(&repos[1].path, &["branch", "both"]).unwrap();
     let on = on_app(window, shark.clone());
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     let chat = chat_of(cx, &shark);
     on(cx, &|s, w, cx| {
         let picks = repos.iter().map(|r| fresh(r, "both")).collect();
         s.queue_attachment(name.clone(), picks, w, cx);
-        let stages: Vec<_> = (s.ws(&name).unwrap().attaching.iter())
+        let stages: Vec<_> = (s.task(&name).unwrap().attaching.iter())
             .map(|a| a.stage)
             .collect();
         use AttachStage::*;
@@ -307,7 +307,7 @@ async fn several_repos_run_in_turn_and_report_partial_success(cx: &mut TestAppCo
         assert!(chat.read(cx).attach_hold);
     });
     settled(cx, window, &shark).await;
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     let attached: Vec<&str> = ws.repos.iter().map(|r| r.name.as_str()).collect();
     assert_eq!(attached, ["api", "docs"]);
     assert!(ws.ready());
@@ -320,10 +320,10 @@ async fn several_repos_run_in_turn_and_report_partial_success(cx: &mut TestAppCo
     });
     // Refused while one is pending.
     on(cx, &|s, w, cx| {
-        s.ws_mut(&name).unwrap().attaching = vec![fresh(&repos[1], "x")];
+        s.task_mut(&name).unwrap().attaching = vec![fresh(&repos[1], "x")];
         s.queue_attachment(name.clone(), vec![fresh(&repos[1], "y")], w, cx);
-        assert_eq!(s.ws(&name).unwrap().attaching[0].branch, "x");
-        s.ws_mut(&name).unwrap().attaching.clear();
+        assert_eq!(s.task(&name).unwrap().attaching[0].branch, "x");
+        s.task_mut(&name).unwrap().attaching.clear();
     });
 }
 
@@ -363,14 +363,14 @@ async fn setup_failure_keeps_the_worktree_until_retry(cx: &mut TestAppContext) {
         &[("api", "echo broken; exit 3"), ("web", &web)],
     );
     let on = on_app(window, shark.clone());
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     let name = ws.name.clone();
     let chat = chat_of(cx, &shark);
     on(cx, &|s, w, cx| {
         s.queue_attachment(name.clone(), vec![fresh(&repos[0], "b")], w, cx)
     });
     settled(cx, window, &shark).await;
-    let failed = ws_of(cx, &shark);
+    let failed = task_of(cx, &shark);
     assert_eq!(failed.repos.len(), 1, "metadata saved");
     assert!(!failed.ready(), "not ready");
     assert_eq!(failed.attaching[0].stage, AttachStage::SetupFailed);
@@ -385,7 +385,7 @@ async fn setup_failure_keeps_the_worktree_until_retry(cx: &mut TestAppContext) {
     assert!(!marker.exists(), "the other repo's scripts didn't run");
     let saved = State::load();
     assert_eq!(
-        saved.workspaces[0].attaching[0].stage,
+        saved.tasks[0].attaching[0].stage,
         AttachStage::SetupFailed
     );
     cx.update(|cx| {
@@ -414,7 +414,7 @@ async fn setup_failure_keeps_the_worktree_until_retry(cx: &mut TestAppContext) {
     });
     press_in(window)(cx, &["down", "enter"]);
     settled(cx, window, &shark).await;
-    assert!(ws_of(cx, &shark).ready());
+    assert!(task_of(cx, &shark).ready());
     cx.update(|cx| {
         let c = chat.read(cx);
         assert!(!c.attach_hold);
@@ -432,7 +432,7 @@ async fn finishing_after_a_dismissed_failure_reports_cleanly(cx: &mut TestAppCon
     let (window, shark, repos) = agent(cx, &home, &["api", "web"], &[("api", "exit 3")]);
     git::git(&repos[1].path, &["branch", "b"]).unwrap();
     let on = on_app(window, shark.clone());
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     on(cx, &|s, w, cx| {
         let picks = vec![fresh(&repos[0], "b"), fresh(&repos[1], "b")];
         s.queue_attachment(name.clone(), picks, w, cx)
@@ -447,7 +447,7 @@ async fn finishing_after_a_dismissed_failure_reports_cleanly(cx: &mut TestAppCon
         s.attachment_menu(name.clone(), "api".into(), w, cx)
     });
     press_in(window)(cx, &["down", "down", "enter"]);
-    assert!(ws_of(cx, &shark).ready());
+    assert!(task_of(cx, &shark).ready());
 }
 
 /// The chip's Retry stays out of a worktree being deleted.
@@ -460,7 +460,7 @@ async fn retry_refuses_during_deletion(cx: &mut TestAppContext) {
     let setup = format!("touch {}; exit 3", marker.display());
     let (window, shark, repos) = agent(cx, &home, &["api"], &[("api", &setup)]);
     let on = on_app(window, shark.clone());
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     on(cx, &|s, w, cx| {
         s.queue_attachment(name.clone(), vec![fresh(&repos[0], "b")], w, cx)
     });
@@ -487,7 +487,7 @@ async fn delete_rechecks_after_the_dialog(cx: &mut TestAppContext) {
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api"], &[]);
     let on = on_app(window, shark.clone());
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     let name = ws.name.clone();
     on(cx, &|s, w, cx| {
         s.queue_attachment(name.clone(), vec![fresh(&repos[0], "b")], w, cx)
@@ -501,7 +501,7 @@ async fn delete_rechecks_after_the_dialog(cx: &mut TestAppContext) {
         })
     };
     let deleting = |cx: &mut TestAppContext| {
-        on(cx, &|s, w, cx| s.archive_ws(name.clone(), false, w, cx));
+        on(cx, &|s, w, cx| s.archive_task(name.clone(), false, w, cx));
     };
     step(cx, Some("Pull"));
     cx.update(|cx| chat.update(cx, |c, cx| assert!(c.enqueue("after pull", vec![], cx))));
@@ -535,14 +535,14 @@ async fn delete_rechecks_after_the_dialog(cx: &mut TestAppContext) {
     .await;
     cx.run_until_parked();
     assert_eq!(fs::read_to_string(wt.join("dirty.txt")).unwrap(), "unsaved");
-    cx.update(|cx| assert_eq!(shark.read(cx).state.workspaces.len(), 1, "kept"));
+    cx.update(|cx| assert_eq!(shark.read(cx).state.tasks.len(), 1, "kept"));
 
     let tip = commit_all(&wt, "unpushed");
     deleting(cx);
     press_in(window)(cx, &["enter"]);
     let gone = shark.clone();
     until(cx, window, move |_, cx| {
-        gone.read(cx).state.workspaces.is_empty()
+        gone.read(cx).state.tasks.is_empty()
     })
     .await;
     assert!(!wt.exists());
@@ -557,21 +557,21 @@ async fn continuing_without_setup_resolves_it(cx: &mut TestAppContext) {
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api", "web"], &[("api", "exit 3")]);
     let on = on_app(window, shark.clone());
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     on(cx, &|s, w, cx| {
         let picks = vec![fresh(&repos[0], "b"), fresh(&repos[1], "b")];
         s.queue_attachment(name.clone(), picks, w, cx)
     });
     settled(cx, window, &shark).await;
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     assert_eq!(ws.repos.len(), 2, "the next repo doesn't wait on it");
     assert_eq!(ws.attaching.len(), 1);
     assert!(!ws.ready());
     on(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
     press_in(window)(cx, &["down", "down", "enter"]);
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     assert!(ws.ready() && ws.dir().join("api").exists());
-    assert!(State::load().workspaces[0].attaching.is_empty());
+    assert!(State::load().tasks[0].attaching.is_empty());
 }
 
 /// Cancelling while queued takes it back with nothing made; once creation starts it can't.
@@ -582,7 +582,7 @@ async fn cancel_works_only_while_queued(cx: &mut TestAppContext) {
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api", "web"], &[]);
     let on = on_app(window, shark.clone());
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     let name = ws.name.clone();
     let chat = chat_of(cx, &shark);
     cx.update(|cx| chat.update(cx, |c, _| c.busy = true));
@@ -590,13 +590,13 @@ async fn cancel_works_only_while_queued(cx: &mut TestAppContext) {
         s.queue_attachment(name.clone(), vec![fresh(&repos[0], "b")], w, cx)
     });
     assert_eq!(stage(cx, &shark), AttachStage::Queued, "a turn runs");
-    assert_eq!(State::load().workspaces[0].attaching.len(), 1, "saved");
+    assert_eq!(State::load().tasks[0].attaching.len(), 1, "saved");
     on(cx, &|s, w, cx| {
         s.attachment_menu(name.clone(), "api".into(), w, cx)
     });
     press_in(window)(cx, &["enter"]);
-    assert!(ws_of(cx, &shark).attaching.is_empty());
-    assert!(State::load().workspaces[0].attaching.is_empty());
+    assert!(task_of(cx, &shark).attaching.is_empty());
+    assert!(State::load().tasks[0].attaching.is_empty());
     assert!(!ws.dir().join("api").exists());
     assert!(!git::has_ref(&repos[0].path, "refs/heads/b"));
     cx.update(|cx| {
@@ -614,12 +614,12 @@ async fn cancel_works_only_while_queued(cx: &mut TestAppContext) {
         let picks = vec![fresh(&repos[0], "b"), fresh(&repos[1], "b")];
         s.queue_attachment(name.clone(), picks, w, cx);
         s.cancel_attachment(&name, w, cx);
-        let left = &s.ws(&name).unwrap().attaching;
+        let left = &s.task(&name).unwrap().attaching;
         assert_eq!(left.len(), 1);
         assert_eq!(left[0].stage, AttachStage::Creating);
     });
     settled(cx, window, &shark).await;
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     assert_eq!(ws.repos.len(), 1);
     assert!(ws.ready() && ws.dir().join("api").exists());
     assert!(!ws.dir().join("web").exists(), "the queued one went");
@@ -633,7 +633,7 @@ async fn a_failed_save_stops_creation_before_it_starts(cx: &mut TestAppContext) 
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api"], &[]);
     let on = on_app(window, shark.clone());
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     let name = ws.name.clone();
     let chat = chat_of(cx, &shark);
     cx.update(|cx| chat.update(cx, |c, _| c.busy = true));
@@ -651,7 +651,7 @@ async fn a_failed_save_stops_creation_before_it_starts(cx: &mut TestAppContext) 
     });
     cx.run_until_parked();
     fs::remove_dir(&state).unwrap();
-    assert!(ws_of(cx, &shark).attaching.is_empty());
+    assert!(task_of(cx, &shark).attaching.is_empty());
     assert!(!ws.dir().join("api").exists());
     assert!(!git::has_ref(&repos[0].path, "refs/heads/b"));
     cx.update(|cx| assert!(!chat.read(cx).attach_hold));
@@ -667,12 +667,12 @@ async fn attachment_starts_when_the_last_work_ends(cx: &mut TestAppContext) {
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api", "web", "docs", "cli", "ops"], &[]);
     let on = on_app(window, shark.clone());
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     let name = ws.name.clone();
     let chat = chat_of(cx, &shark);
     on(cx, &|s, w, cx| s.new_chat(w, cx));
     let other = chat_of(cx, &shark);
-    let task = Task {
+    let task = BackgroundTask {
         id: "t".into(),
         kind: "shell".into(),
         description: "x".into(),
@@ -685,7 +685,7 @@ async fn attachment_starts_when_the_last_work_ends(cx: &mut TestAppContext) {
     };
     let wait = |cx: &mut TestAppContext, n: usize| {
         cx.run_until_parked();
-        let ws = ws_of(cx, &shark);
+        let ws = task_of(cx, &shark);
         assert_eq!(ws.repos.len(), n, "{:?}", ws.attaching);
     };
     // A running turn, in the chat that isn't shown.
@@ -700,7 +700,7 @@ async fn attachment_starts_when_the_last_work_ends(cx: &mut TestAppContext) {
     wait(cx, 1);
 
     // A pending question: the turn holds, and answering it finishes the turn.
-    let asked = crate::agent::parse(
+    let asked = crate::harness::parse(
         r#"{"type":"control_request","request_id":"r","request":{"subtype":"can_use_tool","tool_name":"AskUserQuestion","tool_use_id":"u","input":{"questions":[{"question":"Which?","options":[{"label":"A"}]}]}}}"#,
     ).pop().unwrap();
     cx.update(|cx| {
@@ -761,7 +761,7 @@ async fn git_and_attachment_holds_end_separately(cx: &mut TestAppContext) {
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api"], &[]);
     let on = on_app(window, shark.clone());
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     let chat = chat_of(cx, &shark);
     let step = |cx: &mut TestAppContext, label: Option<&'static str>| {
         on(cx, &|s, _, cx| {
@@ -823,7 +823,7 @@ async fn chats_opened_during_attachment_inherit_the_hold(cx: &mut TestAppContext
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api", "web"], &[]);
     let on = on_app(window, shark.clone());
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     on(cx, &|s, w, cx| {
         s.queue_attachment(name.clone(), vec![fresh(&repos[0], "b")], w, cx)
     });
@@ -832,11 +832,11 @@ async fn chats_opened_during_attachment_inherit_the_hold(cx: &mut TestAppContext
     // A second chat, out of Plan mode, closed with a session to come back to.
     on(cx, &|s, w, cx| {
         s.new_chat(w, cx);
-        let ws = s.active_ws_mut().unwrap();
+        let ws = s.active_task_mut().unwrap();
         ws.chats[1].session_id = Some("s2".into());
         s.close_chat(w, cx);
     });
-    assert_eq!(ws_of(cx, &shark).closed.len(), 1);
+    assert_eq!(task_of(cx, &shark).closed.len(), 1);
     cx.update(|cx| chat.update(cx, |c, _| c.busy = true));
     on(cx, &|s, w, cx| {
         s.queue_attachment(name.clone(), vec![fresh(&repos[1], "b")], w, cx);
@@ -872,13 +872,13 @@ async fn chats_opened_during_attachment_inherit_the_hold(cx: &mut TestAppContext
 }
 
 /// `name`'s directory and an `attaching` record at `stage`; with `made`, its worktree on `branch`
-/// exists too, and with `saved`, `Workspace::repos` knows it.
-fn interrupted(name: &str, repo: &Repo, stage: AttachStage, made: bool, saved: bool) -> Workspace {
-    let dir = workspaces_dir().join(name);
-    let empty = git::create_empty_workspace(&dir, name, name).unwrap();
+/// exists too, and with `saved`, `Task::repos` knows it.
+fn interrupted(name: &str, repo: &Repo, stage: AttachStage, made: bool, saved: bool) -> Task {
+    let dir = tasks_dir().join(name);
+    let empty = git::create_empty_task(&dir, name, name).unwrap();
     let branch = format!("{name}-branch");
     let mut ws = match made {
-        true => git::add_to_workspace(&empty, &dir, repo, &branch, Some("")).unwrap(),
+        true => git::add_to_task(&empty, &dir, repo, &branch, Some("")).unwrap(),
         false => empty.clone(),
     };
     if !saved {
@@ -933,7 +933,7 @@ async fn restart_reconciles_every_stage(cx: &mut TestAppContext) {
     fs::write(replaced_path.join("mine.txt"), "keep").unwrap();
     let mut failed = interrupted("failed", web, SetupFailed, true, true);
     failed.attaching[0].error = Some("exit 3".into());
-    let workspaces = vec![
+    let tasks = vec![
         interrupted("queued", api, Queued, false, false),
         interrupted("untouched", api, Creating, false, false),
         interrupted("finished", api, Creating, true, false),
@@ -960,7 +960,7 @@ async fn restart_reconciles_every_stage(cx: &mut TestAppContext) {
                 },
             )]
             .into(),
-            workspaces,
+            tasks,
             ..Default::default()
         },
         WindowOptions::default(),
@@ -969,7 +969,7 @@ async fn restart_reconciles_every_stage(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     let attempt = |cx: &mut TestAppContext, n: &str| {
         cx.update(|cx| {
-            let ws = shark.read(cx).ws(n).unwrap();
+            let ws = shark.read(cx).task(n).unwrap();
             let a = ws.attaching.first();
             (ws.repos.len(), a.map(|a| a.stage), ws.ready())
         })
@@ -979,7 +979,7 @@ async fn restart_reconciles_every_stage(cx: &mut TestAppContext) {
     assert_eq!(attempt(cx, "queued"), (0, None, false), "cleared");
     assert_eq!(attempt(cx, "untouched"), (0, None, false), "cleared");
     assert_eq!(attempt(cx, "finished"), (1, None, true), "adopted");
-    let adopted = cx.update(|cx| shark.read(cx).ws("finished").unwrap().clone());
+    let adopted = cx.update(|cx| shark.read(cx).task("finished").unwrap().clone());
     assert_eq!(adopted.branch, "finished-branch");
     assert_eq!(adopted.repos[0].base, "main");
     assert_eq!(
@@ -993,7 +993,7 @@ async fn restart_reconciles_every_stage(cx: &mut TestAppContext) {
     }
     assert!(!marker.exists(), "no script reran");
     assert_eq!(attempt(cx, "failed"), (1, Some(SetupFailed), false));
-    let kept = cx.update(|cx| shark.read(cx).ws("failed").unwrap().clone());
+    let kept = cx.update(|cx| shark.read(cx).task("failed").unwrap().clone());
     assert_eq!(kept.attaching[0].error.as_deref(), Some("exit 3"));
     assert_eq!(attempt(cx, "gone"), (1, Some(Uncertain), false));
     assert_eq!(attempt(cx, "branch-only"), (0, Some(Uncertain), false));
@@ -1008,7 +1008,7 @@ async fn restart_reconciles_every_stage(cx: &mut TestAppContext) {
     assert!(git::has_ref(&api.path, "refs/heads/branch-only-branch"));
     let saved = State::load();
     let saved = saved
-        .workspaces
+        .tasks
         .iter()
         .find(|w| w.name == "finished")
         .unwrap();
@@ -1018,7 +1018,7 @@ async fn restart_reconciles_every_stage(cx: &mut TestAppContext) {
     );
 
     // Shown in the header, holding the chats; deletion leaves it alone.
-    on(cx, &|s, w, cx| s.open_workspace_named("foreign", w, cx));
+    on(cx, &|s, w, cx| s.open_task_named("foreign", w, cx));
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         assert!(w.try_find("attach-chip-api").is_some());
@@ -1027,7 +1027,7 @@ async fn restart_reconciles_every_stage(cx: &mut TestAppContext) {
     let chat = chat_of(cx, &shark);
     cx.update(|cx| assert!(chat.read(cx).attach_hold));
     on(cx, &|s, w, cx| {
-        s.remove_workspace("foreign", true, w, cx);
+        s.remove_task("foreign", true, w, cx);
         assert!(s.archiving.is_empty(), "refused");
     });
     // Stopping tracking deletes nothing and lets go of the chats.
@@ -1036,7 +1036,7 @@ async fn restart_reconciles_every_stage(cx: &mut TestAppContext) {
     });
     press_in(window)(cx, &["down", "enter"]);
     assert_eq!(attempt(cx, "foreign"), (0, None, false));
-    let dir = workspaces_dir().join("foreign");
+    let dir = tasks_dir().join("foreign");
     assert_eq!(
         fs::read_to_string(dir.join("api/mine.txt")).unwrap(),
         "keep"
@@ -1045,7 +1045,7 @@ async fn restart_reconciles_every_stage(cx: &mut TestAppContext) {
 
     // Sorted out by hand, Check again clears it.
     git::git(&api.path, &["branch", "-D", "branch-only-branch"]).unwrap();
-    on(cx, &|s, w, cx| s.open_workspace_named("branch-only", w, cx));
+    on(cx, &|s, w, cx| s.open_task_named("branch-only", w, cx));
     on(cx, &|s, w, cx| {
         s.attachment_menu("branch-only".into(), "api".into(), w, cx)
     });
@@ -1053,17 +1053,17 @@ async fn restart_reconciles_every_stage(cx: &mut TestAppContext) {
     assert_eq!(attempt(cx, "branch-only"), (0, None, false));
 
     // Its worktree gone, stopping tracking drops the repo too: `ready` can't pass on nothing.
-    on(cx, &|s, w, cx| s.open_workspace_named("gone", w, cx));
+    on(cx, &|s, w, cx| s.open_task_named("gone", w, cx));
     on(cx, &|s, w, cx| {
         s.attachment_menu("gone".into(), "api".into(), w, cx)
     });
     press_in(window)(cx, &["down", "enter"]);
     assert_eq!(attempt(cx, "gone"), (0, None, false));
-    let dir = workspaces_dir().join("gone");
+    let dir = tasks_dir().join("gone");
     let docs = fs::read_to_string(dir.join("CLAUDE.md")).unwrap();
     assert!(docs.contains("No repositories"), "{docs}");
     let saved = State::load();
-    let saved = saved.workspaces.iter().find(|w| w.name == "gone").unwrap();
+    let saved = saved.tasks.iter().find(|w| w.name == "gone").unwrap();
     assert!(saved.repos.is_empty());
     let chat = chat_of(cx, &shark);
     cx.update(|cx| assert!(!chat.read(cx).ws.ready()));
@@ -1071,7 +1071,7 @@ async fn restart_reconciles_every_stage(cx: &mut TestAppContext) {
     // Stopping tracking a changed identity also drops its stale repo metadata, but no files.
     for name in ["switched", "replaced"] {
         on(cx, &|s, w, cx| {
-            s.open_workspace_named(name, w, cx);
+            s.open_task_named(name, w, cx);
             s.attachment_menu(name.into(), "api".into(), w, cx);
         });
         press_in(window)(cx, &["down", "enter"]);
@@ -1083,7 +1083,7 @@ async fn restart_reconciles_every_stage(cx: &mut TestAppContext) {
     );
     assert_eq!(
         git::git(
-            &workspaces_dir().join("switched/api"),
+            &tasks_dir().join("switched/api"),
             &["branch", "--show-current"]
         )
         .unwrap(),
@@ -1133,7 +1133,7 @@ async fn context_goes_with_the_next_normal_turn(cx: &mut TestAppContext) {
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api", "web"], &[]);
     let on = on_app(window, shark.clone());
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     let chat = chat_of(cx, &shark);
     let ask = |cx: &mut TestAppContext, text: &str| {
         cx.update_window(window, |_, w, cx| {
@@ -1189,7 +1189,7 @@ async fn context_goes_with_the_next_normal_turn(cx: &mut TestAppContext) {
     assert_eq!(pending(cx), 0);
     let saved = State::load();
     assert_eq!(
-        saved.workspaces[0].chats[0].delivered.len(),
+        saved.tasks[0].chats[0].delivered.len(),
         1,
         "survives a restart"
     );
@@ -1204,7 +1204,7 @@ async fn context_goes_with_the_next_normal_turn(cx: &mut TestAppContext) {
     on(cx, &|s, w, cx| {
         s.queue_attachment(name.clone(), vec![fresh(&repos[1], "b")], w, cx);
         let id = format!("{name}~9");
-        let ws = s.active_ws_mut().unwrap();
+        let ws = s.active_task_mut().unwrap();
         ws.push_chat(ChatMeta {
             id,
             session_id: Some("s9".into()),
@@ -1254,10 +1254,10 @@ async fn unloaded_chats_catch_up_after_a_restart(cx: &mut TestAppContext) {
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api"], &[]);
     let on = on_app(window, shark.clone());
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     let (open_id, closed_id) = (format!("{name}~2"), format!("{name}~3"));
     on(cx, &|s, w, cx| {
-        let ws = s.active_ws_mut().unwrap();
+        let ws = s.active_task_mut().unwrap();
         let meta = |id: &String, s: &str| ChatMeta {
             id: id.clone(),
             session_id: Some(s.into()),
@@ -1274,7 +1274,7 @@ async fn unloaded_chats_catch_up_after_a_restart(cx: &mut TestAppContext) {
     cx.run_until_parked();
     let on2 = on_app(window2, shark2.clone());
     on2(cx, &|s, w, cx| {
-        s.open_workspace_named(&name, w, cx);
+        s.open_task_named(&name, w, cx);
         s.select_chat(1, w, cx);
     });
     let chat = chat_of(cx, &shark2);
@@ -1303,7 +1303,7 @@ async fn empty_views_go_live_once_a_repo_attaches(cx: &mut TestAppContext) {
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api"], &[]);
     let on = on_app(window, shark.clone());
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     let name = ws.name.clone();
     on(cx, &|s, w, cx| {
         s.show(Tab::Feature(Feature::Diff), w, cx);
@@ -1382,7 +1382,7 @@ async fn empty_views_go_live_once_a_repo_attaches(cx: &mut TestAppContext) {
         press_in(window)(cx, &["escape"]);
     }
     // A different checkout does not inherit the attached branch's base in its description.
-    let saved = ws_of(cx, &shark).repos[0].clone();
+    let saved = task_of(cx, &shark).repos[0].clone();
     let plain = cx
         .update_window(window, |_, w, cx| {
             w.render_frame(cx);
@@ -1390,7 +1390,7 @@ async fn empty_views_go_live_once_a_repo_attaches(cx: &mut TestAppContext) {
         })
         .unwrap();
     on(cx, &|s, _, cx| {
-        s.ws_mut(&name).unwrap().repos[0].branch = Some("attached-branch".into());
+        s.task_mut(&name).unwrap().repos[0].branch = Some("attached-branch".into());
         cx.notify();
     });
     cx.update_window(window, |_, w, cx| {
@@ -1407,7 +1407,7 @@ async fn empty_views_go_live_once_a_repo_attaches(cx: &mut TestAppContext) {
     })
     .unwrap();
     on(cx, &|s, _, cx| {
-        s.ws_mut(&name).unwrap().repos[0].branch = saved.branch.clone();
+        s.task_mut(&name).unwrap().repos[0].branch = saved.branch.clone();
         cx.notify();
     });
     until(cx, window, |_, cx| {
@@ -1419,8 +1419,8 @@ async fn empty_views_go_live_once_a_repo_attaches(cx: &mut TestAppContext) {
         let sync = s.syncs[&name].read(cx);
         assert_eq!(sync.repos().unwrap()[0].name, "api");
         assert!(sync.blocked(false, cx).is_none());
-        let ws = s.active_ws().unwrap().clone();
-        assert_eq!(s.effective_workspace(ws.clone(), cx).repos.len(), 1);
+        let ws = s.active_task().unwrap().clone();
+        assert_eq!(s.effective_task(ws.clone(), cx).repos.len(), 1);
         assert_eq!(s.active_chat().unwrap().read(cx).ws.repos.len(), 1);
         s.show(Tab::Feature(Feature::Diff), w, cx);
     });
@@ -1459,7 +1459,7 @@ async fn cancelling_one_keeps_the_rest_queued(cx: &mut TestAppContext) {
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api", "web", "docs", "cli"], &[]);
     let on = on_app(window, shark.clone());
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     let chat = chat_of(cx, &shark);
     cx.update(|cx| chat.update(cx, |c, _| c.busy = true));
     on(cx, &|s, w, cx| {
@@ -1476,12 +1476,12 @@ async fn cancelling_one_keeps_the_rest_queued(cx: &mut TestAppContext) {
     });
     press_in(window)(cx, &["enter"]);
     let left = |cx: &mut TestAppContext| -> Vec<String> {
-        (ws_of(cx, &shark).attaching.iter())
+        (task_of(cx, &shark).attaching.iter())
             .map(|a| a.repo.clone())
             .collect()
     };
     assert_eq!(left(cx), ["api", "docs", "cli"]);
-    assert_eq!(State::load().workspaces[0].attaching.len(), 3);
+    assert_eq!(State::load().tasks[0].attaching.len(), 3);
     cx.update(|cx| assert!(chat.read(cx).attach_hold, "the rest still hold"));
 
     on(cx, &|s, w, cx| {
@@ -1497,12 +1497,12 @@ async fn cancelling_one_keeps_the_rest_queued(cx: &mut TestAppContext) {
         let picks = vec![fresh(&repos[0], "b"), fresh(&repos[1], "b")];
         s.queue_attachment(name.clone(), picks, w, cx);
         s.cancel_queued(&name, Some("api"), w, cx);
-        assert_eq!(s.ws(&name).unwrap().attaching.len(), 2);
+        assert_eq!(s.task(&name).unwrap().attaching.len(), 2);
         assert_eq!(s.attach_actions(&name, "api")[0].1, "Close");
         s.cancel_queued(&name, Some("web"), w, cx);
     });
     settled(cx, window, &shark).await;
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     assert_eq!(ws.repos.len(), 1);
     assert!(ws.dir().join("api").exists() && !ws.dir().join("web").exists());
 }
@@ -1516,14 +1516,14 @@ async fn failures_stay_reachable_under_overflow(cx: &mut TestAppContext) {
     let home = test_home();
     let (window, shark, _) = agent(cx, &home, &["api"], &[]);
     let on = on_app(window, shark.clone());
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     let failed: Vec<String> = (0..40).map(|i| format!("repository-{i:02}")).collect();
     on(cx, &|s, _, _| {
         let results = s.attach_results.entry(name.clone()).or_default();
         results.failed = (failed.iter())
             .map(|r| (r.clone(), "branch exists".into()))
             .collect();
-        s.ws_mut(&name).unwrap().repos.push(crate::state::WsRepo {
+        s.task_mut(&name).unwrap().repos.push(crate::state::TaskRepo {
             name: "settled".into(),
             src: "/src/settled".into(),
             base: "main".into(),
@@ -1662,7 +1662,7 @@ async fn the_panel_marks_each_step(cx: &mut TestAppContext) {
     guards!(quiet, _turn, _claude);
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api", "web"], &[]);
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     let chat = chat_of(cx, &shark);
     cx.update(|cx| chat.update(cx, |c, _| c.busy = true));
     let on = on_app(window, shark.clone());
@@ -1706,7 +1706,7 @@ async fn the_panel_marks_each_step(cx: &mut TestAppContext) {
         (None, None, [Done, Done, Done], [None; 3]),
     ] {
         on(cx, &|s, _, _| {
-            let ws = s.ws_mut(&name).unwrap();
+            let ws = s.task_mut(&name).unwrap();
             ws.attaching = (stage.iter())
                 .map(|st| Attachment {
                     stage: *st,
@@ -1755,7 +1755,7 @@ async fn an_open_panel_follows_the_failure(cx: &mut TestAppContext) {
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api"], &[("api", "echo broken; exit 3")]);
     let on = on_app(window, shark.clone());
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     on(cx, &|s, w, cx| {
         s.queue_attachment(name.clone(), vec![fresh(&repos[0], "b")], w, cx);
         s.attachment_menu(name.clone(), "api".into(), w, cx);
@@ -1768,7 +1768,7 @@ async fn an_open_panel_follows_the_failure(cx: &mut TestAppContext) {
     });
     press_in(window)(cx, &["down", "enter"]);
     settled(cx, window, &shark).await;
-    assert!(ws_of(cx, &shark).ready(), "Retry was on the open panel");
+    assert!(task_of(cx, &shark).ready(), "Retry was on the open panel");
     on(cx, &|s, w, cx| {
         s.attachment_menu(name.clone(), "api".into(), w, cx)
     });
@@ -1786,11 +1786,11 @@ async fn the_hold_says_what_it_waits_on(cx: &mut TestAppContext) {
     let home = test_home();
     let (_, shark, repos) = agent(cx, &home, &["api", "web"], &[]);
     let chat = chat_of(cx, &shark);
-    let mut ws = ws_of(cx, &shark);
-    let held = |cx: &mut TestAppContext, ws: &Workspace| {
+    let mut ws = task_of(cx, &shark);
+    let held = |cx: &mut TestAppContext, ws: &Task| {
         cx.update(|cx| {
             chat.update(cx, |c, cx| {
-                c.workspace_changed(ws, cx);
+                c.task_changed(ws, cx);
                 c.held()
             })
         })
@@ -1832,7 +1832,7 @@ async fn the_base_button_picks_a_base(cx: &mut TestAppContext) {
     git::git(src, &["branch", "zz-base"]).unwrap();
     git::git(src, &["update-ref", "refs/remotes/origin/main", "main"]).unwrap();
     let on = on_app(window, shark.clone());
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     let press = press_in(window);
     on(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
     assert_eq!(summary(cx, window), format!("{name} from main"), "visible");
@@ -1864,7 +1864,7 @@ async fn the_base_button_picks_a_base(cx: &mut TestAppContext) {
     press(cx, &["enter"]);
     press(cx, &["enter"]);
     settled(cx, window, &shark).await;
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     assert_eq!(ws.repos[0].base, "zz-base");
     assert_eq!(ws.branch, ws.name, "still the new branch, not zz-base");
 }
@@ -1894,8 +1894,8 @@ async fn with_branch(
     shark: &Entity<Shark>,
     repo: &Repo,
 ) {
-    let name = ws_of(cx, shark).name;
-    let first = fresh(repo, &ws_of(cx, shark).default_branch());
+    let name = task_of(cx, shark).name;
+    let first = fresh(repo, &task_of(cx, shark).default_branch());
     on_app(window, shark.clone())(cx, &|s, w, cx| {
         s.queue_attachment(name.clone(), vec![first.clone()], w, cx)
     });
@@ -1909,13 +1909,13 @@ async fn one_enter_attaches_the_highlighted_repository(cx: &mut TestAppContext) 
     guards!(quiet, _turn, _claude);
     let home = test_home();
     let (window, shark, _) = agent(cx, &home, &["api", "web"], &[]);
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     on_app(window, shark.clone())(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
     assert_eq!(label(cx, window, "create"), "Attach 1 repository");
     press_in(window)(cx, &["down", "enter"]);
     settled(cx, window, &shark).await;
     assert!(!is_open(cx, window));
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     let names: Vec<&str> = ws.repos.iter().map(|r| r.name.as_str()).collect();
     assert_eq!(names, ["web"]);
 }
@@ -1929,7 +1929,7 @@ async fn marks_count_on_the_button(cx: &mut TestAppContext) {
     guards!(quiet, _turn, _claude);
     let home = test_home();
     let (window, shark, _) = agent(cx, &home, &["api", "web", "docs"], &[]);
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     let press = press_in(window);
     on_app(window, shark.clone())(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
     press(cx, &["space"]);
@@ -1953,7 +1953,7 @@ async fn marks_count_on_the_button(cx: &mut TestAppContext) {
         .unwrap();
     settled(cx, window, &shark).await;
     assert!(!is_open(cx, window));
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     let names: Vec<&str> = ws.repos.iter().map(|r| r.name.as_str()).collect();
     assert_eq!(names, ["api", "web"]);
 }
@@ -1966,7 +1966,7 @@ async fn a_later_repository_follows_the_agents_branch(cx: &mut TestAppContext) {
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api", "web"], &[]);
     with_branch(cx, window, &shark, &repos[0]).await;
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     let press = press_in(window);
     on_app(window, shark.clone())(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
     assert!(shows(cx, window, "attach-follows"));
@@ -1976,7 +1976,7 @@ async fn a_later_repository_follows_the_agents_branch(cx: &mut TestAppContext) {
     assert!(is_open(cx, window), "esc goes back, the dialog stays");
     press(cx, &["enter"]);
     settled(cx, window, &shark).await;
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     assert_eq!(ws.repos[1].name, "web");
     assert_eq!(ws.repos[1].branch, None, "the inherited one");
 }
@@ -1988,7 +1988,7 @@ async fn a_collision_says_so_and_suggests_a_name(cx: &mut TestAppContext) {
     guards!(quiet, _turn, _claude);
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api"], &[]);
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     let (name, branch) = (ws.name.clone(), ws.default_branch());
     let src = &repos[0].path;
     git::git(src, &["branch", &branch]).unwrap();
@@ -2007,13 +2007,13 @@ async fn a_collision_says_so_and_suggests_a_name(cx: &mut TestAppContext) {
     );
     press(cx, &["enter"]);
     assert!(is_open(cx, window), "refused, and told");
-    assert!(ws_of(cx, &shark).attaching.is_empty());
+    assert!(task_of(cx, &shark).attaching.is_empty());
     press(cx, &["tab"]);
     assert_eq!(label(cx, window, ("attach-row", 0usize)), "api");
     assert_eq!(summary(cx, window), format!("{branch}-3 from main"));
     press(cx, &["enter"]);
     settled(cx, window, &shark).await;
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     assert_eq!(ws.branch, format!("{branch}-3"));
     assert_eq!(git::git(src, &["rev-parse", &branch]).unwrap(), tip);
 }
@@ -2026,7 +2026,7 @@ async fn a_later_collision_is_that_repositorys_own(cx: &mut TestAppContext) {
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api", "web", "docs"], &[]);
     with_branch(cx, window, &shark, &repos[0]).await;
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     let (name, branch) = (ws.name.clone(), ws.branch.clone());
     git::git(&repos[1].path, &["branch", &branch]).unwrap();
     let press = press_in(window);
@@ -2039,7 +2039,7 @@ async fn a_later_collision_is_that_repositorys_own(cx: &mut TestAppContext) {
     assert!(shows(cx, window, "attach-follows"), "docs still follows");
     press(cx, &["cmd-enter", "enter"]);
     settled(cx, window, &shark).await;
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     let branch_of = |repo: &str| {
         let r = ws.repos.iter().find(|r| r.name == repo).unwrap();
         r.branch.clone()
@@ -2056,16 +2056,16 @@ async fn attached_rows_are_listed_and_disabled(cx: &mut TestAppContext) {
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api", "web", "docs"], &[]);
     with_branch(cx, window, &shark, &repos[0]).await;
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     let on = on_app(window, shark.clone());
     on(cx, &|s, _, _| {
-        let used = |r: &str| crate::state::WsRepo {
+        let used = |r: &str| crate::state::TaskRepo {
             name: r.into(),
             src: "/nowhere".into(),
             base: "main".into(),
             branch: None,
         };
-        s.state.workspaces.push(Workspace {
+        s.state.tasks.push(Task {
             name: "older".into(),
             repos: vec![used("docs")],
             last_interacted_at: Some(1),
@@ -2096,7 +2096,7 @@ async fn no_repositories_go_straight_to_the_folder_panel(cx: &mut TestAppContext
     guards!(quiet, _turn, _claude);
     let home = test_home();
     let (window, shark, _) = agent(cx, &home, &[], &[]);
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
     assert!(cx.did_prompt_for_paths() && !is_open(cx, window));
@@ -2120,7 +2120,7 @@ async fn no_repositories_go_straight_to_the_folder_panel(cx: &mut TestAppContext
     assert_eq!(label(cx, window, "create"), "Attach 1 repository");
     press_in(window)(cx, &["enter"]);
     settled(cx, window, &shark).await;
-    assert_eq!(ws_of(cx, &shark).repos[0].name, "api");
+    assert_eq!(task_of(cx, &shark).repos[0].name, "api");
 }
 
 /// Everything attached: a title, a line and the one thing to do, then the list once it's done.
@@ -2131,7 +2131,7 @@ async fn all_attached_offers_a_local_repository(cx: &mut TestAppContext) {
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api"], &[]);
     with_branch(cx, window, &shark, &repos[0]).await;
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     on_app(window, shark.clone())(cx, &|s, w, cx| s.attach_repository(name.clone(), w, cx));
     assert!(shows(cx, window, "attach-none"));
     assert!(!shows(cx, window, ("attach-row", 0usize)), "no list");
@@ -2147,7 +2147,7 @@ async fn all_attached_offers_a_local_repository(cx: &mut TestAppContext) {
     assert_eq!(label(cx, window, "create"), "Attach 1 repository");
     press(cx, &["enter"]);
     settled(cx, window, &shark).await;
-    assert_eq!(ws_of(cx, &shark).repos[1].name, "web");
+    assert_eq!(task_of(cx, &shark).repos[1].name, "web");
 }
 
 /// The dialog stays through the folder panel: marks, the branch, a repository's base and the
@@ -2159,7 +2159,7 @@ async fn add_local_comes_back_to_the_dialog_as_it_was(cx: &mut TestAppContext) {
     let home = test_home();
     let (window, shark, repos) = agent(cx, &home, &["api", "web"], &[]);
     git::git(&repos[1].path, &["branch", "develop"]).unwrap();
-    let name = ws_of(cx, &shark).name;
+    let name = task_of(cx, &shark).name;
     let press = press_in(window);
     let input = |cx: &mut TestAppContext, text: &str| {
         cx.update_window(window, |_, w, cx| w.input(text, cx))
@@ -2212,18 +2212,18 @@ async fn add_local_comes_back_to_the_dialog_as_it_was(cx: &mut TestAppContext) {
     cx.update_window(window, |_, w, cx| w.click("create", cx))
         .unwrap();
     settled(cx, window, &shark).await;
-    let ws = ws_of(cx, &shark);
+    let ws = task_of(cx, &shark);
     let names: Vec<&str> = ws.repos.iter().map(|r| r.name.as_str()).collect();
     assert_eq!(names, ["api", "web", "docs"]);
     assert_eq!(ws.branch, "my/branch");
     assert_eq!(ws.repos[1].base, "develop");
 }
 
-/// New workspace from branch shares the form and keeps its shell: its heading and count, ticking
+/// New task from branch shares the form and keeps its shell: its heading and count, ticking
 /// with space and enter, and cmd-enter to create.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn new_agent_from_branch_keeps_its_keys(cx: &mut TestAppContext) {
+async fn new_task_from_branch_keeps_its_keys(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
     let repos = repos(&home, &["api", "web"]);
@@ -2246,10 +2246,10 @@ async fn new_agent_from_branch_keeps_its_keys(cx: &mut TestAppContext) {
     press(cx, &["cmd-enter"]);
     until(cx, window, {
         let shark = shark.clone();
-        move |_, cx| shark.read(cx).ws("kept").is_some()
+        move |_, cx| shark.read(cx).task("kept").is_some()
     })
     .await;
-    let ws = cx.update(|cx| shark.read(cx).ws("kept").cloned().unwrap());
+    let ws = cx.update(|cx| shark.read(cx).task("kept").cloned().unwrap());
     assert_eq!(ws.repos.len(), 2);
 }
 
@@ -2330,13 +2330,13 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     s.home.on = false;
                     s.active = Some(name.into());
                     s.tab = Tab::Chat;
-                    let settled = |r: &str| crate::state::WsRepo {
+                    let settled = |r: &str| crate::state::TaskRepo {
                         name: r.into(),
                         src: src.path.clone(),
                         base: "main".into(),
                         branch: None,
                     };
-                    let mut ws = Workspace {
+                    let mut ws = Task {
                         name: name.into(),
                         branch: "you/eng-123-login".into(),
                         chats: ["attach-preview-1", "attach-preview-2"]
@@ -2378,7 +2378,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         ws.linear.attach(s.into());
                     }
                     ws.normalize_tabs();
-                    s.state.workspaces = vec![ws.clone()];
+                    s.state.tasks = vec![ws.clone()];
                     if case == "queued" {
                         for meta in &ws.chats {
                             let chat = s.ensure_chat(&ws, meta, w, cx);
@@ -2394,7 +2394,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     if case == "header" {
                         results.failed.clear();
                     }
-                    let ws = s.ws_mut(name).unwrap();
+                    let ws = s.task_mut(name).unwrap();
                     match case {
                         "overflow" | "chips" => {}
                         "header" => {
@@ -2434,7 +2434,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         "none",
                     ];
                     if dialog.contains(&case) {
-                        let ws = s.ws_mut(name).unwrap();
+                        let ws = s.task_mut(name).unwrap();
                         match case {
                             "first" | "marks" | "change" | "bases" => ws.repos.clear(),
                             "collision" => ws.branch = "you/eng-123-taken".into(),
@@ -2442,14 +2442,14 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                         }
                         // Agents that used the others lately.
                         let used = |name: &str, repo: &str, hours: u64| {
-                            let repo = crate::state::WsRepo {
+                            let repo = crate::state::TaskRepo {
                                 name: repo.into(),
                                 src: src.path.clone(),
                                 base: "main".into(),
                                 branch: None,
                             };
                             let hours = hours * 3_600_000;
-                            Workspace {
+                            Task {
                                 name: name.into(),
                                 repos: vec![repo],
                                 last_interacted_at: Some(
@@ -2458,7 +2458,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 ..Default::default()
                             }
                         };
-                        (s.state.workspaces).extend([used("a", "web", 2), used("b", "api", 30)]);
+                        (s.state.tasks).extend([used("a", "web", 2), used("b", "api", 30)]);
                         if case == "none" {
                             s.state.repos.retain(|r| r.name == "payments");
                         }

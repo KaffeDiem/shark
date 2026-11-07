@@ -1,6 +1,6 @@
 //! GitHub PR identity, discovery, review publication, and coordinated creation.
 use crate::git::{cmd_bounded, dirty, git};
-use crate::state::Workspace;
+use crate::state::Task;
 use std::path::Path;
 
 mod discovery;
@@ -106,7 +106,7 @@ pub type Created = (Vec<(String, String)>, Option<String>);
 /// landed: after a squash merge their commits still count as ahead of the base, and pushing
 /// them again would open a duplicate PR.
 pub fn create_linked_prs(
-    ws: &Workspace,
+    ws: &Task,
     dir: &Path,
     skip: &[String],
     new: &NewPr,
@@ -114,7 +114,7 @@ pub fn create_linked_prs(
     for r in &ws.repos {
         if crate::git::review_pr_url(&dir.join(&r.name), ws.branch_of(r)).is_some() {
             return Err(format!(
-                "{} is a local PR review checkout; create a regular agent to publish changes",
+                "{} is a local PR review checkout; create a regular task to publish changes",
                 r.name
             ));
         }
@@ -146,7 +146,7 @@ pub fn create_linked_prs(
         if !crate::git::has_ref(&wt, &r.base) {
             let b = crate::git::short(&r.base);
             return Err(format!(
-                "{}: its base `{b}` isn't on GitHub; push it first (from its agent), or Change base…",
+                "{}: its base `{b}` isn't on GitHub; push it first (from its task), or Change base…",
                 r.name
             ));
         }
@@ -350,7 +350,7 @@ mod tests {
     /// returns the PRs it created, with a warning.
     #[test]
     fn creation_targets_origin_and_keeps_prs_when_linking_fails() {
-        use crate::git::{add_repo, create_workspace};
+        use crate::git::{add_repo, create_task};
         use std::fs;
         #[cfg(feature = "test-support")]
         let _lock = crate::app::ui_tests::UI_LOCK
@@ -393,8 +393,7 @@ mod tests {
             repos.push(add_repo(&src, &[]).unwrap());
         }
         let dir = root.join("ws/feat");
-        let ws =
-            create_workspace(&dir, "feat", "feat", &crate::git::on_branch(&repos, "feat")).unwrap();
+        let ws = create_task(&dir, "feat", "feat", &crate::git::on_branch(&repos, "feat")).unwrap();
         for name in ["api", "web"] {
             c(
                 &dir.join(name),
@@ -470,7 +469,7 @@ esac
     /// through jq (gh's own filter language) on canned `pr list` JSON.
     #[test]
     fn creates_and_links_prs() {
-        use crate::git::{add_repo, create_workspace};
+        use crate::git::{add_repo, create_task};
         use std::fs;
         #[cfg(feature = "test-support")]
         let _lock = crate::app::ui_tests::UI_LOCK
@@ -517,7 +516,7 @@ esac
         // api is on its own branch.
         let mut on = crate::git::on_branch(&repos, "feat");
         on[0].1 = "kd/api".into();
-        let ws = create_workspace(&dir, "feat", "feat", &on).unwrap();
+        let ws = create_task(&dir, "feat", "feat", &on).unwrap();
         for name in ["api", "web", "ops"] {
             c(
                 &dir.join(name),

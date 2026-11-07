@@ -35,7 +35,7 @@ pub fn uncommitted_files(wt: &Path) -> Result<BTreeMap<String, bool>, String> {
 }
 
 /// Discard only this file, including staged changes. Untracked files are removed;
-/// tracked files restore HEAD, never the workspace's diff base.
+/// tracked files restore HEAD, never the task's diff base.
 pub fn discard_file(wt: &Path, path: &str) -> Result<(), String> {
     let rel = Path::new(path);
     if path.is_empty() || !rel.components().all(|c| matches!(c, Component::Normal(_))) {

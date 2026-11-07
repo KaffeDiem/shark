@@ -10,7 +10,7 @@ pub(super) const ENTER_PLAN: &str = "Only the user turns plan mode on in this ap
 pub(super) const NEEDS_APPROVAL: &str = "This needs the user's approval, which this app can't ask for. Do \
     without it, or tell the user what to run.";
 pub(super) const APPROVED: &str = "I approve the plan. Plan mode is off: implement it now.";
-pub(super) const NEEDS_REPO: &str = "This agent has no repository, so it stays in Plan mode. Attach \
+pub(super) const NEEDS_REPO: &str = "This task has no repository, so it stays in Plan mode. Attach \
     one to build.";
 pub(super) const ATTACHING: &str = "A repository is still attaching or needs a decision in the \
     header, so this agent can't build yet.";
@@ -31,7 +31,7 @@ impl Chat {
                 cx,
             );
         }
-        if let Some(a) = &mut self.agent
+        if let Some(a) = &mut self.harness
             && let Err(e) = a.set_plan_mode(on)
         {
             self.push(Block::Info(format!("switching plan mode failed: {e}")), cx);

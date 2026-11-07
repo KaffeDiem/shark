@@ -1,8 +1,8 @@
-//! The sidebar: sections, workspace rows, the cursor, drag and drop.
+//! The sidebar: sections, task rows, the cursor, drag and drop.
 use super::*;
 
-/// A workspace's status icon: a spinner while an agent runs, else by what it needs from you.
-/// `idle` colours the dashed circle of a workspace that needs nothing.
+/// A task's status icon: a spinner while an agent runs, else by what it needs from you.
+/// `idle` colours the dashed circle of a task that needs nothing.
 pub(super) fn indicator(
     bucket: home::Bucket,
     idle: Hsla,
@@ -27,7 +27,7 @@ pub(super) fn indicator(
         .into_any_element()
 }
 
-pub(super) fn workspace_indicator(
+pub(super) fn task_indicator(
     running: usize,
     attention: &Attn,
     foreground: Hsla,
@@ -81,7 +81,7 @@ pub(super) fn section_icon(name: &str) -> IconName {
         .map_or(IconName::Folder, |(_, i)| *i)
 }
 
-/// "Move to section" in a workspace's right-click menu; ends with "New section", which moves it there.
+/// "Move to section" in a task's right-click menu; ends with "New section", which moves it there.
 pub(super) fn move_submenu(this: &Shark, ws: &str, cx: &Context<Shark>) -> Entry {
     let current = this.section_of(ws);
     let mut entries = vec![];
@@ -153,7 +153,7 @@ fn section_menu(this: &Shark, i: usize, cx: &Context<Shark>) -> Vec<Entry> {
     ]
 }
 
-/// Cursor state taken by [`Shark::cursors`]: sidebar row, its workspace's name, home row.
+/// Cursor state taken by [`Shark::cursors`]: sidebar row, its task's name, home row.
 pub(super) struct Cursors {
     side: Option<usize>,
     ws: Option<String>,
@@ -165,15 +165,15 @@ pub(super) struct Cursors {
 pub(super) enum SideRow {
     /// Index into `state.sections`.
     Section(usize),
-    /// Index into `state.workspaces`.
-    Ws(usize),
+    /// Index into `state.tasks`.
+    Task(usize),
 }
 
 /// The inline section name field in the sidebar.
 pub(super) struct Naming {
     /// The section being renamed; `None` adds one.
     rename: Option<usize>,
-    /// Workspace to move into the new section ("Move to Section › New Section…").
+    /// Task to move into the new section ("Move to Section › New Section…").
     then_move: Option<String>,
     input: Entity<InputState>,
     _sub: Subscription,
@@ -219,40 +219,40 @@ impl Shark {
         self.state
             .sections
             .iter()
-            .position(|s| s.workspaces.iter().any(|w| w == ws))
+            .position(|s| s.tasks.iter().any(|w| w == ws))
     }
 
-    /// Sidebar rows top to bottom: each section, then its workspaces unless it is
-    /// collapsed (and not `unfold`); then the workspaces in no section.
+    /// Sidebar rows top to bottom: each section, then its tasks unless it is
+    /// collapsed (and not `unfold`); then the tasks in no section.
     pub(super) fn side_rows(&self, unfold: bool) -> Vec<SideRow> {
-        let ws = &self.state.workspaces;
+        let ws = &self.state.tasks;
         let mut rows = vec![];
         for (i, s) in self.state.sections.iter().enumerate() {
             rows.push(SideRow::Section(i));
             if unfold || !s.collapsed {
                 rows.extend(
-                    s.workspaces
+                    s.tasks
                         .iter()
                         .filter_map(|n| ws.iter().position(|w| &w.name == n))
-                        .map(SideRow::Ws),
+                        .map(SideRow::Task),
                 );
             }
         }
         rows.extend(
             (0..ws.len())
                 .filter(|&ix| self.section_of(&ws[ix].name).is_none())
-                .map(SideRow::Ws),
+                .map(SideRow::Task),
         );
         rows
     }
 
-    /// Sidebar and home cursors before a workspace is removed; see [`Self::restore_cursors`].
+    /// Sidebar and home cursors before a task is removed; see [`Self::restore_cursors`].
     pub(super) fn cursors(&self, cx: &App) -> Cursors {
         Cursors {
             side: self.side_rows(false).iter().position(|r| *r == self.sel),
-            // The sidebar cursor follows its workspace, not its row number.
+            // The sidebar cursor follows its task, not its row number.
             ws: match self.sel {
-                SideRow::Ws(ix) => self.state.workspaces.get(ix).map(|w| w.name.clone()),
+                SideRow::Task(ix) => self.state.tasks.get(ix).map(|w| w.name.clone()),
                 SideRow::Section(_) => None,
             },
             home: self.home_at(&self.home_rows(cx)),
@@ -263,22 +263,22 @@ impl Shark {
     pub(super) fn restore_cursors(&mut self, name: &str, before: Cursors, cx: &App) {
         let rows = self.side_rows(false);
         let moved = (before.ws.as_deref().filter(|c| *c != name))
-            .and_then(|c| self.state.workspaces.iter().position(|w| w.name == c));
+            .and_then(|c| self.state.tasks.iter().position(|w| w.name == c));
         self.sel = match (self.sel, moved) {
             (SideRow::Section(i), _) => SideRow::Section(i),
-            (_, Some(ix)) => SideRow::Ws(ix),
+            (_, Some(ix)) => SideRow::Task(ix),
             _ => before
                 .side
                 .and_then(|p| rows.get(p.min(rows.len().saturating_sub(1))))
                 .copied()
-                .unwrap_or(SideRow::Ws(0)),
+                .unwrap_or(SideRow::Task(0)),
         };
         if self.home.sel.as_deref() == Some(name) {
             let rows = self.home_rows(cx);
             let at = before.home.unwrap_or(0).min(rows.len().saturating_sub(1));
             self.home.sel = rows
                 .get(at)
-                .map(|r| self.state.workspaces[r.ix].name.clone());
+                .map(|r| self.state.tasks[r.ix].name.clone());
         }
     }
 
@@ -287,13 +287,13 @@ impl Shark {
         self.side_rows(unfold)
             .into_iter()
             .filter_map(|r| match r {
-                SideRow::Ws(ix) => Some(ix),
+                SideRow::Task(ix) => Some(ix),
                 SideRow::Section(_) => None,
             })
             .collect()
     }
 
-    /// Keeps the cursor on a visible row; a workspace hidden by collapsing hands it to its header.
+    /// Keeps the cursor on a visible row; a task hidden by collapsing hands it to its header.
     fn fix_sel(&mut self) {
         let rows = self.side_rows(false);
         if rows.contains(&self.sel) {
@@ -302,7 +302,7 @@ impl Shark {
         self.sel = (self.cursor_section())
             .map(SideRow::Section)
             .or(rows.first().copied())
-            .unwrap_or(SideRow::Ws(0));
+            .unwrap_or(SideRow::Task(0));
     }
 
     fn move_sel(&mut self, nav: Nav, cx: &mut Context<Self>) {
@@ -318,16 +318,16 @@ impl Shark {
         cx.notify();
     }
 
-    /// The section under the sidebar cursor, or the cursor workspace's section.
+    /// The section under the sidebar cursor, or the cursor task's section.
     fn cursor_section(&self) -> Option<usize> {
         match self.sel {
             SideRow::Section(i) => (i < self.state.sections.len()).then_some(i),
-            SideRow::Ws(ix) => self.section_of(&self.state.workspaces.get(ix)?.name),
+            SideRow::Task(ix) => self.section_of(&self.state.tasks.get(ix)?.name),
         }
     }
 
     /// Section actions hit the cursor's section when the sidebar is focused, else the open
-    /// workspace's.
+    /// task's.
     fn target_section(&self, window: &Window) -> Option<usize> {
         if self.sidebar_focus.is_focused(window) {
             return self.cursor_section();
@@ -384,17 +384,17 @@ impl Shark {
         cx.notify();
     }
 
-    pub(super) fn drop_ws(&mut self, ws: &str, target: &str, cx: &mut Context<Self>) {
-        // The workspace under the cursor, so the reorder that shifts indices can put it back.
+    pub(super) fn drop_task(&mut self, ws: &str, target: &str, cx: &mut Context<Self>) {
+        // The task under the cursor, so the reorder that shifts indices can put it back.
         let cursor = match self.sel {
-            SideRow::Ws(ix) => self.state.workspaces.get(ix).map(|w| w.name.clone()),
+            SideRow::Task(ix) => self.state.tasks.get(ix).map(|w| w.name.clone()),
             SideRow::Section(_) => None,
         };
-        self.state.drop_ws(ws, target);
+        self.state.drop_task(ws, target);
         if let Some(ix) =
-            cursor.and_then(|n| self.state.workspaces.iter().position(|w| w.name == n))
+            cursor.and_then(|n| self.state.tasks.iter().position(|w| w.name == n))
         {
-            self.sel = SideRow::Ws(ix);
+            self.sel = SideRow::Task(ix);
         }
         let _ = self.state.save();
         self.fix_sel();
@@ -408,7 +408,7 @@ impl Shark {
         }
         let cursor = match self.sel {
             SideRow::Section(j) => Some(self.state.sections[j].name.clone()),
-            SideRow::Ws(_) => None,
+            SideRow::Task(_) => None,
         };
         move_item(&mut self.state.sections, from, to);
         if let Some(j) = cursor.and_then(|c| self.state.sections.iter().position(|s| s.name == c)) {
@@ -432,7 +432,7 @@ impl Shark {
             self.sel = SideRow::Section(if j > i { j - 1 } else { j });
         }
         self.fix_sel();
-        window.push_notification(format!("Deleted section {} (its agents stay)", s.name), cx);
+        window.push_notification(format!("Deleted section {} (its tasks stay)", s.name), cx);
         cx.notify();
     }
 
@@ -513,7 +513,7 @@ impl Shark {
                         name,
                         icon: "folder".into(),
                         collapsed: false,
-                        workspaces: vec![],
+                        tasks: vec![],
                     });
                     let i = self.state.sections.len() - 1;
                     self.sel = SideRow::Section(i);
@@ -616,11 +616,11 @@ impl Shark {
         })
     }
 
-    /// A workspace's row; `order` is the visible workspaces, whose first nine have a cmd-N.
+    /// A task's row; `order` is the visible tasks, whose first nine have a cmd-N.
     fn ws_row(
         &self,
         ix: usize,
-        w: &Workspace,
+        w: &Task,
         section: Option<usize>,
         order: &[usize],
         window: &Window,
@@ -631,7 +631,7 @@ impl Shark {
         let m = window.modifiers();
         let cmd_held = m.platform && m.number_of_modifiers() == 1;
         let running = self.running_chats(&w.name, cx);
-        let selected = self.sel == SideRow::Ws(ix);
+        let selected = self.sel == SideRow::Task(ix);
         let active = !self.home_shown() && self.active.as_ref() == Some(&w.name);
         let bright = active || (selected && focused);
         let foreground = if bright {
@@ -654,16 +654,16 @@ impl Shark {
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, _, _, cx| {
-                    this.sel = SideRow::Ws(ix);
+                    this.sel = SideRow::Task(ix);
                     cx.notify();
                 }),
             )
-            .on_click(cx.listener(move |this, _, window, cx| this.open_workspace(ix, window, cx)))
+            .on_click(cx.listener(move |this, _, window, cx| this.open_task(ix, window, cx)))
             // Right-click moves the cursor too, so it's clear which row the menu is for.
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, e: &MouseDownEvent, w, cx| {
-                    this.sel = SideRow::Ws(ix);
+                    this.sel = SideRow::Task(ix);
                     let entries = ws_menu(this, &ws, cx);
                     this.show_menu(e.position, entries, w, cx);
                 }),
@@ -671,13 +671,13 @@ impl Shark {
             .map(|d| {
                 self.reorder_source(
                     d,
-                    reorder::Item::Workspace(w.name.clone()),
+                    reorder::Item::Task(w.name.clone()),
                     w.display_title().to_string().into(),
                 )
             })
             .child(match nth {
                 Some(n) if cmd_held => kbd(&format!("cmd-{}", n + 1)).into_any_element(),
-                _ => workspace_indicator(running, &attn, foreground, ISZ, theme),
+                _ => task_indicator(running, &attn, foreground, ISZ, theme),
             })
             .when(!rail, |d| {
                 d.child(
@@ -724,7 +724,7 @@ impl Shark {
                 let name: SharedString = w.display_title().to_string().into();
                 d.tooltip(move |w, cx| Tooltip::new(name.clone()).build(w, cx))
             })
-            // Holding cmd in the rail names every workspace beside its cmd-N key.
+            // Holding cmd in the rail names every task beside its cmd-N key.
             .when(rail && cmd_held, |d| {
                 d.relative().child(
                     div().absolute().top_0().left_full().child(deferred(
@@ -763,10 +763,10 @@ impl Shark {
         let focused = self.sidebar_focus.is_focused(window);
         let selected = self.sel == SideRow::Section(i);
         let tip: SharedString = sec.name.clone().into();
-        // A folded section still shows that a workspace inside needs you.
+        // A folded section still shows that a task inside needs you.
         let needs = sec.collapsed
             && sec
-                .workspaces
+                .tasks
                 .iter()
                 .any(|n| matches!(self.attention_of(n, cx), Attn::Needs(_)));
         sidebar_row(rail, theme)
@@ -809,7 +809,7 @@ impl Shark {
                 )
                 .child(div().flex_1())
                 .when(sec.collapsed, |d| {
-                    d.child(div().text_xs().child(sec.workspaces.len().to_string()))
+                    d.child(div().text_xs().child(sec.tasks.len().to_string()))
                 })
             })
             .when(rail, |d| {
@@ -880,8 +880,8 @@ impl Shark {
                         )),
                     }
                 }
-                SideRow::Ws(ix) => {
-                    let w = &self.state.workspaces[ix];
+                SideRow::Task(ix) => {
+                    let w = &self.state.tasks[ix];
                     let section = self.section_of(&w.name);
                     if section.is_none() {
                         // A new section's field goes below the existing sections.
@@ -889,7 +889,7 @@ impl Shark {
                     }
                     items.push(self.reorder_item(
                         self.ws_row(ix, w, section, &order, window, cx),
-                        reorder::Item::Workspace(w.name.clone()),
+                        reorder::Item::Task(w.name.clone()),
                     ));
                 }
             }
@@ -900,8 +900,8 @@ impl Shark {
                 let mut entries = vec![
                     menu::item(
                         IconName::Plus,
-                        "New agent",
-                        on_shark(cx, |s, w, cx| s.new_empty_agent(w, cx)),
+                        "New task",
+                        on_shark(cx, |s, w, cx| s.new_empty_task(w, cx)),
                     ),
                     menu::item(
                         IconName::FolderPlus,
@@ -925,7 +925,7 @@ impl Shark {
             .group("ws-header")
             .justify_between()
             .items_end()
-            .child(header("Agents"))
+            .child(header("Tasks"))
             .when(!rail, |d| {
                 d.child(
                     div()
@@ -974,7 +974,7 @@ impl Shark {
             .flex_none()
             .map(|d| nav_actions(d, false, cx, Shark::move_sel))
             .on_action(cx.listener(|this, _: &Confirm, window, cx| match this.sel {
-                SideRow::Ws(ix) => this.open_workspace(ix, window, cx),
+                SideRow::Task(ix) => this.open_task(ix, window, cx),
                 SideRow::Section(i) => this.toggle_section(i, cx),
             }))
             .on_action(cx.listener(|this, _: &CollapseDir, _, cx| this.collapse_at_cursor(cx)))
@@ -1021,7 +1021,7 @@ impl Shark {
                                 .gap(px(4.))
                                 .mr(px(8.))
                                 .child(self.render_commands(cx))
-                                .child(self.render_new_workspace(cx)),
+                                .child(self.render_new_task(cx)),
                         )
                     }),
             )
@@ -1038,7 +1038,7 @@ impl Shark {
                     )
                     .children(items)
                     .when(
-                        self.state.workspaces.is_empty() && self.state.sections.is_empty(),
+                        self.state.tasks.is_empty() && self.state.sections.is_empty(),
                         |d| d.child(hint("cmd-n to create")),
                     )
                     .when(self.state.repos.is_empty(), |d| d.child(add_repo_row))

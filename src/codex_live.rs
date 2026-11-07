@@ -1,8 +1,8 @@
 //! QA against the real `codex app-server`: `cargo test codex_live -- --ignored --test-threads=1`.
 //! Each test uses a ChatGPT subscription turn or two; prompts are kept tiny.
-use crate::agent::{self, Agent, Ev};
+use crate::harness::{self, Harness, Ev};
 use crate::git;
-use crate::state::{Repo, Workspace};
+use crate::state::{Repo, Task};
 use gpui_kit::base::async_util::Receiver;
 use std::{
     fs,
@@ -14,10 +14,10 @@ use std::{
 const MODEL: &str = "codex:gpt-6.1-sol";
 const TURN: u64 = 600; // secs a turn may take
 
-/// Two temp repos (api, web) in a workspace linked into `workspaces_dir()`; removed on drop.
+/// Two temp repos (api, web) in a task linked into `workspaces_dir()`; removed on drop.
 struct Env {
     root: PathBuf,
-    ws: Workspace,
+    ws: Task,
 }
 
 impl Env {
@@ -55,13 +55,13 @@ impl Env {
             });
         }
         let on = git::on_branch(&repos, "live");
-        let mut ws = git::create_workspace(&root.join("ws/live"), "live", "live", &on).unwrap();
+        let mut ws = git::create_task(&root.join("ws/live"), "live", "live", &on).unwrap();
         ws.name = format!("cxlive-{tag}-{}", std::process::id());
         // A unique transcript name: the default (`live`) would be a real chat's file.
         ws.chats[0].id = ws.name.clone();
         ws.chats[0].model = Some(model.into());
-        fs::create_dir_all(crate::state::workspaces_dir()).unwrap();
-        let link = crate::state::workspaces_dir().join(&ws.name);
+        fs::create_dir_all(crate::state::tasks_dir()).unwrap();
+        let link = crate::state::tasks_dir().join(&ws.name);
         let _ = fs::remove_file(&link);
         std::os::unix::fs::symlink(root.join("ws/live"), &link).unwrap();
         let _ = fs::remove_file(self::transcript(&ws));
@@ -71,9 +71,9 @@ impl Env {
     fn spawn(&self, session_id: Option<String>) -> Run {
         let mut meta = self.ws.chats[0].clone();
         meta.session_id = session_id;
-        let (agent, rx) = agent::spawn(&self.ws, &meta).unwrap();
+        let (agent, rx) = harness::spawn(&self.ws, &meta).unwrap();
         Run {
-            agent,
+            harness: agent,
             rx,
             evs: vec![],
             t0: Instant::now(),
@@ -85,13 +85,13 @@ impl Env {
     }
 }
 
-fn transcript(ws: &Workspace) -> PathBuf {
+fn transcript(ws: &Task) -> PathBuf {
     crate::transcript::transcript_path(&ws.chats[0].id)
 }
 
 impl Drop for Env {
     fn drop(&mut self) {
-        let _ = fs::remove_file(crate::state::workspaces_dir().join(&self.ws.name));
+        let _ = fs::remove_file(crate::state::tasks_dir().join(&self.ws.name));
         let _ = fs::remove_file(transcript(&self.ws));
         let _ = fs::remove_file(crate::transcript::log_path(&self.ws.chats[0].id));
         let _ = fs::remove_dir_all(&self.root);
@@ -99,7 +99,7 @@ impl Drop for Env {
 }
 
 struct Run {
-    agent: Agent,
+    harness: Harness,
     rx: Receiver<Ev>,
     evs: Vec<Ev>,
     t0: Instant,
@@ -128,7 +128,7 @@ impl Run {
 
     /// Stops the process and waits for its reader's last transcript line.
     fn close(&mut self) {
-        self.agent.stop();
+        self.harness.stop();
         self.until(10, is_exit);
         self.evs.retain(|e| !is_exit(e));
     }
@@ -257,13 +257,13 @@ fn check_replay(env: &Env, live: &[Ev]) {
     assert_eq!(got, want, "transcript replay differs from live events");
 }
 
-/// 1 + 6: an edit and a commit in one repo of the workspace, then the transcript's replay.
+/// 1 + 6: an edit and a commit in one repo of the task, then the transcript's replay.
 #[test]
 #[ignore]
 fn codex_live_edit_commit() {
     let env = Env::new("edit", MODEL);
     let mut r = env.spawn(None);
-    r.agent
+    r.harness
         .send("Create api/hello.txt containing the single line hi, then commit it in the api repo (cd api) with message 'add hello'. Reply with one word when done.")
         .unwrap();
     assert!(r.until(TURN, |e| is_result(e) || is_exit(e)), "no Result");
@@ -325,7 +325,7 @@ fn codex_live_edit_commit() {
 fn codex_live_steer() {
     let env = Env::new("steer", MODEL);
     let mut r = env.spawn(None);
-    r.agent
+    r.harness
         .send("Run the shell command `sleep 8`, then reply with the word FIRST.")
         .unwrap();
     assert!(
@@ -338,7 +338,7 @@ fn codex_live_steer() {
     );
     let at = r.mark();
     let sent = Instant::now();
-    r.agent
+    r.harness
         .send("Also include the word ZEBRA in your reply.")
         .unwrap();
     assert!(r.until(TURN, is_result), "no Result");
@@ -367,12 +367,12 @@ fn codex_live_steer() {
 fn codex_live_interrupt() {
     let env = Env::new("intr", MODEL);
     let mut r = env.spawn(None);
-    r.agent
+    r.harness
         .send("Run the shell command `sleep 37`, then reply OK.")
         .unwrap();
     // Before turn/started it errs (the server would refuse it); the reader may already have
     // seen the turn start, so either is right here.
-    eprintln!("interrupt right after send: {:?}", r.agent.interrupt());
+    eprintln!("interrupt right after send: {:?}", r.harness.interrupt());
     assert!(
         r.until(TURN, |e| matches!(e, Ev::ToolUse { .. }) || is_result(e)),
         "no tool use"
@@ -380,7 +380,7 @@ fn codex_live_interrupt() {
     std::thread::sleep(Duration::from_secs(1));
     let at = r.mark();
     let t = Instant::now();
-    r.agent.interrupt().unwrap();
+    r.harness.interrupt().unwrap();
     assert!(r.until(10, is_result), "no Result within 10s of interrupt");
     let took = t.elapsed();
     let tail: Vec<String> = r.evs[at..].iter().map(short).collect();
@@ -405,7 +405,7 @@ fn codex_live_interrupt() {
         String::from_utf8_lossy(&sleeping.stdout).trim()
     );
     // The process lives on: a second interrupt now has no turn.
-    eprintln!("interrupt when idle: {:?}", r.agent.interrupt());
+    eprintln!("interrupt when idle: {:?}", r.harness.interrupt());
     r.drain(3);
     assert_eq!(r.results(), 1);
     assert!(!r.evs.iter().any(is_exit));
@@ -417,7 +417,7 @@ fn codex_live_interrupt() {
 fn codex_live_resume() {
     let env = Env::new("resume", MODEL);
     let mut a = env.spawn(None);
-    a.agent
+    a.harness
         .send("Remember the word PELICAN. Reply only OK.")
         .unwrap();
     assert!(a.until(TURN, |e| is_result(e) || is_exit(e)));
@@ -428,7 +428,7 @@ fn codex_live_resume() {
     let sid = session_id.clone();
     a.close();
     let mut b = env.spawn(Some(sid.clone()));
-    b.agent
+    b.harness
         .send("What word did I ask you to remember? Reply with just the word.")
         .unwrap();
     assert!(b.until(TURN, |e| is_result(e) || is_exit(e)));
@@ -457,13 +457,13 @@ fn codex_live_resume() {
 fn codex_live_bad_model() {
     let env = Env::new("badmodel", "codex:nope-model");
     let mut r = env.spawn(None);
-    r.agent.send("Reply OK.").unwrap();
+    r.harness.send("Reply OK.").unwrap();
     assert!(
         r.until(90, |e| is_result(e) || is_exit(e)),
         "hang: no Result"
     );
     // The process stays up (the thread itself is fine); a second message fails the same way.
-    r.agent.send("Reply OK.").unwrap();
+    r.harness.send("Reply OK.").unwrap();
     assert!(
         r.until(90, |e| is_result(e) || is_exit(e)),
         "hang on second send"
@@ -487,8 +487,8 @@ fn codex_live_bad_model() {
 fn codex_live_queued() {
     let env = Env::new("queued", MODEL);
     let mut r = env.spawn(None);
-    r.agent.send("Reply with the word ALPHA.").unwrap();
-    r.agent.send("Also include the word BRAVO.").unwrap();
+    r.harness.send("Reply with the word ALPHA.").unwrap();
+    r.harness.send("Also include the word BRAVO.").unwrap();
     assert!(
         r.until(TURN, |e| matches!(e, Ev::Text(t) if t.contains("BRAVO"))),
         "second queued reply never arrived"
@@ -526,11 +526,11 @@ fn codex_live_queued() {
 fn codex_live_steer_at_end() {
     let env = Env::new("steerend", MODEL);
     let mut r = env.spawn(None);
-    r.agent
+    r.harness
         .send("Reply with only the word ONE. Use no tools.")
         .unwrap();
     assert!(r.until(TURN, |e| matches!(e, Ev::Text(_)) || is_result(e)));
-    r.agent
+    r.harness
         .send("Now reply with only the word TWO. Use no tools.")
         .unwrap();
     assert!(
@@ -569,7 +569,7 @@ fn codex_live_plan() {
     env.ws.chats[0].plan = true;
     env.ws.chats[0].fast = Some(false);
     let mut r = env.spawn(None);
-    r.agent
+    r.harness
         .send("Plan adding api/hello.txt containing the single line hi. Two steps at most; don't ask me anything.")
         .unwrap();
     assert!(r.until(TURN, |e| is_result(e) || is_exit(e)), "no Result");
@@ -583,8 +583,8 @@ fn codex_live_plan() {
         !env.repo("api").join("hello.txt").exists(),
         "plan mode edited"
     );
-    r.agent.set_plan_mode(false).unwrap();
-    r.agent
+    r.harness.set_plan_mode(false).unwrap();
+    r.harness
         .send("I approve the plan. Implement it now.")
         .unwrap();
     let at = r.results();
@@ -601,7 +601,7 @@ fn codex_live_plan() {
 fn codex_live_sub_agent() {
     let env = Env::new("subagent", MODEL);
     let mut r = env.spawn(None);
-    r.agent
+    r.harness
         .send("Spawn exactly one sub-agent that runs the shell command `sleep 10` and replies DONE. Wait for it, then run `sleep 5` yourself and reply with only the word FINISHED.")
         .unwrap();
     assert!(r.until(TURN, |e| is_result(e) || is_exit(e)), "no Result");
@@ -638,11 +638,11 @@ fn codex_live_sub_agent() {
     check_replay(&env, &r.evs);
 }
 
-/// Each repo's instructions reach the agent through the workspace's root docs.
+/// Each repo's instructions reach the agent through the task's root docs.
 fn repo_languages(tag: &str, model: &str, how: &str) {
     let env = Env::new(tag, model);
     let mut r = env.spawn(None);
-    r.agent
+    r.harness
         .send(&format!(
             "{how}: which language is each repo written in? One line."
         ))

@@ -16,7 +16,7 @@ pub(super) const CRITTERS: [IconName; 10] = [
 pub(super) const PARADE_LIMIT: usize = 6;
 pub(super) const HOP_INTERVAL: std::time::Duration = std::time::Duration::from_millis(400);
 
-pub(super) fn assign_critters(critters: &mut HashMap<String, usize>, tasks: &[agent::Task]) {
+pub(super) fn assign_critters(critters: &mut HashMap<String, usize>, tasks: &[harness::BackgroundTask]) {
     critters.retain(|id, _| tasks.iter().any(|t| &t.id == id));
     for task in tasks {
         if !critters.contains_key(&task.id) {
@@ -28,7 +28,7 @@ pub(super) fn assign_critters(critters: &mut HashMap<String, usize>, tasks: &[ag
     }
 }
 
-pub(super) fn critter_icon(task: &agent::Task, ix: usize) -> IconName {
+pub(super) fn critter_icon(task: &harness::BackgroundTask, ix: usize) -> IconName {
     if task.kind == "local_bash" {
         IconName::SquareTerminal
     } else {
@@ -47,7 +47,7 @@ pub(super) fn critter_color(ix: usize, theme: &ThemeColor) -> Hsla {
 }
 
 impl Chat {
-    pub(super) fn set_background(&mut self, tasks: Vec<agent::Task>, cx: &mut Context<Self>) {
+    pub(super) fn set_background(&mut self, tasks: Vec<harness::BackgroundTask>, cx: &mut Context<Self>) {
         assign_critters(&mut self.critters, &tasks);
         self.background = tasks;
         if self.background.is_empty() || cx.reduce_motion() || self.replaying {
@@ -214,7 +214,7 @@ mod tests {
 
     #[test]
     fn critters_stay_with_tasks_and_reuse_freed_icons() {
-        let task = |id: &str| agent::Task {
+        let task = |id: &str| harness::BackgroundTask {
             id: id.into(),
             kind: "local_agent".into(),
             description: "Same description".into(),
@@ -231,7 +231,7 @@ mod tests {
         assign_critters(&mut critters, &[task("c"), task("d"), task("a")]);
         assert_eq!(critters["d"], 1);
 
-        let shell = agent::Task {
+        let shell = harness::BackgroundTask {
             kind: "local_bash".into(),
             ..task("shell")
         };
@@ -243,7 +243,7 @@ mod tests {
     #[test]
     fn critters_wrap_when_the_catalog_is_full() {
         let tasks: Vec<_> = (0..CRITTERS.len() * 2 + 1)
-            .map(|i| agent::Task {
+            .map(|i| harness::BackgroundTask {
                 id: i.to_string(),
                 kind: "local_agent".into(),
                 description: String::new(),

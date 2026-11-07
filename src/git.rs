@@ -1,5 +1,5 @@
 use crate::proc::{finish, finish_bytes};
-use crate::state::{Attachment, Repo, Workspace, WsRepo};
+use crate::state::{Attachment, Repo, Task, TaskRepo};
 mod changes;
 mod copy;
 pub mod history;
@@ -141,19 +141,19 @@ pub(crate) fn default_base(src: &Path) -> String {
             .map(String::from)
             .ok_or_else(String::new)
     })
-    // Empty when unknown: the current branch is no trunk (in a worktree it is the workspace's own).
+    // Empty when unknown: the current branch is no trunk (in a worktree it is the task's own).
     .unwrap_or_default()
 }
 
-/// `branch` is the workspace's own; each repo comes with the branch it gets, usually the same.
+/// `branch` is the task's own; each repo comes with the branch it gets, usually the same.
 #[cfg(test)]
-pub fn create_workspace(
+pub fn create_task(
     dir: &Path,
     name: &str,
     branch: &str,
     repos: &[(Repo, String)],
-) -> Result<Workspace, String> {
-    create_workspace_with_prs(dir, name, branch, repos, &[], &[])
+) -> Result<Task, String> {
+    create_task_with_prs(dir, name, branch, repos, &[], &[])
 }
 
 #[derive(Clone, Debug)]
@@ -165,14 +165,14 @@ pub struct PullRequest {
 
 /// PR selections use fresh local review branches, preserving colleagues' branches. `parents`
 /// `(repo, branch)` stack a repo's new branch on another branch: it starts there and targets it.
-pub fn create_workspace_with_prs(
+pub fn create_task_with_prs(
     dir: &Path,
     name: &str,
     branch: &str,
     repos: &[(Repo, String)],
     prs: &[(String, PullRequest)],
     parents: &[(String, String)],
-) -> Result<Workspace, String> {
+) -> Result<Task, String> {
     if repos.is_empty() {
         return Err("pick at least one repo".into());
     }
@@ -195,13 +195,13 @@ pub fn create_workspace_with_prs(
     })
     .into_iter()
     .collect::<Result<Vec<_>, _>>()?;
-    fs::create_dir_all(dir.parent().ok_or("Workspace has no parent")?)
+    fs::create_dir_all(dir.parent().ok_or("Task has no parent")?)
         .map_err(|e| e.to_string())?;
     fs::create_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
     let root_identity = fs::symlink_metadata(dir).map_err(|e| e.to_string())?;
     let attempts = crate::proc::par_map(repos.iter().zip(&plans), |((r, b), p)| {
         let mut owned = OwnedWorktree::default();
-        let result = add_worktree(dir, b, r, p, &mut owned).map(|w| WsRepo {
+        let result = add_worktree(dir, b, r, p, &mut owned).map(|w| TaskRepo {
             branch: (b != branch).then(|| b.clone()),
             ..w
         });
@@ -212,7 +212,7 @@ pub fn create_workspace_with_prs(
             .iter()
             .map(|(result, _)| result.clone())
             .collect::<Result<Vec<_>, _>>()?;
-        let mut ws = Workspace {
+        let mut ws = Task {
             name: name.into(),
             branch: branch.into(),
             repos: done,
@@ -240,11 +240,11 @@ pub fn create_workspace_with_prs(
 
 /// An agent with no repositories yet: its directory, root docs and first chat, in Plan mode.
 /// Nothing is left behind on failure.
-pub fn create_empty_workspace(dir: &Path, name: &str, title: &str) -> Result<Workspace, String> {
-    fs::create_dir_all(dir.parent().ok_or("Workspace has no parent")?)
+pub fn create_empty_task(dir: &Path, name: &str, title: &str) -> Result<Task, String> {
+    fs::create_dir_all(dir.parent().ok_or("Task has no parent")?)
         .map_err(|e| e.to_string())?;
     fs::create_dir(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    let mut ws = Workspace {
+    let mut ws = Task {
         name: name.into(),
         title: title.into(),
         branch: name.into(),
@@ -281,17 +281,17 @@ impl From<String> for AttachError {
     }
 }
 
-/// Adds one more repo to an existing workspace on `branch` and rewrites the root CLAUDE.md; the
-/// first repo's branch becomes the workspace's. With `fresh`, the base (empty: the repo's default)
+/// Adds one more repo to an existing task on `branch` and rewrites the root CLAUDE.md; the
+/// first repo's branch becomes the task's. With `fresh`, the base (empty: the repo's default)
 /// of a branch that must be new; without, an existing branch is used as `plan_worktree` does.
 /// Blocking: it fetches.
-pub fn add_to_workspace(
-    ws: &Workspace,
+pub fn add_to_task(
+    ws: &Task,
     dir: &Path,
     r: &Repo,
     branch: &str,
     fresh: Option<&str>,
-) -> Result<Workspace, AttachError> {
+) -> Result<Task, AttachError> {
     if ws.repos.iter().any(|w| w.name == r.name) {
         return Err(format!("{} is already in {}", r.name, ws.display_title()).into());
     }
@@ -309,7 +309,7 @@ pub fn add_to_workspace(
     }
     let mut owned = OwnedWorktree::default();
     let added = add_worktree(dir, branch, r, &plan, &mut owned).and_then(|wr| {
-        ws.repos.push(WsRepo {
+        ws.repos.push(TaskRepo {
             branch: (branch != ws.branch).then(|| branch.into()),
             ..wr
         });
@@ -330,13 +330,13 @@ pub fn add_to_workspace(
 pub enum Found {
     Nothing,
     /// The worktree, on its branch: the work finished.
-    Worktree(WsRepo),
+    Worktree(TaskRepo),
     /// Something that can't be told from someone else's; says what.
     Unclear(String),
 }
 
 /// Looks at `a`'s source repo, branch and path. Reads only.
-pub fn find_attachment(ws: &Workspace, a: &Attachment) -> Found {
+pub fn find_attachment(ws: &Task, a: &Attachment) -> Found {
     let wt = ws.dir().join(&a.repo);
     let Ok(wts) = worktree_list(&a.src) else {
         return Found::Unclear(format!("{} can't be read", a.src.display()));
@@ -369,7 +369,7 @@ pub fn find_attachment(ws: &Workspace, a: &Attachment) -> Found {
             && git(&wt, &["symbolic-ref", "HEAD"])
                 .is_ok_and(|b| b == format!("refs/heads/{}", a.branch))
         {
-            return Found::Worktree(WsRepo {
+            return Found::Worktree(TaskRepo {
                 name: a.repo.clone(),
                 src: a.src.clone(),
                 base,
@@ -393,7 +393,7 @@ pub fn find_attachment(ws: &Workspace, a: &Attachment) -> Found {
     }
 }
 
-/// A branch of a source repo, as the New workspace dialog lists it.
+/// A branch of a source repo, as the New task dialog lists it.
 #[derive(Clone, Debug)]
 pub struct Branch {
     pub name: String,
@@ -545,7 +545,7 @@ impl Plan {
 /// Checks a repo can take the branch and decides where it starts. Fetches, so it blocks.
 /// With a `parent` branch, a new branch starts on it and the base is `origin/<parent>`.
 fn plan_worktree(branch: &str, r: &Repo, parent: Option<&str>) -> Result<Plan, String> {
-    // A workspace dir deleted by hand leaves a worktree entry that still claims its branch.
+    // A task dir deleted by hand leaves a worktree entry that still claims its branch.
     let _ = git(&r.path, &["worktree", "prune"]);
     if let Some(path) = holder(&worktree_list(&r.path)?, branch) {
         return Err(format!(
@@ -589,7 +589,7 @@ fn plan_worktree(branch: &str, r: &Repo, parent: Option<&str>) -> Result<Plan, S
             }
             None
         }
-        // Already in the base: left over from an archived workspace whose PR merged and lost
+        // Already in the base: left over from an archived task whose PR merged and lost
         // its remote branch; checking it out would restart on old, merged code. Anything else
         // is unpushed work and is reused. Only refused when origin answered: offline or
         // without origin, a local branch is all there is.
@@ -597,7 +597,7 @@ fn plan_worktree(branch: &str, r: &Repo, parent: Option<&str>) -> Result<Plan, S
             if fetched && git(&r.path, &["merge-base", "--is-ancestor", &local, &base]).is_ok() =>
         {
             return Err(format!(
-                "{}: a local branch `{branch}` exists that origin doesn't have and is already merged into {base} (left from a deleted agent?). Pick another name, or rename it: git -C {} branch -m {branch} {branch}-old",
+                "{}: a local branch `{branch}` exists that origin doesn't have and is already merged into {base} (left from a deleted task?). Pick another name, or rename it: git -C {} branch -m {branch} {branch}-old",
                 r.name,
                 r.path.display()
             ));
@@ -670,7 +670,7 @@ fn parent_start(r: &Repo, p: &str) -> Result<String, String> {
     ) {
         (true, _) => Ok(format!("origin/{p}")),
         (false, true) => Err(format!(
-            "{}: `{p}` isn't on GitHub yet; push it first (from its agent)",
+            "{}: `{p}` isn't on GitHub yet; push it first (from its task)",
             r.name
         )),
         (false, false) => Err(format!(
@@ -930,7 +930,7 @@ fn add_worktree(
     r: &Repo,
     plan: &Plan,
     owned: &mut OwnedWorktree,
-) -> Result<WsRepo, String> {
+) -> Result<TaskRepo, String> {
     let wt = dir.join(&r.name);
     if let Some(from) = &plan.from {
         let commit = git(
@@ -963,7 +963,7 @@ fn add_worktree(
     owned.untracked = untracked_fingerprint(&wt, &copied)
         .ok()
         .map(|fp| (fp, copied));
-    Ok(WsRepo {
+    Ok(TaskRepo {
         name: r.name.clone(),
         src: r.path.clone(),
         base: plan.base.clone(),
@@ -1008,16 +1008,16 @@ fn undo_worktree(dir: &Path, branch: &str, r: &Repo, owned: &OwnedWorktree) -> V
     remaining
 }
 
-/// Rewrites the root CLAUDE.md and AGENTS.md from the workspace's repo list; a failure only
+/// Rewrites the root CLAUDE.md and AGENTS.md from the task's repo list; a failure only
 /// leaves them stale.
-pub fn write_claude_md(ws: &Workspace) {
+pub fn write_claude_md(ws: &Task) {
     let _ = write_root_docs(ws, &ws.dir());
 }
 
-/// The files the agent reads at the workspace root: CLAUDE.md for claude, AGENTS.md for codex.
+/// The files the agent reads at the task root: CLAUDE.md for claude, AGENTS.md for codex.
 const ROOT_DOCS: [&str; 2] = ["CLAUDE.md", "AGENTS.md"];
 
-fn write_root_docs(ws: &Workspace, dir: &Path) -> Result<(), String> {
+fn write_root_docs(ws: &Task, dir: &Path) -> Result<(), String> {
     let [claude, agents] = ROOT_DOCS;
     fs::write(dir.join(claude), claude_md(ws, dir))
         .and_then(|()| fs::write(dir.join(agents), agents_md(ws, dir)))
@@ -1039,7 +1039,7 @@ pub fn set_repo_skills(on: bool) {
 
 /// `--add-dir` for each repo: claude loads a repo's `.claude/skills` and `.claude/commands` at
 /// start only from its own cwd upward or from these. A clash shows as `/repo:skill`.
-pub fn claude_skill_args(ws: &Workspace) -> Vec<String> {
+pub fn claude_skill_args(ws: &Task) -> Vec<String> {
     if !repo_skills() {
         return vec![];
     }
@@ -1051,12 +1051,12 @@ pub fn claude_skill_args(ws: &Workspace) -> Vec<String> {
 }
 
 const AGENTS_DIR: &str = ".agents";
-/// Where codex looks at the workspace root.
+/// Where codex looks at the task root.
 const SKILL_LINKS: &str = ".agents/skills";
 
 const SKILL_OWNERS: &str = ".shark-skills.json";
 
-// Never follow a user's directory symlink while managing workspace-owned files.
+// Never follow a user's directory symlink while managing task-owned files.
 fn skill_dirs_owned(dir: &Path) -> bool {
     [AGENTS_DIR, SKILL_LINKS]
         .iter()
@@ -1088,13 +1088,13 @@ fn owned_skill_links(dir: &Path) -> Option<BTreeMap<String, PathBuf>> {
 
 /// Link repo skills into Codex's root. Only recorded, unchanged links belong to Shark;
 /// pre-existing links (including ones from older Shark versions) stay user-owned.
-pub fn link_skills(ws: &Workspace, dir: &Path) {
+pub fn link_skills(ws: &Task, dir: &Path) {
     // Keep the current preference and filesystem reconciliation under the same lock.
     let on = REPO_SKILLS.lock().unwrap_or_else(|e| e.into_inner());
     reconcile_skills(ws, dir, *on);
 }
 
-fn reconcile_skills(ws: &Workspace, dir: &Path, on: bool) {
+fn reconcile_skills(ws: &Task, dir: &Path, on: bool) {
     if !skill_dirs_owned(dir) {
         return;
     }
@@ -1181,7 +1181,7 @@ fn reconcile_skills(ws: &Workspace, dir: &Path, on: bool) {
     }
 }
 
-/// What Shark itself leaves in a workspace root: its docs, Finder litter, the `.context` folder
+/// What Shark itself leaves in a task root: its docs, Finder litter, the `.context` folder
 /// of attachments and the skill links.
 fn root_owned() -> [&'static str; 5] {
     let [claude, agents] = ROOT_DOCS;
@@ -1234,7 +1234,7 @@ fn only_skill_links(dir: &Path) -> bool {
         }))
 }
 
-fn claude_md(ws: &Workspace, dir: &Path) -> String {
+fn claude_md(ws: &Task, dir: &Path) -> String {
     let mut s = header(ws);
     for r in &ws.repos {
         if dir.join(&r.name).join("CLAUDE.md").exists() {
@@ -1252,7 +1252,7 @@ pub fn rules_file(repo_dir: &Path) -> Option<&'static str> {
 }
 
 /// Codex has no `@` imports and reads AGENTS.md only from here, so it is pointed at each repo's.
-fn agents_md(ws: &Workspace, dir: &Path) -> String {
+fn agents_md(ws: &Task, dir: &Path) -> String {
     let mut s = header(ws);
     for r in &ws.repos {
         if let Some(f) = rules_file(&dir.join(&r.name)) {
@@ -1270,10 +1270,10 @@ fn listed(repo: &str) -> String {
     format!("- `{repo}/`: worktree of ")
 }
 
-fn header(ws: &Workspace) -> String {
+fn header(ws: &Task) -> String {
     if ws.repos.is_empty() {
         return format!(
-            "# Workspace `{}`\n\nNo repositories are attached. This directory is NOT a git repo and holds no code: discuss and plan here. Building starts once the user attaches a repository.\n\n",
+            "# Task `{}`\n\nNo repositories are attached. This directory is NOT a git repo and holds no code: discuss and plan here. Building starts once the user attaches a repository.\n\n",
             ws.name
         );
     }
@@ -1283,7 +1283,7 @@ fn header(ws: &Workspace) -> String {
         .map_or(ws.branch.as_str(), |r| ws.branch_of(r));
     let shared = ws.repos.iter().all(|r| ws.branch_of(r) == first);
     let mut s = format!(
-        "# Workspace `{}`\n\nThis directory is NOT a git repo. Each subdirectory is a git worktree{}:\n",
+        "# Task `{}`\n\nThis directory is NOT a git repo. Each subdirectory is a git worktree{}:\n",
         ws.name,
         match shared {
             true => format!(" on branch `{first}`"),
@@ -1339,7 +1339,7 @@ fn remove_blocker(src: &Path, wt: &Path, force: bool) -> Option<&'static str> {
 
 /// The refusals of `remove_workspace`, without removing anything: callers run it before any
 /// side effect (stopping servers, archive scripts).
-pub fn archive_preflight(ws: &Workspace, dir: &Path, force: bool) -> Result<(), String> {
+pub fn archive_preflight(ws: &Task, dir: &Path, force: bool) -> Result<(), String> {
     // Up front, so a refusal in the second repo can't leave the first one removed.
     let blocked: Vec<String> = ws
         .repos
@@ -1384,7 +1384,7 @@ pub fn archive_preflight(ws: &Workspace, dir: &Path, force: bool) -> Result<(), 
     Ok(())
 }
 
-pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), String> {
+pub fn remove_task(ws: &Task, dir: &Path, force: bool) -> Result<(), String> {
     archive_preflight(ws, dir, force)?;
     for r in &ws.repos {
         let wt = dir.join(&r.name);
@@ -1422,10 +1422,10 @@ pub fn remove_workspace(ws: &Workspace, dir: &Path, force: bool) -> Result<(), S
     Ok(())
 }
 
-/// After an archive: deletes the workspace branch in each `(repo, head)` source repo, but only
+/// After an archive: deletes the task branch in each `(repo, head)` source repo, but only
 /// while the branch still points at `head`, the commit that was found merged. `-D` because a
 /// squash merge leaves the branch unmerged as far as git can tell. Returns the repos done.
-pub fn delete_merged_branches(ws: &Workspace, merged: &[(String, String)]) -> Vec<String> {
+pub fn delete_merged_branches(ws: &Task, merged: &[(String, String)]) -> Vec<String> {
     ws.repos
         .iter()
         .filter(|r| {
@@ -1454,7 +1454,7 @@ pub fn compare_rev(repo_dir: &Path, base: &str, uncommitted_only: bool) -> Strin
 
 /// One unified patch for all repos. Every path is prefixed with the repo name.
 /// A failed `git diff` (e.g. a missing base) is an error naming the repo, not an empty patch.
-pub fn combined_diff(ws: &Workspace, dir: &Path, uncommitted_only: bool) -> Result<String, String> {
+pub fn combined_diff(ws: &Task, dir: &Path, uncommitted_only: bool) -> Result<String, String> {
     static SEQ: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let mut out = String::new();
     for r in &ws.repos {

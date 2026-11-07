@@ -31,27 +31,27 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
             .unwrap();
         cx.update_window(window, |_, w, cx| {
             shark.update(cx, |s, cx| {
-                s.state.workspaces = ["Displayed", "Cursor", "Inactive", "Warning", "Unread", "Running"]
-                    .map(|name| Workspace {
+                s.state.tasks = ["Displayed", "Cursor", "Inactive", "Warning", "Unread", "Running"]
+                    .map(|name| Task {
                         name: name.into(),
                         branch: name.into(),
-                        repos: vec![crate::state::WsRepo {
+                        repos: vec![crate::state::TaskRepo {
                             name: "api".into(), src: home.join("api"), base: "main".into(), branch: None,
                         }],
                         chats: vec![ChatMeta { id: name.into(), ..Default::default() }],
                         ..Default::default()
                     }).to_vec();
-                for ws in &mut s.state.workspaces {
+                for ws in &mut s.state.tasks {
                     ws.normalize_tabs();
                 }
                 s.state.repos = vec![Repo { name: "api".into(), path: home.join("api") }];
                 s.state.sections = vec![Section {
                     name: "Projects".into(), icon: "folder".into(), collapsed: false,
-                    workspaces: vec!["Warning".into()],
+                    tasks: vec!["Warning".into()],
                 }];
                 s.unread.insert("Unread".into());
                 for ix in [0, 1, 3, 5] {
-                    let ws = s.state.workspaces[ix].clone();
+                    let ws = s.state.tasks[ix].clone();
                     let chat = cx.new(|cx| Chat::new(ws.clone(), ws.chats[0].clone(), s.state.vim, w, cx));
                     chat.update(cx, |c, cx| {
                         if ix == 5 {
@@ -100,7 +100,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                             s.sel = if case == "section-focus" {
                                 SideRow::Section(0)
                             } else {
-                                SideRow::Ws(1)
+                                SideRow::Task(1)
                             };
                             if matches!(case, "focus" | "section-focus") {
                                 s.sidebar_focus.focus(w, cx);

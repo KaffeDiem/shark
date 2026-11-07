@@ -200,7 +200,7 @@ fn skills_link_into_the_root_and_archive_with_it() {
     let _ = fs::remove_dir_all(&root);
     let (api, web) = (init_repo(&root, "api"), init_repo(&root, "web"));
     let dir = root.join("ws/feat");
-    let ws = create_workspace(&dir, "feat", "feat", &on_branch(&[api, web], "feat")).unwrap();
+    let ws = create_task(&dir, "feat", "feat", &on_branch(&[api, web], "feat")).unwrap();
     let skill = |repo: &str, src: &str, name: &str| {
         let p = dir.join(repo).join(src).join(name);
         fs::create_dir_all(&p).unwrap();
@@ -254,7 +254,7 @@ fn skills_link_into_the_root_and_archive_with_it() {
     reconcile_skills(&ws, &dir, false);
     assert!(!dir.join(".agents").exists());
     reconcile_skills(&ws, &dir, true);
-    remove_workspace(&ws, &dir, false).unwrap();
+    remove_task(&ws, &dir, false).unwrap();
     assert!(!dir.exists());
 }
 
@@ -262,10 +262,10 @@ fn skills_link_into_the_root_and_archive_with_it() {
 fn skills_preserve_user_links_and_avoid_name_collisions() {
     let dir = std::env::temp_dir().join(format!("shark-skill-ownership-{}", std::process::id()));
     let _ = fs::remove_dir_all(&dir);
-    let ws = Workspace {
+    let ws = Task {
         repos: ["api", "web"]
             .into_iter()
-            .map(|name| WsRepo {
+            .map(|name| TaskRepo {
                 name: name.into(),
                 src: dir.join(name),
                 base: "HEAD".into(),
@@ -343,8 +343,8 @@ fn waiting_skill_refresh_observes_disabled_preference() {
     let skill = dir.join("api/.agents/skills/deploy");
     fs::create_dir_all(&skill).unwrap();
     fs::write(skill.join("SKILL.md"), "hi").unwrap();
-    let ws = Workspace {
-        repos: vec![WsRepo {
+    let ws = Task {
+        repos: vec![TaskRepo {
             name: "api".into(),
             src: dir.join("api"),
             base: "HEAD".into(),
@@ -380,7 +380,7 @@ fn waiting_skill_refresh_observes_disabled_preference() {
 fn skills_never_follow_user_directory_symlinks() {
     let root = std::env::temp_dir().join(format!("shark-skill-dirs-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
-    let ws = Workspace::default();
+    let ws = Task::default();
     for name in [AGENTS_DIR, SKILL_LINKS] {
         let dir = root.join(name.replace('/', "-"));
         let external = dir.join("external");
@@ -467,7 +467,7 @@ fn pr_checkout_uses_exact_tip_base_and_rolls_back() {
     let picked = [(repo.clone(), "pr/7".into())];
     let prs = [(repo.name.clone(), pr.clone())];
     let dir = root.join("ws/review");
-    let ws = create_workspace_with_prs(&dir, "review", "pr/7", &picked, &prs, &[]).unwrap();
+    let ws = create_task_with_prs(&dir, "review", "pr/7", &picked, &prs, &[]).unwrap();
     let wt = dir.join("api");
     assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), tip);
     assert_eq!(git(&wt, &["rev-parse", &ws.repos[0].base]).unwrap(), base);
@@ -482,7 +482,7 @@ fn pr_checkout_uses_exact_tip_base_and_rolls_back() {
     );
     let collision = root.join("ws/collision");
     assert!(
-        create_workspace_with_prs(&collision, "collision", "pr/7", &picked, &prs, &[])
+        create_task_with_prs(&collision, "collision", "pr/7", &picked, &prs, &[])
             .err()
             .unwrap()
             .contains("already exists")
@@ -499,7 +499,7 @@ fn pr_checkout_uses_exact_tip_base_and_rolls_back() {
     )];
     let failed = root.join("ws/missing");
     assert!(
-        create_workspace_with_prs(
+        create_task_with_prs(
             &failed,
             "missing",
             "pr/404",
@@ -517,7 +517,7 @@ fn pr_checkout_uses_exact_tip_base_and_rolls_back() {
         (other, "blocked/child".into()),
     ];
     assert!(
-        create_workspace_with_prs(&failed, "rollback", "review-again", &picked, &prs, &[]).is_err()
+        create_task_with_prs(&failed, "rollback", "review-again", &picked, &prs, &[]).is_err()
     );
     assert!(!failed.exists() && !has_ref(&repo.path, "refs/heads/review-again"));
     assert_eq!(review_pr_url(&repo.path, "review-again"), None);
@@ -580,7 +580,7 @@ fn review_base_refresh_follows_target_and_preserves_worktree() {
         base: "release".into(),
     };
     let dir = root.join("ws/review");
-    let ws = create_workspace_with_prs(
+    let ws = create_task_with_prs(
         &dir,
         "review",
         "review-7",
@@ -668,7 +668,7 @@ fn stacked_diff_uses_target_merge_base_and_preserves_index() {
     )
     .unwrap();
     let dir = root.join("ws/child");
-    let mut ws = create_workspace_with_prs(
+    let mut ws = create_task_with_prs(
         &dir,
         "child",
         "child",
@@ -729,12 +729,12 @@ fn stacked_diff_uses_target_merge_base_and_preserves_index() {
 }
 
 #[test]
-fn workspace_roundtrip() {
+fn task_roundtrip() {
     let root = std::env::temp_dir().join(format!("shark-test-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let repos = vec![init_repo(&root, "api"), init_repo(&root, "web")];
     let dir = root.join("ws/feat");
-    let ws = create_workspace(&dir, "feat", "feat-x", &on_branch(&repos, "feat-x")).unwrap();
+    let ws = create_task(&dir, "feat", "feat-x", &on_branch(&repos, "feat-x")).unwrap();
 
     assert_eq!(
         git(&dir.join("api"), &["branch", "--show-current"]).unwrap(),
@@ -752,7 +752,7 @@ fn workspace_roundtrip() {
         "{agents}"
     );
     assert!(
-        create_workspace(
+        create_task(
             &root.join("ws/other"),
             "other",
             "feat-x",
@@ -768,7 +768,7 @@ fn workspace_roundtrip() {
     git(api, &["remote", "add", "origin", &origin.to_string_lossy()]).unwrap();
     git(api, &["push", "-q", "origin", "main"]).unwrap();
     git(api, &["checkout", "-q", "-b", "side"]).unwrap();
-    let other = create_workspace(
+    let other = create_task(
         &root.join("ws/other"),
         "other",
         "feat-y",
@@ -776,10 +776,10 @@ fn workspace_roundtrip() {
     )
     .unwrap();
     assert_eq!(other.repos[0].base, "origin/main");
-    remove_workspace(&other, &root.join("ws/other"), true).unwrap();
+    remove_task(&other, &root.join("ws/other"), true).unwrap();
 
     fs::write(dir.join("web/dirty.txt"), "x\n").unwrap();
-    let err = remove_workspace(&ws, &dir, false).unwrap_err();
+    let err = remove_task(&ws, &dir, false).unwrap_err();
     assert!(err.contains("web") && !err.contains("api"), "{err}");
     assert!(
         dir.join("api/README.md").exists(),
@@ -813,11 +813,11 @@ fn workspace_roundtrip() {
 
     fs::write(dir.join("notes.md"), "mine\n").unwrap();
     assert!(
-        remove_workspace(&ws, &dir, false).is_err(),
+        remove_task(&ws, &dir, false).is_err(),
         "unexpected root file blocks non-forced archive"
     );
     assert!(dir.join("notes.md").exists());
-    remove_workspace(&ws, &dir, true).unwrap();
+    remove_task(&ws, &dir, true).unwrap();
     assert!(!dir.exists());
     assert!(
         !git(&repos[0].path, &["worktree", "list"])
@@ -869,7 +869,7 @@ fn per_repo_branches() {
 
     // api on an origin-only branch, web on the new one.
     let dir = root.join("ws/feat");
-    let ws = create_workspace(
+    let ws = create_task(
         &dir,
         "feat",
         "feat",
@@ -899,7 +899,7 @@ fn per_repo_branches() {
     assert!(get("HEAD").is_none(), "origin/HEAD is dropped");
 
     // A branch checked out in the source checkout is refused; nothing is left behind.
-    let err = create_workspace(
+    let err = create_task(
         &root.join("ws/m"),
         "m",
         "m",
@@ -922,7 +922,7 @@ fn per_repo_branches() {
 
     // A local branch behind origin is fast-forwarded first.
     let b = root.join("ws/b");
-    let bws = create_workspace(
+    let bws = create_task(
         &b,
         "b",
         "behind",
@@ -930,10 +930,10 @@ fn per_repo_branches() {
     )
     .unwrap();
     assert_eq!(git(&b.join("api"), &["rev-parse", "HEAD"]).unwrap(), tip);
-    remove_workspace(&bws, &b, true).unwrap();
+    remove_task(&bws, &b, true).unwrap();
 
     // Archive deletes each repo's own branch.
-    remove_workspace(&ws, &dir, true).unwrap();
+    remove_task(&ws, &dir, true).unwrap();
     let x_head = git(a, &["rev-parse", "kd/x"]).unwrap();
     let merged = [("api".into(), x_head), ("web".into(), "moved".into())];
     assert_eq!(delete_merged_branches(&ws, &merged), ["api"]);
@@ -950,7 +950,7 @@ fn per_repo_branches() {
 
 /// A new branch stacked on a parent starts at `origin/<parent>` (never the local parent's
 /// unpushed commits), targets it, and records it as its parent tip; another repo of the same
-/// workspace stays on its trunk. An unpushed or missing parent (a fork's PR) or an existing
+/// task stays on its trunk. An unpushed or missing parent (a fork's PR) or an existing
 /// branch name refuses and leaves nothing behind.
 #[test]
 fn stacks_new_branches_on_a_parent() {
@@ -986,7 +986,7 @@ fn stacks_new_branches_on_a_parent() {
     git(a, &["push", "-q", "origin", "remote"]).unwrap();
     remote_tip.push_str(&git(a, &["rev-parse", "remote"]).unwrap());
     git(a, &["branch", "-q", "-D", "remote"]).unwrap();
-    // Local is ahead of origin: your own parent workspace with an unpushed commit.
+    // Local is ahead of origin: your own parent task with an unpushed commit.
     branch("ahead", &|| {
         empty_commit(a, "pushed");
         git(a, &["push", "-q", "origin", "ahead"]).unwrap();
@@ -1013,7 +1013,7 @@ fn stacks_new_branches_on_a_parent() {
         let name = format!("on-{parent}");
         let dir = root.join("ws").join(&name);
         let parents = [("api".to_string(), parent.to_string())];
-        let ws = create_workspace_with_prs(
+        let ws = create_task_with_prs(
             &dir,
             &name,
             &name,
@@ -1045,7 +1045,7 @@ fn stacks_new_branches_on_a_parent() {
         let dir = root.join("ws").join(name);
         let parents = [("api".to_string(), parent.to_string())];
         let picked = on_branch(&[web.clone(), api.clone()], name);
-        let err = create_workspace_with_prs(&dir, name, name, &picked, &[], &parents)
+        let err = create_task_with_prs(&dir, name, name, &picked, &[], &parents)
             .err()
             .unwrap();
         assert!(err.contains(want), "{err}");
@@ -1085,7 +1085,7 @@ fn per_repo_branch_edges() {
     let mine = empty_commit(a, "mine");
     git(a, &["checkout", "-q", "main"]).unwrap();
     let d = root.join("ws/d");
-    let dws = create_workspace(
+    let dws = create_task(
         &d,
         "d",
         "div",
@@ -1094,12 +1094,12 @@ fn per_repo_branch_edges() {
     .unwrap();
     assert_eq!(git(&d.join("api"), &["rev-parse", "HEAD"]).unwrap(), mine);
     assert_eq!(git(a, &["rev-parse", "origin/div"]).unwrap(), theirs);
-    remove_workspace(&dws, &d, true).unwrap();
+    remove_task(&dws, &d, true).unwrap();
 
-    // The same existing branch in both repos, under another workspace name: each checks
+    // The same existing branch in both repos, under another task name: each checks
     // out its own, and CLAUDE.md names the one they share.
     let s = root.join("ws/s");
-    let mut sws = create_workspace(
+    let mut sws = create_task(
         &s,
         "s",
         "s",
@@ -1123,9 +1123,9 @@ fn per_repo_branch_edges() {
         md.contains("worktree on branch `shared`:") && !md.contains(" on `"),
         "{md}"
     );
-    // A repo added later gets the workspace branch, and CLAUDE.md now tells them apart.
+    // A repo added later gets the task branch, and CLAUDE.md now tells them apart.
     let cli = init_repo(&root, "cli");
-    sws = add_to_workspace(&sws, &s, &cli, &sws.branch, None).unwrap();
+    sws = add_to_task(&sws, &s, &cli, &sws.branch, None).unwrap();
     assert_eq!(
         git(&s.join("cli"), &["branch", "--show-current"]).unwrap(),
         "s"
@@ -1136,12 +1136,12 @@ fn per_repo_branch_edges() {
         md.contains(" on `shared` ") && md.contains(" on `s` "),
         "{md}"
     );
-    remove_workspace(&sws, &s, true).unwrap();
+    remove_task(&sws, &s, true).unwrap();
 
     // A ref clash (`kd` exists, `kd/y` can't): everything is rolled back.
     git(a, &["branch", "kd"]).unwrap();
     let c = root.join("ws/c");
-    let err = create_workspace(
+    let err = create_task(
         &c,
         "c",
         "c",
@@ -1170,7 +1170,7 @@ fn per_repo_branch_edges() {
     }
 
     // An invalid name for any repo is refused before anything happens.
-    let err = create_workspace(
+    let err = create_task(
         &root.join("ws/bad"),
         "bad",
         "ok",
@@ -1212,7 +1212,7 @@ fn branch_reuse_add_repo_and_blockers() {
     // Origin-only: reused from origin, without tracking it.
     let dir = root.join("ws/r");
     let on = on_branch(&repos[..1], "remote-only");
-    let ws = create_workspace(&dir, "r", "remote-only", &on).unwrap();
+    let ws = create_task(&dir, "r", "remote-only", &on).unwrap();
     let wt = dir.join("api");
     assert_eq!(
         git(&wt, &["branch", "--show-current"]).unwrap(),
@@ -1223,9 +1223,9 @@ fn branch_reuse_add_repo_and_blockers() {
         "--no-track"
     );
 
-    // Local-only (an archived workspace's leftover): refused, and nothing is left behind.
+    // Local-only (an archived task's leftover): refused, and nothing is left behind.
     let on = on_branch(&repos, "local-only");
-    let err = create_workspace(&root.join("ws/l"), "l", "local-only", &on)
+    let err = create_task(&root.join("ws/l"), "l", "local-only", &on)
         .err()
         .unwrap();
     assert!(err.contains("api: a local branch"), "{err}");
@@ -1244,12 +1244,12 @@ fn branch_reuse_add_repo_and_blockers() {
     let wip = git(api, &["rev-parse", "HEAD"]).unwrap();
     git(api, &["checkout", "-q", "main"]).unwrap();
     let u = root.join("ws/u");
-    let uws = create_workspace(&u, "u", "unpushed", &on_branch(&repos[..1], "unpushed")).unwrap();
+    let uws = create_task(&u, "u", "unpushed", &on_branch(&repos[..1], "unpushed")).unwrap();
     assert_eq!(git(&u.join("api"), &["rev-parse", "HEAD"]).unwrap(), wip);
-    remove_workspace(&uws, &u, true).unwrap();
+    remove_task(&uws, &u, true).unwrap();
 
     // A third repo joins on the same branch; CLAUDE.md lists it.
-    let ws = add_to_workspace(&ws, &dir, &repos[1], &ws.branch, None).unwrap();
+    let ws = add_to_task(&ws, &dir, &repos[1], &ws.branch, None).unwrap();
     assert_eq!(
         git(&dir.join("web"), &["branch", "--show-current"]).unwrap(),
         "remote-only"
@@ -1260,14 +1260,14 @@ fn branch_reuse_add_repo_and_blockers() {
             .contains("@web/CLAUDE.md")
     );
     assert!(
-        add_to_workspace(&ws, &dir, &repos[1], &ws.branch, None).is_err(),
+        add_to_task(&ws, &dir, &repos[1], &ws.branch, None).is_err(),
         "already in it"
     );
 
     // A locked worktree blocks archive up front: the other repo stays.
     git(api, &["worktree", "lock", &wt.to_string_lossy()]).unwrap();
     for force in [false, true] {
-        let err = remove_workspace(&ws, &dir, force).unwrap_err();
+        let err = remove_task(&ws, &dir, force).unwrap_err();
         assert!(err.contains("api: locked"), "{err}");
         assert!(dir.join("web/README.md").exists());
     }
@@ -1283,10 +1283,10 @@ fn branch_reuse_add_repo_and_blockers() {
         ],
     )
     .unwrap();
-    let err = remove_workspace(&ws, &dir, false).unwrap_err();
+    let err = remove_task(&ws, &dir, false).unwrap_err();
     assert!(err.contains("web: has submodules"), "{err}");
     assert!(dir.join("api/README.md").exists());
-    remove_workspace(&ws, &dir, true).unwrap();
+    remove_task(&ws, &dir, true).unwrap();
     fs::remove_dir_all(&root).unwrap();
 }
 
@@ -1298,10 +1298,10 @@ fn default_base_skips_pruned_origin_head() {
     let origin = root.join("origin.git");
     git(&root, &["init", "-q", "--bare", &origin.to_string_lossy()]).unwrap();
     let api = &repo.path;
-    // No origin: the current branch is no trunk, but a new workspace still gets a base.
+    // No origin: the current branch is no trunk, but a new task still gets a base.
     assert_eq!(default_base(api), "");
     let dir = root.join("ws/feat");
-    let ws = create_workspace(
+    let ws = create_task(
         &dir,
         "feat",
         "feat",
@@ -1339,7 +1339,7 @@ fn archive_refusal_is_preflighted_and_tolerates_finder_and_moved_source() {
     let _ = fs::remove_dir_all(&root);
     let repo = init_repo(&root, "api");
     let dir = root.join("ws/feat");
-    let ws = create_workspace(
+    let ws = create_task(
         &dir,
         "feat",
         "feat",
@@ -1357,12 +1357,12 @@ fn archive_refusal_is_preflighted_and_tolerates_finder_and_moved_source() {
     // Finder litter alone doesn't block a clean archive.
     fs::write(dir.join(".DS_Store"), "x").unwrap();
     archive_preflight(&ws, &dir, false).unwrap();
-    remove_workspace(&ws, &dir, false).unwrap();
+    remove_task(&ws, &dir, false).unwrap();
     assert!(!dir.exists());
 
-    // Force still removes the workspace when its source repo was moved away.
+    // Force still removes the task when its source repo was moved away.
     let dir = root.join("ws/feat2");
-    let ws = create_workspace(
+    let ws = create_task(
         &dir,
         "feat2",
         "feat2",
@@ -1370,20 +1370,20 @@ fn archive_refusal_is_preflighted_and_tolerates_finder_and_moved_source() {
     )
     .unwrap();
     fs::rename(&repo.path, root.join("moved")).unwrap();
-    assert!(remove_workspace(&ws, &dir, false).is_err());
+    assert!(remove_task(&ws, &dir, false).is_err());
     assert!(dir.join("api/README.md").exists());
-    remove_workspace(&ws, &dir, true).unwrap();
+    remove_task(&ws, &dir, true).unwrap();
     assert!(!dir.exists());
     fs::remove_dir_all(root).unwrap();
 }
 
 #[test]
-fn hand_deleted_workspace_dir_frees_its_branch() {
+fn hand_deleted_task_dir_frees_its_branch() {
     let root = std::env::temp_dir().join(format!("shark-prunable-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let repo = init_repo(&root, "api");
     let dir = root.join("ws/feat");
-    create_workspace(
+    create_task(
         &dir,
         "feat",
         "feat",
@@ -1404,7 +1404,7 @@ fn hand_deleted_workspace_dir_frees_its_branch() {
         None,
         "prunable entry doesn't hold the branch"
     );
-    create_workspace(&dir, "feat", "feat", &on_branch(&[repo], "feat")).unwrap();
+    create_task(&dir, "feat", "feat", &on_branch(&[repo], "feat")).unwrap();
     fs::remove_dir_all(root).unwrap();
 }
 
@@ -1492,11 +1492,11 @@ fn git_bytes_keeps_whitespace_and_git_trims() {
 
 /// An empty agent gets its directory and docs; an existing path is left alone.
 #[test]
-fn empty_workspace_says_no_repositories_are_attached() {
+fn empty_task_says_no_repositories_are_attached() {
     let root = std::env::temp_dir().join(format!("shark-empty-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let dir = root.join("agent-1");
-    let ws = create_empty_workspace(&dir, "agent-1", "Plan it").unwrap();
+    let ws = create_empty_task(&dir, "agent-1", "Plan it").unwrap();
     assert_eq!(
         (ws.branch.as_str(), ws.title.as_str()),
         ("agent-1", "Plan it")
@@ -1509,11 +1509,11 @@ fn empty_workspace_says_no_repositories_are_attached() {
         assert!(!text.contains("worktree"), "{text}");
     }
     fs::write(dir.join("keep"), "x").unwrap();
-    assert!(create_empty_workspace(&dir, "agent-1", "").is_err());
+    assert!(create_empty_task(&dir, "agent-1", "").is_err());
     assert_eq!(fs::read_to_string(dir.join("keep")).unwrap(), "x");
     // Nothing of a repo to clean up, and no worktree stops it.
     fs::remove_file(dir.join("keep")).unwrap();
-    remove_workspace(&ws, &dir, false).unwrap();
+    remove_task(&ws, &dir, false).unwrap();
     assert!(!dir.exists());
     fs::remove_dir_all(&root).unwrap();
 }
@@ -1524,9 +1524,9 @@ fn tmp(tag: &str) -> PathBuf {
     root
 }
 
-fn empty_agent(root: &Path, name: &str) -> (Workspace, PathBuf) {
+fn empty_agent(root: &Path, name: &str) -> (Task, PathBuf) {
     let dir = root.join("ws").join(name);
-    (create_empty_workspace(&dir, name, name).unwrap(), dir)
+    (create_empty_task(&dir, name, name).unwrap(), dir)
 }
 
 /// The fresh path takes the branch and base it's given, and the first repo's branch becomes the
@@ -1537,11 +1537,11 @@ fn fresh_attach_takes_branch_and_base() {
     let (api, web) = (init_repo(&root, "api"), init_repo(&root, "web"));
     let (ws, dir) = empty_agent(&root, "agent-1");
     git(&web.path, &["branch", "develop"]).unwrap();
-    let ws = add_to_workspace(&ws, &dir, &api, "login-1", Some("")).unwrap();
+    let ws = add_to_task(&ws, &dir, &api, "login-1", Some("")).unwrap();
     assert_eq!(ws.branch, "login-1");
     assert_eq!(ws.repos[0].branch, None);
     assert_eq!(ws.repos[0].base, "main");
-    let ws = add_to_workspace(&ws, &dir, &web, "mine", Some("develop")).unwrap();
+    let ws = add_to_task(&ws, &dir, &web, "mine", Some("develop")).unwrap();
     assert_eq!(ws.branch, "login-1");
     assert_eq!(ws.repos[1].branch.as_deref(), Some("mine"));
     assert_eq!(ws.repos[1].base, "develop");
@@ -1584,16 +1584,16 @@ fn fresh_attach_refuses_existing_branches() {
         ("new", "no-such-base"),
         ("bad..name", ""),
     ] {
-        let e = add_to_workspace(&ws, &dir, &api, branch, Some(base)).err();
+        let e = add_to_task(&ws, &dir, &api, branch, Some(base)).err();
         assert!(e.is_some(), "{branch} {base}");
         assert!(!dir.join("api").exists(), "{branch} {base}");
         assert_eq!(refs(&api.path), before, "{branch} {base}");
     }
-    let e = add_to_workspace(&ws, &dir, &api, "remote-only", Some(""))
+    let e = add_to_task(&ws, &dir, &api, "remote-only", Some(""))
         .err()
         .unwrap();
     assert!(e.message.contains("already exists"), "{e:?}");
-    let ws = add_to_workspace(&ws, &dir, &api, "remote-only", None).unwrap();
+    let ws = add_to_task(&ws, &dir, &api, "remote-only", None).unwrap();
     assert_eq!(ws.branch, "remote-only", "the explicit path keeps working");
     let _ = fs::remove_dir_all(root);
 }
@@ -1605,13 +1605,13 @@ fn fresh_attach_rolls_back_only_what_it_made() {
     let root = tmp("fresh-rollback");
     let (api, web) = (init_repo(&root, "api"), init_repo(&root, "web"));
     let (ws, dir) = empty_agent(&root, "agent-1");
-    let ws = add_to_workspace(&ws, &dir, &api, "b", Some("")).unwrap();
+    let ws = add_to_task(&ws, &dir, &api, "b", Some("")).unwrap();
     fs::write(dir.join("api/work.txt"), "unsaved").unwrap();
     git(&web.path, &["branch", "theirs"]).unwrap();
     // The root docs can't be written.
     fs::remove_file(dir.join("AGENTS.md")).unwrap();
     fs::create_dir(dir.join("AGENTS.md")).unwrap();
-    let e = add_to_workspace(&ws, &dir, &web, "b", Some(""))
+    let e = add_to_task(&ws, &dir, &web, "b", Some(""))
         .err()
         .unwrap();
     assert!(!e.message.is_empty() && !e.preserved);
@@ -1637,9 +1637,9 @@ fn find_attachment_tells_states_apart() {
     let root = tmp("find-attachment");
     let api = init_repo(&root, "api");
     let name = format!("find-{}", std::process::id());
-    let dir = crate::state::workspaces_dir().join(&name);
+    let dir = crate::state::tasks_dir().join(&name);
     let _ = fs::remove_dir_all(&dir);
-    let ws = create_empty_workspace(&dir, &name, &name).unwrap();
+    let ws = create_empty_task(&dir, &name, &name).unwrap();
     let a = Attachment::fresh(&api, "feat", "");
     assert!(matches!(find_attachment(&ws, &a), Found::Nothing));
 
@@ -1671,7 +1671,7 @@ fn find_attachment_tells_states_apart() {
     git(&api.path, &["worktree", "remove", &wt]).unwrap();
     git(&api.path, &["branch", "-D", "feat"]).unwrap();
 
-    add_to_workspace(&ws, &dir, &api, "feat", Some("")).unwrap();
+    add_to_task(&ws, &dir, &api, "feat", Some("")).unwrap();
     // The default was main when creation finished; recovery must not take the source's new HEAD.
     git(&api.path, &["checkout", "-q", "-b", "source-moved"]).unwrap();
     let Found::Worktree(found) = find_attachment(&ws, &a) else {

@@ -74,7 +74,7 @@ pub(super) fn summarize(input: &Value, root: &str) -> String {
         .map(str::to_string)
         .unwrap_or_else(|| input.to_string());
     let s = s.lines().next().unwrap_or_default();
-    // Paths inside the workspace read better as repo/file.
+    // Paths inside the task read better as repo/file.
     let s = s
         .strip_prefix(root)
         .map_or(s, |r| r.trim_start_matches('/'));

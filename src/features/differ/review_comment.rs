@@ -197,7 +197,7 @@ pub(crate) fn fenced(s: &str, info: &str) -> String {
 /// revision and the lines as they were, and the agent is asked to report back per id.
 pub(crate) fn prompt(comments: &[Comment], note: &str) -> String {
     let mut out = String::from(
-        "Review comments on the diff. Paths are workspace-relative; \"(old)\" is a line number \
+        "Review comments on the diff. Paths are task-relative; \"(old)\" is a line number \
          in the base version (a removed line). Each comment quotes the lines as they were when \
          it was written. Address each comment:\n",
     );

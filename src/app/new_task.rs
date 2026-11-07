@@ -21,13 +21,13 @@ pub(super) struct AttachTo {
     pub(super) used: HashMap<String, String>,
 }
 
-/// Contents of the New workspace dialog: a branch name and a filterable repo picker.
+/// Contents of the New task dialog: a branch name and a filterable repo picker.
 /// Starts with the last-used repos ticked and floated to the top, so the common case
 /// is type a branch, enter. cmd-b swaps the list for a repo's branches, to check one out
 /// there instead of the new branch, or (alt-enter) to branch from it: a stack.
-pub(super) struct NewWorkspaceForm {
+pub(super) struct NewTaskForm {
     pub(super) branch: Entity<InputState>,
-    /// Home's prompt, sent once the workspace is created.
+    /// Home's prompt, sent once the task is created.
     first: Option<String>,
     picker: Entity<CommandState>,
     repos: Vec<Repo>,
@@ -42,7 +42,7 @@ pub(super) struct NewWorkspaceForm {
     chosen_pr: Vec<Option<complete::Pr>>,
     /// Per repo: the branch the new branch is based on (stacked on), instead of the trunk.
     from: Vec<Option<String>>,
-    /// "Insert workspace below…": the workspace to stack on the new one once it exists.
+    /// "Insert task below…": the task to stack on the new one once it exists.
     insert: Option<String>,
     /// Attach repository: the agent the repos join, instead of a new one. Enter attaches the
     /// marked repos, or the highlighted one with none marked; cmd-b swaps the list for its branch and base, and the
@@ -79,9 +79,9 @@ impl Mode {
     }
 }
 
-impl NewWorkspaceForm {
+impl NewTaskForm {
     /// `from` bases repos' new branch on another branch, `(repo, parent)`; `insert` names the
-    /// workspace that moves on top of the new one.
+    /// task that moves on top of the new one.
     #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         mut repos: Vec<Repo>,
@@ -130,7 +130,7 @@ impl NewWorkspaceForm {
                     .map(|(_, p)| p.clone())
             })
             .collect();
-        let form = NewWorkspaceForm {
+        let form = NewTaskForm {
             from,
             insert,
             attach,
@@ -501,7 +501,7 @@ impl NewWorkspaceForm {
         self.back(window, cx);
     }
 
-    /// The workspace's name and branch: the typed one, else the first picked existing branch
+    /// The task's name and branch: the typed one, else the first picked existing branch
     /// when every ticked repo has one.
     fn primary(&self, cx: &App) -> Option<String> {
         let typed = self.branch.read(cx).value().trim().to_string();
@@ -778,14 +778,14 @@ impl NewWorkspaceForm {
         let insert = self.insert.clone();
         self.shark
             .update(cx, |s, cx| {
-                s.create_workspace_on(branch, repos, prs, parents, insert, prompt, window, cx)
+                s.create_task_on(branch, repos, prs, parents, insert, prompt, window, cx)
             })
             .ok();
         true
     }
 }
 
-impl Render for NewWorkspaceForm {
+impl Render for NewTaskForm {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let (muted, faint) = (theme.muted_foreground, faint(theme));
@@ -852,7 +852,7 @@ impl Render for NewWorkspaceForm {
                 .collect(),
             Mode::Branches(ix) | Mode::Bases(ix) => {
                 let list = self.branches[ix].clone().unwrap_or_default();
-                let new = CommandItem::new().label("New branch (agent name)");
+                let new = CommandItem::new().label("New branch (task name)");
                 (matches!(self.mode, Mode::Branches(_))
                     .then_some(new)
                     .into_iter())
@@ -994,7 +994,7 @@ impl Render for NewWorkspaceForm {
                 .update(cx, |p, cx| p.set_selected_index(at, window, cx));
         }
         let form = v_flex()
-            .key_context("NewWorkspace")
+            .key_context("NewTask")
             .on_action(cx.listener(|this, _: &SwitchField, window, cx| {
                 if this.attach.is_some() {
                     return this.attach_tab(window, cx);
@@ -1042,7 +1042,7 @@ impl Render for NewWorkspaceForm {
                 cx.listener(|this, _: &BranchFromSource, window, cx| this.branch_from(window, cx)),
             )
             .on_action(
-                cx.listener(|this, _: &RefreshWorkspaceSources, window, cx| {
+                cx.listener(|this, _: &RefreshTaskSources, window, cx| {
                     this.refresh(true, window, cx);
                 }),
             )
@@ -1068,7 +1068,7 @@ impl Render for NewWorkspaceForm {
             .child({
                 // As `create_workspace` names it.
                 let name = self.primary(cx).unwrap_or_default().replace('/', "-");
-                let dir = workspaces_dir().join(if name.is_empty() { "<name>" } else { &name });
+                let dir = tasks_dir().join(if name.is_empty() { "<name>" } else { &name });
                 div()
                     .text_xs()
                     .text_color(faint)
@@ -1077,7 +1077,7 @@ impl Render for NewWorkspaceForm {
             })
             .children(self.insert.as_ref().map(|child| {
                 let shark = self.shark.upgrade();
-                let child = shark.map_or(child.clone(), |s| s.read(cx).ws_title(child));
+                let child = shark.map_or(child.clone(), |s| s.read(cx).task_title(child));
                 div().text_xs().text_color(muted).child(format!(
                     "Inserted below `{child}`: {child} will be stacked on it"
                 ))
@@ -1179,7 +1179,7 @@ fn row() -> Div {
 
 /// Attach repository's rows, keys and layout. They follow the issue picker: search on top, a flat
 /// list, keys below.
-impl NewWorkspaceForm {
+impl NewTaskForm {
     fn repo_items(&self, cx: &mut Context<Self>) -> Vec<CommandItem> {
         let entity = cx.entity().downgrade();
         let repos = (0..self.repos.len()).map(|i| {
@@ -1474,7 +1474,7 @@ impl NewWorkspaceForm {
                         .flex_none()
                         .text_xs()
                         .text_color(muted)
-                        .child("Follows the agent's branch"),
+                        .child("Follows the task's branch"),
                 )
             })
             .child(div().flex_1())
@@ -1545,7 +1545,7 @@ impl NewWorkspaceForm {
                 .test_support()
                 .text_xs()
                 .text_color(cx.theme().muted_foreground)
-                .child("Follows the agent's branch"),
+                .child("Follows the task's branch"),
         )
     }
 

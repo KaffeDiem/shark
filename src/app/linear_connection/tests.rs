@@ -32,23 +32,23 @@ fn fake_keychain() -> Keychain {
     Keychain {
         read: |_| {
             log("read");
-            Task::ready(Ok(STORED.lock().unwrap().clone()))
+            gpui_kit::Task::ready(Ok(STORED.lock().unwrap().clone()))
         },
         write: |_, c| {
             log("write");
             if WRITE_FAILS.load(Ordering::Relaxed) {
-                return Task::ready(Err(anyhow::anyhow!("keychain Update failed")));
+                return gpui_kit::Task::ready(Err(anyhow::anyhow!("keychain Update failed")));
             }
             *STORED.lock().unwrap() = Some(c.clone());
-            Task::ready(Ok(()))
+            gpui_kit::Task::ready(Ok(()))
         },
         delete: |_| {
             log("delete");
             if let Some(e) = *DELETE_ERROR.lock().unwrap() {
-                return Task::ready(Err(anyhow::anyhow!(e)));
+                return gpui_kit::Task::ready(Err(anyhow::anyhow!(e)));
             }
             *STORED.lock().unwrap() = None;
-            Task::ready(Ok(()))
+            gpui_kit::Task::ready(Ok(()))
         },
     }
 }
@@ -485,7 +485,7 @@ async fn a_failed_sign_in_reaches_the_user_with_settings_closed(cx: &mut TestApp
     let (window, shark) = setup(cx, None);
     cx.update_window(window, |_, w, cx| {
         shark.update(cx, |s, cx| {
-            let failed = Task::ready(Err(Error::TimedOut));
+            let failed = gpui_kit::Task::ready(Err(Error::TimedOut));
             s.linear_adopt(failed, Method::OAuth, w, cx).detach();
         });
     })
@@ -720,7 +720,7 @@ async fn disconnect_asks_first(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn replacing_a_workspace_warns_and_can_be_declined(cx: &mut TestAppContext) {
+async fn replacing_a_task_warns_and_can_be_declined(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (_, shark) = setup(cx, None);
     use_key(cx, &shark, KEY);
@@ -739,7 +739,7 @@ async fn replacing_a_workspace_warns_and_can_be_declined(cx: &mut TestAppContext
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn reconnecting_the_same_workspace_doesnt_warn(cx: &mut TestAppContext) {
+async fn reconnecting_the_same_task_doesnt_warn(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (_, shark) = setup(cx, None);
     use_key(cx, &shark, KEY);

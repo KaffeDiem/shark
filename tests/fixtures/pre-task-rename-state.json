@@ -1,0 +1,78 @@
+{
+  "reviewed": {},
+  "merge_order": {},
+  "delete_remote_branches": false,
+  "repos": [],
+  "workspaces": [
+    {
+      "last_interacted_at": null,
+      "name": "agent-123",
+      "title": "New agent",
+      "branch": "agent-123",
+      "repos": [],
+      "linear": {
+        "refs": [],
+        "primary": 0
+      },
+      "chats": [
+        {
+          "id": "agent-123",
+          "title": "",
+          "session_id": null,
+          "model": null
+        }
+      ],
+      "closed": [],
+      "active_chat": 0,
+      "diff_closed": true,
+      "git_closed": true,
+      "viewed": {},
+      "tab_order": [
+        {
+          "chat": "agent-123"
+        },
+        {
+          "file": "api/README.md"
+        }
+      ]
+    }
+  ],
+  "vim": false,
+  "editor_font_size": null,
+  "last_repos": [],
+  "recent_apps": [],
+  "last_open": null,
+  "appearance": {
+    "mode": "system",
+    "light": "Linear",
+    "dark": "Linear",
+    "ui_font": null,
+    "mono_font": null
+  },
+  "prompts": {},
+  "sections": [
+    {
+      "name": "Work",
+      "icon": "folder",
+      "collapsed": false,
+      "workspaces": [
+        "agent-123"
+      ]
+    }
+  ],
+  "stay_awake": false,
+  "linear": null,
+  "no_repo_skills": false,
+  "opened_pr": false,
+  "approved_plan": false,
+  "home_checklist_dismissed": false,
+  "palette_used": false,
+  "last_seen_version": "",
+  "last_model": null,
+  "last_effort": null,
+  "unified": false,
+  "uncommitted_only": false,
+  "tree_width": null,
+  "sidebar_width": null,
+  "split_ratio": null
+}

@@ -1,10 +1,10 @@
 use super::*;
 use crate::state::RepoSettings;
 
-/// Repos live in Settings, not the sidebar; leaving for a new agent closes Settings too.
+/// Repos live in Settings, not the sidebar; leaving for a new task closes Settings too.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn repositories_page_lists_repos_and_new_agent_closes_settings(cx: &mut TestAppContext) {
+async fn repositories_page_lists_repos_and_new_task_closes_settings(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let home = test_home();
     let (window, shark) = boot(
@@ -40,10 +40,10 @@ async fn repositories_page_lists_repos_and_new_agent_closes_settings(cx: &mut Te
             w.try_find("settings-page").is_some(),
             "Settings stays underneath"
         );
-        w.click("repo-new-workspace", cx);
+        w.click("repo-new-task", cx);
         w.render_frame(cx);
         assert!(w.try_find("settings-page").is_none());
-        assert!(w.try_find("repo-new-workspace").is_none());
+        assert!(w.try_find("repo-new-task").is_none());
     })
     .unwrap();
 }
@@ -66,7 +66,7 @@ async fn pending_attachment_prevents_removing_its_repo(cx: &mut TestAppContext) 
         cx.update_window(window, |_, w, cx| {
             w.render_frame(cx);
             w.scroll(
-                "repo-new-workspace",
+                "repo-new-task",
                 ScrollDelta::Pixels(point(px(0.), px(-1000.))),
                 cx,
             );
@@ -91,7 +91,7 @@ async fn pending_attachment_prevents_removing_its_repo(cx: &mut TestAppContext) 
                 cx,
             );
             assert_eq!(
-                s.active_ws().unwrap().attaching[0].stage,
+                s.active_task().unwrap().attaching[0].stage,
                 crate::state::AttachStage::Queued
             );
         });
@@ -118,7 +118,7 @@ async fn pending_attachment_prevents_removing_its_repo(cx: &mut TestAppContext) 
 }
 
 /// A repo row opens its settings; its default model, setup, run (cmd-r) and archive scripts
-/// apply to workspaces with it.
+/// apply to tasks with it.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
 async fn repo_settings_scripts_and_model(cx: &mut TestAppContext) {
@@ -150,7 +150,7 @@ async fn repo_settings_scripts_and_model(cx: &mut TestAppContext) {
         w.click(("repo", 0usize), cx);
         w.render_frame(cx);
         assert!(
-            w.try_find("repo-new-workspace").is_some(),
+            w.try_find("repo-new-task").is_some(),
             "a repo row opens its settings"
         );
         w.close_all_dialogs(cx);
@@ -158,7 +158,7 @@ async fn repo_settings_scripts_and_model(cx: &mut TestAppContext) {
     .unwrap();
 
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "scripts".into(),
             git::on_branch(&repos, "scripts"),
             vec![],
@@ -174,7 +174,7 @@ async fn repo_settings_scripts_and_model(cx: &mut TestAppContext) {
     // Untracked files in the worktree would block archiving, so scripts write to the source.
     let wt = repos[0].path.clone();
     let model = |cx: &mut TestAppContext| {
-        cx.read(|cx| shark.read(cx).active_ws().unwrap().chats[0].model.clone())
+        cx.read(|cx| shark.read(cx).active_task().unwrap().chats[0].model.clone())
     };
     assert_eq!(
         model(cx).as_deref(),
@@ -211,10 +211,10 @@ async fn repo_settings_scripts_and_model(cx: &mut TestAppContext) {
         );
     }
 
-    on(cx, &|s, w, cx| s.archive_ws("scripts".into(), false, w, cx));
+    on(cx, &|s, w, cx| s.archive_task("scripts".into(), false, w, cx));
     press_in(window)(cx, &["enter"]);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).state.workspaces.is_empty()
+        shark.read(cx).state.tasks.is_empty()
     })
     .await;
     let archived = fs::read_to_string(repos[0].path.join("archived.txt")).unwrap();

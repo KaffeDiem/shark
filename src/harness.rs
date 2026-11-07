@@ -1,7 +1,7 @@
 //! Drives `claude -p` over its stream-json protocol, one long-lived process per chat. Chats on a
 //! codex model run `codex app-server` instead (`crate::codex`), mapped onto the same `Ev`s.
 use crate::codex;
-use crate::state::{ChatMeta, Workspace, support_dir};
+use crate::state::{ChatMeta, Task, support_dir};
 use crate::transcript::{
     append, compact, log_path, logs_dir, output, transcript_path, transcripts_dir,
 };
@@ -22,7 +22,7 @@ use std::{
 const PERMISSION_MODE: &str = "bypassPermissions";
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct Task {
+pub struct BackgroundTask {
     pub id: String,
     pub kind: String,
     pub description: String,
@@ -148,7 +148,7 @@ pub enum Ev {
         secs: u64,
     },
     /// Backgrounded tasks (subagents, shells) still running after the turn's result.
-    Background(Vec<Task>),
+    Background(Vec<BackgroundTask>),
     /// The turn was cut short by an `interrupt` control request; its result follows.
     Interrupted,
     /// claude asks whether a tool may run (`--permission-prompt-tool stdio`) and waits for
@@ -172,7 +172,7 @@ pub enum Ev {
 /// What claude's result says of a session it no longer has; codex's gone-thread error imitates it.
 pub const SESSION_GONE: &str = "No conversation found with session ID";
 
-pub struct Agent {
+pub struct Harness {
     pid: u32,
     /// Set once the reader thread has reaped the child, so we never signal a reused pid.
     exited: Arc<AtomicBool>,
@@ -209,7 +209,7 @@ fn term_each(live: &[(u32, Arc<AtomicBool>)]) {
     }
 }
 
-pub fn spawn(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receiver<Ev>)> {
+pub fn spawn(ws: &Task, chat: &ChatMeta) -> std::io::Result<(Harness, Receiver<Ev>)> {
     if chat.is_codex() {
         return codex::spawn(ws, chat);
     }
@@ -249,7 +249,7 @@ const SIDE_PROMPT: &str = "The user is asking a quick side question about this c
 
 /// A side question: a throwaway fork of the chat's session with no tools, saved nowhere, so the
 /// chat itself never sees it. Works while the chat's own turn runs.
-pub fn spawn_side(ws: &Workspace, chat: &ChatMeta) -> std::io::Result<(Agent, Receiver<Ev>)> {
+pub fn spawn_side(ws: &Task, chat: &ChatMeta) -> std::io::Result<(Harness, Receiver<Ev>)> {
     if chat.is_codex() {
         return Err(std::io::Error::other("side questions need a Claude model"));
     }
@@ -276,9 +276,9 @@ pub const README: &str = concat!(
     include_str!("../docs/manual.md")
 );
 
-/// A one-shot question about Shark, outside any workspace: no tools, no MCP, saved nowhere.
+/// A one-shot question about Shark, outside any task: no tools, no MCP, saved nowhere.
 /// `system` is appended to claude's system prompt (e.g. `README` and the keymap).
-pub fn spawn_ask(model: &str, system: &str) -> std::io::Result<(Agent, Receiver<Ev>)> {
+pub fn spawn_ask(model: &str, system: &str) -> std::io::Result<(Harness, Receiver<Ev>)> {
     // --safe-mode: no user hooks, skills, plugins or CLAUDE.md (`claude --help`, 2.1.309). Not
     // `--setting-sources ""`: that also drops auth set in settings.json (apiKeyHelper, env).
     let args = bare(system).into_iter().chain(["--safe-mode"]);
@@ -291,7 +291,7 @@ fn run<'a>(
     log_name: &str,
     extra: impl IntoIterator<Item = &'a str>,
     transcript: Option<PathBuf>,
-) -> std::io::Result<(Agent, Receiver<Ev>)> {
+) -> std::io::Result<(Harness, Receiver<Ev>)> {
     // SHARK_CLAUDE swaps in another binary; the UI tests use a fake that swallows stdin.
     let mut cmd = Command::new(crate::proc::claude_bin());
     cmd.args([
@@ -324,7 +324,7 @@ pub(crate) fn start(
     log_name: &str,
     transcript: Option<PathBuf>,
     codex: Option<Arc<Mutex<codex::State>>>,
-) -> std::io::Result<(Agent, Receiver<Ev>)> {
+) -> std::io::Result<(Harness, Receiver<Ev>)> {
     fs::create_dir_all(logs_dir())?;
     fs::create_dir_all(transcripts_dir())?;
     let log = log_path(log_name);
@@ -340,7 +340,7 @@ pub(crate) fn start(
     let reaped = exited.clone();
     let stdin = Arc::new(Mutex::new(child.stdin.take().unwrap()));
     LIVE.lock().unwrap().push((child.id(), exited.clone()));
-    let agent = Agent {
+    let agent = Harness {
         pid: child.id(),
         exited,
         stdin: stdin.clone(),
@@ -382,7 +382,7 @@ pub(crate) fn start(
     Ok((agent, rx))
 }
 
-impl Agent {
+impl Harness {
     /// The running process's backend, independent of the next selected model.
     pub fn is_codex(&self) -> bool {
         self.codex.is_some()
@@ -486,7 +486,7 @@ pub(crate) fn write(stdin: &Mutex<ChildStdin>, v: &Value) -> std::io::Result<()>
     stdin.flush()
 }
 
-impl Drop for Agent {
+impl Drop for Harness {
     fn drop(&mut self) {
         self.stop();
     }
@@ -531,7 +531,7 @@ pub(crate) fn parse_record(v: Value) -> Vec<Ev> {
         }],
         "system" if v["subtype"] == "background_tasks_changed" => vec![Ev::Background(
             blocks_of(&v["tasks"])
-                .map(|t| Task {
+                .map(|t| BackgroundTask {
                     id: s(&t["task_id"]),
                     kind: s(&t["task_type"]),
                     description: match t["description"].as_str() {
@@ -698,12 +698,12 @@ not json"#;
                     mcp: vec!["mobbin".into(), "paper".into()],
                 },
                 Ev::Background(vec![
-                    Task {
+                    BackgroundTask {
                         id: "a1".into(),
                         kind: "local_agent".into(),
                         description: "local_agent a1".into(),
                     },
-                    Task {
+                    BackgroundTask {
                         id: "b2".into(),
                         kind: "local_bash".into(),
                         description: "Run test suite".into(),

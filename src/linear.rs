@@ -1309,7 +1309,7 @@ fn content(s: &Snapshot) -> u64 {
     crate::files::fingerprint(serde_json::to_vec(&read).unwrap_or_default())
 }
 
-/// The attached issues as `Workspace::context` entries, primary first. Each stands alone: a chat
+/// The attached issues as `Task::context` entries, primary first. Each stands alone: a chat
 /// gets only what changed. A ref with no snapshot is skipped.
 pub fn context_notes(attached: &Attachments, snapshots: &[Snapshot]) -> Vec<(String, ContextNote)> {
     let primary = attached.primary();

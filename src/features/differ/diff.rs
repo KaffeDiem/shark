@@ -49,7 +49,7 @@ fn parse_chunk(chunk: &str) -> Option<DiffFile> {
 }
 
 impl DiffData {
-    pub(crate) fn load(ws: &Workspace, uncommitted_only: bool) -> DiffData {
+    pub(crate) fn load(ws: &Task, uncommitted_only: bool) -> DiffData {
         let (patch, mut error) = match git::combined_diff(ws, &ws.dir(), uncommitted_only) {
             Ok(p) => (p, None),
             Err(e) => (String::new(), Some(e)),
@@ -115,7 +115,7 @@ impl DiffData {
 
 impl Differ {
     pub(crate) fn refresh_diff(&mut self, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws().cloned() else {
+        let Some(ws) = self.active_task().cloned() else {
             return;
         };
         self.diff_gen += 1;
@@ -147,7 +147,7 @@ impl Differ {
         data: DiffData,
         cx: &mut Context<Self>,
     ) {
-        if self.workspace_name() == Some(name) && self.diff_gen == generation {
+        if self.task_name() == Some(name) && self.diff_gen == generation {
             self.apply_diff(data, cx);
         }
     }
@@ -201,7 +201,7 @@ impl Differ {
             .get(self.diff_file)
             .map(|f| f.path().clone());
         let tree_on_file = (self.tree_rows.get(self.tree_sel)).is_none_or(|r| r.file.is_some());
-        // First files of this workspace's diff: no mouse scroll yet, so `j` starts a line cursor.
+        // First files of this task's diff: no mouse scroll yet, so `j` starts a line cursor.
         let first_load = self.diff_files.is_empty();
         self.diff_fp = data.fp;
         self.diff_fps = data.fps;
@@ -298,7 +298,7 @@ impl Differ {
     }
 
     pub(crate) fn viewed(&self, ix: usize) -> Viewed {
-        let (Some(ws), Some(f)) = (self.active_ws(), self.diff_files.get(ix)) else {
+        let (Some(ws), Some(f)) = (self.active_task(), self.diff_files.get(ix)) else {
             return Viewed::No;
         };
         match ws.viewed.get(f.path().as_str()) {
@@ -348,10 +348,10 @@ impl Differ {
     }
 
     fn set_viewed(&mut self, files: &[usize], on: bool, cx: &mut Context<Self>) {
-        let Some(name) = self.workspace_name().map(str::to_string) else {
+        let Some(name) = self.task_name().map(str::to_string) else {
             return;
         };
-        let Some(ws) = self.workspace.as_mut().filter(|w| w.name == name) else {
+        let Some(ws) = self.task.as_mut().filter(|w| w.name == name) else {
             return;
         };
         for &ix in files {
@@ -363,7 +363,7 @@ impl Differ {
         }
         // Files outside the current diff (say in Uncommitted mode) keep their marks.
         cx.emit(DifferEvent::Viewed {
-            workspace: name,
+            task: name,
             viewed: ws.viewed.clone(),
         });
         self.recompute_viewed();
@@ -460,7 +460,7 @@ impl Differ {
 
     /// Files belongs only to the active Diff artifact.
     pub(crate) fn tree_shown(&self) -> bool {
-        self.show_tree && self.workspace.is_some()
+        self.show_tree && self.task.is_some()
     }
 
     /// The Diff artifact's internal split; the outer Features rail never resizes.
@@ -749,7 +749,7 @@ impl Differ {
             .get(repo)
             .map(String::as_str)
             .or_else(|| {
-                self.active_ws()?
+                self.active_task()?
                     .repos
                     .iter()
                     .find(|r| r.name == repo)
@@ -760,7 +760,7 @@ impl Differ {
 
     /// The bases the diff compares against, and its total added and deleted lines.
     pub(crate) fn changes_stats(&self) -> (String, usize, usize) {
-        let mut bases: Vec<&str> = (self.active_ws().into_iter())
+        let mut bases: Vec<&str> = (self.active_task().into_iter())
             .flat_map(|ws| ws.repos.iter().map(|r| self.diff_base(&r.name)))
             .collect();
         bases.sort_unstable();
@@ -802,9 +802,9 @@ impl Differ {
                         "All changes"
                     })
                     .tooltip(if self.preferences.uncommitted_only {
-                        "HEAD → working tree: staged, unstaged, and untracked changes. Click for all changes: agent base → working tree.".to_string()
+                        "HEAD → working tree: staged, unstaged, and untracked changes. Click for all changes: task base → working tree.".to_string()
                     } else {
-                        format!("Agent base ({base}) → working tree: committed and uncommitted changes. Click for uncommitted changes: HEAD → working tree.")
+                        format!("Task base ({base}) → working tree: committed and uncommitted changes. Click for uncommitted changes: HEAD → working tree.")
                     })
                     .on_click(cx.listener(|this, _, w, cx| this.toggle_uncommitted(w, cx)))
                     .map(|b| crate::ui::toolbar("uncommitted-only", b)),
@@ -1201,7 +1201,7 @@ impl Differ {
     /// Right-click menu of file `path` (`repo/…`): the tree's file rows, the editor header
     /// and the File tab. By path, since the open file need not be in the diff.
     pub(crate) fn file_menu(&self, path: &str, cx: &Context<Self>) -> Vec<Entry> {
-        let Some(ws) = self.active_ws() else {
+        let Some(ws) = self.active_task() else {
             return vec![];
         };
         let abs = ws.dir().join(path);
@@ -1219,7 +1219,7 @@ impl Differ {
             entries.push(menu::item(
                 IconName::FileCode,
                 "Open in editor",
-                on_differ(self.workspace_name(), cx, move |s, _w, cx| {
+                on_differ(self.task_name(), cx, move |s, _w, cx| {
                     s.request_editor(p.clone(), false, false, cx)
                 }),
             ));
@@ -1230,7 +1230,7 @@ impl Differ {
                 entries.push(menu::item(
                     IconName::Pencil,
                     "Edit working copy",
-                    on_differ(self.workspace_name(), cx, move |s, w, cx| {
+                    on_differ(self.task_name(), cx, move |s, w, cx| {
                         s.request_activation(cx);
                         s.edit_working_copy(Some(p.clone().into()), w, cx)
                     }),
@@ -1241,7 +1241,7 @@ impl Differ {
                 menu::item(
                     IconName::MessageSquare,
                     "Comment",
-                    on_differ(self.workspace_name(), cx, move |s, w, cx| {
+                    on_differ(self.task_name(), cx, move |s, w, cx| {
                         s.request_activation(cx);
                         s.comment_in(&p1, w, cx)
                     }),
@@ -1249,7 +1249,7 @@ impl Differ {
                 menu::item(
                     IconName::Check,
                     "Viewed",
-                    on_differ(self.workspace_name(), cx, move |s, _, cx| {
+                    on_differ(self.task_name(), cx, move |s, _, cx| {
                         s.toggle_viewed_path(&p2, cx)
                     }),
                 )
@@ -1262,9 +1262,9 @@ impl Differ {
             entries.push(menu::item(
                 IconName::Undo,
                 "Discard uncommitted changes…",
-                on_differ(self.workspace_name(), cx, move |_s, _w, cx| {
+                on_differ(self.task_name(), cx, move |_s, _w, cx| {
                     cx.emit(DifferEvent::DiscardFile {
-                        workspace: name.clone(),
+                        task: name.clone(),
                         path: path.clone(),
                     })
                 }),
@@ -1282,7 +1282,7 @@ impl Differ {
                 let item = menu::item(
                     crate::ui::app_icon(app),
                     label,
-                    on_differ(self.workspace_name(), cx, move |_, _, cx| {
+                    on_differ(self.task_name(), cx, move |_, _, cx| {
                         cx.emit(DifferEvent::OpenApp {
                             app,
                             path: a.clone(),
@@ -1310,7 +1310,7 @@ impl Differ {
 
     /// Right-click menu of folder `dir` in the tree; it is the tree cursor's row.
     fn dir_menu(&self, dir: &str, cx: &Context<Self>) -> Vec<Entry> {
-        let Some(ws) = self.active_ws() else {
+        let Some(ws) = self.active_task() else {
             return vec![];
         };
         let abs = ws.dir().join(dir);
@@ -1320,7 +1320,7 @@ impl Differ {
             menu::item(
                 IconName::Check,
                 "All viewed",
-                on_differ(self.workspace_name(), cx, move |s, _, cx| {
+                on_differ(self.task_name(), cx, move |s, _, cx| {
                     s.toggle_viewed_dir(&d, cx)
                 }),
             )
@@ -1336,7 +1336,7 @@ impl Differ {
                     IconName::ChevronDown
                 },
                 if open { "Collapse" } else { "Expand" },
-                on_differ(self.workspace_name(), cx, move |s, _, cx| {
+                on_differ(self.task_name(), cx, move |s, _, cx| {
                     s.set_dir_open(Some(!open), cx)
                 }),
             ));
@@ -1351,7 +1351,7 @@ impl Differ {
             menu::item(
                 IconName::FileDiff,
                 "Uncommitted only",
-                on_differ(self.workspace_name(), cx, |s, w, cx| {
+                on_differ(self.task_name(), cx, |s, w, cx| {
                     s.toggle_uncommitted(w, cx)
                 }),
             )
@@ -1359,18 +1359,18 @@ impl Differ {
             menu::item(
                 IconName::Columns2,
                 "Unified",
-                on_differ(self.workspace_name(), cx, |s, _, cx| s.toggle_diff_mode(cx)),
+                on_differ(self.task_name(), cx, |s, _, cx| s.toggle_diff_mode(cx)),
             )
             .checked(self.preferences.unified),
             menu::item(
                 IconName::RefreshCw,
                 "Refresh",
-                on_differ(self.workspace_name(), cx, |s, _, cx| s.refresh_diff(cx)),
+                on_differ(self.task_name(), cx, |s, _, cx| s.refresh_diff(cx)),
             ),
             menu::item(
                 IconName::PanelRight,
                 "Show files",
-                on_differ(self.workspace_name(), cx, |s, w, cx| s.toggle_tree(w, cx)),
+                on_differ(self.task_name(), cx, |s, w, cx| s.toggle_tree(w, cx)),
             )
             .checked(self.show_tree),
         ];
@@ -1380,7 +1380,7 @@ impl Differ {
                 menu::item(
                     IconName::Send,
                     "Send review…",
-                    on_differ(self.workspace_name(), cx, |s, w, cx| s.open_sheet(w, cx)),
+                    on_differ(self.task_name(), cx, |s, w, cx| s.open_sheet(w, cx)),
                 ),
             ]);
         }

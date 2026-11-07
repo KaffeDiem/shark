@@ -424,7 +424,7 @@ impl Shark {
         let root = language.session.read(cx).project.worktree.clone();
         let text = e.input.read(cx).value().to_string();
         let cursor = e.input.read(cx).cursor();
-        let workspace = self.active.clone();
+        let task = self.active.clone();
         let guard = document::EditGuard::capture();
         let request_editor = editor.clone();
         let editor = editor.downgrade();
@@ -454,7 +454,7 @@ impl Shark {
                 };
                 let input = editor.read(cx).input.read(cx);
                 let unchanged = input.cursor() == cursor && input.value().as_ref() == text;
-                if s.active != workspace || s.editor.as_ref() != Some(&editor) || !unchanged {
+                if s.active != task || s.editor.as_ref() != Some(&editor) || !unchanged {
                     return;
                 }
                 let (result, encoding) = match response {
@@ -466,14 +466,14 @@ impl Shark {
                 }
                 match action {
                     Format | Rename(_) => {
-                        // Format's plain edits take Rename's workspace-edit path.
+                        // Format's plain edits take Rename's task-edit path.
                         let result = if matches!(action, Format) {
                             json!({"changes": {uri.as_str(): result}})
                         } else {
                             result
                         };
                         match serde_json::from_value(result) {
-                            Ok(edit) => s.apply_workspace_edit(
+                            Ok(edit) => s.apply_task_edit(
                                 edit,
                                 encoding,
                                 root,
@@ -523,7 +523,7 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.active_ws() else { return };
+        let Some(ws) = self.active_task() else { return };
         let path = editor.read(cx).path.clone();
         let Some(repo) = path
             .split('/')
@@ -535,7 +535,7 @@ impl Shark {
         let root = ws.dir().join(repo);
         let file = ws.dir().join(&path);
         let weak = editor.downgrade();
-        let workspace = self.active.clone();
+        let task = self.active.clone();
         let task = cx.spawn_in(window, async move |this, cx| {
             // Unit tests never install tools: discovery finds the fake-server session a test
             // registered for the file's worktree.
@@ -554,7 +554,7 @@ impl Shark {
                     .await
             };
             let _ = this.update_in(cx, |s, window, cx| {
-                if s.active != workspace {
+                if s.active != task {
                     return;
                 }
                 let Some(editor) = weak.upgrade() else { return };
@@ -671,7 +671,7 @@ impl Shark {
                     return;
                 };
                 let root = language.session.read(cx).project.worktree.clone();
-                self.apply_workspace_edit(
+                self.apply_task_edit(
                     edit.clone(),
                     *encoding,
                     root,
@@ -699,7 +699,7 @@ impl Shark {
                         let Some(client) = &session.client else {
                             return reply.reject("Session stopped");
                         };
-                        self.apply_workspace_edit(
+                        self.apply_task_edit(
                             edit,
                             client.encoding(),
                             session.project.worktree.clone(),
@@ -762,7 +762,7 @@ impl Shark {
         if locations.len() == 1 {
             return self.open_location(locations[0].clone(), encoding, true, new_tab, window, cx);
         }
-        let workspace = self.active.clone();
+        let task = self.active.clone();
         let editor = self.editor.clone();
         let items = locations
             .iter()
@@ -783,7 +783,7 @@ impl Shark {
             items,
             0,
             move |s, ix, w, cx| {
-                if s.active != workspace || s.editor != editor {
+                if s.active != task || s.editor != editor {
                     return;
                 }
                 s.open_location(locations[ix].clone(), encoding, true, new_tab, w, cx);
@@ -919,7 +919,7 @@ impl Shark {
         }
     }
 
-    /// The open tab showing `path`: through an alias's open path, its own, or its workspace path.
+    /// The open tab showing `path`: through an alias's open path, its own, or its task path.
     fn find_tab(
         &self,
         alias: Option<&Path>,
@@ -951,8 +951,8 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.active_ws() else { return };
-        let workspace = self.active.clone();
+        let Some(ws) = self.active_task() else { return };
+        let task = self.active.clone();
         let directory = ws.dir();
         let roots: Vec<_> = ws.repos.iter().map(|r| directory.join(&r.name)).collect();
         let old = (history || visit.is_some())
@@ -994,7 +994,7 @@ impl Shark {
                     } else {
                         None
                     };
-                    // Installed dependencies are read-only too, like sources outside the workspace.
+                    // Installed dependencies are read-only too, like sources outside the task.
                     let relative = relative.filter(|p| {
                         !p.split('/')
                             .any(|c| c == "node_modules" || c == "site-packages")
@@ -1011,7 +1011,7 @@ impl Shark {
                 }
                 let steps = s.navigation.steps(request);
                 s.navigation.pending = None;
-                if s.active != workspace || s.editor != origin || s.tab != origin_tab {
+                if s.active != task || s.editor != origin || s.tab != origin_tab {
                     return;
                 }
                 let (canonical, original, text, relative, existing_path) = match read {
@@ -1092,7 +1092,7 @@ impl Shark {
                         });
                         let editor = tab.editor.clone();
                         let new = TabId::File(path);
-                        let ws = s.active_ws_mut().unwrap();
+                        let ws = s.active_task_mut().unwrap();
                         match replace {
                             Some((ix, old_tab, old_external, slot)) => {
                                 // An external file sits after the tabs; it remembers the slot
@@ -1159,7 +1159,7 @@ impl Shark {
         .detach();
     }
 
-    pub(super) fn apply_workspace_edit(
+    pub(super) fn apply_task_edit(
         &mut self,
         edit: WorkspaceEdit,
         encoding: Encoding,
@@ -1169,8 +1169,8 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.active_ws() else { return };
-        let workspace = self.active.clone();
+        let Some(ws) = self.active_task() else { return };
+        let task = self.active.clone();
         let directory = ws.dir();
         let inline = self.differ.read(cx).edit_snapshot();
         // Ropes clone cheaply; only the edit's own documents are compared off the UI thread.
@@ -1199,8 +1199,8 @@ impl Shark {
             let _ = this.update_in(cx, |s, window, cx| {
                 let result = (|| -> anyhow::Result<()> {
                     anyhow::ensure!(
-                        s.active == workspace && s.differ.read(cx).edit_snapshot() == inline,
-                        "Workspace or diff changed; request the edit again"
+                        s.active == task && s.differ.read(cx).edit_snapshot() == inline,
+                        "Task or diff changed; request the edit again"
                     );
                     anyhow::ensure!(
                         guard.as_ref().is_none_or(|g| g.is_current()),
@@ -1261,7 +1261,7 @@ impl Shark {
                                     cx,
                                 );
                                 let editor = tab.editor.clone();
-                                s.active_ws_mut()
+                                s.active_task_mut()
                                     .unwrap()
                                     .open_tab(TabId::File(edit.relative));
                                 s.file_tabs.push(tab);

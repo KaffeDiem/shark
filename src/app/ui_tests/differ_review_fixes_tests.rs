@@ -1,5 +1,5 @@
 //! Review-comment fixes in the Diff tab: resolve menu, old-side revs, viewed marks, line
-//! cursor, jumps, drafts across workspaces, edit-working-copy targets.
+//! cursor, jumps, drafts across tasks, edit-working-copy targets.
 use super::*;
 use crate::diff_view::{DiffLineRange, DiffSide};
 use crate::features::differ::test_support::diff::Viewed;
@@ -9,8 +9,8 @@ fn commit_all(dir: &Path) {
     git::commit(dir, &["-qm", "c"]);
 }
 
-/// A booted app with workspace `name` on repo `api`, whose main has `base` committed; returns
-/// the workspace's repo dir.
+/// A booted app with task `name` on repo `api`, whose main has `base` committed; returns
+/// the task's repo dir.
 async fn fixture(
     cx: &mut TestAppContext,
     name: &str,
@@ -35,7 +35,7 @@ async fn fixture(
     let on = on_app(window, shark.clone());
     let branch = name.to_string();
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             branch.clone(),
             git::on_branch(&repos, &branch),
             vec![],
@@ -361,10 +361,10 @@ async fn jumping_to_threads_unfolds_files_and_reaches_orphans(cx: &mut TestAppCo
     fs::remove_dir_all(&home).ok();
 }
 
-/// Leaving a workspace with words in the comment box keeps them as a pending comment there.
+/// Leaving a task with words in the comment box keeps them as a pending comment there.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn switching_workspace_keeps_the_typed_comment(cx: &mut TestAppContext) {
+async fn switching_task_keeps_the_typed_comment(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (home, window, shark, api) = fixture(cx, "w1", &[]).await;
     fs::write(api.join("f"), "a\n").unwrap();
@@ -377,7 +377,7 @@ async fn switching_workspace_keeps_the_typed_comment(cx: &mut TestAppContext) {
     cx.update(|cx| assert!(shark.read(cx).differ.read(cx).review().composer.is_some()));
     let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
     on_app(window, shark.clone())(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "w2".into(),
             git::on_branch(&repos, "w2"),
             vec![],
@@ -387,7 +387,7 @@ async fn switching_workspace_keeps_the_typed_comment(cx: &mut TestAppContext) {
         )
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).differ.read(cx).workspace_name() == Some("w2")
+        shark.read(cx).differ.read(cx).task_name() == Some("w2")
     })
     .await;
     cx.update(|cx| {

@@ -1,4 +1,4 @@
-//! Account usage belongs to the window, independent of the selected workspace.
+//! Account usage belongs to the window, independent of the selected task.
 use super::*;
 use crate::usage::{Allowance, Failure, Provider, Snapshot, Status};
 use gpui_kit::component::FocusTrapElement as _;

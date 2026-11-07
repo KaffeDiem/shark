@@ -3,7 +3,7 @@ use super::*;
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::progress::Progress;
 
-/// How long a workspace's language servers outlive switching away from it.
+/// How long a task's language servers outlive switching away from it.
 pub(super) const PARKED_SESSIONS: std::time::Duration = std::time::Duration::from_secs(5 * 60);
 
 pub(super) struct FileTab {
@@ -82,14 +82,14 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.active_ws() else { return };
+        let Some(ws) = self.active_task() else { return };
         if let Some(ix) = self.file_tab_ix(&path, cx) {
             return self.select_file(ix, window, cx);
         }
         if self.diff_edit_busy(&path, cx) {
             return notify_err(window, cx, format!("{path} has unsaved edits in the diff"));
         }
-        let workspace = ws.name.clone();
+        let task = ws.name.clone();
         let abs = ws.dir().join(&path);
         if std::fs::metadata(&abs).is_ok_and(|m| m.len() > crate::editor::MAX_BYTES) {
             return notify_err(
@@ -106,7 +106,7 @@ impl Shark {
             window,
             cx,
             move |s, window, cx| {
-                if s.active.as_ref() != Some(&workspace) {
+                if s.active.as_ref() != Some(&task) {
                     return;
                 }
                 if s.diff_edit_busy(&path, cx) {
@@ -124,13 +124,13 @@ impl Shark {
                     .position(|t| Some(&t.editor) == replacing.as_ref())
                 {
                     let old = TabId::File(s.file_tabs[ix].editor.read(cx).path.clone());
-                    s.active_ws_mut()
+                    s.active_task_mut()
                         .unwrap()
                         .replace_tab(&old, TabId::File(path));
                     s.file_tabs[ix] = tab;
                     s.prune_language_sessions(cx);
                 } else {
-                    s.active_ws_mut().unwrap().open_tab(TabId::File(path));
+                    s.active_task_mut().unwrap().open_tab(TabId::File(path));
                     s.file_tabs.push(tab);
                 }
                 s.sort_file_tabs(cx);
@@ -200,7 +200,7 @@ impl Shark {
     }
 
     pub(super) fn sort_file_tabs(&mut self, cx: &App) {
-        let Some(ws) = self.active_ws() else { return };
+        let Some(ws) = self.active_task() else { return };
         let order: Vec<_> = ws.file_tabs().cloned().collect();
         self.file_tabs
             // Unlisted (external) files go last, as the strip draws them.
@@ -212,7 +212,7 @@ impl Shark {
     /// Restore disk contents in the background without selecting or focusing a file.
     pub(super) fn restore_file_tabs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let Some(ws) = self
-            .active_ws()
+            .active_task()
             .filter(|ws| ws.file_tabs().next().is_some())
             .cloned()
         else {
@@ -237,7 +237,7 @@ impl Shark {
                 for (path, result) in restored {
                     // It may have been opened, replaced or closed while the read was running.
                     if !s
-                        .active_ws()
+                        .active_task()
                         .unwrap()
                         .tab_order
                         .contains(&TabId::File(path.clone()))
@@ -313,7 +313,7 @@ impl Shark {
                 let at = s
                     .active_tab_index(cx)
                     .filter(|_| shown && s.tab == Tab::File);
-                s.active_ws_mut().unwrap().close_tab(&TabId::File(path));
+                s.active_task_mut().unwrap().close_tab(&TabId::File(path));
                 let _ = s.state.save();
                 s.file_tabs.remove(ix);
                 s.prune_language_sessions(cx);
@@ -334,7 +334,7 @@ impl Shark {
 
     pub(super) fn file_fallback(&self) -> Tab {
         if self
-            .active_ws()
+            .active_task()
             .is_some_and(|ws| !Feature::Diff.is_open(ws))
         {
             Tab::Chat
@@ -348,8 +348,8 @@ impl Shark {
         self.editor = None;
         self.file_tabs.clear();
         self.navigation = Default::default();
-        // ponytail: every server of a workspace switched away from stays up for a fixed idle
-        // window, so memory peaks at that many workspaces' servers; evict by count if it hurts.
+        // ponytail: every server of a task switched away from stays up for a fixed idle
+        // window, so memory peaks at that many tasks' servers; evict by count if it hurts.
         let sessions: Vec<_> = (self.language_sessions.drain())
             .map(|(_, (session, _))| session)
             .collect();
@@ -367,7 +367,7 @@ impl Shark {
         }
     }
 
-    /// Resumes the servers parked when the user left the active workspace.
+    /// Resumes the servers parked when the user left the active task.
     pub(super) fn unpark_sessions(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let parked = self
             .active
@@ -463,7 +463,7 @@ impl Shark {
         if paths.is_empty() {
             return then(self, window, cx);
         }
-        let workspace = self.active.clone();
+        let task = self.active.clone();
         let inline = self.differ.read(cx).edit_snapshot();
         let buffers: Vec<_> = self
             .file_tabs
@@ -486,7 +486,7 @@ impl Shark {
             "Discard",
             move |s, window, cx| {
                 if let Some(f) = then.borrow_mut().take() {
-                    if s.active != workspace
+                    if s.active != task
                         || s.file_tabs.iter().any(|t| {
                             let e = t.editor.read(cx);
                             !buffers.iter().any(|(editor, _, _, _)| editor == &t.editor)
@@ -505,7 +505,7 @@ impl Shark {
                         return notify_err(
                             window,
                             cx,
-                            "The agent or edits changed; try the action again",
+                            "The task or edits changed; try the action again",
                         );
                     }
                     // Closing may still be canceled by the final storage check.
@@ -588,11 +588,11 @@ impl Shark {
         entries
     }
 
-    /// The entries of workspace folder `dir` (`repo/rel`), folders first; a folder opens its
+    /// The entries of task folder `dir` (`repo/rel`), folders first; a folder opens its
     /// own list, a file opens in place of the current one.
     pub(super) fn folder_menu(&mut self, dir: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws() else { return };
-        let workspace = self.active.clone();
+        let Some(ws) = self.active_task() else { return };
+        let task = self.active.clone();
         let abs = ws.dir().join(&dir);
         // The entry the open file sits under starts highlighted.
         let current = (self.editor.as_ref())
@@ -608,7 +608,7 @@ impl Shark {
                 .spawn(async move { list_folder(&abs) })
                 .await;
             let _ = this.update_in(cx, |s, window, cx| {
-                if s.active != workspace {
+                if s.active != task {
                     return;
                 }
                 let entries = match entries {
@@ -632,7 +632,7 @@ impl Shark {
                     items,
                     selected,
                     move |s, ix, w, cx| {
-                        if s.active != workspace {
+                        if s.active != task {
                             return;
                         }
                         let (folder, name) = &entries[ix];
@@ -641,7 +641,7 @@ impl Shark {
                             true => s.folder_menu(path, w, cx),
                             // Like Command-click: a file with unsaved edits stays in its tab.
                             false => {
-                                let path = s.active_ws().unwrap().dir().join(path);
+                                let path = s.active_task().unwrap().dir().join(path);
                                 s.open_source(path, None, None, true, false, None, w, cx)
                             }
                         }
@@ -677,8 +677,8 @@ impl Shark {
             crumbs,
             ..
         } = h;
-        // Each folder of a workspace file lists its entries; a dependency outside the
-        // workspace shows its path as plain text.
+        // Each folder of a task file lists its entries; a dependency outside the
+        // task shows its path as plain text.
         let folders: Vec<(String, String)> = match e.external {
             true => vec![],
             false => (path.match_indices('/'))
@@ -1059,8 +1059,8 @@ fn list_folder(dir: &Path) -> std::io::Result<Vec<(bool, String)>> {
     Ok(entries)
 }
 
-/// Saved paths are untrusted; only regular UTF-8 text within a workspace repo is editable.
-fn restore_file(ws: &Workspace, path: &str) -> Result<(PathBuf, String), String> {
+/// Saved paths are untrusted; only regular UTF-8 text within a task repo is editable.
+fn restore_file(ws: &Task, path: &str) -> Result<(PathBuf, String), String> {
     use std::path::Component;
     let parts: Vec<_> = Path::new(path).components().collect();
     if parts.len() < 2
@@ -1075,7 +1075,7 @@ fn restore_file(ws: &Workspace, path: &str) -> Result<(PathBuf, String), String>
         .iter()
         .any(|r| std::ffi::OsStr::new(&r.name) == repo)
     {
-        return Err("repository is not in this agent".into());
+        return Err("repository is not in this task".into());
     }
     let read = || -> Result<_, std::io::Error> {
         let root = ws.dir().join(repo).canonicalize()?;

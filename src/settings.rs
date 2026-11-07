@@ -283,7 +283,7 @@ impl Settings {
         self.with_state(cx, |s| {
             s.no_repo_skills = !on;
             crate::git::set_repo_skills(on);
-            for ws in &s.workspaces {
+            for ws in &s.tasks {
                 crate::git::link_skills(ws, &ws.dir());
             }
         });
@@ -413,7 +413,7 @@ impl Settings {
                 theme,
                 true,
                 "Skills from repos",
-                "Agents can use the skills in each repo of a workspace",
+                "Agents can use the skills in each repo of a task",
                 Switch::new("repo-skills").checked(!no_skills).on_click({
                     move |&v, _, cx| {
                         this.update(cx, |s, cx| s.set_repo_skills(v, cx)).ok();

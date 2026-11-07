@@ -159,7 +159,7 @@ pub(crate) struct InlineEdit {
 
 impl InlineEdit {
     /// Refresh the original side without changing the unsaved working copy.
-    pub(crate) fn rebase(&mut self, ws: &Workspace, file: &DiffFile) -> Result<(), String> {
+    pub(crate) fn rebase(&mut self, ws: &Task, file: &DiffFile) -> Result<(), String> {
         if let Some(sha) = original_blob(file)
             && self.base_blob.as_deref() == Some(sha)
         {
@@ -203,7 +203,7 @@ fn original_blob(file: &DiffFile) -> Option<&str> {
 }
 
 /// Reads the base and working text of `file` in `ws`, or why it can't be edited in place.
-fn load(ws: &Workspace, file: &DiffFile) -> Result<(String, String, bool), String> {
+fn load(ws: &Task, file: &DiffFile) -> Result<(String, String, bool), String> {
     let path = file.path();
     if file.status() == DiffFileStatus::Deleted || file.is_binary() {
         return Err(format!("{path} is deleted or binary; it can't be edited"));
@@ -251,7 +251,7 @@ impl Differ {
     /// Rebases the edit on a refresh's base; the error that stops the refresh from applying, if
     /// any. The buffer stays intact when a PR is retargeted or its base ref moves.
     pub(crate) fn reconcile_edit(&mut self, data: &DiffData) -> Option<String> {
-        let (ws, e) = (self.active_ws().cloned()?, self.editing.as_mut()?);
+        let (ws, e) = (self.active_task().cloned()?, self.editing.as_mut()?);
         if let Some(error) = &data.error {
             return Some(error.clone());
         }
@@ -346,9 +346,9 @@ impl Differ {
         cx: &mut Context<Self>,
     ) {
         let path = self.edit_target(path, window, cx);
-        if let (Some(path), Some(workspace)) = (path, self.workspace_name()) {
+        if let (Some(path), Some(task)) = (path, self.task_name()) {
             cx.emit(DifferEvent::EditWorkingCopy {
-                workspace: workspace.into(),
+                task: task.into(),
                 path,
             });
         }
@@ -361,7 +361,7 @@ impl Differ {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.active_ws() else {
+        let Some(ws) = self.active_task() else {
             return;
         };
         if self.editing.as_ref().is_some_and(|e| e.path == path) {

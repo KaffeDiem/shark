@@ -52,7 +52,7 @@ async fn sidebar_chrome_themes(cx: &mut TestAppContext) {
             let press = press_in(window);
             let name = format!("chrome-{label}-{}", width as usize);
             on(cx, &|s, w, cx| {
-                s.create_workspace(
+                s.create_task_for_test(
                     name.clone(),
                     git::on_branch(&repos, &name),
                     vec![],
@@ -418,7 +418,7 @@ pub(crate) fn render_pixels() {
     super::menu_pixels::render_pixels(&mut cx);
     render_app_switcher_pixels(&mut cx);
     super::usage_tests::render_pixels(&mut cx);
-    super::workspace_picker_tests::render_pixels(&mut cx);
+    super::task_picker_tests::render_pixels(&mut cx);
     super::navigation_pixels::render_pixels(&mut cx);
     super::drag_tests::render_pixels(&mut cx);
     super::tree_pixels::render_pixels(&mut cx);
@@ -561,12 +561,12 @@ fn render_app_switcher_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 .unwrap();
             cx.update_window(window, |_, w, cx| {
                 shark.update(cx, |s, cx| {
-                    s.state.workspaces = vec![Workspace {
+                    s.state.tasks = vec![Task {
                         name: "switcher-preview".into(),
                         branch: "switcher-preview".into(),
                         ..Default::default()
                     }];
-                    s.sel = SideRow::Ws(0);
+                    s.sel = SideRow::Task(0);
                     s.sidebar_focus.focus(w, cx);
                     s.cycle_open_app(true, w, cx);
                 });

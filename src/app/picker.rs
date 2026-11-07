@@ -1,4 +1,4 @@
-//! "Open file…": fuzzy-pick any file in the workspace's repos and open it in the editor.
+//! "Open file…": fuzzy-pick any file in the task's repos and open it in the editor.
 use super::*;
 use crate::complete::{self, Item, Kind};
 
@@ -10,7 +10,7 @@ pub(super) struct FilePicker {
     hits: Vec<usize>,
     query: String,
     shark: WeakEntity<Shark>,
-    _load: Task<()>,
+    _load: gpui_kit::Task<()>,
 }
 
 impl FilePicker {
@@ -49,7 +49,7 @@ impl FilePicker {
         self.hits = complete::rank(&self.files, &self.query, ROWS);
     }
 
-    /// Workspace-relative path of a hit, `api/src/a.rs`.
+    /// Task-relative path of a hit, `api/src/a.rs`.
     fn path(&self, row: usize) -> Option<String> {
         Some(rel(self.files.get(*self.hits.get(row)?)?))
     }
@@ -99,10 +99,10 @@ impl Render for FilePicker {
 }
 
 impl Shark {
-    /// cmd-p: the picker over every tracked and untracked file of the open workspace.
+    /// cmd-p: the picker over every tracked and untracked file of the open task.
     pub(super) fn open_any_file(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws() else {
-            return notify_err(window, cx, "Open an agent first");
+        let Some(ws) = self.active_task() else {
+            return notify_err(window, cx, "Open a task first");
         };
         let repos = ws.repo_paths();
         let shark = cx.entity().downgrade();
@@ -114,7 +114,7 @@ impl Shark {
 
     /// Opens a picked path; text files only, since the editor would show a binary one empty.
     fn open_any_path(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(ws) = self.active_ws() else { return };
+        let Some(ws) = self.active_task() else { return };
         let abs = ws.dir().join(&path);
         let text = std::fs::metadata(&abs).is_ok_and(|m| m.len() <= crate::editor::MAX_BYTES)
             && std::fs::read(&abs).is_ok_and(|b| std::str::from_utf8(&b).is_ok());

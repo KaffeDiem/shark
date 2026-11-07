@@ -1,6 +1,6 @@
-//! Which workspaces need the user: a turn finished while it wasn't on screen ("unread"), or its
+//! Which tasks need the user: a turn finished while it wasn't on screen ("unread"), or its
 //! next git step is the user's to take ("needs you"). Drives the sidebar row icons, the Dock
-//! badge, OS notifications and the jump to the next such workspace.
+//! badge, OS notifications and the jump to the next such task.
 use crate::app::Shark;
 use crate::sync::{self, Repo};
 use gpui_kit::component::WindowExt as _;
@@ -8,17 +8,17 @@ use gpui_kit::*;
 use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
-/// How often each workspace that isn't shown is checked.
+/// How often each task that isn't shown is checked.
 const BG_EVERY: Duration = Duration::from_secs(300);
-/// One workspace per tick, so the checks are spread out instead of all at once.
+/// One task per tick, so the checks are spread out instead of all at once.
 const TICK: Duration = Duration::from_secs(20);
-/// After gh failed for two workspaces in a row, gh isn't asked for this long.
+/// After gh failed for two tasks in a row, gh isn't asked for this long.
 const BG_BACKOFF: Duration = Duration::from_secs(300);
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum Attn {
     None,
-    /// A turn finished while the workspace wasn't shown.
+    /// A turn finished while the task wasn't shown.
     Unread,
     /// The label of the step that waits for the user.
     Needs(String),
@@ -38,12 +38,12 @@ pub struct Attention {
     /// (empty until the first check landed).
     checked: HashMap<String, Checked>,
     paused_until: Option<Instant>,
-    /// The workspace whose last check failed: one that isn't on GitHub shouldn't pause the rest.
+    /// The task whose last check failed: one that isn't on GitHub shouldn't pause the rest.
     failed: Option<String>,
-    /// The last "needs you" label seen per workspace, so each change notifies once.
+    /// The last "needs you" label seen per task, so each change notifies once.
     announced: HashMap<String, Option<String>>,
     pub window_active: bool,
-    _poll: Option<Task<()>>,
+    _poll: Option<gpui_kit::Task<()>>,
 }
 
 impl Attention {
@@ -63,19 +63,19 @@ impl Attention {
         }
     }
 
-    /// An archived workspace: a later one with its name starts with nothing known.
+    /// An archived task: a later one with its name starts with nothing known.
     pub fn forget(&mut self, name: &str) {
         self.opened(name);
         self.announced.remove(name);
     }
 
-    /// Opening a workspace reads it; its own GitSync polls from now on.
+    /// Opening a task reads it; its own GitSync polls from now on.
     pub fn opened(&mut self, name: &str) {
         self.unread.remove(name);
         self.checked.remove(name);
     }
 
-    /// The workspace to check next: not shown, oldest check first, never-checked before all.
+    /// The task to check next: not shown, oldest check first, never-checked before all.
     fn due(&self, names: &[String], active: Option<&str>, now: Instant) -> Option<String> {
         names
             .iter()
@@ -86,8 +86,8 @@ impl Attention {
             .map(|(_, n)| n.clone())
     }
 
-    /// Stores a background check's outcome. Two different workspaces failing gh in a row pause gh;
-    /// a failure keeps the last label; the open workspace isn't stored (its GitSync polls).
+    /// Stores a background check's outcome. Two different tasks failing gh in a row pause gh;
+    /// a failure keeps the last label; the open task isn't stored (its GitSync polls).
     fn record(
         &mut self,
         name: &str,
@@ -125,21 +125,21 @@ impl Attention {
     }
 }
 
-fn poll(cx: &mut Context<Shark>) -> Task<()> {
+fn poll(cx: &mut Context<Shark>) -> gpui_kit::Task<()> {
     cx.spawn(async move |this, cx| {
         loop {
             cx.background_executor().timer(TICK).await;
             let Ok(next) = this.update(cx, |s, cx| {
                 s.refresh_attention(cx);
                 // With no repos there's nothing to check.
-                let names: Vec<String> = (s.state.workspaces.iter())
+                let names: Vec<String> = (s.state.tasks.iter())
                     .filter(|w| !w.repos.is_empty())
                     .map(|w| w.name.clone())
                     .filter(|n| !s.busy(n, cx))
                     .collect();
                 let now = Instant::now();
                 let name = s.attn.due(&names, s.active.as_deref(), now)?;
-                let ws = (s.state.workspaces.iter())
+                let ws = (s.state.tasks.iter())
                     .find(|w| w.name == name)
                     .cloned()?;
                 let last = (s.attn.checked.get(&name)).map(|c| c.repos.clone());
@@ -184,12 +184,12 @@ impl Shark {
         }
     }
 
-    /// A turn finished off screen, in the workspace or any of its chat tabs.
+    /// A turn finished off screen, in the task or any of its chat tabs.
     fn unread_ws(&self, name: &str) -> bool {
         self.attn.unread.contains(name) || self.chat_unread(name)
     }
 
-    /// The agent is on it (mid-rebase looks like conflicts), or the workspace is going away.
+    /// The agent is on it (mid-rebase looks like conflicts), or the task is going away.
     fn busy(&self, name: &str, cx: &App) -> bool {
         self.archiving.contains(name) || self.running_chats(name, cx) > 0
     }
@@ -210,13 +210,13 @@ impl Shark {
         }
     }
 
-    /// The background check's result, for a workspace other than the open one.
+    /// The background check's result, for a task other than the open one.
     fn bg_checked(&self, name: &str) -> Option<&Checked> {
         let open = self.active.as_deref() == Some(name);
         self.attn.checked.get(name).filter(|_| !open)
     }
 
-    /// Each repo's local and PR state, for workspaces not opened this session too: the same
+    /// Each repo's local and PR state, for tasks not opened this session too: the same
     /// source as `needs_you`. `None` until a probe or background check landed.
     pub(crate) fn overview_repos<'a>(&'a self, name: &str, cx: &'a App) -> Option<&'a [Repo]> {
         match self.bg_checked(name) {
@@ -226,7 +226,7 @@ impl Shark {
     }
 
     pub(crate) fn turn_done(&mut self, name: &str, cx: &mut Context<Self>) {
-        // Home covers the open workspace: its turns end unseen.
+        // Home covers the open task: its turns end unseen.
         let shown = self.active.as_deref() == Some(name) && !self.home_shown();
         if !shown {
             self.attn.unread.insert(name.to_string());
@@ -236,16 +236,16 @@ impl Shark {
             }
         }
         if !shown || !self.attn.window_active {
-            notify(&self.ws_title(name), "The agent finished its turn");
+            notify(&self.task_title(name), "The agent finished its turn");
         }
         self.refresh_attention(cx);
     }
 
-    /// Recounts the Dock badge and notifies when a workspace off screen starts needing you.
+    /// Recounts the Dock badge and notifies when a task off screen starts needing you.
     pub(crate) fn refresh_attention(&mut self, cx: &mut Context<Self>) {
         let names: Vec<String> = self
             .state
-            .workspaces
+            .tasks
             .iter()
             .map(|w| w.name.clone())
             .collect();
@@ -265,14 +265,14 @@ impl Shark {
                 && prev != &needs
                 && !on_screen
             {
-                notify(&self.ws_title(name), l);
+                notify(&self.task_title(name), l);
             }
         }
         set_badge(count);
         cx.notify();
     }
 
-    /// Opens the next workspace after the open one (in sidebar order) that needs you.
+    /// Opens the next task after the open one (in sidebar order) that needs you.
     pub(crate) fn next_attention(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let order = self.ws_order(true);
         let n = order.len();
@@ -282,16 +282,16 @@ impl Shark {
             .and_then(|a| {
                 order
                     .iter()
-                    .position(|&ix| &self.state.workspaces[ix].name == a)
+                    .position(|&ix| &self.state.tasks[ix].name == a)
             })
             .map_or(0, |i| i + 1);
         let hit = (0..n).map(|i| order[(from + i) % n]).find(|&ix| {
-            let name = &self.state.workspaces[ix].name;
+            let name = &self.state.tasks[ix].name;
             self.active.as_ref() != Some(name) && self.attention_of(name, cx) != Attn::None
         });
         match hit {
-            Some(ix) => self.open_workspace(ix, window, cx),
-            None => window.push_notification("No other agent needs you", cx),
+            Some(ix) => self.open_task(ix, window, cx),
+            None => window.push_notification("No other task needs you", cx),
         }
     }
 }
@@ -377,7 +377,7 @@ mod tests {
     }
 
     #[test]
-    fn two_workspaces_failing_in_a_row_pause_gh() {
+    fn two_tasks_failing_in_a_row_pause_gh() {
         let (mut at, now) = (Attention::default(), Instant::now());
         let fail = || Err("no gh".to_string());
         at.record("a", None, fail(), vec![], true, now);

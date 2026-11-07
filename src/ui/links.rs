@@ -1,6 +1,6 @@
-//! Shared Markdown presentation and workspace-relative links.
+//! Shared Markdown presentation and task-relative links.
 use super::*;
-use crate::state::Workspace;
+use crate::state::Task;
 use gpui_kit::component::ActiveTheme as _;
 use gpui_kit::component::clipboard::Clipboard;
 use gpui_kit::component::text::{TextView, TextViewState, TextViewStyle};
@@ -20,8 +20,8 @@ pub(crate) fn copy_button(
         .child(Clipboard::new(id).value(text).tooltip("Copy"))
 }
 
-/// Where `cwd`-relative chat links may point: the workspace dir, then each repo's worktree.
-pub(crate) fn link_roots(ws: &Workspace) -> Vec<PathBuf> {
+/// Where `cwd`-relative chat links may point: the task dir, then each repo's worktree.
+pub(crate) fn link_roots(ws: &Task) -> Vec<PathBuf> {
     let dir = ws.dir();
     let repos = ws.repos.iter().map(|r| dir.join(&r.name));
     std::iter::once(dir.clone()).chain(repos).collect()
@@ -143,7 +143,7 @@ mod tests {
     use super::*;
     use core::prelude::v1::test; // the gpui_kit glob exports a `test` macro that would shadow the builtin
 
-    /// A workspace dir holding `repo/src/lib.rs`, `repo/README.md`, and `repo/a b å.txt`.
+    /// A task dir holding `repo/src/lib.rs`, `repo/README.md`, and `repo/a b å.txt`.
     fn link_fixture(tag: &str) -> (PathBuf, Vec<PathBuf>) {
         let ws = std::env::temp_dir().join(format!("shark-links-{tag}-{}", std::process::id()));
         let repo = ws.join("repo");
@@ -158,7 +158,7 @@ mod tests {
     fn link_target_resolves_relative_paths() {
         let (ws, roots) = link_fixture("rel");
         let at = |rel: &str| Some(format!("file://{}/{rel}", ws.display()));
-        // Prefixed by the repo name, resolved from the workspace dir.
+        // Prefixed by the repo name, resolved from the task dir.
         assert_eq!(
             link_target("repo/src/lib.rs", &roots),
             at("repo/src/lib.rs")

@@ -14,7 +14,7 @@ use gpui_kit::component::input::{Enter, Escape};
 use gpui_kit::component::radio::{Radio, RadioGroup};
 use gpui_kit::component::{Disableable as _, Selectable as _};
 
-/// Where a review goes: a chat of the workspace, or a new one on the picked model and
+/// Where a review goes: a chat of the task, or a new one on the picked model and
 /// thinking level (only `model` and `effort` of the meta are read).
 #[derive(Clone)]
 pub(crate) enum Target {
@@ -24,7 +24,7 @@ pub(crate) enum Target {
 
 #[derive(Clone)]
 pub(crate) struct ReviewRequest {
-    pub workspace: String,
+    pub task: String,
     pub target: Target,
     pub card: ReviewCard,
     comments: Vec<Comment>,
@@ -65,7 +65,7 @@ impl Differ {
         });
         let focus = cx.focus_handle();
         focus.focus(window, cx);
-        let ws = self.active_ws();
+        let ws = self.active_task();
         let cur = ws.and_then(|ws| ws.chats.get(ws.active_chat));
         let title = |c: &ChatMeta| match c.title.is_empty() {
             true => "Untitled chat".to_string(),
@@ -192,8 +192,8 @@ impl Differ {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(id) = (self.active_ws()).and_then(|ws| ws.chats.get(ws.active_chat)) else {
-            return notify_err(window, cx, "Open an agent first");
+        let Some(id) = (self.active_task()).and_then(|ws| ws.chats.get(ws.active_chat)) else {
+            return notify_err(window, cx, "Open a task first");
         };
         let target = Target::Chat(id.id.clone());
         self.send_review_to(target, ids, note, publish, window, cx);
@@ -209,10 +209,10 @@ impl Differ {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(ws) = self.active_ws() else {
-            return notify_err(window, cx, "Open an agent first");
+        let Some(ws) = self.active_task() else {
+            return notify_err(window, cx, "Open a task first");
         };
-        let workspace = ws.name.clone();
+        let task = ws.name.clone();
         self.reanchor_comments(); // the lines as the agent will read them
         let comments: Vec<Comment> = (self.ws_comments().iter())
             .filter(|c| c.status == Status::Pending && ids.contains(&c.id))
@@ -244,7 +244,7 @@ impl Differ {
             },
         };
         cx.emit(DifferEvent::SendReview(ReviewRequest {
-            workspace,
+            task,
             target,
             card,
             comments,
@@ -254,7 +254,7 @@ impl Differ {
     }
 
     pub(crate) fn review_request_valid(&self, request: &ReviewRequest) -> bool {
-        self.workspace_name() == Some(request.workspace.as_str())
+        self.task_name() == Some(request.task.as_str())
             && request
                 .comments
                 .iter()

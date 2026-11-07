@@ -13,9 +13,9 @@ impl Chat {
 
     /// The process handling live events; model selection configures only its successor.
     pub(crate) fn active_codex(&self) -> bool {
-        self.agent.as_ref().map_or_else(
-            || codex::is_codex(self.agent_model.as_deref()),
-            Agent::is_codex,
+        self.harness.as_ref().map_or_else(
+            || codex::is_codex(self.harness_model.as_deref()),
+            Harness::is_codex,
         )
     }
 
@@ -88,7 +88,7 @@ impl Chat {
         let was = self.meta.effort.replace(level.into());
         let level = self.effort();
         self.meta.effort = Some(level.into());
-        if let Some(a) = &mut self.agent {
+        if let Some(a) = &mut self.harness {
             a.set_effort(level);
         }
         if was != self.meta.effort {
@@ -116,7 +116,7 @@ impl Chat {
     /// keeps its tier).
     pub fn set_fast(&mut self, on: bool, cx: &mut Context<Self>) {
         self.meta.fast = Some(on);
-        if let Some(a) = &mut self.agent {
+        if let Some(a) = &mut self.harness {
             a.set_fast(on);
         }
         cx.emit(ChatEvent::Meta);

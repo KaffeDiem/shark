@@ -26,7 +26,7 @@ const NOT_READ: &str = "Keychain access wasn't granted, so Shark can't use Linea
 const REJECTED: &str = "Linear rejected the credential. Reconnect to use it.";
 const BAD_KEY: &str = "Linear didn't accept this key. Check it and try again.";
 const CHANGED: &str = "The Linear connection changed. Try again.";
-/// What leaving a workspace means, for its confirmations.
+/// What leaving a task means, for its confirmations.
 const LEAVING: &str = "Attached issues stay readable but can't refresh. Nothing changes in Linear.";
 /// Settings > Account > Security & Access, per https://linear.app/docs/api-and-webhooks.
 const KEY_PAGE: &str = "https://linear.app/settings/account/security";
@@ -34,9 +34,9 @@ const KEY_PAGE: &str = "https://linear.app/settings/account/security";
 /// The Keychain calls. The test platform's stubs can't fail, so tests swap these.
 #[derive(Clone, Copy)]
 struct Keychain {
-    read: fn(&App) -> Task<anyhow::Result<Option<Credential>>>,
-    write: fn(&App, &Credential) -> Task<anyhow::Result<()>>,
-    delete: fn(&App) -> Task<anyhow::Result<()>>,
+    read: fn(&App) -> gpui_kit::Task<anyhow::Result<Option<Credential>>>,
+    write: fn(&App, &Credential) -> gpui_kit::Task<anyhow::Result<()>>,
+    delete: fn(&App) -> gpui_kit::Task<anyhow::Result<()>>,
 }
 
 type Saver = Box<dyn Fn(&Credential) -> Result<(), String> + Send + Sync>;
@@ -151,7 +151,7 @@ impl Linear {
 async fn change_keychain(
     this: &WeakEntity<Shark>,
     cx: &mut AsyncApp,
-    change: impl FnOnce(&Linear, &App) -> Task<anyhow::Result<()>>,
+    change: impl FnOnce(&Linear, &App) -> gpui_kit::Task<anyhow::Result<()>>,
 ) -> anyhow::Result<()> {
     let old = this.update(cx, |s, cx| {
         cx.notify();
@@ -184,7 +184,7 @@ impl Shark {
     pub(crate) fn linear_credential(
         &mut self,
         cx: &mut Context<Self>,
-    ) -> Task<Result<Credential, Error>> {
+    ) -> gpui_kit::Task<Result<Credential, Error>> {
         let refused = if self.state.linear.is_none() {
             Some(Error::Failed("Connect Linear in Settings first.".into()))
         } else if self.linear.reconnect {
@@ -197,7 +197,7 @@ impl Shark {
             None
         };
         if let Some(e) = refused {
-            return Task::ready(Err(e));
+            return gpui_kit::Task::ready(Err(e));
         }
         let (http, epoch) = (self.linear.http, self.linear.epoch);
         let keychain = self.linear.keychain;
@@ -258,7 +258,7 @@ impl Shark {
         &mut self,
         call: impl FnOnce(&Http, &Credential) -> Result<T, Error> + Send + 'static,
         cx: &mut Context<Self>,
-    ) -> Task<Result<T, Error>> {
+    ) -> gpui_kit::Task<Result<T, Error>> {
         let (credential, http, epoch) = (
             self.linear_credential(cx),
             self.linear.http,
@@ -356,9 +356,9 @@ impl Shark {
         key: &str,
         window: &Window,
         cx: &mut Context<Self>,
-    ) -> Task<bool> {
+    ) -> gpui_kit::Task<bool> {
         if !self.linear.idle() {
-            return Task::ready(false);
+            return gpui_kit::Task::ready(false);
         }
         self.linear.notice = None;
         self.linear.op = Op::Checking;
@@ -400,16 +400,16 @@ impl Shark {
     }
 
     /// Replaces the connection once `checked` has validated a credential, the user has agreed to
-    /// leave a different workspace, and the Keychain holds it. Anything short of that leaves the
+    /// leave a different task, and the Keychain holds it. Anything short of that leaves the
     /// connection as it was. Resolves to whether it was replaced. `window` outlives Settings, so
     /// the result reaches the user after they've closed it.
     fn linear_adopt(
         &mut self,
-        checked: Task<Result<(Credential, Identity), Error>>,
+        checked: gpui_kit::Task<Result<(Credential, Identity), Error>>,
         method: Method,
         window: &Window,
         cx: &mut Context<Self>,
-    ) -> Task<bool> {
+    ) -> gpui_kit::Task<bool> {
         let window = window.window_handle();
         cx.spawn(async move |this, cx| {
             let (credential, identity) = match checked.await {

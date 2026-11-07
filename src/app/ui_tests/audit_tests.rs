@@ -1,7 +1,7 @@
 use super::*;
 
 #[gpui_kit::test]
-fn recreated_workspace_can_save_comments_after_unreadable_store(_: &mut TestAppContext) {
+fn recreated_task_can_save_comments_after_unreadable_store(_: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
     let path = review::comments_path("recreated");
@@ -39,7 +39,7 @@ async fn creation_reservations_and_unsaved_metadata(cx: &mut TestAppContext) {
     fs::create_dir(&state).unwrap();
     on(cx, &|s, w, cx| {
         for _ in 0..2 {
-            s.create_workspace(
+            s.create_task_for_test(
                 "owned".into(),
                 git::on_branch(&repos[..1], "owned"),
                 vec![],
@@ -55,13 +55,13 @@ async fn creation_reservations_and_unsaved_metadata(cx: &mut TestAppContext) {
     })
     .await;
     on(cx, &|s, w, cx| {
-        assert_eq!(s.state.workspaces.len(), 1);
-        assert!(s.state.workspaces[0].dir().join("api").exists());
+        assert_eq!(s.state.tasks.len(), 1);
+        assert!(s.state.tasks[0].dir().join("api").exists());
         assert_eq!(s.unsaved_data(None, cx).len(), 1);
         // An intent that can't be saved stops there, before Git changes anything.
         s.queue_attachment("owned".into(), vec![fresh(&repos[1])], w, cx);
         assert!(s.adding_repos.is_empty());
-        assert!(s.state.workspaces[0].attaching.is_empty());
+        assert!(s.state.tasks[0].attaching.is_empty());
     });
     fs::remove_dir(&state).unwrap();
     on(cx, &|s, _, cx| s.retry_saves(cx));
@@ -75,14 +75,14 @@ async fn creation_reservations_and_unsaved_metadata(cx: &mut TestAppContext) {
     })
     .await;
     on(cx, &|s, w, cx| {
-        assert_eq!(s.state.workspaces[0].repos.len(), 2);
+        assert_eq!(s.state.tasks[0].repos.len(), 2);
         s.queue_attachment("owned".into(), vec![fresh(&repos[2])], w, cx);
     });
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).state.workspaces[0].repos.len() == 3
+        shark.read(cx).state.tasks[0].repos.len() == 3
     })
     .await;
-    assert_eq!(State::load().workspaces[0].repos.len(), 3);
+    assert_eq!(State::load().tasks[0].repos.len(), 3);
     on(cx, &|s, _, cx| assert!(s.unsaved_data(None, cx).is_empty()));
 }
 
@@ -165,7 +165,7 @@ async fn both_editors_keep_hard_link_buffers_and_quit_guards_recheck_saves(
     );
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "save".into(),
             git::on_branch(&repos, "save"),
             vec![],

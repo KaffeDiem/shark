@@ -1,5 +1,5 @@
 use super::*;
-use crate::state::{ChatMeta, NEW_AGENT, SEA_NAMES, TabId};
+use crate::state::{ChatMeta, NEW_TASK, SEA_NAMES, TabId};
 
 /// The app on no repos at all, on a claude that never answers; the guard holds it.
 fn empty_app(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Shark>) {
@@ -8,8 +8,8 @@ fn empty_app(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Shark>) {
     (window, shark)
 }
 
-fn active_ws(cx: &mut TestAppContext, shark: &Entity<Shark>) -> Workspace {
-    cx.update(|cx| shark.read(cx).active_ws().unwrap().clone())
+fn active_task(cx: &mut TestAppContext, shark: &Entity<Shark>) -> Task {
+    cx.update(|cx| shark.read(cx).active_task().unwrap().clone())
 }
 
 fn active_chat(cx: &mut TestAppContext, shark: &Entity<Shark>) -> Entity<crate::chat::Chat> {
@@ -75,7 +75,7 @@ async fn home_prompt_starts_an_agent_without_repos(cx: &mut TestAppContext) {
         assert!(!w.has_active_dialog(cx), "no dialog");
     })
     .unwrap();
-    let ws = active_ws(cx, &shark);
+    let ws = active_task(cx, &shark);
     assert!(SEA_NAMES.contains(&ws.name.as_str()), "{}", ws.name);
     assert_eq!(ws.title, "sketch a login page");
     assert_eq!(ws.branch, ws.name);
@@ -88,8 +88,8 @@ async fn home_prompt_starts_an_agent_without_repos(cx: &mut TestAppContext) {
         assert!(text.contains("No repositories are attached"), "{text}");
     }
     let saved = State::load();
-    assert_eq!(saved.workspaces[0].name, ws.name);
-    assert_eq!(saved.workspaces[0].title, ws.title);
+    assert_eq!(saved.tasks[0].name, ws.name);
+    assert_eq!(saved.tasks[0].title, ws.title);
     let chat = active_chat(cx, &shark);
     cx.update(|cx| {
         assert_eq!(chat.read(cx).sent_texts(), ["sketch a login page"]);
@@ -102,7 +102,7 @@ async fn home_prompt_starts_an_agent_without_repos(cx: &mut TestAppContext) {
 /// the first message titles it, and a second doesn't.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn new_agent_is_empty_until_the_first_message(cx: &mut TestAppContext) {
+async fn new_task_is_empty_until_the_first_message(cx: &mut TestAppContext) {
     let quiet = quiet_claude();
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let _claude = ClaudeGuard::set(&quiet);
@@ -124,8 +124,8 @@ async fn new_agent_is_empty_until_the_first_message(cx: &mut TestAppContext) {
     })
     .unwrap();
     cx.run_until_parked();
-    cx.update(|cx| assert_eq!(shark.read(cx).state.workspaces.len(), 2, "the + button too"));
-    let ws = active_ws(cx, &shark);
+    cx.update(|cx| assert_eq!(shark.read(cx).state.tasks.len(), 2, "the + button too"));
+    let ws = active_task(cx, &shark);
     let shown = ws.display_title().into_owned();
     assert_eq!(shown.to_lowercase(), ws.name);
     assert_ne!(shown, ws.name, "capitalised");
@@ -135,21 +135,21 @@ async fn new_agent_is_empty_until_the_first_message(cx: &mut TestAppContext) {
 
     // OK in the rename dialog, with the field as it opened.
     shark.update(cx, |s, cx| s.set_title(&ws.name, shown.clone(), cx));
-    assert_eq!(active_ws(cx, &shark).title, NEW_AGENT, "still untitled");
+    assert_eq!(active_task(cx, &shark).title, NEW_TASK, "still untitled");
 
     cx.update_window(window, |_, w, cx| {
         chat.update(cx, |c, cx| c.ask("plan the rollout\nin detail", w, cx));
     })
     .unwrap();
     cx.run_until_parked();
-    assert_eq!(active_ws(cx, &shark).title, "plan the rollout");
-    assert_eq!(State::load().workspaces[1].title, "plan the rollout");
+    assert_eq!(active_task(cx, &shark).title, "plan the rollout");
+    assert_eq!(State::load().tasks[1].title, "plan the rollout");
 
     // The name as a title, once it is one, is the user's: a later save doesn't undo it.
     shark.update(cx, |s, cx| s.set_title(&ws.name, shown.clone(), cx));
     chat.update(cx, |_, cx| cx.emit(crate::chat::ChatEvent::Meta));
     cx.run_until_parked();
-    assert_eq!(active_ws(cx, &shark).title, shown);
+    assert_eq!(active_task(cx, &shark).title, shown);
 }
 
 /// An agent saved with the old name and the literal placeholder is still titled by a message.
@@ -162,26 +162,26 @@ async fn first_message_titles_an_old_untitled_agent(cx: &mut TestAppContext) {
     let home = test_home();
     let name = "agent-19a2b";
     let dir = home.join("shark/workspaces").join(name);
-    let ws = git::create_empty_workspace(&dir, name, NEW_AGENT).unwrap();
+    let ws = git::create_empty_task(&dir, name, NEW_TASK).unwrap();
     let state = State {
-        workspaces: vec![ws],
+        tasks: vec![ws],
         ..Default::default()
     };
     let (window, shark) = boot(cx, state, WindowOptions::default());
     cx.run_until_parked();
     cx.update_window(window, |_, w, cx| {
-        shark.update(cx, |s, cx| s.open_workspace_now(0, w, cx));
+        shark.update(cx, |s, cx| s.open_task_now(0, w, cx));
     })
     .unwrap();
     cx.run_until_parked();
-    assert_eq!(active_ws(cx, &shark).display_title(), NEW_AGENT);
+    assert_eq!(active_task(cx, &shark).display_title(), "New task");
     let chat = active_chat(cx, &shark);
     cx.update_window(window, |_, w, cx| {
         chat.update(cx, |c, cx| c.ask("plan the rollout", w, cx));
     })
     .unwrap();
     cx.run_until_parked();
-    assert_eq!(active_ws(cx, &shark).title, "plan the rollout");
+    assert_eq!(active_task(cx, &shark).title, "plan the rollout");
 }
 
 /// The first message can't go out: the agent stays, saved, with the message in its composer.
@@ -197,9 +197,9 @@ async fn failed_first_send_keeps_agent_and_prompt(cx: &mut TestAppContext) {
     cx.update_window(window, |_, w, cx| w.input("sketch a login page", cx))
         .unwrap();
     press_in(window)(cx, &["enter"]);
-    let ws = active_ws(cx, &shark);
+    let ws = active_task(cx, &shark);
     assert_eq!(ws.title, "sketch a login page");
-    assert_eq!(State::load().workspaces.len(), 1);
+    assert_eq!(State::load().tasks.len(), 1);
     assert!(ws.dir().exists());
     let chat = active_chat(cx, &shark);
     cx.update(|cx| {
@@ -233,7 +233,7 @@ async fn failed_save_leaves_no_orphan(cx: &mut TestAppContext) {
     let entries = |dir: PathBuf| fs::read_dir(dir).map_or(0, |d| d.count());
     cx.update(|cx| {
         let s = shark.read(cx);
-        assert!(s.state.workspaces.is_empty() && s.active.is_none());
+        assert!(s.state.tasks.is_empty() && s.active.is_none());
         assert_eq!(s.home.prompt.read(cx).value(), "sketch a login page");
     });
     assert_eq!(entries(home.join("shark/workspaces")), 0, "no orphan");
@@ -243,8 +243,8 @@ async fn failed_save_leaves_no_orphan(cx: &mut TestAppContext) {
 
     let on = on_app(window, shark.clone());
     on(cx, &|s, _, _| s.state.read_only = true);
-    on(cx, &|s, w, cx| s.new_agent(None, None, w, cx));
-    cx.update(|cx| assert!(shark.read(cx).state.workspaces.is_empty()));
+    on(cx, &|s, w, cx| s.new_task(None, None, w, cx));
+    cx.update(|cx| assert!(shark.read(cx).state.tasks.is_empty()));
     assert_eq!(entries(home.join("shark/workspaces")), 0);
 }
 
@@ -260,11 +260,11 @@ async fn generated_identities_never_collide(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     on(cx, &|s, w, cx| {
         for _ in 0..3 {
-            s.new_agent(None, None, w, cx);
+            s.new_task(None, None, w, cx);
         }
     });
     let mut names: Vec<String> = cx.update(|cx| {
-        (shark.read(cx).state.workspaces.iter())
+        (shark.read(cx).state.tasks.iter())
             .map(|w| w.name.clone())
             .collect()
     });
@@ -272,7 +272,7 @@ async fn generated_identities_never_collide(cx: &mut TestAppContext) {
     names.dedup();
     assert_eq!(names.len(), 3);
     for n in &names {
-        assert!(crate::state::workspaces_dir().join(n).is_dir());
+        assert!(crate::state::tasks_dir().join(n).is_dir());
     }
 }
 
@@ -296,7 +296,7 @@ async fn title_edit_leaves_identity_alone(cx: &mut TestAppContext) {
     let on = on_app(window, shark.clone());
     let repos = cx.update(|cx| shark.read(cx).state.repos.clone());
     on(cx, &|s, w, cx| {
-        s.create_workspace(
+        s.create_task_for_test(
             "kd/login".into(),
             git::on_branch(&repos, "kd/login"),
             vec![],
@@ -310,21 +310,21 @@ async fn title_edit_leaves_identity_alone(cx: &mut TestAppContext) {
     })
     .await;
     on(cx, &|s, _, _| {
-        let ws = s.active_ws_mut().unwrap();
+        let ws = s.active_task_mut().unwrap();
         ws.viewed.insert("api/a.rs".into(), 7);
         ws.open_tab(TabId::File("api/a.rs".into()));
         let _ = s.state.save();
     });
-    let was = active_ws(cx, &shark);
+    let was = active_task(cx, &shark);
     assert_eq!(was.display_title(), "kd-login", "no title: the name");
 
-    on(cx, &|s, w, cx| s.rename_agent(was.name.clone(), w, cx));
+    on(cx, &|s, w, cx| s.rename_task(was.name.clone(), w, cx));
     cx.update_window(window, |_, w, cx| w.input("Login work", cx))
         .unwrap();
     press_in(window)(cx, &["enter"]);
 
     let saved = State::load();
-    for ws in [active_ws(cx, &shark), saved.workspaces[0].clone()] {
+    for ws in [active_task(cx, &shark), saved.tasks[0].clone()] {
         assert_eq!(ws.title, "Login work");
         assert_eq!(ws.display_title(), "Login work");
         assert_eq!(ws.name, was.name);
@@ -341,7 +341,7 @@ async fn title_edit_leaves_identity_alone(cx: &mut TestAppContext) {
     );
     // An empty title changes nothing.
     on(cx, &|s, _, cx| s.set_title("kd-login", String::new(), cx));
-    assert_eq!(active_ws(cx, &shark).title, "Login work");
+    assert_eq!(active_task(cx, &shark).title, "Login work");
 }
 
 /// shift-tab, the Plan button and the palette's toggle can't leave Plan mode, and say why with
@@ -360,7 +360,7 @@ async fn every_way_out_of_plan_mode_needs_a_repository(cx: &mut TestAppContext) 
             assert!(c.meta.plan, "{what}: Plan mode stays");
             assert_eq!(c.plan.read(cx).approved, None, "{what}: not approved");
             assert!(c.sent_texts().is_empty(), "{what}: nothing sent");
-            assert_eq!(shark.read(cx).active_ws().unwrap().chats.len(), 1, "{what}");
+            assert_eq!(shark.read(cx).active_task().unwrap().chats.len(), 1, "{what}");
         })
     };
     let offered = |cx: &mut TestAppContext, what: &str| {
@@ -420,9 +420,9 @@ async fn new_and_reopened_chats_open_in_plan_mode(cx: &mut TestAppContext) {
     press(cx, &["cmd-t"]);
     let chat = active_chat(cx, &shark);
     cx.update(|cx| assert!(chat.read(cx).meta.plan && chat.read(cx).plan_open));
-    assert_eq!(active_ws(cx, &shark).chats.len(), 2);
+    assert_eq!(active_task(cx, &shark).chats.len(), 2);
 
-    let id = format!("{}~9", active_ws(cx, &shark).name);
+    let id = format!("{}~9", active_task(cx, &shark).name);
     let closed = ChatMeta {
         id: id.clone(),
         title: "old".into(),
@@ -430,7 +430,7 @@ async fn new_and_reopened_chats_open_in_plan_mode(cx: &mut TestAppContext) {
         ..Default::default()
     };
     on(cx, &|s, _, _| {
-        s.active_ws_mut().unwrap().closed.push(closed.clone());
+        s.active_task_mut().unwrap().closed.push(closed.clone());
     });
     press(cx, &["cmd-shift-t"]);
     let chat = active_chat(cx, &shark);
@@ -441,7 +441,7 @@ async fn new_and_reopened_chats_open_in_plan_mode(cx: &mut TestAppContext) {
     });
     let saved = State::load();
     assert!(
-        (saved.workspaces[0].chats.iter()).any(|c| c.id == id && c.plan),
+        (saved.tasks[0].chats.iter()).any(|c| c.id == id && c.plan),
         "saved"
     );
     // Refused as in a Claude chat: Codex reads `plan` from the meta when it starts.
@@ -451,7 +451,7 @@ async fn new_and_reopened_chats_open_in_plan_mode(cx: &mut TestAppContext) {
     for _ in 0..3 {
         press(cx, &["cmd-w"]);
     }
-    let ws = active_ws(cx, &shark);
+    let ws = active_task(cx, &shark);
     assert_eq!(ws.chats.len(), 1);
     let chat = active_chat(cx, &shark);
     cx.update(|cx| assert!(chat.read(cx).meta.plan, "the last tab's replacement"));
@@ -469,7 +469,7 @@ async fn attaching_never_ends_plan_mode(cx: &mut TestAppContext) {
     let home = crate::state::home();
     let (window, shark, chat) = planned_agent(cx).await;
     let on = on_app(window, shark.clone());
-    let name = active_ws(cx, &shark).name;
+    let name = active_task(cx, &shark).name;
     let n = name.clone();
     on(cx, &|s, w, cx| s.attach_repository(n.clone(), w, cx));
     assert!(cx.did_prompt_for_paths(), "the folder panel");
@@ -484,11 +484,11 @@ async fn attaching_never_ends_plan_mode(cx: &mut TestAppContext) {
     });
     press_in(window)(cx, &["enter"]);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).active_ws().is_some_and(Workspace::ready)
+        shark.read(cx).active_task().is_some_and(Task::ready)
     })
     .await;
     cx.run_until_parked();
-    let ws = active_ws(cx, &shark);
+    let ws = active_task(cx, &shark);
     assert_eq!(ws.repos[0].name, "api");
     assert_eq!(
         git::git(&ws.dir().join("api"), &["branch", "--show-current"]).unwrap(),
@@ -537,7 +537,7 @@ async fn empty_diff_and_git_offer_attaching(cx: &mut TestAppContext) {
         cx.simulate_path_prompt_response(|_| None);
         cx.run_until_parked();
     }
-    let ws = active_ws(cx, &shark);
+    let ws = active_task(cx, &shark);
     let (label, repos) = crate::sync::check_in_background(&ws, &[], true, &[]);
     assert!(matches!(label, Ok(None)) && repos.is_empty(), "{label:?}");
     let refused = |cx: &mut TestAppContext, f: &AppUpdate<'_>, what: &str| {
@@ -571,7 +571,7 @@ async fn empty_diff_and_git_offer_attaching(cx: &mut TestAppContext) {
     cx.update(|cx| assert_eq!(chat.read(cx).queued(), 0, "nothing queued for the agent"));
 }
 
-/// Delete agent says what it removes first; an agent with no repository goes cleanly, with its
+/// Delete task says what it removes first; an agent with no repository goes cleanly, with its
 /// conversation and plans.
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
@@ -581,9 +581,9 @@ async fn delete_agent_confirms_and_removes_everything(cx: &mut TestAppContext) {
     let _claude = ClaudeGuard::set(&quiet);
     test_home();
     let (window, shark, _chat) = planned_agent(cx).await;
-    let ws = active_ws(cx, &shark);
+    let ws = active_task(cx, &shark);
     cx.update_window(window, |_, w, cx| {
-        w.dispatch_action(Box::new(ArchiveWorkspace), cx);
+        w.dispatch_action(Box::new(ArchiveTask), cx);
     })
     .unwrap();
     cx.run_until_parked();
@@ -594,11 +594,11 @@ async fn delete_agent_confirms_and_removes_everything(cx: &mut TestAppContext) {
     assert!(ws.dir().exists());
     press_in(window)(cx, &["enter"]);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
-        shark.read(cx).state.workspaces.is_empty()
+        shark.read(cx).state.tasks.is_empty()
     })
     .await;
     assert!(!ws.dir().exists());
-    assert!(State::load().workspaces.is_empty());
+    assert!(State::load().tasks.is_empty());
 }
 
 /// The branch and PR dialog stays reachable and keeps refusing with no repo to check out;
@@ -611,7 +611,7 @@ async fn branch_dialog_stays_reachable(cx: &mut TestAppContext) {
     let (window, shark) = empty_app(cx);
     let run = |cx: &mut TestAppContext| {
         cx.update_window(window, |_, w, cx| {
-            w.dispatch_action(Box::new(NewWorkspaceFromBranch), cx)
+            w.dispatch_action(Box::new(NewTaskFromBranch), cx)
         })
         .unwrap();
         cx.run_until_parked();

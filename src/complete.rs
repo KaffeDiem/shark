@@ -1,4 +1,4 @@
-//! Composer completions: `@` files across the workspace's repos, `/` skills and commands, `#` PRs.
+//! Composer completions: `@` files across the task's repos, `/` skills and commands, `#` PRs.
 //! Sources load in the background; ranking runs per keystroke over the cached lists.
 use crate::prs::PrStatus;
 pub use crate::prs::{Pr, cached_repo_prs, fetch_repo_prs};
@@ -38,7 +38,7 @@ pub struct Item {
 }
 
 /// Every tracked and untracked-but-not-ignored path in each repo, plus their folders.
-/// Paths are workspace-relative (`api/src/a.rs`), which is how Claude Code resolves `@`.
+/// Paths are task-relative (`api/src/a.rs`), which is how Claude Code resolves `@`.
 pub fn files(repos: &[(String, PathBuf)]) -> Vec<Item> {
     let lists = crate::proc::par_map(repos, |(name, dir)| {
         // -z: unquoted names; --deduplicate: one line per conflicted file, not per stage.
@@ -96,11 +96,11 @@ pub fn mention(path: &str) -> String {
     }
 }
 
-/// Where dropped and pasted files land. The workspace root isn't a repo, so they stay out of
-/// diffs, and archive removes them with the workspace.
+/// Where dropped and pasted files land. The task root isn't a repo, so they stay out of
+/// diffs, and archive removes them with the task.
 pub const ATTACHMENTS: &str = ".context/attachments";
 
-/// The path to mention for a dropped or pasted path. A file inside the workspace is referenced
+/// The path to mention for a dropped or pasted path. A file inside the task is referenced
 /// where it is; one outside is copied into [`ATTACHMENTS`] (a folder is referenced by absolute path).
 pub fn attach(ws: &Path, src: &Path) -> Result<String, String> {
     let err = |e: std::io::Error| format!("{}: {e}", src.display());
@@ -110,7 +110,7 @@ pub fn attach(ws: &Path, src: &Path) -> Result<String, String> {
     // ponytail: outside folders aren't copied (size, nested .git); the agent can read them in place
     if src.is_dir() || src.starts_with(&root) {
         let shown = src.strip_prefix(&root).unwrap_or(&src);
-        // The workspace itself is `./`; a bare `/` would be the filesystem root.
+        // The task itself is `./`; a bare `/` would be the filesystem root.
         let shown = if shown.as_os_str().is_empty() {
             Path::new(".")
         } else {
@@ -215,7 +215,7 @@ fn cache_path(ws: &str) -> PathBuf {
     support_dir().join("commands").join(format!("{ws}.json"))
 }
 
-/// Commands from the last probe of this workspace, so `/` is instant after a restart.
+/// Commands from the last probe of this task, so `/` is instant after a restart.
 pub fn cached_commands(ws: &str) -> Vec<Item> {
     std::fs::read(cache_path(ws))
         .ok()
@@ -440,7 +440,7 @@ mod tests {
             ".context/attachments/Screenshot 2026-10-25 at 10.22.33 AM (1).png"
         );
         assert_eq!(fs::read_dir(ws.join(ATTACHMENTS)).unwrap().count(), 2);
-        // Inside the workspace: referenced, not copied.
+        // Inside the task: referenced, not copied.
         assert_eq!(
             attach(&ws, &ws.join("web/src/a.rs")).unwrap(),
             "web/src/a.rs"

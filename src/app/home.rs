@@ -8,11 +8,11 @@ use crate::sync::PrState;
 use crate::ui::{card, close_button, mode_pills};
 use std::time::SystemTime;
 
-const BUILD: &str = "Describe the work; enter starts an agent";
+const BUILD: &str = "Describe the work; enter starts a task";
 const ASK: &str = "Ask how to do something in Shark";
 const RELEASES: &str = "https://github.com/KaffeDiem/shark/releases/tag/v";
 
-/// Home's workspace groups, in the order they're shown.
+/// Home's task groups, in the order they're shown.
 #[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
 pub(super) enum Bucket {
     Needs,
@@ -32,7 +32,7 @@ impl Bucket {
     }
 }
 
-/// A workspace's group, and for Needs you what it waits on. A running agent outranks the rest
+/// A task's group, and for Needs you what it waits on. A running agent outranks the rest
 /// (as the sidebar's spinner does); a git step that's yours outranks a plan or question the
 /// chat ended on, which outranks a turn you haven't read.
 pub(super) fn bucket(
@@ -70,8 +70,8 @@ fn key_button(b: Button, keys: &str, go: Go, cx: &Context<Shark>) -> Div {
     h_flex().gap_2().child(b).child(kbd(keys))
 }
 
-/// What each workspace waits on and when it last changed. Reads transcript tails.
-fn scan(wss: Vec<Workspace>) -> Vec<(String, Option<&'static str>, Option<SystemTime>)> {
+/// What each task waits on and when it last changed. Reads transcript tails.
+fn scan(wss: Vec<Task>) -> Vec<(String, Option<&'static str>, Option<SystemTime>)> {
     (wss.into_iter())
         .map(|ws| {
             (
@@ -84,26 +84,26 @@ fn scan(wss: Vec<Workspace>) -> Vec<(String, Option<&'static str>, Option<System
 }
 
 pub(crate) struct Home {
-    /// Shown over the open workspace. With none open, Home shows anyway.
+    /// Shown over the open task. With none open, Home shows anyway.
     pub(super) on: bool,
-    /// The workspace list, which takes j/k/enter.
+    /// The task list, which takes j/k/enter.
     pub(super) focus: FocusHandle,
-    /// The workspace under the list cursor.
+    /// The task under the list cursor.
     pub(super) sel: Option<String>,
     pub(super) prompt: Entity<InputState>,
-    /// The prompt asks Shark instead of starting a workspace.
+    /// The prompt asks Shark instead of starting a task.
     pub(super) asking: bool,
     pub(super) ask: Option<Ask>,
     /// Read off the UI thread when Home opens and when a turn ends, not per frame.
     pub(super) waiting: HashMap<String, &'static str>,
     activity: HashMap<String, SystemTime>,
-    /// The latest scan that covers each workspace; an older scan finishing later is ignored.
+    /// The latest scan that covers each task; an older scan finishing later is ignored.
     scans: HashMap<String, u64>,
     scan_no: u64,
     /// The page, scrolled to keep the cursor's row in view; `rows` holds the list's rows.
     page: ScrollHandle,
     rows: ScrollHandle,
-    /// The Get started card expanded, while it shows collapsed (there are workspaces).
+    /// The Get started card expanded, while it shows collapsed (there are tasks).
     pub(super) checklist_open: bool,
     _subs: Vec<Subscription>,
 }
@@ -141,7 +141,7 @@ impl Home {
     }
 }
 
-/// A Home workspace row, in display order.
+/// A Home task row, in display order.
 pub(super) struct HomeRow {
     pub(super) ix: usize,
     bucket: Bucket,
@@ -151,16 +151,16 @@ pub(super) struct HomeRow {
 
 impl Shark {
     /// cmd-n: an agent with an empty conversation.
-    pub(super) fn new_empty_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        self.new_agent(None, None, window, cx)
+    pub(super) fn new_empty_task(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        self.new_task(None, None, window, cx)
     }
 
     /// The branch and PR dialog on the repos of the last one, with Home's typed prompt as the
     /// first message.
-    pub(super) fn new_workspace_default(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+    pub(super) fn new_task_default(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let typed = self.home.prompt.read(cx).value().trim().to_string();
         let first = (self.home_shown() && !self.home.asking && !typed.is_empty()).then_some(typed);
-        self.new_workspace(self.state.last_repos.clone(), first, window, cx)
+        self.new_task_from_repos(self.state.last_repos.clone(), first, window, cx)
     }
 
     /// Home is on screen: asked for, or nothing else to show.
@@ -168,7 +168,7 @@ impl Shark {
         self.home.on || self.active.is_none()
     }
 
-    /// cmd-0: Home, or back to the open workspace.
+    /// cmd-0: Home, or back to the open task.
     pub(super) fn toggle_home(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         match self.home_shown() {
             true => self.leave_home(window, cx),
@@ -191,10 +191,10 @@ impl Shark {
         self.refresh_home(None, cx);
         self.scan_approved(cx);
         let rows = self.home_rows(cx);
-        // The cursor starts on the workspace just left.
+        // The cursor starts on the task just left.
         self.home.sel = self.active.clone().or(self.home.sel.take());
         if self.home_at(&rows).is_none() {
-            self.home.sel = (rows.first()).map(|r| self.state.workspaces[r.ix].name.clone());
+            self.home.sel = (rows.first()).map(|r| self.state.tasks[r.ix].name.clone());
         }
         self.focus_fallback(window, cx);
         cx.notify();
@@ -234,10 +234,10 @@ impl Shark {
         }
     }
 
-    /// Re-reads, in the background, what each workspace (or just `only`) waits on and when it
+    /// Re-reads, in the background, what each task (or just `only`) waits on and when it
     /// last changed.
     pub(super) fn refresh_home(&mut self, only: Option<&str>, cx: &mut Context<Self>) {
-        let wss: Vec<Workspace> = (self.state.workspaces.iter())
+        let wss: Vec<Task> = (self.state.tasks.iter())
             .filter(|w| only.is_none_or(|n| n == w.name))
             .cloned()
             .collect();
@@ -277,7 +277,7 @@ impl Shark {
         if self.state.approved_plan {
             return;
         }
-        let ids: Vec<String> = (self.state.workspaces.iter())
+        let ids: Vec<String> = (self.state.tasks.iter())
             .flat_map(|w| w.chats.iter().chain(&w.closed))
             .map(|c| c.id.clone())
             .collect();
@@ -298,7 +298,7 @@ impl Shark {
     pub(super) fn home_rows(&self, cx: &App) -> Vec<HomeRow> {
         let mut rows: Vec<HomeRow> = (self.ws_order(true).into_iter())
             .map(|ix| {
-                let name = &self.state.workspaces[ix].name;
+                let name = &self.state.tasks[ix].name;
                 let running = self.running_chats(name, cx);
                 let waiting = self.home.waiting.get(name).copied();
                 let (bucket, label) = bucket(running, &self.attention_of(name, cx), waiting);
@@ -318,7 +318,7 @@ impl Shark {
     pub(super) fn home_at(&self, rows: &[HomeRow]) -> Option<usize> {
         let sel = self.home.sel.as_ref()?;
         rows.iter()
-            .position(|r| &self.state.workspaces[r.ix].name == sel)
+            .position(|r| &self.state.tasks[r.ix].name == sel)
     }
 
     /// The cursor's position in `rows`, else the first row.
@@ -332,7 +332,7 @@ impl Shark {
             return;
         }
         let to = nav.to(self.home_at(&rows).unwrap_or(0), rows.len(), 10);
-        self.home.sel = Some(self.state.workspaces[rows[to].ix].name.clone());
+        self.home.sel = Some(self.state.tasks[rows[to].ix].name.clone());
         // The list's children are the rows with a heading before each group's first.
         let headings = rows[..=to].chunk_by(|a, b| a.bucket == b.bucket).count();
         self.home_scroll_to(to + headings);
@@ -357,11 +357,11 @@ impl Shark {
     fn home_confirm(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.home_rows(cx);
         if let Some(r) = self.home_cursor(&rows) {
-            self.open_workspace(rows[r].ix, window, cx)
+            self.open_task(rows[r].ix, window, cx)
         }
     }
 
-    /// esc: stop the answer being written, else back to the workspace.
+    /// esc: stop the answer being written, else back to the task.
     pub(super) fn home_escape(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         if !self.cancel_ask(cx) {
             self.leave_home(window, cx)
@@ -388,10 +388,10 @@ impl Shark {
             }
             return;
         }
-        self.new_agent((!text.is_empty()).then_some(text), None, window, cx);
+        self.new_task((!text.is_empty()).then_some(text), None, window, cx);
     }
 
-    /// A workspace was created with `first` as its first message: clear the prompt if it
+    /// A task was created with `first` as its first message: clear the prompt if it
     /// came from there. A cancelled dialog leaves the prompt as typed.
     pub(super) fn home_prompt_used(
         &mut self,
@@ -420,7 +420,7 @@ impl Shark {
     pub(super) fn checklist(&self, cx: &App) -> [(&'static str, bool); 5] {
         let st = &self.state;
         let pr = st.opened_pr
-            || (st.workspaces.iter()).any(|w| {
+            || (st.tasks.iter()).any(|w| {
                 (self.overview_repos(&w.name, cx))
                     .is_some_and(|r| r.iter().any(|r| r.pr().is_some()))
             });
@@ -430,7 +430,7 @@ impl Shark {
                 !self.deps.is_empty() && self.deps.iter().all(|d| d.ok),
             ),
             ("Add a repo", !st.repos.is_empty()),
-            ("Create an agent", !st.workspaces.is_empty()),
+            ("Create a task", !st.tasks.is_empty()),
             ("Approve a plan", st.approved_plan),
             ("Open a PR", pr),
         ]
@@ -447,18 +447,18 @@ impl Shark {
         cx.notify()
     }
 
-    /// "Approve a plan": plan mode on in the cursor's (or the first) workspace.
+    /// "Approve a plan": plan mode on in the cursor's (or the first) task.
     pub(super) fn try_plan_mode(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let rows = self.home_rows(cx);
         let Some(r) = self.home_cursor(&rows) else {
-            return notify_err(window, cx, "Create an agent first (cmd-n)");
+            return notify_err(window, cx, "Create a task first (cmd-n)");
         };
         let ix = rows[r].ix;
-        // Leaving the open workspace asks about unsaved edits first; plan mode comes after.
+        // Leaving the open task asks about unsaved edits first; plan mode comes after.
         let leaving =
-            (self.state.workspaces.get(ix)).is_some_and(|w| self.active.as_ref() != Some(&w.name));
+            (self.state.tasks.get(ix)).is_some_and(|w| self.active.as_ref() != Some(&w.name));
         self.confirm_discard(leaving, leaving, window, cx, move |s, window, cx| {
-            s.open_workspace(ix, window, cx);
+            s.open_task(ix, window, cx);
             s.with_plan(window, cx, |c, _, cx| c.set_plan_mode(true, cx));
         });
     }
@@ -537,7 +537,7 @@ impl Shark {
                             Button::new("back-to-workspace")
                                 .ghost()
                                 .xsmall()
-                                .label("Back to agent")
+                                .label("Back to task")
                                 .on_click(cx.listener(|this, _, w, cx| this.leave_home(w, cx))),
                         )
                         .child(
@@ -584,8 +584,8 @@ impl Shark {
             .focus_handle(cx)
             .is_focused(window);
         let (title, enter, other) = match self.home.asking {
-            true => ("Ask Shark", "ask", "new agent"),
-            false => ("What do you want to build?", "start agent", "ask Shark"),
+            true => ("Ask Shark", "ask", "new task"),
+            false => ("What do you want to build?", "start task", "ask Shark"),
         };
         v_flex()
             .gap_2()
@@ -662,8 +662,8 @@ impl Shark {
         let theme = cx.theme();
         let done = items.iter().filter(|(_, d)| *d).count();
         let progress = format!("{done} of {}", items.len());
-        // Someone with workspaces knows their way around: one line, opened on click.
-        if !self.state.workspaces.is_empty() && !self.home.checklist_open {
+        // Someone with tasks knows their way around: one line, opened on click.
+        if !self.state.tasks.is_empty() && !self.home.checklist_open {
             return h_flex()
                 .gap_2()
                 .text_sm()
@@ -707,7 +707,7 @@ impl Shark {
             .children(items.iter().enumerate().map(|(i, (label, done))| {
                 let (btn, keys, go): (_, _, Go) = match i {
                     1 => ("Add repo", "cmd-k", Shark::add_repo),
-                    2 => ("New agent", "cmd-n", Shark::new_empty_agent),
+                    2 => ("New task", "cmd-n", Shark::new_empty_task),
                     3 => ("Use plan mode", "shift-tab", Shark::try_plan_mode),
                     _ => ("Create PRs", "cmd-k", Shark::toggle_palette),
                 };
@@ -826,8 +826,8 @@ impl Shark {
         let theme = cx.theme();
         let add = Button::new("home-add-repo").label("Add repo");
         let add = add.on_click(cx.listener(|s, _, w, cx| s.add_repo(w, cx)));
-        let new = Button::new("home-new-ws").label("New agent").primary();
-        let new = key_button(new, "cmd-n", Shark::new_empty_agent, cx);
+        let new = Button::new("home-new-ws").label("New task").primary();
+        let new = key_button(new, "cmd-n", Shark::new_empty_task, cx);
         list.py_8()
             .items_center()
             .gap_3()
@@ -840,19 +840,19 @@ impl Shark {
                 div()
                     .text_base()
                     .text_color(theme.foreground)
-                    .child("No agents yet"),
+                    .child("No tasks yet"),
             )
             .child(
                 div()
                     .text_sm()
                     .text_color(theme.muted_foreground)
-                    .child("An agent plans first; attach a repository when it's time to build"),
+                    .child("A task plans first; attach a repository when it's time to build"),
             )
             .child(h_flex().gap_4().child(new).child(add))
             .into_any_element()
     }
 
-    /// One workspace's row on the list.
+    /// One task's row on the list.
     fn home_ws_row(
         &self,
         r: &HomeRow,
@@ -861,7 +861,7 @@ impl Shark {
         cx: &Context<Self>,
     ) -> AnyElement {
         let theme = cx.theme();
-        let w = &self.state.workspaces[r.ix];
+        let w = &self.state.tasks[r.ix];
         let ix = r.ix;
         let selected = self.home.sel.as_deref() == Some(w.name.as_str());
         let repos = self.overview_repos(&w.name, cx);
@@ -899,7 +899,7 @@ impl Shark {
                     cx.notify()
                 })
             })
-            .on_click(cx.listener(move |this, _, w, cx| this.open_workspace(ix, w, cx)))
+            .on_click(cx.listener(move |this, _, w, cx| this.open_task(ix, w, cx)))
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, e: &MouseDownEvent, w, cx| {

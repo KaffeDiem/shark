@@ -1,7 +1,7 @@
 //! Repo scripts from the repo settings: setup after a worktree is made, run on cmd-r, archive
 //! before a worktree is removed. Each runs in `$SHELL -c` in the repo's worktree, output appended
-//! to the workspace's log (`log_path`).
-use crate::state::{State, Workspace};
+//! to the task's log (`log_path`).
+use crate::state::{State, Task};
 use std::{
     fs::{self, File, OpenOptions},
     io::Write,
@@ -34,7 +34,7 @@ pub struct Job {
 
 /// `phase`'s scripts for `ws`: repos in the sidebar's order (drag to change), each repo's in its
 /// own. `only` limits them to one repo (a repo just added).
-pub fn jobs(state: &State, ws: &Workspace, phase: Phase, only: Option<&str>) -> Vec<Job> {
+pub fn jobs(state: &State, ws: &Task, phase: Phase, only: Option<&str>) -> Vec<Job> {
     let mut repos: Vec<_> = ws.repos.iter().collect();
     repos.sort_by_key(|r| state.repos.iter().position(|x| x.name == r.name));
     (repos.into_iter())
@@ -82,6 +82,8 @@ fn spawn(ws: &str, job: &Job, port: Option<u16>, log: &mut File) -> Result<Child
     }
     cmd.args(["-c", &job.script])
         .current_dir(&job.dir)
+        .env("SHARK_TASK", ws)
+        .env("SHARK_TASK_PATH", job.dir.parent().unwrap_or(&job.dir))
         .env("SHARK_WORKSPACE", ws)
         .env("SHARK_WORKSPACE_PATH", job.dir.parent().unwrap_or(&job.dir))
         .env("SHARK_ROOT_PATH", &job.src)
@@ -109,12 +111,12 @@ pub fn run_all(ws: &str, jobs: &[Job]) -> Result<(), String> {
     Ok(())
 }
 
-/// Run scripts get `SHARK_PORT`, the first of `PORTS` free ports, so two workspaces' dev servers
+/// Run scripts get `SHARK_PORT`, the first of `PORTS` free ports, so two tasks' dev servers
 /// don't fight over one.
 pub const PORTS: u16 = 10;
 const FIRST_PORT: u16 = 51000;
 
-/// The first block of `PORTS` not held by a running or stopping workspace and with all its ports
+/// The first block of `PORTS` not held by a running or stopping task and with all its ports
 /// free, so a server still shutting down (or started outside Shark) isn't handed out again.
 pub fn free_port(held: impl Iterator<Item = u16>) -> Result<u16, String> {
     let held: Vec<u16> = held.chain(stopping().iter().map(|s| s.1)).collect();
@@ -140,7 +142,7 @@ fn port_free(port: u16) -> bool {
     })
 }
 
-/// Runs dropped (cmd-r again) and still stopping in the background, by workspace and port: their
+/// Runs dropped (cmd-r again) and still stopping in the background, by task and port: their
 /// ports stay taken, and archiving and quit wait for them.
 static STOPPING: Mutex<Vec<(String, u16, JoinHandle<()>)>> = Mutex::new(vec![]);
 
@@ -150,7 +152,7 @@ fn stopping() -> std::sync::MutexGuard<'static, Vec<(String, u16, JoinHandle<()>
     s
 }
 
-/// Blocks until `ws`'s dropped runs (every workspace's with `None`) have stopped.
+/// Blocks until `ws`'s dropped runs (every task's with `None`) have stopped.
 pub fn wait_stopping(ws: Option<&str>) {
     let mine: Vec<_> = {
         let mut s = stopping();
@@ -165,7 +167,7 @@ pub fn wait_stopping(ws: Option<&str>) {
     }
 }
 
-/// A workspace's run scripts, started in order; dropping it stops them and their children.
+/// A task's run scripts, started in order; dropping it stops them and their children.
 pub struct Running {
     ws: String,
     pub port: u16,
@@ -292,7 +294,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let ws = format!("scripts-test-{}", std::process::id());
         let jobs = [
-            job(&dir, "echo first >> out; echo $SHARK_WORKSPACE >> out"),
+            job(&dir, "echo first >> out; echo $SHARK_WORKSPACE >> out; test \"$SHARK_TASK\" = \"$SHARK_WORKSPACE\" && test \"$SHARK_TASK_PATH\" = \"$SHARK_WORKSPACE_PATH\" || exit 9"),
             job(&dir, "exit 3"),
             job(&dir, "echo never >> out"),
         ];
