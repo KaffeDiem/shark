@@ -89,6 +89,10 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         ("agent-tasks", |s, w, cx| s.open_agent("designer", w, cx)),
         ("agent-empty", |s, w, cx| s.open_agent("test", w, cx)),
         ("agent-settings", |s, w, cx| s.edit_agent("designer", w, cx)),
+        ("agent-settings-end", |s, w, cx| {
+            s.edit_agent("designer", w, cx);
+            s.home.page.set_offset(point(px(0.), px(-2000.)));
+        }),
         ("agent-history", |s, w, cx| {
             s.open_agent("designer", w, cx);
             s.home.agent_tab = super::super::agent_settings::AgentTab::History;

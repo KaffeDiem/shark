@@ -2,7 +2,7 @@
 use super::*;
 use crate::models::{effort_label, efforts, model_label};
 use crate::state::Agent;
-use crate::ui::{card, row, section};
+use crate::ui::{caption, card, row, section};
 use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectState};
 use std::cell::Cell;
@@ -59,17 +59,40 @@ fn skills_button(slug: &str) -> Button {
         })
 }
 
+/// An empty tab: what's missing and how it fills, in the shape of Home's empty list.
+fn empty_state(
+    theme: &Theme,
+    id: &'static str,
+    icon: IconName,
+    title: &'static str,
+    hint: &'static str,
+) -> impl IntoElement {
+    v_flex()
+        .id(id)
+        .test_support()
+        .py_12()
+        .items_center()
+        .gap_3()
+        .child(Icon::new(icon).with_size(px(32.)).text_color(faint(theme)))
+        .child(div().text_base().child(title))
+        .child(
+            div()
+                .text_sm()
+                .text_color(theme.muted_foreground)
+                .child(hint),
+        )
+}
+
 fn render_history(agent: &Agent, theme: &Theme) -> AnyElement {
     v_flex()
-        .gap_2()
-        .child(section(theme, "History"))
         .when(agent.history.is_empty(), |d| {
-            d.child(
-                div()
-                    .text_sm()
-                    .text_color(theme.muted_foreground)
-                    .child("No task history yet"),
-            )
+            d.child(empty_state(
+                theme,
+                "agent-empty-history",
+                IconName::Archive,
+                "No task history yet",
+                "Deleted tasks are recorded here with their PR state.",
+            ))
         })
         .children(agent.history.iter().enumerate().map(|(i, record)| {
             let status = match record.merged {
@@ -253,7 +276,6 @@ impl Shark {
             return div().child("Agent no longer exists").into_any_element();
         };
         let theme = cx.theme();
-        let refresh_slug = slug.to_string();
         let repos = agent
             .repos
             .iter()
@@ -283,17 +305,13 @@ impl Shark {
                     .on_action(cx.listener(|s, _: &Confirm, w, cx| s.home_confirm(w, cx)))
                     .test_support()
                     .when(tasks.is_empty(), |d| {
-                        d.child(
-                            v_flex()
-                                .id("agent-empty-tasks")
-                                .test_support()
-                                .py_8()
-                                .gap_2()
-                                .child(div().text_base().child("No tasks yet"))
-                                .child(div().text_sm().text_color(theme.muted_foreground).child(
-                                    "Describe the work above and press enter. Each task gets its own branch and chat.",
-                                )),
-                        )
+                        d.child(empty_state(
+                            theme,
+                            "agent-empty-tasks",
+                            IconName::Inbox,
+                            "No tasks yet",
+                            "Describe the work above and press enter. Each task gets its own branch and chat.",
+                        ))
                     })
                     .children(tasks.iter().map(|task| {
                         self.home_ws_row(
@@ -305,27 +323,10 @@ impl Shark {
                     }))
                     .into_any_element()
             }
-            AgentTab::Instructions => v_flex()
+            AgentTab::Instructions => div()
                 .id("agent-instructions-page")
                 .test_support()
-                .gap_6()
                 .children(self.home.agent_editor.clone())
-                .child(
-                    v_flex()
-                        .gap_2()
-                        .child(section(theme, "Skills"))
-                        .child(div().text_sm().text_color(theme.muted_foreground).child(
-                            "Add each skill as <skill>/SKILL.md in this folder, then Refresh skills to update every open task.",
-                        ))
-                        .child(h_flex().gap_2().child(skills_button(slug))
-                        .child(Button::new("agent-refresh-skills").ghost().small().icon(IconName::RefreshCw)
-                            .label("Refresh skills").on_click(cx.listener(move |s, _, window, cx| {
-                                match s.sync_agent(&refresh_slug, true, cx) {
-                                    Ok(()) => window.push_notification(Notification::success("Agent skills refreshed"), cx),
-                                    Err(e) => notify_err(window, cx, format!("Couldn't refresh agent skills: {e}")),
-                                }
-                            })))),
-                )
                 .into_any_element(),
             AgentTab::History => render_history(agent, theme),
         };
@@ -362,11 +363,22 @@ impl Shark {
                             .min_w_0()
                             .truncate()
                             .child(if repos.is_empty() {
-                                "Without a repository · add defaults in Settings".to_string()
+                                "Without a repository".to_string()
                             } else {
                                 format!("In {repos}")
                             }),
                     )
+                    .when(repos.is_empty(), |d| {
+                        d.child(
+                            Button::new("agent-set-defaults")
+                                .ghost()
+                                .xsmall()
+                                .label("Set default repositories")
+                                .on_click(cx.listener(|s, _, w, cx| {
+                                    s.show_agent_tab(AgentTab::Instructions, w, cx)
+                                })),
+                        )
+                    })
                     .child(div().flex_1())
                     .child(
                         Button::new("agent-from-branch")
@@ -406,16 +418,19 @@ impl Shark {
                             .gap_6()
                             .child(
                                 h_flex()
-                                    .gap_3()
+                                    .gap_2()
                                     .child(
+                                        // Outdented by the ghost padding so the glyph lines up
+                                        // with the composer's edge.
                                         Button::new("agent-page-icon")
                                             .accessibility_label("Change agent icon")
                                             .ghost()
+                                            .ml(px(-6.))
                                             .icon(
                                                 Icon::new(super::sidebar::section_icon(
                                                     &agent.icon,
                                                 ))
-                                                .with_size(px(28.)),
+                                                .with_size(px(20.)),
                                             )
                                             .tooltip("Change icon")
                                             .on_click(cx.listener(move |s, _, w, cx| {
@@ -423,24 +438,18 @@ impl Shark {
                                             })),
                                     )
                                     .child(
-                                        v_flex()
-                                            .flex_1()
-                                            .min_w_0()
-                                            .gap_1()
-                                            .child(
-                                                div()
-                                                    .text_xl()
-                                                    .truncate()
-                                                    .font_weight(FontWeight::SEMIBOLD)
-                                                    .child(agent.name.clone()),
-                                            )
-                                            .child(
-                                                div()
-                                                    .text_sm()
-                                                    .truncate()
-                                                    .text_color(theme.muted_foreground)
-                                                    .child(format!("@{}", agent.slug)),
-                                            ),
+                                        div()
+                                            .text_xl()
+                                            .truncate()
+                                            .font_weight(FontWeight::SEMIBOLD)
+                                            .child(agent.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .flex_none()
+                                            .text_sm()
+                                            .text_color(theme.muted_foreground)
+                                            .child(format!("@{}", agent.slug)),
                                     ),
                             )
                             .child(composer)
@@ -459,11 +468,8 @@ impl Shark {
                                             self.home.agent_tab == tab,
                                         )
                                         .on_click(
-                                            cx.listener(move |s, _, window, cx| {
-                                                s.home.agent_tab = tab;
-                                                s.home.page.set_offset(point(px(0.), px(0.)));
-                                                s.home.focus.focus(window, cx);
-                                                cx.notify();
+                                            cx.listener(move |s, _, w, cx| {
+                                                s.show_agent_tab(tab, w, cx)
                                             }),
                                         )
                                     }),
@@ -473,6 +479,13 @@ impl Shark {
                     ),
             )
             .into_any_element()
+    }
+
+    fn show_agent_tab(&mut self, tab: AgentTab, window: &mut Window, cx: &mut Context<Self>) {
+        self.home.agent_tab = tab;
+        self.home.page.set_offset(point(px(0.), px(0.)));
+        self.home.focus.focus(window, cx);
+        cx.notify();
     }
 
     /// The agent's page on its Settings tab, typing into its instructions.
@@ -867,6 +880,17 @@ impl AgentSettingsView {
         self._subs.push(self.watch_effort(window, cx));
     }
 
+    fn refresh_skills(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let slug = self.slug.clone();
+        match self.shark.update(cx, |s, cx| s.sync_agent(&slug, true, cx)) {
+            Ok(Ok(())) => {
+                window.push_notification(Notification::success("Agent skills refreshed"), cx)
+            }
+            Ok(Err(e)) => notify_err(window, cx, format!("Couldn't refresh agent skills: {e}")),
+            Err(_) => {}
+        }
+    }
+
     fn pick_icon(&self, window: &mut Window, cx: &mut Context<Self>) {
         let slug = self.slug.clone();
         self.shark
@@ -902,47 +926,72 @@ impl Render for AgentSettingsView {
                     }))
             })
             .collect::<Vec<_>>();
+        let group = |label, body| v_flex().gap_2().child(section(theme, label)).child(body);
         v_flex()
             .id("agent-settings")
             .test_support()
-            .gap_4()
-            .child(
-                h_flex()
+            .gap_8()
+            .child(group(
+                "Instructions",
+                v_flex()
                     .gap_2()
                     .child(
-                        Button::new("agent-icon")
-                            .accessibility_label("Change agent icon")
-                            .ghost()
-                            .icon(super::sidebar::section_icon(&agent.icon))
-                            .tooltip("Change icon")
-                            .on_click(cx.listener(|this, _, w, cx| this.pick_icon(w, cx))),
+                        div()
+                            .id("agent-instructions")
+                            .test_support()
+                            .child(Textarea::new(&self.instructions)),
                     )
                     .child(
                         div()
-                            .id("agent-name")
-                            .test_support()
-                            .flex_1()
-                            .child(Input::new(&self.name)),
+                            .text_xs()
+                            .text_color(theme.muted_foreground)
+                            .child("Every task of this agent reads these through CLAUDE.md and AGENTS.md."),
                     ),
-            )
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(theme.muted_foreground)
-                    .child(format!("@{}", agent.slug)),
-            )
-            .child(
+            ))
+            .child(group(
+                "Skills",
                 v_flex()
                     .gap_2()
-                    .child(section(theme, "Default repositories"))
-                    .children(toggles),
-            )
-            .child(
+                    .child(div().text_sm().text_color(theme.muted_foreground).child(
+                        "Add each skill as <skill>/SKILL.md in the skills folder, then refresh to update every open task.",
+                    ))
+                    .child(
+                        h_flex()
+                            .gap_2()
+                            .child(skills_button(&self.slug))
+                            .child(
+                                Button::new("agent-refresh-skills")
+                                    .ghost()
+                                    .small()
+                                    .icon(IconName::RefreshCw)
+                                    .label("Refresh skills")
+                                    .on_click(cx.listener(|this, _, w, cx| this.refresh_skills(w, cx))),
+                            ),
+                    ),
+            ))
+            .child(group(
+                "Defaults for new tasks",
                 card(theme)
+                    .child(
+                        v_flex()
+                            .px_3()
+                            .py_3()
+                            .gap_2()
+                            .child(caption(theme, "Repositories", "Where new tasks start"))
+                            .when(toggles.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .text_xs()
+                                        .text_color(theme.muted_foreground)
+                                        .child("No repositories yet. Add one in Settings › Repositories."),
+                                )
+                            })
+                            .child(h_flex().flex_wrap().gap_x_4().gap_y_2().children(toggles)),
+                    )
                     .child(row(
                         theme,
-                        false,
-                        "Default model",
+                        true,
+                        "Model",
                         "Used for new tasks and chats",
                         Select::new(&self.model),
                     ))
@@ -953,32 +1002,50 @@ impl Render for AgentSettingsView {
                         "Their thinking level",
                         Select::new(&self.effort),
                     )),
-            )
-            .child(
-                v_flex()
-                    .gap_2()
-                    .child(section(theme, "Instructions"))
-                    .child(
-                        div()
-                            .id("agent-instructions")
-                            .test_support()
-                            .child(Textarea::new(&self.instructions)),
-                    ),
-            )
-            .child(
-                h_flex().gap_2().child(
-                    Button::new("delete-agent")
-                        .ghost()
-                        .small()
-                        .label("Delete agent…")
-                        .on_click(cx.listener(|this, _, w, cx| {
-                            let slug = this.slug.clone();
-                            this.shark
-                                .update(cx, |s, cx| s.delete_agent(&slug, w, cx))
-                                .ok();
-                        })),
-                ),
-            )
+            ))
+            .child(group(
+                "Agent",
+                card(theme)
+                    .child(row(
+                        theme,
+                        false,
+                        "Name and icon",
+                        "Shown in the sidebar and on its tasks",
+                        h_flex()
+                            .w_full()
+                            .gap_1()
+                            .child(
+                                Button::new("agent-icon")
+                                    .accessibility_label("Change agent icon")
+                                    .ghost()
+                                    .icon(super::sidebar::section_icon(&agent.icon))
+                                    .tooltip("Change icon")
+                                    .on_click(cx.listener(|this, _, w, cx| this.pick_icon(w, cx))),
+                            )
+                            .child(
+                                div()
+                                    .id("agent-name")
+                                    .test_support()
+                                    .flex_1()
+                                    .child(Input::new(&self.name)),
+                            ),
+                    ))
+                    .child(row(
+                        theme,
+                        true,
+                        "Delete agent",
+                        "Removes its instructions, history and skills",
+                        Button::new("delete-agent")
+                            .small()
+                            .label("Delete agent…")
+                            .on_click(cx.listener(|this, _, w, cx| {
+                                let slug = this.slug.clone();
+                                this.shark
+                                    .update(cx, |s, cx| s.delete_agent(&slug, w, cx))
+                                    .ok();
+                            })),
+                    )),
+            ))
             .into_any_element()
     }
 }
