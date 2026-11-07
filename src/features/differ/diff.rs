@@ -1423,7 +1423,7 @@ pub(crate) fn diff_mode(unified: bool) -> DiffMode {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 mod tests {
     // Not `super::*`: it would bring `gpui_kit::test` in over the `#[test]` its macro expands to.
     use super::{DiffData, parse_chunk};

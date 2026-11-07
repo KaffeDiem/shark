@@ -8,6 +8,34 @@ use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectStat
 
 type Choice = Entity<SelectState<SearchableVec<SharedString>>>;
 
+fn repo_model(state: &State, agent: &Agent) -> String {
+    let task = Task {
+        repos: state
+            .repos
+            .iter()
+            .filter(|r| agent.repos.contains(&r.name))
+            .map(|r| crate::state::TaskRepo {
+                name: r.name.clone(),
+                src: r.path.clone(),
+                base: String::new(),
+                branch: None,
+            })
+            .collect(),
+        ..Default::default()
+    };
+    state.defaults_for(&task).0
+}
+
+fn create_skills_folder(slug: &str) -> std::io::Result<PathBuf> {
+    let mut parts = Path::new(slug).components();
+    if !matches!(parts.next(), Some(std::path::Component::Normal(_))) || parts.next().is_some() {
+        return Err(std::io::Error::other("Invalid agent slug"));
+    }
+    let path = crate::state::agent_skills_dir(slug);
+    std::fs::create_dir_all(&path)?;
+    Ok(path)
+}
+
 pub(crate) struct AgentsPage {
     shark: WeakEntity<Shark>,
 }
@@ -194,7 +222,7 @@ impl Shark {
         };
         let shark = cx.entity().downgrade();
         let gone = shark.clone();
-        let last = self.state.new_model();
+        let last = repo_model(&self.state, &agent);
         let view = cx.new(|cx| AgentSettingsView::new(shark, agent, last, window, cx));
         let slug = slug.to_string();
         window.open_dialog(cx, move |d, _, _| {
@@ -531,6 +559,31 @@ impl AgentSettingsView {
         result
     }
 
+    fn set_repo(&mut self, repo: &str, on: bool, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(mut agent) = self.update(cx, |a| {
+            a.repos.retain(|r| r != repo);
+            if on {
+                a.repos.push(repo.into());
+            }
+        }) else {
+            return;
+        };
+        if let Some(shark) = self.shark.upgrade() {
+            self.last = repo_model(&shark.read(cx).state, &agent);
+        }
+        let levels = efforts(agent.model.as_deref().unwrap_or(&self.last));
+        if agent
+            .effort
+            .as_deref()
+            .is_some_and(|e| !levels.contains(&e))
+        {
+            agent.effort = None;
+            self.update(cx, |a| a.effort = None);
+        }
+        self.effort = Self::effort_choice(&agent, &self.last, window, cx);
+        self._subs.push(self.watch_effort(window, cx));
+    }
+
     fn pick_icon(&self, window: &mut Window, cx: &mut Context<Self>) {
         let slug = self.slug.clone();
         self.shark
@@ -561,13 +614,8 @@ impl Render for AgentSettingsView {
                 Checkbox::new(("agent-repo", i))
                     .label(repo.name.clone())
                     .checked(checked)
-                    .on_click(cx.listener(move |this, on: &bool, _, cx| {
-                        this.update(cx, |a| {
-                            a.repos.retain(|r| r != &repo.name);
-                            if *on {
-                                a.repos.push(repo.name.clone());
-                            }
-                        });
+                    .on_click(cx.listener(move |this, on: &bool, window, cx| {
+                        this.set_repo(&repo.name, *on, window, cx);
                     }))
             })
             .collect::<Vec<_>>();
@@ -639,6 +687,19 @@ impl Render for AgentSettingsView {
                 h_flex()
                     .gap_2()
                     .child(
+                        Button::new("agent-skills")
+                            .ghost()
+                            .small()
+                            .icon(IconName::Folder)
+                            .label("Open skills folder")
+                            .on_click(cx.listener(|this, _, w, cx| {
+                                match create_skills_folder(&this.slug) {
+                                    Ok(path) => cx.reveal_path(&path),
+                                    Err(e) => notify_err(w, cx, e.to_string()),
+                                }
+                            })),
+                    )
+                    .child(
                         Button::new("agent-new-task")
                             .ghost()
                             .small()
@@ -665,5 +726,62 @@ impl Render for AgentSettingsView {
                     ),
             )
             .into_any_element()
+    }
+}
+
+#[cfg(all(test, feature = "test-support"))]
+mod tests {
+    use super::*;
+    use core::prelude::v1::test;
+
+    #[test]
+    fn repository_model_controls_effort_without_overriding_an_explicit_agent_model() {
+        let mut state = State {
+            repos: vec![Repo {
+                name: "api".into(),
+                path: "/api".into(),
+            }],
+            last_model: Some("opus".into()),
+            ..Default::default()
+        };
+        state.repo_settings.insert(
+            "api".into(),
+            crate::state::RepoSettings {
+                model: Some("codex:gpt-6.1-sol".into()),
+                ..Default::default()
+            },
+        );
+        let mut agent = Agent {
+            repos: vec!["api".into()],
+            ..Default::default()
+        };
+        let inherited = repo_model(&state, &agent);
+        assert_eq!(inherited, "codex:gpt-6.1-sol");
+        assert!(efforts(&inherited).contains(&"ultra"));
+        agent.model = Some("opus".into());
+        assert!(!efforts(agent.model.as_deref().unwrap_or(&inherited)).contains(&"ultra"));
+        agent.repos.clear();
+        assert_eq!(repo_model(&state, &agent), "opus");
+    }
+
+    #[test]
+    fn skills_folder_uses_the_agent_source_and_reports_creation_errors() {
+        let _turn = crate::app::ui_tests::UI_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let home = crate::app::ui_tests::test_home();
+        let path = create_skills_folder("designer").unwrap();
+        assert_eq!(
+            path,
+            home.join("Library/Application Support/shark/agents/designer/skills")
+        );
+        assert!(path.is_dir());
+        assert_eq!(create_skills_folder("designer").unwrap(), path);
+        assert!(create_skills_folder("../outside").is_err());
+        let blocked = crate::state::agent_skills_dir("blocked");
+        std::fs::create_dir_all(blocked.parent().unwrap()).unwrap();
+        std::fs::write(&blocked, "keep").unwrap();
+        assert!(create_skills_folder("blocked").is_err());
+        assert_eq!(std::fs::read_to_string(blocked).unwrap(), "keep");
     }
 }

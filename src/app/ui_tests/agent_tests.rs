@@ -667,7 +667,21 @@ async fn persistent_agent_starts_isolated_tasks_with_instructions(cx: &mut TestA
         .await;
         cx.run_until_parked();
         cx.update(|cx| assert_eq!(shark.read(cx).home.prompt.read(cx).value(), ""));
+        if count == 1 {
+            let task = cx.read(|cx| shark.read(cx).state.tasks[0].clone());
+            fs::write(task.dir().join("api/first.rs"), "first").unwrap();
+        }
     }
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).state.tasks[1]
+            .agent
+            .as_ref()
+            .unwrap()
+            .siblings[0]
+            .files
+            == ["api/first.rs"]
+    })
+    .await;
     let tasks = cx.update(|cx| shark.read(cx).state.tasks.clone());
     assert_eq!(
         tasks.iter().map(|t| t.title.as_str()).collect::<Vec<_>>(),
@@ -701,6 +715,19 @@ async fn persistent_agent_starts_isolated_tasks_with_instructions(cx: &mut TestA
             );
         }
     }
+    fs::remove_file(tasks[0].dir().join("api/first.rs")).unwrap();
+    fs::write(tasks[0].dir().join("api/second.rs"), "second").unwrap();
+    on_app(window, shark.clone())(cx, &|s, _, cx| s.turn_done(&tasks[0].name, cx));
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).state.tasks[1]
+            .agent
+            .as_ref()
+            .unwrap()
+            .siblings[0]
+            .files
+            == ["api/second.rs"]
+    })
+    .await;
     on_app(window, shark.clone())(cx, &|s, _, cx| {
         s.state.agents[0].instructions = "Use the design system".into();
         s.sync_agent("designer", true, cx);

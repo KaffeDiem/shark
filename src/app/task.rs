@@ -4,7 +4,7 @@ use super::*;
 use crate::state::{AgentLink, AttachStage, Sibling};
 
 impl Shark {
-    pub(super) fn sync_agent(&mut self, slug: &str, docs: bool, cx: &mut Context<Self>) {
+    pub(crate) fn sync_agent(&mut self, slug: &str, docs: bool, cx: &mut Context<Self>) {
         let Some(agent) = self.state.agents.iter().find(|a| a.slug == slug).cloned() else {
             return;
         };
@@ -339,6 +339,7 @@ impl Shark {
             let section = self.ensure_agent_section(&agent.slug, cx);
             self.move_to_section(&name, section, cx);
             self.sync_agent(&agent.slug, false, cx);
+            self.refresh_agent_files(&agent.slug, cx);
         }
         self.open_task_now(self.state.tasks.len() - 1, window, cx);
         self.record_interaction(&name, cx);
@@ -581,6 +582,7 @@ impl Shark {
                                 // Settings may have changed while the worktrees were created.
                                 git::write_claude_md(&current);
                             }
+                            s.refresh_agent_files(&agent.slug, cx);
                             ws = current;
                         }
                         let _ = s.state.save();
@@ -1317,6 +1319,7 @@ impl Shark {
                 crate::plan::delete(&c.id);
             }
         }
+        self.sibling_refreshes.remove(name);
         self.syncs.remove(name);
         self.parked_sessions.remove(name);
         self.git_features.remove(name);

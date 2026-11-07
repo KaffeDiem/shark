@@ -1059,15 +1059,15 @@ pub fn claude_skill_args(ws: &Task) -> Vec<String> {
         .collect()
 }
 
-const AGENTS_DIR: &str = ".agents";
-/// Where codex looks at the task root.
-const SKILL_LINKS: &str = ".agents/skills";
+/// Where each harness discovers skills in its working directory (the task root).
+const HARNESS_SKILL_DIRS: &[&str] = &[".agents/skills", ".claude/skills"];
 
 const SKILL_OWNERS: &str = ".shark-skills.json";
 
 // Never follow a user's directory symlink while managing task-owned files.
-fn skill_dirs_owned(dir: &Path) -> bool {
-    [AGENTS_DIR, SKILL_LINKS]
+fn skill_dirs_owned(dir: &Path, folder: &str) -> bool {
+    let folder = Path::new(folder);
+    [folder.parent().unwrap(), folder]
         .iter()
         .all(|p| match fs::symlink_metadata(dir.join(p)) {
             Ok(m) => m.is_dir(),
@@ -1075,8 +1075,8 @@ fn skill_dirs_owned(dir: &Path) -> bool {
         })
 }
 
-fn owned_skill_links(dir: &Path) -> Option<BTreeMap<String, PathBuf>> {
-    let path = dir.join(AGENTS_DIR).join(SKILL_OWNERS);
+fn owned_skill_links(dir: &Path, folder: &str) -> Option<BTreeMap<String, PathBuf>> {
+    let path = dir.join(folder).parent().unwrap().join(SKILL_OWNERS);
     match fs::symlink_metadata(&path) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Some(BTreeMap::new()),
         Ok(m) if m.is_file() => {
@@ -1095,8 +1095,8 @@ fn owned_skill_links(dir: &Path) -> Option<BTreeMap<String, PathBuf>> {
     }
 }
 
-/// Link repo skills into Codex's root. Only recorded, unchanged links belong to Shark;
-/// pre-existing links (including ones from older Shark versions) stay user-owned.
+/// Link agent skills for every harness, and repo skills for Codex. Only recorded, unchanged
+/// links belong to Shark; pre-existing links stay user-owned.
 pub fn link_skills(ws: &Task, dir: &Path) {
     // Keep the current preference and filesystem reconciliation under the same lock.
     let on = REPO_SKILLS.lock().unwrap_or_else(|e| e.into_inner());
@@ -1104,13 +1104,19 @@ pub fn link_skills(ws: &Task, dir: &Path) {
 }
 
 fn reconcile_skills(ws: &Task, dir: &Path, on: bool) {
-    if !skill_dirs_owned(dir) {
+    for folder in HARNESS_SKILL_DIRS {
+        reconcile_skill_folder(ws, dir, folder, on);
+    }
+}
+
+fn reconcile_skill_folder(ws: &Task, dir: &Path, folder: &str, on: bool) {
+    if !skill_dirs_owned(dir, folder) {
         return;
     }
-    let Some(mut owned) = owned_skill_links(dir) else {
+    let Some(mut owned) = owned_skill_links(dir, folder) else {
         return;
     };
-    let links = dir.join(SKILL_LINKS);
+    let links = dir.join(folder);
     owned.retain(|name, target| fs::read_link(links.join(name)).is_ok_and(|t| &t == target));
     let mut used = HashSet::new();
     let mut user_targets = HashSet::new();
@@ -1131,43 +1137,65 @@ fn reconcile_skills(ws: &Task, dir: &Path, on: bool) {
         Err(_) => return,
     }
     let mut want = BTreeMap::new();
-    for r in ws.repos.iter().filter(|_| on) {
+    let mut add = |skill: String, target: PathBuf, prefix: &str| {
+        if user_targets.contains(&target) {
+            return;
+        }
+        let mut name = skill.clone();
+        if used.contains(&name) {
+            name = format!("{prefix}-{skill}");
+        }
+        let base = name.clone();
+        let mut suffix = 2;
+        while used.contains(&name) {
+            name = format!("{base}-{suffix}");
+            suffix += 1;
+        }
+        used.insert(name.clone());
+        want.insert(name, target);
+    };
+    // Agent skills claim plain names before repo skills, even when repo skills are disabled.
+    if let Some(agent) = &ws.agent {
+        let found = fs::read_dir(crate::state::agent_skills_dir(&agent.slug));
+        let mut found: Vec<_> = found.into_iter().flatten().flatten().collect();
+        found.sort_by_key(|e| e.file_name());
+        for entry in found {
+            if entry.path().join("SKILL.md").is_file() {
+                add(
+                    entry.file_name().to_string_lossy().into_owned(),
+                    entry.path(),
+                    &agent.slug,
+                );
+            }
+        }
+    }
+    for r in ws
+        .repos
+        .iter()
+        .filter(|_| on && folder == HARNESS_SKILL_DIRS[0])
+    {
         let mut own = HashSet::new();
-        for src in [SKILL_LINKS, ".claude/skills"] {
+        for src in HARNESS_SKILL_DIRS {
             let found = fs::read_dir(dir.join(&r.name).join(src));
             let mut found: Vec<_> = found.into_iter().flatten().flatten().collect();
             found.sort_by_key(|e| e.file_name());
             for e in found {
                 let skill = e.file_name().to_string_lossy().into_owned();
-                if !e.path().join("SKILL.md").exists() || !own.insert(skill.clone()) {
+                if !e.path().join("SKILL.md").is_file() || !own.insert(skill.clone()) {
                     continue;
                 }
                 let target = Path::new("../..").join(&r.name).join(src).join(&skill);
-                if user_targets.contains(&target) {
-                    continue;
-                }
-                let mut name = skill.clone();
-                if used.contains(&name) {
-                    name = format!("{}-{skill}", r.name);
-                }
-                let base = name.clone();
-                let mut suffix = 2;
-                while used.contains(&name) {
-                    name = format!("{base}-{suffix}");
-                    suffix += 1;
-                }
-                used.insert(name.clone());
-                want.insert(name, target);
+                add(skill, target, &r.name);
             }
         }
     }
     owned.retain(|name, target| {
         want.get(name) == Some(target) || fs::remove_file(links.join(name)).is_err()
     });
-    let manifest = dir.join(AGENTS_DIR).join(SKILL_OWNERS);
+    let manifest = links.parent().unwrap().join(SKILL_OWNERS);
     if want.is_empty() && owned.is_empty() {
         let _ = fs::remove_file(manifest);
-        let _ = fs::remove_dir(&links).and_then(|()| fs::remove_dir(dir.join(AGENTS_DIR)));
+        let _ = fs::remove_dir(&links).and_then(|()| fs::remove_dir(links.parent().unwrap()));
         return;
     }
     if fs::create_dir_all(&links).is_err() {
@@ -1192,15 +1220,15 @@ fn reconcile_skills(ws: &Task, dir: &Path, on: bool) {
 
 /// What Shark itself leaves in a task root: its docs, Finder litter, the `.context` folder
 /// of attachments and the skill links.
-fn root_owned() -> [&'static str; 5] {
+fn root_owned() -> impl Iterator<Item = &'static str> {
     let [claude, agents] = ROOT_DOCS;
-    [
-        claude,
-        agents,
-        ".DS_Store",
-        attachments_parts().0,
-        AGENTS_DIR,
-    ]
+    [claude, agents, ".DS_Store", attachments_parts().0]
+        .into_iter()
+        .chain(
+            HARNESS_SKILL_DIRS
+                .iter()
+                .map(|p| p.split_once('/').unwrap().0),
+        )
 }
 
 fn attachments_parts() -> (&'static str, &'static str) {
@@ -1210,26 +1238,28 @@ fn attachments_parts() -> (&'static str, &'static str) {
 }
 
 /// Whether `name` in the root is Shark's, not the user's: `.context` only counts while it
-/// holds nothing but attachments and `.agents` nothing but skill links (unreadable, or a file,
+/// holds nothing but attachments and harness folders nothing but skill links (unreadable, or a file,
 /// is unexpected: refuse before removing).
 fn shark_owned(dir: &Path, name: &str) -> bool {
     let (context, attachments) = attachments_parts();
-    root_owned().contains(&name)
+    root_owned().any(|owned| owned == name)
         && (name != context
             || fs::read_dir(dir.join(name))
                 .is_ok_and(|mut es| es.all(|e| e.is_ok_and(|e| e.file_name() == attachments))))
-        && (name != AGENTS_DIR || only_skill_links(dir))
+        && HARNESS_SKILL_DIRS.iter().all(|folder| {
+            folder.split_once('/').unwrap().0 != name || only_skill_links(dir, folder)
+        })
 }
 
-fn only_skill_links(dir: &Path) -> bool {
-    if !skill_dirs_owned(dir) {
+fn only_skill_links(dir: &Path, folder: &str) -> bool {
+    if !skill_dirs_owned(dir, folder) {
         return false;
     }
-    let Some(owned) = owned_skill_links(dir) else {
+    let Some(owned) = owned_skill_links(dir, folder) else {
         return false;
     };
-    let links = dir.join(SKILL_LINKS);
-    fs::read_dir(dir.join(AGENTS_DIR)).is_ok_and(|mut es| {
+    let links = dir.join(folder);
+    fs::read_dir(links.parent().unwrap()).is_ok_and(|mut es| {
         es.all(|e| e.is_ok_and(|e| e.file_name() == "skills" || e.file_name() == SKILL_OWNERS))
     }) && (!links.exists()
         || fs::read_dir(&links).is_ok_and(|mut es| {

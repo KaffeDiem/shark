@@ -211,7 +211,12 @@ impl Shark {
         }
         let slot = ws.chats.iter_mut().find(|c| c.id == meta.id);
         let changed = slot.filter(|s| **s != meta).map(|s| *s = meta).is_some();
-        if untitled || changed {
+        let agent = untitled
+            .then(|| ws.agent.as_ref().map(|a| a.slug.clone()))
+            .flatten();
+        if let Some(slug) = agent {
+            self.sync_agent(&slug, false, cx);
+        } else if changed || untitled {
             let _ = self.state.save();
         }
     }

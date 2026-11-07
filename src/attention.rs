@@ -236,7 +236,103 @@ impl Shark {
         if !shown || !self.attn.window_active {
             notify(&self.task_title(name), "The agent finished its turn");
         }
+        self.refresh_sibling_files(name, cx);
         self.refresh_attention(cx);
+    }
+
+    pub(crate) fn refresh_agent_files(&mut self, slug: &str, cx: &mut Context<Self>) {
+        let names: Vec<_> = self
+            .state
+            .tasks
+            .iter()
+            .filter(|t| t.agent.as_ref().is_some_and(|a| a.slug == slug))
+            .map(|t| t.name.clone())
+            .collect();
+        for name in names {
+            self.refresh_sibling_files(&name, cx);
+        }
+    }
+
+    pub(crate) fn refresh_sibling_files(&mut self, name: &str, cx: &mut Context<Self>) {
+        if self.archiving.contains(name) {
+            return;
+        }
+        let Some(task) = self.state.tasks.iter().find(|t| t.name == name).cloned() else {
+            return;
+        };
+        let Some(agent) = task.agent.as_ref() else {
+            return;
+        };
+        let slug = agent.slug.clone();
+        if !self
+            .state
+            .tasks
+            .iter()
+            .any(|t| t.name != name && t.agent.as_ref().is_some_and(|a| a.slug == slug))
+        {
+            return;
+        }
+        let name = name.to_string();
+        let key = name.clone();
+        let refresh = cx.spawn(async move |this, cx| {
+            let source = task.clone();
+            let files = cx
+                .background_executor()
+                .spawn(async move { sibling_files(&source, &source.dir()) })
+                .await;
+            let Ok(files) = files else { return };
+            this.update(cx, |s, cx| {
+                if s.archiving.contains(&name) {
+                    return;
+                }
+                let Some(current) = s.state.tasks.iter().find(|t| t.name == name) else {
+                    return;
+                };
+                if current.branch != task.branch
+                    || current.repos != task.repos
+                    || current.agent.as_ref().is_none_or(|a| a.slug != slug)
+                {
+                    return;
+                }
+                let sibling = crate::state::Sibling {
+                    title: current.display_title().into(),
+                    branch: current.branch.clone(),
+                    dirs: current
+                        .repos
+                        .iter()
+                        .map(|r| current.dir().join(&r.name).to_string_lossy().into_owned())
+                        .collect(),
+                    files,
+                };
+                let mut changed = false;
+                for other in s.state.tasks.iter_mut().filter(|t| t.name != name) {
+                    let Some(agent) = other.agent.as_mut().filter(|a| a.slug == slug) else {
+                        continue;
+                    };
+                    match agent
+                        .siblings
+                        .iter_mut()
+                        .find(|a| a.branch == sibling.branch && a.dirs == sibling.dirs)
+                    {
+                        Some(old) if *old != sibling => {
+                            *old = sibling.clone();
+                            changed = true;
+                        }
+                        None => {
+                            agent.siblings.push(sibling.clone());
+                            changed = true;
+                        }
+                        _ => {}
+                    }
+                }
+                if changed {
+                    s.sync_agent(&slug, false, cx);
+                }
+            })
+            .ok();
+        });
+        // Replacing the handle cancels an older scan before it can publish stale files.
+        self.sibling_refreshes.insert(key, refresh);
     }
 
     /// Recounts the Dock badge and notifies when a task off screen starts needing you.
@@ -400,5 +496,112 @@ mod tests {
             !at.checked.contains_key("open"),
             "the open one isn't stored"
         );
+    }
+}
+
+fn sibling_files(task: &crate::state::Task, root: &std::path::Path) -> Result<Vec<String>, String> {
+    let mut files = std::collections::BTreeSet::new();
+    for repo in &task.repos {
+        let dir = root.join(&repo.name);
+        let rev = crate::git::compare_rev(&dir, &repo.base, false);
+        if rev.is_empty() {
+            return Err(format!("{}: comparison base unavailable", repo.name));
+        }
+        let diff = crate::git::git_bytes(
+            &dir,
+            &["diff", "--name-only", "-z", "--no-renames", &rev, "--"],
+        )?;
+        let diff = std::str::from_utf8(&diff).map_err(|e| e.to_string())?;
+        for path in diff.split('\0').filter(|p| !p.is_empty()) {
+            files.insert(format!("{}/{path}", repo.name));
+        }
+        for (path, untracked) in crate::git::uncommitted_files(&dir)? {
+            if untracked {
+                files.insert(format!("{}/{path}", repo.name));
+            }
+        }
+    }
+    let more = files.len().saturating_sub(20);
+    let mut files: Vec<_> = files.into_iter().take(20).collect();
+    if more > 0 {
+        files.push(format!("+{more} more"));
+    }
+    Ok(files)
+}
+
+#[cfg(test)]
+mod sibling_file_tests {
+    use super::sibling_files;
+    use crate::{
+        git::git,
+        state::{Task, TaskRepo},
+    };
+    use std::{
+        fs,
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    #[test]
+    fn committed_working_and_untracked_files_are_sorted_capped_and_nul_safe() {
+        let root = std::env::temp_dir().join(format!(
+            "shark-siblings-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let repo = root.join("api");
+        fs::create_dir_all(&repo).unwrap();
+        git(&repo, &["init", "-q", "-b", "main"]).unwrap();
+        let commit = || {
+            git(&repo, &["add", "."]).unwrap();
+            git(
+                &repo,
+                &[
+                    "-c",
+                    "user.name=Test",
+                    "-c",
+                    "user.email=test@example.com",
+                    "commit",
+                    "-qm",
+                    "test",
+                ],
+            )
+            .unwrap();
+        };
+        fs::write(repo.join("tracked.txt"), "before").unwrap();
+        commit();
+        let base = git(&repo, &["rev-parse", "HEAD"]).unwrap();
+        fs::write(repo.join("committed.txt"), "committed").unwrap();
+        commit();
+        fs::write(repo.join("tracked.txt"), "after").unwrap();
+        fs::write(repo.join("odd\nname.txt"), "untracked").unwrap();
+        let mut task = Task {
+            repos: vec![TaskRepo {
+                name: "api".into(),
+                src: repo.clone(),
+                base,
+                branch: None,
+            }],
+            ..Default::default()
+        };
+        assert_eq!(
+            sibling_files(&task, &root).unwrap(),
+            ["api/committed.txt", "api/odd\nname.txt", "api/tracked.txt"]
+        );
+        for i in 0..23 {
+            fs::write(repo.join(format!("overflow-{i:02}.txt")), "x").unwrap();
+        }
+        let files = sibling_files(&task, &root).unwrap();
+        assert_eq!(files.len(), 21);
+        assert_eq!(files.last().unwrap(), "+6 more");
+        assert_eq!(files, sibling_files(&task, &root).unwrap());
+        task.repos[0].base = "missing-ref".into();
+        assert!(
+            sibling_files(&task, &root).is_err(),
+            "a failed probe must not clear the previous files"
+        );
+        fs::remove_dir_all(root).unwrap();
     }
 }

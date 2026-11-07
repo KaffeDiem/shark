@@ -415,7 +415,7 @@ impl Attachment {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct TaskRepo {
     pub name: String,
     pub src: PathBuf,
@@ -783,6 +783,45 @@ impl Task {
                 format!("{AGENT_CONTEXT}{}", agent.slug),
                 ContextNote {
                     fingerprint: crate::files::fingerprint(&agent.instructions),
+                    text,
+                },
+            );
+            let text = if agent.siblings.is_empty() {
+                format!("[shark] As {} you have no other open tasks.", agent.name)
+            } else {
+                let mut text = format!(
+                    "[shark] As {} you also have these open tasks:\n",
+                    agent.name
+                );
+                for sibling in &agent.siblings {
+                    let dirs = sibling
+                        .dirs
+                        .iter()
+                        .map(|p| format!("`{p}`"))
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    let files = if sibling.files.is_empty() {
+                        "none reported".into()
+                    } else {
+                        sibling
+                            .files
+                            .iter()
+                            .map(|p| format!("`{p}`"))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    };
+                    text += &format!(
+                        "- \"{}\" on `{}` ({}), changed: {}\n",
+                        sibling.title, sibling.branch, dirs, files
+                    );
+                }
+                text += "\nAvoid editing those files here; if you must, say so.";
+                text
+            };
+            notes.insert(
+                format!("siblings:{}", agent.slug),
+                ContextNote {
+                    fingerprint: crate::files::fingerprint(&text),
                     text,
                 },
             );
@@ -1280,6 +1319,41 @@ mod tests {
         );
         assert_eq!(slug("  Design / UI! "), "design-ui");
         assert_eq!(slug("!!!"), "");
+    }
+
+    #[test]
+    fn sibling_context_includes_empty_state_and_tracks_only_content_changes() {
+        let mut task = Task {
+            agent: Some(AgentLink {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let empty = task.context()["siblings:designer"].clone();
+        assert!(empty.text.contains("no other open tasks"));
+        task.agent.as_mut().unwrap().siblings.push(Sibling {
+            title: "Spacing".into(),
+            branch: "designer/spacing-marlin".into(),
+            dirs: vec!["/tasks/spacing/api".into()],
+            files: vec!["api/src/ui.rs".into()],
+        });
+        let note = task.context()["siblings:designer"].clone();
+        assert_ne!(note.fingerprint, empty.fingerprint);
+        assert!(note.text.contains("api/src/ui.rs") && note.text.contains("Avoid editing"));
+        assert_eq!(task.context()["siblings:designer"], note);
+        task.agent.as_mut().unwrap().instructions = "New instructions".into();
+        assert_eq!(task.context()["siblings:designer"], note);
+        task.agent.as_mut().unwrap().siblings[0]
+            .files
+            .push("api/src/tokens.rs".into());
+        assert_ne!(
+            task.context()["siblings:designer"].fingerprint,
+            note.fingerprint
+        );
+        task.agent.as_mut().unwrap().siblings.clear();
+        assert_eq!(task.context()["siblings:designer"], empty);
     }
 
     #[test]

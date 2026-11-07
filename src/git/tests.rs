@@ -283,8 +283,8 @@ fn skills_preserve_user_links_and_avoid_name_collisions() {
         fs::write(dir.join(path).join("SKILL.md"), "hi").unwrap();
     }
     reconcile_skills(&ws, &dir, true);
-    let links = dir.join(SKILL_LINKS);
-    let before = owned_skill_links(&dir).unwrap();
+    let links = dir.join(HARNESS_SKILL_DIRS[0]);
+    let before = owned_skill_links(&dir, HARNESS_SKILL_DIRS[0]).unwrap();
     assert_eq!(
         before.len(),
         3,
@@ -296,11 +296,11 @@ fn skills_preserve_user_links_and_avoid_name_collisions() {
     );
     reconcile_skills(&ws, &dir, true);
     assert_eq!(
-        owned_skill_links(&dir).unwrap(),
+        owned_skill_links(&dir, HARNESS_SKILL_DIRS[0]).unwrap(),
         before,
         "stable on refresh"
     );
-    assert!(only_skill_links(&dir));
+    assert!(only_skill_links(&dir, HARNESS_SKILL_DIRS[0]));
 
     let user = Path::new("../../my-skills/custom");
     std::os::unix::fs::symlink(user, links.join("custom")).unwrap();
@@ -311,7 +311,7 @@ fn skills_preserve_user_links_and_avoid_name_collisions() {
     assert_eq!(fs::read_link(links.join("custom")).unwrap(), user);
     assert_eq!(fs::read_link(links.join("deploy")).unwrap(), dir);
     assert!(
-        !only_skill_links(&dir),
+        !only_skill_links(&dir, HARNESS_SKILL_DIRS[0]),
         "ordinary archive must preserve user links"
     );
     reconcile_skills(&ws, &dir, false);
@@ -323,19 +323,20 @@ fn skills_preserve_user_links_and_avoid_name_collisions() {
     std::os::unix::fs::symlink("../../api/.agents/skills/deploy", links.join("old")).unwrap();
     reconcile_skills(&ws, &dir, true);
     assert!(
-        !owned_skill_links(&dir)
+        !owned_skill_links(&dir, HARNESS_SKILL_DIRS[0])
             .unwrap()
             .values()
             .any(|p| p == Path::new("../../api/.agents/skills/deploy"))
     );
     reconcile_skills(&ws, &dir, false);
     assert!(fs::read_link(links.join("old")).is_ok());
-    assert!(!only_skill_links(&dir));
+    assert!(!only_skill_links(&dir, HARNESS_SKILL_DIRS[0]));
     fs::remove_dir_all(&dir).unwrap();
 }
 
 #[test]
 fn waiting_skill_refresh_observes_disabled_preference() {
+    #[cfg(feature = "test-support")]
     let _ui = crate::app::ui_tests::UI_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -370,7 +371,7 @@ fn waiting_skill_refresh_observes_disabled_preference() {
     set_repo_skills(previous);
     result.unwrap();
     assert!(
-        !dir.join(SKILL_LINKS).exists(),
+        !dir.join(HARNESS_SKILL_DIRS[0]).exists(),
         "a queued refresh recreated disabled skills"
     );
     fs::remove_dir_all(dir).unwrap();
@@ -381,28 +382,31 @@ fn skills_never_follow_user_directory_symlinks() {
     let root = std::env::temp_dir().join(format!("shark-skill-dirs-{}", std::process::id()));
     let _ = fs::remove_dir_all(&root);
     let ws = Task::default();
-    for name in [AGENTS_DIR, SKILL_LINKS] {
-        let dir = root.join(name.replace('/', "-"));
-        let external = dir.join("external");
-        fs::create_dir_all(&external).unwrap();
-        let link = dir.join(name);
-        fs::create_dir_all(link.parent().unwrap()).unwrap();
-        std::os::unix::fs::symlink(&external, &link).unwrap();
-        let user_links = if name == AGENTS_DIR {
-            external.join("skills")
-        } else {
-            external.clone()
-        };
-        fs::create_dir_all(&user_links).unwrap();
-        std::os::unix::fs::symlink("../../custom", user_links.join("mine")).unwrap();
-        for on in [true, false] {
-            reconcile_skills(&ws, &dir, on);
-            assert_eq!(
-                fs::read_link(user_links.join("mine")).unwrap(),
-                Path::new("../../custom")
-            );
-            assert_eq!(fs::read_link(&link).unwrap(), external);
-            assert!(!only_skill_links(&dir));
+    for folder in HARNESS_SKILL_DIRS {
+        let parent = folder.split_once('/').unwrap().0;
+        for name in [parent, folder] {
+            let dir = root.join(name.replace('/', "-"));
+            let external = dir.join("external");
+            fs::create_dir_all(&external).unwrap();
+            let link = dir.join(name);
+            fs::create_dir_all(link.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&external, &link).unwrap();
+            let user_links = if name == parent {
+                external.join("skills")
+            } else {
+                external.clone()
+            };
+            fs::create_dir_all(&user_links).unwrap();
+            std::os::unix::fs::symlink("../../custom", user_links.join("mine")).unwrap();
+            for on in [true, false] {
+                reconcile_skills(&ws, &dir, on);
+                assert_eq!(
+                    fs::read_link(user_links.join("mine")).unwrap(),
+                    Path::new("../../custom")
+                );
+                assert_eq!(fs::read_link(&link).unwrap(), external);
+                assert!(!only_skill_links(&dir, folder));
+            }
         }
     }
     fs::remove_dir_all(root).unwrap();
@@ -1744,4 +1748,89 @@ fn root_headers_include_agent_instructions_with_and_without_repos() {
     let text = header(&task);
     assert!(text.contains("## Agent: Designer\n\nAlways use Mobbin."));
     assert!(text.find("- `api/`: worktree of ").unwrap() < text.find("## Agent:").unwrap());
+}
+
+#[test]
+fn agent_skills_reach_each_harness_and_survive_disabled_repo_skills() {
+    #[cfg(feature = "test-support")]
+    let _ui = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let root = std::env::temp_dir().join(format!("shark-agent-skills-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&root);
+    let repo = init_repo(&root, "api");
+    let dir = root.join("task");
+    let mut task = create_task(&dir, "skills", "skills", &on_branch(&[repo], "skills")).unwrap();
+    let slug = format!("skills-test-{}", std::process::id());
+    let source = crate::state::agent_skills_dir(&slug);
+    let _ = fs::remove_dir_all(source.parent().unwrap());
+    fs::create_dir_all(source.join("deploy")).unwrap();
+    fs::write(source.join("deploy/SKILL.md"), "Agent deploy").unwrap();
+    fs::create_dir_all(dir.join("api/.agents/skills/deploy")).unwrap();
+    fs::write(
+        dir.join("api/.agents/skills/deploy/SKILL.md"),
+        "Repo deploy",
+    )
+    .unwrap();
+    git(&dir.join("api"), &["add", "."]).unwrap();
+    commit(&dir.join("api"), &["-qm", "skills"]);
+    task.agent = Some(crate::state::AgentLink {
+        slug,
+        name: "Designer".into(),
+        ..Default::default()
+    });
+
+    reconcile_skills(&task, &dir, true);
+    for folder in HARNESS_SKILL_DIRS {
+        assert_eq!(
+            fs::read_link(dir.join(folder).join("deploy")).unwrap(),
+            source.join("deploy")
+        );
+        assert!(
+            fs::read_link(dir.join(folder).join("deploy"))
+                .unwrap()
+                .is_absolute()
+        );
+        assert!(only_skill_links(&dir, folder));
+    }
+    assert_eq!(
+        fs::read_to_string(dir.join(".agents/skills/api-deploy/SKILL.md")).unwrap(),
+        "Repo deploy"
+    );
+    assert!(!dir.join(".claude/skills/api-deploy").exists());
+    archive_preflight(&task, &dir, false).unwrap();
+    fs::write(dir.join(".claude/settings.local.json"), "{}").unwrap();
+    assert!(
+        archive_preflight(&task, &dir, false)
+            .unwrap_err()
+            .contains(".claude")
+    );
+    fs::remove_file(dir.join(".claude/settings.local.json")).unwrap();
+
+    reconcile_skills(&task, &dir, false);
+    assert!(!dir.join(".agents/skills/api-deploy").exists());
+    for folder in HARNESS_SKILL_DIRS {
+        assert!(dir.join(folder).join("deploy/SKILL.md").is_file());
+        std::os::unix::fs::symlink(&root, dir.join(folder).join("mine")).unwrap();
+    }
+    fs::remove_dir_all(source.join("deploy")).unwrap();
+    reconcile_skills(&task, &dir, false);
+    for folder in HARNESS_SKILL_DIRS {
+        assert!(fs::symlink_metadata(dir.join(folder).join("deploy")).is_err());
+        assert_eq!(fs::read_link(dir.join(folder).join("mine")).unwrap(), root);
+        assert!(!only_skill_links(&dir, folder));
+        fs::remove_file(dir.join(folder).join("mine")).unwrap();
+    }
+    reconcile_skills(&task, &dir, false);
+    fs::create_dir_all(source.join("new")).unwrap();
+    fs::write(source.join("new/SKILL.md"), "New skill").unwrap();
+    reconcile_skills(&task, &dir, false);
+    remove_task(&task, &dir, false).unwrap();
+    assert!(!dir.exists());
+    assert!(
+        source.join("new/SKILL.md").is_file(),
+        "archiving removes links, never the agent skill"
+    );
+    fs::remove_dir_all(root).unwrap();
+    fs::remove_dir_all(source.parent().unwrap()).unwrap();
 }

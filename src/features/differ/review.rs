@@ -1899,6 +1899,7 @@ mod tests {
             .collect()
     }
 
+    #[cfg(feature = "test-support")]
     #[gpui_kit::test]
     fn expanded_context_keeps_local_comments_and_navigation(cx: &mut TestAppContext) {
         cx.update(|cx| {
@@ -1983,6 +1984,7 @@ mod tests {
         });
     }
 
+    #[cfg(feature = "test-support")]
     #[gpui_kit::test]
     fn rows_follow_the_diff_layout(cx: &mut TestAppContext) {
         // Whole-file context narrows to git's default hunks; 7 lines apart stay separate.

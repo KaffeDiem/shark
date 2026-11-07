@@ -8,7 +8,7 @@ use std::time::Duration;
 const POLL_INTERVAL: Duration = Duration::from_secs(300);
 #[cfg(all(test, feature = "test-support"))]
 mod pixels;
-#[cfg(test)]
+#[cfg(all(test, feature = "test-support"))]
 mod store_state;
 #[cfg(all(test, feature = "test-support"))]
 pub(in crate::app) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
