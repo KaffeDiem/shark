@@ -4,6 +4,7 @@
 use super::attach::ChipCard;
 use super::*;
 use crate::linear::{self, Credential, Error, Hit, Http, IssueRef, Lists, Page, Target};
+use crate::state::AgentLink;
 use crate::sync::ago;
 use crate::ui::menu_dialog;
 use crate::usage::now;
@@ -310,6 +311,7 @@ pub(super) struct IssuePicker {
     state: Entity<CommandState>,
     /// The task to attach to; None starts a new one.
     task: Option<String>,
+    agent: Option<AgentLink>,
     /// Why nothing can be asked of Linear; the row to Settings replaces the others.
     blocked: Option<Blocked>,
     /// Lists, cached results and marks belong to this connection.
@@ -795,10 +797,12 @@ impl IssuePicker {
     fn finish(&mut self, snapshots: Vec<Snapshot>, window: &mut Window, cx: &mut Context<Self>) {
         window.close_dialog(cx);
         let task = self.task.clone();
+        let agent = self.agent.clone();
         (self.shark.update(cx, |s, cx| match task {
             Some(name) => s.attach_issues(name, snapshots, window, cx),
             // Nothing can be marked here, so it's the one.
-            None => (snapshots.into_iter()).for_each(|one| s.preview_issue(one, window, cx)),
+            None => (snapshots.into_iter())
+                .for_each(|one| s.preview_issue(one, agent.clone(), window, cx)),
         }))
         .ok();
     }
@@ -1199,9 +1203,14 @@ impl Shark {
         let blocked = self.linear_blocked();
         let connection = (self.state.linear.clone(), self.linear_connection_epoch());
         let shark = cx.entity();
+        let agent = task
+            .is_none()
+            .then(|| self.selected_task_agent(cx))
+            .flatten();
         let picker = cx.new(|cx| IssuePicker {
             state: cx.new(|cx| CommandState::new(window, cx)),
             task,
+            agent,
             blocked,
             connection,
             query: String::new(),
@@ -1478,7 +1487,13 @@ impl Shark {
     }
 
     /// Start from Linear issue's confirmation: nothing exists until it's accepted.
-    fn preview_issue(&mut self, snapshot: Snapshot, window: &mut Window, cx: &mut Context<Self>) {
+    fn preview_issue(
+        &mut self,
+        snapshot: Snapshot,
+        agent: Option<AgentLink>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let title = crate::chat::title_of(&snapshot.title);
         let title = cx.new(|cx| InputState::new(window, cx).default_value(title));
         let description = cx.new(|cx| TextViewState::markdown(&snapshot.description, cx));
@@ -1502,7 +1517,9 @@ impl Shark {
             window.close_dialog(cx);
             let issue = Some((title, issue.clone()));
             shark
-                .update(cx, |s, cx| s.new_task(first, issue, None, window, cx))
+                .update(cx, |s, cx| {
+                    s.new_task(first, issue, agent.clone(), window, cx)
+                })
                 .ok();
         });
         window.open_dialog(cx, move |d, _, cx| {

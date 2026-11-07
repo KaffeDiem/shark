@@ -827,7 +827,7 @@ impl Task {
                         sibling.title, sibling.branch, dirs, files
                     );
                 }
-                text += "\nAvoid editing those files here; if you must, say so.";
+                text += "\nThese tasks use separate worktrees. Their changed files do not restrict edits in this task.";
                 text
             };
             notes.insert(
@@ -1309,7 +1309,9 @@ mod tests {
         });
         let note = task.context()["siblings:designer"].clone();
         assert_ne!(note.fingerprint, empty.fingerprint);
-        assert!(note.text.contains("api/src/ui.rs") && note.text.contains("Avoid editing"));
+        assert!(note.text.contains("api/src/ui.rs"));
+        assert!(note.text.contains("do not restrict edits in this task"));
+        assert!(!note.text.contains("Avoid editing"));
         assert_eq!(task.context()["siblings:designer"], note);
         task.agent.as_mut().unwrap().instructions = "New instructions".into();
         assert_eq!(task.context()["siblings:designer"], note);

@@ -175,7 +175,98 @@ async fn branch_tasks_do_not_inherit_an_invisible_home_draft(cx: &mut TestAppCon
             let s = shark.read(cx);
             assert_eq!(s.home.prompt.read(cx).value().as_ref(), "Keep this draft");
             assert!(s.active_chat().unwrap().read(cx).sent_texts().is_empty());
-            assert!(s.task(branch).unwrap().agent.is_none());
+            let expected = match &destination {
+                home::Destination::Agent(slug) => Some(slug.as_str()),
+                _ => None,
+            };
+            assert_eq!(
+                s.task(branch)
+                    .unwrap()
+                    .agent
+                    .as_ref()
+                    .map(|a| a.slug.as_str()),
+                expected
+            );
         });
     }
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn branch_task_captures_selected_agent_and_repository_defaults(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let skill = crate::state::agent_skills_dir("designer").join("spacing");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(skill.join("SKILL.md"), "# Spacing").unwrap();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos(&home, &["api", "web"]),
+            last_repos: vec!["api".into()],
+            agents: vec![Agent {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                instructions: "Keep spacing consistent".into(),
+                repos: vec!["web".into()],
+                model: Some("opus".into()),
+                effort: Some("low".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    cx.run_until_parked();
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.home.prompt.update(cx, |p, cx| {
+            p.set_value("@designer Fix onboarding spacing", w, cx)
+        });
+        s.new_task_default(w, cx);
+        // The dialog owns the choice; later Home changes must not retarget this task.
+        s.home
+            .prompt
+            .update(cx, |p, cx| p.set_value("Keep a newer draft", w, cx));
+    });
+    cx.update_window(window, |_, w, cx| w.input("spacing", cx))
+        .unwrap();
+    press_in(window)(cx, &["enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).active.as_deref() == Some("spacing")
+    })
+    .await;
+    cx.run_until_parked();
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        let task = s.task("spacing").unwrap();
+        assert_eq!(task.agent.as_ref().unwrap().slug, "designer");
+        assert_eq!(
+            task.agent.as_ref().unwrap().instructions,
+            "Keep spacing consistent"
+        );
+        assert_eq!(
+            task.repos
+                .iter()
+                .map(|r| r.name.as_str())
+                .collect::<Vec<_>>(),
+            ["web"]
+        );
+        assert_eq!(task.title, "Fix onboarding spacing");
+        assert_eq!(task.chats[0].model.as_deref(), Some("opus"));
+        assert_eq!(task.chats[0].effort.as_deref(), Some("low"));
+        for folder in [".agents/skills", ".claude/skills"] {
+            assert_eq!(
+                fs::canonicalize(task.dir().join(folder).join("spacing")).unwrap(),
+                fs::canonicalize(&skill).unwrap()
+            );
+        }
+        assert_eq!(
+            s.active_chat().unwrap().read(cx).sent_texts(),
+            ["Fix onboarding spacing"]
+        );
+        assert_eq!(s.home.prompt.read(cx).value(), "Keep a newer draft");
+    });
 }

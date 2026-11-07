@@ -317,6 +317,11 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(link) = &agent
+            && !self.state.agents.iter().any(|a| a.slug == link.slug)
+        {
+            return notify_err(window, cx, "This agent was deleted. Choose an agent again.");
+        }
         // Nothing is saved this run, so the agent would be gone on restart.
         if self.state.read_only {
             return notify_err(
@@ -326,7 +331,7 @@ impl Shark {
             );
         }
         let name = crate::state::task_name(interaction::now_ms(), |n| {
-            self.creating.contains(n)
+            self.creating.contains_key(n)
                 || self.task(n).is_some()
                 || tasks_dir().join(n).exists()
                 || crate::transcript::transcript_path(n).exists()
@@ -435,7 +440,7 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.new_task_from(picked, first, vec![], None, window, cx)
+        self.new_task_from(picked, first, vec![], None, None, window, cx)
     }
 
     /// The branch and PR dialog with `from` `(repo, parent)` prefilled; `insert` names the
@@ -446,6 +451,7 @@ impl Shark {
         first: Option<String>,
         from: Vec<(String, String)>,
         insert: Option<String>,
+        agent: Option<AgentLink>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -456,7 +462,7 @@ impl Shark {
         let repos = self.state.repos.clone();
         let form = cx.new(|cx| {
             NewTaskForm::new(
-                repos, &picked, first, &from, insert, None, shark, window, cx,
+                repos, &picked, first, agent, &from, insert, None, shark, window, cx,
             )
         });
         let input = form.read(cx).branch.clone();
@@ -497,6 +503,7 @@ impl Shark {
             prompt,
             title,
             None,
+            false,
             window,
             cx,
         )
@@ -516,9 +523,15 @@ impl Shark {
         prompt: Option<String>,
         title: String,
         agent: Option<AgentLink>,
+        fresh: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(link) = &agent
+            && !self.state.agents.iter().any(|a| a.slug == link.slug)
+        {
+            return notify_err(window, cx, "This agent was deleted. Choose an agent again.");
+        }
         let moves = (insert.as_deref())
             .and_then(|n| self.task(n))
             .map(|child| insert_moves(child, &parents, &repos))
@@ -539,10 +552,11 @@ impl Shark {
                 "Can't create tasks: state.json couldn't be read",
             );
         }
-        if self.creating.contains(&name) || self.state.tasks.iter().any(|w| w.name == name) {
+        if self.creating.contains_key(&name) || self.state.tasks.iter().any(|w| w.name == name) {
             return notify_err(window, cx, format!("task `{name}` already exists"));
         }
-        self.creating.insert(name.clone());
+        self.creating
+            .insert(name.clone(), agent.as_ref().map(|a| a.slug.clone()));
         self.state.last_repos = repos.iter().map(|(r, _)| r.name.clone()).collect();
         let _ = self.state.save();
         let dir = tasks_dir().join(&name);
@@ -561,7 +575,7 @@ impl Shark {
                 .background_executor()
                 .spawn(async move {
                     let ws = git::create_task_with_prs(
-                        &dir, &name, &branch, &repos, &prs, &parents, &title, agent,
+                        &dir, &name, &branch, &repos, &prs, &parents, &title, agent, fresh,
                     );
                     // The base a PR targets must exist on GitHub.
                     let pushed = ws.is_ok().then(|| {
@@ -657,7 +671,15 @@ impl Shark {
                             s.run_setup(&setup_ws, None, None, window, cx);
                         }
                     }
-                    Err(e) => notify_err(window, cx, e),
+                    Err(e) => notify_err(
+                        window,
+                        cx,
+                        if fresh {
+                            format!("{e}\nRetry from Home to generate a new branch name.")
+                        } else {
+                            e
+                        },
+                    ),
                 }
             })
             .ok();
@@ -769,7 +791,7 @@ impl Shark {
             return notify_err(window, cx, "A local PR review can't be stacked on");
         }
         let picked = from.iter().map(|(r, _)| r.clone()).collect();
-        self.new_task_from(picked, None, from, insert.then_some(name), window, cx);
+        self.new_task_from(picked, None, from, insert.then_some(name), None, window, cx);
     }
 
     /// "Go to stack…": every branch of the task's stacks, newest first; a pick opens its
@@ -1314,9 +1336,9 @@ impl Shark {
             !repos.is_empty()
                 && repos.len() == ws.repos.len()
                 && ws.repos.iter().all(|expected| {
-                    repos.iter().any(|r| {
-                        r.name == expected.name && r.local.is_ok() && matches!(r.pr, Some(Ok(_)))
-                    })
+                    repos
+                        .iter()
+                        .any(|r| r.name == expected.name && matches!(r.pr, Some(Ok(_))))
                 })
         });
         let prs: Vec<_> = overview
@@ -1376,11 +1398,13 @@ impl Shark {
                             .iter()
                             .map(|(repo, url, _)| (repo.clone(), url.clone()))
                             .collect(),
-                        merged: if !deleted.is_empty()
-                            || prs
-                                .iter()
-                                .any(|(_, _, state)| *state == sync::PrState::Merged)
-                        {
+                        merged: if !task.repos.is_empty()
+                            && task.repos.iter().all(|r| {
+                                deleted.contains(&r.name)
+                                    || prs.iter().any(|(repo, _, state)| {
+                                        repo == &r.name && *state == sync::PrState::Merged
+                                    })
+                            }) {
                             Some(true)
                         } else {
                             known.then_some(false)

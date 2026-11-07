@@ -2,6 +2,88 @@ use super::*;
 use std::time::Duration;
 
 #[test]
+fn automatic_tasks_refuse_retained_branches_but_explicit_tasks_can_reuse_them() {
+    let root = std::env::temp_dir().join(format!("shark-fresh-task-{}", std::process::id()));
+    let repo = init_repo(&root, "api");
+    let branch = "designer/fix-spacing-marlin";
+    git(&repo.path, &["checkout", "-b", branch]).unwrap();
+    fs::write(repo.path.join("previous-task.txt"), "previous task").unwrap();
+    git(&repo.path, &["add", "previous-task.txt"]).unwrap();
+    commit(&repo.path, &["-qm", "Previous task"]);
+    let retained = git(&repo.path, &["rev-parse", "HEAD"]).unwrap();
+    git(&repo.path, &["checkout", "main"]).unwrap();
+    let picked = [(repo.clone(), branch.into())];
+    let agent = AgentLink {
+        slug: "designer".into(),
+        ..Default::default()
+    };
+    let automatic = root.join("automatic");
+    let error = create_task_with_prs(
+        &automatic,
+        "automatic",
+        branch,
+        &picked,
+        &[],
+        &[],
+        "",
+        Some(agent.clone()),
+        true,
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("already exists"), "{error}");
+    assert!(!automatic.exists());
+    assert_eq!(git(&repo.path, &["rev-parse", branch]).unwrap(), retained);
+
+    let explicit = root.join("explicit");
+    let task = create_task_with_prs(
+        &explicit,
+        "explicit",
+        branch,
+        &picked,
+        &[],
+        &[],
+        "",
+        Some(agent.clone()),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        git(&explicit.join("api"), &["rev-parse", "HEAD"]).unwrap(),
+        retained
+    );
+    remove_task(&task, &explicit, false).unwrap();
+
+    git(
+        &repo.path,
+        &[
+            "update-ref",
+            "refs/remotes/origin/designer/fix-spacing-marlin",
+            &retained,
+        ],
+    )
+    .unwrap();
+    git(&repo.path, &["branch", "-D", branch]).unwrap();
+    let error = create_task_with_prs(
+        &automatic,
+        "automatic",
+        branch,
+        &picked,
+        &[],
+        &[],
+        "",
+        Some(agent),
+        true,
+    )
+    .err()
+    .unwrap();
+    assert!(error.contains("already exists"), "{error}");
+    assert!(!automatic.exists());
+    assert!(!has_ref(&repo.path, &format!("refs/heads/{branch}")));
+    fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
 fn included_secrets_require_absent_ignored_destination() {
     use std::os::unix::fs::symlink;
     let root = std::env::temp_dir().join(format!("shark-secret-copy-{}", std::process::id()));
@@ -221,7 +303,7 @@ fn skills_link_into_the_root_and_archive_with_it() {
         n
     };
 
-    reconcile_skills(&ws, &dir, true);
+    reconcile_skills(&ws, &dir, true).unwrap();
     assert_eq!(names(), ["deploy", "lint", "web-deploy"]);
     assert!(links.join("deploy/SKILL.md").exists());
     assert_eq!(
@@ -232,7 +314,7 @@ fn skills_link_into_the_root_and_archive_with_it() {
     // A skill gone from its repo loses its link; a link the user made keeps its place.
     fs::remove_dir_all(dir.join("web/.claude/skills/lint")).unwrap();
     std::os::unix::fs::symlink(&root, links.join("mine")).unwrap();
-    reconcile_skills(&ws, &dir, true);
+    reconcile_skills(&ws, &dir, true).unwrap();
     assert_eq!(names(), ["deploy", "mine", "web-deploy"]);
     fs::remove_file(links.join("mine")).unwrap();
 
@@ -251,9 +333,9 @@ fn skills_link_into_the_root_and_archive_with_it() {
     assert!(err.contains(".agents"), "{err}");
     fs::remove_dir(links.join("real")).unwrap();
 
-    reconcile_skills(&ws, &dir, false);
+    reconcile_skills(&ws, &dir, false).unwrap();
     assert!(!dir.join(".agents").exists());
-    reconcile_skills(&ws, &dir, true);
+    reconcile_skills(&ws, &dir, true).unwrap();
     remove_task(&ws, &dir, false).unwrap();
     assert!(!dir.exists());
 }
@@ -282,7 +364,7 @@ fn skills_preserve_user_links_and_avoid_name_collisions() {
         fs::create_dir_all(dir.join(path)).unwrap();
         fs::write(dir.join(path).join("SKILL.md"), "hi").unwrap();
     }
-    reconcile_skills(&ws, &dir, true);
+    reconcile_skills(&ws, &dir, true).unwrap();
     let links = dir.join(HARNESS_SKILL_DIRS[0]);
     let before = owned_skill_links(&dir, HARNESS_SKILL_DIRS[0]).unwrap();
     assert_eq!(
@@ -294,7 +376,7 @@ fn skills_preserve_user_links_and_avoid_name_collisions() {
         before["web-deploy-2"],
         Path::new("../../web/.agents/skills/deploy")
     );
-    reconcile_skills(&ws, &dir, true);
+    reconcile_skills(&ws, &dir, true).unwrap();
     assert_eq!(
         owned_skill_links(&dir, HARNESS_SKILL_DIRS[0]).unwrap(),
         before,
@@ -307,28 +389,28 @@ fn skills_preserve_user_links_and_avoid_name_collisions() {
     // Replacing one of our links relinquishes ownership too.
     fs::remove_file(links.join("deploy")).unwrap();
     std::os::unix::fs::symlink(&dir, links.join("deploy")).unwrap();
-    reconcile_skills(&ws, &dir, true);
+    reconcile_skills(&ws, &dir, true).unwrap();
     assert_eq!(fs::read_link(links.join("custom")).unwrap(), user);
     assert_eq!(fs::read_link(links.join("deploy")).unwrap(), dir);
     assert!(
         !only_skill_links(&dir, HARNESS_SKILL_DIRS[0]),
         "ordinary archive must preserve user links"
     );
-    reconcile_skills(&ws, &dir, false);
+    reconcile_skills(&ws, &dir, false).unwrap();
     assert_eq!(fs::read_dir(&links).unwrap().count(), 2);
     assert_eq!(fs::read_link(links.join("custom")).unwrap(), user);
     assert_eq!(fs::read_link(links.join("deploy")).unwrap(), dir);
 
     // Old unrecorded links stay user-owned without duplicating the same target.
     std::os::unix::fs::symlink("../../api/.agents/skills/deploy", links.join("old")).unwrap();
-    reconcile_skills(&ws, &dir, true);
+    reconcile_skills(&ws, &dir, true).unwrap();
     assert!(
         !owned_skill_links(&dir, HARNESS_SKILL_DIRS[0])
             .unwrap()
             .values()
             .any(|p| p == Path::new("../../api/.agents/skills/deploy"))
     );
-    reconcile_skills(&ws, &dir, false);
+    reconcile_skills(&ws, &dir, false).unwrap();
     assert!(fs::read_link(links.join("old")).is_ok());
     assert!(!only_skill_links(&dir, HARNESS_SKILL_DIRS[0]));
     fs::remove_dir_all(&dir).unwrap();
@@ -353,7 +435,7 @@ fn waiting_skill_refresh_observes_disabled_preference() {
         }],
         ..Default::default()
     };
-    reconcile_skills(&ws, &dir, true);
+    reconcile_skills(&ws, &dir, true).unwrap();
     let mut preference = REPO_SKILLS.lock().unwrap_or_else(|e| e.into_inner());
     let previous = *preference;
     let (started, waiting) = std::sync::mpsc::channel();
@@ -361,11 +443,11 @@ fn waiting_skill_refresh_observes_disabled_preference() {
     let refresh_ws = ws.clone();
     let refresh = std::thread::spawn(move || {
         started.send(()).unwrap();
-        link_skills(&refresh_ws, &refresh_dir);
+        link_skills(&refresh_ws, &refresh_dir).unwrap();
     });
     waiting.recv().unwrap();
     *preference = false;
-    reconcile_skills(&ws, &dir, false);
+    reconcile_skills(&ws, &dir, false).unwrap();
     drop(preference);
     let result = refresh.join();
     set_repo_skills(previous);
@@ -398,8 +480,10 @@ fn skills_never_follow_user_directory_symlinks() {
             };
             fs::create_dir_all(&user_links).unwrap();
             std::os::unix::fs::symlink("../../custom", user_links.join("mine")).unwrap();
+            write_instructions(&ws, &dir).unwrap();
+            assert!(dir.join("AGENTS.md").is_file());
             for on in [true, false] {
-                reconcile_skills(&ws, &dir, on);
+                assert!(reconcile_skills(&ws, &dir, on).is_err());
                 assert_eq!(
                     fs::read_link(user_links.join("mine")).unwrap(),
                     Path::new("../../custom")
@@ -410,6 +494,68 @@ fn skills_never_follow_user_directory_symlinks() {
         }
     }
     fs::remove_dir_all(root).unwrap();
+}
+
+#[test]
+fn agent_skill_refresh_preserves_links_on_scan_failure_and_reports_install_errors() {
+    #[cfg(feature = "test-support")]
+    let _ui = crate::app::ui_tests::UI_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let slug = format!("skill-errors-{}", std::process::id());
+    let source = crate::state::agent_skills_dir(&slug);
+    let dir = std::env::temp_dir().join(&slug);
+    let _ = fs::remove_dir_all(&dir);
+    let _ = fs::remove_dir_all(source.parent().unwrap());
+    fs::create_dir_all(&dir).unwrap();
+    fs::create_dir(dir.join("AGENTS.md")).unwrap();
+    assert!(write_instructions(&Task::default(), &dir).is_err());
+    fs::remove_dir(dir.join("AGENTS.md")).unwrap();
+    fs::create_dir_all(source.join("deploy")).unwrap();
+    fs::write(source.join("deploy/SKILL.md"), "Deploy").unwrap();
+    let task = Task {
+        agent: Some(AgentLink {
+            slug,
+            ..Default::default()
+        }),
+        ..Default::default()
+    };
+    write_root_docs(&task, &dir).unwrap();
+    let saved = source.with_extension("saved");
+    fs::rename(&source, &saved).unwrap();
+    fs::write(&source, "unreadable as a directory").unwrap();
+    let error = write_root_docs(&task, &dir).unwrap_err();
+    assert!(error.contains(&source.display().to_string()), "{error}");
+    for folder in HARNESS_SKILL_DIRS {
+        assert_eq!(
+            fs::read_link(dir.join(folder).join("deploy")).unwrap(),
+            source.join("deploy")
+        );
+    }
+    fs::remove_file(&source).unwrap();
+    fs::rename(&saved, &source).unwrap();
+    write_root_docs(&task, &dir).unwrap();
+
+    // A colliding user link forces a name beyond the filesystem's component limit.
+    let long = "x".repeat(250);
+    fs::create_dir(source.join(&long)).unwrap();
+    fs::write(source.join(&long).join("SKILL.md"), "Long skill").unwrap();
+    let user = dir.join(HARNESS_SKILL_DIRS[0]).join(&long);
+    std::os::unix::fs::symlink("user-owned", &user).unwrap();
+    assert!(write_root_docs(&task, &dir).is_err());
+    assert_eq!(fs::read_link(&user).unwrap(), Path::new("user-owned"));
+    fs::remove_dir_all(source.join(&long)).unwrap();
+    fs::remove_file(user).unwrap();
+    write_root_docs(&task, &dir).unwrap();
+
+    // An absent source is a deliberate removal, unlike a failed read.
+    fs::remove_dir_all(&source).unwrap();
+    write_root_docs(&task, &dir).unwrap();
+    for folder in HARNESS_SKILL_DIRS {
+        assert!(fs::symlink_metadata(dir.join(folder).join("deploy")).is_err());
+    }
+    fs::remove_dir_all(source.parent().unwrap()).unwrap();
+    fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]
@@ -471,7 +617,8 @@ fn pr_checkout_uses_exact_tip_base_and_rolls_back() {
     let picked = [(repo.clone(), "pr/7".into())];
     let prs = [(repo.name.clone(), pr.clone())];
     let dir = root.join("ws/review");
-    let ws = create_task_with_prs(&dir, "review", "pr/7", &picked, &prs, &[], "", None).unwrap();
+    let ws =
+        create_task_with_prs(&dir, "review", "pr/7", &picked, &prs, &[], "", None, false).unwrap();
     let wt = dir.join("api");
     assert_eq!(git(&wt, &["rev-parse", "HEAD"]).unwrap(), tip);
     assert_eq!(git(&wt, &["rev-parse", &ws.repos[0].base]).unwrap(), base);
@@ -494,7 +641,8 @@ fn pr_checkout_uses_exact_tip_base_and_rolls_back() {
             &prs,
             &[],
             "",
-            None
+            None,
+            false,
         )
         .err()
         .unwrap()
@@ -520,7 +668,8 @@ fn pr_checkout_uses_exact_tip_base_and_rolls_back() {
             &missing,
             &[],
             "",
-            None
+            None,
+            false,
         )
         .is_err()
     );
@@ -540,7 +689,8 @@ fn pr_checkout_uses_exact_tip_base_and_rolls_back() {
             &prs,
             &[],
             "",
-            None
+            None,
+            false,
         )
         .is_err()
     );
@@ -614,6 +764,7 @@ fn review_base_refresh_follows_target_and_preserves_worktree() {
         &[],
         "",
         None,
+        false,
     )
     .unwrap();
     let wt = dir.join("api");
@@ -704,6 +855,7 @@ fn stacked_diff_uses_target_merge_base_and_preserves_index() {
         &[("api".into(), "parent".into())],
         "",
         None,
+        false,
     )
     .unwrap();
     let wt = dir.join("api");
@@ -1051,6 +1203,7 @@ fn stacks_new_branches_on_a_parent() {
             &parents,
             "",
             None,
+            false,
         )
         .unwrap();
         assert_eq!(head(&dir.join("api")), tip, "{parent}");
@@ -1076,7 +1229,7 @@ fn stacks_new_branches_on_a_parent() {
         let dir = root.join("ws").join(name);
         let parents = [("api".to_string(), parent.to_string())];
         let picked = on_branch(&[web.clone(), api.clone()], name);
-        let err = create_task_with_prs(&dir, name, name, &picked, &[], &parents, "", None)
+        let err = create_task_with_prs(&dir, name, name, &picked, &[], &parents, "", None, false)
             .err()
             .unwrap();
         assert!(err.contains(want), "{err}");
@@ -1780,7 +1933,7 @@ fn agent_skills_reach_each_harness_and_survive_disabled_repo_skills() {
         ..Default::default()
     });
 
-    reconcile_skills(&task, &dir, true);
+    reconcile_skills(&task, &dir, true).unwrap();
     for folder in HARNESS_SKILL_DIRS {
         assert_eq!(
             fs::read_link(dir.join(folder).join("deploy")).unwrap(),
@@ -1807,24 +1960,24 @@ fn agent_skills_reach_each_harness_and_survive_disabled_repo_skills() {
     );
     fs::remove_file(dir.join(".claude/settings.local.json")).unwrap();
 
-    reconcile_skills(&task, &dir, false);
+    reconcile_skills(&task, &dir, false).unwrap();
     assert!(!dir.join(".agents/skills/api-deploy").exists());
     for folder in HARNESS_SKILL_DIRS {
         assert!(dir.join(folder).join("deploy/SKILL.md").is_file());
         std::os::unix::fs::symlink(&root, dir.join(folder).join("mine")).unwrap();
     }
     fs::remove_dir_all(source.join("deploy")).unwrap();
-    reconcile_skills(&task, &dir, false);
+    reconcile_skills(&task, &dir, false).unwrap();
     for folder in HARNESS_SKILL_DIRS {
         assert!(fs::symlink_metadata(dir.join(folder).join("deploy")).is_err());
         assert_eq!(fs::read_link(dir.join(folder).join("mine")).unwrap(), root);
         assert!(!only_skill_links(&dir, folder));
         fs::remove_file(dir.join(folder).join("mine")).unwrap();
     }
-    reconcile_skills(&task, &dir, false);
+    reconcile_skills(&task, &dir, false).unwrap();
     fs::create_dir_all(source.join("new")).unwrap();
     fs::write(source.join("new/SKILL.md"), "New skill").unwrap();
-    reconcile_skills(&task, &dir, false);
+    reconcile_skills(&task, &dir, false).unwrap();
     remove_task(&task, &dir, false).unwrap();
     assert!(!dir.exists());
     assert!(

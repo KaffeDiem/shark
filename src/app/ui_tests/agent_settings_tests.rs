@@ -143,8 +143,12 @@ async fn agents_do_not_create_sections_and_deletion_rechecks_open_tasks(cx: &mut
         std::os::unix::fs::symlink(&elsewhere, support.join("agents")).unwrap();
         assert!(!s.can_delete_agent("designer", w, cx));
         fs::remove_file(support.join("agents")).unwrap();
-        s.creating.insert("designer-one-seahorse".into());
+        s.creating.insert("spacing".into(), Some("designer".into()));
         assert!(!s.can_delete_agent("designer", w, cx));
+        assert!(s.can_delete_agent("designer-2", w, cx));
+        s.creating.insert("designer-standalone".into(), None);
+        s.creating.remove("spacing");
+        assert!(s.can_delete_agent("designer", w, cx));
         s.creating.clear();
         s.sel = SideRow::Agent(1);
     });
@@ -167,6 +171,31 @@ async fn agents_do_not_create_sections_and_deletion_rechecks_open_tasks(cx: &mut
         assert_eq!(
             s.state.sections[0].agent, None,
             "the section survives unbound"
+        );
+    });
+    on(cx, &|s, w, cx| {
+        let deleted = AgentLink {
+            slug: "designer".into(),
+            ..Default::default()
+        };
+        s.new_task(None, None, Some(deleted.clone()), w, cx);
+        s.create_task_on(
+            "spacing".into(),
+            vec![],
+            vec![],
+            vec![],
+            None,
+            None,
+            "Spacing".into(),
+            Some(deleted),
+            false,
+            w,
+            cx,
+        );
+        assert!(s.state.tasks.is_empty());
+        assert!(
+            s.creating.is_empty(),
+            "stale dialogs cannot start a deleted agent's task"
         );
     });
 }

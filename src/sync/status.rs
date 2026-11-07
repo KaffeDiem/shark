@@ -2351,6 +2351,7 @@ u UU N... 100644 100644 100644 100644 a b c conflict.rs\0? untracked file\0";
             &parents,
             "",
             None,
+            false,
         )
         .unwrap();
         let wt = root.join("ws/ui/ios");

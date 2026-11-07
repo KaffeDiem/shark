@@ -540,8 +540,20 @@ impl Shark {
             used,
         });
         let shark = cx.entity().downgrade();
-        let form = cx
-            .new(|cx| NewTaskForm::new(repos, &picked, None, &[], None, attach, shark, window, cx));
+        let form = cx.new(|cx| {
+            NewTaskForm::new(
+                repos,
+                &picked,
+                None,
+                None,
+                &[],
+                None,
+                attach,
+                shark,
+                window,
+                cx,
+            )
+        });
         let opened = form.clone();
         window.open_dialog(cx, move |d, _, cx| {
             let f = form.clone();

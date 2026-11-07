@@ -1921,6 +1921,83 @@ async fn starting_from_an_issue_previews_then_plans_without_repos(cx: &mut TestA
     assert_eq!(after.default_branch(), format!("eng-7-{name}"));
 }
 
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn starting_from_an_issue_keeps_the_agent_chosen_before_lookup(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let claude = recording_claude(&quiet);
+    let _claude = ClaudeGuard::set(&claude);
+    let home = test_home();
+    let skill = crate::state::agent_skills_dir("designer").join("spacing");
+    fs::create_dir_all(&skill).unwrap();
+    fs::write(skill.join("SKILL.md"), "# Spacing").unwrap();
+    reset();
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos(&home, &["web"]),
+            agents: vec![crate::state::Agent {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                instructions: "Keep spacing consistent".into(),
+                repos: vec!["web".into()],
+                model: Some("opus".into()),
+                effort: Some("low".into()),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    cx.run_until_parked();
+    connect(cx, &shark);
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.home
+            .prompt
+            .update(cx, |p, cx| p.set_value("@designer Keep this draft", w, cx));
+        s.start_from_issue(w, cx);
+        s.home
+            .prompt
+            .update(cx, |p, cx| p.set_value("A newer standalone draft", w, cx));
+    });
+    type_in(cx, window, "ENG-7");
+    press_in(window)(cx, &["enter"]);
+    assert!(shows(cx, window, "issue-summary"));
+    press_in(window)(cx, &["tab", "tab", "enter"]);
+    let task = task_of(cx, &shark);
+    assert_eq!(task.agent.as_ref().unwrap().slug, "designer");
+    assert_eq!(
+        task.agent.as_ref().unwrap().instructions,
+        "Keep spacing consistent"
+    );
+    assert_eq!(task.chats[0].model.as_deref(), Some("opus"));
+    assert_eq!(task.chats[0].effort.as_deref(), Some("low"));
+    assert!(task.repos.is_empty() && task.chats[0].plan);
+    assert_eq!(ids(&task), ["uuid-7"]);
+    for doc in ["AGENTS.md", "CLAUDE.md"] {
+        assert!(
+            fs::read_to_string(task.dir().join(doc))
+                .unwrap()
+                .contains("Keep spacing consistent")
+        );
+    }
+    for folder in [".agents/skills", ".claude/skills"] {
+        assert_eq!(
+            fs::canonicalize(task.dir().join(folder).join("spacing")).unwrap(),
+            fs::canonicalize(&skill).unwrap()
+        );
+    }
+    assert!(wire(&claude, 0).contains("ENG-7"));
+    cx.read(|cx| {
+        assert_eq!(
+            shark.read(cx).home.prompt.read(cx).value(),
+            "A newer standalone draft"
+        )
+    });
+}
+
 /// A refused delete leaves the snapshots; a finished one takes them. And in the end: Linear only
 /// ever got reads, and the credential is in no file.
 #[gpui_kit::test]

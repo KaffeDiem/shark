@@ -52,7 +52,7 @@ Shark opens on Home (`cmd-0`) when no task is open. It shows what's missing (git
 ## Agents
 Create an agent from the sidebar with a name, icon, instructions, default repositories, model and thinking level. Its page has Tasks, History and Instructions & skills tabs. **Edit agent** opens its editing dialog directly. **New task** opens Home with that agent selected. On Home, use the agent picker or type `@designer fix the onboarding spacing` to start a task. **New task for agent…** in `cmd-k` opens the same prompt. Unknown `@names` stay ordinary text; Ask Shark mode does not start agent tasks.
 
-Each task gets its own branches and worktrees. Several tasks can run for the same agent, including in the same repository. Their chats receive a note naming the other open tasks and their changed files, refreshed when a turn ends. The note lists at most 20 files per task and asks the model to avoid editing them. It is guidance, not a file lock.
+Each task gets its own branches and worktrees. Several tasks can run for the same agent, including in the same repository. Their chats receive a note naming the other open tasks and their changed files, refreshed when a turn ends. The note lists at most 20 files per task for context. Each task can freely edit its own copies of the same files.
 
 Instructions reach Claude through `CLAUDE.md` and Codex through `AGENTS.md`. Closing the agent settings dialog updates every open task; existing chats receive changed instructions with their next message. New chats use the agent's model and thinking defaults before repository defaults.
 

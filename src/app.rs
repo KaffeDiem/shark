@@ -120,7 +120,7 @@ pub struct Shark {
     chrome_pressed: Rc<std::cell::Cell<Option<&'static str>>>,
     /// Workspaces whose worktrees are being removed in the background.
     pub(crate) archiving: HashSet<String>,
-    creating: HashSet<String>,
+    creating: HashMap<String, Option<String>>,
     /// Agents with a repository being created right now (`Task::attaching` has the rest).
     adding_repos: HashSet<String>,
     /// Per agent, how the attachment operation has gone.
@@ -295,7 +295,7 @@ impl Shark {
             restore_generation: 0,
             chrome_pressed: Rc::default(),
             archiving: HashSet::new(),
-            creating: HashSet::new(),
+            creating: HashMap::new(),
             adding_repos: HashSet::new(),
             attach_results: HashMap::new(),
             setting_up: vec![],

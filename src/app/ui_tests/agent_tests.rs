@@ -682,6 +682,75 @@ async fn agent_pages_do_not_target_hidden_tasks(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
+async fn agent_history_requires_all_repositories_to_be_merged(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let repos = repos(&home, &["api", "web"]);
+    let (window, shark) = boot(
+        cx,
+        State {
+            repos: repos.clone(),
+            agents: vec![crate::state::Agent {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    cx.run_until_parked();
+    for (name, other_state, expected) in [
+        ("all-merged", Some("MERGED"), Some(true)),
+        ("partly-merged", Some("OPEN"), Some(false)),
+        ("merged-unknown", None, None),
+    ] {
+        let task = git::create_task_with_prs(
+            &tasks_dir().join(name),
+            name,
+            name,
+            &repos
+                .iter()
+                .map(|r| (r.clone(), name.into()))
+                .collect::<Vec<_>>(),
+            &[],
+            &[],
+            name,
+            Some(AgentLink {
+                slug: "designer".into(),
+                ..Default::default()
+            }),
+            true,
+        )
+        .unwrap();
+        let checked: Vec<_> = task.repos.iter().enumerate().map(|(i, repo)| {
+            let mut checked = crate::sync::Repo::fresh(repo, &task);
+            if let Some(state) = if i == 0 { Some("MERGED") } else { other_state } {
+                checked.pr = Some(Ok(crate::sync::parse_prs(&format!(
+                    r#"[{{"url":"https://github.com/example/{}/pull/7","number":7,"state":"{state}"}}]"#,
+                    repo.name,
+                ))));
+            }
+            checked
+        }).collect();
+        on_app(window, shark.clone())(cx, &|s, w, cx| {
+            s.state.tasks.push(task.clone());
+            s.attn.set_checked(name, checked.clone());
+            s.remove_task(name, true, w, cx);
+        });
+        cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+            shark.read(cx).state.tasks.is_empty()
+        })
+        .await;
+        cx.update(|cx| {
+            let s = shark.read(cx);
+            assert_eq!(s.state.agents[0].history[0].merged, expected, "{name}");
+        });
+    }
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
 async fn persistent_agent_starts_isolated_tasks_with_instructions(cx: &mut TestAppContext) {
     let quiet = quiet_claude();
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());

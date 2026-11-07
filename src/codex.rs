@@ -56,16 +56,19 @@ pub fn spawn(ws: &Task, chat: &ChatMeta) -> std::io::Result<(Harness, Receiver<E
         ..Default::default()
     }));
     if !ws.dir().join("AGENTS.md").exists() {
-        let _ = crate::git::write_claude_md(ws); // a workspace from before codex chats
+        crate::git::write_instructions(ws, &ws.dir()).map_err(std::io::Error::other)?;
     }
     // Also catches skills a pull brought in since the links were last written.
-    crate::git::link_skills(ws, &ws.dir());
+    let notice = crate::git::link_skills(ws, &ws.dir())
+        .err()
+        .map(|e| format!("Couldn't refresh skills: {e}"));
     let (agent, rx) = harness::start(
         cmd,
         &ws.dir(),
         &chat.id,
         Some(transcript_path(&chat.id)),
         Some(st),
+        notice,
     )?;
     let mut params = json!({"cwd": ws.dir(), "approvalPolicy": "never", "sandbox": SANDBOX});
     if let Some(m) = model_id(chat.model.as_deref()) {

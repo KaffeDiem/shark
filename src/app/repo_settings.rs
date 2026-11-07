@@ -394,7 +394,7 @@ impl RepoSettingsView {
                             || w.attaching.iter().any(|a| a.repo == name)
                     })
                     .map(|w| w.display_title().to_string())
-                    .chain(s.creating.iter().chain(&s.adding_repos).cloned())
+                    .chain(s.creating.keys().chain(&s.adding_repos).cloned())
                     .collect()
             })
             .unwrap_or_default();

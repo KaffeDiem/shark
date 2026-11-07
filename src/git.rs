@@ -153,7 +153,7 @@ pub fn create_task(
     branch: &str,
     repos: &[(Repo, String)],
 ) -> Result<Task, String> {
-    create_task_with_prs(dir, name, branch, repos, &[], &[], "", None)
+    create_task_with_prs(dir, name, branch, repos, &[], &[], "", None, false)
 }
 
 #[derive(Clone, Debug)]
@@ -165,6 +165,7 @@ pub struct PullRequest {
 
 /// PR selections use fresh local review branches, preserving colleagues' branches. `parents`
 /// `(repo, branch)` stack a repo's new branch on another branch: it starts there and targets it.
+/// Automatic task launches set `fresh` so retained branches cannot become a new task's work.
 #[allow(clippy::too_many_arguments)]
 pub fn create_task_with_prs(
     dir: &Path,
@@ -175,6 +176,7 @@ pub fn create_task_with_prs(
     parents: &[(String, String)],
     title: &str,
     agent: Option<AgentLink>,
+    fresh: bool,
 ) -> Result<Task, String> {
     if repos.is_empty() {
         return Err("pick at least one repo".into());
@@ -190,6 +192,7 @@ pub fn create_task_with_prs(
     let plans = crate::proc::par_map(repos, |(r, b)| {
         match prs.iter().find(|(name, _)| name == &r.name) {
             Some((_, pr)) => plan_pr_worktree(b, r, pr),
+            None if fresh => plan_fresh(b, r, ""),
             None => {
                 let parent = parents.iter().find(|(n, _)| n == &r.name);
                 plan_worktree(b, r, parent.map(|(_, p)| p.as_str()))
@@ -1026,12 +1029,15 @@ pub fn write_claude_md(ws: &Task) -> Result<(), String> {
 const ROOT_DOCS: [&str; 2] = ["CLAUDE.md", "AGENTS.md"];
 
 fn write_root_docs(ws: &Task, dir: &Path) -> Result<(), String> {
+    write_instructions(ws, dir)?;
+    link_skills(ws, dir)
+}
+
+pub(crate) fn write_instructions(ws: &Task, dir: &Path) -> Result<(), String> {
     let [claude, agents] = ROOT_DOCS;
     fs::write(dir.join(claude), claude_md(ws, dir))
         .and_then(|()| fs::write(dir.join(agents), agents_md(ws, dir)))
-        .map_err(|e| e.to_string())?;
-    link_skills(ws, dir);
-    Ok(())
+        .map_err(|e| e.to_string())
 }
 
 /// Whether agents get the repos' skills: `State::no_repo_skills`, here for the spawn paths.
@@ -1096,24 +1102,57 @@ fn owned_skill_links(dir: &Path, folder: &str) -> Option<BTreeMap<String, PathBu
 
 /// Link agent skills for every harness, and repo skills for Codex. Only recorded, unchanged
 /// links belong to Shark; pre-existing links stay user-owned.
-pub fn link_skills(ws: &Task, dir: &Path) {
+pub fn link_skills(ws: &Task, dir: &Path) -> Result<(), String> {
     // Keep the current preference and filesystem reconciliation under the same lock.
     let on = REPO_SKILLS.lock().unwrap_or_else(|e| e.into_inner());
-    reconcile_skills(ws, dir, *on);
+    reconcile_skills(ws, dir, *on)
 }
 
-fn reconcile_skills(ws: &Task, dir: &Path, on: bool) {
+fn reconcile_skills(ws: &Task, dir: &Path, on: bool) -> Result<(), String> {
     for folder in HARNESS_SKILL_DIRS {
-        reconcile_skill_folder(ws, dir, folder, on);
+        reconcile_skill_folder(ws, dir, folder, on)
+            .map_err(|e| format!("{}: {e}", dir.join(folder).display()))?;
     }
+    Ok(())
 }
 
-fn reconcile_skill_folder(ws: &Task, dir: &Path, folder: &str, on: bool) {
+fn skill_entries(dir: &Path) -> std::io::Result<Vec<fs::DirEntry>> {
+    let read = || {
+        let entries = match fs::read_dir(dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(vec![]),
+            Err(e) => return Err(e),
+        };
+        let mut found = vec![];
+        for entry in entries {
+            let entry = entry?;
+            match fs::metadata(entry.path().join("SKILL.md")) {
+                Ok(meta) if meta.is_file() => found.push(entry),
+                Ok(_) => {}
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                    ) => {}
+                Err(e) => return Err(e),
+            }
+        }
+        found.sort_by_key(|e| e.file_name());
+        Ok(found)
+    };
+    read().map_err(|e| std::io::Error::new(e.kind(), format!("{}: {e}", dir.display())))
+}
+
+fn reconcile_skill_folder(ws: &Task, dir: &Path, folder: &str, on: bool) -> std::io::Result<()> {
     if !skill_dirs_owned(dir, folder) {
-        return;
+        return Err(std::io::Error::other(
+            "Skill directory is unreadable or not an owned directory",
+        ));
     }
     let Some(mut owned) = owned_skill_links(dir, folder) else {
-        return;
+        return Err(std::io::Error::other(
+            "Skill ownership manifest is unreadable or invalid",
+        ));
     };
     let links = dir.join(folder);
     owned.retain(|name, target| fs::read_link(links.join(name)).is_ok_and(|t| &t == target));
@@ -1122,7 +1161,7 @@ fn reconcile_skill_folder(ws: &Task, dir: &Path, folder: &str, on: bool) {
     match fs::read_dir(&links) {
         Ok(entries) => {
             for entry in entries {
-                let Ok(entry) = entry else { return };
+                let entry = entry?;
                 let name = entry.file_name().to_string_lossy().into_owned();
                 if !owned.contains_key(&name) {
                     used.insert(name);
@@ -1133,7 +1172,7 @@ fn reconcile_skill_folder(ws: &Task, dir: &Path, folder: &str, on: bool) {
             }
         }
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-        Err(_) => return,
+        Err(e) => return Err(e),
     }
     let mut want = BTreeMap::new();
     let mut add = |skill: String, target: PathBuf, prefix: &str| {
@@ -1155,17 +1194,12 @@ fn reconcile_skill_folder(ws: &Task, dir: &Path, folder: &str, on: bool) {
     };
     // Agent skills claim plain names before repo skills, even when repo skills are disabled.
     if let Some(agent) = &ws.agent {
-        let found = fs::read_dir(crate::state::agent_skills_dir(&agent.slug));
-        let mut found: Vec<_> = found.into_iter().flatten().flatten().collect();
-        found.sort_by_key(|e| e.file_name());
-        for entry in found {
-            if entry.path().join("SKILL.md").is_file() {
-                add(
-                    entry.file_name().to_string_lossy().into_owned(),
-                    entry.path(),
-                    &agent.slug,
-                );
-            }
+        for entry in skill_entries(&crate::state::agent_skills_dir(&agent.slug))? {
+            add(
+                entry.file_name().to_string_lossy().into_owned(),
+                entry.path(),
+                &agent.slug,
+            );
         }
     }
     for r in ws
@@ -1175,12 +1209,9 @@ fn reconcile_skill_folder(ws: &Task, dir: &Path, folder: &str, on: bool) {
     {
         let mut own = HashSet::new();
         for src in HARNESS_SKILL_DIRS {
-            let found = fs::read_dir(dir.join(&r.name).join(src));
-            let mut found: Vec<_> = found.into_iter().flatten().flatten().collect();
-            found.sort_by_key(|e| e.file_name());
-            for e in found {
+            for e in skill_entries(&dir.join(&r.name).join(src))? {
                 let skill = e.file_name().to_string_lossy().into_owned();
-                if !e.path().join("SKILL.md").is_file() || !own.insert(skill.clone()) {
+                if !own.insert(skill.clone()) {
                     continue;
                 }
                 let target = Path::new("../..").join(&r.name).join(src).join(&skill);
@@ -1188,33 +1219,38 @@ fn reconcile_skill_folder(ws: &Task, dir: &Path, folder: &str, on: bool) {
             }
         }
     }
-    owned.retain(|name, target| {
-        want.get(name) == Some(target) || fs::remove_file(links.join(name)).is_err()
-    });
+    for (name, target) in &owned {
+        if want.get(name) != Some(target) {
+            fs::remove_file(links.join(name))?;
+        }
+    }
+    owned.retain(|name, target| want.get(name) == Some(target));
     let manifest = links.parent().unwrap().join(SKILL_OWNERS);
     if want.is_empty() && owned.is_empty() {
-        let _ = fs::remove_file(manifest);
+        match fs::remove_file(manifest) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
         let _ = fs::remove_dir(&links).and_then(|()| fs::remove_dir(links.parent().unwrap()));
-        return;
+        return Ok(());
     }
-    if fs::create_dir_all(&links).is_err() {
-        return;
-    }
+    fs::create_dir_all(&links)?;
     // Record before creating links: a failed write must never leave untracked owned links.
     for (name, target) in &want {
         if !owned.contains_key(name) {
             owned.insert(name.clone(), target.clone());
         }
     }
-    let Ok(bytes) = serde_json::to_vec(&owned) else {
-        return;
-    };
-    if crate::state::write(&manifest, &bytes).is_err() {
-        return;
-    }
+    let bytes = serde_json::to_vec(&owned)?;
+    crate::state::write(&manifest, &bytes)?;
     for (name, target) in want {
-        let _ = std::os::unix::fs::symlink(target, links.join(name));
+        let link = links.join(name);
+        if !fs::read_link(&link).is_ok_and(|current| current == target) {
+            std::os::unix::fs::symlink(target, link)?;
+        }
     }
+    Ok(())
 }
 
 /// What Shark itself leaves in a task root: its docs, Finder litter, the `.context` folder

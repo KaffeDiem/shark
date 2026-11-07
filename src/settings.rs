@@ -279,14 +279,27 @@ impl Settings {
         cx.notify();
     }
 
-    pub(crate) fn set_repo_skills(&mut self, on: bool, cx: &mut Context<Self>) {
-        self.with_state(cx, |s| {
+    pub(crate) fn set_repo_skills(
+        &mut self,
+        on: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let errors = self.with_state(cx, |s| {
             s.no_repo_skills = !on;
             crate::git::set_repo_skills(on);
-            for ws in &s.tasks {
-                crate::git::link_skills(ws, &ws.dir());
-            }
+            s.tasks
+                .iter()
+                .filter_map(|ws| crate::git::link_skills(ws, &ws.dir()).err())
+                .collect::<Vec<_>>()
         });
+        if let Some(errors) = errors.filter(|errors| !errors.is_empty()) {
+            crate::ui::notify_err(
+                window,
+                cx,
+                format!("Couldn't refresh skills: {}", errors.join("\n")),
+            );
+        }
         cx.notify();
     }
 
@@ -415,8 +428,9 @@ impl Settings {
                 "Skills from repos",
                 "Agents can use the skills in each repo of a task",
                 Switch::new("repo-skills").checked(!no_skills).on_click({
-                    move |&v, _, cx| {
-                        this.update(cx, |s, cx| s.set_repo_skills(v, cx)).ok();
+                    move |&v, window, cx| {
+                        this.update(cx, |s, cx| s.set_repo_skills(v, window, cx))
+                            .ok();
                     }
                 }),
             ))

@@ -1,5 +1,6 @@
 //! The branch and PR dialog: a branch name and a filterable repo or branch picker.
 use super::*;
+use crate::state::AgentLink;
 use gpui_kit::base::Selectable as _;
 use gpui_kit::component::Disableable as _;
 use gpui_kit::component::dialog::Cancel;
@@ -29,6 +30,7 @@ pub(super) struct NewTaskForm {
     pub(super) branch: Entity<InputState>,
     /// Home's prompt, sent once the task is created.
     first: Option<String>,
+    agent: Option<AgentLink>,
     picker: Entity<CommandState>,
     repos: Vec<Repo>,
     picked: Vec<bool>,
@@ -87,6 +89,7 @@ impl NewTaskForm {
         mut repos: Vec<Repo>,
         last: &[String],
         first: Option<String>,
+        agent: Option<AgentLink>,
         from: &[(String, String)],
         insert: Option<String>,
         attach: Option<AttachTo>,
@@ -137,6 +140,7 @@ impl NewTaskForm {
             defaults: vec![None; n],
             branch,
             first,
+            agent,
             picker: cx.new(|cx| CommandState::new(window, cx)),
             repos,
             picked,
@@ -776,6 +780,7 @@ impl NewTaskForm {
             .collect();
         let prompt = self.first.clone();
         let insert = self.insert.clone();
+        let agent = self.agent.clone();
         self.shark
             .update(cx, |s, cx| {
                 let title = prompt
@@ -783,7 +788,7 @@ impl NewTaskForm {
                     .map(crate::chat::title_of)
                     .unwrap_or_default();
                 s.create_task_on(
-                    branch, repos, prs, parents, insert, prompt, title, None, window, cx,
+                    branch, repos, prs, parents, insert, prompt, title, agent, false, window, cx,
                 )
             })
             .ok();

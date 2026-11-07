@@ -571,8 +571,8 @@ impl Shark {
         }
         if self
             .creating
-            .iter()
-            .any(|name| name.starts_with(&format!("{slug}-")))
+            .values()
+            .any(|agent| agent.as_deref() == Some(slug))
         {
             notify_err(window, cx, "Wait for the agent's task to finish creating");
             return false;

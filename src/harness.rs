@@ -313,7 +313,7 @@ fn run<'a>(
         model,
     ]);
     cmd.args(extra);
-    start(cmd, cwd, log_name, transcript, None)
+    start(cmd, cwd, log_name, transcript, None, None)
 }
 
 /// Starts `cmd` in `cwd` and turns its stdout lines into `Ev`s, storing them in
@@ -324,6 +324,7 @@ pub(crate) fn start(
     log_name: &str,
     transcript: Option<PathBuf>,
     codex: Option<Arc<Mutex<codex::State>>>,
+    notice: Option<String>,
 ) -> std::io::Result<(Harness, Receiver<Ev>)> {
     fs::create_dir_all(logs_dir())?;
     fs::create_dir_all(transcripts_dir())?;
@@ -335,6 +336,9 @@ pub(crate) fn start(
         .stderr(File::create(&log)?) // a piped but unread stderr could block the child
         .spawn()?;
     let (tx, rx) = unbounded();
+    if let Some(notice) = notice {
+        let _ = tx.send_blocking(Ev::Notice(notice));
+    }
     let stdout = child.stdout.take().unwrap();
     let exited = Arc::new(AtomicBool::new(false));
     let reaped = exited.clone();
@@ -647,7 +651,19 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner());
         let mut cmd = Command::new("sleep");
         cmd.arg("30");
-        let (agent, rx) = start(cmd, &std::env::temp_dir(), "stop-all-test", None, None).unwrap();
+        let (agent, rx) = start(
+            cmd,
+            &std::env::temp_dir(),
+            "stop-all-test",
+            None,
+            None,
+            Some("Couldn't refresh skills".into()),
+        )
+        .unwrap();
+        assert_eq!(
+            rx.recv_blocking().unwrap(),
+            Ev::Notice("Couldn't refresh skills".into())
+        );
         let entry = (agent.pid, agent.exited.clone());
         assert!(LIVE.lock().unwrap().iter().any(|(p, _)| *p == agent.pid));
         // Only this child: another test's agent shouldn't die with it.

@@ -1,6 +1,7 @@
 //! Home starts tasks; All tasks and agent pages review work without leaving the open task.
 use super::ask::Ask;
 use super::*;
+use crate::state::AgentLink;
 use crate::state::Appearance;
 use crate::sync::PrState;
 use crate::ui::{card, close_button, mode_pills};
@@ -177,12 +178,40 @@ impl Shark {
     /// first message.
     pub(super) fn new_task_default(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         let typed = self.home.prompt.read(cx).value().trim().to_string();
+        let agent = self.selected_task_agent(cx);
+        let picked = agent
+            .as_ref()
+            .and_then(|link| self.state.agents.iter().find(|a| a.slug == link.slug))
+            .map_or_else(|| self.state.last_repos.clone(), |a| a.repos.clone());
+        let (_, body) = agent_prompt(&typed, &self.state.agents);
         let first = (self.home_shown()
             && self.home.destination == Destination::Home
             && !self.home.asking
-            && !typed.is_empty())
-        .then_some(typed);
-        self.new_task_from_repos(self.state.last_repos.clone(), first, window, cx)
+            && !body.is_empty())
+        .then(|| body.to_string());
+        self.new_task_from(picked, first, vec![], None, agent, window, cx)
+    }
+
+    /// Capture the visible choice before a task dialog or asynchronous lookup opens.
+    pub(super) fn selected_task_agent(&self, cx: &App) -> Option<AgentLink> {
+        if !self.home_shown() {
+            return None;
+        }
+        let slug = match &self.home.destination {
+            Destination::Agent(slug) => slug.clone(),
+            Destination::Home if !self.home.asking => {
+                let text = self.home.prompt.read(cx).value();
+                agent_prompt(text.trim(), &self.state.agents).0?.to_string()
+            }
+            _ => return None,
+        };
+        let agent = self.state.agents.iter().find(|a| a.slug == slug)?;
+        Some(AgentLink {
+            slug: agent.slug.clone(),
+            name: agent.name.clone(),
+            instructions: agent.instructions.clone(),
+            siblings: vec![],
+        })
     }
 
     /// Home is on screen: asked for, or nothing else to show.
@@ -579,7 +608,7 @@ impl Shark {
         );
         let sea = crate::state::task_name(interaction::now_ms(), |sea| {
             let name = format!("{prefix}-{sea}").replace('/', "-");
-            self.creating.contains(&name)
+            self.creating.contains_key(&name)
                 || self.task(&name).is_some()
                 || tasks_dir().join(&name).exists()
                 || crate::transcript::transcript_path(&name).exists()
@@ -598,6 +627,7 @@ impl Shark {
             first,
             title,
             Some(link),
+            true,
             window,
             cx,
         );
