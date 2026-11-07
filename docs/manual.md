@@ -11,7 +11,7 @@ Use `cmd-k` for the complete command list and current shortcuts. This guide cove
 Shark needs `git`, `gh` logged into GitHub, and `claude` on your login shell's PATH. Codex models also need `codex`, logged in with `codex login`. Home shows missing tools and a setup checklist.
 
 1. **Add repo** from `cmd-k` or Settings › Repositories. Repositories are registered once and can serve many agents and tasks.
-2. Choose **New agent** in the sidebar. Give it a name, short instructions and default repositories. For example, Designer might use your web repository with “Always use Mobbin to ground your research.”
+2. Choose **New agent** in the sidebar and give it a name. Its page opens on **Settings**, where you add short instructions and default repositories. For example, Designer might use your web repository with “Always use Mobbin to ground your research.”
 3. On Home, choose the agent, describe the work and press `enter`. The first line becomes the task's title. `@designer fix the onboarding spacing` selects the same agent.
 4. Plan or work in its chat, review the changes with **Differ**, and use the git button to commit, open PRs and merge.
 5. Delete the completed task when you no longer need its worktrees and conversations. The agent remains ready for its next task, with the completed task in History.
@@ -22,27 +22,27 @@ Worktrees isolate branches, not the filesystem. Coding sessions can write outsid
 
 ## Agents and navigation
 
-The sidebar gives direct access to Home, All tasks and each agent. An agent's page has **Tasks**, **Instructions & skills** and **History**. **Edit agent** opens its name, icon, instructions, default repositories, model and thinking level. Its slug is stable even when its name changes.
+The sidebar gives direct access to Home, All tasks and each agent. An agent's page has a task prompt above **Tasks**, **Settings** and **History**. **Settings** edits its name, icon, instructions, default repositories, model and thinking level in place; each change saves immediately. Its slug is stable even when its name changes.
 
-**New task** on an agent page opens Home with that agent selected; `cmd-n` does the same there. Elsewhere `cmd-n` opens an empty standalone task. The Home picker and `@slug` shortcut share the same selection, so changing the picker preserves the prompt's body. A cancelled or failed creation keeps the draft.
+Type into an agent page's prompt and press `enter` to start a task with that agent; `cmd-n`, `i` and `a` focus that prompt. Each agent keeps its own draft. Elsewhere `cmd-n` opens an empty standalone task. The Home picker and `@slug` shortcut share the same selection, so changing the picker preserves the prompt's body. A cancelled or failed creation keeps the draft.
 
 The agent selected on Home or its own page also follows **New task from branch or PR…** and **Start from Linear issue**. The branch dialog starts with its default repositories selected. A Home draft is passed along only while that prompt is visible; opening a task dialog from another overview does not send a hidden draft.
 
 Several tasks can run for one agent, including in the same repository. Each has separate worktrees. Chats receive a sibling note listing the agent's other open tasks and their changed files, refreshed after turns. The note lists at most 20 files per task, plus a count of others. It is context: each task can freely edit its own copies of those files.
 
-Agent instructions reach Claude through the task's `CLAUDE.md` and Codex through `AGENTS.md`. Closing the editing dialog refreshes open tasks; existing chats receive changed instructions with their next normal message. A failed refresh is reported so you can retry. New chats prefer the agent's valid model and thinking defaults, then repository settings and the app's defaults.
+Agent instructions reach Claude through the task's `CLAUDE.md` and Codex through `AGENTS.md`. Open tasks refresh shortly after you stop typing on **Settings**; existing chats receive changed instructions with their next normal message. A failed refresh is reported so you can retry. New chats prefer the agent's valid model and thinking defaults, then repository settings and the app's defaults.
 
 History keeps the latest 100 deleted tasks, with their titles, PR links, merge status and dates. **PR state unknown** means Shark lacked enough reliable status to determine the result for the whole task, even if some repositories had known PR states. Deleting an agent requires finishing or deleting its open tasks first; confirmation then removes its instructions, history and skills folder.
 
 ### Skills
 
-On **Instructions & skills**, **Open skills folder** creates:
+On **Settings**, **Open skills folder** creates:
 
 ```text
 ~/Library/Application Support/shark/agents/<slug>/skills/
 ```
 
-Create a `<skill>/SKILL.md` file inside that folder for each skill, then choose **Refresh skills**, or close the agent's editing dialog, to refresh every open task. Shark exposes agent skills to both harnesses through links in the task root. The original skill files remain in the agent's folder when a task is deleted. If a running harness does not discover a new skill, start a new conversation.
+Create a `<skill>/SKILL.md` file inside that folder for each skill, then choose **Refresh skills** to refresh every open task. Shark exposes agent skills to both harnesses through links in the task root. The original skill files remain in the agent's folder when a task is deleted. If a running harness does not discover a new skill, start a new conversation.
 
 **Skills from repos** in Settings › General controls repository skills only; agent skills stay enabled. Claude discovers repository skills and commands through its added repository directories. Codex receives links to repository skills from `.agents/skills` or `.claude/skills`. Agent skills get the plain names first; collisions from repositories use prefixed names. Turning repository skills off removes only Shark's recorded repository links. Skill refresh preserves user files and links it does not own.
 
@@ -184,7 +184,7 @@ The footer's **Usage** panel shows Claude and Codex allowance and reset times. G
 |---|---|
 | Commands and current shortcuts | `cmd-k` |
 | Home / return to active task | `cmd-0` |
-| New task; agent page opens its prompt | `cmd-n` |
+| New task; on an agent page, focus its prompt | `cmd-n` |
 | Find task / cycle recent tasks | `cmd-shift-o` / hold `cmd-o` |
 | New chat / close tab / reopen chat | `cmd-t` / `cmd-w` / `cmd-shift-t` |
 | Next or previous tab | `ctrl-tab` / `ctrl-shift-tab` |

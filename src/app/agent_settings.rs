@@ -5,7 +5,8 @@ use crate::state::Agent;
 use crate::ui::{card, row, section};
 use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectState};
-use gpui_kit::component::text::TextView;
+use std::cell::Cell;
+use std::time::Duration;
 
 type Choice = Entity<SelectState<SearchableVec<SharedString>>>;
 
@@ -172,12 +173,7 @@ impl Shark {
                         Ok(Ok(slug)) => {
                             let shark = shark.clone();
                             window.defer(cx, move |w, cx| {
-                                shark
-                                    .update(cx, |s, cx| {
-                                        s.open_agent(&slug, w, cx);
-                                        s.edit_agent(&slug, w, cx);
-                                    })
-                                    .ok();
+                                shark.update(cx, |s, cx| s.edit_agent(&slug, w, cx)).ok();
                             });
                             true
                         }
@@ -200,6 +196,42 @@ impl Shark {
         self.enter_home(window, cx);
         self.home.destination = super::home::Destination::Agent(slug.to_string());
         self.home.agent_tab = AgentTab::Tasks;
+        let name = self
+            .state
+            .agents
+            .iter()
+            .find(|a| a.slug == slug)
+            .unwrap()
+            .name
+            .clone();
+        if self.home.agent_prompt_for.as_deref() != Some(slug) {
+            let draft = self.home.agent_drafts.remove(slug).unwrap_or_default();
+            let prompt = self.home.agent_prompt.clone();
+            let left = prompt.read(cx).value().to_string();
+            if let Some(prev) = self.home.agent_prompt_for.replace(slug.into())
+                && !left.trim().is_empty()
+            {
+                self.home.agent_drafts.insert(prev, left);
+            }
+            prompt.update(cx, |p, cx| p.set_value(draft, window, cx));
+        }
+        self.home.agent_prompt.update(cx, |p, cx| {
+            p.set_placeholder(format!("Describe a task for {name}"), window, cx)
+        });
+        let editing = |e: &Entity<AgentSettingsView>| e.read(cx).slug == slug;
+        if !self.home.agent_editor.as_ref().is_some_and(editing) {
+            let agent = self
+                .state
+                .agents
+                .iter()
+                .find(|a| a.slug == slug)
+                .unwrap()
+                .clone();
+            let last = repo_model(&self.state, &agent);
+            let shark = cx.entity().downgrade();
+            self.home.agent_editor =
+                Some(cx.new(|cx| AgentSettingsView::new(shark, agent, last, window, cx)));
+        }
         let tasks = self.home_rows(cx);
         if self.home_at(&tasks).is_none() {
             self.home.sel = tasks
@@ -259,10 +291,7 @@ impl Shark {
                                 .gap_2()
                                 .child(div().text_base().child("No tasks yet"))
                                 .child(div().text_sm().text_color(theme.muted_foreground).child(
-                                    format!(
-                                        "Start a task with {} whenever you're ready.",
-                                        agent.name
-                                    ),
+                                    "Describe the work above and press enter. Each task gets its own branch and chat.",
                                 )),
                         )
                     })
@@ -276,77 +305,77 @@ impl Shark {
                     }))
                     .into_any_element()
             }
-            AgentTab::Instructions => {
-                let model = agent
-                    .model
-                    .as_deref()
-                    .filter(|m| MODELS.contains(m))
-                    .map(model_label)
-                    .unwrap_or_else(|| {
-                        format!(
-                            "Repository default ({})",
-                            model_label(&repo_model(&self.state, agent))
-                        )
-                    });
-                let effort = agent
-                    .effort
-                    .as_deref()
-                    .map(effort_label)
-                    .unwrap_or_else(|| "Repository default".into());
-                v_flex()
-                    .id("agent-instructions-page")
-                    .test_support()
-                    .gap_5()
-                    .child(
-                        v_flex()
-                            .gap_2()
-                            .child(section(theme, "Instructions"))
-                            .child(
-                                TextView::markdown(
-                                    "agent-instructions-text",
-                                    if agent.instructions.is_empty() {
-                                        "No instructions yet. Edit this agent to add them."
-                                            .to_string()
-                                    } else {
-                                        agent.instructions.clone()
-                                    },
-                                )
-                                .selectable(true),
-                            ),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_2()
-                            .child(section(theme, "Defaults"))
-                            .child(div().text_sm().child(format!(
-                                "Repositories: {}",
-                                if repos.is_empty() { "None" } else { &repos }
-                            )))
-                            .child(div().text_sm().child(format!("Model: {model}")))
-                            .child(div().text_sm().child(format!("Thinking: {effort}"))),
-                    )
-                    .child(
-                        v_flex()
-                            .gap_2()
-                            .child(section(theme, "Skills"))
-                            .child(div().text_sm().text_color(theme.muted_foreground).child(
-                                "Add each skill as <skill>/SKILL.md in this folder, then Refresh skills to update every open task.",
-                            ))
-                            .child(h_flex().gap_2().child(skills_button(slug))
-                            .child(Button::new("agent-refresh-skills").ghost().small().icon(IconName::RefreshCw)
-                                .label("Refresh skills").on_click(cx.listener(move |s, _, window, cx| {
-                                    match s.sync_agent(&refresh_slug, true, cx) {
-                                        Ok(()) => window.push_notification(Notification::success("Agent skills refreshed"), cx),
-                                        Err(e) => notify_err(window, cx, format!("Couldn't refresh agent skills: {e}")),
-                                    }
-                                })))),
-                    )
-                    .into_any_element()
-            }
+            AgentTab::Instructions => v_flex()
+                .id("agent-instructions-page")
+                .test_support()
+                .gap_6()
+                .children(self.home.agent_editor.clone())
+                .child(
+                    v_flex()
+                        .gap_2()
+                        .child(section(theme, "Skills"))
+                        .child(div().text_sm().text_color(theme.muted_foreground).child(
+                            "Add each skill as <skill>/SKILL.md in this folder, then Refresh skills to update every open task.",
+                        ))
+                        .child(h_flex().gap_2().child(skills_button(slug))
+                        .child(Button::new("agent-refresh-skills").ghost().small().icon(IconName::RefreshCw)
+                            .label("Refresh skills").on_click(cx.listener(move |s, _, window, cx| {
+                                match s.sync_agent(&refresh_slug, true, cx) {
+                                    Ok(()) => window.push_notification(Notification::success("Agent skills refreshed"), cx),
+                                    Err(e) => notify_err(window, cx, format!("Couldn't refresh agent skills: {e}")),
+                                }
+                            })))),
+                )
+                .into_any_element(),
             AgentTab::History => render_history(agent, theme),
         };
-        let (new_slug, edit_slug, composer_slug) =
-            (slug.to_string(), slug.to_string(), slug.to_string());
+        let composer_slug = slug.to_string();
+        let icon_slug = slug.to_string();
+        let focused = (self.home.agent_prompt.read(cx))
+            .focus_handle(cx)
+            .is_focused(window);
+        let composer = v_flex()
+            .gap_2()
+            .child(
+                div()
+                    .id("agent-composer")
+                    .test_support()
+                    .px_3()
+                    .py_2()
+                    .rounded(theme.radius_lg)
+                    .border_1()
+                    .border_color(if focused { theme.primary } else { theme.border })
+                    .bg(theme.secondary)
+                    .text_size(px(14.))
+                    .child(Input::new(&self.home.agent_prompt).appearance(false)),
+            )
+            .child(
+                h_flex()
+                    .gap_3()
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
+                    .child(crate::ui::hint("enter", "start task"))
+                    .child(
+                        div()
+                            .id("agent-default-repos")
+                            .test_support()
+                            .min_w_0()
+                            .truncate()
+                            .child(if repos.is_empty() {
+                                "Without a repository · add defaults in Settings".to_string()
+                            } else {
+                                format!("In {repos}")
+                            }),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("agent-from-branch")
+                            .ghost()
+                            .xsmall()
+                            .label("From branch or PR…")
+                            .on_click(cx.listener(|s, _, w, cx| s.new_task_default(w, cx))),
+                    ),
+            );
         v_flex()
             .id("agent-page")
             .aria_label(format!("{} agent", agent.name))
@@ -377,11 +406,21 @@ impl Shark {
                             .gap_6()
                             .child(
                                 h_flex()
-                                    .flex_wrap()
                                     .gap_3()
                                     .child(
-                                        Icon::new(super::sidebar::section_icon(&agent.icon))
-                                            .with_size(px(28.)),
+                                        Button::new("agent-page-icon")
+                                            .accessibility_label("Change agent icon")
+                                            .ghost()
+                                            .icon(
+                                                Icon::new(super::sidebar::section_icon(
+                                                    &agent.icon,
+                                                ))
+                                                .with_size(px(28.)),
+                                            )
+                                            .tooltip("Change icon")
+                                            .on_click(cx.listener(move |s, _, w, cx| {
+                                                s.pick_agent_icon(&icon_slug, w, cx)
+                                            })),
                                     )
                                     .child(
                                         v_flex()
@@ -402,45 +441,14 @@ impl Shark {
                                                     .text_color(theme.muted_foreground)
                                                     .child(format!("@{}", agent.slug)),
                                             ),
-                                    )
-                                    .child(
-                                        Button::new("agent-page-new-task")
-                                            .flex_none()
-                                            .primary()
-                                            .icon(IconName::Plus)
-                                            .label("New task")
-                                            .on_click(cx.listener(move |s, _, w, cx| {
-                                                s.prefill_agent_task(&new_slug, w, cx)
-                                            })),
-                                    )
-                                    .child(
-                                        Button::new("agent-page-edit")
-                                            .flex_none()
-                                            .ghost()
-                                            .icon(IconName::Pencil)
-                                            .label("Edit agent")
-                                            .on_click(cx.listener(move |s, _, w, cx| {
-                                                s.edit_agent(&edit_slug, w, cx)
-                                            })),
                                     ),
                             )
-                            .child(
-                                div()
-                                    .id("agent-default-repos")
-                                    .text_sm()
-                                    .text_color(theme.muted_foreground)
-                                    .child(if repos.is_empty() {
-                                        "No default repositories".to_string()
-                                    } else {
-                                        format!("Default repositories: {repos}")
-                                    })
-                                    .test_support(),
-                            )
+                            .child(composer)
                             .child(
                                 h_flex().gap_2().flex_wrap().children(
                                     [
                                         (AgentTab::Tasks, "Tasks"),
-                                        (AgentTab::Instructions, "Instructions & skills"),
+                                        (AgentTab::Instructions, "Settings"),
                                         (AgentTab::History, "History"),
                                     ]
                                     .into_iter()
@@ -467,31 +475,15 @@ impl Shark {
             .into_any_element()
     }
 
+    /// The agent's page on its Settings tab, typing into its instructions.
     pub(super) fn edit_agent(&mut self, slug: &str, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(agent) = self.state.agents.iter().find(|a| a.slug == slug).cloned() else {
-            return;
-        };
-        let shark = cx.entity().downgrade();
-        let gone = shark.clone();
-        let last = repo_model(&self.state, &agent);
-        let view = cx.new(|cx| AgentSettingsView::new(shark, agent, last, window, cx));
-        let slug = slug.to_string();
-        window.open_dialog(cx, move |d, _, _| {
-            let (gone, slug) = (gone.clone(), slug.clone());
-            crate::ui::dialog(d)
-                .w(px(640.))
-                .child(view.clone())
-                .on_close(move |_, window, cx| {
-                    let (gone, slug) = (gone.clone(), slug.clone());
-                    window.defer(cx, move |window, cx| {
-                        gone.update(cx, |s, cx| {
-                            if let Err(e) = s.sync_agent(&slug, true, cx) {
-                                notify_err(window, cx, format!("Couldn't refresh agent instructions: {e}. Reopen agent settings and close them to retry."));
-                            }
-                        }).ok();
-                    });
-                })
-        });
+        self.open_agent(slug, window, cx);
+        self.home.agent_tab = AgentTab::Instructions;
+        if let Some(editor) = self.home.agent_editor.clone() {
+            editor.update(cx, |e, cx| {
+                e.instructions.update(cx, |i, cx| i.focus(window, cx))
+            });
+        }
     }
 
     pub(super) fn pick_agent(
@@ -661,7 +653,6 @@ impl Shark {
                         );
                     }
                 }
-                window.close_dialog(cx);
                 s.collapsed_agents.remove(&slug);
                 if s.home.destination == super::home::Destination::Agent(slug.clone()) {
                     s.enter_home(window, cx);
@@ -676,12 +667,15 @@ impl Shark {
     }
 }
 
-struct AgentSettingsView {
+/// An agent's editable settings, shown on its page; every change saves at once.
+pub(super) struct AgentSettingsView {
     shark: WeakEntity<Shark>,
-    slug: String,
+    pub(super) slug: String,
     last: String,
     name: Entity<InputState>,
-    instructions: Entity<TextareaState>,
+    pub(super) instructions: Entity<TextareaState>,
+    /// Bumped per name or instructions edit; only the latest edit's timer syncs open tasks.
+    edits: Rc<Cell<u64>>,
     model: Choice,
     effort: Choice,
     _subs: Vec<Subscription>,
@@ -725,24 +719,29 @@ impl AgentSettingsView {
             instructions,
             model,
             effort,
+            edits: Rc::default(),
             _subs: vec![],
         };
-        this._subs
-            .push(cx.subscribe(&this.name, |this, field, ev, cx| {
+        this._subs.push(
+            cx.subscribe_in(&this.name, window, |this, field, ev, w, cx| {
                 if let InputEvent::Change = ev {
                     let name = field.read(cx).value().trim().to_string();
                     if !name.is_empty() {
                         this.update(cx, |a| a.name = name);
+                        this.sync_soon(w, cx);
                     }
                 }
-            }));
-        this._subs
-            .push(cx.subscribe(&this.instructions, |this, field, ev, cx| {
+            }),
+        );
+        this._subs.push(
+            cx.subscribe_in(&this.instructions, window, |this, field, ev, w, cx| {
                 if let InputEvent::Change = ev {
                     let text = field.read(cx).value().to_string();
                     this.update(cx, |a| a.instructions = text);
+                    this.sync_soon(w, cx);
                 }
-            }));
+            }),
+        );
         this._subs
             .push(cx.subscribe_in(&this.model, window, |this, _, ev, w, cx| {
                 let SelectEvent::Confirm(Some(v)) = ev else {
@@ -818,6 +817,31 @@ impl AgentSettingsView {
         result
     }
 
+    /// Open tasks' CLAUDE.md follows the agent once typing pauses. Detached, so leaving the
+    /// page mid-pause still syncs.
+    fn sync_soon(&self, window: &mut Window, cx: &mut Context<Self>) {
+        let edit = self.edits.get() + 1;
+        self.edits.set(edit);
+        let (edits, shark, slug) = (self.edits.clone(), self.shark.clone(), self.slug.clone());
+        cx.spawn_in(window, async move |_, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(600))
+                .await;
+            if edits.get() != edit {
+                return;
+            }
+            shark
+                .update_in(cx, |s, window, cx| {
+                    if let Err(e) = s.sync_agent(&slug, true, cx) {
+                        let e = format!("Couldn't refresh agent instructions: {e}");
+                        notify_err(window, cx, e);
+                    }
+                })
+                .ok();
+        })
+        .detach();
+    }
+
     fn set_repo(&mut self, repo: &str, on: bool, window: &mut Window, cx: &mut Context<Self>) {
         let Some(mut agent) = self.update(cx, |a| {
             a.repos.retain(|r| r != repo);
@@ -882,8 +906,6 @@ impl Render for AgentSettingsView {
             .id("agent-settings")
             .test_support()
             .gap_4()
-            .max_h(px(600.))
-            .overflow_y_scroll()
             .child(
                 h_flex()
                     .gap_2()
@@ -944,34 +966,18 @@ impl Render for AgentSettingsView {
                     ),
             )
             .child(
-                h_flex()
-                    .gap_2()
-                    .child(skills_button(&self.slug))
-                    .child(
-                        Button::new("agent-new-task")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Plus)
-                            .label("New task")
-                            .on_click(cx.listener(|this, _, w, cx| {
-                                let slug = this.slug.clone();
-                                this.shark
-                                    .update(cx, |s, cx| s.prefill_agent_task(&slug, w, cx))
-                                    .ok();
-                            })),
-                    )
-                    .child(
-                        Button::new("delete-agent")
-                            .ghost()
-                            .small()
-                            .label("Delete agent…")
-                            .on_click(cx.listener(|this, _, w, cx| {
-                                let slug = this.slug.clone();
-                                this.shark
-                                    .update(cx, |s, cx| s.delete_agent(&slug, w, cx))
-                                    .ok();
-                            })),
-                    ),
+                h_flex().gap_2().child(
+                    Button::new("delete-agent")
+                        .ghost()
+                        .small()
+                        .label("Delete agent…")
+                        .on_click(cx.listener(|this, _, w, cx| {
+                            let slug = this.slug.clone();
+                            this.shark
+                                .update(cx, |s, cx| s.delete_agent(&slug, w, cx))
+                                .ok();
+                        })),
+                ),
             )
             .into_any_element()
     }

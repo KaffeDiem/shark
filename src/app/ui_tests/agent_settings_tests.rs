@@ -64,23 +64,22 @@ async fn agent_settings_creates_and_edits_a_stable_identity(cx: &mut TestAppCont
             "agent edits leave task groups alone"
         );
     });
-    press_in(window)(cx, &["escape"]);
-    cx.run_until_parked();
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
+        assert!(!w.has_active_dialog(cx), "creation opens no second dialog");
         assert!(
             w.try_find("agent-page").is_some(),
-            "the empty agent has its own page"
+            "settings are edited on the agent's page"
         );
-        assert!(w.try_find("agent-empty-tasks").is_some());
-        w.click("Instructions & skills", cx);
-        w.render_frame(cx);
-        assert!(w.try_find("agent-instructions-page").is_some());
         assert!(w.try_find("agent-skills").is_some());
+        w.click("Tasks", cx);
+        w.render_frame(cx);
+        assert!(w.try_find("agent-empty-tasks").is_some());
+        assert!(w.try_find("agent-composer").is_some());
         w.click("History", cx);
         w.render_frame(cx);
         assert!(w.try_find("agent-page").is_some());
-        w.click("agent-page-edit", cx);
+        w.click("Settings", cx);
         w.render_frame(cx);
         assert!(w.try_find("agent-settings").is_some());
     })
@@ -262,7 +261,7 @@ async fn agent_settings_shows_history_and_opens_its_task(cx: &mut TestAppContext
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
         assert!(!w.has_active_dialog(cx), "agent is a page, not a dialog");
-        w.click("Instructions & skills", cx);
+        w.click("Settings", cx);
         let s = shark.read(cx);
         assert!(s.home.focus.is_focused(w));
         assert_eq!(s.home.page.offset(), point(px(0.), px(0.)));
@@ -301,9 +300,12 @@ async fn agent_settings_shows_history_and_opens_its_task(cx: &mut TestAppContext
     press_in(window)(cx, &["i"]);
     cx.update_window(window, |_, w, cx| {
         let s = shark.read(cx);
-        assert_eq!(s.home.destination, super::super::home::Destination::Home);
-        assert_eq!(s.home.prompt.read(cx).value().as_ref(), "@designer ");
-        assert!(s.home.prompt.read(cx).focus_handle(cx).is_focused(w));
+        assert_eq!(
+            s.home.destination,
+            super::super::home::Destination::Agent("designer".into()),
+            "i types a task without leaving the agent"
+        );
+        assert!(s.home.agent_prompt.read(cx).focus_handle(cx).is_focused(w));
     })
     .unwrap();
 }
@@ -391,4 +393,50 @@ async fn failed_agent_doc_refresh_preserves_instruction_snapshots_until_retry(
             before.fingerprint
         );
     });
+}
+
+/// Typing on the Settings tab reaches open tasks' CLAUDE.md once typing pauses.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn inline_instruction_edits_reach_open_tasks_after_a_pause(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let link = AgentLink {
+        slug: "designer".into(),
+        name: "Designer".into(),
+        ..Default::default()
+    };
+    let task = git::create_empty_task(&tasks_dir().join("one"), "one", "one", Some(link)).unwrap();
+    let (window, shark) = boot(
+        cx,
+        State {
+            agents: vec![crate::state::Agent {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                ..Default::default()
+            }],
+            tasks: vec![task],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.edit_agent("designer", w, cx));
+    cx.update_window(window, |_, w, cx| w.input("Use tokens", cx))
+        .unwrap();
+    let synced = |cx: &mut TestAppContext| {
+        cx.read(|cx| {
+            shark.read(cx).state.tasks[0]
+                .agent
+                .as_ref()
+                .unwrap()
+                .instructions
+                .clone()
+        })
+    };
+    assert_eq!(synced(cx), "", "no sync while typing");
+    cx.executor().advance_clock(Duration::from_secs(1));
+    cx.run_until_parked();
+    assert_eq!(synced(cx), "Use tokens");
+    let md = cx.read(|cx| shark.read(cx).state.tasks[0].dir().join("CLAUDE.md"));
+    assert!(fs::read_to_string(md).unwrap().contains("Use tokens"));
 }

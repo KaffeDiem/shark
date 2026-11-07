@@ -100,6 +100,13 @@ pub(crate) struct Home {
     /// The task under the list cursor.
     pub(super) sel: Option<String>,
     pub(super) prompt: Entity<InputState>,
+    /// The agent page's task composer, holding `agent_prompt_for`'s draft; other agents'
+    /// drafts wait in `agent_drafts`.
+    pub(super) agent_prompt: Entity<InputState>,
+    pub(super) agent_prompt_for: Option<String>,
+    pub(super) agent_drafts: HashMap<String, String>,
+    /// The agent page's Settings tab.
+    pub(super) agent_editor: Option<Entity<super::agent_settings::AgentSettingsView>>,
     /// The prompt asks Shark instead of starting a task.
     pub(super) asking: bool,
     pub(super) ask: Option<Ask>,
@@ -120,14 +127,22 @@ pub(crate) struct Home {
 impl Home {
     pub(super) fn new(window: &mut Window, cx: &mut Context<Shark>) -> Self {
         let prompt = cx.new(|cx| InputState::new(window, cx).placeholder(BUILD));
-        let _subs =
-            vec![
-                cx.subscribe_in(&prompt, window, |s, _, ev: &InputEvent, w, cx| match ev {
-                    InputEvent::PressEnter { .. } => s.submit_prompt(w, cx),
-                    InputEvent::Change => cx.notify(),
-                    _ => {}
-                }),
-            ];
+        let agent_prompt = cx.new(|cx| InputState::new(window, cx));
+        let _subs = vec![
+            cx.subscribe_in(&prompt, window, |s, _, ev: &InputEvent, w, cx| match ev {
+                InputEvent::PressEnter { .. } => s.submit_prompt(w, cx),
+                InputEvent::Change => cx.notify(),
+                _ => {}
+            }),
+            cx.subscribe_in(&agent_prompt, window, |s, field, ev: &InputEvent, w, cx| {
+                if let InputEvent::PressEnter { .. } = ev
+                    && let Destination::Agent(slug) = s.home.destination.clone()
+                {
+                    let text = field.read(cx).value().trim().to_string();
+                    s.start_agent_task(&slug, text, w, cx);
+                }
+            }),
+        ];
         Home {
             on: false,
             destination: Destination::Home,
@@ -136,6 +151,10 @@ impl Home {
             focus: cx.focus_handle(),
             sel: None,
             prompt,
+            agent_prompt,
+            agent_prompt_for: None,
+            agent_drafts: HashMap::new(),
+            agent_editor: None,
             asking: false,
             ask: None,
             waiting: HashMap::new(),
@@ -150,7 +169,11 @@ impl Home {
     }
 
     pub(super) fn has_focus(&self, window: &Window, cx: &App) -> bool {
-        self.focus.is_focused(window) || self.prompt.read(cx).focus_handle(cx).is_focused(window)
+        self.focus.is_focused(window)
+            || self.prompt.read(cx).focus_handle(cx).is_focused(window)
+            || (self.agent_prompt.read(cx))
+                .focus_handle(cx)
+                .is_focused(window)
     }
 }
 
@@ -184,11 +207,12 @@ impl Shark {
             .and_then(|link| self.state.agents.iter().find(|a| a.slug == link.slug))
             .map_or_else(|| self.state.last_repos.clone(), |a| a.repos.clone());
         let (_, body) = agent_prompt(&typed, &self.state.agents);
-        let first = (self.home_shown()
-            && self.home.destination == Destination::Home
-            && !self.home.asking
-            && !body.is_empty())
-        .then(|| body.to_string());
+        let body = match &self.home.destination {
+            Destination::Home if !self.home.asking => body.to_string(),
+            Destination::Agent(_) => self.home.agent_prompt.read(cx).value().trim().to_string(),
+            _ => String::new(),
+        };
+        let first = (self.home_shown() && !body.is_empty()).then_some(body);
         self.new_task_from(picked, first, vec![], None, agent, window, cx)
     }
 
@@ -507,21 +531,19 @@ impl Shark {
         }
     }
 
+    /// The agent's page, typing into its task composer.
     pub(super) fn prefill_agent_task(
         &mut self,
         slug: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.close_all_dialogs(cx);
-        self.enter_home(window, cx);
-        if self.home.asking {
-            self.toggle_ask_mode(window, cx);
+        self.open_agent(slug, window, cx);
+        if self.home.destination == Destination::Agent(slug.into()) {
+            self.home
+                .agent_prompt
+                .update(cx, |p, cx| p.focus(window, cx));
         }
-        self.home.prompt.update(cx, |p, cx| {
-            p.set_value(format!("@{slug} "), window, cx);
-            p.focus(window, cx);
-        });
     }
 
     pub(super) fn pick_home_agent(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -642,20 +664,28 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if self.home.asking {
-            return;
-        }
         let prompt = self.home.prompt.clone();
         let text = prompt.read(cx).value();
-        let used = match agent {
-            Some(slug) => {
-                let (mentioned, body) = agent_prompt(text.trim(), &self.state.agents);
-                mentioned == Some(slug) && body == first.unwrap_or_default()
-            }
-            None => first.is_some_and(|first| text.trim() == first),
-        };
+        let used = !self.home.asking
+            && match agent {
+                Some(slug) => {
+                    let (mentioned, body) = agent_prompt(text.trim(), &self.state.agents);
+                    mentioned == Some(slug) && body == first.unwrap_or_default()
+                }
+                None => first.is_some_and(|first| text.trim() == first),
+            };
         if used {
             prompt.update(cx, |p, cx| p.set_value("", window, cx));
+        }
+        let Some(slug) = agent else { return };
+        let first = first.unwrap_or_default();
+        if self.home.agent_prompt_for.as_deref() == Some(slug) {
+            let composer = self.home.agent_prompt.clone();
+            if composer.read(cx).value().trim() == first {
+                composer.update(cx, |p, cx| p.set_value("", window, cx));
+            }
+        } else if self.home.agent_drafts.get(slug).map(|d| d.trim()) == Some(first) {
+            self.home.agent_drafts.remove(slug);
         }
     }
 

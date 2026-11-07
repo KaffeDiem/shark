@@ -776,9 +776,9 @@ async fn persistent_agent_starts_isolated_tasks_with_instructions(cx: &mut TestA
     for (count, prompt) in [(1, "one"), (2, "two")] {
         on_app(window, shark.clone())(cx, &|s, w, cx| {
             s.prefill_agent_task("designer", w, cx);
-            s.home.prompt.update(cx, |p, cx| {
-                p.set_value(format!("@designer {prompt}"), w, cx)
-            });
+            s.home
+                .agent_prompt
+                .update(cx, |p, cx| p.set_value(prompt, w, cx));
         });
         press_in(window)(cx, &["enter"]);
         cx.wait_for(window, Duration::from_secs(10), |_, cx| {
@@ -787,7 +787,7 @@ async fn persistent_agent_starts_isolated_tasks_with_instructions(cx: &mut TestA
         })
         .await;
         cx.run_until_parked();
-        cx.update(|cx| assert_eq!(shark.read(cx).home.prompt.read(cx).value(), ""));
+        cx.update(|cx| assert_eq!(shark.read(cx).home.agent_prompt.read(cx).value(), ""));
         if count == 1 {
             let task = cx.read(|cx| shark.read(cx).state.tasks[0].clone());
             fs::write(task.dir().join("api/first.rs"), "first").unwrap();

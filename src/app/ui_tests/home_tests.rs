@@ -481,9 +481,9 @@ async fn agent_prompt_survives_cancelled_or_failed_creation(cx: &mut TestAppCont
     on(cx, &|s, w, cx| {
         s.editor.as_ref().unwrap().update(cx, |e, _| e.dirty = true);
         s.prefill_agent_task("designer", w, cx);
-        s.home.prompt.update(cx, |p, cx| {
-            p.set_value("@designer preserve this prompt", w, cx)
-        });
+        s.home
+            .agent_prompt
+            .update(cx, |p, cx| p.set_value("preserve this prompt", w, cx));
     });
     press(cx, &["enter"]);
     cx.update_window(window, |_, w, cx| assert!(w.has_active_dialog(cx)))
@@ -492,10 +492,7 @@ async fn agent_prompt_survives_cancelled_or_failed_creation(cx: &mut TestAppCont
     cx.read(|cx| {
         let s = shark.read(cx);
         assert_eq!(s.state.tasks.len(), 1);
-        assert_eq!(
-            s.home.prompt.read(cx).value(),
-            "@designer preserve this prompt"
-        );
+        assert_eq!(s.home.agent_prompt.read(cx).value(), "preserve this prompt");
     });
     on(cx, &|s, w, cx| {
         s.editor
@@ -503,29 +500,32 @@ async fn agent_prompt_survives_cancelled_or_failed_creation(cx: &mut TestAppCont
             .unwrap()
             .update(cx, |e, _| e.dirty = false);
         s.state.read_only = true;
-        s.home.prompt.update(cx, |p, cx| p.focus(w, cx));
+        s.home.agent_prompt.update(cx, |p, cx| p.focus(w, cx));
     });
     press(cx, &["enter"]);
     cx.read(|cx| {
         let s = shark.read(cx);
         assert_eq!(s.state.tasks.len(), 1);
-        assert_eq!(
-            s.home.prompt.read(cx).value(),
-            "@designer preserve this prompt"
-        );
+        assert_eq!(s.home.agent_prompt.read(cx).value(), "preserve this prompt");
     });
     on(cx, &|s, w, cx| {
         s.state.read_only = false;
+        s.prefill_agent_task("reviewer", w, cx);
         s.home
-            .prompt
-            .update(cx, |p, cx| p.set_value("@reviewer same prompt", w, cx));
+            .agent_prompt
+            .update(cx, |p, cx| p.set_value("same prompt", w, cx));
         s.home_prompt_used(Some("same prompt"), Some("designer"), w, cx);
         assert_eq!(
-            s.home.prompt.read(cx).value(),
-            "@reviewer same prompt",
+            s.home.agent_prompt.read(cx).value(),
+            "same prompt",
             "another agent's pending task cannot clear this prompt"
         );
         s.prefill_agent_task("designer", w, cx);
+        assert_eq!(
+            s.home.agent_prompt.read(cx).value(),
+            "preserve this prompt",
+            "each agent keeps its own draft"
+        );
     });
     press(cx, &["enter"]);
     cx.read(|cx| {
@@ -533,9 +533,9 @@ async fn agent_prompt_survives_cancelled_or_failed_creation(cx: &mut TestAppCont
         assert_eq!(s.state.tasks.len(), 2);
         assert_eq!(s.state.tasks[1].agent.as_ref().unwrap().slug, "designer");
         assert_eq!(
-            s.home.prompt.read(cx).value(),
+            s.home.agent_prompt.read(cx).value(),
             "",
-            "an empty @agent submission clears after success"
+            "an empty agent submission clears after success"
         );
     });
 }
@@ -595,14 +595,17 @@ async fn home_agent_picker_preserves_draft_and_standalone_choice(cx: &mut TestAp
     press(cx, &["cmd-n"]);
     cx.read(|cx| {
         let s = shark.read(cx);
-        assert_eq!(s.home.destination, super::super::home::Destination::Home);
-        assert_eq!(s.home.prompt.read(cx).value(), "@designer ");
+        assert_eq!(
+            s.home.destination,
+            super::super::home::Destination::Agent("designer".into()),
+            "cmd-n on an agent page stays there"
+        );
         assert_eq!(s.state.tasks.len(), 1);
     });
     on(cx, &|s, w, cx| {
         s.home
-            .prompt
-            .update(cx, |p, cx| p.set_value("@designer another task", w, cx))
+            .agent_prompt
+            .update(cx, |p, cx| p.set_value("another task", w, cx))
     });
     press(cx, &["enter"]);
     cx.wait_for(window, Duration::from_secs(10), |_, cx| {
@@ -617,7 +620,7 @@ async fn home_agent_picker_preserves_draft_and_standalone_choice(cx: &mut TestAp
                 .iter()
                 .any(|task| task.agent.as_ref().is_some_and(|a| a.slug == "designer"))
         );
-        assert_eq!(s.home.prompt.read(cx).value(), "");
+        assert_eq!(s.home.agent_prompt.read(cx).value(), "");
     });
     fs::remove_dir_all(home).ok();
 }
