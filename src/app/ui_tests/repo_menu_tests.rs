@@ -72,9 +72,13 @@ async fn repository_menu_tracks_checkout_and_scopes_links(cx: &mut TestAppContex
     .await;
     on(cx, &|s, _, cx| {
         let ws = s.ws("menu-scope").unwrap();
-        let unknown = menus::branch_entries(s, ws, Some("api"), cx);
-        assert!(!has(&unknown, "Create pull request"), "not GitHub");
-        s.syncs["menu-scope"].update(cx, |g, _| g.set_no_pr("api"));
+        // Only GitHub's answer that there is none offers one; the poll can't land mid-closure.
+        for answer in [None, Some(Err("offline".to_string()))] {
+            s.syncs["menu-scope"].update(cx, |g, _| g.set_no_pr("api", answer));
+            let unknown = menus::branch_entries(s, ws, Some("api"), cx);
+            assert!(!has(&unknown, "Create pull request"));
+        }
+        s.syncs["menu-scope"].update(cx, |g, _| g.set_no_pr("api", Some(Ok(()))));
         let entries = menus::branch_entries(s, ws, Some("api"), cx);
         assert!(has(&entries, "Create pull request"));
         assert!(!has(&entries, "Open pull request"));

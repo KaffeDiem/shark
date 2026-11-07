@@ -467,11 +467,11 @@ impl GitSync {
         Some((pr, pushed))
     }
 
-    /// GitHub has answered that `repo` has no PR.
+    /// What GitHub last said about `repo`'s PR: nothing yet, an error, or that it has none.
     #[cfg(all(test, feature = "test-support"))]
-    pub fn set_no_pr(&mut self, repo: &str) {
+    pub fn set_no_pr(&mut self, repo: &str, answer: Option<Result<(), String>>) {
         let r = self.repos.iter_mut().find(|r| r.name == repo).unwrap();
-        r.pr = Some(Ok(None));
+        r.pr = answer.map(|a| a.map(|()| None));
     }
 
     /// Gives `repo` open PR `number`, whose head is ours when `pushed`.
