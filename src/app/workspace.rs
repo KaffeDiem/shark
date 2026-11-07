@@ -22,13 +22,14 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        self.open_workspace_then(name, window, cx, |_, _, _| {});
+        self.open_workspace_then(name, None, window, cx, |_, _, _| {});
     }
 
     /// Opens `name`, then runs `then`: at once, or once a discard dialog is confirmed.
     pub(super) fn open_workspace_then(
         &mut self,
         name: &str,
+        chat: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
         then: impl FnOnce(&mut Shark, &mut Window, &mut Context<Shark>) + 'static,
@@ -36,7 +37,24 @@ impl Shark {
         if self.archiving.contains(name) || self.ws(name).is_none() {
             return notify_err(window, cx, "The selected agent is no longer available");
         }
+        // Pick after confirmation, before showing anything: the previous chat must stay unread.
+        let prepare_chat = move |s: &mut Self, name: &str| {
+            let Some(id) = chat else { return };
+            let Some(ws) = s.ws_mut(name) else { return };
+            let ix = ws.chats.iter().position(|c| c.id == id).or_else(|| {
+                let ix = ws.closed.iter().position(|c| c.id == id)?;
+                let meta = ws.closed.remove(ix);
+                Some(ws.push_chat(meta))
+            });
+            if let Some(ix) = ix
+                && ws.active_chat != ix
+            {
+                ws.active_chat = ix;
+                let _ = s.state.save();
+            }
+        };
         if self.active.as_deref() == Some(name) {
+            prepare_chat(self, name);
             if self.home.on {
                 self.toggle_home(window, cx);
             }
@@ -57,6 +75,7 @@ impl Shark {
             else {
                 return notify_err(window, cx, "The selected agent is no longer available");
             };
+            prepare_chat(s, &name);
             s.open_workspace_now(ix, window, cx);
             s.record_interaction(&name, cx);
             then(s, window, cx);
@@ -502,7 +521,7 @@ impl Shark {
                         // A dirty file tab in the workspace left behind asks first: send once opened.
                         let deferred = Rc::new(std::cell::Cell::new(false));
                         let (later, setup_ws, key) = (deferred.clone(), ws.clone(), name.clone());
-                        s.open_workspace_then(&name.clone(), window, cx, move |s, window, cx| {
+                        s.open_workspace_then(&key, None, window, cx, move |s, window, cx| {
                             s.home_prompt_used(prompt.as_deref(), window, cx);
                             let chat = (s.active.as_ref() == Some(&name))
                                 .then(|| s.active_chat().cloned())

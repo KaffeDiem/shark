@@ -57,6 +57,8 @@ cargo test live_claude -- --ignored        # real claude CLI round trip (costs a
 cargo test live_codex -- --ignored         # the same through codex app-server
 ```
 
+System notifications belong to Shark and open the agent's chat when clicked. On macOS they require the bundled `Shark.app` and notification permission; unbundled `cargo run` builds skip them.
+
 Releases: merge a PR with the `release` label. CI (which builds every merge to `master`) builds the DMG (`make release`), publishes a GitHub release, and commits the new version to `Cargo.toml`, `Casks/shark.rb` and the Install section above. The version is the one in `Cargo.toml`, or its next patch if that is already released.
 
 ## License
