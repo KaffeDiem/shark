@@ -3,8 +3,9 @@ use super::*;
 use crate::harness::{self, Ev, Harness};
 use gpui_kit::component::text::TextViewState;
 
-const ASK_PROMPT: &str = "You answer questions about Shark, a macOS app for running Claude Code \
-    on features that span several repos. Answer briefly, from the README and the shortcut list \
+const ASK_PROMPT: &str = "You answer questions about Shark, a macOS workbench for directing \
+    reusable agents, running isolated tasks with Claude or Codex across repositories, and \
+    reviewing changes through to merge. Answer briefly, from the README and the shortcut list \
     below only; name the key or the cmd-k command to use. If they don't cover it, say so.";
 
 /// claude's error, or what to do when it's the login one (it says "/login", a chat command).

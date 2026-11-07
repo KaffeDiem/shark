@@ -1,13 +1,18 @@
-# Right-pane features
+# Task features and host boundaries
 
-`Shark` hosts workspace navigation, chats, file editors, GitSync, persistence and
+An agent defines reusable instructions and defaults; each task owns its isolated
+work and review state. Diff and Git are task artifacts. Home, All tasks and agent
+pages are overview destinations, not another task or a shared agent worktree.
+See the [manual](manual.md) for the user workflow.
+
+`Shark` hosts navigation, chats, file editors, GitSync, persistence and
 confirmation dialogs. A feature owns its GPUI entity, private implementation state,
 rendering, controls, focus targets and local actions. It receives explicit context
 and sends typed requests for work outside that boundary.
 
 Feature implementations live in `src/features/differ/` and `src/features/git/`.
 `src/app/features.rs` owns the rail, tabs, activation and focus dispatch;
-`src/app/differ_host.rs` handles Differ's workspace integration. Shared styling,
+`src/app/differ_host.rs` handles Differ's task integration. Shared styling,
 dialogs and clipboard helpers live in `src/ui.rs`. Features import their
 dependencies explicitly and do not depend on the `app` module.
 
@@ -37,50 +42,54 @@ and owns its header/menu workflow.
    closed flags or restoration strings. Add storage and pending-write guards for
    retained entities, including those that are inactive.
 4. Connect only the integration it needs through explicit snapshots and events.
-   Keep workspace/editor coordination in the host. Tests should cover navigation,
+   Keep task/editor coordination in the host. Tests should cover navigation,
    retention, stale asynchronous work and rejection of destructive operations.
 
 ## Differ and Git lifetimes
 
 `src/features/differ/mod.rs` owns one long-lived Differ entity. Its child modules
 own diff loading and refresh generations, tree/filter/layout, inline editing, review UI,
-comments, publication results, media and subscriptions. Switching workspaces resets
+comments, publication results, media and subscriptions. Switching tasks resets
 presentation and invalidates refreshes; comments and pending publication results
-remain keyed by their originating workspace. Closing the tab keeps the entity,
+remain keyed by their originating task. Closing the tab keeps the entity,
 comments and presentation, after the existing inline-edit discard guard runs.
 
-Git remains lazy and cached per workspace. The host gives it the same effective
-comparison bases as Differ (`Shark::effective_workspace`) through
-`GitFeature::set_workspace`; GitSync changes reach it through `Shark::configure_git`.
+Git remains lazy and cached per task. The host gives it the same effective
+comparison bases as Differ (`Shark::effective_task`) through
+`GitFeature::set_task`; GitSync changes reach it through `Shark::configure_git`.
 Its Conversation and Commits views keep their state while the other is shown. Closing
 its tab keeps drafts and pending writes. Quit and archive guards inspect retained Git entities even when another
-workspace or feature is visible. Corrupt draft files remain protected from writes.
+task or feature is visible. Corrupt draft files remain protected from writes.
 
 ## Integration and safety
 
-`src/app/differ_host.rs` translates host state into `WorkspaceSnapshot`: workspace
+`src/app/differ_host.rs` translates host state into `TaskSnapshot`: task
 metadata, effective GitSync comparison bases and PR context. Display preferences
 start from persisted settings. Differ owns preference and viewed-mark changes and
 emits persistence events; an older host snapshot must not overwrite a change before
 its event runs. The host supplies Vim settings and the current editor path explicitly.
 
-Differ emits workspace-qualified editor/chat navigation, edit, discard and
+Differ emits task-qualified editor/chat navigation, edit, discard and
 interaction requests. Git file events call `Differ::open_path`; Differ owns lookup,
-selection and reveal behavior. Menus capture the workspace they were created for.
+selection and reveal behavior. Menus capture the task they were created for.
+
+Overview navigation retains the open task and its dirty editors. Chat and Git
+mutations on agent or All tasks pages require opening a task; task-row actions
+resolve their explicit visible target.
 
 Combined editor/inline-edit confirmation stays in the host. Its snapshots identify
-the workspace, editor entity, path, buffer content, dirty state and pending save.
+the task, editor entity, path, buffer content, dirty state and pending save.
 After a dialog, identities and content must still match before discarding. Inline
 save completion and overwrite confirmation also check the absolute path and input
-entity, so identical relative paths in different workspaces cannot be confused.
-Refresh completion requires both the originating workspace and current generation.
+entity, so identical relative paths in different tasks cannot be confused.
+Refresh completion requires both the originating task and current generation.
 
 For review sends, Differ prepares a validated comment snapshot and intended
-workspace/chat. The host checks that identity and asks Chat to accept the card.
+task/chat. The host checks that identity and asks Chat to accept the card.
 Only acceptance queues the comments and starts optional publication. The host
 updates the queue synchronously before GPUI delivers Chat's acknowledgement events.
 Chat has no dependency on Differ. Publication completion updates the captured
-workspace even if its tab is hidden or another workspace is active.
+task even if its tab is hidden or another task is active.
 
 Plan storage retains save errors and protects files that failed to load. Retry, quit,
 archive and chat-close guards include plan errors, including plans in inactive chats.
@@ -88,7 +97,7 @@ The stored plan and transcript formats remain unchanged.
 
 The host discovers and caches language sessions; `FileEditor` owns detach, discovery
 state and attachment transitions. It exposes read access and concrete operations rather
-than mutable lifecycle fields. Agent adapters likewise own question normalization and
+than mutable lifecycle fields. Harness adapters likewise own question normalization and
 reply encoding; Chat uses the running backend for live events and the selected model
 for the next process. Transcript record construction stays in `transcript`.
 
@@ -97,13 +106,13 @@ for the next process. Transcript record construction stays in `transcript`.
 App integration fixtures live under `src/app/ui_tests`; the native rendering
 harness uses the same module. Differ exposes private-state access only through
 its test-only `test_support` module. Boundary tests cover stale refreshes,
-same-path workspace switches, stale discard/overwrite dialogs and stale menus.
+same-path task switches, stale discard/overwrite dialogs and stale menus.
 Existing review tests cover refused sends, immediate and deferred delivery,
 offscreen publication and draft corruption. Git and mixed-tab tests cover rail
-focus, clamped navigation, every pointer-drag pairing and inactive write guards.
+focus, clamped navigation, task/tab drag boundaries and inactive write guards.
 
 ```sh
-cargo test --features test-support
-cargo test --features test-support --test rendering
+cargo test --features test-support -- --test-threads=1
+cargo test --features test-support --test rendering -- --test-threads=1
 cargo fmt --check
 ```

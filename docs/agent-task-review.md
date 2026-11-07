@@ -1,8 +1,10 @@
-# Agent and task user-story review
+# Agent and task user-story review record
 
 Review of [PR #83](https://github.com/KaffeDiem/shark/pull/83), head `13978a000663e6eb5b8798080c7527c48442af5c`, against the requested direction: **choose an agent → give it a task → review and merge the result**.
 
-**Implementation follow-up:** all five findings have been addressed, and the full serial test suite passes. The original review was against the head above; the fixes and regression coverage are recorded below.
+**Recorded implementation follow-up:** all five findings were addressed, and the full serial test suite passed. The original review was against the head above; the fixes and regression coverage are recorded below.
+
+Acceptance verdicts and test totals are snapshots of this review; see the [manual](manual.md) for current behavior.
 
 Three reviewers examined navigation, identity/instructions/skills, and task lifecycle, then implemented the fixes with focused regression tests. Integration review also corrected agent deletion protection while an explicitly named task is being created.
 
@@ -55,7 +57,7 @@ Three reviewers examined navigation, identity/instructions/skills, and task life
 | F4 · Skill refresh hides failures | Return errors from scanning and reconciliation, preserve links when scanning fails, surface errors in explicit refresh/settings, and send startup refresh warnings through the existing harness notice event. Keep root instruction-write errors separate. | `agent_skill_refresh_preserves_links_on_scan_failure_and_reports_install_errors`, existing skill ownership/collision/symlink tests, and the harness initial-notice assertion. |
 | F5 · Partially merged task labelled Merged | Aggregate merge evidence across every task repository. Known open work is not merged; incomplete status remains unknown. | `agent_history_requires_all_repositories_to_be_merged` exercises all-merged, merged/open and merged/unknown task deletion. |
 
-## Validation and limits
+## Recorded validation and limits
 
 - Original review baseline: `cargo test --features test-support -- --test-threads=1` passed **964 tests**, with **21 ignored**.
 - Implementation validation: `cargo test --features test-support -- --test-threads=1` passed **969 tests**, with **0 failures and 21 ignored**, in 418.48 seconds. Focused regressions, `cargo fmt -- --check`, and `git diff --check` also passed.
