@@ -26,7 +26,7 @@ const NOT_READ: &str = "Keychain access wasn't granted, so Shark can't use Linea
 const REJECTED: &str = "Linear rejected the credential. Reconnect to use it.";
 const BAD_KEY: &str = "Linear didn't accept this key. Check it and try again.";
 const CHANGED: &str = "The Linear connection changed. Try again.";
-/// What leaving a task means, for its confirmations.
+/// What leaving a Linear workspace means, for its confirmations.
 const LEAVING: &str = "Attached issues stay readable but can't refresh. Nothing changes in Linear.";
 /// Settings > Account > Security & Access, per https://linear.app/docs/api-and-webhooks.
 const KEY_PAGE: &str = "https://linear.app/settings/account/security";
@@ -400,7 +400,7 @@ impl Shark {
     }
 
     /// Replaces the connection once `checked` has validated a credential, the user has agreed to
-    /// leave a different task, and the Keychain holds it. Anything short of that leaves the
+    /// leave a different Linear workspace, and the Keychain holds it. Anything short of that leaves the
     /// connection as it was. Resolves to whether it was replaced. `window` outlives Settings, so
     /// the result reaches the user after they've closed it.
     fn linear_adopt(

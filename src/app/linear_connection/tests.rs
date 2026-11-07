@@ -716,7 +716,7 @@ async fn disconnect_asks_first(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn replacing_a_task_warns_and_can_be_declined(cx: &mut TestAppContext) {
+async fn replacing_a_workspace_warns_and_can_be_declined(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (_, shark) = setup(cx, None);
     use_key(cx, &shark, KEY);
@@ -735,7 +735,7 @@ async fn replacing_a_task_warns_and_can_be_declined(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn reconnecting_the_same_task_doesnt_warn(cx: &mut TestAppContext) {
+async fn reconnecting_the_same_workspace_doesnt_warn(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let (_, shark) = setup(cx, None);
     use_key(cx, &shark, KEY);

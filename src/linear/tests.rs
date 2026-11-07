@@ -464,7 +464,7 @@ fn get_issue_builds_a_snapshot() {
 }
 
 #[test]
-fn another_task_is_never_confused_with_the_connected_one() {
+fn another_workspace_is_never_confused_with_the_connected_one() {
     let http = |_: &Req| ok(ISSUE_JSON);
     let elsewhere = parse_issue("https://linear.app/other/issue/ENG-123").unwrap();
     assert_eq!(
