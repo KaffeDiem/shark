@@ -90,6 +90,7 @@ async fn sidebar_chrome_themes(cx: &mut TestAppContext) {
                             w.find("new-chat").bounds().right()
                                 <= w.find("content-island").bounds().right()
                         );
+                        assert_eq!(w.find("new-chat").bounds().size, size(px(28.), px(28.)));
                         assert!(w.find("feature-differ").visible());
                         assert!(w.try_find("show-tree").is_none());
                         assert!(w.try_find("hide-tree").is_none());

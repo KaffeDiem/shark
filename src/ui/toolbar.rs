@@ -18,6 +18,7 @@ struct Interaction {
 struct ToolbarButton {
     id: ElementId,
     button: Button,
+    quiet: bool,
 }
 
 /// `id` must match the button's id so keyboard focus shares the house button's state.
@@ -25,6 +26,16 @@ pub(crate) fn toolbar(id: impl Into<ElementId>, button: Button) -> impl IntoElem
     ToolbarButton {
         id: id.into(),
         button,
+        quiet: false,
+    }
+}
+
+/// A `toolbar` with nothing behind it at rest; the tab hover surface fades in while engaged.
+pub(crate) fn quiet_toolbar(id: impl Into<ElementId>, button: Button) -> impl IntoElement {
+    ToolbarButton {
+        id: id.into(),
+        button,
+        quiet: true,
     }
 }
 
@@ -43,7 +54,9 @@ impl RenderOnce for ToolbarButton {
             |_, _| Interaction::default(),
         );
         let state = interaction.read(cx);
-        let immediate = held || state.pressed || focus.is_focused(window);
+        // A click also focuses the button, which must not hold a quiet surface up afterwards.
+        let focused = focus.is_focused(window) && (!self.quiet || window.last_input_was_keyboard());
+        let immediate = held || state.pressed || focused;
         let engaged = immediate || state.hovered;
         let progress = transition(
             (self.id, "toolbar-engagement"),
@@ -67,15 +80,22 @@ impl RenderOnce for ToolbarButton {
             theme.muted_foreground
         };
         let foreground = muted.blend(bright.alpha(progress));
-        let background = theme.background.blend(bright.alpha(if dark {
-            0.045 + 0.045 * progress
+        let (background, active, border) = if self.quiet {
+            let surface = theme.secondary_hover;
+            (surface.opacity(progress), surface, transparent_black())
         } else {
-            0.025 + 0.035 * progress
-        }));
-        let active = theme
-            .background
-            .blend(bright.alpha(if dark { 0.09 } else { 0.06 }));
-        let border = theme.background.blend(bright.alpha(0.14));
+            (
+                theme.background.blend(bright.alpha(if dark {
+                    0.045 + 0.045 * progress
+                } else {
+                    0.025 + 0.035 * progress
+                })),
+                theme
+                    .background
+                    .blend(bright.alpha(if dark { 0.09 } else { 0.06 })),
+                theme.background.blend(bright.alpha(0.14)),
+            )
+        };
 
         // Rendering inline shares the focus key without adding a layout or accessibility wrapper.
         let button = button
@@ -239,6 +259,7 @@ mod tests {
         selected: bool,
         open: bool,
         compact: bool,
+        quiet: bool,
         progress: f32,
     }
 
@@ -262,6 +283,7 @@ mod tests {
                 ToolbarButton {
                     id: "control".into(),
                     button,
+                    quiet: self.quiet,
                 },
                 window,
                 cx,
@@ -364,6 +386,37 @@ mod tests {
             assert_eq!(view.read(cx).progress, 1.0);
             w.hover("away", cx);
             assert_eq!(view.read(cx).progress, 0.0);
+        })
+        .unwrap();
+    }
+
+    #[gpui_kit::test]
+    fn quiet_toolbar_engages_for_keyboard_focus_but_not_after_a_click(cx: &mut TestAppContext) {
+        let (window, view) = fixture(cx);
+        cx.update_window(window, |_, w, cx| {
+            cx.set_reduce_motion(true);
+            view.update(cx, |v, cx| {
+                v.quiet = true;
+                cx.notify();
+            });
+            w.render_frame(cx);
+            assert_eq!(view.read(cx).progress, 0.0);
+            w.hover("control", cx);
+            assert_eq!(view.read(cx).progress, 1.0);
+            let center = w.find("control").bounds().center();
+            w.pointer_down(center, MouseButton::Left, cx);
+            w.pointer_up(center, MouseButton::Left, cx);
+            assert_eq!(view.read(cx).calls, 1);
+            w.hover("away", cx);
+            // A real click focuses the button; the test click does not, so focus it here.
+            w.focus_next(cx);
+            w.render_frame(cx);
+            assert_eq!(w.find("control").focused(), Some(true));
+            assert_eq!(view.read(cx).progress, 0.0, "a click leaves no surface");
+            w.press("tab", cx);
+            w.render_frame(cx);
+            assert_eq!(w.find("control").focused(), Some(true));
+            assert_eq!(view.read(cx).progress, 1.0, "keyboard focus shows it");
         })
         .unwrap();
     }

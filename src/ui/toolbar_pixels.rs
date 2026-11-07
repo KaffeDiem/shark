@@ -1,5 +1,5 @@
 //! Real Metal checks for quiet toolbar states and the Git split-button geometry.
-use super::toolbar;
+use super::{quiet_toolbar, toolbar};
 use gpui_kit::assets::IconName;
 use gpui_kit::component::button::Button;
 use gpui_kit::component::{ActiveTheme as _, Disableable as _, Selectable as _, h_flex, v_flex};
@@ -37,6 +37,13 @@ impl Render for Preview {
                                 this.clicks += 1;
                                 cx.notify();
                             })),
+                    ))
+                    .child(quiet_toolbar(
+                        "quiet",
+                        Button::new("quiet")
+                            .size(px(32.))
+                            .icon(IconName::Plus)
+                            .accessibility_label("Add"),
                     ))
                     .child(toolbar(
                         "model",
@@ -97,7 +104,7 @@ pub(crate) fn render_pixels(cx: &mut HeadlessAppContext) {
                     WindowOptions {
                         window_bounds: Some(WindowBounds::Windowed(Bounds::new(
                             Point::default(),
-                            size(px(560.), px(140.)),
+                            size(px(600.), px(140.)),
                         ))),
                         focus: false,
                         show: false,
@@ -113,6 +120,46 @@ pub(crate) fn render_pixels(cx: &mut HeadlessAppContext) {
                 )
             })
             .unwrap();
+        for hovered in [false, true] {
+            let (bounds, surface) = cx
+                .update_window(window, |_, w, cx| {
+                    preview.update(cx, |preview, cx| {
+                        preview.state = "idle";
+                        cx.notify();
+                    });
+                    w.pointer_move(point(px(0.), px(0.)), None, cx);
+                    if hovered {
+                        w.hover("quiet", cx);
+                    }
+                    w.render_frame(cx);
+                    let surface = if hovered {
+                        cx.theme().secondary_hover
+                    } else {
+                        cx.theme().background
+                    };
+                    (w.find("quiet").bounds(), surface)
+                })
+                .unwrap();
+            let screenshot = cx
+                .capture_screenshot(window)
+                .expect("real toolbar renderer");
+            let scale = screenshot.width() as f32 / 600.;
+            let edge = bounds.origin + point(px(1.), bounds.size.height / 2.);
+            let inside = bounds.origin + point(px(6.), bounds.size.height / 2.);
+            let expected = Rgba::from(surface);
+            for sample in [edge, inside] {
+                let pixel = screenshot.get_pixel(
+                    (f32::from(sample.x) * scale) as u32,
+                    (f32::from(sample.y) * scale) as u32,
+                );
+                for (c, want) in [expected.r, expected.g, expected.b].into_iter().enumerate() {
+                    assert!(
+                        pixel[c].abs_diff((want * 255.) as u8) <= 2,
+                        "{name} quiet hovered={hovered}: {pixel:?} at {sample:?}"
+                    );
+                }
+            }
+        }
         let mut idle = None;
         for state in ["idle", "hover", "selected", "open", "disabled"] {
             let bounds = cx
@@ -146,7 +193,7 @@ pub(crate) fn render_pixels(cx: &mut HeadlessAppContext) {
                 (_, false) => ([244, 244, 245], [221, 221, 222]),
                 (_, true) => ([237, 237, 238], [221, 221, 222]),
             };
-            let scale = screenshot.width() as f32 / 560.;
+            let scale = screenshot.width() as f32 / 600.;
             for (part, expected) in [("fill", fill), ("border", border)] {
                 let matches = screenshot
                     .enumerate_pixels()
@@ -159,7 +206,7 @@ pub(crate) fn render_pixels(cx: &mut HeadlessAppContext) {
             }
             if let Some(baseline) = &idle {
                 let baseline: &image::RgbaImage = baseline;
-                let scale = screenshot.width() as f32 / 560.;
+                let scale = screenshot.width() as f32 / 600.;
                 let changed = (0..screenshot.height())
                     .flat_map(|y| (0..screenshot.width()).map(move |x| (x, y)))
                     .filter(|&(x, y)| {
@@ -203,5 +250,7 @@ pub(crate) fn render_pixels(cx: &mut HeadlessAppContext) {
         .unwrap();
     }
     cx.update(|cx| cx.set_reduce_motion(previous_motion));
-    println!("toolbar pixels: 10 passed (dark/light states, split geometry and disabled actions)");
+    println!(
+        "toolbar pixels: 14 passed (dark/light states, quiet surfaces, split geometry and disabled actions)"
+    );
 }

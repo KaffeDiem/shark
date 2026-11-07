@@ -36,7 +36,10 @@ async fn repositories_page_lists_repos_and_new_agent_closes_settings(cx: &mut Te
         w.render_frame(cx);
         w.click(("repo", 1usize), cx);
         w.render_frame(cx);
-        assert!(w.try_find("settings-page").is_some(), "Settings stays underneath");
+        assert!(
+            w.try_find("settings-page").is_some(),
+            "Settings stays underneath"
+        );
         w.click("repo-new-workspace", cx);
         w.render_frame(cx);
         assert!(w.try_find("settings-page").is_none());
@@ -146,7 +149,10 @@ async fn repo_settings_scripts_and_model(cx: &mut TestAppContext) {
         w.render_frame(cx);
         w.click(("repo", 0usize), cx);
         w.render_frame(cx);
-        assert!(w.try_find("repo-new-workspace").is_some(), "a repo row opens its settings");
+        assert!(
+            w.try_find("repo-new-workspace").is_some(),
+            "a repo row opens its settings"
+        );
         w.close_all_dialogs(cx);
     })
     .unwrap();

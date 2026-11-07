@@ -25,7 +25,7 @@ use gpui_kit::prelude::FluentBuilder as _;
 use gpui_kit::*;
 pub(crate) use links::{copy_button, link_roots, markdown};
 use std::{rc::Rc, sync::Arc};
-pub(crate) use toolbar::toolbar;
+pub(crate) use toolbar::{quiet_toolbar, toolbar};
 
 /// Inter disambiguation (ss02 + cv05/cv08/zero): serifed I, tailed l, slashed 0 for paths and hashes.
 /// Dialogs render outside this view's tree, so they apply it again.
@@ -255,7 +255,7 @@ pub(crate) fn tab_close(button: Button, theme: &Theme) -> Div {
         )
 }
 
-/// An icon control in the window chrome; the caller applies `toolbar` after its handlers.
+/// An icon control in the window chrome; the caller applies `quiet_toolbar` after its handlers.
 pub(crate) fn side_toggle(id: &'static str, icon: IconName, tip: &'static str) -> Button {
     Button::new(id)
         .ghost()

@@ -609,19 +609,19 @@ impl Shark {
             "Toggle sidebar (cmd-b)",
         )
         .on_click(cx.listener(|this, _, _, cx| this.toggle_sidebar(cx)))
-        .map(|b| toolbar("toggle-sidebar", b))
+        .map(|b| quiet_toolbar("toggle-sidebar", b))
     }
 
     fn render_commands(&self, cx: &Context<Self>) -> impl IntoElement {
         side_toggle("commands", IconName::Command, "Commands (cmd-k)")
             .on_click(cx.listener(|this, _, window, cx| this.toggle_palette(window, cx)))
-            .map(|b| toolbar("commands", b))
+            .map(|b| quiet_toolbar("commands", b))
     }
 
     fn render_new_workspace(&self, cx: &Context<Self>) -> impl IntoElement {
         side_toggle("new-workspace", IconName::SquarePen, "New agent (cmd-n)")
             .on_click(cx.listener(|this, _, window, cx| this.new_empty_agent(window, cx)))
-            .map(|b| toolbar("new-workspace", b))
+            .map(|b| quiet_toolbar("new-workspace", b))
     }
 
     fn draggable_chrome(&self, id: &'static str, d: Stateful<Div>) -> impl IntoElement {
@@ -691,15 +691,17 @@ impl Shark {
                         d.child(
                             Button::new("new-chat")
                                 .ghost()
-                                .xsmall()
                                 .icon(IconName::Plus)
-                                .w(px(24.))
+                                .size(px(28.))
+                                .min_w_0()
+                                .rounded_l(cx.theme().radius)
+                                .rounded_r(cx.theme().radius)
                                 .flex_none()
                                 .tooltip("New chat (cmd-t)")
                                 .on_click(
                                     cx.listener(|this, _, window, cx| this.new_chat(window, cx)),
                                 )
-                                .map(|b| toolbar("new-chat", b)),
+                                .map(|b| quiet_toolbar("new-chat", b)),
                         )
                     }),
             )

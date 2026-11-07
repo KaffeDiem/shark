@@ -71,7 +71,9 @@ key 'keystroke "4"' "command down" # eng-127, a changed image
 key 'keystroke "d"' "command down, shift down"
 sleep 2
 shot diff-images.png
-key 'keystroke "n"' "command down"
+key 'keystroke "k"' "command down" # cmd-n starts an empty agent; this dialog picks repos
+key 'keystroke "New agent from branch"'
+key 'key code 36'
 key 'keystroke "eng-131-sign-in-with-apple"'
 shot multi-repo.png
 key 'key code 53'
