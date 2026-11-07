@@ -85,7 +85,7 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
     for task in &tasks {
         fs::create_dir_all(task.dir()).unwrap();
     }
-    let cases: [(&str, Setup); 8] = [
+    let cases: [(&str, Setup); 9] = [
         ("agent-tasks", |s, w, cx| s.open_agent("designer", w, cx)),
         ("agent-empty", |s, w, cx| s.open_agent("test", w, cx)),
         ("agent-settings", |s, w, cx| s.edit_agent("designer", w, cx)),
@@ -96,6 +96,12 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
         ("home", |s, w, cx| s.enter_home(w, cx)),
         ("home-agent", |s, w, cx| {
             s.prefill_agent_task("designer", w, cx)
+        }),
+        ("home-picked", |s, w, cx| {
+            s.enter_home(w, cx);
+            s.home
+                .prompt
+                .update(cx, |p, cx| p.set_value("@designer Tighten spacing", w, cx));
         }),
         ("all-tasks", |s, w, cx| s.enter_all_tasks(w, cx)),
         ("new-agent", |s, w, cx| {

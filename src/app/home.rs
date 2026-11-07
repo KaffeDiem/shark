@@ -1006,42 +1006,44 @@ impl Shark {
             true => ("Ask Shark", "ask", "new task"),
             false => ("What do you want to build?", "start task", "ask Shark"),
         };
+        // The agent picker sits in the composer's footer, as Codex puts its repo picker.
+        let picker = (!self.home.asking).then(|| {
+            let text = self.home.prompt.read(cx).value();
+            let (slug, _) = agent_prompt(text.trim(), &self.state.agents);
+            let selected = slug.and_then(|slug| self.state.agents.iter().find(|a| a.slug == slug));
+            h_flex().child(
+                Button::new("home-agent-picker")
+                    .xsmall()
+                    .ghost()
+                    .icon(selected.map_or(IconName::GitBranch, |a| {
+                        super::sidebar::section_icon(&a.icon)
+                    }))
+                    .label(selected.map_or_else(
+                        || "Repository defaults".to_string(),
+                        |a| format!("Agent: {}", a.name),
+                    ))
+                    .on_click(cx.listener(|s, _, w, cx| s.pick_home_agent(w, cx))),
+            )
+        });
         v_flex()
             .gap_2()
             .child(div().text_base().text_color(theme.foreground).child(title))
-            .when(!self.home.asking, |d| {
-                let text = self.home.prompt.read(cx).value();
-                let (slug, _) = agent_prompt(text.trim(), &self.state.agents);
-                let selected =
-                    slug.and_then(|slug| self.state.agents.iter().find(|a| a.slug == slug));
-                d.child(
-                    Button::new("home-agent-picker")
-                        .small()
-                        .outline()
-                        .icon(selected.map_or(IconName::GitBranch, |a| {
-                            super::sidebar::section_icon(&a.icon)
-                        }))
-                        .label(selected.map_or_else(
-                            || "Repository defaults".to_string(),
-                            |a| format!("Agent: {}", a.name),
-                        ))
-                        .on_click(cx.listener(|s, _, w, cx| s.pick_home_agent(w, cx))),
-                )
-            })
             .child(
-                div()
+                v_flex()
                     .key_context("HomePrompt")
                     .on_action(
                         cx.listener(|this, _: &SwitchField, w, cx| this.toggle_ask_mode(w, cx)),
                     )
                     .px_3()
                     .py_2()
+                    .gap_1()
                     .rounded(theme.radius_lg)
                     .border_1()
                     .border_color(if focused { theme.primary } else { theme.border })
                     .bg(theme.secondary)
                     .text_size(px(14.))
-                    .child(Input::new(&self.home.prompt).appearance(false)),
+                    .child(Input::new(&self.home.prompt).appearance(false))
+                    .children(picker),
             )
             .child(
                 h_flex()
@@ -1336,9 +1338,12 @@ impl Shark {
         let when = (self.home.activity.get(&w.name))
             .and_then(|t| now.duration_since(*t).ok())
             .map(crate::sync::ago);
-        let names = (w.repos.iter().map(|r| r.name.as_str()))
-            .collect::<Vec<_>>()
-            .join(" · ");
+        // Each repo's status replaces its bare name once checked, so the row keeps two lines.
+        let names = match repos {
+            Some(repos) => repos.iter().map(home_summary).collect::<Vec<_>>(),
+            None => w.repos.iter().map(|r| r.name.clone()).collect(),
+        }
+        .join(" · ");
         let chats = match w.chats.len() {
             1 => "1 chat".to_string(),
             n => format!("{n} chats"),
@@ -1347,7 +1352,7 @@ impl Shark {
         let title = w.display_title().to_string();
         let on = match w.repos.is_empty() {
             true => "No repository".to_string(),
-            false => format!("{} · {names}", w.branch),
+            false => format!("{names} · {}", w.branch),
         };
         let ws = w.clone();
         h_flex()
@@ -1441,20 +1446,7 @@ impl Shark {
                             .text_color(theme.muted_foreground)
                             .child(Icon::new(IconName::GitBranch).with_size(px(12.)))
                             .child(div().min_w_0().truncate().child(format!("{on} · {chats}"))),
-                    )
-                    .children(match repos {
-                        None if w.repos.is_empty() => vec![],
-                        None => vec![div().text_xs().text_color(faint(theme)).child("checking…")],
-                        Some(repos) => (repos.iter())
-                            .map(|r| {
-                                div()
-                                    .truncate()
-                                    .text_xs()
-                                    .text_color(theme.muted_foreground)
-                                    .child(home_summary(r))
-                            })
-                            .collect(),
-                    }),
+                    ),
             )
             .into_any_element()
     }
