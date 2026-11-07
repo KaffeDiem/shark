@@ -15,7 +15,7 @@
 <img src="docs/images/hero.png" width="800" alt="A Shark task with two repos: sidebar, a Diff artifact containing its changed-files tree and split diff, and the Features rail">
 
 ## Why Shark
-Create reusable agents in **Settings › Agents**, then start isolated tasks from Home with `@slug <prompt>`. Each agent keeps its instructions, skills, defaults and task history.
+Create reusable agents from the sidebar, choose one on Home, and start an isolated task. Each agent keeps its instructions, skills, defaults and task history. Run several tasks across repositories and review their changes through to merge.
 
 <table>
 <tr><td width="50%" valign="top"><b>Multi-repo tasks</b><br>One task gets one git worktree per repo on a shared branch, and its chats work across all of them.<br><br><img src="docs/images/multi-repo.png" alt="The new-task dialog with several repos ticked"></td><td width="50%" valign="top"><b>Review the diff like a PR</b><br>Comment on lines across every repo, send the comments to the agent as one review, and track each until it is addressed.<br><br><img src="docs/images/review.png" alt="Send review listing the pending comment threads and the prompt preview"></td></tr>
@@ -36,7 +36,7 @@ Needs `git`, `gh` (logged in) and `claude` on your login shell's PATH. For Codex
 ## Quick start
 A task is one isolated piece of work: its conversations, attached repositories, changes and review state.
 
-Shark opens on Home (`cmd-0`). Type what you want to build and press `enter` to start a task at once, with no dialog and no repository needed (the title comes from the first line), or `tab` to ask Shark how to do something.
+Shark opens on Home (`cmd-0`). Choose an agent or **Repository defaults**, type what you want to build and press `enter` to start a task (the title comes from the first line). `@slug <prompt>` also selects an agent; `tab` asks Shark how to do something. **All tasks** shows work across agents, with optional task groups.
 
 1. Choose **Add repo** in `cmd-k`. `cmd-n` opens a new task with an empty conversation; **Attach repository** (button, or `cmd-k`) gives it a repo. For a branch or PR checkout, or a stack, choose **New task from branch or PR…** in `cmd-k`, tick the repos, and name the branch. `enter` creates the task.
 2. `shift-tab` for plan mode. Revise the plan in the chat, then `a` in the plan pane to build. A task with no repository stays in plan mode, and building needs a repository.

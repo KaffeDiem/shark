@@ -69,7 +69,7 @@ use crate::ui::*;
 use differ::Differ;
 use differ::Viewed;
 use menus::{on_shark, tilde, ws_menu};
-use sidebar::{Naming, SideRow, move_submenu};
+use sidebar::{SideRow, move_submenu};
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 enum Tab {
@@ -95,7 +95,8 @@ enum Pane {
 pub struct Shark {
     pub(crate) state: State,
     sel: SideRow,
-    naming: Option<Naming>,
+    /// Agent navigation folds independently of optional task groups.
+    collapsed_agents: HashSet<String>,
     pub(crate) active: Option<String>,
     /// By chat id; created when a chat is first shown.
     chats: HashMap<String, Entity<Chat>>,
@@ -277,7 +278,7 @@ impl Shark {
         Shark {
             state,
             sel: SideRow::Task(0),
-            naming: None,
+            collapsed_agents: HashSet::new(),
             active: None,
             chats: HashMap::new(),
             awake: None,
@@ -408,6 +409,9 @@ impl Shark {
         cx: &mut Context<Self>,
         f: impl FnOnce(&mut GitSync, &mut Window, &mut Context<GitSync>),
     ) {
+        if self.home_shown() && self.home.destination != home::Destination::Home {
+            return notify_err(window, cx, "Open a task before running a Git action");
+        }
         match self.active_sync().cloned() {
             _ if self.no_repos() => notify_err(window, cx, task::NO_REPO),
             Some(sync) => sync.update(cx, |g, cx| f(g, window, cx)),
@@ -739,11 +743,49 @@ impl Shark {
         let has_controls = controls.is_some();
         let no_repos = self.no_repos();
         let attachments = self.render_attachments(window, cx);
+        let identity = self.active_task().and_then(|task| {
+            let link = task.agent.as_ref()?;
+            let name = self
+                .state
+                .agents
+                .iter()
+                .find(|a| a.slug == link.slug)
+                .map_or_else(|| link.name.clone(), |a| a.name.clone());
+            Some((link.slug.clone(), name, task.display_title().into_owned()))
+        });
         let theme = cx.theme();
         v_flex()
             .flex_1()
             .min_w_0()
             .h_full()
+            .when_some(identity, |d, (slug, name, title)| {
+                d.child(
+                    h_flex()
+                        .id("task-identity")
+                        .h(px(32.))
+                        .flex_none()
+                        .min_w_0()
+                        .px_3()
+                        .gap_1()
+                        .child(
+                            Button::new("task-agent")
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Bot)
+                                .label(name)
+                                .on_click(
+                                    cx.listener(move |s, _, w, cx| s.open_agent(&slug, w, cx)),
+                                ),
+                        )
+                        .child(
+                            Icon::new(IconName::ChevronRight)
+                                .with_size(px(12.))
+                                .text_color(theme.muted_foreground),
+                        )
+                        .child(div().min_w_0().text_sm().truncate().child(title))
+                        .test_support(),
+                )
+            })
             .child(
                 h_flex()
                     .h(px(44.))

@@ -348,6 +348,9 @@ impl Shark {
     /// cmd-t: a new tab at the end of the strip, on the last picked model and thinking level
     /// and the current chat's speed.
     pub(super) fn new_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.chat_actions_available() {
+            return notify_err(window, cx, "Open a task first");
+        }
         let fast = self.active_chat().and_then(|c| c.read(cx).meta.fast);
         let Some(id) = self.active_task().map(Task::next_chat_id) else {
             return notify_err(window, cx, "Open a task first");
@@ -531,6 +534,9 @@ impl Shark {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if !self.chat_actions_available() {
+            return notify_err(window, cx, "Open a task first");
+        }
         let Some(ws) = self.active_task_mut() else {
             return notify_err(window, cx, "Open a task first");
         };
@@ -545,6 +551,9 @@ impl Shark {
     }
 
     pub(super) fn pick_closed_chat(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.chat_actions_available() {
+            return notify_err(window, cx, "Open a task first");
+        }
         let Some(ws) = self.active_task() else {
             return notify_err(window, cx, "Open a task first");
         };
@@ -576,9 +585,17 @@ impl Shark {
         );
     }
 
-    /// The shown agent's chat, or a toast saying to open one.
+    // The legacy Home can resume its open chat. Agent and All tasks pages have no shown chat.
+    fn chat_actions_available(&self) -> bool {
+        !self.home_shown() || self.home.destination == home::Destination::Home
+    }
+
+    /// The shown task's chat, or a toast saying to open one.
     pub(super) fn chat_or_err(&self, window: &mut Window, cx: &mut App) -> Option<Entity<Chat>> {
-        let chat = self.active_chat().cloned();
+        let chat = self
+            .chat_actions_available()
+            .then(|| self.active_chat().cloned())
+            .flatten();
         if chat.is_none() {
             notify_err(window, cx, "Open a task first");
         }
@@ -595,7 +612,7 @@ impl Shark {
     }
 
     pub(super) fn focus_queue(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(chat) = self.active_chat().cloned() {
+        if let Some(chat) = self.chat_or_err(window, cx) {
             self.show(Tab::Chat, window, cx);
             chat.update(cx, |c, cx| c.focus_queue(window, cx));
         }
@@ -707,8 +724,9 @@ impl Shark {
 
     /// The no-menu fast path, so confirm the switch in a toast.
     pub(super) fn set_model(&mut self, ix: usize, window: &mut Window, cx: &mut Context<Self>) {
-        let (Some(chat), Some(m)) = (self.active_chat().cloned(), MODELS.get(ix)) else {
-            return notify_err(window, cx, "Open a task first");
+        let Some(m) = MODELS.get(ix) else { return };
+        let Some(chat) = self.chat_or_err(window, cx) else {
+            return;
         };
         chat.update(cx, |c, cx| c.set_model(m, cx));
         let m = crate::models::model_label(m);

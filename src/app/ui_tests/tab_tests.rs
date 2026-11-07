@@ -686,14 +686,14 @@ async fn zen_shows_only_the_tab(cx: &mut TestAppContext) {
     // Home ends Zen; coming back doesn't restore it.
     press(cx, &["cmd-.", "cmd-0", "cmd-0"]);
     zen(cx, false, Tab::Chat);
-    // Naming a section needs the sidebar: Zen ends and the field has the keys.
+    // Naming a task group uses a focused dialog without leaving Zen.
     press(cx, &["cmd-."]);
     on(cx, &|s, w, cx| s.start_naming(None, None, w, cx));
-    zen(cx, false, Tab::Chat);
+    zen(cx, true, Tab::Chat);
     on(cx, &|s, w, cx| {
-        assert!(s.sidebar_focus.contains_focused(w, cx))
+        assert!(!s.sidebar_focus.contains_focused(w, cx))
     });
-    press(cx, &["escape"]);
+    press(cx, &["escape", "cmd-."]);
     // A side question's field keeps the keys through Zen.
     on(cx, &|s, w, cx| {
         let chat = s.active_chat().unwrap().clone();

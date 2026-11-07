@@ -45,11 +45,12 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                     ws.normalize_tabs();
                 }
                 s.state.repos = vec![Repo { name: "api".into(), path: home.join("api") }];
-                s.state.sections = vec![Section {
-                    agent: None,
-                    name: "Projects".into(), icon: "folder".into(), collapsed: false,
-                    tasks: vec!["Warning".into()],
+                s.state.agents = vec![crate::state::Agent {
+                    slug: "projects".into(), name: "Projects".into(), icon: "bot".into(), ..Default::default()
                 }];
+                s.state.tasks[3].agent = Some(crate::state::AgentLink {
+                    slug: "projects".into(), name: "Projects".into(), instructions: String::new(), siblings: vec![],
+                });
                 s.unread.insert("Unread".into());
                 for ix in [0, 1, 3, 5] {
                     let ws = s.state.tasks[ix].clone();
@@ -74,21 +75,19 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                 "workspace",
                 "home",
                 "focus",
-                "section-focus",
+                "agent-focus",
                 "folded",
-                "rename",
                 "switched",
                 "hover",
             ] {
-                if rail && case == "rename" {
-                    continue;
-                }
                 let checks = cx
                     .update_window(window, |_, w, cx| {
                         shark.update(cx, |s, cx| {
                             s.rail = rail;
-                            s.naming = None;
-                            s.state.sections[0].collapsed = case == "folded";
+                            s.collapsed_agents.clear();
+                            if case == "folded" {
+                                s.collapsed_agents.insert("projects".into());
+                            }
                             s.active = Some(
                                 if case == "switched" {
                                     "Cursor"
@@ -98,18 +97,15 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 .into(),
                             );
                             s.home.on = case == "home";
-                            s.sel = if case == "section-focus" {
-                                SideRow::Section(0)
+                            s.sel = if case == "agent-focus" {
+                                SideRow::Agent(0)
                             } else {
                                 SideRow::Task(1)
                             };
-                            if matches!(case, "focus" | "section-focus") {
+                            if matches!(case, "focus" | "agent-focus") {
                                 s.sidebar_focus.focus(w, cx);
                             } else {
                                 s.home.focus.focus(w, cx);
-                            }
-                            if case == "rename" {
-                                s.start_naming(Some(0), None, w, cx);
                             }
                             cx.notify();
                         });
@@ -179,26 +175,15 @@ pub(super) fn render_pixels(cx: &mut gpui_kit::HeadlessAppContext) {
                                 ));
                             }
                         }
-                        if case == "rename" {
-                            checks.push(("inline name", w.find("section-name").bounds(), bright));
-                        } else {
-                            let b = w.find(("section", 0usize)).bounds();
-                            checks.push((
-                                "section icon",
-                                Bounds::new(
-                                    point(
-                                        b.left() + px(8.),
-                                        b.top() + (b.size.height - px(16.)) / 2.,
-                                    ),
-                                    size(px(16.), px(16.)),
-                                ),
-                                match case {
-                                    "folded" => warning,
-                                    "section-focus" => bright,
-                                    _ => dim,
-                                },
-                            ));
-                        }
+                        let b = w.find(("agent", 0usize)).bounds();
+                        checks.push((
+                            "agent icon",
+                            Bounds::new(
+                                point(b.left() + px(8.), b.top() + (b.size.height - px(16.)) / 2.),
+                                size(px(16.), px(16.)),
+                            ),
+                            warning,
+                        ));
                         let toolbar_ink = if cx.theme().is_dark() {
                             cx.theme()
                                 .background

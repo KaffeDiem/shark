@@ -539,3 +539,162 @@ async fn agent_prompt_survives_cancelled_or_failed_creation(cx: &mut TestAppCont
         );
     });
 }
+
+/// The visible picker shares the typed mention, and standalone selection clears only it.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn home_agent_picker_preserves_draft_and_standalone_choice(cx: &mut TestAppContext) {
+    let quiet = quiet_claude();
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _claude = ClaudeGuard::set(&quiet);
+    let home = test_home();
+    let (window, shark) = boot(
+        cx,
+        State {
+            agents: vec![crate::state::Agent {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    let press = press_in(window);
+    on(cx, &|s, w, cx| {
+        s.home
+            .prompt
+            .update(cx, |p, cx| p.set_value("fix spacing", w, cx))
+    });
+    let pick = |cx: &mut TestAppContext, query: &str| {
+        cx.update_window(window, |_, w, cx| {
+            w.render_frame(cx);
+            w.click("home-agent-picker", cx);
+            w.input(query, cx);
+        })
+        .unwrap();
+        press(cx, &["enter"]);
+    };
+    pick(cx, "Designer");
+    cx.read(|cx| {
+        assert_eq!(
+            shark.read(cx).home.prompt.read(cx).value(),
+            "@designer fix spacing"
+        )
+    });
+    pick(cx, "Repository defaults");
+    cx.read(|cx| assert_eq!(shark.read(cx).home.prompt.read(cx).value(), "fix spacing"));
+    press(cx, &["enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).state.tasks.len() == 1
+    })
+    .await;
+    cx.read(|cx| assert!(shark.read(cx).state.tasks[0].agent.is_none()));
+    on(cx, &|s, w, cx| s.open_agent("designer", w, cx));
+    press(cx, &["cmd-n"]);
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.home.destination, super::super::home::Destination::Home);
+        assert_eq!(s.home.prompt.read(cx).value(), "@designer ");
+        assert_eq!(s.state.tasks.len(), 1);
+    });
+    on(cx, &|s, w, cx| {
+        s.home
+            .prompt
+            .update(cx, |p, cx| p.set_value("@designer another task", w, cx))
+    });
+    press(cx, &["enter"]);
+    cx.wait_for(window, Duration::from_secs(10), |_, cx| {
+        shark.read(cx).state.tasks.len() == 2
+    })
+    .await;
+    cx.read(|cx| {
+        let s = shark.read(cx);
+        assert!(
+            s.state
+                .tasks
+                .iter()
+                .any(|task| task.agent.as_ref().is_some_and(|a| a.slug == "designer"))
+        );
+        assert_eq!(s.home.prompt.read(cx).value(), "");
+    });
+    fs::remove_dir_all(home).ok();
+}
+
+/// Group labels cannot merge distinct groups or change agent membership.
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
+async fn all_tasks_groups_keep_ungrouped_separate_and_agent_instructions(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let home = test_home();
+    let link = crate::state::AgentLink {
+        slug: "designer".into(),
+        instructions: "Preserve these instructions".into(),
+        ..Default::default()
+    };
+    let mut grouped = fake("grouped");
+    grouped.agent = Some(link.clone());
+    let (window, shark) = boot(
+        cx,
+        State {
+            tasks: vec![grouped, fake("ungrouped")],
+            sections: vec![
+                Section {
+                    name: "Ungrouped".into(),
+                    icon: "folder".into(),
+                    tasks: vec!["grouped".into()],
+                    collapsed: false,
+                    agent: None,
+                },
+                Section {
+                    name: "Legacy agent group".into(),
+                    icon: "bot".into(),
+                    tasks: vec!["ungrouped".into()],
+                    collapsed: false,
+                    agent: Some("designer".into()),
+                },
+            ],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| s.enter_all_tasks(w, cx));
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("task-grouping", cx);
+        w.input("Task group", cx);
+    })
+    .unwrap();
+    press_in(window)(cx, &["enter"]);
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(w.try_find(("home-group", 0usize)).is_some());
+        assert!(
+            w.try_find(("home-group", 2usize)).is_some(),
+            "a plain group named Ungrouped must not absorb ungrouped tasks"
+        );
+        let s = shark.read(cx);
+        assert_eq!(
+            s.home_rows(cx).len(),
+            2,
+            "legacy bound groups do not hide tasks"
+        );
+        assert_eq!(s.state.tasks[0].agent.as_ref(), Some(&link));
+    })
+    .unwrap();
+    on(cx, &|s, _, cx| {
+        s.move_to_section("grouped", None, cx);
+        assert_eq!(s.state.tasks[0].agent.as_ref(), Some(&link));
+        assert_eq!(s.home_rows(cx).len(), 2);
+    });
+    press_in(window)(cx, &["escape"]);
+    cx.read(|cx| {
+        assert_eq!(
+            shark.read(cx).home.destination,
+            super::super::home::Destination::Home
+        )
+    });
+    fs::remove_dir_all(home).ok();
+}

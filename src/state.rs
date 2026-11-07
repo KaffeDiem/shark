@@ -1177,50 +1177,6 @@ impl State {
         }
     }
 
-    /// Drag-and-drop of task `ws` onto task `target`: `ws` takes the target's
-    /// slot in the target's section (or among the ungrouped), like a list reorder.
-    pub fn drop_task(&mut self, ws: &str, target: &str) {
-        let section_of = |st: &State, n: &str| {
-            st.sections
-                .iter()
-                .position(|s| s.tasks.iter().any(|w| w == n))
-        };
-        let (from, to) = (section_of(self, ws), section_of(self, target));
-        if ws == target {
-            return;
-        }
-        let pos = |v: &[String], n: &str| v.iter().position(|w| w == n);
-        match to {
-            Some(i) if from == to => {
-                let v = &mut self.sections[i].tasks;
-                let (f, t) = (pos(v, ws).unwrap(), pos(v, target).unwrap());
-                move_item(v, f, t);
-            }
-            Some(i) => {
-                for s in &mut self.sections {
-                    s.tasks.retain(|w| w != ws);
-                }
-                let v = &mut self.sections[i].tasks;
-                let t = pos(v, target).unwrap();
-                v.insert(t, ws.to_string());
-            }
-            None => {
-                for s in &mut self.sections {
-                    s.tasks.retain(|w| w != ws);
-                }
-                let v = &self.tasks;
-                let f = v.iter().position(|w| w.name == ws).unwrap();
-                let t = v.iter().position(|w| w.name == target).unwrap();
-                // Coming from a section it lands before the target; within the list it takes the slot.
-                let t = match from {
-                    Some(_) if f < t => t - 1,
-                    _ => t,
-                };
-                move_item(&mut self.tasks, f, t);
-            }
-        }
-    }
-
     /// Forgets task `name` everywhere the state lists it.
     pub fn remove_task(&mut self, name: &str) {
         self.tasks.retain(|w| w.name != name);
@@ -1857,15 +1813,6 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    fn task(name: &str) -> Task {
-        Task {
-            name: name.into(),
-            branch: name.into(),
-            repos: vec![],
-            ..Default::default()
-        }
-    }
-
     /// A task saved before titles shows its name and saves back loadable.
     #[test]
     fn old_state_has_no_title() {
@@ -1953,37 +1900,6 @@ mod tests {
                 closed
             );
         }
-    }
-
-    #[test]
-    fn drop_ws_reorders() {
-        let mut st = State {
-            tasks: ["a", "b", "c", "d"].map(task).into(),
-            sections: vec![Section {
-                agent: None,
-                name: "S".into(),
-                icon: "folder".into(),
-                collapsed: false,
-                tasks: vec!["c".into(), "d".into()],
-            }],
-            ..Default::default()
-        };
-        let names = |st: &State| st.tasks.iter().map(|w| w.name.clone()).collect::<Vec<_>>();
-        st.drop_task("a", "b"); // down within the ungrouped: takes b's slot
-        assert_eq!(names(&st), ["b", "a", "c", "d"]);
-        st.drop_task("a", "b"); // and back up
-        assert_eq!(names(&st), ["a", "b", "c", "d"]);
-        st.drop_task("d", "c"); // within a section
-        assert_eq!(st.sections[0].tasks, ["d", "c"]);
-        st.drop_task("a", "c"); // into a section, before the target
-        assert_eq!(st.sections[0].tasks, ["d", "a", "c"]);
-        st.drop_task("d", "b"); // out to the ungrouped, before the target
-        assert_eq!(st.sections[0].tasks, ["a", "c"]);
-        let ungrouped: Vec<_> = names(&st)
-            .into_iter()
-            .filter(|n| !st.sections[0].tasks.contains(n))
-            .collect();
-        assert_eq!(ungrouped, ["d", "b"]);
     }
 
     #[test]

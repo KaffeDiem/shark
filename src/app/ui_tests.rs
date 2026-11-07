@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::{fs, path::PathBuf, time::Duration};
 
+mod agent_navigation_tests;
 mod agent_settings_tests;
 mod agent_tests;
 mod app_switcher_tests;
@@ -1095,7 +1096,7 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
         assert_eq!(s.state.last_repos, ["web"]);
     });
 
-    // Sections: name inline, move with `m`, fold with h/l, delete keeps the task.
+    // Manual task groups are named in a dialog and do not hide sidebar tasks.
     press(cx, &["ctrl-w", "h"]);
     run(cx, &NewSection);
     cx.run_until_parked();
@@ -1104,25 +1105,11 @@ async fn keyboard_flow(cx: &mut TestAppContext) {
     press(cx, &["enter"]);
     let sections = |cx: &mut TestAppContext| cx.update(|cx| shark.read(cx).state.sections.clone());
     assert_eq!(sections(cx)[0].name, "Later");
-    cx.update_window(window, |_, w, cx| {
-        let s = shark.read(cx);
-        assert!(s.sidebar_focus.is_focused(w) && s.sel == SideRow::Section(0));
-    })
-    .unwrap();
-    press(cx, &["j", "m"]);
+    run(cx, &MoveToSection);
     cx.run_until_parked();
     press(cx, &["enter"]);
     assert_eq!(sections(cx)[0].tasks, ["kb"]);
-    press(cx, &["j", "h"]);
-    cx.update(|cx| {
-        let s = shark.read(cx);
-        assert!(s.state.sections[0].collapsed && s.sel == SideRow::Section(0));
-        assert!(
-            s.ws_order(false).is_empty(),
-            "cmd-N skips folded workspaces"
-        );
-    });
-    press(cx, &["l"]);
+    cx.update(|cx| assert_eq!(shark.read(cx).ws_order(false).len(), 1));
     run(cx, &DeleteSection);
     assert!(sections(cx).is_empty());
     cx.update(|cx| assert_eq!(shark.read(cx).state.tasks.len(), 1));

@@ -8,11 +8,7 @@ impl Shark {
     /// cmd-r: the active task's run scripts, in order; again stops them. On Home, the
     /// highlighted row's.
     pub(super) fn toggle_run(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let name = match self.home_shown() {
-            true => self.home.sel.as_ref(),
-            false => self.active.as_ref(),
-        };
-        let Some(ws) = name.and_then(|n| self.task(n)).cloned() else {
+        let Some(ws) = self.target(window) else {
             return notify_err(window, cx, "Open a task first");
         };
         if self.archiving.contains(&ws.name) {

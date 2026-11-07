@@ -21,12 +21,9 @@ async fn agent_settings_creates_and_edits_a_stable_identity(cx: &mut TestAppCont
         },
         WindowOptions::default(),
     );
-    on_app(window, shark.clone())(cx, &|s, w, cx| {
-        crate::settings::open_agents(&s.state, w, cx)
-    });
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.new_agent_dialog(w, cx));
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
-        w.click("new-agent", cx);
         w.input("Designer", cx);
     })
     .unwrap();
@@ -46,8 +43,12 @@ async fn agent_settings_creates_and_edits_a_stable_identity(cx: &mut TestAppCont
         assert_eq!(a.slug, "designer");
         assert_eq!(a.repos, ["api"]);
         assert_eq!(a.instructions, "Always use Mobbin to ground your research");
-        assert_eq!(s.state.sections.len(), 1, "reuse the unbound section");
-        assert_eq!(s.state.sections[0].agent.as_deref(), Some("designer"));
+        assert_eq!(
+            s.state.sections.len(),
+            1,
+            "agent creation leaves task groups alone"
+        );
+        assert_eq!(s.state.sections[0].agent, None);
     });
     cx.update_window(window, |_, w, cx| w.click("agent-name", cx))
         .unwrap();
@@ -58,8 +59,32 @@ async fn agent_settings_creates_and_edits_a_stable_identity(cx: &mut TestAppCont
         let s = shark.read(cx);
         assert_eq!(s.state.agents[0].slug, "designer");
         assert_eq!(s.state.agents[0].name, "Design team");
-        assert_eq!(s.state.sections[0].name, "Design team");
+        assert_eq!(
+            s.state.sections[0].name, "Designer",
+            "agent edits leave task groups alone"
+        );
     });
+    press_in(window)(cx, &["escape"]);
+    cx.run_until_parked();
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(
+            w.try_find("agent-page").is_some(),
+            "the empty agent has its own page"
+        );
+        assert!(w.try_find("agent-empty-tasks").is_some());
+        w.click("Instructions & skills", cx);
+        w.render_frame(cx);
+        assert!(w.try_find("agent-instructions-page").is_some());
+        assert!(w.try_find("agent-skills").is_some());
+        w.click("History", cx);
+        w.render_frame(cx);
+        assert!(w.try_find("agent-page").is_some());
+        w.click("agent-page-edit", cx);
+        w.render_frame(cx);
+        assert!(w.try_find("agent-settings").is_some());
+    })
+    .unwrap();
     let saved = State::load();
     assert_eq!(
         saved.agents[0].instructions,
@@ -69,7 +94,7 @@ async fn agent_settings_creates_and_edits_a_stable_identity(cx: &mut TestAppCont
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
-async fn agent_sections_are_unique_and_deletion_rechecks_open_tasks(cx: &mut TestAppContext) {
+async fn agents_do_not_create_sections_and_deletion_rechecks_open_tasks(cx: &mut TestAppContext) {
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     test_home();
     let (window, shark) = boot(cx, State::default(), WindowOptions::default());
@@ -77,9 +102,17 @@ async fn agent_sections_are_unique_and_deletion_rechecks_open_tasks(cx: &mut Tes
     on(cx, &|s, w, cx| {
         assert_eq!(s.create_named_agent("Designer", cx).unwrap(), "designer");
         assert_eq!(s.create_named_agent("Designer", cx).unwrap(), "designer-2");
-        assert_eq!(s.state.sections[0].name, "Designer");
-        assert_eq!(s.state.sections[1].name, "Designer 2");
+        assert!(s.state.sections.is_empty());
+        s.state.sections.push(Section {
+            name: "Legacy".into(),
+            icon: "folder".into(),
+            collapsed: false,
+            tasks: vec![],
+            agent: Some("designer".into()),
+        });
+        s.collapsed_agents.insert("designer".into());
         s.open_agent("designer", w, cx);
+        s.edit_agent("designer", w, cx);
     });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
@@ -113,6 +146,7 @@ async fn agent_sections_are_unique_and_deletion_rechecks_open_tasks(cx: &mut Tes
         s.creating.insert("designer-one-seahorse".into());
         assert!(!s.can_delete_agent("designer", w, cx));
         s.creating.clear();
+        s.sel = SideRow::Agent(1);
     });
     cx.update_window(window, |_, w, cx| {
         w.render_frame(cx);
@@ -123,6 +157,13 @@ async fn agent_sections_are_unique_and_deletion_rechecks_open_tasks(cx: &mut Tes
     cx.read(|cx| {
         let s = shark.read(cx);
         assert_eq!(s.state.agents.len(), 1);
+        assert_eq!(s.sel, SideRow::Agent(0));
+        assert_eq!(s.state.agents[0].slug, "designer-2");
+        assert_eq!(
+            s.home.destination,
+            super::super::home::Destination::AllTasks
+        );
+        assert!(!s.collapsed_agents.contains("designer"));
         assert_eq!(
             s.state.sections[0].agent, None,
             "the section survives unbound"
@@ -147,6 +188,8 @@ async fn agent_settings_shows_history_and_opens_its_task(cx: &mut TestAppContext
         Some(link),
     )
     .unwrap();
+    let unrelated =
+        git::create_empty_task(&tasks_dir().join("other"), "other", "Other task", None).unwrap();
     let history = [Some(true), Some(false), None]
         .into_iter()
         .enumerate()
@@ -172,16 +215,40 @@ async fn agent_settings_shows_history_and_opens_its_task(cx: &mut TestAppContext
                 history,
                 ..Default::default()
             }],
-            tasks: vec![task],
+            tasks: vec![task, unrelated],
             ..Default::default()
         },
         WindowOptions::default(),
     );
     on_app(window, shark.clone())(cx, &|s, w, cx| {
-        crate::settings::open_agents(&s.state, w, cx);
+        s.open_task_now(1, w, cx);
         s.open_agent("designer", w, cx);
+        assert_eq!(
+            s.home.sel.as_deref(),
+            Some("current"),
+            "agent page selects one of its own tasks"
+        );
+        s.home.page.set_offset(point(px(0.), px(-200.)));
     });
     cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        assert!(!w.has_active_dialog(cx), "agent is a page, not a dialog");
+        w.click("Instructions & skills", cx);
+        let s = shark.read(cx);
+        assert!(s.home.focus.is_focused(w));
+        assert_eq!(s.home.page.offset(), point(px(0.), px(0.)));
+        w.render_frame(cx);
+        let skill = crate::state::agent_skills_dir("designer").join("research");
+        fs::create_dir_all(&skill).unwrap();
+        fs::write(skill.join("SKILL.md"), "# Research").unwrap();
+        w.click("agent-refresh-skills", cx);
+        for folder in [".agents/skills", ".claude/skills"] {
+            assert_eq!(
+                fs::read_link(tasks_dir().join("current").join(folder).join("research")).unwrap(),
+                skill
+            );
+        }
+        w.click("History", cx);
         w.render_frame(cx);
         for (i, status) in ["Merged", "Not merged", "PR state unknown"]
             .into_iter()
@@ -193,21 +260,23 @@ async fn agent_settings_shows_history_and_opens_its_task(cx: &mut TestAppContext
             assert!(label.contains("2023"), "history includes its date: {label}");
         }
         assert!(w.try_find("agent-history-pr-0-0").is_some());
-        w.scroll(
-            "agent-settings",
-            ScrollDelta::Pixels(point(px(0.), px(-500.))),
-            cx,
-        );
+        w.click("Tasks", cx);
         w.render_frame(cx);
-        w.click(("agent-open-task", 0usize), cx);
+        w.click(("home-ws", 0usize), cx);
         w.render_frame(cx);
-        assert!(
-            !w.has_active_dialog(cx),
-            "task selection closes settings too"
-        );
+        assert!(!w.has_active_dialog(cx), "task selection opens directly");
     })
     .unwrap();
     cx.read(|cx| assert_eq!(shark.read(cx).active.as_deref(), Some("current")));
+    on_app(window, shark.clone())(cx, &|s, w, cx| s.open_agent("designer", w, cx));
+    press_in(window)(cx, &["i"]);
+    cx.update_window(window, |_, w, cx| {
+        let s = shark.read(cx);
+        assert_eq!(s.home.destination, super::super::home::Destination::Home);
+        assert_eq!(s.home.prompt.read(cx).value().as_ref(), "@designer ");
+        assert!(s.home.prompt.read(cx).focus_handle(cx).is_focused(w));
+    })
+    .unwrap();
 }
 
 #[gpui_kit::test]

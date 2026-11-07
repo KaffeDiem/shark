@@ -3,7 +3,6 @@
 //! connection. Preferences apply immediately.
 use crate::SwitchField;
 use crate::app::Shark;
-use crate::app::agent_settings::AgentsPage;
 use crate::app::linear_connection::LinearPage;
 use crate::app::repo_settings::ReposPage;
 use crate::prompts::{self, PROMPTS};
@@ -30,11 +29,6 @@ pub fn open(state: &State, window: &mut Window, cx: &mut Context<Shark>) {
 /// Settings on its Repositories page.
 pub fn open_repos(state: &State, window: &mut Window, cx: &mut Context<Shark>) {
     open_page(state, REPOS, window, cx)
-}
-
-/// Settings on its Agents page.
-pub fn open_agents(state: &State, window: &mut Window, cx: &mut Context<Shark>) {
-    open_page(state, AGENTS, window, cx)
 }
 
 /// Settings on its Linear page.
@@ -131,7 +125,6 @@ pub struct Settings {
     mono_font: Choice,
     prompts: Vec<Entity<TextareaState>>,
     repos: Entity<ReposPage>,
-    agents: Entity<AgentsPage>,
     linear: Entity<LinearPage>,
     _subs: Vec<Subscription>,
 }
@@ -238,7 +231,6 @@ impl Settings {
 
         let focus = cx.focus_handle();
         let repos = cx.new(|_| ReposPage::new(shark.clone()));
-        let agents = cx.new(|_| AgentsPage::new(shark.clone()));
         let linear = cx.new(|cx| LinearPage::new(shark.clone(), focus.clone(), window, cx));
         Settings {
             shark,
@@ -250,7 +242,6 @@ impl Settings {
             mono_font,
             prompts,
             repos,
-            agents,
             linear,
             _subs: subs,
         }
@@ -585,13 +576,6 @@ const PAGES: &[(IconName, (&str, &str))] = &[
         ),
     ),
     (
-        IconName::Users,
-        (
-            "Agents",
-            "Named instructions and defaults, ready for each new task",
-        ),
-    ),
-    (
         IconName::Link,
         ("Linear", "Read-only access to your Linear issues"),
     ),
@@ -599,8 +583,7 @@ const PAGES: &[(IconName, (&str, &str))] = &[
 
 /// The Repositories page's index in `PAGES`.
 const REPOS: usize = 3;
-const AGENTS: usize = 4;
-const LINEAR: usize = 5;
+const LINEAR: usize = 4;
 
 /// A tiny mock of the app in a theme's colors: sidebar, text lines and a primary button.
 fn preview(theme: &Theme, s: &Swatch, on: bool) -> Div {
@@ -665,7 +648,6 @@ impl Render for Settings {
             1 => self.render_appearance(cx).into_any_element(),
             2 => self.render_prompts(cx).into_any_element(),
             REPOS => self.repos.clone().into_any_element(),
-            AGENTS => self.agents.clone().into_any_element(),
             LINEAR => self.linear.clone().into_any_element(),
             _ => unreachable!("unknown settings page"),
         };

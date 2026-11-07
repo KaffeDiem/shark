@@ -43,6 +43,21 @@ async fn task_picker_navigation_and_focus(cx: &mut TestAppContext) {
     let (window, shark) = fixture(cx);
     let press = press_in(window);
     let on = on_app(window, shark.clone());
+    on(cx, &|s, _, cx| {
+        s.state.agents.push(crate::state::Agent {
+            slug: "designer".into(),
+            name: "Designer".into(),
+            ..Default::default()
+        });
+        s.state.tasks[1].agent = Some(crate::state::AgentLink {
+            slug: "designer".into(),
+            name: "Designer".into(),
+            instructions: String::new(),
+            siblings: vec![],
+        });
+        s.collapsed_agents.insert("designer".into());
+        cx.notify();
+    });
     // Home chooses the newest task, including all folded entries.
     press(cx, &["cmd-shift-o"]);
     cx.update_window(window, |_, w, cx| {
@@ -57,7 +72,11 @@ async fn task_picker_navigation_and_focus(cx: &mut TestAppContext) {
     cx.update(|cx| {
         let s = shark.read(cx);
         assert_eq!(s.active.as_deref(), Some("recent"));
-        assert!(!s.state.sections[0].collapsed);
+        assert!(!s.collapsed_agents.contains("designer"));
+        assert!(
+            s.state.sections[0].collapsed,
+            "opening a task leaves manual groups unchanged"
+        );
         assert!(s.state.tasks[1].last_interacted_at.unwrap() > 20);
     });
     let focus = cx

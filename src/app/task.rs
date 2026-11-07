@@ -114,7 +114,7 @@ impl Shark {
         }
         if self.active.as_deref() == Some(name) {
             if self.home.on {
-                self.toggle_home(window, cx);
+                self.leave_home(window, cx);
             }
             self.record_interaction(name, cx);
             return then(self, window, cx);
@@ -148,11 +148,8 @@ impl Shark {
             self.drop_editor(cx);
         }
         self.sel = SideRow::Task(ix);
-        if let Some(i) = self.section_of(&ws.name)
-            && self.state.sections[i].collapsed
-        {
-            self.state.sections[i].collapsed = false;
-            let _ = self.state.save();
+        if let Some(agent) = &ws.agent {
+            self.collapsed_agents.remove(&agent.slug);
         }
         self.ensure_sync(&ws, window, cx);
         for (name, sync) in &self.syncs {
@@ -363,8 +360,6 @@ impl Shark {
             return notify_err(window, cx, format!("Couldn't save the new task: {e}"));
         }
         if let Some(agent) = &ws.agent {
-            let section = self.ensure_agent_section(&agent.slug, cx);
-            self.move_to_section(&name, section, cx);
             let _ = self.sync_agent(&agent.slug, false, cx);
             self.refresh_agent_files(&agent.slug, cx);
         }
@@ -604,8 +599,6 @@ impl Shark {
                         let name = ws.name.clone();
                         s.state.tasks.push(ws.clone());
                         if let Some(agent) = &ws.agent {
-                            let section = s.ensure_agent_section(&agent.slug, cx);
-                            s.move_to_section(&name, section, cx);
                             // Settings may have changed while the worktrees were created.
                             let docs = s
                                 .state
@@ -1106,7 +1099,16 @@ impl Shark {
             _ if self.home_shown() => self.home.sel.clone()?,
             _ => self.active.clone()?,
         };
-        self.task(&name).cloned()
+        let task = self.task(&name)?;
+        if !self.sidebar_focus.is_focused(window)
+            && self.home_shown()
+            && let home::Destination::Agent(slug) = &self.home.destination
+            && (self.home.agent_tab != agent_settings::AgentTab::Tasks
+                || task.agent.as_ref().is_none_or(|a| &a.slug != slug))
+        {
+            return None;
+        }
+        Some(task.clone())
     }
 
     pub(super) fn with_target(

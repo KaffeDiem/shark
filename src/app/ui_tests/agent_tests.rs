@@ -1,5 +1,5 @@
 use super::*;
-use crate::state::{ChatMeta, NEW_TASK, SEA_NAMES, TabId};
+use crate::state::{AgentLink, ChatMeta, NEW_TASK, SEA_NAMES, TabId};
 
 /// The app on no repos at all, on a claude that never answers; the guard holds it.
 fn empty_app(cx: &mut TestAppContext) -> (AnyWindowHandle, Entity<Shark>) {
@@ -630,6 +630,58 @@ async fn branch_dialog_stays_reachable(cx: &mut TestAppContext) {
 
 #[gpui_kit::test]
 #[allow(clippy::await_holding_lock)]
+async fn agent_pages_do_not_target_hidden_tasks(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    test_home();
+    let link = AgentLink {
+        slug: "designer".into(),
+        name: "Designer".into(),
+        ..Default::default()
+    };
+    let tasks = [("design", Some(link)), ("other", None)]
+        .into_iter()
+        .map(|(name, agent)| {
+            git::create_empty_task(&tasks_dir().join(name), name, name, agent).unwrap()
+        })
+        .collect();
+    let (window, shark) = boot(
+        cx,
+        State {
+            tasks,
+            agents: vec![crate::state::Agent {
+                slug: "designer".into(),
+                name: "Designer".into(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        },
+        WindowOptions::default(),
+    );
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        s.open_task_now(1, w, cx);
+        s.open_agent("designer", w, cx);
+        assert_eq!(s.target(w).unwrap().name, "design");
+        s.home.agent_tab = agent_settings::AgentTab::Instructions;
+        assert!(s.target(w).is_none());
+        s.home.agent_tab = agent_settings::AgentTab::History;
+        assert!(s.target(w).is_none());
+        s.sidebar_focus.focus(w, cx);
+        s.sel = SideRow::Task(1);
+        assert_eq!(
+            s.target(w).unwrap().name,
+            "other",
+            "explicit sidebar selection wins"
+        );
+        s.open_task_then("other", w, cx, |_, _, _| {});
+        assert!(
+            !s.home_shown(),
+            "opening the active task leaves the agent page"
+        );
+    });
+}
+
+#[gpui_kit::test]
+#[allow(clippy::await_holding_lock)]
 async fn persistent_agent_starts_isolated_tasks_with_instructions(cx: &mut TestAppContext) {
     let quiet = quiet_claude();
     let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -688,19 +740,38 @@ async fn persistent_agent_starts_isolated_tasks_with_instructions(cx: &mut TestA
         ["one", "two"]
     );
     assert_ne!(tasks[0].branch, tasks[1].branch);
-    cx.update(|cx| {
-        let section = shark
-            .read(cx)
-            .state
-            .sections
-            .iter()
-            .find(|s| s.agent.as_deref() == Some("designer"))
-            .unwrap();
-        assert_eq!(section.tasks.len(), 2);
-        for task in &tasks {
-            assert!(section.tasks.contains(&task.name));
-        }
+    on_app(window, shark.clone())(cx, &|s, w, cx| {
+        assert!(
+            s.state.sections.is_empty(),
+            "agents do not create task groups"
+        );
+        assert_eq!(
+            s.side_rows(true),
+            [SideRow::Agent(0), SideRow::Task(0), SideRow::Task(1)]
+        );
+        s.state.sections.push(Section {
+            agent: None,
+            name: "Release".into(),
+            icon: "folder".into(),
+            collapsed: false,
+            tasks: vec![],
+        });
+        let instructions = s.state.tasks[0].context()["agent:designer"].clone();
+        s.move_to_section(&tasks[0].name, Some(0), cx);
+        assert_eq!(s.state.tasks[0].context()["agent:designer"], instructions);
+        assert_eq!(
+            s.side_rows(true),
+            [SideRow::Agent(0), SideRow::Task(0), SideRow::Task(1)]
+        );
+        s.open_task_now(1, w, cx);
     });
+    cx.update_window(window, |_, w, cx| {
+        w.render_frame(cx);
+        w.click("task-agent", cx);
+        w.render_frame(cx);
+        assert!(w.try_find("agent-page").is_some());
+    })
+    .unwrap();
     for (i, task) in tasks.iter().enumerate() {
         let agent = task.agent.as_ref().unwrap();
         assert_eq!(agent.slug, "designer");

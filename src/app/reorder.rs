@@ -7,8 +7,6 @@ use std::time::Duration;
 pub(super) enum Item {
     Tab(String, TabId),
     Task(String),
-    Section(usize),
-    Ungrouped,
 }
 
 #[derive(Default)]
@@ -111,7 +109,6 @@ impl Shark {
     pub(super) fn prune_reorder(&self, cx: &App) {
         let mut current = self.reorder_items(true, cx);
         current.extend(self.reorder_items(false, cx));
-        current.push(Item::Ungrouped);
         let mut state = self.reorder.borrow_mut();
         state.bounds.retain(|key, _| current.contains(key));
         if !cx.has_active_drag() {
@@ -185,9 +182,9 @@ impl Shark {
         } else {
             self.side_rows(false)
                 .into_iter()
-                .map(|row| match row {
-                    SideRow::Task(i) => Item::Task(self.state.tasks[i].name.clone()),
-                    SideRow::Section(i) => Item::Section(i),
+                .filter_map(|row| match row {
+                    SideRow::Task(i) => Some(Item::Task(self.state.tasks[i].name.clone())),
+                    SideRow::Agent(_) => None,
                 })
                 .collect()
         }
@@ -207,8 +204,7 @@ impl Shark {
         }
         let valid = |item: &&Item| match (&drag.source, *item) {
             (Item::Tab(ws, _), Item::Tab(other, _)) => ws == other,
-            (Item::Task(_), Item::Task(_) | Item::Section(_) | Item::Ungrouped) => true,
-            (Item::Section(_), Item::Section(_)) => true,
+            (Item::Task(source), Item::Task(target)) => self.can_reorder_tasks(source, target),
             _ => false,
         };
         let (low, high) = axis(&area, horizontal);
@@ -216,8 +212,14 @@ impl Shark {
         let target = state
             .bounds
             .keys()
-            .filter(|key| order.contains(key) || **key == Item::Ungrouped)
+            .filter(|key| order.contains(key))
             .filter(valid)
+            .filter(|item| {
+                horizontal || {
+                    let (start, end) = axis(&state.bounds[*item], false);
+                    coordinate >= start && coordinate <= end
+                }
+            })
             .min_by(|a, b| {
                 let distance = |item: &Item| {
                     let (start, end) = axis(&state.bounds[item], horizontal);
@@ -239,72 +241,31 @@ impl Shark {
         }
         state.target = target.clone();
         state.offsets.clear();
-        let Some(target) = target else { return };
+        let Some(target) = target else {
+            drop(state);
+            cx.notify();
+            return;
+        };
         let before = order.clone();
-        match (&drag.source, &target) {
-            (Item::Section(from), Item::Section(to)) => {
-                let groups = |i: usize| {
-                    let start = before
-                        .iter()
-                        .position(|key| *key == Item::Section(i))
-                        .unwrap();
-                    let end = before
-                        .iter()
-                        .enumerate()
-                        .skip(start + 1)
-                        .find(|(_, key)| {
-                            matches!(key, Item::Section(_))
-                                || matches!(key,Item::Task(n) if self.section_of(n).is_none())
-                        })
-                        .map_or(before.len(), |(i, _)| i);
-                    start..end
-                };
-                let range = groups(*from);
-                let destination = groups(*to);
-                let block: Vec<_> = order.drain(range.clone()).collect();
-                let insert = if range.start < destination.start {
-                    destination.end - block.len()
-                } else {
-                    destination.start
-                };
-                order.splice(insert..insert, block);
-            }
-            (Item::Task(source), _) => {
-                // Use the same grouping rules as the eventual drop, without saving a preview.
-                let mut preview = State {
-                    tasks: self.state.tasks.clone(),
-                    sections: self.state.sections.clone(),
-                    ..State::default()
-                };
-                match &target {
-                    Item::Task(to) => preview.drop_task(source, to),
-                    Item::Section(i) => preview.move_to_section(source, Some(*i)),
-                    Item::Ungrouped => preview.move_to_section(source, None),
-                    _ => {}
-                }
-                order.clear();
-                for (i, section) in preview.sections.iter().enumerate() {
-                    order.push(Item::Section(i));
-                    if !section.collapsed {
-                        order.extend(section.tasks.iter().cloned().map(Item::Task));
-                    }
-                }
-                order.extend(
-                    preview
-                        .tasks
-                        .iter()
-                        .filter(|ws| !preview.sections.iter().any(|s| s.tasks.contains(&ws.name)))
-                        .map(|ws| Item::Task(ws.name.clone())),
-                );
-            }
-            _ => {
-                if let (Some(from), Some(to)) = (
-                    order.iter().position(|key| key == &drag.source),
-                    order.iter().position(|key| key == &target),
-                ) {
-                    move_item(&mut order, from, to);
+        if let (Some(from), Some(to)) = (
+            order.iter().position(|key| key == &drag.source),
+            order.iter().position(|key| key == &target),
+        ) {
+            move_item(&mut order, from, to);
+        }
+        if !horizontal {
+            // Tasks occupy fixed-height slots. Keep agent headings and their gaps stationary.
+            for (item, slot) in order.iter().zip(&before) {
+                if let (Some(original), Some(destination)) =
+                    (state.bounds.get(item), state.bounds.get(slot))
+                {
+                    let offset = destination.top() - original.top();
+                    state.offsets.insert(item.clone(), offset);
                 }
             }
+            drop(state);
+            cx.notify();
+            return;
         }
         let Some(first) = before.first().and_then(|key| state.bounds.get(key)) else {
             return;
@@ -338,18 +299,17 @@ impl Shark {
         self.reorder.borrow_mut().offsets.clear();
         if drag.valid(self, cx)
             && drag.scroll.bounds().contains(&window.mouse_position())
-            && target.as_ref().is_some_and(|key| {
-                *key == Item::Ungrouped || self.reorder_items(drag.horizontal(), cx).contains(key)
-            })
+            && target
+                .as_ref()
+                .is_some_and(|key| self.reorder_items(drag.horizontal(), cx).contains(key))
         {
             match (&drag.source, target) {
                 (Item::Tab(ws, from), Some(Item::Tab(other, to))) if *ws == other => {
                     self.move_tab(ws, from, &to, cx)
                 }
-                (Item::Task(ws), Some(Item::Task(to))) => self.drop_task(ws, &to, cx),
-                (Item::Task(ws), Some(Item::Section(to))) => self.move_to_section(ws, Some(to), cx),
-                (Item::Task(ws), Some(Item::Ungrouped)) => self.move_to_section(ws, None, cx),
-                (Item::Section(from), Some(Item::Section(to))) => self.drop_section(*from, to, cx),
+                (Item::Task(ws), Some(Item::Task(to))) if self.can_reorder_tasks(ws, &to) => {
+                    self.drop_task(ws, &to, cx)
+                }
                 _ => {}
             }
         }

@@ -5,6 +5,7 @@ use crate::state::Agent;
 use crate::ui::{card, row, section};
 use gpui_kit::component::input::{Textarea, TextareaState};
 use gpui_kit::component::select::{SearchableVec, Select, SelectEvent, SelectState};
+use gpui_kit::component::text::TextView;
 
 type Choice = Entity<SelectState<SearchableVec<SharedString>>>;
 
@@ -36,114 +37,87 @@ fn create_skills_folder(slug: &str) -> std::io::Result<PathBuf> {
     Ok(path)
 }
 
-pub(crate) struct AgentsPage {
-    shark: WeakEntity<Shark>,
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum AgentTab {
+    #[default]
+    Tasks,
+    Instructions,
+    History,
 }
 
-impl AgentsPage {
-    pub(crate) fn new(shark: WeakEntity<Shark>) -> Self {
-        Self { shark }
-    }
+fn skills_button(slug: &str) -> Button {
+    let slug = slug.to_string();
+    Button::new("agent-skills")
+        .ghost()
+        .small()
+        .icon(IconName::Folder)
+        .label("Open skills folder")
+        .on_click(move |_, window, cx| match create_skills_folder(&slug) {
+            Ok(path) => cx.reveal_path(&path),
+            Err(e) => notify_err(window, cx, e.to_string()),
+        })
 }
 
-impl Render for AgentsPage {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let agents = self
-            .shark
-            .upgrade()
-            .map(|s| s.read(cx).state.agents.clone())
-            .unwrap_or_default();
-        let theme = cx.theme();
-        v_flex()
-            .gap_3()
-            .child(
-                card(theme).children(agents.into_iter().enumerate().map(|(i, a)| {
-                    h_flex()
-                        .id(("agent", i))
-                        .test_support()
-                        .h(px(48.))
-                        .px_3()
-                        .gap_3()
-                        .when(i > 0, |d| d.border_t_1().border_color(theme.border))
-                        .hover(|d| d.bg(theme.secondary_hover))
-                        .child(Icon::new(super::sidebar::section_icon(&a.icon)).with_size(px(16.)))
-                        .child(
-                            v_flex()
-                                .flex_1()
-                                .min_w_0()
-                                .child(div().text_sm().truncate().child(a.name))
-                                .child(
-                                    div()
-                                        .text_xs()
-                                        .text_color(theme.muted_foreground)
-                                        .child(format!("@{}", a.slug)),
-                                ),
-                        )
-                        .child(Icon::new(IconName::ChevronRight).with_size(px(14.)))
-                        .on_click(cx.listener(move |this, _, w, cx| {
-                            this.shark
-                                .update(cx, |s, cx| s.open_agent(&a.slug, w, cx))
-                                .ok();
-                        }))
-                })),
+fn render_history(agent: &Agent, theme: &Theme) -> AnyElement {
+    v_flex()
+        .gap_2()
+        .child(section(theme, "History"))
+        .when(agent.history.is_empty(), |d| {
+            d.child(
+                div()
+                    .text_sm()
+                    .text_color(theme.muted_foreground)
+                    .child("No task history yet"),
             )
-            .child(
-                Button::new("new-agent")
-                    .ghost()
-                    .small()
-                    .icon(IconName::Plus)
-                    .label("New agent…")
-                    .on_click(cx.listener(|this, _, w, cx| {
-                        this.shark
-                            .update(cx, |s, cx| s.new_agent_dialog(w, cx))
-                            .ok();
-                    })),
-            )
-    }
+        })
+        .children(agent.history.iter().enumerate().map(|(i, record)| {
+            let status = match record.merged {
+                Some(true) => "Merged",
+                Some(false) => "Not merged",
+                None => "PR state unknown",
+            };
+            let date = i64::try_from(record.at)
+                .ok()
+                .and_then(chrono::DateTime::from_timestamp_millis)
+                .map_or_else(
+                    || "Date unknown".into(),
+                    |at| {
+                        at.with_timezone(&chrono::Local)
+                            .format("%b %-d, %Y")
+                            .to_string()
+                    },
+                );
+            v_flex()
+                .id(("agent-history", i))
+                .aria_label(format!("{}, {status}, {date}", record.title))
+                .test_support()
+                .gap_1()
+                .py_2()
+                .when(i > 0, |d| d.border_t_1().border_color(theme.border))
+                .child(div().text_sm().child(record.title.clone()))
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child(format!("{status} · {date}")),
+                )
+                .child(h_flex().gap_2().children(record.prs.iter().enumerate().map(
+                    |(j, (repo, url))| {
+                        let url = url.clone();
+                        Button::new(SharedString::from(format!("agent-history-pr-{i}-{j}")))
+                            .ghost()
+                            .xsmall()
+                            .role(Role::Link)
+                            .label(format!("{repo} PR"))
+                            .tooltip(url.clone())
+                            .on_click(move |_, _, cx| cx.open_url(&url))
+                    },
+                )))
+        }))
+        .into_any_element()
 }
 
 impl Shark {
-    pub(super) fn ensure_agent_section(
-        &mut self,
-        slug: &str,
-        _: &mut Context<Self>,
-    ) -> Option<usize> {
-        if let Some(i) = self
-            .state
-            .sections
-            .iter()
-            .position(|s| s.agent.as_deref() == Some(slug))
-        {
-            return Some(i);
-        }
-        let a = self.state.agents.iter().find(|a| a.slug == slug)?;
-        if let Some(i) = self
-            .state
-            .sections
-            .iter()
-            .position(|s| s.agent.is_none() && s.name == a.name)
-        {
-            let section = &mut self.state.sections[i];
-            section.agent = Some(slug.into());
-            section.icon = a.icon.clone();
-            return Some(i);
-        }
-        let mut name = a.name.clone();
-        let mut suffix = 2;
-        while self.state.sections.iter().any(|s| s.name == name) {
-            name = format!("{} {suffix}", a.name);
-            suffix += 1;
-        }
-        self.state.sections.push(Section {
-            name,
-            icon: a.icon.clone(),
-            collapsed: false,
-            tasks: vec![],
-            agent: Some(slug.into()),
-        });
-        Some(self.state.sections.len() - 1)
-    }
-
     pub(super) fn create_named_agent(
         &mut self,
         name: &str,
@@ -168,17 +142,14 @@ impl Shark {
             slug = format!("{base}-{suffix}");
             suffix += 1;
         }
-        let sections = self.state.sections.clone();
         self.state.agents.push(Agent {
             slug: slug.clone(),
             name: name.into(),
-            icon: "folder".into(),
+            icon: "bot".into(),
             ..Default::default()
         });
-        self.ensure_agent_section(&slug, cx);
         if let Err(e) = self.state.save() {
             self.state.agents.pop();
-            self.state.sections = sections;
             return Err(e.to_string());
         }
         cx.notify();
@@ -201,7 +172,12 @@ impl Shark {
                         Ok(Ok(slug)) => {
                             let shark = shark.clone();
                             window.defer(cx, move |w, cx| {
-                                shark.update(cx, |s, cx| s.open_agent(&slug, w, cx)).ok();
+                                shark
+                                    .update(cx, |s, cx| {
+                                        s.open_agent(&slug, w, cx);
+                                        s.edit_agent(&slug, w, cx);
+                                    })
+                                    .ok();
                             });
                             true
                         }
@@ -217,6 +193,281 @@ impl Shark {
     }
 
     pub(super) fn open_agent(&mut self, slug: &str, window: &mut Window, cx: &mut Context<Self>) {
+        if !self.state.agents.iter().any(|a| a.slug == slug) {
+            return;
+        }
+        window.close_all_dialogs(cx);
+        self.enter_home(window, cx);
+        self.home.destination = super::home::Destination::Agent(slug.to_string());
+        self.home.agent_tab = AgentTab::Tasks;
+        let tasks = self.home_rows(cx);
+        if self.home_at(&tasks).is_none() {
+            self.home.sel = tasks
+                .first()
+                .map(|row| self.state.tasks[row.ix].name.clone());
+        }
+        self.home.page.set_offset(point(px(0.), px(0.)));
+        self.home.focus.focus(window, cx);
+        cx.notify();
+    }
+
+    pub(super) fn render_agent_page(
+        &self,
+        slug: &str,
+        window: &Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let Some(agent) = self.state.agents.iter().find(|a| a.slug == slug) else {
+            return div().child("Agent no longer exists").into_any_element();
+        };
+        let theme = cx.theme();
+        let refresh_slug = slug.to_string();
+        let repos = agent
+            .repos
+            .iter()
+            .filter(|name| self.state.repos.iter().any(|r| &r.name == *name))
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" · ");
+        let content = match self.home.agent_tab {
+            AgentTab::Tasks => {
+                let tasks = self
+                    .home_rows(cx)
+                    .into_iter()
+                    .filter(|r| {
+                        self.state.tasks[r.ix]
+                            .agent
+                            .as_ref()
+                            .is_some_and(|a| a.slug == slug)
+                    })
+                    .collect::<Vec<_>>();
+                let list = v_flex()
+                    .id("agent-tasks")
+                    .key_context("Home")
+                    .track_focus(&self.home.focus)
+                    .track_scroll(&self.home.rows)
+                    .gap_2();
+                nav_actions(list, true, cx, Shark::home_move)
+                    .on_action(cx.listener(|s, _: &Confirm, w, cx| s.home_confirm(w, cx)))
+                    .test_support()
+                    .when(tasks.is_empty(), |d| {
+                        d.child(
+                            v_flex()
+                                .id("agent-empty-tasks")
+                                .test_support()
+                                .py_8()
+                                .gap_2()
+                                .child(div().text_base().child("No tasks yet"))
+                                .child(div().text_sm().text_color(theme.muted_foreground).child(
+                                    format!(
+                                        "Start a task with {} whenever you're ready.",
+                                        agent.name
+                                    ),
+                                )),
+                        )
+                    })
+                    .children(tasks.iter().map(|task| {
+                        self.home_ws_row(
+                            task,
+                            self.home.focus.is_focused(window),
+                            std::time::SystemTime::now(),
+                            cx,
+                        )
+                    }))
+                    .into_any_element()
+            }
+            AgentTab::Instructions => {
+                let model = agent
+                    .model
+                    .as_deref()
+                    .filter(|m| MODELS.contains(m))
+                    .map(model_label)
+                    .unwrap_or_else(|| {
+                        format!(
+                            "Repository default ({})",
+                            model_label(&repo_model(&self.state, agent))
+                        )
+                    });
+                let effort = agent
+                    .effort
+                    .as_deref()
+                    .map(effort_label)
+                    .unwrap_or_else(|| "Repository default".into());
+                v_flex()
+                    .id("agent-instructions-page")
+                    .test_support()
+                    .gap_5()
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .child(section(theme, "Instructions"))
+                            .child(
+                                TextView::markdown(
+                                    "agent-instructions-text",
+                                    if agent.instructions.is_empty() {
+                                        "No instructions yet. Edit this agent to add them."
+                                            .to_string()
+                                    } else {
+                                        agent.instructions.clone()
+                                    },
+                                )
+                                .selectable(true),
+                            ),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .child(section(theme, "Defaults"))
+                            .child(div().text_sm().child(format!(
+                                "Repositories: {}",
+                                if repos.is_empty() { "None" } else { &repos }
+                            )))
+                            .child(div().text_sm().child(format!("Model: {model}")))
+                            .child(div().text_sm().child(format!("Thinking: {effort}"))),
+                    )
+                    .child(
+                        v_flex()
+                            .gap_2()
+                            .child(section(theme, "Skills"))
+                            .child(div().text_sm().text_color(theme.muted_foreground).child(
+                                "Add each skill as <skill>/SKILL.md in this folder, then Refresh skills to update every open task.",
+                            ))
+                            .child(h_flex().gap_2().child(skills_button(slug))
+                            .child(Button::new("agent-refresh-skills").ghost().small().icon(IconName::RefreshCw)
+                                .label("Refresh skills").on_click(cx.listener(move |s, _, window, cx| {
+                                    match s.sync_agent(&refresh_slug, true, cx) {
+                                        Ok(()) => window.push_notification(Notification::success("Agent skills refreshed"), cx),
+                                        Err(e) => notify_err(window, cx, format!("Couldn't refresh agent skills: {e}")),
+                                    }
+                                })))),
+                    )
+                    .into_any_element()
+            }
+            AgentTab::History => render_history(agent, theme),
+        };
+        let (new_slug, edit_slug, composer_slug) =
+            (slug.to_string(), slug.to_string(), slug.to_string());
+        v_flex()
+            .id("agent-page")
+            .aria_label(format!("{} agent", agent.name))
+            .key_context("HomeView")
+            .track_focus(&self.home.focus)
+            .on_action(cx.listener(|s, _: &CancelEdit, w, cx| s.home_escape(w, cx)))
+            .on_action(cx.listener(move |s, _: &FocusComposer, w, cx| {
+                s.prefill_agent_task(&composer_slug, w, cx)
+            }))
+            .test_support()
+            .flex_1()
+            .min_w_0()
+            .h_full()
+            .child(
+                v_flex()
+                    .id("agent-page-scroll")
+                    .track_scroll(&self.home.page)
+                    .overflow_y_scroll()
+                    .flex_1()
+                    .min_h_0()
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .max_w(px(900.))
+                            .mx_auto()
+                            .px_6()
+                            .py_8()
+                            .gap_6()
+                            .child(
+                                h_flex()
+                                    .flex_wrap()
+                                    .gap_3()
+                                    .child(
+                                        Icon::new(super::sidebar::section_icon(&agent.icon))
+                                            .with_size(px(28.)),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .flex_1()
+                                            .min_w_0()
+                                            .gap_1()
+                                            .child(
+                                                div()
+                                                    .text_xl()
+                                                    .truncate()
+                                                    .font_weight(FontWeight::SEMIBOLD)
+                                                    .child(agent.name.clone()),
+                                            )
+                                            .child(
+                                                div()
+                                                    .text_sm()
+                                                    .truncate()
+                                                    .text_color(theme.muted_foreground)
+                                                    .child(format!("@{}", agent.slug)),
+                                            ),
+                                    )
+                                    .child(
+                                        Button::new("agent-page-new-task")
+                                            .flex_none()
+                                            .primary()
+                                            .icon(IconName::Plus)
+                                            .label("New task")
+                                            .on_click(cx.listener(move |s, _, w, cx| {
+                                                s.prefill_agent_task(&new_slug, w, cx)
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("agent-page-edit")
+                                            .flex_none()
+                                            .ghost()
+                                            .icon(IconName::Pencil)
+                                            .label("Edit agent")
+                                            .on_click(cx.listener(move |s, _, w, cx| {
+                                                s.edit_agent(&edit_slug, w, cx)
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .id("agent-default-repos")
+                                    .text_sm()
+                                    .text_color(theme.muted_foreground)
+                                    .child(if repos.is_empty() {
+                                        "No default repositories".to_string()
+                                    } else {
+                                        format!("Default repositories: {repos}")
+                                    })
+                                    .test_support(),
+                            )
+                            .child(
+                                h_flex().gap_2().flex_wrap().children(
+                                    [
+                                        (AgentTab::Tasks, "Tasks"),
+                                        (AgentTab::Instructions, "Instructions & skills"),
+                                        (AgentTab::History, "History"),
+                                    ]
+                                    .into_iter()
+                                    .map(|(tab, label)| {
+                                        crate::ui::option_pill(
+                                            label,
+                                            None,
+                                            self.home.agent_tab == tab,
+                                        )
+                                        .on_click(
+                                            cx.listener(move |s, _, window, cx| {
+                                                s.home.agent_tab = tab;
+                                                s.home.page.set_offset(point(px(0.), px(0.)));
+                                                s.home.focus.focus(window, cx);
+                                                cx.notify();
+                                            }),
+                                        )
+                                    }),
+                                ),
+                            )
+                            .child(content),
+                    ),
+            )
+            .into_any_element()
+    }
+
+    pub(super) fn edit_agent(&mut self, slug: &str, window: &mut Window, cx: &mut Context<Self>) {
         let Some(agent) = self.state.agents.iter().find(|a| a.slug == slug).cloned() else {
             return;
         };
@@ -250,7 +501,7 @@ impl Shark {
         cx: &mut Context<Self>,
     ) {
         if self.state.agents.is_empty() {
-            return crate::settings::open_agents(&self.state, window, cx);
+            return self.new_agent_dialog(window, cx);
         }
         let agents = self.state.agents.clone();
         let items = agents
@@ -369,6 +620,11 @@ impl Shark {
                     .parent()
                     .unwrap()
                     .to_path_buf();
+                let cursor_slug = match s.sel {
+                    SideRow::Agent(i) => s.state.agents.get(i).map(|a| a.slug.clone()),
+                    SideRow::Task(_) => None,
+                };
+                let cursor_at = s.side_rows(false).iter().position(|row| *row == s.sel);
                 let agents = s.state.agents.clone();
                 let sections = s.state.sections.clone();
                 s.state.agents.retain(|a| a.slug != slug);
@@ -382,6 +638,20 @@ impl Shark {
                     s.state.sections = sections;
                     return notify_err(window, cx, e.to_string());
                 }
+                if let Some(cursor_slug) = cursor_slug {
+                    s.sel = s
+                        .state
+                        .agents
+                        .iter()
+                        .position(|a| a.slug == cursor_slug)
+                        .map(SideRow::Agent)
+                        .unwrap_or_else(|| {
+                            let rows = s.side_rows(false);
+                            rows.get(cursor_at.unwrap_or(0).min(rows.len().saturating_sub(1)))
+                                .copied()
+                                .unwrap_or(SideRow::Task(0))
+                        });
+                }
                 if let Err(e) = std::fs::remove_dir_all(&dir) {
                     if e.kind() != std::io::ErrorKind::NotFound {
                         notify_err(
@@ -392,6 +662,12 @@ impl Shark {
                     }
                 }
                 window.close_dialog(cx);
+                s.collapsed_agents.remove(&slug);
+                if s.home.destination == super::home::Destination::Agent(slug.clone()) {
+                    s.enter_home(window, cx);
+                    s.home.destination = super::home::Destination::AllTasks;
+                    s.home.focus.focus(window, cx);
+                }
                 cx.notify();
             },
             window,
@@ -532,27 +808,6 @@ impl AgentSettingsView {
                 let a = s.state.agents.iter_mut().find(|a| a.slug == self.slug)?;
                 f(a);
                 let agent = a.clone();
-                let section = s
-                    .state
-                    .sections
-                    .iter()
-                    .position(|section| section.agent.as_deref() == Some(&self.slug));
-                if let Some(i) = section {
-                    let mut name = agent.name.clone();
-                    let mut suffix = 2;
-                    while s
-                        .state
-                        .sections
-                        .iter()
-                        .enumerate()
-                        .any(|(j, section)| j != i && section.name == name)
-                    {
-                        name = format!("{} {suffix}", agent.name);
-                        suffix += 1;
-                    }
-                    s.state.sections[i].name = name;
-                    s.state.sections[i].icon = agent.icon.clone();
-                }
                 let _ = s.state.save();
                 cx.notify();
                 Some(agent)
@@ -603,15 +858,9 @@ impl Render for AgentSettingsView {
             (
                 s.state.agents.iter().find(|a| a.slug == self.slug).cloned(),
                 s.state.repos.clone(),
-                s.state
-                    .tasks
-                    .iter()
-                    .filter(|task| task.agent.as_ref().is_some_and(|a| a.slug == self.slug))
-                    .map(|task| (task.name.clone(), task.display_title().into_owned()))
-                    .collect::<Vec<_>>(),
             )
         });
-        let (agent, repos, tasks) = state.unwrap_or_default();
+        let (agent, repos) = state.unwrap_or_default();
         let Some(agent) = agent else {
             return div().into_any_element();
         };
@@ -629,85 +878,6 @@ impl Render for AgentSettingsView {
                     }))
             })
             .collect::<Vec<_>>();
-        let open_tasks = v_flex()
-            .gap_2()
-            .child(section(theme, "Open tasks"))
-            .when(tasks.is_empty(), |d| {
-                d.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("No open tasks"),
-                )
-            })
-            .children(tasks.into_iter().enumerate().map(|(i, (name, title))| {
-                Button::new(("agent-open-task", i))
-                    .ghost()
-                    .small()
-                    .label(title)
-                    .on_click(cx.listener(move |this, _, w, cx| {
-                        let shark = this.shark.clone();
-                        w.close_all_dialogs(cx);
-                        shark
-                            .update(cx, |s, cx| s.open_task_named(&name, w, cx))
-                            .ok();
-                    }))
-            }));
-        let history = v_flex()
-            .gap_2()
-            .child(section(theme, "History"))
-            .when(agent.history.is_empty(), |d| {
-                d.child(
-                    div()
-                        .text_sm()
-                        .text_color(theme.muted_foreground)
-                        .child("No task history yet"),
-                )
-            })
-            .children(agent.history.iter().enumerate().map(|(i, record)| {
-                let status = match record.merged {
-                    Some(true) => "Merged",
-                    Some(false) => "Not merged",
-                    None => "PR state unknown",
-                };
-                let date = i64::try_from(record.at)
-                    .ok()
-                    .and_then(chrono::DateTime::from_timestamp_millis)
-                    .map_or_else(
-                        || "Date unknown".into(),
-                        |at| {
-                            at.with_timezone(&chrono::Local)
-                                .format("%b %-d, %Y")
-                                .to_string()
-                        },
-                    );
-                v_flex()
-                    .id(("agent-history", i))
-                    .aria_label(format!("{}, {status}, {date}", record.title))
-                    .test_support()
-                    .gap_1()
-                    .py_2()
-                    .when(i > 0, |d| d.border_t_1().border_color(theme.border))
-                    .child(div().text_sm().child(record.title.clone()))
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(theme.muted_foreground)
-                            .child(format!("{status} · {date}")),
-                    )
-                    .child(h_flex().gap_2().children(record.prs.iter().enumerate().map(
-                        |(j, (repo, url))| {
-                            let url = url.clone();
-                            Button::new(SharedString::from(format!("agent-history-pr-{i}-{j}")))
-                                .ghost()
-                                .xsmall()
-                                .role(Role::Link)
-                                .label(format!("{repo} PR"))
-                                .tooltip(url.clone())
-                                .on_click(move |_, _, cx| cx.open_url(&url))
-                        },
-                    )))
-            }));
         v_flex()
             .id("agent-settings")
             .test_support()
@@ -719,6 +889,7 @@ impl Render for AgentSettingsView {
                     .gap_2()
                     .child(
                         Button::new("agent-icon")
+                            .accessibility_label("Change agent icon")
                             .ghost()
                             .icon(super::sidebar::section_icon(&agent.icon))
                             .tooltip("Change icon")
@@ -775,19 +946,7 @@ impl Render for AgentSettingsView {
             .child(
                 h_flex()
                     .gap_2()
-                    .child(
-                        Button::new("agent-skills")
-                            .ghost()
-                            .small()
-                            .icon(IconName::Folder)
-                            .label("Open skills folder")
-                            .on_click(cx.listener(|this, _, w, cx| {
-                                match create_skills_folder(&this.slug) {
-                                    Ok(path) => cx.reveal_path(&path),
-                                    Err(e) => notify_err(w, cx, e.to_string()),
-                                }
-                            })),
-                    )
+                    .child(skills_button(&self.slug))
                     .child(
                         Button::new("agent-new-task")
                             .ghost()
@@ -814,8 +973,6 @@ impl Render for AgentSettingsView {
                             })),
                     ),
             )
-            .child(open_tasks)
-            .child(history)
             .into_any_element()
     }
 }
