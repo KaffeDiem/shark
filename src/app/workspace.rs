@@ -37,6 +37,7 @@ impl Shark {
         if self.archiving.contains(name) || self.ws(name).is_none() {
             return notify_err(window, cx, "The selected agent is no longer available");
         }
+        let instance = self.ws(name).unwrap().instance_id.clone();
         // Pick after confirmation, before showing anything: the previous chat must stay unread.
         let prepare_chat = move |s: &mut Self, name: &str| {
             let Some(id) = chat else { return true };
@@ -75,7 +76,7 @@ impl Shark {
                 .state
                 .workspaces
                 .iter()
-                .position(|w| w.name == name)
+                .position(|w| w.name == name && w.instance_id == instance)
                 .filter(|_| !s.archiving.contains(&name))
             else {
                 return notify_err(window, cx, "The selected agent is no longer available");

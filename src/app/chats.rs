@@ -221,10 +221,14 @@ impl Shark {
     pub(crate) fn open_notification(
         &mut self,
         name: &str,
+        instance: &str,
         chat: Option<String>,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if instance.is_empty() || self.ws(name).is_none_or(|ws| ws.instance_id != instance) {
+            return notify_err(window, cx, "The selected agent is no longer available");
+        }
         self.open_workspace_then(name, chat, window, cx, |s, window, cx| {
             let Some(ws) = s.active_ws() else { return };
             s.select_chat(ws.active_chat, window, cx);

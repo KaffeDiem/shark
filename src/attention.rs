@@ -236,13 +236,7 @@ impl Shark {
             }
         }
         if !shown || !self.attn.window_active {
-            notify(
-                name,
-                Some(chat),
-                &self.ws_title(name),
-                "The agent finished its turn",
-                cx,
-            );
+            self.notify(name, Some(chat), "The agent finished its turn", cx);
         }
         self.refresh_attention(cx);
     }
@@ -271,7 +265,7 @@ impl Shark {
                 && prev != &needs
                 && !on_screen
             {
-                notify(name, None, &self.ws_title(name), l, cx);
+                self.notify(name, None, l, cx);
             }
         }
         set_badge(count);
@@ -330,7 +324,8 @@ fn set_badge(n: usize) {
 pub(crate) fn init(window: &Window, cx: &mut Context<Shark>) {
     let (window, shark) = (window.window_handle(), cx.entity().downgrade());
     cx.on_system_notification_response(move |response, cx| {
-        let Ok((name, chat)) = serde_json::from_str::<(String, Option<String>)>(&response.tag)
+        let Ok((instance, name, chat)) =
+            serde_json::from_str::<(String, String, Option<String>)>(&response.tag)
         else {
             return;
         };
@@ -338,20 +333,27 @@ pub(crate) fn init(window: &Window, cx: &mut Context<Shark>) {
         cx.activate(true);
         let _ = window.update(cx, |_, window, cx| {
             window.activate_window();
-            shark.update(cx, |s, cx| s.open_notification(&name, chat, window, cx))
+            shark.update(cx, |s, cx| {
+                s.open_notification(&name, &instance, chat, window, cx)
+            })
         });
     });
 }
 
-fn notify(name: &str, chat: Option<&str>, title: &str, body: &str, cx: &App) {
-    cx.show_system_notification(SystemNotification {
-        tag: serde_json::to_string(&(name, chat))
-            .expect("notification identity")
-            .into(),
-        title: format!("shark · {title}").into(),
-        body: body.to_string().into(),
-        actions: vec![],
-    });
+impl Shark {
+    fn notify(&self, name: &str, chat: Option<&str>, body: &str, cx: &App) {
+        let Some(ws) = self.state.workspaces.iter().find(|ws| ws.name == name) else {
+            return;
+        };
+        cx.show_system_notification(SystemNotification {
+            tag: serde_json::to_string(&(&ws.instance_id, name, chat))
+                .expect("notification identity")
+                .into(),
+            title: format!("shark · {}", ws.display_title()).into(),
+            body: body.to_string().into(),
+            actions: vec![],
+        });
+    }
 }
 
 #[cfg(test)]

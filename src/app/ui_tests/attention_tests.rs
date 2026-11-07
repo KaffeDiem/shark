@@ -280,9 +280,54 @@ async fn notification_for_evicted_chat_keeps_current_view(cx: &mut TestAppContex
         });
     }
     on(cx, &|s, w, cx| {
-        s.open_notification("one", None, w, cx);
+        let instance = s.ws("one").unwrap().instance_id.clone();
+        s.open_notification("one", &instance, None, w, cx);
         assert!(!s.home_shown());
         assert_eq!(s.active_chat().unwrap().read(cx).meta.id, new_id);
+    });
+}
+
+#[gpui_kit::test]
+async fn notification_rejects_recreated_agent(cx: &mut TestAppContext) {
+    let _turn = UI_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (window, shark) = fixture(cx);
+    let on = on_app(window, shark.clone());
+    on(cx, &|s, w, cx| {
+        s.state.workspaces[0].chats.clear();
+        s.state.workspaces[0].migrate();
+        s.open_workspace(1, w, cx);
+        s.turn_done("one", "one", cx);
+    });
+    let tag = cx.shown_system_notifications().last().unwrap().tag.clone();
+    on(cx, &|s, w, cx| {
+        let old = s.ws("one").unwrap().instance_id.clone();
+        s.archived("one", Ok(vec![]), w, cx);
+        let mut replacement = Workspace {
+            name: "one".into(),
+            branch: "one".into(),
+            ..Default::default()
+        };
+        replacement.migrate();
+        assert_ne!(replacement.instance_id, old);
+        assert_eq!(replacement.chats[0].id, "one");
+        s.state.workspaces.push(replacement);
+        s.unread.insert("one".into());
+    });
+    click(cx, tag);
+    on(cx, &|s, _, _| {
+        assert_eq!(s.active.as_deref(), Some("two"));
+        assert!(s.unread.contains("one"));
+    });
+    on(cx, &|s, w, cx| {
+        s.open_notification("one", "", Some("one".into()), w, cx);
+        assert_eq!(s.active.as_deref(), Some("two"));
+        s.turn_done("one", "one", cx);
+    });
+    let tag = cx.shown_system_notifications().last().unwrap().tag.clone();
+    click(cx, tag);
+    on(cx, &|s, _, _| {
+        assert_eq!(s.active.as_deref(), Some("one"));
+        assert!(!s.unread.contains("one"));
     });
 }
 
@@ -317,6 +362,24 @@ async fn notification_respects_unsaved_edits(cx: &mut TestAppContext) {
         assert_eq!(s.active.as_deref(), Some("two"));
         assert!(editor.read(cx).dirty);
     });
+    click(cx, tag);
+    on(cx, &|s, w, cx| {
+        assert!(w.has_active_dialog(cx));
+        let mut replacement = s.ws("one").unwrap().clone();
+        replacement.instance_id = Workspace::default().instance_id;
+        s.archived("one", Ok(vec![]), w, cx);
+        s.state.workspaces.push(replacement);
+    });
+    press_in(window)(cx, &["enter"]);
+    on(cx, &|s, _, cx| {
+        assert_eq!(s.active.as_deref(), Some("two"));
+        assert!(
+            editor.read(cx).dirty,
+            "replacement must not discard the original edits"
+        );
+        s.turn_done("one", "one-second", cx);
+    });
+    let tag = cx.shown_system_notifications().last().unwrap().tag.clone();
     click(cx, tag);
     press_in(window)(cx, &["enter"]);
     on(cx, &|s, _, cx| {

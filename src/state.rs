@@ -187,6 +187,9 @@ pub struct Repo {
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Workspace {
+    /// Distinguishes this agent from later agents that reuse its name.
+    #[serde(default)]
+    pub instance_id: String,
     /// Last explicit user interaction, in Unix milliseconds; background work never updates it.
     #[serde(default)]
     pub last_interacted_at: Option<u64>,
@@ -265,9 +268,16 @@ fn diff_closed_by_default() -> bool {
     true
 }
 
+fn workspace_instance_id() -> String {
+    let mut bytes = [0; 16];
+    getrandom::fill(&mut bytes).expect("workspace identity randomness");
+    format!("{:032x}", u128::from_be_bytes(bytes))
+}
+
 impl Default for Workspace {
     fn default() -> Self {
         Self {
+            instance_id: workspace_instance_id(),
             last_interacted_at: None,
             name: String::new(),
             title: String::new(),
@@ -738,6 +748,9 @@ impl Workspace {
 
     /// Gives a workspace saved before chat tabs (or a new one) its first chat.
     pub fn migrate(&mut self) {
+        if self.instance_id.is_empty() {
+            self.instance_id = workspace_instance_id();
+        }
         if self.chats.is_empty() {
             self.chats.push(ChatMeta {
                 id: self.name.clone(),
@@ -1011,6 +1024,7 @@ impl State {
                 ..State::default()
             }
         });
+        let migrated_instances = state.workspaces.iter().any(|ws| ws.instance_id.is_empty());
         let (model, effort) = (state.new_model(), state.last_effort.clone());
         for ws in &mut state.workspaces {
             ws.migrate();
@@ -1019,6 +1033,9 @@ impl State {
                 // Unreadable shows as missing snapshots; `put_snapshot` still won't overwrite it.
                 ws.issues = crate::linear::read_snapshots(&ws.name).unwrap_or_default();
             }
+        }
+        if migrated_instances {
+            let _ = state.save_at(path);
         }
         state
     }
@@ -1815,6 +1832,24 @@ mod tests {
         assert_eq!(ws.tab_order, [TabId::Chat("w~2".into()), TabId::Diff]);
         assert_eq!(ws.closed, [chat("w")]);
         assert!(ws.remove_chat("gone", chat(""), |_| false).is_none());
+    }
+
+    #[test]
+    fn workspace_instance_migration_is_saved_and_stable() {
+        let dir = std::env::temp_dir().join(format!("shark-instance-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("state.json");
+        fs::write(
+            &path,
+            r#"{"repos":[],"workspaces":[{"name":"one","branch":"one","repos":[]}]}"#,
+        )
+        .unwrap();
+        let first = State::load_at(&path);
+        let id = &first.workspaces[0].instance_id;
+        assert!(!id.is_empty());
+        assert_eq!(State::load_at(&path).workspaces[0].instance_id, *id);
+        assert_ne!(Workspace::default().instance_id, *id);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
